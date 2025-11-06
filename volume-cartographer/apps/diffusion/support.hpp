@@ -31,5 +31,8 @@ struct PointHash {
 
 void parse_center(cv::Vec3f& center, const std::string& center_str);
 
-std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm);
+SkeletonGraph trace_skeleton_segments(const cv::Mat& thinned_slice, const po::variables_map& vm);
 void populate_normal_grid(const SkeletonGraph& graph, vc::core::util::GridStore& normal_grid, double spiral_step);
+void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, vc::core::util::GridStore& normal_grid, double spiral_step);
+
+cv::Mat visualize_normal_grid(const vc::core::util::GridStore& normal_grid, const cv::Size& size);

@@ -100,9 +100,9 @@ class CriticalComponentsMetric(BaseMetric):
         
         # Average over batch
         return {
-            "positive": float(np.mean(pos_criticals)),
-            "negative": float(np.mean(neg_criticals)),
-            "total": float(np.mean(pos_criticals + neg_criticals))
+            "critical components negative": float(np.mean(neg_criticals)),
+            "critical components positive": float(np.mean(pos_criticals)),
+            "critical components total": float(np.mean(pos_criticals + neg_criticals)),
         }
 
 

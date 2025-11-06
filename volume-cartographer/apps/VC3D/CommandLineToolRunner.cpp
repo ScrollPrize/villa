@@ -151,13 +151,10 @@ void CommandLineToolRunner::setOmpThreads(int threads)
     _ompThreads = threads;
 }
 
-void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid, int decimateIterations, bool cleanSurface, float cleanK)
+void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
 {
     _optNormalizeUV = normalizeUV;
     _optAlignGrid = alignGrid;
-    _optDecimateIter = decimateIterations;
-    _optCleanSurface = cleanSurface;
-    _optCleanK = cleanK;
 }
 
 void CommandLineToolRunner::setRenderAdvanced(
@@ -565,12 +562,19 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << _objPath;
             if (_optNormalizeUV) args << "--normalize-uv";
             if (_optAlignGrid)   args << "--align-grid";
-            if (_optDecimateIter > 0) {
-                args << "--decimate" << QString::number(_optDecimateIter);
-            }
-            if (_optCleanSurface) {
-                args << "--clean" << QString::number(_optCleanK);
-            }
+            break;
+        case Tool::obj2tifxyz:
+            args << _objPath
+                 << _objOutputDir
+                 << QString::number(_objStretchFactor)
+                 << QString::number(_objMeshUnits)
+                 << QString::number(_objStepSize);
+            break;
+        case Tool::AlphaCompRefine:
+            args << _volumePath
+                 << _segmentPath
+                 << _refineDst
+                 << _jsonParams;
             break;
     }
 
@@ -580,7 +584,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
 QString CommandLineToolRunner::toolName(Tool tool) const
 {
     QString basePath = QCoreApplication::applicationDirPath() + "/";
-
     switch (tool) {
         case Tool::RenderTifXYZ:
             return basePath + "vc_render_tifxyz";
@@ -597,6 +600,12 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::tifxyz2obj:
             return basePath + "vc_tifxyz2obj";
 
+        case Tool::obj2tifxyz:
+            return basePath + "vc_obj2tifxyz_legacy";
+
+        case Tool::AlphaCompRefine:
+            return basePath + "vc_objrefine";
+
         default:
             return "unknown_tool";
     }
@@ -604,6 +613,31 @@ QString CommandLineToolRunner::toolName(Tool tool) const
 
 QString CommandLineToolRunner::getOutputPath() const
 {
+    if (_currentTool == Tool::AlphaCompRefine) {
+        return _refineDst;
+    }
+
     QFileInfo outputInfo(_outputPattern);
     return outputInfo.dir().path();
+}
+
+void CommandLineToolRunner::setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
+                                                float stretchFactor, float meshUnits, int stepSize)
+{
+    _objPath = objPath;
+    _objOutputDir = outputDir;
+    _objStretchFactor = stretchFactor;
+    _objMeshUnits = meshUnits;
+    _objStepSize = stepSize;
+}
+
+void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
+                                               const QString& srcSurface,
+                                               const QString& dstSurface,
+                                               const QString& jsonParams)
+{
+    _volumePath = volumePath;
+    _segmentPath = srcSurface;
+    _refineDst = dstSurface;
+    _jsonParams = jsonParams;
 }

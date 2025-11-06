@@ -32,7 +32,7 @@ class CSurfaceCollection : public QObject
     
 public:
     ~CSurfaceCollection();
-    void setSurface(const std::string &name, Surface*, bool noSignalSend = false);
+    void setSurface(const std::string &name, Surface*, bool noSignalSend = false, bool takeOwnership = true);
     void setPOI(const std::string &name, POI *poi);
     void setIntersection(const std::string &a, const std::string &b, Intersection *intersect);
     Surface *surface(const std::string &name);
@@ -50,9 +50,13 @@ signals:
     void sendIntersectionChanged(std::string, std::string, Intersection*);
     
 protected:
+    struct SurfaceEntry {
+        Surface* ptr = nullptr;
+        bool owns = true;
+    };
+
     bool _regular_pan = false;
-    std::unordered_map<std::string, Surface*> _surfs;
+    std::unordered_map<std::string, SurfaceEntry> _surfs;
     std::unordered_map<std::string, POI*> _pois;
     std::unordered_map<std::pair<std::string,std::string>, Intersection*, string_pair_hash> _intersections;
 };
-

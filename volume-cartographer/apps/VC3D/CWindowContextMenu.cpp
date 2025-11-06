@@ -1,5 +1,11 @@
 #include "CWindow.hpp"
 #include "CSurfaceCollection.hpp"
+#include "SurfacePanelController.hpp"
+#include "VCSettings.hpp"
+
+#include <functional>
+#include <algorithm>
+#include <iostream>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -15,15 +21,19 @@
 #include <QRegularExpressionValidator>
 #include <QFile>
 #include <QTextStream>
+#include <QtGlobal>
+#include <QProcessEnvironment>
+#include <QProgressDialog>
+#include <QPointer>
+#include <QTimer>
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+#include <QStandardPaths>
+#endif
 
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "ToolDialogs.hpp"
-
-
-
-
 
 // --------- local helpers for running external tools -------------------------
 static bool runProcessBlocking(const QString& program,
@@ -35,6 +45,11 @@ static bool runProcessBlocking(const QString& program,
     QProcess p;
     if (!workDir.isEmpty()) p.setWorkingDirectory(workDir);
     p.setProcessChannelMode(QProcess::SeparateChannels);
+
+    std::cout << "Running: " << program.toStdString();
+    for (const QString& arg : args) std::cout << " " << arg.toStdString();
+    std::cout << std::endl;
+
     p.start(program, args);
     if (!p.waitForStarted()) { if (err) *err = QObject::tr("Failed to start %1").arg(program); return false; }
     if (!p.waitForFinished(-1)) { if (err) *err = QObject::tr("Timeout running %1").arg(program); return false; }
@@ -43,53 +58,487 @@ static bool runProcessBlocking(const QString& program,
     return (p.exitStatus()==QProcess::NormalExit && p.exitCode()==0);
 }
 
-static QString resolvePythonPath()
+// --------- locate generic vc_* executables -----------------------------------
+static QString findVcTool(const char* name)
 {
-    QSettings s("VC.ini", QSettings::IniFormat);
-    const QString ini = s.value("python/path").toString();
-    if (!ini.isEmpty() && QFileInfo::exists(ini)) return ini;
-
-    const QString env = QString::fromLocal8Bit(qgetenv("VC_PYTHON"));
-    if (!env.isEmpty() && QFileInfo::exists(env)) return env;
-
-    // Prefer micromamba env you mentioned
-    if (QFileInfo::exists("/opt/micromamba/envs/py310/bin/python"))
-        return "/opt/micromamba/envs/py310/bin/python";
-
-    // Reasonable fallbacks
-    if (QFileInfo::exists("/opt/venv/bin/python3"))  return "/opt/venv/bin/python3";
-    if (QFileInfo::exists("/usr/local/bin/python3")) return "/usr/local/bin/python3";
-    if (QFileInfo::exists("/usr/bin/python3"))       return "/usr/bin/python3";
-    return "python3";
-}
-
-static QString resolveFlatboiScript()
-{
-    QSettings s("VC.ini", QSettings::IniFormat);
-    const QString ini = s.value("scripts/flatboi_path").toString();
-    if (!ini.isEmpty()) return ini;
-
-    const QString envDir = QString::fromLocal8Bit(qgetenv("VC_SCRIPTS_DIR"));
-    if (!envDir.isEmpty()) return QDir(envDir).filePath("flatboi.py");
-
-    // Default to the repo path you requested
-    if (QFileInfo::exists("/src/scripts/flatboi.py"))
-        return "/src/scripts/flatboi.py";
-
-    if (QFileInfo::exists("/usr/bin/flatboi.py"))
-        return "/usr/bin/flatboi.py";
-
-    // Last resort: relative to binary
-    QDir bin(QCoreApplication::applicationDirPath());
-
-    if (QFileInfo::exists(bin.filePath("flatboi.py"))) {
-        return bin.filePath("flatboi.py");
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString key1 = QStringLiteral("tools/%1_path").arg(name);
+    const QString key2 = QStringLiteral("tools/%1").arg(name);
+    const QString iniPath =
+        settings.value(key1, settings.value(key2)).toString().trimmed();
+    if (!iniPath.isEmpty()) {
+        QFileInfo fi(iniPath);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
     }
 
-    return QDir(bin.filePath("../scripts")).filePath("flatboi.py");
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+    const QString onPath = QStandardPaths::findExecutable(QString::fromLatin1(name));
+    if (!onPath.isEmpty()) return onPath;
+#else
+    const QStringList pathDirs =
+        QProcessEnvironment::systemEnvironment().value("PATH")
+            .split(QDir::listSeparator(), Qt::SkipEmptyParts);
+    for (const QString& dir : pathDirs) {
+        const QString candidate = QDir(dir).filePath(QString::fromLatin1(name));
+        QFileInfo fi(candidate);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+#endif
+    return {};
 }
-// ---------------------------------------------------------------------------
 
+namespace { // -------------------- anonymous namespace -------------------------
+
+// Owns the lifecycle for the async SLIM run; deletes itself on finish/cancel
+class SlimJob : public QObject {
+public:
+    SlimJob(CWindow* win,
+            const QString& segDir,
+            const QString& segmentStem,
+            const QString& flatboiExe)
+    : QObject(win)
+    , w_(win)
+    , segDir_(segDir)
+    , stem_(segmentStem)
+    , objPath_(QDir(segDir).filePath(segmentStem + ".obj"))
+    , flatObj_(QDir(segDir).filePath(segmentStem + "_flatboi.obj"))
+    , outFinal_(segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi"))
+    , outTemp_ (segDir.endsWith("_flatboi") ? (segDir + "__rebuild_tmp__") : outFinal_)
+    , flatboiExe_(flatboiExe)
+    , inputIsAlreadyFlat_(segDir.endsWith("_flatboi"))
+    , proc_(new QProcess(this))
+    , progress_(new QProgressDialog(QObject::tr("Preparing SLIM…"), QObject::tr("Cancel"), 0, 0, win))
+    , itRe_(R"(^\s*\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption)
+    , progRe_(R"(^\s*PROGRESS\s+(\d+)\s*/\s*(\d+)\s*$)", QRegularExpression::CaseInsensitiveOption)
+    {
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+        iters_ = s.value("tools/flatboi_iters", 20).toInt();
+        if (iters_ <= 0) iters_ = 20;
+
+        tifxyz2objExe_ = findVcTool("vc_tifxyz2obj");
+        obj2tifxyzExe_ = findVcTool("vc_obj2tifxyz");
+
+        // never create outTemp_ here; we'll let vc_obj2tifxyz create it later
+        if (QFileInfo::exists(outTemp_)) {
+            QDir(outTemp_).removeRecursively();
+        }
+
+        proc_->setWorkingDirectory(segDir_);
+        proc_->setProcessChannelMode(QProcess::MergedChannels);
+
+        progress_->setWindowModality(Qt::WindowModal);
+        progress_->setAutoClose(false);
+        progress_->setAutoReset(true);
+        progress_->setMinimumDuration(0);
+        progress_->setMaximum(1 + iters_ + 1);
+        progress_->setValue(0);
+        progress_->setAttribute(Qt::WA_DeleteOnClose);
+
+        QObject::connect(progress_, &QProgressDialog::canceled,
+                         this, &SlimJob::onCanceled_);
+        QObject::connect(proc_, &QProcess::readyReadStandardOutput,
+                         this, &SlimJob::onStdout_);
+        QObject::connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                         this, &SlimJob::onFinished_);
+        QObject::connect(proc_, &QProcess::errorOccurred,
+                         this, &SlimJob::onProcError_);
+
+        w_->statusBar()->showMessage(QObject::tr("Converting TIFXYZ to OBJ…"), 0);
+        startToObj_();
+    }
+
+private:
+    // Write (or update) meta.json in 'dir' so that it contains:
+    //   "scale": [sx, sy]
+    // Returns true on success; leaves other JSON keys intact if meta.json exists.
+    static bool overwriteMetaScale_(const QString& dir, double sx, double sy) {
+        const QString metaPath = QDir(dir).filePath(QStringLiteral("meta.json"));
+        QJsonObject root;
+
+        // Try to read existing meta.json (optional).
+        if (QFileInfo::exists(metaPath)) {
+            QFile in(metaPath);
+            if (in.open(QIODevice::ReadOnly)) {
+                const auto doc = QJsonDocument::fromJson(in.readAll());
+                if (doc.isObject()) root = doc.object();
+                in.close();
+            }
+        }
+
+        QJsonArray scaleArr; scaleArr.append(sx); scaleArr.append(sy);
+        root.insert(QStringLiteral("scale"), scaleArr);
+
+        QFile out(metaPath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        out.close();
+        return true;
+    }
+
+private:
+    enum class Phase { ToObj, Flatboi, ToTifxyz, Swap, Done };
+
+    void startToObj_() {
+        if (tifxyz2objExe_.isEmpty()) { showImmediateToolNotFound_("vc_tifxyz2obj"); return; }
+        phase_ = Phase::ToObj;
+        progress_->setLabelText(QObject::tr("Converting TIFXYZ → OBJ…"));
+        progress_->setMaximum(1 + iters_ + 1);
+        progress_->setValue(0);
+        ioLog_.clear();
+        QStringList args; args << segDir_ << objPath_;
+        ioLog_ += QStringLiteral("Running: %1 %2\n").arg(tifxyz2objExe_, args.join(' '));
+        proc_->start(tifxyz2objExe_, args);
+    }
+
+    void startFlatboi_() {
+        phase_ = Phase::Flatboi;
+        lastIterSeen_ = 0;
+        progress_->setLabelText(QObject::tr("Running SLIM (flatboi)…"));
+        progress_->setValue(1);
+        ioLog_.clear();
+        QStringList args; args << objPath_ << QString::number(iters_);
+        ioLog_ += QStringLiteral("Running: %1 %2\n").arg(flatboiExe_, args.join(' '));
+        proc_->start(flatboiExe_, args);
+    }
+
+    void startToTifxyz_() {
+        if (obj2tifxyzExe_.isEmpty()) { showImmediateToolNotFound_("vc_obj2tifxyz"); return; }
+        phase_ = Phase::ToTifxyz;
+        progress_->setLabelText(QObject::tr("Converting flattened OBJ → TIFXYZ…"));
+        progress_->setValue(1 + iters_);
+
+        // IMPORTANT: vc_obj2tifxyz expects the target directory NOT to exist.
+        if (QFileInfo::exists(outTemp_)) {
+            ioLog_ += QStringLiteral("Removing existing output dir: %1\n").arg(outTemp_);
+            if (!QDir(outTemp_).removeRecursively()) {
+                QMessageBox::critical(w_, QObject::tr("Error"),
+                                      QObject::tr("Output directory already exists and cannot be removed:\n%1")
+                                      .arg(outTemp_));
+                cleanupAndDelete_();
+                return;
+            }
+        }
+
+        // Ensure parent directory exists; vc_obj2tifxyz will create outTemp_ itself
+        const QString parentPath = QFileInfo(outTemp_).absolutePath();
+        QDir parent(parentPath);
+        if (!parent.exists() && !parent.mkpath(".")) {
+            QMessageBox::critical(w_, QObject::tr("Error"),
+                                  QObject::tr("Cannot create parent directory: %1").arg(parentPath));
+            cleanupAndDelete_();
+            return;
+        }
+
+        ioLog_.clear();
+        QStringList args;
+        args << flatObj_
+             << outTemp_
+             // Downsample UV grid by 20× per axis to reduce compute/memory.
+             << QStringLiteral("--uv-downsample=20");
+        ioLog_ += QStringLiteral("Running: %1 %2\n").arg(obj2tifxyzExe_, args.join(' '));
+        proc_->start(obj2tifxyzExe_, args);
+    }
+
+    void finishSwapIfNeeded_() {
+        if (inputIsAlreadyFlat_) {
+            QDir orig(segDir_);
+            orig.removeRecursively();
+
+            const QFileInfo tmpInfo(outTemp_);
+            QDir parent(tmpInfo.absolutePath());
+            if (!parent.rename(tmpInfo.fileName(), QFileInfo(outFinal_).fileName())) {
+                QMessageBox* warn = new QMessageBox(QMessageBox::Warning,
+                    QObject::tr("Warning"),
+                    QObject::tr("Rebuilt directory created, but failed to overwrite original.\n"
+                                "Kept temporary at:\n%1").arg(outTemp_),
+                    QMessageBox::Ok, w_);
+                warn->setAttribute(Qt::WA_DeleteOnClose);
+                warn->open();
+            }
+        }
+    }
+
+    void showDoneAndCleanup_() {
+        if (progress_) {
+            progress_->setValue(progress_->maximum());
+            progress_->close();
+        }
+
+        QMessageBox* box = new QMessageBox(QMessageBox::Information,
+                                           QObject::tr("SLIM-flatten"),
+                                           QObject::tr("Flattened segment written to:\n%1").arg(outFinal_),
+                                           QMessageBox::Ok, w_);
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        QObject::connect(box, &QMessageBox::finished, this, [this]() {
+            if (progress_) progress_->deleteLater();
+            this->deleteLater();
+        });
+        box->open();
+    }
+
+    void cleanupAndDelete_() {
+        if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
+            QDir(outTemp_).removeRecursively();
+        }
+        if (progress_) { progress_->close(); progress_->deleteLater(); }
+        QTimer::singleShot(0, this, [this](){ this->deleteLater(); });
+    }
+
+
+    void onCanceled_() {
+        if (proc_->state() != QProcess::NotRunning) {
+            proc_->kill();
+            proc_->waitForFinished(3000);
+            
+            // Ensure the process is actually terminated before proceeding
+            if (proc_->state() != QProcess::NotRunning) {
+                return; // Don't proceed with cleanup if process is still running
+            }
+        }
+        if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
+            QDir(outTemp_).removeRecursively();
+        }
+
+        w_->statusBar()->showMessage(QObject::tr("SLIM-flatten cancelled"), 5000);
+        progress_->close();
+        progress_->deleteLater();
+        QTimer::singleShot(0, this, [this](){ this->deleteLater(); });
+    }
+
+    void onStdout_() {
+        const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
+        ioLog_ += chunk;
+        const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
+        for (const QString& raw : lines) {
+            const QString line = raw.trimmed();
+
+            if (phase_ == Phase::Flatboi) {
+                if (auto m = progRe_.match(line); m.hasMatch()) {
+                    const int cur = m.captured(1).toInt();
+                    const int tot = m.captured(2).toInt();
+                    if (tot > 0 && tot != iters_) {
+                        iters_ = tot;
+                        progress_->setMaximum(1 + iters_ + 1);
+                    }
+                    progress_->setLabelText(QObject::tr("SLIM iterations: %1 / %2").arg(cur).arg(iters_));
+                    progress_->setValue(1 + std::max(0, std::min(cur, iters_)));
+                    lastIterSeen_ = std::max(lastIterSeen_, cur);
+                    continue;
+                }
+                if (auto m = itRe_.match(line); m.hasMatch()) {
+                    const int n = m.captured(1).toInt();
+                    lastIterSeen_ = std::max(lastIterSeen_, n);
+                    progress_->setLabelText(QObject::tr("SLIM iterations: %1 / %2").arg(lastIterSeen_).arg(iters_));
+                    progress_->setValue(1 + std::max(0, std::min(lastIterSeen_, iters_)));
+                    continue;
+                }
+            }
+
+            if (line.startsWith("Final stretch") || line.startsWith("Wrote:")) {
+                w_->statusBar()->showMessage(line, 0);
+            }
+        }
+    }
+
+    void onProcError_(QProcess::ProcessError e) {
+        if (errorShown_) return;
+        errorShown_ = true;
+        QString why;
+        switch (e) {
+            case QProcess::FailedToStart: why = QObject::tr("Program not found or not executable."); break;
+            case QProcess::Crashed:       why = QObject::tr("Process crashed."); break;
+            default:                      why = QObject::tr("Process error (%1).").arg(int(e)); break;
+        }
+        QString what;
+        switch (phase_) {
+            case Phase::ToObj:    what = QObject::tr("vc_tifxyz2obj failed to start."); break;
+            case Phase::Flatboi:  what = QObject::tr("flatboi failed to start.");       break;
+            case Phase::ToTifxyz: what = QObject::tr("vc_obj2tifxyz failed to start."); break;
+            default: break;
+        }
+        QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
+                                           what + "\n\n" + ioLog_.trimmed() + "\n\n" + why,
+                                           QMessageBox::Ok, w_);
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        QObject::connect(box, &QMessageBox::finished, this, [this]() { cleanupAndDelete_(); });
+        box->open();
+        w_->statusBar()->showMessage(QObject::tr("SLIM-flatten failed"), 5000);
+    }
+
+    void onFinished_(int exitCode, QProcess::ExitStatus st) {
+        if (errorShown_) return;
+
+        // Error path
+        if (st != QProcess::NormalExit || exitCode != 0) {
+            const QString err = ioLog_.trimmed();
+            QString what;
+            switch (phase_) {
+                case Phase::ToObj:    what = QObject::tr("vc_tifxyz2obj failed."); break;
+                case Phase::Flatboi:  what = QObject::tr("flatboi failed.");       break;
+                case Phase::ToTifxyz: what = QObject::tr("vc_obj2tifxyz failed."); break;
+                default: break;
+            }
+            QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
+                                               what + (err.isEmpty()? QString() : ("\n\n" + err)),
+                                               QMessageBox::Ok, w_);
+            errorShown_ = true;  // Prevent duplicate error dialogs
+            box->setAttribute(Qt::WA_DeleteOnClose);
+            QObject::connect(box, &QMessageBox::finished, this, [this]() {
+                if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
+                    QDir(outTemp_).removeRecursively();
+                }
+                if (progress_) { progress_->close(); progress_->deleteLater(); }
+                this->deleteLater();
+            });
+            box->open();
+            w_->statusBar()->showMessage(QObject::tr("SLIM-flatten failed"), 5000);
+            return;
+        }
+
+        // Success: advance phases
+        if (phase_ == Phase::ToObj) {
+            if (!QFileInfo::exists(objPath_)) { onFinished_(1, QProcess::NormalExit); return; }
+            if (progress_) progress_->setValue(1);
+            startFlatboi_();
+            return;
+        }
+
+        if (phase_ == Phase::Flatboi) {
+            if (!QFileInfo::exists(flatObj_)) { onFinished_(1, QProcess::NormalExit); return; }
+            startToTifxyz_();
+            return;
+        }
+
+        if (phase_ == Phase::ToTifxyz) {
+            if (!QFileInfo::exists(outTemp_) || !QFileInfo(outTemp_).isDir()) {
+                onFinished_(1, QProcess::NormalExit); return;
+            }
+
+            // Ensure the new tifxyz has a deterministic pixel size in meta.json
+            // Requested: "scale": [0.05, 0.05]
+            if (!overwriteMetaScale_(outTemp_, 0.05, 0.05)) {
+                // Non-fatal: warn but continue with swap and completion.
+                QMessageBox* warn = new QMessageBox(QMessageBox::Warning,
+                    QObject::tr("Warning"),
+                    QObject::tr("Converted directory created, but failed to update meta.json scale in:\n%1")
+                        .arg(outTemp_),
+                    QMessageBox::Ok, w_);
+                warn->setAttribute(Qt::WA_DeleteOnClose);
+                warn->open();
+            }
+
+            phase_ = Phase::Swap;
+            finishSwapIfNeeded_();
+            phase_ = Phase::Done;
+
+            w_->statusBar()->showMessage(QObject::tr("SLIM-flatten complete: %1").arg(outFinal_), 5000);
+            showDoneAndCleanup_();
+            return;
+        }
+    }
+
+    static void removeDirIfExists_(const QString& p){
+        if (QFileInfo::exists(p)) { QDir d(p); d.removeRecursively(); }
+    }
+
+private:
+    CWindow* w_ = nullptr;
+
+    // paths & flags
+    QString segDir_;
+    QString stem_;
+    QString objPath_;
+    QString flatObj_;
+    QString outFinal_;
+    QString outTemp_;
+    QString flatboiExe_;
+    bool    inputIsAlreadyFlat_ = false;
+
+    // process & progress
+    QProcess* proc_ = nullptr;
+    QPointer<QProgressDialog> progress_;
+    Phase   phase_ = Phase::ToObj;
+
+    // iteration tracking
+    int iters_ = 20;
+    int lastIterSeen_ = 0;
+    QRegularExpression itRe_;
+    QRegularExpression progRe_;
+
+    // buffered output for error reporting
+    QString ioLog_;
+
+    // resolved executables
+    QString tifxyz2objExe_;
+    QString obj2tifxyzExe_;
+
+    bool errorShown_ = false;
+
+    void showImmediateToolNotFound_(const char* tool) {
+        QMessageBox::critical(w_, QObject::tr("Error"),
+            QObject::tr("Could not find the '%1' executable.\n"
+                        "Tip: set VC.ini [tools] %1_path or ensure it's on PATH.").arg(tool));
+        cleanupAndDelete_();
+    }
+};
+
+// --------- locate 'flatboi' executable --------------------------------------
+static QString findFlatboiExecutable()
+{
+    const QByteArray envFlatboi = qgetenv("FLATBOI");
+    if (!envFlatboi.isEmpty()) {
+        const QString p = QString::fromLocal8Bit(envFlatboi);
+        QFileInfo fi(p);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const QString iniPath = settings.value("tools/flatboi_path",
+                                               settings.value("tools/flatboi")).toString().trimmed();
+        if (!iniPath.isEmpty()) {
+            QFileInfo fi(iniPath);
+            if (fi.exists() && fi.isFile() && fi.isExecutable())
+                return fi.absoluteFilePath();
+        }
+    }
+
+    const QStringList known = {
+        "/usr/local/bin/flatboi",
+        "/home/builder/vc-dependencies/bin/flatboi"
+    };
+    for (const QString& p : known) {
+        QFileInfo fi(p);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+    const QString onPath = QStandardPaths::findExecutable("flatboi");
+    if (!onPath.isEmpty()) return onPath;
+#else
+    const QStringList pathDirs =
+        QProcessEnvironment::systemEnvironment().value("PATH")
+            .split(QDir::listSeparator(), Qt::SkipEmptyParts);
+    for (const QString& dir : pathDirs) {
+        const QString candidate = QDir(dir).filePath("flatboi");
+        QFileInfo fi(candidate);
+        if (fi.exists() && fi.isFile() && fi.isExecutable())
+            return fi.absoluteFilePath();
+    }
+#endif
+
+    return {};
+}
+
+} // -------------------- end anonymous namespace ------------------------------
+
+// ====================== CWindow member functions ==============================
 
 void CWindow::onRenderSegment(const std::string& segmentId)
 {
@@ -99,7 +548,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
         return;
     }
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     const QString volumePath = getCurrentVolumePath();
     const QString segmentPath = QString::fromStdString(surfMeta->path.string());
@@ -110,14 +559,12 @@ void CWindow::onRenderSegment(const std::string& segmentId)
     const int layers = 31;
     const QString outputPattern = QString(outputFormat).replace("%s", segmentOutDir);
 
-    // Prompt user for parameters
     RenderParamsDialog dlg(this, volumePath, segmentPath, outputPattern, scale, resolution, layers);
     if (dlg.exec() != QDialog::Accepted) {
         statusBar()->showMessage(tr("Render cancelled"), 3000);
         return;
     }
 
-    // Initialize command line tool runner if needed
     if (!_cmdRunner) {
         _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
         connect(_cmdRunner, &CommandLineToolRunner::toolStarted,
@@ -129,9 +576,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
                        const QString& /*outputPath*/, bool copyToClipboard) {
                     if (success) {
                         QString displayMsg = message;
-                        if (copyToClipboard) {
-                            displayMsg += tr(" - Path copied to clipboard");
-                        }
+                        if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
                         statusBar()->showMessage(displayMsg, 5000);
                         QMessageBox::information(this, tr("Rendering Complete"), displayMsg);
                     } else {
@@ -141,13 +586,11 @@ void CWindow::onRenderSegment(const std::string& segmentId)
                 });
     }
 
-    // Check if a tool is already running
     if (_cmdRunner->isRunning()) {
         QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
         return;
     }
 
-    // Set up parameters and execute the render tool
     _cmdRunner->setSegmentPath(dlg.segmentPath());
     _cmdRunner->setOutputPattern(dlg.outputPattern());
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
@@ -160,11 +603,10 @@ void CWindow::onRenderSegment(const std::string& segmentId)
     _cmdRunner->setIncludeTifs(dlg.includeTifs());
 
     _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
-
     statusBar()->showMessage(tr("Rendering segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
-void CWindow::onSlimFlattenAndRender(const std::string& segmentId)
+void CWindow::onSlimFlatten(const std::string& segmentId)
 {
     auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
     if (currentVolume == nullptr || !surfMeta) {
@@ -176,102 +618,23 @@ void CWindow::onSlimFlattenAndRender(const std::string& segmentId)
         return;
     }
 
-    // Paths
-    const std::filesystem::path segDirFs = surfMeta->path;           // tifxyz folder
-    const QString  segDir   = QString::fromStdString(segDirFs.string());
-    const QString  objPath  = QDir(segDir).filePath(QString::fromStdString(segmentId) + ".obj");
-    const QString  flatObj  = QDir(segDir).filePath(QString::fromStdString(segmentId) + "_flatboi.obj");
-    QString        outTifxyz= segDir + "_flatboi";
+    const std::filesystem::path segDirFs = surfMeta->path; // tifxyz folder
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
 
-    // If the output dir already exists, offer to delete it (vc_obj2tifxyz requires a non-existent target)
-    if (QFileInfo::exists(outTifxyz)) {
-        const auto ans = QMessageBox::question(
-            this, tr("Output Exists"),
-            tr("The output directory already exists:\n%1\n\nDelete it and recreate?").arg(outTifxyz),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-        if (ans == QMessageBox::No) {
-            statusBar()->showMessage(tr("SLIM-flatten cancelled by user (existing output)."), 5000);
-            return;
-        }
-        QDir dir(outTifxyz);
-        if (!dir.removeRecursively()) {
-            QMessageBox::critical(this, tr("Error"),
-                                  tr("Failed to remove existing output directory:\n%1").arg(outTifxyz));
-            return;
-        }
-    }
-
-    // 1) tifxyz -> obj
-    statusBar()->showMessage(tr("Converting TIFXYZ to OBJ…"), 0);
-    {
-        QString err;
-        if (!runProcessBlocking("vc_tifxyz2obj", QStringList() << segDir << objPath, segDir, nullptr, &err)) {
-            QMessageBox::critical(this, tr("Error"), tr("vc_tifxyz2obj failed.\n\n%1").arg(err));
-            statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
-            return;
-        }
-    }
-
-    // 2) SLIM via python: python /src/scripts/flatboi.py <obj> 60
-    statusBar()->showMessage(tr("Running SLIM (flatboi.py)…"), 0);
-    {
-        const QString py = resolvePythonPath();
-        const QString script = resolveFlatboiScript();
-        if (!QFileInfo::exists(script)) {
-            QMessageBox::critical(this, tr("Error"), tr("flatboi.py not found at:\n%1").arg(script));
-            statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
-            return;
-        }
-        QString err;
-        if (!runProcessBlocking(py, QStringList() << script << objPath << "60", segDir, nullptr, &err)) {
-            QMessageBox::critical(this, tr("Error"), tr("flatboi.py failed.\n\n%1").arg(err));
-            statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
-            return;
-        }
-        if (!QFileInfo::exists(flatObj)) {
-            // flatboi writes <basename>_flatboi.obj next to the input .obj
-            QMessageBox::critical(this, tr("Error"),
-                                  tr("Flattened OBJ was not created:\n%1").arg(flatObj));
-            statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
-            return;
-        }
-    }
-
-    // 3) flattened obj -> tifxyz  (IMPORTANT: do NOT pre-create the directory)
-    statusBar()->showMessage(tr("Converting flattened OBJ back to TIFXYZ…"), 0);
-    {
-        QString err;
-        if (!runProcessBlocking("vc_obj2tifxyz", QStringList() << flatObj << outTifxyz, segDir, nullptr, &err)) {
-            QMessageBox::critical(this, tr("Error"), tr("vc_obj2tifxyz failed.\n\n%1").arg(err));
-            statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
-            return;
-        }
-    }
-
-    // 4) render the *_flatboi folder
-    if (!initializeCommandLineRunner()) {
-        QMessageBox::critical(this, tr("Error"), tr("Failed to initialize command runner."));
+    const QString flatboiExe = findFlatboiExecutable();
+    if (flatboiExe.isEmpty()) {
+        const QString msg =
+            tr("Could not find the 'flatboi' executable.\n"
+               "Looked in known locations and PATH.\n\n"
+               "Tip: set an override via VC.ini [tools] flatboi_path or FLATBOI env var.");
+        QMessageBox::critical(this, tr("Error"), msg);
+        statusBar()->showMessage(tr("SLIM-flatten failed"), 5000);
         return;
     }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
-        return;
-    }
-    {
-        QString outputFormat = "%s/layers/%02d.tif";
-        float scale = 1.0f;
-        int resolution = 0;
-        int layers = 31;
-        const QString outPattern = outputFormat.replace("%s", outTifxyz);
 
-        _cmdRunner->setSegmentPath(outTifxyz);
-        _cmdRunner->setOutputPattern(outPattern);
-        _cmdRunner->setRenderParams(scale, resolution, layers);
-        _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
-        statusBar()->showMessage(tr("Rendering flattened segment…"), 0);
-    }
+    new SlimJob(this, segDir, segmentStem, flatboiExe);
 }
-
 
 void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
 {
@@ -286,21 +649,14 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
         return;
     }
 
-    // Initialize command line tool runner if needed
-    if (!initializeCommandLineRunner()) {
-        return;
-    }
-
-    // Check if a tool is already running
+    if (!initializeCommandLineRunner()) return;
     if (_cmdRunner->isRunning()) {
         QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
         return;
     }
 
-    // Get paths
     QString srcSegment = QString::fromStdString(surfMeta->path.string());
 
-    // Get the volpkg path and create traces directory if it doesn't exist
     std::filesystem::path volpkgPath = std::filesystem::path(fVpkgPath.toStdString());
     std::filesystem::path tracesDir = volpkgPath / "traces";
     std::filesystem::path jsonParamsPath = volpkgPath / "trace_params.json";
@@ -308,23 +664,19 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
 
     statusBar()->showMessage(tr("Preparing to run grow_seg_from_segment..."), 2000);
 
-    // Create traces directory if it doesn't exist
     if (!std::filesystem::exists(tracesDir)) {
-        try {
-            std::filesystem::create_directory(tracesDir);
-        } catch (const std::exception& e) {
+        try { std::filesystem::create_directory(tracesDir); }
+        catch (const std::exception& e) {
             QMessageBox::warning(this, tr("Error"), tr("Failed to create traces directory: %1").arg(e.what()));
             return;
         }
     }
 
-    // Check if trace_params.json exists
     if (!std::filesystem::exists(jsonParamsPath)) {
         QMessageBox::warning(this, tr("Error"), tr("trace_params.json not found in the volpkg"));
         return;
     }
 
-    // Prompt user for parameters
     TraceParamsDialog dlg(this,
                           getCurrentVolumePath(),
                           QString::fromStdString(pathsDir.string()),
@@ -336,7 +688,6 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
         return;
     }
 
-    // Merge JSON from disk with UI overrides, write to a temp file inside target dir
     QJsonObject base;
     {
         QFile f(dlg.jsonParams());
@@ -360,7 +711,6 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
         f.close();
     }
 
-    // Set up parameters and execute the tool
     _cmdRunner->setTraceParams(
         dlg.volumePath(),
         dlg.srcDir(),
@@ -369,7 +719,6 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
         dlg.srcSegment());
     _cmdRunner->setOmpThreads(dlg.ompThreads());
 
-    // Show console before executing to see any debug output
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::GrowSegFromSegment);
     statusBar()->showMessage(tr("Growing segment from: %1").arg(QString::fromStdString(segmentId)), 5000);
@@ -388,30 +737,18 @@ void CWindow::onAddOverlap(const std::string& segmentId)
         return;
     }
 
-    // Initialize command line tool runner if needed
-    if (!initializeCommandLineRunner()) {
-        return;
-    }
-
-    // Check if a tool is already running
+    if (!initializeCommandLineRunner()) return;
     if (_cmdRunner->isRunning()) {
         QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
         return;
     }
 
-    // Get paths
     std::filesystem::path volpkgPath = std::filesystem::path(fVpkgPath.toStdString());
     std::filesystem::path pathsDir = volpkgPath / "paths";
     QString tifxyzPath = QString::fromStdString(surfMeta->path.string());
 
-    // Set up parameters and execute the tool
-    _cmdRunner->setAddOverlapParams(
-        QString::fromStdString(pathsDir.string()),
-        tifxyzPath
-    );
-
+    _cmdRunner->setAddOverlapParams(QString::fromStdString(pathsDir.string()), tifxyzPath);
     _cmdRunner->execute(CommandLineToolRunner::Tool::SegAddOverlap);
-
     statusBar()->showMessage(tr("Adding overlap for segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
@@ -428,24 +765,15 @@ void CWindow::onConvertToObj(const std::string& segmentId)
         return;
     }
 
-    // Initialize command line tool runner if needed
-    if (!initializeCommandLineRunner()) {
-        return;
-    }
-
-    // Check if a tool is already running
+    if (!initializeCommandLineRunner()) return;
     if (_cmdRunner->isRunning()) {
         QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
         return;
     }
 
-    // Get source tifxyz path (this is a directory containing the TIFXYZ files)
     std::filesystem::path tifxyzPath = surfMeta->path;
-
-    // Generate output OBJ path inside the TIFXYZ directory with segment ID as filename
     std::filesystem::path objPath = tifxyzPath / (segmentId + ".obj");
 
-    // Prompt for parameters
     ConvertToObjDialog dlg(this,
                            QString::fromStdString(tifxyzPath.string()),
                            QString::fromStdString(objPath.string()));
@@ -454,12 +782,81 @@ void CWindow::onConvertToObj(const std::string& segmentId)
         return;
     }
 
-    // Set up parameters and execute the tool
     _cmdRunner->setToObjParams(dlg.tifxyzPath(), dlg.objPath());
     _cmdRunner->setOmpThreads(dlg.ompThreads());
-    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid(), dlg.decimateIterations(), dlg.cleanSurface(), static_cast<float>(dlg.cleanK()));
+    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
     statusBar()->showMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+void CWindow::onAlphaCompRefine(const std::string& segmentId)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: No volume package loaded"));
+        return;
+    }
+
+    auto surfMeta = fVpkg->getSurface(segmentId);
+    if (!surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    if (!initializeCommandLineRunner()) return;
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    QString volumePath = getCurrentVolumePath();
+    if (volumePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: Unable to determine volume path"));
+        return;
+    }
+
+    QString srcPath = QString::fromStdString(surfMeta->path.string());
+    QFileInfo srcInfo(srcPath);
+
+    QString defaultOutput;
+    if (srcInfo.isDir()) {
+        defaultOutput = srcInfo.absoluteFilePath() + "_refined";
+    } else {
+        const QString base = srcInfo.completeBaseName();
+        const QString suffix = srcInfo.completeSuffix();
+        QString candidate = srcInfo.absolutePath() + "/" + base + "_refined";
+        if (!suffix.isEmpty()) {
+            candidate += "." + suffix;
+        }
+        defaultOutput = candidate;
+    }
+
+    AlphaCompRefineDialog dlg(this, volumePath, srcPath, defaultOutput);
+    if (dlg.exec() != QDialog::Accepted) {
+        statusBar()->showMessage(tr("Alpha-comp refinement cancelled"), 3000);
+        return;
+    }
+
+    if (dlg.volumePath().isEmpty() || dlg.srcPath().isEmpty() || dlg.dstPath().isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Volume, source, and output paths must be specified"));
+        return;
+    }
+
+    QJsonObject paramsJson = dlg.paramsJson();
+    QString paramsPath = QDir(QDir::tempPath()).filePath(
+        QStringLiteral("vc_objrefine_%1.json").arg(QDateTime::currentMSecsSinceEpoch()));
+
+    QFile paramsFile(paramsPath);
+    if (!paramsFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to write params JSON: %1").arg(paramsPath));
+        return;
+    }
+    paramsFile.write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
+    paramsFile.close();
+
+    _cmdRunner->setObjRefineParams(dlg.volumePath(), dlg.srcPath(), dlg.dstPath(), paramsPath);
+    _cmdRunner->setOmpThreads(dlg.ompThreads());
+    _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
+    statusBar()->showMessage(tr("Refining segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
 void CWindow::onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed)
@@ -469,38 +866,28 @@ void CWindow::onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRa
         return;
     }
 
-    // Initialize command line tool runner if needed
-    if (!initializeCommandLineRunner()) {
-        return;
-    }
-
-    // Check if a tool is already running
+    if (!initializeCommandLineRunner()) return;
     if (_cmdRunner->isRunning()) {
         QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
         return;
     }
 
-    // Get paths
     std::filesystem::path volpkgPath = std::filesystem::path(fVpkgPath.toStdString());
     std::filesystem::path pathsDir = volpkgPath / "paths";
 
-    // Create traces directory if it doesn't exist
     if (!std::filesystem::exists(pathsDir)) {
         QMessageBox::warning(this, tr("Error"), tr("Paths directory not found in the volpkg"));
         return;
     }
 
-    // Get JSON parameters file
     QString jsonFileName = isExpand ? "expand.json" : "seed.json";
     std::filesystem::path jsonParamsPath = volpkgPath / jsonFileName.toStdString();
 
-    // Check if JSON file exists
     if (!std::filesystem::exists(jsonParamsPath)) {
         QMessageBox::warning(this, tr("Error"), tr("%1 not found in the volpkg").arg(jsonFileName));
         return;
     }
 
-    // Get current POI (focus point) for seed coordinates if needed
     int seedX = 0, seedY = 0, seedZ = 0;
     if (!isExpand && !isRandomSeed) {
         POI *poi = _surf_col->poi("focus");
@@ -513,16 +900,12 @@ void CWindow::onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRa
         seedZ = static_cast<int>(poi->p[2]);
     }
 
-    // Set up parameters and execute the tool
     _cmdRunner->setGrowParams(
-        QString(),  // Volume path will be set automatically in execute()
+        QString(),
         QString::fromStdString(pathsDir.string()),
         QString::fromStdString(jsonParamsPath.string()),
-        seedX,
-        seedY,
-        seedZ,
-        isExpand,
-        isRandomSeed
+        seedX, seedY, seedZ,
+        isExpand, isRandomSeed
     );
 
     _cmdRunner->execute(CommandLineToolRunner::Tool::GrowSegFromSeeds);
@@ -532,18 +915,15 @@ void CWindow::onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRa
     statusBar()->showMessage(tr("Growing segment using %1 in %2").arg(jsonFileName).arg(modeDesc), 5000);
 }
 
-// Helper method to initialize command line runner
 bool CWindow::initializeCommandLineRunner()
 {
     if (!_cmdRunner) {
         _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
 
-        // Read parallel processes and iteration count settings from INI file
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         int parallelProcesses = settings.value("perf/parallel_processes", 8).toInt();
         int iterationCount = settings.value("perf/iteration_count", 1000).toInt();
 
-        // Apply the settings
         _cmdRunner->setParallelProcesses(parallelProcesses);
         _cmdRunner->setIterationCount(iterationCount);
 
@@ -554,11 +934,10 @@ bool CWindow::initializeCommandLineRunner()
         connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
                 [this](CommandLineToolRunner::Tool /*tool*/, bool success, const QString& message,
                        const QString& outputPath, bool copyToClipboard) {
+                    Q_UNUSED(outputPath);
                     if (success) {
                         QString displayMsg = message;
-                        if (copyToClipboard) {
-                            displayMsg += tr(" - Path copied to clipboard");
-                        }
+                        if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
                         statusBar()->showMessage(displayMsg, 5000);
                         QMessageBox::information(this, tr("Operation Complete"), displayMsg);
                     } else {
@@ -570,99 +949,335 @@ bool CWindow::initializeCommandLineRunner()
     return true;
 }
 
-void CWindow::onDeleteSegments(const std::vector<std::string>& segmentIds)
+void CWindow::onAWSUpload(const std::string& segmentId)
 {
-    if (segmentIds.empty()) {
+    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot upload to AWS: No volume or invalid segment selected"));
+        return;
+    }
+    if (_cmdRunner && _cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
         return;
     }
 
-    // Create confirmation message
-    QString message;
-    if (segmentIds.size() == 1) {
-        message = tr("Are you sure you want to delete segment '%1'?\n\nThis action cannot be undone.")
-                    .arg(QString::fromStdString(segmentIds[0]));
-    } else {
-        message = tr("Are you sure you want to delete %1 segments?\n\nThis action cannot be undone.")
-                    .arg(segmentIds.size());
-    }
+    const std::filesystem::path segDirFs = surfMeta->path;
+    const QString  segDir   = QString::fromStdString(segDirFs.string());
+    const QString  objPath  = QDir(segDir).filePath(QString::fromStdString(segmentId) + ".obj");
+    const QString  flatObj  = QDir(segDir).filePath(QString::fromStdString(segmentId) + "_flatboi.obj");
+    QString        outTifxyz= segDir + "_flatboi";
 
-    // Show confirmation dialog
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        this, tr("Confirm Deletion"), message,
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-
-    if (reply != QMessageBox::Yes) {
+    if (!QFileInfo::exists(segDir)) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot upload to AWS: Segment directory not found"));
         return;
     }
 
-    // Delete each segment
-    int successCount = 0;
-    QStringList failedSegments;
-    bool needsReload = false;
+    QStringList scrollOptions;
+    scrollOptions << "PHerc0172" << "PHerc0343P" << "PHerc0500P2";
 
-    for (const auto& segmentId : segmentIds) {
-        try {
-            // Use the VolumePkg's removeSegmentation method
-            fVpkg->removeSegmentation(segmentId);
-            successCount++;
-            needsReload = true;
-        } catch (const std::filesystem::filesystem_error& e) {
-            std::cerr << "Failed to delete segment " << segmentId << ": " << e.what() << std::endl;
+    bool ok;
+    QString selectedScroll = QInputDialog::getItem(
+        this,
+        tr("Select Scroll for Upload"),
+        tr("Select the target scroll directory:"),
+        scrollOptions,
+        0, false, &ok
+    );
 
-            // Check if it's a permission error
-            if (e.code() == std::errc::permission_denied) {
-                failedSegments << QString::fromStdString(segmentId) + " (permission denied)";
-            } else {
-                failedSegments << QString::fromStdString(segmentId) + " (filesystem error)";
-            }
-        } catch (const std::exception& e) {
-            failedSegments << QString::fromStdString(segmentId);
-            std::cerr << "Failed to delete segment " << segmentId << ": " << e.what() << std::endl;
-        }
+    if (!ok || selectedScroll.isEmpty()) {
+        statusBar()->showMessage(tr("AWS upload cancelled by user"), 3000);
+        return;
     }
 
-    // Only update UI if we successfully deleted something
-    if (needsReload) {
-        try {
-            // Use incremental removal to update the UI for each successfully deleted segment
-            for (const auto& segmentId : segmentIds) {
-                // Only remove from UI if it was successfully deleted from disk
-                if (std::find(failedSegments.begin(), failedSegments.end(),
-                            QString::fromStdString(segmentId)) == failedSegments.end() &&
-                    std::find(failedSegments.begin(), failedSegments.end(),
-                            QString::fromStdString(segmentId) + " (permission denied)") == failedSegments.end() &&
-                    std::find(failedSegments.begin(), failedSegments.end(),
-                            QString::fromStdString(segmentId) + " (filesystem error)") == failedSegments.end()) {
-                    RemoveSingleSegmentation(segmentId);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString defaultProfile = settings.value("aws/default_profile", "").toString();
+
+    QString awsProfile = QInputDialog::getText(
+        this, tr("AWS Profile"),
+        tr("Enter AWS profile name (leave empty for default credentials):"),
+        QLineEdit::Normal, defaultProfile, &ok
+    );
+
+    if (!ok) {
+        statusBar()->showMessage(tr("AWS upload cancelled by user"), 3000);
+        return;
+    }
+
+    if (!awsProfile.isEmpty()) settings.setValue("aws/default_profile", awsProfile);
+
+    QStringList uploadedFiles;
+    QStringList failedFiles;
+
+    auto uploadFileWithProgress = [&](const QString& localPath, const QString& s3Path, const QString& description, bool isDirectory = false) {
+        if (!QFileInfo::exists(localPath)) return;
+        if (isDirectory && !QFileInfo(localPath).isDir()) return;
+
+        QStringList awsArgs;
+        awsArgs << "s3" << "cp" << localPath << s3Path;
+        if (isDirectory) awsArgs << "--recursive";
+        if (!awsProfile.isEmpty()) { awsArgs << "--profile" << awsProfile; }
+
+        statusBar()->showMessage(tr("Uploading %1...").arg(description), 0);
+
+        QProcess p;
+        p.setWorkingDirectory(segDir);
+        p.setProcessChannelMode(QProcess::MergedChannels);
+        p.start("aws", awsArgs);
+        if (!p.waitForStarted()) { failedFiles << QString("%1: Failed to start AWS CLI").arg(description); return; }
+
+        while (p.state() != QProcess::NotRunning) {
+            if (p.waitForReadyRead(100)) {
+                QString output = QString::fromLocal8Bit(p.readAllStandardOutput());
+                if (!output.isEmpty()) {
+                    const QStringList lines = output.split('\n', Qt::SkipEmptyParts);
+                    for (const QString& line : lines) {
+                        if (line.contains("Completed") || line.contains("upload:")) {
+                            statusBar()->showMessage(QString("Uploading %1: %2").arg(description, line.trimmed()), 0);
+                        }
+                    }
                 }
             }
-
-            // Update the volpkg label and filters
-            UpdateVolpkgLabel(0);
-            onSegFilterChanged(0);
-        } catch (const std::exception& e) {
-            std::cerr << "Error updating UI after deletion: " << e.what() << std::endl;
-            QMessageBox::warning(this, tr("Warning"),
-                               tr("Segments were deleted but there was an error refreshing the list. "
-                                  "Please reload surfaces manually."));
+            QCoreApplication::processEvents();
         }
+
+        p.waitForFinished(-1);
+        if (p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0) {
+            uploadedFiles << description;
+        } else {
+            QString error = QString::fromLocal8Bit(p.readAllStandardError());
+            if (error.isEmpty()) error = QString::fromLocal8Bit(p.readAllStandardOutput());
+            failedFiles << QString("%1: %2").arg(description, error);
+        }
+    };
+
+    auto uploadSegmentContents = [&](const QString& targetDir, const QString& segmentSuffix) {
+        QString segmentName = QString::fromStdString(segmentId) + segmentSuffix;
+
+        QString meshPath = QString("s3://vesuvius-challenge/%1/segments/meshes/%2/")
+            .arg(selectedScroll).arg(segmentName);
+
+        QString objFile = QDir(targetDir).filePath(segmentName + ".obj");
+        uploadFileWithProgress(objFile, meshPath, QString("%1.obj").arg(segmentName));
+
+        QString flatboiObjFile = QDir(targetDir).filePath(segmentName + "_flatboi.obj");
+        uploadFileWithProgress(flatboiObjFile, meshPath, QString("%1_flatboi.obj").arg(segmentName));
+
+        QString xTif = QDir(targetDir).filePath("x.tif");
+        QString yTif = QDir(targetDir).filePath("y.tif");
+        QString zTif = QDir(targetDir).filePath("z.tif");
+        QString metaJson = QDir(targetDir).filePath("meta.json");
+
+        if (QFileInfo::exists(xTif) && QFileInfo::exists(yTif) &&
+            QFileInfo::exists(zTif) && QFileInfo::exists(metaJson)) {
+            uploadFileWithProgress(xTif, meshPath, QString("%1/x.tif").arg(segmentName));
+            uploadFileWithProgress(yTif, meshPath, QString("%1/y.tif").arg(segmentName));
+            uploadFileWithProgress(zTif, meshPath, QString("%1/z.tif").arg(segmentName));
+            uploadFileWithProgress(metaJson, meshPath, QString("%1/meta.json").arg(segmentName));
+        }
+
+        QString overlappingJson = QDir(targetDir).filePath("overlapping.json");
+        uploadFileWithProgress(overlappingJson, meshPath, QString("%1/overlapping.json").arg(segmentName));
+
+        QString layersDir = QDir(targetDir).filePath("layers");
+        if (QFileInfo::exists(layersDir) && QFileInfo(layersDir).isDir()) {
+            QString surfaceVolPath = QString("s3://vesuvius-challenge/%1/segments/surface-volumes/%2/layers/")
+                .arg(selectedScroll).arg(segmentName);
+            uploadFileWithProgress(layersDir, surfaceVolPath, QString("%1/layers").arg(segmentName), true);
+        }
+    };
+
+    QProgressDialog progressDlg(tr("Uploading to AWS S3..."), tr("Cancel"), 0, 0, this);
+    progressDlg.setWindowModality(Qt::WindowModal);
+    progressDlg.setAutoClose(false);
+    progressDlg.show();
+
+    uploadSegmentContents(segDir, "");
+    if (progressDlg.wasCanceled()) { statusBar()->showMessage(tr("AWS upload cancelled"), 3000); return; }
+    if (QFileInfo::exists(outTifxyz) && QFileInfo(outTifxyz).isDir()) {
+        uploadSegmentContents(outTifxyz, "_flatboi");
     }
 
-    // Show result message
-    if (successCount == segmentIds.size()) {
-        statusBar()->showMessage(tr("Successfully deleted %1 segment(s)").arg(successCount), 5000);
-    } else if (successCount > 0) {
-        QMessageBox::warning(this, tr("Partial Success"),
-            tr("Deleted %1 segment(s), but failed to delete: %2\n\n"
-               "Note: Permission errors may require manual deletion or running with elevated privileges.")
-            .arg(successCount)
-            .arg(failedSegments.join(", ")));
+    progressDlg.close();
+
+    if (!uploadedFiles.isEmpty() && failedFiles.isEmpty()) {
+        QMessageBox::information(this, tr("Upload Complete"),
+            tr("Successfully uploaded to S3:\n\n%1").arg(uploadedFiles.join("\n")));
+        statusBar()->showMessage(tr("AWS upload complete"), 5000);
+    } else if (!uploadedFiles.isEmpty() && !failedFiles.isEmpty()) {
+        QMessageBox::warning(this, tr("Partial Upload"),
+            tr("Uploaded:\n%1\n\nFailed:\n%2").arg(uploadedFiles.join("\n"), failedFiles.join("\n")));
+        statusBar()->showMessage(tr("AWS upload partially complete"), 5000);
+    } else if (uploadedFiles.isEmpty() && !failedFiles.isEmpty()) {
+        QMessageBox::critical(this, tr("Upload Failed"),
+            tr("All uploads failed:\n\n%1\n\nPlease check:\n"
+               "- AWS CLI is installed\n"
+               "- AWS credentials are configured\n"
+               "- You have internet connection\n"
+               "- You have permissions for the S3 bucket").arg(failedFiles.join("\n")));
+        statusBar()->showMessage(tr("AWS upload failed"), 5000);
     } else {
-        QMessageBox::critical(this, tr("Deletion Failed"),
-            tr("Failed to delete any segments.\n\n"
-               "Failed segments: %1\n\n"
-               "This may be due to insufficient permissions. "
-               "Try running the application with elevated privileges or manually delete the folders.")
-            .arg(failedSegments.join(", ")));
+        QMessageBox::information(this, tr("No Files to Upload"),
+            tr("No files found to upload for segment: %1").arg(QString::fromStdString(segmentId)));
+        statusBar()->showMessage(tr("No files to upload"), 3000);
+    }
+}
+
+void CWindow::onExportWidthChunks(const std::string& segmentId)
+{
+    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surfMeta) {
+        QMessageBox::warning(this, tr("Error"),
+                             tr("Cannot export: No volume or invalid segment selected"));
+        return;
+    }
+
+    QuadSurface* surf = surfMeta->surface();
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"),
+                             tr("Cannot export: Failed to load segment surface"));
+        return;
+    }
+
+    // Settings with sensible defaults (chunk width is in REAL UV pixels)
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int  chunkWidthReal = std::max(1, settings.value("export/chunk_width_px", 40000).toInt());
+    const bool overwrite      = settings.value("export/overwrite", true).toBool();
+
+    // Determine export root directory: <volpkg>/export (not inside paths)
+    const QString configuredRoot = settings.value("export/dir", "").toString().trimmed();
+    const QString segDir  = QString::fromStdString(surfMeta->path.string());
+    const QString segName = QString::fromStdString(segmentId);
+
+    QString volpkgRoot = fVpkg ? QString::fromStdString(fVpkg->getVolpkgDirectory()) : QString();
+    if (volpkgRoot.isEmpty()) {
+        QDir d(QFileInfo(segDir).absoluteDir());   // start at parent of the segment folder
+        while (!d.isRoot() && !d.dirName().endsWith(".volpkg")) d.cdUp();
+        volpkgRoot = d.dirName().endsWith(".volpkg") ? d.absolutePath()
+                                                    : QFileInfo(segDir).absolutePath();
+    }
+    const QString exportRoot = configuredRoot.isEmpty()
+        ? QDir(volpkgRoot).filePath("export")
+        : configuredRoot;
+
+    QDir outRoot(exportRoot);
+    if (!outRoot.exists() && !outRoot.mkpath(".")) {
+        QMessageBox::critical(this, tr("Error"),
+                              tr("Cannot create export directory:\n%1").arg(exportRoot));
+        return;
+    }
+
+    // Pull points; ROI will be taken from this matrix.
+    cv::Mat_<cv::Vec3f> points = surf->rawPoints();
+    const int W = points.cols;
+    const int H = points.rows;
+    const cv::Vec2f sc = surf->scale();
+    const double sx = (std::isfinite(sc[0]) && sc[0] > 0.0f) ? double(sc[0]) : 1.0; // guard
+
+    // Convert desired real-pixel chunk width → grid columns
+    // Example: 40k real px with scale 0.05 → 2,000 columns per chunk
+    const int chunkCols = std::max(1, int(std::llround(double(chunkWidthReal) * sx)));
+    const int nChunks   = (W + chunkCols - 1) / chunkCols; // ceil-div purely in grid space
+    if (W <= 0 || H <= 0) {
+        QMessageBox::warning(this, tr("Error"),
+                             tr("Surface has invalid dimensions (%1 x %2)").arg(W).arg(H));
+        return;
+    }
+
+    if (nChunks <= 0) {
+        QMessageBox::information(this, tr("Export"), tr("Nothing to export."));
+        return;
+    }
+
+    // Progress dialog
+    QProgressDialog prog(tr("Exporting width-chunks…"), tr("Cancel"), 0, nChunks, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setAutoClose(false);
+    prog.setAutoReset(true);
+    prog.setMinimumDuration(0);
+
+    // Helper to generate a unique directory name if overwrite is false and target exists
+    auto uniqueName = [&](const QString& base)->QString {
+        if (!QFileInfo(outRoot.filePath(base)).exists()) return base;
+        int k = 1;
+        while (QFileInfo(outRoot.filePath(QString("%1_%2").arg(base).arg(k))).exists()) ++k;
+        return QString("%1_%2").arg(base).arg(k);
+    };
+
+    // Zero-pad for nicer sorting
+    auto padded = [nChunks](int idx)->QString {
+        const int digits = (nChunks < 10) ? 1 : (nChunks < 100) ? 2 : (nChunks < 1000) ? 3 : 4;
+        return QString("%1").arg(idx, digits, 10, QChar('0'));
+    };
+
+    // Export loop
+    int exported = 0;
+    QStringList results;
+    QStringList failures;
+
+    for (int c = 0; c < nChunks; ++c) {
+        if (prog.wasCanceled()) break;
+        prog.setLabelText(tr("Exporting slice %1 / %2…").arg(c+1).arg(nChunks));
+        prog.setValue(c);
+        QCoreApplication::processEvents();
+
+        const int x0 = c * chunkCols;
+        const int dx = std::min(chunkCols, W - x0);
+
+        // ROI [all rows, x0:x0+dx)
+        cv::Mat_<cv::Vec3f> roi(points, cv::Range::all(), cv::Range(x0, x0 + dx));
+        cv::Mat_<cv::Vec3f> roiCopy = roi.clone();  // ensure contiguous, independent buffer
+
+        // Create a temp surface for this chunk; scale is preserved.
+        QuadSurface chunkSurf(roiCopy, surf->scale());
+
+        // Build target dir under exportRoot, name "<segName>_<indexPadded>"
+        const QString baseName = QString("%1_%2").arg(segName, padded(c));
+        QString outDirName = baseName;
+        bool forceOverwrite = false;
+        if (QFileInfo(outRoot.filePath(outDirName)).exists()) {
+            if (overwrite) {
+                forceOverwrite = true;
+            } else {
+                outDirName = uniqueName(baseName);
+            }
+        }
+        const QString outAbs = outRoot.filePath(outDirName);
+        const std::string outPath = outAbs.toStdString();
+        const std::string uuid    = outDirName.toStdString();  // uuid ~ folder name
+
+        try {
+            chunkSurf.save(outPath, uuid, forceOverwrite);
+            ++exported;
+            results << outAbs;
+        } catch (const std::exception& e) {
+            failures << QString("%1 — %2").arg(outAbs, e.what());
+        }
+
+        QCoreApplication::processEvents();
+    }
+    prog.setValue(nChunks);
+
+    // Summarize
+    if (exported > 0 && failures.isEmpty()) {
+        QMessageBox::information(this, tr("Export complete"),
+                                 tr("Exported %1 slice(s) to:\n%2")
+                                 .arg(exported)
+                                 .arg(QDir::toNativeSeparators(exportRoot)));
+        statusBar()->showMessage(tr("Exported %1 slice(s) → %2")
+                                 .arg(exported)
+                                 .arg(QDir::toNativeSeparators(exportRoot)),
+                                 5000);
+    } else if (exported > 0 && !failures.isEmpty()) {
+        QMessageBox::warning(this, tr("Partial export"),
+                             tr("Exported %1 slice(s), but failed:\n\n%2")
+                             .arg(exported)
+                             .arg(failures.join('\n')));
+        statusBar()->showMessage(tr("Export partially complete"), 5000);
+    } else if (!failures.isEmpty()) {
+        QMessageBox::critical(this, tr("Export failed"),
+                              tr("All slices failed:\n\n%1").arg(failures.join('\n')));
+        statusBar()->showMessage(tr("Export failed"), 5000);
+    } else {
+        statusBar()->showMessage(tr("Export cancelled"), 3000);
     }
 }

@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Tuple, List, Union
+from typing import Tuple, List, Union, Optional, Iterable
 
 import math
 
@@ -17,6 +17,14 @@ from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTr
 from vesuvius.models.augmentation.transforms.utils.cropping import crop_tensor
 
 
+Z_AXIS = 0
+Y_AXIS = 1
+X_AXIS = 2
+_PERMUTE_ZYX_TO_XYZ = np.array([[0, 0, 1],
+                                [0, 1, 0],
+                                [1, 0, 0]], dtype=float)
+
+
 class SpatialTransform(BasicTransform):
     def __init__(self,
                  patch_size: Tuple[int, ...],
@@ -32,7 +40,8 @@ class SpatialTransform(BasicTransform):
                  scaling: RandomScalar = (0.7, 1.3),
                  p_synchronize_scaling_across_axes: float = 0,
                  bg_style_seg_sampling: bool = True,
-                 mode_seg: str = 'bilinear'
+                 mode_seg: str = 'bilinear',
+                 allowed_rotation_axes: Optional[Iterable[int]] = None
                  ):
         """
         magnitude must be given in pixels!
@@ -54,6 +63,12 @@ class SpatialTransform(BasicTransform):
         self.p_synchronize_def_scale_across_axes = p_synchronize_def_scale_across_axes
         self.bg_style_seg_sampling = bg_style_seg_sampling
         self.mode_seg = mode_seg
+        if allowed_rotation_axes is None:
+            self.allowed_rotation_axes = None
+        else:
+            normalized_axes = sorted({int(axis) for axis in allowed_rotation_axes if 0 <= int(axis) <= 2})
+            self.allowed_rotation_axes = tuple(normalized_axes)
+        self._skip_when_vector = True
 
     def get_parameters(self, **data_dict) -> dict:
         dim = data_dict['image'].ndim - 1
@@ -62,15 +77,40 @@ class SpatialTransform(BasicTransform):
         do_scale = np.random.uniform() < self.p_scaling
         do_deform = np.random.uniform() < self.p_elastic_deform
 
+        allowed_rotation_axes = None
+        if self.allowed_rotation_axes is not None:
+            allowed_rotation_axes = {axis for axis in self.allowed_rotation_axes if 0 <= axis <= 2}
+            if dim == 2:
+                allowed_rotation_axes = {Z_AXIS} if Z_AXIS in allowed_rotation_axes else set()
+            if not allowed_rotation_axes:
+                do_rotation = False
+
+        angles_all = [0.0, 0.0, 0.0]
         if do_rotation:
-            angles = [sample_scalar(self.rotation, image=data_dict['image'], dim=i) for i in range(0, 3)]
+            if dim >= 3:
+                axes_to_sample = range(3)
+            elif dim == 2:
+                axes_to_sample = [Z_AXIS]
+            else:
+                axes_to_sample = range(dim)
+            for axis_idx in axes_to_sample:
+                if allowed_rotation_axes is not None and axis_idx not in allowed_rotation_axes:
+                    continue
+                angles_all[axis_idx] = sample_scalar(self.rotation, image=data_dict['image'], dim=axis_idx)
+
+        if dim == 3:
+            angles = angles_all
+        elif dim == 2:
+            angles = [angles_all[Z_AXIS]]
         else:
-            angles = [0] * dim
+            angles = angles_all[:dim]
+
         if do_scale:
             if np.random.uniform() <= self.p_synchronize_scaling_across_axes:
-                scales = [sample_scalar(self.scaling, image=data_dict['image'], dim=None)] * dim
+                value = sample_scalar(self.scaling, image=data_dict['image'], dim=None)
+                scales = [value] * dim
             else:
-                scales = [sample_scalar(self.scaling, image=data_dict['image'], dim=i) for i in range(0, 3)]
+                scales = [sample_scalar(self.scaling, image=data_dict['image'], dim=i) for i in range(0, dim)]
         else:
             scales = [1] * dim
 
@@ -295,25 +335,38 @@ class SpatialTransform(BasicTransform):
 
 
 def create_affine_matrix_3d(rotation_angles, scaling_factors):
-    # Rotation matrices for each axis
+    """
+    Build an affine matrix for 3D data assuming inputs are provided in (z, y, x) order.
+    """
+    if len(rotation_angles) != 3:
+        raise ValueError(f"Expected 3 rotation angles (z, y, x); got {len(rotation_angles)}")
+    if len(scaling_factors) != 3:
+        raise ValueError(f"Expected 3 scaling factors (z, y, x); got {len(scaling_factors)}")
+
+    angles_zyx = [float(angle) for angle in rotation_angles]
+    scales_zyx = [float(scale) for scale in scaling_factors]
+
+    # Convert to standard (x, y, z) order for matrix composition
+    angles_xyz = [angles_zyx[X_AXIS], angles_zyx[Y_AXIS], angles_zyx[Z_AXIS]]
+    scales_xyz = [scales_zyx[X_AXIS], scales_zyx[Y_AXIS], scales_zyx[Z_AXIS]]
+
     Rx = np.array([[1, 0, 0],
-                   [0, np.cos(rotation_angles[0]), -np.sin(rotation_angles[0])],
-                   [0, np.sin(rotation_angles[0]), np.cos(rotation_angles[0])]])
+                   [0, np.cos(angles_xyz[0]), -np.sin(angles_xyz[0])],
+                   [0, np.sin(angles_xyz[0]), np.cos(angles_xyz[0])]])
 
-    Ry = np.array([[np.cos(rotation_angles[1]), 0, np.sin(rotation_angles[1])],
+    Ry = np.array([[np.cos(angles_xyz[1]), 0, np.sin(angles_xyz[1])],
                    [0, 1, 0],
-                   [-np.sin(rotation_angles[1]), 0, np.cos(rotation_angles[1])]])
+                   [-np.sin(angles_xyz[1]), 0, np.cos(angles_xyz[1])]])
 
-    Rz = np.array([[np.cos(rotation_angles[2]), -np.sin(rotation_angles[2]), 0],
-                   [np.sin(rotation_angles[2]), np.cos(rotation_angles[2]), 0],
+    Rz = np.array([[np.cos(angles_xyz[2]), -np.sin(angles_xyz[2]), 0],
+                   [np.sin(angles_xyz[2]), np.cos(angles_xyz[2]), 0],
                    [0, 0, 1]])
 
-    # Scaling matrix
-    S = np.diag(scaling_factors)
+    S = np.diag(scales_xyz)
 
-    # Combine rotation and scaling
-    RS = Rz @ Ry @ Rx @ S
-    return RS
+    rs_xyz = Rz @ Ry @ Rx @ S
+    rs_zyx = _PERMUTE_ZYX_TO_XYZ @ rs_xyz @ _PERMUTE_ZYX_TO_XYZ
+    return rs_zyx
 
 
 def create_affine_matrix_2d(rotation_angle, scaling_factors):

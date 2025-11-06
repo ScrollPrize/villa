@@ -11,6 +11,9 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
+#include <arpa/inet.h>
+
+#include <opencv2/ximgproc.hpp>
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xarray.hpp)
@@ -27,33 +30,170 @@
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
+static std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm) {
+    cv::Mat skeleton_img;
+    cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
+    SkeletonGraph skeleton_graph = trace_skeleton_segments(skeleton_img, vm);
+    return {std::move(skeleton_graph), std::move(skeleton_img)};
+}
+
 enum class SliceDirection { XY, XZ, YZ };
 
+void run_generate(const po::variables_map& vm);
+void run_convert(const po::variables_map& vm);
+
 int main(int argc, char* argv[]) {
-    po::options_description desc("Generate normal grids for all slices in a Zarr volume.");
-    desc.add_options()
+    po::options_description global("Global options");
+    global.add_options()
         ("help,h", "Print usage message")
-        ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
-        ("output,o", po::value<std::string>()->required(), "Output directory path")
-        ("spiral-step", po::value<double>()->default_value(8.0), "Spiral step for resampling")
-        ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore");
+        ("command", po::value<std::string>(), "Command to execute (generate, convert)")
+        ("subargs", po::value<std::vector<std::string>>(), "Arguments for command");
+
+    po::positional_options_description pos;
+    pos.add("command", 1).add("subargs", -1);
 
     po::variables_map vm;
-    try {
-        po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::parsed_options parsed = po::command_line_parser(argc, argv).
+        options(global).
+        positional(pos).
+        allow_unregistered().
+        run();
+    
+    po::store(parsed, vm);
 
-        if (vm.count("help")) {
-            std::cout << desc << std::endl;
-            return 0;
-        }
+    if (vm.count("help") || !vm.count("command")) {
+        std::cout << "Usage: vc_gen_normalgrids <command> [options]\n\n"
+                  << "Commands:\n"
+                  << "  generate   Generate normal grids for all slices in a Zarr volume.\n"
+                  << "  convert    Recursively find and convert GridStore files to the latest version.\n\n";
+        return 0;
+    }
 
-        po::notify(vm);
-    } catch (const po::error& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        std::cerr << desc << std::endl;
+    std::string cmd = vm["command"].as<std::string>();
+    
+    if (cmd == "generate") {
+        po::options_description generate_desc("`generate` options");
+        generate_desc.add_options()
+            ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
+            ("output,o", po::value<std::string>()->required(), "Output directory path")
+            ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling")
+            ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore");
+
+        std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
+        opts.erase(opts.begin()); // Erase the command
+        
+        po::variables_map generate_vm;
+        po::store(po::command_line_parser(opts).options(generate_desc).run(), generate_vm);
+        po::notify(generate_vm);
+        run_generate(generate_vm);
+
+    } else if (cmd == "convert") {
+        po::options_description convert_desc("`convert` options");
+        convert_desc.add_options()
+            ("input,i", po::value<std::string>()->required(), "Input directory to scan for GridStore files")
+            ("grid-step", po::value<int>()->default_value(64), "New grid cell size for the GridStore");
+
+        std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
+        opts.erase(opts.begin());
+
+        po::variables_map convert_vm;
+        po::store(po::command_line_parser(opts).options(convert_desc).run(), convert_vm);
+        po::notify(convert_vm);
+        run_convert(convert_vm);
+
+    } else {
+        std::cerr << "Error: Unknown command '" << cmd << "'" << std::endl;
         return 1;
     }
 
+    return 0;
+}
+
+void run_convert(const po::variables_map& vm) {
+    fs::path input_dir = vm["input"].as<std::string>();
+    int new_grid_step = vm["grid-step"].as<int>();
+    std::cout << "Scanning directory: " << input_dir << " with new grid step: " << new_grid_step << std::endl;
+
+    std::vector<fs::path> grid_files;
+    for (const auto& entry : fs::recursive_directory_iterator(input_dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".grid") {
+            grid_files.push_back(entry.path());
+        }
+    }
+
+    std::cout << "Found " << grid_files.size() << " grid files to process." << std::endl;
+
+    std::atomic<size_t> converted_count = 0;
+    std::atomic<size_t> skipped_count = 0;
+    std::atomic<size_t> error_count = 0;
+    std::atomic<size_t> processed_count = 0;
+
+    #pragma omp parallel for
+    for (size_t i = 0; i < grid_files.size(); ++i) {
+        const auto& path = grid_files[i];
+        try {
+            std::ifstream file(path, std::ios::binary);
+            if (!file) {
+                #pragma omp critical
+                std::cerr << "Error: Could not open file " << path << std::endl;
+                error_count++;
+                continue;
+            }
+
+            uint32_t magic, version;
+            file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            file.read(reinterpret_cast<char*>(&version), sizeof(version));
+            magic = ntohl(magic);
+            version = ntohl(version);
+
+            if (magic != 0x56434753) { // "VCGS"
+                #pragma omp critical
+                std::cerr << "Warning: Skipping file with invalid magic: " << path << std::endl;
+                skipped_count++;
+                continue;
+            }
+
+            if (version < 3) {
+                vc::core::util::GridStore old_store(path.string());
+                vc::core::util::GridStore new_store(cv::Rect(0, 0, old_store.size().width, old_store.size().height), new_grid_step);
+                
+                auto all_paths = old_store.get_all();
+                for(const auto& p : all_paths) {
+                    new_store.add(*p);
+                }
+                new_store.meta = old_store.meta;
+
+                std::string tmp_path = path.string() + ".tmp";
+                new_store.save(tmp_path);
+                fs::rename(tmp_path, path);
+                converted_count++;
+            } else {
+                skipped_count++;
+            }
+        } catch (const std::exception& e) {
+            #pragma omp critical
+            std::cerr << "Error processing file " << path << ": " << e.what() << std::endl;
+            error_count++;
+        }
+        
+        size_t processed = ++processed_count;
+        if (processed % 100 == 0) {
+            #pragma omp critical
+            std::cout << "Processed " << processed << "/" << grid_files.size()
+                      << " (Converted: " << converted_count
+                      << ", Skipped: " << skipped_count
+                      << ", Errors: " << error_count << ")" << std::endl;
+        }
+    }
+
+    std::cout << "Conversion complete. Total processed: " << processed_count
+              << ", Converted: " << converted_count
+              << ", Skipped: " << skipped_count
+              << ", Errors: " << error_count << std::endl;
+}
+
+
+void run_generate(const po::variables_map& vm) {
     std::string input_path = vm["input"].as<std::string>();
     std::string output_path = vm["output"].as<std::string>();
 
@@ -64,7 +204,7 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<z5::Dataset> ds = z5::openDataset(group_handle, "0");
     if (!ds) {
         std::cerr << "Error: Could not open dataset '0' in volume '" << input_path << "'." << std::endl;
-        return 1;
+        exit(1);
     }
     auto shape = ds->shape();
 
@@ -173,10 +313,9 @@ int main(int argc, char* argv[]) {
                 std::ofstream ofs(out_path); // Create empty file
                 processed++;
             } else {
-                decltype(generate_skeleton_graph(binary_slice, vm)) skeleton_res;
-                skeleton_res = generate_skeleton_graph(binary_slice, vm);
+                auto skeleton_res = generate_skeleton_graph(binary_slice, vm);
                 t.mark("skeleton");
-                auto& [skeleton_graph, skeleton_id_img] = skeleton_res;
+                auto& skeleton_graph = skeleton_res.first;
 
                 vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
                 populate_normal_grid(skeleton_graph, grid_store, spiral_step);
@@ -216,7 +355,7 @@ int main(int argc, char* argv[]) {
                     size_t p = processed; // Read atomic once
                     size_t total_p = total_processed_all_dirs;
                     auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-                    double slices_per_second = (p - skipped) / elapsed_seconds;
+                    double slices_per_second = (p > skipped) ? (p - skipped) / elapsed_seconds : 0.0;
                     if (slices_per_second == 0) slices_per_second = 1; // Avoid division by zero
                     double remaining_seconds = (total_slices_all_dirs - total_p) / slices_per_second;
                     
@@ -227,10 +366,12 @@ int main(int argc, char* argv[]) {
                                 << " | Total " << total_p << "/" << total_slices_all_dirs
                                 << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
                                 << ", skipped: " << skipped
-                                << ", ETA: " << rem_min << "m " << rem_sec << "s"
-                                << ", avg size: " << (total_size / (p - skipped))
-                                << ", avg segments: " << (total_segments / (p - skipped))
-                                << ", avg buckets: " << (total_buckets / (p - skipped));
+                                << ", ETA: " << rem_min << "m " << rem_sec << "s";
+                    if (p > skipped) {
+                        std::cout << ", avg size: " << (total_size / (p - skipped))
+                                  << ", avg segments: " << (total_segments / (p - skipped))
+                                  << ", avg buckets: " << (total_buckets / (p - skipped));
+                    }
 
                     for(auto const& [key, val] : timings) {
                         if (val.count > 0) {
@@ -244,5 +385,4 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Processing complete." << std::endl;
-    return 0;
 }

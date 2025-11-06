@@ -1,6 +1,7 @@
 #pragma once
 #include <filesystem>
 #include <set>
+#include <optional>
 
 #include <opencv2/core.hpp> 
 #include <nlohmann/json_fwd.hpp>
@@ -11,6 +12,8 @@
 
 #define Z_DBG_GEN_PREFIX "auto_grown_"
 
+#define SURF_LOAD_IGNORE_MASK 1
+#define SURF_CHANNEL_NORESIZE 1
 
 struct Rect3D {
     cv::Vec3f low = {0,0,0};
@@ -72,12 +75,33 @@ public:
     void setOrigin(cv::Vec3f origin);
     cv::Vec3f origin();
     float scalarp(cv::Vec3f point) const;
+    void setInPlaneRotation(float radians);
+    float inPlaneRotation() const { return _inPlaneRotation; }
+    cv::Vec3f basisX() const { return _vx; }
+    cv::Vec3f basisY() const { return _vy; }
+    void setAxisAlignedRotationKey(int key);
+    int axisAlignedRotationKey() const { return _axisAlignedRotationKey; }
 protected:
     void update();
     cv::Vec3f _normal = {0,0,1};
     cv::Vec3f _origin = {0,0,0};
+    cv::Vec3f _vx = {1,0,0};
+    cv::Vec3f _vy = {0,1,0};
+    float _inPlaneRotation = 0.0f;
     cv::Matx33d _M;
     cv::Vec3d _T;
+    int _axisAlignedRotationKey = -1;
+};
+
+// Options for writing TIFF from QuadSurface
+struct TiffWriteOptions {
+    enum class Compression { NONE, LZW, DEFLATE };
+    enum class Predictor  { NONE, HORIZONTAL, FLOATINGPOINT };
+
+    bool forceBigTiff = false;
+    int  tileSize = 1024;                 // square tiles
+    Compression compression = Compression::LZW;
+    Predictor  predictor   = Predictor::FLOATINGPOINT; // for float32
 };
 
 //quads based surface class with a pointer implementing a nominal scale of 1 voxel
@@ -102,15 +126,18 @@ public:
     cv::Size size();
     [[nodiscard]] cv::Vec2f scale() const;
 
-    void save(const std::string &path, const std::string &uuid);
-    void save(std::filesystem::path &path);
+    void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
+    void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
+    // Configure how TIFFs are written
+    void setTiffWriteOptions(const TiffWriteOptions& opt) { _tiff_opts = opt; }
     Rect3D bbox();
 
     bool containsPoint(const cv::Vec3f& point, float tolerance) const;
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { return _points; }
+    virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { return _points; }
 
     friend QuadSurface *regularized_local_quad(QuadSurface *src, const cv::Vec3f &ptr, int w, int h, int step_search, int step_out);
     friend QuadSurface *smooth_vc_segmentation(QuadSurface *src);
@@ -118,11 +145,16 @@ public:
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
-    cv::Mat channel(const std::string& name);
+    cv::Mat channel(const std::string& name, int flags = 0);
+    void invalidateCache();
+    void saveOverwrite();
+    void saveSnapshot(int maxBackups = 10);
+    std::vector<std::string> channelNames() const;
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     cv::Mat_<cv::Vec3f>* _points = nullptr;
     cv::Rect _bounds;
+    TiffWriteOptions _tiff_opts;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
 };
@@ -201,17 +233,24 @@ public:
     ~SurfaceMeta();
     void readOverlapping();
     QuadSurface *surface();
-    void setSurface(QuadSurface *surf);
+    void setSurface(QuadSurface *surf, bool takeOwnership = true);
     std::string name();
     std::filesystem::path path;
     QuadSurface *_surf = nullptr;
+    bool _ownsSurface = false;
     Rect3D bbox;
     nlohmann::json *meta = nullptr;
     std::set<std::string> overlapping_str;
     std::set<SurfaceMeta*> overlapping;
+    std::optional<std::filesystem::file_time_type> maskTimestamp() const { return maskTimestamp_; }
+    static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
+
+private:
+    void cacheMaskTimestamp();
+    std::optional<std::filesystem::file_time_type> maskTimestamp_;
 };
 
-QuadSurface *load_quad_from_tifxyz(const std::string &path);
+QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags = 0);
 QuadSurface *regularized_local_quad(QuadSurface *src, const cv::Vec3f &ptr, int w, int h, int step_search = 100, int step_out = 5);
 QuadSurface *smooth_vc_segmentation(QuadSurface *src);
 

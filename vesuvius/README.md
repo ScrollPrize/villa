@@ -14,7 +14,7 @@ From [Vesuvius Challenge](https://scrollprize.org), a Python library for :
 
 `vesuvius` also comes prepackaged with: 
 - extensive data augmentation
-- PyTorch datasets for zarr or image (png, jpg, tif) data
+- Dataset orchestrator with streaming adapters for image (tif/png/jpg), zarr, and napari-backed sources
 
 _this package is in active development_
 
@@ -28,7 +28,7 @@ _this package is in active development_
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
 | `vesuvius.inference_pipeline` | `models.run.vesuvius_pipeline`     | runs the three steps above (predict → blend → finalize) in sequence                                                                                                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
-| `vesuvius.napari_trainer`     | `utils.napari_trainer.main_window` | launches a Napari window for interactive training and inference                                                                                                                                           |
+| `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
 | `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
 | `vesuvius.voxelize_obj`       | `scripts.voxelize_objs`            | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
 | `vesuvius.refine_labels`      | `scripts.edt_frangi_label`         | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
@@ -77,7 +77,7 @@ Additionally, the augmentations provided within this package are from another of
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 
-_**Detailed documentation for training and inference are located in [the docs folder](src/vesuvius/docs)**_
+_**Detailed documentation for training and inference are located in [the docs folder](docs/docs)**_
 ___
 
 
@@ -91,7 +91,7 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](src/vesuvius/docs/images/napari_trainer.png)
+![alt text](docs/docs/images/napari_trainer.png)
 
 ___
 
@@ -105,7 +105,7 @@ ___
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](src/vesuvius/docs/images/proofreader.png)
+![alt text](docs/docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 
@@ -138,7 +138,7 @@ When this command is run:
 - a ConfigManager class will be instantiated, which will take the arguments given and the configuration file, and store these as properties.
 - The trainer class will execute its class method `__build_model`, which will create an instance of `NetworkFromConfig`
 - `NetworkFromConfig` will dynamically determine the number of pooling operations, stages, feature map sizes, operation dimensionality, and other specified parameters
-- The trainer class will execute its `_configure_dataset` method, and create an instance of the proper Pytorch dataset
+- The trainer class will execute its `_configure_dataset` method, instantiating the `DatasetOrchestrator` with the adapter that matches `data_format`
 - The trainer class will execute the rest of the setup required for training, through the following additional class methods:
   - `_build_loss`
   - `_get_optimizer`
@@ -156,9 +156,9 @@ Training will run for 1,000 epochs by default, with 200 batches/epoch. This can 
 
 ### Running inference with `vesuvius.inference_pipeline`
 
-Detailed documentation is available in [the inference readme](src/vesuvius/docs/inference.md)
+Detailed documentation is available in [the inference readme](docs/docs/inference.md)
 
-The inference script used here is unfortunately (by necessity) quite convoluted. It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
+The inference process is a bit convoluted. Due to our focus on very large volumetric data, it becomes very difficult for writes to keep pace with multi-gpu systems, necessitating a map-reduce style of inference where we store intermediate logits before blending.  It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
 
 The inference process is in 3 parts -- inference, blending, and finalization
 
@@ -182,4 +182,3 @@ To use a local model point at either the `nnUNet_results` folder which contains 
 
 ### Rendering and Flattening objs
 Documentation is provided in [the rendering folder](src/vesuvius/rendering/README.md)
-

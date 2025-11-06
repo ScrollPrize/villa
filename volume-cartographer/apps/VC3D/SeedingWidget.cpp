@@ -3,6 +3,7 @@
 #include <QHBoxLayout>
 #include <QMessageBox>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QApplication>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -23,6 +24,10 @@
 #include <algorithm>
 #include <functional>
 
+using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
+using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
+using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
+
 
 
 
@@ -40,7 +45,10 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CSurfaceCollection*
     , jobsRunning(false)
     , _point_collection(point_collection)
     , _surface_collection(surface_collection)
+    , progressUtil(new ProgressUtil(nullptr, this))
 {
+    qRegisterMetaType<PathPrimitive>("PathPrimitive");
+    qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
     setupUI();
 
     if (_point_collection) {
@@ -118,7 +126,17 @@ void SeedingWidget::setupUI()
     processesSpinBox->setValue(16);
     processesLayout->addWidget(processesSpinBox);
     mainLayout->addLayout(processesLayout);
-    
+
+    // OMP threads control
+    auto ompLayout = new QHBoxLayout();
+    ompLayout->addWidget(new QLabel("OMP Threads:", this));
+    ompThreadsSpinBox = new QSpinBox(this);
+    ompThreadsSpinBox->setRange(0, 256);
+    ompThreadsSpinBox->setValue(0);
+    ompThreadsSpinBox->setToolTip("If greater than 0, prefixes commands with OMP_NUM_THREADS before execution");
+    ompLayout->addWidget(ompThreadsSpinBox);
+    mainLayout->addLayout(ompLayout);
+
     // Intensity threshold control
     auto thresholdLayout = new QHBoxLayout();
     thresholdLayout->addWidget(new QLabel("Intensity Threshold:", this));
@@ -196,6 +214,11 @@ void SeedingWidget::setupUI()
     progressBar->setValue(0);
     progressBar->setVisible(false);
     mainLayout->addWidget(progressBar);
+    progressUtil->setProgressBar(progressBar);
+    ProgressUtil::ProgressBarOptions progressDefaults;
+    progressDefaults.textMode = ProgressUtil::ProgressTextMode::Percent;
+    progressDefaults.percentPrecision = 0;
+    progressUtil->configureProgressBar(progressDefaults);
     
     // Connect signals
     connect(modeButton, &QPushButton::clicked, [this, modeButton]() {
@@ -235,7 +258,7 @@ void SeedingWidget::setupUI()
             this, &SeedingWidget::updateParameterPreview);
     
     // Set size policy
-    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 }
 
 void SeedingWidget::setVolumePkg(std::shared_ptr<VolumePkg> vpkg)
@@ -419,33 +442,34 @@ void SeedingWidget::castRays()
         return;
     }
     
-    // Setup progress tracking
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    
+    POI* focusPoi = _surface_collection ? _surface_collection->poi("focus") : nullptr;
+    if (!focusPoi) {
+        QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
+        return;
+    }
+
     // Cast rays at regular angle steps
     const double angleStep = angleStepSpinBox->value();
     const int numSteps = static_cast<int>(360.0 / angleStep);
-    
+
+    ProgressUtil::ProgressBarOptions options;
+    options.textMode = ProgressUtil::ProgressTextMode::Percent;
+    progressUtil->startProgress(numSteps, &options);
+
     for (int i = 0; i < numSteps; i++) {
         // Calculate ray direction in 2D (will be used for XY plane)
         const double angle = i * angleStep * M_PI / 180.0;
         const cv::Vec2f rayDir(cos(angle), sin(angle));
-        
+
         // Find peaks along this ray in 3D
-        POI* focus_poi = _surface_collection->poi("focus");
-        if (!focus_poi) {
-            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
-            return;
-        }
-        findPeaksAlongRay(rayDir, focus_poi->p);
-        
+        findPeaksAlongRay(rayDir, focusPoi->p);
+
         // Update progress
-        progressBar->setValue((i + 1) * 100 / numSteps);
+        progressUtil->updateProgress(i + 1);
         QApplication::processEvents();
     }
-    
-    progressBar->setVisible(false);
+
+    progressUtil->stopProgress();
 }
 
 void SeedingWidget::findPeaksAlongRay(
@@ -511,16 +535,43 @@ void SeedingWidget::findPeaksAlongRay(
 
     auto addCenterOfSegment = [&](size_t s, size_t e) {
         if (e < s || s >= positions.size() || e >= positions.size()) return;
-        // Prefer the position with the largest distance-transform value within the segment (center of band)
-        size_t best_idx = s;
-        float best_dt = sampleDistAt(positions[s]);
+
+        const float distEps = 1e-4f;
+        const float intensityEps = 1e-3f;
+
+        // Start with the geometric center of the segment as a reasonable default
+        size_t center_idx = s + (e - s) / 2;
+        size_t best_idx = center_idx;
+        float best_dt = sampleDistAt(positions[best_idx]);
+        float best_intensity = intensities[best_idx];
+
         for (size_t k = s; k <= e; ++k) {
             float dt = sampleDistAt(positions[k]);
-            if (dt > best_dt) {
-                best_dt = dt;
+            float intensity = intensities[k];
+
+            bool betterDistance = dt > best_dt + distEps;
+            bool similarDistance = std::fabs(dt - best_dt) <= distEps;
+            bool betterIntensity = intensity > best_intensity + intensityEps;
+            bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
+
+            if (betterDistance || (similarDistance && betterIntensity)) {
                 best_idx = k;
+                best_dt = dt;
+                best_intensity = intensity;
+                continue;
+            }
+
+            if (similarDistance && similarIntensity) {
+                size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
+                size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
+                if (newOffset < currentOffset) {
+                    best_idx = k;
+                    best_dt = dt;
+                    best_intensity = intensity;
+                }
             }
         }
+
         _point_collection->addPoint("seeding_peaks", positions[best_idx]);
     };
 
@@ -562,22 +613,11 @@ void SeedingWidget::onRunSegmentationClicked()
         QMessageBox::warning(this, "Error", "No points available for segmentation or volume package not loaded.");
         return;
     }
-    
-    // Update UI
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    infoLabel->setText("Running segmentation jobs...");
-    runSegmentationButton->setEnabled(false);
-    expandSeedsButton->setEnabled(false);
-    
-    // Show cancel button and set jobs running
-    jobsRunning = true;
-    cancelButton->setVisible(true);
-    runningProcesses.clear();
-    
+
     const int numProcesses = processesSpinBox->value();
     const int totalPoints = static_cast<int>(allPoints.size());
-    
+    const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
+
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path seedJsonPath;
@@ -590,8 +630,6 @@ void SeedingWidget::onRunSegmentationClicked()
     } else {
         if (!fVpkg->hasVolumes()) {
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
-            progressBar->setVisible(false);
-            runSegmentationButton->setEnabled(true);
             return;
         }
         
@@ -602,29 +640,38 @@ void SeedingWidget::onRunSegmentationClicked()
         
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            progressBar->setVisible(false);
-            runSegmentationButton->setEnabled(true);
             return;
         }
     }
     
     if (!std::filesystem::exists(seedJsonPath)) {
         QMessageBox::warning(this, "Error", "seed.json not found in volume package.");
-        progressBar->setVisible(false);
-        runSegmentationButton->setEnabled(true);
         return;
     }
     
     if (!currentVolume) {
         QMessageBox::warning(this, "Error", "No current volume selected.");
-        progressBar->setVisible(false);
-        runSegmentationButton->setEnabled(true);
         return;
     }
     
     std::filesystem::path volumePath = currentVolume->path();
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
-    
+
+    // Update UI
+    infoLabel->setText("Running segmentation jobs...");
+    runSegmentationButton->setEnabled(false);
+    expandSeedsButton->setEnabled(false);
+
+    // Show cancel button and set jobs running
+    jobsRunning = true;
+    cancelButton->setVisible(true);
+    runningProcesses.clear();
+
+    ProgressUtil::ProgressBarOptions barOptions;
+    barOptions.textMode = ProgressUtil::ProgressTextMode::DoneRemaining;
+    barOptions.fontPointSize = 11;
+    progressUtil->startProgress(totalPoints, &barOptions);
+
     // Track completion
     int completedJobs = 0;
     int nextPointIndex = 0;
@@ -639,7 +686,13 @@ void SeedingWidget::onRunSegmentationClicked()
         QProcess* process = new QProcess(this);
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(workingDir);
-        
+
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        if (ompThreads > 0) {
+            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
+        }
+        process->setProcessEnvironment(env);
+
         // Connect finished signal
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [this, process, pointIndex, &completedJobs, &nextPointIndex, &startProcessForPoint, totalPoints]
@@ -657,7 +710,7 @@ void SeedingWidget::onRunSegmentationClicked()
                 
                 // Update progress
                 completedJobs++;
-                progressBar->setValue(completedJobs * 100 / totalPoints);
+                progressUtil->updateProgress(completedJobs);
                 
                 // Remove from running list (QPointer will handle null checking)
                 runningProcesses.removeOne(process);
@@ -670,7 +723,7 @@ void SeedingWidget::onRunSegmentationClicked()
                 
                 // Check if all done
                 if (completedJobs >= totalPoints) {
-                    progressBar->setVisible(false);
+                    progressUtil->stopProgress();
                     cancelButton->setVisible(false);
                     jobsRunning = false;
                     runningProcesses.clear();
@@ -683,16 +736,19 @@ void SeedingWidget::onRunSegmentationClicked()
             });
         
         // Start the process
-        QString cmd = QString("%1 \"%2\" \"%3\" \"%4\" %5 %6 %7")
-                         .arg(executablePath)
-                         .arg(QString::fromStdString(volumePath.string()))
-                         .arg(QString::fromStdString(pathsDir.string()))
-                         .arg(QString::fromStdString(seedJsonPath.string()))
-                         .arg(point.p[0])
-                         .arg(point.p[1])
-                         .arg(point.p[2]);
-        
-        std::cout << "Starting job " << pointIndex << ": " << cmd.toStdString() << std::endl;
+        QStringList previewParts;
+        if (ompThreads > 0) {
+            previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
+        }
+        previewParts << executablePath
+                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(seedJsonPath.string()))
+                     << QString::number(point.p[0])
+                     << QString::number(point.p[1])
+                     << QString::number(point.p[2]);
+
+        std::cout << "Starting job " << pointIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
         process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3" << executablePath <<
                       QString::fromStdString(volumePath.string()) <<
@@ -714,6 +770,8 @@ void SeedingWidget::onRunSegmentationClicked()
     while (jobsRunning && completedJobs < totalPoints) {
         QApplication::processEvents(QEventLoop::AllEvents, 100);
     }
+
+    progressUtil->stopProgress();
 }
 
 
@@ -842,13 +900,13 @@ void SeedingWidget::analyzePaths()
     // Compute distance transform once
     computeDistanceTransform();
     
-    // Setup progress tracking
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    
     int totalPaths = paths.size();
     int pathIndex = 0;
     
+    ProgressUtil::ProgressBarOptions options;
+    options.textMode = ProgressUtil::ProgressTextMode::Fraction;
+    progressUtil->startProgress(totalPaths, &options);
+
     // For each path
     for (const auto& path : paths) {
         // Analyze along this path
@@ -856,11 +914,11 @@ void SeedingWidget::analyzePaths()
         
         // Update progress
         pathIndex++;
-        progressBar->setValue(pathIndex * 100 / totalPaths);
+        progressUtil->updateProgress(pathIndex);
         QApplication::processEvents();
     }
-    
-    progressBar->setVisible(false);
+
+    progressUtil->stopProgress();
     
     // Enable segmentation button if we found peaks
     runSegmentationButton->setEnabled(!_point_collection->getPoints("seeding_peaks").empty());
@@ -875,14 +933,14 @@ void SeedingWidget::analyzePaths()
         5000);
 }
 
-void SeedingWidget::findPeaksAlongPath(const PathData& path)
+void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
 {
     if (!currentVolume || path.points.empty()) {
         return;
     }
     
     // densify the path so we don't skip over small surfaces when drawing 
-    PathData densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
+    PathPrimitive densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
     
     // Get volume dimensions for bounds checking
     const int width = currentVolume->sliceWidth();
@@ -930,16 +988,42 @@ void SeedingWidget::findPeaksAlongPath(const PathData& path)
 
     auto addCenterOfSegment = [&](size_t s, size_t e) {
         if (e < s || s >= positions.size() || e >= positions.size()) return;
-        // Prefer the position with the largest distance-transform value within the segment (center of band)
-        size_t best_idx = s;
-        float best_dt = sampleDistAt(positions[s]);
+
+        const float distEps = 1e-4f;
+        const float intensityEps = 1e-3f;
+
+        size_t center_idx = s + (e - s) / 2;
+        size_t best_idx = center_idx;
+        float best_dt = sampleDistAt(positions[best_idx]);
+        float best_intensity = intensities[best_idx];
+
         for (size_t k = s; k <= e; ++k) {
             float dt = sampleDistAt(positions[k]);
-            if (dt > best_dt) {
-                best_dt = dt;
+            float intensity = intensities[k];
+
+            bool betterDistance = dt > best_dt + distEps;
+            bool similarDistance = std::fabs(dt - best_dt) <= distEps;
+            bool betterIntensity = intensity > best_intensity + intensityEps;
+            bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
+
+            if (betterDistance || (similarDistance && betterIntensity)) {
                 best_idx = k;
+                best_dt = dt;
+                best_intensity = intensity;
+                continue;
+            }
+
+            if (similarDistance && similarIntensity) {
+                size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
+                size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
+                if (newOffset < currentOffset) {
+                    best_idx = k;
+                    best_dt = dt;
+                    best_intensity = intensity;
+                }
             }
         }
+
         _point_collection->addPoint("seeding_peaks", positions[best_idx]);
     };
 
@@ -966,7 +1050,14 @@ void SeedingWidget::startDrawing(cv::Vec3f startPoint)
     currentPath.points.clear();
     currentPath.points.push_back(startPoint);
     currentPath.color = generatePathColor();
-    
+    currentPath.lineWidth = 2.0f;
+    currentPath.opacity = 1.0f;
+    currentPath.isEraser = false;
+    currentPath.brushShape = PathBrushShape::Circle;
+    currentPath.renderMode = PathRenderMode::LineStrip;
+    currentPath.pointRadius = 2.5f;
+    currentPath.z = 25.0;
+
     // Show temporary path
     displayPaths();
 }
@@ -1055,13 +1146,13 @@ void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
     updateButtonStates();
 }
 
-void SeedingWidget::findPeaksAlongPathToCollection(const PathData& path, const std::string& collectionName)
+void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, const std::string& collectionName)
 {
     if (!currentVolume || path.points.empty()) {
         return;
     }
 
-    PathData densifiedPath = path.densify(0.5f);
+    PathPrimitive densifiedPath = path.densify(0.5f);
 
     const int width = currentVolume->sliceWidth();
     const int height = currentVolume->sliceHeight();
@@ -1165,7 +1256,7 @@ QColor SeedingWidget::generatePathColor()
 void SeedingWidget::displayPaths()
 {
     // Prepare the list of paths to send
-    QList<PathData> allPaths = paths;
+    QList<PathPrimitive> allPaths = paths;
     
     // Add the current drawing path if we're actively drawing
     if (isDrawing && !currentPath.points.empty()) {
@@ -1265,22 +1356,11 @@ void SeedingWidget::onExpandSeedsClicked()
         QMessageBox::warning(this, "Error", "Volume package or volume not loaded.");
         return;
     }
-    
-    // Update UI
-    progressBar->setVisible(true);
-    progressBar->setValue(0);
-    infoLabel->setText("Running expansion jobs...");
-    expandSeedsButton->setEnabled(false);
-    runSegmentationButton->setEnabled(false);
-    
-    // Show cancel button and set jobs running
-    jobsRunning = true;
-    cancelButton->setVisible(true);
-    runningProcesses.clear();
-    
+
     const int numProcesses = processesSpinBox->value();
     const int expansionIterations = expansionIterationsSpinBox->value();
-    
+    const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
+
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path expandJsonPath;
@@ -1293,8 +1373,6 @@ void SeedingWidget::onExpandSeedsClicked()
     } else {
         if (!fVpkg->hasVolumes()) {
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
-            progressBar->setVisible(false);
-            expandSeedsButton->setEnabled(true);
             return;
         }
         
@@ -1305,22 +1383,34 @@ void SeedingWidget::onExpandSeedsClicked()
         
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            progressBar->setVisible(false);
-            expandSeedsButton->setEnabled(true);
             return;
         }
     }
     
     if (!std::filesystem::exists(expandJsonPath)) {
         QMessageBox::warning(this, "Error", "expand.json not found in volume package.");
-        progressBar->setVisible(false);
-        expandSeedsButton->setEnabled(true);
         return;
     }
     
     std::filesystem::path volumePath = currentVolume->path();
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
-    
+
+    // Update UI
+    infoLabel->setText("Running expansion jobs...");
+    expandSeedsButton->setEnabled(false);
+    runSegmentationButton->setEnabled(false);
+
+    // Show cancel button and set jobs running
+    jobsRunning = true;
+    cancelButton->setVisible(true);
+    runningProcesses.clear();
+
+    ProgressUtil::ProgressBarOptions barOptions;
+    barOptions.textMode = ProgressUtil::ProgressTextMode::DoneRemaining;
+    barOptions.fontPointSize = 11;
+    barOptions.prefix = tr("Expansion ");
+    progressUtil->startProgress(expansionIterations, &barOptions);
+
     // Track completion
     int completedJobs = 0;
     int nextIterationIndex = 0;
@@ -1334,7 +1424,13 @@ void SeedingWidget::onExpandSeedsClicked()
         QProcess* process = new QProcess(this);
         process->setProcessChannelMode(QProcess::MergedChannels);
         process->setWorkingDirectory(workingDir);
-        
+
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        if (ompThreads > 0) {
+            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
+        }
+        process->setProcessEnvironment(env);
+
         // Connect finished signal
         connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [this, process, iterationIndex, &completedJobs, &nextIterationIndex, &startExpansionProcess, expansionIterations]
@@ -1352,7 +1448,7 @@ void SeedingWidget::onExpandSeedsClicked()
                 
                 // Update progress
                 completedJobs++;
-                progressBar->setValue(completedJobs * 100 / expansionIterations);
+                progressUtil->updateProgress(completedJobs);
                 
                 // Remove from running list (QPointer will handle null checking)
                 runningProcesses.removeOne(process);
@@ -1365,7 +1461,7 @@ void SeedingWidget::onExpandSeedsClicked()
                 
                 // Check if all done
                 if (completedJobs >= expansionIterations) {
-                    progressBar->setVisible(false);
+                    progressUtil->stopProgress();
                     cancelButton->setVisible(false);
                     jobsRunning = false;
                     runningProcesses.clear();
@@ -1378,13 +1474,16 @@ void SeedingWidget::onExpandSeedsClicked()
             });
         
         // Start the process
-        QString cmd = QString("%1 \"%2\" \"%3\" \"%4\"")
-                         .arg(executablePath)
-                         .arg(QString::fromStdString(volumePath.string()))
-                         .arg(QString::fromStdString(pathsDir.string()))
-                         .arg(QString::fromStdString(expandJsonPath.string()));
-        
-        std::cout << "Starting expansion job " << iterationIndex << ": " << cmd.toStdString() << std::endl;
+        QStringList previewParts;
+        if (ompThreads > 0) {
+            previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
+        }
+        previewParts << executablePath
+                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
+                     << QString("\"%1\"").arg(QString::fromStdString(expandJsonPath.string()));
+
+        std::cout << "Starting expansion job " << iterationIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
         process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3" << executablePath <<
                       QString::fromStdString(volumePath.string()) <<
@@ -1403,6 +1502,8 @@ void SeedingWidget::onExpandSeedsClicked()
     while (jobsRunning && completedJobs < expansionIterations) {
         QApplication::processEvents(QEventLoop::AllEvents, 100);
     }
+
+    progressUtil->stopProgress();
 }
 
 void SeedingWidget::onCancelClicked()
@@ -1439,12 +1540,11 @@ void SeedingWidget::onCancelClicked()
     }
     
     // Clear the list
-    runningProcesses.clear();
+   runningProcesses.clear();
     
     // Update UI
     cancelButton->setVisible(false);
-    progressBar->setVisible(false);
-    progressBar->setValue(0);
+    progressUtil->stopProgress();
     infoLabel->setText("Jobs cancelled by user");
     
     // Re-enable buttons
@@ -1460,7 +1560,3 @@ void SeedingWidget::onSurfacesLoaded()
     // Update button states when surfaces are loaded/reloaded
     updateButtonStates();
 }
-
-
-
-

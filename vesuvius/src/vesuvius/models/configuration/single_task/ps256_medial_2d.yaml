@@ -1,0 +1,36 @@
+tr_config:
+  patch_size: [256,256]
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  slice_sampling:
+    save_plane_masks: false
+    enabled: true
+    sample_planes: ["z", "y", "x"]
+    sample_rates: [0.75, 0.125, 0.125]
+    random_rotations:
+      y:
+        max_degrees: 15
+        probability: 0.10
+      x:
+        max_degrees: 15
+        probability: 0.10
+    random_tilts:
+      z:
+        x: 25
+        y: 25
+        probability: 0.10
+
+    label_interpolation:
+      surface: linear
+      skel: linear
+  targets:
+    surface:
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
+          smooth: 1e-3

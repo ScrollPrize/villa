@@ -16,6 +16,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <cerrno>
+#include <cstring>
+#include <sstream>
 
 #ifndef CCI_TLS_MAX // Max number for ChunkedCachedInterpolator
 #define CCI_TLS_MAX 256
@@ -93,12 +96,26 @@ public:
                 for (auto const& entry : std::filesystem::directory_iterator(root))
                     if (std::filesystem::is_directory(entry) && std::filesystem::exists(entry.path()/"meta.json") && std::filesystem::is_regular_file(entry.path()/"meta.json")) {
                         paths.insert(entry.path());
-                        std::ifstream meta_f(entry.path()/"meta.json");
-                        nlohmann::json meta = nlohmann::json::parse(meta_f);
-                        std::filesystem::path src = std::filesystem::canonical(meta["dataset_source_path"]);
-                        if (src == std::filesystem::canonical(ds->path())) {
-                            _cache_dir = entry.path();
-                            break;
+                        try {
+                            std::ifstream meta_f(entry.path()/"meta.json");
+                            nlohmann::json meta = nlohmann::json::parse(meta_f);
+                            // Skip entries with invalid or non-existent dataset paths
+                            if (!meta.contains("dataset_source_path") || !meta["dataset_source_path"].is_string())
+                                continue;
+                            std::filesystem::path src_candidate(meta["dataset_source_path"].get<std::string>());
+                            if (!std::filesystem::exists(src_candidate))
+                                continue;
+                            if (!std::filesystem::exists(ds->path()))
+                                continue;
+                            std::filesystem::path src = std::filesystem::canonical(src_candidate);
+                            std::filesystem::path cur = std::filesystem::canonical(ds->path());
+                            if (src == cur) {
+                                _cache_dir = entry.path();
+                                break;
+                            }
+                        } catch (const std::exception&) {
+                            // Ignore malformed cache entries or paths we cannot canonicalize
+                            continue;
                         }
                     }
                 
@@ -222,9 +239,21 @@ public:
         tmp_path = std::filesystem::path(_cache_dir) / ss.str();
         _mutex.unlock();
         int fd = open(tmp_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
+        if (fd == -1) {
+            const int err = errno;
+            std::stringstream msg;
+            msg << "Chunked3d: open failed for " << tmp_path << ": " << std::strerror(err);
+            throw std::runtime_error(msg.str());
+        }
         int ret = ftruncate(fd, len_bytes);
-        if (ret != 0)
-            throw std::runtime_error("oops ftruncate failed!");
+        if (ret != 0) {
+            const int err = errno;
+            close(fd);
+            std::stringstream msg;
+            msg << "Chunked3d: ftruncate failed for " << tmp_path
+                << " (" << len_bytes << " bytes): " << std::strerror(err);
+            throw std::runtime_error(msg.str());
+        }
         T *chunk = (T*)mmap(NULL, len_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
         
@@ -638,7 +667,7 @@ struct Chunked3dFloatFromUint8
         // p has zyx ordering!
         p *= _scale;
         cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
-        uint8_t x = _x(i) ;
+        uint8_t x = _x.safe_at(i);
         return float{x} / 255.f;
     }
 
@@ -672,9 +701,9 @@ struct Chunked3dVec3fFromUint8
         // Both p and returned vector have zyx ordering!
         p *= _scale;
         cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
-        uint8_t x = _x(i) ;
-        uint8_t y = _y(i) ;
-        uint8_t z = _z(i) ;
+        uint8_t x = _x.safe_at(i);
+        uint8_t y = _y.safe_at(i);
+        uint8_t z = _z.safe_at(i);
         return (cv::Vec3f{z, y, x} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
     }
 

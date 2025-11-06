@@ -27,6 +27,14 @@ def update_config_from_args(mgr, args):
     mgr.ckpt_out_base = Path(args.output)
     mgr.tr_info["ckpt_out_base"] = str(mgr.ckpt_out_base)
 
+    # Skip image/zarr preflight checks if requested
+    if hasattr(args, 'skip_image_checks') and args.skip_image_checks:
+        mgr.skip_image_checks = True
+        if hasattr(mgr, 'dataset_config'):
+            mgr.dataset_config['skip_image_checks'] = True
+        if mgr.verbose:
+            print("Skipping image/zarr preflight checks as requested (--skip-image-checks)")
+
     if args.batch_size is not None:
         mgr.train_batch_size = args.batch_size
         mgr.tr_configs["batch_size"] = args.batch_size
@@ -128,6 +136,69 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Disabled spatial transformations (--no-spatial flag set)")
 
+    if hasattr(args, 'rotation_axes') and args.rotation_axes is not None:
+        axis_name_to_index = {
+            'z': 0,
+            'depth': 0,
+            'd': 0,
+            'y': 1,
+            'height': 1,
+            'h': 1,
+            'x': 2,
+            'width': 2,
+            'w': 2,
+        }
+        index_to_axis_name = {0: 'z', 1: 'y', 2: 'x'}
+
+        tokens = [tok.strip().lower() for tok in args.rotation_axes.split(',') if tok.strip()]
+        normalized_indices = []
+
+        if not tokens:
+            normalized_indices = []
+        else:
+            seen = set()
+            special_handled = False
+            for token in tokens:
+                if token in ('all', 'xyz', 'zyx'):
+                    normalized_indices = [0, 1, 2]
+                    special_handled = True
+                    break
+                if token == 'none':
+                    normalized_indices = []
+                    special_handled = True
+                    break
+                if token in axis_name_to_index:
+                    idx = axis_name_to_index[token]
+                else:
+                    try:
+                        idx = int(token)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid value '{token}' for --rotation-axes. "
+                            "Use a comma-separated subset of x,y,z (width,height,depth), digits 0-2, or 'none'."
+                        ) from exc
+                    if idx not in index_to_axis_name:
+                        raise ValueError(
+                            f"Invalid axis index '{idx}' for --rotation-axes. Valid indices are 0, 1, 2."
+                        )
+                if idx not in seen:
+                    normalized_indices.append(idx)
+                    seen.add(idx)
+            if not special_handled and not normalized_indices:
+                raise ValueError(
+                    "No valid axes provided to --rotation-axes. Provide a comma-separated subset of x,y,z or use 'none'."
+                )
+
+        mgr.allowed_rotation_axes = tuple(normalized_indices)
+        axis_names = [index_to_axis_name[idx] for idx in normalized_indices]
+        if hasattr(mgr, 'dataset_config'):
+            mgr.dataset_config['rotation_axes'] = axis_names
+        if mgr.verbose:
+            if axis_names:
+                print(f"Restricting random rotations to axes: {', '.join(axis_names)}")
+            else:
+                print("Disabling random rotations (rotation_axes=none)")
+
     # Handle skip_intensity_sampling (default is True now)
     if hasattr(args, 'skip_intensity_sampling'):
         mgr.skip_intensity_sampling = args.skip_intensity_sampling
@@ -144,6 +215,15 @@ def update_config_from_args(mgr, args):
         mgr.tr_configs["gradient_clip"] = args.grad_clip
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
+
+    # Gradient accumulation steps
+    if hasattr(args, 'gradient_accumulation') and args.gradient_accumulation is not None:
+        if args.gradient_accumulation < 1:
+            raise ValueError(f"--grad-accum/--gradient-accumulation must be >= 1, got {args.gradient_accumulation}")
+        mgr.gradient_accumulation = int(args.gradient_accumulation)
+        mgr.tr_configs["gradient_accumulation"] = int(args.gradient_accumulation)
+        if mgr.verbose:
+            print(f"Set gradient accumulation steps: {mgr.gradient_accumulation}")
 
     if args.scheduler is not None:
         mgr.scheduler = args.scheduler
@@ -168,6 +248,12 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Disabled Automatic Mixed Precision (AMP)")
 
+    if hasattr(args, 'amp_dtype') and args.amp_dtype is not None:
+        mgr.amp_dtype = args.amp_dtype.lower()
+        mgr.tr_configs["amp_dtype"] = mgr.amp_dtype
+        if mgr.verbose:
+            print(f"Set AMP dtype: {mgr.amp_dtype}")
+
     if hasattr(args, 'early_stopping_patience') and args.early_stopping_patience is not None:
         mgr.early_stopping_patience = args.early_stopping_patience
         mgr.tr_configs["early_stopping_patience"] = args.early_stopping_patience
@@ -177,5 +263,75 @@ def update_config_from_args(mgr, args):
             else:
                 print(f"Set early stopping patience: {args.early_stopping_patience} epochs")
 
+    # SSL warmup (mean teacher): ignore EMA consistency loss for N epochs
+    if hasattr(args, 'ssl_warmup') and args.ssl_warmup is not None:
+        mgr.warmup = int(args.ssl_warmup)
+        mgr.tr_configs["ssl_warmup"] = int(args.ssl_warmup)
+        if mgr.verbose:
+            if args.ssl_warmup > 0:
+                print(f"SSL warmup enabled: ignoring EMA consistency loss for first {args.ssl_warmup} epoch(s)")
+            else:
+                print("SSL warmup disabled (0 epochs)")
+
+    # Semi-supervised sampling controls
+    if hasattr(args, 'labeled_ratio') and args.labeled_ratio is not None:
+        if not (0.0 <= args.labeled_ratio <= 1.0):
+            raise ValueError(f"--labeled-ratio must be in [0,1], got {args.labeled_ratio}")
+        mgr.labeled_ratio = float(args.labeled_ratio)
+        mgr.tr_configs["labeled_ratio"] = float(args.labeled_ratio)
+        if mgr.verbose:
+            print(f"Set labeled patch ratio: {mgr.labeled_ratio}")
+
+    if hasattr(args, 'num_labeled') and args.num_labeled is not None:
+        if args.num_labeled < 0:
+            # Convention: -1 means use all labeled patches
+            mgr.num_labeled = None
+            mgr.tr_configs["num_labeled"] = None
+            if mgr.verbose:
+                print("Using all labeled patches (num_labeled=-1)")
+        else:
+            mgr.num_labeled = int(args.num_labeled)
+            mgr.tr_configs["num_labeled"] = int(args.num_labeled)
+            if mgr.verbose:
+                print(f"Set absolute labeled patch count: {mgr.num_labeled}")
+
+    if hasattr(args, 'labeled_batch_size') and args.labeled_batch_size is not None:
+        if args.labeled_batch_size < 1:
+            raise ValueError(f"--labeled-batch-size must be >=1, got {args.labeled_batch_size}")
+        mgr.labeled_batch_size = int(args.labeled_batch_size)
+        mgr.tr_configs["labeled_batch_size"] = int(args.labeled_batch_size)
+        if mgr.verbose:
+            print(f"Set labeled batch size: {mgr.labeled_batch_size}")
+
+
+
+    # Checkpoint/weights loading controls
+    if hasattr(args, 'checkpoint_path') and args.checkpoint_path is not None:
+        mgr.checkpoint_path = Path(args.checkpoint_path)
+        mgr.tr_info["checkpoint_path"] = str(mgr.checkpoint_path)
+        if mgr.verbose:
+            print(f"Set checkpoint path: {mgr.checkpoint_path}")
+
+    if hasattr(args, 'load_weights_only') and args.load_weights_only:
+        mgr.load_weights_only = True
+        mgr.tr_info["load_weights_only"] = True
+        if mgr.verbose:
+            print("Will load model weights only (ignore optimizer/scheduler)")
+
+    if hasattr(args, 'rebuild_from_ckpt_config') and args.rebuild_from_ckpt_config:
+        mgr.rebuild_from_checkpoint_config = True
+        mgr.tr_info["rebuild_from_checkpoint_config"] = True
+        if mgr.verbose:
+            print("Will rebuild model from checkpoint's model_config before loading weights")
+
     mgr.wandb_project = args.wandb_project
     mgr.wandb_entity = args.wandb_entity
+    mgr.wandb_run_name = getattr(args, 'wandb_run_name', None)
+    if mgr.wandb_run_name:
+        mgr.model_name = mgr.wandb_run_name
+        mgr.tr_info["model_name"] = mgr.wandb_run_name
+        if mgr.verbose:
+            print(f"Model name set from wandb run: {mgr.model_name}")
+    mgr.wandb_resume = getattr(args, 'wandb_resume', None)
+    if mgr.wandb_resume:
+        mgr.tr_info["wandb_resume"] = mgr.wandb_resume

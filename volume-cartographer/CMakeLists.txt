@@ -128,9 +128,9 @@ else()
     message(STATUS "Valgrind support disabled")
 endif()
 
-find_program(CCACHE_PROGRAM "ccache")
-if(CCACHE_FOUND)
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE_PROGRAM})
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
 endif()
 
 # Use modern C++ for everything and generate compile_commands database.
@@ -148,6 +148,9 @@ option(VC_INSTALL_UTILS     "Install VC utility programs" on)
 
 # Some helpful constants to be used in subprojects.
 include(VCConstants)
+
+# Enable/disable PaStiX from the build (OFF by default)
+option(VC_WITH_PASTIX "Build with PaStiX support" OFF)
 
 # Look for external dependencies.
 include(VCFindDependencies)

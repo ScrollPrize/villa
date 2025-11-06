@@ -16,7 +16,7 @@
 #include <tiffio.h>
 #include <mutex>
 #include <cmath>
-
+#include <set>
 
 namespace po = boost::program_options;
 
@@ -32,6 +32,38 @@ struct AffineTransform {
         matrix = cv::Mat_<double>::eye(4, 4);
     }
 };
+
+/**
+ * @brief Invert an affine transform in-place.
+ *        M = [A | t; 0 0 0 1]  ->  M^{-1} = [A^{-1} | -A^{-1} t; 0 0 0 1]
+ * @return bool True on success, false if A is non-invertible.
+ */
+static inline bool invertAffineInPlace(AffineTransform& T)
+{
+    cv::Mat A_cv(3, 3, CV_64F);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            A_cv.at<double>(r, c) = T.matrix(r, c);
+
+    cv::Mat Ainv_cv;
+    double det = cv::invert(A_cv, Ainv_cv, cv::DECOMP_LU);
+    if (det < 1e-10) {
+        return false;
+    }
+    cv::Matx33d Ainv;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            Ainv(r, c) = Ainv_cv.at<double>(r, c);
+    const cv::Vec3d t(T.matrix(0,3), T.matrix(1,3), T.matrix(2,3));
+    const cv::Vec3d tinv = -(Ainv * t);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) T.matrix(r, c) = Ainv(r, c);
+        T.matrix(r, 3) = tinv(r);
+    }
+    T.matrix(3,0) = 0.0; T.matrix(3,1) = 0.0; T.matrix(3,2) = 0.0; T.matrix(3,3) = 1.0;
+    return true;
+}
+
 
 /**
  * @brief Load affine transform from file (JSON)
@@ -84,6 +116,56 @@ AffineTransform loadAffineTransform(const std::string& filename) {
     return transform;
 }
 
+/**
+ * @brief Compose two affines: result = B * A (apply A first, then B)
+ */
+static inline AffineTransform composeAffine(const AffineTransform& A, const AffineTransform& B)
+{
+    AffineTransform R;
+    cv::Mat tmp = B.matrix * A.matrix; // left-multiply: row-vector convention used in code
+    tmp.copyTo(R.matrix);
+    return R;
+}
+
+/**
+ * @brief Pretty-print a 4x4 matrix to stdout.
+ */
+static inline void printMat4x4(const cv::Mat_<double>& M, const char* header)
+{
+    if (header) std::cout << header << "\n";
+    std::cout.setf(std::ios::fixed); std::cout << std::setprecision(6);
+    for (int r = 0; r < 4; ++r) {
+        std::cout << "  [";
+        for (int c = 0; c < 4; ++c) {
+            std::cout << std::setw(12) << M(r,c);
+            if (c < 3) std::cout << ", ";
+        }
+        std::cout << "]\n";
+    }
+    std::cout.unsetf(std::ios::floatfield);
+}
+
+/**
+ * @brief Parse an affine spec string possibly ending with an inversion hint.
+ *        Accepted suffixes: :inv, :invert, :i  (e.g., "path/to/A.json:inv").
+ *        Only the trailing token is interpreted, so Windows "C:\..." paths are safe.
+ */
+
+static inline std::pair<std::string, bool> parseAffineSpec(const std::string& spec)
+{
+    std::string path = spec;
+    bool inv = false;
+    const std::vector<std::string> suffixes = {":inv", ":invert", ":i"};
+    for (const auto& suffix : suffixes) {
+        if (spec.size() > suffix.size() &&
+            spec.substr(spec.size() - suffix.size()) == suffix) {
+            inv = true;
+            path = spec.substr(0, spec.size() - suffix.size());
+            break;
+        }
+    }
+    return {path, inv};
+}
 
 
 /**
@@ -465,7 +547,26 @@ static inline void renderSliceFromBase(
     out = tmp;
 }
 
-
+// 16-bit variant (uses the uint16_t overload)
+static inline void renderSliceFromBase16(
+    cv::Mat& out,
+    z5::Dataset* ds,
+    ChunkCache* cache,
+    const cv::Mat_<cv::Vec3f>& basePoints,
+    const cv::Mat_<cv::Vec3f>& stepDirs,
+    float off,
+    float ds_scale)
+{
+    cv::Mat_<cv::Vec3f> coords(basePoints.size());
+    for (int yy = 0; yy < coords.rows; ++yy) {
+        for (int xx = 0; xx < coords.cols; ++xx) {
+            const cv::Vec3f& p = basePoints(yy, xx);
+            const cv::Vec3f& d = stepDirs(yy, xx);
+            coords(yy, xx) = p + off * d * static_cast<float>(ds_scale);
+        }
+    }
+    cv::Mat_<uint16_t> tmp; readInterpolated3D(tmp, ds, coords, cache); out = tmp;
+}
 
 int main(int argc, char *argv[])
 {
@@ -502,10 +603,18 @@ int main(int argc, char *argv[])
             "Crop region width (0 = no crop)")
         ("crop-height", po::value<int>()->default_value(0),
             "Crop region height (0 = no crop)")
+        // Multi-affine interface (preferred):
+        ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(),
+            "One or more affine JSON files, in application order (first listed applies first). "
+            "You may append :inv / :invert / :i to a spec to invert that transform (e.g., --affine A.json:inv). "
+            "Key in JSON: 'transformation_matrix' (3x4 or 4x4).")
+        ("affine-invert", po::value<std::vector<int>>()->multitoken()->composing(),
+            "0-based indices into --affine to invert before composing (e.g., --affine-invert 0 2).")
+        // Backward-compatible single-affine options (deprecated):
         ("affine-transform", po::value<std::string>(),
-            "Path to affine transform file (JSON; key 'transformation_matrix' 3x4 or 4x4)")
+            "[DEPRECATED] Single affine JSON; prefer --affine. Key 'transformation_matrix' (3x4 or 4x4).")
         ("invert-affine", po::bool_switch()->default_value(false),
-            "Invert the given affine before applying (useful if JSON is voxel->world)")
+            "[DEPRECATED] Invert the single --affine-transform.")
         ("scale-segmentation", po::value<float>()->default_value(1.0),
             "Scale segmentation to target scale")
         ("rotate", po::value<double>()->default_value(0.0),
@@ -574,32 +683,70 @@ int main(int argc, char *argv[])
     float scale_seg = parsed["scale-segmentation"].as<float>();
 
     double rotate_angle = parsed["rotate"].as<double>();
-    const bool invert_affine = parsed["invert-affine"].as<bool>();
     int flip_axis = parsed["flip"].as<int>();
     const bool include_tifs = parsed["include-tifs"].as<bool>();
 
     AffineTransform affineTransform;
     bool hasAffine = false;
     
-    if (parsed.count("affine-transform") > 0) {
-        std::string affineFile = parsed["affine-transform"].as<std::string>();
-        try {
-            affineTransform = loadAffineTransform(affineFile);
-            hasAffine = true;
-            std::cout << "Loaded affine transform from: " << affineFile << std::endl;
-            if (invert_affine) {
-                cv::Mat inv = cv::Mat(affineTransform.matrix).inv();
-                if (inv.empty()) {
-                    std::cerr << "Error: affine matrix is non-invertible.\n";
-                    return EXIT_FAILURE;
-                }
-                inv.copyTo(affineTransform.matrix);
-                std::cout << "Note: Inverting affine as requested (--invert-affine).\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading affine transform: " << e.what() << std::endl;
-            return EXIT_FAILURE;
+    // --- New multi-affine loading & composition ---
+    std::vector<std::pair<std::string,bool>> affineSpecs; // (path, invert?)
+    if (parsed.count("affine") > 0) {
+        for (const auto& s : parsed["affine"].as<std::vector<std::string>>()) {
+            affineSpecs.emplace_back(parseAffineSpec(s));
         }
+    }
+    // Back-compat: single --affine-transform [--invert-affine]
+    if (parsed.count("affine-transform") > 0) {
+        const std::string singlePath = parsed["affine-transform"].as<std::string>();
+        const bool singleInv = parsed["invert-affine"].as<bool>();
+        affineSpecs.emplace_back(singlePath, singleInv);
+        std::cout << "[deprecated] Using --affine-transform"
+                  << (singleInv ? " (with inversion)" : "") << "; prefer --affine.\n";
+    }
+    // Optional index-based inversion flags for --affine
+    if (parsed.count("affine-invert") > 0 && !affineSpecs.empty()) {
+        std::set<int> idxInv;
+        for (int idx : parsed["affine-invert"].as<std::vector<int>>()) {
+            if (idx < 0 || idx >= static_cast<int>(affineSpecs.size())) {
+                std::cerr << "Error: --affine-invert index " << idx
+                          << " out of range [0.." << (affineSpecs.size()-1) << "].\n";
+                return EXIT_FAILURE;
+            }
+            idxInv.insert(idx);
+        }
+        int k = 0;
+        for (auto& spec : affineSpecs) {
+            if (idxInv.count(k)) spec.second = true;
+            ++k;
+        }
+    }
+    // Load, optionally invert, then compose (first listed applies first)
+    if (!affineSpecs.empty()) {
+        AffineTransform composed; // identity
+        int k = 0;
+        for (const auto& [path, invertFlag] : affineSpecs) {
+            try {
+                AffineTransform T = loadAffineTransform(path);
+                std::cout << "Loaded affine[" << k << "]: " << path
+                          << (invertFlag ? " (invert)" : "") << std::endl;
+                if (invertFlag) {
+                    if (!invertAffineInPlace(T)) {
+                        std::cerr << "Error: affine[" << k << "] has non-invertible linear part.\n";
+                        return EXIT_FAILURE;
+                    }
+                }
+                composed = composeAffine(composed, T);
+                ++k;
+            } catch (const std::exception& e) {
+                std::cerr << "Error loading affine[" << k << "]: " << e.what() << std::endl;
+                return EXIT_FAILURE;
+
+            }
+        }
+        hasAffine = true;
+        affineTransform = composed;
+        printMat4x4(affineTransform.matrix, "Final composed affine (applied to points first):");
     }
     
     z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
@@ -607,6 +754,11 @@ int main(int argc, char *argv[])
     std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
 
     std::cout << "zarr dataset size for scale group " << group_idx << ds->shape() << std::endl;
+    const bool output_is_u16 = (ds->getDtype() == z5::types::Datatype::uint16);
+    if (output_is_u16)
+        std::cout << "Detected source dtype=uint16 -> rendering as uint16" << std::endl;
+    else
+        std::cout << "Detected source dtype!=uint16 -> rendering as uint8 (default)" << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
     std::cout << "output argument: " << base_output_arg << std::endl;
 
@@ -706,26 +858,40 @@ int main(int argc, char *argv[])
         full_size.height = std::max(1, static_cast<int>(std::lround(full_size.height * sy)));
     }
     
+    // The uncropped, scaled canvas:
     cv::Size tgt_size = full_size;
-    cv::Rect crop = {0,0,tgt_size.width, tgt_size.height};
+    // 'crop' is expressed in the *uncropped* canvas coordinate system
+    cv::Rect crop = {0, 0, full_size.width, full_size.height};
     
     std::cout << "downsample level " << group_idx
               << " (ds_scale=" << ds_scale << ", sA=" << sA
               << ", Pg=" << Pg << ", render_scale=" << render_scale << ")\n";
 
-    // Handle crop parameters
-    int crop_x = parsed["crop-x"].as<int>();
-    int crop_y = parsed["crop-y"].as<int>();
-    int crop_width = parsed["crop-width"].as<int>();
-    int crop_height = parsed["crop-height"].as<int>();
-    
+    // Handle crop parameters (clamped to canvas)
+    const int crop_x = parsed["crop-x"].as<int>();
+    const int crop_y = parsed["crop-y"].as<int>();
+    const int crop_width  = parsed["crop-width"].as<int>();
+    const int crop_height = parsed["crop-height"].as<int>();
+    const cv::Rect canvasROI{0, 0, full_size.width, full_size.height};
     if (crop_width > 0 && crop_height > 0) {
-        crop = {crop_x, crop_y, crop_width, crop_height};
+        const cv::Rect req{crop_x, crop_y, crop_width, crop_height};
+        crop = (req & canvasROI); // intersect with canvas
+        if (crop.width <= 0 || crop.height <= 0) {
+            std::cerr << "Error: crop rectangle " << req
+                      << " lies outside the render canvas " << canvasROI << std::endl;
+            delete surf;
+            return;
+        }
         tgt_size = crop.size();
-    }        
+    } else {
+        crop = canvasROI;              // no crop requested
+        tgt_size = crop.size();
+    }
     
-    std::cout << "rendering size " << tgt_size << " at scale " << tgt_scale << " crop " << crop << std::endl;
-    
+    std::cout << "rendering size " << tgt_size
+              << " at scale " << tgt_scale
+              << " crop " << crop << std::endl;    
+              
     cv::Mat_<cv::Vec3f> points, normals;
     
     bool slice_gen = false;
@@ -738,7 +904,10 @@ int main(int argc, char *argv[])
     if ((tgt_size.width >= 10000 || tgt_size.height >= 10000) && num_slices > 1)
         slice_gen = true;
     else {
-        float u0, v0; computeCanvasOrigin(tgt_size, u0, v0);
+        // Origin must be computed in full (uncropped) canvas and shifted by crop origin.
+        float u0, v0; computeCanvasOrigin(full_size, u0, v0);
+        u0 += static_cast<float>(crop.x);
+        v0 += static_cast<float>(crop.y);
         genTile(surf, tgt_size, static_cast<float>(render_scale), u0, v0, points, normals);
     }
 
@@ -746,8 +915,10 @@ int main(int argc, char *argv[])
         const double render_scale_zarr = render_scale;
 
         cv::Mat_<cv::Vec3f> points, normals;
-        const float u0_full = -0.5f * (static_cast<float>(tgt_size.width)  - 1.0f);
-        const float v0_full = -0.5f * (static_cast<float>(tgt_size.height) - 1.0f);
+        float u0_base, v0_base;
+        computeCanvasOrigin(full_size, u0_base, v0_base);
+        u0_base += static_cast<float>(crop.x);
+        v0_base += static_cast<float>(crop.y);
         const size_t CH = 128, CW = 128;
         const size_t baseZ = std::max(1, num_slices);
         const size_t CZ = baseZ;
@@ -778,7 +949,9 @@ int main(int argc, char *argv[])
             {"clevel",  1},
             {"shuffle", 0}
         };
-        auto dsOut0 = z5::createDataset(outFile, "0", "uint8", shape0, chunks0, std::string("blosc"), compOpts0);
+        const std::string out_dtype0 = output_is_u16 ? "uint16" : "uint8";
+        auto dsOut0 = z5::createDataset(
+            outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
 
         const size_t tilesY_src = (static_cast<size_t>(tgt_size.height) + CH - 1) / CH;
         const size_t tilesX_src = (static_cast<size_t>(tgt_size.width)  + CW - 1) / CW;
@@ -789,8 +962,8 @@ int main(int argc, char *argv[])
         {
             const int dx0 = static_cast<int>(std::min(CW, shape0[2]));
             const int dy0 = static_cast<int>(std::min(CH, shape0[1]));
-            const float u0 = u0_full;
-            const float v0 = v0_full;
+            const float u0 = u0_base;
+            const float v0 = v0_base;
             globalFlipDecision = computeGlobalFlipDecision(
                 surf, dx0, dy0, u0, v0,
                 static_cast<float>(render_scale_zarr),
@@ -809,7 +982,11 @@ int main(int argc, char *argv[])
                     const size_t dy = std::min(static_cast<size_t>(CH), static_cast<size_t>(tgt_size.height) - y0_src);
                     const size_t dx = std::min(static_cast<size_t>(CW), static_cast<size_t>(tgt_size.width)  - x0_src);
 
-                    float u0, v0; computeTileOrigin(tgt_size, x0_src, y0_src, u0, v0);
+                    float u0, v0;
+                    computeTileOrigin(full_size,
+                                      x0_src + static_cast<size_t>(crop.x),
+                                      y0_src + static_cast<size_t>(crop.y),
+                                      u0, v0);
 
                     cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
                     genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
@@ -823,44 +1000,78 @@ int main(int argc, char *argv[])
                         globalFlipDecision,
                         basePoints, stepDirs);
 
-                    const bool swapWH = (rotQuad % 2) == 1 && rotQuad >= 0;
+                    const bool swapWH = (rotQuad >= 0) && ((rotQuad % 2) == 1);
                     const size_t dy_dst = swapWH ? dx : dy;
                     const size_t dx_dst = swapWH ? dy : dx;
-                    xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({dz, dy_dst, dx_dst});
+                    
+                    cv::Mat tileOut; // will be CV_8UC1 or CV_16UC1
 
-                    cv::Mat tileOut; // CV_8UC1
-                    for (size_t zi = 0; zi < dz; ++zi) {
-                        const size_t sliceIndex = z0 + zi;
-                        const float off = static_cast<float>(static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
-                        renderSliceFromBase(tileOut, ds.get(), &chunk_cache, basePoints, stepDirs, off, static_cast<float>(ds_scale));
-
-                        if (rotQuad >= 0 || flip_axis >= 0) {
-                            rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
-                        }
-
-                        // Copy into outChunk
-                        const size_t cH = static_cast<size_t>(tileOut.rows);
-                        const size_t cW = static_cast<size_t>(tileOut.cols);
-                        for (size_t yy = 0; yy < cH; ++yy) {
-                            for (size_t xx = 0; xx < cW; ++xx) {
-                                outChunk(zi, yy, xx) = tileOut.at<uint8_t>(static_cast<int>(yy), static_cast<int>(xx));
+                    if (output_is_u16) {
+                        xt::xarray<uint16_t> outChunk =
+                            xt::empty<uint16_t>({dz, dy_dst, dx_dst});
+                        for (size_t zi = 0; zi < dz; ++zi) {
+                            const size_t sliceIndex = z0 + zi;
+                            const float off = static_cast<float>(
+                                static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
+                            renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
+                                                  basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                            if (rotQuad >= 0 || flip_axis >= 0) {
+                                rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
+                            }
+                            const size_t cH = static_cast<size_t>(tileOut.rows);
+                            const size_t cW = static_cast<size_t>(tileOut.cols);
+                            for (size_t yy = 0; yy < cH; ++yy) {
+                                const uint16_t* src = tileOut.ptr<uint16_t>(static_cast<int>(yy));
+                                for (size_t xx = 0; xx < cW; ++xx) {
+                                    outChunk(zi, yy, xx) = src[xx];
+                                }
                             }
                         }
+                        int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
+                        int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
+                        if (rotQuad >= 0 || flip_axis >= 0) {
+                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                         std::max(rotQuad, 0), flip_axis,
+                                         dstTx, dstTy, dstTilesX, dstTilesY);
+                        }
+                        const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
+                        const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
+                        z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
+                        z5::multiarray::writeSubarray<uint16_t>(dsOut0, outChunk, outOffset.begin());
+                    } else {
+                        xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({dz, dy_dst, dx_dst});
+                        for (size_t zi = 0; zi < dz; ++zi) {
+                            const size_t sliceIndex = z0 + zi;
+                            const float off = static_cast<float>(
+                                static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
+                            renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
+                                                basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                            if (rotQuad >= 0 || flip_axis >= 0) {
+                                rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
+                            }
+                            const size_t cH = static_cast<size_t>(tileOut.rows);
+                            const size_t cW = static_cast<size_t>(tileOut.cols);
+                            for (size_t yy = 0; yy < cH; ++yy) {
+                                const uint8_t* src = tileOut.ptr<uint8_t>(static_cast<int>(yy));
+                                for (size_t xx = 0; xx < cW; ++xx) {
+                                    outChunk(zi, yy, xx) = src[xx];
+                                }
+                            }
+                        }
+                        int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
+                        int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
+                        if (rotQuad >= 0 || flip_axis >= 0) {
+                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                         std::max(rotQuad, 0), flip_axis,
+                                         dstTx, dstTy, dstTilesX, dstTilesY);
+                        }
+                        const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
+                        const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
+                        z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
+                        z5::multiarray::writeSubarray<uint8_t>(dsOut0, outChunk, outOffset.begin());
                     }
-
-                    int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
-                    int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
-                    if (rotQuad >= 0 || flip_axis >= 0) {
-                        mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
-                                     static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
-                                     std::max(rotQuad, 0), flip_axis,
-                                     dstTx, dstTy, dstTilesX, dstTilesY);
-                    }
-                    const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
-                    const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
-
-                    z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
-                    z5::multiarray::writeSubarray<uint8_t>(dsOut0, outChunk, outOffset.begin());
 
                     size_t done = ++tilesDone;
                     int pct = static_cast<int>(100.0 * double(done) / double(totalTiles));
@@ -893,7 +1104,10 @@ int main(int argc, char *argv[])
                 {"clevel",  1},
                 {"shuffle", 0}
             };
-            auto dst = z5::createDataset(outFile, std::to_string(targetLevel), "uint8", dShape, dChunks, std::string("blosc"), compOpts);
+            auto dst = z5::createDataset(
+                outFile, std::to_string(targetLevel),
+                output_is_u16 ? "uint16" : "uint8",
+                dShape, dChunks, std::string("blosc"), compOpts);
 
             const size_t tileZ = dShape[0], tileY = CH, tileX = CW;
             const size_t tilesY = (dShape[1] + tileY - 1) / tileY;
@@ -913,31 +1127,45 @@ int main(int argc, char *argv[])
                         const size_t sy = std::min<size_t>(2*ly, sShape[1] - y*2);
                         const size_t sx = std::min<size_t>(2*lx, sShape[2] - x*2);
 
-                        xt::xarray<uint8_t> srcChunk = xt::empty<uint8_t>({sz, sy, sx});
-                        {
+                        if (output_is_u16) {
+                            xt::xarray<uint16_t> srcChunk = xt::empty<uint16_t>({sz, sy, sx});
+                            z5::types::ShapeType sOff = {static_cast<size_t>(2*z), static_cast<size_t>(2*y), static_cast<size_t>(2*x)};
+                            z5::multiarray::readSubarray<uint16_t>(src, srcChunk, sOff.begin());
+                            xt::xarray<uint16_t> dstChunk = xt::empty<uint16_t>({lz, ly, lx});
+                            for (size_t zz = 0; zz < lz; ++zz)
+                                for (size_t yy = 0; yy < ly; ++yy)
+                                    for (size_t xx = 0; xx < lx; ++xx) {
+                                        uint32_t sum = 0; int cnt = 0;
+                                        for (int dz2 = 0; dz2 < 2 && (2*zz + dz2) < sz; ++dz2)
+                                            for (int dy2 = 0; dy2 < 2 && (2*yy + dy2) < sy; ++dy2)
+                                                for (int dx2 = 0; dx2 < 2 && (2*xx + dx2) < sx; ++dx2) {
+                                                    sum += srcChunk(2*zz + dz2, 2*yy + dy2, 2*xx + dx2);
+                                                    cnt += 1;
+                                                }
+                                        dstChunk(zz, yy, xx) = static_cast<uint16_t>((sum + (cnt/2)) / std::max(1, cnt));
+                                    }
+                            z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
+                            z5::multiarray::writeSubarray<uint16_t>(dst, dstChunk, dOff.begin());
+                        } else {
+                            xt::xarray<uint8_t> srcChunk = xt::empty<uint8_t>({sz, sy, sx});
                             z5::types::ShapeType sOff = {static_cast<size_t>(2*z), static_cast<size_t>(2*y), static_cast<size_t>(2*x)};
                             z5::multiarray::readSubarray<uint8_t>(src, srcChunk, sOff.begin());
-                        }
-
-                        xt::xarray<uint8_t> dstChunk = xt::empty<uint8_t>({lz, ly, lx});
-                        for (size_t zz = 0; zz < lz; ++zz) {
-                            for (size_t yy = 0; yy < ly; ++yy) {
-                                for (size_t xx = 0; xx < lx; ++xx) {
-                                    int sum = 0;
-                                    int cnt = 0;
-                                    for (int dz2 = 0; dz2 < 2 && (2*zz + dz2) < sz; ++dz2)
-                                        for (int dy2 = 0; dy2 < 2 && (2*yy + dy2) < sy; ++dy2)
-                                            for (int dx2 = 0; dx2 < 2 && (2*xx + dx2) < sx; ++dx2) {
-                                                sum += srcChunk(2*zz + dz2, 2*yy + dy2, 2*xx + dx2);
-                                                cnt += 1;
-                                            }
-                                    dstChunk(zz, yy, xx) = static_cast<uint8_t>((sum + (cnt/2)) / std::max(1, cnt));
-                                }
-                            }
-                        }
-
-                        z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
-                        z5::multiarray::writeSubarray<uint8_t>(dst, dstChunk, dOff.begin());
+                            xt::xarray<uint8_t> dstChunk = xt::empty<uint8_t>({lz, ly, lx});
+                            for (size_t zz = 0; zz < lz; ++zz)
+                                for (size_t yy = 0; yy < ly; ++yy)
+                                    for (size_t xx = 0; xx < lx; ++xx) {
+                                        int sum = 0; int cnt = 0;
+                                        for (int dz2 = 0; dz2 < 2 && (2*zz + dz2) < sz; ++dz2)
+                                            for (int dy2 = 0; dy2 < 2 && (2*yy + dy2) < sy; ++dy2)
+                                                for (int dx2 = 0; dx2 < 2 && (2*xx + dx2) < sx; ++dx2) {
+                                                    sum += srcChunk(2*zz + dz2, 2*yy + dy2, 2*xx + dx2);
+                                                    cnt += 1;
+                                                }
+                                        dstChunk(zz, yy, xx) = static_cast<uint8_t>((sum + (cnt/2)) / std::max(1, cnt));
+                                    }
+                            z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
+                            z5::multiarray::writeSubarray<uint8_t>(dst, dstChunk, dOff.begin());
+                        }                        
 
                         size_t done = ++tilesDone;
                         int pct = static_cast<int>(100.0 * double(done) / double(totalTiles));
@@ -973,9 +1201,9 @@ int main(int argc, char *argv[])
         multiscale["version"] = "0.4";
         multiscale["name"] = "render";
         multiscale["axes"] = nlohmann::json::array({
-            nlohmann::json{{"name","z"},{"type","space"},{"unit","pixel"}},
-            nlohmann::json{{"name","y"},{"type","space"},{"unit","pixel"}},
-            nlohmann::json{{"name","x"},{"type","space"},{"unit","pixel"}}
+            nlohmann::json{{"name","z"},{"type","space"}},
+            nlohmann::json{{"name","y"},{"type","space"}},
+            nlohmann::json{{"name","x"},{"type","space"}}
         });
         multiscale["datasets"] = nlohmann::json::array();
         for (int level = 0; level <= 5; ++level) {
@@ -1046,7 +1274,7 @@ int main(int argc, char *argv[])
                     TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, outW);
                     TIFFSetField(tf, TIFFTAG_IMAGELENGTH, outH);
                     TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, 8);
+                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, output_is_u16 ? 16 : 8);
                     TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
                     TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
                     TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
@@ -1065,41 +1293,62 @@ int main(int argc, char *argv[])
                         const uint32_t dx = std::min<uint32_t>(tileW, static_cast<uint32_t>(X) - x0_src);
                         const uint32_t dy = std::min<uint32_t>(tileH, static_cast<uint32_t>(Y) - y0_src);
 
-                        xt::xarray<uint8_t> tile = xt::empty<uint8_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
-                        {
+                        if (output_is_u16) {
+                            xt::xarray<uint16_t> tile = xt::empty<uint16_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
+                            z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
+                            z5::multiarray::readSubarray<uint16_t>(dsL0, tile, off.begin());
+                            std::vector<uint16_t> tileBuf(tileW * tileH, 0);
+                            for (size_t z = 0; z < Z; ++z) {
+                                cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_16UC1);
+                                for (uint32_t yy = 0; yy < dy; ++yy) {
+                                    uint16_t* dst = srcTile.ptr<uint16_t>(static_cast<int>(yy));
+                                    for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
+                                }
+                                cv::Mat& dstTile = srcTile;
+                                const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
+                                const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
+                                const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < ddy; ++yy) {
+                                    const uint16_t* src = dstTile.ptr<uint16_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, ddx * sizeof(uint16_t));
+                                }
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[z]);
+                                    TIFF* tf = tiffs[z];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size() * sizeof(uint16_t)));
+                                }
+                            }
+                        } else {
+                            xt::xarray<uint8_t> tile = xt::empty<uint8_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
                             z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
                             z5::multiarray::readSubarray<uint8_t>(dsL0, tile, off.begin());
-                        }
-
-                        std::vector<uint8_t> tileBuf(tileW * tileH, 0);
-                        for (size_t z = 0; z < Z; ++z) {
-                            cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_8UC1);
-                            for (uint32_t yy = 0; yy < dy; ++yy) {
-                                uint8_t* dst = srcTile.ptr<uint8_t>(static_cast<int>(yy));
-                                for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
-                            }
-                            // No additional rotate/flip here; L0 is final orientation
-                            cv::Mat& dstTile = srcTile;
-                            const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
-                            const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
-
-                            const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
-                            const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
-                            // Fill pad buffer
-                            std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                            for (uint32_t yy = 0; yy < ddy; ++yy) {
-                                const uint8_t* src = dstTile.ptr<uint8_t>(static_cast<int>(yy));
-                                std::memcpy(tileBuf.data() + yy * tileW, src, ddx);
-                            }
-
-                            // Write tile to the corresponding TIFF (per-slice lock)
-                            {
-                                std::lock_guard<std::mutex> guard(tiffLocks[z]);
-                                TIFF* tf = tiffs[z];
-                                const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                (void)tileIndex;
-                                if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBuf.size())) < 0) {
-                                    // ignore individual tile write errors for now
+                            std::vector<uint8_t> tileBuf(tileW * tileH, 0);
+                            for (size_t z = 0; z < Z; ++z) {
+                                cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_8UC1);
+                                for (uint32_t yy = 0; yy < dy; ++yy) {
+                                    uint8_t* dst = srcTile.ptr<uint8_t>(static_cast<int>(yy));
+                                    for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
+                                }
+                                cv::Mat& dstTile = srcTile;
+                                const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
+                                const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
+                                const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < ddy; ++yy) {
+                                    const uint8_t* src = dstTile.ptr<uint8_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, ddx);
+                                }
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[z]);
+                                    TIFF* tf = tiffs[z];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size()));
                                 }
                             }
                         }
@@ -1181,7 +1430,7 @@ int main(int argc, char *argv[])
                     TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(outW));
                     TIFFSetField(tf, TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(outH));
                     TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, 8);
+                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, output_is_u16 ? 16 : 8);
                     TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
                     TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
                     TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
@@ -1194,7 +1443,9 @@ int main(int argc, char *argv[])
                 {
                     const int dx0 = std::min<int>(static_cast<int>(tileW), tgt_size.width);
                     const int dy0 = std::min<int>(static_cast<int>(tileH), tgt_size.height);
-                    float u0, v0; computeCanvasOrigin(tgt_size, u0, v0);
+                    float u0, v0; computeCanvasOrigin(full_size, u0, v0);
+                    u0 += static_cast<float>(crop.x);
+                    v0 += static_cast<float>(crop.y);
                     globalFlipDecision = computeGlobalFlipDecision(
                         surf, dx0, dy0, u0, v0,
                         static_cast<float>(render_scale),
@@ -1216,7 +1467,11 @@ int main(int argc, char *argv[])
                         const uint32_t dy = std::min<uint32_t>(tileH, static_cast<uint32_t>(tgt_size.height) - y0_src);
 
                         // Generate base coordinates/normals for this tile once
-                        float u0, v0; computeTileOrigin(tgt_size, x0_src, y0_src, u0, v0);
+                        float u0, v0;
+                        computeTileOrigin(full_size,
+                                          x0_src + static_cast<size_t>(crop.x),
+                                          y0_src + static_cast<size_t>(crop.y),
+                                          u0, v0);
                         cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
                         genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
                                 static_cast<float>(render_scale), u0, v0, tilePoints, tileNormals);
@@ -1229,36 +1484,69 @@ int main(int argc, char *argv[])
                             globalFlipDecision,
                             basePoints, stepDirs);
 
-                        std::vector<uint8_t> tileBuf(tileW * tileH, 0);
-                        cv::Mat_<uint8_t> tileOut;
-                        for (int zi = 0; zi < num_slices; ++zi) {
-                            const float off = static_cast<float>(static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
-                            renderSliceFromBase(tileOut, ds.get(), &chunk_cache, basePoints, stepDirs, off, static_cast<float>(ds_scale));
-
-                            cv::Mat tileTransformed = tileOut;
-                            rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
-
-                            const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
-                            const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
-                            std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                            for (uint32_t yy = 0; yy < dty; ++yy) {
-                                const uint8_t* src = tileTransformed.ptr<uint8_t>(static_cast<int>(yy));
-                                std::memcpy(tileBuf.data() + yy * tileW, src, dtx);
+                        if (output_is_u16) {
+                            std::vector<uint16_t> tileBuf(tileW * tileH, 0);
+                            cv::Mat tileOut; // CV_16UC1
+                            for (int zi = 0; zi < num_slices; ++zi) {
+                                const float off = static_cast<float>(
+                                    static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
+                                renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
+                                                      basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                                cv::Mat tileTransformed = tileOut;
+                                rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
+                                const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
+                                const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < dty; ++yy) {
+                                    const uint16_t* src = tileTransformed.ptr<uint16_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, dtx * sizeof(uint16_t));
+                                }
+                                int dstTx, dstTy, rTilesX, rTilesY;
+                                mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                             static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                             std::max(rotQuad, 0), flip_axis,
+                                             dstTx, dstTy, rTilesX, rTilesY);
+                                const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
+                                    TIFF* tf = tiffs[static_cast<size_t>(zi)];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size() * sizeof(uint16_t)));
+                                }
                             }
-
-                            int dstTx, dstTy, rTilesX, rTilesY;
-                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
-                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
-                                         std::max(rotQuad, 0), flip_axis,
-                                         dstTx, dstTy, rTilesX, rTilesY);
-                            const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
-                            const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
-
-                            {
-                                std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
-                                TIFF* tf = tiffs[static_cast<size_t>(zi)];
-                                const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBuf.size()));
+                        } else {
+                            std::vector<uint8_t> tileBuf(tileW * tileH, 0);
+                            cv::Mat tileOut; // CV_8UC1
+                            for (int zi = 0; zi < num_slices; ++zi) {
+                                const float off = static_cast<float>(
+                                    static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
+                                renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
+                                                    basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                                cv::Mat tileTransformed = tileOut;
+                                rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
+                                const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
+                                const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
+                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                                for (uint32_t yy = 0; yy < dty; ++yy) {
+                                    const uint8_t* src = tileTransformed.ptr<uint8_t>(static_cast<int>(yy));
+                                    std::memcpy(tileBuf.data() + yy * tileW, src, dtx);
+                                }
+                                int dstTx, dstTy, rTilesX, rTilesY;
+                                mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                             static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                             std::max(rotQuad, 0), flip_axis,
+                                             dstTx, dstTy, rTilesX, rTilesY);
+                                const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
+                                const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
+                                {
+                                    std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
+                                    TIFF* tf = tiffs[static_cast<size_t>(zi)];
+                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
+                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
+                                                         static_cast<tmsize_t>(tileBuf.size()));
+                                }
                             }
                         }
 
@@ -1304,12 +1592,28 @@ int main(int argc, char *argv[])
             std::filesystem::path out_arg_path;
 
             if (batch_format == "zarr") {
-                // Always make a unique zarr per segmentation:
-                // <parent-of(-o)>/<stem-of(-o)>_<seg-name>
-                const auto parent = base.has_parent_path() ? base.parent_path()
-                                                        : std::filesystem::current_path();
-                const std::string stem = base.filename().string(); // “2um_111kev_1.2m”
-                out_arg_path = parent / (stem + "_" + seg_name);
+                // Treat -o as a DIRECTORY in batch-zarr mode so the wrapper can
+                // find layers_* under that directory.
+                // Write:  <-o>/<prefix>_<seg-name>.zarr
+                // And TIFFs: <-o>/layers_<prefix>_<seg-name>
+                std::filesystem::path base_dir;
+                if ((std::filesystem::exists(base) && std::filesystem::is_directory(base)) || !base.has_extension()) {
+                    base_dir = base;
+                    std::error_code ec;
+                    std::filesystem::create_directories(base_dir, ec); // best-effort
+                } else {
+                    // If -o looks like a file, fall back to its parent
+                    base_dir = base.parent_path();
+                    if (base_dir.empty()) base_dir = std::filesystem::current_path();
+                }
+                // Keep prior naming flavor by using the stem (or filename if empty) as prefix
+                const std::string prefix = base.stem().string().empty()
+                                             ? base.filename().string()
+                                             : base.stem().string();
+                out_arg_path = base_dir / (prefix + "_" + seg_name);
+                std::cout << "[batch] writing Zarr under directory: "
+                          << base_dir.string()
+                          << "  name=" << (prefix + "_" + seg_name) << " (.zarr appended)\n";
             } else {
                 // For TIFF, keep old behavior but handle absolute -o correctly
                 out_arg_path = base.is_absolute() ? (base / seg_name)

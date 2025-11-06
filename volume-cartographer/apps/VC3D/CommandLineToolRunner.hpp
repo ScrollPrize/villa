@@ -8,7 +8,7 @@
 #include <QFile>
 
 #include "CWindow.hpp"
-#include "ProgressUtil.hpp"
+#include "elements/ProgressUtil.hpp"
 #include "ConsoleOutputWidget.hpp"
 
 
@@ -34,7 +34,9 @@ public:
         GrowSegFromSegment,
         GrowSegFromSeeds,
         SegAddOverlap,
-        tifxyz2obj
+        tifxyz2obj,
+        obj2tifxyz,
+        AlphaCompRefine
     };
 
     void setVolumePath(const QString& path);
@@ -50,8 +52,15 @@ public:
     void setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment);
     void setAddOverlapParams(QString tgtDir, QString tifxyzPath);
     void setToObjParams(QString tifxyzPath, QString objPath);
-    void setToObjOptions(bool normalizeUV, bool alignGrid, int decimateIterations, bool cleanSurface, float cleanK);
-
+    void setToObjOptions(bool normalizeUV, bool alignGrid);
+    void setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
+                             float stretchFactor = 1000.0f,
+                             float meshUnits = 1.0f,
+                             int stepSize = 20);
+    void setObjRefineParams(const QString& volumePath,
+                            const QString& srcSurface,
+                            const QString& dstSurface,
+                            const QString& jsonParams);
     bool execute(Tool tool);
     void cancel();
     bool isRunning() const;
@@ -124,9 +133,6 @@ private:
     // vc_tifxyz2obj options
     bool _optNormalizeUV{false};
     bool _optAlignGrid{false};
-    int  _optDecimateIter{0};
-    bool _optCleanSurface{false};
-    float _optCleanK{5.0f};
 
     Tool _currentTool;
 
@@ -134,4 +140,10 @@ private:
     QTextStream* _logStream;
 
     int _ompThreads{-1};
+
+    QString _objOutputDir;
+    float _objStretchFactor = 1000.0f;
+    float _objMeshUnits = 1.0f;
+    int _objStepSize = 20;
+    QString _refineDst;
 };

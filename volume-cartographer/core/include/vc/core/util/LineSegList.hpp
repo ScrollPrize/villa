@@ -7,16 +7,16 @@
 #include <limits>
 #include <mutex>
 
-namespace vc {
-namespace core {
-namespace util {
+ namespace vc {
+ namespace core {
+ namespace util {
 
-class LineSegList {
-public:
-    LineSegList(const std::vector<cv::Point>& points) {
-        if (points.empty()) {
-            return;
-        }
+ class LineSegList {
+ public:
+     explicit LineSegList(const std::vector<cv::Point>& points) {
+         if (points.empty()) {
+             return;
+         }
         start_point_ = points[0];
         compressed_data_.reserve(2 * (points.size() - 1));
         for (size_t i = 1; i < points.size(); ++i) {
@@ -56,6 +56,19 @@ public:
     size_t compressed_data_size() const { return compressed_data_size_; }
     cv::Point start_point() const { return start_point_; }
     size_t num_points() const { return 1 + compressed_data_size_ / 2; }
+    size_t get_memory_usage() const {
+       return sizeof(LineSegList) + compressed_data_.capacity();
+    }
+
+    bool operator==(const LineSegList& other) const {
+        if (start_point_ != other.start_point_) return false;
+        if (compressed_data_size_ != other.compressed_data_size_) return false;
+        return memcmp(compressed_data_ptr_, other.compressed_data_ptr_, compressed_data_size_) == 0;
+    }
+
+    bool operator!=(const LineSegList& other) const {
+        return !(*this == other);
+    }
 
 private:
     cv::Point start_point_;

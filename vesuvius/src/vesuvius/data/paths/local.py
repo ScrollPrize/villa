@@ -1,15 +1,20 @@
 import os
 import re
-import yaml
 from typing import Dict, List
-from vesuvius.utils import get_installation_path
+
+import yaml
+
+from vesuvius.install.accept_terms import get_installation_path
 
 
 def update_local_list(base_dir: str, base_dir_cubes: str) -> None:
     install_path = get_installation_path()
-    scroll_config = os.path.join(install_path, 'vesuvius', 'configs', 'scrolls.yaml')
-    directory_config = os.path.join(install_path, 'vesuvius', 'configs', 'directory_structure.yaml')
-    cubes_config = os.path.join(install_path, 'vesuvius', 'configs', 'cubes.yaml')
+    config_dir = os.path.join(install_path, 'vesuvius', 'install', 'configs')
+    os.makedirs(config_dir, exist_ok=True)
+
+    scroll_config = os.path.join(config_dir, 'scrolls.yaml')
+    directory_config = os.path.join(config_dir, 'directory_structure.yaml')
+    cubes_config = os.path.join(config_dir, 'cubes.yaml')
 
     #print(f"Starting directory traversal for: {base_dir}")
     

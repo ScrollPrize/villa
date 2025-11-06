@@ -69,7 +69,17 @@ int main(int argc, char *argv[])
     std::vector<SurfaceMeta*> surfaces;
 
     std::filesystem::path meta_fn = src_path / "meta.json";
+    if (!std::filesystem::exists(meta_fn)) {
+        std::cerr << "Error: meta.json not found at " << meta_fn << std::endl;
+        return EXIT_FAILURE;
+    }
+
     std::ifstream meta_f(meta_fn);
+    if (!meta_f.is_open() || !meta_f.good()) {
+        std::cerr << "Error: Could not open " << meta_fn << std::endl;
+        return EXIT_FAILURE;
+    }
+
     json meta = json::parse(meta_f);
     SurfaceMeta *src = new SurfaceMeta(src_path, meta);
     src->readOverlapping();

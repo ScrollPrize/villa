@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"
@@ -91,6 +91,9 @@ Since the fragments have exposed text on their surfaces, they can be used as gro
             <div className="sm:w-[45%] max-w-[200px] mb-2 mr-2"><img src="/img/data/fr4.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 4 (PHerc. Paris. 1 Fr 39)</figcaption></div>
             <div className="sm:w-[45%] max-w-[130px] mb-2 mr-2"><img src="/img/data/fr5.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 5 (PHerc. 1667 Cr 1 Fr 3)</figcaption></div>
             <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2"><img src="/img/data/fr6.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 6 (PHerc. 51 Cr 4 Fr 48)</figcaption></div>
+            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2"><img src="/img/data/PHerc0009B-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 9B</figcaption></div>
+            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2"><img src="/img/data/PHerc0343P-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 343P</figcaption></div>
+            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2"><img src="/img/data/PHerc0500P2-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 500P2</figcaption></div>
           </div>
         </td>
       </tr>

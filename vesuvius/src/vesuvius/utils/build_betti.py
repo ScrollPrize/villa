@@ -39,9 +39,23 @@ def build_betti_matching():
         print(f"\nBuilding Betti-Matching-3D in {build_dir}...")
         
         # Configure with CMake
-        cmake_cmd = ["cmake", ".."]
+        cmake_cmd = ["cmake"]
+
+        # Try to find pybind11 CMake directory
+        try:
+            import pybind11
+            pybind11_dir = pybind11.get_cmake_dir()
+            cmake_cmd.extend([f"-Dpybind11_DIR={pybind11_dir}"])
+            print(f"Found pybind11 at: {pybind11_dir}")
+        except ImportError:
+            print("Warning: pybind11 not found in Python environment")
+        except AttributeError:
+            print("Warning: Could not get pybind11 CMake directory")
+
         if platform.system() == "Darwin" and platform.machine() == "arm64":
-            cmake_cmd = ["cmake", "-DCMAKE_OSX_ARCHITECTURES=arm64", ".."]
+            cmake_cmd.append("-DCMAKE_OSX_ARCHITECTURES=arm64")
+
+        cmake_cmd.append("..")
         
         print(f"Running: {' '.join(cmake_cmd)}")
         subprocess.run(cmake_cmd, cwd=build_dir, check=True)

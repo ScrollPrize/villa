@@ -9,7 +9,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,000,000+ machine learning and computer vision competition"
+    content="A $1,500,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"
@@ -46,7 +46,6 @@ import TabItem from '@theme/TabItem';
 This tutorial walks through a slice-based approach to segmentation, which is helpful background for learning about the task.
 This was used to generate the 2023 [Grand Prize results](grandprize).
 We are now working on more automated, 3D approaches to segmentation.
-For more information on those approaches, see [Segmentation - a different approach](tutorial4).
 
 :::tip
 Please see the accompanying video tutorial for segmentation using Volume Cartographer here: https://www.youtube.com/watch?v=gdQmepxWhuY

@@ -273,6 +273,19 @@ class VCDataset(Dataset):
                     for x in x_positions:
                         self.all_positions.append((z, y, x))
 
+            # Optional coverage diagnostics in verbose mode
+            if self.verbose and self.all_positions:
+                max_start_z = max(pos[0] for pos in self.all_positions)
+                max_start_y = max(pos[1] for pos in self.all_positions)
+                max_start_x = max(pos[2] for pos in self.all_positions)
+                cov_z = (max_start_z + pZ == image_size[0]) if image_size[0] >= pZ else (max_start_z == 0)
+                cov_y = (max_start_y + pY == image_size[1]) if image_size[1] >= pY else (max_start_y == 0)
+                cov_x = (max_start_x + pX == image_size[2]) if image_size[2] >= pX else (max_start_x == 0)
+                print("\nTiling coverage check:")
+                print(f"  Z axis: start in [0..{max_start_z}], patch {pZ}, size {image_size[0]} -> covers end: {cov_z}")
+                print(f"  Y axis: start in [0..{max_start_y}], patch {pY}, size {image_size[1]} -> covers end: {cov_y}")
+                print(f"  X axis: start in [0..{max_start_x}], patch {pX}, size {image_size[2]} -> covers end: {cov_x}")
+
             # Apply Z-axis partitioning if num_parts > 1
             if self.num_parts > 1:
                 max_z = image_size[0]
