@@ -13,7 +13,7 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from dataset import PatchInCubeDataset, HeatmapDataset, HeatmapDatasetV2, load_datasets
+from dataset import PatchInCubeDataset, HeatmapDatasetV2, load_datasets
 from models import make_model
 from sampling import sample_ddim
 

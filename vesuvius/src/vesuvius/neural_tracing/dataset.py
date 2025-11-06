@@ -23,18 +23,6 @@ class Patch:
     scale: torch.Tensor
     volume: zarr.Array
 
-    def _get_face_indices(self):
-        h, w = torch.tensor(self.zyxs.shape[:2]) - 1
-        indices = torch.arange(h * w).view(h, w)
-        top_left = indices[:-1, :-1].flatten()
-        top_right = indices[:-1, 1:].flatten()
-        bottom_left = indices[1:, :-1].flatten()
-        bottom_right = indices[1:, 1:].flatten()
-        return torch.cat([
-            torch.stack([bottom_left, top_left, top_right], dim=1),
-            torch.stack([bottom_left, top_right, bottom_right], dim=1)
-        ], dim=0)
-
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
         self.valid_quad_mask = torch.any(self.zyxs[:-1, :-1] != -1, dim=-1) & torch.any(self.zyxs[1:, :-1] != -1, dim=-1) & torch.any(self.zyxs[:-1, 1:] != -1, dim=-1) & torch.any(self.zyxs[1:, 1:] != -1, dim=-1)
@@ -51,48 +39,6 @@ class Patch:
             self.scale * factor,
             self.volume
         )
-
-
-class LineDataset(torch.utils.data.IterableDataset):
-    def __init__(self, config):
-        self._config = config
-        self._patches = load_datasets(config)
-
-    def __iter__(self):
-
-        areas = torch.tensor([patch.area for patch in self._patches])
-        area_weights = areas / areas.sum()
-        point_spacing = self._config['point_spacing']
-        total_points = self._config['context_points'] + self._config['generated_points']
-
-        while True:
-            patch = random.choices(self._patches, weights=area_weights)[0]
-
-            # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
-            start_quad_ij = patch.valid_quad_indices[random_idx]
-            start_ij = start_quad_ij + torch.rand(size=[2])
-            
-            # Sample second point at random angle; reject if outside the patch or quad not valid
-            angle = torch.rand(size=[]) * 2 * torch.pi
-            distance = point_spacing * total_points
-            end_ij = start_ij + distance * torch.tensor([torch.cos(angle), torch.sin(angle)])
-            if torch.any(end_ij < 0) or torch.any(end_ij >= torch.tensor(patch.zyxs.shape[:2])):
-                continue
-            if not patch.valid_quad_mask[*end_ij.int()]:
-                continue
-
-            # FIXME: sometimes should sample shorter context (min length of two) to enable bootstrapping traces
-            #  from just a pair of points
-
-            coeffs = torch.linspace(0, 1, total_points)
-            ijs = torch.lerp(start_ij, end_ij, coeffs[:, None])
-            zyxs = F.grid_sample(patch.zyxs, ijs[None, :, ::-1] / patch.zyxs.shape[:2] * 2 - 1, align_corners=True, mode='bilinear', padding_mode='border')
-
-            yield {
-                'zyxs': zyxs,
-                'patch': ...,
-            }
 
 
 class PatchInCubeDataset(torch.utils.data.IterableDataset):
@@ -234,97 +180,6 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
                 'volume': volume_crop,
                 'localiser': localiser,
                 'uvw': uvws,
-            }
-
-
-class HeatmapDataset(torch.utils.data.IterableDataset):
-
-    def __init__(self, config):
-        self._config = config
-        self._patches = load_datasets(config)
-        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
-
-    def __iter__(self):
-
-        areas = torch.tensor([patch.area for patch in self._patches])
-        area_weights = areas / areas.sum()
-        crop_size = torch.tensor(self._config['crop_size'])
-        step_size = torch.tensor(self._config['step_size'])
-        step_count = torch.tensor(self._config['step_count'])
-
-        while True:
-            patch = random.choices(self._patches, weights=area_weights)[0]
-
-            # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
-            start_quad_ij = patch.valid_quad_indices[random_idx]
-            center_ij = start_quad_ij + torch.rand(size=[2])
-            center_zyx = get_zyx_from_patch(center_ij, patch)
-
-            # Crop ROI out of the volume
-            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
-
-            # Sample rows of points along U & V axes
-            uv_deltas = torch.arange(1, step_count + 1)[:, None] * step_size * patch.scale
-            u_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([1, 0])
-            u_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([1, 0])
-            v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
-            v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
-
-            # Check all points lie inside the patch
-            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
-                continue
-            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
-                continue
-            if not patch.valid_quad_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_quad_mask[*v_pos_shifted_ijs.int().T].all():
-                continue
-            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
-                continue
-            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_quad_mask.shape[:2])):
-                continue
-            if not patch.valid_quad_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_quad_mask[*v_neg_shifted_ijs.int().T].all():
-                continue
-            # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
-
-            # Map to 3D space and construct heatmaps
-            u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
-            u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
-            v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
-            v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
-
-            if False:  # separate heatmaps for u & v
-                u_heatmaps = make_heatmaps([u_pos_shifted_zyxs, u_neg_shifted_zyxs], min_corner_zyx, crop_size)
-                v_heatmaps = make_heatmaps([v_pos_shifted_zyxs, v_neg_shifted_zyxs], min_corner_zyx, crop_size)
-                uv_heatmaps = torch.cat([u_heatmaps, v_heatmaps], dim=0)
-            else:  # merged u & v
-                uv_heatmaps = make_heatmaps([u_pos_shifted_zyxs, u_neg_shifted_zyxs, v_pos_shifted_zyxs, v_neg_shifted_zyxs], min_corner_zyx, crop_size)
-
-            # Build localiser volume
-            localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
-
-            #TODO: include full 2d slices for additional context
-            #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
-
-            # FIXME: the loop is a hack because some augmentation sometimes randomly returns None
-            #  we should instead just remove the relevant augmentation (or fix it!)
-            # TODO: consider interaction of augmentation with localiser -- logically should follow translations of
-            #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
-            #  ok since it's 'just more augmentation' that won't be applied during tracing
-            while True:
-                augmented = self._augmentations(image=volume_crop[None], dist_map=localiser[None], regression_target=uv_heatmaps)
-                if augmented['dist_map'] is not None:
-                    break
-            volume_crop = augmented['image'].squeeze(0)
-            localiser = augmented['dist_map'].squeeze(0)
-            uv_heatmaps = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
-            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uv_heatmaps)):
-                # FIXME: why do these NaNs happen occasionally?
-                continue
-
-            yield {
-                'volume': volume_crop,
-                'localiser': localiser,
-                'uv_heatmaps': uv_heatmaps,
             }
 
 
@@ -693,76 +548,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             }
 
 
-class PatchWithCubeDataset(torch.utils.data.IterableDataset):
-
-    def __init__(self, config):
-        self._config = config
-        self._patches = load_datasets(config)
-
-    def _get_crop_from_patch(self, ij, patch_size, step_size, patch):
-        # ij is measured in quads of this patch
-        # patch.scale gives quads per voxel for this patch
-        # patch_size is number of our-model-sized quads we generate; step_size is size in voxels of those quads
-        crop_size_patch_quads = patch_size * step_size * patch.scale
-        grid = torch.stack(torch.meshgrid(
-            torch.linspace(0, crop_size_patch_quads[0], patch_size + 1)[:-1],
-            torch.linspace(0, crop_size_patch_quads[1], patch_size + 1)[:-1],
-        ), dim=-1) + ij
-        normalized_grid = grid / torch.tensor(patch.zyxs.shape[:2]) * 2 - 1
-        interpolated = F.grid_sample(
-            rearrange(patch.zyxs, 'y x zyx -> 1 zyx y x'),
-            normalized_grid.flip(-1).unsqueeze(0),
-            align_corners=True,
-            mode='bilinear',
-            padding_mode='zeros'
-        )
-        interpolated = rearrange(interpolated, '1 zyx y x -> y x zyx')
-        valid_mask = F.grid_sample(
-            rearrange(patch.valid_quad_mask.float(), 'y x -> 1 1 y x'),
-            normalized_grid.flip(-1).unsqueeze(0),
-            align_corners=True,
-            mode='nearest',
-            padding_mode='zeros'
-        ).squeeze(1).squeeze(0)
-        valid_mask = valid_mask != 0.
-        return torch.where(valid_mask[..., None], interpolated, -1), valid_mask
-
-    def __iter__(self):
-
-        areas = torch.tensor([patch.area for patch in self._patches])
-        area_weights = areas / areas.sum()
-        volume_crop_size = torch.tensor(self._config['crop_size'])  # measured in voxels
-        patch_size = torch.tensor(self._config['patch_size'])  # measured in quads of the model
-        step_size = torch.tensor(self._config['step_size'])  # measured in voxels
-
-        while True:
-            patch = random.choices(self._patches, weights=area_weights)[0]
-
-            # Sample a random valid quad in the patch, then a point in that quad
-            # This defines the center of our ROI (in both patch and volume)
-            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
-            start_quad_ij = patch.valid_quad_indices[random_idx]
-            center_ij = start_quad_ij + torch.rand(size=[2])
-
-            # Extract 2D crop from patch, and 3D crop from volume
-            patch_crop, patch_valid = self._get_crop_from_patch(center_ij, patch_size, step_size, patch)
-            if not patch_valid[patch_crop.shape[0] // 2, patch_crop.shape[1] // 2]:
-                continue  # this can happen due to rounding errors
-            center_zyx = patch_crop[patch_crop.shape[0] // 2, patch_crop.shape[1] // 2]
-            volume_crop, _ = get_crop_from_volume(patch.volume, center_zyx, volume_crop_size)
-
-            # Relativise and normalise the patch coordinates
-            patch_crop = torch.where(patch_valid[..., None], (patch_crop - center_zyx) / (patch_size * step_size), -1)
-
-            #TODO: include full 2d slices for additional context
-
-            yield {
-                'volume': volume_crop,
-                'patch_zyx': patch_crop,
-                'patch_valid': patch_valid,
-            }
-
-
 def mark_context_point(volume, point, value=1.):
     center = (point + 0.5).int()
     offsets = torch.tensor([[0, 0, 0], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-2, 0, 0], [2, 0, 0], [0, -2, 0], [0, 2, 0], [0, 0, -2], [0, 0, 2]])
@@ -933,7 +718,7 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         actual_min[2]:actual_max[2]
     ]).to(torch.float32)
     # TODO: should instead always use standardised uint8 volumes!
-    volume_crop /=  255. if volume.dtype == np.uint8 else volume_crop.amax()
+    volume_crop /= 255. if volume.dtype == np.uint8 else volume_crop.amax()
     volume_crop = volume_crop * 2 - 1
 
     # Pad if needed
