@@ -228,6 +228,9 @@ void VolumeOverlayController::refreshVolumeOptions()
 void VolumeOverlayController::toggleVisibility()
 {
     if (_overlayVisible) {
+        if (_overlayOpacity > 0.0f) {
+            _overlayOpacityBeforeToggle = _overlayOpacity;
+        }
         if (!_overlayVolumeId.empty()) {
             _overlayVolumeIdBeforeToggle = _overlayVolumeId;
         }
@@ -290,7 +293,16 @@ void VolumeOverlayController::toggleVisibility()
         restored = hasOverlaySelection();
     }
 
-    _overlayVisible = hasOverlaySelection() && _overlayOpacity > 0.0f;
+    if (!restored) {
+        emit requestStatusMessage(tr("Selected overlay volume unavailable"), 1200);
+        return;
+    }
+
+    const float restoredOpacity = (_overlayOpacityBeforeToggle > 0.0f) ? _overlayOpacityBeforeToggle : 0.5f;
+    setOpacity(restoredOpacity);
+
+    const bool hasSelection = hasOverlaySelection();
+    _overlayVisible = hasSelection && _overlayOpacity > 0.0f;
     if (_overlayVisible) {
         _overlayVolumeIdBeforeToggle.clear();
         _overlayOpacityBeforeToggle = _overlayOpacity;
@@ -300,7 +312,13 @@ void VolumeOverlayController::toggleVisibility()
         saveState();
     }
 
-    emit requestStatusMessage(_overlayVisible ? tr("Volume overlay shown") : tr("Selected overlay volume unavailable"), 1200);
+    if (_overlayVisible) {
+        emit requestStatusMessage(tr("Volume overlay shown"), 1200);
+    } else if (hasSelection) {
+        emit requestStatusMessage(tr("Volume overlay shown (opacity 0%)"), 1200);
+    } else {
+        emit requestStatusMessage(tr("Selected overlay volume unavailable"), 1200);
+    }
 }
 
 bool VolumeOverlayController::hasOverlaySelection() const
