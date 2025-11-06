@@ -68,7 +68,7 @@ If you want to install vc3d from source, the easiest path is to look at the [doc
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
 
 :::warning
-if you are using Ubuntu , the default open file limit is 1024. You may encounter errors when running VC3D. To fix this, run `ulimit -Sn 750000` (or some other high number) in the terminal you plan to launch VC3D/Docker from before doing so.
+if you are using Ubuntu, the default open file limit is 1024. You may encounter errors when running VC3D. To fix this, run `ulimit -Sn 750000` (or some other high number) in the terminal you plan to launch VC3D/Docker from before doing so.
 :::
 
 ### Data formatting
@@ -93,7 +93,7 @@ Your folder structure should resemble this:
     └── config.json - REQUIRED!
 ```
 
-There is only one additional requirement with the latest updates , which is the computation of a normal grid. These can be computed using the `vc_gen_normalgrids` tool , and shuold be placed at the root of your volpkg in a folder called `normal_grids`.
+There is only one additional requirement with the latest updates , which is the computation of a normal grid. These can be computed using the `vc_gen_normalgrids` tool , and should be placed at the root of your volpkg in a folder called `normal_grids`.
 
 Scroll 5 (PHerc172) has precomputed versions of direction fields and normal grids, available at the following links: 
 

@@ -168,49 +168,58 @@ void SurfacePanelController::loadSurfacesIncremental()
         }
     }
 
-    std::size_t reloadCount = 0;
-    for (const auto& id : changes.toReload) {
-        std::cout << "Reloading segmentation: " << id << std::endl;
-        Surface* currentSurface = _surfaces ? _surfaces->surface(id) : nullptr;
-        Surface* activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
-        const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface == currentSurface);
+    if (!changes.toReload.empty()) {
+        std::vector<std::string> reloadedIds;
+        reloadedIds.reserve(changes.toReload.size());
 
-        if (_surfaces) {
-            _surfaces->setSurface(id, nullptr, true, false);
-            if (wasActiveSeg) {
-                _surfaces->setSurface("segmentation", nullptr, false, false);
+        for (const auto& id : changes.toReload) {
+            std::cout << "Queueing for reload: " << id << std::endl;
+            Surface* currentSurface = _surfaces ? _surfaces->surface(id) : nullptr;
+            Surface* activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+            const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface == currentSurface);
+
+            if (_surfaces) {
+                _surfaces->setSurface(id, nullptr, true, false);
+                if (wasActiveSeg) {
+                    _surfaces->setSurface("segmentation", nullptr, false, false);
+                }
+            }
+
+            if (_opchains && _opchains->count(id)) {
+                delete (*_opchains)[id];
+                _opchains->erase(id);
+            }
+            _volumePkg->unloadSurface(id);
+            reloadedIds.push_back(id);
+        }
+
+        _volumePkg->loadSurfacesBatch(reloadedIds);
+
+        for (const auto& id : reloadedIds) {
+            auto surfMeta = _volumePkg->getSurface(id);
+            if (!surfMeta) {
+                continue;
+            }
+
+            QuadSurface* reloadedSurface = surfMeta->surface();
+            if (_surfaces) {
+                _surfaces->setSurface(id, reloadedSurface, true, false);
+                Surface* activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+                if (activeSegSurface == nullptr) {
+                    _surfaces->setSurface("segmentation", reloadedSurface, false, false);
+                }
+            }
+
+            refreshSurfaceMetrics(id);
+            if (_currentSurfaceId == id) {
+                syncSelectionUi(id, reloadedSurface);
             }
         }
-
-        if (_opchains && _opchains->count(id)) {
-            delete (*_opchains)[id];
-            _opchains->erase(id);
-        }
-
-        _volumePkg->unloadSurface(id);
-        auto surfMeta = _volumePkg->loadSurface(id);
-        if (!surfMeta) {
-            continue;
-        }
-
-        QuadSurface* reloadedSurface = surfMeta->surface();
-        if (_surfaces) {
-            _surfaces->setSurface(id, reloadedSurface, true, false);
-            if (wasActiveSeg) {
-                _surfaces->setSurface("segmentation", reloadedSurface, false, false);
-            }
-        }
-
-        refreshSurfaceMetrics(id);
-        if (_currentSurfaceId == id) {
-            syncSelectionUi(id, reloadedSurface);
-        }
-        ++reloadCount;
     }
 
     std::cout << "Incremental delta: add=" << changes.toAdd.size()
-        << " remove=" << changes.toRemove.size()
-        << " reload=" << reloadCount << std::endl;
+              << " remove=" << changes.toRemove.size()
+              << " reload=" << changes.toReload.size() << std::endl;
 
     applyFilters();
     if (_filtersUpdated) {
@@ -276,6 +285,11 @@ SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChan
                 continue;
             }
             if (addedIds.find(uiId) != addedIds.end()) {
+                continue;
+            }
+            // Only check timestamps for surfaces that are actually loaded in memory.
+            // If not loaded, we'll get fresh data when we eventually load it.
+            if (!_volumePkg->isSurfaceLoaded(uiId)) {
                 continue;
             }
             auto surfMeta = _volumePkg->getSurface(uiId);
