@@ -20,7 +20,7 @@ import tifffile as tiff
 from numcodecs import LZ4
 from tqdm.auto import tqdm
 import fsspec
-from zarr.experimental.cache_store import CacheStore
+from vendored_cache_store import CacheStore
 from zarr.storage import LocalStore, FsspecStore
 
 from k8s import get_tqdm_kwargs
