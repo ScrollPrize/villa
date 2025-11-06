@@ -381,6 +381,28 @@ struct LossSettings {
         w[LossType::CORRECTION] = 1.0f;
     }
 
+    void applyJsonWeights(const nlohmann::json& params) {
+        const auto set_weight = [&](const char* key, LossType type) {
+            const auto it = params.find(key);
+            if (it == params.end() || it->is_null()) {
+                return;
+            }
+            if (it->is_number()) {
+                w[type] = static_cast<float>(it->get<double>());
+            } else {
+                std::cerr << key << " must be numeric" << std::endl;
+            }
+        };
+
+        set_weight("snap_weight", LossType::SNAP);
+        set_weight("normal_weight", LossType::NORMAL);
+        set_weight("straight_weight", LossType::STRAIGHT);
+        set_weight("dist_weight", LossType::DIST);
+        set_weight("direction_weight", LossType::DIRECTION);
+        set_weight("sdir_weight", LossType::SDIR);
+        set_weight("correction_weight", LossType::CORRECTION);
+    }
+
     float operator()(LossType type, const cv::Vec2i& p) const {
         if (!w_mats[type].empty()) {
             return w_mats[type](p);
@@ -1441,6 +1463,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 {
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
+    loss_settings.applyJsonWeights(params);
 
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
@@ -1518,8 +1541,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int stop_gen = params.value("generations", 100);
     float step = params.value("step_size", 20.0f);
     trace_params.unit = step*scale;
-    const double sdir_w   = params.value("sdir_weight",  loss_settings[LossType::SDIR]);
-    loss_settings[LossType::SDIR] = static_cast<float>(sdir_w);
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
               << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
