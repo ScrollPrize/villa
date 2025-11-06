@@ -1604,7 +1604,7 @@ void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
     }
     const int currentSteps = _growthSteps;
     if (method == SegmentationGrowthMethod::Corrections) {
-        _tracerGrowthSteps = std::max(1, (currentSteps > 0) ? currentSteps : _tracerGrowthSteps);
+        _tracerGrowthSteps = (currentSteps > 0) ? currentSteps : std::max(1, _tracerGrowthSteps);
     }
     _growthMethod = method;
     int targetSteps = currentSteps;
