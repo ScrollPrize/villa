@@ -645,6 +645,17 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit addOverlapRequested(segmentId);
     });
 
+    if (_volumePkg) {
+        QAction* copyOutAction = contextMenu.addAction(tr("Copy Out"));
+        connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
+            emit neighborCopyRequested(segmentId, true);
+        });
+        QAction* copyInAction = contextMenu.addAction(tr("Copy In"));
+        connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
+            emit neighborCopyRequested(segmentId, false);
+        });
+    }
+
     contextMenu.addSeparator();
 
     QAction* renderAction = contextMenu.addAction(tr("Render segment"));

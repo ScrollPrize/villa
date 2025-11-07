@@ -595,6 +595,8 @@ int main(int argc, char *argv[])
             "When using --render-folder, choose 'zarr' or 'tif' output")
         ("num-slices,n", po::value<int>()->default_value(1),
             "Number of slices to render")
+        ("slice-step", po::value<float>()->default_value(1.0f),
+            "Spacing between successive slices along the surface normal (fractional values allowed)")
         ("crop-x", po::value<int>()->default_value(0),
             "Crop region X coordinate")
         ("crop-y", po::value<int>()->default_value(0),
@@ -678,6 +680,11 @@ int main(int argc, char *argv[])
     float tgt_scale = parsed["scale"].as<float>();
     int group_idx = parsed["group-idx"].as<int>();
     int num_slices = parsed["num-slices"].as<int>();
+    double slice_step = static_cast<double>(parsed["slice-step"].as<float>());
+    if (!std::isfinite(slice_step) || slice_step <= 0.0) {
+        std::cerr << "Error: --slice-step must be positive.\n";
+        return EXIT_FAILURE;
+    }
     // Downsample factor for this OME-Zarr pyramid level: g=0 -> 1, g=1 -> 0.5, ...
     const float ds_scale = std::ldexp(1.0f, -group_idx);  // 2^(-group_idx)
     float scale_seg = parsed["scale-segmentation"].as<float>();
@@ -921,6 +928,7 @@ int main(int argc, char *argv[])
         v0_base += static_cast<float>(crop.y);
         const size_t CH = 128, CW = 128;
         const size_t baseZ = std::max(1, num_slices);
+        const double baseZ_center = 0.5 * (static_cast<double>(baseZ) - 1.0);
         const size_t CZ = baseZ;
         const int rotQuad = normalizeQuadrantRotation(rotate_angle);
         cv::Size zarr_xy_size = tgt_size;
@@ -1012,7 +1020,7 @@ int main(int argc, char *argv[])
                         for (size_t zi = 0; zi < dz; ++zi) {
                             const size_t sliceIndex = z0 + zi;
                             const float off = static_cast<float>(
-                                static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
+                                (static_cast<double>(sliceIndex) - baseZ_center) * slice_step);
                             renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
                                                   basePoints, stepDirs, off, static_cast<float>(ds_scale));
                             if (rotQuad >= 0 || flip_axis >= 0) {
@@ -1044,7 +1052,7 @@ int main(int argc, char *argv[])
                         for (size_t zi = 0; zi < dz; ++zi) {
                             const size_t sliceIndex = z0 + zi;
                             const float off = static_cast<float>(
-                                static_cast<double>(sliceIndex) - 0.5 * (static_cast<double>(baseZ) - 1.0));
+                                (static_cast<double>(sliceIndex) - baseZ_center) * slice_step);
                             renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
                                                 basePoints, stepDirs, off, static_cast<float>(ds_scale));
                             if (rotQuad >= 0 || flip_axis >= 0) {
@@ -1188,6 +1196,7 @@ int main(int argc, char *argv[])
         attrs["source_zarr"] = vol_path.string();
         attrs["source_group"] = group_idx;
         attrs["num_slices"] = baseZ;
+        attrs["slice_step"] = slice_step;
         {
             cv::Size attr_xy = tgt_size;
             const int rotQuadAttr = normalizeQuadrantRotation(rotate_angle);
@@ -1390,6 +1399,7 @@ int main(int argc, char *argv[])
 
                 const uint32_t tileW = 128;
                 const uint32_t tileH = 128;
+                const double num_slices_center = 0.5 * (static_cast<double>(std::max(1, num_slices)) - 1.0);
 
                 std::vector<TIFF*> tiffs(static_cast<size_t>(num_slices), nullptr);
                 std::vector<std::mutex> tiffLocks(static_cast<size_t>(num_slices));
@@ -1489,7 +1499,7 @@ int main(int argc, char *argv[])
                             cv::Mat tileOut; // CV_16UC1
                             for (int zi = 0; zi < num_slices; ++zi) {
                                 const float off = static_cast<float>(
-                                    static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
+                                    (static_cast<double>(zi) - num_slices_center) * slice_step);
                                 renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
                                                       basePoints, stepDirs, off, static_cast<float>(ds_scale));
                                 cv::Mat tileTransformed = tileOut;
@@ -1521,7 +1531,7 @@ int main(int argc, char *argv[])
                             cv::Mat tileOut; // CV_8UC1
                             for (int zi = 0; zi < num_slices; ++zi) {
                                 const float off = static_cast<float>(
-                                    static_cast<double>(zi) - 0.5 * (static_cast<double>(num_slices) - 1.0));
+                                    (static_cast<double>(zi) - num_slices_center) * slice_step);
                                 renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
                                                     basePoints, stepDirs, off, static_cast<float>(ds_scale));
                                 cv::Mat tileTransformed = tileOut;

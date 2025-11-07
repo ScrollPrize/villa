@@ -11,11 +11,13 @@
 #include <memory>
 #include <vector>
 #include <deque>
+#include <optional>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
 
 #include <QShortcut>
+#include <QSet>
 #include <unordered_map>
 
 #include "CPointCollectionWidget.hpp"
@@ -59,6 +61,7 @@ class MenuActionController;
 class SegmentationGrower;
 class WindowRangeWidget;
 class QLabel;
+class QTemporaryFile;
 
 class CWindow : public QMainWindow
 {
@@ -92,6 +95,7 @@ public slots:
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
+    void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,
@@ -297,6 +301,32 @@ private:
     std::set<std::pair<std::string, std::string>> _pendingSegmentUpdates; // (dirName, segmentId)
     QElapsedTimer _lastInotifyProcessTime;
     static constexpr int INOTIFY_THROTTLE_MS = 100;
+
+    struct NeighborCopyJob {
+        enum class Stage { None, FirstPass, SecondPass };
+        Stage stage{Stage::None};
+        QString segmentId;
+        QString volumePath;
+        QString resumeSurfacePath;
+        QString outputDir;
+        QString generatedSurfacePath;
+        QString pass1JsonPath;
+        QString pass2JsonPath;
+        QString directoryPrefix;
+        bool copyOut{true};
+        QSet<QString> baselineEntries;
+        std::unique_ptr<QTemporaryFile> pass1JsonFile;
+        std::unique_ptr<QTemporaryFile> pass2JsonFile;
+    };
+
+    std::optional<NeighborCopyJob> _neighborCopyJob;
+    void handleNeighborCopyToolFinished(bool success);
+    QString findNewNeighborSurface(const NeighborCopyJob& job) const;
+    bool startNeighborCopyPass(const QString& paramsPath,
+                               const QString& resumeSurface,
+                               const QString& resumeOpt,
+                               int ompThreads);
+    void launchNeighborCopySecondPass();
 
 
 };  // class CWindow

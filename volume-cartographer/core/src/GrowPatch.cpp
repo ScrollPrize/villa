@@ -1281,8 +1281,14 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
     // cv::imwrite("opt_mask.tif", mask);
 }
 
+struct LocalOptimizationConfig {
+    int max_iterations = 1000;
+    bool use_dense_qr = false;
+};
+
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
-    TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false)
+    TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false,
+    const LocalOptimizationConfig* solver_config = nullptr)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
     // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
@@ -1310,9 +1316,13 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
         }
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    if (solver_config && solver_config->use_dense_qr) {
+        options.linear_solver_type = ceres::DENSE_QR;
+    } else {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    }
     options.minimizer_progress_to_stdout = false;
-    options.max_num_iterations = 1000;
+    options.max_num_iterations = solver_config ? solver_config->max_iterations : 1000;
 
     // options.function_tolerance = 1e-4;
     // options.use_nonmonotonic_steps = true;
@@ -1945,8 +1955,32 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             local_optimization(100, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
         }
         else if (params.value("resume_opt", "skip") == "local") {
-            int opt_step = 16;
-            std::cout << "local opt" << std::endl;
+            int opt_step = params.value("resume_local_opt_step", 16);
+            if (opt_step <= 0) {
+                std::cerr << "WARNING: resume_local_opt_step must be > 0; defaulting to 16" << std::endl;
+                opt_step = 16;
+            }
+
+            int default_radius = opt_step * 2;
+            int opt_radius = params.value("resume_local_opt_radius", default_radius);
+            if (opt_radius <= 0) {
+                std::cerr << "WARNING: resume_local_opt_radius must be > 0; defaulting to " << default_radius << std::endl;
+                opt_radius = default_radius;
+            }
+
+            LocalOptimizationConfig resume_local_config;
+            resume_local_config.max_iterations = params.value("resume_local_max_iters", 1000);
+            if (resume_local_config.max_iterations <= 0) {
+                std::cerr << "WARNING: resume_local_max_iters must be > 0; defaulting to 1000" << std::endl;
+                resume_local_config.max_iterations = 1000;
+            }
+            resume_local_config.use_dense_qr = params.value("resume_local_dense_qr", false);
+
+            std::cout << "local opt (step=" << opt_step
+                      << ", radius=" << opt_radius
+                      << ", max_iters=" << resume_local_config.max_iterations
+                      << ", dense_qr=" << std::boolalpha << resume_local_config.use_dense_qr
+                      << std::noboolalpha << ")" << std::endl;
             std::vector<cv::Vec2i> opt_local;
             for (int j = used_area.y; j < used_area.br().y; ++j) {
                 for (int i = used_area.x; i < used_area.br().x; ++i) {
@@ -1969,7 +2003,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(opt_step*2, p, trace_params, trace_data, loss_settings, true);
+                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config);
                     done++;
 #pragma omp critical
                     {

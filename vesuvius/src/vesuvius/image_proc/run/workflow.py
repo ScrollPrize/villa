@@ -175,6 +175,8 @@ def run_workflow(
     worker_count = max(1, int(num_workers or 1))
 
     if not use_process_pool or worker_count == 1:
+        if initializer is not None:
+            initializer(*initargs)
         iterable = tqdm(items, desc=progress_desc) if show_progress else items
         return [worker_fn(item) for item in iterable]
 

@@ -120,6 +120,7 @@ signals:
     void alphaCompRefineRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
+    void neighborCopyRequested(const QString& segmentId, bool copyOut);
 
 
 private:

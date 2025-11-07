@@ -337,7 +337,7 @@ class nnUNetTrainerSkeletonRecall(nnUNetTrainer):
                 )
             )
 
-        transforms.append(SkeletonTransform(do_tube=False))
+        transforms.append(SkeletonTransform(do_tube=False, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted
@@ -375,7 +375,7 @@ class nnUNetTrainerSkeletonRecall(nnUNetTrainer):
                 )
             )
 
-        transforms.append(SkeletonTransform(do_tube=True))
+        transforms.append(SkeletonTransform(do_tube=True, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted
@@ -548,9 +548,6 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainerSkeletonRecall):
             )
         )
 
-        from vesuvius.models.augmentation.transforms.utils.morphological_closing import MorphologicalClosingTransform
-        transforms.append(MorphologicalClosingTransform(structure_size=2))
-
         if do_dummy_2d_data_aug:
             transforms.append(Convert2DTo3DTransform())
 
@@ -693,7 +690,7 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainerSkeletonRecall):
                 )
             )
 
-        transforms.append(MedialSurfaceTransform(do_tube=False))
+        transforms.append(MedialSurfaceTransform(do_tube=False, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted
@@ -731,7 +728,7 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainerSkeletonRecall):
                 )
             )
 
-        transforms.append(MedialSurfaceTransform(do_tube=True))
+        transforms.append(MedialSurfaceTransform(do_tube=True, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted

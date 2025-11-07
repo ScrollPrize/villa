@@ -1074,6 +1074,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onAddOverlap(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::neighborCopyRequested,
+            this, [this](const QString& segmentId, bool copyOut) {
+                onNeighborCopyRequested(segmentId, copyOut);
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::convertToObjRequested,
             this, [this](const QString& segmentId) {
                 onConvertToObj(segmentId.toStdString());

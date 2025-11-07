@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QJsonArray>
+#include <QVector>
 #include <QSettings>
 
 class RenderParamsDialog : public QDialog {
@@ -257,4 +258,41 @@ private:
     QCheckBox* chkRefine_{nullptr};
     QCheckBox* chkVertexColor_{nullptr};
     QCheckBox* chkOverwrite_{nullptr};
+};
+
+struct NeighborCopyVolumeOption {
+    QString id;
+    QString name;
+    QString path;
+};
+
+class NeighborCopyDialog : public QDialog {
+    Q_OBJECT
+public:
+    NeighborCopyDialog(QWidget* parent,
+                       const QString& surfacePath,
+                       const QVector<NeighborCopyVolumeOption>& volumes,
+                       const QString& defaultVolumeId,
+                       const QString& defaultOutputPath);
+
+    QString surfacePath() const;
+    QString selectedVolumeId() const;
+    QString selectedVolumePath() const;
+    QString outputPath() const;
+    int resumeLocalOptStep() const;
+    int resumeLocalOptRadius() const;
+    int resumeLocalMaxIters() const;
+    bool resumeLocalDenseQr() const;
+
+private:
+    void populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
+                               const QString& defaultVolumeId);
+
+    QLineEdit* edtSurface_{nullptr};
+    QComboBox* cmbVolume_{nullptr};
+    QLineEdit* edtOutput_{nullptr};
+    QSpinBox* spResumeStep_{nullptr};
+    QSpinBox* spResumeRadius_{nullptr};
+    QSpinBox* spResumeMaxIters_{nullptr};
+    QCheckBox* chkResumeDenseQr_{nullptr};
 };
