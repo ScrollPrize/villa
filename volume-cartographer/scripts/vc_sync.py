@@ -6,12 +6,15 @@ Automatically ignores:
 - Hidden files and directories (starting with .)
 - Any directory containing 'layers' in its name (e.g., layers/, layers_fullres/, old_layers/)
 - The .s3sync.json configuration file and .s3sync.db database
+- Files matching backup patterns (see BACKUP_PATTERNS)
+- Directories named 'backups' (unless --sync-backups is specified)
 
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
-    python s3_sync.py status <directory> [--verbose]
-    python s3_sync.py sync <directory> [--dry-run]
-    python s3_sync.py update <directory>
+    python s3_sync.py status <directory> [--verbose] [--sync-backups]
+    python s3_sync.py sync <directory> [--dry-run] [--sync-backups]
+    python s3_sync.py update <directory> [--sync-backups]
+    python s3_sync.py reset <directory> [--sync-backups]
 """
 
 import os
@@ -26,6 +29,16 @@ from enum import Enum
 from contextlib import contextmanager
 
 
+# Backup file patterns - these files are only uploaded, never downloaded or deleted
+# Note: This is separate from the backups/ directory filter which is controlled by --sync-backups
+BACKUP_PATTERNS = [
+    '_backup',
+    '.backup',
+    '_bak',
+    '.bak',
+]
+
+
 class SyncAction(Enum):
     UPLOAD = "upload"
     DOWNLOAD = "download"
@@ -33,6 +46,11 @@ class SyncAction(Enum):
     SKIP = "skip"
     DELETE_LOCAL = "delete_local"
     DELETE_REMOTE = "delete_remote"
+
+
+def is_backup_file(filename):
+    """Check if a file matches backup patterns"""
+    return any(pattern in filename.lower() for pattern in BACKUP_PATTERNS)
 
 
 class S3SyncManager:
@@ -48,6 +66,10 @@ class S3SyncManager:
         else:
             if not s3_bucket or not s3_prefix:
                 raise ValueError("s3_bucket and s3_prefix required for initialization")
+
+            # Create directory if it doesn't exist during init
+            os.makedirs(self.local_dir, exist_ok=True)
+
             self.s3_bucket = s3_bucket
             self.s3_prefix = s3_prefix.rstrip('/')
             self.aws_profile = aws_profile
@@ -82,16 +104,16 @@ class S3SyncManager:
         """Initialize SQLite database for file tracking"""
         conn = sqlite3.connect(self.db_file)
         conn.execute('''
-            CREATE TABLE IF NOT EXISTS files (
-                path TEXT PRIMARY KEY,
-                local_size INTEGER,
-                local_mtime REAL,
-                s3_size INTEGER,
-                s3_mtime REAL,
-                s3_etag TEXT,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+                     CREATE TABLE IF NOT EXISTS files (
+                                                          path TEXT PRIMARY KEY,
+                                                          local_size INTEGER,
+                                                          local_mtime REAL,
+                                                          s3_size INTEGER,
+                                                          s3_mtime REAL,
+                                                          s3_etag TEXT,
+                                                          last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                     )
+                     ''')
 
         # Create index for faster lookups
         conn.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path)')
@@ -108,11 +130,22 @@ class S3SyncManager:
         conn.close()
 
     def _run_aws_command(self, cmd):
-        """Run AWS CLI command with optional profile"""
+        """Run AWS CLI command with optional profile and better error handling"""
         if self.aws_profile:
             cmd.extend(['--profile', self.aws_profile])
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return result
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return result
+        except subprocess.CalledProcessError as e:
+            print(f"\n❌ AWS CLI Error:")
+            print(f"Command: {' '.join(cmd)}")
+            print(f"Exit code: {e.returncode}")
+            if e.stdout:
+                print(f"Stdout: {e.stdout}")
+            if e.stderr:
+                print(f"Stderr: {e.stderr}")
+            raise
 
     def _get_s3_url(self, relative_path=None):
         """Get S3 URL for a file or directory"""
@@ -125,14 +158,31 @@ class S3SyncManager:
         dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
         return dt.timestamp()
 
-    def scan_local_files(self):
+    def _cleanup_empty_dirs(self, filepath):
+        """Remove empty parent directories after file deletion"""
+        dirpath = os.path.dirname(filepath)
+
+        while dirpath and dirpath != self.local_dir:
+            try:
+                if os.path.isdir(dirpath) and not os.listdir(dirpath):
+                    print(f"    Removing empty directory: {os.path.relpath(dirpath, self.local_dir)}")
+                    os.rmdir(dirpath)
+                    dirpath = os.path.dirname(dirpath)
+                else:
+                    break
+            except OSError:
+                break
+
+    def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
         print(f"Scanning local directory: {self.local_dir}")
         files = {}
 
         for root, dirs, filenames in os.walk(self.local_dir):
-            # Skip hidden directories and directories containing 'layers'
-            dirs[:] = [d for d in dirs if not d.startswith('.') and 'layers' not in d.lower()]
+            # Skip hidden directories, directories containing 'layers', and backups (unless requested)
+            dirs[:] = [d for d in dirs if not d.startswith('.') and
+                       'layers' not in d.lower() and
+                       (include_backups or d != 'backups')]
 
             for filename in filenames:
                 # Skip hidden files, sync config, and database
@@ -147,17 +197,22 @@ class S3SyncManager:
                 if any('layers' in part.lower() for part in path_parts[:-1]):
                     continue
 
+                # Skip files in backups directories unless explicitly requested
+                if not include_backups and 'backups' in path_parts[:-1]:
+                    continue
+
                 stat = os.stat(filepath)
                 files[relative_path] = {
                     'path': relative_path,
                     'local_size': stat.st_size,
-                    'local_mtime': stat.st_mtime
+                    'local_mtime': stat.st_mtime,
+                    'is_backup': is_backup_file(filename)
                 }
 
         print(f"Found {len(files)} local files")
         return files
 
-    def scan_s3_files(self):
+    def scan_s3_files(self, include_backups=False):
         """Scan S3 bucket for files with pagination support"""
         print(f"Scanning S3: s3://{self.s3_bucket}/{self.s3_prefix}/")
         files = {}
@@ -208,11 +263,16 @@ class S3SyncManager:
                 if any('layers' in part.lower() for part in path_parts[:-1]):
                     continue
 
+                # Skip backups directories unless explicitly requested
+                if not include_backups and 'backups' in path_parts[:-1]:
+                    continue
+
                 files[relative_path] = {
                     'path': relative_path,
                     's3_size': obj['Size'],
                     's3_mtime': self._parse_timestamp(obj['LastModified']),
-                    's3_etag': obj.get('ETag', '').strip('"')
+                    's3_etag': obj.get('ETag', '').strip('"'),
+                    'is_backup': is_backup_file(filename)
                 }
 
             page_count += 1
@@ -230,12 +290,12 @@ class S3SyncManager:
         print(f"Found {len(files)} S3 files")
         return files
 
-    def update_files(self):
+    def update_files(self, include_backups=False):
         """Update file tracking with current state"""
         print("\nUpdating file tracking...")
 
-        local_files = self.scan_local_files()
-        s3_files = self.scan_s3_files()
+        local_files = self.scan_local_files(include_backups)
+        s3_files = self.scan_s3_files(include_backups)
 
         with self._get_db() as conn:
             # Get all tracked paths
@@ -286,6 +346,29 @@ class S3SyncManager:
             s3_info = s3_files.get(path)
             tracked_info = tracked_files.get(path, {})
 
+            # Check if this is a backup file
+            is_backup = (local_info and local_info.get('is_backup')) or \
+                        (s3_info and s3_info.get('is_backup'))
+
+            # Backup files: only upload, never download or delete
+            if is_backup:
+                if local_info and not s3_info:
+                    actions[path] = (SyncAction.UPLOAD, "Backup file (new)")
+                elif local_info and s3_info:
+                    # Check if local backup changed
+                    local_changed = (tracked_info.get('local_size') != local_info['local_size'] or
+                                     (tracked_info.get('local_mtime') and
+                                      abs(tracked_info['local_mtime'] - local_info['local_mtime']) > 1))
+                    if local_changed:
+                        actions[path] = (SyncAction.UPLOAD, "Backup file (modified)")
+                    else:
+                        actions[path] = (SyncAction.SKIP, "Backup file (in sync)")
+                elif s3_info and not local_info:
+                    # Backup exists on S3 but not locally - skip (never download backups)
+                    actions[path] = (SyncAction.SKIP, "Backup file (S3 only, not downloading)")
+                continue
+
+            # Regular file logic (non-backup)
             # File only exists locally
             if local_info and not s3_info:
                 if tracked_info.get('s3_size') is not None:
@@ -380,7 +463,7 @@ class S3SyncManager:
         s3_mtime = self._parse_timestamp(data['LastModified'])
         s3_etag = data.get('ETag', '').strip('"')
 
-        # Update database
+        # Update database with actual local file info
         with self._get_db() as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO files 
@@ -412,7 +495,12 @@ class S3SyncManager:
 
         print(f"  ✓ Downloaded: {path}")
 
-        # Update database
+        # Get the actual mtime of the downloaded file
+        stat = os.stat(local_path)
+        actual_local_mtime = stat.st_mtime
+        actual_local_size = stat.st_size
+
+        # Update database with actual file stats
         with self._get_db() as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO files 
@@ -420,8 +508,8 @@ class S3SyncManager:
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (
                 path,
-                s3_files[path]['s3_size'],
-                datetime.now().timestamp(),
+                actual_local_size,
+                actual_local_mtime,  # Use actual mtime from filesystem
                 s3_files[path]['s3_size'],
                 s3_files[path]['s3_mtime'],
                 s3_files[path].get('s3_etag')
@@ -436,6 +524,9 @@ class S3SyncManager:
         print(f"  Deleting local: {path}")
         os.remove(local_path)
         print(f"  ✓ Deleted local: {path}")
+
+        # Clean up empty directories
+        self._cleanup_empty_dirs(local_path)
 
         # Remove from database
         with self._get_db() as conn:
@@ -460,12 +551,29 @@ class S3SyncManager:
 
         return True
 
-    def sync(self, dry_run=False):
+    def _print_file_preview(self, files, title, max_files=50):
+        """Print preview of files to be processed"""
+        if not files:
+            return
+
+        print(f"\n{title} ({len(files)} total):")
+        for i, (path, reason) in enumerate(sorted(files)[:max_files], 1):
+            print(f"  {i}. {path}")
+            if reason:
+                print(f"     └─ {reason}")
+
+        if len(files) > max_files:
+            print(f"  ... and {len(files) - max_files} more files")
+
+    def sync(self, dry_run=False, include_backups=False):
         """Perform interactive sync operation"""
+        if not include_backups:
+            print("Note: Ignoring backups/ directories (use --sync-backups to include them)")
+
         print("\nAnalyzing changes...")
 
-        local_files = self.scan_local_files()
-        s3_files = self.scan_s3_files()
+        local_files = self.scan_local_files(include_backups)
+        s3_files = self.scan_s3_files(include_backups)
 
         actions = self.analyze_changes(local_files, s3_files)
 
@@ -500,6 +608,13 @@ class S3SyncManager:
             print("\n✓ Everything is in sync!")
             return
 
+        # Show preview of files
+        self._print_file_preview(uploads, "Files to Upload")
+        self._print_file_preview(downloads, "Files to Download")
+        self._print_file_preview(deletes_local, "Files to Delete Locally")
+        self._print_file_preview(deletes_remote, "Files to Delete from S3")
+        self._print_file_preview(conflicts, "Conflicts to Resolve")
+
         if dry_run:
             print("\n--dry-run mode: No changes will be made")
             return
@@ -531,38 +646,53 @@ class S3SyncManager:
 
         # Process uploads
         for path, reason in uploads:
-            self.perform_upload(path, local_files)
-            success_count += 1
+            try:
+                self.perform_upload(path, local_files)
+                success_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed to upload {path}: {e}")
 
         # Process downloads
         for path, reason in downloads:
-            self.perform_download(path, s3_files)
-            success_count += 1
+            try:
+                self.perform_download(path, s3_files)
+                success_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed to download {path}: {e}")
 
         # Process deletions
         for path, reason in deletes_local:
-            self.perform_delete_local(path)
-            success_count += 1
+            try:
+                self.perform_delete_local(path)
+                success_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed to delete local {path}: {e}")
 
         for path, reason in deletes_remote:
-            self.perform_delete_remote(path)
-            success_count += 1
+            try:
+                self.perform_delete_remote(path)
+                success_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed to delete remote {path}: {e}")
 
         # Process resolved conflicts
         for path, action in resolved_actions:
-            if action == SyncAction.UPLOAD:
-                self.perform_upload(path, local_files)
-            elif action == SyncAction.DOWNLOAD:
-                self.perform_download(path, s3_files)
-            elif action == SyncAction.DELETE_LOCAL:
-                self.perform_delete_local(path)
-            elif action == SyncAction.DELETE_REMOTE:
-                self.perform_delete_remote(path)
-            success_count += 1
+            try:
+                if action == SyncAction.UPLOAD:
+                    self.perform_upload(path, local_files)
+                elif action == SyncAction.DOWNLOAD:
+                    self.perform_download(path, s3_files)
+                elif action == SyncAction.DELETE_LOCAL:
+                    self.perform_delete_local(path)
+                elif action == SyncAction.DELETE_REMOTE:
+                    self.perform_delete_remote(path)
+                success_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed to process {path}: {e}")
 
         print(f"\n✓ Sync complete: {success_count}/{total_operations} operations successful")
 
-    def show_status(self, verbose=False):
+    def show_status(self, verbose=False, include_backups=False):
         """Show sync status"""
         print(f"S3 Sync Status")
         print(f"Local directory: {self.local_dir}")
@@ -570,6 +700,9 @@ class S3SyncManager:
 
         if self.aws_profile:
             print(f"AWS Profile: {self.aws_profile}")
+
+        if not include_backups:
+            print("Note: Ignoring backups/ directories (use --sync-backups to include them)")
 
         # Get database stats
         with self._get_db() as conn:
@@ -579,8 +712,8 @@ class S3SyncManager:
 
         print("\nAnalyzing changes...")
 
-        local_files = self.scan_local_files()
-        s3_files = self.scan_s3_files()
+        local_files = self.scan_local_files(include_backups)
+        s3_files = self.scan_s3_files(include_backups)
         actions = self.analyze_changes(local_files, s3_files)
 
         # Count actions
@@ -622,19 +755,23 @@ def main():
     status_parser = subparsers.add_parser('status', help='Show sync status')
     status_parser.add_argument('directory', help='Local directory')
     status_parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed file list')
+    status_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in sync')
 
     # Sync command
     sync_parser = subparsers.add_parser('sync', help='Perform interactive sync')
     sync_parser.add_argument('directory', help='Local directory')
     sync_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced without doing it')
+    sync_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in sync')
 
     # Update command
     update_parser = subparsers.add_parser('update', help='Update file tracking with current state')
     update_parser.add_argument('directory', help='Local directory')
+    update_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in tracking')
 
     # Reset command
     reset_parser = subparsers.add_parser('reset', help='Reset sync tracking (mark all as synced)')
     reset_parser.add_argument('directory', help='Local directory')
+    reset_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in reset')
 
     args = parser.parse_args()
 
@@ -650,8 +787,8 @@ def main():
 
         # Initial sync: download any S3 files that don't exist locally
         print("\nChecking for files to download from S3...")
-        local_files = manager.scan_local_files()
-        s3_files = manager.scan_s3_files()
+        local_files = manager.scan_local_files(include_backups=False)  # Don't include backups by default
+        s3_files = manager.scan_s3_files(include_backups=False)
 
         # Find files that exist in S3 but not locally
         files_to_download = []
@@ -661,35 +798,42 @@ def main():
 
         if files_to_download:
             print(f"\nFound {len(files_to_download)} files in S3 that don't exist locally.")
+            print("Note: Excluding backups/ directories. Use --sync-backups if needed.")
             response = input("Download all files? [y/N]: ").strip().lower()
 
             if response == 'y':
-                print(f"\nDownloading {len(files_to_download)} files...")
-                success_count = 0
+                print(f"\nDownloading {len(files_to_download)} files using aws s3 sync (this is much faster)...")
+                print(f"S3 location: s3://{args.s3_bucket}/{args.s3_prefix}/")
+                print(f"Local directory: {args.directory}\n")
 
-                for i, path in enumerate(files_to_download, 1):
-                    if i % 100 == 0:
-                        print(f"  Progress: {i}/{len(files_to_download)} files...")
+                # Use aws s3 sync for bulk download - much faster!
+                cmd = [
+                    'aws', 's3', 'sync',
+                    f"s3://{args.s3_bucket}/{args.s3_prefix}/",
+                    args.directory,
+                    '--exclude', '.*',  # Exclude hidden files
+                    '--exclude', '*.obj',  # Exclude .obj files
+                ]
 
-                    local_path = os.path.join(args.directory, path)
-                    s3_path = manager._get_s3_url(path)
+                # Add excludes for layers and backups directories
+                cmd.extend(['--exclude', '*layers*/*'])
+                cmd.extend(['--exclude', '*/backups/*'])
 
-                    # Create directory if needed
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                if args.profile:
+                    cmd.extend(['--profile', args.profile])
 
-                    cmd = ['aws', 's3', 'cp', s3_path, local_path]
-                    if args.profile:
-                        cmd.extend(['--profile', args.profile])
-
-                    subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    success_count += 1
-
-                print(f"\n✓ Downloaded {success_count} files successfully")
+                # Run without capture_output so we see live progress
+                try:
+                    subprocess.run(cmd, check=True)
+                    print(f"\n✓ Download complete!")
+                except subprocess.CalledProcessError as e:
+                    print(f"\n❌ Download failed with exit code {e.returncode}")
+                    sys.exit(1)
         else:
             print("✓ All S3 files already exist locally")
 
-        # Do initial tracking update after downloads
-        manager.update_files()
+        # Do initial tracking update after downloads (exclude backups by default)
+        manager.update_files(include_backups=False)
 
         print("\n✓ Initialization complete!")
         print("Use 'status' command to see current sync state")
@@ -706,21 +850,23 @@ def main():
         manager = S3SyncManager(args.directory)
 
         if args.command == 'status':
-            manager.show_status(args.verbose)
+            manager.show_status(args.verbose, getattr(args, 'sync_backups', False))
 
         elif args.command == 'sync':
-            manager.sync(args.dry_run)
+            manager.sync(args.dry_run, getattr(args, 'sync_backups', False))
 
         elif args.command == 'update':
-            manager.update_files()
+            manager.update_files(getattr(args, 'sync_backups', False))
 
         elif args.command == 'reset':
             print("Resetting sync tracking...")
             print("This will mark all current files as synced.")
+            if not getattr(args, 'sync_backups', False):
+                print("Note: Excluding backups/ directories (use --sync-backups to include them)")
             response = input("Continue? [y/N]: ").strip().lower()
 
             if response == 'y':
-                manager.update_files()
+                manager.update_files(getattr(args, 'sync_backups', False))
                 print("✓ Sync tracking reset. All files marked as in sync.")
             else:
                 print("Reset cancelled.")

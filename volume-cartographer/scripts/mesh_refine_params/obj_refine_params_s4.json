@@ -1,0 +1,11 @@
+{
+"start": -5.0, 
+"stop": 20.0,
+"step": 0.5,
+"border_off": 0,
+"r": 3,
+"low": 95,
+"high": 255,
+"reader_scale": 0.5,
+"cache_gb": 40
+}

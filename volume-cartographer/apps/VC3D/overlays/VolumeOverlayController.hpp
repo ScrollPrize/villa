@@ -66,6 +66,7 @@ private:
     std::shared_ptr<Volume> _overlayVolume;
 
     std::string _overlayVolumeId;
+    std::string _overlayVolumeIdBeforeToggle;
     std::string _overlayColormapName;
     float _overlayOpacity{0.5f};
     float _overlayOpacityBeforeToggle{0.5f};

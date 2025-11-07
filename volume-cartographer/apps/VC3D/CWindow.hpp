@@ -87,6 +87,7 @@ public slots:
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
+    void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
@@ -95,8 +96,9 @@ public slots:
                                    SegmentationGrowthDirection direction,
                                    int steps,
                                    bool inpaintOnly);
-   void onFocusPOIChanged(std::string name, POI* poi);
+    void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
+    void onMoveSegmentToPaths(const QString& segmentId);
 
 public:
     CWindow();

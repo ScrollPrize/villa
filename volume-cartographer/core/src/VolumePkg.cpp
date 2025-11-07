@@ -17,7 +17,7 @@ VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileL
 {
     config_ = Metadata(fileLocation / ::CONFIG);
 
-    std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders"};
+    std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders","backups"};
 
     for (const auto& d : dirs) {
         if (not std::filesystem::exists(rootDir_ / d)) {
@@ -267,16 +267,14 @@ void VolumePkg::refreshSegmentations()
     }
 
     // Find and add new segmentations (on disk but not in memory)
-    for (const auto& diskPath : diskPaths) {
-        bool found = false;
-        for (const auto& seg : segmentations_) {
-            if (seg.second->path() == diskPath) {
-                found = true;
-                break;
-            }
-        }
+    // Build a set of currently loaded paths for O(1) lookup
+    std::set<std::filesystem::path> loadedPaths;
+    for (const auto& seg : segmentations_) {
+        loadedPaths.insert(seg.second->path());
+    }
 
-        if (!found) {
+    for (const auto& diskPath : diskPaths) {
+        if (loadedPaths.find(diskPath) == loadedPaths.end()) {
             try {
                 auto s = Segmentation::New(diskPath);
                 segmentations_.emplace(s->id(), s);

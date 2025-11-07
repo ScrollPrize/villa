@@ -1,5 +1,7 @@
 #include "SettingsDialog.hpp"
 
+#include "VCSettings.hpp"
+
 #include <QSettings>
 #include <QMessageBox>
 #include <QToolTip>
@@ -10,7 +12,7 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
 {
     setupUi(this);
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     edtDefaultPathVolpkg->setText(settings.value("volpkg/default_path").toString());
     chkAutoOpenVolpkg->setChecked(settings.value("volpkg/auto_open", true).toInt() != 0);
@@ -59,7 +61,7 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
 void SettingsDialog::accept()
 {
     // Store the settings
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     settings.setValue("volpkg/default_path", edtDefaultPathVolpkg->text());
     settings.setValue("volpkg/auto_open", chkAutoOpenVolpkg->isChecked() ? "1" : "0");

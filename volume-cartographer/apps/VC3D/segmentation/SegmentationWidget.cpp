@@ -1,13 +1,16 @@
 #include "SegmentationWidget.hpp"
 
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "VCSettings.hpp"
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFileDialog>
 #include <QGroupBox>
 #include <QGridLayout>
@@ -16,6 +19,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QLoggingCategory>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -166,6 +170,33 @@ QString SegmentationWidget::determineDefaultVolumeId(const QVector<QPair<QString
     return {};
 }
 
+void SegmentationWidget::applyGrowthSteps(int steps, bool persist, bool fromUi)
+{
+    const int minimum = (_growthMethod == SegmentationGrowthMethod::Corrections) ? 0 : 1;
+    const int clamped = std::clamp(steps, minimum, 1024);
+
+    if ((!fromUi || clamped != steps) && _spinGrowthSteps) {
+        QSignalBlocker blocker(_spinGrowthSteps);
+        _spinGrowthSteps->setValue(clamped);
+    }
+
+    if (clamped > 0) {
+        _tracerGrowthSteps = std::max(1, clamped);
+    }
+
+    _growthSteps = clamped;
+
+    if (persist) {
+        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
+        writeSetting(QStringLiteral("growth_steps_tracer"), _tracerGrowthSteps);
+    }
+}
+
+void SegmentationWidget::setGrowthSteps(int steps, bool persist)
+{
+    applyGrowthSteps(steps, persist, false);
+}
+
 SegmentationWidget::SegmentationWidget(QWidget* parent)
     : QWidget(parent)
 {
@@ -206,7 +237,7 @@ void SegmentationWidget::buildUi()
     auto* dirRow = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
-    _spinGrowthSteps->setRange(1, 1024);
+    _spinGrowthSteps->setRange(0, 1024);
     _spinGrowthSteps->setSingleStep(1);
     _spinGrowthSteps->setToolTip(tr("Number of iterations to run when growing the segmentation."));
     dirRow->addWidget(stepsLabel);
@@ -527,8 +558,11 @@ void SegmentationWidget::buildUi()
         _directionFieldRemoveButton = new QPushButton(tr("Remove"), directionParent);
         _directionFieldRemoveButton->setToolTip(tr("Delete the selected direction field entry."));
         _directionFieldRemoveButton->setEnabled(false);
+        _directionFieldClearButton = new QPushButton(tr("Clear"), directionParent);
+        _directionFieldClearButton->setToolTip(tr("Clear selection and reset the form for adding a new entry."));
         row->addWidget(_directionFieldAddButton);
         row->addWidget(_directionFieldRemoveButton);
+        row->addWidget(_directionFieldClearButton);
         row->addStretch(1);
     });
 
@@ -635,14 +669,8 @@ void SegmentationWidget::buildUi()
     connectDirectionCheckbox(_chkGrowthDirLeft);
     connectDirectionCheckbox(_chkGrowthDirRight);
 
-    connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        value = std::clamp(value, 1, 1024);
-        if (_growthSteps == value) {
-            return;
-        }
-        _growthSteps = value;
-        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
-    });
+    connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int value) { applyGrowthSteps(value, true, true); });
 
     const auto triggerConfiguredGrowth = [this]() {
         const auto allowed = allowedGrowthDirections();
@@ -815,6 +843,7 @@ void SegmentationWidget::buildUi()
         _directionFields.push_back(std::move(config));
         refreshDirectionFieldList();
         persistDirectionFields();
+        clearDirectionFieldForm();
     });
 
     connect(_directionFieldRemoveButton, &QPushButton::clicked, this, [this]() {
@@ -825,6 +854,10 @@ void SegmentationWidget::buildUi()
         _directionFields.erase(_directionFields.begin() + row);
         refreshDirectionFieldList();
         persistDirectionFields();
+    });
+
+    connect(_directionFieldClearButton, &QPushButton::clicked, this, [this]() {
+        clearDirectionFieldForm();
     });
 
     connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -1094,7 +1127,7 @@ void SegmentationWidget::syncUiState()
 
 void SegmentationWidget::restoreSettings()
 {
-    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
 
     _restoringSettings = true;
@@ -1144,8 +1177,14 @@ void SegmentationWidget::restoreSettings()
     _smoothIterations = std::clamp(_smoothIterations, 1, 25);
     _growthMethod = segmentationGrowthMethodFromInt(
         settings.value(QStringLiteral("growth_method"), static_cast<int>(_growthMethod)).toInt());
-    _growthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
-    _growthSteps = std::clamp(_growthSteps, 1, 1024);
+    int storedGrowthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
+    storedGrowthSteps = std::clamp(storedGrowthSteps, 0, 1024);
+    _tracerGrowthSteps = settings
+                             .value(QStringLiteral("growth_steps_tracer"),
+                                    std::max(1, storedGrowthSteps))
+                             .toInt();
+    _tracerGrowthSteps = std::clamp(_tracerGrowthSteps, 1, 1024);
+    applyGrowthSteps(storedGrowthSteps, false, false);
     _growthDirectionMask = normalizeGrowthDirectionMask(
         settings.value(QStringLiteral("growth_direction_mask"), kGrowDirAllMask).toInt());
 
@@ -1203,7 +1242,7 @@ void SegmentationWidget::restoreSettings()
 
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
 {
-    QSettings settings(QStringLiteral("VC.ini"), QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
     settings.setValue(key, value);
     settings.endGroup();
@@ -1561,7 +1600,18 @@ void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
     if (_growthMethod == method) {
         return;
     }
+    const int currentSteps = _growthSteps;
+    if (method == SegmentationGrowthMethod::Corrections) {
+        _tracerGrowthSteps = (currentSteps > 0) ? currentSteps : std::max(1, _tracerGrowthSteps);
+    }
     _growthMethod = method;
+    int targetSteps = currentSteps;
+    if (method == SegmentationGrowthMethod::Corrections) {
+        targetSteps = 0;
+    } else {
+        targetSteps = (currentSteps < 1) ? std::max(1, _tracerGrowthSteps) : std::max(1, currentSteps);
+    }
+    applyGrowthSteps(targetSteps, true, false);
     writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
     syncUiState();
     emit growthMethodChanged(_growthMethod);
@@ -1902,6 +1952,50 @@ void SegmentationWidget::updateDirectionFieldListGeometry()
     _directionFieldList->updateGeometry();
 }
 
+void SegmentationWidget::clearDirectionFieldForm()
+{
+    // Clear the list selection
+    if (_directionFieldList) {
+        _directionFieldList->setCurrentRow(-1);
+    }
+
+    // Reset member variables to defaults
+    _directionFieldPath.clear();
+    _directionFieldOrientation = SegmentationDirectionFieldOrientation::Normal;
+    _directionFieldScale = 0;
+    _directionFieldWeight = 1.0;
+
+    // Update the form fields to reflect the cleared state
+    const bool previousUpdating = _updatingDirectionFieldForm;
+    _updatingDirectionFieldForm = true;
+
+    if (_directionFieldPathEdit) {
+        _directionFieldPathEdit->clear();
+    }
+    if (_comboDirectionFieldOrientation) {
+        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
+        if (idx >= 0) {
+            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_comboDirectionFieldScale) {
+        int idx = _comboDirectionFieldScale->findData(0);
+        if (idx >= 0) {
+            _comboDirectionFieldScale->setCurrentIndex(idx);
+        }
+    }
+    if (_spinDirectionFieldWeight) {
+        _spinDirectionFieldWeight->setValue(1.0);
+    }
+
+    _updatingDirectionFieldForm = previousUpdating;
+
+    // Update button states
+    if (_directionFieldRemoveButton) {
+        _directionFieldRemoveButton->setEnabled(false);
+    }
+}
+
 void SegmentationWidget::persistDirectionFields()
 {
     QVariantList serialized;
@@ -2049,17 +2143,20 @@ void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direct
         return;
     }
 
-    const int minSteps = inpaintOnly ? 0 : 1;
-    const int clampedSteps = std::clamp(steps, minSteps, 1024);
     const SegmentationGrowthMethod method = inpaintOnly
         ? SegmentationGrowthMethod::Tracer
         : _growthMethod;
 
+    const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
+    const int minSteps = allowZeroSteps ? 0 : 1;
+    const int clampedSteps = std::clamp(steps, minSteps, 1024);
+    const int finalSteps = clampedSteps;
+
     qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(method)
                         << segmentationGrowthDirectionToString(direction)
-                        << "steps" << clampedSteps
+                        << "steps" << finalSteps
                         << "inpaintOnly" << inpaintOnly;
-    emit growSurfaceRequested(method, direction, clampedSteps, inpaintOnly);
+    emit growSurfaceRequested(method, direction, finalSteps, inpaintOnly);
 }
 
 int SegmentationWidget::normalizeGrowthDirectionMask(int mask)

@@ -1,6 +1,7 @@
 #include "CWindow.hpp"
 #include "CSurfaceCollection.hpp"
 #include "SurfacePanelController.hpp"
+#include "VCSettings.hpp"
 
 #include <functional>
 #include <algorithm>
@@ -60,7 +61,7 @@ static bool runProcessBlocking(const QString& program,
 // --------- locate generic vc_* executables -----------------------------------
 static QString findVcTool(const char* name)
 {
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QString key1 = QStringLiteral("tools/%1_path").arg(name);
     const QString key2 = QStringLiteral("tools/%1").arg(name);
     const QString iniPath =
@@ -112,7 +113,7 @@ public:
     , itRe_(R"(^\s*\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption)
     , progRe_(R"(^\s*PROGRESS\s+(\d+)\s*/\s*(\d+)\s*$)", QRegularExpression::CaseInsensitiveOption)
     {
-        QSettings s("VC.ini", QSettings::IniFormat);
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
         iters_ = s.value("tools/flatboi_iters", 20).toInt();
         if (iters_ <= 0) iters_ = 20;
 
@@ -497,7 +498,7 @@ static QString findFlatboiExecutable()
     }
 
     {
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const QString iniPath = settings.value("tools/flatboi_path",
                                                settings.value("tools/flatboi")).toString().trimmed();
         if (!iniPath.isEmpty()) {
@@ -547,7 +548,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
         return;
     }
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     const QString volumePath = getCurrentVolumePath();
     const QString segmentPath = QString::fromStdString(surfMeta->path.string());
@@ -788,6 +789,76 @@ void CWindow::onConvertToObj(const std::string& segmentId)
     statusBar()->showMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
+void CWindow::onAlphaCompRefine(const std::string& segmentId)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: No volume package loaded"));
+        return;
+    }
+
+    auto surfMeta = fVpkg->getSurface(segmentId);
+    if (!surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    if (!initializeCommandLineRunner()) return;
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    QString volumePath = getCurrentVolumePath();
+    if (volumePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: Unable to determine volume path"));
+        return;
+    }
+
+    QString srcPath = QString::fromStdString(surfMeta->path.string());
+    QFileInfo srcInfo(srcPath);
+
+    QString defaultOutput;
+    if (srcInfo.isDir()) {
+        defaultOutput = srcInfo.absoluteFilePath() + "_refined";
+    } else {
+        const QString base = srcInfo.completeBaseName();
+        const QString suffix = srcInfo.completeSuffix();
+        QString candidate = srcInfo.absolutePath() + "/" + base + "_refined";
+        if (!suffix.isEmpty()) {
+            candidate += "." + suffix;
+        }
+        defaultOutput = candidate;
+    }
+
+    AlphaCompRefineDialog dlg(this, volumePath, srcPath, defaultOutput);
+    if (dlg.exec() != QDialog::Accepted) {
+        statusBar()->showMessage(tr("Alpha-comp refinement cancelled"), 3000);
+        return;
+    }
+
+    if (dlg.volumePath().isEmpty() || dlg.srcPath().isEmpty() || dlg.dstPath().isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Volume, source, and output paths must be specified"));
+        return;
+    }
+
+    QJsonObject paramsJson = dlg.paramsJson();
+    QString paramsPath = QDir(QDir::tempPath()).filePath(
+        QStringLiteral("vc_objrefine_%1.json").arg(QDateTime::currentMSecsSinceEpoch()));
+
+    QFile paramsFile(paramsPath);
+    if (!paramsFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to write params JSON: %1").arg(paramsPath));
+        return;
+    }
+    paramsFile.write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
+    paramsFile.close();
+
+    _cmdRunner->setObjRefineParams(dlg.volumePath(), dlg.srcPath(), dlg.dstPath(), paramsPath);
+    _cmdRunner->setOmpThreads(dlg.ompThreads());
+    _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
+    statusBar()->showMessage(tr("Refining segment: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
 void CWindow::onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed)
 {
     if (currentVolume == nullptr) {
@@ -849,7 +920,7 @@ bool CWindow::initializeCommandLineRunner()
     if (!_cmdRunner) {
         _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
 
-        QSettings settings("VC.ini", QSettings::IniFormat);
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         int parallelProcesses = settings.value("perf/parallel_processes", 8).toInt();
         int iterationCount = settings.value("perf/iteration_count", 1000).toInt();
 
@@ -918,7 +989,7 @@ void CWindow::onAWSUpload(const std::string& segmentId)
         return;
     }
 
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     QString defaultProfile = settings.value("aws/default_profile", "").toString();
 
     QString awsProfile = QInputDialog::getText(
@@ -1068,7 +1139,7 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
     }
 
     // Settings with sensible defaults (chunk width is in REAL UV pixels)
-    QSettings settings("VC.ini", QSettings::IniFormat);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const int  chunkWidthReal = std::max(1, settings.value("export/chunk_width_px", 40000).toInt());
     const bool overwrite      = settings.value("export/overwrite", true).toBool();
 

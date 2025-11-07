@@ -79,6 +79,7 @@ public:
     void setCorrectionsAnnotateChecked(bool enabled);
     void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                    std::optional<uint64_t> activeId);
+    void setGrowthSteps(int steps, bool persist = true);
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
@@ -124,8 +125,10 @@ private:
     void applyDirectionFieldDraftToSelection(int row);
     void updateDirectionFieldListItem(int row);
     void updateDirectionFieldListGeometry();
+    void clearDirectionFieldForm();
     [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
                                                    const QString& requestedId) const;
+    void applyGrowthSteps(int steps, bool persist, bool fromUi);
     void setGrowthDirectionMask(int mask);
     void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
     void applyGrowthDirectionMaskToUi();
@@ -162,6 +165,7 @@ private:
 
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     int _growthSteps{5};
+    int _tracerGrowthSteps{5};
     int _growthDirectionMask{0};
 
     QString _directionFieldPath;
@@ -195,6 +199,7 @@ private:
     QDoubleSpinBox* _spinDirectionFieldWeight{nullptr};
     QPushButton* _directionFieldAddButton{nullptr};
     QPushButton* _directionFieldRemoveButton{nullptr};
+    QPushButton* _directionFieldClearButton{nullptr};
     QListWidget* _directionFieldList{nullptr};
 
     QGroupBox* _groupCorrections{nullptr};

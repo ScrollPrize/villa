@@ -27,7 +27,24 @@
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
 namespace
+{void createRotatingBackup(QuadSurface* surface, const std::filesystem::path& surfacePath, int maxBackups = 10)
 {
+    if (!surface) {
+        return;
+    }
+
+    qCInfo(lcSegGrowth) << "Creating backup for:" << QString::fromStdString(surfacePath.string());
+
+    try {
+        // Create a rotating backup snapshot
+        // This handles path normalization, rotation, and file copying automatically
+        surface->saveSnapshot(maxBackups);
+        qCInfo(lcSegGrowth) << "Backup creation complete";
+    } catch (const std::exception& e) {
+        qCWarning(lcSegGrowth) << "Failed to create backup:" << e.what();
+    }
+}
+
 void ensureMetaObject(QuadSurface* surface)
 {
     if (!surface) {
@@ -426,7 +443,8 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-
+        std::filesystem::path surface_path = context.resumeSurface->path;
+        createRotatingBackup(context.resumeSurface, surface_path);
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
                                       context.cache,
