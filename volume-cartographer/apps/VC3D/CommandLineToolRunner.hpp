@@ -36,7 +36,8 @@ public:
         SegAddOverlap,
         tifxyz2obj,
         obj2tifxyz,
-        AlphaCompRefine
+        AlphaCompRefine,
+        NeighborCopy
     };
 
     void setVolumePath(const QString& path);
@@ -61,6 +62,11 @@ public:
                             const QString& srcSurface,
                             const QString& dstSurface,
                             const QString& jsonParams);
+    void setNeighborCopyParams(const QString& volumePath,
+                               const QString& paramsJson,
+                               const QString& resumeSurface,
+                               const QString& outputDir,
+                               const QString& resumeOpt);
     bool execute(Tool tool);
     void cancel();
     bool isRunning() const;
@@ -106,6 +112,8 @@ private:
     QString _tifxyzPath;
     QString _objPath;
     QString _jsonParams;
+    QString _resumeSurfacePath;
+    QString _resumeOpt;
     
     float _scale;
     int _resolution;
@@ -140,6 +148,7 @@ private:
     QTextStream* _logStream;
 
     int _ompThreads{-1};
+    bool _explicitVolumePath{false};
 
     QString _objOutputDir;
     float _objStretchFactor = 1000.0f;

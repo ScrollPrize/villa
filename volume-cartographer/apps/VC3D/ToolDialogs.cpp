@@ -15,6 +15,7 @@
 #include <QList>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
+#include <QVariant>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -983,4 +984,133 @@ void AlphaCompRefineDialog::updateSessionFromUI()
     s_vertexColor = chkVertexColor_->isChecked();
     s_overwrite = chkOverwrite_->isChecked();
     s_ompThreads = ompThreads();
+}
+
+// ================= NeighborCopyDialog =================
+NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
+                                       const QString& surfacePath,
+                                       const QVector<NeighborCopyVolumeOption>& volumes,
+                                       const QString& defaultVolumeId,
+                                       const QString& defaultOutputPath)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("Copy Neighbor"));
+    auto main = new QVBoxLayout(this);
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    edtSurface_ = new QLineEdit(surfacePath, this);
+    edtSurface_->setReadOnly(true);
+    form->addRow(tr("Target surface:"), edtSurface_);
+
+    cmbVolume_ = new QComboBox(this);
+    populateVolumeOptions(volumes, defaultVolumeId);
+    form->addRow(tr("Target volume:"), cmbVolume_);
+
+    QWidget* outPick = pathPicker(this, edtOutput_, tr("Select output directory"), true);
+    edtOutput_->setText(defaultOutputPath);
+    form->addRow(tr("Output path:"), outPick);
+
+    auto pass2Group = new QGroupBox(tr("Second pass resume optimization"), this);
+    auto pass2Form = new QFormLayout(pass2Group);
+    pass2Form->setSpacing(6);
+
+    spResumeStep_ = new QSpinBox(this);
+    spResumeStep_->setRange(1, 512);
+    spResumeStep_->setValue(16);
+    spResumeStep_->setToolTip(tr("Stride applied when selecting cells for resume-local optimization during pass 2."));
+    pass2Form->addRow(tr("Local step:"), spResumeStep_);
+
+    spResumeRadius_ = new QSpinBox(this);
+    spResumeRadius_->setRange(1, 2048);
+    spResumeRadius_->setValue(spResumeStep_->value() * 2);
+    spResumeRadius_->setToolTip(tr("Radius (in cells) optimized around each resume-local seed during pass 2."));
+    pass2Form->addRow(tr("Local radius:"), spResumeRadius_);
+
+    spResumeMaxIters_ = new QSpinBox(this);
+    spResumeMaxIters_->setRange(1, 10000);
+    spResumeMaxIters_->setSingleStep(50);
+    spResumeMaxIters_->setValue(1000);
+    spResumeMaxIters_->setToolTip(tr("Maximum Ceres iterations per resume-local solve during pass 2."));
+    pass2Form->addRow(tr("Max iterations:"), spResumeMaxIters_);
+
+    chkResumeDenseQr_ = new QCheckBox(tr("Use dense QR solver"), this);
+    chkResumeDenseQr_->setToolTip(tr("Switch resume-local solves in pass 2 to the dense QR linear solver."));
+    pass2Form->addRow(tr("Dense QR:"), chkResumeDenseQr_);
+
+    main->addWidget(pass2Group);
+
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(buttons, &QDialogButtonBox::accepted, this, &NeighborCopyDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, this, &NeighborCopyDialog::reject);
+    main->addWidget(buttons);
+
+    ensureDialogWidthForEdits(this, {edtSurface_, edtOutput_}, 260);
+}
+
+void NeighborCopyDialog::populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
+                                               const QString& defaultVolumeId)
+{
+    cmbVolume_->clear();
+    int defaultIndex = -1;
+    for (int i = 0; i < volumes.size(); ++i) {
+        const auto& opt = volumes[i];
+        QString label = opt.name.isEmpty()
+            ? opt.id
+            : tr("%1 (%2)").arg(opt.name, opt.id);
+        cmbVolume_->addItem(label, opt.path);
+        cmbVolume_->setItemData(i, opt.id, Qt::UserRole + 1);
+        if (defaultIndex == -1 && !defaultVolumeId.isEmpty() && opt.id == defaultVolumeId) {
+            defaultIndex = i;
+        }
+    }
+    if (cmbVolume_->count() > 0) {
+        cmbVolume_->setCurrentIndex(defaultIndex >= 0 ? defaultIndex : 0);
+    }
+}
+
+QString NeighborCopyDialog::surfacePath() const
+{
+    return edtSurface_ ? edtSurface_->text().trimmed() : QString();
+}
+
+QString NeighborCopyDialog::selectedVolumeId() const
+{
+    if (!cmbVolume_) {
+        return QString();
+    }
+    return cmbVolume_->currentData(Qt::UserRole + 1).toString();
+}
+
+QString NeighborCopyDialog::selectedVolumePath() const
+{
+    if (!cmbVolume_) {
+        return QString();
+    }
+    return cmbVolume_->currentData(Qt::UserRole).toString();
+}
+
+QString NeighborCopyDialog::outputPath() const
+{
+    return edtOutput_ ? edtOutput_->text().trimmed() : QString();
+}
+
+int NeighborCopyDialog::resumeLocalOptStep() const
+{
+    return spResumeStep_ ? spResumeStep_->value() : 16;
+}
+
+int NeighborCopyDialog::resumeLocalOptRadius() const
+{
+    return spResumeRadius_ ? spResumeRadius_->value() : resumeLocalOptStep() * 2;
+}
+
+int NeighborCopyDialog::resumeLocalMaxIters() const
+{
+    return spResumeMaxIters_ ? spResumeMaxIters_->value() : 1000;
+}
+
+bool NeighborCopyDialog::resumeLocalDenseQr() const
+{
+    return chkResumeDenseQr_ ? chkResumeDenseQr_->isChecked() : false;
 }
