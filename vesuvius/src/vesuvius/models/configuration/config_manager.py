@@ -47,6 +47,9 @@ class ConfigManager:
         if not raw_targets and "targets" in self.model_config:
             raw_targets = self.model_config.get("targets") or {}
 
+        if raw_targets:
+            self.validate_target_names(raw_targets.keys())
+
         self.targets = {}
         for target_name, target_info in raw_targets.items():
             info_dict = dict(target_info or {})
@@ -681,8 +684,8 @@ class ConfigManager:
     def set_targets_and_data(self, targets_dict, data_dict):
         """
         Generic method to set targets and data from any source (napari, TIF, zarr, etc.)
-        this is necessary primarily because the target dict has to be created/set , and the desired 
-        loss functions have to be set for each target. it's a bit convoluted but i couldnt think of a simpler way 
+        this is necessary primarily because the target dict has to be created/set , and the desired
+        loss functions have to be set for each target. it's a bit convoluted but i couldnt think of a simpler way
 
         Parameters
         ----------
@@ -693,6 +696,8 @@ class ConfigManager:
             Dictionary with target names as keys and list of volume data as values
             Example: {"ink": [{"data": {...}, "out_channels": 1, "name": "image1_ink"}]}
         """
+        self.validate_target_names(targets_dict.keys())
+
         self.targets = deepcopy(targets_dict)
 
         # Ensure all targets have out_channels, default to 2
@@ -877,6 +882,29 @@ class ConfigManager:
                     
         if self.verbose and self.auxiliary_tasks:
             print(f"Applied {len(self.auxiliary_tasks)} auxiliary tasks to targets")
+
+    def validate_target_names(self, target_names):
+        """
+        Validate that target names don't conflict with reserved names.
+
+        Parameters
+        ----------
+        target_names : iterable
+            Collection of target names to validate
+
+        Raises
+        ------
+        ValueError
+            If any target name matches a reserved name
+        """
+        reserved_names = {'mask', 'is_unlabeled', 'plane_mask'}
+        for name in target_names:
+            if name in reserved_names:
+                raise ValueError(
+                    f"Target name '{name}' is reserved and cannot be used. "
+                    f"Reserved names: {', '.join(sorted(reserved_names))}. "
+                    f"Please choose a different name for your target."
+                )
 
     def auto_detect_channels(self, dataset=None, sample=None):
         """
