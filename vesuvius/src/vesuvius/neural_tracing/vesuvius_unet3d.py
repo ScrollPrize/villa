@@ -671,7 +671,9 @@ class Vesuvius3dUnetModel(nn.Module):
         # Network parameters - configurable input/output channels
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.time_emb_dim = model_config.get('time_emb_dim', 128)  # Default to 128 if not specified
+        self.time_emb_dim = model_config.get('time_emb_dim', None)
+        if self.time_emb_dim == 0:
+            self.time_emb_dim = None
         
         conv_op = nn.Conv3d
         norm_op = nn.InstanceNorm3d
@@ -688,7 +690,7 @@ class Vesuvius3dUnetModel(nn.Module):
         self.strides = [[2, 2, 2]] * self.num_stages
         
         # Timestep embedding
-        self.time_embedding = SinusoidalPositionEmbeddings(self.time_emb_dim)
+        self.time_embedding = SinusoidalPositionEmbeddings(self.time_emb_dim) if self.time_emb_dim else None
         
         # Build encoder
         self.encoder = Encoder(
@@ -751,7 +753,7 @@ class Vesuvius3dUnetModel(nn.Module):
             Output tensor of shape (B, C, D, H, W) - predicted noise
         """
         # Get timestep embeddings
-        time_emb = self.time_embedding(timesteps)  # (B, time_emb_dim)
+        time_emb = self.time_embedding(timesteps) if self.time_embedding is not None else None  # (B, time_emb_dim)
         
         # Get skip connections from encoder
         skips = self.encoder(x, time_emb)

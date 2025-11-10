@@ -61,6 +61,6 @@
           320
         ],
         "squeeze_excitation": true,
-        "time_emb_dim": 4
+        "time_emb_dim": 0
       }
 }
