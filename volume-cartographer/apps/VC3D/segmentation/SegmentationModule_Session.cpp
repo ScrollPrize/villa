@@ -16,6 +16,9 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
     clearUndoStack();
     clearInvalidationBrush();
     setInvalidationBrushActive(false);
+    resetHoverLookupDetail();
+    _hoverPointer.valid = false;
+    _hoverPointer.viewer = nullptr;
     if (!_editManager->beginSession(surface)) {
         qCWarning(lcSegModule) << "Failed to begin segmentation editing session";
         return false;
@@ -51,6 +54,9 @@ void SegmentationModule::endEditingSession()
     clearLineDragStroke();
     setInvalidationBrushActive(false);
     _lineDrawKeyActive = false;
+    resetHoverLookupDetail();
+    _hoverPointer.valid = false;
+    _hoverPointer.viewer = nullptr;
     refreshOverlay();
     QuadSurface* baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
     QuadSurface* previewSurface = _editManager ? _editManager->previewSurface() : nullptr;

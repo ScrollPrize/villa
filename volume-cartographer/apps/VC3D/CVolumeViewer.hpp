@@ -110,6 +110,9 @@ public:
     float overlayWindowLow() const { return _overlayWindowLow; }
     float overlayWindowHigh() const { return _overlayWindowHigh; }
 
+    void setSegmentationCursorMirroring(bool enabled) { _mirrorCursorToSegmentation = enabled; }
+    bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
+
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _baseWindowLow; }
     float volumeWindowHigh() const { return _baseWindowHigh; }
@@ -258,6 +261,7 @@ protected:
     float _overlayWindowHigh{255.0f};
     float _baseWindowLow{0.0f};
     float _baseWindowHigh{255.0f};
+    bool _mirrorCursorToSegmentation{false};
     bool _overlayImageValid{false};
     QImage _overlayImage;
 

@@ -18,6 +18,13 @@ class SegmentationEditManager : public QObject
     Q_OBJECT
 
 public:
+    enum class GridSearchResolution
+    {
+        Low,
+        Medium,
+        High
+    };
+
     struct GridKey
     {
         int row{0};
@@ -89,7 +96,9 @@ public:
     void refreshFromBaseSurface();
 
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
-                                                        float* outDistance = nullptr) const;
+                                                        float* outDistance = nullptr,
+                                                        GridSearchResolution detail =
+                                                            GridSearchResolution::High) const;
     std::optional<cv::Vec3f> vertexWorldPosition(int row, int col) const;
 
     bool beginActiveDrag(const std::pair<int, int>& gridIndex);
@@ -119,6 +128,7 @@ private:
     void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld);
     void clearActiveDrag();
     float stepNormalization() const;
+    void resetPointerSeed();
 
     QuadSurface* _baseSurface{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
@@ -134,4 +144,7 @@ private:
     std::vector<GridKey> _recentTouched;
     ActiveDrag _activeDrag;
     cv::Vec2f _gridScale{1.0f, 1.0f};
+
+    mutable bool _pointerSeedValid{false};
+    mutable cv::Vec3f _pointerSeed{0.0f, 0.0f, 0.0f};
 };

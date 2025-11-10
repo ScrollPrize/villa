@@ -78,6 +78,7 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
 
     viewer->setSurface(surfaceName);
     viewer->setSegmentationEditActive(_segmentationEditActive);
+    viewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
     if (_segmentationOverlay) {
         _segmentationOverlay->attachViewer(viewer);
@@ -316,6 +317,16 @@ void ViewerManager::setResetDefaultFor(CVolumeViewer* viewer, bool value)
         return;
     }
     _resetDefaults[viewer] = value;
+}
+
+void ViewerManager::setSegmentationCursorMirroring(bool enabled)
+{
+    _mirrorCursorToSegmentation = enabled;
+    for (auto* viewer : _viewers) {
+        if (viewer) {
+            viewer->setSegmentationCursorMirroring(enabled);
+        }
+    }
 }
 
 void ViewerManager::forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const

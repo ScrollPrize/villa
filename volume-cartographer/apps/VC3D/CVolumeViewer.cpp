@@ -434,19 +434,16 @@ void CVolumeViewer::onCursorMove(QPointF scene_loc)
     } else {
         if (_cursor) {
             _cursor->show();
-            // Update cursor position visually without POI
             PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
             QuadSurface *quad = dynamic_cast<QuadSurface*>(_surf);
-            cv::Vec3f sp;
-
             if (plane) {
-                sp = plane->project(p, 1.0, _scale);
+                const cv::Vec3f sp = plane->project(p, 1.0, _scale);
+                _cursor->setPos(sp[0], sp[1]);
             } else if (quad) {
-                auto ptr = quad->pointer();
-                _surf->pointTo(ptr, p, 4.0, 100);
-                sp = _surf->loc(ptr) * _scale;
+                // We already know the cursor's scene position when interacting with a quad,
+                // so avoid re-running the expensive pointTo() search.
+                _cursor->setPos(scene_loc);
             }
-            _cursor->setPos(sp[0], sp[1]);
         }
 
         POI *cursor = _surf_col->poi("cursor");
@@ -1114,7 +1111,13 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         if (!_surf) {
             return;
         }
-        
+
+        if (_surf_name == "segmentation" && !_mirrorCursorToSegmentation) {
+            if (!poi->src || poi->src != _surf) {
+                return;
+            }
+        }
+
         PlaneSurface *slice_plane = dynamic_cast<PlaneSurface*>(_surf);
         // QuadSurface *crop = dynamic_cast<QuadSurface*>(_surf_col->surface("visible_segmentation"));
         QuadSurface *crop = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));

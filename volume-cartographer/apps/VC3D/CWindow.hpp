@@ -142,6 +142,8 @@ private:
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory = false);
     bool centerFocusOnCursor();
+    void setSegmentationCursorMirroring(bool enabled);
+    bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -217,6 +219,7 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};
+    bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
     std::unordered_map<std::string, OpChain*> _opchains;

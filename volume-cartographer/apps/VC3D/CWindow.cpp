@@ -446,6 +446,7 @@ CWindow::CWindow() :
 
     _point_collection = new VCCollection(this);
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    _mirrorCursorToSegmentation = settings.value("viewer/mirror_cursor_to_segmentation", false).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
     // setAttribute(Qt::WA_DeleteOnClose);
@@ -463,6 +464,7 @@ CWindow::CWindow() :
     connect(_surf_col, &CSurfaceCollection::sendPOIChanged, this, &CWindow::onFocusPOIChanged);
 
     _viewerManager = std::make_unique<ViewerManager>(_surf_col, _point_collection, chunk_cache, this);
+    _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
     connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CVolumeViewer* viewer) {
         configureViewerConnections(viewer);
     });
@@ -1000,6 +1002,27 @@ bool CWindow::centerFocusOnCursor()
     }
 
     return centerFocusAt(cursor->p, cursor->n, cursor->src, true);
+}
+
+void CWindow::setSegmentationCursorMirroring(bool enabled)
+{
+    if (_mirrorCursorToSegmentation == enabled) {
+        return;
+    }
+
+    _mirrorCursorToSegmentation = enabled;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue("viewer/mirror_cursor_to_segmentation", enabled ? "1" : "0");
+
+    if (_viewerManager) {
+        _viewerManager->setSegmentationCursorMirroring(enabled);
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
+                                         : tr("Mirroring cursor to Surface view disabled"),
+                                  2000);
+    }
 }
 
 // Create widgets

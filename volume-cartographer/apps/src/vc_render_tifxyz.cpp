@@ -17,6 +17,7 @@
 #include <mutex>
 #include <cmath>
 #include <set>
+#include <cctype>
 
 namespace po = boost::program_options;
 
@@ -568,6 +569,97 @@ static inline void renderSliceFromBase16(
     cv::Mat_<uint16_t> tmp; readInterpolated3D(tmp, ds, coords, cache); out = tmp;
 }
 
+enum class AccumType {
+    Max,
+    Mean,
+    Median
+};
+
+template <typename T>
+static inline void computeMedianFromSamples(const std::vector<cv::Mat>& samples, cv::Mat& out)
+{
+    if (samples.empty()) {
+        out.release();
+        return;
+    }
+    const int rows = samples.front().rows;
+    const int cols = samples.front().cols;
+    out.create(rows, cols, samples.front().type());
+    std::vector<T> values(samples.size());
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
+            for (size_t i = 0; i < samples.size(); ++i) {
+                values[i] = samples[i].at<T>(y, x);
+            }
+            std::sort(values.begin(), values.end());
+            if ((values.size() % 2) == 1) {
+                out.at<T>(y, x) = values[values.size() / 2];
+            } else {
+                const T a = values[values.size() / 2 - 1];
+                const T b = values[values.size() / 2];
+                out.at<T>(y, x) = static_cast<T>((static_cast<uint32_t>(a) + static_cast<uint32_t>(b) + 1) / 2);
+            }
+        }
+    }
+}
+
+template <typename RenderFunc>
+static inline void renderAccumulatedSlice(
+    cv::Mat& out,
+    RenderFunc&& renderFunc,
+    float baseOff,
+    const std::vector<float>& accumOffsets,
+    AccumType accumType,
+    int cvType)
+{
+    if (accumOffsets.empty()) {
+        renderFunc(out, baseOff);
+        return;
+    }
+
+    const size_t sampleCount = accumOffsets.size();
+
+    if (sampleCount == 1) {
+        renderFunc(out, baseOff + accumOffsets.front());
+        return;
+    }
+
+    if (accumType == AccumType::Max) {
+        renderFunc(out, baseOff + accumOffsets.front());
+        cv::Mat tmp;
+        for (size_t i = 1; i < sampleCount; ++i) {
+            renderFunc(tmp, baseOff + accumOffsets[i]);
+            cv::max(out, tmp, out);
+        }
+    } else if (accumType == AccumType::Mean) {
+        cv::Mat sample;
+        renderFunc(sample, baseOff + accumOffsets.front());
+        cv::Mat sum;
+        sample.convertTo(sum, CV_64F);
+        for (size_t i = 1; i < sampleCount; ++i) {
+            renderFunc(sample, baseOff + accumOffsets[i]);
+            cv::Mat tmp;
+            sample.convertTo(tmp, CV_64F);
+            sum += tmp;
+        }
+        sum /= static_cast<double>(sampleCount);
+        sum.convertTo(out, cvType);
+    } else { // Median
+        std::vector<cv::Mat> samples;
+        samples.reserve(sampleCount);
+        cv::Mat sample;
+        for (size_t i = 0; i < sampleCount; ++i) {
+            renderFunc(sample, baseOff + accumOffsets[i]);
+            samples.emplace_back(sample.clone());
+        }
+        if (cvType == CV_16UC1) {
+            computeMedianFromSamples<uint16_t>(samples, out);
+        } else {
+            computeMedianFromSamples<uint8_t>(samples, out);
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     // clang-format off
@@ -597,6 +689,10 @@ int main(int argc, char *argv[])
             "Number of slices to render")
         ("slice-step", po::value<float>()->default_value(1.0f),
             "Spacing between successive slices along the surface normal (fractional values allowed)")
+        ("accum", po::value<float>()->default_value(0.0f),
+            "Optional fractional accumulation step (< slice-step) aggregated into each output slice (0 = disabled)")
+        ("accum-type", po::value<std::string>()->default_value("max"),
+            "Accumulation reducer when --accum > 0: max, mean, or median")
         ("crop-x", po::value<int>()->default_value(0),
             "Crop region X coordinate")
         ("crop-y", po::value<int>()->default_value(0),
@@ -684,6 +780,49 @@ int main(int argc, char *argv[])
     if (!std::isfinite(slice_step) || slice_step <= 0.0) {
         std::cerr << "Error: --slice-step must be positive.\n";
         return EXIT_FAILURE;
+    }
+    double accum_step = static_cast<double>(parsed["accum"].as<float>());
+    if (!std::isfinite(accum_step) || accum_step < 0.0) {
+        std::cerr << "Error: --accum must be non-negative.\n";
+        return EXIT_FAILURE;
+    }
+    std::string accum_type_str = parsed["accum-type"].as<std::string>();
+    std::transform(accum_type_str.begin(), accum_type_str.end(), accum_type_str.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    AccumType accumType = AccumType::Max;
+    if (accum_type_str == "max") {
+        accumType = AccumType::Max;
+    } else if (accum_type_str == "mean") {
+        accumType = AccumType::Mean;
+    } else if (accum_type_str == "median") {
+        accumType = AccumType::Median;
+    } else {
+        std::cerr << "Error: --accum-type must be one of: max, mean, median.\n";
+        return EXIT_FAILURE;
+    }
+    std::vector<float> accumOffsets;
+    if (accum_step > 0.0) {
+        if (accum_step > slice_step) {
+            std::cerr << "Error: --accum must be <= --slice-step.\n";
+            return EXIT_FAILURE;
+        }
+        const double ratio = slice_step / accum_step;
+        const double rounded = std::round(ratio);
+        const double tol = 1e-4;
+        if (std::abs(ratio - rounded) > tol) {
+            std::cerr << "Error: --accum must evenly divide --slice-step (ratio="
+                      << ratio << ").\n";
+            return EXIT_FAILURE;
+        }
+        const size_t samples = std::max<size_t>(1, static_cast<size_t>(rounded));
+        const double spacing = slice_step / static_cast<double>(samples);
+        accumOffsets.reserve(samples);
+        for (size_t i = 0; i < samples; ++i) {
+            accumOffsets.push_back(static_cast<float>(spacing * static_cast<double>(i)));
+        }
+        accum_step = spacing;
+        std::cout << "Accumulation enabled: " << samples << " samples per slice at step "
+                  << spacing << " using '" << accum_type_str << "' reducer." << std::endl;
     }
     // Downsample factor for this OME-Zarr pyramid level: g=0 -> 1, g=1 -> 0.5, ...
     const float ds_scale = std::ldexp(1.0f, -group_idx);  // 2^(-group_idx)
@@ -1015,14 +1154,18 @@ int main(int argc, char *argv[])
                     cv::Mat tileOut; // will be CV_8UC1 or CV_16UC1
 
                     if (output_is_u16) {
+                        auto renderOne16 = [&](cv::Mat& dst, float offset) {
+                            renderSliceFromBase16(dst, ds.get(), &chunk_cache,
+                                                  basePoints, stepDirs, offset, static_cast<float>(ds_scale));
+                        };
                         xt::xarray<uint16_t> outChunk =
                             xt::empty<uint16_t>({dz, dy_dst, dx_dst});
                         for (size_t zi = 0; zi < dz; ++zi) {
                             const size_t sliceIndex = z0 + zi;
                             const float off = static_cast<float>(
                                 (static_cast<double>(sliceIndex) - baseZ_center) * slice_step);
-                            renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
-                                                  basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                            renderAccumulatedSlice(
+                                tileOut, renderOne16, off, accumOffsets, accumType, CV_16UC1);
                             if (rotQuad >= 0 || flip_axis >= 0) {
                                 rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
                             }
@@ -1048,13 +1191,17 @@ int main(int argc, char *argv[])
                         z5::types::ShapeType outOffset = {z0, y0_dst, x0_dst};
                         z5::multiarray::writeSubarray<uint16_t>(dsOut0, outChunk, outOffset.begin());
                     } else {
+                        auto renderOne8 = [&](cv::Mat& dst, float offset) {
+                            renderSliceFromBase(dst, ds.get(), &chunk_cache,
+                                                basePoints, stepDirs, offset, static_cast<float>(ds_scale));
+                        };
                         xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({dz, dy_dst, dx_dst});
                         for (size_t zi = 0; zi < dz; ++zi) {
                             const size_t sliceIndex = z0 + zi;
                             const float off = static_cast<float>(
                                 (static_cast<double>(sliceIndex) - baseZ_center) * slice_step);
-                            renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
-                                                basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                            renderAccumulatedSlice(
+                                tileOut, renderOne8, off, accumOffsets, accumType, CV_8UC1);
                             if (rotQuad >= 0 || flip_axis >= 0) {
                                 rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
                             }
@@ -1197,6 +1344,11 @@ int main(int argc, char *argv[])
         attrs["source_group"] = group_idx;
         attrs["num_slices"] = baseZ;
         attrs["slice_step"] = slice_step;
+        if (!accumOffsets.empty()) {
+            attrs["accum_step"] = accum_step;
+            attrs["accum_type"] = accum_type_str;
+            attrs["accum_samples"] = static_cast<int>(accumOffsets.size());
+        }
         {
             cv::Size attr_xy = tgt_size;
             const int rotQuadAttr = normalizeQuadrantRotation(rotate_angle);
@@ -1495,13 +1647,17 @@ int main(int argc, char *argv[])
                             basePoints, stepDirs);
 
                         if (output_is_u16) {
+                            auto renderOne16 = [&](cv::Mat& dst, float offset) {
+                                renderSliceFromBase16(dst, ds.get(), &chunk_cache,
+                                                      basePoints, stepDirs, offset, static_cast<float>(ds_scale));
+                            };
                             std::vector<uint16_t> tileBuf(tileW * tileH, 0);
                             cv::Mat tileOut; // CV_16UC1
                             for (int zi = 0; zi < num_slices; ++zi) {
                                 const float off = static_cast<float>(
                                     (static_cast<double>(zi) - num_slices_center) * slice_step);
-                                renderSliceFromBase16(tileOut, ds.get(), &chunk_cache,
-                                                      basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                                renderAccumulatedSlice(
+                                    tileOut, renderOne16, off, accumOffsets, accumType, CV_16UC1);
                                 cv::Mat tileTransformed = tileOut;
                                 rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
                                 const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
@@ -1527,13 +1683,17 @@ int main(int argc, char *argv[])
                                 }
                             }
                         } else {
+                            auto renderOne8 = [&](cv::Mat& dst, float offset) {
+                                renderSliceFromBase(dst, ds.get(), &chunk_cache,
+                                                    basePoints, stepDirs, offset, static_cast<float>(ds_scale));
+                            };
                             std::vector<uint8_t> tileBuf(tileW * tileH, 0);
                             cv::Mat tileOut; // CV_8UC1
                             for (int zi = 0; zi < num_slices; ++zi) {
                                 const float off = static_cast<float>(
                                     (static_cast<double>(zi) - num_slices_center) * slice_step);
-                                renderSliceFromBase(tileOut, ds.get(), &chunk_cache,
-                                                    basePoints, stepDirs, off, static_cast<float>(ds_scale));
+                                renderAccumulatedSlice(
+                                    tileOut, renderOne8, off, accumOffsets, accumType, CV_8UC1);
                                 cv::Mat tileTransformed = tileOut;
                                 rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
                                 const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);

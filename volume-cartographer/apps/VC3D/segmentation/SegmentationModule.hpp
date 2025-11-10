@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QElapsedTimer>
 #include <QPointer>
 #include <QSet>
 #include <QLoggingCategory>
@@ -15,6 +16,8 @@
 
 #include <opencv2/core.hpp>
 
+#include "../CVolumeViewer.hpp"
+#include "SegmentationEditManager.hpp"
 #include "SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
@@ -71,6 +74,7 @@ public:
     void setSmoothingStrength(float strength);
     void setSmoothingIterations(int iterations);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
+    void setHoverPreviewEnabled(bool enabled);
 
     void applyEdits();
     void resetEdits();
@@ -97,6 +101,8 @@ public:
     [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload() const;
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
+    [[nodiscard]] bool hoverPreviewEnabled() const { return _hoverPreviewEnabled; }
+    bool ensureHoverTarget();
 
     struct HoverInfo
     {
@@ -225,6 +231,9 @@ private:
 
     void updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
     [[nodiscard]] bool isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
+    SegmentationEditManager::GridSearchResolution hoverLookupDetail(const cv::Vec3f& worldPos);
+    void resetHoverLookupDetail();
+    void recordPointerSample(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
 
     bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPull(int direction);
@@ -257,6 +266,7 @@ private:
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Tracer};
     int _growthSteps{10};
     bool _ignoreSegSurfaceChange{false};
+    bool _hoverPreviewEnabled{true};
 
     std::unique_ptr<segmentation::CorrectionsState> _corrections;
 
@@ -280,4 +290,21 @@ private:
     QTimer* _autosaveTimer{nullptr};
     bool _pendingAutosave{false};
     bool _autosaveNotifiedFailure{false};
+
+    struct HoverLookupMetrics
+    {
+        bool initialized{false};
+        cv::Vec3f lastWorld{0.0f, 0.0f, 0.0f};
+        float smoothedWorldUnitsPerSecond{0.0f};
+        QElapsedTimer timer;
+    };
+
+    HoverLookupMetrics _hoverLookup;
+    struct HoverPointerSample
+    {
+        bool valid{false};
+        cv::Vec3f world{0.0f, 0.0f, 0.0f};
+        QPointer<CVolumeViewer> viewer;
+    };
+    HoverPointerSample _hoverPointer;
 };

@@ -312,6 +312,16 @@ void SegmentationWidget::buildUi()
     _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     layout->addWidget(_lblNormalGrid);
 
+    auto* hoverRow = new QHBoxLayout();
+    hoverRow->addSpacing(4);
+    _chkShowHoverMarker = new QCheckBox(tr("Show hover marker"), this);
+    _chkShowHoverMarker->setToolTip(tr("Toggle the hover indicator in the segmentation viewer. "
+                                       "Disabling this hides the preview marker and defers grid lookups "
+                                       "until you drag or use push/pull."));
+    hoverRow->addWidget(_chkShowHoverMarker);
+    hoverRow->addStretch(1);
+    layout->addLayout(hoverRow);
+
     _groupEditing = new CollapsibleSettingsGroup(tr("Editing"), this);
     auto* falloffLayout = _groupEditing->contentLayout();
     auto* falloffParent = _groupEditing->contentWidget();
@@ -655,6 +665,9 @@ void SegmentationWidget::buildUi()
     connect(_chkEditing, &QCheckBox::toggled, this, [this](bool enabled) {
         updateEditingState(enabled, true);
     });
+    connect(_chkShowHoverMarker, &QCheckBox::toggled, this, [this](bool enabled) {
+        setShowHoverMarker(enabled);
+    });
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
@@ -944,6 +957,11 @@ void SegmentationWidget::syncUiState()
         _chkEraseBrush->setEnabled(_editingEnabled);
     }
 
+    if (_chkShowHoverMarker) {
+        const QSignalBlocker blocker(_chkShowHoverMarker);
+        _chkShowHoverMarker->setChecked(_showHoverMarker);
+    }
+
     const bool editingActive = _editingEnabled && !_growthInProgress;
 
     auto updateSpin = [&](QDoubleSpinBox* spin, float value) {
@@ -1149,6 +1167,7 @@ void SegmentationWidget::restoreSettings()
 
     _pushPullRadiusSteps = settings.value(QStringLiteral("push_pull_radius_steps"), _dragRadiusSteps).toFloat();
     _pushPullSigmaSteps = settings.value(QStringLiteral("push_pull_sigma_steps"), _dragSigmaSteps).toFloat();
+    _showHoverMarker = settings.value(QStringLiteral("show_hover_marker"), _showHoverMarker).toBool();
 
     _dragRadiusSteps = std::clamp(_dragRadiusSteps, 0.25f, 128.0f);
     _dragSigmaSteps = std::clamp(_dragSigmaSteps, 0.05f, 64.0f);
@@ -1273,6 +1292,22 @@ void SegmentationWidget::setEraseBrushActive(bool active)
     }
     _eraseBrushActive = sanitized;
     syncUiState();
+}
+
+void SegmentationWidget::setShowHoverMarker(bool enabled)
+{
+    if (_showHoverMarker == enabled) {
+        return;
+    }
+    _showHoverMarker = enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("show_hover_marker"), _showHoverMarker);
+        emit hoverMarkerToggled(_showHoverMarker);
+    }
+    if (_chkShowHoverMarker) {
+        const QSignalBlocker blocker(_chkShowHoverMarker);
+        _chkShowHoverMarker->setChecked(_showHoverMarker);
+    }
 }
 
 void SegmentationWidget::setPendingChanges(bool pending)

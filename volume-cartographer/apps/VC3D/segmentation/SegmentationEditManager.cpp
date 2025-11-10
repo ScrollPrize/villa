@@ -62,6 +62,7 @@ bool SegmentationEditManager::beginSession(QuadSurface* baseSurface)
 
     _baseSurface = baseSurface;
     _gridScale = baseSurface->scale();
+    resetPointerSeed();
 
     _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(baseSurface->rawPoints().clone());
     auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
@@ -98,6 +99,7 @@ void SegmentationEditManager::endSession()
     _previewPoints = nullptr;
     _originalPoints.reset();
     _baseSurface = nullptr;
+    resetPointerSeed();
     _dirty = false;
     _pendingGrowthMarking = false;
 }
@@ -180,6 +182,7 @@ void SegmentationEditManager::refreshFromBaseSurface()
         return;
     }
     _gridScale = _baseSurface->scale();
+    resetPointerSeed();
 
     auto current = _baseSurface->rawPoints();
     if (!_originalPoints) {
@@ -199,15 +202,35 @@ void SegmentationEditManager::refreshFromBaseSurface()
     _dirty = !_editedVertices.empty();
 }
 
+namespace
+{
+struct StridedSearchProfile
+{
+    int stride{1};
+    int maxRadius{0};
+    int radiusStep{1};
+    float breakMultiplier{1.5f};
+};
+}
+
 std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(const cv::Vec3f& worldPos,
-                                                                              float* outDistance) const
+                                                                              float* outDistance,
+                                                                              GridSearchResolution detail) const
 {
     if (!_baseSurface) {
         return std::nullopt;
     }
 
-    cv::Vec3f ptr = _baseSurface->pointer();
+    cv::Vec3f ptr;
+    if (_pointerSeedValid) {
+        ptr = _pointerSeed;
+    } else {
+        ptr = _baseSurface->pointer();
+        _pointerSeed = ptr;
+        _pointerSeedValid = true;
+    }
     const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400);
+    _pointerSeed = ptr;
     cv::Vec3f raw = _baseSurface->loc_raw(ptr);
 
     const cv::Mat_<cv::Vec3f>* points = nullptr;
@@ -256,34 +279,93 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     int bestRow = -1;
     int bestCol = -1;
 
-    constexpr int kInitialRadius = 12;
-    for (int radius = 0; radius <= kInitialRadius; ++radius) {
-        const int rowStart = std::max(0, approxRow - radius);
-        const int rowEnd = std::min(rows - 1, approxRow + radius);
-        const int colStart = std::max(0, approxCol - radius);
-        const int colEnd = std::min(cols - 1, approxCol + radius);
+    const auto runDenseSearch = [&]() {
+        constexpr int kInitialRadius = 12;
+        for (int radius = 0; radius <= kInitialRadius; ++radius) {
+            const int rowStart = std::max(0, approxRow - radius);
+            const int rowEnd = std::min(rows - 1, approxRow + radius);
+            const int colStart = std::max(0, approxCol - radius);
+            const int colEnd = std::min(cols - 1, approxCol + radius);
 
-        for (int r = rowStart; r <= rowEnd; ++r) {
-            for (int c = colStart; c <= colEnd; ++c) {
-                accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
+            for (int r = rowStart; r <= rowEnd; ++r) {
+                for (int c = colStart; c <= colEnd; ++c) {
+                    accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
+                }
+            }
+
+            if (bestRow != -1) {
+                const float bestDist = std::sqrt(bestDistSq);
+                const float breakThreshold = (radius == 0)
+                                                 ? stepNorm
+                                                 : stepNorm * 1.5f * static_cast<float>(radius);
+                if (bestDist <= breakThreshold) {
+                    break;
+                }
             }
         }
 
-        if (bestRow != -1) {
-            const float bestDist = std::sqrt(bestDistSq);
-            const float breakThreshold = (radius == 0) ? stepNorm : stepNorm * 1.5f * static_cast<float>(radius);
-            if (bestDist <= breakThreshold) {
-                break;
+        if (bestRow == -1 || bestDistSq > stepNormSq * 25.0f) {
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
+                }
             }
         }
+    };
+
+    const auto runStridedSearch = [&](const StridedSearchProfile& profile) {
+        if (profile.stride <= 0 || profile.radiusStep <= 0 || profile.maxRadius < 0) {
+            return;
+        }
+
+        for (int radius = 0; radius <= profile.maxRadius; radius += profile.radiusStep) {
+            const int rowStart = approxRow - radius;
+            const int rowEnd = approxRow + radius;
+            const int colStart = approxCol - radius;
+            const int colEnd = approxCol + radius;
+
+            for (int r = rowStart; r <= rowEnd; r += profile.stride) {
+                if (r < 0 || r >= rows) {
+                    continue;
+                }
+                for (int c = colStart; c <= colEnd; c += profile.stride) {
+                    if (c < 0 || c >= cols) {
+                        continue;
+                    }
+                    accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
+                }
+            }
+
+            if (bestRow != -1) {
+                const float bestDist = std::sqrt(bestDistSq);
+                const float breakRadius = (radius == 0)
+                                              ? stepNorm
+                                              : stepNorm * profile.breakMultiplier * static_cast<float>(radius);
+                if (bestDist <= breakRadius) {
+                    break;
+                }
+            }
+        }
+    };
+
+    switch (detail) {
+    case GridSearchResolution::Low: {
+        runStridedSearch(StridedSearchProfile{4, 16, 4, 2.5f});
+        if (bestRow == -1) {
+            runStridedSearch(StridedSearchProfile{2, 12, 2, 1.75f});
+        }
+        break;
     }
-
-    if (bestRow == -1 || bestDistSq > stepNormSq * 25.0f) {
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
-            }
+    case GridSearchResolution::Medium: {
+        runStridedSearch(StridedSearchProfile{2, 12, 2, 1.75f});
+        if (bestRow == -1) {
+            runDenseSearch();
         }
+        break;
+    }
+    case GridSearchResolution::High:
+        runDenseSearch();
+        break;
     }
 
     if (bestRow == -1) {
@@ -883,6 +965,12 @@ void SegmentationEditManager::clearActiveDrag()
     _activeDrag.baseWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
     _activeDrag.targetWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
     _activeDrag.samples.clear();
+}
+
+void SegmentationEditManager::resetPointerSeed()
+{
+    _pointerSeedValid = false;
+    _pointerSeed = cv::Vec3f(0.0f, 0.0f, 0.0f);
 }
 
 float SegmentationEditManager::stepNormalization() const

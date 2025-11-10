@@ -118,6 +118,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
+        _hoverPreviewEnabled = _widget->showHoverMarker();
     }
 
     if (_overlay) {
@@ -193,6 +194,49 @@ SegmentationModule::HoverInfo SegmentationModule::hoverInfo() const
     return info;
 }
 
+void SegmentationModule::setHoverPreviewEnabled(bool enabled)
+{
+    if (_hoverPreviewEnabled == enabled) {
+        return;
+    }
+    _hoverPreviewEnabled = enabled;
+    resetHoverLookupDetail();
+    if (!enabled && _hover.valid) {
+        _hover.clear();
+    }
+    refreshOverlay();
+}
+
+bool SegmentationModule::ensureHoverTarget()
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+    if (_hoverPreviewEnabled) {
+        return _hover.valid;
+    }
+    if (!_hoverPointer.valid) {
+        return false;
+    }
+    CVolumeViewer* viewer = _hoverPointer.viewer.data();
+    if (!viewer) {
+        _hoverPointer.valid = false;
+        return false;
+    }
+    auto gridIndex = _editManager->worldToGridIndex(_hoverPointer.world);
+    if (!gridIndex) {
+        _hover.clear();
+        return false;
+    }
+    auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second);
+    if (!world) {
+        _hover.clear();
+        return false;
+    }
+    _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
+    return true;
+}
+
 void SegmentationModule::bindWidgetSignals()
 {
     if (!_widget) {
@@ -237,6 +281,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setSmoothingStrength);
     connect(_widget, &SegmentationWidget::smoothingIterationsChanged,
             this, &SegmentationModule::setSmoothingIterations);
+    connect(_widget, &SegmentationWidget::hoverMarkerToggled,
+            this, &SegmentationModule::setHoverPreviewEnabled);
     connect(_widget, &SegmentationWidget::correctionsCreateRequested,
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
@@ -318,6 +364,9 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
+        resetHoverLookupDetail();
+        _hoverPointer.valid = false;
+        _hoverPointer.viewer = nullptr;
         if (_pendingAutosave) {
             performAutosave();
         }
@@ -473,7 +522,7 @@ void SegmentationModule::refreshOverlay()
                 .isGrowth = false
             };
         }
-    } else if (_hover.valid) {
+    } else if (_hover.valid && _hoverPreviewEnabled) {
         state.activeMarker = SegmentationOverlayController::VertexMarker{
             .row = _hover.row,
             .col = _hover.col,
@@ -861,34 +910,126 @@ bool SegmentationModule::isNearRotationHandle(CVolumeViewer* viewer, const cv::V
     return _rotationHandleHitTester(viewer, worldPos);
 }
 
+SegmentationEditManager::GridSearchResolution SegmentationModule::hoverLookupDetail(const cv::Vec3f& worldPos)
+{
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        resetHoverLookupDetail();
+        return SegmentationEditManager::GridSearchResolution::High;
+    }
+
+    if (!_hoverLookup.initialized) {
+        _hoverLookup.initialized = true;
+        _hoverLookup.lastWorld = worldPos;
+        _hoverLookup.smoothedWorldUnitsPerSecond = 0.0f;
+        _hoverLookup.timer.start();
+        return SegmentationEditManager::GridSearchResolution::High;
+    }
+
+    const qint64 elapsedNs = _hoverLookup.timer.nsecsElapsed();
+    _hoverLookup.timer.restart();
+    double dtSec = static_cast<double>(elapsedNs) / 1e9;
+    if (dtSec <= 1e-4) {
+        dtSec = 1e-4;
+    }
+
+    const cv::Vec3f delta = worldPos - _hoverLookup.lastWorld;
+    _hoverLookup.lastWorld = worldPos;
+
+    const float distance = cv::norm(delta);
+    const float instantaneousSpeed = distance / static_cast<float>(dtSec);
+
+    constexpr float kSmoothing = 0.2f;
+    if (_hoverLookup.smoothedWorldUnitsPerSecond <= 0.0f) {
+        _hoverLookup.smoothedWorldUnitsPerSecond = instantaneousSpeed;
+    } else {
+        _hoverLookup.smoothedWorldUnitsPerSecond =
+            _hoverLookup.smoothedWorldUnitsPerSecond * (1.0f - kSmoothing) +
+            instantaneousSpeed * kSmoothing;
+    }
+
+    constexpr float kMediumThreshold = 4.0f;
+    constexpr float kLowThreshold = 12.0f;
+
+    if (_hoverLookup.smoothedWorldUnitsPerSecond >= kLowThreshold) {
+        return SegmentationEditManager::GridSearchResolution::Low;
+    }
+    if (_hoverLookup.smoothedWorldUnitsPerSecond >= kMediumThreshold) {
+        return SegmentationEditManager::GridSearchResolution::Medium;
+    }
+    return SegmentationEditManager::GridSearchResolution::High;
+}
+
+void SegmentationModule::resetHoverLookupDetail()
+{
+    if (_hoverLookup.timer.isValid()) {
+        _hoverLookup.timer.invalidate();
+    }
+    _hoverLookup.initialized = false;
+    _hoverLookup.smoothedWorldUnitsPerSecond = 0.0f;
+    _hoverLookup.lastWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
+}
+
+void SegmentationModule::recordPointerSample(CVolumeViewer* viewer, const cv::Vec3f& worldPos)
+{
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        _hoverPointer.valid = false;
+        _hoverPointer.viewer = nullptr;
+        return;
+    }
+    if (!viewer || !isSegmentationViewer(viewer)) {
+        _hoverPointer.valid = false;
+        _hoverPointer.viewer = nullptr;
+        return;
+    }
+
+    _hoverPointer.valid = true;
+    _hoverPointer.viewer = viewer;
+    _hoverPointer.world = worldPos;
+}
+
 void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     bool hoverChanged = false;
 
-    if (!_editManager || !_editManager->hasSession()) {
+    if (!_hoverPreviewEnabled) {
+        resetHoverLookupDetail();
+        if (_hover.valid) {
+            _hover.clear();
+            hoverChanged = true;
+        }
+    } else if (!_editManager || !_editManager->hasSession()) {
+        resetHoverLookupDetail();
         if (_hover.valid) {
             _hover.clear();
             hoverChanged = true;
         }
     } else {
-        auto gridIndex = _editManager->worldToGridIndex(worldPos);
-        if (!gridIndex) {
+        const auto detail = hoverLookupDetail(worldPos);
+        if (detail != SegmentationEditManager::GridSearchResolution::High) {
             if (_hover.valid) {
                 _hover.clear();
                 hoverChanged = true;
             }
-        } else if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
-            const bool rowChanged = !_hover.valid || _hover.row != gridIndex->first;
-            const bool colChanged = !_hover.valid || _hover.col != gridIndex->second;
-            const bool worldChanged = !_hover.valid || cv::norm(_hover.world - *world) >= 1e-4f;
-            const bool viewerChanged = !_hover.valid || _hover.viewer != viewer;
-            if (rowChanged || colChanged || worldChanged || viewerChanged) {
-                _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
+        } else {
+            auto gridIndex = _editManager->worldToGridIndex(worldPos, nullptr, detail);
+            if (!gridIndex) {
+                if (_hover.valid) {
+                    _hover.clear();
+                    hoverChanged = true;
+                }
+            } else if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
+                const bool rowChanged = !_hover.valid || _hover.row != gridIndex->first;
+                const bool colChanged = !_hover.valid || _hover.col != gridIndex->second;
+                const bool worldChanged = !_hover.valid || cv::norm(_hover.world - *world) >= 1e-4f;
+                const bool viewerChanged = !_hover.valid || _hover.viewer != viewer;
+                if (rowChanged || colChanged || worldChanged || viewerChanged) {
+                    _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
+                    hoverChanged = true;
+                }
+            } else if (_hover.valid) {
+                _hover.clear();
                 hoverChanged = true;
             }
-        } else if (_hover.valid) {
-            _hover.clear();
-            hoverChanged = true;
         }
     }
 

@@ -74,6 +74,9 @@ public:
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
 
+    void setSegmentationCursorMirroring(bool enabled);
+    bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
+
     void forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const;
 
 signals:
@@ -104,6 +107,7 @@ private:
     float _overlayWindowHigh{255.0f};
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
+    bool _mirrorCursorToSegmentation{false};
 
     VolumeOverlayController* _volumeOverlay{nullptr};
 };
