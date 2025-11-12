@@ -134,8 +134,12 @@ void SurfacePanelController::loadSurfaces(bool reload)
 
     populateSurfaceTree();
     applyFilters();
+    logSurfaceLoadSummary();
     if (_filtersUpdated) {
         _filtersUpdated();
+    }
+    if (_viewerManager) {
+        _viewerManager->primeSurfacePatchIndicesAsync();
     }
     emit surfacesLoaded();
 }
@@ -222,8 +226,12 @@ void SurfacePanelController::loadSurfacesIncremental()
               << " reload=" << changes.toReload.size() << std::endl;
 
     applyFilters();
+    logSurfaceLoadSummary();
     if (_filtersUpdated) {
         _filtersUpdated();
+    }
+    if (_viewerManager) {
+        _viewerManager->primeSurfacePatchIndicesAsync();
     }
     emit surfacesLoaded();
     std::cout << "Incremental surface load completed." << std::endl;
@@ -558,13 +566,19 @@ void SurfacePanelController::handleTreeSelectionChanged()
     OpChain* chain = ensureOpChainFor(id);
     QuadSurface* surface = chain ? chain->src() : nullptr;
 
+    bool surfaceJustLoaded = false;
     if (!surface && _volumePkg) {
         if (auto surfMeta = _volumePkg->getSurface(id)) {
             surface = surfMeta->surface();
+            surfaceJustLoaded = (surface != nullptr);
         }
     }
 
     if (surface && _surfaces) {
+        // Keep the named entry in sync so intersection viewers can retain this mesh
+        if (surfaceJustLoaded || !_surfaces->surface(id)) {
+            _surfaces->setSurface(id, surface, true, false);
+        }
         _surfaces->setSurface("segmentation", surface, false, false);
     }
 
@@ -578,6 +592,10 @@ void SurfacePanelController::handleTreeSelectionChanged()
     }
 
     emit surfaceActivated(idQString, surface, chain);
+
+    if (surfaceJustLoaded) {
+        applyFilters();
+    }
 }
 
 void SurfacePanelController::showContextMenu(const QPoint& pos)
@@ -667,6 +685,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
         emit convertToObjRequested(segmentId);
     });
+    QAction* cropBoundsAction = contextMenu.addAction(tr("Crop bounds to valid region"));
+    connect(cropBoundsAction, &QAction::triggered, this, [this, segmentId]() {
+        emit cropBoundsRequested(segmentId);
+    });
 
     QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
     connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
@@ -721,6 +743,16 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     deleteAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_TrashIcon));
     connect(deleteAction, &QAction::triggered, this, [this, deletionTargets]() {
         handleDeleteSegments(deletionTargets);
+    });
+
+    contextMenu.addSeparator();
+
+    const std::string segmentIdStd = segmentId.toStdString();
+    QAction* highlightAction = contextMenu.addAction(tr("Highlight in slice views"));
+    highlightAction->setCheckable(true);
+    highlightAction->setChecked(_highlightedSurfaceIds.count(segmentIdStd) > 0);
+    connect(highlightAction, &QAction::toggled, this, [this, segmentIdStd](bool checked) {
+        applyHighlightSelection(segmentIdStd, checked);
     });
 
     contextMenu.exec(_ui.treeWidget->mapToGlobal(pos));
@@ -1318,6 +1350,33 @@ void SurfacePanelController::applyFiltersInternal()
         }
     }
 
+    auto collectVisibleSurfaces = [&](std::set<std::string>& out) {
+        if (!_ui.treeWidget) {
+            return;
+        }
+        QTreeWidgetItemIterator visIt(_ui.treeWidget);
+        while (*visIt) {
+            auto* item = *visIt;
+            const auto idStr = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            std::string id = idStr.toStdString();
+            if (!id.empty() && !item->isHidden()) {
+                auto meta = _volumePkg->getSurface(id);
+                if (!meta) {
+                    meta = _volumePkg->loadSurface(id);
+                }
+                if (meta) {
+                    out.insert(id);
+                    if (_surfaces && !_surfaces->surface(id)) {
+                        if (auto* quad = meta->surface()) {
+                            _surfaces->setSurface(id, quad, true, false);
+                        }
+                    }
+                }
+            }
+            ++visIt;
+        }
+    };
+
     if (!hasActiveFilters) {
         QTreeWidgetItemIterator it(_ui.treeWidget);
         while (*it) {
@@ -1326,9 +1385,7 @@ void SurfacePanelController::applyFiltersInternal()
         }
 
         std::set<std::string> intersects = {"segmentation"};
-        for (const auto& id : _volumePkg->getLoadedSurfaceIDs()) {
-            intersects.insert(id);
-        }
+        collectVisibleSurfaces(intersects);
 
         if (_viewerManager) {
             _viewerManager->forEachViewer([&intersects](CVolumeViewer* viewer) {
@@ -1346,10 +1403,7 @@ void SurfacePanelController::applyFiltersInternal()
     POI* poi = _surfaces ? _surfaces->poi("focus") : nullptr;
     int filterCounter = 0;
     const bool currentOnly = isChecked(_filters.currentOnly);
-
-    if (currentOnly && !_currentSurfaceId.empty() && _volumePkg->getSurface(_currentSurfaceId)) {
-        intersects.insert(_currentSurfaceId);
-    }
+    const bool restrictToCurrent = currentOnly && !_currentSurfaceId.empty();
 
     QTreeWidgetItemIterator it(_ui.treeWidget);
     while (*it) {
@@ -1358,6 +1412,18 @@ void SurfacePanelController::applyFiltersInternal()
 
         bool show = true;
         auto surfMeta = _volumePkg->getSurface(id);
+        if (!surfMeta) {
+            surfMeta = _volumePkg->loadSurface(id);
+        }
+        if (surfMeta && _surfaces && !_surfaces->surface(id)) {
+            if (auto* quad = surfMeta->surface()) {
+                _surfaces->setSurface(id, quad, true, false);
+            }
+        }
+
+        if (restrictToCurrent && !id.empty()) {
+            show = show && (id == _currentSurfaceId);
+        }
 
         if (surfMeta) {
             if (isChecked(_filters.focusPoints) && poi) {
@@ -1463,13 +1529,22 @@ void SurfacePanelController::applyFiltersInternal()
 
         item->setHidden(!show);
 
-        if (show && !currentOnly && surfMeta) {
-            intersects.insert(id);
-        } else if (!show) {
+        if (!show) {
             filterCounter++;
         }
 
         ++it;
+    }
+
+    intersects.clear();
+    intersects.insert("segmentation");
+    bool insertedCurrent = false;
+    if (restrictToCurrent && _volumePkg->getSurface(_currentSurfaceId)) {
+        intersects.insert(_currentSurfaceId);
+        insertedCurrent = true;
+    }
+    if (!restrictToCurrent || !insertedCurrent) {
+        collectVisibleSurfaces(intersects);
     }
 
     if (_viewerManager) {
@@ -1569,4 +1644,74 @@ OpChain* SurfacePanelController::ensureOpChainFor(const std::string& id)
         it = _opchains->find(id);
     }
     return it != _opchains->end() ? it->second : nullptr;
+}
+
+void SurfacePanelController::logSurfaceLoadSummary() const
+{
+    if (!_volumePkg) {
+        std::cout << "[SurfacePanel] No volume package set; skipping surface load summary." << std::endl;
+        return;
+    }
+
+    const auto segIds = _volumePkg->segmentationIDs();
+    if (segIds.empty()) {
+        std::cout << "[SurfacePanel] No segmentation IDs available." << std::endl;
+        return;
+    }
+
+    size_t loadedCount = 0;
+    std::vector<std::string> missing;
+    missing.reserve(segIds.size());
+
+    for (const auto& id : segIds) {
+        bool hasSurface = false;
+        if (_surfaces) {
+            if (_surfaces->surface(id)) {
+                hasSurface = true;
+            }
+        } else {
+            hasSurface = static_cast<bool>(_volumePkg->getSurface(id));
+        }
+
+        if (hasSurface) {
+            ++loadedCount;
+        } else {
+            missing.push_back(id);
+        }
+    }
+
+    std::cout << "[SurfacePanel] Loaded " << loadedCount << " / " << segIds.size()
+              << " surfaces into memory." << std::endl;
+    if (!missing.empty()) {
+        const size_t previewCount = std::min<size_t>(missing.size(), 10);
+        std::cout << "[SurfacePanel] Missing (" << missing.size() << ") IDs: ";
+        for (size_t i = 0; i < previewCount; ++i) {
+            std::cout << missing[i];
+            if (i + 1 < previewCount) {
+                std::cout << ", ";
+            }
+        }
+        if (missing.size() > previewCount) {
+            std::cout << ", ...";
+        }
+        std::cout << std::endl;
+    }
+}
+
+void SurfacePanelController::applyHighlightSelection(const std::string& id, bool enabled)
+{
+    if (id.empty()) {
+        return;
+    }
+
+    if (enabled) {
+        _highlightedSurfaceIds.insert(id);
+    } else {
+        _highlightedSurfaceIds.erase(id);
+    }
+
+    if (_viewerManager) {
+        std::vector<std::string> ids(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
+        _viewerManager->setHighlightedSurfaceIds(ids);
+    }
 }

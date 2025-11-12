@@ -6,6 +6,9 @@
 #include <functional>
 #include <algorithm>
 #include <iostream>
+#include <cmath>
+#include <optional>
+#include <vector>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -37,6 +40,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "ToolDialogs.hpp"
+#include <nlohmann/json.hpp>
 
 // --------- local helpers for running external tools -------------------------
 static bool runProcessBlocking(const QString& program,
@@ -93,6 +97,45 @@ static QString findVcTool(const char* name)
 }
 
 namespace { // -------------------- anonymous namespace -------------------------
+
+bool isValidSurfacePoint(const cv::Vec3f& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]) &&
+           !(point[0] == -1.f && point[1] == -1.f && point[2] == -1.f);
+}
+
+std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& points)
+{
+    if (points.empty()) {
+        return std::nullopt;
+    }
+
+    int minRow = points.rows;
+    int maxRow = -1;
+    int minCol = points.cols;
+    int maxCol = -1;
+
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            if (!isValidSurfacePoint(points(r, c))) {
+                continue;
+            }
+            minRow = std::min(minRow, r);
+            maxRow = std::max(maxRow, r);
+            minCol = std::min(minCol, c);
+            maxCol = std::max(maxCol, c);
+        }
+    }
+
+    if (maxRow < 0 || maxCol < 0) {
+        return std::nullopt;
+    }
+
+    return cv::Rect(minCol,
+                    minRow,
+                    maxCol - minCol + 1,
+                    maxRow - minRow + 1);
+}
 
 // Owns the lifecycle for the async SLIM run; deletes itself on finish/cancel
 class SlimJob : public QObject {
@@ -940,6 +983,167 @@ void CWindow::onConvertToObj(const std::string& segmentId)
     _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
     statusBar()->showMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: No volume package loaded"));
+        return;
+    }
+
+    auto surfMeta = fVpkg->getSurface(segmentId);
+    if (!surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    QuadSurface* surface = surfMeta->surface();
+    if (!surface) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Failed to load data"));
+        return;
+    }
+
+    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Missing coordinate grid"));
+        return;
+    }
+
+    const int origCols = points->cols;
+    const int origRows = points->rows;
+
+    const auto boundsOpt = computeValidSurfaceBounds(*points);
+    if (!boundsOpt) {
+        QMessageBox::warning(this,
+                             tr("Crop failed"),
+                             tr("Surface %1 does not contain any valid vertices to crop.")
+                                 .arg(QString::fromStdString(segmentId)));
+        return;
+    }
+
+    const cv::Rect roi = *boundsOpt;
+    if (roi.x == 0 && roi.y == 0 && roi.width == origCols && roi.height == origRows) {
+        if (statusBar()) {
+            statusBar()->showMessage(
+                tr("Surface %1 already occupies the tightest bounds.")
+                    .arg(QString::fromStdString(segmentId)),
+                4000);
+        }
+        return;
+    }
+
+    struct CroppedChannel {
+        std::string name;
+        cv::Mat data;
+    };
+    std::vector<CroppedChannel> croppedChannels;
+    croppedChannels.reserve(surface->channelNames().size());
+
+    const auto channelNames = surface->channelNames();
+    for (const auto& name : channelNames) {
+        cv::Mat channelData = surface->channel(name, SURF_CHANNEL_NORESIZE);
+        if (channelData.empty()) {
+            continue;
+        }
+        if (channelData.cols % origCols != 0 || channelData.rows % origRows != 0) {
+            QMessageBox::warning(this,
+                                 tr("Crop failed"),
+                                 tr("Channel '%1' has size %2×%3, which is not divisible by the surface grid %4×%5.")
+                                     .arg(QString::fromStdString(name))
+                                     .arg(channelData.cols)
+                                     .arg(channelData.rows)
+                                     .arg(origCols)
+                                     .arg(origRows));
+            return;
+        }
+
+        const int scaleX = channelData.cols / origCols;
+        const int scaleY = channelData.rows / origRows;
+        const cv::Rect chanRect(roi.x * scaleX,
+                                roi.y * scaleY,
+                                roi.width * scaleX,
+                                roi.height * scaleY);
+        if (chanRect.x < 0 || chanRect.y < 0 ||
+            chanRect.x + chanRect.width > channelData.cols ||
+            chanRect.y + chanRect.height > channelData.rows) {
+            QMessageBox::warning(this,
+                                 tr("Crop failed"),
+                                 tr("Computed crop exceeds the bounds of channel '%1'.")
+                                     .arg(QString::fromStdString(name)));
+            return;
+        }
+
+        croppedChannels.push_back({name, channelData(chanRect).clone()});
+    }
+
+    cv::Mat_<cv::Vec3f> croppedPoints = (*points)(roi).clone();
+
+    std::unique_ptr<QuadSurface> tempSurface;
+    try {
+        tempSurface = std::make_unique<QuadSurface>(croppedPoints, surface->scale());
+        tempSurface->path = surface->path;
+        tempSurface->id = surface->id;
+        if (surface->meta) {
+            tempSurface->meta = new nlohmann::json(*surface->meta);
+        }
+        for (const auto& ch : croppedChannels) {
+            tempSurface->setChannel(ch.name, ch.data);
+        }
+        tempSurface->save(surface->path.string(), surface->id, true);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this,
+                              tr("Crop failed"),
+                              tr("Failed to crop %1: %2")
+                                  .arg(QString::fromStdString(segmentId))
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    croppedPoints.copyTo(*points);
+    for (const auto& ch : croppedChannels) {
+        surface->setChannel(ch.name, ch.data);
+    }
+    surface->invalidateCache();
+
+    if (tempSurface && tempSurface->meta) {
+        if (!surface->meta) {
+            surface->meta = new nlohmann::json(*tempSurface->meta);
+        } else {
+            *surface->meta = *tempSurface->meta;
+        }
+        if (surface->meta) {
+            if (surfMeta->meta) {
+                *surfMeta->meta = *surface->meta;
+            } else {
+                surfMeta->meta = new nlohmann::json(*surface->meta);
+            }
+        }
+    }
+
+    surfMeta->bbox = surface->bbox();
+
+    if (_surf_col) {
+        _surf_col->setSurface(segmentId, surface, false, false);
+        if (_surfID == segmentId) {
+            _surf_col->setSurface("segmentation", surface, false, false);
+        }
+    }
+    if (_surfacePanel) {
+        _surfacePanel->refreshSurfaceMetrics(segmentId);
+    }
+
+    const QString segLabel = QString::fromStdString(segmentId);
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Cropped %1 to %2×%3 (offset %4,%5)")
+                .arg(segLabel)
+                .arg(roi.width)
+                .arg(roi.height)
+                .arg(roi.x)
+                .arg(roi.y),
+            5000);
+    }
 }
 
 void CWindow::onAlphaCompRefine(const std::string& segmentId)

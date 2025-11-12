@@ -388,9 +388,14 @@ void SegmentationModule::applyEdits()
         }
     }
     clearInvalidationBrush();
+    auto dirtyBounds = _editManager->takeEditedBounds();
     _editManager->applyPreview();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+        auto* preview = _editManager->previewSurface();
+        if (preview && dirtyBounds) {
+            _editManager->publishDirtyBounds(*dirtyBounds);
+        }
+        _surfaces->setSurface("segmentation", preview, false, false);
     }
     emitPendingChanges();
     markAutosaveNeeded(true);

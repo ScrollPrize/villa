@@ -10,6 +10,7 @@ add_library(vc_core
         src/Volume.cpp
         src/VolumePkg.cpp
         src/ChunkedTensor.cpp
+        src/SurfacePatchIndex.cpp
         src/Logging.cpp
         src/Slicing.cpp
         src/Surface.cpp

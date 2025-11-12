@@ -85,6 +85,8 @@ public:
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
     void refreshSessionFromSurface(QuadSurface* surface);
+    bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
+    void requestAutosaveFromGrowth();
 
     void attachViewer(CVolumeViewer* viewer);
     void updateViewerCursors();

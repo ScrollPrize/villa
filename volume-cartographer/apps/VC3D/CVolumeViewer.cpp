@@ -3,6 +3,7 @@
 
 #include "VolumeViewerCmaps.hpp"
 #include "VCSettings.hpp"
+#include "ViewerManager.hpp"
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
@@ -27,7 +28,9 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <cstdlib>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <opencv2/imgproc.hpp>
@@ -284,11 +287,12 @@ static cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& poi
 }
 
 
-CVolumeViewer::CVolumeViewer(CSurfaceCollection *col, QWidget* parent)
+CVolumeViewer::CVolumeViewer(CSurfaceCollection *col, ViewerManager* manager, QWidget* parent)
     : QWidget(parent)
     , fGraphicsView(nullptr)
     , fBaseImageItem(nullptr)
     , _surf_col(col)
+    , _viewerManager(manager)
     , _highlighted_point_id(0)
     , _selected_point_id(0)
     , _dragged_point_id(0)
@@ -770,8 +774,12 @@ void CVolumeViewer::onIntersectionChanged(std::string a, std::string b, Intersec
     if (_ignore_intersect_change && intersection == _ignore_intersect_change)
         return;
 
-    if (!_intersect_tgts.count(a) || !_intersect_tgts.count(b))
+    const bool tracksVisibleSeg = (_surf_name == "segmentation" && (a == "visible_segmentation" || b == "visible_segmentation"));
+    const bool involvesSurfName = (a == _surf_name || b == _surf_name);
+
+    if (!involvesSurfName && !tracksVisibleSeg) {
         return;
+    }
 
     //FIXME fix segmentation vs visible_segmentation naming and usage ..., think about dependency chain ..
     if (a == _surf_name || (_surf_name == "segmentation" && a == "visible_segmentation"))
@@ -779,13 +787,15 @@ void CVolumeViewer::onIntersectionChanged(std::string a, std::string b, Intersec
     else if (b == _surf_name || (_surf_name == "segmentation" && b == "visible_segmentation"))
         invalidateIntersect(a);
     
-    renderIntersections();
+    if (a == _surf_name || b == _surf_name) {
+        renderIntersections();
+    }
 }
 
 void CVolumeViewer::setIntersects(const std::set<std::string> &set)
 {
     _intersect_tgts = set;
-    
+
     renderIntersections();
 }
 
@@ -799,6 +809,36 @@ void CVolumeViewer::setIntersectionOpacity(float opacity)
             }
         }
     }
+}
+
+void CVolumeViewer::setIntersectionThickness(float thickness)
+{
+    thickness = std::max(0.0f, thickness);
+    if (std::abs(thickness - _intersectionThickness) < 1e-6f) {
+        return;
+    }
+    _intersectionThickness = thickness;
+    renderIntersections();
+}
+
+void CVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
+{
+    std::unordered_set<std::string> next(ids.begin(), ids.end());
+    if (next == _highlightedSurfaceIds) {
+        return;
+    }
+    _highlightedSurfaceIds = std::move(next);
+    renderIntersections();
+}
+
+void CVolumeViewer::setSurfacePatchSamplingStride(int stride)
+{
+    stride = std::max(1, stride);
+    if (_surfacePatchSamplingStride == stride) {
+        return;
+    }
+    _surfacePatchSamplingStride = stride;
+    renderIntersections();
 }
 
 void CVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
@@ -1555,79 +1595,114 @@ void CVolumeViewer::renderIntersections()
 {
     if (!volume || !volume->zarrDataset() || !_surf)
         return;
-    
-    std::vector<std::string> remove;
-    for (auto &pair : _intersect_items)
-        if (!_intersect_tgts.count(pair.first)) {
-            for(auto &item : pair.second) {
-                fScene->removeItem(item);
-                delete item;
-            }
-            remove.push_back(pair.first);
+
+    const QRectF viewRect = fGraphicsView
+        ? fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect()
+        : QRectF(curr_img_area);
+
+    auto removeItemsForKey = [&](const std::string& key) {
+        auto it = _intersect_items.find(key);
+        if (it == _intersect_items.end()) {
+            return;
         }
-    for(auto key : remove)
-        _intersect_items.erase(key);
+        for (auto* item : it->second) {
+            fScene->removeItem(item);
+            delete item;
+        }
+        _intersect_items.erase(it);
+    };
+
+    auto clearAllIntersectionItems = [&]() {
+        std::vector<std::string> keys;
+        keys.reserve(_intersect_items.size());
+        for (const auto& pair : _intersect_items) {
+            keys.push_back(pair.first);
+        }
+        for (const auto& key : keys) {
+            removeItemsForKey(key);
+        }
+    };
 
     PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
 
     
     if (plane) {
-        cv::Rect plane_roi = {curr_img_area.x()/_scale, curr_img_area.y()/_scale, curr_img_area.width()/_scale, curr_img_area.height()/_scale};
+        cv::Rect plane_roi = {static_cast<int>(viewRect.x()/_scale),
+                              static_cast<int>(viewRect.y()/_scale),
+                              static_cast<int>(viewRect.width()/_scale),
+                              static_cast<int>(viewRect.height()/_scale)};
+        // Enlarge the sampled region so nearby intersections outside the viewport still get clipped.
+        const int dominantSpan = std::max(plane_roi.width, plane_roi.height);
+        const int planeRoiPadding = 8;
+        plane_roi.x -= planeRoiPadding;
+        plane_roi.y -= planeRoiPadding;
+        plane_roi.width += planeRoiPadding * 2;
+        plane_roi.height += planeRoiPadding * 2;
 
         cv::Vec3f corner = plane->coord(cv::Vec3f(0,0,0), {plane_roi.x, plane_roi.y, 0.0});
         Rect3D view_bbox = {corner, corner};
         view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {plane_roi.br().x, plane_roi.y, 0}));
         view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {plane_roi.x, plane_roi.br().y, 0}));
         view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {plane_roi.br().x, plane_roi.br().y, 0}));
+        const cv::Vec3f bboxExtent = view_bbox.high - view_bbox.low;
+        const float maxExtent = std::max(std::abs(bboxExtent[0]),
+                              std::max(std::abs(bboxExtent[1]), std::abs(bboxExtent[2])));
+        const float viewPadding = std::max(64.0f, maxExtent * 0.1f);
+        view_bbox.low -= cv::Vec3f(viewPadding, viewPadding, viewPadding);
+        view_bbox.high += cv::Vec3f(viewPadding, viewPadding, viewPadding);
+
+        const SurfacePatchIndex* patchIndex =
+            _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        if (!patchIndex) {
+            clearAllIntersectionItems();
+            return;
+        }
+        const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
 
         std::vector<std::string> intersect_cands;
-        std::vector<std::string> intersect_tgts_v;
-
-        for (auto key : _intersect_tgts)
-            intersect_tgts_v.push_back(key);
-
-#pragma omp parallel for
-        for(int n=0;n<intersect_tgts_v.size();n++) {
-            std::string key = intersect_tgts_v[n];
-            bool haskey;
-#pragma omp critical
-            haskey = _intersect_items.count(key);
-            if (!haskey && dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
-                QuadSurface *segmentation = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
-
-                if (intersect(view_bbox, segmentation->bbox()))
-#pragma omp critical
-                    intersect_cands.push_back(key);
-                else
-#pragma omp critical
-                    _intersect_items[key] = {};
+        intersect_cands.reserve(_intersect_tgts.size());
+        for (const auto& key : _intersect_tgts) {
+            Surface* surfacePtr = _surf_col->surface(key);
+            if (!surfacePtr) {
+                std::cout << "[CVolumeViewer] skip candidate '" << key << "' (surface missing)\n";
+                continue;
             }
-        }
-
-        std::vector<std::vector<std::vector<cv::Vec3f>>> intersections(intersect_cands.size());
-
-#pragma omp parallel for
-        for(int n=0;n<intersect_cands.size();n++) {
-            std::string key = intersect_cands[n];
-            QuadSurface *segmentation = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
-
-            std::vector<std::vector<cv::Vec2f>> xy_seg_;
-            if (key == "segmentation") {
-                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale, 1000);
+            auto* segmentation = dynamic_cast<QuadSurface*>(surfacePtr);
+            if (!segmentation) {
+                std::cout << "[CVolumeViewer] skip candidate '" << key << "' (not QuadSurface)\n";
+                continue;
             }
-            else
-                find_intersect_segments(intersections[n], xy_seg_, segmentation->rawPoints(), plane, plane_roi, 4/_scale);
 
+            intersect_cands.push_back(key);
         }
 
         std::hash<std::string> str_hasher;
-
-        for(int n=0;n<intersect_cands.size();n++) {
-            std::string key = intersect_cands[n];
-
-            if (!intersections.size()) {
-                _intersect_items[key] = {};
+        size_t colorIndex = 0;
+        for (const auto& key : intersect_cands) {
+            QuadSurface *segmentation = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
+            if (!segmentation) {
                 continue;
+            }
+
+            std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
+            patchIndex->queryTriangles(view_bbox, segmentation, triangleCandidates);
+
+            std::vector<IntersectionLine> intersectionLines;
+            intersectionLines.reserve(triangleCandidates.size());
+            for (const auto& candidate : triangleCandidates) {
+                auto segment = SurfacePatchIndex::clipTriangleToPlane(candidate, *plane, clipTolerance);
+                if (!segment) {
+                    continue;
+                }
+
+                IntersectionLine line;
+                line.world.reserve(2);
+                line.surfaceParams.reserve(2);
+                for (int i = 0; i < 2; ++i) {
+                    line.world.push_back(segment->world[i]);
+                    line.surfaceParams.push_back(segment->surfaceParams[i]);
+                }
+                intersectionLines.push_back(std::move(line));
             }
 
             size_t seed = str_hasher(key);
@@ -1638,8 +1713,45 @@ void CVolumeViewer::renderIntersections()
             cvcol[prim] = 200 + rand() % 55;
 
             QColor col(cvcol[0],cvcol[1],cvcol[2]);
-            float width = 2;
+            float width = 3;
             int z_value = 5;
+
+            static const QColor palette[] = {
+                QColor(255, 50, 50),
+                QColor(255, 161, 50),
+                QColor(238, 255, 50),
+                QColor(128, 255, 50),
+                QColor(50, 255, 83),
+                QColor(50, 255, 193),
+                QColor(50, 206, 255),
+                QColor(50, 95, 255),
+                QColor(116, 50, 255),
+                QColor(226, 50, 255),
+                QColor(255, 50, 173),
+                QColor(255, 50, 63),
+                QColor(255, 148, 50),
+                QColor(250, 255, 50),
+                QColor(140, 255, 50),
+                QColor(50, 255, 71),
+                QColor(50, 255, 181),
+                QColor(50, 218, 255),
+                QColor(50, 108, 255),
+                QColor(104, 50, 255),
+                QColor(214, 50, 255),
+                QColor(255, 50, 185),
+                QColor(255, 50, 75),
+                QColor(255, 136, 50),
+                QColor(255, 246, 50),
+                QColor(153, 255, 50),
+                QColor(50, 255, 59),
+                QColor(50, 255, 169),
+                QColor(50, 230, 255),
+                QColor(50, 120, 255),
+                QColor(91, 50, 255),
+                QColor(201, 50, 255),
+            };
+            col = palette[colorIndex % std::size(palette)];
+            ++colorIndex;
 
             if (key == "segmentation") {
                 col =
@@ -1650,120 +1762,135 @@ void CVolumeViewer::renderIntersections()
                 z_value = 20;
             }
 
+            if (!_highlightedSurfaceIds.empty() && _highlightedSurfaceIds.count(key)) {
+                col = QColor(0, 220, 255);
+                width = 4;
+                z_value = 30;
+            }
 
-            QuadSurface *segmentation = dynamic_cast<QuadSurface*>(_surf_col->surface(intersect_cands[n]));
             std::vector<QGraphicsItem*> items;
-
-            int len = 0;
-            for (auto seg : intersections[n]) {
+            items.reserve(intersectionLines.size());
+            for (const auto& line : intersectionLines) {
+                if (line.world.size() < 2) {
+                    continue;
+                }
                 QPainterPath path;
-
                 bool first = true;
-                cv::Vec3f last = {-1,-1,-1};
-                for (auto wp : seg)
-                {
-                    len++;
+                for (const auto& wp : line.world) {
                     cv::Vec3f p = plane->project(wp, 1.0, _scale);
-
-                    if (last[0] != -1 && cv::norm(p-last) >= 8) {
-                        auto item = fGraphicsView->scene()->addPath(path, QPen(col, width));
-                        item->setZValue(z_value);
-                        item->setOpacity(_intersectionOpacity);
-                        items.push_back(item);
-                        first = true;
-                    }
-                    last = p;
-
                     if (first)
-                        path.moveTo(p[0],p[1]);
+                        path.moveTo(p[0], p[1]);
                     else
-                        path.lineTo(p[0],p[1]);
+                        path.lineTo(p[0], p[1]);
                     first = false;
                 }
-                auto item = fGraphicsView->scene()->addPath(path, QPen(col, width));
+                auto* item = fGraphicsView->scene()->addPath(path, QPen(col, width));
                 item->setZValue(z_value);
                 item->setOpacity(_intersectionOpacity);
+                if (fBaseImageItem) {
+                    item->setParentItem(fBaseImageItem);
+                }
                 items.push_back(item);
             }
-            _intersect_items[key] = items;
-            _ignore_intersect_change = new Intersection({intersections[n]});
-            _surf_col->setIntersection(_surf_name, key, _ignore_intersect_change);
-            _ignore_intersect_change = nullptr;
+
+            if (!items.empty()) {
+                removeItemsForKey(key);
+                _intersect_items[key] = items;
+            } else {
+                removeItemsForKey(key);
+            }
+
+            if (_surf_col && !intersectionLines.empty()) {
+                auto* intersection = new Intersection();
+                intersection->lines = std::move(intersectionLines);
+                _ignore_intersect_change = intersection;
+                _surf_col->setIntersection(_surf_name, key, intersection);
+                _ignore_intersect_change = nullptr;
+            }
         }
+
+        // Remove stale intersections that are no longer requested.
+        std::vector<std::string> planeKeysToRemove;
+        for (const auto& entry : _intersect_items) {
+            if (!_intersect_tgts.count(entry.first)) {
+                planeKeysToRemove.push_back(entry.first);
+            }
+        }
+        for (const auto& key : planeKeysToRemove) {
+            removeItemsForKey(key);
+        }
+
     }
     else if (_surf_name == "segmentation" /*&& dynamic_cast<QuadSurface*>(_surf_col->surface("visible_segmentation"))*/) {
-        // QuadSurface *crop = dynamic_cast<QuadSurface*>(_surf_col->surface("visible_segmentation"));
-
         //TODO make configurable, for now just show everything!
         std::vector<std::pair<std::string,std::string>> intersects = _surf_col->intersections("segmentation");
-        for(auto pair : intersects) {
+        QuadSurface* quadSurface = dynamic_cast<QuadSurface*>(_surf);
+        if (!quadSurface) {
+            return;
+        }
+
+        for (auto pair : intersects) {
             std::string key = pair.first;
             if (key == "segmentation")
                 key = pair.second;
             
-            if (_intersect_items.count(key) || !_intersect_tgts.count(key))
+            if (!_intersect_tgts.count(key))
                 continue;
-            
-            std::unordered_map<cv::Vec3f,cv::Vec3f,vec3f_hash> location_cache;
-            std::vector<cv::Vec3f> src_locations;
 
-            for (auto seg : _surf_col->intersection(pair.first, pair.second)->lines)
-                for (auto wp : seg)
-                    src_locations.push_back(wp);
-            
-#pragma omp parallel
-            {
-                // SurfacePointer *ptr = crop->pointer();
-                auto ptr = _surf->pointer();
-#pragma omp for
-                for (auto wp : src_locations) {
-                    // float res = crop->pointTo(ptr, wp, 2.0, 100);
-                    // cv::Vec3f p = crop->loc(ptr)*_ds_scale + cv::Vec3f(_vis_center[0],_vis_center[1],0);
-                    float res = _surf->pointTo(ptr, wp, 2.0, 100);
-                    cv::Vec3f p = _surf->loc(ptr)*_scale ;//+ cv::Vec3f(_vis_center[0],_vis_center[1],0);
-                    //FIXME still happening?
-                    if (res >= 2.0)
-                        p = {-1,-1,-1};
-                        // std::cout << "WARNING pointTo() high residual in renderIntersections()" << std::endl;
-#pragma omp critical
-                    location_cache[wp] = p;
-                }
+            Intersection* storedIntersection = _surf_col->intersection(pair.first, pair.second);
+            if (!storedIntersection || storedIntersection->lines.empty()) {
+                continue;
             }
-            
+
             std::vector<QGraphicsItem*> items;
-            for (auto seg : _surf_col->intersection(pair.first, pair.second)->lines) {
+            for (const auto& line : storedIntersection->lines) {
+                if (line.surfaceParams.size() < 2 || line.surfaceParams.size() != line.world.size()) {
+                    continue;
+                }
                 QPainterPath path;
-                
                 bool first = true;
-                cv::Vec3f last = {-1,-1,-1};
-                for (auto wp : seg)
-                {
-                    cv::Vec3f p = location_cache[wp];
-                    
-                    if (p[0] == -1)
+                for (const auto& param : line.surfaceParams) {
+                    cv::Vec3f p = quadSurface->loc(param) * _scale;
+                    if (p[0] == -1) {
                         continue;
-
-                    if (last[0] != -1 && cv::norm(p-last) >= 8) {
-                        auto item = fGraphicsView->scene()->addPath(path, QPen(key == "seg yz" ? COLOR_SEG_YZ: COLOR_SEG_XZ, 2));
-                        item->setZValue(5);
-                        item->setOpacity(_intersectionOpacity);
-                        items.push_back(item);
-                        first = true;
                     }
-                    last = p;
-
                     if (first)
-                        path.moveTo(p[0],p[1]);
+                        path.moveTo(p[0], p[1]);
                     else
-                        path.lineTo(p[0],p[1]);
+                        path.lineTo(p[0], p[1]);
                     first = false;
                 }
+
+                if (path.isEmpty()) {
+                    continue;
+                }
+
                 auto item = fGraphicsView->scene()->addPath(path, QPen(key == "seg yz" ? COLOR_SEG_YZ: COLOR_SEG_XZ, 2));
                 item->setZValue(5);
                 item->setOpacity(_intersectionOpacity);
+                if (fBaseImageItem) {
+                    item->setParentItem(fBaseImageItem);
+                }
                 items.push_back(item);
             }
-            _intersect_items[key] = items;
+
+            if (!items.empty()) {
+                removeItemsForKey(key);
+                _intersect_items[key] = items;
+            } else {
+                removeItemsForKey(key);
+            }
+        }
+
+        // Remove intersection drawings for keys that are no longer being tracked.
+        std::vector<std::string> keysToRemove;
+        for (const auto& entry : _intersect_items) {
+            if (!_intersect_tgts.count(entry.first)) {
+                keysToRemove.push_back(entry.first);
+            }
+        }
+        for (const auto& key : keysToRemove) {
+            removeItemsForKey(key);
         }
     }
 }
@@ -2267,7 +2394,6 @@ void CVolumeViewer::updateAllOverlays()
     }
 
     invalidateVis();
-    invalidateIntersect();
     renderIntersections();
 
     emit overlaysUpdated();

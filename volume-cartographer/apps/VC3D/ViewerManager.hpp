@@ -2,12 +2,16 @@
 
 #include <QObject>
 #include <QString>
+#include <QFutureWatcher>
 
 #include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
 class CVolumeViewer;
@@ -22,6 +26,8 @@ class VolumeOverlayController;
 class ChunkCache;
 class SegmentationModule;
 class Volume;
+class Surface;
+class QuadSurface;
 
 class ViewerManager : public QObject
 {
@@ -71,6 +77,10 @@ public:
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 
+    void setSurfacePatchSamplingStride(int stride);
+    int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
+    void primeSurfacePatchIndicesAsync();
+
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
 
@@ -78,12 +88,20 @@ public:
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
 
     void forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const;
+    void setIntersectionThickness(float thickness);
+    float intersectionThickness() const { return _intersectionThickness; }
+    void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
+    SurfacePatchIndex* surfacePatchIndex();
 
 signals:
     void viewerCreated(CVolumeViewer* viewer);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
+
+private slots:
+    void handleSurfacePatchIndexPrimeFinished();
+    void handleSurfaceChanged(std::string name, Surface* surf);
 
 private:
     CSurfaceCollection* _surfaces;
@@ -99,6 +117,7 @@ private:
     std::vector<CVolumeViewer*> _viewers;
     std::unordered_map<CVolumeViewer*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
+    float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;
     std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
@@ -108,6 +127,15 @@ private:
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
+    int _surfacePatchSamplingStride{1};
 
     VolumeOverlayController* _volumeOverlay{nullptr};
+    SurfacePatchIndex _surfacePatchIndex;
+    bool _surfacePatchIndexDirty{true};
+    std::unordered_map<const QuadSurface*, int> _surfaceDirtyBoundsVersions;
+    std::unordered_set<QuadSurface*> _indexedSurfaces;
+    std::vector<QuadSurface*> _pendingSurfacePatchIndexSurfaces;
+    QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
+
+    void rebuildSurfacePatchIndexIfNeeded();
 };

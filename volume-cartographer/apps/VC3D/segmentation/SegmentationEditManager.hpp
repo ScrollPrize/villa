@@ -81,6 +81,9 @@ public:
     [[nodiscard]] QuadSurface* baseSurface() const { return _baseSurface; }
     [[nodiscard]] QuadSurface* previewSurface() const { return _previewSurface.get(); }
 
+    // Synchronize a rectangular region with the latest base-surface data without rebuilding the session.
+    bool applyExternalSurfaceUpdate(const cv::Rect& vertexRect);
+
     void setRadius(float radiusSteps);
     void setSigma(float sigmaSteps);
 
@@ -89,7 +92,9 @@ public:
 
     [[nodiscard]] bool hasPendingChanges() const { return _dirty; }
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const;
-    bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points, bool dirtyState);
+    bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
+                          bool dirtyState,
+                          std::optional<cv::Rect>* outDiffBounds = nullptr);
 
     void resetPreview();
     void applyPreview();
@@ -110,14 +115,17 @@ public:
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }
+    [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
+    void publishDirtyBounds(const cv::Rect& vertexRect);
     void markNextEditsAsGrowth();
 
     void bakePreviewToOriginal();
     bool invalidateRegion(int centerRow, int centerCol, int radius);
     bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
+    std::optional<cv::Rect> takeEditedBounds();
 
 private:
     static bool isInvalidPoint(const cv::Vec3f& value);
@@ -129,6 +137,8 @@ private:
     void clearActiveDrag();
     float stepNormalization() const;
     void resetPointerSeed();
+    void expandEditedBounds(int row, int col);
+    void publishDirtyBoundsFromRecentTouched();
 
     QuadSurface* _baseSurface{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
@@ -144,6 +154,7 @@ private:
     std::vector<GridKey> _recentTouched;
     ActiveDrag _activeDrag;
     cv::Vec2f _gridScale{1.0f, 1.0f};
+    std::optional<cv::Rect> _editedBounds;
 
     mutable bool _pointerSeedValid{false};
     mutable cv::Vec3f _pointerSeed{0.0f, 0.0f, 0.0f};

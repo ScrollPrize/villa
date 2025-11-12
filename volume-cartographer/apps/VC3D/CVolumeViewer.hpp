@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <optional>
 #include "overlays/ViewerOverlayControllerBase.hpp"
@@ -13,8 +14,10 @@
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QImage;
+class ViewerManager;
 
 
 class CVolumeViewer : public QWidget
@@ -22,7 +25,7 @@ class CVolumeViewer : public QWidget
     Q_OBJECT
 
 public:
-    CVolumeViewer(CSurfaceCollection *col, QWidget* parent = 0);
+    CVolumeViewer(CSurfaceCollection *col, ViewerManager* manager, QWidget* parent = 0);
     ~CVolumeViewer(void);
 
     void setCache(ChunkCache *cache);
@@ -96,6 +99,11 @@ public:
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
+    void setIntersectionThickness(float thickness);
+    float intersectionThickness() const { return _intersectionThickness; }
+    void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
+    void setSurfacePatchSamplingStride(int stride);
+    int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
 
     void setOverlayVolume(std::shared_ptr<Volume> volume);
     std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
@@ -215,12 +223,18 @@ protected:
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
     Intersection *_ignore_intersect_change = nullptr;
+    bool _autoRefocusOnOffscreenIntersections = true;
+    bool _hasLastPlaneOrigin = false;
+    cv::Vec3f _lastPlaneOrigin = {0.0f, 0.0f, 0.0f};
     
     CSurfaceCollection *_surf_col = nullptr;
+    ViewerManager* _viewerManager = nullptr;
     
     VCCollection* _point_collection = nullptr;
 
     float _intersectionOpacity{1.0f};
+    float _intersectionThickness{0.0f};
+    std::unordered_set<std::string> _highlightedSurfaceIds;
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;
@@ -265,5 +279,5 @@ protected:
     bool _overlayImageValid{false};
     QImage _overlayImage;
 
-
+    int _surfacePatchSamplingStride{1};
 };  // class CVolumeViewer

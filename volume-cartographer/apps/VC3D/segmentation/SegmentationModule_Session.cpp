@@ -148,11 +148,16 @@ bool SegmentationModule::restoreUndoSnapshot()
     }
 
     _suppressUndoCapture = true;
-    bool applied = _editManager->setPreviewPoints(points, false);
+    std::optional<cv::Rect> undoBounds;
+    bool applied = _editManager->setPreviewPoints(points, false, &undoBounds);
     if (applied) {
         _editManager->applyPreview();
         if (_surfaces) {
-            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+            auto* preview = _editManager->previewSurface();
+            if (preview && undoBounds && undoBounds->width > 0 && undoBounds->height > 0) {
+                _editManager->publishDirtyBounds(*undoBounds);
+            }
+            _surfaces->setSurface("segmentation", preview, false, false);
         }
         clearInvalidationBrush();
         refreshOverlay();
@@ -197,4 +202,22 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     }
     refreshOverlay();
     emitPendingChanges();
+}
+
+bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect)
+{
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+    if (!_editManager->applyExternalSurfaceUpdate(vertexRect)) {
+        return false;
+    }
+    refreshOverlay();
+    emitPendingChanges();
+    return true;
+}
+
+void SegmentationModule::requestAutosaveFromGrowth()
+{
+    markAutosaveNeeded();
 }
