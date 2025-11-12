@@ -139,6 +139,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _drawBBoxAct->setCheckable(true);
     connect(_drawBBoxAct, &QAction::toggled, this, &MenuActionController::toggleDrawBBox);
 
+    _mirrorCursorAct = new QAction(QObject::tr("Sync cursor to Surface view"), this);
+    _mirrorCursorAct->setCheckable(true);
+    if (qWindow) {
+        _mirrorCursorAct->setChecked(qWindow->segmentationCursorMirroringEnabled());
+    }
+    connect(_mirrorCursorAct, &QAction::toggled, this, &MenuActionController::toggleCursorMirroring);
+
     _surfaceFromSelectionAct = new QAction(QObject::tr("Surface from Selection"), this);
     connect(_surfaceFromSelectionAct, &QAction::triggered, this, &MenuActionController::surfaceFromSelection);
 
@@ -191,6 +198,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
         _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
     }
 
+    _viewMenu->addAction(_mirrorCursorAct);
     _viewMenu->addSeparator();
     _viewMenu->addAction(_resetViewsAct);
     _viewMenu->addSeparator();
@@ -599,6 +607,14 @@ void MenuActionController::toggleDrawBBox(bool enabled)
             }
         }
     });
+}
+
+void MenuActionController::toggleCursorMirroring(bool enabled)
+{
+    if (!_window) {
+        return;
+    }
+    _window->setSegmentationCursorMirroring(enabled);
 }
 
 void MenuActionController::surfaceFromSelection()

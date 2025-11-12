@@ -125,6 +125,7 @@ public:
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000) override;
     cv::Size size();
     [[nodiscard]] cv::Vec2f scale() const;
+    [[nodiscard]] cv::Vec3f center() const;
 
     void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
     void save(const std::filesystem::path &path, bool force_overwrite = false);
@@ -258,9 +259,6 @@ bool overlap(SurfaceMeta &a, SurfaceMeta &b, int max_iters = 1000);
 bool contains(SurfaceMeta &a, const cv::Vec3f &loc, int max_iters = 1000);
 bool contains(SurfaceMeta &a, const std::vector<cv::Vec3f> &locs);
 bool contains_any(SurfaceMeta &a, const std::vector<cv::Vec3f> &locs);
-
-//TODO constrain to visible area? or add visible area display?
-void find_intersect_segments(std::vector<std::vector<cv::Vec3f>> &seg_vol, std::vector<std::vector<cv::Vec2f>> &seg_grid, const cv::Mat_<cv::Vec3f> &points, PlaneSurface *plane, const cv::Rect &plane_roi, float step, int min_tries = 10);
 
 float min_loc(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f &loc, cv::Vec3f &out, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds, PlaneSurface *plane, float init_step = 16.0, float min_step = 0.125);
 

@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class CSurfaceCollection;
@@ -111,6 +112,7 @@ signals:
     void growSegmentRequested(const QString& segmentId);
     void addOverlapRequested(const QString& segmentId);
     void convertToObjRequested(const QString& segmentId);
+    void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
     void awsUploadRequested(const QString& segmentId);
     void growSeedsRequested(const QString& segmentId, bool isExpand, bool isRandomSeed);
@@ -120,6 +122,7 @@ signals:
     void alphaCompRefineRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
+    void neighborCopyRequested(const QString& segmentId, bool copyOut);
 
 
 private:
@@ -148,6 +151,8 @@ private:
                                bool enabledRevisit,
                                bool enabledInspect);
     OpChain* ensureOpChainFor(const std::string& id);
+    void logSurfaceLoadSummary() const;
+    void applyHighlightSelection(const std::string& id, bool enabled);
 
     UiRefs _ui;
     CSurfaceCollection* _surfaces{nullptr};
@@ -165,4 +170,5 @@ private:
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
+    std::unordered_set<std::string> _highlightedSurfaceIds;
 };

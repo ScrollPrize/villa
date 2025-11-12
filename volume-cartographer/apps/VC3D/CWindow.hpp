@@ -11,11 +11,13 @@
 #include <memory>
 #include <vector>
 #include <deque>
+#include <optional>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
 
 #include <QShortcut>
+#include <QSet>
 #include <unordered_map>
 
 #include "CPointCollectionWidget.hpp"
@@ -59,6 +61,7 @@ class MenuActionController;
 class SegmentationGrower;
 class WindowRangeWidget;
 class QLabel;
+class QTemporaryFile;
 
 class CWindow : public QMainWindow
 {
@@ -87,11 +90,13 @@ public slots:
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
+    void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
+    void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,
@@ -138,6 +143,8 @@ private:
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory = false);
     bool centerFocusOnCursor();
+    void setSegmentationCursorMirroring(bool enabled);
+    bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -213,6 +220,7 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     CSurfaceCollection *_surf_col;
     bool _useAxisAlignedSlices{false};
+    bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
     std::unordered_map<std::string, OpChain*> _opchains;
@@ -297,6 +305,32 @@ private:
     std::set<std::pair<std::string, std::string>> _pendingSegmentUpdates; // (dirName, segmentId)
     QElapsedTimer _lastInotifyProcessTime;
     static constexpr int INOTIFY_THROTTLE_MS = 100;
+
+    struct NeighborCopyJob {
+        enum class Stage { None, FirstPass, SecondPass };
+        Stage stage{Stage::None};
+        QString segmentId;
+        QString volumePath;
+        QString resumeSurfacePath;
+        QString outputDir;
+        QString generatedSurfacePath;
+        QString pass1JsonPath;
+        QString pass2JsonPath;
+        QString directoryPrefix;
+        bool copyOut{true};
+        QSet<QString> baselineEntries;
+        std::unique_ptr<QTemporaryFile> pass1JsonFile;
+        std::unique_ptr<QTemporaryFile> pass2JsonFile;
+    };
+
+    std::optional<NeighborCopyJob> _neighborCopyJob;
+    void handleNeighborCopyToolFinished(bool success);
+    QString findNewNeighborSurface(const NeighborCopyJob& job) const;
+    bool startNeighborCopyPass(const QString& paramsPath,
+                               const QString& resumeSurface,
+                               const QString& resumeOpt,
+                               int ompThreads);
+    void launchNeighborCopySecondPass();
 
 
 };  // class CWindow

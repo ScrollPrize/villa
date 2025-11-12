@@ -10,6 +10,48 @@
 
 
 
+namespace {
+
+QString quoteArg(const QString& arg)
+{
+    if (arg.isEmpty())
+        return "\"\"";
+
+    bool needsQuotes = false;
+    for (const QChar& ch : arg) {
+        if (ch.isSpace() || ch == '"' || ch == '\'' || ch == '\\') {
+            needsQuotes = true;
+            break;
+        }
+    }
+
+    if (!needsQuotes) {
+        return arg;
+    }
+
+    QString escaped = arg;
+    escaped.replace('\\', "\\\\");
+    escaped.replace('"', "\\\"");
+    return "\"" + escaped + "\"";
+}
+
+QString formatCommand(const QString& program, const QStringList& args, int ompThreads)
+{
+    QStringList quotedArgs;
+    quotedArgs.reserve(args.size());
+    for (const auto& arg : args) {
+        quotedArgs << quoteArg(arg);
+    }
+
+    QString base = QString("%1 %2").arg(program, quotedArgs.join(' '));
+    if (ompThreads > 0) {
+        return QString("OMP_NUM_THREADS=%1 %2").arg(ompThreads).arg(base);
+    }
+    return base;
+}
+
+} // namespace
+
 CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent)
     : QObject(parent)
     , _mainWindow(mainWindow)
@@ -64,6 +106,7 @@ CommandLineToolRunner::~CommandLineToolRunner()
 void CommandLineToolRunner::setVolumePath(const QString& path)
 {
     _volumePath = path;
+    _explicitVolumePath = !_volumePath.isEmpty();
 }
 
 void CommandLineToolRunner::setSegmentPath(const QString& path)
@@ -85,7 +128,7 @@ void CommandLineToolRunner::setRenderParams(float scale, int resolution, int lay
 
 void CommandLineToolRunner::setGrowParams(QString volumePath, QString tgtDir, QString jsonParams, int seed_x, int seed_y, int seed_z, bool useExpandMode, bool useRandomSeed)
 {
-    _volumePath = volumePath;
+    setVolumePath(volumePath);
     _tgtDir = tgtDir;
     _jsonParams = jsonParams;
     _seed_x = seed_x;
@@ -122,7 +165,7 @@ void CommandLineToolRunner::setGrowParams(QString volumePath, QString tgtDir, QS
 
 void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
 {
-    _volumePath = volumePath;
+    setVolumePath(volumePath);
     _srcDir = srcDir;
     _tgtDir = tgtDir;
     _jsonParams = jsonParams;
@@ -198,16 +241,24 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    if (_mainWindow) {
-        QString currentVolumePath = _mainWindow->getCurrentVolumePath();
-        if (currentVolumePath.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+    if (_explicitVolumePath) {
+        if (_volumePath.isEmpty()) {
+            QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
             return false;
         }
-        _volumePath = currentVolumePath;
-    } else if (_volumePath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
-        return false;
+    } else {
+        QString resolvedVolumePath = _volumePath;
+        if (_mainWindow) {
+            resolvedVolumePath = _mainWindow->getCurrentVolumePath();
+            if (resolvedVolumePath.isEmpty()) {
+                QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+                return false;
+            }
+        } else if (resolvedVolumePath.isEmpty()) {
+            QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
+            return false;
+        }
+        _volumePath = resolvedVolumePath;
     }
 
     if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
@@ -218,6 +269,13 @@ bool CommandLineToolRunner::execute(Tool tool)
     if (tool == Tool::GrowSegFromSegment && _srcSegment.isEmpty()) {
         QMessageBox::warning(nullptr, tr("Error"), tr("Source segment not specified."));
         return false;
+    }
+
+    if (tool == Tool::NeighborCopy) {
+        if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty() || _tgtDir.isEmpty()) {
+            QMessageBox::warning(nullptr, tr("Error"), tr("Neighbor copy parameters incomplete."));
+            return false;
+        }
     }
 
     if (tool == Tool::RenderTifXYZ) {
@@ -294,6 +352,7 @@ bool CommandLineToolRunner::execute(Tool tool)
 
     QStringList args = buildArguments(tool);
     QString toolCommand = toolName(tool);
+    QString formattedCommand = formatCommand(toolCommand, args, _ompThreads);
 
     QString startMessage;
 
@@ -326,6 +385,11 @@ bool CommandLineToolRunner::execute(Tool tool)
         emit toolStarted(_currentTool, startMessage);
 
         _consoleOutput->setTitle(tr("Running: %1").arg(toolCommand));
+        _consoleOutput->appendOutput(tr("Command: %1\n").arg(formattedCommand));
+        if (_logStream) {
+            *_logStream << "Command: " << formattedCommand << Qt::endl;
+            _logStream->flush();
+        }
 
         if (_autoShowConsole) {
             showConsoleOutput();
@@ -423,6 +487,8 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
         _logFile = nullptr;
     }
 
+    _explicitVolumePath = false;
+
     if (exitCode == 0 && exitStatus == QProcess::NormalExit) {
         QString message = tr("%1 completed successfully").arg(toolName(_currentTool));
         QString outputPath = getOutputPath();
@@ -484,6 +550,8 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
     }
 
     if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
+
+    _explicitVolumePath = false;
 
     emit toolFinished(_currentTool, false, errorMessage, QString(), false);
 
@@ -576,6 +644,15 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << _refineDst
                  << _jsonParams;
             break;
+        case Tool::NeighborCopy:
+            args << "-v" << _volumePath
+                 << "-p" << _jsonParams
+                 << "--resume" << _resumeSurfacePath
+                 << "-t" << _tgtDir;
+            if (!_resumeOpt.isEmpty()) {
+                args << "--resume-opt" << _resumeOpt;
+            }
+            break;
     }
 
     return args;
@@ -606,6 +683,9 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::AlphaCompRefine:
             return basePath + "vc_objrefine";
 
+        case Tool::NeighborCopy:
+            return basePath + "vc_grow_seg_from_seed";
+
         default:
             return "unknown_tool";
     }
@@ -615,6 +695,9 @@ QString CommandLineToolRunner::getOutputPath() const
 {
     if (_currentTool == Tool::AlphaCompRefine) {
         return _refineDst;
+    }
+    if (_currentTool == Tool::NeighborCopy) {
+        return _tgtDir;
     }
 
     QFileInfo outputInfo(_outputPattern);
@@ -636,8 +719,21 @@ void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
                                                const QString& dstSurface,
                                                const QString& jsonParams)
 {
-    _volumePath = volumePath;
+    setVolumePath(volumePath);
     _segmentPath = srcSurface;
     _refineDst = dstSurface;
     _jsonParams = jsonParams;
+}
+
+void CommandLineToolRunner::setNeighborCopyParams(const QString& volumePath,
+                                                  const QString& paramsJson,
+                                                  const QString& resumeSurface,
+                                                  const QString& outputDir,
+                                                  const QString& resumeOpt)
+{
+    setVolumePath(volumePath);
+    _jsonParams = paramsJson;
+    _resumeSurfacePath = resumeSurface;
+    _tgtDir = outputDir;
+    _resumeOpt = resumeOpt;
 }

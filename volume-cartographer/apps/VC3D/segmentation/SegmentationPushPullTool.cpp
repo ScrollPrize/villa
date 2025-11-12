@@ -449,6 +449,9 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
         return true;
     }
 
+    if (!_module.ensureHoverTarget()) {
+        return false;
+    }
     const auto hover = _module.hoverInfo();
     if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
         return false;
@@ -515,6 +518,9 @@ bool SegmentationPushPullTool::applyStepInternal()
         return false;
     }
 
+    if (!_module.ensureHoverTarget()) {
+        return false;
+    }
     const auto hover = _module.hoverInfo();
     if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
         qCWarning(lcSegPushPull) << "Push/pull aborted: hover info invalid or viewer not ready.";

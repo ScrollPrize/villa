@@ -330,6 +330,7 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
     }
 
     if (!buttons.testFlag(Qt::LeftButton)) {
+        recordPointerSample(viewer, worldPos);
         updateHover(viewer, worldPos);
     }
 }
@@ -400,6 +401,7 @@ void SegmentationModule::handleWheel(CVolumeViewer* viewer,
         break;
     }
 
+    recordPointerSample(viewer, worldPos);
     updateHover(viewer, worldPos);
     const float updatedRadius = falloffRadius(targetTool);
     QString label;
