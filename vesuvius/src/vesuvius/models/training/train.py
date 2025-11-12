@@ -268,6 +268,13 @@ class BaseTrainer:
             task_losses = []
             deferred_losses = []
 
+            target_ignore_value = None
+            for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                value = task_info.get(alias)
+                if value is not None:
+                    target_ignore_value = value
+                    break
+
             if "losses" in task_info:
                 print(f"Target {task_name} using multiple losses:")
                 for loss_cfg in task_info["losses"]:
@@ -279,6 +286,9 @@ class BaseTrainer:
                     for key, value in loss_cfg.items():
                         if key not in {"name", "weight", "kwargs", "start_epoch"}:
                             loss_kwargs.setdefault(key, value)
+
+                    if target_ignore_value is not None and "ignore_index" not in loss_kwargs:
+                        loss_kwargs["ignore_index"] = target_ignore_value
 
                     weight = loss_kwargs.get("weight", None)
                     ignore_index = loss_kwargs.get("ignore_index", -100)
@@ -597,12 +607,25 @@ class BaseTrainer:
             task_metrics = []
 
             num_classes = task_config.get('num_classes', 2)
-            task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes))
+            target_ignore_value = None
+            for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                value = task_config.get(alias)
+                if value is not None:
+                    target_ignore_value = value
+                    break
+
+            if target_ignore_value is not None:
+                task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes, ignore_index=target_ignore_value))
+            else:
+                task_metrics.append(ConnectedComponentsMetric(num_classes=num_classes))
 
             # if num_classes == 2:
             #     task_metrics.append(CriticalComponentsMetric())
 
-            task_metrics.append(IOUDiceMetric(num_classes=num_classes))
+            if target_ignore_value is not None:
+                task_metrics.append(IOUDiceMetric(num_classes=num_classes, ignore_index=target_ignore_value))
+            else:
+                task_metrics.append(IOUDiceMetric(num_classes=num_classes))
             # task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
