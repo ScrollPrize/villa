@@ -12,7 +12,8 @@ class MedialSurfaceTransform(BasicTransform):
                  do_tube: bool = True,
                  do_open: bool = False,
                  do_close: bool = True,
-                 target_keys: Optional[Sequence[str]] = None,):
+                 target_keys: Optional[Sequence[str]] = None,
+                 ignore_values: Optional[dict] = None,):
         """
         Calculates the medial surface skeleton of the segmentation (plus an optional 2 px tube around it)
         and adds it to the dict with the key "skel"
@@ -22,6 +23,7 @@ class MedialSurfaceTransform(BasicTransform):
         self.do_open = do_open
         self.do_close = do_close
         self.target_keys = tuple(target_keys) if target_keys else None
+        self.ignore_values = dict(ignore_values or {})
 
     def apply(self, data_dict, **params):
         # Collect regression keys to avoid processing continuous aux targets
@@ -45,8 +47,14 @@ class MedialSurfaceTransform(BasicTransform):
             orig_device = t.device
             seg_all = t.detach().cpu().numpy()
 
-            bin_seg = seg_all > 0
-            seg_all_skel = np.zeros_like(bin_seg, dtype=np.float32)
+            ignore_value = self.ignore_values.get(target_key)
+            if ignore_value is not None:
+                seg_processed = np.where(seg_all == ignore_value, 0, seg_all)
+            else:
+                seg_processed = seg_all
+
+            bin_seg = seg_processed > 0
+            seg_all_skel = np.zeros_like(seg_processed, dtype=np.float32)
 
             for c in range(bin_seg.shape[0]):
                 seg_c = bin_seg[c]
@@ -69,7 +77,7 @@ class MedialSurfaceTransform(BasicTransform):
                 if self.do_close:
                     skel = closing(skel)
 
-                seg_all_skel[c] = (skel.astype(np.float32) * seg_all[c].astype(np.float32))
+                seg_all_skel[c] = (skel.astype(np.float32) * seg_processed[c].astype(np.float32))
 
             data_dict[f"{target_key}_skel"] = torch.from_numpy(seg_all_skel).to(orig_device)
 

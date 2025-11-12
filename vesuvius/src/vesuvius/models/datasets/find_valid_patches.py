@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 from tqdm import tqdm
@@ -146,6 +146,28 @@ def reduce_block_to_scalar(
     flat = arr.reshape(spatial_shape + (int(np.prod(extra_shape)),))
     return np.linalg.norm(flat, axis=-1)
 
+def zero_ignore_labels(array: np.ndarray, ignore_label: Union[int, float]) -> np.ndarray:
+    """Return a copy of ``array`` with the ignore label value zeroed out."""
+
+    arr = np.asarray(array)
+    if arr.size == 0:
+        return arr
+
+    if isinstance(ignore_label, float) and np.isnan(ignore_label):
+        mask = np.isnan(arr)
+    else:
+        try:
+            mask = (arr == ignore_label)
+        except TypeError:
+            return arr
+
+    if not np.any(mask):
+        return arr
+
+    result = arr.copy()
+    result[mask] = 0
+    return result
+
 
 def check_patch_chunk(
     chunk,
@@ -154,6 +176,7 @@ def check_patch_chunk(
     bbox_threshold=0.5,
     label_threshold=0.05,
     channel_selector: Union[int, Sequence[int], None] = None,
+    ignore_label: Optional[Union[int, float]] = None,
 ):
     """Identify valid label patches within a chunk of candidate positions."""
 
@@ -182,6 +205,8 @@ def check_patch_chunk(
                 patch = sheet_label[base_slice + direct_selector]
             else:
                 patch = sheet_label[base_slice]
+            if ignore_label is not None:
+                patch = zero_ignore_labels(patch, ignore_label)
             patch = collapse_patch_to_spatial(
                 patch,
                 spatial_ndim=2,
@@ -210,6 +235,8 @@ def check_patch_chunk(
                 patch = sheet_label[base_slice + direct_selector]
             else:
                 patch = sheet_label[base_slice]
+            if ignore_label is not None:
+                patch = zero_ignore_labels(patch, ignore_label)
             patch = collapse_patch_to_spatial(
                 patch,
                 spatial_ndim=3,
@@ -248,6 +275,7 @@ def find_valid_patches(
     num_workers=4,
     downsample_level=1,
     channel_selectors: Sequence[Union[int, Sequence[int], None]] | None = None,
+    ignore_labels: Sequence[Optional[Union[int, float]]] | None = None,
 ):
     """
     Finds patches that contain:
@@ -264,12 +292,15 @@ def find_valid_patches(
         max_z, max_y, max_x: maximum coordinates for patch extraction (full resolution)
         num_workers: number of processes for parallel processing
         downsample_level: Resolution level to use for patch finding (0=full res, 1=2x downsample, etc.)
+        ignore_labels: Optional per-volume ignore values that should be treated as background.
     
     Returns:
         List of dictionaries with 'volume_idx', 'volume_name', and 'start_pos' (coordinates at full resolution)
     """
     if len(label_arrays) != len(label_names):
         raise ValueError("Number of label arrays must match number of label names")
+    if ignore_labels is not None and len(ignore_labels) != len(label_arrays):
+        raise ValueError("ignore_labels must match number of label arrays when provided")
     
     all_valid_patches = []
     
@@ -304,6 +335,17 @@ def find_valid_patches(
         selector = None
         if channel_selectors is not None:
             selector = channel_selectors[vol_idx]
+        ignore_label = None
+        if ignore_labels is not None:
+            ignore_label = ignore_labels[vol_idx]
+
+        if label_array is None:
+            logger.warning(
+                "Volume '%s' has no label array available at index %d; skipping validation",
+                label_name,
+                vol_idx,
+            )
+            continue
 
         # Access the appropriate resolution level for patch finding
         actual_downsample_factor = downsample_factor
@@ -365,6 +407,12 @@ def find_valid_patches(
                         label_name,
                         actual_downsampled_patch_size,
                     )
+            if downsampled_array is None:
+                logger.warning(
+                    "Volume '%s': unable to resolve label data for validation; skipping",
+                    label_name,
+                )
+                continue
         except Exception as e:
             print(f"Error accessing resolution level {downsample_level} for {label_name}: {e}")
             # Fallback to the array itself at full resolution
@@ -378,6 +426,12 @@ def find_valid_patches(
                 label_name,
                 e,
             )
+            if downsampled_array is None:
+                logger.warning(
+                    "Volume '%s': no label data available after fallback; skipping",
+                    label_name,
+                )
+                continue
         
         # Check if data is 2D or 3D based on patch dimensionality
         spatial_ndim = len(actual_downsampled_patch_size)
@@ -458,7 +512,9 @@ def find_valid_patches(
                     x_start = x_group[0]
                     x_stop = x_group[-1] + dpX
 
-                    block = downsampled_array[y_start:y_stop, x_start:x_stop]
+                    block = np.asarray(downsampled_array[y_start:y_stop, x_start:x_stop])
+                    if ignore_label is not None:
+                        block = zero_ignore_labels(block, ignore_label)
                     block = reduce_block_to_scalar(
                         block,
                         spatial_ndim=2,
@@ -532,7 +588,11 @@ def find_valid_patches(
                         x_start = x_group[0]
                         x_stop = x_group[-1] + dpX
 
-                        block = downsampled_array[z_start:z_stop, y_start:y_stop, x_start:x_stop]
+                        block = np.asarray(
+                            downsampled_array[z_start:z_stop, y_start:y_stop, x_start:x_stop]
+                        )
+                        if ignore_label is not None:
+                            block = zero_ignore_labels(block, ignore_label)
                         block = reduce_block_to_scalar(
                             block,
                             spatial_ndim=3,

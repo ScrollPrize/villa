@@ -357,6 +357,7 @@ class BaseDataset(Dataset):
             stride_override = tuple(int(v) for v in stride_override)
 
         channel_selector = self._resolve_label_channel_selector(target_names)
+        ignore_map = self._resolve_target_ignore_labels(target_names)
 
         config = ChunkSliceConfig(
             patch_size=patch_size,
@@ -383,6 +384,7 @@ class BaseDataset(Dataset):
             labels: Dict[str, Optional[np.ndarray]] = {}
             label_source = None
             cache_key_path: Optional[Path] = None
+            label_ignore_value: Optional[Union[int, float]] = None
 
             for target_name in target_names:
                 try:
@@ -393,10 +395,16 @@ class BaseDataset(Dataset):
                     ) from exc
                 label_array = self._get_entry_label(entry)
                 labels[target_name] = label_array
-                if label_source is None:
-                    source_candidate = self._get_entry_label_source(entry)
-                    if source_candidate is not None:
-                        label_source = source_candidate
+                ignore_candidate = ignore_map.get(target_name)
+                source_candidate = self._get_entry_label_source(entry)
+                if source_candidate is None:
+                    source_candidate = label_array
+                if label_source is None and source_candidate is not None:
+                    label_source = source_candidate
+                    if label_ignore_value is None and ignore_candidate is not None:
+                        label_ignore_value = ignore_candidate
+                elif label_ignore_value is None and ignore_candidate is not None:
+                    label_ignore_value = ignore_candidate
                 if cache_key_path is None:
                     path_candidate = self._get_entry_label_path(entry)
                     if path_candidate:
@@ -410,6 +418,7 @@ class BaseDataset(Dataset):
                     labels=labels,
                     label_source=label_source,
                     cache_key_path=cache_key_path,
+                    label_ignore_value=label_ignore_value,
                     meshes=reference_info.get('meshes', {}),
                 )
             )
@@ -425,6 +434,20 @@ class BaseDataset(Dataset):
             if selector is not None:
                 return self._normalize_channel_selector(selector)
         return None
+
+    def _resolve_target_ignore_labels(
+        self, target_names: Sequence[str]
+    ) -> Dict[str, Union[int, float]]:
+        ignore_map: Dict[str, Union[int, float]] = {}
+        for target_name in target_names:
+            info = self.targets.get(target_name) or {}
+            for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                if alias in info:
+                    value = info.get(alias)
+                    if value is not None:
+                        ignore_map[target_name] = value  # store first non-null alias per target
+                        break
+        return ignore_map
 
     @staticmethod
     def _normalize_channel_selector(
@@ -882,7 +905,21 @@ class BaseDataset(Dataset):
         skeleton_targets = self._skeleton_loss_targets()
         if skeleton_targets:
             from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
-            transforms.append(MedialSurfaceTransform(do_tube=False, target_keys=skeleton_targets))
+            ignore_values = {}
+            for target_name in skeleton_targets:
+                cfg = self.targets.get(target_name, {}) if isinstance(self.targets, dict) else {}
+                for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                    value = cfg.get(alias)
+                    if value is not None:
+                        ignore_values[target_name] = value
+                        break
+            transforms.append(
+                MedialSurfaceTransform(
+                    do_tube=False,
+                    target_keys=skeleton_targets,
+                    ignore_values=ignore_values or None,
+                )
+            )
             print(f"Added MedialSurfaceTransform to training pipeline for targets: {', '.join(skeleton_targets)}")
 
         return ComposeTransforms(transforms)
@@ -899,7 +936,21 @@ class BaseDataset(Dataset):
         from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
         
         transforms = []
-        transforms.append(MedialSurfaceTransform(do_tube=False, target_keys=skeleton_targets))
+        ignore_values = {}
+        for target_name in skeleton_targets:
+            cfg = self.targets.get(target_name, {}) if isinstance(self.targets, dict) else {}
+            for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                value = cfg.get(alias)
+                if value is not None:
+                    ignore_values[target_name] = value
+                    break
+        transforms.append(
+            MedialSurfaceTransform(
+                do_tube=False,
+                target_keys=skeleton_targets,
+                ignore_values=ignore_values or None,
+            )
+        )
         print(f"Added MedialSurfaceTransform to validation pipeline for targets: {', '.join(skeleton_targets)}")
         
         return ComposeTransforms(transforms)
