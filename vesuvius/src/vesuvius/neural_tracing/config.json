@@ -1,5 +1,5 @@
 {
-    "out_dir": "../out/2025-10-09",
+    "out_dir": "/mnt/bcache/projects/vesuvius-scrolls/neural-tracing/out/2025-11-10",
     "wandb_project": "neural-tracing",
     "wandb_entity": "vesuvius-challenge",
     "seed": 0,
@@ -8,7 +8,7 @@
     "log_frequency": 200,
     "ckpt_frequency": 5000,
     "mixed_precision": "fp16",
-    "learning_rate": 1e-4,
+    "learning_rate": 1e-3,
     "weight_decay": 1e-4,
     "lr_warmup_steps": 1000,
     "num_iterations": 250000,
@@ -35,10 +35,10 @@
         "only_spatial_and_intensity": false
       },
       "point_perturbation": {
-        "perturb_probability": 0.9,
+        "perturb_probability": 0.95,
         "uv_max_perturbation": 8,
         "w_max_perturbation": 24,
-        "main_component_distance_factor": 0.4
+        "main_component_distance_factor": 0.45
       },
       "representation": "heatmap",
       "step_size": 10,
