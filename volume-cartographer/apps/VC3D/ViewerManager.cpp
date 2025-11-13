@@ -579,11 +579,7 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf)
 
         bool skippedDueToExistingIndex = false;
         if (!_surfacePatchIndexDirty) {
-            // If surface is not yet indexed, always do a full index regardless of dirty bounds
-            if (!alreadyIndexed) {
-                indexUpdated = _surfacePatchIndex.updateSurface(quad);
-            } else if (dirtyVertices) {
-                // Surface already indexed, try incremental region update
+            if (dirtyVertices) {
                 if (auto cellRegion = vertexRectToCellRegion(*dirtyVertices, quad)) {
                     regionUpdated = _surfacePatchIndex.updateSurfaceRegion(
                         quad,
@@ -592,11 +588,10 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf)
                         cellRegion->colStart,
                         cellRegion->colEnd);
                 }
-            } else if (dirtyBoundsRegressed) {
-                // Dirty bounds regressed, need full reindex
+            }
+            if (!regionUpdated && (!alreadyIndexed || dirtyBoundsRegressed)) {
                 indexUpdated = _surfacePatchIndex.updateSurface(quad);
-            } else {
-                // Already indexed, no dirty vertices, no regression - skip
+            } else if (!regionUpdated && alreadyIndexed && !dirtyBoundsRegressed) {
                 skippedDueToExistingIndex = true;
             }
         }

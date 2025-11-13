@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -17,15 +18,11 @@
 
 #include "vc/core/util/Surface.hpp"
 
+
 namespace bg = boost::geometry;
 namespace bgi = boost::geometry::index;
 
 namespace {
-
-inline bool equalVec3f(const cv::Vec3f& a, const cv::Vec3f& b)
-{
-    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
-}
 
 inline bool shouldSampleIndex(int idx, int count, int stride)
 {
@@ -142,12 +139,34 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
 
 struct CellKey {
     QuadSurface* surface = nullptr;
-    int row = 0;
-    int col = 0;
+    std::uint64_t packed = 0;
+
+    CellKey() = default;
+    CellKey(QuadSurface* surf, int rowIndex, int colIndex)
+        : surface(surf),
+          packed(pack(rowIndex, colIndex))
+    {}
+
+    static std::uint64_t pack(int rowIndex, int colIndex) noexcept
+    {
+        auto r = static_cast<std::uint64_t>(static_cast<std::uint32_t>(rowIndex));
+        auto c = static_cast<std::uint64_t>(static_cast<std::uint32_t>(colIndex));
+        return (r << 32) | c;
+    }
+
+    int rowIndex() const noexcept
+    {
+        return static_cast<int>(packed >> 32);
+    }
+
+    int colIndex() const noexcept
+    {
+        return static_cast<int>(packed & 0xffffffffULL);
+    }
 
     bool operator==(const CellKey& other) const noexcept
     {
-        return surface == other.surface && row == other.row && col == other.col;
+        return surface == other.surface && packed == other.packed;
     }
 };
 
@@ -155,8 +174,8 @@ struct CellKeyHash {
     std::size_t operator()(const CellKey& key) const noexcept
     {
         std::size_t h = std::hash<QuadSurface*>{}(key.surface);
-        h ^= static_cast<std::size_t>(key.row) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h ^= static_cast<std::size_t>(key.col) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        const std::size_t packedHash = std::hash<std::uint64_t>{}(key.packed);
+        h ^= packedHash + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -168,14 +187,11 @@ struct SurfacePatchIndex::Impl {
         QuadSurface* surface = nullptr;
         int i = 0;
         int j = 0;
-        std::array<cv::Vec3f, 4> corners{};
 
         bool operator==(const PatchRecord& other) const noexcept {
             return surface == other.surface &&
                    i == other.i &&
-                   j == other.j &&
-                   std::equal(corners.begin(), corners.end(),
-                              other.corners.begin(), equalVec3f);
+                   j == other.j;
         }
     };
 
@@ -184,18 +200,12 @@ struct SurfacePatchIndex::Impl {
         int i = 0;
         int j = 0;
         int triangleIndex = 0;
-        std::array<cv::Vec3f, 3> world{};
-        std::array<cv::Vec3f, 3> surfaceParams{};
 
         bool operator==(const TriangleRecord& other) const noexcept {
             return surface == other.surface &&
                    i == other.i &&
                    j == other.j &&
-                   triangleIndex == other.triangleIndex &&
-                   std::equal(world.begin(), world.end(),
-                              other.world.begin(), equalVec3f) &&
-                   std::equal(surfaceParams.begin(), surfaceParams.end(),
-                              other.surfaceParams.begin(), equalVec3f);
+                   triangleIndex == other.triangleIndex;
         }
     };
 
@@ -211,7 +221,15 @@ struct SurfacePatchIndex::Impl {
     struct CellEntry {
         bool hasPatch = false;
         Entry patch;
-        std::vector<TriangleEntry> triangles;
+        std::array<TriangleEntry, 2> triangles;
+        std::size_t triangleCount = 0;
+    };
+
+    struct CellRecord {
+        bool hasPatch = false;
+        Box3 patchBounds;
+        std::size_t triangleCount = 0;
+        std::array<Box3, 2> triangleBounds;
     };
 
     size_t patchCount = 0;
@@ -219,7 +237,8 @@ struct SurfacePatchIndex::Impl {
     float bboxPadding = 0.0f;
     int samplingStride = 1;
 
-    std::unordered_map<CellKey, CellEntry, CellKeyHash> cellEntries;
+    std::unordered_map<CellKey, CellRecord, CellKeyHash> cellEntries;
+    std::unordered_map<QuadSurface*, std::vector<CellKey>> surfaceCellKeys;
 
     struct PatchHit {
         bool valid = false;
@@ -242,6 +261,14 @@ struct SurfacePatchIndex::Impl {
                                int row,
                                float bboxPadding,
                                CellEntry& outEntry);
+    static CellRecord makeCellRecord(const CellEntry& entry);
+    static bool loadPatchCorners(const PatchRecord& rec,
+                                 std::array<cv::Vec3f, 4>& outCorners);
+    static bool loadTriangleGeometry(const TriangleRecord& rec,
+                                     std::array<cv::Vec3f, 3>& world,
+                                     std::array<cv::Vec3f, 3>& surfaceParams);
+    void recordCellKey(const CellKey& key);
+    void forgetCellKey(const CellKey& key);
 
     void removeCellEntry(const CellKey& key);
     void insertCells(const std::vector<std::pair<CellKey, CellEntry>>& cells);
@@ -259,10 +286,15 @@ struct SurfacePatchIndex::Impl {
     static PatchHit evaluatePatch(const PatchRecord& rec, const cv::Vec3f& point) {
         PatchHit best;
 
-        const auto& p00 = rec.corners[0];
-        const auto& p10 = rec.corners[1];
-        const auto& p11 = rec.corners[2];
-        const auto& p01 = rec.corners[3];
+        std::array<cv::Vec3f, 4> corners;
+        if (!loadPatchCorners(rec, corners)) {
+            return best;
+        }
+
+        const auto& p00 = corners[0];
+        const auto& p10 = corners[1];
+        const auto& p11 = corners[2];
+        const auto& p01 = corners[3];
 
         // Triangle 0: (p00, p10, p01)
         {
@@ -350,7 +382,7 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(QuadSurface* surface,
                 continue;
             }
 
-            result.emplace_back(CellKey{surface, j, i}, std::move(entry));
+            result.emplace_back(CellKey(surface, j, i), std::move(entry));
         }
     }
 
@@ -364,6 +396,7 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
     }
     impl_->bboxPadding = bboxPadding;
     impl_->cellEntries.clear();
+    impl_->surfaceCellKeys.clear();
     impl_->patchCount = 0;
     impl_->triangleCount = 0;
 
@@ -380,7 +413,7 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
     std::vector<std::vector<std::pair<CellKey, Impl::CellEntry>>> cellsPerSurface(surfaceCount);
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) if(surfaceCount > 1)
+#pragma omp parallel for schedule(dynamic) if(surfaceCount > 1)
 #endif
     for (int idx = 0; idx < static_cast<int>(surfaceCount); ++idx) {
         QuadSurface* surface = surfaces[idx];
@@ -400,7 +433,7 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
     for (const auto& cells : cellsPerSurface) {
         estimatedPatches += cells.size();
         for (const auto& cell : cells) {
-            estimatedTriangles += cell.second.triangles.size();
+            estimatedTriangles += cell.second.triangleCount;
         }
     }
     entries.reserve(estimatedPatches);
@@ -411,10 +444,11 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
             if (cell.second.hasPatch) {
                 entries.push_back(cell.second.patch);
             }
-            for (const auto& tri : cell.second.triangles) {
-                triangleEntries.push_back(tri);
+            for (std::size_t triIdx = 0; triIdx < cell.second.triangleCount; ++triIdx) {
+                triangleEntries.push_back(cell.second.triangles[triIdx]);
             }
-            impl_->cellEntries.emplace(cell.first, std::move(cell.second));
+            impl_->cellEntries.emplace(cell.first, Impl::makeCellRecord(cell.second));
+            impl_->surfaceCellKeys[cell.first.surface].push_back(cell.first);
         }
     }
 
@@ -444,6 +478,7 @@ void SurfacePatchIndex::clear()
         impl_->cellEntries.clear();
         impl_->samplingStride = 1;
         impl_->triangleCount = 0;
+        impl_->surfaceCellKeys.clear();
     }
 }
 
@@ -534,7 +569,9 @@ void SurfacePatchIndex::queryBox(const Rect3D& bounds,
         candidate.surface = rec.surface;
         candidate.i = rec.i;
         candidate.j = rec.j;
-        candidate.corners = rec.corners;
+        if (!Impl::loadPatchCorners(rec, candidate.corners)) {
+            continue;
+        }
         outCandidates.push_back(candidate);
     }
 }
@@ -567,8 +604,9 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
         candidate.i = rec.i;
         candidate.j = rec.j;
         candidate.triangleIndex = rec.triangleIndex;
-        candidate.world = rec.world;
-        candidate.surfaceParams = rec.surfaceParams;
+        if (!Impl::loadTriangleGeometry(rec, candidate.world, candidate.surfaceParams)) {
+            continue;
+        }
         outCandidates.push_back(candidate);
     }
 }
@@ -579,20 +617,16 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(QuadSurface* surface)
         return false;
     }
 
-    std::vector<CellKey> keys;
-    keys.reserve(cellEntries.size());
-    for (const auto& entry : cellEntries) {
-        if (entry.first.surface == surface) {
-            keys.push_back(entry.first);
-        }
-    }
-
-    if (keys.empty()) {
+    auto it = surfaceCellKeys.find(surface);
+    if (it == surfaceCellKeys.end() || it->second.empty()) {
         return false;
     }
 
+    std::vector<CellKey> keys = it->second;
     for (const auto& key : keys) {
-        removeCellEntry(key);
+        if (cellEntries.find(key) != cellEntries.end()) {
+            removeCellEntry(key);
+        }
     }
 
     if (tree && patchCount == 0) {
@@ -669,16 +703,19 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
         return std::nullopt;
     }
 
-    std::vector<IntersectionEndpoint> endpoints;
+    std::array<IntersectionEndpoint, 6> endpoints{};
+    size_t endpointCount = 0;
     const float mergeDistance = epsilon * 4.0f;
 
     auto addEndpoint = [&](const cv::Vec3f& world, const cv::Vec3f& param) {
-        for (const auto& existing : endpoints) {
-            if (pointsApproximatelyEqual(existing.world, world, mergeDistance)) {
+        for (size_t idx = 0; idx < endpointCount; ++idx) {
+            if (pointsApproximatelyEqual(endpoints[idx].world, world, mergeDistance)) {
                 return;
             }
         }
-        endpoints.push_back({world, param});
+        if (endpointCount < endpoints.size()) {
+            endpoints[endpointCount++] = {world, param};
+        }
     };
 
     auto addVertexIfOnPlane = [&](int idx) {
@@ -724,15 +761,15 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
     addEdgeIntersection(1, 2);
     addEdgeIntersection(2, 0);
 
-    if (endpoints.size() < 2) {
+    if (endpointCount < 2) {
         return std::nullopt;
     }
 
-    if (endpoints.size() > 2) {
+    if (endpointCount > 2) {
         float bestDist = -1.0f;
         std::pair<size_t, size_t> bestPair = {0, 1};
-        for (size_t a = 0; a < endpoints.size(); ++a) {
-            for (size_t b = a + 1; b < endpoints.size(); ++b) {
+        for (size_t a = 0; a < endpointCount; ++a) {
+            for (size_t b = a + 1; b < endpointCount; ++b) {
                 float dist = cv::norm(endpoints[a].world - endpoints[b].world);
                 if (dist > bestDist) {
                     bestDist = dist;
@@ -742,9 +779,9 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
         }
         IntersectionEndpoint first = endpoints[bestPair.first];
         IntersectionEndpoint second = endpoints[bestPair.second];
-        endpoints.clear();
-        endpoints.push_back(first);
-        endpoints.push_back(second);
+        endpoints[0] = first;
+        endpoints[1] = second;
+        endpointCount = 2;
     }
 
     TriangleSegment segment;
@@ -834,6 +871,7 @@ bool SurfacePatchIndex::setSamplingStride(int stride)
     impl_->cellEntries.clear();
     impl_->patchCount = 0;
     impl_->triangleCount = 0;
+    impl_->surfaceCellKeys.clear();
     return true;
 }
 
@@ -843,6 +881,125 @@ int SurfacePatchIndex::samplingStride() const
         return 1;
     }
     return std::max(1, impl_->samplingStride);
+}
+SurfacePatchIndex::Impl::CellRecord
+SurfacePatchIndex::Impl::makeCellRecord(const CellEntry& entry)
+{
+    CellRecord record;
+    record.hasPatch = entry.hasPatch;
+    if (entry.hasPatch) {
+        record.patchBounds = entry.patch.first;
+    }
+    record.triangleCount = entry.triangleCount;
+    for (std::size_t idx = 0; idx < entry.triangleCount && idx < record.triangleBounds.size(); ++idx) {
+        record.triangleBounds[idx] = entry.triangles[idx].first;
+    }
+    return record;
+}
+bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
+                                               std::array<cv::Vec3f, 4>& outCorners)
+{
+    if (!rec.surface) {
+        return false;
+    }
+    const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+    if (!points) {
+        return false;
+    }
+    const int rows = points->rows;
+    const int cols = points->cols;
+    if (rows < 2 || cols < 2) {
+        return false;
+    }
+
+    const int row = rec.j;
+    const int col = rec.i;
+    if (row < 0 || col < 0 || row + 1 >= rows || col + 1 >= cols) {
+        return false;
+    }
+
+    const cv::Vec3f& p00 = (*points)(row, col);
+    const cv::Vec3f& p10 = (*points)(row, col + 1);
+    const cv::Vec3f& p01 = (*points)(row + 1, col);
+    const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
+
+    if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
+        return false;
+    }
+
+    outCorners = {p00, p10, p11, p01};
+    return true;
+}
+
+bool SurfacePatchIndex::Impl::loadTriangleGeometry(const TriangleRecord& rec,
+                                                   std::array<cv::Vec3f, 3>& world,
+                                                   std::array<cv::Vec3f, 3>& surfaceParams)
+{
+    if (!rec.surface) {
+        return false;
+    }
+
+    PatchRecord patch{rec.surface, rec.i, rec.j};
+    std::array<cv::Vec3f, 4> corners;
+    if (!loadPatchCorners(patch, corners)) {
+        return false;
+    }
+
+    const float baseX = static_cast<float>(rec.i);
+    const float baseY = static_cast<float>(rec.j);
+
+    auto makeParam = [&](float dx, float dy) {
+        return makePtrFromAbsCoord(rec.surface, baseX + dx, baseY + dy);
+    };
+
+    if (rec.triangleIndex == 0) {
+        world = {corners[0], corners[1], corners[3]};
+        surfaceParams = {
+            makeParam(0.0f, 0.0f),
+            makeParam(1.0f, 0.0f),
+            makeParam(0.0f, 1.0f)
+        };
+    } else if (rec.triangleIndex == 1) {
+        world = {corners[1], corners[2], corners[3]};
+        surfaceParams = {
+            makeParam(1.0f, 0.0f),
+            makeParam(1.0f, 1.0f),
+            makeParam(0.0f, 1.0f)
+        };
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+void SurfacePatchIndex::Impl::recordCellKey(const CellKey& key)
+{
+    if (!key.surface) {
+        return;
+    }
+    surfaceCellKeys[key.surface].push_back(key);
+}
+
+void SurfacePatchIndex::Impl::forgetCellKey(const CellKey& key)
+{
+    if (!key.surface) {
+        return;
+    }
+    auto it = surfaceCellKeys.find(key.surface);
+    if (it == surfaceCellKeys.end()) {
+        return;
+    }
+    auto& keys = it->second;
+    auto removeIt = std::remove_if(keys.begin(), keys.end(), [&](const CellKey& existing) {
+        return existing.packed == key.packed;
+    });
+    if (removeIt != keys.end()) {
+        keys.erase(removeIt, keys.end());
+    }
+    if (keys.empty()) {
+        surfaceCellKeys.erase(it);
+    }
 }
 bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
                                              const cv::Mat_<cv::Vec3f>& points,
@@ -864,11 +1021,11 @@ bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
     rec.surface = surface;
     rec.i = col;
     rec.j = row;
-    rec.corners = {p00, p10, p11, p01};
 
-    cv::Vec3f low = rec.corners[0];
-    cv::Vec3f high = rec.corners[0];
-    for (const cv::Vec3f& c : rec.corners) {
+    std::array<cv::Vec3f, 4> corners = {p00, p10, p11, p01};
+    cv::Vec3f low = corners[0];
+    cv::Vec3f high = corners[0];
+    for (const cv::Vec3f& c : corners) {
         low[0] = std::min(low[0], c[0]);
         low[1] = std::min(low[1], c[1]);
         low[2] = std::min(low[2], c[2]);
@@ -887,23 +1044,15 @@ bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
 
     outEntry.patch = std::make_pair(Box3(min_pt, max_pt), rec);
     outEntry.hasPatch = true;
-    outEntry.triangles.clear();
-    outEntry.triangles.reserve(2);
+    outEntry.triangleCount = 0;
 
     auto addTriangle = [&](const std::array<cv::Vec3f, 3>& worldPts,
-                           const std::array<cv::Vec2f, 3>& gridPts,
                            int triIndex) {
         TriangleRecord triRec;
         triRec.surface = surface;
         triRec.i = col;
         triRec.j = row;
         triRec.triangleIndex = triIndex;
-        triRec.world = worldPts;
-        for (size_t v = 0; v < triRec.surfaceParams.size(); ++v) {
-            const float absX = gridPts[v][0];
-            const float absY = gridPts[v][1];
-            triRec.surfaceParams[v] = makePtrFromAbsCoord(surface, absX, absY);
-        }
 
         cv::Vec3f triLow = worldPts[0];
         cv::Vec3f triHigh = worldPts[0];
@@ -918,24 +1067,13 @@ bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
 
         Point3 triMin(triLow[0], triLow[1], triLow[2]);
         Point3 triMax(triHigh[0], triHigh[1], triHigh[2]);
-        outEntry.triangles.emplace_back(Box3(triMin, triMax), triRec);
+        if (outEntry.triangleCount < outEntry.triangles.size()) {
+            outEntry.triangles[outEntry.triangleCount++] = std::make_pair(Box3(triMin, triMax), triRec);
+        }
     };
 
-    addTriangle(
-        {p00, p10, p01},
-        {cv::Vec2f(static_cast<float>(col), static_cast<float>(row)),
-         cv::Vec2f(static_cast<float>(col + 1), static_cast<float>(row)),
-         cv::Vec2f(static_cast<float>(col), static_cast<float>(row + 1))},
-        0
-    );
-
-    addTriangle(
-        {p10, p11, p01},
-        {cv::Vec2f(static_cast<float>(col + 1), static_cast<float>(row)),
-         cv::Vec2f(static_cast<float>(col + 1), static_cast<float>(row + 1)),
-         cv::Vec2f(static_cast<float>(col), static_cast<float>(row + 1))},
-        1
-    );
+    addTriangle({p00, p10, p01}, 0);
+    addTriangle({p10, p11, p01}, 1);
 
     return true;
 }
@@ -947,16 +1085,32 @@ void SurfacePatchIndex::Impl::removeCellEntry(const CellKey& key)
         return;
     }
 
-    if (tree && it->second.hasPatch) {
-        tree->remove(it->second.patch);
+    const CellRecord& record = it->second;
+
+    const int row = key.rowIndex();
+    const int col = key.colIndex();
+
+    if (tree && record.hasPatch) {
+        PatchRecord rec;
+        rec.surface = key.surface;
+        rec.i = col;
+        rec.j = row;
+        Entry entry(record.patchBounds, rec);
+        tree->remove(entry);
         if (patchCount > 0) {
             --patchCount;
         }
     }
 
     if (triangleTree) {
-        for (const auto& tri : it->second.triangles) {
-            triangleTree->remove(tri);
+        for (std::size_t idx = 0; idx < record.triangleCount; ++idx) {
+            TriangleRecord triRec;
+            triRec.surface = key.surface;
+            triRec.i = col;
+            triRec.j = row;
+            triRec.triangleIndex = static_cast<int>(idx);
+            TriangleEntry entry(record.triangleBounds[idx], triRec);
+            triangleTree->remove(entry);
             if (triangleCount > 0) {
                 --triangleCount;
             }
@@ -964,6 +1118,7 @@ void SurfacePatchIndex::Impl::removeCellEntry(const CellKey& key)
     }
 
     cellEntries.erase(it);
+    forgetCellKey(key);
 }
 
 void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, CellEntry>>& cells)
@@ -977,17 +1132,18 @@ void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, C
             ++patchCount;
         }
 
-        if (!cell.second.triangles.empty()) {
+        if (cell.second.triangleCount > 0) {
             if (!triangleTree) {
                 triangleTree = std::make_unique<TriangleTree>();
             }
-            for (const auto& tri : cell.second.triangles) {
-                triangleTree->insert(tri);
+            for (std::size_t triIdx = 0; triIdx < cell.second.triangleCount; ++triIdx) {
+                triangleTree->insert(cell.second.triangles[triIdx]);
                 ++triangleCount;
             }
         }
 
-        cellEntries[cell.first] = cell.second;
+        cellEntries[cell.first] = makeCellRecord(cell.second);
+        recordCellKey(cell.first);
     }
 }
 
@@ -998,6 +1154,10 @@ void SurfacePatchIndex::Impl::removeCells(QuadSurface* surface,
                                           int colEnd)
 {
     if (!surface) {
+        return;
+    }
+    auto surfaceIt = surfaceCellKeys.find(surface);
+    if (surfaceIt == surfaceCellKeys.end() || surfaceIt->second.empty()) {
         return;
     }
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
@@ -1018,20 +1178,12 @@ void SurfacePatchIndex::Impl::removeCells(QuadSurface* surface,
     }
 
     std::vector<CellKey> keys;
-    keys.reserve(static_cast<size_t>(rowEnd - rowStart) * static_cast<size_t>(colEnd - colStart));
-
-    for (int row = rowStart; row < rowEnd; ++row) {
-        if (!shouldSampleIndex(row, cellRowCount, samplingStride)) {
-            continue;
-        }
-        for (int col = colStart; col < colEnd; ++col) {
-            if (!shouldSampleIndex(col, cellColCount, samplingStride)) {
-                continue;
-            }
-            CellKey key{surface, row, col};
-            if (cellEntries.find(key) != cellEntries.end()) {
-                keys.push_back(key);
-            }
+    keys.reserve(surfaceIt->second.size());
+    for (const auto& key : surfaceIt->second) {
+        int row = key.rowIndex();
+        int col = key.colIndex();
+        if (row >= rowStart && row < rowEnd && col >= colStart && col < colEnd) {
+            keys.push_back(key);
         }
     }
 
