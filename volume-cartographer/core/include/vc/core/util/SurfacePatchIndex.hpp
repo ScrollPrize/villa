@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -66,6 +68,14 @@ public:
                         QuadSurface* targetSurface,
                         std::vector<TriangleCandidate>& outCandidates) const;
 
+    void forEachTriangle(const Rect3D& bounds,
+                         QuadSurface* targetSurface,
+                         const std::function<void(const TriangleCandidate&)>& visitor) const;
+
+    void forEachTriangle(const Rect3D& bounds,
+                         const std::unordered_set<QuadSurface*>& targetSurfaces,
+                         const std::function<void(const TriangleCandidate&)>& visitor) const;
+
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
                                                               const PlaneSurface& plane,
                                                               float epsilon = 1e-4f);
@@ -81,6 +91,11 @@ public:
     int samplingStride() const;
 
 private:
+    void forEachTriangleImpl(const Rect3D& bounds,
+                             QuadSurface* targetSurface,
+                             const std::unordered_set<QuadSurface*>* filterSurfaces,
+                             const std::function<void(const TriangleCandidate&)>& visitor) const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

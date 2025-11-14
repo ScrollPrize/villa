@@ -79,7 +79,7 @@ public:
 
     [[nodiscard]] bool hasSession() const { return static_cast<bool>(_baseSurface); }
     [[nodiscard]] QuadSurface* baseSurface() const { return _baseSurface; }
-    [[nodiscard]] QuadSurface* previewSurface() const { return _previewSurface.get(); }
+    [[nodiscard]] QuadSurface* previewSurface() const { return _baseSurface; }
 
     // Synchronize a rectangular region with the latest base-surface data without rebuilding the session.
     bool applyExternalSurfaceUpdate(const cv::Rect& vertexRect);
@@ -130,7 +130,6 @@ public:
 private:
     static bool isInvalidPoint(const cv::Vec3f& value);
     void rebuildPreviewFromOriginal();
-    void ensurePreviewAvailable();
     bool buildActiveSamples(const std::pair<int, int>& gridIndex);
     void applyGaussianToSamples(const cv::Vec3f& delta);
     void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld);
@@ -143,7 +142,6 @@ private:
     QuadSurface* _baseSurface{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
     cv::Mat_<cv::Vec3f>* _previewPoints{nullptr};
-    std::unique_ptr<QuadSurface> _previewSurface;
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};

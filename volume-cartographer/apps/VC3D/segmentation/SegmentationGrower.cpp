@@ -80,6 +80,42 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     surface->meta = new nlohmann::json(nlohmann::json::object());
 }
 
+int readDirtyBoundsVersion(const nlohmann::json* meta)
+{
+    if (!meta || !meta->is_object()) {
+        return 0;
+    }
+
+    if (auto versionIt = meta->find("dirty_bounds_version");
+        versionIt != meta->end() && versionIt->is_number_integer()) {
+        return versionIt->get<int>();
+    }
+
+    if (auto boundsIt = meta->find("dirty_bounds");
+        boundsIt != meta->end() && boundsIt->is_object()) {
+        if (auto versionIt = boundsIt->find("version");
+            versionIt != boundsIt->end() && versionIt->is_number_integer()) {
+            return versionIt->get<int>();
+        }
+    }
+
+    return 0;
+}
+
+void restoreDirtyBoundsVersion(nlohmann::json& meta, int version)
+{
+    if (version <= 0) {
+        return;
+    }
+
+    meta["dirty_bounds_version"] = version;
+
+    if (auto boundsIt = meta.find("dirty_bounds");
+        boundsIt != meta.end() && boundsIt->is_object()) {
+        (*boundsIt)["version"] = version;
+    }
+}
+
 bool isInvalidPoint(const cv::Vec3f& value)
 {
     return !std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) ||
@@ -164,8 +200,45 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     return std::make_pair(approxRow, approxCol);
 }
 
+std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* surface,
+                                                                 SurfacePatchIndex* patchIndex,
+                                                                 const cv::Vec3f& worldPos,
+                                                                 cv::Vec3f& pointerSeed,
+                                                                 bool& pointerSeedValid)
+{
+    if (!surface) {
+        return std::nullopt;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+
+    if (patchIndex) {
+        cv::Vec2f gridScale = surface->scale();
+        float scale = std::max(gridScale[0], gridScale[1]);
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            scale = 1.0f;
+        }
+        const float tolerance = std::max(8.0f, scale * 8.0f);
+        if (auto hit = patchIndex->locate(worldPos, tolerance, surface)) {
+            const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
+                                       0,
+                                       points->cols - 1);
+            const int row = std::clamp(static_cast<int>(std::round(hit->ptr[1])),
+                                       0,
+                                       points->rows - 1);
+            return std::make_pair(row, col);
+        }
+    }
+
+    return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid);
+}
+
 std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,
-                                                      const SegmentationCorrectionsPayload& corrections)
+                                                      const SegmentationCorrectionsPayload& corrections,
+                                                      ViewerManager* viewerManager)
 {
     if (!surface || corrections.empty()) {
         return std::nullopt;
@@ -176,105 +249,75 @@ std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,
         return std::nullopt;
     }
 
+    SurfacePatchIndex* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+
     cv::Vec3f pointerSeed{0.0f, 0.0f, 0.0f};
     bool pointerSeedValid = false;
 
     const int rows = points->rows;
     const int cols = points->cols;
 
-    int overallMinRow = rows;
-    int overallMaxRow = -1;
-    int overallMinCol = cols;
-    int overallMaxCol = -1;
+    constexpr int kPaddingCells = 12;
 
-    bool haveCollectionRect = false;
+    bool anyMapped = false;
     int unionRowStart = rows;
     int unionRowEnd = 0;
     int unionColStart = cols;
     int unionColEnd = 0;
-
-    constexpr float kCollectionRadiusPadding = 8.0f;
-    constexpr int kFallbackPadding = 16;
 
     for (const auto& collection : corrections.collections) {
         if (collection.points.empty()) {
             continue;
         }
 
-        std::vector<cv::Point2f> gridPoints;
-        gridPoints.reserve(collection.points.size());
+        int collectionMinRow = rows;
+        int collectionMaxRow = -1;
+        int collectionMinCol = cols;
+        int collectionMaxCol = -1;
 
         for (const auto& colPoint : collection.points) {
-            auto gridIndex = worldToGridIndexApprox(surface, colPoint.p, pointerSeed, pointerSeedValid);
+            auto gridIndex = locateGridIndexWithPatchIndex(surface,
+                                                           patchIndex,
+                                                           colPoint.p,
+                                                           pointerSeed,
+                                                           pointerSeedValid);
             if (!gridIndex) {
                 continue;
             }
             const auto [row, col] = *gridIndex;
-            overallMinRow = std::min(overallMinRow, row);
-            overallMaxRow = std::max(overallMaxRow, row);
-            overallMinCol = std::min(overallMinCol, col);
-            overallMaxCol = std::max(overallMaxCol, col);
-            gridPoints.emplace_back(static_cast<float>(col), static_cast<float>(row));
+            collectionMinRow = std::min(collectionMinRow, row);
+            collectionMaxRow = std::max(collectionMaxRow, row);
+            collectionMinCol = std::min(collectionMinCol, col);
+            collectionMaxCol = std::max(collectionMaxCol, col);
         }
 
-        if (gridPoints.empty()) {
+        if (collectionMinRow > collectionMaxRow || collectionMinCol > collectionMaxCol) {
             continue;
         }
 
-        cv::Point2f center(0.0f, 0.0f);
-        for (const auto& pt : gridPoints) {
-            center += pt;
-        }
-        center *= (1.0f / static_cast<float>(gridPoints.size()));
+        anyMapped = true;
+        const int rowStart = std::max(0, collectionMinRow - kPaddingCells);
+        const int rowEndExclusive = std::min(rows, collectionMaxRow + kPaddingCells + 1);
+        const int colStart = std::max(0, collectionMinCol - kPaddingCells);
+        const int colEndExclusive = std::min(cols, collectionMaxCol + kPaddingCells + 1);
 
-        float maxDist = 0.0f;
-        for (const auto& pt : gridPoints) {
-            const float dx = pt.x - center.x;
-            const float dy = pt.y - center.y;
-            maxDist = std::max(maxDist, std::sqrt(dx * dx + dy * dy));
-        }
-
-        const float paddedRadius = std::max(0.0f, maxDist) + kCollectionRadiusPadding;
-        const int rowStart = std::max(0, static_cast<int>(std::floor(center.y - paddedRadius)));
-        const int rowEndExclusive = std::min(rows, static_cast<int>(std::ceil(center.y + paddedRadius)));
-        const int colStart = std::max(0, static_cast<int>(std::floor(center.x - paddedRadius)));
-        const int colEndExclusive = std::min(cols, static_cast<int>(std::ceil(center.x + paddedRadius)));
-
-        if (rowStart < rowEndExclusive && colStart < colEndExclusive) {
-            haveCollectionRect = true;
-            unionRowStart = std::min(unionRowStart, rowStart);
-            unionRowEnd = std::max(unionRowEnd, rowEndExclusive);
-            unionColStart = std::min(unionColStart, colStart);
-            unionColEnd = std::max(unionColEnd, colEndExclusive);
-        }
+        unionRowStart = std::min(unionRowStart, rowStart);
+        unionRowEnd = std::max(unionRowEnd, rowEndExclusive);
+        unionColStart = std::min(unionColStart, colStart);
+        unionColEnd = std::max(unionColEnd, colEndExclusive);
     }
 
-    int finalRowStart = rows;
-    int finalRowEnd = 0;
-    int finalColStart = cols;
-    int finalColEnd = 0;
-
-    if (haveCollectionRect) {
-        finalRowStart = unionRowStart;
-        finalRowEnd = unionRowEnd;
-        finalColStart = unionColStart;
-        finalColEnd = unionColEnd;
-    } else if (overallMaxRow >= 0 && overallMaxCol >= 0) {
-        finalRowStart = std::max(0, overallMinRow - kFallbackPadding);
-        finalRowEnd = std::min(rows, overallMaxRow + kFallbackPadding + 1);
-        finalColStart = std::max(0, overallMinCol - kFallbackPadding);
-        finalColEnd = std::min(cols, overallMaxCol + kFallbackPadding + 1);
-    } else {
-        return std::nullopt;
+    if (!anyMapped) {
+        return cv::Rect(0, 0, cols, rows);
     }
 
-    const int width = std::max(0, finalColEnd - finalColStart);
-    const int height = std::max(0, finalRowEnd - finalRowStart);
+    const int width = std::max(0, unionColEnd - unionColStart);
+    const int height = std::max(0, unionRowEnd - unionRowStart);
     if (width == 0 || height == 0) {
-        return std::nullopt;
+        return cv::Rect(0, 0, cols, rows);
     }
 
-    return cv::Rect(finalColStart, finalRowStart, width, height);
+    return cv::Rect(unionColStart, unionRowStart, width, height);
 }
 
 void applyDirtyBoundsToSurface(QuadSurface* surface, const cv::Rect& vertexRect)
@@ -530,7 +573,9 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     std::optional<cv::Rect> correctionDirtyBounds;
     if (usingCorrections) {
-        correctionDirtyBounds = computeCorrectionsDirtyBounds(segmentationSurface, corrections);
+        correctionDirtyBounds = computeCorrectionsDirtyBounds(segmentationSurface,
+                                                              corrections,
+                                                              _context.viewerManager);
         if (correctionDirtyBounds) {
             const int rowEnd = correctionDirtyBounds->y + correctionDirtyBounds->height;
             const int colEnd = correctionDirtyBounds->x + correctionDirtyBounds->width;
@@ -715,6 +760,10 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
+        const int existingDirtyBoundsVersion = readDirtyBoundsVersion(targetSurface->meta);
+        const int resultDirtyBoundsVersion =
+            readDirtyBoundsVersion(result.surface ? result.surface->meta : nullptr);
+
         nlohmann::json preservedTags = nlohmann::json::object();
         bool hadPreservedTags = false;
         if (targetSurface->meta && targetSurface->meta->is_object()) {
@@ -737,6 +786,11 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->meta = new nlohmann::json(*result.surface->meta);
         } else {
             ensureSurfaceMetaObject(targetSurface);
+        }
+
+        if (targetSurface->meta && targetSurface->meta->is_object()) {
+            const int restoredVersion = std::max(existingDirtyBoundsVersion, resultDirtyBoundsVersion);
+            restoreDirtyBoundsVersion(*targetSurface->meta, restoredVersion);
         }
 
         if (hadPreservedTags && targetSurface->meta && targetSurface->meta->is_object()) {
@@ -792,6 +846,10 @@ void SegmentationGrower::onFutureFinished()
 
     if (_context.surfaces) {
         _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, false);
+    }
+
+    if (_context.viewerManager && request.segmentationSurface) {
+        _context.viewerManager->refreshSurfacePatchIndex(request.segmentationSurface);
     }
 
     if (!resetDefaults.empty()) {

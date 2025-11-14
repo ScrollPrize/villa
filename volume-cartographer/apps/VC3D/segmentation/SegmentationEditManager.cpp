@@ -19,19 +19,6 @@ bool isInvalidPoint(const cv::Vec3f& value)
            (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
 }
 
-void syncMaskChannel(QuadSurface* dst, QuadSurface* src)
-{
-    if (!dst || !src) {
-        return;
-    }
-    cv::Mat mask = src->channel("mask");
-    if (mask.empty()) {
-        dst->setChannel("mask", cv::Mat());
-    } else {
-        dst->setChannel("mask", mask);
-    }
-}
-
 void ensureSurfaceMetaObject(QuadSurface* surface)
 {
     if (!surface) {
@@ -60,24 +47,17 @@ bool SegmentationEditManager::beginSession(QuadSurface* baseSurface)
 
     ensureSurfaceMetaObject(baseSurface);
 
+    auto* basePoints = baseSurface->rawPointsPtr();
+    if (!basePoints || basePoints->empty()) {
+        return false;
+    }
+
     _baseSurface = baseSurface;
     _gridScale = baseSurface->scale();
     resetPointerSeed();
 
-    _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(baseSurface->rawPoints().clone());
-    auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
-    _previewSurface = std::make_unique<QuadSurface>(previewMatrix, baseSurface->scale());
-    if (_previewSurface->meta) {
-        delete _previewSurface->meta;
-        _previewSurface->meta = nullptr;
-    }
-    if (baseSurface->meta) {
-        _previewSurface->meta = new nlohmann::json(*baseSurface->meta);
-    }
-    _previewSurface->path = baseSurface->path;
-    _previewSurface->id = baseSurface->id;
-    syncMaskChannel(_previewSurface.get(), baseSurface);
-    _previewPoints = _previewSurface->rawPointsPtr();
+    _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(basePoints->clone());
+    _previewPoints = basePoints;
 
     _editedVertices.clear();
     _recentTouched.clear();
@@ -97,7 +77,6 @@ void SegmentationEditManager::endSession()
     clearActiveDrag();
     _editedBounds.reset();
 
-    _previewSurface.reset();
     _previewPoints = nullptr;
     _originalPoints.reset();
     _baseSurface = nullptr;
@@ -211,12 +190,8 @@ void SegmentationEditManager::resetPreview()
 
 void SegmentationEditManager::applyPreview()
 {
-    if (!_baseSurface || !_previewPoints) {
+    if (!_previewPoints) {
         return;
-    }
-
-    if (auto* basePoints = _baseSurface->rawPointsPtr()) {
-        _previewPoints->copyTo(*basePoints);
     }
 
     if (_originalPoints) {
@@ -245,12 +220,11 @@ void SegmentationEditManager::refreshFromBaseSurface()
         current.copyTo(*_originalPoints);
     }
 
-    if (!_previewSurface) {
-        auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
-        _previewSurface = std::make_unique<QuadSurface>(previewMatrix, _baseSurface->scale());
-        _previewPoints = _previewSurface->rawPointsPtr();
+    _previewPoints = _baseSurface->rawPointsPtr();
+    if (!_previewPoints) {
+        _dirty = !_editedVertices.empty();
+        return;
     }
-    syncMaskChannel(_previewSurface.get(), _baseSurface);
 
     rebuildPreviewFromOriginal();
     _dirty = !_editedVertices.empty();
@@ -278,14 +252,16 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     baseRegion.copyTo(originalRegion);
 
     cv::Mat_<cv::Vec3f>* previewMatrix = _previewPoints;
-    if (!previewMatrix && _previewSurface) {
-        previewMatrix = _previewSurface->rawPointsPtr();
+    if (!previewMatrix && _baseSurface) {
+        previewMatrix = _baseSurface->rawPointsPtr();
         _previewPoints = previewMatrix;
     }
-    if (previewMatrix) {
-        cv::Mat previewRegion(*previewMatrix, clipped);
-        baseRegion.copyTo(previewRegion);
+    if (!previewMatrix) {
+        return false;
     }
+
+    cv::Mat previewRegion(*previewMatrix, clipped);
+    baseRegion.copyTo(previewRegion);
 
     auto containsKey = [&](const GridKey& key) {
         return key.row >= clipped.y && key.row < clipped.y + clipped.height &&
@@ -362,12 +338,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     _pointerSeed = ptr;
     cv::Vec3f raw = _baseSurface->loc_raw(ptr);
 
-    const cv::Mat_<cv::Vec3f>* points = nullptr;
-    if (_previewPoints) {
-        points = _previewPoints;
-    } else if (_previewSurface) {
-        points = _previewSurface->rawPointsPtr();
-    }
+    const cv::Mat_<cv::Vec3f>* points = _previewPoints;
     if (!points) {
         points = _baseSurface->rawPointsPtr();
     }
@@ -806,13 +777,13 @@ std::optional<cv::Rect> SegmentationEditManager::recentTouchedBounds() const
 
 void SegmentationEditManager::publishDirtyBounds(const cv::Rect& vertexRect)
 {
-    if (!_previewSurface || vertexRect.width <= 0 || vertexRect.height <= 0) {
+    if (!_baseSurface || vertexRect.width <= 0 || vertexRect.height <= 0) {
         return;
     }
 
-    ensureSurfaceMetaObject(_previewSurface.get());
+    ensureSurfaceMetaObject(_baseSurface);
 
-    auto& meta = *_previewSurface->meta;
+    auto& meta = *_baseSurface->meta;
     int version = 0;
     if (meta.contains("dirty_bounds_version") && meta["dirty_bounds_version"].is_number_integer()) {
         version = meta["dirty_bounds_version"].get<int>();
@@ -1009,19 +980,6 @@ void SegmentationEditManager::rebuildPreviewFromOriginal()
         }
         (*_previewPoints)(key.row, key.col) = edit.currentWorld;
     }
-}
-
-void SegmentationEditManager::ensurePreviewAvailable()
-{
-    if (_previewPoints) {
-        return;
-    }
-    if (!_originalPoints) {
-        return;
-    }
-    auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
-    _previewSurface = std::make_unique<QuadSurface>(previewMatrix, _gridScale);
-    _previewPoints = _previewSurface->rawPointsPtr();
 }
 
 bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& gridIndex)
