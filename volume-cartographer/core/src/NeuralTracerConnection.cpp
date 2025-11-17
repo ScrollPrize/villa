@@ -17,12 +17,25 @@ namespace
         if (send(sock, msg.c_str(), msg.length(), 0) < 0)
             throw std::runtime_error("Failed to send request");
 
-        std::string response;
+        std::string response_str;
         char buffer[1];
         while (recv(sock, buffer, 1, 0) == 1 && buffer[0] != '\n')
-            response += buffer[0];
+            response_str += buffer[0];
 
-        return nlohmann::json::parse(response);
+        std::cout << "Received from neural tracer: " << response_str << std::endl;
+
+        // Replace NaN with null for valid JSON parsing
+        size_t pos = 0;
+        while ((pos = response_str.find("NaN", pos)) != std::string::npos) {
+            bool prefix_ok = (pos == 0) || (response_str[pos-1] == ' ') || (response_str[pos-1] == ',') || (response_str[pos-1] == '[');
+            bool suffix_ok = (pos + 3 >= response_str.length()) || (response_str[pos+3] == ' ') || (response_str[pos+3] == ',') || (response_str[pos+3] == ']');
+            if (prefix_ok && suffix_ok) {
+                response_str.replace(pos, 3, "null");
+            }
+            pos += 4; // move past "null"
+        }
+
+        return nlohmann::json::parse(response_str);
     }
 }
 
@@ -44,7 +57,7 @@ NeuralTracerConnection::NeuralTracerConnection(std::string const & socket_path) 
         if (sock >= 0) {
             close(sock);
         }
-        throw std::runtime_error("Failed to connect to socket");
+        throw std::runtime_error("Failed to connect to socket " + socket_path);
     }
 }
 
@@ -78,19 +91,31 @@ NeuralTracerConnection::NextUvs NeuralTracerConnection::get_next_points(
 
     NextUvs result;
 
-    for (auto const& u_candidate : response["u_candidates"]) {
-        result.next_u_xyzs.emplace_back(
-            u_candidate[0].get<float>(),
-            u_candidate[1].get<float>(),
-            u_candidate[2].get<float>()
-        );
+    auto get_float_or_nan = [](const nlohmann::json& j) {
+        return j.is_null() ? std::numeric_limits<float>::quiet_NaN() : j.get<float>();
+    };
+
+    if (response.contains("u_candidates")) {
+        for (auto const& u_candidate : response["u_candidates"]) {
+            if (u_candidate.is_array() && u_candidate.size() == 3) {
+                result.next_u_xyzs.emplace_back(
+                    get_float_or_nan(u_candidate[0]),
+                    get_float_or_nan(u_candidate[1]),
+                    get_float_or_nan(u_candidate[2])
+                );
+            }
+        }
     }
-    for (auto const& v_candidate : response["v_candidates"]) {
-        result.next_v_xyzs.emplace_back(
-            v_candidate[0].get<float>(),
-            v_candidate[1].get<float>(),
-            v_candidate[2].get<float>()
-        );
+    if (response.contains("v_candidates")) {
+        for (auto const& v_candidate : response["v_candidates"]) {
+            if (v_candidate.is_array() && v_candidate.size() == 3) {
+                result.next_v_xyzs.emplace_back(
+                    get_float_or_nan(v_candidate[0]),
+                    get_float_or_nan(v_candidate[1]),
+                    get_float_or_nan(v_candidate[2])
+                );
+            }
+        }
     }
 
     return result;

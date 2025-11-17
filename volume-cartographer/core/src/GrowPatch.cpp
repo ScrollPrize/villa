@@ -31,6 +31,7 @@
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include "vc/tracer/NeuralTracerConnection.h"
 
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2
@@ -531,6 +532,90 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
 }
 
 } // namespace
+
+static void call_neural_tracer_for_point(
+    const cv::Vec2i& p,
+    TraceParameters& trace_params,
+    NeuralTracerConnection* neural_tracer)
+{
+    if (!neural_tracer) return;
+
+    // Find the quad with the most existing corners adjacent to the new point p
+    cv::Vec2i best_quad_tl(-1, -1);
+    int max_corners = 0;
+
+    // Check the 4 possible quads that p could be a corner of
+    cv::Vec2i potential_quad_tls[4] = {
+        p + cv::Vec2i(-1, -1), // p is bottom-right
+        p + cv::Vec2i(-1, 0),  // p is bottom-left
+        p + cv::Vec2i(0, -1),  // p is top-right
+        p + cv::Vec2i(0, 0)    // p is top-left
+    };
+
+    for (const auto& tl : potential_quad_tls) {
+        if (tl[0] < 0 || tl[1] < 0 || tl[0] >= trace_params.state.rows - 1 || tl[1] >= trace_params.state.cols - 1) continue;
+
+        int corner_count = 0;
+        cv::Vec2i corners[4] = {tl, tl + cv::Vec2i(0, 1), tl + cv::Vec2i(1, 0), tl + cv::Vec2i(1, 1)};
+        for (const auto& corner : corners) {
+            if (point_in_bounds(trace_params.state, corner) && (trace_params.state(corner) & STATE_LOC_VALID)) {
+                corner_count++;
+            }
+        }
+
+        if (corner_count > max_corners) {
+            max_corners = corner_count;
+            best_quad_tl = tl;
+        }
+    }
+
+    if (max_corners == 3 && best_quad_tl[0] != -1) {
+        cv::Vec3f center(0,0,0);
+        int points_for_avg = 0;
+        
+        auto get_point = [&](const cv::Vec2i& offset) -> std::optional<cv::Vec3f> {
+            cv::Vec2i abs_pos = best_quad_tl + offset;
+            if (point_in_bounds(trace_params.dpoints, abs_pos) && (trace_params.state(abs_pos) & STATE_LOC_VALID)) {
+                const auto& p_double = trace_params.dpoints(abs_pos);
+                cv::Vec3f p_float(p_double[0], p_double[1], p_double[2]);
+                center += p_float;
+                points_for_avg++;
+                return p_float;
+            }
+            return std::nullopt;
+        };
+
+        std::optional<cv::Vec3f> p_tl = get_point({0,0});
+        std::optional<cv::Vec3f> p_tr = get_point({0,1});
+        std::optional<cv::Vec3f> p_bl = get_point({1,0});
+        std::optional<cv::Vec3f> p_br = get_point({1,1});
+
+        if (points_for_avg > 0) center /= (float)points_for_avg;
+
+        std::optional<cv::Vec3f> prev_u, prev_v, prev_diag;
+        if (!p_tl.has_value()) { // p is tl
+            prev_u = p_tr; prev_v = p_bl; prev_diag = p_br;
+        } else if (!p_tr.has_value()) { // p is tr
+            prev_u = p_tl; prev_v = p_br; prev_diag = p_bl;
+        } else if (!p_bl.has_value()) { // p is bl
+            prev_u = p_br; prev_v = p_tl; prev_diag = p_tr;
+        } else if (!p_br.has_value()) { // p is br
+            prev_u = p_bl; prev_v = p_tr; prev_diag = p_tl;
+        }
+        
+        std::cout << "Calling neural tracer for new point at " << p << " (part of quad " << best_quad_tl << ")" << std::endl;
+        std::cout << "  center: " << center << std::endl;
+        if(prev_u) std::cout << "  prev_u: " << *prev_u << std::endl; else std::cout << "  prev_u: null" << std::endl;
+        if(prev_v) std::cout << "  prev_v: " << *prev_v << std::endl; else std::cout << "  prev_v: null" << std::endl;
+        if(prev_diag) std::cout << "  prev_diag: " << *prev_diag << std::endl; else std::cout << "  prev_diag: null" << std::endl;
+
+        auto next_uvs = neural_tracer->get_next_points(center, prev_u, prev_v, prev_diag);
+        
+        std::cout << "  neural tracer returned " << next_uvs.next_u_xyzs.size() << " u points and " << next_uvs.next_v_xyzs.size() << " v points." << std::endl;
+        for(const auto& pu : next_uvs.next_u_xyzs) std::cout << "    u: " << pu << std::endl;
+        for(const auto& pv : next_uvs.next_v_xyzs) std::cout << "    v: " << pv << std::endl;
+    }
+}
 
 // global CUDA to allow use to set to false globally
 // in the case they have cuda avail, but do not want to use it
@@ -1461,6 +1546,21 @@ struct thresholdedDistance
 
 QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
+    std::unique_ptr<NeuralTracerConnection> neural_tracer;
+    if (params.contains("neural_socket")) {
+        std::string socket_path = params["neural_socket"];
+        if (!socket_path.empty()) {
+            try {
+                neural_tracer = std::make_unique<NeuralTracerConnection>(socket_path);
+                std::cout << "Neural tracer connection enabled on " << socket_path << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to connect neural tracer: " << e.what() << std::endl;
+            }
+        }
+    }
+    if (!neural_tracer) {
+        std::cout << "Neural tracer not active" << std::endl;
+    }
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
@@ -2254,6 +2354,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
 #pragma omp critical
                 {
+                    call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
                     succ++;
                     succ_gen++;
                     if (!used_area.contains(cv::Point(p[1],p[0]))) {
