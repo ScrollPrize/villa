@@ -15,7 +15,18 @@ constexpr auto CONFIG = "config.json";
 
 VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileLocation}
 {
-    config_ = Metadata(fileLocation / ::CONFIG);
+    auto configPath = fileLocation / ::CONFIG;
+    if (!std::filesystem::exists(configPath)) {
+        throw std::runtime_error("could not find config file '" + configPath.string() + "'");
+    }
+    std::ifstream configFile(configPath.string());
+    if (!configFile) {
+        throw std::runtime_error("could not open config file '" + configPath.string() + "'");
+    }
+    configFile >> config_;
+    if (configFile.bad()) {
+        throw std::runtime_error("could not read config file '" + configPath.string() + "'");
+    }
 
     std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders","backups"};
 
@@ -48,7 +59,7 @@ std::shared_ptr<VolumePkg> VolumePkg::New(const std::filesystem::path& fileLocat
 
 std::string VolumePkg::name() const
 {
-    auto name = config_.get<std::string>("name");
+    auto name = config_["name"].get<std::string>();
     if (name != "NULL") {
         return name;
     }
@@ -56,7 +67,7 @@ std::string VolumePkg::name() const
     return "UnnamedVolume";
 }
 
-int VolumePkg::version() const { return config_.get<int>("version"); }
+int VolumePkg::version() const { return config_["version"].get<int>(); }
 
 bool VolumePkg::hasVolumes() const { return !volumes_.empty(); }
 

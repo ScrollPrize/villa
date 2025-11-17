@@ -10,10 +10,10 @@
 #include <unordered_map>
 
 #include <filesystem>
-#include "vc/core/types/Metadata.hpp"
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkgVersion.hpp"
 
 class VolumePkg
 {
@@ -56,7 +56,7 @@ public:
     bool reloadSingleSegmentation(const std::string& id);
 
 private:
-    Metadata config_;
+    nlohmann::json config_;
     std::filesystem::path rootDir_;
     std::map<std::string, std::shared_ptr<Volume>> volumes_;
     std::map<std::string, std::shared_ptr<Segmentation>> segmentations_;

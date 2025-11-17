@@ -1,21 +1,73 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Logging.hpp"
 
+static const std::filesystem::path METADATA_FILE = "meta.json";
+
 Segmentation::Segmentation(std::filesystem::path path)
-    : DiskBasedObjectBaseClass(std::move(path))
+    : path_(std::move(path))
 {
-    if (metadata_.get<std::string>("type") != "seg") {
+    loadMetadata();
+
+    if (metadata_["type"].get<std::string>() != "seg") {
         throw std::runtime_error("File not of type: seg");
     }
 }
 
 Segmentation::Segmentation(std::filesystem::path path, std::string uuid, std::string name)
-    : DiskBasedObjectBaseClass(
-          std::move(path), std::move(uuid), std::move(name))
+    : path_(std::move(path))
 {
-    metadata_.set("type", "seg");
-    metadata_.set("volume", std::string{});
-    metadata_.save();
+    metadata_["uuid"] = uuid;
+    metadata_["name"] = name;
+    metadata_["type"] = "seg";
+    metadata_["volume"] = std::string{};
+    saveMetadata();
+}
+
+void Segmentation::loadMetadata()
+{
+    auto metaPath = path_ / METADATA_FILE;
+    if (!std::filesystem::exists(metaPath)) {
+        throw std::runtime_error("could not find json file '" + metaPath.string() + "'");
+    }
+    std::ifstream jsonFile(metaPath.string());
+    if (!jsonFile) {
+        throw std::runtime_error("could not open json file '" + metaPath.string() + "'");
+    }
+
+    jsonFile >> metadata_;
+    if (jsonFile.bad()) {
+        throw std::runtime_error("could not read json file '" + metaPath.string() + "'");
+    }
+}
+
+std::string Segmentation::id() const
+{
+    return metadata_["uuid"].get<std::string>();
+}
+
+std::string Segmentation::name() const
+{
+    return metadata_["name"].get<std::string>();
+}
+
+void Segmentation::setName(const std::string& n)
+{
+    metadata_["name"] = n;
+}
+
+void Segmentation::saveMetadata()
+{
+    auto metaPath = path_ / METADATA_FILE;
+    std::ofstream jsonFile(metaPath.string(), std::ofstream::out);
+    jsonFile << metadata_ << '\n';
+    if (jsonFile.fail()) {
+        throw std::runtime_error("could not write json file '" + metaPath.string() + "'");
+    }
+}
+
+bool Segmentation::checkDir(std::filesystem::path path)
+{
+    return std::filesystem::is_directory(path) && std::filesystem::exists(path / METADATA_FILE);
 }
 
 std::shared_ptr<Segmentation> Segmentation::New(const std::filesystem::path& path)
@@ -35,8 +87,8 @@ bool Segmentation::isSurfaceLoaded() const
 
 bool Segmentation::canLoadSurface() const
 {
-    return metadata_.hasKey("format") &&
-           metadata_.get<std::string>("format") == "tifxyz";
+    return metadata_.contains("format") &&
+           metadata_["format"].get<std::string>() == "tifxyz";
 }
 
 std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()

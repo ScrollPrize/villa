@@ -78,7 +78,6 @@
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
 
-#include "vc/core/types/Exceptions.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -2606,8 +2605,8 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
     // Linear voxel size (µm/voxel) for cm² conversion
     float voxelsize = 1.0f;
     try {
-        if (currentVolume && currentVolume->metadata().hasKey("voxelsize")) {
-            voxelsize = currentVolume->metadata().get<float>("voxelsize");
+        if (currentVolume) {
+            voxelsize = static_cast<float>(currentVolume->voxelSize());
         }
     } catch (...) { voxelsize = 1.0f; }
     if (!std::isfinite(voxelsize) || voxelsize <= 0.f) voxelsize = 1.0f;
