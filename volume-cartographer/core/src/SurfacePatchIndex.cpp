@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -220,8 +221,8 @@ struct SurfacePatchIndex::Impl {
     std::unique_ptr<TriangleTree> triangleTree;
     struct CellEntry {
         bool hasPatch = false;
-        Entry patch;
-        std::array<TriangleEntry, 2> triangles;
+        std::optional<Entry> patch;
+        std::array<std::optional<TriangleEntry>, 2> triangles;
         std::size_t triangleCount = 0;
     };
 
@@ -442,10 +443,10 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
     for (auto& cells : cellsPerSurface) {
         for (auto& cell : cells) {
             if (cell.second.hasPatch) {
-                entries.push_back(cell.second.patch);
+                entries.push_back(*cell.second.patch);
             }
             for (std::size_t triIdx = 0; triIdx < cell.second.triangleCount; ++triIdx) {
-                triangleEntries.push_back(cell.second.triangles[triIdx]);
+                triangleEntries.push_back(*cell.second.triangles[triIdx]);
             }
             impl_->cellEntries.emplace(cell.first, Impl::makeCellRecord(cell.second));
             impl_->surfaceCellKeys[cell.first.surface].push_back(cell.first);
@@ -888,11 +889,11 @@ SurfacePatchIndex::Impl::makeCellRecord(const CellEntry& entry)
     CellRecord record;
     record.hasPatch = entry.hasPatch;
     if (entry.hasPatch) {
-        record.patchBounds = entry.patch.first;
+        record.patchBounds = entry.patch->first;
     }
     record.triangleCount = entry.triangleCount;
     for (std::size_t idx = 0; idx < entry.triangleCount && idx < record.triangleBounds.size(); ++idx) {
-        record.triangleBounds[idx] = entry.triangles[idx].first;
+        record.triangleBounds[idx] = entry.triangles[idx]->first;
     }
     return record;
 }
@@ -1128,7 +1129,7 @@ void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, C
             if (!tree) {
                 tree = std::make_unique<PatchTree>();
             }
-            tree->insert(cell.second.patch);
+            tree->insert(*cell.second.patch);
             ++patchCount;
         }
 
@@ -1137,7 +1138,7 @@ void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, C
                 triangleTree = std::make_unique<TriangleTree>();
             }
             for (std::size_t triIdx = 0; triIdx < cell.second.triangleCount; ++triIdx) {
-                triangleTree->insert(cell.second.triangles[triIdx]);
+                triangleTree->insert(*cell.second.triangles[triIdx]);
                 ++triangleCount;
             }
         }

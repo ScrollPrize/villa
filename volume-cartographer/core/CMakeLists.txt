@@ -28,7 +28,6 @@ target_link_libraries(vc_core
         opencv_highgui
         opencv_calib3d
         opencv_video
-        spdlog::spdlog
         nlohmann_json::nlohmann_json
         z5
         OpenMP::OpenMP_CXX

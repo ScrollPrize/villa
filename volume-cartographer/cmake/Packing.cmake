@@ -39,6 +39,6 @@ set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)#ONE_PER_GROUP)
 set(CPACK_DEB_COMPONENT_INSTALL YES)
 
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS qt6-base-dev libceres-dev libboost-system-dev libboost-program-options-dev libopencv-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS qt6-base-dev libceres-dev libboost-system-dev libboost-program-options-dev libopencv-dev libblosc-dev libgsl-dev libsdl2-dev)
 
 include(CPack)

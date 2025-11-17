@@ -98,9 +98,6 @@ endif()
 set(XTENSOR_USE_XSIMD 1)
 find_package(xtensor REQUIRED)
 
-# ---- spdlog ------------------------------------------------------------------
-find_package(spdlog 1.4.2 CONFIG REQUIRED)
-
 # ---- nlohmann/json -----------------------------------------------------------
 if (VC_BUILD_JSON)
     FetchContent_Declare(
