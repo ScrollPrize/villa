@@ -2333,22 +2333,27 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                 trace_params.dpoints(p) = init;
 
-                // Set up a new local optimzation problem for the candidate point and its neighbors (initially just distance
-                // and curvature losses, not nearness-to-surface)
-                ceres::Problem problem;
+                if (generation > 4 && neural_tracer) {
+                    trace_params.dpoints(p) = init;
+                    trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                } else {
+                    // Set up a new local optimzation problem for the candidate point and its neighbors (initially just distance
+                    // and curvature losses, not nearness-to-surface)
+                    ceres::Problem problem;
 
-                trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
+                    trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
 
-                std::vector<double*> parameter_blocks;
-                problem.GetParameterBlocks(&parameter_blocks);
-                for (auto& block : parameter_blocks) {
-                    problem.SetParameterBlockConstant(block);
+                    std::vector<double*> parameter_blocks;
+                    problem.GetParameterBlocks(&parameter_blocks);
+                    for (auto& block : parameter_blocks) {
+                        problem.SetParameterBlockConstant(block);
+                    }
+                    problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
+
+                    ceres::Solver::Summary summary;
+                    ceres::Solve(options, &problem, &summary);
                 }
-                problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
-
-                ceres::Solver::Summary summary;
-                ceres::Solve(options, &problem, &summary);
 
                 generations(p) = generation;
 
@@ -2365,13 +2370,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                if (local_opt_r > 1)
-                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                if (generation <= 4 || !neural_tracer) {
+                    local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                    if (local_opt_r > 1)
+                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                }
             }  // end parallel iteration over cands
         }
 
-        if (!global_opt) {
+        if (generation > 4 && neural_tracer) {
+            // Skip optimizations
+        } else if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
             // of the newly added points
             std::vector<cv::Vec2i> opt_local;
