@@ -442,7 +442,7 @@ cv::Vec3f PlaneSurface::project(cv::Vec3f wp, float render_scale, float coord_sc
     cv::Vec3d res = _M*cv::Vec3d(wp)+_T;
     res *= render_scale*coord_scale;
 
-    return {res(0), res(1), res(2)};
+    return {static_cast<float>(res(0)), static_cast<float>(res(1)), static_cast<float>(res(2))};
 }
 
 float PlaneSurface::scalarp(cv::Vec3f point) const
@@ -524,7 +524,7 @@ QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
     //-1 as many times we read with linear interpolation and access +1 locations
     _bounds = {0,0,_points->cols-1,_points->rows-1};
     _scale = scale;
-    _center = {_points->cols/2.0/_scale[0],_points->rows/2.0/_scale[1],0};
+    _center = {static_cast<float>(_points->cols/2.0/_scale[0]), static_cast<float>(_points->rows/2.0/_scale[1]), 0.f};
 }
 
 QuadSurface::~QuadSurface()
@@ -541,7 +541,7 @@ QuadSurface *smooth_vc_segmentation(QuadSurface *src)
     double sx, sy;
     vc_segmentation_scales(points, sx, sy);
 
-    return new QuadSurface(points, {sx,sy});
+    return new QuadSurface(points, {static_cast<float>(sx), static_cast<float>(sy)});
 }
 
 cv::Vec3f QuadSurface::pointer()
@@ -584,7 +584,7 @@ cv::Vec3f QuadSurface::loc_raw(const cv::Vec3f &ptr)
 
 cv::Size QuadSurface::size()
 {
-    return {_points->cols / _scale[0], _points->rows / _scale[1]};
+    return {static_cast<int>(_points->cols / _scale[0]), static_cast<int>(_points->rows / _scale[1])};
 }
 
 cv::Vec2f QuadSurface::scale() const
@@ -655,9 +655,9 @@ void QuadSurface::invalidateCache()
     if (_points) {
         _bounds = {0, 0, _points->cols - 1, _points->rows - 1};
         _center = {
-            _points->cols / 2.0 / _scale[0],
-            _points->rows / 2.0 / _scale[1],
-            0
+            static_cast<float>(_points->cols / 2.0 / _scale[0]),
+            static_cast<float>(_points->rows / 2.0 / _scale[1]),
+            0.f
         };
     } else {
         _bounds = {0, 0, -1, -1};
@@ -968,7 +968,7 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
     int r_full = 0;
     for(int r=0;r<10*max_iters && r_full < max_iters;r++) {
         //FIXME skipn invalid init locs!
-        loc = {1 + (rand() % (points.cols-3)), 1 + (rand() % (points.rows-3))};
+        loc = {static_cast<float>(1 + (rand() % (points.cols-3))), static_cast<float>(1 + (rand() % (points.rows-3)))};
 
         if (points(loc[1],loc[0])[0] == -1)
             continue;
@@ -1025,7 +1025,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     int r_full = 0;
     int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
-        loc = {1 + (rand() % (_points->cols-3)), 1 + (rand() % (_points->rows-3))};
+        loc = {static_cast<float>(1 + (rand() % (_points->cols-3))), static_cast<float>(1 + (rand() % (_points->rows-3)))};
 
         if ((*_points)(loc[1],loc[0])[0] == -1) {
             skip_count++;
@@ -1888,7 +1888,7 @@ bool overlap(SurfaceMeta &a, SurfaceMeta &b, int max_iters)
 
     cv::Mat_<cv::Vec3f> points = a.surface()->rawPoints();
     for(int r=0; r<std::max(10, max_iters/10); r++) {
-        cv::Vec2f p = {rand() % points.cols, rand() % points.rows};
+        cv::Vec2f p = {static_cast<float>(rand() % points.cols), static_cast<float>(rand() % points.rows)};
         cv::Vec3f loc = points(p[1], p[0]);
         if (loc[0] == -1)
             continue;

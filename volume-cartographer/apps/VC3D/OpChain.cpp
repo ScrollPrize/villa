@@ -80,7 +80,7 @@ void OpChain::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv:
         last->gen(coords, normals, size, ptr, scale, offset);
     }
     else
-        last->gen(coords, normals, size, cv::Vec3f(0,0,0), scale, {-size.width/2, -size.height/2, ptr_center[2]+offset[2]});
+        last->gen(coords, normals, size, cv::Vec3f(0,0,0), scale, {static_cast<float>(-size.width/2), static_cast<float>(-size.height/2), ptr_center[2]+offset[2]});
 }
 
 const char *op_name(Surface *op)

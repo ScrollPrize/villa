@@ -400,7 +400,7 @@ bool scene2vol(cv::Vec3f &p, cv::Vec3f &n, Surface *_surf, const std::string &_s
     }
     
     try {
-        cv::Vec3f surf_loc = {scene_loc.x()/_ds_scale, scene_loc.y()/_ds_scale,0};
+        cv::Vec3f surf_loc = {static_cast<float>(scene_loc.x()/_ds_scale), static_cast<float>(scene_loc.y()/_ds_scale),0};
         
         auto ptr = _surf->pointer();
         
@@ -1230,13 +1230,13 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
         cv::Mat_<cv::Vec3f> slice_coords;
         cv::Mat_<uint8_t> slice_img;
 
-        cv::Vec2f roi_c = {roi.x+roi.width/2, roi.y + roi.height/2};
+        cv::Vec2f roi_c = {static_cast<float>(roi.x+roi.width/2), static_cast<float>(roi.y + roi.height/2)};
         _ptr = _surf->pointer();
         cv::Vec3f diff = {roi_c[0],roi_c[1],0};
         _surf->move(_ptr, diff/_scale);
         _vis_center = roi_c;
         float z_step = z * _ds_scale;  // Scale the step to maintain consistent physical distance
-        _surf->gen(&slice_coords, nullptr, roi.size(), _ptr, _scale, {-roi.width/2, -roi.height/2, _z_off + z_step});
+        _surf->gen(&slice_coords, nullptr, roi.size(), _ptr, _scale, {static_cast<float>(-roi.width/2), static_cast<float>(-roi.height/2), _z_off + z_step});
 
         readInterpolated3D(slice_img, volume->zarrDataset(_ds_sd_idx), slice_coords*_ds_scale, cache, _useFastInterpolation);
 
@@ -1389,7 +1389,7 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
         baseGray = render_composite(roi);
     } else {
         if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-            _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {roi.x, roi.y, _z_off});
+            _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
 
             uint8_t planeId = 0;
             if (plane->axisAlignedRotationKey() >= 0 && cache && baseDataset &&
@@ -1463,7 +1463,7 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     if (_overlayVolume && _overlayOpacity > 0.0f) {
         if (coords.empty()) {
             if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-                _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {roi.x, roi.y, _z_off});
+                _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
             } else {
                 cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
                 _ptr = _surf->pointer();
@@ -1573,7 +1573,7 @@ void CVolumeViewer::renderVisible(bool force)
         return;
     
     
-    curr_img_area = {bbox.left(),bbox.top(), bbox.width(), bbox.height()};
+    curr_img_area = {static_cast<int>(bbox.left()),static_cast<int>(bbox.top()), static_cast<int>(bbox.width()), static_cast<int>(bbox.height())};
     
     cv::Mat img = render_area({curr_img_area.x(), curr_img_area.y(), curr_img_area.width(), curr_img_area.height()});
     
@@ -1656,11 +1656,11 @@ void CVolumeViewer::renderIntersections()
         plane_roi.width += planeRoiPadding * 2;
         plane_roi.height += planeRoiPadding * 2;
 
-        cv::Vec3f corner = plane->coord(cv::Vec3f(0,0,0), {plane_roi.x, plane_roi.y, 0.0});
+        cv::Vec3f corner = plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.x), static_cast<float>(plane_roi.y), 0.0});
         Rect3D view_bbox = {corner, corner};
-        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {plane_roi.br().x, plane_roi.y, 0}));
-        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {plane_roi.x, plane_roi.br().y, 0}));
-        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {plane_roi.br().x, plane_roi.br().y, 0}));
+        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.br().x), static_cast<float>(plane_roi.y), 0}));
+        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.x), static_cast<float>(plane_roi.br().y), 0}));
+        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.br().x), static_cast<float>(plane_roi.br().y), 0}));
         const cv::Vec3f bboxExtent = view_bbox.high - view_bbox.low;
         const float maxExtent = std::max(std::abs(bboxExtent[0]),
                               std::max(std::abs(bboxExtent[1]), std::abs(bboxExtent[2])));

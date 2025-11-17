@@ -365,13 +365,13 @@ int main(int argc, char *argv[])
                     cv::Vec2f p;
                     int side = rand() % 4;
                     if (side == 0)
-                        p = {rand() % h, 0};
+                        p = {static_cast<float>(rand() % h), 0};
                     else if (side == 1)
-                        p = {0, rand() % w};
+                        p = {0, static_cast<float>(rand() % w)};
                     else if (side == 2)
-                        p = {rand() % h, w-1};
+                        p = {static_cast<float>(rand() % h), static_cast<float>(w-1)};
                     else if (side == 3)
-                        p = {h-1, rand() % w};
+                        p = {static_cast<float>(h-1), static_cast<float>(rand() % w)};
 
                     cv::Vec2f searchdir = cv::Vec2f(h/2,w/2) - p;
                     cv::normalize(searchdir, searchdir);
@@ -434,9 +434,9 @@ int main(int argc, char *argv[])
             int max_attempts = 1000;
             
             while(count < max_attempts && !succ) {
-                origin = {128 + (rand() % (ds->shape(2)-384)), 
-                         128 + (rand() % (ds->shape(1)-384)), 
-                         128 + (rand() % (ds->shape(0)-384))};
+                origin = {static_cast<double>(128 + (rand() % (ds->shape(2)-384))),
+                         static_cast<double>(128 + (rand() % (ds->shape(1)-384))),
+                         static_cast<double>(128 + (rand() % (ds->shape(0)-384)))};
 
                 count++;
                 auto chunk_id = chunk_size;
@@ -447,9 +447,9 @@ int main(int argc, char *argv[])
                 if (!ds->chunkExists(chunk_id))
                     continue;
 
-                cv::Vec3d dir = {(rand() % 1024) - 512,
-                                (rand() % 1024) - 512,
-                                (rand() % 1024) - 512};
+                cv::Vec3d dir = {static_cast<double>((rand() % 1024) - 512),
+                                static_cast<double>((rand() % 1024) - 512),
+                                static_cast<double>((rand() % 1024) - 512)};
                 cv::normalize(dir, dir);
 
                 for(int i=0;i<128;i++) {

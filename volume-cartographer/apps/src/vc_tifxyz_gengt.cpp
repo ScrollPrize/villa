@@ -91,7 +91,7 @@ IntersectVec getIntersects(const cv::Vec2i &seed, const cv::Mat_<cv::Vec3f> &poi
     uint32_t sr = seed[1];
     for(int i=0;i<1000;i++)
     {
-        cv::Vec2f loc = {rand_r(&sr) % points.cols, seed[1] - 50 + (rand_r(&sr) % 100)};
+        cv::Vec2f loc = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(seed[1] - 50 + (rand_r(&sr) % 100))};
         cv::Vec3f res;
         float dist = search_min_line(points, loc, res, o, n, step, 0.01);
 

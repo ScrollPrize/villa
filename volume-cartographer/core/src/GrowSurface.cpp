@@ -235,7 +235,7 @@ public:
             return {-1,-1,-1};
         else {
             cv::Rect bounds = {0, 0, sm->surface()->rawPoints().rows-2,sm->surface()->rawPoints().cols-2};
-            cv::Vec2i li = {floor(l[0]),floor(l[1])};
+            cv::Vec2i li = {static_cast<int>(floor(l[0])),static_cast<int>(floor(l[1]))};
             if (bounds.contains(cv::Point(li)))
                 return at_int_inv(sm->surface()->rawPoints(), l);
             else
@@ -252,7 +252,7 @@ public:
             return false;
         else {
             cv::Rect bounds = {0, 0, sm->surface()->rawPoints().rows-2,sm->surface()->rawPoints().cols-2};
-            cv::Vec2i li = {floor(l[0]),floor(l[1])};
+            cv::Vec2i li = {static_cast<int>(floor(l[0])),static_cast<int>(floor(l[1]))};
             if (bounds.contains(cv::Point(li)))
             {
                 if (sm->surface()->rawPoints()(li[0],li[1])[0] == -1)
@@ -993,7 +993,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (state(j,i) & STATE_LOC_VALID) {
                 data_new.surfs({j,i}).insert(&sm);
-                data_new.loc(&sm, {j,i}) = {j,i};
+                data_new.loc(&sm, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
             }
 
     cv::Mat_<uint8_t> new_state = state.clone();
@@ -1051,7 +1051,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (new_state(j,i) & STATE_LOC_VALID) {
                 data_inp.surfs({j,i}).insert(&sm_inp);
-                data_inp.loc(&sm_inp, {j,i}) = {j,i};
+                data_inp.loc(&sm_inp, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
             }
 
     ceres::Problem problem;
@@ -1569,7 +1569,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         }
     }
 
-    data.loc(seed,{y0,x0}) = {seed_loc[0], seed_loc[1]};
+    data.loc(seed,{y0,x0}) = {static_cast<double>(seed_loc[0]), static_cast<double>(seed_loc[1])};
     data.surfs({y0,x0}).insert(seed);
     if (approved_sm.contains(seed)) data.setApproved(seed, {y0,x0});
     points(y0,x0) = data.lookup_int(seed,{y0,x0});

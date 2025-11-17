@@ -81,7 +81,7 @@ float find_loc_wind_slow(cv::Vec2f &loc, float tgt_wind, const cv::Mat_<cv::Vec3
         cv::Vec2f cand = loc;
         
         if (r)
-            cand = {rand_r(&sr) % points.cols, rand_r(&sr) % points.rows};
+            cand = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(rand_r(&sr) % points.rows)};
         
         if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
             continue;

@@ -990,8 +990,8 @@ cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
 {
     cv::Vec2f inb_loc = {loc[0], loc[1]};
     //move inside from the grid border so w can access required locations
-    inb_loc = vmax(inb_loc, {1,1});
-    inb_loc = vmin(inb_loc, {points.cols-3,points.rows-3});
+    inb_loc = vmax(inb_loc, {1.f,1.f});
+    inb_loc = vmin(inb_loc, {static_cast<float>(points.cols-3), static_cast<float>(points.rows-3)});
     
     if (!loc_valid_xy(points, inb_loc))
         return {NAN,NAN,NAN};
@@ -1094,7 +1094,7 @@ cv::Mat_<cv::Vec3f> smooth_vc_segmentation(const cv::Mat_<cv::Vec3f> &points)
     #pragma omp parallel for
     for(int j=1;j<points.rows;j++)
         for(int i=1;i<points.cols-1;i++) {
-            cv::Vec2f loc = {i,j};
+            cv::Vec2f loc = {static_cast<float>(i), static_cast<float>(j)};
             min_loc(points, loc, out(j,i), blur(j,i), false);
         }
         

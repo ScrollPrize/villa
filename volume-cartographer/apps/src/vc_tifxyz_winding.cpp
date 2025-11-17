@@ -94,14 +94,14 @@ float surf_th = 0.5;
 IntersectVec getIntersects(const cv::Vec2i &seed, const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &step)
 {
     cv::Vec3f o = points(seed[1],seed[0]);
-    cv::Vec3f n = grid_normal(points, {seed[0],seed[1],0});
+    cv::Vec3f n = grid_normal(points, {static_cast<float>(seed[0]),static_cast<float>(seed[1]),0});
     if (std::isnan(n[0]))
         return {};
     std::vector<cv::Vec2f> locs = {seed};
     uint32_t sr = seed[1];
     for(int i=0;i<1000;i++)
     {
-        cv::Vec2f loc = {rand_r(&sr) % points.cols, seed[1] - 50 + (rand_r(&sr) % 100)};
+        cv::Vec2f loc = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(seed[1] - 50 + (rand_r(&sr) % 100))};
         cv::Vec3f res;
         float dist = search_min_line(points, loc, res, o, n, step, 0.01);
         
@@ -197,7 +197,7 @@ bool loc_valid_nan(const cv::Mat_<float> &m, const cv::Vec2d &l)
         return false;
     
     cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
-    cv::Vec2i li = {floor(l[0]),floor(l[1])};
+    cv::Vec2i li = {static_cast<int>(floor(l[0])),static_cast<int>(floor(l[1]))};
     
     if (!bounds.contains(cv::Point(li)))
         return false;
@@ -326,7 +326,7 @@ int main(int argc, char *argv[])
     // }
     
     for(auto &iv : intersects) {
-        cv::Vec3b col = {50+rand() % 155,50+rand() % 155,50+rand() % 155};
+        cv::Vec3b col = {static_cast<unsigned char>(50+rand() % 155),static_cast<unsigned char>(50+rand() % 155),static_cast<unsigned char>(50+rand() % 155)};
         for(auto &pair : iv) {
             // img(pair.second[1],pair.second[0]) = col;
             // std::cout << pair.first << pair.second << std::endl;
@@ -389,11 +389,11 @@ int main(int argc, char *argv[])
             abort();
         else
             seed_idx++;
-    cv::Vec2i seed = {intersects[seed_idx][0].second[1],intersects[seed_idx][0].second[0]};
+    cv::Vec2i seed = {static_cast<int>(intersects[seed_idx][0].second[1]),static_cast<int>(intersects[seed_idx][0].second[0])};
     
     std::vector<cv::Vec3b> wind_cols;
     for(int i=0;i<400;i++) {
-        cv::Vec3b col = {50+rand() % 127,50+rand() % 127,50+rand() % 127};
+        cv::Vec3b col = {static_cast<unsigned char>(50+rand() % 127),static_cast<unsigned char>(50+rand() % 127),static_cast<unsigned char>(50+rand() % 127)};
         col[rand()%3] = 192+rand()%63;
         if (i%2 == 0)
             col *= 0.5;
@@ -426,9 +426,9 @@ int main(int argc, char *argv[])
             for(int n=0;n<iv.size()-1;n++) {
                 int x1 = iv[n].second[0];
                 int x2 = iv[n+1].second[0];
-                
-                cv::Vec2i p1i = {iv[n].second[1],iv[n].second[0]};
-                cv::Vec2i p2i = {iv[n+1].second[1],iv[n+1].second[0]};
+
+                cv::Vec2i p1i = {static_cast<int>(iv[n].second[1]),static_cast<int>(iv[n].second[0])};
+                cv::Vec2i p2i = {static_cast<int>(iv[n+1].second[1]),static_cast<int>(iv[n+1].second[0])};
                 
                 int ref_x = wind_x_ref[std::min<int>((x1+x2)/wind_sd, wind_x_ref.size()-1)];
                 

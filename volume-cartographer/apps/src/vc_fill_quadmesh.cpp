@@ -107,7 +107,7 @@ bool loc_valid_nan(const cv::Mat_<float> &m, const cv::Vec2d &l)
         return false;
     
     cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
-    cv::Vec2i li = {floor(l[0]),floor(l[1])};
+    cv::Vec2i li = {static_cast<int>(floor(l[0])),static_cast<int>(floor(l[1]))};
     
     if (!bounds.contains(cv::Point(li)))
         return false;
@@ -445,7 +445,7 @@ float find_loc_wind_slow(cv::Vec2f &loc, float tgt_wind, const cv::Mat_<cv::Vec3
         cv::Vec2f cand = loc;
         
         if (r)
-            cand = {rand_r(&sr) % points.cols, rand_r(&sr) % points.rows};
+            cand = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(rand_r(&sr) % points.rows)};
         
         if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
             continue;
@@ -546,7 +546,7 @@ float find_loc_wind(cv::Vec2f &loc, float tgt_wind, const cv::Mat_<cv::Vec3f> &p
         cv::Vec2f cand = loc;
         
         if (full_r || !loc_valid_nan_xy(winding, cand))
-            cand = {rand_r(&sr) % points.cols, rand_r(&sr) % points.rows};
+            cand = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(rand_r(&sr) % points.rows)};
         
         if (abs(winding(cand[1],cand[0])-tgt_wind) > 0.3)
             continue;
@@ -610,7 +610,7 @@ static bool loc_valid(const cv::Mat_<float> &m, const cv::Vec2d &l)
         return false;
     
     cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
-    cv::Vec2i li = {floor(l[0]),floor(l[1])};
+    cv::Vec2i li = {static_cast<int>(floor(l[0])),static_cast<int>(floor(l[1]))};
     
     if (!bounds.contains(cv::Point(li)))
         return false;
@@ -902,7 +902,7 @@ int main(int argc, char *argv[])
             for(int i=0;i<surf_points[s].cols;i++) {
                 if (surf_points[s](j, i)[0] == -1)
                     continue;
-                cv::Vec3f n = grid_normal(surf_points[s], {i,j,0});
+                cv::Vec3f n = grid_normal(surf_points[s], {static_cast<float>(i),static_cast<float>(j),0});
                 cv::Vec3f p = surf_points[s](j,i);
                 if (std::isnan(n[0]))
                     continue;
@@ -1081,13 +1081,13 @@ int main(int argc, char *argv[])
             winding(j,i) = winding_in(j*trace_mul, i*trace_mul);
             if (points(j,i)[0] != -1) {
                 state(j,i) = STATE_LOC_VALID | STATE_COORD_VALID;
-                surf_locs[0](j,i) = {j*trace_mul,i*trace_mul};
+                surf_locs[0](j,i) = {static_cast<double>(j*trace_mul),static_cast<double>(i*trace_mul)};
             }
             else {
                 if (points(j-1,i)[0] != -1) 
                     points(j, i) = points(j-1,i) + cv::Vec3d(0.1,0.1,0.1);
                 else
-                    points(j, i) = {rand()%1000,rand()%1000,rand()%1000};
+                    points(j, i) = {static_cast<double>(rand()%1000),static_cast<double>(rand()%1000),static_cast<double>(rand()%1000)};
                 state(j,i) = STATE_COORD_VALID;
             }
         }
@@ -1380,9 +1380,9 @@ int main(int argc, char *argv[])
                 for (int s=0;s<surf_points.size();s++) {
                     if (supports[s](p)) {
                         if (loc_valid(surf_points[s], surf_locs[s](p))) {
-                            if (abs(at_int(winds[s], {surf_locs[s](p)[1],surf_locs[s](p)[0]}) - tgt_wind[x]) <= wind_th) {
+                            if (abs(at_int(winds[s], {static_cast<float>(surf_locs[s](p)[1]),static_cast<float>(surf_locs[s](p)[0])}) - tgt_wind[x]) <= wind_th) {
                                 //FIXME check wind + support + loc avlid
-                                float int_w = at_int(winds[s], {surf_locs[s](p)[1],surf_locs[s](p)[0]});
+                                float int_w = at_int(winds[s], {static_cast<float>(surf_locs[s](p)[1]),static_cast<float>(surf_locs[s](p)[0])});
                                 avg_wind[x] += int_w;
                                 wind_counts[x]++;
                                 if (i == x) {
@@ -1395,7 +1395,7 @@ int main(int argc, char *argv[])
                                 
                             }
                             else
-                                std::cout << "wind th " << abs(at_int(winds[s], {surf_locs[s](p)[1],surf_locs[s](p)[0]}) - tgt_wind[x]) << " " << at_int(winds[s], {surf_locs[s](p)[1],surf_locs[s](p)[0]}) << tgt_wind[x] << " " << std::endl;
+                                std::cout << "wind th " << abs(at_int(winds[s], {static_cast<float>(surf_locs[s](p)[1]),static_cast<float>(surf_locs[s](p)[0])}) - tgt_wind[x]) << " " << at_int(winds[s], {static_cast<float>(surf_locs[s](p)[1]),static_cast<float>(surf_locs[s](p)[0])}) << tgt_wind[x] << " " << std::endl;
                         }
                         else
                         {

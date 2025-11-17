@@ -74,7 +74,7 @@ public:
         _border = compute_f.BORDER;
         
         if (_ds)
-            _shape = {_ds->shape()[0],_ds->shape()[1],_ds->shape()[2]};
+            _shape = {static_cast<int>(_ds->shape()[0]), static_cast<int>(_ds->shape()[1]), static_cast<int>(_ds->shape()[2])};
         
         if (cache_root.empty())
             return;
@@ -258,9 +258,9 @@ public:
         close(fd);
         
         cv::Vec3i offset =
-        {id[0]*s-_border,
-            id[1]*s-_border,
-            id[2]*s-_border};
+        {static_cast<int>(id[0]*s-_border),
+            static_cast<int>(id[1]*s-_border),
+            static_cast<int>(id[2]*s-_border)};
 
         CHUNKT small = xt::empty<T>({s,s,s});
         CHUNKT large;
@@ -305,9 +305,9 @@ public:
         CHUNKT small = xt::empty<T>({s,s,s});
 
         cv::Vec3i offset =
-        {id[0]*s-_border,
-            id[1]*s-_border,
-            id[2]*s-_border};
+        {static_cast<int>(id[0]*s-_border),
+            static_cast<int>(id[1]*s-_border),
+            static_cast<int>(id[2]*s-_border)};
             
         CHUNKT large;
         if (_ds) {
@@ -666,9 +666,9 @@ struct Chunked3dFloatFromUint8
     {
         // p has zyx ordering!
         p *= _scale;
-        cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
+        cv::Vec3i i{static_cast<int>(lround(p[0])), static_cast<int>(lround(p[1])), static_cast<int>(lround(p[2]))};
         uint8_t x = _x.safe_at(i);
-        return float{x} / 255.f;
+        return static_cast<float>(x) / 255.f;
     }
 
     float operator()(double z, double y, double x)
@@ -700,11 +700,11 @@ struct Chunked3dVec3fFromUint8
     {
         // Both p and returned vector have zyx ordering!
         p *= _scale;
-        cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
+        cv::Vec3i i{static_cast<int>(lround(p[0])), static_cast<int>(lround(p[1])), static_cast<int>(lround(p[2]))};
         uint8_t x = _x.safe_at(i);
         uint8_t y = _y.safe_at(i);
         uint8_t z = _z.safe_at(i);
-        return (cv::Vec3f{z, y, x} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
+        return (cv::Vec3f{static_cast<float>(z), static_cast<float>(y), static_cast<float>(x)} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
     }
 
     cv::Vec3f operator()(double z, double y, double x)
