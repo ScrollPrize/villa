@@ -799,6 +799,15 @@ void CVolumeViewer::setIntersects(const std::set<std::string> &set)
     renderIntersections();
 }
 
+void CVolumeViewer::setSegmentationEditActive(bool active)
+{
+    if (_segmentationEditActive == active) {
+        return;
+    }
+    _segmentationEditActive = active;
+    renderIntersections();
+}
+
 void CVolumeViewer::setIntersectionOpacity(float opacity)
 {
     _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
@@ -1033,6 +1042,11 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
     if (name == _surf_name) {
         curr_img_area = {0,0,0,0};
         renderVisible(true); // Immediate render of slice
+    }
+
+    if (_intersect_tgts.count(name)) {
+        invalidateIntersect(name);
+        renderIntersections();
     }
 
     // Defer overlay updates
@@ -1624,6 +1638,9 @@ void CVolumeViewer::renderIntersections()
     };
 
     PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
+    QuadSurface* activeSegSurface =
+        _surf_col ? dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation")) : nullptr;
+    const bool segmentationAliasRequested = _intersect_tgts.count("segmentation") > 0;
 
     
     if (plane) {
@@ -1647,7 +1664,7 @@ void CVolumeViewer::renderIntersections()
         const cv::Vec3f bboxExtent = view_bbox.high - view_bbox.low;
         const float maxExtent = std::max(std::abs(bboxExtent[0]),
                               std::max(std::abs(bboxExtent[1]), std::abs(bboxExtent[2])));
-        const float viewPadding = std::max(64.0f, maxExtent * 0.1f);
+        const float viewPadding = std::max(64.0f, maxExtent * 0.25f);
         view_bbox.low -= cv::Vec3f(viewPadding, viewPadding, viewPadding);
         view_bbox.high += cv::Vec3f(viewPadding, viewPadding, viewPadding);
 
@@ -1659,8 +1676,9 @@ void CVolumeViewer::renderIntersections()
         }
         const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
 
-        std::vector<std::string> intersect_cands;
-        intersect_cands.reserve(_intersect_tgts.size());
+        using IntersectionCandidate = std::pair<std::string, QuadSurface*>;
+        std::vector<IntersectionCandidate> intersectCandidates;
+        intersectCandidates.reserve(_intersect_tgts.size());
         for (const auto& key : _intersect_tgts) {
             Surface* surfacePtr = _surf_col->surface(key);
             if (!surfacePtr) {
@@ -1673,24 +1691,72 @@ void CVolumeViewer::renderIntersections()
                 continue;
             }
 
-            intersect_cands.push_back(key);
-        }
-
-        std::hash<std::string> str_hasher;
-        size_t colorIndex = 0;
-        for (const auto& key : intersect_cands) {
-            QuadSurface *segmentation = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
-            if (!segmentation) {
+            if (_segmentationEditActive && activeSegSurface && segmentationAliasRequested &&
+                segmentation == activeSegSurface && key != "segmentation") {
+                removeItemsForKey(key);
                 continue;
             }
 
-            std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
-            patchIndex->queryTriangles(view_bbox, segmentation, triangleCandidates);
+            intersectCandidates.emplace_back(key, segmentation);
+        }
+
+        std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
+        patchIndex->queryTriangles(view_bbox, nullptr, triangleCandidates);
+
+        std::unordered_map<QuadSurface*, std::vector<size_t>> trianglesBySurface;
+        trianglesBySurface.reserve(intersectCandidates.size());
+        for (size_t idx = 0; idx < triangleCandidates.size(); ++idx) {
+            auto* surface = triangleCandidates[idx].surface;
+            if (!surface) {
+                continue;
+            }
+            trianglesBySurface[surface].push_back(idx);
+        }
+
+        auto intersectionLinesEqual = [](const std::vector<IntersectionLine>& lhs,
+                                         const std::vector<IntersectionLine>& rhs) {
+            if (lhs.size() != rhs.size()) {
+                return false;
+            }
+            for (size_t idx = 0; idx < lhs.size(); ++idx) {
+                const auto& a = lhs[idx];
+                const auto& b = rhs[idx];
+                if (a.world.size() != b.world.size() ||
+                    a.surfaceParams.size() != b.surfaceParams.size()) {
+                    return false;
+                }
+                for (size_t pointIdx = 0; pointIdx < a.world.size(); ++pointIdx) {
+                    if (a.world[pointIdx] != b.world[pointIdx]) {
+                        return false;
+                    }
+                }
+                for (size_t pointIdx = 0; pointIdx < a.surfaceParams.size(); ++pointIdx) {
+                    if (a.surfaceParams[pointIdx] != b.surfaceParams[pointIdx]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        size_t colorIndex = 0;
+        for (const auto& candidate : intersectCandidates) {
+            const auto& key = candidate.first;
+            QuadSurface* segmentation = candidate.second;
+
+            const auto trianglesIt = trianglesBySurface.find(segmentation);
+            if (trianglesIt == trianglesBySurface.end()) {
+                removeItemsForKey(key);
+                continue;
+            }
+
+            const auto& candidateIndices = trianglesIt->second;
 
             std::vector<IntersectionLine> intersectionLines;
-            intersectionLines.reserve(triangleCandidates.size());
-            for (const auto& candidate : triangleCandidates) {
-                auto segment = SurfacePatchIndex::clipTriangleToPlane(candidate, *plane, clipTolerance);
+            intersectionLines.reserve(candidateIndices.size());
+            for (size_t candidateIndex : candidateIndices) {
+                const auto& triCandidate = triangleCandidates[candidateIndex];
+                auto segment = SurfacePatchIndex::clipTriangleToPlane(triCandidate, *plane, clipTolerance);
                 if (!segment) {
                     continue;
                 }
@@ -1705,14 +1771,7 @@ void CVolumeViewer::renderIntersections()
                 intersectionLines.push_back(std::move(line));
             }
 
-            size_t seed = str_hasher(key);
-            srand(seed);
-
-            int prim = rand() % 3;
-            cv::Vec3i cvcol = {100 + rand() % 255, 100 + rand() % 255, 100 + rand() % 255};
-            cvcol[prim] = 200 + rand() % 55;
-
-            QColor col(cvcol[0],cvcol[1],cvcol[2]);
+            QColor col;
             float width = 3;
             int z_value = 5;
 
@@ -1753,11 +1812,12 @@ void CVolumeViewer::renderIntersections()
             col = palette[colorIndex % std::size(palette)];
             ++colorIndex;
 
-            if (key == "segmentation") {
-                col =
-                    (_surf_name == "seg yz"   ? COLOR_SEG_YZ
-                     : _surf_name == "seg xz" ? COLOR_SEG_XZ
-                                              : COLOR_SEG_XY);
+            const bool isActiveSegmentation =
+                activeSegSurface && segmentation == activeSegSurface;
+            if (isActiveSegmentation) {
+                col = (_surf_name == "seg yz"   ? COLOR_SEG_YZ
+                       : _surf_name == "seg xz" ? COLOR_SEG_XZ
+                                                : COLOR_SEG_XY);
                 width = 3;
                 z_value = 20;
             }
@@ -1800,7 +1860,15 @@ void CVolumeViewer::renderIntersections()
                 removeItemsForKey(key);
             }
 
-            if (_surf_col && !intersectionLines.empty()) {
+            bool shouldUpdateIntersection = _surf_col && !intersectionLines.empty();
+            if (shouldUpdateIntersection) {
+                if (auto* existing = _surf_col->intersection(_surf_name, key)) {
+                    shouldUpdateIntersection =
+                        !intersectionLinesEqual(existing->lines, intersectionLines);
+                }
+            }
+
+            if (shouldUpdateIntersection) {
                 auto* intersection = new Intersection();
                 intersection->lines = std::move(intersectionLines);
                 _ignore_intersect_change = intersection;

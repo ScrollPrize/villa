@@ -915,7 +915,7 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     pass2JsonFile->write(QJsonDocument(pass2Params).toJson(QJsonDocument::Indented));
     pass2JsonFile->flush();
 
-    _neighborCopyJob.emplace();
+    _neighborCopyJob = NeighborCopyJob{};
     auto& job = *_neighborCopyJob;
     job.stage = NeighborCopyJob::Stage::FirstPass;
     job.segmentId = segmentId;

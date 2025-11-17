@@ -39,8 +39,6 @@ find_dependency(OpenCV @OpenCV_VERSION_MAJOR@.@OpenCV_VERSION_MINOR@ QUIET REQUI
 ### TIFF ###
 find_dependency(TIFF QUIET REQUIRED)
 
-### spdlog ###
-find_dependency(spdlog CONFIG QUIET REQUIRED)
 
 ### smgl ###
 find_dependency(smgl @smgl_VERSION@ CONFIG QUIET REQUIRED)

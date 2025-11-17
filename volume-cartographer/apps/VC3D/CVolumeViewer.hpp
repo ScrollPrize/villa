@@ -70,7 +70,7 @@ public:
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
-    void setSegmentationEditActive(bool active) { _segmentationEditActive = active; }
+    void setSegmentationEditActive(bool active);
 
     void fitSurfaceInView();
     void updateAllOverlays();

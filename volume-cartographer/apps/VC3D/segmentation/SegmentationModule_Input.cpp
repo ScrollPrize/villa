@@ -118,6 +118,16 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return false;
     }
 
+    // Q and E keys to adjust push pull radius
+    const bool radiusAdjustKey = (event->key() == Qt::Key_Q || event->key() == Qt::Key_E);
+    if (radiusAdjustKey && event->modifiers() == Qt::NoModifier) {
+        const float step = (event->key() == Qt::Key_E) ? 0.25f : -0.25f;
+        const float newRadius = _pushPullRadiusSteps + step;
+        setPushPullRadius(newRadius);
+        event->accept();
+        return true;
+    }
+
     if (event->key() == Qt::Key_T && event->modifiers() == Qt::NoModifier) {
         onCorrectionsCreateRequested();
         event->accept();
