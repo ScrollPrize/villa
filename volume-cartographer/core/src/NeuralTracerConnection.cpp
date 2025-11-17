@@ -12,15 +12,18 @@
 namespace
 {
     nlohmann::json process_json_request(const nlohmann::json& req, int sock) {
-
-        std::string msg = req.dump() + "\n";
-        if (send(sock, msg.c_str(), msg.length(), 0) < 0)
-            throw std::runtime_error("Failed to send request");
-
         std::string response_str;
-        char buffer[1];
-        while (recv(sock, buffer, 1, 0) == 1 && buffer[0] != '\n')
-            response_str += buffer[0];
+
+#pragma omp critical
+        {
+            std::string msg = req.dump() + "\n";
+            if (send(sock, msg.c_str(), msg.length(), 0) < 0)
+                throw std::runtime_error("Failed to send request");
+
+            char buffer[1];
+            while (recv(sock, buffer, 1, 0) == 1 && buffer[0] != '\n')
+                response_str += buffer[0];
+        }
 
         std::cout << "Received from neural tracer: " << response_str << std::endl;
 
