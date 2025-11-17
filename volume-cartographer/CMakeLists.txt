@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
-include(FetchContent)
 
 set(VC_VERSION 3.0.2)
 
@@ -136,10 +135,6 @@ endif()
 # Use modern C++ for everything and generate compile_commands database.
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 
-# Choose what to build
-option(VC_BUILD_APPS     "Compile VC core programs"    on)
-option(VC_BUILD_GUI      "Compile GUI programs"        on)
-option(VC_BUILD_UTILS    "Compile VC utility programs" on)
 
 # Choose what to install
 option(VC_INSTALL_APPS      "Install VC core programs"    on)
@@ -155,15 +150,6 @@ option(VC_WITH_PASTIX "Build with PaStiX support" OFF)
 # Look for external dependencies.
 include(VCFindDependencies)
 
-# Weird bug on macOS where system includes aren't included with the right flag
-if (APPLE)
-    set(CMAKE_INCLUDE_SYSTEM_FLAG_CXX "-isystem ")
-endif()
-
-if (VC_BUILD_TESTS)
-    enable_testing()
-endif()
-
 option(VC_DEVELOPER_WARNINGS "For developers: Enable extensive compiler warnings" OFF)
 mark_as_advanced(VC_DEVELOPER_WARNINGS)
 if(VC_DEVELOPER_WARNINGS)
@@ -172,11 +158,7 @@ endif()
 
 add_subdirectory(misc)
 add_subdirectory(core)
-
-
-if (VC_BUILD_APPS)
-    add_subdirectory(apps)
-endif()
+add_subdirectory(apps)
 
 include(VCPackageConfig)
 include(VCInstall)

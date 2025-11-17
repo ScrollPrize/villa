@@ -1,9 +1,7 @@
 ############
 # GUI Apps #
 ############
-if(VC_BUILD_GUI)
 add_subdirectory(VC3D)
-endif()
 
 #################
 # CMD Line Apps #
