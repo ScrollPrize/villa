@@ -540,75 +540,130 @@ static void call_neural_tracer_for_point(
 {
     if (!neural_tracer) return;
 
-    // Find the quad with the most existing corners adjacent to the new point p
-    cv::Vec2i best_quad_tl(-1, -1);
-    int max_corners = 0;
-
-    // Check the 4 possible quads that p could be a corner of
-    cv::Vec2i potential_quad_tls[4] = {
-        p + cv::Vec2i(-1, -1), // p is bottom-right
-        p + cv::Vec2i(-1, 0),  // p is bottom-left
-        p + cv::Vec2i(0, -1),  // p is top-right
-        p + cv::Vec2i(0, 0)    // p is top-left
+    // 1. Find the best existing neighbor of p to use as the "center"
+    cv::Vec2i neighbors[] = {
+        p + cv::Vec2i(-1, 0), // up
+        p + cv::Vec2i(1, 0),  // down
+        p + cv::Vec2i(0, -1), // left
+        p + cv::Vec2i(0, 1)   // right
     };
 
-    for (const auto& tl : potential_quad_tls) {
-        if (tl[0] < 0 || tl[1] < 0 || tl[0] >= trace_params.state.rows - 1 || tl[1] >= trace_params.state.cols - 1) continue;
-
-        int corner_count = 0;
-        cv::Vec2i corners[4] = {tl, tl + cv::Vec2i(0, 1), tl + cv::Vec2i(1, 0), tl + cv::Vec2i(1, 1)};
-        for (const auto& corner : corners) {
-            if (point_in_bounds(trace_params.state, corner) && (trace_params.state(corner) & STATE_LOC_VALID)) {
-                corner_count++;
-            }
-        }
-
-        if (corner_count > max_corners) {
-            max_corners = corner_count;
-            best_quad_tl = tl;
+    std::vector<cv::Vec2i> potential_centers;
+    for (const auto& n : neighbors) {
+        if (point_in_bounds(trace_params.state, n) && (trace_params.state(n) & STATE_LOC_VALID)) {
+            potential_centers.push_back(n);
         }
     }
 
-    if (max_corners == 3 && best_quad_tl[0] != -1) {
-        const auto& p_double = trace_params.dpoints(p);
-        cv::Vec3f center(p_double[0], p_double[1], p_double[2]);
+    if (potential_centers.empty()) {
+        std::cout << "Neural tracer: No valid neighbors for point " << p << " to use as center." << std::endl;
+        return;
+    }
 
-        auto get_point = [&](const cv::Vec2i& offset) -> std::optional<cv::Vec3f> {
-            cv::Vec2i abs_pos = best_quad_tl + offset;
-            if (point_in_bounds(trace_params.dpoints, abs_pos) && (trace_params.state(abs_pos) & STATE_LOC_VALID)) {
-                const auto& p_double_neighbor = trace_params.dpoints(abs_pos);
-                return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
+    cv::Vec2i best_center_pos = {-1, -1};
+    int max_neighbor_count = -1;
+
+    for (const auto& c_pos : potential_centers) {
+        int current_neighbor_count = 0;
+        // Check 8 neighbors of c_pos to find the one with the most context
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                cv::Vec2i n_pos = c_pos + cv::Vec2i(dy, dx);
+                if (point_in_bounds(trace_params.state, n_pos) && (trace_params.state(n_pos) & STATE_LOC_VALID)) {
+                    current_neighbor_count++;
+                }
             }
-            return std::nullopt;
-        };
-
-        std::optional<cv::Vec3f> p_tl = get_point({0,0});
-        std::optional<cv::Vec3f> p_tr = get_point({0,1});
-        std::optional<cv::Vec3f> p_bl = get_point({1,0});
-        std::optional<cv::Vec3f> p_br = get_point({1,1});
-
-        std::optional<cv::Vec3f> prev_u, prev_v, prev_diag;
-        if (!p_tl.has_value()) { // p is tl
-            prev_u = p_tr; prev_v = p_bl; prev_diag = p_br;
-        } else if (!p_tr.has_value()) { // p is tr
-            prev_u = p_tl; prev_v = p_br; prev_diag = p_bl;
-        } else if (!p_bl.has_value()) { // p is bl
-            prev_u = p_br; prev_v = p_tl; prev_diag = p_tr;
-        } else if (!p_br.has_value()) { // p is br
-            prev_u = p_bl; prev_v = p_tr; prev_diag = p_tl;
         }
-        
-        std::cout << "Calling neural tracer for new point at " << p << " (part of quad " << best_quad_tl << ")" << std::endl;
-        std::cout << "  center: " << center << std::endl;
-        if(prev_u) std::cout << "  prev_u: " << *prev_u << std::endl; else std::cout << "  prev_u: null" << std::endl;
-        if(prev_v) std::cout << "  prev_v: " << *prev_v << std::endl; else std::cout << "  prev_v: null" << std::endl;
-        if(prev_diag) std::cout << "  prev_diag: " << *prev_diag << std::endl; else std::cout << "  prev_diag: null" << std::endl;
 
-        auto next_uvs = neural_tracer->get_next_points(center, prev_u, prev_v, prev_diag);
-        
-        std::cout << "  neural tracer returned " << next_uvs.next_u_xyzs.size() << " u points and " << next_uvs.next_v_xyzs.size() << " v points." << std::endl;
-        for(const auto& pu : next_uvs.next_u_xyzs) std::cout << "    u: " << pu << std::endl;
-        for(const auto& pv : next_uvs.next_v_xyzs) std::cout << "    v: " << pv << std::endl;
+        if (current_neighbor_count > max_neighbor_count) {
+            max_neighbor_count = current_neighbor_count;
+            best_center_pos = c_pos;
+        }
+    }
+
+    if (best_center_pos[0] == -1) {
+        std::cout << "Neural tracer: Could not determine best center for point " << p << std::endl;
+        return;
+    }
+
+    // 2. Prepare tracer input based on the best center
+    const auto& center_p_double = trace_params.dpoints(best_center_pos);
+    cv::Vec3f center_xyz(center_p_double[0], center_p_double[1], center_p_double[2]);
+
+    auto get_point = [&](const cv::Vec2i& pos) -> std::optional<cv::Vec3f> {
+        if (point_in_bounds(trace_params.dpoints, pos) && (trace_params.state(pos) & STATE_LOC_VALID)) {
+            const auto& p_double_neighbor = trace_params.dpoints(pos);
+            return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
+        }
+        return std::nullopt;
+    };
+
+    const cv::Vec2i u_dir = {0, 1}; // Horizontal offset
+    const cv::Vec2i v_dir = {1, 0}; // Vertical offset
+
+    std::optional<cv::Vec3f> prev_u = get_point(best_center_pos - u_dir);
+    std::optional<cv::Vec3f> prev_v = get_point(best_center_pos - v_dir);
+    std::optional<cv::Vec3f> prev_diag;
+
+    if (prev_u.has_value() && prev_v.has_value()) {
+        prev_diag = get_point(best_center_pos - u_dir - v_dir);
+    } else if (prev_u.has_value()) {
+        prev_diag = get_point(best_center_pos - u_dir + v_dir);
+        if (!prev_diag.has_value()) {
+            prev_diag = get_point(best_center_pos - u_dir - v_dir);
+        }
+    } else if (prev_v.has_value()) {
+        prev_diag = get_point(best_center_pos - v_dir + u_dir);
+        if (!prev_diag.has_value()) {
+            prev_diag = get_point(best_center_pos - v_dir - u_dir);
+        }
+    }
+
+    std::cout << "Calling neural tracer for new point at " << p << " with center at " << best_center_pos << std::endl;
+    std::cout << "  center: " << center_xyz << std::endl;
+    if(prev_u) std::cout << "  prev_u: " << *prev_u << std::endl; else std::cout << "  prev_u: null" << std::endl;
+    if(prev_v) std::cout << "  prev_v: " << *prev_v << std::endl; else std::cout << "  prev_v: null" << std::endl;
+    if(prev_diag) std::cout << "  prev_diag: " << *prev_diag << std::endl; else std::cout << "  prev_diag: null" << std::endl;
+
+    // 3. Call tracer and select the best output
+    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, prev_v, prev_diag);
+    
+    std::cout << "  neural tracer returned " << next_uvs.next_u_xyzs.size() << " u points and " << next_uvs.next_v_xyzs.size() << " v points." << std::endl;
+    for(const auto& pu : next_uvs.next_u_xyzs) std::cout << "    u: " << pu << std::endl;
+    for(const auto& pv : next_uvs.next_v_xyzs) std::cout << "    v: " << pv << std::endl;
+
+    cv::Vec2i diff = p - best_center_pos;
+    bool is_u_prediction = (diff[1] != 0);
+    bool is_v_prediction = (diff[0] != 0);
+
+    const auto& p_initial_guess_d = trace_params.dpoints(p);
+    cv::Vec3f p_initial_guess(p_initial_guess_d[0], p_initial_guess_d[1], p_initial_guess_d[2]);
+    cv::Vec3f best_prediction = p_initial_guess;
+    float min_dist_sq = std::numeric_limits<float>::max();
+
+    const auto& candidates = is_u_prediction ? next_uvs.next_u_xyzs : next_uvs.next_v_xyzs;
+    if ((is_u_prediction || is_v_prediction) && !candidates.empty()) {
+        std::cout << "  Selecting from " << (is_u_prediction ? "U" : "V") << " candidates for point " << p << std::endl;
+        for (const auto& candidate : candidates) {
+            if (cv::norm(candidate) > 1e-6) { // Check for non-zero/valid point
+                float dist_sq = cv::norm(candidate - p_initial_guess, cv::NORM_L2SQR);
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    best_prediction = candidate;
+                }
+            }
+        }
+    } else {
+        std::cout << "  No candidates returned for the predicted direction." << std::endl;
+        return;
+    }
+
+    if (min_dist_sq < std::numeric_limits<float>::max()) {
+        std::cout << "  Updating point " << p << " from " << p_initial_guess << " to " << best_prediction << std::endl;
+        trace_params.dpoints(p) = {best_prediction[0], best_prediction[1], best_prediction[2]};
+    } else {
+        std::cout << "  No valid prediction found among candidates." << std::endl;
     }
 }
 
@@ -2328,26 +2383,24 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                 trace_params.dpoints(p) = init;
 
+                // Always perform the initial Ceres solve to get a good starting point.
+                ceres::Problem problem;
+                trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
+
+                std::vector<double*> parameter_blocks;
+                problem.GetParameterBlocks(&parameter_blocks);
+                for (auto& block : parameter_blocks) {
+                    problem.SetParameterBlockConstant(block);
+                }
+                problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
+
+                ceres::Solver::Summary summary;
+                ceres::Solve(options, &problem, &summary);
+
+                // After generation 4, use the neural tracer's output as the final point.
                 if (generation > 4 && neural_tracer) {
-                    trace_params.dpoints(p) = init;
-                    trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                } else {
-                    // Set up a new local optimzation problem for the candidate point and its neighbors (initially just distance
-                    // and curvature losses, not nearness-to-surface)
-                    ceres::Problem problem;
-
-                    trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
-
-                    std::vector<double*> parameter_blocks;
-                    problem.GetParameterBlocks(&parameter_blocks);
-                    for (auto& block : parameter_blocks) {
-                        problem.SetParameterBlockConstant(block);
-                    }
-                    problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
-
-                    ceres::Solver::Summary summary;
-                    ceres::Solve(options, &problem, &summary);
+                    call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
                 }
 
                 generations(p) = generation;
@@ -2364,8 +2417,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     succ_gen_ps.push_back(p);
                 }
 
-                call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
-
+                // Before generation 5, or if no tracer is active, do further local optimization.
                 if (generation <= 4 || !neural_tracer) {
                     local_optimization(1, p, trace_params, trace_data, loss_settings, true);
                     if (local_opt_r > 1)
