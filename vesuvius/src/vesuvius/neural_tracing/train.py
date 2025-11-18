@@ -15,38 +15,16 @@ import torch.nn.functional as F
 
 from dataset import PatchInCubeDataset, HeatmapDatasetV2, load_datasets
 from models import make_model
-from sampling import sample_ddim
 
 
-def prepare_batch(batch, noise_scheduler, generative, cfg_uncond_prob):
-    clean_heatmaps = batch['uv_heatmaps_out']
-    if generative:
-        # FIXME: should use non-uniform timestep distribution
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, size=[clean_heatmaps.shape[0]], device=clean_heatmaps.device).long()
-        noise = torch.randn_like(clean_heatmaps)
-        noisy_heatmaps = noise_scheduler.add_noise(clean_heatmaps, noise, timesteps)
-        conditioning_mask = 0 if torch.rand(clean_heatmaps.shape[0]) < cfg_uncond_prob else 1
-    else:
-        timesteps = torch.zeros(clean_heatmaps.shape[0], device=clean_heatmaps.device, dtype=torch.long)
-        noisy_heatmaps = torch.zeros_like(clean_heatmaps)
-        conditioning_mask = 1
-    if (not generative) or noise_scheduler.config.prediction_type == 'sample':
-        targets = clean_heatmaps
-    elif noise_scheduler.config.prediction_type == 'v_prediction':
-        targets = noise_scheduler.get_velocity(clean_heatmaps, noise, timesteps)
-    elif noise_scheduler.config.prediction_type == 'epsilon':
-        targets = noise
-    else:
-        assert False
+def prepare_batch(batch):
     inputs = torch.cat([
-        batch['volume'].unsqueeze(1) * conditioning_mask,
-        batch['localiser'].unsqueeze(1) * conditioning_mask,  # TODO: should this one be removed for cfg?
-        rearrange(batch['uv_heatmaps_in'], 'b z y x c -> b c z y x') * conditioning_mask,  # TODO: what about this one? it's already randomly dropped 'intrinsically'
-    ] + (
-        [rearrange(noisy_heatmaps, 'b z y x c -> b c z y x')] if generative else []
-    ), dim=1)
-    targets = rearrange(targets, 'b z y x c -> b c z y x')
-    return timesteps, inputs, targets
+        batch['volume'].unsqueeze(1),
+        batch['localiser'].unsqueeze(1),
+        rearrange(batch['uv_heatmaps_in'], 'b z y x c -> b c z y x'),
+    ], dim=1)
+    targets = rearrange(batch['uv_heatmaps_out'], 'b z y x c -> b c z y x')
+    return inputs, targets
 
 
 @click.command()
@@ -83,14 +61,6 @@ def train(config_path):
 
     model = make_model(config)
 
-    noise_scheduler = diffusers.DDPMScheduler(
-        num_train_timesteps=1000,
-        prediction_type='sample',  # TODO: try v-prediction?
-        beta_schedule='linear',  # squaredcos_cap_v2 should give even-smaller SNR at T=1000
-        timestep_spacing='trailing',  # ...so we 'see' step 1000 during inference
-        clip_sample=True,  # FIXME: does this mean we should tell the sampler use_clipped_model_output also?
-    )
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     lr_scheduler = diffusers.optimization.get_cosine_schedule_with_warmup(
         optimizer=optimizer,
@@ -122,12 +92,12 @@ def train(config_path):
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
 
-        timesteps, inputs, targets = prepare_batch(batch, noise_scheduler, config['generative'], config['cfg_uncond_prob'])
+        inputs, targets = prepare_batch(batch)
         mask = torch.ones_like(targets[:, :1, ...])  # TODO!
 
         wandb_log = {}
         with accelerator.accumulate(model):
-            target_pred = model(inputs, timesteps)
+            target_pred = model(inputs)
             loss = loss_fn(target_pred, targets, mask)
             if torch.isnan(loss):
                 raise ValueError('loss is NaN')
@@ -147,9 +117,9 @@ def train(config_path):
                 model.eval()
 
                 val_batch = next(val_iterator)
-                val_timesteps, val_inputs, val_targets = prepare_batch(val_batch, noise_scheduler, config['generative'], config['cfg_uncond_prob'])
+                val_inputs, val_targets = prepare_batch(val_batch)
                 val_mask = torch.ones_like(val_targets[:, :1, ...])  # TODO!
-                val_target_pred = model(val_inputs, val_timesteps)
+                val_target_pred = model(val_inputs)
                 val_loss = loss_fn(val_target_pred, val_targets, val_mask)
                 wandb_log['val_loss'] = val_loss.item()
 
@@ -195,25 +165,6 @@ def train(config_path):
                 plt.imsave(f'{out_dir}/{iteration:06}_train.png', train_canvas)
                 plt.imsave(f'{out_dir}/{iteration:06}_val.png', val_canvas)
 
-                if config['generative']:
-                    eval_num_samples = 4
-                    assert targets.shape[0] == 1  # since the argmin needs to be per-iib otherwise, and we need either a loop or a separate dimensions for sample vs batch
-                    gt_heatmaps = rearrange(batch['uv_heatmaps'], 'b z y x c -> b c z y x')
-                    sample_heatmaps = sample_ddim(
-                        model,
-                        torch.tile(inputs[:, :2], (eval_num_samples, 1, 1, 1, 1)),
-                        noise_scheduler,
-                        (eval_num_samples, *targets.shape[1:]),
-                        torch.Generator().manual_seed(config['seed']),
-                        cfg_scale=config['cfg_scale']
-                    )
-                    sample_heatmaps = sample_heatmaps[torch.argmin((sample_heatmaps - gt_heatmaps).abs().mean(dim=(1, 2, 3, 4)))]
-                    canvas = torch.stack([inputs[:, :1].expand(-1, 3, -1, -1, -1), squish(sample_heatmaps[None]), squish(gt_heatmaps)], dim=-1)
-                    canvas_mask = torch.stack([torch.ones_like(mask), torch.ones_like(mask), mask], dim=-1)
-                    canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
-                    canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
-                    plt.imsave(f'{out_dir}/{iteration:06}_sample.png', canvas.cpu())
-
                 model.train()
 
         if iteration % config['ckpt_frequency'] == 0:
@@ -221,7 +172,6 @@ def train(config_path):
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
-                'noise_scheduler': noise_scheduler.config,
                 'config': config,
                 'step': iteration,
             }, f'{out_dir}/ckpt_{iteration:06}.pth' )

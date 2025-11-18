@@ -43,10 +43,7 @@
       "representation": "heatmap",
       "step_size": 10,
       "step_count": 1,
-      "generative": false,
       "binary": true,
-      "cfg_uncond_prob": 0.1,
-      "cfg_scale": 1.5,
       "crop_size": 128,
       "model_type": "unet",
       "model_config": {

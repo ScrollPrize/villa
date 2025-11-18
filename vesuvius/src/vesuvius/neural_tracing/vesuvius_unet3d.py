@@ -741,7 +741,7 @@ class Vesuvius3dUnetModel(nn.Module):
                 blocks.append(6)
         return blocks
     
-    def forward(self, x, timesteps):
+    def forward(self, x, timesteps=None):
         """
         Forward pass for denoising diffusion.
         
