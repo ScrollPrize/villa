@@ -446,6 +446,7 @@ CWindow::CWindow() :
 
     _point_collection = new VCCollection(this);
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    _mirrorCursorToSegmentation = settings.value("viewer/mirror_cursor_to_segmentation", false).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
     // setAttribute(Qt::WA_DeleteOnClose);
@@ -463,6 +464,7 @@ CWindow::CWindow() :
     connect(_surf_col, &CSurfaceCollection::sendPOIChanged, this, &CWindow::onFocusPOIChanged);
 
     _viewerManager = std::make_unique<ViewerManager>(_surf_col, _point_collection, chunk_cache, this);
+    _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
     connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CVolumeViewer* viewer) {
         configureViewerConnections(viewer);
     });
@@ -1002,6 +1004,27 @@ bool CWindow::centerFocusOnCursor()
     return centerFocusAt(cursor->p, cursor->n, cursor->src, true);
 }
 
+void CWindow::setSegmentationCursorMirroring(bool enabled)
+{
+    if (_mirrorCursorToSegmentation == enabled) {
+        return;
+    }
+
+    _mirrorCursorToSegmentation = enabled;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue("viewer/mirror_cursor_to_segmentation", enabled ? "1" : "0");
+
+    if (_viewerManager) {
+        _viewerManager->setSegmentationCursorMirroring(enabled);
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
+                                         : tr("Mirroring cursor to Surface view disabled"),
+                                  2000);
+    }
+}
+
 // Create widgets
 void CWindow::CreateWidgets(void)
 {
@@ -1074,9 +1097,17 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onAddOverlap(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::neighborCopyRequested,
+            this, [this](const QString& segmentId, bool copyOut) {
+                onNeighborCopyRequested(segmentId, copyOut);
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::convertToObjRequested,
             this, [this](const QString& segmentId) {
                 onConvertToObj(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::cropBoundsRequested,
+            this, [this](const QString& segmentId) {
+                onCropSurfaceToValidRegion(segmentId.toStdString());
             });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
@@ -1541,6 +1572,70 @@ void CWindow::CreateWidgets(void)
     });
     if (_viewerManager) {
         _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
+    }
+
+    if (auto* spinIntersectionThickness = ui.doubleSpinIntersectionThickness) {
+        const double savedThickness = settings.value("viewer/intersection_thickness",
+                                                     spinIntersectionThickness->value()).toDouble();
+        const double boundedThickness = std::clamp(savedThickness,
+                                                   static_cast<double>(spinIntersectionThickness->minimum()),
+                                                   static_cast<double>(spinIntersectionThickness->maximum()));
+        spinIntersectionThickness->setValue(boundedThickness);
+        connect(spinIntersectionThickness,
+                QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this,
+                [this](double value) {
+                    if (!_viewerManager) {
+                        return;
+                    }
+                    _viewerManager->setIntersectionThickness(static_cast<float>(value));
+                });
+        if (_viewerManager) {
+            _viewerManager->setIntersectionThickness(static_cast<float>(spinIntersectionThickness->value()));
+        }
+    }
+
+    auto* comboIntersectionSampling = ui.comboIntersectionSampling;
+    if (comboIntersectionSampling) {
+        struct SamplingOption {
+            const char* label;
+            int stride;
+        };
+        const SamplingOption options[] = {
+            {"Full (1x)", 1},
+            {"2x", 2},
+            {"4x", 4},
+            {"8x", 8},
+        };
+        comboIntersectionSampling->clear();
+        for (const auto& opt : options) {
+            comboIntersectionSampling->addItem(tr(opt.label), opt.stride);
+        }
+
+        const int savedStride = settings.value("viewer/intersection_sampling_stride", 1).toInt();
+        int selectedIndex = comboIntersectionSampling->findData(savedStride);
+        if (selectedIndex < 0) {
+            selectedIndex = comboIntersectionSampling->findData(1);
+        }
+        if (selectedIndex >= 0) {
+            comboIntersectionSampling->setCurrentIndex(selectedIndex);
+        }
+
+        connect(comboIntersectionSampling,
+                QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this,
+                [this, comboIntersectionSampling](int) {
+                    if (!_viewerManager) {
+                        return;
+                    }
+                    const int stride = std::max(1, comboIntersectionSampling->currentData().toInt());
+                    _viewerManager->setSurfacePatchSamplingStride(stride);
+                });
+
+        if (_viewerManager) {
+            const int stride = std::max(1, comboIntersectionSampling->currentData().toInt());
+            _viewerManager->setSurfacePatchSamplingStride(stride);
+        }
     }
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
@@ -2887,13 +2982,24 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
-        const auto configurePlane = [origin](PlaneSurface* plane,
-                                            float degrees,
-                                            const cv::Vec3f& baseNormal) {
+        auto logPlaneShift = [](const char* label, const cv::Vec3f& prevOrigin, const cv::Vec3f& nextOrigin) {
+            if (cv::norm(prevOrigin - nextOrigin) > 1e-3f) {
+                std::cout << "[CWindow] applySlicePlaneOrientation moved " << label
+                          << " origin from [" << prevOrigin[0] << ", " << prevOrigin[1] << ", " << prevOrigin[2]
+                          << "] to [" << nextOrigin[0] << ", " << nextOrigin[1] << ", " << nextOrigin[2] << "]"
+                          << std::endl;
+            }
+        };
+
+        const auto configurePlane = [&](const char* label,
+                                        PlaneSurface* plane,
+                                        float degrees,
+                                        const cv::Vec3f& baseNormal) {
             if (!plane) {
                 return;
             }
 
+            cv::Vec3f previousOrigin = plane->origin();
             plane->setOrigin(origin);
             plane->setInPlaneRotation(0.0f);
 
@@ -2914,10 +3020,12 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             } else {
                 plane->setInPlaneRotation(0.0f);
             }
+
+            logPlaneShift(label, previousOrigin, plane->origin());
         };
 
-        configurePlane(segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
-        configurePlane(segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
+        configurePlane("seg xz", segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
+        configurePlane("seg yz", segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
 
         if (segXZ) {
             segXZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
@@ -2948,6 +3056,9 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
+        cv::Vec3f prevXZOrigin = segXZ->origin();
+        cv::Vec3f prevYZOrigin = segYZ->origin();
+
         segXZ->setOrigin(origin);
         segYZ->setOrigin(origin);
 
@@ -2962,6 +3073,17 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         segYZ->setInPlaneRotation(0.0f);
         segXZ->setAxisAlignedRotationKey(-1);
         segYZ->setAxisAlignedRotationKey(-1);
+
+        auto logPlaneShift = [](const char* label, const cv::Vec3f& prevOrigin, const cv::Vec3f& nextOrigin) {
+            if (cv::norm(prevOrigin - nextOrigin) > 1e-3f) {
+                std::cout << "[CWindow] applySlicePlaneOrientation moved " << label
+                          << " origin from [" << prevOrigin[0] << ", " << prevOrigin[1] << ", " << prevOrigin[2]
+                          << "] to [" << nextOrigin[0] << ", " << nextOrigin[1] << ", " << nextOrigin[2] << "]"
+                          << std::endl;
+            }
+        };
+        logPlaneShift("seg xz", prevXZOrigin, segXZ->origin());
+        logPlaneShift("seg yz", prevYZOrigin, segYZ->origin());
 
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);

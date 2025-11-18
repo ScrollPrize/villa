@@ -334,7 +334,7 @@ class nnUNetTrainerSkeletonRecallNoTube(nnUNetTrainer):
                 )
             )
 
-        transforms.append(SkeletonTransform(do_tube=False))
+        transforms.append(SkeletonTransform(do_tube=False, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted
@@ -372,7 +372,7 @@ class nnUNetTrainerSkeletonRecallNoTube(nnUNetTrainer):
                 )
             )
 
-        transforms.append(SkeletonTransform(do_tube=True))
+        transforms.append(SkeletonTransform(do_tube=True, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted
@@ -679,7 +679,7 @@ class nnUNetTrainerMedialSurfaceRecallNoTube(nnUNetTrainerSkeletonRecallNoTube):
                 )
             )
 
-        transforms.append(MedialSurfaceTransform(do_tube=False))
+        transforms.append(MedialSurfaceTransform(do_tube=False, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted
@@ -717,7 +717,7 @@ class nnUNetTrainerMedialSurfaceRecallNoTube(nnUNetTrainerSkeletonRecallNoTube):
                 )
             )
 
-        transforms.append(MedialSurfaceTransform(do_tube=True))
+        transforms.append(MedialSurfaceTransform(do_tube=True, ignore_label=ignore_label))
 
         if regions is not None:
             # the ignore label must also be converted

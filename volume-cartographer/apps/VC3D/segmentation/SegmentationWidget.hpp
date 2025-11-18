@@ -50,6 +50,7 @@ public:
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
+    [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -66,6 +67,7 @@ public:
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
     void setEraseBrushActive(bool active);
+    void setShowHoverMarker(bool enabled);
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
@@ -110,6 +112,7 @@ signals:
     void correctionsCollectionSelected(uint64_t collectionId);
     void correctionsAnnotateToggled(bool enabled);
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
+    void hoverMarkerToggled(bool enabled);
 
 private:
     void buildUi();
@@ -155,6 +158,7 @@ private:
     AlphaPushPullConfig _alphaPushPullConfig{};
     float _smoothStrength{0.4f};
     int _smoothIterations{2};
+    bool _showHoverMarker{true};
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;
@@ -237,6 +241,7 @@ private:
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};
     QCheckBox* _chkEraseBrush{nullptr};
+    QCheckBox* _chkShowHoverMarker{nullptr};
 
     QGroupBox* _groupCustomParams{nullptr};
     QPlainTextEdit* _editCustomParams{nullptr};

@@ -33,6 +33,7 @@ def configure_targets(mgr, loss_list=None):
         elif mgr.data_format == "napari":
             print("Warning: target detection not implemented for napari format.")
         if targets:
+            mgr.validate_target_names(targets)
             mgr.targets = {}
             for t in sorted(targets):
                 mgr.targets[t] = {

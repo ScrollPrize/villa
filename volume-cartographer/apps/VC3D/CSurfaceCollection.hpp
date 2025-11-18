@@ -15,9 +15,15 @@ struct POI
     cv::Vec3f n = {0,0,0};
 };
 
+struct IntersectionLine
+{
+    std::vector<cv::Vec3f> world;         // 3D points in volume space
+    std::vector<cv::Vec3f> surfaceParams; // QuadSurface ptr-space samples aligned with `world`
+};
+
 struct Intersection
 {
-    std::vector<std::vector<cv::Vec3f>> lines;
+    std::vector<IntersectionLine> lines;
 };
 
 

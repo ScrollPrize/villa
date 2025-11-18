@@ -34,6 +34,7 @@ private slots:
     void toggleConsoleOutput();
     void generateReviewReport();
     void toggleDrawBBox(bool enabled);
+    void toggleCursorMirroring(bool enabled);
     void surfaceFromSelection();
     void clearSelection();
     void runTeleaInpaint();
@@ -66,6 +67,7 @@ private:
     QAction* _showConsoleAct{nullptr};
     QAction* _reportingAct{nullptr};
     QAction* _drawBBoxAct{nullptr};
+    QAction* _mirrorCursorAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
     QAction* _teleaAct{nullptr};

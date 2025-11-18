@@ -6,6 +6,9 @@
 #include <functional>
 #include <algorithm>
 #include <iostream>
+#include <cmath>
+#include <optional>
+#include <vector>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -26,6 +29,9 @@
 #include <QProgressDialog>
 #include <QPointer>
 #include <QTimer>
+#include <QTemporaryFile>
+#include <QSet>
+#include <QVector>
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
 #include <QStandardPaths>
 #endif
@@ -34,6 +40,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "ToolDialogs.hpp"
+#include <nlohmann/json.hpp>
 
 // --------- local helpers for running external tools -------------------------
 static bool runProcessBlocking(const QString& program,
@@ -90,6 +97,45 @@ static QString findVcTool(const char* name)
 }
 
 namespace { // -------------------- anonymous namespace -------------------------
+
+bool isValidSurfacePoint(const cv::Vec3f& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]) &&
+           !(point[0] == -1.f && point[1] == -1.f && point[2] == -1.f);
+}
+
+std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& points)
+{
+    if (points.empty()) {
+        return std::nullopt;
+    }
+
+    int minRow = points.rows;
+    int maxRow = -1;
+    int minCol = points.cols;
+    int maxCol = -1;
+
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            if (!isValidSurfacePoint(points(r, c))) {
+                continue;
+            }
+            minRow = std::min(minRow, r);
+            maxRow = std::max(maxRow, r);
+            minCol = std::min(minCol, c);
+            maxCol = std::max(maxCol, c);
+        }
+    }
+
+    if (maxRow < 0 || maxCol < 0) {
+        return std::nullopt;
+    }
+
+    return cv::Rect(minCol,
+                    minRow,
+                    maxCol - minCol + 1,
+                    maxRow - minRow + 1);
+}
 
 // Owns the lifecycle for the async SLIM run; deletes itself on finish/cancel
 class SlimJob : public QObject {
@@ -536,6 +582,20 @@ static QString findFlatboiExecutable()
     return {};
 }
 
+static QSet<QString> snapshotDirectoryEntries(const QString& dirPath)
+{
+    QSet<QString> entries;
+    QDir dir(dirPath);
+    if (!dir.exists()) {
+        return entries;
+    }
+    const QFileInfoList infoList = dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QFileInfo& info : infoList) {
+        entries.insert(info.fileName());
+    }
+    return entries;
+}
+
 } // -------------------- end anonymous namespace ------------------------------
 
 // ====================== CWindow member functions ==============================
@@ -565,26 +625,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
         return;
     }
 
-    if (!_cmdRunner) {
-        _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
-        connect(_cmdRunner, &CommandLineToolRunner::toolStarted,
-                [this](CommandLineToolRunner::Tool /*tool*/, const QString& message) {
-                    statusBar()->showMessage(message, 0);
-                });
-        connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
-                [this](CommandLineToolRunner::Tool /*tool*/, bool success, const QString& message,
-                       const QString& /*outputPath*/, bool copyToClipboard) {
-                    if (success) {
-                        QString displayMsg = message;
-                        if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
-                        statusBar()->showMessage(displayMsg, 5000);
-                        QMessageBox::information(this, tr("Rendering Complete"), displayMsg);
-                    } else {
-                        statusBar()->showMessage(tr("Rendering failed"), 5000);
-                        QMessageBox::critical(this, tr("Rendering Error"), message);
-                    }
-                });
-    }
+    if (!initializeCommandLineRunner()) return;
 
     if (_cmdRunner->isRunning()) {
         QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
@@ -752,6 +793,161 @@ void CWindow::onAddOverlap(const std::string& segmentId)
     statusBar()->showMessage(tr("Adding overlap for segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
+void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
+{
+    if (!fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    if (!initializeCommandLineRunner()) return;
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+        QMessageBox::warning(this, tr("Warning"), tr("Another neighbor copy request is already running."));
+        return;
+    }
+
+    auto surfMeta = fVpkg->getSurface(segmentId.toStdString());
+    if (!surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Invalid surface selected."));
+        return;
+    }
+
+    QVector<NeighborCopyVolumeOption> volumeOptions;
+    for (const auto& volumeId : fVpkg->volumeIDs()) {
+        auto volume = fVpkg->volume(volumeId);
+        if (!volume) {
+            continue;
+        }
+        NeighborCopyVolumeOption option;
+        option.id = QString::fromStdString(volumeId);
+        option.name = QString::fromStdString(volume->name());
+        option.path = QString::fromStdString(volume->path().string());
+        volumeOptions.push_back(option);
+    }
+
+    if (volumeOptions.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No volumes available in the volume package."));
+        return;
+    }
+
+    QString defaultVolumeId = volumeOptions.front().id;
+    if (!currentVolumeId.empty()) {
+        const QString currentId = QString::fromStdString(currentVolumeId);
+        for (const auto& opt : volumeOptions) {
+            if (opt.id == currentId) {
+                defaultVolumeId = currentId;
+                break;
+            }
+        }
+    }
+
+    const QString surfacePath = QString::fromStdString(surfMeta->path.string());
+    QString volpkgRoot = fVpkgPath;
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(fVpkg->getVolpkgDirectory());
+    }
+    QString defaultOutputDir = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+
+    NeighborCopyDialog dlg(this, surfacePath, volumeOptions, defaultVolumeId, defaultOutputDir);
+    if (dlg.exec() != QDialog::Accepted) {
+        statusBar()->showMessage(tr("Copy %1 cancelled").arg(copyOut ? tr("out") : tr("in")), 3000);
+        return;
+    }
+
+    QString selectedVolumePath = dlg.selectedVolumePath();
+    if (selectedVolumePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No target volume selected."));
+        return;
+    }
+
+    QString outputDirPath = dlg.outputPath().trimmed();
+    if (outputDirPath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Output path cannot be empty."));
+        return;
+    }
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(".")) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
+        return;
+    }
+    outputDirPath = outDir.absolutePath();
+
+    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+
+    QJsonObject pass1Params;
+    pass1Params["normal_grid_path"] = normalGridPath;
+    pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
+    pass1Params["neighbor_max_distance"] = 50;
+    pass1Params["mode"] = QStringLiteral("gen_neighbor");
+    pass1Params["neighbor_min_clearance"] = 4;
+    pass1Params["neighbor_fill"] = true;
+    pass1Params["neighbor_interp_window"] = 5;
+    pass1Params["generations"] = 2;
+    pass1Params["neighbor_spike_window"] = 2;
+
+    auto pass1JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass1_XXXXXX.json"));
+    if (!pass1JsonFile->open()) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file."));
+        return;
+    }
+    pass1JsonFile->write(QJsonDocument(pass1Params).toJson(QJsonDocument::Indented));
+    pass1JsonFile->flush();
+
+    QJsonObject pass2Params;
+    pass2Params["normal_grid_path"] = normalGridPath;
+    pass2Params["max_gen"] = 1;
+    pass2Params["generations"] = 1;
+    pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
+    pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
+    pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
+    pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
+
+    auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
+    if (!pass2JsonFile->open()) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file for pass 2."));
+        return;
+    }
+    pass2JsonFile->write(QJsonDocument(pass2Params).toJson(QJsonDocument::Indented));
+    pass2JsonFile->flush();
+
+    _neighborCopyJob.emplace();
+    auto& job = *_neighborCopyJob;
+    job.stage = NeighborCopyJob::Stage::FirstPass;
+    job.segmentId = segmentId;
+    job.volumePath = selectedVolumePath;
+    job.resumeSurfacePath = surfacePath;
+    job.outputDir = outputDirPath;
+    job.pass1JsonPath = pass1JsonFile->fileName();
+    job.pass2JsonPath = pass2JsonFile->fileName();
+    job.directoryPrefix = copyOut ? QStringLiteral("neighbor_out_") : QStringLiteral("neighbor_in_");
+    job.copyOut = copyOut;
+    job.baselineEntries = snapshotDirectoryEntries(outputDirPath);
+    job.pass1JsonFile = std::move(pass1JsonFile);
+    job.pass2JsonFile = std::move(pass2JsonFile);
+    job.generatedSurfacePath.clear();
+
+    if (!startNeighborCopyPass(job.pass1JsonPath,
+                               job.resumeSurfacePath,
+                               QStringLiteral("skip"),
+                               -1)) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to launch neighbor copy pass."));
+        _neighborCopyJob.reset();
+        _cmdRunner->setOmpThreads(-1);
+        return;
+    }
+
+    const QString dirName = QFileInfo(job.resumeSurfacePath).fileName();
+    statusBar()->showMessage(tr("Copy %1 started for %2")
+                                 .arg(copyOut ? tr("out") : tr("in"))
+                                 .arg(dirName.isEmpty() ? segmentId : dirName),
+                             5000);
+}
+
 void CWindow::onConvertToObj(const std::string& segmentId)
 {
     if (currentVolume == nullptr || !fVpkg) {
@@ -787,6 +983,167 @@ void CWindow::onConvertToObj(const std::string& segmentId)
     _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
     statusBar()->showMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: No volume package loaded"));
+        return;
+    }
+
+    auto surfMeta = fVpkg->getSurface(segmentId);
+    if (!surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    QuadSurface* surface = surfMeta->surface();
+    if (!surface) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Failed to load data"));
+        return;
+    }
+
+    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Missing coordinate grid"));
+        return;
+    }
+
+    const int origCols = points->cols;
+    const int origRows = points->rows;
+
+    const auto boundsOpt = computeValidSurfaceBounds(*points);
+    if (!boundsOpt) {
+        QMessageBox::warning(this,
+                             tr("Crop failed"),
+                             tr("Surface %1 does not contain any valid vertices to crop.")
+                                 .arg(QString::fromStdString(segmentId)));
+        return;
+    }
+
+    const cv::Rect roi = *boundsOpt;
+    if (roi.x == 0 && roi.y == 0 && roi.width == origCols && roi.height == origRows) {
+        if (statusBar()) {
+            statusBar()->showMessage(
+                tr("Surface %1 already occupies the tightest bounds.")
+                    .arg(QString::fromStdString(segmentId)),
+                4000);
+        }
+        return;
+    }
+
+    struct CroppedChannel {
+        std::string name;
+        cv::Mat data;
+    };
+    std::vector<CroppedChannel> croppedChannels;
+    croppedChannels.reserve(surface->channelNames().size());
+
+    const auto channelNames = surface->channelNames();
+    for (const auto& name : channelNames) {
+        cv::Mat channelData = surface->channel(name, SURF_CHANNEL_NORESIZE);
+        if (channelData.empty()) {
+            continue;
+        }
+        if (channelData.cols % origCols != 0 || channelData.rows % origRows != 0) {
+            QMessageBox::warning(this,
+                                 tr("Crop failed"),
+                                 tr("Channel '%1' has size %2×%3, which is not divisible by the surface grid %4×%5.")
+                                     .arg(QString::fromStdString(name))
+                                     .arg(channelData.cols)
+                                     .arg(channelData.rows)
+                                     .arg(origCols)
+                                     .arg(origRows));
+            return;
+        }
+
+        const int scaleX = channelData.cols / origCols;
+        const int scaleY = channelData.rows / origRows;
+        const cv::Rect chanRect(roi.x * scaleX,
+                                roi.y * scaleY,
+                                roi.width * scaleX,
+                                roi.height * scaleY);
+        if (chanRect.x < 0 || chanRect.y < 0 ||
+            chanRect.x + chanRect.width > channelData.cols ||
+            chanRect.y + chanRect.height > channelData.rows) {
+            QMessageBox::warning(this,
+                                 tr("Crop failed"),
+                                 tr("Computed crop exceeds the bounds of channel '%1'.")
+                                     .arg(QString::fromStdString(name)));
+            return;
+        }
+
+        croppedChannels.push_back({name, channelData(chanRect).clone()});
+    }
+
+    cv::Mat_<cv::Vec3f> croppedPoints = (*points)(roi).clone();
+
+    std::unique_ptr<QuadSurface> tempSurface;
+    try {
+        tempSurface = std::make_unique<QuadSurface>(croppedPoints, surface->scale());
+        tempSurface->path = surface->path;
+        tempSurface->id = surface->id;
+        if (surface->meta) {
+            tempSurface->meta = new nlohmann::json(*surface->meta);
+        }
+        for (const auto& ch : croppedChannels) {
+            tempSurface->setChannel(ch.name, ch.data);
+        }
+        tempSurface->save(surface->path.string(), surface->id, true);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this,
+                              tr("Crop failed"),
+                              tr("Failed to crop %1: %2")
+                                  .arg(QString::fromStdString(segmentId))
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    croppedPoints.copyTo(*points);
+    for (const auto& ch : croppedChannels) {
+        surface->setChannel(ch.name, ch.data);
+    }
+    surface->invalidateCache();
+
+    if (tempSurface && tempSurface->meta) {
+        if (!surface->meta) {
+            surface->meta = new nlohmann::json(*tempSurface->meta);
+        } else {
+            *surface->meta = *tempSurface->meta;
+        }
+        if (surface->meta) {
+            if (surfMeta->meta) {
+                *surfMeta->meta = *surface->meta;
+            } else {
+                surfMeta->meta = new nlohmann::json(*surface->meta);
+            }
+        }
+    }
+
+    surfMeta->bbox = surface->bbox();
+
+    if (_surf_col) {
+        _surf_col->setSurface(segmentId, surface, false, false);
+        if (_surfID == segmentId) {
+            _surf_col->setSurface("segmentation", surface, false, false);
+        }
+    }
+    if (_surfacePanel) {
+        _surfacePanel->refreshSurfaceMetrics(segmentId);
+    }
+
+    const QString segLabel = QString::fromStdString(segmentId);
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Cropped %1 to %2×%3 (offset %4,%5)")
+                .arg(segLabel)
+                .arg(roi.width)
+                .arg(roi.height)
+                .arg(roi.x)
+                .arg(roi.y),
+            5000);
+    }
 }
 
 void CWindow::onAlphaCompRefine(const std::string& segmentId)
@@ -932,21 +1289,167 @@ bool CWindow::initializeCommandLineRunner()
                     statusBar()->showMessage(message, 0);
                 });
         connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
-                [this](CommandLineToolRunner::Tool /*tool*/, bool success, const QString& message,
+                [this](CommandLineToolRunner::Tool tool, bool success, const QString& message,
                        const QString& outputPath, bool copyToClipboard) {
                     Q_UNUSED(outputPath);
-                    if (success) {
-                        QString displayMsg = message;
-                        if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
-                        statusBar()->showMessage(displayMsg, 5000);
-                        QMessageBox::information(this, tr("Operation Complete"), displayMsg);
+                    const bool neighborJobActive = _neighborCopyJob.has_value() &&
+                        tool == CommandLineToolRunner::Tool::NeighborCopy;
+
+                    bool suppressDialogs = neighborJobActive && success &&
+                                           _neighborCopyJob->stage == NeighborCopyJob::Stage::FirstPass;
+
+                    if (!suppressDialogs) {
+                        if (success) {
+                            QString displayMsg = message;
+                            if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
+                            statusBar()->showMessage(displayMsg, 5000);
+                            QMessageBox::information(this, tr("Operation Complete"), displayMsg);
+                        } else {
+                            statusBar()->showMessage(tr("Operation failed"), 5000);
+                            QMessageBox::critical(this, tr("Error"), message);
+                        }
                     } else {
-                        statusBar()->showMessage(tr("Operation failed"), 5000);
-                        QMessageBox::critical(this, tr("Error"), message);
+                        statusBar()->showMessage(tr("Neighbor copy pass 1 complete"), 2000);
+                    }
+
+                    if (neighborJobActive) {
+                        handleNeighborCopyToolFinished(success);
                     }
                 });
     }
     return true;
+}
+
+void CWindow::handleNeighborCopyToolFinished(bool success)
+{
+    if (!_neighborCopyJob) {
+        return;
+    }
+
+    auto& job = *_neighborCopyJob;
+    if (!success) {
+        _cmdRunner->setOmpThreads(-1);
+        _neighborCopyJob.reset();
+        return;
+    }
+
+    if (job.stage == NeighborCopyJob::Stage::FirstPass) {
+        const QString newSurface = findNewNeighborSurface(job);
+        if (newSurface.isEmpty()) {
+            QMessageBox::warning(this, tr("Error"),
+                                 tr("Could not locate the newly generated neighbor surface in %1.")
+                                     .arg(job.outputDir));
+            _cmdRunner->setOmpThreads(-1);
+            _neighborCopyJob.reset();
+            return;
+        }
+
+        job.generatedSurfacePath = newSurface;
+        job.baselineEntries.insert(QFileInfo(newSurface).fileName());
+        job.stage = NeighborCopyJob::Stage::SecondPass;
+
+        statusBar()->showMessage(
+            tr("Neighbor copy pass 1 complete: %1")
+                .arg(QFileInfo(newSurface).fileName()),
+            3000);
+
+        launchNeighborCopySecondPass();
+        return;
+    }
+
+    const bool copyOut = job.copyOut;
+    const QString surfaceName = QFileInfo(job.generatedSurfacePath).fileName();
+    _neighborCopyJob.reset();
+    _cmdRunner->setOmpThreads(-1);
+
+    if (_surfacePanel) {
+        _surfacePanel->reloadSurfacesFromDisk();
+    }
+
+    statusBar()->showMessage(tr("Copy %1 complete: %2")
+                                 .arg(copyOut ? tr("out") : tr("in"))
+                                 .arg(surfaceName),
+                             5000);
+}
+
+QString CWindow::findNewNeighborSurface(const NeighborCopyJob& job) const
+{
+    QDir dir(job.outputDir);
+    if (!dir.exists()) {
+        return QString();
+    }
+
+    const QFileInfoList infoList = dir.entryInfoList(
+        QDir::Dirs | QDir::NoDotAndDotDot,
+        QDir::Time);
+
+    QFileInfo newest;
+    bool found = false;
+    for (const QFileInfo& info : infoList) {
+        const QString name = info.fileName();
+        if (!name.startsWith(job.directoryPrefix)) {
+            continue;
+        }
+        if (job.baselineEntries.contains(name)) {
+            continue;
+        }
+        if (!found || info.lastModified() > newest.lastModified()) {
+            newest = info;
+            found = true;
+        }
+    }
+
+    return found ? newest.absoluteFilePath() : QString();
+}
+
+bool CWindow::startNeighborCopyPass(const QString& paramsPath,
+                                    const QString& resumeSurface,
+                                    const QString& resumeOpt,
+                                    int ompThreads)
+{
+    if (!_cmdRunner || !_neighborCopyJob) {
+        return false;
+    }
+
+    auto& job = *_neighborCopyJob;
+    _cmdRunner->setNeighborCopyParams(
+        job.volumePath,
+        paramsPath,
+        resumeSurface,
+        job.outputDir,
+        resumeOpt);
+    _cmdRunner->setOmpThreads(ompThreads);
+    _cmdRunner->showConsoleOutput();
+    return _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
+}
+
+void CWindow::launchNeighborCopySecondPass()
+{
+    if (!_neighborCopyJob) {
+        return;
+    }
+
+    const QString resumeSurface = _neighborCopyJob->generatedSurfacePath;
+    const bool copyOut = _neighborCopyJob->copyOut;
+
+    QTimer::singleShot(0, this, [this, resumeSurface, copyOut]() {
+        if (!_neighborCopyJob || _neighborCopyJob->stage != NeighborCopyJob::Stage::SecondPass) {
+            return;
+        }
+        if (!startNeighborCopyPass(_neighborCopyJob->pass2JsonPath,
+                                   resumeSurface,
+                                   QStringLiteral("local"),
+                                   12)) {
+            _cmdRunner->setOmpThreads(-1);
+            QMessageBox::warning(this, tr("Error"), tr("Failed to launch the second neighbor copy pass."));
+            _neighborCopyJob.reset();
+            return;
+        }
+
+        statusBar()->showMessage(
+            tr("Copy %1 pass 2 running").arg(copyOut ? tr("out") : tr("in")),
+            3000);
+    });
 }
 
 void CWindow::onAWSUpload(const std::string& segmentId)
