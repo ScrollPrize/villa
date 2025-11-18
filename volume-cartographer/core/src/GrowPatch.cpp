@@ -570,17 +570,14 @@ static void call_neural_tracer_for_point(
     }
 
     if (max_corners == 3 && best_quad_tl[0] != -1) {
-        cv::Vec3f center(0,0,0);
-        int points_for_avg = 0;
-        
+        const auto& p_double = trace_params.dpoints(p);
+        cv::Vec3f center(p_double[0], p_double[1], p_double[2]);
+
         auto get_point = [&](const cv::Vec2i& offset) -> std::optional<cv::Vec3f> {
             cv::Vec2i abs_pos = best_quad_tl + offset;
             if (point_in_bounds(trace_params.dpoints, abs_pos) && (trace_params.state(abs_pos) & STATE_LOC_VALID)) {
-                const auto& p_double = trace_params.dpoints(abs_pos);
-                cv::Vec3f p_float(p_double[0], p_double[1], p_double[2]);
-                center += p_float;
-                points_for_avg++;
-                return p_float;
+                const auto& p_double_neighbor = trace_params.dpoints(abs_pos);
+                return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
             }
             return std::nullopt;
         };
@@ -589,8 +586,6 @@ static void call_neural_tracer_for_point(
         std::optional<cv::Vec3f> p_tr = get_point({0,1});
         std::optional<cv::Vec3f> p_bl = get_point({1,0});
         std::optional<cv::Vec3f> p_br = get_point({1,1});
-
-        if (points_for_avg > 0) center /= (float)points_for_avg;
 
         std::optional<cv::Vec3f> prev_u, prev_v, prev_diag;
         if (!p_tl.has_value()) { // p is tl
@@ -2359,7 +2354,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
 #pragma omp critical
                 {
-                    call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
                     succ++;
                     succ_gen++;
                     if (!used_area.contains(cv::Point(p[1],p[0]))) {
@@ -2369,6 +2363,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     fringe.push_back(p);
                     succ_gen_ps.push_back(p);
                 }
+
+                call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
 
                 if (generation <= 4 || !neural_tracer) {
                     local_optimization(1, p, trace_params, trace_data, loss_settings, true);
