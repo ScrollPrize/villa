@@ -5,9 +5,6 @@
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "OpChain.hpp"
-#include "OpsList.hpp"
-#include "OpsSettings.hpp"
 #include "CVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
@@ -187,9 +184,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(qWindow->ui.dockWidgetVolumes->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetSegmentation->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDistanceTransform->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetOpList->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDrawing->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetOpSettings->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetComposite->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetView->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetOverlay->toggleViewAction());

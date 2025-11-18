@@ -14,7 +14,6 @@
 class CSurfaceCollection;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
-class OpChain;
 class VolumePkg;
 class CVolumeViewer;
 class VCCollection;
@@ -72,7 +71,6 @@ public:
     SurfacePanelController(const UiRefs& ui,
                            CSurfaceCollection* surfaces,
                            ViewerManager* viewerManager,
-                           std::unordered_map<std::string, OpChain*>* opchains,
                            std::function<CVolumeViewer*()> segmentationViewerProvider,
                            std::function<void()> filtersUpdated,
                            QObject* parent = nullptr);
@@ -106,7 +104,7 @@ signals:
     void surfacesLoaded();
     void surfaceSelectionCleared();
     void filtersApplied(int hiddenCount);
-    void surfaceActivated(const QString& id, QuadSurface* surface, OpChain* chain);
+    void surfaceActivated(const QString& id, QuadSurface* surface);
     void copySegmentPathRequested(const QString& segmentId);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
@@ -150,14 +148,12 @@ private:
                                bool enabledReviewed,
                                bool enabledRevisit,
                                bool enabledInspect);
-    OpChain* ensureOpChainFor(const std::string& id);
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
 
     UiRefs _ui;
     CSurfaceCollection* _surfaces{nullptr};
     ViewerManager* _viewerManager{nullptr};
-    std::unordered_map<std::string, OpChain*>* _opchains{nullptr};
     std::shared_ptr<VolumePkg> _volumePkg;
     std::function<CVolumeViewer*()> _segmentationViewerProvider;
     std::function<void()> _filtersUpdated;

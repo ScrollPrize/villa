@@ -142,7 +142,6 @@ public:
 
     friend QuadSurface *regularized_local_quad(QuadSurface *src, const cv::Vec3f &ptr, int w, int h, int step_search, int step_out);
     friend QuadSurface *smooth_vc_segmentation(QuadSurface *src);
-    friend class ControlPointSurface;
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
@@ -158,71 +157,6 @@ protected:
     TiffWriteOptions _tiff_opts;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
-};
-
-
-//surface representing some operation on top of a base surface
-//by default all ops but gen() are forwarded to the base
-class DeltaSurface : public Surface
-{
-public:
-    //default - just assign base ptr, override if additional processing necessary
-    //like relocate ctrl points, mark as dirty, ...
-    virtual void setBase(Surface *base);
-    DeltaSurface(Surface *base);
-
-    virtual cv::Vec3f pointer() override;
-
-    void move(cv::Vec3f &ptr, const cv::Vec3f &offset) override;
-    bool valid(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
-    cv::Vec3f loc(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
-    cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
-    cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
-    void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) override = 0;
-    float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000) override;
-
-protected:
-    Surface *_base = nullptr;
-};
-
-//might in the future have more properties! or those props are handled in whatever class manages a set of control points ...
-class SurfaceControlPoint
-{
-public:
-    SurfaceControlPoint(Surface *base, const cv::Vec3f &ptr_, const cv::Vec3f &control);
-    cv::Vec3f ptr; //location of control point in base surface
-    cv::Vec3f orig_wp; //the original 3d location where the control point was created
-    cv::Vec3f normal; //original normal
-    cv::Vec3f control_point; //actual control point location - should be in line with _orig_wp along the normal, but could change if the underlaying surface changes!
-};
-
-class ControlPointSurface : public DeltaSurface
-{
-public:
-    ControlPointSurface(Surface *base) : DeltaSurface(base) {};
-    void addControlPoint(const cv::Vec3f &base_ptr, cv::Vec3f control_point);
-    void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) override;
-
-    void setBase(Surface *base);
-
-protected:
-    std::vector<SurfaceControlPoint> _controls;
-};
-
-class RefineCompSurface : public DeltaSurface
-{
-public:
-    RefineCompSurface(z5::Dataset *ds, ChunkCache<uint8_t> *cache, QuadSurface *base = nullptr);
-    void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) override;
-
-    float start = 0;
-    float stop = -100;
-    float step = 2.0;
-    float low = 0.1;
-    float high = 1.0;
-protected:
-    z5::Dataset *_ds;
-    ChunkCache<uint8_t> *_cache;
 };
 
 class SurfaceMeta

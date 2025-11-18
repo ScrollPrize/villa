@@ -21,10 +21,6 @@ set(srcs
     elements/RangeSlider.hpp
     SettingsDialog.cpp
     CSurfaceCollection.cpp
-    OpChain.cpp
-    OpsList.cpp
-    OpsSettings.cpp
-    formsetsrc.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SeedingWidget.cpp

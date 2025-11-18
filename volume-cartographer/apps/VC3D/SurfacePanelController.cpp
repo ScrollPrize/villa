@@ -3,7 +3,6 @@
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
 #include "CSurfaceCollection.hpp"
-#include "OpChain.hpp"
 #include "CVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
@@ -66,7 +65,6 @@ void sync_tag(nlohmann::json& dict, bool checked, const std::string& name, const
 SurfacePanelController::SurfacePanelController(const UiRefs& ui,
                                                CSurfaceCollection* surfaces,
                                                ViewerManager* viewerManager,
-                                               std::unordered_map<std::string, OpChain*>* opchains,
                                                std::function<CVolumeViewer*()> segmentationViewerProvider,
                                                std::function<void()> filtersUpdated,
                                                QObject* parent)
@@ -74,7 +72,6 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
     , _ui(ui)
     , _surfaces(surfaces)
     , _viewerManager(viewerManager)
-    , _opchains(opchains)
     , _segmentationViewerProvider(std::move(segmentationViewerProvider))
     , _filtersUpdated(std::move(filtersUpdated))
 {
@@ -111,12 +108,6 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (reload) {
-        if (_opchains) {
-            for (auto& pair : *_opchains) {
-                delete pair.second;
-            }
-            _opchains->clear();
-        }
         _volumePkg->unloadAllSurfaces();
     }
 
@@ -189,10 +180,6 @@ void SurfacePanelController::loadSurfacesIncremental()
                 }
             }
 
-            if (_opchains && _opchains->count(id)) {
-                delete (*_opchains)[id];
-                _opchains->erase(id);
-            }
             _volumePkg->unloadSurface(id);
             reloadedIds.push_back(id);
         }
@@ -475,11 +462,6 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId)
         _volumePkg->unloadSurface(segId);
     }
 
-    if (_opchains && _opchains->count(segId)) {
-        delete (*_opchains)[segId];
-        _opchains->erase(segId);
-    }
-
     if (_ui.treeWidget) {
         QTreeWidgetItemIterator it(_ui.treeWidget);
         while (*it) {
@@ -563,11 +545,9 @@ void SurfacePanelController::handleTreeSelectionChanged()
     const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     const std::string id = idQString.toStdString();
 
-    OpChain* chain = ensureOpChainFor(id);
-    QuadSurface* surface = chain ? chain->src() : nullptr;
-
+    QuadSurface* surface = nullptr;
     bool surfaceJustLoaded = false;
-    if (!surface && _volumePkg) {
+    if (_volumePkg) {
         if (auto surfMeta = _volumePkg->getSurface(id)) {
             surface = surfMeta->surface();
             surfaceJustLoaded = (surface != nullptr);
@@ -591,7 +571,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
         }
     }
 
-    emit surfaceActivated(idQString, surface, chain);
+    emit surfaceActivated(idQString, surface);
 
     if (surfaceJustLoaded) {
         applyFilters();
@@ -1210,9 +1190,7 @@ void SurfacePanelController::onTagCheckboxToggled()
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
         QuadSurface* surface = nullptr;
 
-        if (_opchains && _opchains->count(id) && (*_opchains)[id]) {
-            surface = (*_opchains)[id]->src();
-        } else if (_volumePkg) {
+        if (_volumePkg) {
             auto meta = _volumePkg->getSurface(id);
             if (meta) {
                 surface = meta->surface();
@@ -1626,24 +1604,6 @@ void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,
     if (_tags.inspect) {
         _tags.inspect->setEnabled(enabledInspect);
     }
-}
-
-OpChain* SurfacePanelController::ensureOpChainFor(const std::string& id)
-{
-    if (!_opchains) {
-        return nullptr;
-    }
-
-    auto it = _opchains->find(id);
-    if (it == _opchains->end()) {
-        if (_volumePkg) {
-            if (auto meta = _volumePkg->getSurface(id)) {
-                (*_opchains)[id] = new OpChain(meta->surface());
-            }
-        }
-        it = _opchains->find(id);
-    }
-    return it != _opchains->end() ? it->second : nullptr;
 }
 
 void SurfacePanelController::logSurfaceLoadSummary() const
