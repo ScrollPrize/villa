@@ -15,7 +15,7 @@ from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import B
 from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
 
-def get_training_augmentations(crop_size, no_spatial, only_spatial_and_intensity):
+def get_training_augmentations(crop_size, allow_transposes, only_spatial_and_intensity):
     """
     Create training transforms using custom batchgeneratorsv2.
     Returns None for validation (no augmentations).
@@ -25,29 +25,7 @@ def get_training_augmentations(crop_size, no_spatial, only_spatial_and_intensity
 
     transforms = []
 
-    if not no_spatial:
-        # Configure rotation based on patch aspect ratio
-        rotation_for_DA = (-np.pi, np.pi)
-        mirror_axes = (0, 1, 2)
-
-        # Add SpatialTransform for rotations, scaling, elastic deformations
-        transforms.append(
-            SpatialTransform(
-                (patch_d, patch_h, patch_w),
-                patch_center_dist_from_border=0,
-                random_crop=False,
-                p_elastic_deform=0,
-                p_rotation=0.2,
-                rotation=rotation_for_DA,
-                p_scaling=0.2,
-                scaling=(0.7, 1.4),
-                p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False,  # =, mode_seg='nearest'
-                elastic_deform_magnitude=(10, 50)
-            )
-        )
-        
-    if True:  # diverges from vesuvius!
+    if allow_transposes:  # diverges from vesuvius!
         # Only add transpose transform if all three dimensions are equal
         if patch_d == patch_h == patch_w:
             transforms.append(RandomTransform(

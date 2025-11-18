@@ -188,7 +188,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     def __init__(self, config, patches_for_split):
         self._config = config
         self._patches = patches_for_split
-        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
+        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
         self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels

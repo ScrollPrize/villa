@@ -31,7 +31,7 @@
       ],
     "num_val_segments_per_volume": 1,
       "augmentation": {
-        "no_spatial": true,
+        "allow_transposes": true,
         "only_spatial_and_intensity": false
       },
       "point_perturbation": {
