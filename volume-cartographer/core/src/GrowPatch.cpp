@@ -554,30 +554,28 @@ static bool call_neural_tracer_for_point(
         if (!is_valid(neighbor)) continue;
 
         // Determine the local coordinate system based on the direction from neighbor to p.
-        cv::Vec2i u_dir = {p[0] - neighbor[0], p[1] - neighbor[1]};
-        cv::Vec2i v_dir = {-u_dir[1], u_dir[0]};
+        cv::Vec2i growth_dir = {p[0] - neighbor[0], p[1] - neighbor[1]};
+        cv::Vec2i ortho_dir = {-growth_dir[1], growth_dir[0]};
 
         int score = 0;
-        bool h_valid = false, v_valid = false;
+        bool u_context_valid = false;
+        bool v_context_valid = false;
 
-        // Check for horizontal neighbor (prev_u)
-        cv::Vec2i p_prev_u = neighbor - v_dir;
-        if (is_valid(p_prev_u)) {
+        // Check for point behind neighbor along the growth axis
+        if (is_valid(neighbor - growth_dir)) {
             score++;
-            h_valid = true;
+            u_context_valid = true;
         }
 
-        // Check for vertical neighbor (prev_v)
-        cv::Vec2i p_prev_v = neighbor - u_dir;
-        if (is_valid(p_prev_v)) {
+        // Check for point behind neighbor along the orthogonal axis
+        if (is_valid(neighbor - ortho_dir)) {
             score++;
-            v_valid = true;
+            v_context_valid = true;
         }
 
-        // Diagonal can only be scored if both horizontal and vertical neighbors exist.
-        if (h_valid && v_valid) {
-            cv::Vec2i p_prev_diag = neighbor - u_dir - v_dir;
-            if (is_valid(p_prev_diag)) {
+        // Diagonal can only be scored if both primary context points exist.
+        if (u_context_valid && v_context_valid) {
+            if (is_valid(neighbor - growth_dir - ortho_dir)) {
                 score++;
             }
         }
@@ -607,31 +605,24 @@ static bool call_neural_tracer_for_point(
         return std::nullopt;
     };
 
-    cv::Vec2i u_dir = {p[0] - best_neighbor[0], best_neighbor[1] - best_neighbor[1]};
-    cv::Vec2i v_dir = {-u_dir[1], u_dir[0]};
+    cv::Vec2i growth_dir = {p[0] - best_neighbor[0], p[1] - best_neighbor[1]};
+    cv::Vec2i ortho_dir = {-growth_dir[1], growth_dir[0]};
 
-    cv::Vec2i p_prev_u_ctx = best_neighbor - v_dir;
-    cv::Vec2i p_prev_v_ctx = best_neighbor - u_dir;
-    cv::Vec2i p_prev_diag_ctx = best_neighbor - u_dir - v_dir;
-
-    prev_u = get_point(p_prev_u_ctx);
-    prev_v = get_point(p_prev_v_ctx);
+    prev_u = get_point(best_neighbor - growth_dir);
+    prev_v = get_point(best_neighbor - ortho_dir);
     
-    // Only send the diagonal if both h and v context points are present.
     if (prev_u.has_value() && prev_v.has_value()) {
-        prev_diag = get_point(p_prev_diag_ctx);
+        prev_diag = get_point(best_neighbor - growth_dir - ortho_dir);
     }
 
-    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, prev_v, prev_diag);
+    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, {}, {});
 
-    cv::Vec2i diff = p - best_neighbor;
-    bool is_u_prediction = (diff[1] != 0 || diff[0] != 0); // Simplified logic
-
-    // The tracer doesn't have an initial guess. Pick the first valid point returned.
+    // Since growth_dir corresponds to the tracer's u-axis, we only check the u_xyzs results.
+    const auto& candidates = next_uvs.next_u_xyzs;
+    
     cv::Vec3f best_prediction;
     bool found_prediction = false;
 
-    const auto& candidates = is_u_prediction ? next_uvs.next_u_xyzs : next_uvs.next_v_xyzs;
     if (!candidates.empty()) {
         for (const auto& candidate : candidates) {
             if (cv::norm(candidate) > 1e-6) { // Check for non-zero/valid point
