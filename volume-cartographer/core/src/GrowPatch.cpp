@@ -544,60 +544,57 @@ static bool call_neural_tracer_for_point(
         return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
     };
 
-    cv::Vec2i best_dir = {-2, -2};
+    cv::Vec2i best_dir(-2, -2);
+    cv::Vec2i best_ortho_dir(0, 0);
+    std::optional<cv::Vec2i> best_diag_pos;
     int max_score = -1;
 
-    cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
     for (const auto& dir : dirs) {
-        if (!is_valid(p-dir)) continue;
-        if (!is_valid(p-2*dir)) continue;
+        if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {
+            continue;
+        }
 
-        best_dir = dir;
-        break;
+        const cv::Vec2i center_pos = p - dir;
+        const cv::Vec2i prev_u_pos = p - 2 * dir;
 
-        // cv::Vec2i ortho_dir = {-dir[1], dir[0]};
-        //
-        // int score = 0;
-        // bool u_context_valid = false;
-        // bool v_context_valid = false;
-        //
-        // // Check for point behind neighbor along the growth axis
-        // if (is_valid(neighbor - growth_dir)) {
-        //     score++;
-        //     u_context_valid = true;
-        // }
-        //
-        // // Check for point behind neighbor along the orthogonal axis
-        // if (is_valid(neighbor - ortho_dir)) {
-        //     score++;
-        //     v_context_valid = true;
-        // }
-        //
-        // // Diagonal can only be scored if both primary context points exist.
-        // if (u_context_valid && v_context_valid) {
-        //     if (is_valid(neighbor - growth_dir - ortho_dir)) {
-        //         score++;
-        //     }
-        // }
-        //
-        // if (score > max_score) {
-        //     max_score = score;
-        //     best_neighbor = neighbor;
-        //     std::cout << "best" << growth_dir << std::endl;
-        // }
+        const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
+
+        for (const auto& ortho_dir : ortho_dirs) {
+            int current_score = 2; // center + prev_u
+            std::optional<cv::Vec2i> current_diag_pos;
+
+            bool v_valid = false;
+            cv::Vec2i prev_v_pos;
+            if (ortho_dir[0] != 0 || ortho_dir[1] != 0) {
+                if (is_valid(center_pos - ortho_dir)) {
+                    v_valid = true;
+                    prev_v_pos = center_pos - ortho_dir;
+                    current_score++;
+                }
+            }
+
+            // if (current_diag_pos.has_value()) {
+            //     current_score++;
+            // }
+
+            if (current_score > max_score) {
+                max_score = current_score;
+                best_dir = dir;
+                best_ortho_dir = ortho_dir;
+                best_diag_pos = current_diag_pos;
+            }
+        }
     }
 
-    if (best_dir[0] == -2) {
-        // No valid neighbor found to provide context, cannot call tracer.
+    if (max_score == -1) {
         return false;
     }
 
-    // We found the best neighbor to act as the center. Now, gather its context points.
-    const auto& center_p_double = trace_params.dpoints(p-best_dir);
+    const cv::Vec2i center_pos = p - best_dir;
+    const auto& center_p_double = trace_params.dpoints(center_pos);
     cv::Vec3f center_xyz(center_p_double[0], center_p_double[1], center_p_double[2]);
-    
-    std::optional<cv::Vec3f> prev_u, prev_v, prev_diag;
 
     auto get_point = [&](const cv::Vec2i& pos) -> std::optional<cv::Vec3f> {
         if (is_valid(pos)) {
@@ -607,34 +604,28 @@ static bool call_neural_tracer_for_point(
         return std::nullopt;
     };
 
-    // cv::Vec2i growth_dir = {p[0] - best_neighbor[0], p[1] - best_neighbor[1]};
-    // cv::Vec2i ortho_dir = {-growth_dir[1], growth_dir[0]};
+    std::optional<cv::Vec3f> prev_u = get_point(p - 2 * best_dir);
+    std::optional<cv::Vec3f> prev_v;
+    std::optional<cv::Vec3f> prev_diag;
 
-    // std::cout << growth_dir << std::endl;
+    if (best_ortho_dir[0] != 0 || best_ortho_dir[1] != 0) {
+        prev_v = get_point(center_pos - best_ortho_dir);
+    }
+    if (best_diag_pos.has_value()) {
+        prev_diag = get_point(*best_diag_pos);
+    }
 
-    prev_u = get_point(p - 2*best_dir);
-    // prev_v = get_point(best_neighbor - ortho_dir);
-    
-    // if (prev_u.has_value() && prev_v.has_value()) {
-    //     prev_diag = get_point(best_neighbor - growth_dir - ortho_dir);
-    // }
+    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, prev_v, prev_diag);
 
-    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, {}, {});
-
-    // Since growth_dir corresponds to the tracer's u-axis, we only check the u_xyzs results.
     const auto& candidates = next_uvs.next_u_xyzs;
-    
     cv::Vec3f best_prediction;
     bool found_prediction = false;
 
     if (!candidates.empty()) {
-        // for (const auto& candidate : candidates) {
-            if (cv::norm(candidates[0]) > 1e-6) { // Check for non-zero/valid point
-                best_prediction = candidates[0];
-                found_prediction = true;
-                // break;
-            }
-        // }
+        if (cv::norm(candidates[0]) > 1e-6) {
+            best_prediction = candidates[0];
+            found_prediction = true;
+        }
     }
 
     if (found_prediction) {
