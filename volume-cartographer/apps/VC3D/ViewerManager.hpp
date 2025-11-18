@@ -23,7 +23,7 @@ class PathsOverlayController;
 class BBoxOverlayController;
 class VectorOverlayController;
 class VolumeOverlayController;
-class ChunkCache;
+template <typename T> class ChunkCache;
 class SegmentationModule;
 class Volume;
 class Surface;
@@ -36,7 +36,7 @@ class ViewerManager : public QObject
 public:
     ViewerManager(CSurfaceCollection* surfaces,
                   VCCollection* points,
-                  ChunkCache* cache,
+                  ChunkCache<uint8_t>* cache,
                   QObject* parent = nullptr);
 
     CVolumeViewer* createViewer(const std::string& surfaceName,
@@ -106,7 +106,7 @@ private slots:
 private:
     CSurfaceCollection* _surfaces;
     VCCollection* _points;
-    ChunkCache* _chunkCache;
+    ChunkCache<uint8_t>* _chunkCache;
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
     PathsOverlayController* _pathsOverlay{nullptr};

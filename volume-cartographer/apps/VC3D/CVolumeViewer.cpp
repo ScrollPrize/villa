@@ -706,7 +706,7 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
         std::cout << "FIXME: onVolumeClicked()" << std::endl;
 }
 
-void CVolumeViewer::setCache(ChunkCache *cache_)
+void CVolumeViewer::setCache(ChunkCache<uint8_t> *cache_)
 {
     cache = cache_;
 }

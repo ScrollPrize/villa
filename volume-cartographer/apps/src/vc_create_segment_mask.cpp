@@ -56,11 +56,11 @@ int main(int argc, char *argv[])
     // If volume path provided, generate with image data
     if (!volume_path.empty()) {
         std::shared_ptr<Volume> volume;
-        ChunkCache* cache = nullptr;
+        ChunkCache<uint8_t>* cache = nullptr;
 
         try {
             volume = Volume::New(volume_path);
-            cache = new ChunkCache(1ULL * 1024ULL * 1024ULL * 1024ULL);
+            cache = new ChunkCache<uint8_t>(1ULL * 1024ULL * 1024ULL * 1024ULL);
 
             generate_mask(surf, mask, img,
                          volume->zarrDataset(0),

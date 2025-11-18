@@ -19,7 +19,7 @@ class ViewerManager;
 class SurfacePanelController;
 class VolumePkg;
 class Volume;
-class ChunkCache;
+template <typename T> class ChunkCache;
 class QuadSurface;
 class CVolumeViewer;
 
@@ -34,7 +34,7 @@ public:
         SegmentationWidget* widget{nullptr};
         CSurfaceCollection* surfaces{nullptr};
         ViewerManager* viewerManager{nullptr};
-        ChunkCache* chunkCache{nullptr};
+        ChunkCache<uint8_t>* chunkCache{nullptr};
     };
 
     struct UiCallbacks

@@ -75,83 +75,8 @@ static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chu
 }
 
 
-int ChunkCache::groupIdx(const std::string &name)
-{
-    if (!_group_store.count(name))
-        _group_store[name] = _group_store.size()+1;
-    
-     return _group_store[name];
-}
-    
-void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
-{
-    if (_stored >= _size) {
-        using KP = std::pair<cv::Vec4i, uint64_t>;
-        std::vector<KP> gen_list(_gen_store.begin(), _gen_store.end());
-        std::sort(gen_list.begin(), gen_list.end(), [](KP &a, KP &b){ return a.second < b.second; });
-        for(auto it : gen_list) {
-            std::shared_ptr<xt::xarray<uint8_t>> ar = _store[it.first];
-            //TODO we could remove this with lower probability so we dont store infiniteyl empty blocks but also keep more of them as they are cheap
-            if (ar.get()) {
-                size_t size = ar.get()->storage().size(); // elements (uint8)
-                size *= sizeof(uint8_t);
-                ar.reset();
-                _stored -= size;
-            
-                _store.erase(it.first);
-                _gen_store.erase(it.first);
-            }
 
-            //we delete 10% of cache content to amortize sorting costs
-            if (_stored < 0.9*_size) {
-                break;
-            }
-        }
-    }
-
-    if (ar) {
-        if (_store.count(idx)) {
-            assert(_store[idx].get());
-            _stored -= _store[idx]->size() * sizeof(uint8_t);
-        }
-        _stored += ar->size() * sizeof(uint8_t);
-    }
-    _store[idx].reset(ar);
-    _generation++;
-    _gen_store[idx] = _generation;
-}
-
-void ChunkCache::put16(const cv::Vec4i &idx, xt::xarray<uint16_t> *ar)
-{
-    if (_stored >= _size) {
-        using KP = std::pair<cv::Vec4i, uint64_t>;
-        std::vector<KP> gen_list(_gen_store16.begin(), _gen_store16.end());
-        std::sort(gen_list.begin(), gen_list.end(), [](KP &a, KP &b){ return a.second < b.second; });
-        for(auto it : gen_list) {
-            std::shared_ptr<xt::xarray<uint16_t>> ar = _store16[it.first];
-            if (ar.get()) {
-                size_t size = ar.get()->storage().size() * sizeof(uint16_t);
-                ar.reset();
-                _stored -= size;
-                _store16.erase(it.first);
-                _gen_store16.erase(it.first);
-            }
-            if (_stored < 0.9*_size) break;
-        }
-    }
-    if (ar) {
-        if (_store16.count(idx)) {
-            assert(_store16[idx].get());
-            _stored -= _store16[idx]->size() * sizeof(uint16_t);
-        }
-        _stored += ar->size() * sizeof(uint16_t);
-    }
-    _store16[idx].reset(ar);
-    _generation++;
-    _gen_store16[idx] = _generation;
-}
-
-void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache* cache) {
+void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache<uint8_t>* cache) {
     int group_idx = cache->groupIdx(ds->path());
     cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
     auto chunksize = ds->chunking().blockShape();
@@ -237,7 +162,7 @@ void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, con
     }
 }
 
-void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache* cache) {
+void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache<uint16_t>* cache) {
     int group_idx = cache->groupIdx(ds->path());
     cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
     auto chunksize = ds->chunking().blockShape();
@@ -261,16 +186,16 @@ void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major>& out, cons
 
         {
             std::shared_lock<std::shared_mutex> lock(cache->mutex);
-            if (cache->has16(idx)) chunk_ref = cache->get16(idx);
+            if (cache->has(idx)) chunk_ref = cache->get(idx);
             else needs_read = true;
         }
 
         if (needs_read) {
             auto* new_chunk = readChunk<uint16_t>(*ds, {(size_t)idx[1], (size_t)idx[2], (size_t)idx[3]});
             std::unique_lock<std::shared_mutex> lock(cache->mutex);
-            if (!cache->has16(idx)) cache->put16(idx, new_chunk);
+            if (!cache->has(idx)) cache->put(idx, new_chunk);
             else delete new_chunk;
-            chunk_ref = cache->get16(idx);
+            chunk_ref = cache->get(idx);
         }
 
         int cz = idx[1], cy = idx[2], cx = idx[3];
@@ -305,59 +230,7 @@ void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major>& out, cons
     }
 }
 
-ChunkCache::~ChunkCache()
-{
-    for(auto &it : _store)
-        it.second.reset();
-    for(auto &it : _store16)
-        it.second.reset();
-}
-
-void ChunkCache::reset()
-{
-    _gen_store.clear();
-    _group_store.clear();
-    _store.clear();
-    _gen_store16.clear();
-    _store16.clear();
-
-    _generation = 0;
-    _stored = 0;
-}
-
-std::shared_ptr<xt::xarray<uint8_t>> ChunkCache::get(const cv::Vec4i &idx)
-{
-    auto res = _store.find(idx);
-    if (res == _store.end())
-        return nullptr;
-
-    _generation++;
-    _gen_store[idx] = _generation;
-    
-    return res->second;
-}
-
-bool ChunkCache::has(const cv::Vec4i &idx)
-{
-    return _store.count(idx);
-}
-
-std::shared_ptr<xt::xarray<uint16_t>> ChunkCache::get16(const cv::Vec4i &idx)
-{
-    auto res = _store16.find(idx);
-    if (res == _store16.end())
-        return nullptr;
-    _generation++;
-    _gen_store16[idx] = _generation;
-    return res->second;
-}
-
-bool ChunkCache::has16(const cv::Vec4i &idx)
-{
-    return _store16.count(idx);
-}
-
-void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache) {
+void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache) {
     out = cv::Mat_<uint8_t>(coords.size(), 0);
     int group_idx = cache->groupIdx(ds->path());
 
@@ -446,7 +319,7 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     }
 }
 
-static void readNearestNeighbor16(cv::Mat_<uint16_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache) {
+static void readNearestNeighbor16(cv::Mat_<uint16_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache) {
     out = cv::Mat_<uint16_t>(coords.size(), 0);
     int group_idx = cache->groupIdx(ds->path());
 
@@ -489,12 +362,12 @@ static void readNearestNeighbor16(cv::Mat_<uint16_t> &out, const z5::Dataset *ds
                             last_idx = idx;
                             #pragma omp critical(cache_access)
                             {
-                                if (!cache->has16(idx)) {
+                                if (!cache->has(idx)) {
                                     auto* new_chunk = readChunk<uint16_t>(*ds, {size_t(ix), size_t(iy), size_t(iz)});
-                                    cache->put16(idx, new_chunk);
-                                    chunk_ref = cache->get16(idx);
+                                    cache->put(idx, new_chunk);
+                                    chunk_ref = cache->get(idx);
                                 } else {
-                                    chunk_ref = cache->get16(idx);
+                                    chunk_ref = cache->get(idx);
                                 }
                             }
                             chunk = chunk_ref.get();
@@ -517,7 +390,7 @@ static void readNearestNeighbor16(cv::Mat_<uint16_t> &out, const z5::Dataset *ds
 }
 
 void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
-                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache, bool nearest_neighbor) {
+                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache, bool nearest_neighbor) {
     if (nearest_neighbor) {
         return readNearestNeighbor(out,ds,coords,cache);
     }
@@ -789,7 +662,7 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
 }
 
 void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds,
-                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache, bool nearest_neighbor) {
+                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache, bool nearest_neighbor) {
     if (nearest_neighbor) {
         return readNearestNeighbor16(out,ds,coords,cache);
     }
@@ -872,10 +745,10 @@ void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds,
     for(auto &it : chunks) {
         std::shared_ptr<xt::xarray<uint16_t>> chunk_ref;
         cv::Vec4i idx = it.first;
-        if (!cache->has16(idx)) {
+        if (!cache->has(idx)) {
             needs_io.push_back({idx,nullptr});
         } else {
-            chunk_ref = cache->get16(idx);
+            chunk_ref = cache->get(idx);
             chunks[idx] = chunk_ref;
         }
     }
@@ -889,8 +762,8 @@ void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds,
     cache->mutex.lock();
     for(auto &it : needs_io) {
         cv::Vec4i idx = it.first;
-        cache->put16(idx, it.second);
-        chunks[idx] = cache->get16(idx);
+        cache->put(idx, it.second);
+        chunks[idx] = cache->get(idx);
     }
     cache->mutex.unlock();
 

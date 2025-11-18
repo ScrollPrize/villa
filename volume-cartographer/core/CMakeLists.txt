@@ -10,6 +10,7 @@ add_library(vc_core
         src/ChunkedTensor.cpp
         src/SurfacePatchIndex.cpp
         src/Logging.cpp
+        src/ChunkCache.cpp
         src/Slicing.cpp
         src/Surface.cpp
         src/Render.cpp

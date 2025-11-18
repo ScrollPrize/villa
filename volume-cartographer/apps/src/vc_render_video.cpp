@@ -102,7 +102,7 @@ int main(int argc, char *argv[])
 
     cv::Size tgt_size = {3840, 2160};
 
-    ChunkCache chunk_cache(10e9);
+    ChunkCache<uint8_t> chunk_cache(10e9);
 
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 

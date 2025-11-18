@@ -1188,7 +1188,7 @@ void ControlPointSurface::setBase(Surface *base)
     std::cout << "ERROR implement search for ControlPointSurface::setBase()" << std::endl;
 }
 
-RefineCompSurface::RefineCompSurface(z5::Dataset *ds, ChunkCache *cache, QuadSurface *base)
+RefineCompSurface::RefineCompSurface(z5::Dataset *ds, ChunkCache<uint8_t> *cache, QuadSurface *base)
 : DeltaSurface(base)
 {
     _ds = ds;
@@ -1249,7 +1249,7 @@ struct DSReader
 {
     z5::Dataset *ds;
     float scale;
-    ChunkCache *cache;
+    ChunkCache<uint8_t> *cache;
 };
 
 
@@ -2035,7 +2035,7 @@ void generate_mask(QuadSurface* surf,
                             cv::Mat_<uint8_t>& img,
                             z5::Dataset* ds_high,
                             z5::Dataset* ds_low,
-                            ChunkCache* cache) {
+                            ChunkCache<uint8_t>* cache) {
     cv::Mat_<cv::Vec3f> points = surf->rawPoints();
 
     // Choose resolution based on surface size

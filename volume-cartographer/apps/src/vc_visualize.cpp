@@ -27,7 +27,7 @@ using json = nlohmann::json;
 class SegmentRenderer {
     std::shared_ptr<VolumePkg> vpkg_;
     std::shared_ptr<Volume> volume_;
-    ChunkCache* cache_;
+    ChunkCache<uint8_t>* cache_;
 
     struct SurfaceInfo {
         std::string id;
@@ -141,7 +141,7 @@ public:
         std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
         std::cout << "Volume dimensions: " << volume_->sliceWidth() << "x"
                   << volume_->sliceHeight() << "x" << volume_->numSlices() << std::endl;
-        cache_ = new ChunkCache(1ULL * 1024ULL * 1024ULL * 1024ULL);
+        cache_ = new ChunkCache<uint8_t>(1ULL * 1024ULL * 1024ULL * 1024ULL);
     }
 
     ~SegmentRenderer() {

@@ -15,7 +15,7 @@ enum class OpChainSourceMode: int
 class OpChain : public Surface {
 public:
     OpChain(QuadSurface *src) : _src(src) { if (src->rawPoints().rows < 1000) _src_mode = OpChainSourceMode::RAW; };
-    QuadSurface *surf(const cv::Vec3f &ptr, const cv::Size &size, float z, float scale, ChunkCache *cache, z5::Dataset *ds);
+    QuadSurface *surf(const cv::Vec3f &ptr, const cv::Size &size, float z, float scale, ChunkCache<uint8_t> *cache, z5::Dataset *ds);
     void append(DeltaSurface *op);
 
     cv::Vec3f pointer() override;

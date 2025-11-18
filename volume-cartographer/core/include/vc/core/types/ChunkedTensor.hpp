@@ -60,7 +60,7 @@ class Chunked3d {
 public:
     using CHUNKT = xt::xtensor<T,3,xt::layout_type::column_major>;
 
-    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache *cache) : _compute_f(compute_f), _ds(ds), _cache(cache)
+    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache<T> *cache) : _compute_f(compute_f), _ds(ds), _cache(cache)
     {
         _border = compute_f.BORDER;
     };
@@ -69,7 +69,7 @@ public:
         if (!_persistent)
             remove_all(_cache_dir);
     };
-    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache *cache, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache)
+    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache<T> *cache, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache)
     {
         _border = compute_f.BORDER;
         
@@ -428,7 +428,7 @@ public:
 
     std::unordered_map<cv::Vec3i,T*,vec3i_hash> _chunks;
     z5::Dataset *_ds;
-    ChunkCache *_cache;
+    ChunkCache<T> *_cache;
     size_t _border;
     C &_compute_f;
     std::shared_mutex _mutex;
@@ -654,7 +654,7 @@ private:
 
 struct Chunked3dFloatFromUint8
 {
-    Chunked3dFloatFromUint8(std::unique_ptr<z5::Dataset> &&ds, float scale, ChunkCache *cache, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dFloatFromUint8(std::unique_ptr<z5::Dataset> &&ds, float scale, ChunkCache<uint8_t> *cache, std::string const &cache_root, std::string const &unique_id) :
         _passthrough{unique_id},
         _x(_passthrough, ds.get(), cache, cache_root),
         _scale(scale),  // multiplying by this maps indices of the 'canonical' volume to indices of our dataset
@@ -684,7 +684,7 @@ struct Chunked3dFloatFromUint8
 
 struct Chunked3dVec3fFromUint8
 {
-    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<z5::Dataset>> &&dss, float scale, ChunkCache *cache, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<z5::Dataset>> &&dss, float scale, ChunkCache<uint8_t> *cache, std::string const &cache_root, std::string const &unique_id) :
         _passthrough_x{unique_id + "_x"},
         _passthrough_y{unique_id + "_y"},
         _passthrough_z{unique_id + "_z"},

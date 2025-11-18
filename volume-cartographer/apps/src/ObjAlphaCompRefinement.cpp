@@ -142,7 +142,7 @@ bool istype(const std::string &line, const std::string &type)
 struct DSReader {
     z5::Dataset* ds;
     float scale;
-    ChunkCache* cache;
+    ChunkCache<uint8_t>* cache;
     std::mutex read_mutex;
 };
 
@@ -416,7 +416,7 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group << " " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
     std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
-    ChunkCache chunk_cache(cfg.cache_bytes);
+    ChunkCache<uint8_t> chunk_cache(cfg.cache_bytes);
 
     DSReader reader = {ds.get(), cfg.reader_scale, &chunk_cache};
 

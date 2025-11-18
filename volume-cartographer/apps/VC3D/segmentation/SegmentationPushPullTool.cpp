@@ -837,7 +837,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
         scale = 1.0f;
     }
 
-    ChunkCache* cache = viewer->chunkCachePtr();
+    ChunkCache<uint8_t>* cache = viewer->chunkCachePtr();
 
     AlphaPushPullConfig cfg = sanitizeConfig(_alphaConfig);
 

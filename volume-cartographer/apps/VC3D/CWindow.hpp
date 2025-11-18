@@ -213,8 +213,8 @@ private:
     QMdiArea *mdiArea;
 
     bool can_change_volume_();
-    
-    ChunkCache *chunk_cache;
+
+    ChunkCache<uint8_t> *chunk_cache;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

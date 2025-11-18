@@ -97,7 +97,7 @@ QString directionToString(SegmentationGrowthDirection direction)
 }
 
 bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
-                          ChunkCache* cache,
+                          ChunkCache<uint8_t>* cache,
                           const QString& cacheRoot,
                           std::vector<DirectionField>& out,
                           QString& error)

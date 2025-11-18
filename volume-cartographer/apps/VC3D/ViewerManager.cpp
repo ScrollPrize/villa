@@ -101,7 +101,7 @@ std::optional<CellRegion> vertexRectToCellRegion(const cv::Rect& vertexRect,
 
 ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
                              VCCollection* points,
-                             ChunkCache* cache,
+                             ChunkCache<uint8_t>* cache,
                              QObject* parent)
     : QObject(parent)
     , _surfaces(surfaces)

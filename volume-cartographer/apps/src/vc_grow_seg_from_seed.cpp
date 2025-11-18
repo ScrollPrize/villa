@@ -82,7 +82,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
     return false;
 }
 
-static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, std::filesystem::path const &cache_root)
+static auto load_direction_fields(json const&params, ChunkCache<uint8_t> *chunk_cache, std::filesystem::path const &cache_root)
 {
     std::vector<DirectionField> direction_fields;
     if (params.contains("direction_fields")) {
@@ -255,7 +255,7 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
 
-    ChunkCache chunk_cache(params.value("cache_size", 1e9));
+    ChunkCache<uint8_t> chunk_cache(params.value("cache_size", 1e9));
 
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> tensor(pass, ds.get(), &chunk_cache);

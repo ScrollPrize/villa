@@ -274,7 +274,7 @@ void SeedingWidget::setCurrentVolume(std::shared_ptr<Volume> volume)
     updateButtonStates();
 }
 
-void SeedingWidget::setCache(ChunkCache* cache)
+void SeedingWidget::setCache(ChunkCache<uint8_t>* cache)
 {
     chunkCache = cache;
 }

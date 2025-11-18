@@ -529,7 +529,7 @@ static inline void genTile(
 static inline void renderSliceFromBase(
     cv::Mat& out,
     z5::Dataset* ds,
-    ChunkCache* cache,
+    ChunkCache<uint8_t>* cache,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
     float off,
@@ -552,7 +552,7 @@ static inline void renderSliceFromBase(
 static inline void renderSliceFromBase16(
     cv::Mat& out,
     z5::Dataset* ds,
-    ChunkCache* cache,
+    ChunkCache<uint16_t>* cache,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
     float off,
@@ -934,7 +934,8 @@ int main(int argc, char *argv[])
     const size_t cache_gb = parsed["cache-gb"].as<size_t>();
     const size_t cache_bytes = cache_gb * 1024ull * 1024ull * 1024ull;
     std::cout << "Chunk cache: " << cache_gb << " GB (" << cache_bytes << " bytes)" << std::endl;
-    ChunkCache chunk_cache(cache_bytes);
+    ChunkCache<uint8_t> chunk_cache_u8(cache_bytes);
+    ChunkCache<uint16_t> chunk_cache_u16(cache_bytes);
 
     auto process_one = [&](const std::filesystem::path& seg_folder, const std::string& out_arg, bool force_zarr) -> void {
         std::filesystem::path output_path_local(out_arg);
@@ -1155,7 +1156,7 @@ int main(int argc, char *argv[])
 
                     if (output_is_u16) {
                         auto renderOne16 = [&](cv::Mat& dst, float offset) {
-                            renderSliceFromBase16(dst, ds.get(), &chunk_cache,
+                            renderSliceFromBase16(dst, ds.get(), &chunk_cache_u16,
                                                   basePoints, stepDirs, offset, static_cast<float>(ds_scale));
                         };
                         xt::xarray<uint16_t> outChunk =
@@ -1192,7 +1193,7 @@ int main(int argc, char *argv[])
                         z5::multiarray::writeSubarray<uint16_t>(dsOut0, outChunk, outOffset.begin());
                     } else {
                         auto renderOne8 = [&](cv::Mat& dst, float offset) {
-                            renderSliceFromBase(dst, ds.get(), &chunk_cache,
+                            renderSliceFromBase(dst, ds.get(), &chunk_cache_u8,
                                                 basePoints, stepDirs, offset, static_cast<float>(ds_scale));
                         };
                         xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({dz, dy_dst, dx_dst});
@@ -1648,7 +1649,7 @@ int main(int argc, char *argv[])
 
                         if (output_is_u16) {
                             auto renderOne16 = [&](cv::Mat& dst, float offset) {
-                                renderSliceFromBase16(dst, ds.get(), &chunk_cache,
+                                renderSliceFromBase16(dst, ds.get(), &chunk_cache_u16,
                                                       basePoints, stepDirs, offset, static_cast<float>(ds_scale));
                             };
                             std::vector<uint16_t> tileBuf(tileW * tileH, 0);
@@ -1684,7 +1685,7 @@ int main(int argc, char *argv[])
                             }
                         } else {
                             auto renderOne8 = [&](cv::Mat& dst, float offset) {
-                                renderSliceFromBase(dst, ds.get(), &chunk_cache,
+                                renderSliceFromBase(dst, ds.get(), &chunk_cache_u8,
                                                     basePoints, stepDirs, offset, static_cast<float>(ds_scale));
                             };
                             std::vector<uint8_t> tileBuf(tileW * tileH, 0);

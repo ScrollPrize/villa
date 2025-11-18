@@ -213,7 +213,7 @@ void DrawingWidget::setCurrentVolume(std::shared_ptr<Volume> volume)
     updateUI();
 }
 
-void DrawingWidget::setCache(ChunkCache* cache)
+void DrawingWidget::setCache(ChunkCache<uint8_t>* cache)
 {
     chunkCache = cache;
 }

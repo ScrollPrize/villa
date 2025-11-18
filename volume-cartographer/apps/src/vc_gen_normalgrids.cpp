@@ -224,7 +224,7 @@ void run_generate(const po::variables_map& vm) {
     std::ofstream o(output_fs_path / "metadata.json");
     o << std::setw(4) << metadata << std::endl;
 
-    ChunkCache cache(10llu*1024*1024*1024);
+    ChunkCache<uint8_t> cache(10llu*1024*1024*1024);
 
     size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
     std::atomic<size_t> total_processed_all_dirs = 0;

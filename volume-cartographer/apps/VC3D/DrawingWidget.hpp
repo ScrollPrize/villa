@@ -42,7 +42,7 @@ public:
     void setCurrentVolume(std::shared_ptr<Volume> volume);
     
     /** Set the cache for volume data access */
-    void setCache(ChunkCache* cache);
+    void setCache(ChunkCache<uint8_t>* cache);
     
     /** Clear all drawn paths */
     void clearAllPaths();
@@ -148,7 +148,7 @@ private:
     std::shared_ptr<VolumePkg> fVpkg;
     std::shared_ptr<Volume> currentVolume;
     std::string currentVolumeId;
-    ChunkCache* chunkCache;
+    ChunkCache<uint8_t>* chunkCache;
     
     // Drawing state
     int currentPathId;

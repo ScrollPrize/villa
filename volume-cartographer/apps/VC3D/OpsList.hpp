@@ -17,7 +17,7 @@ public:
     explicit OpsList(QWidget* parent = nullptr);
     ~OpsList();
 
-    void setDataset(z5::Dataset *ds, ChunkCache *cache, float scale);
+    void setDataset(z5::Dataset *ds, ChunkCache<uint8_t> *cache, float scale);
 
 
 private slots:
@@ -39,7 +39,7 @@ private:
 
     //FIXME currently stored for refinement layer - make this somehow generic ...
     z5::Dataset *_ds = nullptr;
-    ChunkCache *_cache = nullptr;
+    ChunkCache<uint8_t> *_cache = nullptr;
     float _scale = 0.0;
 };
 

@@ -212,7 +212,7 @@ protected:
 class RefineCompSurface : public DeltaSurface
 {
 public:
-    RefineCompSurface(z5::Dataset *ds, ChunkCache *cache, QuadSurface *base = nullptr);
+    RefineCompSurface(z5::Dataset *ds, ChunkCache<uint8_t> *cache, QuadSurface *base = nullptr);
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) override;
 
     float start = 0;
@@ -222,7 +222,7 @@ public:
     float high = 1.0;
 protected:
     z5::Dataset *_ds;
-    ChunkCache *_cache;
+    ChunkCache<uint8_t> *_cache;
 };
 
 class SurfaceMeta
@@ -280,7 +280,7 @@ void generate_mask(QuadSurface* surf,
                             cv::Mat_<uint8_t>& img,
                             z5::Dataset* ds_high = nullptr,
                             z5::Dataset* ds_low = nullptr,
-                            ChunkCache* cache = nullptr);
+                            ChunkCache<uint8_t>* cache = nullptr);
 
 class MultiSurfaceIndex {
 private:

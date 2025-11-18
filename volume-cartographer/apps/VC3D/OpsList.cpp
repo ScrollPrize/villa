@@ -63,7 +63,7 @@ void OpsList::onAppendOpClicked()
     sendOpChainChanged(_op_chain);
 }
 
-void OpsList::setDataset(z5::Dataset *ds, ChunkCache *cache, float scale)
+void OpsList::setDataset(z5::Dataset *ds, ChunkCache<uint8_t> *cache, float scale)
 {
     _ds = ds;
     _cache = cache;
