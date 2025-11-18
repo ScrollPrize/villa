@@ -544,55 +544,57 @@ static bool call_neural_tracer_for_point(
         return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
     };
 
-    cv::Vec2i best_neighbor = {-1, -1};
+    cv::Vec2i best_dir = {-2, -2};
     int max_score = -1;
 
-    // Iterate through the 4 direct neighbors of p to find the best context.
-    cv::Vec2i p_neighbors[] = {{p[0] - 1, p[1]}, {p[0] + 1, p[1]}, {p[0], p[1] - 1}, {p[0], p[1] + 1}};
+    cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
-    for (const auto& neighbor : p_neighbors) {
-        if (!is_valid(neighbor)) continue;
+    for (const auto& dir : dirs) {
+        if (!is_valid(p-dir)) continue;
+        if (!is_valid(p-2*dir)) continue;
 
-        // Determine the local coordinate system based on the direction from neighbor to p.
-        cv::Vec2i growth_dir = {p[0] - neighbor[0], p[1] - neighbor[1]};
-        cv::Vec2i ortho_dir = {-growth_dir[1], growth_dir[0]};
+        best_dir = dir;
+        break;
 
-        int score = 0;
-        bool u_context_valid = false;
-        bool v_context_valid = false;
-
-        // Check for point behind neighbor along the growth axis
-        if (is_valid(neighbor - growth_dir)) {
-            score++;
-            u_context_valid = true;
-        }
-
-        // Check for point behind neighbor along the orthogonal axis
-        if (is_valid(neighbor - ortho_dir)) {
-            score++;
-            v_context_valid = true;
-        }
-
-        // Diagonal can only be scored if both primary context points exist.
-        if (u_context_valid && v_context_valid) {
-            if (is_valid(neighbor - growth_dir - ortho_dir)) {
-                score++;
-            }
-        }
-
-        if (score > max_score) {
-            max_score = score;
-            best_neighbor = neighbor;
-        }
+        // cv::Vec2i ortho_dir = {-dir[1], dir[0]};
+        //
+        // int score = 0;
+        // bool u_context_valid = false;
+        // bool v_context_valid = false;
+        //
+        // // Check for point behind neighbor along the growth axis
+        // if (is_valid(neighbor - growth_dir)) {
+        //     score++;
+        //     u_context_valid = true;
+        // }
+        //
+        // // Check for point behind neighbor along the orthogonal axis
+        // if (is_valid(neighbor - ortho_dir)) {
+        //     score++;
+        //     v_context_valid = true;
+        // }
+        //
+        // // Diagonal can only be scored if both primary context points exist.
+        // if (u_context_valid && v_context_valid) {
+        //     if (is_valid(neighbor - growth_dir - ortho_dir)) {
+        //         score++;
+        //     }
+        // }
+        //
+        // if (score > max_score) {
+        //     max_score = score;
+        //     best_neighbor = neighbor;
+        //     std::cout << "best" << growth_dir << std::endl;
+        // }
     }
 
-    if (best_neighbor[0] == -1) {
+    if (best_dir[0] == -2) {
         // No valid neighbor found to provide context, cannot call tracer.
         return false;
     }
 
     // We found the best neighbor to act as the center. Now, gather its context points.
-    const auto& center_p_double = trace_params.dpoints(best_neighbor);
+    const auto& center_p_double = trace_params.dpoints(p-best_dir);
     cv::Vec3f center_xyz(center_p_double[0], center_p_double[1], center_p_double[2]);
     
     std::optional<cv::Vec3f> prev_u, prev_v, prev_diag;
@@ -605,15 +607,17 @@ static bool call_neural_tracer_for_point(
         return std::nullopt;
     };
 
-    cv::Vec2i growth_dir = {p[0] - best_neighbor[0], p[1] - best_neighbor[1]};
-    cv::Vec2i ortho_dir = {-growth_dir[1], growth_dir[0]};
+    // cv::Vec2i growth_dir = {p[0] - best_neighbor[0], p[1] - best_neighbor[1]};
+    // cv::Vec2i ortho_dir = {-growth_dir[1], growth_dir[0]};
 
-    prev_u = get_point(best_neighbor - growth_dir);
-    prev_v = get_point(best_neighbor - ortho_dir);
+    // std::cout << growth_dir << std::endl;
+
+    prev_u = get_point(p - 2*best_dir);
+    // prev_v = get_point(best_neighbor - ortho_dir);
     
-    if (prev_u.has_value() && prev_v.has_value()) {
-        prev_diag = get_point(best_neighbor - growth_dir - ortho_dir);
-    }
+    // if (prev_u.has_value() && prev_v.has_value()) {
+    //     prev_diag = get_point(best_neighbor - growth_dir - ortho_dir);
+    // }
 
     auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, {}, {});
 
@@ -624,13 +628,13 @@ static bool call_neural_tracer_for_point(
     bool found_prediction = false;
 
     if (!candidates.empty()) {
-        for (const auto& candidate : candidates) {
-            if (cv::norm(candidate) > 1e-6) { // Check for non-zero/valid point
-                best_prediction = candidate;
+        // for (const auto& candidate : candidates) {
+            if (cv::norm(candidates[0]) > 1e-6) { // Check for non-zero/valid point
+                best_prediction = candidates[0];
                 found_prediction = true;
-                break;
+                // break;
             }
-        }
+        // }
     }
 
     if (found_prediction) {
@@ -2399,7 +2403,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
         // ...then start iterating over candidates in parallel using the above to yield points
-#pragma omp parallel
+// #pragma omp parallel
         {
             CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
 //             int idx = rand() % cands.size();
@@ -2453,7 +2457,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     continue;
 
                 bool point_was_placed = false;
-                if (neural_tracer) {
+                const int CERES_GENS = 4;
+                if (neural_tracer && generation > CERES_GENS) {
                     point_was_placed = call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
                 } else {
                     // Standard Ceres optimization path
@@ -2475,8 +2480,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     ceres::Solve(options, &problem, &summary);
 
                     local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                    if (local_opt_r > 1)
-                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                    // if (local_opt_r > 1)
+                        // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
                     
                     point_was_placed = true;
                 }

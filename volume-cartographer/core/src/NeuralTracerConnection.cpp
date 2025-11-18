@@ -25,8 +25,6 @@ namespace
                 response_str += buffer[0];
         }
 
-        std::cout << "Received from neural tracer: " << response_str << std::endl;
-
         // Replace NaN with null for valid JSON parsing
         size_t pos = 0;
         while ((pos = response_str.find("NaN", pos)) != std::string::npos) {
