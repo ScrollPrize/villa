@@ -31,6 +31,7 @@
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include "vc/tracer/NeuralTracerConnection.h"
 
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2
@@ -531,6 +532,110 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
 }
 
 } // namespace
+
+static bool call_neural_tracer_for_point(
+    const cv::Vec2i& p,
+    TraceParameters& trace_params,
+    NeuralTracerConnection* neural_tracer)
+{
+    if (!neural_tracer) return false;
+
+    auto is_valid = [&](const cv::Vec2i& pt) {
+        return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
+    };
+
+    cv::Vec2i best_dir(-2, -2);
+    cv::Vec2i best_ortho_dir(0, 0);
+    std::optional<cv::Vec2i> best_diag_pos;
+    int max_score = -1;
+
+    const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+    for (const auto& dir : dirs) {
+        if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {
+            continue;
+        }
+
+        const cv::Vec2i center_pos = p - dir;
+        const cv::Vec2i prev_u_pos = p - 2 * dir;
+
+        const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
+
+        for (const auto& ortho_dir : ortho_dirs) {
+            int current_score = 2; // center + prev_u
+            std::optional<cv::Vec2i> current_diag_pos;
+
+            bool v_valid = false;
+            cv::Vec2i prev_v_pos;
+            if (ortho_dir[0] != 0 || ortho_dir[1] != 0) {
+                if (is_valid(center_pos - ortho_dir)) {
+                    v_valid = true;
+                    prev_v_pos = center_pos - ortho_dir;
+                    current_score++;
+                }
+            }
+
+            // if (current_diag_pos.has_value()) {
+            //     current_score++;
+            // }
+
+            if (current_score > max_score) {
+                max_score = current_score;
+                best_dir = dir;
+                best_ortho_dir = ortho_dir;
+                best_diag_pos = current_diag_pos;
+            }
+        }
+    }
+
+    if (max_score == -1) {
+        return false;
+    }
+
+    const cv::Vec2i center_pos = p - best_dir;
+    const auto& center_p_double = trace_params.dpoints(center_pos);
+    cv::Vec3f center_xyz(center_p_double[0], center_p_double[1], center_p_double[2]);
+
+    auto get_point = [&](const cv::Vec2i& pos) -> std::optional<cv::Vec3f> {
+        if (is_valid(pos)) {
+            const auto& p_double_neighbor = trace_params.dpoints(pos);
+            return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
+        }
+        return std::nullopt;
+    };
+
+    std::optional<cv::Vec3f> prev_u = get_point(p - 2 * best_dir);
+    std::optional<cv::Vec3f> prev_v;
+    std::optional<cv::Vec3f> prev_diag;
+
+    if (best_ortho_dir[0] != 0 || best_ortho_dir[1] != 0) {
+        prev_v = get_point(center_pos - best_ortho_dir);
+    }
+    if (best_diag_pos.has_value()) {
+        prev_diag = get_point(*best_diag_pos);
+    }
+
+    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, prev_v, prev_diag);
+
+    const auto& candidates = next_uvs.next_u_xyzs;
+    cv::Vec3f best_prediction;
+    bool found_prediction = false;
+
+    if (!candidates.empty()) {
+        if (cv::norm(candidates[0]) > 1e-6) {
+            best_prediction = candidates[0];
+            found_prediction = true;
+        }
+    }
+
+    if (found_prediction) {
+        trace_params.dpoints(p) = {best_prediction[0], best_prediction[1], best_prediction[2]};
+        trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+        return true;
+    }
+
+    return false;
+}
 
 // global CUDA to allow use to set to false globally
 // in the case they have cuda avail, but do not want to use it
@@ -1471,6 +1576,21 @@ struct thresholdedDistance
 
 QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
+    std::unique_ptr<NeuralTracerConnection> neural_tracer;
+    if (params.contains("neural_socket")) {
+        std::string socket_path = params["neural_socket"];
+        if (!socket_path.empty()) {
+            try {
+                neural_tracer = std::make_unique<NeuralTracerConnection>(socket_path);
+                std::cout << "Neural tracer connection enabled on " << socket_path << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to connect neural tracer: " << e.what() << std::endl;
+            }
+        }
+    }
+    if (!neural_tracer) {
+        std::cout << "Neural tracer not active" << std::endl;
+    }
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
@@ -1914,30 +2034,94 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
 
     } else {
-        // Initialise the trace at the center of the available area, as a tiny single-quad patch at the seed point
-        used_area = cv::Rect(x0,y0,2,2);
-        //these are locations in the local volume!
-        trace_params.dpoints(y0,x0) = origin;
-        trace_params.dpoints(y0,x0+1) = origin+vx*0.1;
-        trace_params.dpoints(y0+1,x0) = origin+vy*0.1;
-        trace_params.dpoints(y0+1,x0+1) = origin+vx*0.1 + vy*0.1;
+        if (neural_tracer) {
+            std::cout << "Initializing with neural tracer..." << std::endl;
+            
+            trace_params.dpoints(y0, x0) = origin;
+            trace_params.state(y0, x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+            generations(y0, x0) = 1;
+            fringe.push_back({y0, x0});
 
-        trace_params.state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-        trace_params.state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-        trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
-        trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+            auto next_points = neural_tracer->get_next_points(origin, std::nullopt, std::nullopt, std::nullopt);
 
-        generations(y0,x0) = 1;
-        generations(y0,x0+1) = 1;
-        generations(y0+1,x0) = 1;
-        generations(y0+1,x0+1) = 1;
+            if (next_points.next_u_xyzs.size() >= 4) {
+                std::cout << "Neural tracer returned " << next_points.next_u_xyzs.size() << " initial points." << std::endl;
+                
+                std::vector<cv::Vec3f> points = next_points.next_u_xyzs;
+                if (points.size() > 4) points.resize(4);
 
-        fringe.push_back({y0,x0});
-        fringe.push_back({y0+1,x0});
-        fringe.push_back({y0,x0+1});
-        fringe.push_back({y0+1,x0+1});
+                float max_dist_sq = -1.0f;
+                int idx1 = -1, idx2 = -1;
+                for (int i = 0; i < 4; ++i) {
+                    for (int j = i + 1; j < 4; ++j) {
+                        float d_sq = cv::norm(points[i] - points[j], cv::NORM_L2SQR);
+                        if (d_sq > max_dist_sq) {
+                            max_dist_sq = d_sq;
+                            idx1 = i;
+                            idx2 = j;
+                        }
+                    }
+                }
 
-        std::cout << "init loss count " << loss_count << std::endl;
+                std::vector<int> remaining_indices;
+                for (int i = 0; i < 4; ++i) {
+                    if (i != idx1 && i != idx2) remaining_indices.push_back(i);
+                }
+                int idx3 = remaining_indices[0];
+                int idx4 = remaining_indices[1];
+
+                cv::Vec2i grid_pos[] = {{y0, x0 + 1}, {y0, x0 - 1}, {y0 - 1, x0}, {y0 + 1, x0}};
+                cv::Vec3f tracer_points[] = {points[idx1], points[idx2], points[idx3], points[idx4]};
+
+                for (int i = 0; i < 4; ++i) {
+                    trace_params.dpoints(grid_pos[i]) = tracer_points[i];
+                    trace_params.state(grid_pos[i]) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    generations(grid_pos[i]) = 1;
+                    fringe.push_back(grid_pos[i]);
+                }
+
+                used_area = cv::Rect(x0 - 1, y0 - 1, 3, 3);
+                local_optimization(3, {y0,x0}, trace_params, trace_data, loss_settings, true);
+            } else {
+                std::cout << "Neural tracer initialization failed (not enough points), falling back to default." << std::endl;
+                used_area = cv::Rect(x0,y0,2,2);
+                trace_params.dpoints(y0,x0) = origin;
+                trace_params.dpoints(y0,x0+1) = origin+vx*0.1;
+                trace_params.dpoints(y0+1,x0) = origin+vy*0.1;
+                trace_params.dpoints(y0+1,x0+1) = origin+vx*0.1 + vy*0.1;
+                trace_params.state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+                trace_params.state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+                trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+                trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+                generations(y0,x0) = 1; generations(y0,x0+1) = 1; generations(y0+1,x0) = 1; generations(y0+1,x0+1) = 1;
+                fringe.push_back({y0,x0}); fringe.push_back({y0+1,x0}); fringe.push_back({y0,x0+1}); fringe.push_back({y0+1,x0+1});
+            }
+        } else {
+            // Initialise the trace at the center of the available area, as a tiny single-quad patch at the seed point
+            used_area = cv::Rect(x0,y0,2,2);
+            //these are locations in the local volume!
+            trace_params.dpoints(y0,x0) = origin;
+            trace_params.dpoints(y0,x0+1) = origin+vx*0.1;
+            trace_params.dpoints(y0+1,x0) = origin+vy*0.1;
+            trace_params.dpoints(y0+1,x0+1) = origin+vx*0.1 + vy*0.1;
+
+            trace_params.state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+            trace_params.state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+            trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+            trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+
+            generations(y0,x0) = 1;
+            generations(y0,x0+1) = 1;
+            generations(y0+1,x0) = 1;
+            generations(y0+1,x0+1) = 1;
+
+            fringe.push_back({y0,x0});
+            fringe.push_back({y0+1,x0});
+            fringe.push_back({y0,x0+1});
+            fringe.push_back({y0+1,x0+1});
+
+            std::cout << "init loss count " << loss_count << std::endl;
+        }
     }
 
     int succ_start = succ;
@@ -2210,7 +2394,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
         // ...then start iterating over candidates in parallel using the above to yield points
-#pragma omp parallel
+// #pragma omp parallel
         {
             CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
 //             int idx = rand() % cands.size();
@@ -2257,54 +2441,63 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     }
                 }
 
-                // Initial guess for the corresponding 3D location is a perturbation of the position of the best-connected neighbor
                 avg /= ref_count;
 
                 //"fast" skip based on avg z value out of limits
                 if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
                     continue;
 
-                cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
-                trace_params.dpoints(p) = init;
+                bool point_was_placed = false;
+                const int CERES_GENS = 4;
+                if (neural_tracer && generation > CERES_GENS) {
+                    point_was_placed = call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
+                } else {
+                    // Standard Ceres optimization path
+                    cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
+                    trace_params.dpoints(p) = init;
 
-                // Set up a new local optimzation problem for the candidate point and its neighbors (initially just distance
-                // and curvature losses, not nearness-to-surface)
-                ceres::Problem problem;
+                    ceres::Problem problem;
+                    trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
 
-                trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                int local_loss_count = add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
+                    std::vector<double*> parameter_blocks;
+                    problem.GetParameterBlocks(&parameter_blocks);
+                    for (auto& block : parameter_blocks) {
+                        problem.SetParameterBlockConstant(block);
+                    }
+                    problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
 
-                std::vector<double*> parameter_blocks;
-                problem.GetParameterBlocks(&parameter_blocks);
-                for (auto& block : parameter_blocks) {
-                    problem.SetParameterBlockConstant(block);
+                    ceres::Solver::Summary summary;
+                    ceres::Solve(options, &problem, &summary);
+
+                    local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                    // if (local_opt_r > 1)
+                        // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                    
+                    point_was_placed = true;
                 }
-                problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
 
-                ceres::Solver::Summary summary;
-                ceres::Solve(options, &problem, &summary);
-
-                generations(p) = generation;
+                if (point_was_placed) {
+                    generations(p) = generation;
 
 #pragma omp critical
-                {
-                    succ++;
-                    succ_gen++;
-                    if (!used_area.contains(cv::Point(p[1],p[0]))) {
-                        used_area = used_area | cv::Rect(p[1],p[0],1,1);
+                    {
+                        succ++;
+                        succ_gen++;
+                        if (!used_area.contains(cv::Point(p[1],p[0]))) {
+                            used_area = used_area | cv::Rect(p[1],p[0],1,1);
+                        }
+
+                        fringe.push_back(p);
+                        succ_gen_ps.push_back(p);
                     }
-
-                    fringe.push_back(p);
-                    succ_gen_ps.push_back(p);
                 }
-
-                local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                if (local_opt_r > 1)
-                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
             }  // end parallel iteration over cands
         }
 
-        if (!global_opt) {
+        if (generation > 4 && neural_tracer) {
+            // Skip optimizations
+        } else if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
             // of the newly added points
             std::vector<cv::Vec2i> opt_local;
