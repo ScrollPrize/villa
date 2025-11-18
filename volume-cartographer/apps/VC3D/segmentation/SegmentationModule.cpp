@@ -29,6 +29,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
 

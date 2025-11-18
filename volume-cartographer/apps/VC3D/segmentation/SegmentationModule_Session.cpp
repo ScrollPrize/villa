@@ -6,6 +6,8 @@
 
 #include <QLoggingCategory>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 bool SegmentationModule::beginEditingSession(QuadSurface* surface)
 {
     if (!_editManager || !surface) {

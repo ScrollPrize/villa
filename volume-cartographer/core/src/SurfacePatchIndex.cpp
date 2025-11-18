@@ -18,6 +18,8 @@
 #endif
 
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 
 
 namespace bg = boost::geometry;

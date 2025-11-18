@@ -127,10 +127,10 @@ else()
     message(STATUS "Valgrind support disabled")
 endif()
 
-find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
-endif()
+#find_program(CCACHE_PROGRAM ccache)
+#if(CCACHE_PROGRAM)
+#    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
+#endif()
 
 # Use modern C++ for everything and generate compile_commands database.
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)

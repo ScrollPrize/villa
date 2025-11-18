@@ -2,6 +2,7 @@
 // Small utility to apply an affine (and optional scale-segmentation) to
 // either OBJ or TIFXYZ geometry, writing the transformed result.
 
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 
 #include <boost/program_options.hpp>

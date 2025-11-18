@@ -24,6 +24,9 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
 Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
 
 namespace

@@ -23,7 +23,8 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <nlohmann/json.hpp>
-#include "vc/core/util/Surface.hpp"  // QuadSurface
+#include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;

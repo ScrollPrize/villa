@@ -25,6 +25,9 @@ class QStandardItemModel;
 class QuadSurface;
 class DropdownChecklistButton;
 
+// Forward declare for QuadSurface pointer usage
+#include "vc/core/util/QuadSurface.hpp"
+
 class SurfacePanelController : public QObject
 {
     Q_OBJECT

@@ -23,6 +23,8 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 namespace {
 struct CellRegion {
     int rowStart = 0;

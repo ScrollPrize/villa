@@ -4,11 +4,14 @@
 
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 
 #include <QtGlobal>
 
 #include <algorithm>
 #include <cmath>
+
+#include "vc/core/util/QuadSurface.hpp"
 
 namespace
 {

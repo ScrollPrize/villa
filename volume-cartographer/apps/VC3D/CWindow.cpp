@@ -80,6 +80,9 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/SurfaceMeta.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
 

@@ -12,6 +12,8 @@
 #include <cmath>
 #include <unordered_set>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 namespace
 {
 constexpr float kBrushSampleSpacing = 2.0f;

@@ -11,6 +11,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 namespace vc::surface
 {

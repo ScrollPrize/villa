@@ -17,6 +17,9 @@
 #include <utility>
 #include <cmath>
 
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
 ViewerOverlayControllerBase::PathPrimitive
 ViewerOverlayControllerBase::PathPrimitive::densify(float samplingInterval) const
 {

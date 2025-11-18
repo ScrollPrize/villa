@@ -1,5 +1,6 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include <opencv2/imgcodecs.hpp>
 #include <boost/program_options.hpp>

@@ -15,6 +15,7 @@
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/ChunkCache.hpp"
 
 class QImage;
 class ViewerManager;

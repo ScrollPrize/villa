@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <cmath>
 
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
 namespace
 {
 constexpr const char* kOverlayGroup = "vector_overlays";

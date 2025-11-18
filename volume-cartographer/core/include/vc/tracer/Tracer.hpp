@@ -1,5 +1,7 @@
 #pragma once
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceMeta.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 struct Chunked3dFloatFromUint8;

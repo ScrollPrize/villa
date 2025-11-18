@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "vc/core/util/PlaneSurface.hpp"
+
 namespace
 {
 constexpr const char* kOverlayGroup = "plane_slicing_guides";

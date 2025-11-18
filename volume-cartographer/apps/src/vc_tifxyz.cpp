@@ -1,5 +1,6 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include <opencv2/opencv.hpp>
 #include <filesystem>
