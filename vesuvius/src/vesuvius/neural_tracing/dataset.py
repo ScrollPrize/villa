@@ -389,9 +389,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             center_ij = start_quad_ij + torch.rand(size=[2])
             center_zyx = get_zyx_from_patch(center_ij, patch)
 
-            # Crop ROI out of the volume
-            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
-
             # Sample rows of points along U & V axes
             uv_deltas = torch.arange(1, step_count + 1)[:, None] * step_size * patch.scale
             u_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([1, 0])
@@ -448,7 +445,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
                 v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
             
-            # Get final crop volume
+            # Get crop volume and its min-corner (which may be slightly negative)
             volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
 
             # Map to 3D space and construct heatmaps
