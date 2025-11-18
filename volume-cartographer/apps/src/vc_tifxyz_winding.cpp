@@ -1,3 +1,4 @@
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"

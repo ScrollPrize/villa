@@ -6,6 +6,17 @@
 #include <filesystem>
 #include <tiffio.h>
 
+// Options for writing TIFF from QuadSurface
+struct TiffWriteOptions {
+    enum class Compression { NONE, LZW, DEFLATE };
+    enum class Predictor  { NONE, HORIZONTAL, FLOATINGPOINT };
+
+    bool forceBigTiff = false;
+    int  tileSize = 1024;                 // square tiles
+    Compression compression = Compression::LZW;
+    Predictor  predictor   = Predictor::FLOATINGPOINT; // for float32
+};
+
 // Write a 32-bit float single-channel image as tiled BigTIFF with LZW compression
 void writeFloatBigTiff(const std::filesystem::path& outPath,
                               const cv::Mat& img,

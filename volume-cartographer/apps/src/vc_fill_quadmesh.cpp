@@ -1,7 +1,8 @@
+#include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 
@@ -606,17 +607,17 @@ void interp_lin_2d(const cv::Mat_<E> &m, T y, T x, T *v) {
     v[0] = (T(1)-fy)*c0 + fy*c1;
 }
 
-static bool loc_valid(const cv::Mat_<float> &m, const cv::Vec2d &l)
+static bool loc_valid_paper(const cv::Mat_<float> &m, const cv::Vec2d &l)
 {
     if (l[0] == -1)
         return false;
-    
+
     cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
     cv::Vec2i li = {static_cast<int>(floor(l[0])),static_cast<int>(floor(l[1]))};
-    
+
     if (!bounds.contains(cv::Point(li)))
         return false;
-    
+
     if (std::isnan(m(li[0],li[1])))
         return false;
     if (std::isnan(m(li[0]+1,li[1])))
@@ -637,7 +638,7 @@ struct Interp2DLoss {
     bool operator()(const T* const l, T* residual) const {
         T v[3];
         
-        if (!loc_valid(_m, {val(l[0]), val(l[1])})) {
+        if (!loc_valid_paper(_m, {val(l[0]), val(l[1])})) {
             residual[0] = T(0);
             return true;
         }

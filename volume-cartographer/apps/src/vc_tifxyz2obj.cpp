@@ -1,4 +1,5 @@
 // vc_tifxyz2obj.cpp
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"

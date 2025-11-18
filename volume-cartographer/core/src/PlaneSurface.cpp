@@ -1,4 +1,5 @@
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -249,3 +250,76 @@ cv::Vec3f PlaneSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
     return _normal;
 }
+
+
+//search location in points where we minimize error to multiple objectives using iterated local search
+//tgts,tds -> distance to some POIs
+//plane -> stay on plane
+float min_loc(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f &loc, cv::Vec3f &out, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds, PlaneSurface *plane, float init_step, float min_step)
+{
+    if (!loc_valid(points, {loc[1],loc[0]})) {
+        out = {-1,-1,-1};
+        return -1;
+    }
+
+    bool changed = true;
+    cv::Vec3f val = at_int(points, loc);
+    out = val;
+    float best = tdist_sum(val, tgts, tds);
+    if (plane) {
+        float d = plane->pointDist(val);
+        best += d*d;
+    }
+    float res;
+
+    // std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,-1},{-1,0},{-1,1},{1,-1},{1,0},{1,1}};
+    std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,0},{1,0}};
+    float step = init_step;
+
+
+
+    while (changed) {
+        changed = false;
+
+        for(auto &off : search) {
+            cv::Vec2f cand = loc+off*step;
+
+            if (!loc_valid(points, {cand[1],cand[0]})) {
+                // out = {-1,-1,-1};
+                // loc = {-1,-1};
+                // return -1;
+                continue;
+            }
+
+            val = at_int(points, cand);
+            // std::cout << "at" << cand << val << std::endl;
+            res = tdist_sum(val, tgts, tds);
+            if (plane) {
+                float d = plane->pointDist(val);
+                res += d*d;
+            }
+            if (res < best) {
+                // std::cout << res << val << step << cand << "\n";
+                changed = true;
+                best = res;
+                loc = cand;
+                out = val;
+            }
+            // else
+                // std::cout << "(" << res << val << step << cand << "\n";
+        }
+
+        if (changed)
+            continue;
+
+        step *= 0.5;
+        changed = true;
+
+        if (step < min_step)
+            break;
+    }
+
+    // std::cout << "best" << best << out << "\n" <<  std::endl;
+    return best;
+}
+
