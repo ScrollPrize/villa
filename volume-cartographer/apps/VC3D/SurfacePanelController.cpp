@@ -1060,7 +1060,7 @@ void SurfacePanelController::connectFilterSignals()
     }
 
     if (_pointCollection) {
-        connect(_pointCollection, &VCCollection::collectionAdded, this, [this](uint64_t) {
+        connect(_pointCollection, &VCCollection::collectionsAdded, this, [this](const std::vector<uint64_t>&) {
             rebuildPointSetFilterModel();
             applyFilters();
         });

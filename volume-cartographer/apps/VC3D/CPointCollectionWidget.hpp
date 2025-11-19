@@ -36,7 +36,7 @@ public slots:
 
 private slots:
     void refreshTree();
-    void onCollectionAdded(uint64_t collectionId);
+    void onCollectionsAdded(const std::vector<uint64_t>& collectionIds);
     void onCollectionChanged(uint64_t collectionId);
     void onCollectionRemoved(uint64_t collectionId);
     void onPointAdded(const ColPoint& point);

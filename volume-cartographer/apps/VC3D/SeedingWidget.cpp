@@ -52,7 +52,7 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CSurfaceCollection*
     setupUI();
 
     if (_point_collection) {
-        connect(_point_collection, &VCCollection::collectionAdded, this, &SeedingWidget::onCollectionAdded);
+        connect(_point_collection, &VCCollection::collectionsAdded, this, &SeedingWidget::onCollectionsAdded);
         connect(_point_collection, &VCCollection::collectionChanged, this, &SeedingWidget::onCollectionChanged);
         connect(_point_collection, &VCCollection::collectionRemoved, this, &SeedingWidget::onCollectionRemoved);
         onCollectionChanged(0); // Initial population
@@ -280,7 +280,7 @@ void SeedingWidget::setCache(ChunkCache<uint8_t>* cache)
 }
 
 
-void SeedingWidget::onCollectionAdded(uint64_t collectionId)
+void SeedingWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
 {
     onCollectionChanged(0);
 }
