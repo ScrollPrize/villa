@@ -186,3 +186,96 @@ float tdist_sum(const cv::Vec3f &v, const std::vector<cv::Vec3f> &tgts, const st
 
     return sum;
 }
+
+// Helper: remove spatial outliers based on robust neighbor-distance stats
+cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, float distance_threshold, bool print_stats)
+{
+    cv::Mat_<cv::Vec3f> cleaned = points.clone();
+
+    std::vector<float> all_neighbor_dists;
+    all_neighbor_dists.reserve(points.rows * points.cols);
+
+    // First pass: gather neighbor distances
+    for (int j = 0; j < points.rows; ++j) {
+        for (int i = 0; i < points.cols; ++i) {
+            if (points(j, i)[0] == -1.f) continue;
+            const cv::Vec3f& center = points(j, i);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    const int ny = j + dy;
+                    const int nx = i + dx;
+                    if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
+                        if (points(ny, nx)[0] != -1.f) {
+                            const cv::Vec3f& neighbor = points(ny, nx);
+                            const float dist = cv::norm(center - neighbor);
+                            if (std::isfinite(dist) && dist > 0.f) {
+                                all_neighbor_dists.push_back(dist);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    float median_dist = 0.0f;
+    float mad = 0.0f;
+    if (!all_neighbor_dists.empty()) {
+        std::sort(all_neighbor_dists.begin(), all_neighbor_dists.end());
+        median_dist = all_neighbor_dists[all_neighbor_dists.size() / 2];
+        std::vector<float> abs_devs;
+        abs_devs.reserve(all_neighbor_dists.size());
+        for (float d : all_neighbor_dists) {
+            abs_devs.push_back(std::abs(d - median_dist));
+        }
+        std::sort(abs_devs.begin(), abs_devs.end());
+        mad = abs_devs[abs_devs.size() / 2];
+    }
+    const float threshold = median_dist + distance_threshold * (mad / 0.6745f);
+
+    if (print_stats) {
+        std::cout << "Outlier detection statistics:" << std::endl;
+        std::cout << "  Median neighbor distance: " << median_dist << std::endl;
+        std::cout << "  MAD: " << mad << std::endl;
+        std::cout << "  K (sigma multiplier): " << distance_threshold << std::endl;
+        std::cout << "  Distance threshold: " << threshold << std::endl;
+    }
+
+    // Second pass: invalidate isolated/far points
+    int removed_count = 0;
+    for (int j = 0; j < points.rows; ++j) {
+        for (int i = 0; i < points.cols; ++i) {
+            if (points(j, i)[0] == -1.f) continue;
+            const cv::Vec3f& center = points(j, i);
+            float min_neighbor = std::numeric_limits<float>::infinity();
+            int neighbor_count = 0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    const int ny = j + dy;
+                    const int nx = i + dx;
+                    if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
+                        if (points(ny, nx)[0] != -1.f) {
+                            const float dist = cv::norm(center - points(ny, nx));
+                            if (std::isfinite(dist)) {
+                                min_neighbor = std::min(min_neighbor, dist);
+                                neighbor_count++;
+                            }
+                        }
+                    }
+                }
+            }
+            if (neighbor_count == 0 || (min_neighbor > threshold && threshold > 0.f)) {
+                cleaned(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
+                if (print_stats) removed_count++;
+            }
+        }
+    }
+
+    if (print_stats) {
+        std::cout << "Surface cleaning: removed " << removed_count << " outlier points" << std::endl;
+    }
+
+    return cleaned;
+}
