@@ -213,7 +213,7 @@ void PointsOverlayController::connectCollectionSignals()
 
     disconnectCollectionSignals();
 
-    _collectionConnections[0] = connect(_collection, &VCCollection::collectionAdded,
+    _collectionConnections[0] = connect(_collection, &VCCollection::collectionsAdded,
                                         this, &PointsOverlayController::handleCollectionMutated);
     _collectionConnections[1] = connect(_collection, &VCCollection::collectionRemoved,
                                         this, &PointsOverlayController::handleCollectionMutated);

@@ -74,7 +74,7 @@ public:
 
 signals:
    void collectionChanged(uint64_t collectionId); // Generic signal for name/metadata changes
-    void collectionAdded(uint64_t collectionId);
+    void collectionsAdded(const std::vector<uint64_t>& collectionIds);
     void collectionRemoved(uint64_t collectionId);
 
     void pointAdded(const ColPoint& point);
