@@ -39,7 +39,7 @@ signals:
     
 public slots:
     void onSurfacesLoaded();  // Called when surfaces have been loaded/reloaded
-    void onCollectionAdded(uint64_t collectionId);
+    void onCollectionsAdded(const std::vector<uint64_t>& collectionIds);
     void onCollectionChanged(uint64_t collectionId);
     void onCollectionRemoved(uint64_t collectionId);
     

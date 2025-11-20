@@ -384,14 +384,13 @@ bool VCCollection::loadFromJSON(const std::string& filename)
             _points[point_pair.first] = point_pair.second;
         }
     }
- 
-    for (const auto& col_pair : _collections) {
-        emit collectionAdded(col_pair.first);
-        for (const auto& point_pair : col_pair.second.points) {
-            emit pointAdded(point_pair.second);
-        }
+
+    std::vector<uint64_t> collectionIds;
+    for (const auto& [col_id, _] : _collections) {
+        collectionIds.push_back(col_id);
     }
- 
+    emit collectionsAdded(collectionIds);
+
     return true;
 }
  
@@ -429,7 +428,7 @@ uint64_t VCCollection::findOrCreateCollectionByName(const std::string& name)
         (float)rand() / RAND_MAX
     };
     _collections[new_id] = {new_id, name, {}, {}, color};
-    emit collectionAdded(new_id);
+    emit collectionsAdded({new_id});
     return new_id;
 }
 

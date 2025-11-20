@@ -25,7 +25,7 @@ CPointCollectionWidget::CPointCollectionWidget(VCCollection *collection, QWidget
 
     setupUi();
 
-    connect(_point_collection, &VCCollection::collectionAdded, this, &CPointCollectionWidget::onCollectionAdded);
+    connect(_point_collection, &VCCollection::collectionsAdded, this, &CPointCollectionWidget::onCollectionsAdded);
     connect(_point_collection, &VCCollection::collectionChanged, this, &CPointCollectionWidget::onCollectionChanged);
     connect(_point_collection, &VCCollection::collectionRemoved, this, &CPointCollectionWidget::onCollectionRemoved);
     connect(_point_collection, &VCCollection::pointAdded, this, &CPointCollectionWidget::onPointAdded);
@@ -216,22 +216,24 @@ void CPointCollectionWidget::onResetClicked()
     }
 }
 
-void CPointCollectionWidget::onCollectionAdded(uint64_t collectionId)
+void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
 {
-    const auto& collection = _point_collection->getAllCollections().at(collectionId);
-    QStandardItem *name_item = new QStandardItem(QString::fromStdString(collection.name));
-    QColor color(collection.color[0] * 255, collection.color[1] * 255, collection.color[2] * 255);
-    name_item->setData(QBrush(color), Qt::DecorationRole);
-    name_item->setData(QVariant::fromValue(collection.id));
-    name_item->setFlags(name_item->flags() & ~Qt::ItemIsEditable);
-    
-    QStandardItem *count_item = new QStandardItem(QString::number(collection.points.size()));
-    count_item->setFlags(count_item->flags() & ~Qt::ItemIsEditable);
-    
-    _model->appendRow({name_item, count_item});
+    for (uint64_t collectionId : collectionIds) {
+        const auto& collection = _point_collection->getAllCollections().at(collectionId);
+        QStandardItem *name_item = new QStandardItem(QString::fromStdString(collection.name));
+        QColor color(collection.color[0] * 255, collection.color[1] * 255, collection.color[2] * 255);
+        name_item->setData(QBrush(color), Qt::DecorationRole);
+        name_item->setData(QVariant::fromValue(collection.id));
+        name_item->setFlags(name_item->flags() & ~Qt::ItemIsEditable);
 
-    for(const auto& point_pair : collection.points) {
-        onPointAdded(point_pair.second);
+        QStandardItem *count_item = new QStandardItem(QString::number(collection.points.size()));
+        count_item->setFlags(count_item->flags() & ~Qt::ItemIsEditable);
+
+        _model->appendRow({name_item, count_item});
+
+        for(const auto& point_pair : collection.points) {
+            onPointAdded(point_pair.second);
+        }
     }
 }
 
