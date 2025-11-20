@@ -7,6 +7,7 @@
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
+#include <QGraphicsItem>
 
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"

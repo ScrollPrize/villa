@@ -1,6 +1,6 @@
 #pragma once
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/matx.hpp>
 
 // Provide operator== for cv::Vec2i to be used by default by std::unordered_set
 static inline bool operator==(const cv::Vec2i& a, const cv::Vec2i& b) {

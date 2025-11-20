@@ -12,7 +12,6 @@ add_library(vc_core
         src/Logging.cpp
         src/ChunkCache.cpp
         src/Slicing.cpp
-        src/Surface.cpp
         src/PlaneSurface.cpp
         src/SurfaceMeta.cpp
         src/QuadSurface.cpp

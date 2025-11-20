@@ -7,6 +7,11 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QTextStream>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMessageBox>
+#include <QClipboard>
+#include <QApplication>
 
 
 

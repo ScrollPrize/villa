@@ -6,10 +6,19 @@
 #include <unordered_set>
 #include <utility>
 
+#include <QGuiApplication>
+#include <QSettings>
+#include <QVBoxLayout>
+#include <QTimer>
+#include <QLabel>
 #include <QPainter>
+#include <QPainterPath>
 #include <QScopedValueRollback>
 #include <QGraphicsView>
 #include <QGraphicsScene>
+#include <QGraphicsItem>
+#include <QGraphicsPixmapItem>
+#include <QGraphicsEllipseItem>
 
 #include "CVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"

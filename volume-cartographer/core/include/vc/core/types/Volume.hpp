@@ -2,11 +2,19 @@
 
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <vector>
 #include <nlohmann/json.hpp>
-#include <z5/dataset.hxx>
-#include <z5/filesystem/handle.hxx>
-#include "z5/types/types.hxx"
 
+// Forward declarations
+namespace z5 {
+    class Dataset;
+
+        namespace filesystem::handle {
+            class File;
+        }
+
+}
 
 class Volume
 {
@@ -17,7 +25,7 @@ public:
 
     Volume(std::filesystem::path path, std::string uuid, std::string name);
 
-    ~Volume() = default;
+    ~Volume();
 
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);

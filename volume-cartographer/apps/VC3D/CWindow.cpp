@@ -7,7 +7,12 @@
 #include <QKeyEvent>
 #include <QSettings>
 #include <QMdiArea>
+#include <QMdiSubWindow>
 #include <QApplication>
+#include <QGuiApplication>
+#include <QStyleHints>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QClipboard>
 #include <QDateTime>
 #include <QFileDialog>

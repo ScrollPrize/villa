@@ -1,10 +1,5 @@
 #pragma once
 
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/Surface.hpp"
-#include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
-
 
 void render_binary_mask(QuadSurface* surf,
                          cv::Mat_<uint8_t>& mask,

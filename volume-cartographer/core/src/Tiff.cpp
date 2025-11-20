@@ -3,26 +3,9 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 
-#include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
-//TODO remove
-#include <opencv2/highgui.hpp>
-
-#include <unordered_map>
-#include <nlohmann/json.hpp>
-#include <system_error>
-#include <cmath>
-#include <limits>
-#include <cerrno>
 #include <algorithm>
 #include <vector>
-
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <fcntl.h>
-#include <stdio.h>
-#include <unistd.h>
 
 // Use libtiff for BigTIFF; fall back to OpenCV if not present.
 #include <tiffio.h>
@@ -30,8 +13,8 @@
 // Write a 32-bit float single-channel image as tiled BigTIFF with LZW compression
 void writeFloatBigTiff(const std::filesystem::path& outPath,
                               const cv::Mat& img,
-                              uint32_t tileW = 1024,
-                              uint32_t tileH = 1024)
+                              uint32_t tileW,
+                              uint32_t tileH)
 {
     if (img.empty())
         throw std::runtime_error("empty image for " + outPath.string());
@@ -109,8 +92,8 @@ void writeFloatBigTiff(const std::filesystem::path& outPath,
 // Write a single-channel image (8U, 16U, or 32F) as tiled BigTIFF with LZW compression
 void writeSingleChannelBigTiff(const std::filesystem::path& outPath,
                                       const cv::Mat& img,
-                                      uint32_t tileW = 1024,
-                                      uint32_t tileH = 1024)
+                                      uint32_t tileW,
+                                      uint32_t tileH)
 {
     if (img.empty())
         throw std::runtime_error("empty image for " + outPath.string());

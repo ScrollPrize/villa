@@ -5,8 +5,8 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPainter>
+#include <QScrollBar>
 #include <cmath>
-#include <QPainter>
 
 
 

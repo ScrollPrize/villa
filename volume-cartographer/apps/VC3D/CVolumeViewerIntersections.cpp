@@ -5,6 +5,8 @@
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
+#include <QGraphicsItem>
+#include <QPainterPath>
 
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"

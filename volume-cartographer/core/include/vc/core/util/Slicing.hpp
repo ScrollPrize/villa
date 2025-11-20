@@ -6,7 +6,8 @@
 
 #include <vc/core/util/ChunkCache.hpp>
 
-#include <z5/dataset.hxx>
+// Forward declaration
+namespace z5 { class Dataset; }
 
 //NOTE depending on request this might load a lot (the whole array) into RAM
 // void readInterpolated3D(xt::xarray<uint8_t> &out, z5::Dataset *ds, const xt::xarray<float> &coords, ChunkCache *cache = nullptr);

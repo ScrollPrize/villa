@@ -1,12 +1,10 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <memory>
-#include <mutex>
 #include <optional>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/types.hpp>
 #include <nlohmann/json.hpp>
 
 #include "vc/core/util/GridStore.hpp"

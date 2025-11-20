@@ -4,7 +4,6 @@
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
-#include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceMeta.hpp"
 
 class Segmentation

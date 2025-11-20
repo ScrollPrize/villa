@@ -1,6 +1,12 @@
 #pragma once
 
-#include <QtWidgets>
+#include <QWidget>
+#include <QPointF>
+#include <QRectF>
+#include <QColor>
+#include <QString>
+#include <QList>
+#include <QImage>
 
 #include <memory>
 #include <set>
@@ -17,7 +23,11 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/ChunkCache.hpp"
 
-class QImage;
+class QGraphicsScene;
+class QGraphicsItem;
+class QGraphicsPixmapItem;
+class QLabel;
+class QTimer;
 class ViewerManager;
 
 

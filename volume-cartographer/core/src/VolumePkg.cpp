@@ -2,10 +2,6 @@
 
 #include <set>
 #include <utility>
-#include <sys/inotify.h>
-#include <unistd.h>
-#include <poll.h>
-#include <cerrno>
 #include <cstring>
 
 #include "vc/core/util/DateTime.hpp"

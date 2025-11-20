@@ -1,6 +1,7 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <opencv2/imgcodecs.hpp>
+#include <nlohmann/json.hpp>
 
 #include "z5/attributes.hxx"
 #include "z5/dataset.hxx"
@@ -46,6 +47,8 @@ Volume::Volume(std::filesystem::path path, std::string uuid, std::string name)
 
     zarrOpen();
 }
+
+Volume::~Volume() = default;
 
 void Volume::loadMetadata()
 {

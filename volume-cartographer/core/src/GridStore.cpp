@@ -1,10 +1,10 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
- 
+
+#include <set>
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>
-#include <numeric>
 
 #include <arpa/inet.h>
 

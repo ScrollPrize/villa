@@ -8,7 +8,7 @@
 #include <iostream>
 
 // Helper for non-maximum suppression
-void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst, int size) {
+static void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst, int size) {
     cv::Mat dilated;
     cv::dilate(src, dilated, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(size, size)));
     cv::compare(src, dilated, dst, cv::CMP_EQ);

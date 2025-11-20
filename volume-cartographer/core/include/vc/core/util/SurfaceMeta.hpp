@@ -5,7 +5,7 @@
 #include <optional>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/matx.hpp>
 #include <nlohmann/json_fwd.hpp>
 
 #include "Surface.hpp"

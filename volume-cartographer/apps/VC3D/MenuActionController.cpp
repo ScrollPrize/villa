@@ -28,6 +28,8 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QMainWindow>
+#include <QMdiArea>
+#include <QMdiSubWindow>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>

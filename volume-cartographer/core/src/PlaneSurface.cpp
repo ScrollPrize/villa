@@ -1,12 +1,10 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
 
-#include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 
 #include <cmath>
 #include <limits>
-#include <algorithm>
 
 namespace {
 

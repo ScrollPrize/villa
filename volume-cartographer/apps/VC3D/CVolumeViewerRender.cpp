@@ -5,6 +5,9 @@
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
+#include <QGraphicsPixmapItem>
+#include <QGraphicsEllipseItem>
+#include <QGraphicsItem>
 
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"

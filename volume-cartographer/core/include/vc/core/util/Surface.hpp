@@ -4,13 +4,13 @@
 #include <string>
 
 #include <opencv2/core.hpp>
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 //base surface class
 class Surface
 {
 public:
-    virtual ~Surface();
+    virtual ~Surface() { delete meta; }
 
     // get a central location point
     virtual cv::Vec3f pointer() = 0;
