@@ -143,6 +143,7 @@ private:
     bool centerFocusOnCursor();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
+    void updateSurfaceOverlayDropdown();
 
 private slots:
     void onSegmentationDirChanged(int index);

@@ -1117,6 +1117,94 @@
     </layout>
    </widget>
   </widget>
+   <widget class="QDockWidget" name="dockWidgetRenderSettings">
+     <property name="windowTitle">
+      <string>Render Settings</string>
+     </property>
+     <attribute name="dockWidgetArea">
+      <number>1</number>
+     </attribute>
+     <widget class="QWidget" name="dockWidgetRenderSettingsContents">
+      <layout class="QGridLayout" name="gridLayoutRenderSettings">
+       <item row="0" column="0">
+        <widget class="QLabel" name="labelBaseColormap">
+         <property name="text">
+          <string>Base colormap</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1" colspan="2">
+        <widget class="QComboBox" name="baseColormapSelect"/>
+       </item>
+       <item row="1" column="0" colspan="3">
+        <widget class="QCheckBox" name="chkStretchValues">
+         <property name="text">
+          <string>Auto-stretch to full range</string>
+         </property>
+         <property name="toolTip">
+          <string>Automatically stretch volume values to 0-255 range before applying colormap</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="0" colspan="3">
+        <widget class="Line" name="line">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="0" colspan="3">
+        <widget class="QCheckBox" name="chkSurfaceOverlay">
+         <property name="text">
+          <string>Show surface overlap</string>
+         </property>
+         <property name="toolTip">
+          <string>Highlight regions where another surface is within threshold distance</string>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="0">
+        <widget class="QLabel" name="labelOverlaySurface">
+         <property name="text">
+          <string>Overlay surface</string>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="1" colspan="2">
+        <widget class="QComboBox" name="surfaceOverlaySelect"/>
+       </item>
+       <item row="5" column="0">
+        <widget class="QLabel" name="labelOverlapThreshold">
+         <property name="text">
+          <string>Threshold</string>
+         </property>
+        </widget>
+       </item>
+       <item row="5" column="1">
+        <widget class="QDoubleSpinBox" name="spinOverlapThreshold">
+         <property name="minimum">
+          <double>0.100000000000000</double>
+         </property>
+         <property name="maximum">
+          <double>50.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.500000000000000</double>
+         </property>
+         <property name="value">
+          <double>5.000000000000000</double>
+         </property>
+         <property name="suffix">
+          <string> vox</string>
+         </property>
+         <property name="toolTip">
+          <string>Distance threshold in voxels for overlap detection</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </widget>
   <action name="actionOpen">
    <property name="text">
     <string>Open</string>

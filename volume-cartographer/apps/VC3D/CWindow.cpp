@@ -567,7 +567,8 @@ CWindow::CWindow() :
                                ui.dockWidgetComposite,
                                ui.dockWidgetVolumes,
                                ui.dockWidgetView,
-                               ui.dockWidgetOverlay }) {
+                               ui.dockWidgetOverlay,
+                               ui.dockWidgetRenderSettings  }) {
         ensureDockWidgetFeatures(dock);
     }
     ensureDockWidgetFeatures(_point_collection_widget);
@@ -1069,6 +1070,8 @@ void CWindow::CreateWidgets(void)
     }
     connect(_surfacePanel.get(), &SurfacePanelController::surfacesLoaded, this, [this]() {
         emit sendSurfacesLoaded();
+        // Update surface overlay dropdown when surfaces are loaded
+        updateSurfaceOverlayDropdown();
     });
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceSelectionCleared, this, [this]() {
         clearSurfaceSelection();
@@ -1332,6 +1335,7 @@ void CWindow::CreateWidgets(void)
     // Keep the view-related docks on the left and grouped together as tabs
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetView);
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
+    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetRenderSettings);
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetComposite);
 
     auto ensureTabified = [this](QDockWidget* primary, QDockWidget* candidate) {
@@ -1343,6 +1347,7 @@ void CWindow::CreateWidgets(void)
     };
 
     ensureTabified(ui.dockWidgetView, ui.dockWidgetOverlay);
+    ensureTabified(ui.dockWidgetView, ui.dockWidgetRenderSettings);
     ensureTabified(ui.dockWidgetView, ui.dockWidgetComposite);
 
     const auto tabOrder = tabifiedDockWidgets(ui.dockWidgetView);
@@ -1377,6 +1382,66 @@ void CWindow::CreateWidgets(void)
         };
         _volumeOverlay->setUi(overlayUi);
     }
+
+        // Setup base colormap selector
+    {
+        const auto& entries = CVolumeViewer::overlayColormapEntries();
+        ui.baseColormapSelect->clear();
+        ui.baseColormapSelect->addItem(tr("None (Grayscale)"), QString());
+        for (const auto& entry : entries) {
+            ui.baseColormapSelect->addItem(entry.label, QString::fromStdString(entry.id));
+        }
+        ui.baseColormapSelect->setCurrentIndex(0);
+    }
+
+    connect(ui.baseColormapSelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
+        if (index < 0 || !_viewerManager) return;
+        const QString id = ui.baseColormapSelect->currentData().toString();
+        _viewerManager->forEachViewer([&id](CVolumeViewer* viewer) {
+            viewer->setBaseColormap(id.toStdString());
+        });
+    });
+
+    connect(ui.chkStretchValues, &QCheckBox::toggled, [this](bool checked) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([checked](CVolumeViewer* viewer) {
+            viewer->setStretchValues(checked);
+        });
+    });
+
+    // Setup surface overlay controls
+    connect(ui.chkSurfaceOverlay, &QCheckBox::toggled, [this](bool checked) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([checked](CVolumeViewer* viewer) {
+            viewer->setSurfaceOverlayEnabled(checked);
+        });
+        ui.surfaceOverlaySelect->setEnabled(checked);
+        ui.spinOverlapThreshold->setEnabled(checked);
+    });
+
+    connect(ui.surfaceOverlaySelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
+        if (index < 0 || !_viewerManager) return;
+        const QString surfaceName = ui.surfaceOverlaySelect->currentData().toString();
+        _viewerManager->forEachViewer([&surfaceName](CVolumeViewer* viewer) {
+            viewer->setSurfaceOverlay(surfaceName.toStdString());
+        });
+    });
+
+    connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([value](CVolumeViewer* viewer) {
+            viewer->setSurfaceOverlapThreshold(static_cast<float>(value));
+        });
+    });
+
+    // Initially disable surface overlay controls
+    ui.surfaceOverlaySelect->setEnabled(false);
+    ui.spinOverlapThreshold->setEnabled(false);
+
+    // Initialize surface overlay dropdown (will be populated when surfaces load)
+    updateSurfaceOverlayDropdown();
+
+
 
     connect(
         volSelect, &QComboBox::currentIndexChanged, [this](const int& index) {
@@ -3971,5 +4036,40 @@ void CWindow::onMoveSegmentToPaths(const QString& segmentId)
         QMessageBox::critical(this, tr("Error"),
             tr("Failed to move segment: %1\n\n"
                "The segment has been unloaded from the viewer.").arg(e.what()));
+    }
+}
+
+void CWindow::updateSurfaceOverlayDropdown()
+{
+    if (!ui.surfaceOverlaySelect) {
+        return;
+    }
+
+    const QSignalBlocker blocker(ui.surfaceOverlaySelect);
+    QString currentSelection = ui.surfaceOverlaySelect->currentData().toString();
+
+    ui.surfaceOverlaySelect->clear();
+    ui.surfaceOverlaySelect->addItem(tr("(None)"), QString());
+
+    if (_surf_col) {
+        const auto names = _surf_col->surfaceNames();
+        int selectedIndex = 0;
+        int currentIndex = 1; // Start at 1 since "(None)" is at 0
+
+        for (const auto& name : names) {
+            // Only add QuadSurfaces (actual segmentations), skip PlaneSurfaces (xy, xz, yz, etc.)
+            Surface* surf = _surf_col->surface(name);
+            if (surf && dynamic_cast<QuadSurface*>(surf)) {
+                ui.surfaceOverlaySelect->addItem(QString::fromStdString(name), QString::fromStdString(name));
+
+                // Restore previous selection if it still exists
+                if (QString::fromStdString(name) == currentSelection) {
+                    selectedIndex = currentIndex;
+                }
+                currentIndex++;
+            }
+        }
+
+        ui.surfaceOverlaySelect->setCurrentIndex(selectedIndex);
     }
 }

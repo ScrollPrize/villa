@@ -155,6 +155,18 @@ public:
 
     const ActiveSegmentationHandle& activeSegmentationHandle() const;
 
+    void setBaseColormap(const std::string& colormapId);
+    const std::string& baseColormap() const { return _baseColormapId; }
+    void setStretchValues(bool enabled);
+    bool stretchValues() const { return _stretchValues; }
+
+    void setSurfaceOverlayEnabled(bool enabled);
+    bool surfaceOverlayEnabled() const { return _surfaceOverlayEnabled; }
+    void setSurfaceOverlay(const std::string& surfaceName);
+    const std::string& surfaceOverlay() const { return _surfaceOverlayName; }
+    void setSurfaceOverlapThreshold(float threshold);
+    float surfaceOverlapThreshold() const { return _surfaceOverlapThreshold; }
+
     struct OverlayColormapEntry {
         QString label;
         std::string id;
@@ -312,4 +324,12 @@ protected:
     void markActiveSegmentationDirty();
     mutable ActiveSegmentationHandle _activeSegHandle;
     mutable bool _activeSegHandleDirty{true};
+
+
+    std::string _baseColormapId;
+    bool _stretchValues{false};
+    bool _surfaceOverlayEnabled{false};
+    std::string _surfaceOverlayName;
+    float _surfaceOverlapThreshold{5.0f};
+
 };  // class CVolumeViewer
