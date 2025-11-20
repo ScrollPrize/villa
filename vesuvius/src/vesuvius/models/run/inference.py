@@ -14,11 +14,10 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
-from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.models.utilities.model_loader import load_for_inference
 from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
 from pathlib import Path
-from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.blending import generate_gaussian_map
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.data.volume import Volume
@@ -202,48 +201,27 @@ class Inferer():
 
 
     def _load_model(self):
-        # check if model_path is a Hugging Face model path (starts with "hf://")
+        hf_model_path = None
+        local_model_path = self.model_path
+
         if isinstance(self.model_path, str) and self.model_path.startswith("hf://"):
             hf_model_path = self.model_path.replace("hf://", "")
+            local_model_path = None
             if self.verbose:
                 print(f"Loading model from Hugging Face repo: {hf_model_path}")
-            model_info = load_model_for_inference(
-                model_folder=None,
-                hf_model_path=hf_model_path,
-                hf_token=self.hf_token if hasattr(self, 'hf_token') else None,
-                device_str=str(self.device),
-                verbose=self.verbose
-            )
-            
-            # Check if this is a train.py model from HuggingFace
-            if isinstance(model_info, dict) and model_info.get('is_train_py', False):
-                checkpoint_path = Path(model_info['checkpoint_path'])
-                if self.verbose:
-                    print(f"Loading train.py checkpoint from HuggingFace: {checkpoint_path}")
-                model_info = self._load_train_py_model(checkpoint_path)
-        else:
-            # Check if this is a train.py checkpoint (single .pth file)
-            model_path = Path(self.model_path)
-            is_train_py_checkpoint = model_path.is_file() and model_path.suffix == '.pth'
-            
-            if is_train_py_checkpoint:
-                # Load train.py checkpoint
-                if self.verbose:
-                    print(f"Loading train.py checkpoint from: {self.model_path}")
-                model_info = self._load_train_py_model(model_path)
-            else:
-                # Load from local path using nnUNet loader
-                if self.verbose:
-                    print(f"Loading nnUNet model from local path: {self.model_path}")
-                model_info = load_model_for_inference(
-                    model_folder=self.model_path,
-                    device_str=str(self.device),
-                    verbose=self.verbose
-                )
+
+        model_info = load_for_inference(
+            model_path=local_model_path,
+            hf_model_path=hf_model_path,
+            hf_token=self.hf_token if hasattr(self, 'hf_token') else None,
+            device=str(self.device),
+            verbose=self.verbose
+        )
         
-        # model loader returns a dict, network is the actual model
         model = model_info['network']
         model.eval()
+        self.model_normalization_scheme = model_info.get('normalization_scheme', self.model_normalization_scheme)
+        self.model_intensity_properties = model_info.get('intensity_properties', self.model_intensity_properties)
         
         # patch size and number of classes from model_info
         self.model_patch_size = tuple(model_info.get('patch_size', (192, 192, 192)))
@@ -330,109 +308,6 @@ class Inferer():
 
         return model
     
-    def _load_train_py_model(self, checkpoint_path):
-        """Load a model checkpoint from train.py format."""
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
-        # Load checkpoint
-        checkpoint_data = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        
-        # Extract model configuration
-        model_config = checkpoint_data.get('model_config', {})
-        if not model_config:
-            raise ValueError("No model configuration found in checkpoint")
-        
-        # Extract normalization info if present
-        if 'normalization_scheme' in checkpoint_data:
-            self.model_normalization_scheme = checkpoint_data['normalization_scheme']
-            if self.verbose:
-                print(f"Found normalization scheme in checkpoint: {self.model_normalization_scheme}")
-        
-        if 'intensity_properties' in checkpoint_data:
-            self.model_intensity_properties = checkpoint_data['intensity_properties']
-            if self.verbose:
-                print("Found intensity properties in checkpoint:")
-                for key, value in self.model_intensity_properties.items():
-                    print(f"  {key}: {value:.4f}")
-        
-        # Create minimal config manager for NetworkFromConfig
-        class MinimalConfigManager:
-            def __init__(self, model_config):
-                self.model_config = model_config
-                self.targets = model_config.get('targets', {})
-                self.train_patch_size = model_config.get('train_patch_size', model_config.get('patch_size', (128, 128, 128)))
-                self.train_batch_size = model_config.get('train_batch_size', model_config.get('batch_size', 2))
-                self.in_channels = model_config.get('in_channels', 1)
-                self.autoconfigure = model_config.get('autoconfigure', False)
-                self.model_name = model_config.get('model_name', 'Model')
-                
-                # Set spacing based on patch size dimensions
-                self.spacing = [1] * len(self.train_patch_size)
-        
-        mgr = MinimalConfigManager(model_config)
-        
-        # Build model using NetworkFromConfig
-        model = NetworkFromConfig(mgr)
-        model = model.to(self.device)
-        
-        # Load weights
-        model_state_dict = checkpoint_data.get('model', checkpoint_data)
-        
-        # Check if this is a compiled model state dict
-        is_compiled = any("_orig_mod." in key for key in model_state_dict.keys())
-        
-        # Compile model if needed
-        if self.device.type == 'cuda' and is_compiled:
-            if self.verbose:
-                print("Compiling model to match checkpoint format")
-            model = torch.compile(model)
-        
-        # Load state dict
-        model.load_state_dict(model_state_dict, strict=True)
-        if self.verbose:
-            print("Model weights loaded successfully")
-        
-        # Handle multi-target models
-        if len(mgr.targets) > 1:
-            if self.verbose:
-                print(f"Multi-target model detected with targets: {list(mgr.targets.keys())}")
-            
-            # Set multi-task flag
-            self.is_multi_task = True
-            
-            # Calculate total output channels and store target info
-            self.target_info = {}
-            num_classes = 0
-            for target_name, target_config in mgr.targets.items():
-                target_channels = target_config.get('out_channels', 1)
-                self.target_info[target_name] = {
-                    'out_channels': target_channels,
-                    'start_channel': num_classes,
-                    'end_channel': num_classes + target_channels
-                }
-                num_classes += target_channels
-            
-            if self.verbose:
-                print(f"Total output channels across all targets: {num_classes}")
-                print(f"Target channel mapping: {self.target_info}")
-        else:
-            # Single target model
-            target_name = list(mgr.targets.keys())[0] if mgr.targets else 'output'
-            num_classes = mgr.targets.get(target_name, {}).get('out_channels', 1)
-        
-        # Create model_info dict compatible with the rest of the code
-        model_info = {
-            'network': model,
-            'patch_size': mgr.train_patch_size,
-            'num_input_channels': mgr.in_channels,
-            'num_seg_heads': num_classes,
-            'model_config': model_config,
-            'targets': mgr.targets
-        }
-        
-        return model_info
-
     def _resolve_normalization(self):
         """Resolve normalization scheme and parameters consistently for all paths.
         Returns a tuple: (normalization_scheme, global_mean, global_std, intensity_props).

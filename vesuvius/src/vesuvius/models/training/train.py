@@ -39,7 +39,7 @@ from vesuvius.models.training.save_checkpoint import (
     save_final_checkpoint
 )
 
-from vesuvius.models.utilities.load_checkpoint import load_checkpoint
+from vesuvius.models.utilities.model_loader import load_checkpoint
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.models.utilities.compute_gradient_norm import compute_gradient_norm
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
