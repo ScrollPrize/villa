@@ -126,6 +126,25 @@ public:
     float volumeWindowLow() const { return _baseWindowLow; }
     float volumeWindowHigh() const { return _baseWindowHigh; }
 
+    struct ActiveSegmentationHandle {
+        QuadSurface* surface{nullptr};
+        std::string slotName;
+        QColor accentColor;
+        bool viewerIsSegmentationView{false};
+
+        bool valid() const { return surface != nullptr; }
+        explicit operator bool() const { return valid(); }
+        void reset()
+        {
+            surface = nullptr;
+            slotName.clear();
+            accentColor = QColor();
+            viewerIsSegmentationView = false;
+        }
+    };
+
+    const ActiveSegmentationHandle& activeSegmentationHandle() const;
+
     struct OverlayColormapEntry {
         QString label;
         std::string id;
@@ -142,7 +161,6 @@ public slots:
     void onCollectionSelected(uint64_t collectionId);
     void onSurfaceChanged(std::string name, Surface *surf);
     void onPOIChanged(std::string name, POI *poi);
-    void onIntersectionChanged(std::string a, std::string b, Intersection *intersection);
     void onScrolled();
     void onResized();
     void onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers);
@@ -223,7 +241,6 @@ protected:
 
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
-    Intersection *_ignore_intersect_change = nullptr;
     bool _autoRefocusOnOffscreenIntersections = true;
     bool _hasLastPlaneOrigin = false;
     cv::Vec3f _lastPlaneOrigin = {0.0f, 0.0f, 0.0f};
@@ -281,4 +298,8 @@ protected:
     QImage _overlayImage;
 
     int _surfacePatchSamplingStride{1};
+
+    void markActiveSegmentationDirty();
+    mutable ActiveSegmentationHandle _activeSegHandle;
+    mutable bool _activeSegHandleDirty{true};
 };  // class CVolumeViewer

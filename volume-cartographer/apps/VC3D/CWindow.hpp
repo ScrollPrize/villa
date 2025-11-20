@@ -12,6 +12,7 @@
 #include <vector>
 #include <deque>
 #include <optional>
+#include <chrono>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -19,6 +20,7 @@
 #include <QShortcut>
 #include <QSet>
 #include <unordered_map>
+#include <map>
 
 #include "CPointCollectionWidget.hpp"
 #include "CSurfaceCollection.hpp"
@@ -254,6 +256,10 @@ private:
     void updateAxisAlignedSliceInteraction();
     float currentAxisAlignedRotationDegrees(const std::string& surfaceName) const;
     void setAxisAlignedRotationDegrees(const std::string& surfaceName, float degrees);
+    void scheduleAxisAlignedOrientationUpdate();
+    void flushAxisAlignedOrientationUpdate();
+    void processAxisAlignedOrientationUpdate();
+    void cancelAxisAlignedOrientationTimer();
     static float normalizeDegrees(float degrees);
 
     struct AxisAlignedSliceDragState {
@@ -264,6 +270,8 @@ private:
     std::unordered_map<const CVolumeViewer*, AxisAlignedSliceDragState> _axisAlignedSliceDrags;
     float _axisAlignedSegXZRotationDeg = 0.0f;
     float _axisAlignedSegYZRotationDeg = 0.0f;
+    QTimer* _axisAlignedRotationTimer{nullptr};
+    bool _axisAlignedOrientationDirty{false};
 
     int _inotifyFd;
     QSocketNotifier* _inotifyNotifier;
@@ -278,6 +286,9 @@ private:
     void processInotifySegmentRename(const std::string& dirName, const std::string& oldId, const std::string& newId);
     void processInotifySegmentUpdate(const std::string& dirName, const std::string& segmentName);
     void scheduleInotifyProcessing();
+    bool shouldSkipInotifyForSegment(const std::string& segmentId, const char* eventCategory);
+    void markSegmentRecentlyEdited(const std::string& segmentId);
+    void pruneExpiredRecentlyEdited();
 
     // Periodic timer for inotify events
     QTimer* _inotifyProcessTimer;
@@ -296,7 +307,9 @@ private:
     // Set to track unique segments that need updating (to avoid duplicates)
     std::set<std::pair<std::string, std::string>> _pendingSegmentUpdates; // (dirName, segmentId)
     QElapsedTimer _lastInotifyProcessTime;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> _recentlyEditedSegments;
     static constexpr int INOTIFY_THROTTLE_MS = 100;
+    static constexpr int RECENT_EDIT_GRACE_SECONDS = 30;
 
     struct NeighborCopyJob {
         enum class Stage { None, FirstPass, SecondPass };

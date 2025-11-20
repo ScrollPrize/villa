@@ -188,12 +188,10 @@ void CVolumeViewer::renderIntersections()
                 }
 
                 IntersectionLine line;
-                line.world.reserve(2);
-                line.surfaceParams.reserve(2);
-                for (int i = 0; i < 2; ++i) {
-                    line.world.push_back(segment->world[i]);
-                    line.surfaceParams.push_back(segment->surfaceParams[i]);
-                }
+                line.world[0] = segment->world[0];
+                line.world[1] = segment->world[1];
+                line.surfaceParams[0] = segment->surfaceParams[0];
+                line.surfaceParams[1] = segment->surfaceParams[1];
                 intersectionLines.push_back(std::move(line));
             }
 
@@ -285,22 +283,6 @@ void CVolumeViewer::renderIntersections()
             } else {
                 removeItemsForKey(key);
             }
-
-            bool shouldUpdateIntersection = _surf_col && !intersectionLines.empty();
-            if (shouldUpdateIntersection) {
-                if (auto* existing = _surf_col->intersection(_surf_name, key)) {
-                    shouldUpdateIntersection =
-                        !intersectionLinesEqual(existing->lines, intersectionLines);
-                }
-            }
-
-            if (shouldUpdateIntersection) {
-                auto* intersection = new Intersection();
-                intersection->lines = std::move(intersectionLines);
-                _ignore_intersect_change = intersection;
-                _surf_col->setIntersection(_surf_name, key, intersection);
-                _ignore_intersect_change = nullptr;
-            }
         }
 
         // Remove stale intersections that are no longer requested.
@@ -314,78 +296,6 @@ void CVolumeViewer::renderIntersections()
             removeItemsForKey(key);
         }
 
-    }
-    else if (_surf_name == "segmentation" /*&& dynamic_cast<QuadSurface*>(_surf_col->surface("visible_segmentation"))*/) {
-        //TODO make configurable, for now just show everything!
-        std::vector<std::pair<std::string,std::string>> intersects = _surf_col->intersections("segmentation");
-        QuadSurface* quadSurface = dynamic_cast<QuadSurface*>(_surf);
-        if (!quadSurface) {
-            return;
-        }
-
-        for (auto pair : intersects) {
-            std::string key = pair.first;
-            if (key == "segmentation")
-                key = pair.second;
-
-            if (!_intersect_tgts.count(key))
-                continue;
-
-            Intersection* storedIntersection = _surf_col->intersection(pair.first, pair.second);
-            if (!storedIntersection || storedIntersection->lines.empty()) {
-                continue;
-            }
-
-            std::vector<QGraphicsItem*> items;
-            for (const auto& line : storedIntersection->lines) {
-                if (line.surfaceParams.size() < 2 || line.surfaceParams.size() != line.world.size()) {
-                    continue;
-                }
-                QPainterPath path;
-                bool first = true;
-                for (const auto& param : line.surfaceParams) {
-                    cv::Vec3f p = quadSurface->loc(param) * _scale;
-                    if (p[0] == -1) {
-                        continue;
-                    }
-                    if (first)
-                        path.moveTo(p[0], p[1]);
-                    else
-                        path.lineTo(p[0], p[1]);
-                    first = false;
-                }
-
-                if (path.isEmpty()) {
-                    continue;
-                }
-
-                auto item = fGraphicsView->scene()->addPath(path, QPen(key == "seg yz" ? COLOR_SEG_YZ: COLOR_SEG_XZ, 2));
-                item->setZValue(5);
-                item->setOpacity(_intersectionOpacity);
-                if (fBaseImageItem) {
-                    item->setParentItem(fBaseImageItem);
-                }
-                items.push_back(item);
-            }
-
-            if (!items.empty()) {
-                removeItemsForKey(key);
-                _intersect_items[key] = items;
-            } else {
-                removeItemsForKey(key);
-            }
-        }
-
-        // Remove intersection drawings for keys that are no longer being tracked.
-        std::vector<std::string> keysToRemove;
-        for (const auto& entry : _intersect_items) {
-            if (!_intersect_tgts.count(entry.first)) {
-                keysToRemove.push_back(entry.first);
-            }
-        }
-        for (const auto& key : keysToRemove) {
-            removeItemsForKey(key);
-        }
     }
 }
 
@@ -410,29 +320,6 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
     }
 }
 
-
-void CVolumeViewer::onIntersectionChanged(std::string a, std::string b, Intersection *intersection)
-{
-    if (_ignore_intersect_change && intersection == _ignore_intersect_change)
-        return;
-
-    const bool tracksVisibleSeg = (_surf_name == "segmentation" && (a == "visible_segmentation" || b == "visible_segmentation"));
-    const bool involvesSurfName = (a == _surf_name || b == _surf_name);
-
-    if (!involvesSurfName && !tracksVisibleSeg) {
-        return;
-    }
-
-    //FIXME fix segmentation vs visible_segmentation naming and usage ..., think about dependency chain ..
-    if (a == _surf_name || (_surf_name == "segmentation" && a == "visible_segmentation"))
-        invalidateIntersect(b);
-    else if (b == _surf_name || (_surf_name == "segmentation" && b == "visible_segmentation"))
-        invalidateIntersect(a);
-
-    if (a == _surf_name || b == _surf_name) {
-        renderIntersections();
-    }
-}
 
 void CVolumeViewer::setIntersects(const std::set<std::string> &set)
 {

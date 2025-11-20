@@ -17,9 +17,6 @@ CSurfaceCollection::~CSurfaceCollection()
         delete pair.second;
     }
 
-    for (auto& pair : _intersections) {
-        delete pair.second;
-    }
 }
 
 void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership)
@@ -100,43 +97,4 @@ std::vector<std::string> CSurfaceCollection::poiNames()
         keys.push_back(it.first);
 
     return keys;
-}
-
-void CSurfaceCollection::setIntersection(const std::string &a, const std::string &b, Intersection *intersect)
-{
-    auto key = std::make_pair(a, b);
-    if (_intersections.count(key)) {
-        delete _intersections[key];  // Delete old before overwriting
-    }
-    _intersections[key] = intersect;
-    sendIntersectionChanged(a, b, intersect);
-}
-
-Intersection *CSurfaceCollection::intersection(const std::string &a, const std::string &b)
-{
-    if (_intersections.count({a,b}))
-        return _intersections[{a,b}];
-        
-    if (_intersections.count({b,a}))
-        return _intersections[{b,a}];
-    
-    return nullptr;
-}
-
-std::vector<std::pair<std::string,std::string>> CSurfaceCollection::intersections(const std::string &a)
-{
-    std::vector<std::pair<std::string,std::string>> res;
-
-    if (!a.size()) {
-        for(auto item : _intersections)
-            res.push_back(item.first);
-    }
-    else
-        for(auto item : _intersections) {
-            if (item.first.first == a)
-                res.push_back(item.first);
-            else if (item.first.second == a)
-                res.push_back(item.first);
-        }
-    return res;
 }

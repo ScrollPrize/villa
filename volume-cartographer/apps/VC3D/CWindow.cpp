@@ -41,6 +41,7 @@
 #include <QPen>
 #include <QFont>
 #include <QPainter>
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -320,6 +321,7 @@ namespace
 constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
 constexpr float kEpsilon = 1e-6f;
 constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
+constexpr int kAxisAlignedRotationApplyDelayMs = 25;
 
 int axisAlignedRotationCacheKey(float degrees)
 {
@@ -484,9 +486,18 @@ CWindow::CWindow() :
     _planeSlicingOverlay->bindToViewerManager(_viewerManager.get());
     _planeSlicingOverlay->setRotationSetter([this](const std::string& planeName, float degrees) {
         setAxisAlignedRotationDegrees(planeName, degrees);
-        applySlicePlaneOrientation();
+        scheduleAxisAlignedOrientationUpdate();
+    });
+    _planeSlicingOverlay->setRotationFinishedCallback([this]() {
+        flushAxisAlignedOrientationUpdate();
     });
     _planeSlicingOverlay->setAxisAlignedEnabled(_useAxisAlignedSlices);
+
+    _axisAlignedRotationTimer = new QTimer(this);
+    _axisAlignedRotationTimer->setSingleShot(true);
+    _axisAlignedRotationTimer->setInterval(kAxisAlignedRotationApplyDelayMs);
+    connect(_axisAlignedRotationTimer, &QTimer::timeout,
+            this, &CWindow::processAxisAlignedOrientationUpdate);
 
     _volumeOverlay = std::make_unique<VolumeOverlayController>(_viewerManager.get(), this);
     connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
@@ -2723,6 +2734,13 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         enabled = already;
     }
 
+    std::optional<std::string> recentlyEditedId;
+    if (!enabled) {
+        if (auto* activeSurface = _segmentationModule->activeBaseSurface()) {
+            recentlyEditedId = activeSurface->id;
+        }
+    }
+
     if (enabled) {
         QuadSurface* activeSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
 
@@ -2745,6 +2763,10 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         }
     } else {
         _segmentationModule->endEditingSession();
+
+        if (recentlyEditedId && !recentlyEditedId->empty()) {
+            markSegmentRecentlyEdited(*recentlyEditedId);
+        }
     }
 
     const QString message = enabled
@@ -2844,6 +2866,48 @@ void CWindow::setAxisAlignedRotationDegrees(const std::string& surfaceName, floa
     }
 }
 
+void CWindow::scheduleAxisAlignedOrientationUpdate()
+{
+    if (!_useAxisAlignedSlices) {
+        applySlicePlaneOrientation();
+        return;
+    }
+    _axisAlignedOrientationDirty = true;
+    if (!_axisAlignedRotationTimer) {
+        applySlicePlaneOrientation();
+        return;
+    }
+    if (!_axisAlignedRotationTimer->isActive()) {
+        _axisAlignedRotationTimer->start(kAxisAlignedRotationApplyDelayMs);
+    }
+}
+
+void CWindow::flushAxisAlignedOrientationUpdate()
+{
+    if (!_axisAlignedOrientationDirty) {
+        return;
+    }
+    cancelAxisAlignedOrientationTimer();
+    applySlicePlaneOrientation();
+}
+
+void CWindow::processAxisAlignedOrientationUpdate()
+{
+    if (!_axisAlignedOrientationDirty) {
+        return;
+    }
+    _axisAlignedOrientationDirty = false;
+    applySlicePlaneOrientation();
+}
+
+void CWindow::cancelAxisAlignedOrientationTimer()
+{
+    if (_axisAlignedRotationTimer && _axisAlignedRotationTimer->isActive()) {
+        _axisAlignedRotationTimer->stop();
+    }
+    _axisAlignedOrientationDirty = false;
+}
+
 void CWindow::updateAxisAlignedSliceInteraction()
 {
     if (!_viewerManager) {
@@ -2908,7 +2972,7 @@ void CWindow::onAxisAlignedSliceMouseMove(CVolumeViewer* viewer, const cv::Vec3f
     }
 
     setAxisAlignedRotationDegrees(surfaceName, candidate);
-    applySlicePlaneOrientation();
+    scheduleAxisAlignedOrientationUpdate();
 
 }
 
@@ -2922,6 +2986,7 @@ void CWindow::onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseBut
     if (it != _axisAlignedSliceDrags.end()) {
         it->second.active = false;
     }
+    flushAxisAlignedOrientationUpdate();
 }
 
 void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
@@ -2929,6 +2994,8 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
     if (!_surf_col) {
         return;
     }
+
+    cancelAxisAlignedOrientationTimer();
 
     POI *focus = _surf_col->poi("focus");
     cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
@@ -3279,42 +3346,44 @@ void CWindow::processInotifySegmentUpdate(const std::string& dirName, const std:
         return;
     }
 
-    bool wasSelected = (_surfID == segmentId);
-
-    // Skip reload if this surface is currently being edited to avoid use-after-free
-    // when autosave triggers an inotify event
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
-        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
-            Logger()->info("Skipping reload of {} - currently being edited", segmentId);
-            return;
-        }
+    // Skip reloads triggered right after editing sessions end
+    if (shouldSkipInotifyForSegment(segmentId, "reload")) {
+        return;
     }
+
+    bool wasSelected = (_surfID == segmentId);
 
     // Reload the segmentation
     if (fVpkg->reloadSingleSegmentation(segmentId)) {
-        // Remove and re-add to UI to refresh all metadata
-        if (_surfacePanel) {
-            _surfacePanel->removeSingleSegmentation(segmentId);
-        }
-
-        // Re-load surface
         try {
             auto surfMeta = fVpkg->loadSurface(segmentId);
             if (surfMeta) {
-                _surf_col->setSurface(segmentId, surfMeta->surface(), true);
+                QuadSurface* reloadedSurface = surfMeta->surface();
+                if (!reloadedSurface) {
+                    Logger()->warn("Reloaded segment {} returned null surface", segmentId);
+                    return;
+                }
+
+                if (_surf_col) {
+                    _surf_col->setSurface(segmentId, reloadedSurface, false, false);
+                }
+
                 if (_surfacePanel) {
-                    _surfacePanel->addSingleSegmentation(segmentId);
+                    _surfacePanel->refreshSurfaceMetrics(segmentId);
                 }
 
                 statusBar()->showMessage(tr("Updated: %1").arg(QString::fromStdString(segmentName)), 2000);
 
-                // Reselect if it was selected
                 if (wasSelected) {
                     _surfID = segmentId;
-                    auto surface = _surf_col->surface(segmentId);  // Changed from getSurface to surface
-                    if (surface && _surfacePanel) {
-                        _surfacePanel->syncSelectionUi(segmentId, dynamic_cast<QuadSurface*>(surface));
+                    _surf = reloadedSurface;
+
+                    if (_surf_col) {
+                        _surf_col->setSurface("segmentation", _surf, false, false);
+                    }
+
+                    if (_surfacePanel) {
+                        _surfacePanel->syncSelectionUi(segmentId, _surf);
                     }
                 }
             }
@@ -3409,14 +3478,9 @@ void CWindow::processInotifySegmentAddition(const std::string& dirName, const st
     // The UUID will be the directory name (or will be updated to match)
     std::string segmentId = segmentName;
 
-    // Skip addition if this surface is currently being edited to avoid use-after-free
-    // when autosave triggers delete/add inotify events
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
-        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
-            Logger()->info("Skipping addition of {} - currently being edited", segmentId);
-            return;
-        }
+    // Skip addition if editing just stopped recently to avoid thrashing the active surface
+    if (shouldSkipInotifyForSegment(segmentId, "addition")) {
+        return;
     }
 
     // Switch directory if needed
@@ -3476,14 +3540,9 @@ void CWindow::processInotifySegmentRemoval(const std::string& dirName, const std
 
     bool isCurrentDir = (dirName == fVpkg->getSegmentationDirectory());
 
-    // Skip removal if this surface is currently being edited to avoid use-after-free
-    // when autosave triggers delete/add inotify events
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
-        if (activeBaseSurface && activeBaseSurface->id == segmentId) {
-            Logger()->info("Skipping removal of {} - currently being edited", segmentId);
-            return;
-        }
+    // Skip removal if editing just ended or is still running
+    if (shouldSkipInotifyForSegment(segmentId, "removal")) {
+        return;
     }
 
     // Remove from VolumePkg
@@ -3515,10 +3574,6 @@ void CWindow::processPendingInotifyEvents()
         switch (evt.type) {
             case InotifyEvent::Removal:
                 removals.push_back(evt);
-                // Check if this removal is our current selection
-                if (evt.segmentId == previousSelection) {
-                    previousSelectionRemoved = true;
-                }
                 break;
             case InotifyEvent::Rename:
                 renames.push_back(evt);
@@ -3529,6 +3584,64 @@ void CWindow::processPendingInotifyEvents()
             case InotifyEvent::Update:
                 updates.push_back(evt);
                 break;
+        }
+    }
+
+    if (!removals.empty() && !additions.empty()) {
+        using EventKey = std::pair<std::string, std::string>;
+        auto makeKey = [](const InotifyEvent& evt) -> EventKey {
+            return {evt.dirName, evt.segmentId};
+        };
+
+        std::map<EventKey, int> additionCounts;
+        for (const auto& addition : additions) {
+            additionCounts[makeKey(addition)]++;
+        }
+
+        std::map<EventKey, int> pairedCounts;
+        std::vector<InotifyEvent> filteredRemovals;
+        filteredRemovals.reserve(removals.size());
+
+        for (const auto& removal : removals) {
+            EventKey key = makeKey(removal);
+            auto availableIt = additionCounts.find(key);
+            const int available = (availableIt != additionCounts.end()) ? availableIt->second : 0;
+            auto existingPairIt = pairedCounts.find(key);
+            const int alreadyPaired = (existingPairIt != pairedCounts.end()) ? existingPairIt->second : 0;
+
+            if (available > alreadyPaired) {
+                pairedCounts[key] = alreadyPaired + 1;
+
+                InotifyEvent updateEvt;
+                updateEvt.type = InotifyEvent::Update;
+                updateEvt.dirName = removal.dirName;
+                updateEvt.segmentId = removal.segmentId;
+                updates.push_back(updateEvt);
+            } else {
+                filteredRemovals.push_back(removal);
+            }
+        }
+
+        std::vector<InotifyEvent> filteredAdditions;
+        filteredAdditions.reserve(additions.size());
+        for (const auto& addition : additions) {
+            EventKey key = makeKey(addition);
+            auto pairIt = pairedCounts.find(key);
+            if (pairIt != pairedCounts.end() && pairIt->second > 0) {
+                pairIt->second--;
+                continue;
+            }
+            filteredAdditions.push_back(addition);
+        }
+
+        removals.swap(filteredRemovals);
+        additions.swap(filteredAdditions);
+    }
+
+    for (const auto& evt : removals) {
+        if (evt.segmentId == previousSelection) {
+            previousSelectionRemoved = true;
+            break;
         }
     }
 
@@ -3654,6 +3767,83 @@ void CWindow::scheduleInotifyProcessing()
     _inotifyProcessTimer->setSingleShot(true);
     _inotifyProcessTimer->setInterval(INOTIFY_THROTTLE_MS);
     _inotifyProcessTimer->start();
+}
+
+bool CWindow::shouldSkipInotifyForSegment(const std::string& segmentId, const char* eventCategory)
+{
+    if (segmentId.empty()) {
+        return false;
+    }
+
+    const char* category = eventCategory ? eventCategory : "inotify event";
+
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        if (auto* activeBaseSurface = _segmentationModule->activeBaseSurface()) {
+            if (activeBaseSurface->id == segmentId) {
+                Logger()->info("Skipping {} for {} - currently being edited", category, segmentId);
+                return true;
+            }
+        }
+    }
+
+    pruneExpiredRecentlyEdited();
+
+    if (_recentlyEditedSegments.empty()) {
+        return false;
+    }
+
+    auto it = _recentlyEditedSegments.find(segmentId);
+    if (it == _recentlyEditedSegments.end()) {
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - it->second;
+    const auto grace = std::chrono::seconds(RECENT_EDIT_GRACE_SECONDS);
+
+    if (elapsed < grace) {
+        const double elapsedSeconds =
+            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() / 1000.0;
+        const double remainingSeconds = std::max(
+            0.0, static_cast<double>(RECENT_EDIT_GRACE_SECONDS) - elapsedSeconds);
+        Logger()->info("Skipping {} for {} - edits ended {:.1f}s ago ({}s grace remaining)",
+                       category,
+                       segmentId,
+                       elapsedSeconds,
+                       static_cast<int>(std::ceil(remainingSeconds)));
+        return true;
+    }
+
+    _recentlyEditedSegments.erase(it);
+    return false;
+}
+
+void CWindow::markSegmentRecentlyEdited(const std::string& segmentId)
+{
+    if (segmentId.empty()) {
+        return;
+    }
+
+    pruneExpiredRecentlyEdited();
+    _recentlyEditedSegments[segmentId] = std::chrono::steady_clock::now();
+}
+
+void CWindow::pruneExpiredRecentlyEdited()
+{
+    if (_recentlyEditedSegments.empty()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::seconds(RECENT_EDIT_GRACE_SECONDS);
+
+    for (auto it = _recentlyEditedSegments.begin(); it != _recentlyEditedSegments.end(); ) {
+        if (now - it->second >= grace) {
+            it = _recentlyEditedSegments.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 

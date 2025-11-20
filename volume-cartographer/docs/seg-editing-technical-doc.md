@@ -13,7 +13,7 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 1. **Session start** – `SegmentationModule::beginEditingSession` receives the
    active `QuadSurface` from the segmentation tooling and forwards it to
    `SegmentationEditManager::beginSession`. The manager snapshots the original
-   point grid, clones a preview surface, and mirrors metadata on the clone
+   point grid for undo/reset, then edits the base surface in place
    (`SegmentationEditManager.cpp`).
 2. **Vertex edit tracking** – The manager maintains an unordered-map of
    `VertexEdit { row, col, originalWorld, currentWorld, isGrowth }`. Entries are
@@ -32,10 +32,11 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    active marker plus the currently affected neighbours (as reported by
    `SegmentationEditManager::recentTouched`). During a drag it projects the
    Gaussian radius into viewer space so users understand the footprint.
-5. **Persistence** – "Apply" copies the preview grid back into the base surface
-   and clears the edit map. Note that these actions (applying changes and clearing the edit map) also occur immediately after a manipulation of any vertex, so using "Apply" is not typically necessary. "Reset" discards active drags and rebuilds the
-   preview from the original snapshot. A session ends by destroying the preview
-   clone and clearing overlay state.
+5. **Persistence** – "Apply" simply bakes the current base grid into the
+   original snapshot and clears the edit map (this also happens automatically
+   after each committed drag). "Reset" discards active drags and copies the
+   original snapshot back onto the base surface. A session ends by clearing
+   overlay state and cached snapshots.
 
 
 ## Component Overview
@@ -44,7 +45,7 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 | --- | --- |
 | `SegmentationWidget` | Minimal Qt sidebar with an editing toggle, Gaussian controls (radius/sigma in grid steps), and Apply/Reset/Stop affordances. Growth volume selection is still exposed for downstream tooling. |
 | `SegmentationModule` | Binds the widget, edit manager, overlay, and viewers. Routes input events, maintains drag/hover state, updates overlays, and exposes helper signals (status messages, growth requests). |
-| `SegmentationEditManager` | Owns the preview surface, vertex edit map, Gaussian sampling cache for active drags, and dirty tracking. Provides helpers to map world coordinates to grid indices and to query vertex positions. |
+| `SegmentationEditManager` | Owns the undo snapshot (`_originalPoints`), the in-place preview pointer, vertex edit map, Gaussian sampling cache for active drags, and dirty tracking. Provides helpers to map world coordinates to grid indices and to query vertex positions. |
 | `SegmentationOverlayController` | Draws the active vertex marker, affected neighbours, optional mask overlay points, and the projected Gaussian radius. |
 | `QuadSurface` (core layer) | Stores the dense `cv::Mat_<cv::Vec3f>` grid and metadata that represent the segmentation patch. |
 
@@ -52,16 +53,18 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 ## Session Lifecycle
 
 1. **Begin** – `SegmentationModule::beginEditingSession` primes the edit manager
-   with the base surface, updates overlay parameters, and publishes the preview
-   to the shared surface collection.
-2. **Edit** – All vertex mutations occur on the preview grid. The module
+   with the base surface, updates overlay parameters, and republishes that same
+   surface through the shared collection so viewers refresh immediately.
+2. **Edit** – All vertex mutations occur directly on the base surface while the
+   module keeps `_originalPoints` as the reset snapshot. The module
    continuously mirrors dirty state back to the widget so the UI can flag
    pending changes.
-3. **Apply / Reset** – `SegmentationEditManager::applyPreview` copies the preview
-   grid into the base surface and refreshes the original snapshot. `resetPreview`
-   clears the edit map and restores the preview from the original snapshot.
+3. **Apply / Reset** – `SegmentationEditManager::applyPreview` refreshes the
+   original snapshot from the live surface (no extra copies into the base
+   surface). `resetPreview` clears the edit map and copies `_originalPoints`
+   back into the base surface.
 4. **End** – `SegmentationModule::endEditingSession` cancels any active drag,
-   clears overlay markers, and releases the preview surface.
+   clears overlay markers, and drops the cached snapshot state.
 
 
 ## Gaussian Falloff Workflow
@@ -115,4 +118,3 @@ unused.
 The controller renders simple filled circles for neighbours, a highlighted circle
 for the active vertex, and (during drag) an outline representing the world-space
 radius.
-

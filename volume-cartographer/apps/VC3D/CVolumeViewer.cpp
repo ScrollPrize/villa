@@ -18,7 +18,6 @@
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 
-
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -40,7 +39,40 @@ constexpr auto COLOR_CURSOR =  Qt::cyan;
 constexpr float MIN_ZOOM = 0.03125f;
 constexpr float MAX_ZOOM = 4.0f;
 
+#define COLOR_SEG_YZ Qt::yellow
+#define COLOR_SEG_XZ Qt::red
+#define COLOR_SEG_XY QColor(255, 140, 0)
 
+const CVolumeViewer::ActiveSegmentationHandle& CVolumeViewer::activeSegmentationHandle() const
+{
+    if (!_activeSegHandleDirty) {
+        return _activeSegHandle;
+    }
+
+    ActiveSegmentationHandle handle;
+    handle.slotName = "segmentation";
+    handle.viewerIsSegmentationView = (_surf_name == "segmentation");
+    handle.accentColor =
+        (_surf_name == "seg yz"   ? COLOR_SEG_YZ
+         : _surf_name == "seg xz" ? COLOR_SEG_XZ
+                                   : COLOR_SEG_XY);
+    if (_surf_col) {
+        handle.surface = dynamic_cast<QuadSurface*>(_surf_col->surface(handle.slotName));
+    }
+    if (!handle.surface) {
+        handle.slotName.clear();
+    }
+
+    _activeSegHandle = handle;
+    _activeSegHandleDirty = false;
+    return _activeSegHandle;
+}
+
+void CVolumeViewer::markActiveSegmentationDirty()
+{
+    _activeSegHandleDirty = true;
+    _activeSegHandle.reset();
+}
 
 CVolumeViewer::CVolumeViewer(CSurfaceCollection *col, ViewerManager* manager, QWidget* parent)
     : QWidget(parent)
@@ -453,13 +485,18 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
         }
     }
 
+    const auto& segmentation = activeSegmentationHandle();
+
     // Forward the click for focus
-    if (dynamic_cast<PlaneSurface*>(_surf))
+    if (dynamic_cast<PlaneSurface*>(_surf)) {
         sendVolumeClicked(p, n, _surf, buttons, modifiers);
-    else if (_surf_name == "segmentation")
-        sendVolumeClicked(p, n, _surf_col->surface("segmentation"), buttons, modifiers);
-    else
+    }
+    else if (segmentation.viewerIsSegmentationView && segmentation.surface) {
+        sendVolumeClicked(p, n, segmentation.surface, buttons, modifiers);
+    }
+    else {
         std::cout << "FIXME: onVolumeClicked()" << std::endl;
+    }
 }
 
 void CVolumeViewer::setCache(ChunkCache<uint8_t> *cache_)
@@ -491,6 +528,7 @@ void CVolumeViewer::setSurface(const std::string &name)
 {
     _surf_name = name;
     _surf = nullptr;
+    markActiveSegmentationDirty();
     onSurfaceChanged(name, _surf_col->surface(name));
 }
 
@@ -503,7 +541,6 @@ void CVolumeViewer::invalidateVis()
     }
     slice_vis_items.resize(0);
 }
-
 
 void CVolumeViewer::setSegmentationEditActive(bool active)
 {
@@ -621,6 +658,10 @@ void CVolumeViewer::fitSurfaceInView()
 
 void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
 {
+    if (name == "segmentation" || name == _surf_name) {
+        markActiveSegmentationDirty();
+    }
+
     if (_surf_name == name) {
         _surf = surf;
         if (!_surf) {
@@ -777,8 +818,8 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         }
 
         PlaneSurface *slice_plane = dynamic_cast<PlaneSurface*>(_surf);
-        // QuadSurface *crop = dynamic_cast<QuadSurface*>(_surf_col->surface("visible_segmentation"));
-        QuadSurface *crop = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
+        const auto& segmentation = activeSegmentationHandle();
+        QuadSurface *crop = segmentation.surface;
         
         cv::Vec3f sp;
         float dist = -1;
@@ -786,7 +827,7 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
             dist = slice_plane->pointDist(poi->p);
             sp = slice_plane->project(poi->p, 1.0, _scale);
         }
-        else if (_surf_name == "segmentation" && crop)
+        else if (segmentation.viewerIsSegmentationView && crop)
         {
             auto ptr = crop->pointer();
             dist = crop->pointTo(ptr, poi->p, 2.0);
@@ -958,12 +999,16 @@ void CVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt
     // Forward for drawing widgets
     cv::Vec3f p, n;
     if (scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
-        if (dynamic_cast<PlaneSurface*>(_surf))
+        const auto& segmentation = activeSegmentationHandle();
+        if (dynamic_cast<PlaneSurface*>(_surf)) {
             emit sendMouseReleaseVolume(p, button, modifiers);
-        else if (_surf_name == "segmentation")
+        }
+        else if (segmentation.viewerIsSegmentationView) {
             emit sendMouseReleaseVolume(p, button, modifiers);
-        else
+        }
+        else {
             std::cout << "FIXME: onMouseRelease()" << std::endl;
+        }
     }
 }
 

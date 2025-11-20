@@ -57,6 +57,11 @@ void PlaneSlicingOverlayController::setRotationSetter(std::function<void(const s
     _rotationSetter = std::move(setter);
 }
 
+void PlaneSlicingOverlayController::setRotationFinishedCallback(std::function<void()> callback)
+{
+    _rotationFinishedCallback = std::move(callback);
+}
+
 void PlaneSlicingOverlayController::setAxisAlignedOverlayOpacity(float opacity)
 {
     float clamped = std::clamp(opacity, 0.0f, 1.0f);
@@ -396,9 +401,13 @@ void PlaneSlicingOverlayController::handleMouseRelease(CVolumeViewer* viewer,
     }
 
     if (button == Qt::LeftButton && _activeDrag.viewer == viewer) {
+        const bool hadActiveDrag = !_activeDrag.planeName.empty();
         _activeDrag.viewer = nullptr;
         _activeDrag.planeName.clear();
         viewer->fGraphicsView->setCursor(Qt::ArrowCursor);
+        if (hadActiveDrag && _rotationFinishedCallback) {
+            _rotationFinishedCallback();
+        }
     }
 }
 

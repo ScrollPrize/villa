@@ -92,6 +92,7 @@ public:
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
+    void refreshSurfacePatchIndex(QuadSurface* surface);
 
 signals:
     void viewerCreated(CVolumeViewer* viewer);
