@@ -11,10 +11,10 @@ Automatically ignores:
 
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
-    python s3_sync.py status <directory> [--verbose] [--sync-backups]
-    python s3_sync.py sync <directory> [--dry-run] [--sync-backups]
-    python s3_sync.py update <directory> [--sync-backups]
-    python s3_sync.py reset <directory> [--sync-backups]
+    python s3_sync.py status <directory> [--verbose] [--sync-backups] [--enable-segment=<segment_id>]
+    python s3_sync.py sync <directory> [--dry-run] [--sync-backups] [--upload-only] [--download-only] [--enable-segment=<segment_id>]
+    python s3_sync.py update <directory> [--sync-backups] [--enable-segment=<segment_id>]
+    python s3_sync.py reset <directory> [--sync-backups] [--enable-segment=<segment_id>]
 """
 
 import os
@@ -51,6 +51,25 @@ class SyncAction(Enum):
 def is_backup_file(filename):
     """Check if a file matches backup patterns"""
     return any(pattern in filename.lower() for pattern in BACKUP_PATTERNS)
+
+
+def matches_segment_filter(path, segment_id):
+    """Check if a path matches the segment filter"""
+    if not segment_id:
+        return True
+
+    # Normalize path separators
+    path_normalized = path.replace('\\', '/')
+
+    # Check for paths/segment_XXX or backups/segment_XXX
+    segment_patterns = [
+        f'paths/segment_{segment_id}',
+        f'backups/segment_{segment_id}',
+        f'/paths/segment_{segment_id}',
+        f'/backups/segment_{segment_id}',
+    ]
+
+    return any(pattern in path_normalized for pattern in segment_patterns)
 
 
 class S3SyncManager:
@@ -173,9 +192,11 @@ class S3SyncManager:
             except OSError:
                 break
 
-    def scan_local_files(self, include_backups=False):
+    def scan_local_files(self, include_backups=False, segment_id=None):
         """Scan local directory for files"""
         print(f"Scanning local directory: {self.local_dir}")
+        if segment_id:
+            print(f"  Filtering for segment: {segment_id}")
         files = {}
 
         for root, dirs, filenames in os.walk(self.local_dir):
@@ -201,6 +222,10 @@ class S3SyncManager:
                 if not include_backups and 'backups' in path_parts[:-1]:
                     continue
 
+                # Apply segment filter if specified
+                if not matches_segment_filter(relative_path, segment_id):
+                    continue
+
                 stat = os.stat(filepath)
                 files[relative_path] = {
                     'path': relative_path,
@@ -212,9 +237,11 @@ class S3SyncManager:
         print(f"Found {len(files)} local files")
         return files
 
-    def scan_s3_files(self, include_backups=False):
+    def scan_s3_files(self, include_backups=False, segment_id=None):
         """Scan S3 bucket for files with pagination support"""
         print(f"Scanning S3: s3://{self.s3_bucket}/{self.s3_prefix}/")
+        if segment_id:
+            print(f"  Filtering for segment: {segment_id}")
         files = {}
         continuation_token = None
         page_count = 0
@@ -267,6 +294,10 @@ class S3SyncManager:
                 if not include_backups and 'backups' in path_parts[:-1]:
                     continue
 
+                # Apply segment filter if specified
+                if not matches_segment_filter(relative_path, segment_id):
+                    continue
+
                 files[relative_path] = {
                     'path': relative_path,
                     's3_size': obj['Size'],
@@ -290,12 +321,12 @@ class S3SyncManager:
         print(f"Found {len(files)} S3 files")
         return files
 
-    def update_files(self, include_backups=False):
+    def update_files(self, include_backups=False, segment_id=None):
         """Update file tracking with current state"""
         print("\nUpdating file tracking...")
 
-        local_files = self.scan_local_files(include_backups)
-        s3_files = self.scan_s3_files(include_backups)
+        local_files = self.scan_local_files(include_backups, segment_id)
+        s3_files = self.scan_s3_files(include_backups, segment_id)
 
         with self._get_db() as conn:
             # Get all tracked paths
@@ -329,7 +360,7 @@ class S3SyncManager:
 
         print("File tracking updated successfully")
 
-    def analyze_changes(self, local_files, s3_files):
+    def analyze_changes(self, local_files, s3_files, upload_only=False, download_only=False):
         """Analyze what needs to be synced and detect conflicts"""
         actions = {}
 
@@ -353,13 +384,14 @@ class S3SyncManager:
             # Backup files: only upload, never download or delete
             if is_backup:
                 if local_info and not s3_info:
-                    actions[path] = (SyncAction.UPLOAD, "Backup file (new)")
+                    if not download_only:
+                        actions[path] = (SyncAction.UPLOAD, "Backup file (new)")
                 elif local_info and s3_info:
                     # Check if local backup changed
                     local_changed = (tracked_info.get('local_size') != local_info['local_size'] or
                                      (tracked_info.get('local_mtime') and
                                       abs(tracked_info['local_mtime'] - local_info['local_mtime']) > 1))
-                    if local_changed:
+                    if local_changed and not download_only:
                         actions[path] = (SyncAction.UPLOAD, "Backup file (modified)")
                     else:
                         actions[path] = (SyncAction.SKIP, "Backup file (in sync)")
@@ -372,16 +404,26 @@ class S3SyncManager:
             # File only exists locally
             if local_info and not s3_info:
                 if tracked_info.get('s3_size') is not None:
-                    actions[path] = (SyncAction.DELETE_LOCAL, "S3 file was deleted")
+                    # File was on S3 but now deleted
+                    if not upload_only:
+                        actions[path] = (SyncAction.DELETE_LOCAL, "S3 file was deleted")
+                    else:
+                        actions[path] = (SyncAction.SKIP, "S3 file was deleted (upload-only mode)")
                 else:
-                    actions[path] = (SyncAction.UPLOAD, "New local file")
+                    if not download_only:
+                        actions[path] = (SyncAction.UPLOAD, "New local file")
 
             # File only exists on S3
             elif s3_info and not local_info:
                 if tracked_info.get('local_size') is not None:
-                    actions[path] = (SyncAction.DELETE_REMOTE, "Local file was deleted")
+                    # File was local but now deleted
+                    if not download_only:
+                        actions[path] = (SyncAction.DELETE_REMOTE, "Local file was deleted")
+                    else:
+                        actions[path] = (SyncAction.SKIP, "Local file was deleted (download-only mode)")
                 else:
-                    actions[path] = (SyncAction.DOWNLOAD, "New S3 file")
+                    if not upload_only:
+                        actions[path] = (SyncAction.DOWNLOAD, "New S3 file")
 
             # File exists in both places
             elif local_info and s3_info:
@@ -395,17 +437,30 @@ class S3SyncManager:
                                   tracked_info.get('s3_etag') != s3_info['s3_etag'])
 
                     if local_changed and s3_changed:
-                        actions[path] = (SyncAction.CONFLICT, "Both local and S3 modified since last sync")
+                        # Conflict - respect directional flags
+                        if upload_only:
+                            actions[path] = (SyncAction.UPLOAD, "Both modified (upload-only mode)")
+                        elif download_only:
+                            actions[path] = (SyncAction.DOWNLOAD, "Both modified (download-only mode)")
+                        else:
+                            actions[path] = (SyncAction.CONFLICT, "Both local and S3 modified since last sync")
                     elif local_changed:
-                        actions[path] = (SyncAction.UPLOAD, "Local file modified")
+                        if not download_only:
+                            actions[path] = (SyncAction.UPLOAD, "Local file modified")
                     elif s3_changed:
-                        actions[path] = (SyncAction.DOWNLOAD, "S3 file modified")
+                        if not upload_only:
+                            actions[path] = (SyncAction.DOWNLOAD, "S3 file modified")
                     else:
                         actions[path] = (SyncAction.SKIP, "Files are in sync")
                 else:
                     # No tracking history
                     if local_info['local_size'] != s3_info['s3_size']:
-                        actions[path] = (SyncAction.CONFLICT, "Files differ (no sync history)")
+                        if upload_only:
+                            actions[path] = (SyncAction.UPLOAD, "Files differ (upload-only mode)")
+                        elif download_only:
+                            actions[path] = (SyncAction.DOWNLOAD, "Files differ (download-only mode)")
+                        else:
+                            actions[path] = (SyncAction.CONFLICT, "Files differ (no sync history)")
                     else:
                         actions[path] = (SyncAction.SKIP, "Files appear to be in sync")
 
@@ -565,17 +620,29 @@ class S3SyncManager:
         if len(files) > max_files:
             print(f"  ... and {len(files) - max_files} more files")
 
-    def sync(self, dry_run=False, include_backups=False):
+    def sync(self, dry_run=False, include_backups=False, upload_only=False, download_only=False, segment_id=None):
         """Perform interactive sync operation"""
+        if upload_only and download_only:
+            print("Error: Cannot use both --upload-only and --download-only")
+            sys.exit(1)
+
         if not include_backups:
             print("Note: Ignoring backups/ directories (use --sync-backups to include them)")
 
+        if upload_only:
+            print("Mode: Upload-only (no downloads or local deletions)")
+        elif download_only:
+            print("Mode: Download-only (no uploads or remote deletions)")
+
+        if segment_id:
+            print(f"Segment filter: {segment_id}")
+
         print("\nAnalyzing changes...")
 
-        local_files = self.scan_local_files(include_backups)
-        s3_files = self.scan_s3_files(include_backups)
+        local_files = self.scan_local_files(include_backups, segment_id)
+        s3_files = self.scan_s3_files(include_backups, segment_id)
 
-        actions = self.analyze_changes(local_files, s3_files)
+        actions = self.analyze_changes(local_files, s3_files, upload_only, download_only)
 
         # Separate actions by type
         uploads = []
@@ -628,6 +695,21 @@ class S3SyncManager:
             action = self.resolve_conflict(path, reason, local_info, s3_info)
             if action != SyncAction.SKIP:
                 resolved_actions.append((path, action))
+
+        # Warn about deletions in directional modes
+        if upload_only and deletes_remote:
+            print(f"\n⚠️  Warning: {len(deletes_remote)} files will be deleted from S3 (upload-only mode)")
+            response = input("Are you sure you want to delete these remote files? [y/N]: ").strip().lower()
+            if response != 'y':
+                print("Skipping remote deletions")
+                deletes_remote = []
+
+        if download_only and deletes_local:
+            print(f"\n⚠️  Warning: {len(deletes_local)} files will be deleted locally (download-only mode)")
+            response = input("Are you sure you want to delete these local files? [y/N]: ").strip().lower()
+            if response != 'y':
+                print("Skipping local deletions")
+                deletes_local = []
 
         # Confirm before proceeding
         total_operations = (len(uploads) + len(downloads) + len(deletes_local) +
@@ -692,7 +774,7 @@ class S3SyncManager:
 
         print(f"\n✓ Sync complete: {success_count}/{total_operations} operations successful")
 
-    def show_status(self, verbose=False, include_backups=False):
+    def show_status(self, verbose=False, include_backups=False, segment_id=None):
         """Show sync status"""
         print(f"S3 Sync Status")
         print(f"Local directory: {self.local_dir}")
@@ -704,6 +786,9 @@ class S3SyncManager:
         if not include_backups:
             print("Note: Ignoring backups/ directories (use --sync-backups to include them)")
 
+        if segment_id:
+            print(f"Segment filter: {segment_id}")
+
         # Get database stats
         with self._get_db() as conn:
             cursor = conn.execute('SELECT COUNT(*) as count FROM files')
@@ -712,8 +797,8 @@ class S3SyncManager:
 
         print("\nAnalyzing changes...")
 
-        local_files = self.scan_local_files(include_backups)
-        s3_files = self.scan_s3_files(include_backups)
+        local_files = self.scan_local_files(include_backups, segment_id)
+        s3_files = self.scan_s3_files(include_backups, segment_id)
         actions = self.analyze_changes(local_files, s3_files)
 
         # Count actions
@@ -756,22 +841,28 @@ def main():
     status_parser.add_argument('directory', help='Local directory')
     status_parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed file list')
     status_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in sync')
+    status_parser.add_argument('--enable-segment', help='Only sync files under segment (e.g., 1234 for segment_1234)')
 
     # Sync command
     sync_parser = subparsers.add_parser('sync', help='Perform interactive sync')
     sync_parser.add_argument('directory', help='Local directory')
     sync_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced without doing it')
     sync_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in sync')
+    sync_parser.add_argument('--upload-only', action='store_true', help='Only upload files, do not download')
+    sync_parser.add_argument('--download-only', action='store_true', help='Only download files, do not upload')
+    sync_parser.add_argument('--enable-segment', help='Only sync files under segment (e.g., 1234 for segment_1234)')
 
     # Update command
     update_parser = subparsers.add_parser('update', help='Update file tracking with current state')
     update_parser.add_argument('directory', help='Local directory')
     update_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in tracking')
+    update_parser.add_argument('--enable-segment', help='Only track files under segment (e.g., 1234 for segment_1234)')
 
     # Reset command
     reset_parser = subparsers.add_parser('reset', help='Reset sync tracking (mark all as synced)')
     reset_parser.add_argument('directory', help='Local directory')
     reset_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in reset')
+    reset_parser.add_argument('--enable-segment', help='Only reset files under segment (e.g., 1234 for segment_1234)')
 
     args = parser.parse_args()
 
@@ -850,23 +941,41 @@ def main():
         manager = S3SyncManager(args.directory)
 
         if args.command == 'status':
-            manager.show_status(args.verbose, getattr(args, 'sync_backups', False))
+            manager.show_status(
+                args.verbose,
+                getattr(args, 'sync_backups', False),
+                getattr(args, 'enable_segment', None)
+            )
 
         elif args.command == 'sync':
-            manager.sync(args.dry_run, getattr(args, 'sync_backups', False))
+            manager.sync(
+                args.dry_run,
+                getattr(args, 'sync_backups', False),
+                getattr(args, 'upload_only', False),
+                getattr(args, 'download_only', False),
+                getattr(args, 'enable_segment', None)
+            )
 
         elif args.command == 'update':
-            manager.update_files(getattr(args, 'sync_backups', False))
+            manager.update_files(
+                getattr(args, 'sync_backups', False),
+                getattr(args, 'enable_segment', None)
+            )
 
         elif args.command == 'reset':
             print("Resetting sync tracking...")
             print("This will mark all current files as synced.")
             if not getattr(args, 'sync_backups', False):
                 print("Note: Excluding backups/ directories (use --sync-backups to include them)")
+            if getattr(args, 'enable_segment', None):
+                print(f"Segment filter: {getattr(args, 'enable_segment', None)}")
             response = input("Continue? [y/N]: ").strip().lower()
 
             if response == 'y':
-                manager.update_files(getattr(args, 'sync_backups', False))
+                manager.update_files(
+                    getattr(args, 'sync_backups', False),
+                    getattr(args, 'enable_segment', None)
+                )
                 print("✓ Sync tracking reset. All files marked as in sync.")
             else:
                 print("Reset cancelled.")
