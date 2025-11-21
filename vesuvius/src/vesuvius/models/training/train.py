@@ -1786,8 +1786,8 @@ def main():
                               help="Path to configuration YAML file")
 
     # Paths & Format
-    grp_paths.add_argument("-o", "--output", default="checkpoints",
-                           help="Output directory for saving checkpoints and configs")
+    grp_paths.add_argument("-o", "--output", default=None,
+                           help="Output directory for saving checkpoints and configs (default: <input>/checkpoints)")
     grp_paths.add_argument("--format", choices=["image", "zarr", "napari"],
                            help="Data format (auto-detected if omitted)")
     grp_paths.add_argument("--val-dir", type=str,
@@ -1923,11 +1923,16 @@ def main():
     mgr.load_config(args.config_path)
     print(f"Loaded configuration from: {args.config_path}")
 
-    if not Path(args.input).exists():
+    input_path = Path(args.input)
+    if not input_path.exists():
         raise ValueError(f"Input directory does not exist: {args.input}")
 
     if args.val_dir is not None and not Path(args.val_dir).exists():
         raise ValueError(f"Validation directory does not exist: {args.val_dir}")
+
+    # Default checkpoints under the dataset path if not provided
+    if args.output is None:
+        args.output = str(input_path / "checkpoints")
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
 

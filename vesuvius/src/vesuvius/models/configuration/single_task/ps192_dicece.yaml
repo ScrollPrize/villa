@@ -4,9 +4,9 @@ tr_config:
   augment_on_device: false
 
 dataset_config:
-  min_labeled_ratio: 0 
-  min_bbox_percent: 0
-  skip_patch_validation: true
+  min_labeled_ratio: 0.5
+  min_bbox_percent: 0.5
+  skip_patch_validation: false
   targets:
     surface:
       activation: "none"

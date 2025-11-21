@@ -296,14 +296,37 @@ class ChunkSlicer:
         positions: List[Tuple[int, Tuple[int, ...]]] = []
         entries: List[Dict[str, object]] = []
 
-        for labeled_idx, volume in enumerate(labeled_volumes):
+        try:
+            from tqdm import tqdm  # type: ignore
+        except Exception:  # pragma: no cover - optional dependency
+            tqdm = None
+
+        volume_iter = enumerate(labeled_volumes)
+        if tqdm is not None:
+            volume_iter = tqdm(
+                volume_iter,
+                total=len(labeled_volumes),
+                desc="Validating label volumes",
+                unit="vol",
+            )
+
+        for labeled_idx, volume in volume_iter:
             label_array = volume.label_source
             if label_array is None:
                 continue
 
             ignore_value = volume.label_ignore_value
             candidate_patches = self.enumerate(volume, stride=self.config.stride)
-            for candidate in candidate_patches:
+            patch_iter = candidate_patches
+            if tqdm is not None:
+                patch_iter = tqdm(
+                    candidate_patches,
+                    desc=f"[{volume.name}] patches",
+                    leave=False,
+                    unit="patch",
+                )
+
+            for candidate in patch_iter:
                 mask_patch = self._extract_label_patch(label_array, candidate.position)
                 if mask_patch is None:
                     continue
@@ -344,6 +367,9 @@ class ChunkSlicer:
                         'start_pos': list(position),
                     }
                 )
+
+            if tqdm is not None:
+                patch_iter.close()  # type: ignore[attr-defined]
 
         return positions, entries
 

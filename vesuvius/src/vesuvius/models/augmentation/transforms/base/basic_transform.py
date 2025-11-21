@@ -24,27 +24,32 @@ class BasicTransform(abc.ABC):
         # Special handling for known keys
         if data_dict.get('image') is not None:
             # Always transform images, even for unlabeled data
-            data_dict['image'] = self._apply_to_image(data_dict['image'], **params)
+            data_dict['image'] = self._apply_and_check('image', self._apply_to_image, data_dict['image'], **params)
 
         # Skip all label transforms for unlabeled data
         if not is_unlabeled:
             if data_dict.get('regression_target') is not None:
-                data_dict['regression_target'] = self._apply_to_segmentation(data_dict['regression_target'], **params)
+                data_dict['regression_target'] = self._apply_and_check(
+                    'regression_target', self._apply_to_segmentation, data_dict['regression_target'], **params)
 
             if data_dict.get('segmentation') is not None:
-                data_dict['segmentation'] = self._apply_to_segmentation(data_dict['segmentation'], **params)
+                data_dict['segmentation'] = self._apply_and_check(
+                    'segmentation', self._apply_to_segmentation, data_dict['segmentation'], **params)
 
             if data_dict.get('dist_map') is not None:
-                data_dict['dist_map'] = self._apply_to_dist_map(data_dict['dist_map'], **params)
+                data_dict['dist_map'] = self._apply_and_check(
+                    'dist_map', self._apply_to_dist_map, data_dict['dist_map'], **params)
 
             if data_dict.get('geols_labels') is not None:
-                data_dict['geols_labels'] = self._apply_to_dist_map(data_dict['geols_labels'], **params)
+                data_dict['geols_labels'] = self._apply_and_check(
+                    'geols_labels', self._apply_to_dist_map, data_dict['geols_labels'], **params)
 
             if data_dict.get('keypoints') is not None:
-                data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
+                data_dict['keypoints'] = self._apply_and_check(
+                    'keypoints', self._apply_to_keypoints, data_dict['keypoints'], **params)
 
             if data_dict.get('bbox') is not None:
-                data_dict['bbox'] = self._apply_to_bbox(data_dict['bbox'], **params)
+                data_dict['bbox'] = self._apply_and_check('bbox', self._apply_to_bbox, data_dict['bbox'], **params)
 
             # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
             # Skip 'ignore_masks' as it shouldn't be transformed
@@ -57,9 +62,11 @@ class BasicTransform(abc.ABC):
                     continue
                 # Choose interpolation mode based on whether the key is marked as regression
                 if key in regression_keys:
-                    data_dict[key] = self._apply_to_regr_target(data_dict[key], **params)
+                    data_dict[key] = self._apply_and_check(
+                        key, self._apply_to_regr_target, data_dict[key], **params)
                 else:
-                    data_dict[key] = self._apply_to_segmentation(data_dict[key], **params)
+                    data_dict[key] = self._apply_and_check(
+                        key, self._apply_to_segmentation, data_dict[key], **params)
 
         return data_dict
 
@@ -87,6 +94,23 @@ class BasicTransform(abc.ABC):
     def get_parameters(self, **data_dict) -> dict:
         return {}
 
+    def _apply_and_check(self, key, fn, value, **params):
+        if value is None:
+            return value
+        result = fn(value, **params)
+        self._log_if_invalid(key, result)
+        return result
+
+    def _log_if_invalid(self, key, tensor):
+        if not torch.is_tensor(tensor):
+            return
+        if torch.isfinite(tensor).all().item():
+            return
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        print(f"[Augmentation Warning] {type(self).__name__} produced NaN/Inf in '{key}' "
+              f"(nan={nan_count}, inf={inf_count})")
+
     def __repr__(self):
         ret_str = str(type(self).__name__) + "( " + ", ".join(
             [key + " = " + repr(val) for key, val in self.__dict__.items()]) + " )"
@@ -96,14 +120,15 @@ class BasicTransform(abc.ABC):
 class ImageOnlyTransform(BasicTransform):
     def apply(self, data_dict: dict, **params) -> dict:
         if data_dict.get('image') is not None:
-            data_dict['image'] = self._apply_to_image(data_dict['image'], **params)
+            data_dict['image'] = self._apply_and_check('image', self._apply_to_image, data_dict['image'], **params)
         return data_dict
 
 
 class SegOnlyTransform(BasicTransform):
     def apply(self, data_dict: dict, **params) -> dict:
         if data_dict.get('segmentation') is not None:
-            data_dict['segmentation'] = self._apply_to_segmentation(data_dict['segmentation'], **params)
+            data_dict['segmentation'] = self._apply_and_check(
+                'segmentation', self._apply_to_segmentation, data_dict['segmentation'], **params)
         return data_dict
 
 
