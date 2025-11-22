@@ -20,6 +20,7 @@ class Inference:
 
         self.model = model
         self.config = config
+        self.heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
 
         model = self.accelerator.prepare(model)
         model.eval()
@@ -33,11 +34,12 @@ class Inference:
 
     def get_heatmaps_at(self, zyx, prev_u, prev_v, prev_diag):
         crop_size = self.config['crop_size']
+        heatmap_sigma = self.heatmap_sigma
         volume_crop, min_corner_zyx = get_crop_from_volume(self.volume, zyx, crop_size)
         localiser = build_localiser(zyx, min_corner_zyx, crop_size)
-        prev_u_heatmap = make_heatmaps([prev_u[None]], min_corner_zyx, crop_size) if prev_u is not None else torch.zeros([1, crop_size, crop_size, crop_size])
-        prev_v_heatmap = make_heatmaps([prev_v[None]], min_corner_zyx, crop_size) if prev_v is not None else torch.zeros([1, crop_size, crop_size, crop_size])
-        prev_diag_heatmap = make_heatmaps([prev_diag[None]], min_corner_zyx, crop_size) if prev_diag is not None else torch.zeros([1, crop_size, crop_size, crop_size])
+        prev_u_heatmap = make_heatmaps([prev_u[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma) if prev_u is not None else torch.zeros([1, crop_size, crop_size, crop_size])
+        prev_v_heatmap = make_heatmaps([prev_v[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma) if prev_v is not None else torch.zeros([1, crop_size, crop_size, crop_size])
+        prev_diag_heatmap = make_heatmaps([prev_diag[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma) if prev_diag is not None else torch.zeros([1, crop_size, crop_size, crop_size])
         inputs = torch.cat([
             volume_crop[None, None].to(self.accelerator.device),
             localiser[None, None].to(self.accelerator.device),

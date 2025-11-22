@@ -1,3 +1,4 @@
+import copy
 import os
 import cv2
 import zarr
@@ -10,11 +11,12 @@ import scipy.ndimage
 import networkx as nx
 from tqdm import tqdm
 from einops import rearrange
+from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
-from fft_conv_pytorch import fft_conv
 
 import vesuvius.neural_tracing.augmentation as augmentation
+
 
 
 @dataclass
@@ -22,6 +24,7 @@ class Patch:
     zyxs: torch.Tensor
     scale: torch.Tensor
     volume: zarr.Array
+    volume_name: str | None = None
 
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
@@ -37,7 +40,8 @@ class Patch:
         return Patch(
             torch.where((self.zyxs == -1).all(dim=-1, keepdim=True), -1, self.zyxs / factor),
             self.scale * factor,
-            self.volume
+            self.volume,
+            self.volume_name,
         )
 
 
@@ -57,7 +61,9 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
         # assert num_context_points >= 1  # ...since we always include one point at the center of the patch
         crop_size = torch.tensor(self._config['crop_size'])
 
+        sample_idx = 0
         while True:
+            sample_idx += 1
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
@@ -80,7 +86,7 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             # context_zyxs = [self._get_zyx_from_patch(context_ij, patch) for context_ij in context_ij]
 
             # Crop ROI out of the volume; mark context points
-            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
+            volume_crop, min_corner_zyx = self._get_crop_from_volume(patch.volume, center_zyx, crop_size)
             # self._mark_context_point(volume_crop, center_zyx - min_corner_zyx)
             # for context_zyx in context_zyxs:
             #     self._mark_context_point(volume_crop, context_zyx - min_corner_zyx)
@@ -172,8 +178,9 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
             volume_crop = augmented['image'].squeeze(0)
             localiser = augmented['dist_map'][0]
             uvws = rearrange(augmented['dist_map'][1:], 'c z y x -> z y x c')
-            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uvws)):
+            if not torch.isfinite(volume_crop).all() or not torch.isfinite(localiser).all() or not torch.isfinite(uvws).all():
                 # FIXME: why do these NaNs happen occasionally?
+                print(f"[DataWarning] NaN/Inf encountered (sample {sample_idx}, volume={getattr(patch, 'volume_name', None)})")
                 continue  
 
             yield {
@@ -184,15 +191,71 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
 
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
+    _channel_range_cache = {}
+    _kernel_offsets_cache = {}
+    _kernel_value_cache = {}
 
     def __init__(self, config, patches_for_split):
         self._config = config
         self._patches = patches_for_split
+        self._heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
         self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
         self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels
         self._main_component_distance_factor = config['point_perturbation']['main_component_distance_factor']
+
+        self._perturb_cache_key = None
+        self._perturb_cache_value = None
+        self._use_zscore = config.get("zscore", True)
+        self._sampling = {}
+        self._quad_bboxes = {}
+
+        for patch in self._patches:
+            top_left = patch.zyxs[:-1, :-1]
+            top_right = patch.zyxs[:-1, 1:]
+            bottom_left = patch.zyxs[1:, :-1]
+            bottom_right = patch.zyxs[1:, 1:]
+            quad_corners = torch.stack([
+                torch.stack([top_left, top_right], dim=2),
+                torch.stack([bottom_left, bottom_right], dim=2),
+            ], dim=2)  # shape: (h-1, w-1, 2, 2, 3)
+            points_per_side = (1 / patch.scale + 0.5).int()
+            v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
+            u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
+            self._sampling[id(patch)] = {
+                "quad_corners": quad_corners,
+                "v_points": v_points,
+                "u_points": u_points,
+                "uv_weights": self._make_quad_weights(v_points, u_points),
+                "quad_corners_flat": quad_corners.view(*quad_corners.shape[:2], 4, 3),
+            }
+
+            valid_centers = patch.quad_centers[patch.valid_quad_mask]
+            if len(valid_centers) == 0:
+                bbox_min = torch.zeros(3, dtype=patch.quad_centers.dtype)
+                bbox_max = bbox_min
+            else:
+                bbox_min = valid_centers.min(dim=0).values
+                bbox_max = valid_centers.max(dim=0).values
+            self._quad_bboxes[id(patch)] = (bbox_min, bbox_max)
+
+    def _normalize_volume_crop(self, volume_crop: torch.Tensor) -> torch.Tensor:
+        if self._use_zscore:
+            mean = torch.mean(volume_crop)
+            std = torch.std(volume_crop).clamp(min=1e-8)
+            return (volume_crop - mean) / std
+        return volume_crop
+
+    def _get_crop_from_volume(self, volume, center_zyx, crop_size):
+        if self._use_zscore:
+            volume_crop, min_corner_zyx = get_crop_from_volume(volume, center_zyx, crop_size, normalize=False)
+            volume_crop = self._normalize_volume_crop(volume_crop)
+            return volume_crop, min_corner_zyx
+
+        volume_crop, min_corner_zyx = get_crop_from_volume(volume, center_zyx, crop_size)
+        volume_crop = self._normalize_volume_crop(volume_crop)
+        return volume_crop, min_corner_zyx
 
     def _sample_points_from_quads(self, patch, quad_mask):
         """Sample points finely from quads specified by the mask"""
@@ -218,14 +281,47 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         
         return points_covering_quads.view(-1, 3)
 
+    @staticmethod
+    def _make_quad_weights(v_points, u_points):
+        one_minus_v = 1 - v_points
+        one_minus_u = 1 - u_points
+        w_tl = one_minus_v[:, None] * one_minus_u[None, :]
+        w_tr = one_minus_v[:, None] * u_points[None, :]
+        w_bl = v_points[:, None] * one_minus_u[None, :]
+        w_br = v_points[:, None] * u_points[None, :]
+        weights = torch.stack([w_tl, w_tr, w_bl, w_br], dim=-1)
+        return weights.view(-1, 4)
+
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
-        """Get mask of quads that fall within the crop region"""
-        return patch.valid_quad_mask & torch.all(patch.quad_centers >= min_corner_zyx, dim=-1) & torch.all(patch.quad_centers < min_corner_zyx + crop_size, dim=-1)
+        """Get mask of quads that fall within the crop region."""
+        bbox_min, bbox_max = self._quad_bboxes[id(patch)]
+        crop_min = min_corner_zyx.to(dtype=bbox_min.dtype)
+        crop_size_tensor = torch.as_tensor(crop_size, dtype=bbox_min.dtype, device=crop_min.device)
+        crop_max = crop_min + crop_size_tensor
+        if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
+            return torch.zeros_like(patch.valid_quad_mask)
+
+        return patch.valid_quad_mask & torch.all(patch.quad_centers >= crop_min, dim=-1) & torch.all(patch.quad_centers < crop_max, dim=-1)
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
+        bbox_min, bbox_max = self._quad_bboxes[id(patch)]
+        crop_min = min_corner_zyx.to(dtype=bbox_min.dtype)
+        crop_size_tensor = torch.as_tensor(crop_size, dtype=bbox_min.dtype)
+        crop_max = crop_min + crop_size_tensor
+        if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
+            return torch.empty((0, 3), dtype=torch.float32)
+
         quad_in_crop = self._get_quads_in_crop(patch, min_corner_zyx, crop_size)
-        return self._sample_points_from_quads(patch, quad_in_crop)
+        if not torch.any(quad_in_crop):
+            return torch.empty((0, 3), dtype=torch.float32)
+
+        info = self._sampling[id(patch)]
+        filtered_quads_zyxs = info["quad_corners_flat"][quad_in_crop]
+        weights = info["uv_weights"]
+        points_covering_quads = torch.einsum("kc,ncd->nkd", weights, filtered_quads_zyxs)
+
+        return points_covering_quads.reshape(-1, 3)
 
     def _get_current_patch_center_component_mask(self, current_patch, center_ij, min_corner_zyx, crop_size):
         """Get the mask of the connected component containing the center point"""
@@ -252,50 +348,62 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         
         return component_mask
 
-    def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
-        """Pre-compute and cache all patch points for efficient distance calculations"""
-        
-        # Get the main component mask
+    def _make_cache_key(self, patch, center_ij, min_corner_zyx, crop_size):
+        return (
+            id(patch),
+            tuple(center_ij.tolist()),
+            tuple(min_corner_zyx.tolist()),
+            int(crop_size),
+        )
+
+    def _compute_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        """Pre-compute the patch-point sets for a given crop context."""
         quad_main_component = self._get_current_patch_center_component_mask(current_patch, center_ij, min_corner_zyx, crop_size)
-        
+
         all_patch_points = []
-        
-        # Check all other patches from the same volume
         for other_patch in self._patches:
             if other_patch is current_patch or other_patch.volume is not current_patch.volume:
-                continue  # Skip current patch and patches from different volumes
-            
-            # Get finely sampled points from this patch in the crop region
+                continue
             patch_points = self._get_patch_points_in_crop(other_patch, min_corner_zyx, crop_size)
-            
             if len(patch_points) > 0:
                 all_patch_points.append(patch_points)
-        
-        # Check other parts of the current patch (excluding main component)
+
         quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
         quad_excluding_main = quad_in_crop & ~quad_main_component
-        
-        # Sample points from remaining parts of current patch
         other_patch_points = self._sample_points_from_quads(current_patch, quad_excluding_main)
-        
         if len(other_patch_points) > 0:
             all_patch_points.append(other_patch_points)
-        
+
         return all_patch_points
+
+    def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        """Pre-compute and cache all patch points for efficient distance calculations."""
+        key = self._make_cache_key(current_patch, center_ij, min_corner_zyx, crop_size)
+        if key != self._perturb_cache_key:
+            self._perturb_cache_key = key
+            raw_points = self._compute_cached_patch_points(current_patch, center_ij, min_corner_zyx, crop_size)
+            concat = None
+            if raw_points and any(p.numel() > 0 for p in raw_points):
+                concat = torch.cat([p for p in raw_points if p.numel() > 0], dim=0)
+            self._perturb_cache_value = {"points": raw_points, "concat": concat}
+        return self._perturb_cache_value
 
     def _get_distance_to_nearest_patch_cached(self, point_zyx, cached_patch_points):
         """Calculate the distance to the nearest patch using pre-computed patch points"""
-        
         if not cached_patch_points:
             return float('inf')
-        
+        if isinstance(cached_patch_points, dict):
+            concat = cached_patch_points.get("concat", None)
+            if concat is None or concat.numel() == 0:
+                return float('inf')
+            return torch.norm(concat - point_zyx, dim=-1).min().item()
+
         min_distance = float('inf')
-        
         for patch_points in cached_patch_points:
-            # Calculate minimum distance to any point in this patch
+            if patch_points.numel() == 0:
+                continue
             distances = torch.norm(patch_points - point_zyx, dim=-1)
             min_distance = min(min_distance, distances.min().item())
-        
         return min_distance
 
     def _get_perturbed_zyx_from_patch(self, point_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=False):
@@ -373,31 +481,99 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         return final_zyx
 
     @classmethod
-    def make_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size):
+    def _get_channel_range(cls, num_channels, device):
+        key = (num_channels, device)
+        if key not in cls._channel_range_cache:
+            cls._channel_range_cache[key] = torch.arange(num_channels, device=device)
+        return cls._channel_range_cache[key]
 
-        # zyxs is a list of different 'kinds' of points (positive / negative, U/V); each entry is a list zyxs at different steps
-        assert all(zyxs.shape[0] == all_zyxs[0].shape[0] for zyxs in all_zyxs)
-        heatmaps = torch.zeros([crop_size, crop_size, crop_size, all_zyxs[0].shape[0]])
-        def scatter(zyxs):
-            coords = torch.cat([
-                (zyxs - min_corner_zyx + 0.5).int(),
-                torch.arange(zyxs.shape[0])[:, None]
-            ], dim=1)
-            # FIXME: the following shouldn't be needed
-            coords = coords[(coords[..., :3] >= 0).all(dim=1) & (coords[..., :3] < crop_size).all(dim=1)]
-            heatmaps[*coords.T] = 1.
+    @classmethod
+    def _get_kernel_offsets(cls, device, sigma):
+        sigma = float(sigma)
+        if sigma not in cls._kernel_offsets_cache:
+            _, kernel_size = _get_gaussian_kernel(sigma)
+            radius = kernel_size // 2
+            coords = torch.arange(kernel_size) - radius
+            z_off, y_off, x_off = torch.meshgrid(coords, coords, coords, indexing='ij')
+            cls._kernel_offsets_cache[sigma] = torch.stack([z_off, y_off, x_off], dim=-1).view(-1, 3)
+        return cls._kernel_offsets_cache[sigma].to(device=device)
+
+    @classmethod
+    def _get_kernel_values(cls, device, dtype, sigma):
+        key = (device, dtype, float(sigma))
+        if key not in cls._kernel_value_cache:
+            kernel, _ = _get_gaussian_kernel(sigma)
+            cls._kernel_value_cache[key] = kernel.to(device=device, dtype=dtype).reshape(-1)
+        return cls._kernel_value_cache[key]
+
+    @classmethod
+    def _collect_coords(cls, all_zyxs, min_corner_zyx, crop_size_int, device, dtype):
+        channel_count = all_zyxs[0].shape[0]
+        coords_accum = []
+        channel_accum = []
+        channel_range = cls._get_channel_range(channel_count, device)
+        min_corner = min_corner_zyx.to(device=device, dtype=dtype)
+
         for zyxs in all_zyxs:
-            scatter(zyxs)
+            coords = (zyxs.to(device=device, dtype=dtype) - min_corner + 0.5).to(torch.int64)
+            valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_int).all(dim=1)
+            if not torch.any(valid_mask):
+                continue
+            coords_accum.append(coords[valid_mask])
+            channel_accum.append(channel_range[valid_mask])
 
-        convolved = fft_conv(
-            rearrange(heatmaps, 'z y x c -> c 1 z y x'),
-            kernel[None, None],
-            padding=kernel_size // 2
-        )
+        if not coords_accum:
+            return channel_count, None, None
 
-        heatmaps_gaussian = rearrange(convolved, 'c 1 z y x -> c z y x')
+        all_coords = torch.cat(coords_accum, dim=0)
+        all_channels = torch.cat(channel_accum, dim=0)
+        return channel_count, all_coords, all_channels
 
-        return heatmaps_gaussian
+    @classmethod
+    def _scatter_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size):
+        crop_size_int = int(crop_size)
+        dtype = all_zyxs[0].dtype
+        device = all_zyxs[0].device
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
+        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+
+        if coords is None:
+            return heatmaps
+
+        z, y, x = coords.unbind(dim=1)
+        values = torch.ones_like(channels, dtype=dtype)
+        heatmaps.index_put_((channels, z, y, x), values, accumulate=True)
+        return heatmaps
+
+    @classmethod
+    def make_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size, apply_gaussian=True, sigma: float = 2.0):
+        if not apply_gaussian:
+            return cls._scatter_heatmaps(all_zyxs, min_corner_zyx, crop_size)
+
+        crop_size_int = int(crop_size)
+        dtype = all_zyxs[0].dtype
+        device = all_zyxs[0].device
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
+        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+
+        if coords is None:
+            return heatmaps
+
+        kernel_offsets = cls._get_kernel_offsets(device, sigma)
+        kernel_values = cls._get_kernel_values(device, dtype, sigma)
+
+        expanded_coords = coords[:, None, :] + kernel_offsets[None, :, :]
+        in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_int).all(dim=-1)
+
+        if torch.any(in_bounds):
+            valid_positions = expanded_coords[in_bounds]
+            valid_channels = channels[:, None].expand(-1, kernel_offsets.shape[0])[in_bounds]
+            valid_values = kernel_values.expand(coords.shape[0], -1)[in_bounds]
+
+            z, y, x = valid_positions.unbind(dim=1)
+            heatmaps.index_put_((valid_channels, z, y, x), valid_values, accumulate=True)
+
+        return heatmaps
 
     def __iter__(self):
 
@@ -406,8 +582,11 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         crop_size = torch.tensor(self._config['crop_size'])
         step_size = torch.tensor(self._config['step_size'])
         step_count = torch.tensor(self._config['step_count'])
+        heatmap_sigma = self._heatmap_sigma
 
+        sample_idx = 0
         while True:
+            sample_idx += 1
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
@@ -423,32 +602,34 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
             v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
 
-            # Check all points lie inside the patch
-            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if not patch.valid_vertex_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_vertex_mask[*v_pos_shifted_ijs.int().T].all():
-                continue
-            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if not patch.valid_vertex_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_vertex_mask[*v_neg_shifted_ijs.int().T].all():
-                continue
-            # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
-            # FIXME: if the 'missing' point is on the negative side and the relevant _cond is true, then actually we're fine
+            def valid_steps(shifted_ijs):
+                ij_int = shifted_ijs.long()
+                h, w = patch.valid_vertex_mask.shape[:2]
+                in_bounds = (ij_int[:, 0] >= 0) & (ij_int[:, 0] < h) & (ij_int[:, 1] >= 0) & (ij_int[:, 1] < w)
+                valid = torch.zeros(shifted_ijs.shape[0], dtype=torch.bool, device=shifted_ijs.device)
+                if in_bounds.any():
+                    valid[in_bounds] = patch.valid_vertex_mask[ij_int[in_bounds, 0], ij_int[in_bounds, 1]]
+                return valid
+
+            u_pos_valid = valid_steps(u_pos_shifted_ijs)
+            u_neg_valid = valid_steps(u_neg_shifted_ijs)
+            v_pos_valid = valid_steps(v_pos_shifted_ijs)
+            v_neg_valid = valid_steps(v_neg_shifted_ijs)
 
             # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
             if torch.rand([]) < 0.5:
                 u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
+                u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
             if torch.rand([]) < 0.5:
                 v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
+                v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
 
             # Similarly, randomly swap U & V axes
             if torch.rand([]) < 0.5:
                 u_pos_shifted_ijs, v_pos_shifted_ijs = v_pos_shifted_ijs, u_pos_shifted_ijs
                 u_neg_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, u_neg_shifted_ijs
+                u_pos_valid, v_pos_valid = v_pos_valid, u_pos_valid
+                u_neg_valid, v_neg_valid = v_neg_valid, u_neg_valid
 
             # Apply perturbations to center and negative points
             if torch.rand([]) < self._perturb_prob:
@@ -458,22 +639,25 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 center_zyx = self._get_perturbed_zyx_from_patch(center_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=True)
                 
                 # Perturb negative points (context points) in 3D (both uv and normal)
-                u_neg_shifted_zyxs = torch.stack([
-                    self._get_perturbed_zyx_from_patch(u_neg_shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False) 
-                    for i in range(len(u_neg_shifted_ijs))
-                ])
-                v_neg_shifted_zyxs = torch.stack([
-                    self._get_perturbed_zyx_from_patch(v_neg_shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False) 
-                    for i in range(len(v_neg_shifted_ijs))
-                ])
+                def _perturb_or_lookup(shifted_ijs, valid_mask):
+                    zyxs = []
+                    for i in range(len(shifted_ijs)):
+                        if valid_mask[i]:
+                            zyxs.append(self._get_perturbed_zyx_from_patch(shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False))
+                        else:
+                            zyxs.append(get_zyx_from_patch(shifted_ijs[i], patch))
+                    return torch.stack(zyxs)
+
+                u_neg_shifted_zyxs = _perturb_or_lookup(u_neg_shifted_ijs, u_neg_valid)
+                v_neg_shifted_zyxs = _perturb_or_lookup(v_neg_shifted_ijs, v_neg_valid)
                 
             else:
                 # No perturbation applied, use original coordinates
                 u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
                 v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
             
-            # Get crop volume and its min-corner (which may be slightly negative)
-            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
+            # Get crop volume (with optional normalization) and its min-corner (which may be slightly negative)
+            volume_crop, min_corner_zyx = self._get_crop_from_volume(patch.volume, center_zyx, crop_size)
 
             # Map to 3D space and construct heatmaps
             u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
@@ -483,13 +667,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 if cond:
                     # Conditioning on this direction: include one negative point as input, and all positive as output
                     assert suppress_out is None
-                    in_heatmaps = self.make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size)
-                    out_heatmaps = self.make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size)
+                    in_heatmaps = self.make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                    out_heatmaps = self.make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size, sigma=heatmap_sigma)
                 else:
                     # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
                     in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
                     out_points = ([pos_shifted_zyxs] if suppress_out != 'pos' else []) + ([neg_shifted_zyxs] if suppress_out != 'neg' else [])
-                    out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
+                    out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size, sigma=heatmap_sigma) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
                 return in_heatmaps, out_heatmaps
 
             # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
@@ -526,6 +710,25 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             else:
                 diag_zyx = None
 
+            if (u_cond and not u_neg_valid[0]) or (v_cond and not v_neg_valid[0]):
+                continue
+
+            def build_out_channel_mask(cond, suppress_out, pos_valid, neg_valid):
+                if cond:
+                    return pos_valid
+                mask = torch.zeros_like(pos_valid)
+                if suppress_out != 'pos':
+                    mask |= pos_valid
+                if suppress_out != 'neg':
+                    mask |= neg_valid
+                return mask
+
+            u_out_channel_mask = build_out_channel_mask(u_cond, suppress_out_u, u_pos_valid, u_neg_valid)
+            v_out_channel_mask = build_out_channel_mask(v_cond, suppress_out_v, v_pos_valid, v_neg_valid)
+            if not (u_out_channel_mask.any() or v_out_channel_mask.any()):
+                # No valid supervision remaining
+                continue
+
             # *_in_heatmaps always have a single plane, either the first negative point or empty
             # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
             u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
@@ -533,11 +736,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if ~u_cond and ~v_cond:
                 # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
                 u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
+                combined_mask = u_out_channel_mask | v_out_channel_mask
+                u_out_channel_mask = v_out_channel_mask = combined_mask
             if diag_zyx is not None:
-                diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size)
+                diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
             else:
                 diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
             uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
+            out_channel_mask = torch.cat([u_out_channel_mask, v_out_channel_mask])
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -557,18 +763,318 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             volume_crop = augmented['image'].squeeze(0)
             localiser = augmented['dist_map'].squeeze(0)
             uv_heatmaps_both = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
-            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uv_heatmaps_both)):
+            if not torch.isfinite(volume_crop).all() or not torch.isfinite(localiser).all() or not torch.isfinite(uv_heatmaps_both).all():
                 # FIXME: why do these NaNs happen occasionally?
+                print(f"[DataWarning] NaN/Inf encountered (sample {sample_idx}, volume={getattr(patch, 'volume_name', None)})")
                 continue
 
             uv_heatmaps_in = uv_heatmaps_both[..., :3]
             uv_heatmaps_out = uv_heatmaps_both[..., 3:]
+            out_channel_mask_expanded = out_channel_mask.to(device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype).view(1, 1, 1, -1)
+            uv_heatmaps_out_mask = out_channel_mask_expanded.expand_as(uv_heatmaps_out)
+            uv_heatmaps_out = uv_heatmaps_out * uv_heatmaps_out_mask
 
             yield {
                 'volume': volume_crop,
                 'localiser': localiser,
                 'uv_heatmaps_in': uv_heatmaps_in,
                 'uv_heatmaps_out': uv_heatmaps_out,
+                'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
+            }
+
+
+class ForwardAlignedHeatmapDataset(HeatmapDatasetV2):
+    """
+    Aligns each crop to a local canonical frame before augmentation so that the positive U
+    direction becomes +X, the V direction becomes +Y, and the surface normal becomes +Z. This
+    reduces directional variance and makes "forward" consistent across samples.
+    """
+
+    _local_grid_cache = {}
+
+    def __init__(self, config, patches_for_split):
+        cfg = copy.deepcopy(config)
+        forward_cfg = cfg.get("forward_align", {})
+        aug_cfg = cfg.setdefault("augmentation", {})
+        aug_cfg["allow_transposes"] = forward_cfg.get("allow_transposes", False)
+
+        self._forward_align_cfg = forward_cfg
+        super().__init__(cfg, patches_for_split)
+
+    @staticmethod
+    def _safe_normalize(vec, eps=1e-6):
+        norm = torch.linalg.norm(vec)
+        if (not torch.isfinite(norm).item()) or norm.item() < eps:
+            return None
+        return vec / norm
+
+    def _estimate_local_frame(self, patch, center_ij):
+        """Build an orthonormal frame from patch geometry; returns R whose columns are (fwd, side, normal) in zyx."""
+        device = patch.zyxs.device
+        dtype = patch.zyxs.dtype
+
+        def sample(offset):
+            return get_zyx_from_patch(center_ij + offset, patch).to(device=device, dtype=dtype)
+
+        u_offset = torch.tensor([0.0, 1.0], device=device, dtype=dtype)
+        v_offset = torch.tensor([1.0, 0.0], device=device, dtype=dtype)
+
+        forward_vec = sample(u_offset) - sample(-u_offset)
+        side_vec = sample(v_offset) - sample(-v_offset)
+
+        forward = self._safe_normalize(forward_vec)
+        side = self._safe_normalize(side_vec)
+        if forward is None or side is None:
+            return None
+
+        normal = self._safe_normalize(torch.linalg.cross(forward, side))
+        if normal is None:
+            return None
+
+        side = self._safe_normalize(side - torch.dot(side, forward) * forward - torch.dot(side, normal) * normal) or torch.linalg.cross(normal, forward)
+        forward = self._safe_normalize(forward - torch.dot(forward, normal) * normal) or torch.linalg.cross(side, normal)
+
+        if side is None or forward is None:
+            return None
+
+        if self._forward_align_cfg.get("prefer_positive_normal_z", True) and normal[0] < 0:
+            normal = -normal
+            forward = -forward
+
+        return torch.stack([forward, side, normal], dim=1)  # columns: x/y/z in global zyx coords
+
+    @classmethod
+    def _get_local_grid(cls, crop_size, device, dtype):
+        key = (int(crop_size), device, dtype)
+        if key not in cls._local_grid_cache:
+            size = int(crop_size)
+            z, y, x = torch.meshgrid(
+                torch.arange(size, device=device),
+                torch.arange(size, device=device),
+                torch.arange(size, device=device),
+                indexing="ij",
+            )
+            center = (size - 1) / 2.0
+            coords_local = torch.stack([x - center, y - center, z - center], dim=-1).to(dtype=dtype)
+            cls._local_grid_cache[key] = (coords_local.view(-1, 3), center)
+        return cls._local_grid_cache[key]
+
+    def _make_rotation_grid(self, R, crop_size, device, dtype):
+        coords_local_flat, center = self._get_local_grid(crop_size, device, dtype)
+        rotated = coords_local_flat @ R.T + center  # back to global zyx voxel coordinates
+        coords = rotated.view(int(crop_size), int(crop_size), int(crop_size), 3)
+
+        norm = (crop_size - 1)
+        grid = torch.empty((1, int(crop_size), int(crop_size), int(crop_size), 3), device=device, dtype=dtype)
+        grid[..., 0] = coords[..., 2] * 2.0 / norm - 1.0  # x
+        grid[..., 1] = coords[..., 1] * 2.0 / norm - 1.0  # y
+        grid[..., 2] = coords[..., 0] * 2.0 / norm - 1.0  # z
+        return grid
+
+    def _apply_forward_alignment(self, volume_crop, localiser, uv_heatmaps_both, patch, center_ij):
+        frame = self._estimate_local_frame(patch, center_ij)
+        if frame is None:
+            return volume_crop, localiser, uv_heatmaps_both
+
+        crop_size = volume_crop.shape[0]
+        grid = self._make_rotation_grid(frame.to(device=volume_crop.device, dtype=volume_crop.dtype), crop_size, volume_crop.device, volume_crop.dtype)
+
+        volume_rot = F.grid_sample(
+            volume_crop[None, None],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).squeeze(0).squeeze(0)
+
+        localiser_rot = F.grid_sample(
+            localiser[None, None],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).squeeze(0).squeeze(0)
+
+        uv_both_rot = F.grid_sample(
+            uv_heatmaps_both.permute(3, 0, 1, 2)[None],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).squeeze(0).permute(1, 2, 3, 0)
+
+        return volume_rot, localiser_rot, uv_both_rot
+
+    def __iter__(self):
+        areas = torch.tensor([patch.area for patch in self._patches])
+        area_weights = areas / areas.sum()
+        crop_size = torch.tensor(self._config['crop_size'])
+        step_size = torch.tensor(self._config['step_size'])
+        step_count = torch.tensor(self._config['step_count'])
+        heatmap_sigma = self._heatmap_sigma
+
+        sample_idx = 0
+        while True:
+            sample_idx += 1
+            patch = random.choices(self._patches, weights=area_weights)[0]
+
+            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            start_quad_ij = patch.valid_quad_indices[random_idx]
+            center_ij = start_quad_ij + torch.rand(size=[2])
+            center_zyx = get_zyx_from_patch(center_ij, patch)
+
+            uv_deltas = torch.arange(1, step_count + 1)[:, None] * step_size * patch.scale
+            u_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([1, 0])
+            u_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([1, 0])
+            v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
+            v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
+
+            def valid_steps(shifted_ijs):
+                ij_int = shifted_ijs.long()
+                h, w = patch.valid_vertex_mask.shape[:2]
+                in_bounds = (ij_int[:, 0] >= 0) & (ij_int[:, 0] < h) & (ij_int[:, 1] >= 0) & (ij_int[:, 1] < w)
+                valid = torch.zeros(shifted_ijs.shape[0], dtype=torch.bool, device=shifted_ijs.device)
+                if in_bounds.any():
+                    valid[in_bounds] = patch.valid_vertex_mask[ij_int[in_bounds, 0], ij_int[in_bounds, 1]]
+                return valid
+
+            u_pos_valid = valid_steps(u_pos_shifted_ijs)
+            u_neg_valid = valid_steps(u_neg_shifted_ijs)
+            v_pos_valid = valid_steps(v_pos_shifted_ijs)
+            v_neg_valid = valid_steps(v_neg_shifted_ijs)
+
+            if torch.rand([]) < 0.5:
+                u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
+                u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
+            if torch.rand([]) < 0.5:
+                v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
+                v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
+            if torch.rand([]) < 0.5:
+                u_pos_shifted_ijs, v_pos_shifted_ijs = v_pos_shifted_ijs, u_pos_shifted_ijs
+                u_neg_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, u_neg_shifted_ijs
+                u_pos_valid, v_pos_valid = v_pos_valid, u_pos_valid
+                u_neg_valid, v_neg_valid = v_neg_valid, u_neg_valid
+
+            if torch.rand([]) < self._perturb_prob:
+                min_corner_zyx = (center_zyx - crop_size // 2).int()
+
+                center_zyx = self._get_perturbed_zyx_from_patch(center_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=True)
+
+                def _perturb_or_lookup(shifted_ijs, valid_mask):
+                    zyxs = []
+                    for i in range(len(shifted_ijs)):
+                        if valid_mask[i]:
+                            zyxs.append(self._get_perturbed_zyx_from_patch(shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False))
+                        else:
+                            zyxs.append(get_zyx_from_patch(shifted_ijs[i], patch))
+                    return torch.stack(zyxs)
+
+                u_neg_shifted_zyxs = _perturb_or_lookup(u_neg_shifted_ijs, u_neg_valid)
+                v_neg_shifted_zyxs = _perturb_or_lookup(v_neg_shifted_ijs, v_neg_valid)
+
+            else:
+                u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
+                v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
+
+            volume_crop, min_corner_zyx = self._get_crop_from_volume(patch.volume, center_zyx, crop_size)
+
+            u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
+            v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
+
+            def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs, cond, suppress_out=None):
+                if cond:
+                    in_heatmaps = self.make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                    out_heatmaps = self.make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                else:
+                    in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
+                    out_points = ([pos_shifted_zyxs] if suppress_out != 'pos' else []) + ([neg_shifted_zyxs] if suppress_out != 'neg' else [])
+                    out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size, sigma=heatmap_sigma) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
+                return in_heatmaps, out_heatmaps
+
+            u_cond, v_cond = torch.rand([2]) < 0.75
+
+            diag_ij = None
+            suppress_out_u = suppress_out_v = None
+
+            if (u_cond ^ v_cond) and torch.rand([]) < 0.6:
+                diag_is_pos = torch.rand([]) < 0.5
+                if u_cond:
+                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], (v_pos_shifted_ijs if diag_is_pos else v_neg_shifted_ijs)[0, 1]])
+                    suppress_out_v = 'neg' if diag_is_pos else 'pos'
+                else:
+                    diag_ij = torch.stack([(u_pos_shifted_ijs if diag_is_pos else u_neg_shifted_ijs)[0, 0], v_neg_shifted_ijs[0, 1]])
+                    suppress_out_u = 'neg' if diag_is_pos else 'pos'
+            if (u_cond & v_cond) and torch.rand([]) < 0.5:
+                if torch.rand([]) < 0.5:
+                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]])
+                else:
+                    diag_ij = torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]])
+            if diag_ij is not None:
+                if torch.any(diag_ij < 0) or torch.any(diag_ij >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
+                    continue
+                if not patch.valid_vertex_mask[*diag_ij.int()]:
+                    continue
+                diag_zyx = get_zyx_from_patch(diag_ij, patch)
+            else:
+                diag_zyx = None
+
+            if (u_cond and not u_neg_valid[0]) or (v_cond and not v_neg_valid[0]):
+                continue
+
+            def build_out_channel_mask(cond, suppress_out, pos_valid, neg_valid):
+                if cond:
+                    return pos_valid
+                mask = torch.zeros_like(pos_valid)
+                if suppress_out != 'pos':
+                    mask |= pos_valid
+                if suppress_out != 'neg':
+                    mask |= neg_valid
+                return mask
+
+            u_out_channel_mask = build_out_channel_mask(u_cond, suppress_out_u, u_pos_valid, u_neg_valid)
+            v_out_channel_mask = build_out_channel_mask(v_cond, suppress_out_v, v_pos_valid, v_neg_valid)
+            if not (u_out_channel_mask.any() or v_out_channel_mask.any()):
+                continue
+
+            u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
+            v_in_heatmaps, v_out_heatmaps = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs, v_cond, suppress_out_v)
+            if ~u_cond and ~v_cond:
+                u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
+                combined_mask = u_out_channel_mask | v_out_channel_mask
+                u_out_channel_mask = v_out_channel_mask = combined_mask
+            if diag_zyx is not None:
+                diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+            else:
+                diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
+            uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
+            out_channel_mask = torch.cat([u_out_channel_mask, v_out_channel_mask])
+
+            localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
+
+            volume_crop, localiser, uv_heatmaps_both = self._apply_forward_alignment(volume_crop, localiser, rearrange(uv_heatmaps_both, 'c z y x -> z y x c'), patch, center_ij)
+
+            while True:
+                augmented = self._augmentations(image=volume_crop[None], dist_map=localiser[None], regression_target=uv_heatmaps_both.permute(3, 0, 1, 2))
+                if augmented['dist_map'] is not None:
+                    break
+            volume_crop = augmented['image'].squeeze(0)
+            localiser = augmented['dist_map'].squeeze(0)
+            uv_heatmaps_both = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
+            if not torch.isfinite(volume_crop).all() or not torch.isfinite(localiser).all() or not torch.isfinite(uv_heatmaps_both).all():
+                print(f"[DataWarning] NaN/Inf encountered (sample {sample_idx}, volume={getattr(patch, 'volume_name', None)})")
+                continue
+
+            uv_heatmaps_in = uv_heatmaps_both[..., :3]
+            uv_heatmaps_out = uv_heatmaps_both[..., 3:]
+            uv_heatmaps_out_mask = out_channel_mask.to(device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype).view(1, 1, 1, -1).expand_as(uv_heatmaps_out)
+            uv_heatmaps_out = uv_heatmaps_out * uv_heatmaps_out_mask
+
+            yield {
+                'volume': volume_crop,
+                'localiser': localiser,
+                'uv_heatmaps_in': uv_heatmaps_in,
+                'uv_heatmaps_out': uv_heatmaps_out,
+                'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
             }
 
 
@@ -594,17 +1100,20 @@ def get_zyx_from_patch(ij, patch):
     return rearrange(interpolated, '1 c b 1 -> b c').view(*batch_dims, -1)
 
 
-# FIXME: memoized method instead of global code
-sigma=2.
-kernel_size = int(6 * sigma + 1)
-if kernel_size % 2 == 0:
-    kernel_size += 1
-coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
-z_coords, y_coords, x_coords = torch.meshgrid(coords, coords, coords, indexing='ij')
-kernel = torch.exp(-(z_coords**2 + y_coords**2 + x_coords**2) / (2 * sigma**2))
+@lru_cache(maxsize=None)
+def _get_gaussian_kernel(sigma: float = 2.0):
+    """Build and cache a 3D Gaussian kernel for heatmap smoothing."""
+    sigma = float(sigma)
+    kernel_size = int(6 * sigma + 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+    z_coords, y_coords, x_coords = torch.meshgrid(coords, coords, coords, indexing='ij')
+    kernel = torch.exp(-(z_coords**2 + y_coords**2 + x_coords**2) / (2 * sigma**2))
+    return kernel, kernel_size
 
-def make_heatmaps(all_zyxs, min_corner_zyx, crop_size):
-    return HeatmapDatasetV2.make_heatmaps(all_zyxs, min_corner_zyx, crop_size)
+def make_heatmaps(all_zyxs, min_corner_zyx, crop_size, sigma: float = 2.0):
+    return HeatmapDatasetV2.make_heatmaps(all_zyxs, min_corner_zyx, crop_size, apply_gaussian=True, sigma=sigma)
 
 
 def load_datasets(config):
@@ -626,7 +1135,7 @@ def load_datasets(config):
         volume_scale = dataset['volume_scale']
         volume = ome_zarr[str(volume_scale)]
 
-        patches = load_tifxyz_patches(dataset['segments_path'], dataset.get('z_range', None), volume)
+        patches = load_tifxyz_patches(dataset['segments_path'], dataset.get('z_range', None), volume, volume_path)
         patches_wrt_volume_scale = dataset.get('segments_scale', 0)  # if specified, patches are assumed to already target the volume at this scale
 
         if 'roi_path' in dataset:
@@ -650,7 +1159,7 @@ def load_datasets(config):
     return train_patches, val_patches
 
 
-def load_tifxyz_patches(segments_path, z_range, volume):
+def load_tifxyz_patches(segments_path, z_range, volume, volume_name=None):
 
     segment_paths = glob.glob(segments_path + "/*")
     segment_paths = sorted([path for path in segment_paths if os.path.isdir(path)])
@@ -670,7 +1179,7 @@ def load_tifxyz_patches(segments_path, z_range, volume):
                 cv2.imread( f'{segment_path}/{coord}.tif', flags=cv2.IMREAD_UNCHANGED)
                 for coord in 'zyx'
             ], axis=-1))
-            all_patches.append(Patch(zyxs, scale, volume))
+            all_patches.append(Patch(zyxs, scale, volume, volume_name))
         except Exception as e:
             print(f'error loading {segment_path}: {e}')
             continue
@@ -699,12 +1208,13 @@ def filter_patches_by_roi(patches, approved_cubes):
                 valid_rows[0] : valid_rows[-1] + 1,
                 valid_cols[0] : valid_cols[-1] + 1
             ]
-            filtered_patches.append(Patch(cropped_zyxs, patch.scale, patch.volume))
+            filtered_patches.append(Patch(cropped_zyxs, patch.scale, patch.volume, patch.volume_name))
     return filtered_patches
 
 
-def get_crop_from_volume(volume, center_zyx, crop_size):
-    """Crop volume around center point, padding with zeros if needed"""
+def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
+    """Crop volume around center point, padding with zeros if needed.
+    When normalize is True, scales to [-1, 1]; otherwise returns raw values as float32."""
     crop_min = (center_zyx - crop_size // 2).int()
     crop_max = crop_min + crop_size
 
@@ -718,9 +1228,16 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         actual_min[1]:actual_max[1],
         actual_min[2]:actual_max[2]
     ]).to(torch.float32)
-    # TODO: should instead always use standardised uint8 volumes!
-    volume_crop /= 255. if volume.dtype == np.uint8 else volume_crop.amax()
-    volume_crop = volume_crop * 2 - 1
+    if normalize:
+        # TODO: should instead always use standardised uint8 volumes!
+        if volume.dtype == np.uint8:
+            volume_crop = volume_crop / 255.
+        else:
+            # Guard against empty/constant crops (amax == 0) or NaNs in the source data
+            max_val = torch.nan_to_num(volume_crop.abs().amax(), nan=0.0, posinf=0.0, neginf=0.0)
+            max_val = max_val.clamp_min(1e-6)
+            volume_crop = volume_crop / max_val
+        volume_crop = torch.nan_to_num(volume_crop * 2 - 1, nan=-1.0, posinf=1.0, neginf=-1.0)
 
     # Pad if needed
     pad_before = actual_min - crop_min
