@@ -2,8 +2,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn as nn
 from torch.nn import MSELoss, SmoothL1Loss, L1Loss
+from torch.nn.modules.loss import _Loss
 import sys
 import os
+import warnings
 from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     components_to_matrix,
@@ -62,6 +64,79 @@ class SkipLastTargetChannelWrapper(nn.Module):
             # squeeze channel dimension
             target = torch.squeeze(target, dim=1)
         return self.loss(input, target)
+
+
+class GeneralizedDiceLoss(_Loss):
+    """
+    Generalised Dice loss as described in:
+    Sudre, C. et al. (2017) "Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations."
+    """
+
+    def __init__(self, include_background: bool = True, do_sigmoid: bool = False, do_softmax: bool = False, w_type: str = "square"):
+        super().__init__()
+        if do_sigmoid and do_softmax:
+            raise ValueError("do_sigmoid=True and do_softmax=True are not compatible.")
+
+        self.include_background = include_background
+        self.do_sigmoid = do_sigmoid
+        self.do_softmax = do_softmax
+
+        if w_type == "uniform":
+            self.w_func = torch.ones_like
+        elif w_type == "simple":
+            self.w_func = lambda x: torch.reciprocal(x)
+        elif w_type == "square":
+            self.w_func = lambda x: torch.reciprocal(x * x)
+        else:
+            raise ValueError(f"unknown option for `w_type`: {w_type}")
+
+    def forward(self, pred: torch.Tensor, ground: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
+        """
+        Args:
+            pred: shape (B, C, H, W) or (B, C, D, H, W)
+            ground: either a label map with shape (B, 1, ...) or a one-hot / multi-label tensor with shape matching pred
+        """
+        if ground.dim() != pred.dim():
+            raise ValueError(f"Ground truth must have same dimensionality as pred. Got {ground.dim()} vs {pred.dim()}")
+
+        psum = pred.float()
+        if self.do_sigmoid:
+            psum = psum.sigmoid()
+        if self.do_softmax:
+            psum = torch.softmax(psum, dim=1)
+
+        # Build target tensor with channel dimension matching pred
+        if ground.shape[1] == 1 and pred.shape[1] > 1:
+            # Label map -> one-hot
+            one_hot = F.one_hot(ground.long().squeeze(1), num_classes=pred.shape[1])
+            spatial_dims = list(range(1, one_hot.dim() - 1))
+            permute_order = [0, one_hot.dim() - 1] + spatial_dims
+            tsum = one_hot.permute(*permute_order).float().contiguous()
+        elif ground.shape[1] == pred.shape[1]:
+            tsum = ground.float()
+        else:
+            raise ValueError(f"Ground truth should have either 1 channel or match pred channels. Got {ground.shape[1]} vs {pred.shape[1]}")
+
+        if not self.include_background and tsum.shape[1] > 1:
+            tsum = tsum[:, 1:]
+            psum = psum[:, 1:]
+        elif not self.include_background and tsum.shape[1] == 1:
+            warnings.warn("single channel prediction, `include_background=False` ignored.")
+
+        batch_size, n_classes = tsum.shape[:2]
+        tsum = tsum.view(batch_size, n_classes, -1)
+        psum = psum.view(batch_size, n_classes, -1)
+
+        intersection = (psum * tsum).sum(2)
+        sums = psum.sum(2) + tsum.sum(2)
+
+        w = self.w_func(tsum.sum(2))
+        inf_mask = torch.isinf(w)
+        if inf_mask.any():
+            w[inf_mask] = 0.0
+
+        score = (2.0 * intersection * w + smooth) / (sums * w + smooth)
+        return 1 - score.mean()
 
 
 
