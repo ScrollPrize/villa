@@ -31,7 +31,7 @@
       ],
     "num_val_segments_per_volume": 1,
       "augmentation": {
-        "allow_transposes": true,
+        "allow_transposes": false,
         "only_spatial_and_intensity": false
       },
       "point_perturbation": {
@@ -43,6 +43,9 @@
       "representation": "heatmap",
       "step_size": 10,
       "step_count": 1,
+      "multistep_count": 2,
+      "multistep_prob":  1,
+      "multistep_samples": 8,
       "binary": true,
       "crop_size": 128,
       "model_type": "unet",

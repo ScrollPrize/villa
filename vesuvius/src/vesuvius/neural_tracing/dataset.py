@@ -379,6 +379,12 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         crop_size = torch.tensor(self._config['crop_size'])
         step_size = torch.tensor(self._config['step_size'])
         step_count = torch.tensor(self._config['step_count'])
+        if torch.rand([]) < self._config['multistep_prob']:
+            multistep_count = self._config['multistep_count']
+            step_count *= multistep_count
+            crop_size += step_size * step_count * (multistep_count - 1) * 2
+        else:
+            multistep_count = 1
 
         while True:
             patch = random.choices(self._patches, weights=area_weights)[0]
@@ -467,7 +473,11 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
             # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
 
-            u_cond, v_cond = torch.rand([2]) < 0.75
+            if multistep_count == 1:
+                u_cond, v_cond = torch.rand([2]) < 0.75
+            else:
+                # For now, multi-step only works for a 'chain', i.e. conditioning on exactly one of u/v
+                u_cond, v_cond = torch.tensor([True, False] if torch.rand([]) < 0.5 else [False, True])
 
             diag_ij = None
             suppress_out_u = suppress_out_v = None
@@ -584,7 +594,7 @@ def make_heatmaps(all_zyxs, min_corner_zyx, crop_size):
     def scatter(zyxs):
         coords = torch.cat([
             (zyxs - min_corner_zyx + 0.5).int(),
-            torch.arange(zyxs.shape[0])[:, None]
+            torch.arange(zyxs.shape[0], device=zyxs.device)[:, None]
         ], dim=1)
         # FIXME: the following shouldn't be needed
         coords = coords[(coords[..., :3] >= 0).all(dim=1) & (coords[..., :3] < crop_size).all(dim=1)]
