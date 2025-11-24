@@ -1,6 +1,7 @@
 {
     "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/test",
-
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "neural-tracing",
     "seed": 0,
     "batch_size": 4,
     "num_workers": 8,
