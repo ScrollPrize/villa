@@ -50,7 +50,19 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     def __init__(self, config, patches_for_split):
         self._config = config
-        self._patches = patches_for_split
+        self._cache_bytes = None
+        self._cached_stores = []
+        self._cached_volumes = []
+
+        cache_gb_config = config.get("cache_max_gb", config.get("volume_cache_gb", None))
+        patches = patches_for_split
+        if cache_gb_config is not None:
+            cache_gb = float(cache_gb_config)
+            if cache_gb > 0:
+                self._cache_bytes = int(cache_gb * 1024 ** 3)
+                patches = self._wrap_patches_with_cache(patches_for_split)
+
+        self._patches = patches
         self._heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
         self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
@@ -96,6 +108,41 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             volume_key = id(patch.volume)
             self._volume_patch_bboxes.setdefault(volume_key, []).append((patch, bbox_min, bbox_max))
             self._vertex_normals[id(patch)] = self._compute_vertex_normals(patch)
+
+    def _wrap_patches_with_cache(self, patches):
+        """Re-open patch volumes behind an LRU store cache and share the cached arrays."""
+        cached_stores = {}
+        cached_volumes = {}
+        cached_patches = []
+
+        for patch in patches:
+            volume = patch.volume
+            store = getattr(volume, "store", None)
+            path = getattr(volume, "path", None)
+            if store is None or path is None or self._cache_bytes is None:
+                cached_patches.append(patch)
+                continue
+
+            store_key = id(store)
+            if isinstance(store, zarr.storage.LRUStoreCache):
+                cache_store = store
+            else:
+                cache_store = cached_stores.get(store_key)
+                if cache_store is None:
+                    cache_store = zarr.storage.LRUStoreCache(store, max_size=self._cache_bytes)
+                    cached_stores[store_key] = cache_store
+
+            volume_key = (id(cache_store), path)
+            cached_volume = cached_volumes.get(volume_key)
+            if cached_volume is None:
+                cached_volume = zarr.open_array(store=cache_store, path=path, mode="r")
+                cached_volumes[volume_key] = cached_volume
+
+            cached_patches.append(Patch(patch.zyxs, patch.scale, cached_volume))
+
+        self._cached_stores = list(cached_stores.values())
+        self._cached_volumes = list(cached_volumes.values())
+        return cached_patches
 
     def _reset_iter_caches(self):
         self._perturb_cache_key = None

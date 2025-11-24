@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+import scipy.ndimage
 
 import vesuvius.neural_tracing.dataset as base_dataset
 from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, get_zyx_from_patch
@@ -254,10 +256,107 @@ class HeatmapDatasetV2BBoxGuard(HeatmapDatasetV2):
         return final_zyx
 
 
+class HeatmapDatasetV2LRUStoreCache(HeatmapDatasetV2):
+    """
+    Variant that reopens the zarr volumes behind each patch with an LRUStoreCache
+    to cache hot chunks in memory. Useful for benchmarking disk I/O bottlenecks
+    without affecting the default dataset behaviour.
+    """
+
+    def __init__(self, config, patches):
+        config = dict(config)
+        cache_gb = config.get("cache_max_gb", config.get("volume_cache_gb", None))
+        if cache_gb is None:
+            config["cache_max_gb"] = 4
+        super().__init__(config, patches)
+
+
 __all__ = [
     "HeatmapDatasetV2BilinearLookup",
     "HeatmapDatasetV2CoarseDistance",
     "HeatmapDatasetV2PrecomputedNormals",
     "HeatmapDatasetV2TorchComponent",
     "HeatmapDatasetV2BBoxGuard",
+    "HeatmapDatasetV2LRUStoreCache",
+    "HeatmapDatasetV2DistanceTransform",
 ]
+
+
+class HeatmapDatasetV2DistanceTransform(HeatmapDatasetV2):
+    """
+    Variant that builds a per-crop binary occupancy grid and runs a single 3D
+    distance transform; each distance query becomes an O(1) lookup.
+    """
+
+    def _compute_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        quad_main_component = self._get_current_patch_center_component_mask(
+            current_patch, center_ij, min_corner_zyx, crop_size
+        )
+
+        crop_size_int = int(crop_size)
+        occupancy = np.zeros((crop_size_int, crop_size_int, crop_size_int), dtype=np.bool_)
+
+        def _points_to_indices(points):
+            if points.numel() == 0:
+                return None
+            coords = torch.round(points - min_corner_zyx).to(dtype=torch.int64)
+            in_bounds = (coords >= 0).all(dim=1) & (coords < crop_size_int).all(dim=1)
+            if not torch.any(in_bounds):
+                return None
+            coords = coords[in_bounds]
+            return coords[:, 0].cpu().numpy(), coords[:, 1].cpu().numpy(), coords[:, 2].cpu().numpy()
+
+        crop_min = min_corner_zyx.to(dtype=current_patch.zyxs.dtype, device=current_patch.zyxs.device)
+        crop_max = crop_min + torch.as_tensor(crop_size, dtype=crop_min.dtype, device=crop_min.device)
+
+        volume_key = id(current_patch.volume)
+        for other_patch, bbox_min, bbox_max in self._volume_patch_bboxes.get(volume_key, []):
+            if other_patch is current_patch:
+                continue
+            if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
+                continue
+            patch_points = self._get_patch_points_in_crop(other_patch, min_corner_zyx, crop_size)
+            idx = _points_to_indices(patch_points)
+            if idx is not None:
+                occupancy[idx] = True
+
+        quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
+        quad_excluding_main = quad_in_crop & ~quad_main_component
+        other_patch_points = self._sample_points_from_quads(current_patch, quad_excluding_main)
+        idx = _points_to_indices(other_patch_points)
+        if idx is not None:
+            occupancy[idx] = True
+
+        # Distance in voxels to nearest occupied voxel
+        if occupancy.any():
+            distance_field = scipy.ndimage.distance_transform_edt(~occupancy).astype(np.float32)
+        else:
+            distance_field = np.full_like(occupancy, np.inf, dtype=np.float32)
+        return distance_field
+
+    def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        key = self._make_cache_key(current_patch, center_ij, min_corner_zyx, crop_size)
+        if key != self._perturb_cache_key:
+            self._perturb_cache_key = key
+            distance_field = self._compute_cached_patch_points(current_patch, center_ij, min_corner_zyx, crop_size)
+            self._perturb_cache_value = {
+                "distance_field": torch.from_numpy(distance_field),
+                "min_corner": min_corner_zyx.to(dtype=torch.float32).clone(),
+            }
+        return self._perturb_cache_value
+
+    def _get_distance_to_nearest_patch_cached(self, point_zyx, cached_patch_points):
+        if not cached_patch_points:
+            return float("inf")
+        distance_field = cached_patch_points.get("distance_field", None)
+        if distance_field is None:
+            return float("inf")
+
+        min_corner = cached_patch_points["min_corner"]
+        rel = torch.round(point_zyx - min_corner).to(dtype=torch.int64)
+        crop_size = distance_field.shape[0]
+        if ((rel < 0) | (rel >= crop_size)).any():
+            return float("inf")
+
+        z, y, x = rel.tolist()
+        return distance_field[z, y, x].item()
