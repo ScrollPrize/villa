@@ -652,7 +652,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             volume_crop = augmented['image'].squeeze(0)
             localiser = augmented['dist_map'].squeeze(0)
             uv_heatmaps_both = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
-            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uv_heatmaps_both)):
+            if not torch.isfinite(volume_crop).all() or not torch.isfinite(localiser).all() or not torch.isfinite(uv_heatmaps_both).all():
                 # FIXME: why do these NaNs happen occasionally?
                 continue
 
