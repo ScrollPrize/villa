@@ -316,48 +316,35 @@ def train(config_path):
                 val_loss = loss_fn(val_target_pred, val_targets, val_mask).mean()
                 wandb_log['val_loss'] = val_loss.item()
 
-                if False:
-                    def squish(x):
-                        return torch.stack([x[:, :8].amax(dim=1), x[:, 8:16].amax(dim=1), torch.zeros_like(x[:, 0])], dim=1)
+                def make_canvas(inputs, targets, target_pred):
+                    colours_by_step = torch.rand([target_pred.shape[1], 3], device=inputs.device) * 0.7 + 0.2
+                    colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
+                    def overlay_crosshair(x):
+                        x = x.clone()
+                        red = torch.tensor([0.8, 0, 0], device=x.device)
+                        x[:, x.shape[1] // 2 - 7 : x.shape[1] // 2 - 1, x.shape[2] // 2, :] = red
+                        x[:, x.shape[1] // 2 + 2 : x.shape[1] // 2 + 8, x.shape[2] // 2, :] = red
+                        x[:, x.shape[1] // 2, x.shape[2] // 2 - 7 : x.shape[2] // 2 - 1, :] = red
+                        x[:, x.shape[1] // 2, x.shape[2] // 2 + 2 : x.shape[2] // 2 + 8, :] = red
+                        return x
+                    def inputs_slice(dim):
+                        return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
+                    def projections(x):
+                        x = torch.cat([inputs[:, 2:5], x], dim=1)
+                        coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
+                        return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
+                    if targets.shape[1] > target_pred.shape[1]:
+                        assert targets.shape[1] // target_pred.shape[1] == config['multistep_count']
+                        targets_vis = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
+                        # TODO: also visualise multi-step predictions
+                    else:
+                        targets_vis = targets
                     canvas = torch.stack([
-                        inputs[:, :1].expand(-1, 3, -1, -1, -1),
-                        squish(inputs[:, 2:]),
-                        squish(target_pred),
-                        squish(targets),
+                        torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
+                        projections(F.sigmoid(target_pred)),
+                        projections(targets_vis),
                     ], dim=-1)
-                    canvas_mask = torch.stack([torch.ones_like(mask), mask, torch.ones_like(mask), mask], dim=-1)
-                    canvas = (canvas * 0.5 + 0.5).clip(0, 1) * canvas_mask
-                    canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
-                else:
-                    def make_canvas(inputs, targets, target_pred):
-                        colours_by_step = torch.rand([target_pred.shape[1], 3], device=inputs.device) * 0.7 + 0.2
-                        colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
-                        def overlay_crosshair(x):
-                            x = x.clone()
-                            red = torch.tensor([0.8, 0, 0], device=x.device)
-                            x[:, x.shape[1] // 2 - 7 : x.shape[1] // 2 - 1, x.shape[2] // 2, :] = red
-                            x[:, x.shape[1] // 2 + 2 : x.shape[1] // 2 + 8, x.shape[2] // 2, :] = red
-                            x[:, x.shape[1] // 2, x.shape[2] // 2 - 7 : x.shape[2] // 2 - 1, :] = red
-                            x[:, x.shape[1] // 2, x.shape[2] // 2 + 2 : x.shape[2] // 2 + 8, :] = red
-                            return x
-                        def inputs_slice(dim):
-                            return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
-                        def projections(x):
-                            x = torch.cat([inputs[:, 2:5], x], dim=1)
-                            coloured = x[..., None] * colours_by_step[None, :, None, None, None, :]
-                            return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
-                        if targets.shape[1] > target_pred.shape[1]:
-                            assert targets.shape[1] // target_pred.shape[1] == config['multistep_count']
-                            targets_vis = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
-                            # TODO: also visualise multi-step predictions
-                        else:
-                            targets_vis = targets
-                        canvas = torch.stack([
-                            torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
-                            projections(F.sigmoid(target_pred)),
-                            projections(targets_vis),
-                        ], dim=-1)
-                        return rearrange(canvas.clip(0, 1), 'b y x rgb v -> (b y) (v x) rgb').cpu()
+                    return rearrange(canvas.clip(0, 1), 'b y x rgb v -> (b y) (v x) rgb').cpu()
 
                 train_canvas = make_canvas(inputs, targets, target_pred)
                 val_canvas = make_canvas(val_inputs, val_targets, val_target_pred)
