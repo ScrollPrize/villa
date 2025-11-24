@@ -58,6 +58,8 @@ We’re awarding **$200,000** (single winner) for delivering **automated virtual
 
 Ink detection is **not required**; the focus is high-quality segmentation, continuity, and flattening suitable for later reading.
 
+We accept submissions for this prize until 11:59pm Pacific, December 31st, 2025!
+
 <div className="mb-4">
   <img src="/img/landing/scroll.webp" className="w-[50%]"/>
   <figcaption className="mt-[-6px]">A carbonized scroll.</figcaption>
@@ -102,6 +104,10 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
   2) Higher **coverage** across the two scrolls;    
   3) Fewer **total human-hours** (sum over both);  
   4) Earlier submission timestamp.
+
+### Deadline
+- **11:59pm Pacific, December 31st, 2025**
+
 </details>
 
 [Submission Form](https://forms.gle/MqP3XQGX7o2ZFfZW6)
