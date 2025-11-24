@@ -61,7 +61,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._perturb_cache_key = None
         self._perturb_cache_value = None
         self._quad_in_crop_cache = {}
-        self._component_mask_cache = {}
         self._volume_patch_bboxes = {}
         self._sampling = {}
         self._quad_bboxes = {}
@@ -99,7 +98,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     def _reset_iter_caches(self):
         self._quad_in_crop_cache.clear()
-        self._component_mask_cache.clear()
 
     def _sample_points_from_quads(self, patch, quad_mask):
         """Sample points finely from quads specified by the mask"""
@@ -190,16 +188,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     def _get_current_patch_center_component_mask(self, current_patch, center_ij, min_corner_zyx, crop_size):
         """Get the mask of the connected component containing the center point"""
-        cache_key = self._make_cache_key(current_patch, center_ij, min_corner_zyx, crop_size)
-        cached = self._component_mask_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
         quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
         
         if not torch.any(quad_in_crop):
             component_mask = torch.zeros_like(quad_in_crop)
-            self._component_mask_cache[cache_key] = component_mask
             return component_mask
         
         center_quad = center_ij.int()
@@ -207,7 +199,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             center_quad[1] < 0 or center_quad[1] >= quad_in_crop.shape[1] or
             not quad_in_crop[center_quad[0], center_quad[1]]):
             component_mask = torch.zeros_like(quad_in_crop)
-            self._component_mask_cache[cache_key] = component_mask
             return component_mask
 
         # use scipy label instead of dfs
@@ -218,11 +209,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         label = labeled[center_quad[0].item(), center_quad[1].item()]
         if label == 0:
             component_mask = torch.zeros_like(quad_in_crop)
-            self._component_mask_cache[cache_key] = component_mask
             return component_mask
 
         component_mask = torch.as_tensor(labeled == label, device=quad_in_crop.device)
-        self._component_mask_cache[cache_key] = component_mask
         return component_mask
 
     def _make_cache_key(self, patch, center_ij, min_corner_zyx, crop_size):
