@@ -10,9 +10,9 @@ import scipy.ndimage
 import networkx as nx
 from tqdm import tqdm
 from einops import rearrange
+from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
-from fft_conv_pytorch import fft_conv
 
 import vesuvius.neural_tracing.augmentation as augmentation
 
@@ -185,6 +185,9 @@ class PatchInCubeDataset(torch.utils.data.IterableDataset):
 
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
+    _channel_range_cache = {}
+    _kernel_offsets_cache = {}
+    _kernel_value_cache = {}
 
     def __init__(self, config, patches_for_split):
         self._config = config
@@ -371,8 +374,103 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             else:
                 # Normal is too small, skip 3D perturbation
                 final_zyx = perturbed_zyx
-        
+
         return final_zyx
+
+    @classmethod
+    def _get_channel_range(cls, num_channels, device):
+        key = (num_channels, device)
+        if key not in cls._channel_range_cache:
+            cls._channel_range_cache[key] = torch.arange(num_channels, device=device)
+        return cls._channel_range_cache[key]
+
+    @classmethod
+    def _get_kernel_offsets(cls, device, sigma):
+        sigma = float(sigma)
+        if sigma not in cls._kernel_offsets_cache:
+            _, kernel_size = _get_gaussian_kernel(sigma)
+            radius = kernel_size // 2
+            coords = torch.arange(kernel_size) - radius
+            z_off, y_off, x_off = torch.meshgrid(coords, coords, coords, indexing='ij')
+            cls._kernel_offsets_cache[sigma] = torch.stack([z_off, y_off, x_off], dim=-1).view(-1, 3)
+        return cls._kernel_offsets_cache[sigma].to(device=device)
+
+    @classmethod
+    def _get_kernel_values(cls, device, dtype, sigma):
+        key = (device, dtype, float(sigma))
+        if key not in cls._kernel_value_cache:
+            kernel, _ = _get_gaussian_kernel(sigma)
+            cls._kernel_value_cache[key] = kernel.to(device=device, dtype=dtype).reshape(-1)
+        return cls._kernel_value_cache[key]
+
+    @classmethod
+    def _collect_coords(cls, all_zyxs, min_corner_zyx, crop_size_int, device, dtype):
+        channel_count = all_zyxs[0].shape[0]
+        coords_accum = []
+        channel_accum = []
+        channel_range = cls._get_channel_range(channel_count, device)
+        min_corner = min_corner_zyx.to(device=device, dtype=dtype)
+
+        for zyxs in all_zyxs:
+            coords = (zyxs.to(device=device, dtype=dtype) - min_corner + 0.5).to(torch.int64)
+            valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_int).all(dim=1)
+            if not torch.any(valid_mask):
+                continue
+            coords_accum.append(coords[valid_mask])
+            channel_accum.append(channel_range[valid_mask])
+
+        if not coords_accum:
+            return channel_count, None, None
+
+        all_coords = torch.cat(coords_accum, dim=0)
+        all_channels = torch.cat(channel_accum, dim=0)
+        return channel_count, all_coords, all_channels
+
+    @classmethod
+    def _scatter_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size):
+        crop_size_int = int(crop_size)
+        dtype = all_zyxs[0].dtype
+        device = all_zyxs[0].device
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
+        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+
+        if coords is None:
+            return heatmaps
+
+        z, y, x = coords.unbind(dim=1)
+        values = torch.ones_like(channels, dtype=dtype)
+        heatmaps.index_put_((channels, z, y, x), values, accumulate=True)
+        return heatmaps
+
+    @classmethod
+    def make_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size, apply_gaussian=True, sigma: float = 2.0):
+        if not apply_gaussian:
+            return cls._scatter_heatmaps(all_zyxs, min_corner_zyx, crop_size)
+
+        crop_size_int = int(crop_size)
+        dtype = all_zyxs[0].dtype
+        device = all_zyxs[0].device
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
+        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+
+        if coords is None:
+            return heatmaps
+
+        kernel_offsets = cls._get_kernel_offsets(device, sigma)
+        kernel_values = cls._get_kernel_values(device, dtype, sigma)
+
+        expanded_coords = coords[:, None, :] + kernel_offsets[None, :, :]
+        in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_int).all(dim=-1)
+
+        if torch.any(in_bounds):
+            valid_positions = expanded_coords[in_bounds]
+            valid_channels = channels[:, None].expand(-1, kernel_offsets.shape[0])[in_bounds]
+            valid_values = kernel_values.expand(coords.shape[0], -1)[in_bounds]
+
+            z, y, x = valid_positions.unbind(dim=1)
+            heatmaps.index_put_((valid_channels, z, y, x), valid_values, accumulate=True)
+
+        return heatmaps
 
     def __iter__(self):
 
@@ -381,6 +479,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         crop_size = torch.tensor(self._config['crop_size'])
         step_size = torch.tensor(self._config['step_size'])
         step_count = torch.tensor(self._config['step_count'])
+        heatmap_sigma = self._heatmap_sigma
 
         while True:
             patch = random.choices(self._patches, weights=area_weights)[0]
@@ -461,13 +560,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 if cond:
                     # Conditioning on this direction: include one negative point as input, and all positive as output
                     assert suppress_out is None
-                    in_heatmaps = make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size)
-                    out_heatmaps = make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size)
+                    in_heatmaps = self.make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                    out_heatmaps = self.make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size, sigma=heatmap_sigma)
                 else:
                     # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
                     in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
                     out_points = ([pos_shifted_zyxs] if suppress_out != 'pos' else []) + ([neg_shifted_zyxs] if suppress_out != 'neg' else [])
-                    out_heatmaps = make_heatmaps(out_points, min_corner_zyx, crop_size) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
+                    out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size, sigma=heatmap_sigma) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
                 return in_heatmaps, out_heatmaps
 
             # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
@@ -534,7 +633,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 combined_mask = u_out_channel_mask | v_out_channel_mask
                 u_out_channel_mask = v_out_channel_mask = combined_mask
             if diag_zyx is not None:
-                diag_in_heatmaps = make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size)
+                diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
             else:
                 diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
             uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
@@ -599,40 +698,21 @@ def get_zyx_from_patch(ij, patch):
     return rearrange(interpolated, '1 c b 1 -> b c').view(*batch_dims, -1)
 
 
-# FIXME: memoized method instead of global code
-sigma=2.
-kernel_size = int(6 * sigma + 1)
-if kernel_size % 2 == 0:
-    kernel_size += 1
-coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
-z_coords, y_coords, x_coords = torch.meshgrid(coords, coords, coords, indexing='ij')
-kernel = torch.exp(-(z_coords**2 + y_coords**2 + x_coords**2) / (2 * sigma**2))
+@lru_cache(maxsize=None)
+def _get_gaussian_kernel(sigma: float = 2.0):
+    """Build and cache a 3D Gaussian kernel for heatmap smoothing."""
+    sigma = float(sigma)
+    kernel_size = int(6 * sigma + 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+    z_coords, y_coords, x_coords = torch.meshgrid(coords, coords, coords, indexing='ij')
+    kernel = torch.exp(-(z_coords**2 + y_coords**2 + x_coords**2) / (2 * sigma**2))
+    return kernel, kernel_size
 
-def make_heatmaps(all_zyxs, min_corner_zyx, crop_size):
 
-    # zyxs is a list of different 'kinds' of points (positive / negative, U/V); each entry is a list zyxs at different steps
-    assert all(zyxs.shape[0] == all_zyxs[0].shape[0] for zyxs in all_zyxs)
-    heatmaps = torch.zeros([crop_size, crop_size, crop_size, all_zyxs[0].shape[0]])
-    def scatter(zyxs):
-        coords = torch.cat([
-            (zyxs - min_corner_zyx + 0.5).int(),
-            torch.arange(zyxs.shape[0])[:, None]
-        ], dim=1)
-        # FIXME: the following shouldn't be needed
-        coords = coords[(coords[..., :3] >= 0).all(dim=1) & (coords[..., :3] < crop_size).all(dim=1)]
-        heatmaps[*coords.T] = 1.
-    for zyxs in all_zyxs:
-        scatter(zyxs)
-
-    convolved = fft_conv(
-        rearrange(heatmaps, 'z y x c -> c 1 z y x'),
-        kernel[None, None],
-        padding=kernel_size // 2
-    )
-
-    heatmaps_gaussian = rearrange(convolved, 'c 1 z y x -> c z y x')
-
-    return heatmaps_gaussian
+def make_heatmaps(all_zyxs, min_corner_zyx, crop_size, sigma: float = 2.0):
+    return HeatmapDatasetV2.make_heatmaps(all_zyxs, min_corner_zyx, crop_size, apply_gaussian=True, sigma=sigma)
 
 
 def load_datasets(config):
