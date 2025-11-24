@@ -198,13 +198,17 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
         
         if not torch.any(quad_in_crop):
-            return torch.zeros_like(quad_in_crop)
+            component_mask = torch.zeros_like(quad_in_crop)
+            self._component_mask_cache[cache_key] = component_mask
+            return component_mask
         
         center_quad = center_ij.int()
         if (center_quad[0] < 0 or center_quad[0] >= quad_in_crop.shape[0] or 
             center_quad[1] < 0 or center_quad[1] >= quad_in_crop.shape[1] or
             not quad_in_crop[center_quad[0], center_quad[1]]):
-            return torch.zeros_like(quad_in_crop)
+            component_mask = torch.zeros_like(quad_in_crop)
+            self._component_mask_cache[cache_key] = component_mask
+            return component_mask
 
         # use scipy label instead of dfs
         structure = np.array([[0, 1, 0],
@@ -213,7 +217,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         labeled, _ = scipy.ndimage.label(quad_in_crop.cpu().numpy(), structure=structure)
         label = labeled[center_quad[0].item(), center_quad[1].item()]
         if label == 0:
-            return torch.zeros_like(quad_in_crop)
+            component_mask = torch.zeros_like(quad_in_crop)
+            self._component_mask_cache[cache_key] = component_mask
+            return component_mask
 
         component_mask = torch.as_tensor(labeled == label, device=quad_in_crop.device)
         self._component_mask_cache[cache_key] = component_mask
@@ -278,6 +284,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         min_distance = float('inf')
         
         for patch_points in cached_patch_points:
+            if patch_points.numel() == 0:
+                print("[DataWarning] empty patch_points in distance check")
+                continue
             # Calculate minimum distance to any point in this patch
             distances = torch.norm(patch_points - point_zyx, dim=-1)
             min_distance = min(min_distance, distances.min().item())
