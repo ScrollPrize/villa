@@ -110,7 +110,12 @@ def train(config_path):
         else:
             # TODO: should this instead weight each element in batch equally regardless of valid area?
             return ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
-            
+
+    ds_enabled = bool(config.get('enable_deep_supervision', False))
+    ds_weights = None
+    ds_loss_fn = None
+
+
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
 
@@ -121,9 +126,26 @@ def train(config_path):
             mask = torch.ones_like(targets)
 
         wandb_log = {}
+        target_pred_for_vis = None
         with accelerator.accumulate(model):
-            target_pred = model(inputs)
-            loss = loss_fn(target_pred, targets, mask)
+            outputs = model(inputs)
+            target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
+
+            if ds_enabled and isinstance(target_pred, (list, tuple)):
+                if ds_weights is None:
+                    ds_weights = _compute_ds_weights(len(target_pred))
+                ds_targets = [_resize_for_ds(targets, t.shape[2:], mode='trilinear', align_corners=False) for t in target_pred]
+                ds_masks = [_resize_for_ds(mask, t.shape[2:], mode='nearest') for t in target_pred]
+                if ds_loss_fn is None:
+                    ds_loss_fn = DeepSupervisionWrapper(loss_fn, ds_weights)
+                loss = ds_loss_fn(target_pred, ds_targets, ds_masks)
+                target_pred_for_vis = target_pred[0]
+            else:
+                if isinstance(target_pred, (list, tuple)):
+                    target_pred = target_pred[0]
+                loss = loss_fn(target_pred, targets, mask)
+                target_pred_for_vis = target_pred
+
             if torch.isnan(loss):
                 raise ValueError('loss is NaN')
             accelerator.backward(loss)
@@ -147,8 +169,23 @@ def train(config_path):
                     val_mask = rearrange(val_batch['uv_heatmaps_out_mask'], 'b z y x c -> b c z y x')
                 else:
                     val_mask = torch.ones_like(val_targets)
-                val_target_pred = model(val_inputs)
-                val_loss = loss_fn(val_target_pred, val_targets, val_mask)
+                val_outputs = model(val_inputs)
+                val_target_pred = val_outputs['uv_heatmaps'] if isinstance(val_outputs, dict) else val_outputs
+
+                if ds_enabled and isinstance(val_target_pred, (list, tuple)):
+                    if ds_weights is None:
+                        ds_weights = _compute_ds_weights(len(val_target_pred))
+                    val_ds_targets = [_resize_for_ds(val_targets, t.shape[2:], mode='trilinear', align_corners=False) for t in val_target_pred]
+                    val_ds_masks = [_resize_for_ds(val_mask, t.shape[2:], mode='nearest') for t in val_target_pred]
+                    if ds_loss_fn is None:
+                        ds_loss_fn = DeepSupervisionWrapper(loss_fn, ds_weights)
+                    val_loss = ds_loss_fn(val_target_pred, val_ds_targets, val_ds_masks)
+                    val_target_pred_for_vis = val_target_pred[0]
+                else:
+                    if isinstance(val_target_pred, (list, tuple)):
+                        val_target_pred = val_target_pred[0]
+                    val_loss = loss_fn(val_target_pred, val_targets, val_mask)
+                    val_target_pred_for_vis = val_target_pred
                 wandb_log['val_loss'] = val_loss.item()
 
                 if False:
@@ -200,9 +237,6 @@ def train(config_path):
                             row, col = divmod(idx, cols)
                             grid[row * h : (row + 1) * h, col * w : (col + 1) * w] = sample_canvases[idx]
                         return grid
-
-                target_pred_for_vis = target_pred[0] if isinstance(target_pred, (list, tuple)) else target_pred
-                val_target_pred_for_vis = val_target_pred[0] if isinstance(val_target_pred, (list, tuple)) else val_target_pred
 
                 train_canvas = make_canvas(inputs, targets, target_pred_for_vis)
                 val_canvas = make_canvas(val_inputs, val_targets, val_target_pred_for_vis)

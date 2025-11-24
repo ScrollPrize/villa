@@ -18,11 +18,10 @@ class Inference:
             mixed_precision=config['mixed_precision'],
         )
 
-        self.model = model
+        self.model = self.accelerator.prepare(model)
         self.config = config
 
-        model = self.accelerator.prepare(model)
-        model.eval()
+        self.model.eval()
 
         print(f"loading volume zarr {volume_zarr}...")
         ome_zarr = zarr.open_group(volume_zarr, mode='r')
@@ -45,8 +44,11 @@ class Inference:
             prev_v_heatmap[None].to(self.accelerator.device),
             prev_diag_heatmap[None].to(self.accelerator.device),
         ], dim=1)
-        timesteps = torch.zeros([1], dtype=torch.long, device=self.accelerator.device)
-        logits = self.model(inputs, timesteps).squeeze(0).reshape(2, self.config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
+        outputs = self.model(inputs)
+        logits = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
+        if isinstance(logits, (list, tuple)):
+            logits = logits[0]
+        logits = logits.squeeze(0).reshape(2, self.config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
         # TODO: test-time augmentation! as well as flip/rotate also consider very small spatial jitters etc
         return F.sigmoid(logits), min_corner_zyx
 

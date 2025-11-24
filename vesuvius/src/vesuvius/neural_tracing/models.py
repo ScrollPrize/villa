@@ -1,13 +1,55 @@
 import torch
+from types import SimpleNamespace
 
-from vesuvius_unet3d import Vesuvius3dUnetModel
+from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from youssef_mae import Vesuvius3dViTModel
 
 
-def make_model(config):
+def _config_dict_to_mgr(config_dict):
+    """Create a minimal ConfigManager-like object from a plain config dict."""
+    model_config = dict(config_dict.get('model_config', {}) or {})
 
+    # Allow overriding targets; default to a single uv_heatmaps head
+    targets = config_dict.get('targets')
+    if not targets:
+        targets = {
+            'uv_heatmaps': {
+                'out_channels': config_dict['step_count'] * 2,
+                'activation': 'none',
+            }
+        }
+
+    mgr = SimpleNamespace()
+    mgr.model_config = model_config
+    mgr.train_patch_size = tuple([config_dict['crop_size']] * 3)
+    mgr.train_batch_size = int(config_dict.get('batch_size', 1))
+    mgr.in_channels = 5  # volume + localiser + 3 conditioning heatmaps
+    mgr.model_name = config_dict.get('model_name', 'neural_tracing')
+    mgr.autoconfigure = True  # explicit per request
+    mgr.spacing = model_config.get('spacing', [1, 1, 1])
+    mgr.targets = targets
+    mgr.enable_deep_supervision = bool(config_dict.get('enable_deep_supervision', False))
+    # Explicitly mark dimensionality so NetworkFromConfig skips guessing
+    mgr.op_dims = 3
+    return mgr
+
+
+def build_network_from_config_dict(config_dict):
+    mgr = _config_dict_to_mgr(config_dict)
+    model = NetworkFromConfig(mgr)
+
+    # NetworkFromConfig builds decoders with deep_supervision disabled;
+    # flip them on when requested so we emit multi-scale logits.
+    if getattr(mgr, 'enable_deep_supervision', False) and hasattr(model, 'task_decoders'):
+        for dec in model.task_decoders.values():
+            if hasattr(dec, 'deep_supervision'):
+                dec.deep_supervision = True
+    return model
+
+
+def make_model(config):
     if config['model_type'] == 'unet':
-        return Vesuvius3dUnetModel(in_channels=5, out_channels=config['step_count'] * 2, config=config)
+        return build_network_from_config_dict(config)
     elif config['model_type'] == 'vit':
         return Vesuvius3dViTModel(
             mae_ckpt_path=config['model_config'].get('mae_ckpt_path', None),
