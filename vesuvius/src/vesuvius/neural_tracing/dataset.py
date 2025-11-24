@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from fft_conv_pytorch import fft_conv
 
-import augmentation
+import vesuvius.neural_tracing.augmentation as augmentation
+
 
 
 @dataclass
