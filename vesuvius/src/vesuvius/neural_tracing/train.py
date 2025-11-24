@@ -13,7 +13,8 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from dataset import PatchInCubeDataset, HeatmapDatasetV2, load_datasets
+from dataset import HeatmapDatasetV2, load_datasets
+from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
 from models import make_model
 
 
