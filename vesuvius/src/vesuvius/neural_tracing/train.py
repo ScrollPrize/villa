@@ -6,7 +6,6 @@ import click
 import torch
 import wandb
 import random
-import diffusers
 import accelerate
 import numpy as np
 from tqdm import tqdm
@@ -17,6 +16,8 @@ import torch.nn.functional as F
 from dataset import HeatmapDatasetV2, load_datasets
 from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
+from vesuvius.models.training.optimizers import create_optimizer
+from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from models import make_model
 
@@ -80,11 +81,28 @@ def train(config_path):
             if accelerator.is_main_process:
                 accelerator.print(f"torch.compile failed ({e}); continuing without compilation")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    lr_scheduler = diffusers.optimization.get_cosine_schedule_with_warmup(
+    optimizer_config = config.get('optimizer') or {}
+    if isinstance(optimizer_config, str):
+        optimizer_config = {'name': optimizer_config}
+    else:
+        optimizer_config = dict(optimizer_config)
+    optimizer_config.setdefault('name', config.get('optimizer_name', 'adamw'))
+    optimizer_config.setdefault('learning_rate', config.get('learning_rate', 1e-3))
+    optimizer_config.setdefault('weight_decay', config.get('weight_decay', 1e-4))
+
+    optimizer = create_optimizer(optimizer_config, model)
+
+    scheduler_type = config.get('scheduler', 'diffusers_cosine_warmup')
+    scheduler_kwargs = dict(config.get('scheduler_kwargs', {}) or {})
+    scheduler_kwargs.setdefault('warmup_steps', config.get('lr_warmup_steps', 1000))
+    total_scheduler_steps = config['num_iterations'] * accelerator.state.num_processes  # See comment below on accelerator.prepare
+    # FIXME: accelerator.prepare wraps schedulers so that they step once per process; multiply steps to compensate
+    lr_scheduler = get_scheduler(
+        scheduler_type=scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=config['lr_warmup_steps'],
-        num_training_steps=config['num_iterations'] * accelerate.PartialState().num_processes,  # FIXME: nasty adjustment by num_processes here accounts for the fact that accelerator's prepare_scheduler weirdly causes the scheduler to take num_processes scheduler-steps per optimiser-step
+        initial_lr=optimizer_config.get('learning_rate', config.get('learning_rate', 1e-3)),
+        max_steps=total_scheduler_steps,
+        **scheduler_kwargs,
     )
 
     if 'load_ckpt' in config:

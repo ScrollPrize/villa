@@ -140,7 +140,8 @@ def get_scheduler(scheduler_type: str,
     Factory function to create learning rate schedulers.
     
     Args:
-        scheduler_type: Type of scheduler ('poly', 'warmup_poly', 'cosine', 'cosine_warmup', 'step')
+        scheduler_type: Type of scheduler ('poly', 'warmup_poly', 'cosine', 'cosine_warmup',
+            'diffusers_cosine_warmup', 'step')
         optimizer: The optimizer to schedule
         initial_lr: The initial learning rate
         max_steps: The maximum number of steps
@@ -183,6 +184,24 @@ def get_scheduler(scheduler_type: str,
             min_lr=min_lr,
             warmup_steps=warmup_steps,
             gamma=gamma
+        )
+    
+    elif scheduler_type == 'diffusers_cosine_warmup':
+        warmup_steps = kwargs.get('warmup_steps', int(0.1 * max_steps))
+        num_cycles = kwargs.get('num_cycles', 0.5)
+
+        try:
+            from diffusers.optimization import get_cosine_schedule_with_warmup
+        except ImportError as exc:
+            raise ImportError(
+                "diffusers is required for the 'diffusers_cosine_warmup' scheduler"
+            ) from exc
+
+        return get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max_steps,
+            num_cycles=num_cycles,
         )
     
     elif scheduler_type == 'step':
