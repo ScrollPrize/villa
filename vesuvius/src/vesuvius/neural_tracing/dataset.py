@@ -60,7 +60,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
         self._perturb_cache_key = None
         self._perturb_cache_value = None
-        self._quad_in_crop_cache = {}
         self._volume_patch_bboxes = {}
         self._sampling = {}
         self._quad_bboxes = {}
@@ -97,7 +96,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             self._volume_patch_bboxes.setdefault(volume_key, []).append((patch, bbox_min, bbox_max))
 
     def _reset_iter_caches(self):
-        self._quad_in_crop_cache.clear()
+        self._perturb_cache_key = None
+        self._perturb_cache_value = None
 
     def _sample_points_from_quads(self, patch, quad_mask):
         """Sample points finely from quads specified by the mask"""
@@ -144,27 +144,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get mask of quads that fall within the crop region."""
-        cache_key = (
-            id(patch),
-            tuple(torch.as_tensor(min_corner_zyx, dtype=torch.int64, device='cpu').tolist()),
-            int(crop_size),
-        )
-        cached = self._quad_in_crop_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
         bbox_min, bbox_max = self._quad_bboxes[id(patch)]
         crop_min = min_corner_zyx.to(dtype=bbox_min.dtype)
         crop_size_tensor = torch.as_tensor(crop_size, dtype=bbox_min.dtype, device=crop_min.device)
         crop_max = crop_min + crop_size_tensor
         if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
-            quad_mask = torch.zeros_like(patch.valid_quad_mask)
-            self._quad_in_crop_cache[cache_key] = quad_mask
-            return quad_mask
+            return torch.zeros_like(patch.valid_quad_mask)
 
-        quad_mask = patch.valid_quad_mask & torch.all(patch.quad_centers >= crop_min, dim=-1) & torch.all(patch.quad_centers < crop_max, dim=-1)
-        self._quad_in_crop_cache[cache_key] = quad_mask
-        return quad_mask
+        return patch.valid_quad_mask & torch.all(patch.quad_centers >= crop_min, dim=-1) & torch.all(patch.quad_centers < crop_max, dim=-1)
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
