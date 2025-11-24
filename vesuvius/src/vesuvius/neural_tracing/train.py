@@ -84,7 +84,10 @@ def train(config_path):
         if config['binary']:
             targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
             from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
-            return DC_and_BCE_loss(bce_kwargs={}, soft_dice_kwargs={'ddp': False})(target_pred, targets_binary)
+            # Apply mask by zeroing invalid regions before computing the combined loss.
+            return DC_and_BCE_loss(bce_kwargs={}, soft_dice_kwargs={'ddp': False})(
+                target_pred * mask, targets_binary * mask
+            )
         else:
             # TODO: should this instead weight each element in batch equally regardless of valid area?
             return ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
@@ -93,7 +96,10 @@ def train(config_path):
     for iteration, batch in enumerate(train_dataloader):
 
         inputs, targets = prepare_batch(batch)
-        mask = torch.ones_like(targets[:, :1, ...])  # TODO!
+        if 'uv_heatmaps_out_mask' in batch:
+            mask = rearrange(batch['uv_heatmaps_out_mask'], 'b z y x c -> b c z y x')
+        else:
+            mask = torch.ones_like(targets)
 
         wandb_log = {}
         with accelerator.accumulate(model):
@@ -118,7 +124,10 @@ def train(config_path):
 
                 val_batch = next(val_iterator)
                 val_inputs, val_targets = prepare_batch(val_batch)
-                val_mask = torch.ones_like(val_targets[:, :1, ...])  # TODO!
+                if 'uv_heatmaps_out_mask' in val_batch:
+                    val_mask = rearrange(val_batch['uv_heatmaps_out_mask'], 'b z y x c -> b c z y x')
+                else:
+                    val_mask = torch.ones_like(val_targets)
                 val_target_pred = model(val_inputs)
                 val_loss = loss_fn(val_target_pred, val_targets, val_mask)
                 wandb_log['val_loss'] = val_loss.item()
