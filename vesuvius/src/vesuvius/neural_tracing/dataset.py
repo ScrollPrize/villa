@@ -535,14 +535,18 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 center_zyx = self._get_perturbed_zyx_from_patch(center_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=True)
                 
                 # Perturb negative points (context points) in 3D (both uv and normal)
-                u_neg_shifted_zyxs = torch.stack([
-                    self._get_perturbed_zyx_from_patch(u_neg_shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False) 
-                    for i in range(len(u_neg_shifted_ijs))
-                ])
-                v_neg_shifted_zyxs = torch.stack([
-                    self._get_perturbed_zyx_from_patch(v_neg_shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False) 
-                    for i in range(len(v_neg_shifted_ijs))
-                ])
+                def _perturb_or_lookup(shifted_ijs, valid_mask):
+                    # Skip perturbation for invalid points to avoid wasted work/cache churn
+                    zyxs = []
+                    for i in range(len(shifted_ijs)):
+                        if valid_mask[i]:
+                            zyxs.append(self._get_perturbed_zyx_from_patch(shifted_ijs[i], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False))
+                        else:
+                            zyxs.append(get_zyx_from_patch(shifted_ijs[i], patch))
+                    return torch.stack(zyxs)
+
+                u_neg_shifted_zyxs = _perturb_or_lookup(u_neg_shifted_ijs, u_neg_valid)
+                v_neg_shifted_zyxs = _perturb_or_lookup(v_neg_shifted_ijs, v_neg_valid)
                 
             else:
                 # No perturbation applied, use original coordinates
