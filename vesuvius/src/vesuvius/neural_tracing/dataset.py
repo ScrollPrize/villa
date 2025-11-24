@@ -30,7 +30,7 @@ class Patch:
         self.valid_quad_indices = torch.stack(torch.where(self.valid_quad_mask), dim=-1)
         self.valid_vertex_mask = torch.any(self.zyxs != -1, dim=-1)
         assert len(self.valid_quad_indices) > 0
-        self.area = (~self.valid_quad_mask).sum() * (1 / self.scale).prod()
+        self.area = self.valid_quad_mask.sum() * (1 / self.scale).prod()
         self.quad_centers = torch.where(self.valid_quad_mask[..., None], 0.5 * (self.zyxs[1:, 1:] + self.zyxs[:-1, :-1]), torch.tensor(-1.))
 
     def retarget(self, factor):
