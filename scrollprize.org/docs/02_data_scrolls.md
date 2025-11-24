@@ -137,6 +137,6 @@ From the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/offici
 
 Volumes:
 
-* [20250728140407](https://data.aws.ash2txt.org/samples/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/) (entire scroll): 9.4µm, 113keV, 1.2m propagation distance. uint8 OME-Zarr archive. Total size: XX TB
-* [20250820105138](https://data.aws.ash2txt.org/samples/PHerc0139/volumes/20250820105138-2.403um-0.2m-77keV-masked.zarr/) (3 cm tall slab): 2.4µm, 77keV, 0.22 propagation distance. uint8 OME-Zarr archive. Total size: XX TB
-* [20250822062710](https://data.aws.ash2txt.org/samples/PHerc0139/volumes/20250822062710-2.403um-0.2m-77keV-masked.zarr/) (3 cm tall slab): 2.4µm, 77keV, 0.22 propagation distance. uint8 OME-Zarr archive. Total size: XX TB
+* [20250728140407](https://data.aws.ash2txt.org/samples/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/) (entire scroll): 9.4µm, 113keV, 1.2m propagation distance. uint8 OME-Zarr archive. Total size: 287.4 GB
+* [20250820105138](https://data.aws.ash2txt.org/samples/PHerc0139/volumes/20250820105138-2.403um-0.2m-77keV-masked.zarr/) (3 cm tall slab): 2.4µm, 77keV, 0.22 propagation distance. uint8 OME-Zarr archive. Total size: 3.8 TB
+* [20250822062710](https://data.aws.ash2txt.org/samples/PHerc0139/volumes/20250822062710-2.403um-0.2m-77keV-masked.zarr/) (3 cm tall slab): 2.4µm, 77keV, 0.22 propagation distance. uint8 OME-Zarr archive. Total size: 3.9 TB

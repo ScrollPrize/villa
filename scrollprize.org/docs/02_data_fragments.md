@@ -155,8 +155,8 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
   <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0009B-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 9B – infrared</figcaption></div>
 </div>
 Data available [here](https://data.aws.ash2txt.org/samples/PHerc0009B/) and [here](https://dl.ash2txt.org/fragments/PHerc0009B/).
-- Volume [20250521125136](https://data.aws.ash2txt.org/samples/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/) , 8.64µm, 1.2m propagation distance, 116keV average incident energy. · OME‑Zarr
-- Volume [20250820154339](https://data.aws.ash2txt.org/samples/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/) , 2.40µm, 0.3m propagation distance, 77keV average incident energy. · OME‑Zarr
+- Volume [20250521125136](https://data.aws.ash2txt.org/samples/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/) , 8.64µm, 1.2m propagation distance, 116keV average incident energy. uint8 OME-Zarr archive. Total size: 72.4 GB
+- Volume [20250820154339](https://data.aws.ash2txt.org/samples/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/) , 2.40µm, 0.3m propagation distance, 77keV average incident energy. uint8 OME-Zarr archive. Total size: 1.7 TB
 - Multispectral stack (16 bands)
 - Unwrapped segments
 - Case + mesh STL
