@@ -63,6 +63,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._volume_patch_bboxes = {}
         self._sampling = {}
         self._quad_bboxes = {}
+        self._vertex_normals = {}
 
         for patch in self._patches:
             top_left = patch.zyxs[:-1, :-1]
@@ -94,10 +95,39 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             self._quad_bboxes[id(patch)] = (bbox_min, bbox_max)
             volume_key = id(patch.volume)
             self._volume_patch_bboxes.setdefault(volume_key, []).append((patch, bbox_min, bbox_max))
+            self._vertex_normals[id(patch)] = self._compute_vertex_normals(patch)
 
     def _reset_iter_caches(self):
         self._perturb_cache_key = None
         self._perturb_cache_value = None
+
+    def _make_cache_key(self, patch, center_ij, min_corner_zyx, crop_size):
+        return (
+            id(patch),
+            tuple(center_ij.tolist()),
+            tuple(min_corner_zyx.tolist()),
+            int(crop_size),
+        )
+
+    @staticmethod
+    def _make_quad_weights(v_points, u_points):
+        one_minus_v = 1 - v_points
+        one_minus_u = 1 - u_points
+        w_tl = one_minus_v[:, None] * one_minus_u[None, :]
+        w_tr = one_minus_v[:, None] * u_points[None, :]
+        w_bl = v_points[:, None] * one_minus_u[None, :]
+        w_br = v_points[:, None] * u_points[None, :]
+        weights = torch.stack([w_tl, w_tr, w_bl, w_br], dim=-1)
+        return weights.view(-1, 4)
+
+    @classmethod
+    def _get_quad_weights(cls, points_per_side, device):
+        key = (int(points_per_side[0]), int(points_per_side[1]), device)
+        if key not in cls._quad_weight_cache:
+            v_points = torch.arange(points_per_side[0], dtype=torch.float32, device=device) / points_per_side[0]
+            u_points = torch.arange(points_per_side[1], dtype=torch.float32, device=device) / points_per_side[1]
+            cls._quad_weight_cache[key] = cls._make_quad_weights(v_points, u_points)
+        return cls._quad_weight_cache[key]
 
     def _sample_points_from_quads(self, patch, quad_mask):
         """Sample points finely from quads specified by the mask"""
@@ -120,27 +150,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         weights = self._get_quad_weights(points_per_side, device=filtered_quads_zyxs.device)
         points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners_flat)
 
-        return points_covering_quads.view(-1, 3)
-
-    @staticmethod
-    def _make_quad_weights(v_points, u_points):
-        one_minus_v = 1 - v_points
-        one_minus_u = 1 - u_points
-        w_tl = one_minus_v[:, None] * one_minus_u[None, :]
-        w_tr = one_minus_v[:, None] * u_points[None, :]
-        w_bl = v_points[:, None] * one_minus_u[None, :]
-        w_br = v_points[:, None] * u_points[None, :]
-        weights = torch.stack([w_tl, w_tr, w_bl, w_br], dim=-1)
-        return weights.view(-1, 4)
-
-    @classmethod
-    def _get_quad_weights(cls, points_per_side, device):
-        key = (int(points_per_side[0]), int(points_per_side[1]), device)
-        if key not in cls._quad_weight_cache:
-            v_points = torch.arange(points_per_side[0], dtype=torch.float32, device=device) / points_per_side[0]
-            u_points = torch.arange(points_per_side[1], dtype=torch.float32, device=device) / points_per_side[1]
-            cls._quad_weight_cache[key] = cls._make_quad_weights(v_points, u_points)
-        return cls._quad_weight_cache[key]
+        return points_covering_quads.reshape(-1, 3)
 
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get mask of quads that fall within the crop region."""
@@ -152,6 +162,28 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             return torch.zeros_like(patch.valid_quad_mask)
 
         return patch.valid_quad_mask & torch.all(patch.quad_centers >= crop_min, dim=-1) & torch.all(patch.quad_centers < crop_max, dim=-1)
+
+    @staticmethod
+    def _compute_vertex_normals(patch):
+        """Pre-compute unit normals per vertex from valid quads."""
+        zyxs = patch.zyxs.to(dtype=torch.float32)
+        normals = torch.zeros_like(zyxs, dtype=torch.float32)
+
+        tl = zyxs[:-1, :-1]
+        tr = zyxs[:-1, 1:]
+        bl = zyxs[1:, :-1]
+        quad_normals = torch.linalg.cross(tr - tl, bl - tl)
+        quad_normals = quad_normals * patch.valid_quad_mask[..., None]
+
+        normals[:-1, :-1] += quad_normals
+        normals[:-1, 1:] += quad_normals
+        normals[1:, :-1] += quad_normals
+        normals[1:, 1:] += quad_normals
+
+        norms = torch.linalg.norm(normals, dim=-1, keepdim=True)
+        normals = torch.where(norms > 1e-6, normals / norms, torch.zeros_like(normals))
+        normals = torch.where(patch.valid_vertex_mask[..., None], normals, torch.zeros_like(normals))
+        return normals
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
@@ -200,14 +232,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
         component_mask = torch.as_tensor(labeled == label, device=quad_in_crop.device)
         return component_mask
-
-    def _make_cache_key(self, patch, center_ij, min_corner_zyx, crop_size):
-        return (
-            id(patch),
-            tuple(center_ij.tolist()),
-            tuple(min_corner_zyx.tolist()),
-            int(crop_size),
-        )
 
     def _compute_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
         """Pre-compute the patch-point sets for a given crop context."""
@@ -299,47 +323,31 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             perturbed_zyx = get_zyx_from_patch(perturbed_ij, patch)
         
         # Estimate quad normal at this point for 3D perturbation
-        # Get neighboring points to estimate the surface normal
         i, j = perturbed_ij.int()
-        h, w = patch.zyxs.shape[:2]
-        
-        # Get surrounding points for normal estimation
-        neighbors = []
-        for di in [-1, 0, 1]:
-            for dj in [-1, 0, 1]:
-                ni, nj = i + di, j + dj
-                if 0 <= ni < h and 0 <= nj < w and patch.valid_vertex_mask[ni, nj]:
-                    neighbors.append(patch.zyxs[ni, nj])
-        
-        if len(neighbors) < 3:
-            # Not enough neighbors for normal estimation, skip 3D perturbation
-            final_zyx = perturbed_zyx
-        else:
-            # Estimate surface normal using cross product of two edges
-            normal = torch.linalg.cross(neighbors[1] - neighbors[0], neighbors[2] - neighbors[0], dim=-1)
-            normal_norm = torch.norm(normal)
-            if normal_norm > 1e-6:
-                normal = normal / normal_norm
-                # Apply random 3D offset along normal direction using w threshold
-                normal_offset_magnitude = (torch.rand([]) * 2 - 1) * self._w_max_perturbation
-                
-                # Pre-compute patch points once for efficient distance calculations
-                cached_patch_points = self._get_cached_patch_points(patch, center_ij, min_corner_zyx, crop_size)
-                
-                # Find a perturbation size that is acceptable, i.e. doesn't bring us too close to another patch
-                while abs(normal_offset_magnitude) >= 1.0:
-                    nearest_patch_distance = self._get_distance_to_nearest_patch_cached(perturbed_zyx, cached_patch_points)
-                    if abs(normal_offset_magnitude) <= nearest_patch_distance * self._main_component_distance_factor:
-                        break
-                    normal_offset_magnitude *= 0.8
-                else:
-                    normal_offset_magnitude = 0.
-                
-                # Apply the acceptable perturbation
-                final_zyx = perturbed_zyx + normal_offset_magnitude * normal
+        normal = self._vertex_normals[id(patch)][i, j]
+        normal_norm = torch.norm(normal)
+        if normal_norm > 1e-6:
+            normal = normal / normal_norm
+            # Apply random 3D offset along normal direction using w threshold
+            normal_offset_magnitude = (torch.rand([]) * 2 - 1) * self._w_max_perturbation
+
+            # Pre-compute patch points once for efficient distance calculations
+            cached_patch_points = self._get_cached_patch_points(patch, center_ij, min_corner_zyx, crop_size)
+
+            # Find a perturbation size that is acceptable, i.e. doesn't bring us too close to another patch
+            while abs(normal_offset_magnitude) >= 1.0:
+                nearest_patch_distance = self._get_distance_to_nearest_patch_cached(perturbed_zyx, cached_patch_points)
+                if abs(normal_offset_magnitude) <= nearest_patch_distance * self._main_component_distance_factor:
+                    break
+                normal_offset_magnitude *= 0.8
             else:
-                # Normal is too small, skip 3D perturbation
-                final_zyx = perturbed_zyx
+                normal_offset_magnitude = 0.
+
+            # Apply the acceptable perturbation
+            final_zyx = perturbed_zyx + normal_offset_magnitude * normal
+        else:
+            # Normal is too small or invalid, skip 3D perturbation
+            final_zyx = perturbed_zyx
 
         return final_zyx
 
