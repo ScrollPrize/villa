@@ -52,17 +52,7 @@
       "crop_size": 128,
       "model_type": "unet",
       "model_config": {
-        "conv_op": "nn.Conv3d",
-        "norm_op": "nn.InstanceNorm3d",
-        "features_per_stage": [
-          32,
-          64,
-          128,
-          256,
-          320,
-          320
-        ],
         "squeeze_excitation": true,
-        "time_emb_dim": 0
+        "basic_decoder_block": "BasicBlockD"
       }
 }
