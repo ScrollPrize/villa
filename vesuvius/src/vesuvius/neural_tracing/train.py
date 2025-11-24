@@ -16,6 +16,8 @@ import torch.nn.functional as F
 
 from dataset import HeatmapDatasetV2, load_datasets
 from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
+from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from models import make_model
 
 
@@ -27,7 +29,6 @@ def prepare_batch(batch):
     ], dim=1)
     targets = rearrange(batch['uv_heatmaps_out'], 'b z y x c -> b c z y x')
     return inputs, targets
-
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -69,6 +70,15 @@ def train(config_path):
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
 
     model = make_model(config)
+    compile_enabled = config.get('compile_model', config.get('compile', True))
+    if compile_enabled:
+        try:
+            model = torch.compile(model)
+            if accelerator.is_main_process:
+                accelerator.print("Model compiled with torch.compile")
+        except Exception as e:
+            if accelerator.is_main_process:
+                accelerator.print(f"torch.compile failed ({e}); continuing without compilation")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     lr_scheduler = diffusers.optimization.get_cosine_schedule_with_warmup(
