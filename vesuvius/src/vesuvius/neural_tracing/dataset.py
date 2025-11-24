@@ -257,7 +257,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             concat = None
             if raw_points and any(p.numel() > 0 for p in raw_points):
                 concat = torch.cat([p for p in raw_points if p.numel() > 0], dim=0)
-            self._perturb_cache_value = {"points": raw_points, "concat": concat}
+            self._perturb_cache_value = {"concat": concat}
         return self._perturb_cache_value
 
     def _get_distance_to_nearest_patch_cached(self, point_zyx, cached_patch_points):
