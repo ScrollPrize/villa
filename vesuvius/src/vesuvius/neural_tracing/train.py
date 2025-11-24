@@ -1,5 +1,6 @@
 
 import os
+import math
 import json
 import click
 import torch
@@ -34,6 +35,14 @@ def train(config_path):
 
     with open(config_path, 'r') as f:
         config = json.load(f)
+
+    # Backward compatibility for configs that omit iteration count
+    config.setdefault('num_iterations', 250000)
+    # Default image logging options to avoid NameErrors when not provided
+    log_image_max_samples = config.get('log_image_max_samples', 16)
+    log_image_grid_cols = config.get('log_image_grid_cols', 4)
+    log_image_ext = config.get('log_image_ext', 'jpg')
+    log_image_quality = config.get('log_image_quality', 80)
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)
