@@ -146,6 +146,11 @@ def train(config_path):
                     canvas = rearrange(canvas[:, :, canvas.shape[2] // 2], 'b uvw y x v -> (b y) (v x) uvw')
                 else:
                     def make_canvas(inputs, targets, target_pred):
+                        sample_count = min(inputs.shape[0], log_image_max_samples)
+                        inputs = inputs[:sample_count]
+                        targets = targets[:sample_count]
+                        target_pred = target_pred[:sample_count]
+
                         colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
                         colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)  # white for conditioning points
                         def overlay_crosshair(x):
@@ -167,12 +172,26 @@ def train(config_path):
                             projections(F.sigmoid(target_pred)),
                             projections(targets),
                         ], dim=-1)
-                        return rearrange(canvas.clip(0, 1), 'b y x rgb v -> (b y) (v x) rgb').cpu()
+                        sample_canvases = rearrange(canvas.clip(0, 1), 'b y x rgb v -> b y (v x) rgb').cpu()
+                        b, h, w, c = sample_canvases.shape
+                        cols = min(log_image_grid_cols, b)
+                        rows = math.ceil(b / cols)
+                        grid = torch.zeros((rows * h, cols * w, c), dtype=sample_canvases.dtype)
+                        for idx in range(b):
+                            row, col = divmod(idx, cols)
+                            grid[row * h : (row + 1) * h, col * w : (col + 1) * w] = sample_canvases[idx]
+                        return grid
 
-                train_canvas = make_canvas(inputs, targets, target_pred)
-                val_canvas = make_canvas(val_inputs, val_targets, val_target_pred)
-                plt.imsave(f'{out_dir}/{iteration:06}_train.png', train_canvas)
-                plt.imsave(f'{out_dir}/{iteration:06}_val.png', val_canvas)
+                target_pred_for_vis = target_pred[0] if isinstance(target_pred, (list, tuple)) else target_pred
+                val_target_pred_for_vis = val_target_pred[0] if isinstance(val_target_pred, (list, tuple)) else val_target_pred
+
+                train_canvas = make_canvas(inputs, targets, target_pred_for_vis)
+                val_canvas = make_canvas(val_inputs, val_targets, val_target_pred_for_vis)
+                save_kwargs = {'format': log_image_ext}
+                if log_image_ext in ('jpg', 'jpeg'):
+                    save_kwargs['pil_kwargs'] = {'quality': log_image_quality}
+                plt.imsave(f'{out_dir}/{iteration:06}_train.{log_image_ext}', train_canvas, **save_kwargs)
+                plt.imsave(f'{out_dir}/{iteration:06}_val.{log_image_ext}', val_canvas, **save_kwargs)
 
                 model.train()
 
