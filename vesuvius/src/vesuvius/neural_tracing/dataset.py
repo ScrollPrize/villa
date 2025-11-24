@@ -265,7 +265,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             not quad_in_crop[center_quad[0], center_quad[1]]):
             return torch.zeros_like(quad_in_crop)
 
-        # use scipy label instead of dfs 
+        # use scipy label instead of dfs
         structure = np.array([[0, 1, 0],
                               [1, 1, 1],
                               [0, 1, 0]], dtype=np.int8)
