@@ -264,18 +264,17 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             center_quad[1] < 0 or center_quad[1] >= quad_in_crop.shape[1] or
             not quad_in_crop[center_quad[0], center_quad[1]]):
             return torch.zeros_like(quad_in_crop)
-        
-        component_mask = torch.zeros_like(quad_in_crop)
-        stack = [(center_quad[0].item(), center_quad[1].item())]
-        
-        while stack:
-            i, j = stack.pop()
-            if (0 <= i < quad_in_crop.shape[0] and 0 <= j < quad_in_crop.shape[1] and 
-                quad_in_crop[i, j] and not component_mask[i, j]):
-                component_mask[i, j] = True
-                stack.extend([(i-1, j), (i+1, j), (i, j-1), (i, j+1)])
-        
-        return component_mask
+
+        # use scipy label instead of dfs 
+        structure = np.array([[0, 1, 0],
+                              [1, 1, 1],
+                              [0, 1, 0]], dtype=np.int8)
+        labeled, _ = scipy.ndimage.label(quad_in_crop.cpu().numpy(), structure=structure)
+        label = labeled[center_quad[0].item(), center_quad[1].item()]
+        if label == 0:
+            return torch.zeros_like(quad_in_crop)
+
+        return torch.as_tensor(labeled == label, device=quad_in_crop.device)
 
     def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
         """Pre-compute and cache all patch points for efficient distance calculations"""
