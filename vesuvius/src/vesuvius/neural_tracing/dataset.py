@@ -398,32 +398,35 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
             v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
 
-            # Check all points lie inside the patch
-            if torch.any(u_pos_shifted_ijs < 0) or torch.any(u_pos_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if torch.any(v_pos_shifted_ijs < 0) or torch.any(v_pos_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if not patch.valid_vertex_mask[*u_pos_shifted_ijs.int().T].all() or not patch.valid_vertex_mask[*v_pos_shifted_ijs.int().T].all():
-                continue
-            if torch.any(u_neg_shifted_ijs < 0) or torch.any(u_neg_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if torch.any(v_neg_shifted_ijs < 0) or torch.any(v_neg_shifted_ijs >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
-                continue
-            if not patch.valid_vertex_mask[*u_neg_shifted_ijs.int().T].all() or not patch.valid_vertex_mask[*v_neg_shifted_ijs.int().T].all():
-                continue
-            # FIXME: should mask instead of skipping (unless zero 'other' points), i.e. don't apply loss on these points
-            # FIXME: if the 'missing' point is on the negative side and the relevant _cond is true, then actually we're fine
+            def valid_steps(shifted_ijs):
+                """Mark which shifted points remain in-bounds and on valid vertices."""
+                ij_int = shifted_ijs.long()
+                h, w = patch.valid_vertex_mask.shape[:2]
+                in_bounds = (ij_int[:, 0] >= 0) & (ij_int[:, 0] < h) & (ij_int[:, 1] >= 0) & (ij_int[:, 1] < w)
+                valid = torch.zeros(shifted_ijs.shape[0], dtype=torch.bool, device=shifted_ijs.device)
+                if in_bounds.any():
+                    valid[in_bounds] = patch.valid_vertex_mask[ij_int[in_bounds, 0], ij_int[in_bounds, 1]]
+                return valid
+
+            u_pos_valid = valid_steps(u_pos_shifted_ijs)
+            u_neg_valid = valid_steps(u_neg_shifted_ijs)
+            v_pos_valid = valid_steps(v_pos_shifted_ijs)
+            v_neg_valid = valid_steps(v_neg_shifted_ijs)
 
             # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
             if torch.rand([]) < 0.5:
                 u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
+                u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
             if torch.rand([]) < 0.5:
                 v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
+                v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
 
             # Similarly, randomly swap U & V axes
             if torch.rand([]) < 0.5:
                 u_pos_shifted_ijs, v_pos_shifted_ijs = v_pos_shifted_ijs, u_pos_shifted_ijs
                 u_neg_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, u_neg_shifted_ijs
+                u_pos_valid, v_pos_valid = v_pos_valid, u_pos_valid
+                u_neg_valid, v_neg_valid = v_neg_valid, u_neg_valid
 
             # Apply perturbations to center and negative points
             if torch.rand([]) < self._perturb_prob:
@@ -501,6 +504,26 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             else:
                 diag_zyx = None
 
+            if (u_cond and not u_neg_valid[0]) or (v_cond and not v_neg_valid[0]):
+                # Can't condition on a missing point
+                continue
+
+            def build_out_channel_mask(cond, suppress_out, pos_valid, neg_valid):
+                if cond:
+                    return pos_valid
+                mask = torch.zeros_like(pos_valid)
+                if suppress_out != 'pos':
+                    mask |= pos_valid
+                if suppress_out != 'neg':
+                    mask |= neg_valid
+                return mask
+
+            u_out_channel_mask = build_out_channel_mask(u_cond, suppress_out_u, u_pos_valid, u_neg_valid)
+            v_out_channel_mask = build_out_channel_mask(v_cond, suppress_out_v, v_pos_valid, v_neg_valid)
+            if not (u_out_channel_mask.any() or v_out_channel_mask.any()):
+                # No valid supervision remaining
+                continue
+
             # *_in_heatmaps always have a single plane, either the first negative point or empty
             # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
             u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
@@ -508,11 +531,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if ~u_cond and ~v_cond:
                 # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
                 u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
+                combined_mask = u_out_channel_mask | v_out_channel_mask
+                u_out_channel_mask = v_out_channel_mask = combined_mask
             if diag_zyx is not None:
                 diag_in_heatmaps = make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size)
             else:
                 diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
             uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
+            out_channel_mask = torch.cat([u_out_channel_mask, v_out_channel_mask])
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -538,12 +564,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
             uv_heatmaps_in = uv_heatmaps_both[..., :3]
             uv_heatmaps_out = uv_heatmaps_both[..., 3:]
+            out_channel_mask_expanded = out_channel_mask.to(device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype).view(1, 1, 1, -1)
+            uv_heatmaps_out_mask = out_channel_mask_expanded.expand_as(uv_heatmaps_out)
+            uv_heatmaps_out = uv_heatmaps_out * uv_heatmaps_out_mask
 
             yield {
                 'volume': volume_crop,
                 'localiser': localiser,
                 'uv_heatmaps_in': uv_heatmaps_in,
                 'uv_heatmaps_out': uv_heatmaps_out,
+                'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
             }
 
 
