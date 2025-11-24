@@ -188,6 +188,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     _channel_range_cache = {}
     _kernel_offsets_cache = {}
     _kernel_value_cache = {}
+    _quad_weight_cache = {}
 
     def __init__(self, config, patches_for_split):
         self._config = config
@@ -216,12 +217,31 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         ], dim=1)  # quad, top/bottom, left/right, zyx
         
         points_per_side = (1 / patch.scale + 0.5).int()
-        v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
-        u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
-        points_covering_quads = torch.lerp(filtered_quads_zyxs[:, None, 0, :], filtered_quads_zyxs[:, None, 1, :], v_points[None, :, None, None])
-        points_covering_quads = torch.lerp(points_covering_quads[:, :, None, 0], points_covering_quads[:, :, None, 1], u_points[None, None, :, None])
-        
+        quad_corners_flat = filtered_quads_zyxs.view(filtered_quads_zyxs.shape[0], 4, 3)
+        weights = self._get_quad_weights(points_per_side, device=filtered_quads_zyxs.device)
+        points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners_flat)
+
         return points_covering_quads.view(-1, 3)
+
+    @staticmethod
+    def _make_quad_weights(v_points, u_points):
+        one_minus_v = 1 - v_points
+        one_minus_u = 1 - u_points
+        w_tl = one_minus_v[:, None] * one_minus_u[None, :]
+        w_tr = one_minus_v[:, None] * u_points[None, :]
+        w_bl = v_points[:, None] * one_minus_u[None, :]
+        w_br = v_points[:, None] * u_points[None, :]
+        weights = torch.stack([w_tl, w_tr, w_bl, w_br], dim=-1)
+        return weights.view(-1, 4)
+
+    @classmethod
+    def _get_quad_weights(cls, points_per_side, device):
+        key = (int(points_per_side[0]), int(points_per_side[1]), device)
+        if key not in cls._quad_weight_cache:
+            v_points = torch.arange(points_per_side[0], dtype=torch.float32, device=device) / points_per_side[0]
+            u_points = torch.arange(points_per_side[1], dtype=torch.float32, device=device) / points_per_side[1]
+            cls._quad_weight_cache[key] = cls._make_quad_weights(v_points, u_points)
+        return cls._quad_weight_cache[key]
 
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get mask of quads that fall within the crop region"""
