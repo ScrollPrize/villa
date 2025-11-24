@@ -7,7 +7,6 @@ import torch
 import random
 import numpy as np
 import scipy.ndimage
-import networkx as nx
 from tqdm import tqdm
 from einops import rearrange
 from functools import lru_cache
@@ -42,147 +41,6 @@ class Patch:
         )
 
 
-class PatchInCubeDataset(torch.utils.data.IterableDataset):
-
-    def __init__(self, config):
-        self._config = config
-        self._patches = load_datasets(config)
-        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['no_spatial'], config['augmentation']['only_spatial_and_intensity'])
-
-    def __iter__(self):
-
-        areas = torch.tensor([patch.area for patch in self._patches])
-        area_weights = areas / areas.sum()
-        # context_point_distance = self._config['context_point_distance']
-        # num_context_points = self._config['num_context_points']
-        # assert num_context_points >= 1  # ...since we always include one point at the center of the patch
-        crop_size = torch.tensor(self._config['crop_size'])
-
-        while True:
-            patch = random.choices(self._patches, weights=area_weights)[0]
-
-            # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
-            start_quad_ij = patch.valid_quad_indices[random_idx]
-            center_ij = start_quad_ij + torch.rand(size=[2])
-            # TODO: maybe erode inwards before doing this, so we can directly
-            #  avoid sampling points that are too near the edge of the patch
-
-            # # Sample other nearby random points as additional context; reject if outside patch
-            # angle = torch.rand(size=[num_context_points]) * 2 * torch.pi
-            # distance = context_point_distance * patch.scale
-            # context_ij = center_ij + distance * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
-            # if torch.any(context_ij < 0) or torch.any(context_ij >= torch.tensor(patch.zyxs.shape[:2])):
-            #     continue
-            # if not patch.valid_quad_mask[*context_ij.int().T].all():
-            #     continue
-
-            center_zyx = get_zyx_from_patch(center_ij, patch)
-            # context_zyxs = [self._get_zyx_from_patch(context_ij, patch) for context_ij in context_ij]
-
-            # Crop ROI out of the volume; mark context points
-            volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
-            # self._mark_context_point(volume_crop, center_zyx - min_corner_zyx)
-            # for context_zyx in context_zyxs:
-            #     self._mark_context_point(volume_crop, context_zyx - min_corner_zyx)
-
-            # Find quads that are in the volume crop, and reachable from the start quad without leaving the crop
-
-            # FIXME: instead check any corner in crop, and clamp to bounds later
-            quad_centers = 0.5 * (patch.zyxs[1:, 1:] + patch.zyxs[:-1, :-1])
-            quad_in_crop = patch.valid_quad_mask & torch.all(quad_centers >= min_corner_zyx, dim=-1) & torch.all(quad_centers < min_corner_zyx + crop_size, dim=-1)
-            
-            # Build neighbor graph of quads that are in the volume crop
-            G = nx.Graph()
-            quad_indices = torch.stack(torch.where(quad_in_crop), dim=-1)
-            
-            # Add nodes for each quad in crop using (i, j) as node ID
-            for i, j in quad_indices:
-                G.add_node((i.item(), j.item()))
-            
-            # Add edges between neighboring quads
-            for i, j in quad_indices:
-                # Check 4-connected neighbors
-                neighbors = [(i-1, j), (i+1, j), (i, j-1), (i, j+1)]
-                for ni, nj in neighbors:
-                    if (0 <= ni < quad_in_crop.shape[0] and 
-                        0 <= nj < quad_in_crop.shape[1] and 
-                        quad_in_crop[ni, nj]):
-                        G.add_edge((i.item(), j.item()), (ni.item(), nj.item()))
-            
-            # Find reachable quads starting from start_quad_ij
-            start_node = (start_quad_ij[0].item(), start_quad_ij[1].item())
-            if not G.has_node(start_node):
-                print('WARNING: start_quad_ij not in crop')
-                continue
-            reachable_quads = nx.node_connected_component(G, start_node)
-            reachable_quads = torch.tensor(list(reachable_quads))
-            
-            # Create new mask with only reachable quads
-            quad_reachable_in_crop = torch.zeros_like(quad_in_crop)
-            quad_reachable_in_crop[*reachable_quads.T] = True
-            
-            # Rasterise the (cropped, reachable) surface patch
-            filtered_quads_zyxs = torch.stack([
-                torch.stack([
-                    patch.zyxs[:-1, :-1][quad_reachable_in_crop],
-                    patch.zyxs[:-1, 1:][quad_reachable_in_crop],
-                ], dim=1),
-                torch.stack([
-                    patch.zyxs[1:, :-1][quad_reachable_in_crop],
-                    patch.zyxs[1:, 1:][quad_reachable_in_crop],
-                ], dim=1),
-            ], dim=1)  # quad, top/bottom, left/right, zyx
-            oversample_factor = 2
-            points_per_side = (1 / patch.scale + 0.5).int() * oversample_factor
-            v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
-            u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
-            points_covering_quads = torch.lerp(filtered_quads_zyxs[:, None, 0, :], filtered_quads_zyxs[:, None, 1, :], v_points[None, :, None, None])
-            points_covering_quads = torch.lerp(points_covering_quads[:, :, None, 0], points_covering_quads[:, :, None, 1], u_points[None, None, :, None])
-            indices_in_crop = (points_covering_quads - min_corner_zyx + 0.5).int().clip(0, crop_size - 1)
-            rasterised = torch.zeros([crop_size, crop_size, crop_size], dtype=torch.float32)
-            rasterised[*indices_in_crop.view(-1, 3).T] = 1.
-
-            # Construct UV map on the surface
-            filtered_quads_uvs = torch.stack(torch.where(quad_reachable_in_crop), dim=-1)
-            uv_grid = torch.stack(torch.meshgrid(u_points, v_points, indexing='ij'), dim=-1)
-            interpolated_uvs = filtered_quads_uvs[:, None, None, :] + uv_grid
-            uvs = torch.zeros([crop_size, crop_size, crop_size, 2], dtype=torch.float32)
-            uvs[*indices_in_crop.view(-1, 3).T] = interpolated_uvs.view(-1, 2)
-
-            # Extend into free space: find EDT, and use feature transform to get nearest UV
-            edt, ft = scipy.ndimage.morphology.distance_transform_edt((rasterised == 0).numpy(), return_indices=True)
-            edt /= ((crop_size // 2) ** 2 * 3) ** 0.5 + 1.  # worst case: only center point is fg, hence max(edt) is 'radius' to corners
-            edt = torch.exp(-edt / 0.25)
-            edt = edt.to(torch.float32) * 2 - 1  # ...so it's "signed" but the zero point is arbitrary
-            uvs = uvs[*ft]
-            uvs = (uvs - center_ij) / patch.scale / (crop_size * 2)  # *2 is somewhat arbitrary; worst-ish-case = patch wrapping round three sides of cube
-            uvws = torch.cat([uvs, edt[..., None]], dim=-1).to(torch.float32)
-
-            localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
-
-            #TODO: include full 2d slices for additional context
-            #  if so, need to augment them consistently with the 3d crop -> tricky for geometric transforms
-
-            # FIXME: the loop is a hack because some augmentation sometimes randomly returns None
-            #  we should instead just remove the relevant augmentation (or fix it!)
-            while True:  
-                augmented = self._augmentations(image=volume_crop[None], dist_map=torch.cat([localiser[None], rearrange(uvws, 'z y x c -> c z y x')], dim=0))
-                if augmented['dist_map'] is not None:
-                    break
-            volume_crop = augmented['image'].squeeze(0)
-            localiser = augmented['dist_map'][0]
-            uvws = rearrange(augmented['dist_map'][1:], 'c z y x -> z y x c')
-            if torch.any(torch.isnan(volume_crop)) or torch.any(torch.isnan(localiser)) or torch.any(torch.isnan(uvws)):
-                # FIXME: why do these NaNs happen occasionally?
-                continue  
-
-            yield {
-                'volume': volume_crop,
-                'localiser': localiser,
-                'uvw': uvws,
-            }
-
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     _channel_range_cache = {}
@@ -199,6 +57,49 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
         self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels
         self._main_component_distance_factor = config['point_perturbation']['main_component_distance_factor']
+
+        self._perturb_cache_key = None
+        self._perturb_cache_value = None
+        self._quad_in_crop_cache = {}
+        self._component_mask_cache = {}
+        self._volume_patch_bboxes = {}
+        self._sampling = {}
+        self._quad_bboxes = {}
+
+        for patch in self._patches:
+            top_left = patch.zyxs[:-1, :-1]
+            top_right = patch.zyxs[:-1, 1:]
+            bottom_left = patch.zyxs[1:, :-1]
+            bottom_right = patch.zyxs[1:, 1:]
+            quad_corners = torch.stack([
+                torch.stack([top_left, top_right], dim=2),
+                torch.stack([bottom_left, bottom_right], dim=2),
+            ], dim=2)  # shape: (h-1, w-1, 2, 2, 3)
+            points_per_side = (1 / patch.scale + 0.5).int()
+            v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
+            u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
+            self._sampling[id(patch)] = {
+                "quad_corners": quad_corners,
+                "v_points": v_points,
+                "u_points": u_points,
+                "uv_weights": self._make_quad_weights(v_points, u_points),
+                "quad_corners_flat": quad_corners.view(*quad_corners.shape[:2], 4, 3),
+            }
+
+            valid_centers = patch.quad_centers[patch.valid_quad_mask]
+            if len(valid_centers) == 0:
+                bbox_min = torch.zeros(3, dtype=patch.quad_centers.dtype)
+                bbox_max = bbox_min
+            else:
+                bbox_min = valid_centers.min(dim=0).values
+                bbox_max = valid_centers.max(dim=0).values
+            self._quad_bboxes[id(patch)] = (bbox_min, bbox_max)
+            volume_key = id(patch.volume)
+            self._volume_patch_bboxes.setdefault(volume_key, []).append((patch, bbox_min, bbox_max))
+
+    def _reset_iter_caches(self):
+        self._quad_in_crop_cache.clear()
+        self._component_mask_cache.clear()
 
     def _sample_points_from_quads(self, patch, quad_mask):
         """Sample points finely from quads specified by the mask"""
@@ -244,16 +145,56 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         return cls._quad_weight_cache[key]
 
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
-        """Get mask of quads that fall within the crop region"""
-        return patch.valid_quad_mask & torch.all(patch.quad_centers >= min_corner_zyx, dim=-1) & torch.all(patch.quad_centers < min_corner_zyx + crop_size, dim=-1)
+        """Get mask of quads that fall within the crop region."""
+        cache_key = (
+            id(patch),
+            tuple(torch.as_tensor(min_corner_zyx, dtype=torch.int64, device='cpu').tolist()),
+            int(crop_size),
+        )
+        cached = self._quad_in_crop_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bbox_min, bbox_max = self._quad_bboxes[id(patch)]
+        crop_min = min_corner_zyx.to(dtype=bbox_min.dtype)
+        crop_size_tensor = torch.as_tensor(crop_size, dtype=bbox_min.dtype, device=crop_min.device)
+        crop_max = crop_min + crop_size_tensor
+        if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
+            quad_mask = torch.zeros_like(patch.valid_quad_mask)
+            self._quad_in_crop_cache[cache_key] = quad_mask
+            return quad_mask
+
+        quad_mask = patch.valid_quad_mask & torch.all(patch.quad_centers >= crop_min, dim=-1) & torch.all(patch.quad_centers < crop_max, dim=-1)
+        self._quad_in_crop_cache[cache_key] = quad_mask
+        return quad_mask
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
+        bbox_min, bbox_max = self._quad_bboxes[id(patch)]
+        crop_min = min_corner_zyx.to(dtype=bbox_min.dtype)
+        crop_size_tensor = torch.as_tensor(crop_size, dtype=bbox_min.dtype)
+        crop_max = crop_min + crop_size_tensor
+        if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
+            return torch.empty((0, 3), dtype=torch.float32)
+
         quad_in_crop = self._get_quads_in_crop(patch, min_corner_zyx, crop_size)
-        return self._sample_points_from_quads(patch, quad_in_crop)
+        if not torch.any(quad_in_crop):
+            return torch.empty((0, 3), dtype=torch.float32)
+
+        info = self._sampling[id(patch)]
+        filtered_quads_zyxs = info["quad_corners_flat"][quad_in_crop]
+        weights = info["uv_weights"]
+        points_covering_quads = torch.einsum("kc,ncd->nkd", weights, filtered_quads_zyxs)
+
+        return points_covering_quads.reshape(-1, 3)
 
     def _get_current_patch_center_component_mask(self, current_patch, center_ij, min_corner_zyx, crop_size):
         """Get the mask of the connected component containing the center point"""
+        cache_key = self._make_cache_key(current_patch, center_ij, min_corner_zyx, crop_size)
+        cached = self._component_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
         
         if not torch.any(quad_in_crop):
@@ -274,45 +215,66 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         if label == 0:
             return torch.zeros_like(quad_in_crop)
 
-        return torch.as_tensor(labeled == label, device=quad_in_crop.device)
+        component_mask = torch.as_tensor(labeled == label, device=quad_in_crop.device)
+        self._component_mask_cache[cache_key] = component_mask
+        return component_mask
 
-    def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
-        """Pre-compute and cache all patch points for efficient distance calculations"""
-        
-        # Get the main component mask
+    def _make_cache_key(self, patch, center_ij, min_corner_zyx, crop_size):
+        return (
+            id(patch),
+            tuple(center_ij.tolist()),
+            tuple(min_corner_zyx.tolist()),
+            int(crop_size),
+        )
+
+    def _compute_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        """Pre-compute the patch-point sets for a given crop context."""
         quad_main_component = self._get_current_patch_center_component_mask(current_patch, center_ij, min_corner_zyx, crop_size)
-        
+
         all_patch_points = []
-        
-        # Check all other patches from the same volume
-        for other_patch in self._patches:
-            if other_patch is current_patch or other_patch.volume is not current_patch.volume:
-                continue  # Skip current patch and patches from different volumes
-            
-            # Get finely sampled points from this patch in the crop region
+        crop_min = min_corner_zyx.to(dtype=current_patch.zyxs.dtype, device=current_patch.zyxs.device)
+        crop_max = crop_min + torch.as_tensor(crop_size, dtype=crop_min.dtype, device=crop_min.device)
+
+        volume_key = id(current_patch.volume)
+        for other_patch, bbox_min, bbox_max in self._volume_patch_bboxes.get(volume_key, []):
+            if other_patch is current_patch:
+                continue  # handled separately below
+            if (bbox_max < crop_min).any() or (bbox_min >= crop_max).any():
+                continue  # cheap reject: patch bbox does not overlap crop
             patch_points = self._get_patch_points_in_crop(other_patch, min_corner_zyx, crop_size)
-            
             if len(patch_points) > 0:
                 all_patch_points.append(patch_points)
-        
-        # Check other parts of the current patch (excluding main component)
+
         quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
         quad_excluding_main = quad_in_crop & ~quad_main_component
-        
-        # Sample points from remaining parts of current patch
         other_patch_points = self._sample_points_from_quads(current_patch, quad_excluding_main)
-        
         if len(other_patch_points) > 0:
             all_patch_points.append(other_patch_points)
-        
+
         return all_patch_points
+
+    def _get_cached_patch_points(self, current_patch, center_ij, min_corner_zyx, crop_size):
+        """Pre-compute and cache all patch points for efficient distance calculations."""
+        key = self._make_cache_key(current_patch, center_ij, min_corner_zyx, crop_size)
+        if key != self._perturb_cache_key:
+            self._perturb_cache_key = key
+            raw_points = self._compute_cached_patch_points(current_patch, center_ij, min_corner_zyx, crop_size)
+            concat = None
+            if raw_points and any(p.numel() > 0 for p in raw_points):
+                concat = torch.cat([p for p in raw_points if p.numel() > 0], dim=0)
+            self._perturb_cache_value = {"points": raw_points, "concat": concat}
+        return self._perturb_cache_value
 
     def _get_distance_to_nearest_patch_cached(self, point_zyx, cached_patch_points):
         """Calculate the distance to the nearest patch using pre-computed patch points"""
-        
         if not cached_patch_points:
             return float('inf')
-        
+        if isinstance(cached_patch_points, dict):
+            concat = cached_patch_points.get("concat", None)
+            if concat is None or concat.numel() == 0:
+                return float('inf')
+            return torch.norm(concat - point_zyx, dim=-1).min().item()
+
         min_distance = float('inf')
         
         for patch_points in cached_patch_points:
@@ -501,6 +463,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         heatmap_sigma = self._heatmap_sigma
 
         while True:
+            self._reset_iter_caches()
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
