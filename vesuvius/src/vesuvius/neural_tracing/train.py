@@ -39,6 +39,62 @@ def prepare_batch(batch, recrop_center, recrop_size):
     return recrop(inputs, recrop_center, recrop_size), recrop(targets, recrop_center, recrop_size)
 
 
+def safe_crop_with_padding(tensor, min_corner, crop_size):
+    """Crop tensor around min_corner with zero-padding if crop goes outside bounds.
+
+    Args:
+        tensor: Tensor to crop, shape [batch, z, y, x, ...] where ... can be additional dims (e.g., channels)
+        min_corner: Minimum corner of crop [batch, 3] in zyx order
+        crop_size: Size of the crop (int)
+
+    Returns:
+        Cropped tensor with shape [batch, crop_size, crop_size, crop_size, ...]
+    """
+    crop_size_int = int(crop_size)
+    max_corner = min_corner + crop_size_int
+
+    # Get tensor spatial shape (last 3 dims before any trailing dimensions)
+    spatial_shape = torch.tensor(tensor.shape[1:4], device=min_corner.device, dtype=min_corner.dtype)
+
+    # Clamp to tensor bounds
+    actual_min = torch.maximum(min_corner, torch.zeros_like(min_corner))
+    actual_max = torch.minimum(max_corner, spatial_shape.unsqueeze(0).expand_as(actual_min))
+
+    # Extract valid portion and pad if needed
+    crops = []
+    for iib in range(tensor.shape[0]):
+        crop = tensor[
+            iib,
+            actual_min[iib, 0].int().item() : actual_max[iib, 0].int().item(),
+            actual_min[iib, 1].int().item() : actual_max[iib, 1].int().item(),
+            actual_min[iib, 2].int().item() : actual_max[iib, 2].int().item()
+        ]
+
+        # Pad if needed
+        pad_before = (actual_min[iib] - min_corner[iib]).int()
+        pad_after = (max_corner[iib] - actual_max[iib]).int()
+
+        if torch.any(pad_before > 0) or torch.any(pad_after > 0):
+            # F.pad expects padding in reverse order of dimensions (last dim first)
+            # For tensor [z, y, x, ...]: pad last 3 dims (spatial) and any trailing dims
+            # Format: (pad_for_last_dim_before, pad_for_last_dim_after, ..., pad_for_first_dim_before, pad_for_first_dim_after)
+            trailing_dims = crop.dim() - 3
+            # Padding for trailing dimensions (if any) - no padding needed
+            trailing_padding = (0, 0) * trailing_dims if trailing_dims > 0 else ()
+            # Padding for spatial dimensions: x, y, z (in reverse order)
+            spatial_padding = (
+                pad_before[2].item(), pad_after[2].item(),  # x (last spatial dim)
+                pad_before[1].item(), pad_after[1].item(),  # y
+                pad_before[0].item(), pad_after[0].item()   # z (first spatial dim)
+            )
+            paddings = trailing_padding + spatial_padding
+            crop = F.pad(crop, paddings, mode='constant', value=0)
+
+        crops.append(crop)
+
+    return torch.stack(crops, dim=0)
+
+
 def transform_to_first_crop_space(step_pred, offset, crop_size):
     """Transform predictions from a later step's crop space to the first step's crop space.
 
@@ -240,16 +296,11 @@ def train(config_path):
 
                     # Prepare the volume (sub-)crop and localiser. For the localiser we take the original since
                     # we still want the center of it (conceptually we create a new localiser at the new center)
-                    max_corner_new_subcrop_in_outer = min_corner_new_subcrop_in_outer + config['crop_size']
-                    step_volume_crop = torch.stack([
-                        batch['volume'][
-                            iib,
-                            min_corner_new_subcrop_in_outer[iib, 0] : max_corner_new_subcrop_in_outer[iib, 0],
-                            min_corner_new_subcrop_in_outer[iib, 1] : max_corner_new_subcrop_in_outer[iib, 1],
-                            min_corner_new_subcrop_in_outer[iib, 2] : max_corner_new_subcrop_in_outer[iib, 2]
-                        ]
-                        for iib in range(min_corner_new_subcrop_in_outer.shape[0])
-                    ], dim=0)
+                    step_volume_crop = safe_crop_with_padding(
+                        batch['volume'],
+                        min_corner_new_subcrop_in_outer,
+                        config['crop_size']
+                    )
                     # FIXME: this makes assumptions about how prepare_batch arranges stuff; can we unify?
                     step_inputs = torch.cat([
                         step_volume_crop.unsqueeze(1),
@@ -261,15 +312,11 @@ def train(config_path):
                     # TODO: make checkpointing optional
                     step_pred = torch.utils.checkpoint.checkpoint(model, step_inputs)
 
-                    step_targets = torch.stack([
-                        batch['uv_heatmaps_out'][
-                            iib,
-                            min_corner_new_subcrop_in_outer[iib, 0] : max_corner_new_subcrop_in_outer[iib, 0],
-                            min_corner_new_subcrop_in_outer[iib, 1] : max_corner_new_subcrop_in_outer[iib, 1],
-                            min_corner_new_subcrop_in_outer[iib, 2] : max_corner_new_subcrop_in_outer[iib, 2]
-                        ]
-                        for iib in range(min_corner_new_subcrop_in_outer.shape[0])
-                    ], dim=0)
+                    step_targets = safe_crop_with_padding(
+                        batch['uv_heatmaps_out'],
+                        min_corner_new_subcrop_in_outer,
+                        config['crop_size']
+                    )
                     step_targets = rearrange(step_targets[..., step_idx::config['multistep_count']], 'b z y x c -> b c z y x')
 
                     # Store sample #0 prediction for visualization
