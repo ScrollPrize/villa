@@ -58,6 +58,8 @@ We’re awarding **$200,000** (single winner) for delivering **automated virtual
 
 Ink detection is **not required**; the focus is high-quality segmentation, continuity, and flattening suitable for later reading.
 
+We accept submissions for this prize until 11:59pm Pacific, December 31st, 2025!
+
 <div className="mb-4">
   <img src="/img/landing/scroll.webp" className="w-[50%]"/>
   <figcaption className="mt-[-6px]">A carbonized scroll.</figcaption>
@@ -102,9 +104,33 @@ Ink detection is **not required**; the focus is high-quality segmentation, conti
   2) Higher **coverage** across the two scrolls;    
   3) Fewer **total human-hours** (sum over both);  
   4) Earlier submission timestamp.
+
+### Deadline
+- **11:59pm Pacific, December 31st, 2025**
+
 </details>
 
 [Submission Form](https://forms.gle/MqP3XQGX7o2ZFfZW6)
+
+***
+
+## 3D Surface Detection Challenge (hosted on Kaggle)
+
+We are holding a $100,000 prize pool competition for detection of the recto papyrus surfaces in the 3D CT scans.
+The contest is currently hosted on Kaggle on [this page](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
+
+### Prizes
+- 1st place: $25,000
+- 2nd place: $20,000
+- 3rd place: $15,000
+- 4th place: $10,000
+- 5th–10th: $5,000
+
+### Timeline
+- November 13, 2025 - Start Date.
+- February 6, 2026 - Entry Deadline. You must accept the competition rules before this date in order to compete.
+- February 6, 2026 - Team Merger Deadline. This is the last day participants may join or merge teams.
+- February 13, 2026 - Final Submission Deadline.
 
 ***
 
