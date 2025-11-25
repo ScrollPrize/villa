@@ -14,7 +14,8 @@ def infer_with_tta(model,
                    tta_type: str = 'mirroring',
                    *,
                    is_multi_task: bool = False,
-                   concat_multi_task_outputs=None) -> torch.Tensor:
+                   concat_multi_task_outputs=None,
+                   batched: bool = False) -> torch.Tensor:
     """
     Apply TTA for 3D or 2D models.
 
@@ -25,6 +26,7 @@ def infer_with_tta(model,
                 'rotation' uses axis transpositions to rotate volumes
     - is_multi_task: if True, model returns a dict; provide concat_multi_task_outputs
                      to concatenate dict outputs into a tensor (B, C, ...)
+    - batched: if True, run all augmentations in one forward by concatenating along batch
     """
     if tta_type not in ('mirroring', 'rotation'):
         raise ValueError(f"Unsupported tta_type: {tta_type}")
@@ -39,82 +41,53 @@ def infer_with_tta(model,
 
     if tta_type == 'mirroring':
         if spatial_dims == 3:
-            m0 = model(inputs)
-            m1 = model(torch.flip(inputs, dims=[-1]))
-            m2 = model(torch.flip(inputs, dims=[-2]))
-            m3 = model(torch.flip(inputs, dims=[-3]))
-            m4 = model(torch.flip(inputs, dims=[-1, -2]))
-            m5 = model(torch.flip(inputs, dims=[-1, -3]))
-            m6 = model(torch.flip(inputs, dims=[-2, -3]))
-            m7 = model(torch.flip(inputs, dims=[-1, -2, -3]))
-
-            m0 = _concat_if_multi_task(m0, is_multi_task, concat_multi_task_outputs)
-            m1 = _concat_if_multi_task(m1, is_multi_task, concat_multi_task_outputs)
-            m2 = _concat_if_multi_task(m2, is_multi_task, concat_multi_task_outputs)
-            m3 = _concat_if_multi_task(m3, is_multi_task, concat_multi_task_outputs)
-            m4 = _concat_if_multi_task(m4, is_multi_task, concat_multi_task_outputs)
-            m5 = _concat_if_multi_task(m5, is_multi_task, concat_multi_task_outputs)
-            m6 = _concat_if_multi_task(m6, is_multi_task, concat_multi_task_outputs)
-            m7 = _concat_if_multi_task(m7, is_multi_task, concat_multi_task_outputs)
-
-            outputs = [
-                m0,
-                torch.flip(m1, dims=[-1]),
-                torch.flip(m2, dims=[-2]),
-                torch.flip(m3, dims=[-3]),
-                torch.flip(m4, dims=[-1, -2]),
-                torch.flip(m5, dims=[-1, -3]),
-                torch.flip(m6, dims=[-2, -3]),
-                torch.flip(m7, dims=[-1, -2, -3])
+            augments = [
+                (lambda t: t, lambda t: t),
+                (lambda t: torch.flip(t, dims=[-1]), lambda t: torch.flip(t, dims=[-1])),
+                (lambda t: torch.flip(t, dims=[-2]), lambda t: torch.flip(t, dims=[-2])),
+                (lambda t: torch.flip(t, dims=[-3]), lambda t: torch.flip(t, dims=[-3])),
+                (lambda t: torch.flip(t, dims=[-1, -2]), lambda t: torch.flip(t, dims=[-1, -2])),
+                (lambda t: torch.flip(t, dims=[-1, -3]), lambda t: torch.flip(t, dims=[-1, -3])),
+                (lambda t: torch.flip(t, dims=[-2, -3]), lambda t: torch.flip(t, dims=[-2, -3])),
+                (lambda t: torch.flip(t, dims=[-1, -2, -3]), lambda t: torch.flip(t, dims=[-1, -2, -3])),
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
         else:  # 2D flips over H and W
-            m0 = model(inputs)
-            m1 = model(torch.flip(inputs, dims=[-1]))  # W
-            m2 = model(torch.flip(inputs, dims=[-2]))  # H
-            m3 = model(torch.flip(inputs, dims=[-2, -1]))  # HW
-
-            m0 = _concat_if_multi_task(m0, is_multi_task, concat_multi_task_outputs)
-            m1 = _concat_if_multi_task(m1, is_multi_task, concat_multi_task_outputs)
-            m2 = _concat_if_multi_task(m2, is_multi_task, concat_multi_task_outputs)
-            m3 = _concat_if_multi_task(m3, is_multi_task, concat_multi_task_outputs)
-
-            outputs = [
-                m0,
-                torch.flip(m1, dims=[-1]),
-                torch.flip(m2, dims=[-2]),
-                torch.flip(m3, dims=[-2, -1])
+            augments = [
+                (lambda t: t, lambda t: t),
+                (lambda t: torch.flip(t, dims=[-1]), lambda t: torch.flip(t, dims=[-1])),
+                (lambda t: torch.flip(t, dims=[-2]), lambda t: torch.flip(t, dims=[-2])),
+                (lambda t: torch.flip(t, dims=[-2, -1]), lambda t: torch.flip(t, dims=[-2, -1])),
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
-
     else:  # rotation
         if spatial_dims == 3:
-            r0 = model(inputs)
-            x_up = torch.transpose(inputs, -3, -1)
-            r_x_up = model(x_up)
-            z_up = torch.transpose(inputs, -3, -2)
-            r_z_up = model(z_up)
-
-            r0 = _concat_if_multi_task(r0, is_multi_task, concat_multi_task_outputs)
-            r_x_up = _concat_if_multi_task(r_x_up, is_multi_task, concat_multi_task_outputs)
-            r_z_up = _concat_if_multi_task(r_z_up, is_multi_task, concat_multi_task_outputs)
-
-            outputs = [
-                r0,
-                torch.transpose(r_x_up, -3, -1),
-                torch.transpose(r_z_up, -3, -2)
+            augments = [
+                (lambda t: t, lambda t: t),
+                (lambda t: torch.transpose(t, -3, -1), lambda t: torch.transpose(t, -3, -1)),
+                (lambda t: torch.transpose(t, -3, -2), lambda t: torch.transpose(t, -3, -2)),
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
         else:  # 2D: use transpose(H,W) as rotation
-            r0 = model(inputs)
-            hw = torch.transpose(inputs, -2, -1)
-            r_hw = model(hw)
-
-            r0 = _concat_if_multi_task(r0, is_multi_task, concat_multi_task_outputs)
-            r_hw = _concat_if_multi_task(r_hw, is_multi_task, concat_multi_task_outputs)
-
-            outputs = [
-                r0,
-                torch.transpose(r_hw, -2, -1)
+            augments = [
+                (lambda t: t, lambda t: t),
+                (lambda t: torch.transpose(t, -2, -1), lambda t: torch.transpose(t, -2, -1)),
             ]
-            return torch.mean(torch.stack(outputs, dim=0), dim=0)
+
+    if not batched:
+        outputs = []
+        for apply_fn, invert_fn in augments:
+            aug_inputs = apply_fn(inputs)
+            out = model(aug_inputs)
+            out = _concat_if_multi_task(out, is_multi_task, concat_multi_task_outputs)
+            outputs.append(invert_fn(out))
+        return torch.mean(torch.stack(outputs, dim=0), dim=0)
+
+    base_bs = inputs.shape[0]
+    augmented_inputs = [apply_fn(inputs) for apply_fn, _ in augments]
+    cat_inputs = torch.cat(augmented_inputs, dim=0)
+    merged = model(cat_inputs)
+    merged = _concat_if_multi_task(merged, is_multi_task, concat_multi_task_outputs)
+
+    chunks = torch.split(merged, base_bs, dim=0)
+    outputs = []
+    for idx, (_, invert_fn) in enumerate(augments):
+        outputs.append(invert_fn(chunks[idx]))
+    return torch.mean(torch.stack(outputs, dim=0), dim=0)
