@@ -29,7 +29,7 @@ def get_training_augmentations(crop_size, allow_transposes, only_spatial_and_int
         # Only add transpose transform if all three dimensions are equal
         if patch_d == patch_h == patch_w:
             transforms.append(RandomTransform(
-                TransposeAxesTransform(allowed_axes={0, 1, 2}),
+                TransposeAxesTransform(allowed_axes={0, 1, 2}, normal_keys={'normals'}),
                 apply_probability=0.5  # diverges from vesuvius!
             ))
 
