@@ -2,6 +2,7 @@
 import os
 import cv2
 import json
+import numpy as np
 
 
 def get_area(zyxs, step_size, voxel_size_um):
@@ -13,6 +14,12 @@ def get_area(zyxs, step_size, voxel_size_um):
 
 
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_metadata={}):
+    if hasattr(zyxs, "detach"):
+        zyxs = zyxs.detach().cpu().numpy()
+    else:
+        zyxs = np.asarray(zyxs)
+    zyxs = zyxs.astype(np.float32)
+
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
     cv2.imwrite(f'{path}/x.tif', zyxs[..., 2])
@@ -32,4 +39,3 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_m
             **additional_metadata
         }, f, indent=4)
     return True
-
