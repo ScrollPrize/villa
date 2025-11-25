@@ -17,6 +17,7 @@ import vesuvius.neural_tracing.augmentation as augmentation
 
 
 
+
 @dataclass
 class Patch:
     zyxs: torch.Tensor
@@ -39,8 +40,6 @@ class Patch:
             self.scale * factor,
             self.volume
         )
-
-
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     _channel_range_cache = {}
@@ -242,6 +241,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         crop_max = crop_min + torch.as_tensor(crop_size, dtype=crop_min.dtype, device=crop_min.device)
 
         volume_key = id(current_patch.volume)
+
+        # Check all other patches from the same volume
         for other_patch, bbox_min, bbox_max in self._volume_patch_bboxes.get(volume_key, []):
             if other_patch is current_patch:
                 continue  # handled separately below
@@ -251,9 +252,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if len(patch_points) > 0:
                 all_patch_points.append(patch_points)
 
+        # Check other parts of the current patch (excluding main component)
         quad_in_crop = self._get_quads_in_crop(current_patch, min_corner_zyx, crop_size)
         quad_excluding_main = quad_in_crop & ~quad_main_component
+
+        # Sample points from remaining parts of current patch
         other_patch_points = self._sample_points_from_quads(current_patch, quad_excluding_main)
+
         if len(other_patch_points) > 0:
             all_patch_points.append(other_patch_points)
 
@@ -453,6 +458,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         crop_size = torch.tensor(self._config['crop_size'])
         step_size = torch.tensor(self._config['step_size'])
         step_count = torch.tensor(self._config['step_count'])
+        multistep_prob = float(self._config.get('multistep_prob', 0.0))
+        multistep_count = int(self._config.get('multistep_count', 1))
+        if torch.rand([]) < multistep_prob:
+            step_count *= multistep_count
+            crop_size += step_size * step_count * (multistep_count - 1) * 2
+        else:
+            multistep_count = 1
         heatmap_sigma = self._heatmap_sigma
 
         while True:
@@ -460,7 +472,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             patch = random.choices(self._patches, weights=area_weights)[0]
 
             # Sample a random valid quad in the patch, then a point in that quad
-            random_idx = torch.randint(len(patch.valid_quad_indices) - 1, size=[])
+            random_idx = torch.randint(len(patch.valid_quad_indices), size=[])
             start_quad_ij = patch.valid_quad_indices[random_idx]
             center_ij = start_quad_ij + torch.rand(size=[2])
             center_zyx = get_zyx_from_patch(center_ij, patch)
@@ -531,92 +543,225 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             # Get crop volume and its min-corner (which may be slightly negative)
             volume_crop, min_corner_zyx = get_crop_from_volume(patch.volume, center_zyx, crop_size)
 
+            seg = seg_mask = None
+            normals = normals_mask = None
+            surface_pts_crop = None
+            normals_covering_quads = None
+
+            needs_surface = self._config.get("aux_segmentation", False) or self._config.get("aux_normals", False)
+            if needs_surface:
+                quad_in_crop = self._get_quads_in_crop(patch, min_corner_zyx, crop_size)
+
+                if torch.any(quad_in_crop):
+                    info = self._sampling[id(patch)]
+                    weights = info["uv_weights"]  # [P, 4]
+
+                    quad_corners = info["quad_corners_flat"][quad_in_crop]
+                    points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners).reshape(-1, 3)
+                    surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device)).round().long()
+                    in_bounds = ((surface_pts_crop >= 0) & (surface_pts_crop < crop_size)).all(dim=1)
+                    surface_pts_crop = surface_pts_crop[in_bounds]
+                    if self._config.get("aux_normals", False):
+                        vertex_normals = self._vertex_normals[id(patch)]
+                        filtered_quad_normals = torch.stack([
+                            torch.stack([vertex_normals[:-1, :-1][quad_in_crop], vertex_normals[:-1, 1:][quad_in_crop]], dim=1),
+                            torch.stack([vertex_normals[1:, :-1][quad_in_crop], vertex_normals[1:, 1:][quad_in_crop]], dim=1),
+                        ], dim=1)  # [N, 2, 2, 3]
+                        quad_normals_flat = filtered_quad_normals.view(filtered_quad_normals.shape[0], 4, 3)
+                        normals_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_normals_flat).reshape(-1, 3)
+                        normals_covering_quads = normals_covering_quads[in_bounds]
+
+            if self._config.get("aux_segmentation", False):
+                # Use the same dense surface sampling as normals, then keep only the component touching the center quad.
+                if surface_pts_crop is None or surface_pts_crop.numel() == 0:
+                    continue
+                seg = torch.zeros((crop_size, crop_size, crop_size), device=surface_pts_crop.device, dtype=torch.float32)
+                z, y, x = surface_pts_crop.unbind(dim=1)
+                seg[z, y, x] = 1.0
+
+                center_voxel = (center_zyx - min_corner_zyx).round().long()
+                center_voxel = torch.clamp(center_voxel, 0, crop_size - 1)
+                seg[center_voxel[0], center_voxel[1], center_voxel[2]] = 1.0
+                # Only supervise where we have a label
+                seg_mask = seg.clone()
+
+            if self._config.get("aux_normals", False):
+                # Build dense normals by bilinearly interpolating vertex normals within each quad and splatting to voxels.
+                if normals_covering_quads is None or surface_pts_crop is None or surface_pts_crop.numel() == 0:
+                    continue
+                normals = torch.zeros((3, crop_size, crop_size, crop_size), device=surface_pts_crop.device, dtype=torch.float32)
+                counts = torch.zeros((1, crop_size, crop_size, crop_size), device=surface_pts_crop.device, dtype=torch.float32)
+                z, y, x = surface_pts_crop.unbind(dim=1)
+                norms = torch.linalg.norm(normals_covering_quads, dim=1, keepdim=True)
+                normals_covering_quads = torch.where(norms > 1e-6, normals_covering_quads / norms, torch.zeros_like(normals_covering_quads))
+                normals.index_put_((torch.arange(3, device=surface_pts_crop.device)[:, None], z[None], y[None], x[None]), normals_covering_quads.T, accumulate=True)
+                counts.index_put_((torch.zeros_like(z), z, y, x), torch.ones_like(z, dtype=torch.float32), accumulate=True)
+                mask = (counts > 0).float()
+                normals = torch.where(mask > 0, normals / torch.clamp(counts, min=1e-6), torch.zeros_like(normals))
+                normals_mask = mask
+
             # Map to 3D space and construct heatmaps
             u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
             v_pos_shifted_zyxs = get_zyx_from_patch(v_pos_shifted_ijs, patch)
 
-            def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs, cond, suppress_out=None):
-                if cond:
-                    # Conditioning on this direction: include one negative point as input, and all positive as output
-                    assert suppress_out is None
-                    in_heatmaps = self.make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
-                    out_heatmaps = self.make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size, sigma=heatmap_sigma)
-                else:
-                    # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
-                    in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
-                    out_points = ([pos_shifted_zyxs] if suppress_out != 'pos' else []) + ([neg_shifted_zyxs] if suppress_out != 'neg' else [])
-                    out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size, sigma=heatmap_sigma) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
-                return in_heatmaps, out_heatmaps
+            masked_conditioning = bool(self._config.get("masked_conditioning", False))
+            include_condition_mask = bool(self._config.get("include_condition_mask_channel", False))
 
-            # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
+            condition_mask_for_batch = None
+            condition_mask_channels = 0
 
-            u_cond, v_cond = torch.rand([2]) < 0.75
+            if masked_conditioning:
+                slot_heatmaps = []
+                slot_valids = []
 
-            diag_ij = None
-            suppress_out_u = suppress_out_v = None
-            
-            if (u_cond ^ v_cond) and torch.rand([]) < 0.6:
-                # With 60% probability in one-cond case, also condition on a diagonal that is adjacent
-                # to the conditioned-on (1st neg) point, and suppress output (positive/negative) heatmaps
-                # for the perpendicular (not-cond) direction on the same side as the diagonal
-                diag_is_pos = torch.rand([]) < 0.5
-                if u_cond:
-                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], (v_pos_shifted_ijs if diag_is_pos else v_neg_shifted_ijs)[0, 1]])
-                    suppress_out_v = 'neg' if diag_is_pos else 'pos'
-                else:
-                    diag_ij = torch.stack([(u_pos_shifted_ijs if diag_is_pos else u_neg_shifted_ijs)[0, 0], v_neg_shifted_ijs[0, 1]])
-                    suppress_out_u = 'neg' if diag_is_pos else 'pos'
-            if (u_cond & v_cond) and torch.rand([]) < 0.5:
-                # With 50% probability in two-cond case, also condition on a diagonal in a 'to x from' direction, so
-                # adjacent to exactly one of the conditioned-on (1st neg) points
-                if torch.rand([]) < 0.5:
-                    diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]])
-                else:
-                    diag_ij = torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]])
-            if diag_ij is not None:
-                if torch.any(diag_ij < 0) or torch.any(diag_ij >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
+                def _append_slots(points_zyx, valid_flags):
+                    for idx in range(points_zyx.shape[0]):
+                        slot_heatmaps.append(self.make_heatmaps([points_zyx[idx:idx+1]], min_corner_zyx, crop_size, sigma=heatmap_sigma))
+                        slot_valids.append(valid_flags[idx])
+
+                _append_slots(u_neg_shifted_zyxs, u_neg_valid)
+                _append_slots(u_pos_shifted_zyxs, u_pos_valid)
+                _append_slots(v_neg_shifted_zyxs, v_neg_valid)
+                _append_slots(v_pos_shifted_zyxs, v_pos_valid)
+
+                if self._config.get("masked_include_diag", False):
+                    diag_prob = float(self._config.get("masked_diag_prob", 0.5))
+                    diag_candidates = [
+                        (torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]]), u_neg_valid[0] & v_pos_valid[0]),
+                        (torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]]), u_pos_valid[0] & v_neg_valid[0]),
+                        (torch.stack([u_neg_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]]), u_neg_valid[0] & v_neg_valid[0]),
+                        (torch.stack([u_pos_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]]), u_pos_valid[0] & v_pos_valid[0]),
+                    ]
+                    valid_diags = [(ij, ok) for ij, ok in diag_candidates if ok]
+                    diag_valid = False
+                    diag_heatmap = torch.zeros_like(slot_heatmaps[0])
+                    if valid_diags and torch.rand([]) < diag_prob:
+                        diag_ij, _ = random.choice(valid_diags)
+                        diag_zyx = get_zyx_from_patch(diag_ij, patch)
+                        diag_heatmap = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                        diag_valid = True
+                    slot_heatmaps.append(diag_heatmap)
+                    slot_valids.append(torch.tensor(diag_valid, device=diag_heatmap.device))
+
+                valid_mask = torch.as_tensor(slot_valids, device=slot_heatmaps[0].device, dtype=torch.bool) if slot_heatmaps else torch.tensor([], device=u_pos_shifted_zyxs.device, dtype=torch.bool)
+                if valid_mask.numel() == 0 or not valid_mask.any():
                     continue
-                if not patch.valid_vertex_mask[*diag_ij.int()]:
+
+                known_prob = float(self._config.get("masked_condition_known_prob", 0.5))
+                known_mask = (torch.rand_like(valid_mask, dtype=torch.float32) < known_prob) & valid_mask
+                unknown_mask = valid_mask & ~known_mask
+                if not unknown_mask.any():
+                    # Ensure at least one slot remains to supervise
+                    valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+                    chosen = valid_indices[torch.randint(len(valid_indices), size=[])]
+                    known_mask[chosen] = False
+                    unknown_mask[chosen] = True
+
+                uv_heatmaps_out_all = torch.cat(slot_heatmaps, dim=0)
+                uv_heatmaps_in_all = uv_heatmaps_out_all * known_mask[:, None, None, None].to(dtype=uv_heatmaps_out_all.dtype)
+                out_channel_mask = unknown_mask
+                condition_mask_for_batch = known_mask[:, None, None, None].to(dtype=uv_heatmaps_out_all.dtype, device=uv_heatmaps_out_all.device)
+                condition_mask_for_batch = condition_mask_for_batch.expand_as(uv_heatmaps_out_all)
+                condition_mask_channels = condition_mask_for_batch.shape[0] if include_condition_mask else 0
+
+                condition_channels = uv_heatmaps_in_all.shape[0]
+                uv_heatmaps_both = torch.cat(
+                    [uv_heatmaps_in_all, uv_heatmaps_out_all] + ([condition_mask_for_batch] if include_condition_mask else []),
+                    dim=0
+                )
+                uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
+            else:
+                def make_in_out_heatmaps(pos_shifted_zyxs, neg_shifted_zyxs, cond, suppress_out=None):
+                    if cond:
+                        # Conditioning on this direction: include one negative point as input, and all positive as output
+                        assert suppress_out is None
+                        in_heatmaps = self.make_heatmaps([neg_shifted_zyxs[:1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                        out_heatmaps = self.make_heatmaps([pos_shifted_zyxs], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                    else:
+                        # Not conditioning on this direction: include all positive and negative points as output, and nothing as input
+                        in_heatmaps = torch.zeros([1, crop_size, crop_size, crop_size])
+                        out_points = ([pos_shifted_zyxs] if suppress_out != 'pos' else []) + ([neg_shifted_zyxs] if suppress_out != 'neg' else [])
+                        out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size, sigma=heatmap_sigma) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
+                    return in_heatmaps, out_heatmaps
+
+                # TODO: is there a nicer way to arrange this that expresses the logic/cases better?
+
+                if multistep_count == 1:
+                    u_cond, v_cond = torch.rand([2]) < 0.75
+                else:
+                    # For now, multi-step only works for a 'chain', i.e. conditioning on exactly one of u/v
+                    u_cond, v_cond = torch.tensor([True, False] if torch.rand([]) < 0.5 else [False, True])
+
+                diag_ij = None
+                suppress_out_u = suppress_out_v = None
+                
+                if (u_cond ^ v_cond) and torch.rand([]) < 0.6:
+                    # With 60% probability in one-cond case, also condition on a diagonal that is adjacent
+                    # to the conditioned-on (1st neg) point, and suppress output (positive/negative) heatmaps
+                    # for the perpendicular (not-cond) direction on the same side as the diagonal
+                    diag_is_pos = torch.rand([]) < 0.5
+                    if u_cond:
+                        diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], (v_pos_shifted_ijs if diag_is_pos else v_neg_shifted_ijs)[0, 1]])
+                        suppress_out_v = 'neg' if diag_is_pos else 'pos'
+                    else:
+                        diag_ij = torch.stack([(u_pos_shifted_ijs if diag_is_pos else u_neg_shifted_ijs)[0, 0], v_neg_shifted_ijs[0, 1]])
+                        suppress_out_u = 'neg' if diag_is_pos else 'pos'
+                if (u_cond & v_cond) and torch.rand([]) < 0.5:
+                    # With 50% probability in two-cond case, also condition on a diagonal in a 'to x from' direction, so
+                    # adjacent to exactly one of the conditioned-on (1st neg) points
+                    if torch.rand([]) < 0.5:
+                        diag_ij = torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]])
+                    else:
+                        diag_ij = torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]])
+                if diag_ij is not None:
+                    if torch.any(diag_ij < 0) or torch.any(diag_ij >= torch.tensor(patch.valid_vertex_mask.shape[:2])):
+                        continue
+                    if not patch.valid_vertex_mask[*diag_ij.int()]:
+                        continue
+                    diag_zyx = get_zyx_from_patch(diag_ij, patch)
+                else:
+                    diag_zyx = None
+
+                if (u_cond and not u_neg_valid[0]) or (v_cond and not v_neg_valid[0]):
+                    # Can't condition on a missing point
                     continue
-                diag_zyx = get_zyx_from_patch(diag_ij, patch)
-            else:
-                diag_zyx = None
 
-            if (u_cond and not u_neg_valid[0]) or (v_cond and not v_neg_valid[0]):
-                # Can't condition on a missing point
-                continue
+                def build_out_channel_mask(cond, suppress_out, pos_valid, neg_valid):
+                    if cond:
+                        return pos_valid
+                    mask = torch.zeros_like(pos_valid)
+                    if suppress_out != 'pos':
+                        mask |= pos_valid
+                    if suppress_out != 'neg':
+                        mask |= neg_valid
+                    return mask
 
-            def build_out_channel_mask(cond, suppress_out, pos_valid, neg_valid):
-                if cond:
-                    return pos_valid
-                mask = torch.zeros_like(pos_valid)
-                if suppress_out != 'pos':
-                    mask |= pos_valid
-                if suppress_out != 'neg':
-                    mask |= neg_valid
-                return mask
+                u_out_channel_mask = build_out_channel_mask(u_cond, suppress_out_u, u_pos_valid, u_neg_valid)
+                v_out_channel_mask = build_out_channel_mask(v_cond, suppress_out_v, v_pos_valid, v_neg_valid)
+                if not (u_out_channel_mask.any() or v_out_channel_mask.any()):
+                    # No valid supervision remaining
+                    continue
 
-            u_out_channel_mask = build_out_channel_mask(u_cond, suppress_out_u, u_pos_valid, u_neg_valid)
-            v_out_channel_mask = build_out_channel_mask(v_cond, suppress_out_v, v_pos_valid, v_neg_valid)
-            if not (u_out_channel_mask.any() or v_out_channel_mask.any()):
-                # No valid supervision remaining
-                continue
+                # *_in_heatmaps always have a single plane, either the first negative point or empty
+                # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
+                u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
+                v_in_heatmaps, v_out_heatmaps = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs, v_cond, suppress_out_v)
+                if ~u_cond and ~v_cond:
+                    # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
+                    u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
+                    combined_mask = u_out_channel_mask | v_out_channel_mask
+                    u_out_channel_mask = v_out_channel_mask = combined_mask
+                if diag_zyx is not None:
+                    diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
+                else:
+                    diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
 
-            # *_in_heatmaps always have a single plane, either the first negative point or empty
-            # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
-            u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
-            v_in_heatmaps, v_out_heatmaps = make_in_out_heatmaps(v_pos_shifted_zyxs, v_neg_shifted_zyxs, v_cond, suppress_out_v)
-            if ~u_cond and ~v_cond:
-                # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
-                u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
-                combined_mask = u_out_channel_mask | v_out_channel_mask
-                u_out_channel_mask = v_out_channel_mask = combined_mask
-            if diag_zyx is not None:
-                diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
-            else:
-                diag_in_heatmaps = torch.zeros_like(u_in_heatmaps)
-            uv_heatmaps_both = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps, u_out_heatmaps, v_out_heatmaps], dim=0)
-            out_channel_mask = torch.cat([u_out_channel_mask, v_out_channel_mask])
+                uv_heatmaps_in_all = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps], dim=0)
+                uv_heatmaps_out_all = torch.cat([u_out_heatmaps, v_out_heatmaps], dim=0)
+                out_channel_mask = torch.cat([u_out_channel_mask, v_out_channel_mask])
+                condition_channels = uv_heatmaps_in_all.shape[0]
+                uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
+                uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -629,30 +774,86 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             # TODO: consider interaction of augmentation with localiser -- logically should follow translations of
             #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
             #  ok since it's 'just more augmentation' that won't be applied during tracing
+            uv_channels = uv_heatmaps_both.shape[0]
+            regression_target = uv_heatmaps_both
+            seg_for_aug = seg[None] if seg is not None else None
             while True:
-                augmented = self._augmentations(image=volume_crop[None], dist_map=localiser[None], regression_target=uv_heatmaps_both)
+                augmented = self._augmentations(
+                    image=volume_crop[None],
+                    dist_map=localiser[None],
+                    regression_target=regression_target,
+                    segmentation=seg_for_aug,
+                    normals=normals,
+                    normals_mask=normals_mask,
+                )
                 if augmented['dist_map'] is not None:
                     break
             volume_crop = augmented['image'].squeeze(0)
             localiser = augmented['dist_map'].squeeze(0)
-            uv_heatmaps_both = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
+            regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
+            uv_heatmaps_both = regression_aug[..., :uv_channels]
+            if seg is not None:
+                seg_aug = augmented.get('segmentation', None)
+                if seg_aug is None:
+                    continue
+                seg = rearrange(seg_aug, 'c z y x -> z y x c')[..., 0]
+                # Spatial augments can blur the segmentation plane; snap back to binary.
+                seg = (seg > 0.25).float()
+                seg_mask = seg
+            if normals is not None:
+                # Use explicitly tracked normals so vector components are permuted correctly
+                normals_aug = augmented.get('normals', None)
+                if normals_aug is not None:
+                    normals = rearrange(normals_aug, 'c z y x -> z y x c')
+                normals_mask_aug = augmented.get('normals_mask', None)
+                if normals_mask_aug is not None:
+                    if normals_mask_aug.ndim == 4 and normals_mask_aug.shape[0] == 1:
+                        normals_mask = normals_mask_aug.squeeze(0)
+                    elif normals_mask_aug.ndim == 4:
+                        # fallback: drop channel dim by taking first channel
+                        normals_mask = normals_mask_aug[0]
+                    else:
+                        normals_mask = normals_mask_aug
             if not torch.isfinite(volume_crop).all() or not torch.isfinite(localiser).all() or not torch.isfinite(uv_heatmaps_both).all():
                 # FIXME: why do these NaNs happen occasionally?
                 continue
 
-            uv_heatmaps_in = uv_heatmaps_both[..., :3]
-            uv_heatmaps_out = uv_heatmaps_both[..., 3:]
+            uv_heatmaps_in = uv_heatmaps_both[..., :condition_channels]
+            uv_heatmaps_out = uv_heatmaps_both[..., condition_channels:condition_channels + uv_heatmaps_out_all_channels]
+            condition_mask_aug = None
+            if condition_mask_channels:
+                condition_mask_aug = uv_heatmaps_both[..., condition_channels + uv_heatmaps_out_all_channels:]
             out_channel_mask_expanded = out_channel_mask.to(device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype).view(1, 1, 1, -1)
             uv_heatmaps_out_mask = out_channel_mask_expanded.expand_as(uv_heatmaps_out)
             uv_heatmaps_out = uv_heatmaps_out * uv_heatmaps_out_mask
 
-            yield {
+            batch_dict = {
                 'volume': volume_crop,
                 'localiser': localiser,
                 'uv_heatmaps_in': uv_heatmaps_in,
                 'uv_heatmaps_out': uv_heatmaps_out,
                 'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
             }
+            if condition_mask_aug is not None:
+                batch_dict['condition_mask'] = condition_mask_aug
+
+            if self._config.get("aux_segmentation", False) and seg is not None:
+                batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
+            if self._config.get("aux_normals", False) and normals is not None:
+                batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
+
+            yield batch_dict
+
+
+
+
+class HeatmapDatasetV2Masked(HeatmapDatasetV2):
+    """Variant of HeatmapDatasetV2 that uses fixed slots + masking for conditioning."""
+
+    def __init__(self, config, patches_for_split):
+        masked_config = dict(config)
+        masked_config['masked_conditioning'] = True
+        super().__init__(masked_config, patches_for_split)
 
 
 def mark_context_point(volume, point, value=1.):
@@ -666,7 +867,10 @@ def get_zyx_from_patch(ij, patch):
     original_shape = ij.shape
     batch_dims = original_shape[:-1]
     ij_flat = ij.view(-1, 2)
-    normalized_ij = ij_flat / torch.tensor(patch.zyxs.shape[:2]) * 2 - 1
+    # Align grid coords to vertex centers: -1 -> [0,0], +1 -> [H-1, W-1]
+    denom = torch.as_tensor(patch.zyxs.shape[:2], device=ij_flat.device, dtype=ij_flat.dtype) - 1
+    denom = torch.clamp(denom, min=1)  # avoid divide-by-zero on degenerate patches
+    normalized_ij = ij_flat / denom * 2 - 1
     interpolated = F.grid_sample(
         rearrange(patch.zyxs, 'h w c -> 1 c h w'),
         rearrange(normalized_ij.flip(-1), 'b xy -> 1 b 1 xy'),
@@ -792,32 +996,64 @@ def filter_patches_by_roi(patches, approved_cubes):
 
 
 def get_crop_from_volume(volume, center_zyx, crop_size):
-    """Crop volume around center point, padding with zeros if needed"""
-    crop_min = (center_zyx - crop_size // 2).int()
-    crop_max = crop_min + crop_size
+    """Crop volume around center point, padding with zeros if needed.
 
-    # Clamp to volume bounds
+    Guarantees the returned crop is exactly `crop_size` on each axis, even if the
+    requested center lies far outside the volume (previously this could yield
+    huge tensors and blow up concatenation in inference).
+    """
+    crop_size_int = int(crop_size)
+    crop_min = (center_zyx - crop_size_int // 2).int()
+    crop_max = crop_min + crop_size_int
+
+    vol_shape = torch.tensor(volume.shape)
+
+    # Clamp requested bounds to the volume and ensure max >= min so slicing is safe
     actual_min = torch.maximum(crop_min, torch.zeros_like(crop_min))
-    actual_max = torch.minimum(crop_max, torch.tensor(volume.shape))
+    actual_max = torch.minimum(crop_max, vol_shape)
+    actual_max = torch.maximum(actual_max, actual_min)
 
-    # Extract valid portion and convert to tensor
+    # Extract valid portion (may be empty if far outside the volume)
     volume_crop = torch.from_numpy(volume[
         actual_min[0]:actual_max[0],
         actual_min[1]:actual_max[1],
         actual_min[2]:actual_max[2]
     ]).to(torch.float32)
-    # TODO: should instead always use standardised uint8 volumes!
-    volume_crop /= 255. if volume.dtype == np.uint8 else volume_crop.amax()
+
+    if volume_crop.numel() > 0:
+        # TODO: should instead always use standardised uint8 volumes!
+        if volume.dtype == np.uint8:
+            volume_crop = volume_crop / 255.
+        else:
+            max_val = volume_crop.amax()
+            volume_crop = volume_crop / max_val if max_val > 0 else volume_crop
+    else:
+        volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
     volume_crop = volume_crop * 2 - 1
 
-    # Pad if needed
-    pad_before = actual_min - crop_min
-    pad_after = crop_max - actual_max
+    # Compute padding so final shape is exactly crop_size_int in each dimension.
+    pad_before = torch.clamp(actual_min - crop_min, min=0)
+    pad_before = torch.minimum(pad_before, torch.tensor(crop_size_int).repeat(3))
+
+    current_shape = torch.tensor(volume_crop.shape)
+    pad_after = crop_size_int - current_shape - pad_before
+    pad_after = torch.clamp(pad_after, min=0)
+
     if torch.any(pad_before > 0) or torch.any(pad_after > 0):
-        paddings = pad_before[2], pad_after[2], pad_before[1], pad_after[1], pad_before[0], pad_after[0]
+        paddings = (
+            int(pad_before[2].item()), int(pad_after[2].item()),
+            int(pad_before[1].item()), int(pad_after[1].item()),
+            int(pad_before[0].item()), int(pad_after[0].item()),
+        )
         volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
 
-    return volume_crop, crop_min
+    # Ensure any edge cases still return the desired shape.
+    if volume_crop.shape != (crop_size_int, crop_size_int, crop_size_int):
+        volume_crop = volume_crop[:crop_size_int, :crop_size_int, :crop_size_int]
+
+    # min_corner reflects the coordinate of voxel [0,0,0] after padding/truncation
+    min_corner = actual_min - pad_before
+    return volume_crop, min_corner
 
 
 def build_localiser(center_zyx, min_corner_zyx, crop_size):
