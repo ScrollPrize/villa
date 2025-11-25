@@ -657,7 +657,10 @@ class NetworkFromConfig(nn.Module):
                 logits = logits[0]
             activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
             if activation_fn is not None and not self.training:
-                logits = activation_fn(logits)
+                if isinstance(logits, (list, tuple)):
+                    logits = type(logits)(activation_fn(l) for l in logits)
+                else:
+                    logits = activation_fn(logits)
             results[task_name] = logits
 
         # Handle tasks that use shared decoder + heads
@@ -668,7 +671,10 @@ class NetworkFromConfig(nn.Module):
                 logits = head(shared_features)
                 activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
                 if activation_fn is not None and not self.training:
-                    logits = activation_fn(logits)
+                    if isinstance(logits, (list, tuple)):
+                        logits = type(logits)(activation_fn(l) for l in logits)
+                    else:
+                        logits = activation_fn(logits)
                 results[task_name] = logits
         
         # Return MAE mask if requested (for MAE training)
