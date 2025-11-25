@@ -7,8 +7,8 @@ import numpy as np
 import random
 from pathlib import Path
 
-from models import make_model, load_checkpoint
-from infer import Inference
+from vesuvius.neural_tracing.models import make_model, load_checkpoint
+from vesuvius.neural_tracing.infer import Inference
 
 
 @click.command()
