@@ -70,6 +70,13 @@ models = [
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
     "psutil>=7.1.0",
+
+    # Data pipeline / I/O and compression
+    "aiohttp>=3.12.15",
+    "blosc2>=2.5.1",
+    "dask>=2024.8.0",
+    "dask-image>=2024.5.3",
+    "lxml>=6.0.2",
 ]
 # Rendering and geometry utilities
 render = [
@@ -96,6 +103,7 @@ notebooks = [
     "jupyterlab>=4",
     "ipykernel>=6",
     "matplotlib",
+    "nest-asyncio>=1.6.0",
 ]
 
 tests = ["pytest>=8.4.2"]
@@ -143,8 +151,23 @@ all = [
     "magic-class>=0.7.17",
     "pyqt6",
 
+    "nest-asyncio>=1.6.0",
+
+    # Development / build tooling
+    "build",
+    "pybind11>=3.0.1",
+    "setuptools>=80.9.0",
+    "wheel",
+
     # Tests
     "pytest>=8.4.2",
+
+    # Data pipeline / I/O and compression
+    "aiohttp>=3.12.15",
+    "blosc2>=2.5.1",
+    "dask>=2024.8.0",
+    "dask-image>=2024.5.3",
+    "lxml>=6.0.2",
 ]
 
 [project.urls]
