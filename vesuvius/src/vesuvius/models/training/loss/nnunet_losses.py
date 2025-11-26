@@ -199,14 +199,7 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
 
         dc = (2 * intersect + self.smooth) / (torch.clip(sum_gt + sum_pred + self.smooth, 1e-8))
 
-        # Sum over channels (not average) so each channel contributes independently.
-        # Exclude channels with no valid mask voxels entirely.
-        if loss_mask is not None:
-            # Compute which (batch, channel) entries have any non-zero mask values
-            channel_has_mask = loss_mask.flatten(2).any(dim=2)  # shape: (B, C)
-            dc = (dc * channel_has_mask).sum()
-        else:
-            dc = dc.sum()
+        dc = dc.mean()
         return -dc
 
 
