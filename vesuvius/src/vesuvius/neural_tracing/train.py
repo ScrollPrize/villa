@@ -232,8 +232,12 @@ def train(config_path):
                 soft_dice_kwargs={'ddp': False}
             )(target_pred, targets_binary, mask_for_loss)
         else:
-            # TODO: should this instead weight each element in batch equally regardless of valid area?
-            return ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
+            if mask is None:
+                mask = torch.ones_like(targets)
+            bce = F.binary_cross_entropy_with_logits(
+                target_pred, targets, reduction='none'
+            )
+            return (bce * mask).sum() / (mask.sum() + 1e-8)
 
     def loss_fn_per_example(target_pred, targets, mask):
         """Per-sample variant for multistep training (no deep supervision)."""
@@ -251,7 +255,10 @@ def train(config_path):
             if mask is None:
                 mask = torch.ones_like(targets)
             mask_sum = mask.flatten(1).sum(dim=1)
-            per_batch = ((target_pred - targets) ** 2 * mask).flatten(1).sum(dim=1) / (mask_sum + 1e-8)
+            bce = F.binary_cross_entropy_with_logits(
+                target_pred, targets, reduction='none'
+            ).flatten(1)
+            per_batch = (bce * mask.flatten(1)).sum(dim=1) / (mask_sum + 1e-8)
             return per_batch
 
     def compute_multistep_loss_and_pred(model, inputs, targets, batch, config):
