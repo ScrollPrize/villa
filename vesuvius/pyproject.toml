@@ -97,6 +97,8 @@ notebooks = [
     "matplotlib",
 ]
 
+tests = ["pytest>=8.4.2"]
+
 # Convenience alias to install everything
 all = [
     # Machine-learning & training stack
@@ -138,6 +140,9 @@ all = [
     "magicgui>=0.10.1",
     "magic-class>=0.7.17",
     "pyqt6",
+
+    # Tests
+    "pytest>=8.4.2",
 ]
 
 [project.urls]
