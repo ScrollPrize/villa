@@ -99,8 +99,14 @@ def train(config_path):
     total_scheduler_steps = config['num_iterations'] * accelerator.state.num_processes  # See comment below on accelerator.prepare
     # FIXME: accelerator.prepare wraps schedulers so that they step once per process; multiply steps to compensate
 
-    optimizer_type = config.setdefault('optimizer', 'adamw')
-    optimizer_kwargs = dict(config.setdefault('optimizer_kwargs', {}) or {})
+    optimizer_config = config.setdefault('optimizer', 'adamw')
+    # Handle optimizer being either a string or a dict
+    if isinstance(optimizer_config, dict):
+        optimizer_type = optimizer_config.get('name', 'adamw')
+        optimizer_kwargs = dict(optimizer_config)
+    else:
+        optimizer_type = optimizer_config
+        optimizer_kwargs = dict(config.setdefault('optimizer_kwargs', {}) or {})
     optimizer_kwargs.setdefault('learning_rate', config.setdefault('learning_rate', 1e-3))
     optimizer_kwargs.setdefault('weight_decay', config.setdefault('weight_decay', 1e-4))
     config['optimizer_kwargs'] = optimizer_kwargs
