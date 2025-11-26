@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, load_datasets, make_heatmaps
-from vesuvius.neural_tracing.dataset_slotted import HeatmapDatasetSlotted
+from vesuvius.neural_tracing.datasets.dataset_slotted import HeatmapDatasetSlotted
 from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
 from vesuvius.models.training.optimizers import create_optimizer
