@@ -42,7 +42,8 @@ def prepare_batch(batch, config, recrop_center=None, recrop_size=None):
 
     condition_mask = batch.get('condition_mask')
     condition_mask_channels = []
-    if condition_mask is not None and config.get("include_condition_mask_channel", False):
+    # Default to including condition mask channels so the model sees the full conditioning signal
+    if condition_mask is not None and config.get("include_condition_mask_channel", True):
         condition_mask_channels.append(rearrange(condition_mask, 'b z y x c -> b c z y x'))
 
     use_localiser = bool(config.get('use_localiser', True))
@@ -158,9 +159,9 @@ def train(config_path):
             config.setdefault('use_localiser', True)
         if dataset_variant == 'masked' or config.get('masked_conditioning', False):
             slot_count = 4 * int(config.get('step_count', 1))
-            if config.get('masked_include_diag', False):
+            if config.get('masked_include_diag', True):
                 slot_count += 1
-            conditioning_channels = slot_count * 2 if config.get('include_condition_mask_channel', False) else slot_count
+            conditioning_channels = slot_count * 2 if config.get('include_condition_mask_channel', True) else slot_count
             config.setdefault('conditioning_channels', conditioning_channels)
             config.setdefault('out_channels', slot_count)
         dataset_cls = HeatmapDatasetV2Masked if dataset_variant == 'masked' or config.get('masked_conditioning', False) else HeatmapDatasetV2
@@ -177,24 +178,19 @@ def train(config_path):
     config.setdefault('compile_model', config.get('compile', True))
     compile_enabled = config['compile_model']
     if compile_enabled:
-        try:
-            model = torch.compile(model)
-            if accelerator.is_main_process:
-                accelerator.print("Model compiled with torch.compile")
-        except Exception as e:
-            if accelerator.is_main_process:
-                accelerator.print(f"torch.compile failed ({e}); continuing without compilation")
+        model = torch.compile(model)
+        if accelerator.is_main_process:
+            accelerator.print("Model compiled with torch.compile")
 
     optimizer_config = config.get('optimizer') or {}
     if isinstance(optimizer_config, str):
         optimizer_config = {'name': optimizer_config}
-    else:
-        optimizer_config = dict(optimizer_config)
-    optimizer_config.setdefault('name', config.get('optimizer_name', 'adamw'))
-    optimizer_config.setdefault('learning_rate', config.get('learning_rate', 1e-3))
-    optimizer_config.setdefault('weight_decay', config.get('weight_decay', 1e-4))
-    config['optimizer'] = optimizer_config
-
+    config['optimizer'] = {
+        'name': 'adamw',
+        'learning_rate': 1e-3,
+        'weight_decay': 1e-4,
+        **optimizer_config
+    }
     optimizer = create_optimizer(optimizer_config, model)
 
     scheduler_type = config.setdefault('scheduler', 'diffusers_cosine_warmup')
@@ -498,7 +494,7 @@ def train(config_path):
             raise ValueError("compute_slot_multistep_loss_and_pred called with multistep_count <= 1")
         slots_per_step = max(1, int(config.get('slots_per_step', 1)))
         use_localiser = bool(config.get('use_localiser', True))
-        include_condition_mask = bool(config.get('include_condition_mask_channel', False))
+        include_condition_mask = bool(config.get('include_condition_mask_channel', True))
 
         # Slice inputs back into components so we can update conditioning between steps.
         channel_idx = 0
@@ -619,7 +615,7 @@ def train(config_path):
 
         if iteration == 0 and accelerator.is_main_process:
             cond_mask = batch.get('condition_mask')
-            cond_mask_channels = cond_mask.shape[-1] if (cond_mask is not None and config.get("include_condition_mask_channel", False)) else 0
+            cond_mask_channels = cond_mask.shape[-1] if (cond_mask is not None and config.get("include_condition_mask_channel", True)) else 0
             accelerator.print("First batch input summary:")
             accelerator.print(f"  inputs: {tuple(inputs.shape)} | channels: volume=1, localiser={'1' if config.get('use_localiser', True) else '0'}, "
                               f"uv_heatmaps_in={batch['uv_heatmaps_in'].shape[-1]}, condition_mask={cond_mask_channels}")
