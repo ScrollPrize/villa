@@ -36,7 +36,7 @@
           ],
   "num_val_segments_per_volume": 1,
     "augmentation": {
-      "allow_transposes": true,
+      "allow_transposes": false,
       "only_spatial_and_intensity": false
     },
     "enable_deep_supervision": false,
