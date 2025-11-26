@@ -214,7 +214,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Include comprehensive documentation
    * Provide usage examples
 3. Technical Integration
-   * Accept standard community formats (multipage TIFs, on-disk numpy arrays)
+   * Accept standard community formats (e.g. OME-Zarr or Zarr arrays, quadmeshes, triangular meshes)
    * Maintain consistent output formats
    * Designed for modular integration
 </details>
