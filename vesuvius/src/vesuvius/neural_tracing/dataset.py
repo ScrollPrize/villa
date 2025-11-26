@@ -526,22 +526,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             # Can't condition on a missing point
             return None
 
-        def build_out_channel_mask(cond, suppress_out, pos_valid, neg_valid):
-            if cond:
-                return pos_valid
-            mask = torch.zeros_like(pos_valid)
-            if suppress_out != 'pos':
-                mask |= pos_valid
-            if suppress_out != 'neg':
-                mask |= neg_valid
-            return mask
-
-        u_out_channel_mask = build_out_channel_mask(u_cond, suppress_out_u, u_pos_valid, u_neg_valid)
-        v_out_channel_mask = build_out_channel_mask(v_cond, suppress_out_v, v_pos_valid, v_neg_valid)
-        if not (u_out_channel_mask.any() or v_out_channel_mask.any()):
-            # No valid supervision remaining
-            return None
-
         # *_in_heatmaps always have a single plane, either the first negative point or empty
         # *_out_heatmaps always have one plane per step, and may contain only positive or both positive and negative points
         u_in_heatmaps, u_out_heatmaps = make_in_out_heatmaps(u_pos_shifted_zyxs, u_neg_shifted_zyxs, u_cond, suppress_out_u)
@@ -549,8 +533,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         if ~u_cond and ~v_cond:
             # In this case U & V are (nearly) indistinguishable, so don't force the model to separate them
             u_out_heatmaps = v_out_heatmaps = torch.maximum(u_out_heatmaps, v_out_heatmaps)
-            combined_mask = u_out_channel_mask | v_out_channel_mask
-            u_out_channel_mask = v_out_channel_mask = combined_mask
         if diag_zyx is not None:
             diag_in_heatmaps = self.make_heatmaps([diag_zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
         else:
@@ -558,7 +540,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
         uv_heatmaps_in_all = torch.cat([u_in_heatmaps, v_in_heatmaps, diag_in_heatmaps], dim=0)
         uv_heatmaps_out_all = torch.cat([u_out_heatmaps, v_out_heatmaps], dim=0)
-        out_channel_mask = torch.cat([u_out_channel_mask, v_out_channel_mask])
         condition_channels = uv_heatmaps_in_all.shape[0]
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
         uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
@@ -567,7 +548,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
             'uv_heatmaps_out_all_channels': uv_heatmaps_out_all_channels,
-            'out_channel_mask': out_channel_mask,
             'condition_mask_channels': 0,
         }
 
@@ -781,8 +761,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
             condition_channels = heatmap_result['condition_channels']
             uv_heatmaps_out_all_channels = heatmap_result['uv_heatmaps_out_all_channels']
-            out_channel_mask = heatmap_result['out_channel_mask']
-            condition_mask_channels = heatmap_result['condition_mask_channels']
+            condition_mask_channels = heatmap_result.get('condition_mask_channels', 0)
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -850,7 +829,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 localiser=localiser,
                 uv_heatmaps_in=uv_heatmaps_in,
                 uv_heatmaps_out=uv_heatmaps_out,
-                out_channel_mask=out_channel_mask,
+                out_channel_mask=heatmap_result.get('out_channel_mask'),
                 condition_mask_aug=condition_mask_aug,
                 seg=seg,
                 seg_mask=seg_mask,
