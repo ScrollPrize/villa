@@ -70,6 +70,13 @@ models = [
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
     "psutil>=7.1.0",
+
+    # Data pipeline / I/O and compression
+    "aiohttp>=3.12.15",
+    "blosc2>=2.5.1",
+    "dask>=2024.8.0",
+    "dask-image>=2024.5.3",
+    "lxml>=6.0.2",
 ]
 # Rendering and geometry utilities
 render = [
