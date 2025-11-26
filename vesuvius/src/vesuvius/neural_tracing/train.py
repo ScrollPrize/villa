@@ -391,7 +391,7 @@ def train(config_path):
                     )
                     total_loss = total_loss + normals_loss_weight * normals_loss
 
-            if torch.isnan(total_loss):
+            if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
             accelerator.backward(total_loss)
             if accelerator.sync_gradients:
