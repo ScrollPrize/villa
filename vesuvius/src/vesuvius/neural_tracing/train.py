@@ -103,7 +103,7 @@ def train(config_path):
 
     multistep_mode = str(config.get('multistep_mode', 'chain')).lower()
     if multistep_mode == 'chain':
-        config.setdefault('multistep_count', 2)
+        config.setdefault('multistep_count', 1)  # default to single-step; multistep is opt-in
         config.setdefault('multistep_prob', 1.0)
         config.setdefault('multistep_samples', 8)
 
@@ -223,10 +223,14 @@ def train(config_path):
         if config['binary']:
             targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
             from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
-            # Apply mask by zeroing invalid regions before computing the combined loss.
-            return DC_and_BCE_loss(bce_kwargs={}, soft_dice_kwargs={'ddp': False})(
-                target_pred * mask, targets_binary * mask
-            )
+            mask_for_loss = mask
+            if mask_for_loss is None:
+                mask_for_loss = torch.ones_like(targets_binary, dtype=targets_binary.dtype, device=targets_binary.device)
+            # Use the loss' native masking so masked voxels are excluded from both BCE and Dice.
+            return DC_and_BCE_loss(
+                bce_kwargs={'reduction': 'none'},
+                soft_dice_kwargs={'ddp': False}
+            )(target_pred, targets_binary, mask_for_loss)
         else:
             # TODO: should this instead weight each element in batch equally regardless of valid area?
             return ((target_pred - targets) ** 2 * mask).sum() / mask.sum()
