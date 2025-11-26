@@ -139,6 +139,7 @@ def train(config_path):
     val_iterator = iter(val_dataloader)
 
     def loss_fn(target_pred, targets, mask):
+        """Compute per-batch losses (returns shape [batch_size], caller must apply .mean())."""
         if config['binary']:
             targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
             # FIXME: nasty; fix DC_and_BCE_loss themselves to support not reducing over batch dim
@@ -148,11 +149,11 @@ def train(config_path):
             dice = torch.stack([
                 dice_loss_fn(target_pred[i:i+1], targets_binary[i:i+1]) for i in range(target_pred.shape[0])
             ])
-            return (bce + dice).mean()
+            return bce + dice
         else:
             # TODO: should this instead weight each element in batch equally regardless of valid area?
             per_batch = ((target_pred - targets) ** 2 * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4))
-            return per_batch.mean()
+            return per_batch
 
     def compute_multistep_loss_and_pred(model, inputs, targets, mask, batch, config):
         """Multistep sampling + importance-weighted loss; returns scalar loss and stacked preds for viz."""
@@ -326,14 +327,20 @@ def train(config_path):
         raise ValueError(f"aux_{name} is enabled but model did not return '{name}'")
 
     def compute_loss_with_ds(pred, target, mask, base_loss_fn, cache_key):
+        # Wrap base_loss_fn to return scalar (mean over batch) for DS wrapper compatibility
+        # Some loss functions (e.g., loss_fn) return per-batch [B], others (e.g., CosineSimilarityLoss) return scalar
+        def mean_loss_fn(p, t, m):
+            loss = base_loss_fn(p, t, m)
+            return loss.mean() if loss.dim() > 0 else loss
+
         pred_for_vis = pred
         if ds_enabled and isinstance(pred, (list, tuple)):
             cache = ds_cache[cache_key]
             if cache['weights'] is None or len(cache['weights']) != len(pred):
                 cache['weights'] = _compute_ds_weights(len(pred))
-                cache['loss_fn'] = DeepSupervisionWrapper(base_loss_fn, cache['weights'])
+                cache['loss_fn'] = DeepSupervisionWrapper(mean_loss_fn, cache['weights'])
             elif cache['loss_fn'] is None:
-                cache['loss_fn'] = DeepSupervisionWrapper(base_loss_fn, cache['weights'])
+                cache['loss_fn'] = DeepSupervisionWrapper(mean_loss_fn, cache['weights'])
             targets_resized = [_resize_for_ds(target, t.shape[2:], mode='trilinear', align_corners=False) for t in pred]
             masks_resized = None
             if mask is not None:
@@ -343,7 +350,7 @@ def train(config_path):
         else:
             if isinstance(pred, (list, tuple)):
                 pred = pred[0]
-            loss = base_loss_fn(pred, target, mask)
+            loss = mean_loss_fn(pred, target, mask)
             pred_for_vis = pred
         return loss, pred_for_vis
 
