@@ -499,6 +499,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             v_pos_valid = valid_steps(v_pos_shifted_ijs)
             v_neg_valid = valid_steps(v_neg_shifted_ijs)
 
+            # If any step along U or V would fall outside the patch or onto an invalid vertex, resample.
+            if not (u_pos_valid.all() and u_neg_valid.all() and v_pos_valid.all() and v_neg_valid.all()):
+                continue
+
             # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
             if torch.rand([]) < 0.5:
                 u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
