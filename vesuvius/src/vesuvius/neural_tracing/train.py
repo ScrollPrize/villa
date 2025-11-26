@@ -148,11 +148,11 @@ def train(config_path):
             dice = torch.stack([
                 dice_loss_fn(target_pred[i:i+1], targets_binary[i:i+1]) for i in range(target_pred.shape[0])
             ])
-            return bce + dice
+            return (bce + dice).mean()
         else:
             # TODO: should this instead weight each element in batch equally regardless of valid area?
             per_batch = ((target_pred - targets) ** 2 * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4))
-            return per_batch
+            return per_batch.mean()
 
     def compute_multistep_loss_and_pred(model, inputs, targets, mask, batch, config):
         """Multistep sampling + importance-weighted loss; returns scalar loss and stacked preds for viz."""
