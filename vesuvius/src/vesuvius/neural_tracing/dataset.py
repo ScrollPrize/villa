@@ -845,8 +845,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             yield batch_dict
 
 
-
-
 class HeatmapDatasetV2Masked(HeatmapDatasetV2):
     """Variant of HeatmapDatasetV2 that uses fixed slots + masking for conditioning."""
 
