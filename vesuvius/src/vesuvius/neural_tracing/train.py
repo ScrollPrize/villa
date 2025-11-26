@@ -108,10 +108,10 @@ def train(config_path):
         config.setdefault('multistep_samples', 8)
 
     config.setdefault('num_iterations', 250000)
-    log_image_max_samples = config.get('log_image_max_samples', 4)
-    log_image_grid_cols = config.get('log_image_grid_cols', 2)
-    log_image_ext = config.get('log_image_ext', 'jpg')
-    log_image_quality = config.get('log_image_quality', 80)
+    log_image_max_samples = config.setdefault('log_image_max_samples', 4)
+    log_image_grid_cols = config.setdefault('log_image_grid_cols', 2)
+    log_image_ext = config.setdefault('log_image_ext', 'jpg')
+    log_image_quality = config.setdefault('log_image_quality', 80)
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)
@@ -138,7 +138,8 @@ def train(config_path):
         'normals': {'weights': None, 'loss_fn': None},
     }
 
-    grad_clip = int(config.get('grad_clip', 5))
+    config.setdefault('grad_clip', 5)
+    grad_clip = int(config['grad_clip'])
 
     accelerator = accelerate.Accelerator(
         mixed_precision=config['mixed_precision'],
@@ -173,7 +174,8 @@ def train(config_path):
     # FIXME: need separate data-loaders for multi-step and single-step training, since have different target shapes
 
     model = make_model(config)
-    compile_enabled = config.get('compile_model', config.get('compile', True))
+    config.setdefault('compile_model', config.get('compile', True))
+    compile_enabled = config['compile_model']
     if compile_enabled:
         try:
             model = torch.compile(model)
@@ -191,12 +193,15 @@ def train(config_path):
     optimizer_config.setdefault('name', config.get('optimizer_name', 'adamw'))
     optimizer_config.setdefault('learning_rate', config.get('learning_rate', 1e-3))
     optimizer_config.setdefault('weight_decay', config.get('weight_decay', 1e-4))
+    config['optimizer'] = optimizer_config
 
     optimizer = create_optimizer(optimizer_config, model)
 
-    scheduler_type = config.get('scheduler', 'diffusers_cosine_warmup')
+    scheduler_type = config.setdefault('scheduler', 'diffusers_cosine_warmup')
     scheduler_kwargs = dict(config.get('scheduler_kwargs', {}) or {})
     scheduler_kwargs.setdefault('warmup_steps', config.get('lr_warmup_steps', 1000))
+    config['scheduler_kwargs'] = scheduler_kwargs
+    config.setdefault('lr_warmup_steps', scheduler_kwargs['warmup_steps'])
     total_scheduler_steps = config['num_iterations'] * accelerator.state.num_processes  # See comment below on accelerator.prepare
     # FIXME: accelerator.prepare wraps schedulers so that they step once per process; multiply steps to compensate
     lr_scheduler = get_scheduler(
