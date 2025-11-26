@@ -36,7 +36,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Sync dependencies
-        run: uv sync
+        run: uv sync --extra all
 
       - name: Run tests
         run: uv run pytest tests
