@@ -183,23 +183,34 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
         if loss_mask is None:
             intersect = (x * y_onehot).sum(axes)
             sum_pred = x.sum(axes)
+            channel_valid = None
         else:
             intersect = (x * y_onehot * loss_mask).sum(axes)
             sum_pred = (x * loss_mask).sum(axes)
+            # Track which channels have any valid voxels (shape [B, C])
+            channel_valid = loss_mask.sum(axes) > 0
 
         if self.batch_dice:
             if self.ddp:
                 intersect = AllGatherGrad.apply(intersect).sum(0)
                 sum_pred = AllGatherGrad.apply(sum_pred).sum(0)
                 sum_gt = AllGatherGrad.apply(sum_gt).sum(0)
+                if channel_valid is not None:
+                    channel_valid = AllGatherGrad.apply(channel_valid.float()).sum(0) > 0
 
             intersect = intersect.sum(0)
             sum_pred = sum_pred.sum(0)
             sum_gt = sum_gt.sum(0)
+            if channel_valid is not None:
+                channel_valid = channel_valid.any(0) if channel_valid.ndim > 1 else channel_valid
 
         dc = (2 * intersect + self.smooth) / (torch.clip(sum_gt + sum_pred + self.smooth, 1e-8))
 
-        dc = dc.mean()
+        # Only average over channels that have valid supervision
+        if channel_valid is not None and channel_valid.any():
+            dc = dc[channel_valid].mean()
+        else:
+            dc = dc.mean()
         return -dc
 
 
