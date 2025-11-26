@@ -234,8 +234,14 @@ def train(config_path):
         accelerator.print(f"Binary: {config.get('binary', False)}")
         accelerator.print("")
         accelerator.print("Point Perturbation:")
-        accelerator.print(f"  point_perturbation_std: {config.get('point_perturbation_std', 0)}")
-        accelerator.print(f"  point_perturbation_max: {config.get('point_perturbation_max', 0)}")
+        pp = config.get('point_perturbation', {})
+        if pp:
+            accelerator.print(f"  perturb_probability: {pp.get('perturb_probability', 'not set')}")
+            accelerator.print(f"  uv_max_perturbation: {pp.get('uv_max_perturbation', 'not set')}")
+            accelerator.print(f"  w_max_perturbation: {pp.get('w_max_perturbation', 'not set')}")
+            accelerator.print(f"  main_component_distance_factor: {pp.get('main_component_distance_factor', 'not set')}")
+        else:
+            accelerator.print("  (not configured)")
         accelerator.print("")
         accelerator.print("Step Settings:")
         accelerator.print(f"  step_size: {config.get('step_size', 'not set')}")
