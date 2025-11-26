@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, HeatmapDatasetV2Masked, load_datasets, make_heatmaps
 from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
-from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
@@ -237,22 +237,19 @@ def train(config_path):
 
     def loss_fn_per_example(target_pred, targets, mask):
         """Per-sample variant for multistep training (no deep supervision)."""
-        if mask is None:
-            mask = torch.ones_like(targets)
         if config['binary']:
             targets_binary = (targets > 0.5).long()
-            mask_expanded = mask.expand_as(targets_binary)
             bce = F.binary_cross_entropy_with_logits(
                 target_pred, targets_binary.float(), reduction='none'
-            )
-            bce = (bce * mask_expanded).sum(dim=(1, 2, 3, 4)) / (mask_expanded.sum(dim=(1, 2, 3, 4)) + 1e-8)
-
-            pred_prob = torch.sigmoid(target_pred)
-            intersection = (pred_prob * targets_binary * mask_expanded).sum(dim=(1, 2, 3, 4))
-            denom = (pred_prob * mask_expanded).sum(dim=(1, 2, 3, 4)) + (targets_binary * mask_expanded).sum(dim=(1, 2, 3, 4))
-            dice = 1 - (2 * intersection + 1e-5) / (denom + 1e-5)
+            ).mean(dim=(1, 2, 3, 4))
+            dice_loss_fn = MemoryEfficientSoftDiceLoss(apply_nonlin=torch.sigmoid, batch_dice=False, ddp=False)
+            dice = torch.stack([
+                dice_loss_fn(target_pred[i:i+1], targets_binary[i:i+1]) for i in range(target_pred.shape[0])
+            ])
             return bce + dice
         else:
+            if mask is None:
+                mask = torch.ones_like(targets)
             mask_sum = mask.flatten(1).sum(dim=1)
             per_batch = ((target_pred - targets) ** 2 * mask).flatten(1).sum(dim=1) / (mask_sum + 1e-8)
             return per_batch
@@ -356,19 +353,17 @@ def train(config_path):
                 prev_uv = torch.zeros([prev_heatmap.shape[0], 2, *prev_heatmap.shape[1:]], device=prev_heatmap.device, dtype=prev_heatmap.dtype)
                 prev_uv[torch.arange(prev_heatmap.shape[0]), step_directions] = prev_heatmap
 
+                # Prepare the volume (sub-)crop and localiser. For the localiser we take the original since
+                # we still want the center of it (conceptually we create a new localiser at the new center)
                 step_volume_crop = safe_crop_with_padding(
                     batch['volume'],
                     min_corner_new_subcrop_in_outer,
                     config['crop_size']
                 )
+                # FIXME: this makes assumptions about how prepare_batch arranges stuff; can we unify?
                 step_input_parts = [step_volume_crop.unsqueeze(1)]
                 if use_localiser:
-                    step_localiser = safe_crop_with_padding(
-                        batch['localiser'],
-                        min_corner_new_subcrop_in_outer,
-                        config['crop_size']
-                    )
-                    step_input_parts.append(step_localiser.unsqueeze(1))
+                    step_input_parts.append(inputs[:, 1:2])  # borrow the original localiser subcrop
                 step_input_parts.extend([
                     prev_uv,  # prev_u, prev_v
                     torch.zeros_like(prev_uv[:, :1]),  # prev_diag
@@ -425,9 +420,15 @@ def train(config_path):
             step_unnormalised_probs_by_sample_by_later_step.append(sample_step_unnormalised_probs)
             step_proposal_probs_by_sample_by_later_step.append(sample_step_proposal_probs)
 
+        # First step loss is added directly without importance weighting
         loss = first_step_loss
-        cumulative_weights = [torch.ones_like(first_step_loss)] * sample_count
+
+        # Later step losses are accumulated and weighted using self-normalized importance sampling
+        # later_step_idx is the index into losses_by_sample_by_later_step (which excludes first step)
+        cumulative_weights = [1] * sample_count
         for later_step_idx in range(multistep_count - 1):
+
+            # Update cumulative importance weights
             for sample_idx in range(sample_count):
                 target_prob = step_unnormalised_probs_by_sample_by_later_step[sample_idx][later_step_idx]
                 proposal_prob = step_proposal_probs_by_sample_by_later_step[sample_idx][later_step_idx]
