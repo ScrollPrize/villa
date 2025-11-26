@@ -14,7 +14,8 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, HeatmapDatasetV2Masked, load_datasets, make_heatmaps
+from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, load_datasets, make_heatmaps
+from vesuvius.neural_tracing.dataset_slotted import HeatmapDatasetSlotted
 from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
 from vesuvius.models.training.optimizers import create_optimizer
@@ -102,6 +103,23 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
+    # Dataset variant defaults
+    config.setdefault('dataset_variant', 'standard')
+    config.setdefault('step_count', 1)
+    if config['dataset_variant'] == 'slotted':
+        config.setdefault('masked_conditioning', True)
+        config.setdefault('use_localiser', False)
+        config.setdefault('masked_include_diag', True)
+        config.setdefault('include_condition_mask_channel', True)
+        slot_count = 4 * config['step_count']
+        if config['masked_include_diag']:
+            slot_count += 1
+        config.setdefault('conditioning_channels', slot_count * 2 if config['include_condition_mask_channel'] else slot_count)
+        config.setdefault('out_channels', slot_count)
+    else:
+        config.setdefault('masked_conditioning', False)
+        config.setdefault('use_localiser', True)
+
     multistep_mode = str(config.get('multistep_mode', 'chain')).lower()
     if multistep_mode == 'chain':
         config.setdefault('multistep_count', 1)  # default to single-step; multistep is opt-in
@@ -152,19 +170,7 @@ def train(config_path):
 
     if config['representation'] == 'heatmap':
         train_patches, val_patches = load_datasets(config)
-        dataset_variant = config.get('dataset_variant', 'standard')
-        if dataset_variant == 'masked' or config.get('masked_conditioning', False):
-            config.setdefault('use_localiser', False)
-        else:
-            config.setdefault('use_localiser', True)
-        if dataset_variant == 'masked' or config.get('masked_conditioning', False):
-            slot_count = 4 * int(config.get('step_count', 1))
-            if config.get('masked_include_diag', True):
-                slot_count += 1
-            conditioning_channels = slot_count * 2 if config.get('include_condition_mask_channel', True) else slot_count
-            config.setdefault('conditioning_channels', conditioning_channels)
-            config.setdefault('out_channels', slot_count)
-        dataset_cls = HeatmapDatasetV2Masked if dataset_variant == 'masked' or config.get('masked_conditioning', False) else HeatmapDatasetV2
+        dataset_cls = HeatmapDatasetSlotted if config['masked_conditioning'] else HeatmapDatasetV2
         train_dataset = dataset_cls(config, train_patches)
         val_dataset = dataset_cls(config, val_patches)
     else:
