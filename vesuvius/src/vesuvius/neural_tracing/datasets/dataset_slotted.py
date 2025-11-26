@@ -104,3 +104,45 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             'out_channel_mask': out_channel_mask,
             'condition_mask_channels': condition_mask_channels,
         }
+
+    def _build_batch_dict(
+        self,
+        volume_crop,
+        localiser,
+        uv_heatmaps_in,
+        uv_heatmaps_out,
+        out_channel_mask,
+        condition_mask_aug,
+        seg,
+        seg_mask,
+        normals,
+        normals_mask,
+    ):
+        """Build batch dict with masking for slotted dataset."""
+        out_channel_mask_expanded = out_channel_mask.to(
+            device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype
+        ).view(1, 1, 1, -1)
+        uv_heatmaps_out_mask = out_channel_mask_expanded.expand_as(uv_heatmaps_out)
+        # Combine the channel mask with the spatial support of the targets so we only
+        # supervise voxels that actually have label signal.
+        uv_heatmaps_out = uv_heatmaps_out * uv_heatmaps_out_mask
+        spatial_support_mask = (uv_heatmaps_out != 0).to(dtype=uv_heatmaps_out_mask.dtype)
+        uv_heatmaps_out_mask = uv_heatmaps_out_mask * spatial_support_mask
+        uv_heatmaps_out = uv_heatmaps_out * spatial_support_mask
+
+        batch_dict = {
+            'volume': volume_crop,
+            'localiser': localiser,
+            'uv_heatmaps_in': uv_heatmaps_in,
+            'uv_heatmaps_out': uv_heatmaps_out,
+            'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
+        }
+        if condition_mask_aug is not None:
+            batch_dict['condition_mask'] = condition_mask_aug
+
+        if self._config.get("aux_segmentation", False) and seg is not None:
+            batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
+        if self._config.get("aux_normals", False) and normals is not None:
+            batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
+
+        return batch_dict
