@@ -222,6 +222,15 @@ def train(config_path):
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
+
+    if accelerator.is_main_process:
+        accelerator.print("\n=== Training Configuration ===")
+        accelerator.print(f"Optimizer: {optimizer_config.get('name', 'adamw')}")
+        accelerator.print(f"Scheduler: {scheduler_type}")
+        accelerator.print(f"Initial LR: {optimizer_config.get('learning_rate', config.get('learning_rate', 1e-3))}")
+        accelerator.print(f"Weight Decay: {optimizer_config.get('weight_decay', config.get('weight_decay', 1e-4))}")
+        accelerator.print("==============================\n")
+
     val_iterator = iter(val_dataloader)
 
     def loss_fn(target_pred, targets, mask):
