@@ -1,26 +1,19 @@
 import torch
 import torch.nn.functional as F
 
-def recrop(x, center, size):
-    return x[
-        ...,
-        center[0] - size // 2 : center[0] + size // 2,
-        center[1] - size // 2 : center[1] + size // 2,
-        center[2] - size // 2 : center[2] + size // 2
-    ]
-
 def safe_crop_with_padding(tensor, min_corner, crop_size):
     """Crop tensor around min_corner with zero-padding if crop goes outside bounds.
 
     Args:
         tensor: Tensor to crop, shape [batch, z, y, x, ...] where ... can be additional dims (e.g., channels)
-        min_corner: Minimum corner of crop [batch, 3] in zyx order
+        min_corner: Minimum corner of crop [batch, 3] or [3] in zyx order
         crop_size: Size of the crop (int)
 
     Returns:
         Cropped tensor with shape [batch, crop_size, crop_size, crop_size, ...]
     """
     crop_size_int = int(crop_size)
+    min_corner = torch.broadcast_to(min_corner, (tensor.shape[0], 3))
     max_corner = min_corner + crop_size_int
 
     # Get tensor spatial shape (last 3 dims before any trailing dimensions)

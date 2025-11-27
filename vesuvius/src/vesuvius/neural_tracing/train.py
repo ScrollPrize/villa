@@ -19,24 +19,10 @@ from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from vesuvius.neural_tracing.models import make_model
-from vesuvius.neural_tracing.cropping import (safe_crop_with_padding,
-                                              transform_to_first_crop_space,
-                                              recrop)
+from vesuvius.neural_tracing.cropping import safe_crop_with_padding, transform_to_first_crop_space
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
 from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
 
-
-
-def prepare_batch(batch, recrop_center, recrop_size):
-    if recrop_center is None:
-        recrop_center = torch.tensor(batch['volume'].shape[-3:]) // 2
-    inputs = torch.cat([
-        batch['volume'].unsqueeze(1),
-        batch['localiser'].unsqueeze(1),
-        rearrange(batch['uv_heatmaps_in'], 'b z y x c -> b c z y x'),
-    ], dim=1)
-    targets = rearrange(batch['uv_heatmaps_out'], 'b z y x c -> b c z y x')
-    return recrop(inputs, recrop_center, recrop_size), recrop(targets, recrop_center, recrop_size)
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -49,7 +35,6 @@ def train(config_path):
     os.makedirs(out_dir, exist_ok=True)
 
     ds_enabled = config.setdefault('enable_deep_supervision', False)
-    multistep_enabled = config.setdefault('multistep_count', 1) > 1
     use_seg = config.setdefault('aux_segmentation', False)
     use_normals = config.setdefault('aux_normals', False)
     seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
@@ -138,6 +123,29 @@ def train(config_path):
 
     val_iterator = iter(val_dataloader)
 
+    def prepare_inputs(batch, min_corner_in_outer, prev_uvd_cropped):
+        # Prepare the volume (sub-)crop and localiser. For the localiser we take a crop at the
+        # original center (conceptually we create a new localiser at the new subcrop center)
+        crop_size = config['crop_size']
+        volume_crop = safe_crop_with_padding(
+            batch['volume'],
+            min_corner_in_outer,
+            crop_size
+        )
+        outer_shape = batch['localiser'].shape
+        localiser = batch['localiser'][
+            :,
+            outer_shape[1] // 2 - crop_size // 2 : outer_shape[1] // 2 + crop_size // 2,
+            outer_shape[2] // 2 - crop_size // 2 : outer_shape[2] // 2 + crop_size // 2,
+            outer_shape[3] // 2 - crop_size // 2 : outer_shape[3] // 2 + crop_size // 2,
+        ]
+        inputs = torch.cat([
+            volume_crop.unsqueeze(1),
+            localiser.unsqueeze(1),
+            prev_uvd_cropped,  # prev_u, prev_v, prev_diag
+        ], dim=1)
+        return inputs
+
     def loss_fn(target_pred, targets, mask):
         """Compute per-batch losses (returns shape [batch_size], caller must apply .mean())."""
         if config['binary']:
@@ -155,20 +163,73 @@ def train(config_path):
             per_batch = ((target_pred - targets) ** 2 * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4))
             return per_batch
 
-    def compute_multistep_loss_and_pred(model, inputs, targets, mask, batch, config):
-        """Multistep sampling + importance-weighted loss; returns scalar loss and stacked preds for viz."""
-        multistep_count = int(config.get('multistep_count', 1))
-        if multistep_count <= 1:
-            raise ValueError("compute_multistep_loss_and_pred called with multistep_count <= 1")
-        sample_count = int(config.get('multistep_samples', 1))
+    def compute_loss_and_pred(batch):
 
-        target_pred = model(inputs)
+        multistep_count = config.get('multistep_count', 1)
+        sample_count = config.get('multistep_samples', 1)
 
-        if targets.shape[1] <= target_pred.shape[1]:
-            raise ValueError("multistep training expects targets to have more channels than model outputs")
+        outer_crop_shape = torch.tensor(batch['volume'].shape[-3:], device=accelerator.device)
+        outer_crop_center = outer_crop_shape // 2
 
+        first_min_corner_in_outer = outer_crop_center - config['crop_size'] // 2
+        first_prev_uvd_subcrop = rearrange(safe_crop_with_padding(batch['uv_heatmaps_in'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
+        first_step_inputs = prepare_inputs(batch, first_min_corner_in_outer, first_prev_uvd_subcrop)
+        targets = rearrange(safe_crop_with_padding(batch['uv_heatmaps_out'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
+        mask = torch.ones_like(targets[:, :1, ...])  # TODO
+
+        outputs = model(first_step_inputs)
+
+        target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
+
+        assert targets.shape[1] == target_pred.shape[1] * multistep_count
         first_step_targets = targets[:, ::multistep_count]
-        first_step_loss = loss_fn(target_pred, first_step_targets, mask)
+
+        # First step: compute loss with deep supervision if enabled
+        if ds_enabled and isinstance(target_pred, (list, tuple)):
+            # Deep supervision: compute loss at each scale and sum (weighted), but preserve per-batch structure
+            cache = ds_cache['uv']
+            if cache['weights'] is None or len(cache['weights']) != len(target_pred):
+                cache['weights'] = _compute_ds_weights(len(target_pred))
+            targets_resized = [_resize_for_ds(first_step_targets, t.shape[2:], mode='trilinear', align_corners=False) for t in target_pred]
+            masks_resized = None
+            if mask is not None:
+                masks_resized = [_resize_for_ds(mask, t.shape[2:], mode='nearest') for t in target_pred]
+
+            # Compute per-batch losses at each scale
+            first_step_heatmap_loss = torch.zeros([])
+            for i, weight in enumerate(cache['weights']):
+                if weight != 0:
+                    scale_loss = loss_fn(target_pred[i], targets_resized[i], masks_resized[i] if masks_resized else mask)
+                    first_step_heatmap_loss = first_step_heatmap_loss + weight * scale_loss
+        else:
+            if isinstance(target_pred, (list, tuple)):
+                target_pred = target_pred[0]
+            first_step_heatmap_loss = loss_fn(target_pred, first_step_targets, mask)
+
+        first_step_heatmap_loss = first_step_heatmap_loss.mean()  # over batch
+        first_step_loss = first_step_heatmap_loss
+
+        # Add auxiliary segmentation & normal losses for first step
+        if use_seg:
+            seg = safe_crop_with_padding(batch['seg'], first_min_corner_in_outer, config['crop_size']).unsqueeze(1)
+            seg_mask = (seg > 0).float()
+            seg_pred = require_head(outputs, 'seg')
+            seg_loss, seg_pred_for_vis = compute_loss_with_ds(
+                seg_pred, seg, seg_mask, loss_fn, 'seg'
+            )
+            first_step_loss = first_step_loss + seg_loss_weight * seg_loss
+        else:
+            seg_loss = seg = seg_pred_for_vis = None
+        if use_normals:
+            normals = rearrange(safe_crop_with_padding(batch['normals'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
+            normals_mask = (normals.abs().sum(dim=1, keepdim=True) > 0).float()
+            normals_pred = require_head(outputs, 'normals')
+            normals_loss, normals_pred_for_vis = compute_loss_with_ds(
+                normals_pred, normals, normals_mask, normals_loss_fn, 'normals'
+            )
+            first_step_loss = first_step_loss + normals_loss_weight * normals_loss
+        else:
+            normals_loss = normals = normals_pred_for_vis = None
 
         # Direction to extend (assumes exactly one of prev_u/prev_v is set).
         step_directions = batch['uv_heatmaps_in'].amax(dim=[1, 2, 3])[:, :2].argmax(dim=-1)
@@ -209,13 +270,12 @@ def train(config_path):
         first_step_pred_vis = torch.full_like(target_pred, -100.0)
         first_step_pred_vis[torch.arange(target_pred.shape[0]), step_directions] = target_pred.detach()[torch.arange(target_pred.shape[0]), step_directions]
 
-        outer_crop_shape = torch.tensor(batch['volume'].shape[-3:], device=first_sample_zyxs_in_first_subcrop.device)
-        outer_crop_center = outer_crop_shape // 2
         first_sample_zyxs_in_outer_crop = first_sample_zyxs_in_first_subcrop + (outer_crop_shape - config['crop_size']) // 2
 
         losses_by_sample_by_later_step = []
         step_unnormalised_probs_by_sample_by_later_step = []
         step_proposal_probs_by_sample_by_later_step = []
+        all_step_targets_vis = [first_step_targets]
         all_step_preds_vis = [first_step_pred_vis]
 
         for sample_idx in range(sample_count):
@@ -236,23 +296,12 @@ def train(config_path):
                 prev_uv = torch.zeros([prev_heatmap.shape[0], 2, *prev_heatmap.shape[1:]], device=prev_heatmap.device, dtype=prev_heatmap.dtype)
                 prev_uv[torch.arange(prev_heatmap.shape[0]), step_directions] = prev_heatmap
 
-                # Prepare the volume (sub-)crop and localiser. For the localiser we take the original since
-                # we still want the center of it (conceptually we create a new localiser at the new center)
-                step_volume_crop = safe_crop_with_padding(
-                    batch['volume'],
-                    min_corner_new_subcrop_in_outer,
-                    config['crop_size']
-                )
-                # FIXME: this makes assumptions about how prepare_batch arranges stuff; can we unify?
-                step_inputs = torch.cat([
-                    step_volume_crop.unsqueeze(1),
-                    inputs[:, 1:2],  # borrow the original localiser subcrop
-                    prev_uv,  # prev_u, prev_v
-                    torch.zeros_like(prev_uv[:, :1]),  # prev_diag
-                ], dim=1)
+                prev_uvd = torch.cat([prev_uv, torch.zeros_like(prev_uv[:, :1])], dim=1)
+                step_inputs = prepare_inputs(batch, min_corner_new_subcrop_in_outer, prev_uvd)
 
                 # TODO: make checkpointing optional
-                step_pred = torch.utils.checkpoint.checkpoint(model, step_inputs)
+                step_pred = torch.utils.checkpoint.checkpoint(model, step_inputs, use_reentrant=False)
+                step_pred = step_pred['uv_heatmaps'] if isinstance(outputs, dict) else outputs
 
                 step_targets = safe_crop_with_padding(
                     batch['uv_heatmaps_out'],
@@ -266,7 +315,9 @@ def train(config_path):
                     step_pred_filtered[torch.arange(step_pred.shape[0]), step_directions] = step_pred.detach()[torch.arange(step_pred.shape[0]), step_directions]
                     first_step_crop_min = outer_crop_center - config['crop_size'] // 2
                     offset = min_corner_new_subcrop_in_outer - first_step_crop_min
+                    step_target_in_first_crop = transform_to_first_crop_space(step_targets, offset, config['crop_size'])
                     step_pred_in_first_crop = transform_to_first_crop_space(step_pred_filtered, offset, config['crop_size'])
+                    all_step_targets_vis.append(step_target_in_first_crop)
                     all_step_preds_vis.append(step_pred_in_first_crop)
 
                 # Since the model runs in single-cond mode for this step, it predicts a point along
@@ -292,11 +343,9 @@ def train(config_path):
             step_unnormalised_probs_by_sample_by_later_step.append(sample_step_unnormalised_probs)
             step_proposal_probs_by_sample_by_later_step.append(sample_step_proposal_probs)
 
-        # First step loss is added directly without importance weighting
-        loss = first_step_loss
-
         # Later step losses are accumulated and weighted using self-normalized importance sampling
         # later_step_idx is the index into losses_by_sample_by_later_step (which excludes first step)
+        later_step_loss = torch.zeros([])
         cumulative_weights = [1] * sample_count
         for later_step_idx in range(multistep_count - 1):
 
@@ -307,19 +356,25 @@ def train(config_path):
                 cumulative_weights[sample_idx] = cumulative_weights[sample_idx] * target_prob / (proposal_prob + 1e-8)
             cumulative_weights_stacked = torch.stack(cumulative_weights, dim=0)  # sample_count, batch_size
 
-            step_losses = torch.stack(
-                [losses_by_sample_by_later_step[sample_idx][later_step_idx] for sample_idx in range(sample_count)],
-                dim=0
-            )
+            step_losses = torch.stack([
+                losses_by_sample_by_later_step[sample_idx][later_step_idx]
+                for sample_idx in range(sample_count)
+            ], dim=0)
             weighted_loss_sum = (step_losses * cumulative_weights_stacked).sum(dim=0)
             total_weights_sum = cumulative_weights_stacked.sum(dim=0)
-            loss = loss + (weighted_loss_sum / (total_weights_sum + 1e-8))
+            later_step_loss = later_step_loss + (weighted_loss_sum / (total_weights_sum + 1e-8))
 
-        loss = loss.mean()
+        later_step_loss = later_step_loss.mean()
+        total_loss = first_step_loss + later_step_loss
 
+        target_all_steps = rearrange(torch.stack(all_step_targets_vis, dim=2), 'b uv s z y x -> b (uv s) z y x')
         target_pred_all_steps = rearrange(torch.stack(all_step_preds_vis, dim=2), 'b uv s z y x -> b (uv s) z y x')
 
-        return loss, target_pred_all_steps
+        return (
+            total_loss, first_step_heatmap_loss, later_step_loss, seg_loss, normals_loss,
+            first_step_inputs, target_all_steps, target_pred_all_steps,
+            seg, seg_pred_for_vis, normals, normals_pred_for_vis
+        )
 
     def require_head(outputs, name):
         if isinstance(outputs, dict) and name in outputs:
@@ -333,7 +388,6 @@ def train(config_path):
             loss = base_loss_fn(p, t, m)
             return loss.mean() if loss.dim() > 0 else loss
 
-        pred_for_vis = pred
         if ds_enabled and isinstance(pred, (list, tuple)):
             cache = ds_cache[cache_key]
             if cache['weights'] is None or len(cache['weights']) != len(pred):
@@ -357,46 +411,14 @@ def train(config_path):
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
 
-        inputs, targets = prepare_batch(batch, None, config['crop_size'])
-        mask = torch.ones_like(targets[:, :1, ...])  # TODO!
-
         wandb_log = {}
-        target_pred_for_vis = None
         with accelerator.accumulate(model):
-            if multistep_enabled:
-                if ds_enabled or use_seg or use_normals:
-                    raise ValueError("multistep currently supports heatmaps only; disable deep supervision and auxiliary heads.")
-                total_loss, target_pred_for_vis = compute_multistep_loss_and_pred(
-                    model, inputs, targets, mask, batch, config
-                )
-                seg_pred_for_vis = None
-                normals_pred_for_vis = None
-            else:
-                outputs = model(inputs)
-                target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
-                heatmap_loss, target_pred_for_vis = compute_loss_with_ds(
-                    target_pred, targets, mask, loss_fn, 'uv'
-                )
-                total_loss = heatmap_loss
-                seg = seg_mask = seg_pred_for_vis = None
-                normals = normals_mask = normals_pred_for_vis = None
 
-                if use_seg:
-                    seg = batch['seg'].unsqueeze(1)
-                    seg_mask = (seg > 0).float()  # mask where seg is labeled
-                    seg_pred = require_head(outputs, 'seg')
-                    seg_loss, seg_pred_for_vis = compute_loss_with_ds(
-                        seg_pred, seg, seg_mask, loss_fn, 'seg'
-                    )
-                    total_loss = total_loss + seg_loss_weight * seg_loss
-                if use_normals:
-                    normals = rearrange(batch['normals'], 'b z y x c -> b c z y x')
-                    normals_mask = (normals.abs().sum(dim=1, keepdim=True) > 0).float()  # mask where normals exist
-                    normals_pred = require_head(outputs, 'normals')
-                    normals_loss, normals_pred_for_vis = compute_loss_with_ds(
-                        normals_pred, normals, normals_mask, normals_loss_fn, 'normals'
-                    )
-                    total_loss = total_loss + normals_loss_weight * normals_loss
+            (
+                total_loss, first_step_heatmap_loss, later_step_loss, seg_loss, normals_loss,
+                inputs_for_vis, targets_for_vis, target_pred_for_vis,
+                seg_for_vis, seg_pred_for_vis, normals_for_vis, normals_pred_for_vis
+            ) = compute_loss_and_pred(batch)
 
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
@@ -408,9 +430,11 @@ def train(config_path):
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
+        wandb_log['first_step_heatmap_loss'] = first_step_heatmap_loss.detach().item()
+        if config.get('multistep_count', 1) > 1:
+            wandb_log['later_step_loss'] = later_step_loss.detach().item()
         if use_seg:
             wandb_log['seg_loss'] = seg_loss.detach().item()
-            wandb_log['heatmap_loss'] = heatmap_loss.detach().item()
         if use_normals:
             wandb_log['normals_loss'] = normals_loss.detach().item()
         progress_bar.set_postfix({'loss': wandb_log['loss']})
@@ -421,54 +445,30 @@ def train(config_path):
                 model.eval()
 
                 val_batch = next(val_iterator)
-                val_inputs, val_targets = prepare_batch(val_batch, None, config['crop_size'])
-                val_mask = torch.ones_like(val_targets[:, :1, ...])  # TODO!
-                val_seg = val_seg_mask = val_seg_pred_for_vis = None
-                val_normals = val_normals_mask = val_normals_pred_for_vis = None
-                if multistep_enabled:
-                    if ds_enabled or use_seg or use_normals:
-                        raise ValueError("multistep validation currently supports heatmaps only; disable deep supervision and auxiliary heads.")
-                    total_val_loss, val_target_pred_for_vis = compute_multistep_loss_and_pred(
-                        model, val_inputs, val_targets, val_mask, val_batch, config
-                    )
-                else:
-                    val_outputs = model(val_inputs)
-                    val_target_pred = val_outputs['uv_heatmaps'] if isinstance(val_outputs, dict) else val_outputs
-                    val_heatmap_loss, val_target_pred_for_vis = compute_loss_with_ds(
-                        val_target_pred, val_targets, val_mask, loss_fn, 'uv'
-                    )
-                    total_val_loss = val_heatmap_loss
-                    if use_seg:
-                        val_seg = val_batch['seg'].unsqueeze(1)
-                        val_seg_mask = (val_seg > 0).float()  # mask where seg is labeled
-                        val_seg_pred = require_head(val_outputs, 'seg')
-                        val_seg_loss, val_seg_pred_for_vis = compute_loss_with_ds(
-                            val_seg_pred, val_seg, val_seg_mask, loss_fn, 'seg'
-                        )
-                        total_val_loss = total_val_loss + seg_loss_weight * val_seg_loss
-                    if use_normals:
-                        val_normals = rearrange(val_batch['normals'], 'b z y x c -> b c z y x')
-                        val_normals_mask = (val_normals.abs().sum(dim=1, keepdim=True) > 0).float()  # mask where normals exist
-                        val_normals_pred = require_head(val_outputs, 'normals')
-                        val_normals_loss, val_normals_pred_for_vis = compute_loss_with_ds(
-                            val_normals_pred, val_normals, val_normals_mask, normals_loss_fn, 'normals'
-                        )
-                        total_val_loss = total_val_loss + normals_loss_weight * val_normals_loss
+
+                (
+                    total_val_loss, val_first_step_heatmap_loss, val_later_step_loss, val_seg_loss, val_normals_loss,
+                    val_inputs_for_vis, val_targets_for_vis, val_target_pred_for_vis,
+                    val_seg_for_vis, val_seg_pred_for_vis, val_normals_for_vis, val_normals_pred_for_vis
+                ) = compute_loss_and_pred(val_batch)
+
                 wandb_log['val_loss'] = total_val_loss.item()
-                if not multistep_enabled and use_seg:
+                wandb_log['val_first_step_heatmap_loss'] = val_first_step_heatmap_loss.item()
+                if config.get('multistep_count', 1) > 1:
+                    wandb_log['val_later_step_loss'] = val_later_step_loss.item()
+                if use_seg:
                     wandb_log['val_seg_loss'] = val_seg_loss.item()
-                    wandb_log['val_heatmap_loss'] = val_heatmap_loss.item()
-                if not multistep_enabled and use_normals:
+                if use_normals:
                     wandb_log['val_normals_loss'] = val_normals_loss.item()
 
                 log_image_ext = config.get('log_image_ext', 'jpg')
-                make_canvas(inputs, targets, target_pred_for_vis, config,
-                           seg=seg, seg_pred=seg_pred_for_vis, normals=normals,
-                           normals_pred=normals_pred_for_vis, normals_mask=normals_mask,
+                make_canvas(inputs_for_vis, targets_for_vis, target_pred_for_vis, config,
+                           seg=seg_for_vis, seg_pred=seg_pred_for_vis, normals=normals_for_vis,
+                           normals_pred=normals_pred_for_vis, normals_mask=None,
                            save_path=f'{out_dir}/{iteration:06}_train.{log_image_ext}')
-                make_canvas(val_inputs, val_targets, val_target_pred_for_vis, config,
-                           seg=val_seg, seg_pred=val_seg_pred_for_vis, normals=val_normals,
-                           normals_pred=val_normals_pred_for_vis, normals_mask=val_normals_mask,
+                make_canvas(val_inputs_for_vis, val_targets_for_vis, val_target_pred_for_vis, config,
+                           seg=val_seg_for_vis, seg_pred=val_seg_pred_for_vis, normals=val_normals_for_vis,
+                           normals_pred=val_normals_pred_for_vis, normals_mask=None,
                            save_path=f'{out_dir}/{iteration:06}_val.{log_image_ext}')
 
                 model.train()
