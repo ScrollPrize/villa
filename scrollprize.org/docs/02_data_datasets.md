@@ -44,7 +44,7 @@ Here are some organized datasets suited for particular tasks or subproblems.
 Largely, these curate the segmentation efforts of our team and community.
 Click one of the datasets to find a download along with more information.
 
-## `fiber-skeletons`
+## `fiber-skeletons` (2025-07)
 
 A dataset of manually annotated papyrus fibers - the individual strands that make up a papyrus sheet.
 
@@ -64,7 +64,7 @@ The fibers have been converted to a volumetric/voxelized representation to be us
 - [README](https://dl.ash2txt.org/datasets/fiber-skeletons/README.txt)
 - [.zip download](https://dl.ash2txt.org/datasets/fiber-skeletons/fiber-skeletons.zip) (422 MB)
 
-## `volumetric-instance-labels`
+## `volumetric-instance-labels` (2024-10)
 
 Volumetric instance segmentation labels.
 
@@ -78,7 +78,7 @@ For each cube, the original scroll volume data and the instance segmentation dat
 - [README](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/README.txt)
 - [.zip download](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/instance-labels-harmonized.zip) (1.4 GB)
 
-## `grand-prize-banner-region`
+## `grand-prize-banner-region` (2024-12)
 
 Data related to the 2023 Grand Prize (GP) region from Scroll 1.
 
