@@ -5,6 +5,7 @@
 
 #include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
+#include <QGraphicsPixmapItem>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
@@ -174,6 +175,21 @@ void ViewerOverlayControllerBase::OverlayBuilder::addArrow(const QPointF& start,
     prim.headLength = headLength;
     prim.headWidth = headWidth;
     prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QPointF& offset,
+                                                            qreal scale,
+                                                            qreal opacity,
+                                                            qreal z)
+{
+    ImagePrimitive prim;
+    prim.image = image;
+    prim.offset = offset;
+    prim.scale = scale;
+    prim.opacity = opacity;
+    prim.z = z;
     _primitives.emplace_back(std::move(prim));
 }
 
@@ -700,6 +716,21 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
 
                     auto* item = new QGraphicsPathItem(path);
                     addItem(item, prim.style);
+                } else if constexpr (std::is_same_v<T, ImagePrimitive>) {
+                    flushPointGroups();
+                    if (prim.image.isNull()) {
+                        return;
+                    }
+
+                    QPixmap pixmap = QPixmap::fromImage(prim.image);
+                    auto* item = new QGraphicsPixmapItem(pixmap);
+                    item->setOpacity(std::clamp(prim.opacity, 0.0, 1.0));
+                    item->setZValue(prim.z);
+                    item->setPos(prim.offset);
+                    item->setScale(prim.scale);
+
+                    scene->addItem(item);
+                    items.push_back(item);
                 }
             },
             primitive);

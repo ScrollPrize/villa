@@ -87,6 +87,16 @@ public:
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
+    // Approval mask getters
+    [[nodiscard]] bool approvalMaskMode() const { return _approvalMaskMode; }
+    [[nodiscard]] bool approvalPaintModeApprove() const { return _approvalPaintModeApprove; }
+    [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
+
+    // Approval mask setters
+    void setApprovalMaskMode(bool enabled);
+    void setApprovalPaintMode(bool approve);
+    void setApprovalBrushRadius(float radius);
+
 signals:
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
@@ -113,6 +123,11 @@ signals:
     void correctionsAnnotateToggled(bool enabled);
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
+    void approvalMaskModeChanged(bool enabled);
+    void approvalPaintModeChanged(bool approve);
+    void approvalBrushRadiusChanged(float radius);
+    void approvalStrokesApplyRequested();
+    void approvalStrokesClearRequested();
 
 private:
     void buildUi();
@@ -254,4 +269,16 @@ private:
     int _correctionsZMin{0};
     int _correctionsZMax{0};
     bool _correctionsAnnotateChecked{false};
+
+    // Approval mask state and UI
+    bool _approvalMaskMode{false};
+    bool _approvalPaintModeApprove{true};  // true = approve, false = unapprove
+    float _approvalBrushRadius{5.0f};
+    CollapsibleSettingsGroup* _groupApprovalMask{nullptr};
+    QCheckBox* _chkApprovalMaskMode{nullptr};
+    QPushButton* _btnMarkApproved{nullptr};
+    QPushButton* _btnMarkUnapproved{nullptr};
+    QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
+    QPushButton* _btnApplyApprovalStrokes{nullptr};
+    QPushButton* _btnClearApprovalStrokes{nullptr};
 };

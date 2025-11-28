@@ -518,6 +518,63 @@ void SegmentationWidget::buildUi()
 
     layout->addWidget(_groupEditing);
 
+    // Approval Mask Group
+    _groupApprovalMask = new CollapsibleSettingsGroup(tr("Approval Mask"), this);
+    auto* approvalLayout = _groupApprovalMask->contentLayout();
+    auto* approvalParent = _groupApprovalMask->contentWidget();
+
+    // Mode toggle checkbox
+    _chkApprovalMaskMode = new QCheckBox(tr("Enable Approval Mask Mode"), approvalParent);
+    _chkApprovalMaskMode->setToolTip(tr("Toggle between surface editing mode and approval mask painting mode. "
+                                         "When enabled, brush strokes paint approved/unapproved regions instead of modifying the surface."));
+    approvalLayout->addWidget(_chkApprovalMaskMode);
+
+    // Paint mode buttons (Approve / Unapprove)
+    auto* paintModeRow = new QHBoxLayout();
+    paintModeRow->setSpacing(8);
+    auto* paintModeLabel = new QLabel(tr("Paint mode:"), approvalParent);
+    _btnMarkApproved = new QPushButton(tr("Mark Approved"), approvalParent);
+    _btnMarkApproved->setCheckable(true);
+    _btnMarkApproved->setChecked(true);
+    _btnMarkApproved->setToolTip(tr("Paint regions as approved (green). Click to select this mode."));
+    _btnMarkUnapproved = new QPushButton(tr("Mark Unapproved"), approvalParent);
+    _btnMarkUnapproved->setCheckable(true);
+    _btnMarkUnapproved->setToolTip(tr("Paint regions as unapproved (red). Click to select this mode."));
+    paintModeRow->addWidget(paintModeLabel);
+    paintModeRow->addWidget(_btnMarkApproved);
+    paintModeRow->addWidget(_btnMarkUnapproved);
+    paintModeRow->addStretch(1);
+    approvalLayout->addLayout(paintModeRow);
+
+    // Brush radius spinner
+    auto* brushRadiusRow = new QHBoxLayout();
+    brushRadiusRow->setSpacing(8);
+    auto* brushRadiusLabel = new QLabel(tr("Brush radius:"), approvalParent);
+    _spinApprovalBrushRadius = new QDoubleSpinBox(approvalParent);
+    _spinApprovalBrushRadius->setDecimals(1);
+    _spinApprovalBrushRadius->setRange(0.5, 500.0);
+    _spinApprovalBrushRadius->setSingleStep(1.0);
+    _spinApprovalBrushRadius->setValue(_approvalBrushRadius);
+    _spinApprovalBrushRadius->setToolTip(tr("Radius of the approval mask brush in surface pixels. Larger values paint wider regions."));
+    brushRadiusRow->addWidget(brushRadiusLabel);
+    brushRadiusRow->addWidget(_spinApprovalBrushRadius);
+    brushRadiusRow->addStretch(1);
+    approvalLayout->addLayout(brushRadiusRow);
+
+    // Apply and Clear buttons
+    auto* buttonRow = new QHBoxLayout();
+    buttonRow->setSpacing(8);
+    _btnApplyApprovalStrokes = new QPushButton(tr("Apply"), approvalParent);
+    _btnApplyApprovalStrokes->setToolTip(tr("Apply pending approval strokes to the surface. This permanently saves the painted regions."));
+    _btnClearApprovalStrokes = new QPushButton(tr("Clear"), approvalParent);
+    _btnClearApprovalStrokes->setToolTip(tr("Clear all pending approval strokes without applying them."));
+    buttonRow->addWidget(_btnApplyApprovalStrokes);
+    buttonRow->addWidget(_btnClearApprovalStrokes);
+    buttonRow->addStretch(1);
+    approvalLayout->addLayout(buttonRow);
+
+    layout->addWidget(_groupApprovalMask);
+
     _groupDirectionField = new CollapsibleSettingsGroup(tr("Direction Fields"), this);
 
     auto* directionParent = _groupDirectionField->contentWidget();
@@ -668,6 +725,36 @@ void SegmentationWidget::buildUi()
     connect(_chkShowHoverMarker, &QCheckBox::toggled, this, [this](bool enabled) {
         setShowHoverMarker(enabled);
     });
+
+    // Approval mask signal connections
+    connect(_chkApprovalMaskMode, &QCheckBox::toggled, this, [this](bool enabled) {
+        setApprovalMaskMode(enabled);
+    });
+
+    connect(_btnMarkApproved, &QPushButton::clicked, this, [this]() {
+        if (!_btnMarkApproved->isChecked()) {
+            _btnMarkApproved->setChecked(true);
+            return;
+        }
+        _btnMarkUnapproved->setChecked(false);
+        setApprovalPaintMode(true);  // true = approve
+    });
+
+    connect(_btnMarkUnapproved, &QPushButton::clicked, this, [this]() {
+        if (!_btnMarkUnapproved->isChecked()) {
+            _btnMarkUnapproved->setChecked(true);
+            return;
+        }
+        _btnMarkApproved->setChecked(false);
+        setApprovalPaintMode(false);  // false = unapprove
+    });
+
+    connect(_spinApprovalBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setApprovalBrushRadius(static_cast<float>(value));
+    });
+
+    connect(_btnApplyApprovalStrokes, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesApplyRequested);
+    connect(_btnClearApprovalStrokes, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesClearRequested);
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
@@ -1307,6 +1394,60 @@ void SegmentationWidget::setShowHoverMarker(bool enabled)
     if (_chkShowHoverMarker) {
         const QSignalBlocker blocker(_chkShowHoverMarker);
         _chkShowHoverMarker->setChecked(_showHoverMarker);
+    }
+}
+
+void SegmentationWidget::setApprovalMaskMode(bool enabled)
+{
+    if (_approvalMaskMode == enabled) {
+        return;
+    }
+    _approvalMaskMode = enabled;
+    qInfo() << "SegmentationWidget: Approval mask mode changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_mask_mode"), _approvalMaskMode);
+        qInfo() << "  Emitting approvalMaskModeChanged signal";
+        emit approvalMaskModeChanged(_approvalMaskMode);
+    }
+    if (_chkApprovalMaskMode) {
+        const QSignalBlocker blocker(_chkApprovalMaskMode);
+        _chkApprovalMaskMode->setChecked(_approvalMaskMode);
+    }
+    syncUiState();
+}
+
+void SegmentationWidget::setApprovalPaintMode(bool approve)
+{
+    if (_approvalPaintModeApprove == approve) {
+        return;
+    }
+    _approvalPaintModeApprove = approve;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_paint_mode_approve"), _approvalPaintModeApprove);
+        emit approvalPaintModeChanged(_approvalPaintModeApprove);
+    }
+    if (_btnMarkApproved && _btnMarkUnapproved) {
+        const QSignalBlocker blocker1(_btnMarkApproved);
+        const QSignalBlocker blocker2(_btnMarkUnapproved);
+        _btnMarkApproved->setChecked(_approvalPaintModeApprove);
+        _btnMarkUnapproved->setChecked(!_approvalPaintModeApprove);
+    }
+}
+
+void SegmentationWidget::setApprovalBrushRadius(float radius)
+{
+    const float sanitized = std::clamp(radius, 0.5f, 100.0f);
+    if (std::abs(_approvalBrushRadius - sanitized) < 1e-4f) {
+        return;
+    }
+    _approvalBrushRadius = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_radius"), _approvalBrushRadius);
+        emit approvalBrushRadiusChanged(_approvalBrushRadius);
+    }
+    if (_spinApprovalBrushRadius) {
+        const QSignalBlocker blocker(_spinApprovalBrushRadius);
+        _spinApprovalBrushRadius->setValue(static_cast<double>(_approvalBrushRadius));
     }
 }
 

@@ -46,6 +46,7 @@ class QTimer;
 class SegmentationBrushTool;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
+class ApprovalMaskBrushTool;
 
 class SegmentationModule : public QObject
 {
@@ -75,6 +76,15 @@ public:
     void setSmoothingIterations(int iterations);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
     void setHoverPreviewEnabled(bool enabled);
+
+    void setApprovalMaskMode(bool enabled);
+    [[nodiscard]] bool approvalMaskMode() const { return _approvalMaskMode; }
+    void setApprovalMaskPaintMode(bool approve);
+    void setApprovalMaskBrushRadius(float radiusSteps);
+    void applyApprovalStrokes();
+    [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
+    [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
+    void clearApprovalStrokes();
 
     void applyEdits();
     void resetEdits();
@@ -136,6 +146,7 @@ private:
     friend class SegmentationBrushTool;
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
+    friend class ApprovalMaskBrushTool;
     friend class segmentation::CorrectionsState;
 
     enum class FalloffTool
@@ -284,6 +295,10 @@ private:
     std::unique_ptr<SegmentationBrushTool> _brushTool;
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
+    std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
+
+    bool _approvalMaskMode{false};
+    float _approvalMaskBrushRadius{5.0f};
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};

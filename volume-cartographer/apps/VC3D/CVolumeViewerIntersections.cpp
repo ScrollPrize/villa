@@ -2,6 +2,7 @@
 #include "vc/ui/UDataManipulateUtils.hpp"
 
 #include "ViewerManager.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
@@ -29,6 +30,9 @@
 #define COLOR_SEG_YZ Qt::yellow
 #define COLOR_SEG_XZ Qt::red
 #define COLOR_SEG_XY QColor(255, 140, 0)
+#define COLOR_APPROVED QColor(0, 200, 0)
+#define COLOR_PENDING QColor(0, 150, 255)
+#define COLOR_PENDING_UNAPPROVE QColor(255, 50, 50)
 
 #include <algorithm>
 #include <cmath>
@@ -254,12 +258,78 @@ void CVolumeViewer::renderIntersections()
                 z_value = 30;
             }
 
+            // Get the segmentation overlay for approval mask checking (only for active segmentation)
+            SegmentationOverlayController* segOverlay = nullptr;
+            if (isActiveSegmentation && _viewerManager) {
+                segOverlay = _viewerManager->segmentationOverlay();
+            }
+            const bool checkApproval = segOverlay && segOverlay->hasApprovalMaskData();
+
+            qDebug() << "renderIntersections: key=" << QString::fromStdString(key)
+                     << "isActiveSegmentation=" << isActiveSegmentation
+                     << "segOverlay=" << (segOverlay != nullptr)
+                     << "checkApproval=" << checkApproval;
+
             std::vector<QGraphicsItem*> items;
             items.reserve(intersectionLines.size());
             for (const auto& line : intersectionLines) {
                 if (line.world.size() < 2) {
                     continue;
                 }
+
+                // Determine color and width based on approval status
+                QColor lineColor = col;
+                float lineWidth = width;
+                int lineZ = z_value;
+
+                if (checkApproval) {
+                    // surfaceParams stores ptr-space coordinates: (absX - center[0]*scale[0], absY - center[1]*scale[1], 0)
+                    // We need to convert back to absolute grid indices
+                    const cv::Vec3f center = segmentation->center();
+                    const cv::Vec2f scale = segmentation->scale();
+
+                    // Convert ptr-space back to absolute grid coords
+                    // ptr = abs - center * scale, so abs = ptr + center * scale
+                    const float absCol0 = line.surfaceParams[0][0] + center[0] * scale[0];
+                    const float absRow0 = line.surfaceParams[0][1] + center[1] * scale[1];
+                    const float absCol1 = line.surfaceParams[1][0] + center[0] * scale[0];
+                    const float absRow1 = line.surfaceParams[1][1] + center[1] * scale[1];
+
+                    const int row0 = static_cast<int>(std::round(absRow0));
+                    const int col0 = static_cast<int>(std::round(absCol0));
+                    const int row1 = static_cast<int>(std::round(absRow1));
+                    const int col1 = static_cast<int>(std::round(absCol1));
+
+                    int approval0 = segOverlay->queryApprovalStatus(row0, col0);
+                    int approval1 = segOverlay->queryApprovalStatus(row1, col1);
+                    int approvalState = std::max(approval0, approval1);
+
+                    static int logCount = 0;
+                    if (logCount < 20) {
+                        qDebug() << "  line gridCoords: p0=(" << col0 << "," << row0 << ") p1=(" << col1 << "," << row1 << ")"
+                                 << "approval0=" << approval0 << "approval1=" << approval1 << "state=" << approvalState
+                                 << "center=(" << center[0] << "," << center[1] << ") scale=(" << scale[0] << "," << scale[1] << ")";
+                        ++logCount;
+                    }
+
+                    if (approvalState == 3) {
+                        // Pending unapproval - red, thicker
+                        lineColor = COLOR_PENDING_UNAPPROVE;
+                        lineWidth = width + 6.0f;
+                        lineZ = z_value + 5;
+                    } else if (approvalState == 2) {
+                        // Pending approval - blue, thicker
+                        lineColor = COLOR_PENDING;
+                        lineWidth = width + 6.0f;
+                        lineZ = z_value + 5;
+                    } else if (approvalState == 1) {
+                        // Saved approval - green, thicker
+                        lineColor = COLOR_APPROVED;
+                        lineWidth = width + 6.0f;
+                        lineZ = z_value + 5;
+                    }
+                }
+
                 QPainterPath path;
                 bool first = true;
                 for (const auto& wp : line.world) {
@@ -270,8 +340,8 @@ void CVolumeViewer::renderIntersections()
                         path.lineTo(p[0], p[1]);
                     first = false;
                 }
-                auto* item = fGraphicsView->scene()->addPath(path, QPen(col, width));
-                item->setZValue(z_value);
+                auto* item = fGraphicsView->scene()->addPath(path, QPen(lineColor, lineWidth));
+                item->setZValue(lineZ);
                 item->setOpacity(_intersectionOpacity);
                 if (fBaseImageItem) {
                     item->setParentItem(fBaseImageItem);

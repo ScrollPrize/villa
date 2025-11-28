@@ -1199,6 +1199,7 @@ void CWindow::CreateWidgets(void)
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
     _segmentationOverlay->setEditManager(_segmentationEdit.get());
+    _segmentationOverlay->setViewerManager(_viewerManager.get());
 
     _segmentationModule = std::make_unique<SegmentationModule>(
         _segmentationWidget,

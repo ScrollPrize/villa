@@ -6,6 +6,7 @@
 
 #include <QColor>
 #include <QFont>
+#include <QImage>
 #include <QPointF>
 #include <QRectF>
 #include <QString>
@@ -112,13 +113,22 @@ public:
         OverlayStyle style{};
     };
 
+    struct ImagePrimitive {
+        QImage image;
+        QPointF offset{0.0, 0.0};  // Scene-space offset (like setOffset)
+        qreal scale{1.0};           // Uniform scale factor (like setScale)
+        qreal opacity{1.0};
+        qreal z{0.0};
+    };
+
     using OverlayPrimitive = std::variant<PointPrimitive,
                                           CirclePrimitive,
                                           LineStripPrimitive,
                                           RectPrimitive,
                                           TextPrimitive,
                                           PathPrimitive,
-                                          ArrowPrimitive>;
+                                          ArrowPrimitive,
+                                          ImagePrimitive>;
 
     struct FilteredPoints {
         std::vector<cv::Vec3f> volumePoints;
@@ -187,6 +197,12 @@ protected:
                       qreal headLength,
                       qreal headWidth,
                       OverlayStyle style);
+
+        void addImage(const QImage& image,
+                      const QPointF& offset,
+                      qreal scale,
+                      qreal opacity,
+                      qreal z);
 
         bool empty() const { return _primitives.empty(); }
         std::vector<OverlayPrimitive> takePrimitives();

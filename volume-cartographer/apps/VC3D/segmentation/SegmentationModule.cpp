@@ -8,12 +8,14 @@
 #include "SegmentationBrushTool.hpp"
 #include "SegmentationLineTool.hpp"
 #include "SegmentationPushPullTool.hpp"
+#include "ApprovalMaskBrushTool.hpp"
 #include "SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 
+#include <QDebug>
 #include <QLoggingCategory>
 #include <QPointer>
 #include <QString>
@@ -133,6 +135,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _surfaces);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
+
+    _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
 
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
 
@@ -293,6 +297,16 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsAnnotateToggled);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
+    connect(_widget, &SegmentationWidget::approvalMaskModeChanged,
+            this, &SegmentationModule::setApprovalMaskMode);
+    connect(_widget, &SegmentationWidget::approvalPaintModeChanged,
+            this, &SegmentationModule::setApprovalMaskPaintMode);
+    connect(_widget, &SegmentationWidget::approvalBrushRadiusChanged,
+            this, &SegmentationModule::setApprovalMaskBrushRadius);
+    connect(_widget, &SegmentationWidget::approvalStrokesApplyRequested,
+            this, &SegmentationModule::applyApprovalStrokes);
+    connect(_widget, &SegmentationWidget::approvalStrokesClearRequested,
+            this, &SegmentationModule::clearApprovalStrokes);
 
     _widget->setEraseBrushActive(false);
 }
@@ -378,6 +392,118 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     emit editingEnabledChanged(enabled);
     updateAutosaveState();
 }
+
+void SegmentationModule::setApprovalMaskMode(bool enabled)
+{
+    if (_approvalMaskMode == enabled) {
+        return;
+    }
+
+    _approvalMaskMode = enabled;
+    qCInfo(lcSegModule) << "=== Approval Mask Mode:" << (enabled ? "ENABLED" : "DISABLED") << "===";
+
+    if (_approvalMaskMode) {
+        // Entering approval mask mode
+        qCInfo(lcSegModule) << "  Activating approval brush tool";
+        if (_approvalTool) {
+            _approvalTool->setActive(true);
+
+            // Set surface on approval tool
+            if (_editManager && _editManager->hasSession()) {
+                qCInfo(lcSegModule) << "  Setting surface on approval tool (has active session)";
+                _approvalTool->setSurface(_editManager->baseSurface());
+
+                // Load approval mask into QImage for direct painting
+                if (_overlay) {
+                    _overlay->loadApprovalMaskImage(_editManager->baseSurface());
+                    qCInfo(lcSegModule) << "  Loaded approval mask into QImage";
+                }
+            } else {
+                qCWarning(lcSegModule) << "  WARNING: No active editing session!";
+            }
+        } else {
+            qCWarning(lcSegModule) << "  ERROR: Approval tool is null!";
+        }
+
+        // Deactivate regular editing tools
+        deactivateInvalidationBrush();
+        clearLineDragStroke();
+        stopAllPushPull();
+    } else {
+        // Exiting approval mask mode
+        qCInfo(lcSegModule) << "  Deactivating approval brush tool";
+        if (_approvalTool) {
+            _approvalTool->setActive(false);
+            _approvalTool->clear();
+        }
+    }
+
+    refreshOverlay();
+}
+
+void SegmentationModule::setApprovalMaskPaintMode(bool approve)
+{
+    if (_approvalTool) {
+        _approvalTool->setPaintMode(approve
+            ? ApprovalMaskBrushTool::PaintMode::Approve
+            : ApprovalMaskBrushTool::PaintMode::Unapprove);
+    }
+}
+
+void SegmentationModule::setApprovalMaskBrushRadius(float radiusSteps)
+{
+    _approvalMaskBrushRadius = std::max(0.5f, radiusSteps);
+}
+
+void SegmentationModule::applyApprovalStrokes()
+{
+    qCInfo(lcSegModule) << "Applying approval strokes...";
+    if (!_approvalTool) {
+        qCWarning(lcSegModule) << "  No approval tool available";
+        return;
+    }
+
+    if (!_approvalTool->hasPendingStrokes()) {
+        qCInfo(lcSegModule) << "  No pending strokes to apply";
+        emit statusMessageRequested(tr("No pending approval strokes to apply."), kStatusShort);
+        return;
+    }
+
+    const bool success = _approvalTool->applyPending(_approvalMaskBrushRadius);
+    if (success) {
+        qCInfo(lcSegModule) << "  Successfully applied approval strokes";
+
+        // Save the QImage back to disk
+        if (_overlay && _editManager && _editManager->hasSession()) {
+            _overlay->saveApprovalMaskToSurface(_editManager->baseSurface());
+            qCInfo(lcSegModule) << "  Saved approval mask to disk";
+        }
+
+        // Refresh to show the painted result
+        refreshOverlay();
+    } else {
+        qCWarning(lcSegModule) << "  Failed to apply approval strokes";
+    }
+}
+
+void SegmentationModule::clearApprovalStrokes()
+{
+    qCInfo(lcSegModule) << "Clearing approval strokes...";
+    if (!_approvalTool) {
+        qCWarning(lcSegModule) << "  No approval tool available";
+        return;
+    }
+
+    if (!_approvalTool->hasPendingStrokes()) {
+        qCInfo(lcSegModule) << "  No pending strokes to clear";
+        return;
+    }
+
+    _approvalTool->clear();
+    emit statusMessageRequested(tr("Cleared pending approval strokes."), kStatusShort);
+    qCInfo(lcSegModule) << "  Approval strokes cleared";
+}
+
 void SegmentationModule::applyEdits()
 {
     if (!_editManager || !_editManager->hasSession()) {
@@ -490,14 +616,22 @@ void SegmentationModule::emitPendingChanges()
 
 void SegmentationModule::refreshOverlay()
 {
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+
     if (!_overlay) {
         return;
     }
+
+    QElapsedTimer stepTimer;
+    stepTimer.start();
 
     SegmentationOverlayController::State state;
     state.gaussianRadiusSteps = falloffRadius(_activeFalloff);
     state.gaussianSigmaSteps = falloffSigma(_activeFalloff);
     state.gridStepWorld = gridStepWorld();
+
+    qCInfo(lcSegModule) << "[PERF] refreshOverlay: init state:" << stepTimer.elapsed() << "ms";
 
     const auto toFalloffMode = [](FalloffTool tool) {
         using Mode = SegmentationOverlayController::State::FalloffMode;
@@ -552,6 +686,8 @@ void SegmentationModule::refreshOverlay()
         }
     }
 
+    stepTimer.restart();
+
     std::vector<cv::Vec3f> maskPoints;
     std::size_t maskReserve = 0;
     const bool brushHasOverlay = _brushTool &&
@@ -575,6 +711,8 @@ void SegmentationModule::refreshOverlay()
         const auto& linePts = _lineTool->overlayPoints();
         maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
     }
+
+    qCInfo(lcSegModule) << "[PERF] refreshOverlay: build maskPoints (" << maskPoints.size() << " points):" << stepTimer.elapsed() << "ms";
 
     const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
@@ -601,7 +739,29 @@ void SegmentationModule::refreshOverlay()
 
     state.displayRadiusSteps = falloffRadius(overlayTool);
 
+    stepTimer.restart();
+
+    // Approval mask state
+    state.approvalMaskMode = _approvalMaskMode;
+    state.approvalBrushRadius = _approvalMaskBrushRadius;
+    state.surface = (hasSession && _editManager) ? _editManager->baseSurface() : nullptr;
+    if (_approvalTool) {
+        state.approvalStrokeActive = _approvalTool->strokeActive();
+        state.approvalStrokeSegments = _approvalTool->overlayStrokeSegments();
+        state.approvalCurrentStroke = _approvalTool->overlayPoints();
+        state.paintingApproval = (_approvalTool->paintMode() == ApprovalMaskBrushTool::PaintMode::Approve);
+
+        qCInfo(lcSegModule) << "[PERF] refreshOverlay: copy approval overlay ("
+                            << state.approvalStrokeSegments.size() << " segments, "
+                            << state.approvalCurrentStroke.size() << " current points):"
+                            << stepTimer.elapsed() << "ms";
+    }
+
+    stepTimer.restart();
     _overlay->applyState(state);
+    qCInfo(lcSegModule) << "[PERF] refreshOverlay: applyState took:" << stepTimer.elapsed() << "ms";
+
+    qCInfo(lcSegModule) << "[PERF] refreshOverlay: TOTAL:" << totalTimer.elapsed() << "ms";
 }
 
 
@@ -820,14 +980,31 @@ bool SegmentationModule::isSegmentationViewer(const CVolumeViewer* viewer) const
 
 float SegmentationModule::gridStepWorld() const
 {
+    float result = 1.0f;
+    const QuadSurface* surface = nullptr;
+
     if (!_editManager || !_editManager->hasSession()) {
-        return 1.0f;
+        // For approval mask mode, try to get base surface scale even without active session
+        if (_editManager && _editManager->baseSurface()) {
+            surface = _editManager->baseSurface();
+            result = averageScale(surface->scale());
+        }
+    } else {
+        surface = _editManager->previewSurface();
+        if (!surface) {
+            surface = _editManager->baseSurface();
+        }
+        if (surface) {
+            result = averageScale(surface->scale());
+        }
     }
-    const auto* surface = _editManager->previewSurface();
-    if (!surface) {
-        return 1.0f;
+
+    static int logCounter = 0;
+    if (logCounter++ % 100 == 0) {  // Log every 100th call to avoid spam
+        qDebug() << "[gridStepWorld] result:" << result << "surface:" << (surface ? "valid" : "NULL");
     }
-    return averageScale(surface->scale());
+
+    return result;
 }
 
 void SegmentationModule::beginDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos)
