@@ -14,17 +14,20 @@ import random
 import accelerate
 import numpy as np
 from tqdm import tqdm
+import torch.utils.checkpoint
 from einops import rearrange
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.dataset import load_datasets
 from vesuvius.neural_tracing.datasets.dataset_slotted import HeatmapDatasetSlotted
-from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
+from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from vesuvius.neural_tracing.models import make_model
 from vesuvius.neural_tracing.cropping import recrop
-from vesuvius.neural_tracing.visualization import make_canvas
+from vesuvius.models.training.loss.losses import CosineSimilarityLoss
+from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
 
 
 def prepare_batch(batch, config, recrop_center=None, recrop_size=None):
@@ -223,7 +226,14 @@ def train(config_path):
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)
-    grad_clip = int(config['grad_clip'])
+    grad_clip = config.setdefault('grad_clip', 5)
+
+    # Deep supervision and auxiliary task settings (aligned with train.py)
+    ds_enabled = config.setdefault('enable_deep_supervision', False)
+    use_seg = config.setdefault('aux_segmentation', False)
+    use_normals = config.setdefault('aux_normals', False)
+    seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
+    normals_loss_weight = config.setdefault('normals_loss_weight', 1.0)
 
     # Set random seeds
     random.seed(config['seed'])
@@ -231,8 +241,14 @@ def train(config_path):
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
 
-    # Create loss function
+    # Create loss functions
     loss_fn = make_loss_fn(config)
+    normals_loss_fn = CosineSimilarityLoss(dim=1, eps=1e-8)
+    ds_cache = {
+        'uv': {'weights': None, 'loss_fn': None},
+        'seg': {'weights': None, 'loss_fn': None},
+        'normals': {'weights': None, 'loss_fn': None},
+    }
 
     # Setup accelerator
     accelerator = accelerate.Accelerator(
@@ -263,29 +279,30 @@ def train(config_path):
         if accelerator.is_main_process:
             accelerator.print("Model compiled with torch.compile")
 
-    # Setup optimizer
-    optimizer_config = config.get('optimizer') or {}
-    if isinstance(optimizer_config, str):
-        optimizer_config = {'name': optimizer_config}
-    config['optimizer'] = {
-        'name': 'adamw',
-        'learning_rate': 1e-3,
-        'weight_decay': 1e-4,
-        **optimizer_config
-    }
-    optimizer = create_optimizer(optimizer_config, model)
-
-    # Setup scheduler
+    # Setup scheduler and optimizer (aligned with train.py)
     scheduler_type = config.setdefault('scheduler', 'diffusers_cosine_warmup')
-    scheduler_kwargs = dict(config.get('scheduler_kwargs', {}) or {})
-    scheduler_kwargs.setdefault('warmup_steps', config.get('lr_warmup_steps', 1000))
+    scheduler_kwargs = dict(config.setdefault('scheduler_kwargs', {}) or {})
+    scheduler_kwargs.setdefault('warmup_steps', config.setdefault('lr_warmup_steps', 1000))
     config['scheduler_kwargs'] = scheduler_kwargs
-    config.setdefault('lr_warmup_steps', scheduler_kwargs['warmup_steps'])
     total_scheduler_steps = config['num_iterations'] * accelerator.state.num_processes
+
+    optimizer_config = config.setdefault('optimizer', 'adamw')
+    # Handle optimizer being either a string or a dict
+    if isinstance(optimizer_config, dict):
+        optimizer_type = optimizer_config.get('name', 'adamw')
+        optimizer_kwargs = dict(optimizer_config)
+    else:
+        optimizer_type = optimizer_config
+        optimizer_kwargs = dict(config.setdefault('optimizer_kwargs', {}) or {})
+    optimizer_kwargs.setdefault('learning_rate', config.setdefault('learning_rate', 1e-3))
+    optimizer_kwargs.setdefault('weight_decay', config.setdefault('weight_decay', 1e-4))
+    config['optimizer_kwargs'] = optimizer_kwargs
+    optimizer = create_optimizer({'name': optimizer_type, **optimizer_kwargs}, model)
+
     lr_scheduler = get_scheduler(
         scheduler_type=scheduler_type,
         optimizer=optimizer,
-        initial_lr=optimizer_config.get('learning_rate', config.get('learning_rate', 1e-3)),
+        initial_lr=optimizer_kwargs['learning_rate'],
         max_steps=total_scheduler_steps,
         **scheduler_kwargs,
     )
@@ -302,22 +319,72 @@ def train(config_path):
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
 
-    # Print configuration
+    # Print configuration (using shared print_training_config from train.py)
     if accelerator.is_main_process:
-        accelerator.print("\n=== Slot Training Configuration ===")
+        print_training_config(config, accelerator)
+        # Additional slot-specific info
+        accelerator.print("\n=== Slot-Specific Configuration ===")
         accelerator.print(f"Slot count: {slot_count}")
         accelerator.print(f"Multistep: {multistep_enabled} (count={config.get('multistep_count', 1)})")
         accelerator.print(f"Slots per step: {config.get('slots_per_step', 1)}")
         accelerator.print(f"Include diag: {config['masked_include_diag']}")
         accelerator.print(f"Include condition mask channel: {config['include_condition_mask_channel']}")
-        accelerator.print(f"Optimizer: {optimizer_config.get('name', 'adamw')}")
-        accelerator.print(f"Scheduler: {scheduler_type}")
-        accelerator.print(f"Initial LR: {optimizer_config.get('learning_rate', config.get('learning_rate', 1e-3))}")
-        accelerator.print(f"Grad Clip: {grad_clip}")
-        accelerator.print(f"Binary: {config.get('binary', False)}")
         accelerator.print("====================================\n")
 
     val_iterator = iter(val_dataloader)
+
+    def require_head(outputs, name):
+        if isinstance(outputs, dict) and name in outputs:
+            return outputs[name]
+        raise ValueError(f"aux_{name} is enabled but model did not return '{name}'")
+
+    def compute_loss_with_ds(pred, target, mask, base_loss_fn, cache_key):
+        # Wrap base_loss_fn to return scalar (mean over batch) for DS wrapper compatibility
+        def mean_loss_fn(p, t, m):
+            loss = base_loss_fn(p, t, m)
+            return loss.mean() if loss.dim() > 0 else loss
+
+        if ds_enabled and isinstance(pred, (list, tuple)):
+            cache = ds_cache[cache_key]
+            if cache['weights'] is None or len(cache['weights']) != len(pred):
+                cache['weights'] = _compute_ds_weights(len(pred))
+                cache['loss_fn'] = DeepSupervisionWrapper(mean_loss_fn, cache['weights'])
+            elif cache['loss_fn'] is None:
+                cache['loss_fn'] = DeepSupervisionWrapper(mean_loss_fn, cache['weights'])
+            targets_resized = [_resize_for_ds(target, t.shape[2:], mode='trilinear', align_corners=False) for t in pred]
+            masks_resized = None
+            if mask is not None:
+                masks_resized = [_resize_for_ds(mask, t.shape[2:], mode='nearest') for t in pred]
+            loss = cache['loss_fn'](pred, targets_resized, masks_resized)
+            pred_for_vis = pred[0]
+        else:
+            if isinstance(pred, (list, tuple)):
+                pred = pred[0]
+            loss = mean_loss_fn(pred, target, mask)
+            pred_for_vis = pred
+        return loss, pred_for_vis
+
+    def compute_heatmap_loss_with_ds(target_pred, targets, mask):
+        """Compute heatmap loss with optional deep supervision support."""
+        if ds_enabled and isinstance(target_pred, (list, tuple)):
+            cache = ds_cache['uv']
+            if cache['weights'] is None or len(cache['weights']) != len(target_pred):
+                cache['weights'] = _compute_ds_weights(len(target_pred))
+            targets_resized = [_resize_for_ds(targets, t.shape[2:], mode='trilinear', align_corners=False) for t in target_pred]
+            masks_resized = None
+            if mask is not None:
+                masks_resized = [_resize_for_ds(mask, t.shape[2:], mode='nearest') for t in target_pred]
+
+            heatmap_loss = torch.zeros([])
+            for i, weight in enumerate(cache['weights']):
+                if weight != 0:
+                    scale_loss = loss_fn(target_pred[i], targets_resized[i], masks_resized[i] if masks_resized else mask)
+                    heatmap_loss = heatmap_loss + weight * scale_loss
+            return heatmap_loss.mean(), target_pred[0]
+        else:
+            if isinstance(target_pred, (list, tuple)):
+                target_pred = target_pred[0]
+            return loss_fn(target_pred, targets, mask).mean(), target_pred
 
     # Training loop
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
@@ -337,18 +404,49 @@ def train(config_path):
             accelerator.print(f"  targets: {tuple(targets.shape)} | mask_present={'uv_heatmaps_out_mask' in batch}")
 
         wandb_log = {}
+        seg_loss = normals_loss = None
+        seg_for_vis = seg_pred_for_vis = normals_for_vis = normals_pred_for_vis = None
+
         with accelerator.accumulate(model):
             if multistep_enabled:
-                total_loss, target_pred_for_vis = compute_slot_multistep_loss(
+                heatmap_loss, target_pred_for_vis = compute_slot_multistep_loss(
                     model, inputs, targets, mask, config, loss_fn
                 )
+                outputs = None  # Multistep doesn't return full outputs for aux losses yet
             else:
                 outputs = model(inputs)
                 target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
-                total_loss = loss_fn(target_pred, targets, mask).mean()
-                target_pred_for_vis = target_pred
+                heatmap_loss, target_pred_for_vis = compute_heatmap_loss_with_ds(target_pred, targets, mask)
 
-            if torch.isnan(total_loss):
+            total_loss = heatmap_loss
+
+            # Auxiliary segmentation loss
+            if use_seg and outputs is not None:
+                seg = batch.get('seg')
+                if seg is not None:
+                    seg = rearrange(seg, 'b z y x -> b 1 z y x') if seg.dim() == 4 else seg.unsqueeze(1)
+                    seg_mask = (seg > 0).float()
+                    seg_pred = require_head(outputs, 'seg')
+                    seg_loss, seg_pred_for_vis = compute_loss_with_ds(
+                        seg_pred, seg, seg_mask, loss_fn, 'seg'
+                    )
+                    total_loss = total_loss + seg_loss_weight * seg_loss
+                    seg_for_vis = seg
+
+            # Auxiliary normals loss
+            if use_normals and outputs is not None:
+                normals = batch.get('normals')
+                if normals is not None:
+                    normals = rearrange(normals, 'b z y x c -> b c z y x')
+                    normals_mask = (normals.abs().sum(dim=1, keepdim=True) > 0).float()
+                    normals_pred = require_head(outputs, 'normals')
+                    normals_loss, normals_pred_for_vis = compute_loss_with_ds(
+                        normals_pred, normals, normals_mask, normals_loss_fn, 'normals'
+                    )
+                    total_loss = total_loss + normals_loss_weight * normals_loss
+                    normals_for_vis = normals
+
+            if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
             accelerator.backward(total_loss)
             if accelerator.sync_gradients:
@@ -358,6 +456,11 @@ def train(config_path):
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
+        wandb_log['heatmap_loss'] = heatmap_loss.detach().item()
+        if use_seg and seg_loss is not None:
+            wandb_log['seg_loss'] = seg_loss.detach().item()
+        if use_normals and normals_loss is not None:
+            wandb_log['normals_loss'] = normals_loss.detach().item()
         progress_bar.set_postfix({'loss': wandb_log['loss']})
         progress_bar.update(1)
 
@@ -373,25 +476,65 @@ def train(config_path):
                 else:
                     val_mask = torch.ones_like(val_targets)
 
+                val_seg_loss = val_normals_loss = None
+                val_seg_for_vis = val_seg_pred_for_vis = val_normals_for_vis = val_normals_pred_for_vis = None
+
                 if multistep_enabled:
-                    total_val_loss, val_target_pred_for_vis = compute_slot_multistep_loss(
+                    val_heatmap_loss, val_target_pred_for_vis = compute_slot_multistep_loss(
                         model, val_inputs, val_targets, val_mask, config, loss_fn
                     )
+                    val_outputs = None
                 else:
                     val_outputs = model(val_inputs)
                     val_target_pred = val_outputs['uv_heatmaps'] if isinstance(val_outputs, dict) else val_outputs
-                    total_val_loss = loss_fn(val_target_pred, val_targets, val_mask).mean()
-                    val_target_pred_for_vis = val_target_pred
+                    val_heatmap_loss, val_target_pred_for_vis = compute_heatmap_loss_with_ds(val_target_pred, val_targets, val_mask)
+
+                total_val_loss = val_heatmap_loss
+
+                # Auxiliary segmentation loss for validation
+                if use_seg and val_outputs is not None:
+                    val_seg = val_batch.get('seg')
+                    if val_seg is not None:
+                        val_seg = rearrange(val_seg, 'b z y x -> b 1 z y x') if val_seg.dim() == 4 else val_seg.unsqueeze(1)
+                        val_seg_mask = (val_seg > 0).float()
+                        val_seg_pred = require_head(val_outputs, 'seg')
+                        val_seg_loss, val_seg_pred_for_vis = compute_loss_with_ds(
+                            val_seg_pred, val_seg, val_seg_mask, loss_fn, 'seg'
+                        )
+                        total_val_loss = total_val_loss + seg_loss_weight * val_seg_loss
+                        val_seg_for_vis = val_seg
+
+                # Auxiliary normals loss for validation
+                if use_normals and val_outputs is not None:
+                    val_normals = val_batch.get('normals')
+                    if val_normals is not None:
+                        val_normals = rearrange(val_normals, 'b z y x c -> b c z y x')
+                        val_normals_mask = (val_normals.abs().sum(dim=1, keepdim=True) > 0).float()
+                        val_normals_pred = require_head(val_outputs, 'normals')
+                        val_normals_loss, val_normals_pred_for_vis = compute_loss_with_ds(
+                            val_normals_pred, val_normals, val_normals_mask, normals_loss_fn, 'normals'
+                        )
+                        total_val_loss = total_val_loss + normals_loss_weight * val_normals_loss
+                        val_normals_for_vis = val_normals
 
                 wandb_log['val_loss'] = total_val_loss.item()
+                wandb_log['val_heatmap_loss'] = val_heatmap_loss.item()
+                if use_seg and val_seg_loss is not None:
+                    wandb_log['val_seg_loss'] = val_seg_loss.item()
+                if use_normals and val_normals_loss is not None:
+                    wandb_log['val_normals_loss'] = val_normals_loss.item()
 
                 # Create and save visualization
                 cond_start = 2 if config.get('use_localiser', False) else 1
                 log_image_ext = config.get('log_image_ext', 'jpg')
                 make_canvas(inputs, targets, target_pred_for_vis, config,
+                           seg=seg_for_vis, seg_pred=seg_pred_for_vis,
+                           normals=normals_for_vis, normals_pred=normals_pred_for_vis, normals_mask=None,
                            cond_channel_start=cond_start,
                            save_path=f'{out_dir}/{iteration:06}_train.{log_image_ext}')
                 make_canvas(val_inputs, val_targets, val_target_pred_for_vis, config,
+                           seg=val_seg_for_vis, seg_pred=val_seg_pred_for_vis,
+                           normals=val_normals_for_vis, normals_pred=val_normals_pred_for_vis, normals_mask=None,
                            cond_channel_start=cond_start,
                            save_path=f'{out_dir}/{iteration:06}_val.{log_image_ext}')
 
