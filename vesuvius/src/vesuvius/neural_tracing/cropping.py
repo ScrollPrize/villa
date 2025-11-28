@@ -71,7 +71,7 @@ def transform_to_first_crop_space(step_pred, offset, crop_size):
     """
 
     output_shape = step_pred.shape[:2] + (crop_size,) * 3
-    step_pred_in_first_crop = torch.full(output_shape, -100., device=step_pred.device, dtype=step_pred.dtype)
+    step_pred_in_first_crop = torch.full(output_shape, step_pred.amin(), device=step_pred.device, dtype=step_pred.dtype)
 
     src_start = torch.clamp(-offset, 0, crop_size)
     src_end = torch.clamp(crop_size - offset, 0, crop_size)

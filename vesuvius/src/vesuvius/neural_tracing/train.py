@@ -167,6 +167,7 @@ def train(config_path):
 
         multistep_count = config.get('multistep_count', 1)
         sample_count = config.get('multistep_samples', 1)
+        bidirectional = config.get('bidirectional', False)
 
         outer_crop_shape = torch.tensor(batch['volume'].shape[-3:], device=accelerator.device)
         outer_crop_center = outer_crop_shape // 2
@@ -283,7 +284,10 @@ def train(config_path):
             sample_step_unnormalised_probs = [first_step_sample_unnormalised_probs[:, sample_idx]]
             sample_step_proposal_probs = [first_step_proposal_probs[:, sample_idx]]
 
-            for step_idx in range(1, multistep_count):
+            def do_step(direction):
+                nonlocal current_center_in_outer_crop, prev_center_in_outer_crop
+                assert direction in ['forward', 'backward']
+
                 min_corner_new_subcrop_in_outer = current_center_in_outer_crop - config['crop_size'] // 2
 
                 prev_heatmap = torch.cat([
@@ -300,12 +304,23 @@ def train(config_path):
                 step_pred = torch.utils.checkpoint.checkpoint(model, step_inputs, use_reentrant=False)
                 step_pred = step_pred['uv_heatmaps'] if isinstance(outputs, dict) else outputs
 
-                step_targets = safe_crop_with_padding(
-                    batch['uv_heatmaps_out'],
-                    min_corner_new_subcrop_in_outer,
-                    config['crop_size']
+                if direction == 'forward':
+                    step_targets = batch['uv_heatmaps_out'][..., step_idx::multistep_count]
+                elif step_idx > 1:
+                    # When reversing 'later' steps, the target is the target of the previous forward step
+                    step_targets = batch['uv_heatmaps_out'][..., step_idx - 2::multistep_count]
+                else:
+                    # When reversing the first step, the target is the initial center, i.e. center of the outer
+                    # crop, which isn't a standard target
+                    step_targets = batch['center_heatmaps']
+                step_targets = rearrange(
+                    safe_crop_with_padding(
+                        step_targets,
+                        min_corner_new_subcrop_in_outer,
+                        config['crop_size']
+                    ),
+                    'b z y x c -> b c z y x'
                 )
-                step_targets = rearrange(step_targets[..., step_idx::multistep_count], 'b z y x c -> b c z y x')
 
                 if sample_idx == 0:
                     step_pred_filtered = torch.full_like(step_pred, -100.0)
@@ -327,14 +342,31 @@ def train(config_path):
                 step_loss = loss_fn(step_pred, step_targets, mask)
                 sample_losses.append(step_loss)
 
-                if step_idx < multistep_count - 1:
-                    step_pred_for_dir = step_pred.squeeze(1)
-                    sample_zyxs_in_subcrop, sample_unnormalised_probs, proposal_probs = sample_for_next_step(
-                        step_pred_for_dir, num_samples=1, cube_radius=later_step_cube_radius)
-                    sample_step_unnormalised_probs.append(sample_unnormalised_probs.squeeze(1))
-                    sample_step_proposal_probs.append(proposal_probs.squeeze(1))
-                    prev_center_in_outer_crop = current_center_in_outer_crop
-                    current_center_in_outer_crop = sample_zyxs_in_subcrop.squeeze(1) + min_corner_new_subcrop_in_outer
+                step_pred_for_dir = step_pred.squeeze(1)
+                sample_zyxs_in_subcrop, sample_unnormalised_probs, proposal_probs = sample_for_next_step(
+                    step_pred_for_dir, num_samples=1, cube_radius=later_step_cube_radius)
+                sample_step_unnormalised_probs.append(sample_unnormalised_probs.squeeze(1))
+                sample_step_proposal_probs.append(proposal_probs.squeeze(1))
+                prev_center_in_outer_crop = current_center_in_outer_crop
+                current_center_in_outer_crop = sample_zyxs_in_subcrop.squeeze(1) + min_corner_new_subcrop_in_outer
+
+            for step_idx in range(1, multistep_count):
+                do_step(direction='forward')
+
+            if bidirectional:
+
+                # Take steps back along the chain. current_center_in_outer_crop is the output point from the last forward
+                # step (i.e. what would be the next center if we took more steps forward); it becomes the first center for
+                # the reverse direction. prev_center_in_outer_crop is the previous point of the forward chain, i.e. the last
+                # center point at which the model was evaluation
+
+                assert multistep_count > 1  # FIXME: in principle we could support the 1-step case, but need to get the gt (unperturbed) target
+
+                # Swap current and previous points, ready to go backwards
+                current_center_in_outer_crop, prev_center_in_outer_crop = prev_center_in_outer_crop, current_center_in_outer_crop
+
+                for step_idx in range(multistep_count - 1, 0, -1):
+                    do_step(direction='backward')
 
             losses_by_sample_by_later_step.append(sample_losses)
             step_unnormalised_probs_by_sample_by_later_step.append(sample_step_unnormalised_probs)

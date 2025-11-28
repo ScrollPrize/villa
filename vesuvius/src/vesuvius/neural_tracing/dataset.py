@@ -469,6 +469,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         v_pos_valid,
         v_neg_valid,
         multistep_count,
+        include_center,
     ):
         """Build heatmaps using u/v direction conditioning. Returns None to signal resample needed."""
 
@@ -543,11 +544,19 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
         uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
 
+        if include_center:
+            maybe_center_heatmap = {
+                'center_heatmap': self.make_heatmaps([torch.full([1, 3], crop_size / 2)], torch.zeros([3]), crop_size, sigma=heatmap_sigma)
+            }
+        else:
+            maybe_center_heatmap = {}
+
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
             'uv_heatmaps_out_all_channels': uv_heatmaps_out_all_channels,
             'condition_mask_channels': 0,
+            **maybe_center_heatmap,
         }
 
     def _build_batch_dict(
@@ -562,6 +571,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         seg_mask,
         normals,
         normals_mask,
+        center_heatmaps,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -569,6 +579,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             'localiser': localiser,
             'uv_heatmaps_in': uv_heatmaps_in,
             'uv_heatmaps_out': uv_heatmaps_out,
+            **({'center_heatmaps': center_heatmaps} if center_heatmaps is not None else {}),
         }
 
         if self._config.get("aux_segmentation", False) and seg is not None:
@@ -589,7 +600,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         multistep_count = int(self._config.get('multistep_count', 1))
         if torch.rand([]) < multistep_prob:
             step_count *= multistep_count
-            crop_size += step_size * step_count * (multistep_count - 1) * 2
+            crop_size += step_size * step_count * multistep_count * 2
         else:
             multistep_count = 1
         heatmap_sigma = self._heatmap_sigma
@@ -753,6 +764,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 v_pos_valid=v_pos_valid,
                 v_neg_valid=v_neg_valid,
                 multistep_count=multistep_count,
+                include_center=self._config.get('bidirectional', False),
             )
             if heatmap_result is None:
                 continue
@@ -823,6 +835,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if condition_mask_channels:
                 condition_mask_aug = uv_heatmaps_both[..., condition_channels + uv_heatmaps_out_all_channels:]
 
+            # Note this isn't augmented (which is a problem if we add spatial augmentations)
+            maybe_center_heatmaps = rearrange(torch.tile(heatmap_result['center_heatmap'], [2, 1, 1, 1]), 'uv z y x -> z y x uv') if 'center_heatmap' in heatmap_result else None
+
             batch_dict = self._build_batch_dict(
                 volume_crop=volume_crop,
                 localiser=localiser,
@@ -834,6 +849,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 seg_mask=seg_mask,
                 normals=normals,
                 normals_mask=normals_mask,
+                center_heatmaps=maybe_center_heatmaps,
             )
 
             yield batch_dict
