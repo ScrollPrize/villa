@@ -178,8 +178,11 @@ def train(config_path):
         targets = rearrange(safe_crop_with_padding(batch['uv_heatmaps_out'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
         mask = torch.ones_like(targets[:, :1, ...])  # TODO
 
-        outputs = model(first_step_inputs)
-
+        if multistep_count > 1:
+            outputs = torch.utils.checkpoint.checkpoint(model, first_step_inputs, use_reentrant=False)
+        else:
+            outputs = model(first_step_inputs)
+        
         target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
 
         assert targets.shape[1] == target_pred.shape[1] * multistep_count
