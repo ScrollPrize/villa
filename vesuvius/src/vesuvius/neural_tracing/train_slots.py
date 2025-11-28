@@ -25,23 +25,12 @@ from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from vesuvius.neural_tracing.models import make_model
-from vesuvius.neural_tracing.cropping import recrop
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
 from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
 
 
-def prepare_batch(batch, config, recrop_center=None, recrop_size=None):
+def prepare_batch(batch, config):
     """Prepare batch tensors for slotted conditioning training."""
-    if recrop_size is None:
-        recrop_size = config.get('crop_size')
-    if recrop_center is None:
-        recrop_center = torch.tensor(batch['volume'].shape[-3:]) // 2
-
-    uv_heatmaps_out_mask = batch.get('uv_heatmaps_out_mask')
-    uv_heatmaps_out_mask_cf = None
-    if uv_heatmaps_out_mask is not None:
-        uv_heatmaps_out_mask_cf = rearrange(uv_heatmaps_out_mask, 'b z y x c -> b c z y x')
-
     condition_mask = batch.get('condition_mask')
     condition_mask_channels = []
     if condition_mask is not None and config.get("include_condition_mask_channel", True):
@@ -58,15 +47,6 @@ def prepare_batch(batch, config, recrop_center=None, recrop_size=None):
 
     inputs = torch.cat(input_parts, dim=1)
     targets = rearrange(batch['uv_heatmaps_out'], 'b z y x c -> b c z y x')
-
-    if recrop_size is not None:
-        inputs = recrop(inputs, recrop_center, recrop_size)
-        targets = recrop(targets, recrop_center, recrop_size)
-        if uv_heatmaps_out_mask_cf is not None:
-            uv_heatmaps_out_mask_cf = recrop(uv_heatmaps_out_mask_cf, recrop_center, recrop_size)
-
-    if uv_heatmaps_out_mask_cf is not None:
-        batch['uv_heatmaps_out_mask'] = rearrange(uv_heatmaps_out_mask_cf, 'b c z y x -> b z y x c')
 
     return inputs, targets
 
