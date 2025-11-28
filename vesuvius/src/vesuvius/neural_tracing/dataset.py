@@ -427,16 +427,15 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             return cls._scatter_heatmaps(all_zyxs, min_corner_zyx, crop_size)
 
         crop_size_int = int(crop_size)
-        dtype = all_zyxs[0].dtype
         device = all_zyxs[0].device
-        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
-        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, torch.float32)
+        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=torch.float32)
 
         if coords is None:
             return heatmaps
 
         kernel_offsets = cls._get_kernel_offsets(device, sigma)
-        kernel_values = cls._get_kernel_values(device, dtype, sigma)
+        kernel_values = cls._get_kernel_values(device, torch.float32, sigma)
 
         expanded_coords = coords[:, None, :] + kernel_offsets[None, :, :]
         in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_int).all(dim=-1)
