@@ -69,8 +69,6 @@ def train(config_path):
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
 
-    # FIXME: need separate data-loaders for multi-step and single-step training, since have different target shapes
-
     model = make_model(config)
     config.setdefault('compile_model', config.get('compile', True))
     compile_enabled = config['compile_model']
@@ -151,11 +149,12 @@ def train(config_path):
         if config['binary']:
             targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
             # FIXME: nasty; fix DC_and_BCE_loss themselves to support not reducing over batch dim
-            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred, targets_binary.float()).mean(dim=(1, 2, 3, 4))
+            # FIXME: nasty treatment of mask
+            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred * mask, targets_binary.float()).mean(dim=(1, 2, 3, 4))
             from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss
             dice_loss_fn = MemoryEfficientSoftDiceLoss(apply_nonlin=torch.sigmoid, batch_dice=False, ddp=False)
             dice = torch.stack([
-                dice_loss_fn(target_pred[i:i+1], targets_binary[i:i+1]) for i in range(target_pred.shape[0])
+                dice_loss_fn(target_pred[i:i+1] * mask[i:i+1], targets_binary[i:i+1] * mask[i:i+1]) for i in range(target_pred.shape[0])
             ])
             return bce + dice
         else:
@@ -235,7 +234,7 @@ def train(config_path):
         else:
             normals_loss = normals = normals_pred_for_vis = None
 
-        # Direction to extend (assumes exactly one of prev_u/prev_v is set).
+        # Direction to extend (assumes exactly one of prev_u/prev_v is set)
         step_directions = batch['uv_heatmaps_in'].amax(dim=[1, 2, 3])[:, :2].argmax(dim=-1)
 
         first_step_cube_radius = 4
@@ -278,6 +277,13 @@ def train(config_path):
         step_proposal_probs_by_sample_by_later_step = []
         all_step_targets_vis = [first_step_targets]
         all_step_preds_vis = [target_pred.detach()]
+
+        # FIXME: if we supported multi-step for non-chain cases, then we could always enable it hence wouldn't need this
+        if multistep_count > 1:
+            multistep_targets_available = batch['uv_heatmaps_out'][:, ..., 1::multistep_count].amax(dim=(1, 2, 3, 4)) > 0
+        else:
+            multistep_targets_available = torch.zeros(batch['uv_heatmaps_out'].shape[0], dtype=bool)
+        mask = mask * multistep_targets_available[:, None, None, None, None]
 
         for sample_idx in range(sample_count):
             current_center_in_outer_crop = first_sample_zyxs_in_outer_crop[:, sample_idx, :]
@@ -348,10 +354,11 @@ def train(config_path):
                 step_pred_for_dir = step_pred.squeeze(1)
                 sample_zyxs_in_subcrop, sample_unnormalised_probs, proposal_probs = sample_for_next_step(
                     step_pred_for_dir, num_samples=1, cube_radius=later_step_cube_radius)
+                sample_zyxs_in_outer = sample_zyxs_in_subcrop.squeeze(1) + min_corner_new_subcrop_in_outer
                 sample_step_unnormalised_probs.append(sample_unnormalised_probs.squeeze(1))
                 sample_step_proposal_probs.append(proposal_probs.squeeze(1))
-                prev_center_in_outer_crop = current_center_in_outer_crop
-                current_center_in_outer_crop = sample_zyxs_in_subcrop.squeeze(1) + min_corner_new_subcrop_in_outer
+                prev_center_in_outer_crop = torch.where(multistep_targets_available[:, None], current_center_in_outer_crop, prev_center_in_outer_crop)
+                current_center_in_outer_crop = torch.where(multistep_targets_available[:, None], sample_zyxs_in_outer, current_center_in_outer_crop)
 
             for step_idx in range(1, multistep_count):
                 do_step(direction='forward')
