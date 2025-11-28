@@ -267,16 +267,13 @@ def train(config_path):
         first_sample_zyxs_in_first_subcrop, first_step_sample_unnormalised_probs, first_step_proposal_probs = sample_for_next_step(
             first_step_pred_for_dir, num_samples=sample_count, cube_radius=first_step_cube_radius)
 
-        first_step_pred_vis = torch.full_like(target_pred, -100.0)
-        first_step_pred_vis[torch.arange(target_pred.shape[0]), step_directions] = target_pred.detach()[torch.arange(target_pred.shape[0]), step_directions]
-
         first_sample_zyxs_in_outer_crop = first_sample_zyxs_in_first_subcrop + (outer_crop_shape - config['crop_size']) // 2
 
         losses_by_sample_by_later_step = []
         step_unnormalised_probs_by_sample_by_later_step = []
         step_proposal_probs_by_sample_by_later_step = []
         all_step_targets_vis = [first_step_targets]
-        all_step_preds_vis = [first_step_pred_vis]
+        all_step_preds_vis = [target_pred.detach()]
 
         for sample_idx in range(sample_count):
             current_center_in_outer_crop = first_sample_zyxs_in_outer_crop[:, sample_idx, :]
