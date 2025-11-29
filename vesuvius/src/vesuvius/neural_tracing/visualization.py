@@ -90,10 +90,9 @@ def make_canvas(
     if normals_mask is not None:
         normals_mask = normals_mask[:sample_count]
 
-    if multistep_count > 1 and targets.shape[1] % multistep_count == 0:
-        uv_channels = targets.shape[1] // multistep_count
-        targets = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=uv_channels).amax(dim=2)
-        target_pred = rearrange(target_pred, 'b (uv s) z y x -> b uv s z y x', uv=uv_channels).amax(dim=2)
+    if multistep_count > 1:
+        targets = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
+        target_pred = rearrange(target_pred, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
 
     colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
     colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)

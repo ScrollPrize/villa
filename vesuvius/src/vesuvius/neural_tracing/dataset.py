@@ -427,16 +427,15 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             return cls._scatter_heatmaps(all_zyxs, min_corner_zyx, crop_size)
 
         crop_size_int = int(crop_size)
-        dtype = all_zyxs[0].dtype
         device = all_zyxs[0].device
-        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
-        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, torch.float32)
+        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=torch.float32)
 
         if coords is None:
             return heatmaps
 
         kernel_offsets = cls._get_kernel_offsets(device, sigma)
-        kernel_values = cls._get_kernel_values(device, dtype, sigma)
+        kernel_values = cls._get_kernel_values(device, torch.float32, sigma)
 
         expanded_coords = coords[:, None, :] + kernel_offsets[None, :, :]
         in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_int).all(dim=-1)
@@ -469,7 +468,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         u_neg_valid,
         v_pos_valid,
         v_neg_valid,
-        multistep_count,
+        use_multistep,
+        include_center,
     ):
         """Build heatmaps using u/v direction conditioning. Returns None to signal resample needed."""
 
@@ -486,7 +486,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 out_heatmaps = self.make_heatmaps(out_points, min_corner_zyx, crop_size, sigma=heatmap_sigma) if out_points else torch.zeros([pos_shifted_zyxs.shape[0], crop_size, crop_size, crop_size])
             return in_heatmaps, out_heatmaps
 
-        if multistep_count == 1:
+        if not use_multistep:
             u_cond, v_cond = torch.rand([2]) < 0.75
         else:
             # For now, multi-step only works for a 'chain', i.e. conditioning on exactly one of u/v
@@ -544,11 +544,19 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
         uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
 
+        if include_center:
+            maybe_center_heatmap = {
+                'center_heatmap': self.make_heatmaps([torch.full([1, 3], crop_size / 2)], torch.zeros([3]), crop_size, sigma=heatmap_sigma)
+            }
+        else:
+            maybe_center_heatmap = {}
+
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
             'uv_heatmaps_out_all_channels': uv_heatmaps_out_all_channels,
             'condition_mask_channels': 0,
+            **maybe_center_heatmap,
         }
 
     def _build_batch_dict(
@@ -563,6 +571,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         seg_mask,
         normals,
         normals_mask,
+        center_heatmaps,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -570,6 +579,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             'localiser': localiser,
             'uv_heatmaps_in': uv_heatmaps_in,
             'uv_heatmaps_out': uv_heatmaps_out,
+            **({'center_heatmaps': center_heatmaps} if center_heatmaps is not None else {}),
         }
 
         if self._config.get("aux_segmentation", False) and seg is not None:
@@ -585,19 +595,23 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         area_weights = areas / areas.sum()
         crop_size = torch.tensor(self._config['crop_size'])
         step_size = torch.tensor(self._config['step_size'])
-        step_count = torch.tensor(self._config['step_count'])
         multistep_prob = float(self._config.get('multistep_prob', 0.0))
         multistep_count = int(self._config.get('multistep_count', 1))
-        if torch.rand([]) < multistep_prob:
-            step_count *= multistep_count
-            crop_size += step_size * step_count * (multistep_count - 1) * 2
-        else:
-            multistep_count = 1
         heatmap_sigma = self._heatmap_sigma
+
+        crop_size += step_size * torch.tensor(self._config['step_count']) * (multistep_count - 1) * 2
 
         while True:
             self._reset_iter_caches()
             patch = random.choices(self._patches, weights=area_weights)[0]
+
+            # Decide whether to return multi-step targets for this data point
+            if multistep_count > 1 and torch.rand([]) < multistep_prob:
+                step_count = multistep_count * torch.tensor(self._config['step_count'])
+                use_multistep = True
+            else:
+                step_count = torch.tensor(self._config['step_count'])
+                use_multistep = False
 
             # Sample a random valid quad in the patch, then a point in that quad
             random_idx = torch.randint(len(patch.valid_quad_indices), size=[])
@@ -753,7 +767,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 u_neg_valid=u_neg_valid,
                 v_pos_valid=v_pos_valid,
                 v_neg_valid=v_neg_valid,
-                multistep_count=multistep_count,
+                use_multistep=use_multistep,
+                include_center=self._config.get('bidirectional', False),
             )
             if heatmap_result is None:
                 continue
@@ -824,6 +839,21 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             if condition_mask_channels:
                 condition_mask_aug = uv_heatmaps_both[..., condition_channels + uv_heatmaps_out_all_channels:]
 
+            # Note this isn't augmented (which is a problem if we add spatial augmentations)
+            maybe_center_heatmaps = rearrange(torch.tile(heatmap_result['center_heatmap'], [2, 1, 1, 1]), 'uv z y x -> z y x uv') if 'center_heatmap' in heatmap_result else None
+
+            if multistep_count > 1 and not use_multistep:
+                # Allocate blank channels in output heatmaps
+                # FIXME: if we supported multi-step loss for non-chain cases, then we could always enable it hence wouldn't need this
+                assert uv_heatmaps_out.shape[-1] == 2 * step_count
+                other_step_zeros = torch.zeros([*uv_heatmaps_out.shape[:-1], (multistep_count - 1) * step_count], device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype)
+                uv_heatmaps_out = torch.cat([
+                    uv_heatmaps_out[..., :step_count],
+                    other_step_zeros,
+                    uv_heatmaps_out[..., step_count:],
+                    other_step_zeros,
+                ], dim=-1)
+
             batch_dict = self._build_batch_dict(
                 volume_crop=volume_crop,
                 localiser=localiser,
@@ -835,6 +865,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 seg_mask=seg_mask,
                 normals=normals,
                 normals_mask=normals_mask,
+                center_heatmaps=maybe_center_heatmaps,
             )
 
             yield batch_dict

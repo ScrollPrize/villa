@@ -69,8 +69,6 @@ def train(config_path):
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
 
-    # FIXME: need separate data-loaders for multi-step and single-step training, since have different target shapes
-
     model = make_model(config)
     config.setdefault('compile_model', config.get('compile', True))
     compile_enabled = config['compile_model']
@@ -151,11 +149,12 @@ def train(config_path):
         if config['binary']:
             targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
             # FIXME: nasty; fix DC_and_BCE_loss themselves to support not reducing over batch dim
-            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred, targets_binary.float()).mean(dim=(1, 2, 3, 4))
+            # FIXME: nasty treatment of mask
+            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred * mask, targets_binary.float()).mean(dim=(1, 2, 3, 4))
             from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss
             dice_loss_fn = MemoryEfficientSoftDiceLoss(apply_nonlin=torch.sigmoid, batch_dice=False, ddp=False)
             dice = torch.stack([
-                dice_loss_fn(target_pred[i:i+1], targets_binary[i:i+1]) for i in range(target_pred.shape[0])
+                dice_loss_fn(target_pred[i:i+1] * mask[i:i+1], targets_binary[i:i+1] * mask[i:i+1]) for i in range(target_pred.shape[0])
             ])
             return bce + dice
         else:
@@ -167,6 +166,7 @@ def train(config_path):
 
         multistep_count = config.get('multistep_count', 1)
         sample_count = config.get('multistep_samples', 1)
+        bidirectional = config.get('bidirectional', False)
 
         outer_crop_shape = torch.tensor(batch['volume'].shape[-3:], device=accelerator.device)
         outer_crop_center = outer_crop_shape // 2
@@ -177,8 +177,11 @@ def train(config_path):
         targets = rearrange(safe_crop_with_padding(batch['uv_heatmaps_out'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
         mask = torch.ones_like(targets[:, :1, ...])  # TODO
 
-        outputs = model(first_step_inputs)
-
+        if multistep_count > 1:
+            outputs = torch.utils.checkpoint.checkpoint(model, first_step_inputs, use_reentrant=False)
+        else:
+            outputs = model(first_step_inputs)
+        
         target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
 
         assert targets.shape[1] == target_pred.shape[1] * multistep_count
@@ -231,7 +234,7 @@ def train(config_path):
         else:
             normals_loss = normals = normals_pred_for_vis = None
 
-        # Direction to extend (assumes exactly one of prev_u/prev_v is set).
+        # Direction to extend (assumes exactly one of prev_u/prev_v is set)
         step_directions = batch['uv_heatmaps_in'].amax(dim=[1, 2, 3])[:, :2].argmax(dim=-1)
 
         first_step_cube_radius = 4
@@ -267,16 +270,20 @@ def train(config_path):
         first_sample_zyxs_in_first_subcrop, first_step_sample_unnormalised_probs, first_step_proposal_probs = sample_for_next_step(
             first_step_pred_for_dir, num_samples=sample_count, cube_radius=first_step_cube_radius)
 
-        first_step_pred_vis = torch.full_like(target_pred, -100.0)
-        first_step_pred_vis[torch.arange(target_pred.shape[0]), step_directions] = target_pred.detach()[torch.arange(target_pred.shape[0]), step_directions]
-
         first_sample_zyxs_in_outer_crop = first_sample_zyxs_in_first_subcrop + (outer_crop_shape - config['crop_size']) // 2
 
         losses_by_sample_by_later_step = []
         step_unnormalised_probs_by_sample_by_later_step = []
         step_proposal_probs_by_sample_by_later_step = []
         all_step_targets_vis = [first_step_targets]
-        all_step_preds_vis = [first_step_pred_vis]
+        all_step_preds_vis = [target_pred.detach()]
+
+        # FIXME: if we supported multi-step for non-chain cases, then we could always enable it hence wouldn't need this
+        if multistep_count > 1:
+            multistep_targets_available = batch['uv_heatmaps_out'][:, ..., 1::multistep_count].amax(dim=(1, 2, 3, 4)) > 0
+        else:
+            multistep_targets_available = torch.zeros(batch['uv_heatmaps_out'].shape[0], dtype=bool)
+        mask = mask * multistep_targets_available[:, None, None, None, None]
 
         for sample_idx in range(sample_count):
             current_center_in_outer_crop = first_sample_zyxs_in_outer_crop[:, sample_idx, :]
@@ -286,7 +293,10 @@ def train(config_path):
             sample_step_unnormalised_probs = [first_step_sample_unnormalised_probs[:, sample_idx]]
             sample_step_proposal_probs = [first_step_proposal_probs[:, sample_idx]]
 
-            for step_idx in range(1, multistep_count):
+            def do_step(direction):
+                nonlocal current_center_in_outer_crop, prev_center_in_outer_crop
+                assert direction in ['forward', 'backward']
+
                 min_corner_new_subcrop_in_outer = current_center_in_outer_crop - config['crop_size'] // 2
 
                 prev_heatmap = torch.cat([
@@ -303,12 +313,23 @@ def train(config_path):
                 step_pred = torch.utils.checkpoint.checkpoint(model, step_inputs, use_reentrant=False)
                 step_pred = step_pred['uv_heatmaps'] if isinstance(outputs, dict) else outputs
 
-                step_targets = safe_crop_with_padding(
-                    batch['uv_heatmaps_out'],
-                    min_corner_new_subcrop_in_outer,
-                    config['crop_size']
+                if direction == 'forward':
+                    step_targets = batch['uv_heatmaps_out'][..., step_idx::multistep_count]
+                elif step_idx > 1:
+                    # When reversing 'later' steps, the target is the target of the previous forward step
+                    step_targets = batch['uv_heatmaps_out'][..., step_idx - 2::multistep_count]
+                else:
+                    # When reversing the first step, the target is the initial center, i.e. center of the outer
+                    # crop, which isn't a standard target
+                    step_targets = batch['center_heatmaps']
+                step_targets = rearrange(
+                    safe_crop_with_padding(
+                        step_targets,
+                        min_corner_new_subcrop_in_outer,
+                        config['crop_size']
+                    ),
+                    'b z y x c -> b c z y x'
                 )
-                step_targets = rearrange(step_targets[..., step_idx::multistep_count], 'b z y x c -> b c z y x')
 
                 if sample_idx == 0:
                     step_pred_filtered = torch.full_like(step_pred, -100.0)
@@ -330,14 +351,32 @@ def train(config_path):
                 step_loss = loss_fn(step_pred, step_targets, mask)
                 sample_losses.append(step_loss)
 
-                if step_idx < multistep_count - 1:
-                    step_pred_for_dir = step_pred.squeeze(1)
-                    sample_zyxs_in_subcrop, sample_unnormalised_probs, proposal_probs = sample_for_next_step(
-                        step_pred_for_dir, num_samples=1, cube_radius=later_step_cube_radius)
-                    sample_step_unnormalised_probs.append(sample_unnormalised_probs.squeeze(1))
-                    sample_step_proposal_probs.append(proposal_probs.squeeze(1))
-                    prev_center_in_outer_crop = current_center_in_outer_crop
-                    current_center_in_outer_crop = sample_zyxs_in_subcrop.squeeze(1) + min_corner_new_subcrop_in_outer
+                step_pred_for_dir = step_pred.squeeze(1)
+                sample_zyxs_in_subcrop, sample_unnormalised_probs, proposal_probs = sample_for_next_step(
+                    step_pred_for_dir, num_samples=1, cube_radius=later_step_cube_radius)
+                sample_zyxs_in_outer = sample_zyxs_in_subcrop.squeeze(1) + min_corner_new_subcrop_in_outer
+                sample_step_unnormalised_probs.append(sample_unnormalised_probs.squeeze(1))
+                sample_step_proposal_probs.append(proposal_probs.squeeze(1))
+                prev_center_in_outer_crop = torch.where(multistep_targets_available[:, None], current_center_in_outer_crop, prev_center_in_outer_crop)
+                current_center_in_outer_crop = torch.where(multistep_targets_available[:, None], sample_zyxs_in_outer, current_center_in_outer_crop)
+
+            for step_idx in range(1, multistep_count):
+                do_step(direction='forward')
+
+            if bidirectional:
+
+                # Take steps back along the chain. current_center_in_outer_crop is the output point from the last forward
+                # step (i.e. what would be the next center if we took more steps forward); it becomes the first center for
+                # the reverse direction. prev_center_in_outer_crop is the previous point of the forward chain, i.e. the last
+                # center point at which the model was evaluation
+
+                assert multistep_count > 1  # FIXME: in principle we could support the 1-step case, but need to get the gt (unperturbed) target
+
+                # Swap current and previous points, ready to go backwards
+                current_center_in_outer_crop, prev_center_in_outer_crop = prev_center_in_outer_crop, current_center_in_outer_crop
+
+                for step_idx in range(multistep_count - 1, 0, -1):
+                    do_step(direction='backward')
 
             losses_by_sample_by_later_step.append(sample_losses)
             step_unnormalised_probs_by_sample_by_later_step.append(sample_step_unnormalised_probs)
