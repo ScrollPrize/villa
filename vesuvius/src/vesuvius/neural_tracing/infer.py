@@ -22,7 +22,7 @@ class Inference:
         self.model = self.accelerator.prepare(model)
         self.device = self.accelerator.device
         self.config = config
-        self.do_tta = config.get('do_tta', True)
+        self.do_tta = config.get('do_tta', False)
         self.tta_type = config.get('tta_type', "rotation")
         self.tta_batched = bool(config.get('tta_batched', True))
 
