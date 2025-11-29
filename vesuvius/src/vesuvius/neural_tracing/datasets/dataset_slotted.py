@@ -123,12 +123,8 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             device=uv_heatmaps_out.device, dtype=uv_heatmaps_out.dtype
         ).view(1, 1, 1, -1)
         uv_heatmaps_out_mask = out_channel_mask_expanded.expand_as(uv_heatmaps_out)
-        # Combine the channel mask with the spatial support of the targets so we only
-        # supervise voxels that actually have label signal.
+        # Apply channel mask so known slots are zeroed; keep background in unknown slots.
         uv_heatmaps_out = uv_heatmaps_out * uv_heatmaps_out_mask
-        spatial_support_mask = (uv_heatmaps_out != 0).to(dtype=uv_heatmaps_out_mask.dtype)
-        uv_heatmaps_out_mask = uv_heatmaps_out_mask * spatial_support_mask
-        uv_heatmaps_out = uv_heatmaps_out * spatial_support_mask
 
         batch_dict = {
             'volume': volume_crop,
