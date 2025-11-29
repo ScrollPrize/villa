@@ -199,7 +199,7 @@ def train(config_path):
                 masks_resized = [_resize_for_ds(mask, t.shape[2:], mode='nearest') for t in target_pred]
 
             # Compute per-batch losses at each scale
-            first_step_heatmap_loss = torch.zeros([])
+            first_step_heatmap_loss = torch.zeros([], device=target_pred[0].device)
             for i, weight in enumerate(cache['weights']):
                 if weight != 0:
                     scale_loss = loss_fn(target_pred[i], targets_resized[i], masks_resized[i] if masks_resized else mask)
@@ -279,10 +279,12 @@ def train(config_path):
         all_step_preds_vis = [target_pred.detach()]
 
         # FIXME: if we supported multi-step for non-chain cases, then we could always enable it hence wouldn't need this
+        multistep_available_device = mask.device
         if multistep_count > 1:
             multistep_targets_available = batch['uv_heatmaps_out'][:, ..., 1::multistep_count].amax(dim=(1, 2, 3, 4)) > 0
         else:
-            multistep_targets_available = torch.zeros(batch['uv_heatmaps_out'].shape[0], dtype=bool)
+            multistep_targets_available = torch.zeros(batch['uv_heatmaps_out'].shape[0], dtype=bool, device=multistep_available_device)
+        multistep_targets_available = multistep_targets_available.to(multistep_available_device)
         mask = mask * multistep_targets_available[:, None, None, None, None]
 
         for sample_idx in range(sample_count):
@@ -384,7 +386,7 @@ def train(config_path):
 
         # Later step losses are accumulated and weighted using self-normalized importance sampling
         # later_step_idx is the index into losses_by_sample_by_later_step (which excludes first step)
-        later_step_loss = torch.zeros([])
+        later_step_loss = torch.zeros([], device=mask.device)
         cumulative_weights = [1] * sample_count
         for later_step_idx in range(multistep_count - 1):
 
