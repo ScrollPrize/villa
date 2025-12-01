@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 import matplotlib.pyplot as plt
+from torchvision.transforms.v2.functional._color import _hsv_to_rgb
 
 
 def print_training_config(config, accelerator):
@@ -94,8 +95,9 @@ def make_canvas(
         targets = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
         target_pred = rearrange(target_pred, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
 
-    colours_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * 0.7 + 0.2
-    colours_by_step = torch.cat([torch.ones([3, 3], device=inputs.device), colours_by_step], dim=0)
+    hsv_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * torch.tensor([1.0, 0.4, 0.6], device=inputs.device) + torch.tensor([0.0, 0.6, 0.4], device=inputs.device)
+    colours_by_step = _hsv_to_rgb(hsv_by_step[:, :, None, None]).squeeze()
+    colours_by_step = torch.cat([torch.ones([2, 3], device=inputs.device), torch.full([1, 3], 0.5, device=inputs.device), colours_by_step], dim=0)
 
     def overlay_crosshair(x):
         x = x.clone()
