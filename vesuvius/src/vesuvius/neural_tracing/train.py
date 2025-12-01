@@ -166,6 +166,8 @@ def train(config_path):
 
         multistep_count = config.get('multistep_count', 1)
         sample_count = config.get('multistep_samples', 1)
+        sampling_mode = config.get('multistep_sampling_mode', 'categorical')
+        assert sampling_mode in ['categorical', 'expectation']
         bidirectional = config.get('bidirectional', False)
 
         outer_crop_shape = torch.tensor(batch['volume'].shape[-3:], device=accelerator.device)
@@ -241,28 +243,66 @@ def train(config_path):
         later_step_cube_radius = 2  # smaller radius for later steps to reduce variance
 
         def sample_for_next_step(step_pred_for_dir, num_samples, cube_radius):
-            cube_center = torch.argmax(step_pred_for_dir.view(step_pred_for_dir.shape[0], -1), dim=1)
-            cube_center = torch.stack(torch.unravel_index(cube_center, step_pred_for_dir.shape[1:]), dim=-1)  # batch, zyx
-            cube_center = torch.clamp(
-                cube_center,
-                torch.tensor(cube_radius, device=cube_center.device),
-                torch.tensor(step_pred_for_dir.shape[1:], device=cube_center.device) - cube_radius - 1
-            )
+            if sampling_mode == 'categorical':
 
-            sample_zyxs_in_subcrop = torch.randint(
-                -cube_radius, cube_radius + 1, [1, num_samples, 3], device=cube_center.device
-            ) + cube_center[:, None, :]
-            cube_volume = (2 * cube_radius + 1) ** 3
-            sample_logits = step_pred_for_dir[
-                torch.arange(step_pred_for_dir.shape[0], device=step_pred_for_dir.device)[:, None].expand(-1, num_samples),
-                sample_zyxs_in_subcrop[..., 0],
-                sample_zyxs_in_subcrop[..., 1],
-                sample_zyxs_in_subcrop[..., 2]
-            ]
+                cube_center = torch.argmax(step_pred_for_dir.view(step_pred_for_dir.shape[0], -1), dim=1)
+                cube_center = torch.stack(torch.unravel_index(cube_center, step_pred_for_dir.shape[1:]), dim=-1)  # batch, zyx
+                cube_center = torch.clamp(
+                    cube_center,
+                    torch.tensor(cube_radius, device=cube_center.device),
+                    torch.tensor(step_pred_for_dir.shape[1:], device=cube_center.device) - cube_radius - 1
+                )
 
-            temperature = 20.0
-            sample_unnormalised_probs = torch.sigmoid(sample_logits / temperature)
-            proposal_probs = torch.full_like(sample_unnormalised_probs, 1.0 / cube_volume)
+                sample_zyxs_in_subcrop = torch.randint(
+                    -cube_radius, cube_radius + 1, [1, num_samples, 3], device=cube_center.device
+                ) + cube_center[:, None, :]
+                cube_volume = (2 * cube_radius + 1) ** 3
+                sample_logits = step_pred_for_dir[
+                    torch.arange(step_pred_for_dir.shape[0], device=step_pred_for_dir.device)[:, None].expand(-1, num_samples),
+                    sample_zyxs_in_subcrop[..., 0],
+                    sample_zyxs_in_subcrop[..., 1],
+                    sample_zyxs_in_subcrop[..., 2]
+                ]
+
+                temperature = 20.0
+                sample_unnormalised_probs = torch.sigmoid(sample_logits / temperature)
+                proposal_probs = torch.full_like(sample_unnormalised_probs, 1.0 / cube_volume)
+
+            else:
+
+                # TODO: we could instead split into blobs first (non-differentiably) then use expectations
+                #  over near-blob (voronoi?) regions
+
+                temperature = 1.0  # setting this too high will collapse centroid to the center of the crop
+                prob_map = torch.sigmoid(step_pred_for_dir / temperature)
+                prob_normalized = prob_map / (prob_map.sum(dim=(1, 2, 3), keepdim=True) + 1.e-8)
+
+                batch_size = step_pred_for_dir.shape[0]
+                shape = step_pred_for_dir.shape[1:]
+                device = step_pred_for_dir.device
+
+                z_coords = torch.arange(shape[0], device=device, dtype=torch.float32)
+                y_coords = torch.arange(shape[1], device=device, dtype=torch.float32)
+                x_coords = torch.arange(shape[2], device=device, dtype=torch.float32)
+                zyx_grid = torch.stack(torch.meshgrid(z_coords, y_coords, x_coords, indexing='ij'), dim=-1)
+
+                centroid = (prob_normalized.unsqueeze(-1) * zyx_grid).sum(dim=(1, 2, 3))
+
+                if num_samples > 1:
+                    noise_sigma = 1.5
+                    noise = torch.randn(batch_size, num_samples, 3, device=device) * noise_sigma
+                    sample_zyxs_in_subcrop = centroid[:, None, :] + noise
+                else:
+                    sample_zyxs_in_subcrop = centroid[:, None, :]
+
+                sample_zyxs_in_subcrop = sample_zyxs_in_subcrop.round().long().clamp(
+                    torch.tensor([0, 0, 0], device=device),
+                    torch.tensor(shape, device=device) - 1
+                )
+
+                # TODO: not correct in num_samples>1 case, and unclear what to do in num_samples=1 case
+                sample_unnormalised_probs = torch.full([batch_size, num_samples], 1. / num_samples, device=device)
+                proposal_probs = sample_unnormalised_probs
 
             return sample_zyxs_in_subcrop, sample_unnormalised_probs, proposal_probs
 
