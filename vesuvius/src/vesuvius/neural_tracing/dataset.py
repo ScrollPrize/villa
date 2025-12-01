@@ -841,7 +841,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             # We can't do this earlier due to how diagonal points are constructed
             if torch.rand([]) < 0.5:
                 assert uv_heatmaps_in.shape[-1] == 3 and uv_heatmaps_out.shape[-1] % 2 == 0
-                uv_heatmaps_in = torch.cat([uv_heatmaps_in[..., 3:], uv_heatmaps_in[..., :3]], dim=-1)
+                uv_heatmaps_in = uv_heatmaps_in[..., [1, 0, 2]]
                 uv_heatmaps_out = torch.cat([uv_heatmaps_out[..., uv_heatmaps_out.shape[-1] // 2:], uv_heatmaps_out[..., :uv_heatmaps_out.shape[-1] // 2]], dim=-1)
 
             batch_dict = self._build_batch_dict(
