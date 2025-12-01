@@ -542,7 +542,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         uv_heatmaps_out_all = torch.cat([u_out_heatmaps, v_out_heatmaps], dim=0)
         condition_channels = uv_heatmaps_in_all.shape[0]
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
-        uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
 
         if include_center:
             maybe_center_heatmap = {
@@ -554,8 +553,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
-            'uv_heatmaps_out_all_channels': uv_heatmaps_out_all_channels,
-            'condition_mask_channels': 0,
             **maybe_center_heatmap,
         }
 
@@ -565,8 +562,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         localiser,
         uv_heatmaps_in,
         uv_heatmaps_out,
-        out_channel_mask,
-        condition_mask_aug,
         seg,
         seg_mask,
         normals,
@@ -767,9 +762,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 continue
 
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
-            condition_channels = heatmap_result['condition_channels']
-            uv_heatmaps_out_all_channels = heatmap_result['uv_heatmaps_out_all_channels']
-            condition_mask_channels = heatmap_result.get('condition_mask_channels', 0)
+            heatmap_num_in_channels = heatmap_result['condition_channels']
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -826,11 +819,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 # FIXME: why do these NaNs happen occasionally?
                 continue
 
-            uv_heatmaps_in = uv_heatmaps_both[..., :condition_channels]
-            uv_heatmaps_out = uv_heatmaps_both[..., condition_channels:condition_channels + uv_heatmaps_out_all_channels]
-            condition_mask_aug = None
-            if condition_mask_channels:
-                condition_mask_aug = uv_heatmaps_both[..., condition_channels + uv_heatmaps_out_all_channels:]
+            uv_heatmaps_in = uv_heatmaps_both[..., :heatmap_num_in_channels]
+            uv_heatmaps_out = uv_heatmaps_both[..., heatmap_num_in_channels:]
 
             # Note this isn't augmented (which is a problem if we add spatial augmentations)
             maybe_center_heatmaps = rearrange(torch.tile(heatmap_result['center_heatmap'], [2, 1, 1, 1]), 'uv z y x -> z y x uv') if 'center_heatmap' in heatmap_result else None
@@ -859,8 +849,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 localiser=localiser,
                 uv_heatmaps_in=uv_heatmaps_in,
                 uv_heatmaps_out=uv_heatmaps_out,
-                out_channel_mask=heatmap_result.get('out_channel_mask'),
-                condition_mask_aug=condition_mask_aug,
                 seg=seg,
                 seg_mask=seg_mask,
                 normals=normals,
