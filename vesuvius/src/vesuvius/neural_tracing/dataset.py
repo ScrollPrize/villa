@@ -653,13 +653,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
                 v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
 
-            # Similarly, randomly swap U & V axes
-            if torch.rand([]) < 0.5:
-                u_pos_shifted_ijs, v_pos_shifted_ijs = v_pos_shifted_ijs, u_pos_shifted_ijs
-                u_neg_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, u_neg_shifted_ijs
-                u_pos_valid, v_pos_valid = v_pos_valid, u_pos_valid
-                u_neg_valid, v_neg_valid = v_neg_valid, u_neg_valid
-
             # Apply perturbations to center and negative points
             if torch.rand([]) < self._perturb_prob:
                 min_corner_zyx = (center_zyx - crop_size // 2).int()
@@ -853,6 +846,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                     uv_heatmaps_out[..., step_count:],
                     other_step_zeros,
                 ], dim=-1)
+
+            # As an additional augmentation, randomly swap U & V axes in heatmaps
+            # We can't do this earlier due to how diagonal points are constructed
+            if torch.rand([]) < 0.5:
+                assert uv_heatmaps_in.shape[-1] == 3 and uv_heatmaps_out.shape[-1] % 2 == 0
+                uv_heatmaps_in = torch.cat([uv_heatmaps_in[..., 3:], uv_heatmaps_in[..., :3]], dim=-1)
+                uv_heatmaps_out = torch.cat([uv_heatmaps_out[..., uv_heatmaps_out.shape[-1] // 2:], uv_heatmaps_out[..., :uv_heatmaps_out.shape[-1] // 2]], dim=-1)
 
             batch_dict = self._build_batch_dict(
                 volume_crop=volume_crop,
