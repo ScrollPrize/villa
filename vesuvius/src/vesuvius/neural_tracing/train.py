@@ -376,9 +376,11 @@ def train(config_path):
                 if sample_idx == 0:
                     step_pred_filtered = torch.full_like(step_pred, -100.0)
                     step_pred_filtered[torch.arange(step_pred.shape[0]), step_directions] = step_pred.detach()[torch.arange(step_pred.shape[0]), step_directions]
+                    step_targets_filtered = torch.zeros_like(step_targets)
+                    step_targets_filtered[torch.arange(step_targets.shape[0]), step_directions] = step_targets.detach()[torch.arange(step_targets.shape[0]), step_directions]
                     first_step_crop_min = outer_crop_center - config['crop_size'] // 2
                     offset = min_corner_new_subcrop_in_outer - first_step_crop_min
-                    step_target_in_first_crop = transform_to_first_crop_space(step_targets, offset, config['crop_size'])
+                    step_target_in_first_crop = transform_to_first_crop_space(step_targets_filtered, offset, config['crop_size'])
                     step_pred_in_first_crop = transform_to_first_crop_space(step_pred_filtered, offset, config['crop_size'])
                     all_step_targets_vis.append(step_target_in_first_crop)
                     all_step_preds_vis.append(step_pred_in_first_crop)
