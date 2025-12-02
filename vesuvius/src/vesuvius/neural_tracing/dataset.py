@@ -829,8 +829,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 if seg_aug is None:
                     continue
                 seg = rearrange(seg_aug, 'c z y x -> z y x c')[..., 0]
-                # Spatial augments can blur the segmentation plane; snap back to binary.
-                seg = (seg > 0.25).float()
+                # dilate the seg label to add a bit of thickness
+                seg = F.max_pool3d(seg[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
                 seg_mask = seg
             if normals is not None:
                 # Use explicitly tracked normals so vector components are permuted correctly
