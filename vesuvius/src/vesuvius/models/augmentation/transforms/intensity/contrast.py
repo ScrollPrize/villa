@@ -66,32 +66,3 @@ class ContrastTransform(ImageOnlyTransform):
                 img[c].clamp_(minm, maxm)
 
         return img
-
-
-if __name__ == '__main__':
-    from time import time
-    import os
-
-    os.environ['OMP_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-
-    mbt = ContrastTransform(BGContrast((0.75, 1.25)).sample_contrast, True, False, p_per_channel=1)
-
-    times_torch = []
-    for _ in range(100):
-        data_dict = {'image': torch.ones((2, 128, 192, 64))}
-        st = time()
-        out = mbt(**data_dict)
-        times_torch.append(time() - st)
-    print('torch', np.mean(times_torch))
-
-    from batchgenerators.transforms.color_transforms import ContrastAugmentationTransform
-
-    gnt_bg = ContrastAugmentationTransform((0.75, 1.25), preserve_range=True, per_channel=True, p_per_channel=1)
-    times_bg = []
-    for _ in range(100):
-        data_dict = {'data': np.ones((1, 2, 128, 192, 64))}
-        st = time()
-        out = gnt_bg(**data_dict)
-        times_bg.append(time() - st)
-    print('bg', np.mean(times_bg))

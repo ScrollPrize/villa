@@ -2,7 +2,7 @@ from typing import Union, List, Tuple
 
 import torch
 
-from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
 
 
 class MoveSegAsOneHotToDataTransform(BasicTransform):

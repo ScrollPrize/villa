@@ -1,4 +1,3 @@
-import os
 from typing import Tuple
 
 from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
@@ -46,35 +45,3 @@ class GaussianNoiseTransform(ImageOnlyTransform):
             ]
             gaussian = torch.cat(gaussian, dim=0)
         return gaussian
-
-
-if __name__ == "__main__":
-    from time import time
-    import numpy as np
-
-    os.environ['OMP_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-
-    gnt = GaussianNoiseTransform((0, 0.1), 1, False)
-
-    times = []
-    for _ in range(1000):
-        data_dict = {'image': torch.ones((2, 32, 32, 32))}
-        st = time()
-        out = gnt(**data_dict)
-        times.append(time() - st)
-    print('torch', np.mean(times))
-
-    from batchgenerators.transforms.noise_transforms import GaussianNoiseTransform
-
-    gnt_bg = GaussianNoiseTransform((0, 0.1), 1, 1, True)
-
-    times = []
-    for _ in range(1000):
-        data_dict = {'data': np.ones((1, 2, 32, 32, 32))}
-        st = time()
-        out = gnt_bg(**data_dict)
-        times.append(time() - st)
-
-    print('bg', np.mean(times))
-    # torch is 2.5x faster

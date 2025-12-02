@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from acvl_utils.morphology.morphology_helper import label_with_component_sizes
 
-from batchgeneratorsv2.transforms.base.basic_transform import ImageOnlyTransform
+from vesuvius.models.augmentation.transforms.base.basic_transform import ImageOnlyTransform
 
 
 class RemoveRandomConnectedComponentFromOneHotEncodingTransform(ImageOnlyTransform):
