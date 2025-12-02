@@ -222,7 +222,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         # use scipy label instead of dfs; use 8-connectivity (including diagonals) to avoid dashed lines
         structure = np.array([[1, 1, 1],
                               [1, 1, 1],
-                              [0, 1, 0]], dtype=np.int8)
+                              [1, 1, 1]], dtype=np.int8)
         labeled, _ = scipy.ndimage.label(quad_in_crop.cpu().numpy(), structure=structure)
         label = labeled[center_quad[0].item(), center_quad[1].item()]
         if label == 0:
