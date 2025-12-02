@@ -1,5 +1,5 @@
 {
-    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/test",
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/aux_segmentation2",
     "wandb_entity": "vesuvius-challenge",
     "wandb_project": "neural-tracing",
     "seed": 0,
@@ -9,9 +9,9 @@
     "log_frequency": 200,
     "ckpt_frequency": 5000,
     "mixed_precision": "fp16",
-    "learning_rate": 1e-3,
+    "learning_rate": 0.0002,
     "weight_decay": 1e-4,
-    "lr_warmup_steps": 1000,
+    "lr_warmup_steps": 500,
     "num_iterations": 250000,
     "datasets": [
               {
@@ -38,7 +38,8 @@
     "num_val_segments_per_volume": 1,
       "augmentation": {
         "allow_transposes": true,
-        "only_spatial_and_intensity": false
+        "only_spatial_and_intensity": false,
+        "allow_mirroring": true
       },
       "point_perturbation": {
         "perturb_probability": 0.95,
@@ -52,8 +53,11 @@
       "binary": true,
       "crop_size": 128,
       "model_type": "unet",
+      "aux_segmentation": true,
+      "seg_loss_weight": 0.25,
+      "enable_deep_supervision": false,
       "model_config": {
-        "squeeze_excitation": true,
+        "features_per_stage": [32,64,128,256,320,512],
         "basic_decoder_block": "BasicBlockD"
       }
 }

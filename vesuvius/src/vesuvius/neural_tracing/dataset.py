@@ -51,7 +51,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._config = config
         self._patches = patches_for_split
         self._heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
-        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'], config['augmentation']['only_spatial_and_intensity'])
+        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'],config['augmentation']['allow_mirroring'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
         self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels
@@ -74,8 +74,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 torch.stack([bottom_left, bottom_right], dim=2),
             ], dim=2)  # shape: (h-1, w-1, 2, 2, 3)
             points_per_side = (1 / patch.scale + 0.5).int()
-            v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
-            u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
+            # Use linspace to include both endpoints [0, 1] to avoid gaps between adjacent quads
+            v_points = torch.linspace(0, 1, points_per_side[0] + 1, dtype=torch.float32)
+            u_points = torch.linspace(0, 1, points_per_side[1] + 1, dtype=torch.float32)
             self._sampling[id(patch)] = {
                 "quad_corners": quad_corners,
                 "v_points": v_points,
@@ -123,8 +124,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     def _get_quad_weights(cls, points_per_side, device):
         key = (int(points_per_side[0]), int(points_per_side[1]), device)
         if key not in cls._quad_weight_cache:
-            v_points = torch.arange(points_per_side[0], dtype=torch.float32, device=device) / points_per_side[0]
-            u_points = torch.arange(points_per_side[1], dtype=torch.float32, device=device) / points_per_side[1]
+            # Use linspace to include both endpoints [0, 1] to avoid gaps between adjacent quads
+            v_points = torch.linspace(0, 1, points_per_side[0] + 1, dtype=torch.float32, device=device)
+            u_points = torch.linspace(0, 1, points_per_side[1] + 1, dtype=torch.float32, device=device)
             cls._quad_weight_cache[key] = cls._make_quad_weights(v_points, u_points)
         return cls._quad_weight_cache[key]
 
@@ -219,10 +221,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             component_mask = torch.zeros_like(quad_in_crop)
             return component_mask
 
-        # use scipy label instead of dfs
-        structure = np.array([[0, 1, 0],
+        # use scipy label instead of dfs; use 8-connectivity (including diagonals) to avoid dashed lines
+        structure = np.array([[1, 1, 1],
                               [1, 1, 1],
-                              [0, 1, 0]], dtype=np.int8)
+                              [1, 1, 1]], dtype=np.int8)
         labeled, _ = scipy.ndimage.label(quad_in_crop.cpu().numpy(), structure=structure)
         label = labeled[center_quad[0].item(), center_quad[1].item()]
         if label == 0:
@@ -660,10 +662,18 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 u_pos_valid, v_pos_valid = v_pos_valid, u_pos_valid
                 u_neg_valid, v_neg_valid = v_neg_valid, u_neg_valid
 
+            # Anchor the main surface component to the *unperturbed* conditioning context
+            center_zyx_unperturbed = center_zyx.clone()
+            anchor_candidates_world = [
+                get_zyx_from_patch(u_neg_shifted_ijs[0], patch),
+                get_zyx_from_patch(v_neg_shifted_ijs[0], patch),
+                center_zyx_unperturbed,
+            ]
+
             # Apply perturbations to center and negative points
             if torch.rand([]) < self._perturb_prob:
                 min_corner_zyx = (center_zyx - crop_size // 2).int()
-                
+
                 # Perturb center point in 3D (only normal perturbation, no uv)
                 center_zyx = self._get_perturbed_zyx_from_patch(center_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=True)
                 
@@ -695,6 +705,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             normals_covering_quads = None
 
             needs_surface = self._config.get("aux_segmentation", False) or self._config.get("aux_normals", False)
+            surface_mask = None
+            anchor_voxel = None
             if needs_surface:
                 quad_in_crop = self._get_quads_in_crop(patch, min_corner_zyx, crop_size)
 
@@ -707,6 +719,26 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                     surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device)).round().long()
                     in_bounds = ((surface_pts_crop >= 0) & (surface_pts_crop < crop_size)).all(dim=1)
                     surface_pts_crop = surface_pts_crop[in_bounds]
+                    if surface_pts_crop.numel() > 0:
+                        surface_mask = torch.zeros((1, crop_size, crop_size, crop_size), device=surface_pts_crop.device, dtype=torch.float32)
+                        z, y, x = surface_pts_crop.unbind(dim=1)
+                        surface_mask.index_put_((torch.zeros_like(z), z, y, x), torch.ones_like(z, dtype=torch.float32), accumulate=True)
+                        surface_mask = (surface_mask > 0).float()
+                        # Choose a component anchor from *unperturbed* conditioning points, then center
+                        for cand in anchor_candidates_world:
+                            voxel = (cand - min_corner_zyx).round().long()
+                            voxel = torch.clamp(voxel, 0, crop_size - 1)
+                            if surface_mask[0, voxel[0], voxel[1], voxel[2]] > 0:
+                                anchor_voxel = voxel
+                                break
+                        # Keep only the connected component touching the chosen anchor to avoid fragmented masks
+                        if anchor_voxel is not None and surface_mask[0, anchor_voxel[0], anchor_voxel[1], anchor_voxel[2]] > 0:
+                            structure = np.ones((3, 3, 3), dtype=np.int8)
+                            labeled, _ = scipy.ndimage.label(surface_mask[0].cpu().numpy(), structure=structure)
+                            label = labeled[anchor_voxel[0].item(), anchor_voxel[1].item(), anchor_voxel[2].item()]
+                            if label != 0:
+                                surface_mask_np = (labeled == label)[None].astype(np.float32)
+                                surface_mask = torch.from_numpy(surface_mask_np).to(surface_mask.device)
                     if self._config.get("aux_normals", False):
                         vertex_normals = self._vertex_normals[id(patch)]
                         filtered_quad_normals = torch.stack([
@@ -716,20 +748,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                         quad_normals_flat = filtered_quad_normals.view(filtered_quad_normals.shape[0], 4, 3)
                         normals_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_normals_flat).reshape(-1, 3)
                         normals_covering_quads = normals_covering_quads[in_bounds]
-
-            if self._config.get("aux_segmentation", False):
-                # Use the same dense surface sampling as normals, then keep only the component touching the center quad.
-                if surface_pts_crop is None or surface_pts_crop.numel() == 0:
-                    continue
-                seg = torch.zeros((crop_size, crop_size, crop_size), device=surface_pts_crop.device, dtype=torch.float32)
-                z, y, x = surface_pts_crop.unbind(dim=1)
-                seg[z, y, x] = 1.0
-
-                center_voxel = (center_zyx - min_corner_zyx).round().long()
-                center_voxel = torch.clamp(center_voxel, 0, crop_size - 1)
-                seg[center_voxel[0], center_voxel[1], center_voxel[2]] = 1.0
-                # Only supervise where we have a label
-                seg_mask = seg.clone()
 
             if self._config.get("aux_normals", False):
                 # Build dense normals by bilinearly interpolating vertex normals within each quad and splatting to voxels.
@@ -744,7 +762,22 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 counts.index_put_((torch.zeros_like(z), z, y, x), torch.ones_like(z, dtype=torch.float32), accumulate=True)
                 mask = (counts > 0).float()
                 normals = torch.where(mask > 0, normals / torch.clamp(counts, min=1e-6), torch.zeros_like(normals))
-                normals_mask = mask
+                # Use the same occupancy mask for normals and segmentation to avoid mismatches
+                normals_mask = surface_mask if surface_mask is not None else mask
+                if anchor_voxel is not None:
+                    normals_mask[0, anchor_voxel[0], anchor_voxel[1], anchor_voxel[2]] = 1.0
+
+            if self._config.get("aux_segmentation", False):
+                # Build segmentation from the same surface occupancy as normals to keep both labels aligned.
+                if surface_mask is None:
+                    continue
+                seg = surface_mask.squeeze(0).clone()
+
+                center_voxel = (center_zyx - min_corner_zyx).round().long()
+                center_voxel = torch.clamp(center_voxel, 0, crop_size - 1)
+                seg[center_voxel[0], center_voxel[1], center_voxel[2]] = 1.0
+                # Only supervise where we have a label
+                seg_mask = seg.clone()
 
             # Map to 3D space and construct heatmaps
             u_pos_shifted_zyxs = get_zyx_from_patch(u_pos_shifted_ijs, patch)
@@ -807,14 +840,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
-            if seg is not None:
-                seg_aug = augmented.get('segmentation', None)
-                if seg_aug is None:
-                    continue
-                seg = rearrange(seg_aug, 'c z y x -> z y x c')[..., 0]
-                # Spatial augments can blur the segmentation plane; snap back to binary.
-                seg = (seg > 0.25).float()
-                seg_mask = seg
             if normals is not None:
                 # Use explicitly tracked normals so vector components are permuted correctly
                 normals_aug = augmented.get('normals', None)
@@ -829,6 +854,30 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                         normals_mask = normals_mask_aug[0]
                     else:
                         normals_mask = normals_mask_aug
+                # Keep seg perfectly aligned to normals_mask if both are present
+                if normals_mask is not None:
+                    seg = normals_mask.squeeze(0)
+                    seg_mask = seg
+            if seg is not None and seg_mask is None:
+                seg_aug = augmented.get('segmentation', None)
+                if seg_aug is None:
+                    continue
+                seg = rearrange(seg_aug, 'c z y x -> z y x c')[..., 0]
+                seg = (seg > 0.25).float()
+                seg_mask = seg
+            if seg is not None:
+                # Small 6-connected dilation to fortify the seg label after all augmentations
+                kernel = torch.zeros((1, 1, 3, 3, 3), device=seg.device, dtype=seg.dtype)
+                kernel[0, 0, 1, 1, 1] = 1
+                kernel[0, 0, 0, 1, 1] = 1
+                kernel[0, 0, 2, 1, 1] = 1
+                kernel[0, 0, 1, 0, 1] = 1
+                kernel[0, 0, 1, 2, 1] = 1
+                kernel[0, 0, 1, 1, 0] = 1
+                kernel[0, 0, 1, 1, 2] = 1
+                seg_conv = F.conv3d(seg[None, None], kernel, padding=1)
+                seg = (seg_conv > 0).float()[0, 0]
+                seg_mask = seg
             if not torch.isfinite(volume_crop).all() or not torch.isfinite(localiser).all() or not torch.isfinite(uv_heatmaps_both).all():
                 # FIXME: why do these NaNs happen occasionally?
                 continue

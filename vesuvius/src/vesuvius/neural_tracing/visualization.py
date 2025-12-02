@@ -117,10 +117,17 @@ def make_canvas(
 
     def seg_overlay(mask, colour, alpha=0.6):
         views = []
+        # Accept masks in shape [B, Z, Y, X] or [B, 1, Z, Y, X]
+        if mask.ndim == 5:
+            mask_vol = mask[:, 0]
+        elif mask.ndim == 4:
+            mask_vol = mask
+        else:
+            raise ValueError(f"Unexpected seg mask shape {tuple(mask.shape)}; expected 4D or 5D.")
         volume = inputs[:, 0]
         for dim in range(3):
             vol_slice = volume.select(dim=dim + 1, index=volume.shape[dim + 1] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5
-            mask_slice = mask[:, 0].select(dim=dim + 1, index=mask.shape[dim + 1] // 2)[..., None].clamp(0, 1)
+            mask_slice = mask_vol.select(dim=dim + 1, index=mask_vol.shape[dim + 1] // 2)[..., None].clamp(0, 1)
             coloured = vol_slice * (1 - mask_slice * alpha) + colour * (mask_slice * alpha)
             views.append(overlay_crosshair(coloured))
         return torch.cat(views, dim=1)
@@ -150,8 +157,16 @@ def make_canvas(
             seg_pred_vis = seg_pred
             if isinstance(seg_pred_vis, (list, tuple)):
                 seg_pred_vis = seg_pred_vis[0]
-            seg_pred_mask = torch.sigmoid(seg_pred_vis)
-            views.append(seg_overlay(seg_pred_mask, torch.tensor([0.0, 0.0, 1.0], device=inputs.device), alpha=0.45))
+            # Show sigmoid probabilities as grayscale slices
+            seg_probs = torch.sigmoid(seg_pred_vis)
+            if seg_probs.ndim == 5:
+                seg_probs = seg_probs[:, 0]
+            slices = []
+            for dim in range(3):
+                prob_slice = seg_probs.select(dim=dim + 1, index=seg_probs.shape[dim + 1] // 2)
+                prob_slice = prob_slice[..., None].expand(-1, -1, -1, 3)
+                slices.append(overlay_crosshair(prob_slice))
+            views.append(torch.cat(slices, dim=1))
 
     if normals is not None:
         views.append(normals_vis(normals))

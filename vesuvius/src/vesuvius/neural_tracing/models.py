@@ -27,7 +27,7 @@ def _config_dict_to_mgr(config_dict):
         targets = dict(targets)
         targets['seg'] = {
             'out_channels': 1,
-            'activation': 'sigmoid',
+            'activation': 'none',
         }
     if config_dict.get('aux_normals', False) and 'normals' not in targets:
         targets = dict(targets)

@@ -32,7 +32,8 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         u_neg_valid,
         v_pos_valid,
         v_neg_valid,
-        multistep_count,
+        use_multistep=False,
+        include_center=False,
     ):
         """Build slot-based heatmaps with masking."""
         slot_heatmaps = []
@@ -97,12 +98,22 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         )
         uv_heatmaps_out_all_channels = uv_heatmaps_out_all.shape[0]
 
+        maybe_center_heatmap = {}
+        if include_center:
+            maybe_center_heatmap['center_heatmap'] = self.make_heatmaps(
+                [torch.full([1, 3], crop_size / 2)],
+                torch.zeros([3]),
+                crop_size,
+                sigma=heatmap_sigma,
+            )
+
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
             'uv_heatmaps_out_all_channels': uv_heatmaps_out_all_channels,
             'out_channel_mask': out_channel_mask,
             'condition_mask_channels': condition_mask_channels,
+            **maybe_center_heatmap,
         }
 
     def _build_batch_dict(
@@ -117,6 +128,7 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         seg_mask,
         normals,
         normals_mask,
+        center_heatmaps=None,
     ):
         """Build batch dict with masking for slotted dataset."""
         out_channel_mask_expanded = out_channel_mask.to(
@@ -132,6 +144,7 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             'uv_heatmaps_in': uv_heatmaps_in,
             'uv_heatmaps_out': uv_heatmaps_out,
             'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
+            **({'center_heatmaps': center_heatmaps} if center_heatmaps is not None else {}),
         }
         if condition_mask_aug is not None:
             batch_dict['condition_mask'] = condition_mask_aug

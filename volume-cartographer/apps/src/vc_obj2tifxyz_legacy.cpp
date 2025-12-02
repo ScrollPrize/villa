@@ -9,6 +9,14 @@
 #include <map>
 #include <algorithm>
 #include <limits>
+#include <cmath>
+#include <chrono>
+#include <random>
+#include <system_error>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <opencv2/imgproc.hpp>
 
@@ -33,9 +41,38 @@ private:
     std::vector<UV> uvs;
     std::vector<Face> faces;
     
-    cv::Vec2f uv_min, uv_max;
-    cv::Vec2i grid_size;
-    cv::Vec2f scale;
+    cv::Vec2f uv_min{0.f, 0.f};
+    cv::Vec2f uv_max{0.f, 0.f};
+    cv::Vec2i grid_size{0, 0};
+    cv::Vec2f scale{0.f, 0.f};
+
+    struct MappedMat : public cv::Mat_<cv::Vec3f> {
+        void* mapped = nullptr;
+        size_t length = 0;
+        int fd = -1;
+        std::filesystem::path path;
+
+        MappedMat(int rows, int cols, void* ptr, size_t len, int fd_, std::filesystem::path p)
+            : cv::Mat_<cv::Vec3f>(rows, cols, reinterpret_cast<cv::Vec3f*>(ptr))
+            , mapped(ptr)
+            , length(len)
+            , fd(fd_)
+            , path(std::move(p))
+        {}
+
+        ~MappedMat() {
+            if (mapped && mapped != MAP_FAILED) {
+                munmap(mapped, length);
+            }
+            if (fd >= 0) {
+                close(fd);
+            }
+            if (!path.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+        }
+    };
     
 public:
     bool loadObj(const std::string& filename) {
@@ -102,77 +139,47 @@ public:
         return !vertices.empty() && !faces.empty() && !uvs.empty();
     }
     
-    void determineGridDimensions(float stretch_factor = 1000.0f) {
-        // Find UV bounds from all UVs used in faces
-        uv_min = cv::Vec2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-        uv_max = cv::Vec2f(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
-        
-        for (const auto& face : faces) {
-            for (int i = 0; i < 3; i++) {
-                if (face.vt[i] >= 0 && face.vt[i] < uvs.size()) {
-                    cv::Vec2f uv = uvs[face.vt[i]].coord;
-                    uv_min[0] = std::min(uv_min[0], uv[0]);
-                    uv_min[1] = std::min(uv_min[1], uv[1]);
-                    uv_max[0] = std::max(uv_max[0], uv[0]);
-                    uv_max[1] = std::max(uv_max[1], uv[1]);
-                }
-            }
+    QuadSurface* createQuadSurface(float mesh_units = 1.0f, float uv_pixels_per_unit = 20.0f) {
+        if (uv_pixels_per_unit <= 0.0f) {
+            std::cerr << "Invalid UV pixel density: " << uv_pixels_per_unit << std::endl;
+            return nullptr;
         }
-        
+
+        if (!computeUVBounds()) {
+            return nullptr;
+        }
+
+        const cv::Vec2f uv_range = uv_max - uv_min;
+        if (uv_range[0] <= 0.0f || uv_range[1] <= 0.0f) {
+            std::cerr << "Invalid UV bounds (zero area)." << std::endl;
+            return nullptr;
+        }
+
+        grid_size[0] = std::max(2, static_cast<int>(std::ceil(uv_range[0] * uv_pixels_per_unit)) + 1);
+        grid_size[1] = std::max(2, static_cast<int>(std::ceil(uv_range[1] * uv_pixels_per_unit)) + 1);
+
+        const double grid_megs = static_cast<double>(grid_size[0]) * static_cast<double>(grid_size[1]) * sizeof(cv::Vec3f) / (1024.0 * 1024.0);
         std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to [" 
                   << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
-        
-        // Two-pass approach:
-        // Pass 1: Create preliminary grid to measure scale
-        cv::Vec2f uv_range = uv_max - uv_min;
-        cv::Vec2i preliminary_grid_size;
-        preliminary_grid_size[0] = static_cast<int>(std::ceil(uv_range[0] * stretch_factor)) + 1;
-        preliminary_grid_size[1] = static_cast<int>(std::ceil(uv_range[1] * stretch_factor)) + 1;
-        
-        std::cout << "Creating preliminary grid: " << preliminary_grid_size[0] << " x " << preliminary_grid_size[1] << " to measure scale..." << std::endl;
-        
-        // Temporary scale for preliminary rasterization
-        cv::Vec2f temp_scale;
-        temp_scale[0] = uv_range[0] * stretch_factor / (preliminary_grid_size[0] - 1);
-        temp_scale[1] = uv_range[1] * stretch_factor / (preliminary_grid_size[1] - 1);
-        
-        // Create preliminary grid
-        cv::Mat_<cv::Vec3f> preliminary_points(preliminary_grid_size[1], preliminary_grid_size[0], cv::Vec3f(-1, -1, -1));
-        
-        // Rasterize with temporary scale
-        scale = temp_scale;
-        grid_size = preliminary_grid_size;
-        for (const auto& face : faces) {
-            rasterizeTriangle(preliminary_points, face);
+        std::cout << "Grid dimensions: " << grid_size[0] << " x " << grid_size[1]
+                  << " (~" << uv_pixels_per_unit << " px per UV unit)"
+                  << " ~" << grid_megs << " MB" << std::endl;
+
+        bool used_mmap = false;
+        cv::Mat_<cv::Vec3f>* points = allocatePointGrid(grid_size[1], grid_size[0], &used_mmap);
+        if (!points) {
+            std::cerr << "Failed to allocate point grid." << std::endl;
+            return nullptr;
         }
-        
-        // Calculate actual scale from preliminary grid
-        calculateScaleFromGrid(preliminary_points);
-        cv::Vec2f measured_scale = scale;
-        
-        // Pass 2: Calculate final grid dimensions from measured scale
-        // The measured scale tells us the physical distance between adjacent grid points
-        // We multiply by stretch_factor to get the number of grid points needed
-        grid_size[0] = static_cast<int>(std::round(measured_scale[0] * stretch_factor)) + 1;
-        grid_size[1] = static_cast<int>(std::round(measured_scale[1] * stretch_factor)) + 1;
-        
-        std::cout << "Final grid dimensions: " << grid_size[0] << " x " << grid_size[1] << std::endl;
-        std::cout << "Scale factors: " << measured_scale[0] << ", " << measured_scale[1] << std::endl;
-        
-        // Set final scale
-        scale = measured_scale;
-    }
-    
-    QuadSurface* createQuadSurface(float mesh_units = 1.0f, int step = 1) {
-        // Create points matrix initialized with invalid values
-        cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
-        
-        // Rasterize triangles onto the grid
-        for (const auto& face : faces) {
-            rasterizeTriangle(*points, face);
+        if (used_mmap) {
+            std::cout << "Using mmap-backed grid for rasterization." << std::endl;
         }
-        
-        // Count valid points
+        const float uv_to_px = uv_pixels_per_unit;
+
+        for (const auto& face : faces) {
+            rasterizeTriangle(*points, face, uv_to_px);
+        }
+
         int valid_count = 0;
         for (int y = 0; y < grid_size[1]; y++) {
             for (int x = 0; x < grid_size[0]; x++) {
@@ -181,37 +188,31 @@ public:
                 }
             }
         }
-        
+
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
-        
-        // Always calculate scale from the grid to preserve anisotropic scaling
+
+        if (valid_count == 0) {
+            std::cerr << "No valid grid points rasterized; check UV parametrization or step size." << std::endl;
+            delete points;
+            return nullptr;
+        }
+
         calculateScaleFromGrid(*points, mesh_units);
 
-        if (step != 1) {
-
-            cv::Size small = cv::Size(points->cols/step, points->rows/step);
-            //crop to nearest multiple
-            *points = points->operator()(cv::Rect(0,0,small.width*step, small.height*step));
-            cv::resize(*points, *points, small, 0, 0, cv::INTER_NEAREST);
-
-            scale /= step;
-        }
-        
         return new QuadSurface(points, scale);
     }
     
     void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
-        // Based on vc_segmentation_scales from Slicing.cpp
         double sum_x = 0;
         double sum_y = 0;
         int count = 0;
         
         // Skip borders (10% on each side) to avoid artifacts
-        int jmin = points.rows * 0.1 + 1;
-        int jmax = points.rows * 0.9;
-        int imin = points.cols * 0.1 + 1;
-        int imax = points.cols * 0.9;
+        int jmin = static_cast<int>(points.rows * 0.1) + 1;
+        int jmax = static_cast<int>(points.rows * 0.9);
+        int imin = static_cast<int>(points.cols * 0.1) + 1;
+        int imax = static_cast<int>(points.cols * 0.9);
         int step = 4;
         
         // For small grids, use all points
@@ -226,18 +227,15 @@ public:
         // Calculate average distance between adjacent points
         for (int j = jmin; j < jmax; j += step) {
             for (int i = imin; i < imax; i += step) {
-                // Skip invalid points
                 if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
                     continue;
                 
-                // Distance to neighbor in X direction
                 cv::Vec3f v = points(j, i) - points(j, i-1);
                 double dist_x = std::sqrt(v.dot(v));
                 if (dist_x > 0) {
                     sum_x += dist_x;
                 }
                 
-                // Distance to neighbor in Y direction
                 v = points(j, i) - points(j-1, i);
                 double dist_y = std::sqrt(v.dot(v));
                 if (dist_y > 0) {
@@ -248,64 +246,133 @@ public:
         }
         
         if (count > 0 && sum_x > 0 && sum_y > 0) {
-            // Scale is the average distance between points, adjusted by mesh units
-            scale[0] = (sum_x / count) * mesh_units;
-            scale[1] = (sum_y / count) * mesh_units;
+            scale[0] = static_cast<float>((sum_x / count) * mesh_units);
+            scale[1] = static_cast<float>((sum_y / count) * mesh_units);
         } else {
-            // Fallback to UV-based scale if we couldn't calculate from grid
-            std::cerr << "Warning: Could not calculate scale from grid, using UV-based fallback" << std::endl;
-            // scale already set in determineGridDimensions
+            std::cerr << "Warning: Could not calculate scale from grid; leaving scale unchanged." << std::endl;
         }
         
         std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
     }
     
 private:
-    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const Face& face) {
-        // Get triangle vertices and UVs
-        cv::Vec3f v0 = vertices[face.v[0]].pos;
-        cv::Vec3f v1 = vertices[face.v[1]].pos;
-        cv::Vec3f v2 = vertices[face.v[2]].pos;
+    bool computeUVBounds() {
+        const float inf = std::numeric_limits<float>::infinity();
+        uv_min = {inf, inf};
+        uv_max = {-inf, -inf};
+        bool found = false;
+
+        for (const auto& face : faces) {
+            for (int i = 0; i < 3; i++) {
+                if (face.vt[i] >= 0 && face.vt[i] < static_cast<int>(uvs.size())) {
+                    cv::Vec2f uv = uvs[face.vt[i]].coord;
+                    uv_min[0] = std::min(uv_min[0], uv[0]);
+                    uv_min[1] = std::min(uv_min[1], uv[1]);
+                    uv_max[0] = std::max(uv_max[0], uv[0]);
+                    uv_max[1] = std::max(uv_max[1], uv[1]);
+                    found = true;
+                }
+            }
+        }
+
+        if (!found) {
+            std::cerr << "No valid UV coordinates found for faces." << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    cv::Mat_<cv::Vec3f>* allocatePointGrid(int rows, int cols, bool* used_mmap = nullptr) {
+        const size_t length = static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(cv::Vec3f);
+        const auto tmp_dir = std::filesystem::temp_directory_path();
+
+        if (used_mmap) {
+            *used_mmap = false;
+        }
+
+        if (length > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+            std::cerr << "Grid too large for mmap backing; falling back to heap allocation." << std::endl;
+            return new cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(-1, -1, -1));
+        }
+
+        // Build a simple unique filename
+        std::uniform_int_distribution<int> dist(0, std::numeric_limits<int>::max());
+        std::mt19937 rng(static_cast<unsigned int>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::path tmp_path;
+        int fd = -1;
+        void* ptr = MAP_FAILED;
+
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            tmp_path = tmp_dir / ("vc_obj2tifxyz_" + std::to_string(dist(rng)) + ".bin");
+            fd = ::open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0) {
+                continue;
+            }
+            if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
+                ::close(fd);
+                fd = -1;
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+                continue;
+            }
+            ptr = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (ptr == MAP_FAILED) {
+                ::close(fd);
+                fd = -1;
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+                continue;
+            }
+            break;
+        }
+
+        if (ptr == MAP_FAILED || fd < 0) {
+            // Fallback to in-memory allocation
+            std::cerr << "Warning: falling back to heap allocation for point grid." << std::endl;
+            auto* mat = new cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(-1, -1, -1));
+            return mat;
+        }
+
+        auto* mapped = new MappedMat(rows, cols, ptr, length, fd, tmp_path);
+        mapped->setTo(cv::Vec3f(-1.f, -1.f, -1.f));
+        if (used_mmap) {
+            *used_mmap = true;
+        }
+        return mapped;
+    }
+
+    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const Face& face, float uv_to_px) {
+        for (int k = 0; k < 3; ++k) {
+            if (face.v[k] < 0 || face.v[k] >= static_cast<int>(vertices.size())) {
+                return;
+            }
+            if (face.vt[k] < 0 || face.vt[k] >= static_cast<int>(uvs.size())) {
+                return;
+            }
+        }
+
+        const cv::Vec3f v0 = vertices[face.v[0]].pos;
+        const cv::Vec3f v1 = vertices[face.v[1]].pos;
+        const cv::Vec3f v2 = vertices[face.v[2]].pos;
         
-        cv::Vec2f uv0 = uvs[face.vt[0]].coord;
-        cv::Vec2f uv1 = uvs[face.vt[1]].coord;
-        cv::Vec2f uv2 = uvs[face.vt[2]].coord;
+        cv::Vec2f uv0 = (uvs[face.vt[0]].coord - uv_min) * uv_to_px;
+        cv::Vec2f uv1 = (uvs[face.vt[1]].coord - uv_min) * uv_to_px;
+        cv::Vec2f uv2 = (uvs[face.vt[2]].coord - uv_min) * uv_to_px;
+
+        int min_x = std::max(0, static_cast<int>(std::floor(std::min({uv0[0], uv1[0], uv2[0]}))));
+        int max_x = std::min(grid_size[0] - 1, static_cast<int>(std::ceil(std::max({uv0[0], uv1[0], uv2[0]}))));
+        int min_y = std::max(0, static_cast<int>(std::floor(std::min({uv0[1], uv1[1], uv2[1]}))));
+        int max_y = std::min(grid_size[1] - 1, static_cast<int>(std::ceil(std::max({uv0[1], uv1[1], uv2[1]}))));
         
-        // Transform UVs to grid coordinates
-        // Map from [uv_min, uv_max] to [0, grid_size-1]
-        cv::Vec2f uv_range = uv_max - uv_min;
-        uv0 = (uv0 - uv_min);
-        uv0[0] = uv0[0] / uv_range[0] * (grid_size[0] - 1);
-        uv0[1] = uv0[1] / uv_range[1] * (grid_size[1] - 1);
-        
-        uv1 = (uv1 - uv_min);
-        uv1[0] = uv1[0] / uv_range[0] * (grid_size[0] - 1);
-        uv1[1] = uv1[1] / uv_range[1] * (grid_size[1] - 1);
-        
-        uv2 = (uv2 - uv_min);
-        uv2[0] = uv2[0] / uv_range[0] * (grid_size[0] - 1);
-        uv2[1] = uv2[1] / uv_range[1] * (grid_size[1] - 1);
-        
-        // Find bounding box in grid coordinates
-        int min_x = std::max(0, static_cast<int>(std::floor(std::min({uv0[0], uv1[0], uv2[0]}))) - 1);
-        int max_x = std::min(grid_size[0] - 1, static_cast<int>(std::ceil(std::max({uv0[0], uv1[0], uv2[0]}))) + 1);
-        int min_y = std::max(0, static_cast<int>(std::floor(std::min({uv0[1], uv1[1], uv2[1]}))) - 1);
-        int max_y = std::min(grid_size[1] - 1, static_cast<int>(std::ceil(std::max({uv0[1], uv1[1], uv2[1]}))) + 1);
-        
-        // Rasterize triangle
         for (int y = min_y; y <= max_y; y++) {
             for (int x = min_x; x <= max_x; x++) {
-                cv::Vec2f p(x, y);
-                
-                // Compute barycentric coordinates
+                cv::Vec2f p(static_cast<float>(x), static_cast<float>(y));
                 cv::Vec3f bary = computeBarycentric(p, uv0, uv1, uv2);
                 
-                // Check if point is inside triangle
-                if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
-                    // Interpolate 3D position
+                const float eps = -1e-4f;
+                if (bary[0] >= eps && bary[1] >= eps && bary[2] >= eps) {
                     cv::Vec3f pos = bary[0] * v0 + bary[1] * v1 + bary[2] * v2;
                     
-                    // Only update if not already set (first triangle wins)
                     if (points(y, x)[0] == -1) {
                         points(y, x) = pos;
                     }
@@ -325,7 +392,12 @@ private:
         float dot11 = v1.dot(v1);
         float dot12 = v1.dot(v2);
         
-        float invDenom = 1.0f / (dot00 * dot11 - dot01 * dot01);
+        float denom = dot00 * dot11 - dot01 * dot01;
+        if (std::abs(denom) < 1e-20f || !std::isfinite(denom)) {
+            return {-1.f, -1.f, -1.f};
+        }
+
+        float invDenom = 1.0f / denom;
         float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
         float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
         
@@ -335,46 +407,36 @@ private:
 
 int main(int argc, char *argv[])
 {
-    if (argc < 3 || argc > 6) {
-        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [stretch_factor] [mesh_units] [step_size]" << std::endl;
-        std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
+    if (argc < 3 || argc > 5) {
+        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [mesh_units] [uv_pixels_per_unit]" << std::endl;
+        std::cout << "Converts an OBJ file to tifxyz format using UV-grid projection." << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
-        std::cout << "  stretch_factor: UV scaling factor (default: 1000.0)" << std::endl;
-        std::cout << "  mesh_units: Units of the mesh coordinates in micrometers (default: 1.0)" << std::endl;
-        std::cout << "  step size: quadmesh stepping factor (default 20)" << std::endl;
+        std::cout << "  mesh_units        : micrometers per OBJ unit (default: 1.0)" << std::endl;
+        std::cout << "  uv_pixels_per_unit: UV pixel density (default: 20.0)" << std::endl;
         std::cout << std::endl;
-        std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
-        std::cout << "Example: " << argv[0] << " mesh.obj output_dir" << std::endl;
+        std::cout << "Note: UV parameterization is rasterized with barycentric interpolation; no stretch factor is needed." << std::endl;
+        std::cout << "Example: " << argv[0] << " mesh.obj output_dir 1.0 20" << std::endl;
         return EXIT_SUCCESS;
     }
 
     std::filesystem::path obj_path = argv[1];
     std::filesystem::path output_dir = argv[2];
-    float stretch_factor = 1000.0f;
     float mesh_units = 1.0f;  // mesh units in micrometers
-    int step = 20;
+    float uv_pixels_per_unit = 20.0f;
     
     if (argc >= 4) {
-        stretch_factor = std::atof(argv[3]);
-        if (stretch_factor <= 0) {
-            std::cerr << "Invalid stretch factor: " << stretch_factor << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
-    
-    if (argc >= 5) {
-        mesh_units = std::atof(argv[4]);
+        mesh_units = std::atof(argv[3]);
         if (mesh_units <= 0) {
             std::cerr << "Invalid mesh units: " << mesh_units << std::endl;
             return EXIT_FAILURE;
         }
     }
 
-    if (argc >= 6) {
-        step = std::atoi(argv[5]);
-        if (mesh_units <= 0) {
-            std::cerr << "invalid step size: " << step << std::endl;
+    if (argc >= 5) {
+        uv_pixels_per_unit = std::atof(argv[4]);
+        if (uv_pixels_per_unit <= 0) {
+            std::cerr << "Invalid UV pixel density: " << uv_pixels_per_unit << std::endl;
             return EXIT_FAILURE;
         }
     }
@@ -387,9 +449,8 @@ int main(int argc, char *argv[])
     std::cout << "Converting OBJ to tifxyz format" << std::endl;
     std::cout << "Input: " << obj_path << std::endl;
     std::cout << "Output: " << output_dir << std::endl;
-    std::cout << "Stretch factor: " << stretch_factor << std::endl;
     std::cout << "Mesh units: " << mesh_units << " micrometers" << std::endl;
-    std::cout << "Step size: " << step << std::endl;
+    std::cout << "UV pixels per unit: " << uv_pixels_per_unit << std::endl;
     
     ObjToTifxyzConverter converter;
     
@@ -399,11 +460,8 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     
-    // Determine grid dimensions from UV coordinates
-    converter.determineGridDimensions(stretch_factor);
-    
-    // Create quad surface
-    QuadSurface* surf = converter.createQuadSurface(mesh_units, step);
+    // Create quad surface directly from UV grid projection
+    QuadSurface* surf = converter.createQuadSurface(mesh_units, uv_pixels_per_unit);
     if (!surf) {
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;

@@ -106,11 +106,9 @@ def train(config_path):
     grad_clip = config.setdefault('grad_clip', 5)
 
     if 'load_ckpt' in config:
-        print(f'loading checkpoint {config["load_ckpt"]}')
+        accelerator.print(f'loading checkpoint {config["load_ckpt"]}')
         ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        # Note we don't load the lr_scheduler state (i.e. training starts 'hot'), nor any config
 
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
@@ -150,11 +148,11 @@ def train(config_path):
             targets_binary = (targets > 0.5).long()  # FIXME: should instead not do the gaussian conv in data-loader!
             # FIXME: nasty; fix DC_and_BCE_loss themselves to support not reducing over batch dim
             # FIXME: nasty treatment of mask
-            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred * mask, targets_binary.float()).mean(dim=(1, 2, 3, 4))
+            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred.float() * mask, targets_binary.float()).mean(dim=(1, 2, 3, 4))
             from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss
             dice_loss_fn = MemoryEfficientSoftDiceLoss(apply_nonlin=torch.sigmoid, batch_dice=False, ddp=False)
             dice = torch.stack([
-                dice_loss_fn(target_pred[i:i+1] * mask[i:i+1], targets_binary[i:i+1] * mask[i:i+1]) for i in range(target_pred.shape[0])
+                dice_loss_fn(target_pred[i:i+1].float() * mask[i:i+1], targets_binary[i:i+1] * mask[i:i+1]) for i in range(target_pred.shape[0])
             ])
             return bce + dice
         else:
@@ -209,13 +207,13 @@ def train(config_path):
                 target_pred = target_pred[0]
             first_step_heatmap_loss = loss_fn(target_pred, first_step_targets, mask)
 
-        first_step_heatmap_loss = first_step_heatmap_loss.mean()  # over batch
+        first_step_heatmap_loss = first_step_heatmap_loss.mean().float()  # over batch
         first_step_loss = first_step_heatmap_loss
 
         # Add auxiliary segmentation & normal losses for first step
         if use_seg:
             seg = safe_crop_with_padding(batch['seg'], first_min_corner_in_outer, config['crop_size']).unsqueeze(1)
-            seg_mask = (seg > 0).float()
+            seg_mask = torch.ones_like(seg)  # supervise full crop
             seg_pred = require_head(outputs, 'seg')
             seg_loss, seg_pred_for_vis = compute_loss_with_ds(
                 seg_pred, seg, seg_mask, loss_fn, 'seg'
@@ -405,7 +403,7 @@ def train(config_path):
             total_weights_sum = cumulative_weights_stacked.sum(dim=0)
             later_step_loss = later_step_loss + (weighted_loss_sum / (total_weights_sum + 1e-8))
 
-        later_step_loss = later_step_loss.mean()
+        later_step_loss = later_step_loss.mean().float()
         total_loss = first_step_loss + later_step_loss
 
         target_all_steps = rearrange(torch.stack(all_step_targets_vis, dim=2), 'b uv s z y x -> b (uv s) z y x')
@@ -447,7 +445,7 @@ def train(config_path):
                 pred = pred[0]
             loss = mean_loss_fn(pred, target, mask)
             pred_for_vis = pred
-        return loss, pred_for_vis
+        return loss.float(), pred_for_vis
 
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
@@ -462,6 +460,18 @@ def train(config_path):
             ) = compute_loss_and_pred(batch)
 
             if torch.isnan(total_loss).any():
+                # Print diagnostic info before raising
+                print(f'\n[NaN Debug] Iteration {iteration}')
+                print(f'  first_step_heatmap_loss: {first_step_heatmap_loss.item() if first_step_heatmap_loss is not None else None}')
+                print(f'  later_step_loss: {later_step_loss.item() if later_step_loss is not None else None}')
+                print(f'  seg_loss: {seg_loss.item() if seg_loss is not None else None}')
+                print(f'  normals_loss: {normals_loss.item() if normals_loss is not None else None}')
+                for k, v in batch.items():
+                    if hasattr(v, 'isnan'):
+                        nans = v.isnan().sum().item()
+                        infs = torch.isinf(v).sum().item()
+                        if nans > 0 or infs > 0:
+                            print(f'  batch[{k}]: nan={nans}, inf={infs}')
                 raise ValueError('loss is NaN')
             accelerator.backward(total_loss)
             if accelerator.sync_gradients:

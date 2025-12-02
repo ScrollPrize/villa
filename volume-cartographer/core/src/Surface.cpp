@@ -30,10 +30,11 @@
 namespace {
 
 // Write a 32-bit float single-channel image as tiled BigTIFF with LZW compression
-static void writeFloatBigTiff(const std::filesystem::path& outPath,
-                              const cv::Mat& img,
-                              uint32_t tileW = 1024,
-                              uint32_t tileH = 1024)
+static void writeFloatTiledTiff(const std::filesystem::path& outPath,
+                                const cv::Mat& img,
+                                bool useBigTiff,
+                                uint32_t tileW = 1024,
+                                uint32_t tileH = 1024)
 {
     if (img.empty())
         throw std::runtime_error("empty image for " + outPath.string());
@@ -41,9 +42,9 @@ static void writeFloatBigTiff(const std::filesystem::path& outPath,
         throw std::runtime_error("expected CV_32FC1 for " + outPath.string());
     }
 
-    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8"); // BigTIFF
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), useBigTiff ? "w8" : "w");
     if (!tf)
-        throw std::runtime_error("Failed to open BigTIFF for writing: " + outPath.string());
+        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
 
     const uint32_t W = static_cast<uint32_t>(img.cols);
     const uint32_t H = static_cast<uint32_t>(img.rows);
@@ -108,20 +109,101 @@ static void writeFloatBigTiff(const std::filesystem::path& outPath,
     TIFFClose(tf);
 }
 
-// Write a single-channel image (8U, 16U, or 32F) as tiled BigTIFF with LZW compression
-static void writeSingleChannelBigTiff(const std::filesystem::path& outPath,
-                                      const cv::Mat& img,
-                                      uint32_t tileW = 1024,
-                                      uint32_t tileH = 1024)
+// Write a single channel from an interleaved CV_32FC3 Mat_<Vec3f> as tiled TIFF.
+static void writeFloatTiledTiffChannel(const std::filesystem::path& outPath,
+                                       const cv::Mat_<cv::Vec3f>& img,
+                                       int channel,
+                                       bool useBigTiff,
+                                       uint32_t tileW = 1024,
+                                       uint32_t tileH = 1024)
+{
+    if (img.empty())
+        throw std::runtime_error("empty image for " + outPath.string());
+    if (channel < 0 || channel > 2)
+        throw std::runtime_error("invalid channel index for " + outPath.string());
+
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), useBigTiff ? "w8" : "w");
+    if (!tf)
+        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
+
+    const uint32_t W = static_cast<uint32_t>(img.cols);
+    const uint32_t H = static_cast<uint32_t>(img.rows);
+
+    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
+    TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
+    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE,   32);
+    TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
+    TIFFSetField(tf, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
+    TIFFSetField(tf, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
+    TIFFSetField(tf, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
+#ifdef PREDICTOR_FLOATINGPOINT
+    TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_FLOATINGPOINT);
+#else
+    TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_HORIZONTAL);
+#endif
+
+    TIFFSetField(tf, TIFFTAG_TILEWIDTH,  tileW);
+    TIFFSetField(tf, TIFFTAG_TILELENGTH, tileH);
+
+    const tmsize_t tileBytes = static_cast<tmsize_t>(tileW) *
+                               static_cast<tmsize_t>(tileH) *
+                               static_cast<tmsize_t>(sizeof(float));
+    std::vector<float> tileBuf(static_cast<size_t>(tileW) * tileH, -1.0f);
+
+    for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
+        const uint32_t dy = std::min(tileH, H - y0);
+        for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
+            const uint32_t dx = std::min(tileW, W - x0);
+
+            // Fill tile buffer (pad right/bottom with -1.0f)
+            for (uint32_t ty = 0; ty < tileH; ++ty) {
+                float* dst = tileBuf.data() + ty * tileW;
+                if (ty < dy) {
+                    for (uint32_t tx = 0; tx < dx; ++tx) {
+                        dst[tx] = img(static_cast<int>(y0 + ty), static_cast<int>(x0 + tx))[channel];
+                    }
+                    if (dx < tileW) {
+                        std::fill(dst + dx, dst + tileW, -1.0f);
+                    }
+                } else {
+                    std::fill(dst, dst + tileW, -1.0f);
+                }
+            }
+
+            const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
+            if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), tileBytes) < 0) {
+                TIFFClose(tf);
+                throw std::runtime_error("TIFFWriteEncodedTile failed at tile (" +
+                                          std::to_string(x0) + "," + std::to_string(y0) +
+                                          ") in " + outPath.string());
+            }
+        }
+    }
+
+    if (!TIFFWriteDirectory(tf)) {
+        TIFFClose(tf);
+        throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
+    }
+    TIFFClose(tf);
+}
+
+// Write a single-channel image (8U, 16U, or 32F) as tiled TIFF with LZW compression
+static void writeSingleChannelTiledTiff(const std::filesystem::path& outPath,
+                                        const cv::Mat& img,
+                                        bool useBigTiff,
+                                        uint32_t tileW = 1024,
+                                        uint32_t tileH = 1024)
 {
     if (img.empty())
         throw std::runtime_error("empty image for " + outPath.string());
     if (img.channels() != 1)
         throw std::runtime_error("expected single-channel image for " + outPath.string());
 
-    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8");
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), useBigTiff ? "w8" : "w");
     if (!tf)
-        throw std::runtime_error("Failed to open BigTIFF: " + outPath.string());
+        throw std::runtime_error("Failed to open TIFF: " + outPath.string());
 
     const uint32_t W = static_cast<uint32_t>(img.cols);
     const uint32_t H = static_cast<uint32_t>(img.rows);
@@ -1445,15 +1527,15 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
         }
     }
 
-    // Split the points matrix into x, y, z channels
-    std::vector<cv::Mat> xyz;
-    cv::split((*_points), xyz);
+    // Use mmap-backed points directly to avoid materializing full channel copies
+    const uint32_t tile = static_cast<uint32_t>(std::max(1, _tiff_opts.tileSize));
+    const bool useBigTiff = _tiff_opts.forceBigTiff;
 
-    // Write x/y/z as 32-bit float tiled BigTIFF with LZW
+    // Write x/y/z as 32-bit float tiled TIFF with LZW
     try {
-        writeFloatBigTiff(path / "x.tif", xyz[0]);
-        writeFloatBigTiff(path / "y.tif", xyz[1]);
-        writeFloatBigTiff(path / "z.tif", xyz[2]);
+        writeFloatTiledTiffChannel(path / "x.tif", *_points, 0, useBigTiff, tile, tile);
+        writeFloatTiledTiffChannel(path / "y.tif", *_points, 1, useBigTiff, tile, tile);
+        writeFloatTiledTiffChannel(path / "z.tif", *_points, 2, useBigTiff, tile, tile);
     } catch (const std::exception& e) {
         path = original_path; // Restore on error
         throw;
@@ -1467,12 +1549,11 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
         if (!mat.empty()) {
             bool wrote = false;
 
-            // Try BigTIFF for large single-channel ancillary data (8U/16U/32F)
+            // Try tiled TIFF for single-channel ancillary data (8U/16U/32F)
             if (mat.channels() == 1 &&
-                (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
-            {
+                (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1)) {
                 try {
-                    writeSingleChannelBigTiff(path / (name + ".tif"), mat);
+                    writeSingleChannelTiledTiff(path / (name + ".tif"), mat, useBigTiff, tile, tile);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV

@@ -844,9 +844,8 @@ void MenuActionController::importObjAsPatch()
 
         QStringList args;
         args << objFile << outputDir;
-        args << QString::number(1000.0f)
-             << QString::number(1.0f)
-             << QString::number(20);
+        args << QString::number(1.0f)    // mesh units (micrometers per OBJ unit)
+             << QString::number(20.0f);  // UV pixels per unit
 
         QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
         process.start(toolPath, args);
