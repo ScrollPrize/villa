@@ -120,9 +120,10 @@ def make_canvas(
     def seg_overlay(mask, colour, alpha=0.6):
         views = []
         volume = inputs[:, 0]
+        mask_no_channel = mask[:, 0]  # [B, Z, Y, X]
         for dim in range(3):
             vol_slice = volume.select(dim=dim + 1, index=volume.shape[dim + 1] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5
-            mask_slice = mask[:, 0].select(dim=dim + 1, index=mask.shape[dim + 1] // 2)[..., None].clamp(0, 1)
+            mask_slice = mask_no_channel.select(dim=dim + 1, index=mask_no_channel.shape[dim + 1] // 2)[..., None].clamp(0, 1)
             coloured = vol_slice * (1 - mask_slice * alpha) + colour * (mask_slice * alpha)
             views.append(overlay_crosshair(coloured))
         return torch.cat(views, dim=1)

@@ -1,6 +1,7 @@
 import numpy as np
 
 from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
+from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
 from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTransform
 from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
@@ -15,7 +16,7 @@ from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import B
 from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
 
-def get_training_augmentations(crop_size, allow_transposes, only_spatial_and_intensity):
+def get_training_augmentations(crop_size, allow_transposes, allow_mirroring, only_spatial_and_intensity):
     """
     Create training transforms using custom batchgeneratorsv2.
     Returns None for validation (no augmentations).
@@ -33,7 +34,12 @@ def get_training_augmentations(crop_size, allow_transposes, only_spatial_and_int
                 apply_probability=0.5  # diverges from vesuvius!
             ))
 
-    # Always add intensity transforms  
+    if allow_mirroring:
+        transforms.append(RandomTransform(
+            MirrorTransform(allowed_axes=(0, 1, 2), normal_keys={'normals'}),
+            apply_probability=0.5
+        ))
+    # Always add intensity transforms
     one_of_intensity = OneOfTransform([
         MultiplicativeBrightnessTransform(
             multiplier_range=BGContrast((0.75, 1.25)),

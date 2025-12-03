@@ -33,33 +33,3 @@ class MultiplicativeBrightnessTransform(ImageOnlyTransform):
             m = multipliers[idx]
             img[c] *= m
         return img
-
-
-if __name__ == '__main__':
-    from time import time
-    import numpy as np
-    import os
-
-    os.environ['OMP_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-
-    mbt = MultiplicativeBrightnessTransform((0.5, 2.), False, 1)
-
-    times_torch = []
-    for _ in range(1000):
-        data_dict = {'image': torch.ones((2, 128, 192, 64))}
-        st = time()
-        out = mbt(**data_dict)
-        times_torch.append(time() - st)
-    print('torch', np.mean(times_torch))
-
-    from batchgenerators.transforms.color_transforms import BrightnessMultiplicativeTransform
-
-    gnt_bg = BrightnessMultiplicativeTransform((0.5, 2), True, p_per_sample=1)
-    times_bg = []
-    for _ in range(1000):
-        data_dict = {'data': np.ones((1, 2, 128, 192, 64))}
-        st = time()
-        out = gnt_bg(**data_dict)
-        times_bg.append(time() - st)
-    print('bg', np.mean(times_bg))

@@ -390,6 +390,59 @@ def get_n_blocks_per_stage(num_stages):
             blocks.append(6)
     return blocks
 
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
+class SqueezeExcite(nn.Module):
+    """Squeeze and Excitation block."""
+    def __init__(self, channels, conv_op, rd_ratio=1./16, rd_divisor=8):
+        super(SqueezeExcite, self).__init__()
+        self.channels = channels
+        self.rd_ratio = rd_ratio
+        self.rd_divisor = rd_divisor
+
+        # Calculate reduction channels
+        rd_channels = max(1, int(channels * rd_ratio))
+        rd_channels = max(1, rd_channels // rd_divisor * rd_divisor)
+
+        # Global average pooling
+        if conv_op == nn.Conv3d:
+            self.global_pool = nn.AdaptiveAvgPool3d(1)
+        elif conv_op == nn.Conv2d:
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+        elif conv_op == nn.Conv1d:
+            self.global_pool = nn.AdaptiveAvgPool1d(1)
+        else:
+            raise RuntimeError(f"Invalid conv op: {conv_op}")
+
+        self.fc1 = nn.Linear(channels, rd_channels)
+        self.fc2 = nn.Linear(rd_channels, channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        y = self.global_pool(x).view(b, c)
+        y = self.relu(self.fc1(y))
+        y = self.sigmoid(self.fc2(y))
+        y = y.view(b, c, *([1] * (x.ndim - 2)))
+        return x * y
+
+
 def determine_dimensionality(patch_size, pool_type='avg', verbose=False):
     """
     Centralized function to determine dimensionality and set appropriate operations

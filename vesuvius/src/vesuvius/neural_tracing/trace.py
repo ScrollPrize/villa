@@ -21,7 +21,8 @@ from vesuvius.neural_tracing.tifxyz import save_tifxyz, get_area
 @click.option('--volume_zarr', type=click.Path(exists=True), required=True, help='Path to ome-zarr folder')
 @click.option('--volume_scale', type=int, required=True, help='OME scale to use')
 @click.option('--steps_per_crop', type=int, required=True, help='Number of steps to take before sampling a new crop')
-def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps_per_crop):
+@click.option('--strip_steps', type=int, default=100, help='Number of steps for strip mode tracing')
+def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps_per_crop, strip_steps):
 
     with open(config_path, 'r') as f:
         config = json.load(f)
@@ -333,9 +334,9 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
         if True:  # strip-then-extrude
 
             strip_direction = 'u'
-            strip_zyxs = trace_strip(start_zyx, num_steps=100, direction=strip_direction)
+            strip_zyxs = trace_strip(start_zyx, num_steps=strip_steps, direction=strip_direction)
             save_point_collection(f'points_{strip_direction}_{timestamp}.json', strip_zyxs)
-            patch_zyxs = trace_patch(strip_zyxs, num_steps=100, direction='v' if strip_direction == 'u' else 'u')
+            patch_zyxs = trace_patch(strip_zyxs, num_steps=strip_steps, direction='v' if strip_direction == 'u' else 'u')
 
         else:  # freeform 2D growth
 

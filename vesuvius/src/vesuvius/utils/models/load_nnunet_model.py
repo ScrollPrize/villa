@@ -1,8 +1,14 @@
 import os
+import json
 import torch
 from typing import Union, List, Tuple, Dict, Any, Optional
-from batchgenerators.utilities.file_and_folder_operations import load_json, join
 import tempfile
+
+
+def load_json(file_path: str) -> dict:
+    """Load a JSON file and return its contents."""
+    with open(file_path, 'r') as f:
+        return json.load(f)
 import shutil
 
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
@@ -44,7 +50,7 @@ def initialize_network(architecture_class_name: str,
             exec(f"import {i}")
             
     network_class = recursive_find_python_class(
-        join(nnunetv2.__path__[0], "network_architecture"),
+        os.path.join(nnunetv2.__path__[0], "network_architecture"),
         architecture_class_name,
         current_module="nnunetv2.network_architecture"
     )
@@ -89,8 +95,8 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
         model_path = os.path.dirname(model_folder)
     
     # Check for dataset.json and plans.json
-    dataset_json_path = join(model_path, 'dataset.json')
-    plans_json_path = join(model_path, 'plans.json')
+    dataset_json_path = os.path.join(model_path, 'dataset.json')
+    plans_json_path = os.path.join(model_path, 'plans.json')
     
     if custom_dataset_json is None and not os.path.exists(dataset_json_path):
         raise FileNotFoundError(f"dataset.json not found at: {dataset_json_path}")
@@ -104,16 +110,16 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
     plans_manager = PlansManager(plans)
     
     if os.path.basename(model_folder).startswith('fold_'):
-        checkpoint_file = join(model_folder, checkpoint_name)
+        checkpoint_file = os.path.join(model_folder, checkpoint_name)
     else:
-        checkpoint_file = join(model_folder, f'fold_{fold}', checkpoint_name)
+        checkpoint_file = os.path.join(model_folder, f'fold_{fold}', checkpoint_name)
 
     if not os.path.exists(checkpoint_file) and checkpoint_name == 'checkpoint_final.pth':
         alt_checkpoint_name = 'checkpoint_best.pth'
         if os.path.basename(model_folder).startswith('fold_'):
-            checkpoint_file = join(model_folder, alt_checkpoint_name)
+            checkpoint_file = os.path.join(model_folder, alt_checkpoint_name)
         else:
-            checkpoint_file = join(model_folder, f'fold_{fold}', alt_checkpoint_name)
+            checkpoint_file = os.path.join(model_folder, f'fold_{fold}', alt_checkpoint_name)
 
         if os.path.exists(checkpoint_file):
             if should_print:
@@ -144,7 +150,7 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
     
     # Build the network architecture (without deep supervision for inference)
     # Try trainer class first, fallback to direct initialization
-    trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
+    trainer_class = recursive_find_python_class(os.path.join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
                                                trainer_name, 'nnunetv2.training.nnUNetTrainer')
     
     network = None

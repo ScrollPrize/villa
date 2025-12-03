@@ -217,7 +217,7 @@ def train(config_path):
         # Add auxiliary segmentation & normal losses for first step
         if use_seg:
             seg = safe_crop_with_padding(batch['seg'], first_min_corner_in_outer, config['crop_size']).unsqueeze(1)
-            seg_mask = (seg > 0).float()
+            seg_mask = torch.ones_like(seg)  # supervise full crop
             seg_pred = require_head(outputs, 'seg')
             seg_loss, seg_pred_for_vis = compute_loss_with_ds(
                 seg_pred, seg, seg_mask, loss_fn, 'seg'

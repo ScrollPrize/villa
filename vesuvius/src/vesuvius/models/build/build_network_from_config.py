@@ -362,7 +362,7 @@ class NetworkFromConfig(nn.Module):
             )
             # Heads map from decoder feature channels at highest resolution to task outputs
             head_in_ch = self.shared_encoder.output_channels[0]
-            for target_name in tasks_using_shared:
+            for target_name in sorted(tasks_using_shared):
                 out_ch = self.targets[target_name]["out_channels"]
                 self.task_heads[target_name] = self.conv_op(head_in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
                 activation_str = self.targets[target_name].get("activation", "none")
@@ -370,7 +370,7 @@ class NetworkFromConfig(nn.Module):
                 print(f"Task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
 
         # Build separate decoders for tasks that requested them
-        for target_name in tasks_using_separate:
+        for target_name in sorted(tasks_using_separate):
             out_channels = self.targets[target_name]["out_channels"]
             activation_str = self.targets[target_name].get("activation", "none")
             self.task_decoders[target_name] = Decoder(
@@ -534,7 +534,7 @@ class NetworkFromConfig(nn.Module):
                 decoder_num_heads=model_config.get("decoder_num_heads", 12),
                 drop_path_rate=decoder_drop_path_rate,
             )
-            for target_name in tasks_using_shared:
+            for target_name in sorted(tasks_using_shared):
                 out_ch = self.targets[target_name]["out_channels"]
                 # Primus is 3D
                 self.task_heads[target_name] = nn.Conv3d(decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
@@ -543,7 +543,7 @@ class NetworkFromConfig(nn.Module):
                 print(f"Primus task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
 
         # Separate Primus decoders per task
-        for target_name in tasks_using_separate:
+        for target_name in sorted(tasks_using_separate):
             out_channels = self.targets[target_name]["out_channels"]
             activation_str = self.targets[target_name].get("activation", "none")
             self.task_decoders[target_name] = PrimusDecoder(

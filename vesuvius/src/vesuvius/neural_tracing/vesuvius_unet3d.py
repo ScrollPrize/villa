@@ -6,43 +6,13 @@ import numpy as np
 import math
 from typing import Union, List, Tuple, Type
 
-
-def maybe_convert_scalar_to_list(conv_op, scalar):
-    """Convert scalar to list based on convolution operation dimensions."""
-    if isinstance(scalar, (tuple, list)):
-        return scalar
-    elif conv_op == nn.Conv3d:
-        return [scalar] * 3
-    elif conv_op == nn.Conv2d:
-        return [scalar] * 2
-    elif conv_op == nn.Conv1d:
-        return [scalar] * 1
-    else:
-        raise RuntimeError(f"Invalid conv op: {conv_op}")
-
-
-def get_matching_pool_op(conv_op, adaptive=False, pool_type='avg'):
-    """Get matching pooling operation for convolution type."""
-    if conv_op == nn.Conv3d:
-        return nn.AdaptiveAvgPool3d if adaptive else nn.AvgPool3d
-    elif conv_op == nn.Conv2d:
-        return nn.AdaptiveAvgPool2d if adaptive else nn.AvgPool2d
-    elif conv_op == nn.Conv1d:
-        return nn.AdaptiveAvgPool1d if adaptive else nn.AvgPool1d
-    else:
-        raise RuntimeError(f"Invalid conv op: {conv_op}")
-
-
-def get_matching_convtransp(conv_op):
-    """Get matching transpose convolution operation."""
-    if conv_op == nn.Conv3d:
-        return nn.ConvTranspose3d
-    elif conv_op == nn.Conv2d:
-        return nn.ConvTranspose2d
-    elif conv_op == nn.Conv1d:
-        return nn.ConvTranspose1d
-    else:
-        raise RuntimeError(f"Invalid conv op: {conv_op}")
+from vesuvius.models.utilities.utils import (
+    maybe_convert_scalar_to_list,
+    get_matching_pool_op,
+    get_matching_convtransp,
+    DropPath,
+    SqueezeExcite,
+)
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -92,59 +62,6 @@ class FiLM(nn.Module):
         
         # Apply FiLM: x = scale * x + shift
         return scale * x + shift
-
-
-class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample."""
-    def __init__(self, drop_prob=None):
-        super(DropPath, self).__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x):
-        if self.drop_prob == 0. or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        output = x.div(keep_prob) * random_tensor
-        return output
-
-
-class SqueezeExcite(nn.Module):
-    """Squeeze and Excitation block."""
-    def __init__(self, channels, conv_op, rd_ratio=1./16, rd_divisor=8):
-        super(SqueezeExcite, self).__init__()
-        self.channels = channels
-        self.rd_ratio = rd_ratio
-        self.rd_divisor = rd_divisor
-        
-        # Calculate reduction channels
-        rd_channels = max(1, int(channels * rd_ratio))
-        rd_channels = max(1, rd_channels // rd_divisor * rd_divisor)
-        
-        # Global average pooling
-        if conv_op == nn.Conv3d:
-            self.global_pool = nn.AdaptiveAvgPool3d(1)
-        elif conv_op == nn.Conv2d:
-            self.global_pool = nn.AdaptiveAvgPool2d(1)
-        elif conv_op == nn.Conv1d:
-            self.global_pool = nn.AdaptiveAvgPool1d(1)
-        else:
-            raise RuntimeError(f"Invalid conv op: {conv_op}")
-        
-        self.fc1 = nn.Linear(channels, rd_channels)
-        self.fc2 = nn.Linear(rd_channels, channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        b, c = x.shape[:2]
-        y = self.global_pool(x).view(b, c)
-        y = self.relu(self.fc1(y))
-        y = self.sigmoid(self.fc2(y))
-        y = y.view(b, c, *([1] * (x.ndim - 2)))
-        return x * y
 
 
 class ConvDropoutNormReLU(nn.Module):
