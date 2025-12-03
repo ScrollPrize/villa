@@ -49,6 +49,7 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     spinIterationCount->setValue(settings.value("perf/iteration_count", 1000).toInt());
     cmbDownscaleOverride->setCurrentIndex(settings.value("perf/downscale_override", 0).toInt());
     chkFastInterpolation->setChecked(settings.value("perf/fast_interpolation", false).toBool());
+    chkEnableFileWatching->setChecked(settings.value("perf/enable_file_watching", true).toBool());
 
 
     connect(btnHelpDownscaleOverride, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDownscaleOverride->toolTip()); });
@@ -94,6 +95,7 @@ void SettingsDialog::accept()
     settings.setValue("perf/iteration_count", spinIterationCount->value());
     settings.setValue("perf/downscale_override", cmbDownscaleOverride->currentIndex());
     settings.setValue("perf/fast_interpolation", chkFastInterpolation->isChecked() ? "1" : "0");
+    settings.setValue("perf/enable_file_watching", chkEnableFileWatching->isChecked() ? "1" : "0");
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

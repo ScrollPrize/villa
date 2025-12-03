@@ -2,6 +2,7 @@
 #include "vc/ui/UDataManipulateUtils.hpp"
 
 #include "ViewerManager.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
@@ -29,6 +30,9 @@
 #define COLOR_SEG_YZ Qt::yellow
 #define COLOR_SEG_XZ Qt::red
 #define COLOR_SEG_XY QColor(255, 140, 0)
+#define COLOR_APPROVED QColor(0, 200, 0)
+#define COLOR_PENDING QColor(0, 150, 255)
+#define COLOR_PENDING_UNAPPROVE QColor(255, 50, 50)
 
 #include <algorithm>
 #include <cmath>
@@ -254,12 +258,75 @@ void CVolumeViewer::renderIntersections()
                 z_value = 30;
             }
 
+            // Get the segmentation overlay for approval mask checking (only for active segmentation)
+            SegmentationOverlayController* segOverlay = nullptr;
+            if (isActiveSegmentation && _viewerManager) {
+                segOverlay = _viewerManager->segmentationOverlay();
+            }
+            const bool checkApproval = segOverlay && segOverlay->hasApprovalMaskData();
+
             std::vector<QGraphicsItem*> items;
             items.reserve(intersectionLines.size());
             for (const auto& line : intersectionLines) {
                 if (line.world.size() < 2) {
                     continue;
                 }
+
+                // Determine color and width based on approval status
+                QColor lineColor = col;
+                float lineWidth = width;
+                int lineZ = z_value;
+
+                if (checkApproval) {
+                    // surfaceParams stores ptr-space coordinates: (absX - center[0]*scale[0], absY - center[1]*scale[1], 0)
+                    // We need to convert back to absolute grid indices
+                    const cv::Vec3f center = segmentation->center();
+                    const cv::Vec2f scale = segmentation->scale();
+
+                    // Convert ptr-space back to absolute grid coords (keep as float for bilinear)
+                    // ptr = abs - center * scale, so abs = ptr + center * scale
+                    const float absCol0 = line.surfaceParams[0][0] + center[0] * scale[0];
+                    const float absRow0 = line.surfaceParams[0][1] + center[1] * scale[1];
+                    const float absCol1 = line.surfaceParams[1][0] + center[0] * scale[0];
+                    const float absRow1 = line.surfaceParams[1][1] + center[1] * scale[1];
+
+                    // Use bilinear interpolation for sub-pixel accuracy
+                    int status0 = 0, status1 = 0;
+                    const float intensity0 = segOverlay->queryApprovalBilinear(absRow0, absCol0, &status0);
+                    const float intensity1 = segOverlay->queryApprovalBilinear(absRow1, absCol1, &status1);
+
+                    // Use max status for color, average intensity for blending
+                    const int approvalState = std::max(status0, status1);
+                    const float approvalIntensity = std::max(intensity0, intensity1);
+
+                    if (approvalState > 0 && approvalIntensity > 0.0f) {
+                        // Select base color based on status
+                        QColor baseColor;
+                        if (approvalState == 3) {
+                            baseColor = COLOR_PENDING_UNAPPROVE;  // Red for pending unapproval
+                        } else if (approvalState == 2) {
+                            baseColor = COLOR_PENDING;  // Blue for pending approval
+                        } else {
+                            baseColor = COLOR_APPROVED;  // Green for saved
+                        }
+
+                        // Blend the color based on bilinear intensity (smooth edges)
+                        // At edges (low intensity), blend toward the original line color
+                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);  // Scale up for faster transition
+                        lineColor = QColor(
+                            static_cast<int>(col.red() * (1.0f - blendFactor) + baseColor.red() * blendFactor),
+                            static_cast<int>(col.green() * (1.0f - blendFactor) + baseColor.green() * blendFactor),
+                            static_cast<int>(col.blue() * (1.0f - blendFactor) + baseColor.blue() * blendFactor),
+                            baseColor.alpha()
+                        );
+
+                        // Width scales with intensity for smoother edge appearance
+                        const float extraWidth = 6.0f * blendFactor;
+                        lineWidth = width + extraWidth;
+                        lineZ = z_value + 5;
+                    }
+                }
+
                 QPainterPath path;
                 bool first = true;
                 for (const auto& wp : line.world) {
@@ -270,8 +337,8 @@ void CVolumeViewer::renderIntersections()
                         path.lineTo(p[0], p[1]);
                     first = false;
                 }
-                auto* item = fGraphicsView->scene()->addPath(path, QPen(col, width));
-                item->setZValue(z_value);
+                auto* item = fGraphicsView->scene()->addPath(path, QPen(lineColor, lineWidth));
+                item->setZValue(lineZ);
                 item->setOpacity(_intersectionOpacity);
                 if (fBaseImageItem) {
                     item->setParentItem(fBaseImageItem);

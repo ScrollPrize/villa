@@ -502,10 +502,23 @@
            </property>
           </widget>
          </item>
+         <item row="6" column="0" colspan="2">
+          <widget class="QCheckBox" name="chkEnableFileWatching">
+           <property name="text">
+            <string>Enable file watching (detect external changes to segments)</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+           <property name="toolTip">
+            <string>When enabled, VC3D will watch for external changes to segment files and automatically reload them. Disable if you experience issues with file watching. Requires restart.</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </widget>
       </item>
-      
+
      </layout>
     </widget>
    </item>

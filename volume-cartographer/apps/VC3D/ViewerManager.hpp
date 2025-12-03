@@ -46,6 +46,7 @@ public:
     const std::vector<CVolumeViewer*>& viewers() const { return _viewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
+    SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
     void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);

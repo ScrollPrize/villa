@@ -2,6 +2,7 @@
 
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
+#include "ApprovalMaskBrushTool.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include <QLoggingCategory>
@@ -35,6 +36,11 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
     }
 
     useFalloff(_activeFalloff);
+
+    // Set surface on approval tool if edit approval mask mode is active
+    if (isEditingApprovalMask() && _approvalTool) {
+        _approvalTool->setSurface(_editManager->baseSurface());
+    }
 
     if (_overlay) {
         refreshOverlay();

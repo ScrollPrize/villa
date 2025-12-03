@@ -934,6 +934,7 @@ void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::
     // Forward for drawing widgets
     cv::Vec3f p, n;
     if (scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
+        _lastScenePos = scene_loc;  // Track for grid coordinate lookups
         sendMousePressVolume(p, n, button, modifiers);
     }
 }
@@ -976,7 +977,8 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
         cv::Vec3f p, n;
         if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale))
             return;
-        
+
+        _lastScenePos = scene_loc;  // Track for grid coordinate lookups
         emit sendMouseMoveVolume(p, buttons, modifiers);
     }
 }

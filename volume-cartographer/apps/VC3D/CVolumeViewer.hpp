@@ -96,6 +96,10 @@ public:
     // Transform scene coordinates to volume coordinates
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
     QPointF volumePointToScene(const cv::Vec3f& vol_point) { return volumeToScene(vol_point); }
+    // Get the last known scene position (for coordinate lookups)
+    QPointF lastScenePosition() const { return _lastScenePos; }
+    // Get the dataset scale factor for scene→surface coordinate conversion
+    float dsScale() const { return _ds_scale; }
     Surface* currentSurface() const;
 
     // BBox drawing mode for segmentation view
@@ -243,7 +247,8 @@ protected:
     QLabel *_lbl = nullptr;
 
     float _z_off = 0.0;
-    
+    QPointF _lastScenePos;  // Last known scene position for grid coordinate lookups
+
     // Composite view settings
     bool _composite_enabled = false;
     int _composite_layers = 7;

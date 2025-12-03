@@ -90,6 +90,8 @@ else()
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
+    # Add openmp_stub to the export set so install(EXPORT) works
+    install(TARGETS openmp_stub EXPORT "${targets_export_name}")
 endif()
 
 # ---- xtensor/xsimd toggle used by your code ---------------------------------
