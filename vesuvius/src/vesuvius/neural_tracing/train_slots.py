@@ -31,16 +31,10 @@ from vesuvius.neural_tracing.visualization import make_canvas, print_training_co
 
 def prepare_batch(batch, config):
     """Prepare batch tensors for slotted conditioning training."""
-    condition_mask = batch.get('condition_mask')
-    condition_mask_channels = []
-    if condition_mask is not None and config.get("include_condition_mask_channel", True):
-        condition_mask_channels.append(rearrange(condition_mask, 'b z y x c -> b c z y x'))
-
     use_localiser = bool(config.get('use_localiser', False))
     input_parts = [
         batch['volume'].unsqueeze(1),
         rearrange(batch['uv_heatmaps_in'], 'b z y x c -> b c z y x'),
-        *condition_mask_channels,
     ]
     if use_localiser:
         input_parts.insert(1, batch['localiser'].unsqueeze(1))
@@ -89,7 +83,6 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
 
     slots_per_step = max(1, int(config.get('slots_per_step', 1)))
     use_localiser = bool(config.get('use_localiser', False))
-    include_condition_mask = bool(config.get('include_condition_mask_channel', True))
 
     # Slice inputs back into components so we can update conditioning between steps
     channel_idx = 0
@@ -103,11 +96,6 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
 
     slot_channels = targets.shape[1]
     uv_cond = inputs[:, channel_idx : channel_idx + slot_channels]
-    channel_idx += slot_channels
-
-    cond_mask = None
-    if include_condition_mask:
-        cond_mask = inputs[:, channel_idx : channel_idx + slot_channels]
 
     # Channels with non-zero mask are the ones we should eventually supervise
     remaining_slots = (mask.flatten(2).sum(dim=2) > 0)
@@ -115,7 +103,6 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
         raise ValueError("slot multistep expects uv_heatmaps_out_mask to mark at least one slot")
 
     current_cond = uv_cond.clone()
-    current_cond_mask = cond_mask.clone() if cond_mask is not None else None
     preds_for_vis = torch.zeros_like(targets)
     step_losses = []
 
@@ -124,8 +111,6 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
         if use_localiser:
             parts.append(localiser)
         parts.append(current_cond)
-        if include_condition_mask and current_cond_mask is not None:
-            parts.append(current_cond_mask)
         return torch.cat(parts, dim=1)
 
     for step_idx in range(multistep_count):
@@ -160,8 +145,6 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
         preds_for_vis = torch.where(step_selector_cf, step_pred, preds_for_vis)
         pred_heatmaps = torch.sigmoid(step_pred.detach())
         current_cond = torch.where(step_selector_cf, pred_heatmaps, current_cond)
-        if current_cond_mask is not None:
-            current_cond_mask = torch.where(step_selector_cf, torch.ones_like(current_cond_mask), current_cond_mask)
 
     if not step_losses:
         raise ValueError("slot multistep did not select any slots to supervise")
@@ -181,17 +164,22 @@ def train(config_path):
     # Force slotted variant settings
     config['dataset_variant'] = 'slotted'
     config['masked_conditioning'] = True
-    config.setdefault('use_localiser', False)
+    config.setdefault('use_localiser', True)
     config.setdefault('masked_include_diag', True)
-    config.setdefault('include_condition_mask_channel', True)
     config.setdefault('step_count', 1)
 
-    # Calculate slot count based on step_count
-    slot_count = 4 * config['step_count']
+    # Calculate channel counts based on step_count
+    # Input: 4 cardinal + diag_in (5 conditioning slots)
+    # Output: 4 cardinal + diag_in + diag_out (6 output slots)
+    cardinal_slots = 4 * config['step_count']
     if config['masked_include_diag']:
-        slot_count += 1
-    config.setdefault('conditioning_channels', slot_count * 2 if config['include_condition_mask_channel'] else slot_count)
-    config.setdefault('out_channels', slot_count)
+        conditioning_slots = cardinal_slots + 1  # diag_in only
+        out_slots = cardinal_slots + 2  # diag_in + diag_out
+    else:
+        conditioning_slots = cardinal_slots
+        out_slots = cardinal_slots
+    config.setdefault('conditioning_channels', conditioning_slots)
+    config.setdefault('out_channels', out_slots)
 
     # Multistep settings
     config.setdefault('multistep_count', 1)
@@ -304,11 +292,10 @@ def train(config_path):
         print_training_config(config, accelerator)
         # Additional slot-specific info
         accelerator.print("\n=== Slot-Specific Configuration ===")
-        accelerator.print(f"Slot count: {slot_count}")
+        accelerator.print(f"Conditioning slots: {conditioning_slots}, Output slots: {out_slots}")
         accelerator.print(f"Multistep: {multistep_enabled} (count={config.get('multistep_count', 1)})")
         accelerator.print(f"Slots per step: {config.get('slots_per_step', 1)}")
         accelerator.print(f"Include diag: {config['masked_include_diag']}")
-        accelerator.print(f"Include condition mask channel: {config['include_condition_mask_channel']}")
         accelerator.print("====================================\n")
 
     val_iterator = iter(val_dataloader)
@@ -344,28 +331,6 @@ def train(config_path):
             pred_for_vis = pred
         return loss, pred_for_vis
 
-    def compute_heatmap_loss_with_ds(target_pred, targets, mask):
-        """Compute heatmap loss with optional deep supervision support."""
-        if ds_enabled and isinstance(target_pred, (list, tuple)):
-            cache = ds_cache['uv']
-            if cache['weights'] is None or len(cache['weights']) != len(target_pred):
-                cache['weights'] = _compute_ds_weights(len(target_pred))
-            targets_resized = [_resize_for_ds(targets, t.shape[2:], mode='trilinear', align_corners=False) for t in target_pred]
-            masks_resized = None
-            if mask is not None:
-                masks_resized = [_resize_for_ds(mask, t.shape[2:], mode='nearest') for t in target_pred]
-
-            heatmap_loss = torch.zeros([])
-            for i, weight in enumerate(cache['weights']):
-                if weight != 0:
-                    scale_loss = loss_fn(target_pred[i], targets_resized[i], masks_resized[i] if masks_resized else mask)
-                    heatmap_loss = heatmap_loss + weight * scale_loss
-            return heatmap_loss.mean(), target_pred[0]
-        else:
-            if isinstance(target_pred, (list, tuple)):
-                target_pred = target_pred[0]
-            return loss_fn(target_pred, targets, mask).mean(), target_pred
-
     # Training loop
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
     for iteration, batch in enumerate(train_dataloader):
@@ -377,8 +342,6 @@ def train(config_path):
             mask = torch.ones_like(targets)
 
         if iteration == 0 and accelerator.is_main_process:
-            cond_mask = batch.get('condition_mask')
-            cond_mask_channels = cond_mask.shape[-1] if (cond_mask is not None and config.get("include_condition_mask_channel", True)) else 0
             accelerator.print("First batch input summary:")
             accelerator.print(f"  inputs: {tuple(inputs.shape)}")
             accelerator.print(f"  targets: {tuple(targets.shape)} | mask_present={'uv_heatmaps_out_mask' in batch}")
@@ -396,7 +359,7 @@ def train(config_path):
             else:
                 outputs = model(inputs)
                 target_pred = outputs['uv_heatmaps'] if isinstance(outputs, dict) else outputs
-                heatmap_loss, target_pred_for_vis = compute_heatmap_loss_with_ds(target_pred, targets, mask)
+                heatmap_loss, target_pred_for_vis = compute_loss_with_ds(target_pred, targets, mask, loss_fn, 'uv')
 
             total_loss = heatmap_loss
 
@@ -467,7 +430,7 @@ def train(config_path):
                 else:
                     val_outputs = model(val_inputs)
                     val_target_pred = val_outputs['uv_heatmaps'] if isinstance(val_outputs, dict) else val_outputs
-                    val_heatmap_loss, val_target_pred_for_vis = compute_heatmap_loss_with_ds(val_target_pred, val_targets, val_mask)
+                    val_heatmap_loss, val_target_pred_for_vis = compute_loss_with_ds(val_target_pred, val_targets, val_mask, loss_fn, 'uv')
 
                 total_val_loss = val_heatmap_loss
 
@@ -507,16 +470,22 @@ def train(config_path):
                 # Create and save visualization
                 cond_start = 2 if config.get('use_localiser', False) else 1
                 log_image_ext = config.get('log_image_ext', 'jpg')
+                train_img_path = f'{out_dir}/{iteration:06}_train.{log_image_ext}'
+                val_img_path = f'{out_dir}/{iteration:06}_val.{log_image_ext}'
                 make_canvas(inputs, targets, target_pred_for_vis, config,
                            seg=seg_for_vis, seg_pred=seg_pred_for_vis,
                            normals=normals_for_vis, normals_pred=normals_pred_for_vis, normals_mask=None,
                            cond_channel_start=cond_start,
-                           save_path=f'{out_dir}/{iteration:06}_train.{log_image_ext}')
+                           save_path=train_img_path)
                 make_canvas(val_inputs, val_targets, val_target_pred_for_vis, config,
                            seg=val_seg_for_vis, seg_pred=val_seg_pred_for_vis,
                            normals=val_normals_for_vis, normals_pred=val_normals_pred_for_vis, normals_mask=None,
                            cond_channel_start=cond_start,
-                           save_path=f'{out_dir}/{iteration:06}_val.{log_image_ext}')
+                           save_path=val_img_path)
+
+                if wandb.run is not None:
+                    wandb_log['train_image'] = wandb.Image(train_img_path)
+                    wandb_log['val_image'] = wandb.Image(val_img_path)
 
                 model.train()
 

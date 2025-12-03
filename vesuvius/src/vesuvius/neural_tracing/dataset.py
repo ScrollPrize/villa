@@ -513,12 +513,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         u_neg_shifted_zyxs,
         v_pos_shifted_zyxs,
         v_neg_shifted_zyxs,
-        u_cond,
-        v_cond,
-        suppress_out_u,
-        suppress_out_v,
-        diag_zyx,
-        include_center,
+        u_neg_shifted_zyxs_unperturbed=None,
+        v_neg_shifted_zyxs_unperturbed=None,
+        u_cond=None,
+        v_cond=None,
+        suppress_out_u=None,
+        suppress_out_v=None,
+        diag_zyx=None,
+        include_center=False,
     ):
         """Build heatmaps using u/v direction conditioning."""
 
@@ -564,6 +566,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             'condition_channels': condition_channels,
             **maybe_center_heatmap,
         }
+
+    def _should_swap_uv_axes(self):
+        """Whether to apply UV axis swap augmentation. Override in subclasses."""
+        return True
 
     def _build_batch_dict(
         self,
@@ -678,9 +684,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 center_zyx_unperturbed,
             ]
 
-            # Get negative coordinates (only perturb if conditioning on that direction)
-            u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
-            v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
+            # Get negative coordinates (unperturbed)
+            u_neg_shifted_zyxs_unperturbed = get_zyx_from_patch(u_neg_shifted_ijs, patch)
+            v_neg_shifted_zyxs_unperturbed = get_zyx_from_patch(v_neg_shifted_ijs, patch)
+
+            # Start with unperturbed, then optionally apply perturbation
+            u_neg_shifted_zyxs = u_neg_shifted_zyxs_unperturbed.clone()
+            v_neg_shifted_zyxs = v_neg_shifted_zyxs_unperturbed.clone()
 
             # Apply perturbations only to the directions we're conditioning on
             if torch.rand([]) < self._perturb_prob:
@@ -790,6 +800,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 u_neg_shifted_zyxs=u_neg_shifted_zyxs,
                 v_pos_shifted_zyxs=v_pos_shifted_zyxs,
                 v_neg_shifted_zyxs=v_neg_shifted_zyxs,
+                u_neg_shifted_zyxs_unperturbed=u_neg_shifted_zyxs_unperturbed,
+                v_neg_shifted_zyxs_unperturbed=v_neg_shifted_zyxs_unperturbed,
                 u_cond=u_cond,
                 v_cond=v_cond,
                 suppress_out_u=suppress_out_u,
@@ -876,7 +888,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
             # As an additional augmentation, randomly swap U & V axes in heatmaps
             # We can't do this earlier due to how diagonal points are constructed
-            if torch.rand([]) < 0.5:
+            if self._should_swap_uv_axes() and torch.rand([]) < 0.5:
                 assert uv_heatmaps_in.shape[-1] == 3 and uv_heatmaps_out.shape[-1] % 2 == 0
                 uv_heatmaps_in = uv_heatmaps_in[..., [1, 0, 2]]
                 uv_heatmaps_out = torch.cat([uv_heatmaps_out[..., uv_heatmaps_out.shape[-1] // 2:], uv_heatmaps_out[..., :uv_heatmaps_out.shape[-1] // 2]], dim=-1)

@@ -91,13 +91,46 @@ def make_canvas(
     if normals_mask is not None:
         normals_mask = normals_mask[:sample_count]
 
-    if multistep_count > 1:
+    # For non-slotted multistep, collapse step dimension for visualization
+    # Slotted variant uses fixed slots, not (uv, steps) organization
+    if multistep_count > 1 and config.get('dataset_variant') != 'slotted':
         targets = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
         target_pred = rearrange(target_pred, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
 
-    hsv_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * torch.tensor([1.0, 0.4, 0.6], device=inputs.device) + torch.tensor([0.0, 0.6, 0.4], device=inputs.device)
-    colours_by_step = _hsv_to_rgb(hsv_by_step[:, :, None, None]).squeeze()
-    colours_by_step = torch.cat([torch.ones([2, 3], device=inputs.device), torch.full([1, 3], 0.5, device=inputs.device), colours_by_step], dim=0)
+    # For slotted, show all conditioning channels; otherwise limit to 3
+    is_slotted = config.get('dataset_variant') == 'slotted'
+    if is_slotted:
+        num_cond_channels = inputs.shape[1] - cond_channel_start  # all conditioning channels
+    else:
+        num_cond_channels = min(3, inputs.shape[1] - cond_channel_start)
+
+    # Create colors for visualization
+    if is_slotted:
+        # Fixed semantic colors for slotted: conditioning (5) + output (6) channels
+        # Conditioning: u_neg, u_pos, v_neg, v_pos, diag_in (shown in gray/white - known inputs)
+        # Output: u_neg, u_pos, v_neg, v_pos, diag_in, diag_out (colored - predictions)
+        cond_colors = torch.tensor([
+            [1.0, 1.0, 1.0],  # u_neg - white
+            [1.0, 1.0, 1.0],  # u_pos - white
+            [1.0, 1.0, 1.0],  # v_neg - white
+            [1.0, 1.0, 1.0],  # v_pos - white
+            [1.0, 1.0, 1.0],  # diag_in - white
+        ], device=inputs.device)
+        out_colors = torch.tensor([
+            [1.0, 0.3, 0.3],  # u_neg - red
+            [1.0, 0.6, 0.2],  # u_pos - orange
+            [0.3, 0.5, 1.0],  # v_neg - blue
+            [0.3, 0.9, 0.9],  # v_pos - cyan
+            [0.3, 0.9, 0.4],  # diag_in - green
+            [0.9, 0.3, 0.9],  # diag_out - magenta
+        ], device=inputs.device)
+        colours_by_step = torch.cat([cond_colors[:num_cond_channels], out_colors[:targets.shape[1]]], dim=0)
+    else:
+        # Original behavior: white/gray for conditioning, random for outputs
+        hsv_by_step = torch.rand([targets.shape[1], 3], device=inputs.device) * torch.tensor([1.0, 0.4, 0.6], device=inputs.device) + torch.tensor([0.0, 0.6, 0.4], device=inputs.device)
+        out_colors = _hsv_to_rgb(hsv_by_step[:, :, None, None]).squeeze()
+        cond_colors = torch.cat([torch.ones([2, 3], device=inputs.device), torch.full([1, 3], 0.5, device=inputs.device)], dim=0)
+        colours_by_step = torch.cat([cond_colors[:num_cond_channels], out_colors], dim=0)
 
     def overlay_crosshair(x):
         x = x.clone()
@@ -112,7 +145,7 @@ def make_canvas(
         return overlay_crosshair(inputs[:, 0].select(dim=dim + 1, index=inputs.shape[(dim + 2)] // 2)[..., None].expand(-1, -1, -1, 3) * 0.5 + 0.5)
 
     def projections(x):
-        cond_end = min(cond_channel_start + 3, inputs.shape[1])
+        cond_end = cond_channel_start + num_cond_channels
         x = torch.cat([inputs[:, cond_channel_start:cond_end], x], dim=1)
         coloured = x[..., None] * colours_by_step[None, :x.shape[1], None, None, None, :]
         return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
