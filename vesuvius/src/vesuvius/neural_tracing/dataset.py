@@ -565,99 +565,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             **maybe_center_heatmap,
         }
 
-    def _sample_extra_history_ijs(self, center_ij, step_size, scale, num_extra_prev_points, extra_prev_stride):
-        """Sample extra history point coordinates in ij space for both directions.
-
-        Returns dict with u_extra_neg_ijs, u_extra_pos_ijs, v_extra_neg_ijs, v_extra_pos_ijs,
-        or all None if num_extra_prev_points == 0.
-        """
-        if num_extra_prev_points <= 0:
-            return {
-                'u_extra_neg_ijs': None, 'u_extra_pos_ijs': None,
-                'v_extra_neg_ijs': None, 'v_extra_pos_ijs': None,
-            }
-        # Points are at indices 2, 2+stride, 2+2*stride, ... from center
-        extra_indices = 2 + torch.arange(num_extra_prev_points) * extra_prev_stride
-        extra_deltas = extra_indices[:, None] * step_size * scale
-        return {
-            'u_extra_neg_ijs': center_ij - extra_deltas * torch.tensor([1, 0]),
-            'u_extra_pos_ijs': center_ij + extra_deltas * torch.tensor([1, 0]),
-            'v_extra_neg_ijs': center_ij - extra_deltas * torch.tensor([0, 1]),
-            'v_extra_pos_ijs': center_ij + extra_deltas * torch.tensor([0, 1]),
-        }
-
-    def _validate_extra_history(self, extra_history_ijs, valid_steps_fn):
-        """Check if all extra history points are valid. Returns True if valid or no history points."""
-        if extra_history_ijs['u_extra_neg_ijs'] is None:
-            return True
-        return (
-            valid_steps_fn(extra_history_ijs['u_extra_neg_ijs']).all() and
-            valid_steps_fn(extra_history_ijs['u_extra_pos_ijs']).all() and
-            valid_steps_fn(extra_history_ijs['v_extra_neg_ijs']).all() and
-            valid_steps_fn(extra_history_ijs['v_extra_pos_ijs']).all()
-        )
-
-    def _flip_extra_history(self, extra_history_ijs, flip_u, flip_v):
-        """Swap neg/pos extra history points when flipping directions."""
-        if extra_history_ijs['u_extra_neg_ijs'] is None:
-            return extra_history_ijs
-        result = dict(extra_history_ijs)
-        if flip_u:
-            result['u_extra_neg_ijs'], result['u_extra_pos_ijs'] = (
-                extra_history_ijs['u_extra_pos_ijs'], extra_history_ijs['u_extra_neg_ijs']
-            )
-        if flip_v:
-            result['v_extra_neg_ijs'], result['v_extra_pos_ijs'] = (
-                extra_history_ijs['v_extra_pos_ijs'], extra_history_ijs['v_extra_neg_ijs']
-            )
-        return result
-
-    def _convert_extra_history_to_zyx(self, extra_history_ijs, patch):
-        """Convert extra history ij coordinates to 3D zyx coordinates."""
-        if extra_history_ijs['u_extra_neg_ijs'] is None:
-            return {'u_extra_neg_zyxs': None, 'v_extra_neg_zyxs': None}
-        return {
-            'u_extra_neg_zyxs': get_zyx_from_patch(extra_history_ijs['u_extra_neg_ijs'], patch),
-            'v_extra_neg_zyxs': get_zyx_from_patch(extra_history_ijs['v_extra_neg_ijs'], patch),
-        }
-
-    def _build_extra_history_heatmaps(self, extra_history_zyxs, min_corner_zyx, crop_size, heatmap_sigma, num_extra_prev_points):
-        """Build extra history heatmaps with random dropout of points.
-
-        Returns tensor of shape [2, crop_size, crop_size, crop_size] or None if no history.
-        """
-        if extra_history_zyxs['u_extra_neg_zyxs'] is None:
-            return None
-
-        # randomly select which history points to include (0 to num_extra_prev_points)
-        # as a form of dropout
-        num_to_use = torch.randint(0, num_extra_prev_points + 1, []).item()
-
-        if num_to_use == 0:
-            return torch.zeros([2, crop_size, crop_size, crop_size], dtype=torch.float32)
-
-        # randomly select which points to use (without replacement)
-        selected_indices = torch.randperm(num_extra_prev_points)[:num_to_use]
-
-        u_extra_neg_zyxs = extra_history_zyxs['u_extra_neg_zyxs']
-        v_extra_neg_zyxs = extra_history_zyxs['v_extra_neg_zyxs']
-
-        u_heatmap = torch.zeros([1, crop_size, crop_size, crop_size], dtype=torch.float32)
-        v_heatmap = torch.zeros([1, crop_size, crop_size, crop_size], dtype=torch.float32)
-
-        for i in selected_indices:
-            u_heatmap += self.make_heatmaps([u_extra_neg_zyxs[i:i+1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
-            v_heatmap += self.make_heatmaps([v_extra_neg_zyxs[i:i+1]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
-
-        return torch.cat([u_heatmap, v_heatmap], dim=0)
-
-    @staticmethod
-    def _swap_extra_history_uv(extra_history_heatmaps):
-        """Swap U and V channels in extra history heatmaps."""
-        if extra_history_heatmaps is None:
-            return None
-        return extra_history_heatmaps[..., [1, 0]]
-
     def _build_batch_dict(
         self,
         volume_crop,
@@ -669,7 +576,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         normals,
         normals_mask,
         center_heatmaps,
-        extra_history_heatmaps=None,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -684,8 +590,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
         if self._config.get("aux_normals", False) and normals is not None:
             batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
-        if extra_history_heatmaps is not None:
-            batch_dict['extra_history_heatmaps'] = extra_history_heatmaps
 
         return batch_dict
 
@@ -698,8 +602,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         multistep_prob = float(self._config.get('multistep_prob', 0.0))
         multistep_count = int(self._config.get('multistep_count', 1))
         heatmap_sigma = self._heatmap_sigma
-        num_extra_prev_points = int(self._config.get('num_extra_prev_points', 0))
-        extra_prev_stride = int(self._config.get('extra_prev_stride', 1))
 
         crop_size += step_size * torch.tensor(self._config['step_count']) * (multistep_count - 1) * 2
 
@@ -728,11 +630,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             v_pos_shifted_ijs = center_ij + uv_deltas * torch.tensor([0, 1])
             v_neg_shifted_ijs = center_ij - uv_deltas * torch.tensor([0, 1])
 
-            # sample extra history points for context (not counting the conditioning point(s))
-            extra_history_ijs = self._sample_extra_history_ijs(
-                center_ij, step_size, patch.scale, num_extra_prev_points, extra_prev_stride
-            )
-
             def valid_steps(shifted_ijs):
                 """Mark which shifted points remain in-bounds and on valid vertices."""
                 ij_int = shifted_ijs.long()
@@ -747,22 +644,18 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             u_neg_valid = valid_steps(u_neg_shifted_ijs)
             v_pos_valid = valid_steps(v_pos_shifted_ijs)
             v_neg_valid = valid_steps(v_neg_shifted_ijs)
-            extra_valid = self._validate_extra_history(extra_history_ijs, valid_steps)
 
             # If any step along U or V would fall outside the patch or onto an invalid vertex, resample.
-            if not (u_pos_valid.all() and u_neg_valid.all() and v_pos_valid.all() and v_neg_valid.all() and extra_valid):
+            if not (u_pos_valid.all() and u_neg_valid.all() and v_pos_valid.all() and v_neg_valid.all()):
                 continue
 
             # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
-            flip_u = torch.rand([]) < 0.5
-            flip_v = torch.rand([]) < 0.5
-            if flip_u:
+            if torch.rand([]) < 0.5:
                 u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
                 u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
-            if flip_v:
+            if torch.rand([]) < 0.5:
                 v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
                 v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
-            extra_history_ijs = self._flip_extra_history(extra_history_ijs, flip_u, flip_v)
 
             # Decide conditioning directions early so we know which points to perturb
             cond_result = self._decide_conditioning(
@@ -789,17 +682,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             u_neg_shifted_zyxs = get_zyx_from_patch(u_neg_shifted_ijs, patch)
             v_neg_shifted_zyxs = get_zyx_from_patch(v_neg_shifted_ijs, patch)
 
-            # convert extra history pt coords (these are NOT perturbed)
-            extra_history_zyxs = self._convert_extra_history_to_zyx(extra_history_ijs, patch)
-
             # Apply perturbations only to the directions we're conditioning on
             if torch.rand([]) < self._perturb_prob:
                 min_corner_zyx = (center_zyx - crop_size // 2).int()
 
-                # perturb center point in 3D (only normal perturbation, no uv)
+                # Perturb center point in 3D (only normal perturbation, no uv)
                 center_zyx = self._get_perturbed_zyx_from_patch(center_ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=True)
 
-                # only perturb the first negative point for each conditioned direction
+                # Only perturb the first negative point for each conditioned direction
                 if u_cond:
                     u_neg_shifted_zyxs[0] = self._get_perturbed_zyx_from_patch(u_neg_shifted_ijs[0], patch, center_ij, min_corner_zyx, crop_size, is_center_point=False)
                 if v_cond:
@@ -911,11 +801,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
             heatmap_num_in_channels = heatmap_result['condition_channels']
 
-            # build extra history heatmaps with random dropout
-            extra_history_heatmaps = self._build_extra_history_heatmaps(
-                extra_history_zyxs, min_corner_zyx, crop_size, heatmap_sigma, num_extra_prev_points
-            )
-
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
 
@@ -928,14 +813,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
             #  ok since it's 'just more augmentation' that won't be applied during tracing
             uv_channels = uv_heatmaps_both.shape[0]
-            
-            # if we have extra history pts,  we need to augment them with the rest of the heatmaps
-            if extra_history_heatmaps is not None:
-                extra_history_channels = extra_history_heatmaps.shape[0]
-                regression_target = torch.cat([uv_heatmaps_both, extra_history_heatmaps], dim=0)
-            else:
-                extra_history_channels = 0
-                regression_target = uv_heatmaps_both
+            regression_target = uv_heatmaps_both
             seg_for_aug = seg[None] if seg is not None else None
             while True:
                 augmented = self._augmentations(
@@ -952,10 +830,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
-            if extra_history_channels > 0:
-                extra_history_heatmaps = regression_aug[..., uv_channels:uv_channels + extra_history_channels]
-            else:
-                extra_history_heatmaps = None
             if seg is not None:
                 seg_aug = augmented.get('segmentation', None)
                 if seg_aug is None:
@@ -1006,7 +880,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 assert uv_heatmaps_in.shape[-1] == 3 and uv_heatmaps_out.shape[-1] % 2 == 0
                 uv_heatmaps_in = uv_heatmaps_in[..., [1, 0, 2]]
                 uv_heatmaps_out = torch.cat([uv_heatmaps_out[..., uv_heatmaps_out.shape[-1] // 2:], uv_heatmaps_out[..., :uv_heatmaps_out.shape[-1] // 2]], dim=-1)
-                extra_history_heatmaps = self._swap_extra_history_uv(extra_history_heatmaps)
 
             batch_dict = self._build_batch_dict(
                 volume_crop=volume_crop,
@@ -1018,7 +891,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 normals=normals,
                 normals_mask=normals_mask,
                 center_heatmaps=maybe_center_heatmaps,
-                extra_history_heatmaps=extra_history_heatmaps,
             )
 
             yield batch_dict

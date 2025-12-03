@@ -37,11 +37,6 @@ def train(config_path):
     ds_enabled = config.setdefault('enable_deep_supervision', False)
     use_seg = config.setdefault('aux_segmentation', False)
     use_normals = config.setdefault('aux_normals', False)
-
-    # Extra history and multistep are not yet compatible
-    # TODO: implement history for multistep
-    if config.get('num_extra_prev_points', 0) > 0 and config.get('multistep_count', 1) > 1:
-        raise ValueError("num_extra_prev_points > 0 is not compatible with multistep_count > 1")
     seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
     normals_loss_weight = config.setdefault('normals_loss_weight', 1.0)
     random.seed(config['seed'])
@@ -126,7 +121,7 @@ def train(config_path):
 
     val_iterator = iter(val_dataloader)
 
-    def prepare_inputs(batch, min_corner_in_outer, prev_uvd_cropped, extra_history_cropped=None):
+    def prepare_inputs(batch, min_corner_in_outer, prev_uvd_cropped):
         # Prepare the volume (sub-)crop and localiser. For the localiser we take a crop at the
         # original center (conceptually we create a new localiser at the new subcrop center)
         crop_size = config['crop_size']
@@ -142,14 +137,11 @@ def train(config_path):
             outer_shape[2] // 2 - crop_size // 2 : outer_shape[2] // 2 + crop_size // 2,
             outer_shape[3] // 2 - crop_size // 2 : outer_shape[3] // 2 + crop_size // 2,
         ]
-        input_parts = [
+        inputs = torch.cat([
             volume_crop.unsqueeze(1),
             localiser.unsqueeze(1),
             prev_uvd_cropped,  # prev_u, prev_v, prev_diag
-        ]
-        if extra_history_cropped is not None:
-            input_parts.append(extra_history_cropped)
-        inputs = torch.cat(input_parts, dim=1)
+        ], dim=1)
         return inputs
 
     def loss_fn(target_pred, targets, mask):
@@ -183,12 +175,7 @@ def train(config_path):
 
         first_min_corner_in_outer = outer_crop_center - config['crop_size'] // 2
         first_prev_uvd_subcrop = rearrange(safe_crop_with_padding(batch['uv_heatmaps_in'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
-        # Crop extra history heatmaps if present (only for single-step; multistep + extra history does not yet work)
-        if 'extra_history_heatmaps' in batch:
-            extra_history_subcrop = rearrange(safe_crop_with_padding(batch['extra_history_heatmaps'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
-        else:
-            extra_history_subcrop = None
-        first_step_inputs = prepare_inputs(batch, first_min_corner_in_outer, first_prev_uvd_subcrop, extra_history_subcrop)
+        first_step_inputs = prepare_inputs(batch, first_min_corner_in_outer, first_prev_uvd_subcrop)
         targets = rearrange(safe_crop_with_padding(batch['uv_heatmaps_out'], first_min_corner_in_outer, config['crop_size']), 'b z y x c -> b c z y x')
         mask = torch.ones_like(targets[:, :1, ...])  # TODO
 

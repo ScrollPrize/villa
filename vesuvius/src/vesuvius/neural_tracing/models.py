@@ -10,12 +10,7 @@ def _config_dict_to_mgr(config_dict):
     model_config = dict(config_dict.get('model_config', {}) or {})
 
     # Allow overriding targets; default to a single uv_heatmaps head
-    # Base conditioning: prev_u, prev_v, prev_diag (3 channels)
-    # Extra history: extra_prev_u, extra_prev_v (2 channels if num_extra_prev_points > 0)
-    num_extra_prev_points = int(config_dict.get('num_extra_prev_points', 0))
-    base_conditioning_channels = 3  # prev_u, prev_v, prev_diag
-    extra_history_channels = 2 if num_extra_prev_points > 0 else 0
-    conditioning_channels = int(config_dict.get('conditioning_channels', base_conditioning_channels + extra_history_channels))
+    conditioning_channels = int(config_dict.get('conditioning_channels', 3))
     use_localiser = bool(config_dict.get('use_localiser', True))
     default_out_channels = int(config_dict.get('out_channels', config_dict['step_count'] * 2))
 
@@ -67,12 +62,7 @@ def build_network_from_config_dict(config_dict):
 
 
 def make_model(config):
-    # Base conditioning: prev_u, prev_v, prev_diag (3 channels)
-    # Extra history: extra_prev_u, extra_prev_v (2 channels if num_extra_prev_points > 0)
-    num_extra_prev_points = int(config.get('num_extra_prev_points', 0))
-    base_conditioning_channels = 3
-    extra_history_channels = 2 if num_extra_prev_points > 0 else 0
-    conditioning_channels = int(config.get('conditioning_channels', base_conditioning_channels + extra_history_channels))
+    conditioning_channels = int(config.get('conditioning_channels', 3))
     use_localiser = bool(config.get('use_localiser', True))
     default_out_channels = int(config.get('out_channels', config['step_count'] * 2))
 
