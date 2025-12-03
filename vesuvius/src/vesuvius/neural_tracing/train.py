@@ -319,6 +319,8 @@ def train(config_path):
         all_step_preds_vis = [target_pred.detach()]
 
         # FIXME: if we supported multi-step for non-chain cases, then we could always enable it hence wouldn't need this
+        # Note for batch elements where multi-step targets are not available, we still compute multi-step predictions,
+        # but do not calculate the loss nor visualise them
         multistep_available_device = mask.device
         if multistep_count > 1:
             multistep_targets_available = batch['uv_heatmaps_out'][:, ..., 1::multistep_count].amax(dim=(1, 2, 3, 4)) > 0
@@ -375,9 +377,10 @@ def train(config_path):
 
                 if sample_idx == 0:
                     step_pred_filtered = torch.full_like(step_pred, -100.0)
-                    step_pred_filtered[torch.arange(step_pred.shape[0]), step_directions] = step_pred.detach()[torch.arange(step_pred.shape[0]), step_directions]
+                    where_multistep_targets_available = torch.where(multistep_targets_available)[0]
+                    step_pred_filtered[where_multistep_targets_available, step_directions[multistep_targets_available]] = step_pred.detach()[where_multistep_targets_available, step_directions[multistep_targets_available]]
                     step_targets_filtered = torch.zeros_like(step_targets)
-                    step_targets_filtered[torch.arange(step_targets.shape[0]), step_directions] = step_targets.detach()[torch.arange(step_targets.shape[0]), step_directions]
+                    step_targets_filtered[where_multistep_targets_available, step_directions[multistep_targets_available]] = step_targets.detach()[where_multistep_targets_available, step_directions[multistep_targets_available]]
                     first_step_crop_min = outer_crop_center - config['crop_size'] // 2
                     offset = min_corner_new_subcrop_in_outer - first_step_crop_min
                     step_target_in_first_crop = transform_to_first_crop_space(step_targets_filtered, offset, config['crop_size'])
