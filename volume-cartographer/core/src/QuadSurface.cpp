@@ -564,55 +564,67 @@ void QuadSurface::saveOverwrite()
     id = uuid;
 }
 
+void QuadSurface::invalidateMask()
+{
+    // Clear from memory
+    _channels.erase("mask");
+
+    // Delete from disk
+    if (!path.empty()) {
+        std::filesystem::path maskFile = path / "mask.tif";
+        std::error_code ec;
+        std::filesystem::remove(maskFile, ec);
+    }
+}
+
+void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
+{
+    // Split the points matrix into x, y, z channels
+    std::vector<cv::Mat> xyz;
+    cv::split((*_points), xyz);
+
+    // Write x/y/z as 32-bit float tiled BigTIFF with LZW
+    writeFloatBigTiff(dir / "x.tif", xyz[0]);
+    writeFloatBigTiff(dir / "y.tif", xyz[1]);
+    writeFloatBigTiff(dir / "z.tif", xyz[2]);
+
+    // OpenCV compression params for fallback
+    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
+
+    // Save additional channels
+    for (auto const& [name, mat] : _channels) {
+        if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
+            bool wrote = false;
+
+            // Try BigTIFF for large single-channel ancillary data (8U/16U/32F)
+            if (mat.channels() == 1 &&
+                (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
+            {
+                try {
+                    writeSingleChannelBigTiff(dir / (name + ".tif"), mat);
+                    wrote = true;
+                } catch (...) {
+                    wrote = false; // Fall back to OpenCV
+                }
+            }
+
+            // Fallback to OpenCV for multi-channel or other formats
+            if (!wrote) {
+                cv::imwrite((dir / (name + ".tif")).string(), mat, compression_params);
+            }
+        }
+    }
+}
+
 void QuadSurface::saveSnapshot(int maxBackups)
 {
     if (path.empty()) {
         throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
     }
 
-    // Normalize the surface path to get the canonical path under paths/
-    std::filesystem::path canonicalPath = path;
-    std::filesystem::path volpkgRoot;
-    std::string segmentName;
-
-    // Check if this is already a backup path (contains /backups/)
-    std::string pathStr = canonicalPath.string();
-    size_t backupsPos = pathStr.find("/backups/");
-
-    if (backupsPos != std::string::npos) {
-        // This is a backup path. Reconstruct the canonical path.
-        std::filesystem::path tempPath = canonicalPath;
-
-        while (tempPath.has_parent_path()) {
-            std::string filename = tempPath.filename().string();
-
-            // Check if this is a numeric backup directory (0, 1, 2, etc.)
-            bool isNumeric = !filename.empty() &&
-                           std::all_of(filename.begin(), filename.end(), ::isdigit);
-
-            if (isNumeric) {
-                std::filesystem::path parent = tempPath.parent_path();
-                std::filesystem::path grandparent = parent.parent_path();
-
-                if (grandparent.filename() == "backups") {
-                    segmentName = parent.filename().string();
-                    volpkgRoot = grandparent.parent_path();
-                    canonicalPath = volpkgRoot / "paths" / segmentName;
-                    break;
-                }
-            }
-            tempPath = tempPath.parent_path();
-        }
-
-        if (segmentName.empty()) {
-            volpkgRoot = canonicalPath.parent_path().parent_path();
-            segmentName = canonicalPath.filename().string();
-        }
-    } else {
-        // Regular path: /path/to/scroll.volpkg/paths/segment_name
-        volpkgRoot = canonicalPath.parent_path().parent_path();
-        segmentName = canonicalPath.filename().string();
-    }
+    // Path is expected to be: /path/to/scroll.volpkg/paths/segment_name
+    std::filesystem::path volpkgRoot = path.parent_path().parent_path();
+    std::string segmentName = path.filename().string();
 
     // Create centralized backups directory structure
     std::filesystem::path backupsDir = volpkgRoot / "backups" / segmentName;
@@ -672,31 +684,39 @@ void QuadSurface::saveSnapshot(int maxBackups)
         snapshot_dest = backupsDir / std::to_string(maxBackups - 1);
     }
 
-    // Save the original path and ID before creating the snapshot
-    std::filesystem::path originalPath = path;
-    std::string originalId = id;
+    // Create the snapshot directory
+    std::filesystem::create_directories(snapshot_dest, ec);
+    if (ec) {
+        throw std::runtime_error("Failed to create snapshot directory: " + ec.message());
+    }
 
-    // Create the snapshot
-    save(snapshot_dest, true);
+    // Write surface data (skip mask - we'll copy it from disk instead)
+    writeDataToDirectory(snapshot_dest, "mask");
 
-    // Restore the original path and ID to keep this surface pointing to its canonical location
-    path = originalPath;
-    id = originalId;
+    // Write metadata - create a copy so we don't modify the original
+    nlohmann::json snapshotMeta;
+    if (meta) {
+        snapshotMeta = *meta;
+    }
+    snapshotMeta["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
+                            {bbox().high[0], bbox().high[1], bbox().high[2]}};
+    snapshotMeta["type"] = "seg";
+    snapshotMeta["uuid"] = id;
+    snapshotMeta["format"] = "tifxyz";
+    snapshotMeta["scale"] = {_scale[0], _scale[1]};
 
-    // Copy mask.tif and generations.tif if they exist from the canonical path
-    std::filesystem::path maskFile = canonicalPath / "mask.tif";
-    std::filesystem::path generationsFile = canonicalPath / "generations.tif";
+    std::ofstream o(snapshot_dest / "meta.json");
+    o << std::setw(4) << snapshotMeta << std::endl;
+    o.close();
+
+    // Copy mask.tif and generations.tif if they exist on disk
+    std::filesystem::path maskFile = path / "mask.tif";
+    std::filesystem::path generationsFile = path / "generations.tif";
 
     if (std::filesystem::exists(maskFile)) {
         std::filesystem::path destMask = snapshot_dest / "mask.tif";
         std::filesystem::copy_file(maskFile, destMask,
             std::filesystem::copy_options::overwrite_existing, ec);
-        if (!ec) {
-            // Delete the original mask.tif after successful copy
-            std::filesystem::remove(maskFile, ec);
-            // Clear the mask channel from memory so it doesn't get re-saved later
-            _channels.erase("mask");
-        }
     }
 
     if (std::filesystem::exists(generationsFile)) {
@@ -730,45 +750,12 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
         }
     }
 
-    // Split the points matrix into x, y, z channels
-    std::vector<cv::Mat> xyz;
-    cv::split((*_points), xyz);
-
-    // Write x/y/z as 32-bit float tiled BigTIFF with LZW
+    // Write surface data to temp directory
     try {
-        writeFloatBigTiff(path / "x.tif", xyz[0]);
-        writeFloatBigTiff(path / "y.tif", xyz[1]);
-        writeFloatBigTiff(path / "z.tif", xyz[2]);
+        writeDataToDirectory(path);
     } catch (const std::exception& e) {
         path = original_path; // Restore on error
         throw;
-    }
-
-    // OpenCV compression params for fallback
-    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
-
-    // Save additional channels
-    for (auto const& [name, mat] : _channels) {
-        if (!mat.empty()) {
-            bool wrote = false;
-
-            // Try BigTIFF for large single-channel ancillary data (8U/16U/32F)
-            if (mat.channels() == 1 &&
-                (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
-            {
-                try {
-                    writeSingleChannelBigTiff(path / (name + ".tif"), mat);
-                    wrote = true;
-                } catch (...) {
-                    wrote = false; // Fall back to OpenCV
-                }
-            }
-
-            // Fallback to OpenCV for multi-channel or other formats
-            if (!wrote) {
-                cv::imwrite((path / (name + ".tif")).string(), mat, compression_params);
-            }
-        }
     }
 
     // Prepare and write metadata

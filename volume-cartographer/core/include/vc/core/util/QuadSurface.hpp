@@ -72,6 +72,7 @@ public:
     void invalidateCache();
     void saveOverwrite();
     void saveSnapshot(int maxBackups = 10);
+    void invalidateMask();
     std::vector<std::string> channelNames() const;
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
@@ -80,6 +81,10 @@ protected:
     TiffWriteOptions _tiff_opts;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
+
+private:
+    // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
+    void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
 };
 
 QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags = 0);

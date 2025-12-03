@@ -817,6 +817,11 @@ void SegmentationGrower::onFutureFinished()
         surfaceToPersist = request.segmentationSurface;
     }
 
+    // Mask is no longer valid after growth/inpainting
+    if (surfaceToPersist) {
+        surfaceToPersist->invalidateMask();
+    }
+
     if (!sessionActive) {
         try {
             if (surfaceToPersist) {
