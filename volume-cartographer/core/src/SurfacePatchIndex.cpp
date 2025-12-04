@@ -24,21 +24,6 @@ namespace bgi = boost::geometry::index;
 
 namespace {
 
-inline bool shouldSampleIndex(int idx, int count, int stride)
-{
-    if (count <= 0) {
-        return false;
-    }
-    if (idx < 0 || idx >= count) {
-        return false;
-    }
-    if (stride <= 1) {
-        return true;
-    }
-    const int lastIndex = count - 1;
-    return (idx % stride == 0) || (idx == lastIndex);
-}
-
 struct TriangleHit {
     cv::Vec3f closest{0, 0, 0};
     cv::Vec3f bary{0, 0, 0}; // weights for vertices (sum to 1, >= 0)
@@ -171,11 +156,13 @@ struct SurfacePatchIndex::Impl {
         QuadSurface* surface = nullptr;
         int i = 0;
         int j = 0;
+        int stride = 1;
 
         bool operator==(const PatchRecord& other) const noexcept {
             return surface == other.surface &&
                    i == other.i &&
-                   j == other.j;
+                   j == other.j &&
+                   stride == other.stride;
         }
     };
 
@@ -333,6 +320,7 @@ struct SurfacePatchIndex::Impl {
                                const cv::Mat_<cv::Vec3f>& points,
                                int col,
                                int row,
+                               int stride,
                                float bboxPadding,
                                CellEntry& outEntry);
     static bool loadPatchCorners(const PatchRecord& rec,
@@ -449,17 +437,11 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(QuadSurface* surface,
         static_cast<size_t>((colSpan + samplingStride - 1) / samplingStride);
     result.reserve(estimatedCells);
 
-    for (int j = rowStart; j < rowEnd; ++j) {
-        if (!shouldSampleIndex(j, cellRowCount, samplingStride)) {
-            continue;
-        }
-        for (int i = colStart; i < colEnd; ++i) {
-            if (!shouldSampleIndex(i, cellColCount, samplingStride)) {
-                continue;
-            }
-
+    // Step by stride, creating cells that span 'stride' vertices
+    for (int j = rowStart; j < rowEnd; j += samplingStride) {
+        for (int i = colStart; i < colEnd; i += samplingStride) {
             CellEntry entry;
-            if (!buildCellEntry(surface, *points, i, j, bboxPadding, entry)) {
+            if (!buildCellEntry(surface, *points, i, j, samplingStride, bboxPadding, entry)) {
                 continue;
             }
 
@@ -487,28 +469,57 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
     }
 
     impl_->samplingStride = std::max(1, impl_->samplingStride);
+    const int stride = impl_->samplingStride;
+    const float padding = bboxPadding;
 
-    std::vector<Impl::Entry> entries;
+    // Pre-create all masks (sequential, enables thread-safe parallel access)
     for (QuadSurface* surface : surfaces) {
-        auto cells = Impl::collectEntriesForSurface(surface,
-                                                    bboxPadding,
-                                                    impl_->samplingStride,
-                                                    0,
-                                                    std::numeric_limits<int>::max(),
-                                                    0,
-                                                    std::numeric_limits<int>::max());
+        impl_->ensureMask(surface);
+    }
 
-        entries.reserve(entries.size() + cells.size());
+    // Per-surface results for parallel collection
+    using CellResult = std::vector<std::pair<CellKey, Impl::CellEntry>>;
+    std::vector<CellResult> perSurfaceCells(surfaceCount);
 
-        for (auto& cell : cells) {
-            if (cell.second.hasPatch) {
-                entries.push_back(*cell.second.patch);
-            }
-            auto& mask = impl_->ensureMask(cell.first.surface);
+    // Parallel phase: collect entries and update masks for each surface
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < surfaceCount; ++i) {
+        perSurfaceCells[i] = Impl::collectEntriesForSurface(
+            surfaces[i],
+            padding,
+            stride,
+            0,
+            std::numeric_limits<int>::max(),
+            0,
+            std::numeric_limits<int>::max());
+
+        // Update mask for this surface (each surface has its own mask, no contention)
+        auto& mask = impl_->surfaceCellRecords[surfaces[i]];
+        for (auto& cell : perSurfaceCells[i]) {
             mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);
-            // Cache entry for correct removal during incremental updates
             if (cell.second.hasPatch) {
                 mask.storeEntry(cell.first.rowIndex(), cell.first.colIndex(), *cell.second.patch);
+            }
+        }
+    }
+
+    // Merge entries from all surfaces
+    size_t totalEntries = 0;
+    for (const auto& cells : perSurfaceCells) {
+        for (const auto& cell : cells) {
+            if (cell.second.hasPatch) {
+                ++totalEntries;
+            }
+        }
+    }
+
+    std::vector<Impl::Entry> entries;
+    entries.reserve(totalEntries);
+
+    for (auto& cells : perSurfaceCells) {
+        for (auto& cell : cells) {
+            if (cell.second.hasPatch) {
+                entries.push_back(std::move(*cell.second.patch));
             }
         }
     }
@@ -687,6 +698,15 @@ void SurfacePatchIndex::forEachTriangleImpl(
         // Precompute surface params for the quad (use cached center*scale offsets)
         const float baseX = static_cast<float>(rec.i);
         const float baseY = static_cast<float>(rec.j);
+        const int stride = std::max(1, rec.stride);
+
+        // Compute effective stride (clamped at boundaries, matching loadPatchCorners)
+        const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+        const int cols = points ? points->cols : 0;
+        const int rows = points ? points->rows : 0;
+        const float effectiveStrideX = static_cast<float>(std::min(stride, cols - 1 - rec.i));
+        const float effectiveStrideY = static_cast<float>(std::min(stride, rows - 1 - rec.j));
+
         auto cacheIt = surfaceOffsetCache.find(rec.surface);
         if (cacheIt == surfaceOffsetCache.end()) {
             const cv::Vec3f center = rec.surface->center();
@@ -696,12 +716,12 @@ void SurfacePatchIndex::forEachTriangleImpl(
         }
         const float cx = cacheIt->second.cx;
         const float cy = cacheIt->second.cy;
-        // Params for corners: [0]=(0,0), [1]=(1,0), [2]=(1,1), [3]=(0,1)
+        // Params for corners: [0]=(0,0), [1]=(stride,0), [2]=(stride,stride), [3]=(0,stride)
         std::array<cv::Vec3f, 4> params = {
             cv::Vec3f(baseX - cx, baseY - cy, 0.0f),
-            cv::Vec3f(baseX + 1.0f - cx, baseY - cy, 0.0f),
-            cv::Vec3f(baseX + 1.0f - cx, baseY + 1.0f - cy, 0.0f),
-            cv::Vec3f(baseX - cx, baseY + 1.0f - cy, 0.0f)
+            cv::Vec3f(baseX + effectiveStrideX - cx, baseY - cy, 0.0f),
+            cv::Vec3f(baseX + effectiveStrideX - cx, baseY + effectiveStrideY - cy, 0.0f),
+            cv::Vec3f(baseX - cx, baseY + effectiveStrideY - cy, 0.0f)
         };
 
         // Emit both triangles from cached corners/params
@@ -1104,14 +1124,20 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
 
     const int row = rec.j;
     const int col = rec.i;
-    if (row < 0 || col < 0 || row + 1 >= rows || col + 1 >= cols) {
+    const int stride = std::max(1, rec.stride);
+
+    // Clamp stride to not exceed bounds
+    const int effectiveColStride = std::min(stride, cols - 1 - col);
+    const int effectiveRowStride = std::min(stride, rows - 1 - row);
+
+    if (row < 0 || col < 0 || effectiveColStride <= 0 || effectiveRowStride <= 0) {
         return false;
     }
 
     const cv::Vec3f& p00 = (*points)(row, col);
-    const cv::Vec3f& p10 = (*points)(row, col + 1);
-    const cv::Vec3f& p01 = (*points)(row + 1, col);
-    const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
+    const cv::Vec3f& p10 = (*points)(row, col + effectiveColStride);
+    const cv::Vec3f& p01 = (*points)(row + effectiveRowStride, col);
+    const cv::Vec3f& p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
 
     if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
         return false;
@@ -1125,13 +1151,23 @@ bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
                                              const cv::Mat_<cv::Vec3f>& points,
                                              int col,
                                              int row,
+                                             int stride,
                                              float bboxPadding,
                                              CellEntry& outEntry)
 {
+    // Clamp stride to not exceed bounds
+    const int maxColStride = points.cols - 1 - col;
+    const int maxRowStride = points.rows - 1 - row;
+    const int effectiveColStride = std::min(stride, maxColStride);
+    const int effectiveRowStride = std::min(stride, maxRowStride);
+    if (effectiveColStride <= 0 || effectiveRowStride <= 0) {
+        return false;
+    }
+
     const cv::Vec3f& p00 = points(row, col);
-    const cv::Vec3f& p10 = points(row, col + 1);
-    const cv::Vec3f& p01 = points(row + 1, col);
-    const cv::Vec3f& p11 = points(row + 1, col + 1);
+    const cv::Vec3f& p10 = points(row, col + effectiveColStride);
+    const cv::Vec3f& p01 = points(row + effectiveRowStride, col);
+    const cv::Vec3f& p11 = points(row + effectiveRowStride, col + effectiveColStride);
 
     if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
         return false;
@@ -1141,6 +1177,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
     rec.surface = surface;
     rec.i = col;
     rec.j = row;
+    rec.stride = stride;
 
     std::array<cv::Vec3f, 4> corners = {p00, p10, p11, p01};
     outEntry.patch = buildEntryFromCorners(rec, corners, bboxPadding);

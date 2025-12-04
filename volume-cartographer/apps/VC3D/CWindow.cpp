@@ -1721,9 +1721,18 @@ void CWindow::CreateWidgets(void)
                     _viewerManager->setSurfacePatchSamplingStride(stride);
                 });
 
+        // Update combobox when stride changes programmatically (e.g., tiered defaults)
         if (_viewerManager) {
-            const int stride = std::max(1, comboIntersectionSampling->currentData().toInt());
-            _viewerManager->setSurfacePatchSamplingStride(stride);
+            connect(_viewerManager.get(),
+                    &ViewerManager::samplingStrideChanged,
+                    this,
+                    [comboIntersectionSampling](int stride) {
+                        const int index = comboIntersectionSampling->findData(stride);
+                        if (index >= 0 && index != comboIntersectionSampling->currentIndex()) {
+                            QSignalBlocker blocker(comboIntersectionSampling);
+                            comboIntersectionSampling->setCurrentIndex(index);
+                        }
+                    });
         }
     }
 
@@ -2152,6 +2161,10 @@ void CWindow::OpenVolume(const QString& path)
 
     if (_surfacePanel) {
         _surfacePanel->setVolumePkg(fVpkg);
+        // Reset stride user override so tiered defaults apply to new volume
+        if (_viewerManager) {
+            _viewerManager->resetStrideUserOverride();
+        }
         _surfacePanel->loadSurfaces(false);
     }
     if (_menuController) {
@@ -2481,6 +2494,10 @@ void CWindow::onSegmentationDirChanged(int index)
         // Set the new directory in the VolumePkg
         fVpkg->setSegmentationDirectory(newDir);
 
+        // Reset stride user override so tiered defaults apply to new directory
+        if (_viewerManager) {
+            _viewerManager->resetStrideUserOverride();
+        }
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(false);
         }

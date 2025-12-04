@@ -437,9 +437,12 @@ void ViewerManager::setVolumeWindow(float low, float high)
     emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
 
-void ViewerManager::setSurfacePatchSamplingStride(int stride)
+void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated)
 {
     stride = std::max(1, stride);
+    if (userInitiated) {
+        _surfacePatchStrideUserSet = true;
+    }
     if (_surfacePatchSamplingStride == stride) {
         return;
     }
@@ -458,6 +461,8 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride)
             viewer->setSurfacePatchSamplingStride(_surfacePatchSamplingStride);
         }
     }
+
+    emit samplingStrideChanged(_surfacePatchSamplingStride);
 }
 
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
@@ -521,9 +526,31 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         return;
     }
 
+    // Apply tiered default stride based on surface count (if not user-set)
+    const size_t surfaceCount = quadSurfaces.size();
+    _targetRefinedStride = 0;  // Reset refinement target
+
+    if (!_surfacePatchStrideUserSet) {
+        int defaultStride;
+        if (surfaceCount > 2500) {
+            // > 2500: build at 4x and keep at 4x
+            defaultStride = 4;
+        } else if (surfaceCount >= 500) {
+            // 500-2500: build at 4x initially, then refine to 2x
+            defaultStride = 4;
+            _targetRefinedStride = 2;
+        } else {
+            // < 500: build at 2x and keep at 2x
+            defaultStride = 2;
+        }
+        setSurfacePatchSamplingStride(defaultStride, false);
+    }
+
     auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
-    auto future = QtConcurrent::run([surfacesForTask]() mutable -> std::shared_ptr<SurfacePatchIndex> {
+    const int stride = _surfacePatchSamplingStride;
+    auto future = QtConcurrent::run([surfacesForTask, stride]() mutable -> std::shared_ptr<SurfacePatchIndex> {
         auto index = std::make_shared<SurfacePatchIndex>();
+        index->setSamplingStride(stride);
         index->rebuild(surfacesForTask);
         return index;
     });
@@ -579,9 +606,43 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _indexedSurfaces.clear();
     _indexedSurfaces.insert(_pendingSurfacePatchIndexSurfaces.begin(),
                             _pendingSurfacePatchIndexSurfaces.end());
-    _pendingSurfacePatchIndexSurfaces.clear();
     qCInfo(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
-                            << _indexedSurfaces.size() << "surfaces";
+                            << _indexedSurfaces.size() << "surfaces"
+                            << "at stride" << _surfacePatchSamplingStride;
+    forEachViewer([](CVolumeViewer* v) { v->renderIntersections(); });
+
+    // Check if progressive refinement is needed
+    if (_targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride) {
+        qCInfo(lcViewerManager) << "Starting progressive refinement from stride"
+                                << _surfacePatchSamplingStride << "to" << _targetRefinedStride;
+        const int targetStride = _targetRefinedStride;
+        _targetRefinedStride = 0;  // Clear target to prevent infinite loop
+        setSurfacePatchSamplingStride(targetStride, false);
+
+        // Trigger another async rebuild at the refined stride
+        auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
+        if (surfacesForTask.empty()) {
+            // Re-collect surfaces if needed
+            if (_surfaces) {
+                for (Surface* surf : _surfaces->surfaces()) {
+                    if (auto* quad = dynamic_cast<QuadSurface*>(surf)) {
+                        surfacesForTask.push_back(quad);
+                    }
+                }
+            }
+        }
+        _pendingSurfacePatchIndexSurfaces = surfacesForTask;
+
+        auto future = QtConcurrent::run([surfacesForTask, targetStride]() mutable -> std::shared_ptr<SurfacePatchIndex> {
+            auto index = std::make_shared<SurfacePatchIndex>();
+            index->setSamplingStride(targetStride);
+            index->rebuild(surfacesForTask);
+            return index;
+        });
+        _surfacePatchIndexWatcher->setFuture(future);
+    } else {
+        _pendingSurfacePatchIndexSurfaces.clear();
+    }
 }
 
 bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate)
