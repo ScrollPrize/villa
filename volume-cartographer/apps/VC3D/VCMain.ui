@@ -1051,7 +1051,7 @@
         <number>1</number>
        </property>
        <property name="toolTip">
-        <string>Number of slices to pan with Shift+ScrollWheel (Alt+ScrollWheel to adjust)</string>
+        <string>Number of slices to pan with Shift+ScrollWheel. Adjust step size with Shift+G and Shift+H.</string>
        </property>
       </widget>
      </item>
