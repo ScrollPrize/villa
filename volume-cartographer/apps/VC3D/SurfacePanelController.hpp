@@ -12,6 +12,7 @@
 #include <vector>
 
 class CSurfaceCollection;
+class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
 class VolumePkg;
@@ -53,6 +54,7 @@ public:
         QCheckBox* hideUnapproved{nullptr};
         QCheckBox* inspectOnly{nullptr};
         QCheckBox* currentOnly{nullptr};
+        QLineEdit* surfaceIdFilter{nullptr};
     };
 
     struct TagUiRefs {

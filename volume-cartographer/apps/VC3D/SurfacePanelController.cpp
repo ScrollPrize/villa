@@ -16,6 +16,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QLineEdit>
 #include <QAction>
 #include <QMenu>
 #include <QMessageBox>
@@ -1112,6 +1113,10 @@ void SurfacePanelController::connectFilterSignals()
             applyFilters();
         });
     }
+
+    if (_filters.surfaceIdFilter) {
+        connect(_filters.surfaceIdFilter, &QLineEdit::textChanged, this, [this]() { applyFilters(); });
+    }
 }
 
 void SurfacePanelController::connectTagSignals()
@@ -1339,6 +1344,9 @@ void SurfacePanelController::applyFiltersInternal()
         return box && box->isChecked();
     };
 
+    const QString surfaceIdFilterText = _filters.surfaceIdFilter ? _filters.surfaceIdFilter->text().trimmed() : QString{};
+    const bool hasSurfaceIdFilter = !surfaceIdFilterText.isEmpty();
+
     bool hasActiveFilters = isChecked(_filters.focusPoints) ||
                             isChecked(_filters.unreviewed) ||
                             isChecked(_filters.revisit) ||
@@ -1347,7 +1355,8 @@ void SurfacePanelController::applyFiltersInternal()
                             isChecked(_filters.partialReview) ||
                             isChecked(_filters.currentOnly) ||
                             isChecked(_filters.hideUnapproved) ||
-                            isChecked(_filters.inspectOnly);
+                            isChecked(_filters.inspectOnly) ||
+                            hasSurfaceIdFilter;
 
     auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr);
     if (!hasActiveFilters && model) {
@@ -1432,6 +1441,10 @@ void SurfacePanelController::applyFiltersInternal()
 
         if (restrictToCurrent && !id.empty()) {
             show = show && (id == _currentSurfaceId);
+        }
+
+        if (hasSurfaceIdFilter && !id.empty()) {
+            show = show && QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
         }
 
         if (surfMeta) {

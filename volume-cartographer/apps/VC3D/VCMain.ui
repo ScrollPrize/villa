@@ -222,6 +222,16 @@
            </widget>
           </item>
           <item>
+           <widget class="QLineEdit" name="lineEditSurfaceFilter">
+            <property name="placeholderText">
+             <string>Filter by surface ID...</string>
+            </property>
+            <property name="clearButtonEnabled">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
            <widget class="SurfaceTreeWidget" name="treeWidgetSurfaces">
             <property name="alternatingRowColors">
              <bool>true</bool>
