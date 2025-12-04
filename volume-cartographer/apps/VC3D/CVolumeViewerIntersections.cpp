@@ -38,6 +38,28 @@
 #include <algorithm>
 #include <cmath>
 
+// Helper to compare intersection lines for caching
+static bool intersectionLinesEqual(const std::vector<IntersectionLine>& a,
+                                   const std::vector<IntersectionLine>& b)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    constexpr float epsilon = 1e-4f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        for (int j = 0; j < 2; ++j) {
+            const auto& wa = a[i].world[j];
+            const auto& wb = b[i].world[j];
+            if (std::abs(wa[0] - wb[0]) > epsilon ||
+                std::abs(wa[1] - wb[1]) > epsilon ||
+                std::abs(wa[2] - wb[2]) > epsilon) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void CVolumeViewer::renderIntersections()
 {
     if (!volume || !volume->zarrDataset() || !_surf)
@@ -101,14 +123,6 @@ void CVolumeViewer::renderIntersections()
         view_bbox.low -= cv::Vec3f(viewPadding, viewPadding, viewPadding);
         view_bbox.high += cv::Vec3f(viewPadding, viewPadding, viewPadding);
 
-        const SurfacePatchIndex* patchIndex =
-            _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (!patchIndex) {
-            clearAllIntersectionItems();
-            return;
-        }
-        const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
-
         using IntersectionCandidate = std::pair<std::string, QuadSurface*>;
         std::vector<IntersectionCandidate> intersectCandidates;
         intersectCandidates.reserve(_intersect_tgts.size());
@@ -139,6 +153,15 @@ void CVolumeViewer::renderIntersections()
         for (const auto& candidate : intersectCandidates) {
             targetSurfaces.insert(candidate.second);
         }
+
+        const SurfacePatchIndex* patchIndex =
+            _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        if (!patchIndex) {
+            clearAllIntersectionItems();
+            return;
+        }
+
+        const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
 
         std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
         patchIndex->queryTriangles(view_bbox, targetSurfaces, triangleCandidates);
@@ -182,6 +205,22 @@ void CVolumeViewer::renderIntersections()
                 line.surfaceParams[1] = segment->surfaceParams[1];
                 intersectionLines.push_back(std::move(line));
             }
+
+            // Check if intersection lines match cached - if so, skip expensive recreation
+            auto cachedIt = _cachedIntersectionLines.find(key);
+            const bool hasCache = cachedIt != _cachedIntersectionLines.end();
+            const bool hasExistingItems = _intersect_items.count(key) && !_intersect_items[key].empty();
+            if (hasCache && hasExistingItems && intersectionLinesEqual(intersectionLines, cachedIt->second)) {
+                // Lines unchanged - just update opacity on existing items and continue
+                for (auto* item : _intersect_items[key]) {
+                    item->setOpacity(_intersectionOpacity);
+                }
+                ++colorIndex;
+                continue;
+            }
+
+            // Update cache
+            _cachedIntersectionLines[key] = intersectionLines;
 
             QColor col;
             float width = 3;
@@ -363,6 +402,7 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
             }
         }
         _intersect_items.clear();
+        _cachedIntersectionLines.clear();
     }
     else if (_intersect_items.count(name)) {
         for(auto &item : _intersect_items[name]) {
@@ -370,6 +410,7 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
             delete item;
         }
         _intersect_items.erase(name);
+        _cachedIntersectionLines.erase(name);
     }
 }
 

@@ -103,9 +103,11 @@ signals:
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
-    void handleSurfaceChanged(std::string name, Surface* surf);
+    void handleSurfaceChanged(std::string name, Surface* surf, bool isEditUpdate = false);
 
 private:
+    bool updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate);
+
     CSurfaceCollection* _surfaces;
     VCCollection* _points;
     ChunkCache<uint8_t>* _chunkCache;

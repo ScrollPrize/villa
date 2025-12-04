@@ -496,6 +496,7 @@ void SegmentationPushPullTool::stop(int direction)
 
 void SegmentationPushPullTool::stopAll()
 {
+    const bool wasActive = _state.active;
     _state.active = false;
     _state.direction = 0;
     if (_timer && _timer->isActive()) {
@@ -506,6 +507,13 @@ void SegmentationPushPullTool::stopAll()
     _activeAlphaEnabled = false;
     if (_module._activeFalloff == SegmentationModule::FalloffTool::PushPull) {
         _module.useFalloff(SegmentationModule::FalloffTool::Drag);
+    }
+
+    // Trigger final surface update after all push/pull steps are complete.
+    // This is the batched update - individual steps only accumulate dirty bounds.
+    if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
+        _editManager->ensureDirtyBounds();
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
     }
 }
 
@@ -768,9 +776,9 @@ bool SegmentationPushPullTool::applyStepInternal()
     _editManager->commitActiveDrag();
     _editManager->applyPreview();
 
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
-    }
+    // Accumulate dirty bounds during push/pull steps, but don't trigger the full
+    // signal cascade on every step. setSurface() is called once in stopAll().
+    _editManager->ensureDirtyBounds();
 
     _module.refreshOverlay();
     _module.emitPendingChanges();

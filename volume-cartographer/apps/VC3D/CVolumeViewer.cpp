@@ -686,14 +686,17 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
         markActiveSegmentationDirty();
     }
 
+    // Track whether we need to re-render intersections (debounce multiple triggers)
+    bool needsIntersectionUpdate = false;
+
     // When active segmentation changes, force re-render of intersections
     // so the highlight colors update immediately (old segment loses highlight,
     // new segment gains it)
     // Skip if _intersect_tgts contains "segmentation" since it will be handled
     // by the intersection target logic below (avoids create-delete-create race
     // that can confuse Qt's scene invalidation)
-    if (name == "segmentation")  {
-        renderIntersections();
+    if (name == "segmentation" && !_intersect_tgts.count("segmentation")) {
+        needsIntersectionUpdate = true;
     }
 
     if (_surf_name == name) {
@@ -702,6 +705,7 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
             clearAllOverlayGroups();
             fScene->clear();
             _intersect_items.clear();
+            _cachedIntersectionLines.clear();
             slice_vis_items.clear();
             _paths.clear();
             emit overlaysUpdated();
@@ -725,11 +729,16 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
         renderVisible(true); // Immediate render of slice
         // When the slice plane itself moves, re-render intersections since
         // the view_bbox will be at the new position
-        renderIntersections();
+        needsIntersectionUpdate = true;
     }
 
     if (_intersect_tgts.count(name)) {
         invalidateIntersect(name);
+        needsIntersectionUpdate = true;
+    }
+
+    // Single renderIntersections() call to avoid create-delete-create race
+    if (needsIntersectionUpdate) {
         renderIntersections();
     }
 
@@ -1281,6 +1290,7 @@ void CVolumeViewer::onVolumeClosing()
         }
         // Clear all item collections
         _intersect_items.clear();
+        _cachedIntersectionLines.clear();
         slice_vis_items.clear();
         _paths.clear();
         emit overlaysUpdated();

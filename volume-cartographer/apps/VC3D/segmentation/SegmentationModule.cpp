@@ -1180,9 +1180,10 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
     _drag.lastWorld = worldPos;
     _drag.moved = true;
 
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
-    }
+    // Accumulate dirty bounds during drag, but don't trigger the full signal cascade
+    // on every mouse move. The overlay will update (showing vertex positions),
+    // and the full intersection/R-tree update will happen in finishDrag().
+    _editManager->ensureDirtyBounds();
 
     refreshOverlay();
     emitPendingChanges();

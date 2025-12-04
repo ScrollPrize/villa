@@ -110,6 +110,13 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (reload) {
+        // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
+        if (_surfaces) {
+            auto names = _surfaces->surfaceNames();
+            for (const auto& name : names) {
+                _surfaces->setSurface(name, nullptr, true, false);
+            }
+        }
         _volumePkg->unloadAllSurfaces();
     }
 

@@ -195,6 +195,10 @@ void SegmentationEditManager::applyPreview()
         return;
     }
 
+    if (_editedBounds) {
+        publishDirtyBounds(*_editedBounds);
+    }
+
     if (_originalPoints) {
         _previewPoints->copyTo(*_originalPoints);
     }
@@ -204,6 +208,44 @@ void SegmentationEditManager::applyPreview()
     clearActiveDrag();
     _editedBounds.reset();
     _dirty = false;
+}
+
+void SegmentationEditManager::ensureDirtyBounds()
+{
+    if (!_baseSurface) {
+        return;
+    }
+
+    ensureSurfaceMetaObject(_baseSurface);
+    auto& meta = *_baseSurface->meta;
+
+    // Get new bounds from recent touched or edited bounds
+    std::optional<cv::Rect> newBounds;
+    if (auto bounds = recentTouchedBounds()) {
+        newBounds = bounds;
+    } else if (_editedBounds) {
+        newBounds = _editedBounds;
+    }
+
+    if (!newBounds) {
+        return;
+    }
+
+    // If existing bounds are valid, union them with new bounds
+    if (meta.contains("dirty_bounds") && meta["dirty_bounds"].is_object()) {
+        const auto& b = meta["dirty_bounds"];
+        const int rs = b.value("row_start", -1);
+        const int re = b.value("row_end", -1);
+        const int cs = b.value("col_start", -1);
+        const int ce = b.value("col_end", -1);
+        if (rs >= 0 && cs >= 0 && re > rs && ce > cs) {
+            // Union with existing bounds
+            cv::Rect existing(cs, rs, ce - cs, re - rs);
+            *newBounds = existing | *newBounds;
+        }
+    }
+
+    publishDirtyBounds(*newBounds);
 }
 
 void SegmentationEditManager::refreshFromBaseSurface()
