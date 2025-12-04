@@ -181,7 +181,6 @@ void CVolumeViewer::renderIntersections()
             }
         }
 
-        size_t colorIndex = 0;
         for (const auto& candidate : intersectCandidates) {
             const auto& key = candidate.first;
             QuadSurface* segmentation = candidate.second;
@@ -230,7 +229,6 @@ void CVolumeViewer::renderIntersections()
                 for (auto* item : _intersect_items[key]) {
                     item->setOpacity(_intersectionOpacity);
                 }
-                ++colorIndex;
                 continue;
             }
 
@@ -242,41 +240,68 @@ void CVolumeViewer::renderIntersections()
             int z_value = 5;
 
             static const QColor palette[] = {
-                QColor(50, 150, 255),   // sky blue (was red)
-                QColor(150, 50, 200),   // violet (was orange)
-                QColor(50, 220, 180),   // aqua (was yellow)
-                QColor(128, 255, 50),
-                QColor(50, 255, 83),
-                QColor(50, 255, 193),
-                QColor(50, 206, 255),
-                QColor(50, 95, 255),
-                QColor(116, 50, 255),
-                QColor(226, 50, 255),
-                QColor(255, 50, 173),
-                QColor(0, 200, 150),    // teal (was red-ish)
-                QColor(100, 180, 255),  // light blue (was orange-ish)
-                QColor(180, 100, 220),  // light purple (was yellow-ish)
-                QColor(140, 255, 50),
-                QColor(50, 255, 71),
-                QColor(50, 255, 181),
-                QColor(50, 218, 255),
-                QColor(50, 108, 255),
-                QColor(104, 50, 255),
-                QColor(214, 50, 255),
-                QColor(255, 50, 185),
-                QColor(50, 180, 130),   // sea green (was red-ish)
-                QColor(130, 100, 255),  // periwinkle (was orange-ish)
-                QColor(255, 100, 200),  // pink (was yellow-ish)
-                QColor(153, 255, 50),
-                QColor(50, 255, 59),
-                QColor(50, 255, 169),
-                QColor(50, 230, 255),
-                QColor(50, 120, 255),
-                QColor(91, 50, 255),
-                QColor(201, 50, 255),
+                // Vibrant saturated colors
+                QColor(80, 180, 255),   // sky blue
+                QColor(180, 80, 220),   // violet
+                QColor(80, 220, 200),   // aqua/teal
+                QColor(220, 80, 180),   // magenta
+                QColor(80, 130, 255),   // medium blue
+                QColor(160, 80, 255),   // purple
+                QColor(80, 255, 220),   // cyan
+                QColor(255, 80, 200),   // hot pink
+                QColor(120, 220, 80),   // lime green
+                QColor(80, 180, 120),   // spring green
+
+                // Lighter/pastel variants
+                QColor(150, 200, 255),  // light sky blue
+                QColor(200, 150, 230),  // light violet
+                QColor(150, 230, 210),  // light aqua
+                QColor(230, 150, 200),  // light magenta
+                QColor(150, 170, 255),  // light blue
+                QColor(190, 150, 255),  // light purple
+                QColor(150, 255, 230),  // light cyan
+                QColor(255, 150, 210),  // light pink
+                QColor(180, 240, 150),  // light lime
+                QColor(150, 230, 170),  // light spring green
+
+                // Deeper/darker variants
+                QColor(50, 120, 200),   // deep blue
+                QColor(140, 50, 180),   // deep violet
+                QColor(50, 180, 160),   // deep teal
+                QColor(180, 50, 140),   // deep magenta
+                QColor(50, 90, 200),    // navy blue
+                QColor(120, 50, 200),   // deep purple
+                QColor(50, 200, 180),   // deep cyan
+                QColor(200, 50, 160),   // deep pink
+                QColor(80, 160, 60),    // forest green
+                QColor(50, 140, 100),   // deep sea green
+
+                // Extra variations with different saturation
+                QColor(100, 160, 220),  // muted blue
+                QColor(160, 100, 200),  // muted violet
+                QColor(100, 200, 180),  // muted teal
+                QColor(200, 100, 170),  // muted magenta
+                QColor(120, 180, 240),  // soft blue
+                QColor(180, 120, 220),  // soft purple
+                QColor(120, 220, 200),  // soft cyan
+                QColor(220, 120, 190),  // soft pink
+                QColor(140, 200, 100),  // soft lime
+                QColor(100, 180, 130),  // muted green
             };
+
+            // Persistent color assignment: once a surface gets a color, it keeps it (up to 500 surfaces)
+            size_t colorIndex;
+            auto colorIt = _surfaceColorAssignments.find(key);
+            if (colorIt != _surfaceColorAssignments.end()) {
+                colorIndex = colorIt->second;
+            } else if (_surfaceColorAssignments.size() < 500) {
+                colorIndex = _nextColorIndex++;
+                _surfaceColorAssignments[key] = colorIndex;
+            } else {
+                // Over 500 surfaces - fall back to hash-based assignment
+                colorIndex = std::hash<std::string>{}(key);
+            }
             col = palette[colorIndex % std::size(palette)];
-            ++colorIndex;
 
             const bool isActiveSegmentation =
                 activeSegSurface && segmentation == activeSegSurface;

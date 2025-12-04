@@ -285,6 +285,10 @@ protected:
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::unordered_set<std::string> _highlightedSurfaceIds;
+
+    // Persistent color assignments for intersection rendering (up to 500 surfaces)
+    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
+    size_t _nextColorIndex{0};
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;
