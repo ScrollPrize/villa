@@ -414,6 +414,21 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
         }
         renderVisible();
         emit overlaysUpdated();
+
+        // Update center marker position after zoom for QuadSurface
+        if (_center_marker && _center_marker->isVisible()) {
+            if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
+                POI* focus = _surf_col->poi("focus");
+                if (focus) {
+                    auto ptr = quad->pointer();
+                    float dist = quad->pointTo(ptr, focus->p, 4.0, 100);
+                    if (dist < 4.0) {
+                        cv::Vec3f sp = quad->loc(ptr) * _scale;
+                        _center_marker->setPos(sp[0], sp[1]);
+                    }
+                }
+            }
+        }
     }
 
     _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
@@ -808,8 +823,7 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
             if (dist < 4.0) {
                 cv::Vec3f sp = quad->loc(ptr) * _scale;
                 if (_center_marker) {
-                    QPointF parentOffset = fBaseImageItem->offset();
-                    _center_marker->setPos(sp[0] - parentOffset.x(), sp[1] - parentOffset.y());
+                    _center_marker->setPos(sp[0], sp[1]);
                     _center_marker->show();
                 }
                 fGraphicsView->centerOn(sp[0], sp[1]);
