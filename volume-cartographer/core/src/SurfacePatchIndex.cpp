@@ -524,6 +524,10 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
             }
             auto& mask = impl_->ensureMask(cell.first.surface);
             mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);
+            // Cache entry for correct removal during incremental updates
+            if (cell.second.hasPatch) {
+                mask.storeEntry(cell.first.rowIndex(), cell.first.colIndex(), *cell.second.patch);
+            }
         }
     }
 
