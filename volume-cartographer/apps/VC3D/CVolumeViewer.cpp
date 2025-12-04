@@ -808,7 +808,8 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
             if (dist < 4.0) {
                 cv::Vec3f sp = quad->loc(ptr) * _scale;
                 if (_center_marker) {
-                    _center_marker->setPos(sp[0], sp[1]);
+                    QPointF parentOffset = fBaseImageItem->offset();
+                    _center_marker->setPos(sp[0] - parentOffset.x(), sp[1] - parentOffset.y());
                     _center_marker->show();
                 }
                 fGraphicsView->centerOn(sp[0], sp[1]);
