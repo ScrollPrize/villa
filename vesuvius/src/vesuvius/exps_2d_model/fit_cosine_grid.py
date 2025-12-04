@@ -301,6 +301,7 @@ def fit_cosine_grid(
 	unet_checkpoint: str | None = None,
 	unet_layer: int | None = None,
 	unet_crop: int = 8,
+	crop: tuple[int, int, int, int] | None = None,
 	compile_model: bool = False,
 	final_float: bool = False,
 ) -> None:
@@ -334,64 +335,118 @@ def fit_cosine_grid(
     unet_mag_img: torch.Tensor | None = None
  
     # Image we sample from (source resolution).
-    if unet_checkpoint is not None:
-        # Use UNet inference on the specified TIFF layer, then fit the cosine grid
-        # directly to the UNet cosine output (channel 0).
-        raw_layer = load_tiff_layer(
-            image_path,
-            torch_device,
-            layer=unet_layer if unet_layer is not None else 0,
-        )
-        unet_model = load_unet(
-            device=torch_device,
-            weights=unet_checkpoint,
-            in_channels=1,
-            out_channels=3,
-            base_channels=32,
-            num_levels=6,
-            max_channels=1024,
-        )
-        unet_model.eval()
-        with torch.no_grad():
-            pred_unet = unet_model(raw_layer)
-
-        # Optional spatial crop after UNet inference, before any downscaling.
-        if unet_crop is not None and unet_crop > 0:
-            c = int(unet_crop)
-            _, _, h_u, w_u = pred_unet.shape
-            if h_u > 2 * c and w_u > 2 * c:
-                pred_unet = pred_unet[:, :, c:-c, c:-c]
-
-        # Optionally visualize all three UNet outputs at the beginning (after crop).
-        if output_prefix is not None:
-            p = Path(output_prefix)
-            unet_np = pred_unet[0].detach().cpu().numpy()  # (3,H,W)
-            cos_np = unet_np[0]
-            mag_np = unet_np[1]
-            dir_np = unet_np[2]
-            tifffile.imwrite(f"{p}_unet_cos.tif", cos_np.astype("float32"), compression="lzw")
-            tifffile.imwrite(f"{p}_unet_mag.tif", mag_np.astype("float32"), compression="lzw")
-            tifffile.imwrite(f"{p}_unet_dir.tif", dir_np.astype("float32"), compression="lzw")
-
-        # Cosine output (channel 0) is the main intensity target for the fit.
-        image = torch.clamp(pred_unet[:, 0:1], 0.0, 1.0)
-        # Magnitude branch (channel 1) encodes gradient magnitude; kept for period-sum loss.
-        unet_mag_img = torch.clamp(pred_unet[:, 1:2], 0.0, 1.0)
-        # Direction branch (channel 2) encodes 0.5 + 0.5*cos(2*theta); we keep it
-        # for an auxiliary directional loss in sample space.
-        unet_dir_img = torch.clamp(pred_unet[:, 2:3], 0.0, 1.0)
+    p_input = Path(image_path)
+    if p_input.is_dir():
+    	# Directory mode: interpret --input as a directory containing precomputed
+    	# tiled UNet outputs (_cos/_mag/_dir). In this mode no UNet checkpoint
+    	# should be provided.
+    	if unet_checkpoint is not None:
+    		raise ValueError(
+    			"When --input is a directory, --unet-checkpoint must not be set; "
+    			"pass the directory with tiled UNet outputs as --input and omit "
+    			"--unet-checkpoint."
+    		)
+    
+    	# There should be exactly one cosine TIFF in the directory. We ignore
+    	# --layer here and always use that single *_cos.tif as the intensity
+    	# source, together with its matching *_mag/_dir files.
+    	cos_files = sorted(p_input.glob("*_cos.tif"))
+    	if len(cos_files) != 1:
+    		raise ValueError(
+    			f"Expected exactly one *_cos.tif in directory {p_input}, "
+    			f"found {len(cos_files)}."
+    		)
+    
+    	cos_path = cos_files[0]
+    	base_stem = cos_path.stem
+    	if base_stem.endswith("_cos"):
+    		base_stem = base_stem[:-4]
+    	mag_path = cos_path.with_name(f"{base_stem}_mag.tif")
+    	dir_path = cos_path.with_name(f"{base_stem}_dir.tif")
+    
+    	cos_np = tifffile.imread(str(cos_path)).astype("float32")
+    	mag_np = tifffile.imread(str(mag_path)).astype("float32")
+    	dir_np = tifffile.imread(str(dir_path)).astype("float32")
+    
+    	cos_t = torch.from_numpy(cos_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    	mag_t = torch.from_numpy(mag_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    	dir_t = torch.from_numpy(dir_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    
+    	image = torch.clamp(cos_t, 0.0, 1.0)
+    	unet_mag_img = torch.clamp(mag_t, 0.0, 1.0)
+    	unet_dir_img = torch.clamp(dir_t, 0.0, 1.0)
+    elif unet_checkpoint is not None:
+    	# Use UNet inference on the specified TIFF layer, then fit the cosine grid
+    	# directly to the UNet cosine output (channel 0).
+    	raw_layer = load_tiff_layer(
+    		image_path,
+    		torch_device,
+    		layer=unet_layer if unet_layer is not None else 0,
+    	)
+    	unet_model = load_unet(
+    		device=torch_device,
+    		weights=unet_checkpoint,
+    		in_channels=1,
+    		out_channels=3,
+    		base_channels=32,
+    		num_levels=6,
+    		max_channels=1024,
+    	)
+    	unet_model.eval()
+    	with torch.no_grad():
+    		pred_unet = unet_model(raw_layer)
+    
+    	# Optional spatial crop after UNet inference, before any downscaling.
+    	if unet_crop is not None and unet_crop > 0:
+    		c = int(unet_crop)
+    		_, _, h_u, w_u = pred_unet.shape
+    		if h_u > 2 * c and w_u > 2 * c:
+    			pred_unet = pred_unet[:, :, c:-c, c:-c]
+    
+    	# Optionally visualize all three UNet outputs at the beginning (after crop).
+    	if output_prefix is not None:
+    		p = Path(output_prefix)
+    		unet_np = pred_unet[0].detach().cpu().numpy()  # (3,H,W)
+    		cos_np = unet_np[0]
+    		mag_np = unet_np[1]
+    		dir_np = unet_np[2]
+    		tifffile.imwrite(f"{p}_unet_cos.tif", cos_np.astype("float32"), compression="lzw")
+    		tifffile.imwrite(f"{p}_unet_mag.tif", mag_np.astype("float32"), compression="lzw")
+    		tifffile.imwrite(f"{p}_unet_dir.tif", dir_np.astype("float32"), compression="lzw")
+    
+    	# Cosine output (channel 0) is the main intensity target for the fit.
+    	image = torch.clamp(pred_unet[:, 0:1], 0.0, 1.0)
+    	# Magnitude branch (channel 1) encodes gradient magnitude; kept for period-sum loss.
+    	unet_mag_img = torch.clamp(pred_unet[:, 1:2], 0.0, 1.0)
+    	# Direction branch (channel 2) encodes 0.5 + 0.5*cos(2*theta); we keep it
+    	# for an auxiliary directional loss in sample space.
+    	unet_dir_img = torch.clamp(pred_unet[:, 2:3], 0.0, 1.0)
     else:
-        # If a specific TIFF layer is requested, mirror the UNet branch behavior
-        # and load only that layer; otherwise fall back to generic image loading.
-        if unet_layer is not None:
-            image = load_tiff_layer(
-                image_path,
-                torch_device,
-                layer=unet_layer,
-            )
-        else:
-            image = load_image(image_path, torch_device)
- 
+    	# If a specific TIFF layer is requested, mirror the UNet branch behavior
+    	# and load only that layer; otherwise fall back to generic image loading.
+    	if unet_layer is not None:
+    		image = load_tiff_layer(
+    			image_path,
+    			torch_device,
+    			layer=unet_layer,
+    		)
+    	else:
+    		image = load_image(image_path, torch_device)
+    
+    # Optional spatial crop on the source image/UNet outputs before any downscaling.
+    if crop is not None:
+    	x, y, w_c, h_c = (int(v) for v in crop)
+    	_, _, h_img0, w_img0 = image.shape
+    	x0 = max(0, min(x, w_img0))
+    	y0 = max(0, min(y, h_img0))
+    	x1 = max(x0, min(x + w_c, w_img0))
+    	y1 = max(y0, min(y + h_c, h_img0))
+    	image = image[:, :, y0:y1, x0:x1]
+    	if unet_dir_img is not None:
+    		unet_dir_img = unet_dir_img[:, :, y0:y1, x0:x1]
+    	if unet_mag_img is not None:
+    		unet_mag_img = unet_mag_img[:, :, y0:y1, x0:x1]
+    
     # Optionally downscale the image used for fitting before we derive any geometry
     # from it. From this point on, only the (possibly downscaled) size is used.
     if img_downscale_factor is not None and img_downscale_factor > 1.0:
@@ -2030,8 +2085,16 @@ def fit_cosine_grid(
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser("Fit 2D cosine grid to an image")
-    parser.add_argument("--image", type=str, required=True, help="Path to input image (TIFF).")
+    parser = argparse.ArgumentParser("Fit 2D cosine grid to an image or tiled UNet outputs")
+    parser.add_argument(
+    	"--input",
+    	type=str,
+    	required=True,
+    	help=(
+    		"Path to input TIFF image (stack) or directory containing precomputed "
+    		"tiled UNet outputs (_cos/_mag/_dir)."
+    	),
+    )
     parser.add_argument(
         "--steps",
         type=int,
@@ -2094,20 +2157,25 @@ def main() -> None:
         help="Downscale factor for internal resolution relative to avg image size.",
     )
     parser.add_argument(
-        "--unet-checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Path to UNet checkpoint. If set, run UNet on the specified TIFF "
-            "layer and fit the cosine grid to its channel-0 output instead of "
-            "the raw image."
-        ),
+    	"--unet-checkpoint",
+    	type=str,
+    	default=None,
+    	help=(
+    		"Path to UNet checkpoint (.pt). If set, run UNet on the specified TIFF "
+    		"layer from --input (when it is a TIFF file) and fit the cosine grid "
+    		"to its channel-0 output. Must not be set when --input is a directory "
+    		"of precomputed tiled UNet outputs."
+    	),
     )
     parser.add_argument(
-        "--layer",
-        type=int,
-        default=None,
-        help="Layer index of the input TIFF stack to use with --unet-checkpoint.",
+    	"--layer",
+    	type=int,
+    	default=None,
+    	help=(
+    		"Layer index of the input TIFF stack (when --input is a file), or the "
+    		"layer suffix to select in a directory of tiled UNet outputs "
+    		"(filenames of the form *_layerXXXX_{cos,mag,dir}.tif)."
+    	),
     )
     parser.add_argument(
         "--center",
@@ -2186,6 +2254,14 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-prefix", type=str, default=None)
     parser.add_argument(
+    	"--crop",
+    	type=int,
+    	nargs=4,
+    	metavar=("X", "Y", "W", "H"),
+    	default=None,
+    	help="Optional crop rectangle in pixels (x,y,w,h) applied before fitting.",
+    )
+    parser.add_argument(
         "--snapshot",
         type=int,
         default=None,
@@ -2206,7 +2282,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     fit_cosine_grid(
-    	image_path=args.image,
+    	image_path=args.input,
     	steps=args.steps,
     	steps_stage1=args.steps_stage1,
     	steps_stage2=args.steps_stage2,
@@ -2238,6 +2314,7 @@ def main() -> None:
     	unet_checkpoint=args.unet_checkpoint,
     	unet_layer=args.layer,
     	unet_crop=args.unet_crop,
+    	crop=tuple(args.crop) if args.crop is not None else None,
     	compile_model=args.compile_model,
     	final_float=args.final_float,
     )
