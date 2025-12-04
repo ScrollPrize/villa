@@ -218,8 +218,8 @@ bool SegmentationModule::ensureHoverTarget()
     if (!_editManager || !_editManager->hasSession()) {
         return false;
     }
-    if (_hoverPreviewEnabled) {
-        return _hover.valid;
+    if (_hoverPreviewEnabled && _hover.valid) {
+        return true;
     }
     if (!_hoverPointer.valid) {
         return false;
