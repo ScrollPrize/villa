@@ -2008,7 +2008,7 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
         Logger()->error("Cannot open .volpkg: {}", nVpkgPath);
         QMessageBox::warning(
             this, "Error",
-            "Volume package failed to load. Package might be corrupt.");
+            "Volume package failed to load. Package might be corrupt. Check the console log for a detailed error message.");
         return false;
     }
     return true;
