@@ -755,13 +755,18 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(QuadSurface* surface)
     }
 
     SurfaceCellMask& mask = it->second;
-    for (int row = 0; row < mask.rows; ++row) {
-        for (int col = 0; col < mask.cols; ++col) {
-            if (mask.isActive(row, col)) {
-                removeCellEntry(mask, surface, row, col);
+
+    // Iterate only over cached entries instead of entire grid (O(active) vs O(rows*cols))
+    if (tree && !mask.cachedEntries.empty()) {
+        for (const auto& [idx, entry] : mask.cachedEntries) {
+            if (tree->remove(entry) && patchCount > 0) {
+                --patchCount;
             }
         }
     }
+
+    // Clear the mask entirely (faster than individual eraseEntry calls)
+    mask.clear();
     surfaceCellRecords.erase(it);
 
     if (tree && patchCount == 0) {

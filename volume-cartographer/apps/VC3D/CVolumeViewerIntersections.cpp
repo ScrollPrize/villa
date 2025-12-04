@@ -167,17 +167,18 @@ void CVolumeViewer::renderIntersections()
 
         const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
 
-        std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
-        patchIndex->queryTriangles(view_bbox, targetSurfaces, triangleCandidates);
+        // Use member buffers to preserve capacity across frames
+        patchIndex->queryTriangles(view_bbox, targetSurfaces, _triangleCandidates);
 
-        std::unordered_map<QuadSurface*, std::vector<size_t>> trianglesBySurface;
-        trianglesBySurface.reserve(intersectCandidates.size());
-        for (size_t idx = 0; idx < triangleCandidates.size(); ++idx) {
-            auto* surface = triangleCandidates[idx].surface;
-            if (!surface) {
-                continue;
+        // Clear and rebuild surface mapping (reuses allocated vectors)
+        for (auto& [surf, indices] : _trianglesBySurface) {
+            indices.clear();
+        }
+        for (size_t idx = 0; idx < _triangleCandidates.size(); ++idx) {
+            auto* surface = _triangleCandidates[idx].surface;
+            if (surface) {
+                _trianglesBySurface[surface].push_back(idx);
             }
-            trianglesBySurface[surface].push_back(idx);
         }
 
         size_t colorIndex = 0;
@@ -185,8 +186,8 @@ void CVolumeViewer::renderIntersections()
             const auto& key = candidate.first;
             QuadSurface* segmentation = candidate.second;
 
-            const auto trianglesIt = trianglesBySurface.find(segmentation);
-            if (trianglesIt == trianglesBySurface.end()) {
+            const auto trianglesIt = _trianglesBySurface.find(segmentation);
+            if (trianglesIt == _trianglesBySurface.end()) {
                 removeItemsForKey(key);
                 continue;
             }
@@ -199,7 +200,7 @@ void CVolumeViewer::renderIntersections()
 
             #pragma omp parallel for schedule(dynamic, 64)
             for (size_t k = 0; k < numCandidates; ++k) {
-                const auto& triCandidate = triangleCandidates[candidateIndices[k]];
+                const auto& triCandidate = _triangleCandidates[candidateIndices[k]];
                 auto segment = SurfacePatchIndex::clipTriangleToPlane(triCandidate, *plane, clipTolerance);
                 if (segment) {
                     IntersectionLine line;
@@ -310,8 +311,24 @@ void CVolumeViewer::renderIntersections()
                 approvalOffsetY = center[1] * scale[1];
             }
 
-            std::vector<QGraphicsItem*> items;
-            items.reserve(intersectionLines.size());
+            // Batch lines by style (color/width/z) to reduce QGraphicsItem count
+            struct LineStyle {
+                QColor color;
+                float width;
+                int z;
+                bool operator==(const LineStyle& o) const {
+                    return color == o.color && width == o.width && z == o.z;
+                }
+            };
+            struct LineStyleHash {
+                size_t operator()(const LineStyle& s) const {
+                    return std::hash<int>()(s.color.rgba()) ^
+                           std::hash<int>()(static_cast<int>(s.width * 100)) ^
+                           std::hash<int>()(s.z);
+                }
+            };
+            std::unordered_map<LineStyle, QPainterPath, LineStyleHash> batchedPaths;
+
             for (const auto& line : intersectionLines) {
                 // Determine color and width based on approval status
                 QColor lineColor = col;
@@ -319,37 +336,29 @@ void CVolumeViewer::renderIntersections()
                 int lineZ = z_value;
 
                 if (checkApproval) {
-                    // surfaceParams stores ptr-space coordinates: (absX - center[0]*scale[0], absY - center[1]*scale[1], 0)
-                    // We need to convert back to absolute grid indices
-                    // ptr = abs - center * scale, so abs = ptr + center * scale
                     const float absCol0 = line.surfaceParams[0][0] + approvalOffsetX;
                     const float absRow0 = line.surfaceParams[0][1] + approvalOffsetY;
                     const float absCol1 = line.surfaceParams[1][0] + approvalOffsetX;
                     const float absRow1 = line.surfaceParams[1][1] + approvalOffsetY;
 
-                    // Use bilinear interpolation for sub-pixel accuracy
                     int status0 = 0, status1 = 0;
                     const float intensity0 = segOverlay->queryApprovalBilinear(absRow0, absCol0, &status0);
                     const float intensity1 = segOverlay->queryApprovalBilinear(absRow1, absCol1, &status1);
 
-                    // Use max status for color, average intensity for blending
                     const int approvalState = std::max(status0, status1);
                     const float approvalIntensity = std::max(intensity0, intensity1);
 
                     if (approvalState > 0 && approvalIntensity > 0.0f) {
-                        // Select base color based on status
                         QColor baseColor;
                         if (approvalState == 3) {
-                            baseColor = COLOR_PENDING_UNAPPROVE;  // Red for pending unapproval
+                            baseColor = COLOR_PENDING_UNAPPROVE;
                         } else if (approvalState == 2) {
-                            baseColor = COLOR_PENDING;  // Blue for pending approval
+                            baseColor = COLOR_PENDING;
                         } else {
-                            baseColor = COLOR_APPROVED;  // Green for saved
+                            baseColor = COLOR_APPROVED;
                         }
 
-                        // Blend the color based on bilinear intensity (smooth edges)
-                        // At edges (low intensity), blend toward the original line color
-                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);  // Scale up for faster transition
+                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);
                         lineColor = QColor(
                             static_cast<int>(col.red() * (1.0f - blendFactor) + baseColor.red() * blendFactor),
                             static_cast<int>(col.green() * (1.0f - blendFactor) + baseColor.green() * blendFactor),
@@ -357,25 +366,27 @@ void CVolumeViewer::renderIntersections()
                             baseColor.alpha()
                         );
 
-                        // Width scales with intensity for smoother edge appearance
                         const float extraWidth = 6.0f * blendFactor;
                         lineWidth = width + extraWidth;
                         lineZ = z_value + 5;
                     }
                 }
 
-                QPainterPath path;
-                bool first = true;
-                for (const auto& wp : line.world) {
-                    cv::Vec3f p = plane->project(wp, 1.0, _scale);
-                    if (first)
-                        path.moveTo(p[0], p[1]);
-                    else
-                        path.lineTo(p[0], p[1]);
-                    first = false;
-                }
-                auto* item = fGraphicsView->scene()->addPath(path, QPen(lineColor, lineWidth));
-                item->setZValue(lineZ);
+                // Add line to batched path for this style
+                LineStyle style{lineColor, lineWidth, lineZ};
+                QPainterPath& path = batchedPaths[style];
+                cv::Vec3f p0 = plane->project(line.world[0], 1.0, _scale);
+                cv::Vec3f p1 = plane->project(line.world[1], 1.0, _scale);
+                path.moveTo(p0[0], p0[1]);
+                path.lineTo(p1[0], p1[1]);
+            }
+
+            // Create one QGraphicsItem per style batch
+            std::vector<QGraphicsItem*> items;
+            items.reserve(batchedPaths.size());
+            for (const auto& [style, path] : batchedPaths) {
+                auto* item = fGraphicsView->scene()->addPath(path, QPen(style.color, style.width));
+                item->setZValue(style.z);
                 item->setOpacity(_intersectionOpacity);
                 if (fBaseImageItem) {
                     item->setParentItem(fBaseImageItem);
