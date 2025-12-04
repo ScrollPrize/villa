@@ -672,6 +672,13 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
         return false;
     }
 
+    // Pre-expand _editedBounds to cover entire smoothing region.
+    // This ensures R-tree updates include all affected cells, even those
+    // where individual vertex changes fall below the 1e-5 threshold.
+    for (const auto& key : regionVec) {
+        expandEditedBounds(key.row, key.col);
+    }
+
     std::unordered_map<GridKey, cv::Vec3f, GridKeyHash> currentValues;
     currentValues.reserve(regionVec.size());
     for (const auto& key : regionVec) {
@@ -1142,6 +1149,12 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
 
     GridKey key{row, col};
     const float delta = static_cast<float>(cv::norm(newWorld - original));
+
+    // Always expand dirty bounds when vertex is touched (needed for R-tree updates)
+    expandEditedBounds(row, col);
+    _dirty = true;
+
+    // But only track in _editedVertices if change is significant
     if (delta < 1e-4f) {
         _editedVertices.erase(key);
         return;
@@ -1156,9 +1169,6 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
             it->second.isGrowth = true;
         }
     }
-
-    expandEditedBounds(row, col);
-    _dirty = true;
 }
 
 void SegmentationEditManager::expandEditedBounds(int row, int col)

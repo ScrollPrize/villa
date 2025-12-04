@@ -533,8 +533,9 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     if (!_surfacePatchStrideUserSet) {
         int defaultStride;
         if (surfaceCount > 2500) {
-            // > 2500: build at 4x and keep at 4x
-            defaultStride = 4;
+            // > 2500: build at 8x initially, then refine to 4x
+            defaultStride = 8;
+            _targetRefinedStride = 4;
         } else if (surfaceCount >= 500) {
             // 500-2500: build at 4x initially, then refine to 2x
             defaultStride = 4;
@@ -545,6 +546,10 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         }
         setSurfacePatchSamplingStride(defaultStride, false);
     }
+
+    // Clear dirty flag since we're about to do an async build
+    // (prevents rebuildSurfacePatchIndexIfNeeded from triggering a synchronous build)
+    _surfacePatchIndexDirty = false;
 
     auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
     const int stride = _surfacePatchSamplingStride;

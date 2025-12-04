@@ -394,11 +394,10 @@ void CVolumeViewer::renderIntersections()
                 items.push_back(item);
             }
 
+            // Always remove old items before storing new ones (even if empty)
+            removeItemsForKey(key);
             if (!items.empty()) {
-                removeItemsForKey(key);
                 _intersect_items[key] = items;
-            } else {
-                removeItemsForKey(key);
             }
         }
 
