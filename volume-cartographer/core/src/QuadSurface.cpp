@@ -537,7 +537,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
             // Use nearest point as starting location hint
             cv::Vec3f hint_ptr{0, 0, 0};
             // Recursively call without indices to avoid infinite loop
-            float hint_dist = pointTo(hint_ptr, nearest->position, th, max_iters / 4, nullptr, nullptr);
+            float hint_dist = pointTo(hint_ptr, nearest->position, th, std::max(1, max_iters / 4), nullptr, nullptr);
             if (hint_dist >= 0 && hint_dist < min_dist) {
                 // Now search from this hint toward our actual target
                 loc = cv::Vec2f(hint_ptr[0], hint_ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
