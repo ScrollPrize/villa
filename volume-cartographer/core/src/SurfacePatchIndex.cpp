@@ -856,8 +856,8 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
         return std::nullopt;
     } else if (positive == 0 && negative == 0 && onPlane == 2) {
         // Edge on the plane; vertices already counted below.
-    } else if (positive == 0 || negative == 0) {
-        // Triangle is fully on one side of plane.
+    } else if ((positive == 0 || negative == 0) && onPlane == 0) {
+        // Triangle is fully on one side of plane (no vertices near it).
         return std::nullopt;
     }
 
