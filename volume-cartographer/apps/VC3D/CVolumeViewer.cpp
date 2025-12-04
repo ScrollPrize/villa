@@ -336,7 +336,7 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(_surf);
         int stepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
-        int adjustedSteps = (steps > 0) ? stepSize : -stepSize;
+        int adjustedSteps = steps * stepSize;
 
         if (_surf_name != "segmentation" && plane && _surf_col) {
             POI* focus = _surf_col->poi("focus");
