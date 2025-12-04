@@ -225,8 +225,9 @@ void CVolumeViewer::renderIntersections()
             const bool hasCache = cachedIt != _cachedIntersectionLines.end();
             const bool hasExistingItems = _intersect_items.count(key) && !_intersect_items[key].empty();
             if (hasCache && hasExistingItems && intersectionLinesEqual(intersectionLines, cachedIt->second)) {
-                // Lines unchanged - just update opacity on existing items and continue
+                // Lines unchanged - just update opacity and visibility on existing items and continue
                 for (auto* item : _intersect_items[key]) {
+                    item->setVisible(true);
                     item->setOpacity(_intersectionOpacity);
                 }
                 continue;
