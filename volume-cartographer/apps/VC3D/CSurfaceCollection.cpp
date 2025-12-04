@@ -36,6 +36,13 @@ void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool
     }
 }
 
+void CSurfaceCollection::emitSurfacesChanged()
+{
+    // Emit a signal to notify listeners that surfaces have been modified in batch.
+    // Use empty name and nullptr to indicate batch update.
+    sendSurfaceChanged("", nullptr, false);
+}
+
 void CSurfaceCollection::setPOI(const std::string &name, POI *poi)
 {
     _pois[name] = poi;
