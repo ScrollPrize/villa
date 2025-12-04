@@ -190,7 +190,7 @@ bool SegmentationBrushTool::applyPending(float dragRadiusSteps)
     }
 
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
     }
 
     _module.emitPendingChanges();

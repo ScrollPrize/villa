@@ -173,7 +173,14 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     if (event->key() == Qt::Key_T && event->modifiers() == Qt::NoModifier) {
-        onCorrectionsCreateRequested();
+        if (!_editingEnabled) {
+            setEditingEnabled(true);
+            if (_widget) {
+                _widget->setEditingEnabled(true);
+            }
+        } else {
+            setCorrectionsAnnotateMode(true, true);
+        }
         event->accept();
         return true;
     }

@@ -414,6 +414,21 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
         }
         renderVisible();
         emit overlaysUpdated();
+
+        // Update center marker position after zoom for QuadSurface
+        if (_center_marker && _center_marker->isVisible()) {
+            if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
+                POI* focus = _surf_col->poi("focus");
+                if (focus) {
+                    auto ptr = quad->pointer();
+                    float dist = quad->pointTo(ptr, focus->p, 4.0, 100);
+                    if (dist < 4.0) {
+                        cv::Vec3f sp = quad->loc(ptr) * _scale;
+                        _center_marker->setPos(sp[0], sp[1]);
+                    }
+                }
+            }
+        }
     }
 
     _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
@@ -665,10 +680,23 @@ void CVolumeViewer::fitSurfaceInView()
 }
 
 
-void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
+void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEditUpdate)
 {
     if (name == "segmentation" || name == _surf_name) {
         markActiveSegmentationDirty();
+    }
+
+    // Track whether we need to re-render intersections (debounce multiple triggers)
+    bool needsIntersectionUpdate = false;
+
+    // When active segmentation changes, force re-render of intersections
+    // so the highlight colors update immediately (old segment loses highlight,
+    // new segment gains it)
+    // Skip if _intersect_tgts contains "segmentation" since it will be handled
+    // by the intersection target logic below (avoids create-delete-create race
+    // that can confuse Qt's scene invalidation)
+    if (name == "segmentation" && !_intersect_tgts.count("segmentation")) {
+        needsIntersectionUpdate = true;
     }
 
     if (_surf_name == name) {
@@ -677,6 +705,7 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
             clearAllOverlayGroups();
             fScene->clear();
             _intersect_items.clear();
+            _cachedIntersectionLines.clear();
             slice_vis_items.clear();
             _paths.clear();
             emit overlaysUpdated();
@@ -686,7 +715,9 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
         }
         else {
             invalidateVis();
-            _z_off = 0.0f;
+            if (!isEditUpdate) {
+                _z_off = 0.0f;
+            }
             if (name == "segmentation" && _resetViewOnSurfaceChange) {
                 fitSurfaceInView();
             }
@@ -696,10 +727,18 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
     if (name == _surf_name) {
         curr_img_area = {0,0,0,0};
         renderVisible(true); // Immediate render of slice
+        // When the slice plane itself moves, re-render intersections since
+        // the view_bbox will be at the new position
+        needsIntersectionUpdate = true;
     }
 
     if (_intersect_tgts.count(name)) {
         invalidateIntersect(name);
+        needsIntersectionUpdate = true;
+    }
+
+    // Single renderIntersections() call to avoid create-delete-create race
+    if (needsIntersectionUpdate) {
         renderIntersections();
     }
 
@@ -1251,6 +1290,7 @@ void CVolumeViewer::onVolumeClosing()
         }
         // Clear all item collections
         _intersect_items.clear();
+        _cachedIntersectionLines.clear();
         slice_vis_items.clear();
         _paths.clear();
         emit overlaysUpdated();

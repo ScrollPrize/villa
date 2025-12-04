@@ -99,6 +99,7 @@ public:
     void resetPreview();
     void applyPreview();
     void refreshFromBaseSurface();
+    void ensureDirtyBounds();
 
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,

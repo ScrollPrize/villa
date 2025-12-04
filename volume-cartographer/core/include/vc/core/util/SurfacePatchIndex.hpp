@@ -21,13 +21,6 @@ public:
         float distance = -1.0f;
     };
 
-    struct PatchCandidate {
-        QuadSurface* surface = nullptr;
-        int i = 0;
-        int j = 0;
-        std::array<cv::Vec3f, 4> corners{};
-    };
-
     struct TriangleCandidate {
         QuadSurface* surface = nullptr;
         int i = 0;
@@ -60,12 +53,12 @@ public:
                                        float tolerance,
                                        QuadSurface* targetSurface = nullptr) const;
 
-    void queryBox(const Rect3D& bounds,
-                  QuadSurface* targetSurface,
-                  std::vector<PatchCandidate>& outCandidates) const;
-
     void queryTriangles(const Rect3D& bounds,
                         QuadSurface* targetSurface,
+                        std::vector<TriangleCandidate>& outCandidates) const;
+
+    void queryTriangles(const Rect3D& bounds,
+                        const std::unordered_set<QuadSurface*>& targetSurfaces,
                         std::vector<TriangleCandidate>& outCandidates) const;
 
     void forEachTriangle(const Rect3D& bounds,

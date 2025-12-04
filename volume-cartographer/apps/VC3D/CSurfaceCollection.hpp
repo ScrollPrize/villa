@@ -38,7 +38,8 @@ class CSurfaceCollection : public QObject
     
 public:
     ~CSurfaceCollection();
-    void setSurface(const std::string &name, Surface*, bool noSignalSend = false, bool takeOwnership = true);
+    void setSurface(const std::string &name, Surface*, bool noSignalSend = false, bool takeOwnership = true, bool isEditUpdate = false);
+    void emitSurfacesChanged();  // Emit signal to notify listeners of batch surface changes
     void setPOI(const std::string &name, POI *poi);
     Surface *surface(const std::string &name);
     POI *poi(const std::string &name);
@@ -48,7 +49,7 @@ public:
     std::vector<std::string> poiNames();
     
 signals:
-    void sendSurfaceChanged(std::string, Surface*);
+    void sendSurfaceChanged(std::string, Surface*, bool isEditUpdate = false);
     void sendPOIChanged(std::string, POI*);
     
 protected:

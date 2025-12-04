@@ -437,9 +437,12 @@ void ViewerManager::setVolumeWindow(float low, float high)
     emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
 
-void ViewerManager::setSurfacePatchSamplingStride(int stride)
+void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated)
 {
     stride = std::max(1, stride);
+    if (userInitiated) {
+        _surfacePatchStrideUserSet = true;
+    }
     if (_surfacePatchSamplingStride == stride) {
         return;
     }
@@ -458,6 +461,8 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride)
             viewer->setSurfacePatchSamplingStride(_surfacePatchSamplingStride);
         }
     }
+
+    emit samplingStrideChanged(_surfacePatchSamplingStride);
 }
 
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
@@ -521,9 +526,36 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         return;
     }
 
+    // Apply tiered default stride based on surface count (if not user-set)
+    const size_t surfaceCount = quadSurfaces.size();
+    _targetRefinedStride = 0;  // Reset refinement target
+
+    if (!_surfacePatchStrideUserSet) {
+        int defaultStride;
+        if (surfaceCount > 2500) {
+            // > 2500: build at 8x initially, then refine to 4x
+            defaultStride = 8;
+            _targetRefinedStride = 4;
+        } else if (surfaceCount >= 500) {
+            // 500-2500: build at 4x initially, then refine to 2x
+            defaultStride = 4;
+            _targetRefinedStride = 2;
+        } else {
+            // < 500: build at 2x and keep at 2x
+            defaultStride = 2;
+        }
+        setSurfacePatchSamplingStride(defaultStride, false);
+    }
+
+    // Clear dirty flag since we're about to do an async build
+    // (prevents rebuildSurfacePatchIndexIfNeeded from triggering a synchronous build)
+    _surfacePatchIndexDirty = false;
+
     auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
-    auto future = QtConcurrent::run([surfacesForTask]() mutable -> std::shared_ptr<SurfacePatchIndex> {
+    const int stride = _surfacePatchSamplingStride;
+    auto future = QtConcurrent::run([surfacesForTask, stride]() mutable -> std::shared_ptr<SurfacePatchIndex> {
         auto index = std::make_shared<SurfacePatchIndex>();
+        index->setSamplingStride(stride);
         index->rebuild(surfacesForTask);
         return index;
     });
@@ -579,12 +611,137 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _indexedSurfaces.clear();
     _indexedSurfaces.insert(_pendingSurfacePatchIndexSurfaces.begin(),
                             _pendingSurfacePatchIndexSurfaces.end());
-    _pendingSurfacePatchIndexSurfaces.clear();
     qCInfo(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
-                            << _indexedSurfaces.size() << "surfaces";
+                            << _indexedSurfaces.size() << "surfaces"
+                            << "at stride" << _surfacePatchSamplingStride;
+    forEachViewer([](CVolumeViewer* v) { v->renderIntersections(); });
+
+    // Check if progressive refinement is needed
+    if (_targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride) {
+        qCInfo(lcViewerManager) << "Starting progressive refinement from stride"
+                                << _surfacePatchSamplingStride << "to" << _targetRefinedStride;
+        const int targetStride = _targetRefinedStride;
+        _targetRefinedStride = 0;  // Clear target to prevent infinite loop
+        setSurfacePatchSamplingStride(targetStride, false);
+
+        // Trigger another async rebuild at the refined stride
+        auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
+        if (surfacesForTask.empty()) {
+            // Re-collect surfaces if needed
+            if (_surfaces) {
+                for (Surface* surf : _surfaces->surfaces()) {
+                    if (auto* quad = dynamic_cast<QuadSurface*>(surf)) {
+                        surfacesForTask.push_back(quad);
+                    }
+                }
+            }
+        }
+        _pendingSurfacePatchIndexSurfaces = surfacesForTask;
+
+        auto future = QtConcurrent::run([surfacesForTask, targetStride]() mutable -> std::shared_ptr<SurfacePatchIndex> {
+            auto index = std::make_shared<SurfacePatchIndex>();
+            index->setSamplingStride(targetStride);
+            index->rebuild(surfacesForTask);
+            return index;
+        });
+        _surfacePatchIndexWatcher->setFuture(future);
+    } else {
+        _pendingSurfacePatchIndexSurfaces.clear();
+    }
 }
 
-void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf)
+bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate)
+{
+    if (!quad) {
+        return false;
+    }
+
+    bool regionUpdated = false;
+    bool indexUpdated = false;
+
+    std::optional<cv::Rect> dirtyVertices;
+    bool dirtyBoundsRegressed = false;
+    const bool alreadyIndexed = _indexedSurfaces.count(quad) != 0;
+    if (auto dirtyInfo = readDirtyBounds(quad)) {
+        int lastVersion = 0;
+        auto it = _surfaceDirtyBoundsVersions.find(quad);
+        if (it != _surfaceDirtyBoundsVersions.end()) {
+            lastVersion = it->second;
+        }
+        if (dirtyInfo->version > lastVersion) {
+            dirtyVertices = dirtyInfo->rect;
+        } else if (dirtyInfo->version < lastVersion) {
+            dirtyBoundsRegressed = true;
+        }
+        _surfaceDirtyBoundsVersions[quad] = dirtyInfo->version;
+    } else {
+        _surfaceDirtyBoundsVersions.erase(quad);
+    }
+
+    // Fast-path: already indexed, nothing dirty, and global index is clean.
+    // Note: We no longer force full rebuild just because isEditUpdate=true without dirty bounds.
+    // If no dirty bounds are provided, we trust the existing index is still valid.
+    if (!_surfacePatchIndexDirty && alreadyIndexed && !dirtyVertices && !dirtyBoundsRegressed) {
+        return true; // Index already up-to-date for this surface.
+    }
+
+    bool skippedDueToExistingIndex = false;
+    if (!_surfacePatchIndexDirty) {
+        if (dirtyVertices) {
+            if (auto cellRegion = vertexRectToCellRegion(*dirtyVertices, quad)) {
+                regionUpdated = _surfacePatchIndex.updateSurfaceRegion(
+                    quad,
+                    cellRegion->rowStart,
+                    cellRegion->rowEnd,
+                    cellRegion->colStart,
+                    cellRegion->colEnd);
+            }
+        }
+        if (!regionUpdated && (!alreadyIndexed || dirtyBoundsRegressed)) {
+            // Fall back to full surface reindex if:
+            // - Surface not yet indexed, OR
+            // - Dirty bounds regressed (version went backwards), OR
+            // - We had dirty vertices but region update failed (cells may have been removed)
+            indexUpdated = _surfacePatchIndex.updateSurface(quad);
+            if (indexUpdated) {
+                std::string rebuildReason;
+                if (dirtyBoundsRegressed) {
+                    rebuildReason = "due to regressed dirty bounds";
+                } else if (dirtyVertices) {
+                    rebuildReason = "due to failed region update";
+                } else {
+                    rebuildReason = "because surface was not yet indexed";
+                }
+                qCInfo(lcViewerManager)
+                    << "Rebuilt SurfacePatchIndex entries for surface" << quad->id.c_str()
+                    << rebuildReason.c_str();
+            }
+        } else if (!regionUpdated && alreadyIndexed && !dirtyBoundsRegressed) {
+            // Only skip update if no dirty vertices were reported - existing index is truly valid
+            skippedDueToExistingIndex = true;
+        }
+    }
+    if (dirtyBoundsRegressed) {
+        // When version regresses (e.g., after undo), we only need to rebuild this surface.
+        // The full surface rebuild was already triggered above when dirtyBoundsRegressed=true.
+        // Don't mark the global index dirty - other surfaces are still valid.
+        _indexedSurfaces.erase(quad);
+        qCInfo(lcViewerManager)
+            << "Dirty bounds regressed for surface" << quad->id.c_str()
+            << "- rebuilt this surface only";
+    }
+    if (skippedDueToExistingIndex) {
+        regionUpdated = true;
+    }
+    if (regionUpdated || indexUpdated) {
+        _indexedSurfaces.insert(quad);
+    }
+
+    _surfacePatchIndexDirty = _surfacePatchIndexDirty || !(regionUpdated || indexUpdated);
+    return regionUpdated || indexUpdated;
+}
+
+void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bool isEditUpdate)
 {
     bool affectsSurfaceIndex = false;
     bool regionUpdated = false;
@@ -592,67 +749,8 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf)
 
     if (auto* quad = dynamic_cast<QuadSurface*>(surf)) {
         affectsSurfaceIndex = true;
-        std::optional<cv::Rect> dirtyVertices;
-        bool dirtyBoundsRegressed = false;
-        const bool alreadyIndexed = _indexedSurfaces.count(quad) != 0;
-        if (auto dirtyInfo = readDirtyBounds(quad)) {
-            int lastVersion = 0;
-            auto it = _surfaceDirtyBoundsVersions.find(quad);
-            if (it != _surfaceDirtyBoundsVersions.end()) {
-                lastVersion = it->second;
-            }
-            if (dirtyInfo->version > lastVersion) {
-                dirtyVertices = dirtyInfo->rect;
-            } else if (dirtyInfo->version < lastVersion) {
-                dirtyBoundsRegressed = true;
-            }
-            _surfaceDirtyBoundsVersions[quad] = dirtyInfo->version;
-        } else {
-            _surfaceDirtyBoundsVersions.erase(quad);
-        }
-
-        bool skippedDueToExistingIndex = false;
-        if (!_surfacePatchIndexDirty) {
-            if (dirtyVertices) {
-                if (auto cellRegion = vertexRectToCellRegion(*dirtyVertices, quad)) {
-                    regionUpdated = _surfacePatchIndex.updateSurfaceRegion(
-                        quad,
-                        cellRegion->rowStart,
-                        cellRegion->rowEnd,
-                        cellRegion->colStart,
-                        cellRegion->colEnd);
-                    if (regionUpdated) {
-                        qCInfo(lcViewerManager)
-                            << "Updated SurfacePatchIndex region for surface" << quad->id.c_str()
-                            << "rows" << cellRegion->rowStart << "to" << cellRegion->rowEnd
-                            << "cols" << cellRegion->colStart << "to" << cellRegion->colEnd;
-                    }
-                }
-            }
-            if (!regionUpdated && (!alreadyIndexed || dirtyBoundsRegressed)) {
-                indexUpdated = _surfacePatchIndex.updateSurface(quad);
-                if (indexUpdated) {
-                    qCInfo(lcViewerManager)
-                        << "Rebuilt SurfacePatchIndex entries for surface" << quad->id.c_str()
-                        << "due to missing or regressed dirty bounds";
-                }
-            } else if (!regionUpdated && alreadyIndexed && !dirtyBoundsRegressed) {
-                skippedDueToExistingIndex = true;
-            }
-        }
-        if (dirtyBoundsRegressed) {
-            _surfacePatchIndexDirty = true;
-            _indexedSurfaces.erase(quad);
-            qCInfo(lcViewerManager)
-                << "Dirty bounds regressed for surface" << quad->id.c_str()
-                << "- scheduling global SurfacePatchIndex rebuild";
-        }
-        if (skippedDueToExistingIndex) {
-            regionUpdated = true;
-        }
-        if (regionUpdated || indexUpdated) {
-            _indexedSurfaces.insert(quad);
-            qCInfo(lcViewerManager) << "SurfacePatchIndex updated for surface" << quad->id.c_str();
+        if (updateSurfacePatchIndexForSurface(quad, isEditUpdate)) {
+            regionUpdated = true;  // Signal that work was done (prevents marking index dirty)
         }
     } else if (!surf) {
         affectsSurfaceIndex = true;

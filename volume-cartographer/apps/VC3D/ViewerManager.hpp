@@ -78,9 +78,10 @@ public:
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 
-    void setSurfacePatchSamplingStride(int stride);
+    void setSurfacePatchSamplingStride(int stride, bool userInitiated = true);
     int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
     void primeSurfacePatchIndicesAsync();
+    void resetStrideUserOverride() { _surfacePatchStrideUserSet = false; }
 
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
@@ -100,12 +101,15 @@ signals:
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
+    void samplingStrideChanged(int stride);
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
-    void handleSurfaceChanged(std::string name, Surface* surf);
+    void handleSurfaceChanged(std::string name, Surface* surf, bool isEditUpdate = false);
 
 private:
+    bool updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate);
+
     CSurfaceCollection* _surfaces;
     VCCollection* _points;
     ChunkCache<uint8_t>* _chunkCache;
@@ -130,6 +134,8 @@ private:
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
     int _surfacePatchSamplingStride{1};
+    bool _surfacePatchStrideUserSet{false};
+    int _targetRefinedStride{0};  // 0 = no refinement pending
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;

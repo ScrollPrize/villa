@@ -20,6 +20,7 @@
 
 #include <omp.h>
 
+#include <iostream>
 #include <optional>
 #include <cstdlib>
 #include <unordered_map>
@@ -37,10 +38,43 @@
 #include <algorithm>
 #include <cmath>
 
+// Helper to compare intersection lines for caching
+static bool intersectionLinesEqual(const std::vector<IntersectionLine>& a,
+                                   const std::vector<IntersectionLine>& b)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    constexpr float epsilon = 1e-4f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        for (int j = 0; j < 2; ++j) {
+            const auto& wa = a[i].world[j];
+            const auto& wb = b[i].world[j];
+            if (std::abs(wa[0] - wb[0]) > epsilon ||
+                std::abs(wa[1] - wb[1]) > epsilon ||
+                std::abs(wa[2] - wb[2]) > epsilon) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void CVolumeViewer::renderIntersections()
 {
     if (!volume || !volume->zarrDataset() || !_surf)
         return;
+
+    // Lazy refresh of cached surface pointers if needed
+    if (_cachedIntersectSurfaces.size() != _intersect_tgts.size() && _surf_col) {
+        _cachedIntersectSurfaces.clear();
+        _cachedIntersectSurfaces.reserve(_intersect_tgts.size());
+        for (const auto& key : _intersect_tgts) {
+            if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
+                _cachedIntersectSurfaces[key] = surf;
+            }
+        }
+    }
 
     const QRectF viewRect = fGraphicsView
         ? fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect()
@@ -100,26 +134,11 @@ void CVolumeViewer::renderIntersections()
         view_bbox.low -= cv::Vec3f(viewPadding, viewPadding, viewPadding);
         view_bbox.high += cv::Vec3f(viewPadding, viewPadding, viewPadding);
 
-        const SurfacePatchIndex* patchIndex =
-            _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (!patchIndex) {
-            clearAllIntersectionItems();
-            return;
-        }
-        const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
-
         using IntersectionCandidate = std::pair<std::string, QuadSurface*>;
         std::vector<IntersectionCandidate> intersectCandidates;
-        intersectCandidates.reserve(_intersect_tgts.size());
-        for (const auto& key : _intersect_tgts) {
-            Surface* surfacePtr = _surf_col->surface(key);
-            if (!surfacePtr) {
-                std::cout << "[CVolumeViewer] skip candidate '" << key << "' (surface missing)\n";
-                continue;
-            }
-            auto* segmentation = dynamic_cast<QuadSurface*>(surfacePtr);
+        intersectCandidates.reserve(_cachedIntersectSurfaces.size());
+        for (const auto& [key, segmentation] : _cachedIntersectSurfaces) {
             if (!segmentation) {
-                std::cout << "[CVolumeViewer] skip candidate '" << key << "' (not QuadSurface)\n";
                 continue;
             }
 
@@ -132,115 +151,157 @@ void CVolumeViewer::renderIntersections()
             intersectCandidates.emplace_back(key, segmentation);
         }
 
-        std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
-        patchIndex->queryTriangles(view_bbox, nullptr, triangleCandidates);
-
-        std::unordered_map<QuadSurface*, std::vector<size_t>> trianglesBySurface;
-        trianglesBySurface.reserve(intersectCandidates.size());
-        for (size_t idx = 0; idx < triangleCandidates.size(); ++idx) {
-            auto* surface = triangleCandidates[idx].surface;
-            if (!surface) {
-                continue;
-            }
-            trianglesBySurface[surface].push_back(idx);
+        // Build set of surfaces to filter query (avoids processing irrelevant triangles)
+        std::unordered_set<QuadSurface*> targetSurfaces;
+        targetSurfaces.reserve(intersectCandidates.size());
+        for (const auto& candidate : intersectCandidates) {
+            targetSurfaces.insert(candidate.second);
         }
 
-        auto intersectionLinesEqual = [](const std::vector<IntersectionLine>& lhs,
-                                         const std::vector<IntersectionLine>& rhs) {
-            if (lhs.size() != rhs.size()) {
-                return false;
-            }
-            for (size_t idx = 0; idx < lhs.size(); ++idx) {
-                const auto& a = lhs[idx];
-                const auto& b = rhs[idx];
-                if (a.world.size() != b.world.size() ||
-                    a.surfaceParams.size() != b.surfaceParams.size()) {
-                    return false;
-                }
-                for (size_t pointIdx = 0; pointIdx < a.world.size(); ++pointIdx) {
-                    if (a.world[pointIdx] != b.world[pointIdx]) {
-                        return false;
-                    }
-                }
-                for (size_t pointIdx = 0; pointIdx < a.surfaceParams.size(); ++pointIdx) {
-                    if (a.surfaceParams[pointIdx] != b.surfaceParams[pointIdx]) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        };
+        const SurfacePatchIndex* patchIndex =
+            _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        if (!patchIndex) {
+            clearAllIntersectionItems();
+            return;
+        }
 
-        size_t colorIndex = 0;
+        const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
+
+        // Use member buffers to preserve capacity across frames
+        patchIndex->queryTriangles(view_bbox, targetSurfaces, _triangleCandidates);
+
+        // Clear and rebuild surface mapping (reuses allocated vectors)
+        for (auto& [surf, indices] : _trianglesBySurface) {
+            indices.clear();
+        }
+        for (size_t idx = 0; idx < _triangleCandidates.size(); ++idx) {
+            auto* surface = _triangleCandidates[idx].surface;
+            if (surface) {
+                _trianglesBySurface[surface].push_back(idx);
+            }
+        }
+
         for (const auto& candidate : intersectCandidates) {
             const auto& key = candidate.first;
             QuadSurface* segmentation = candidate.second;
 
-            const auto trianglesIt = trianglesBySurface.find(segmentation);
-            if (trianglesIt == trianglesBySurface.end()) {
+            const auto trianglesIt = _trianglesBySurface.find(segmentation);
+            if (trianglesIt == _trianglesBySurface.end()) {
                 removeItemsForKey(key);
                 continue;
             }
 
             const auto& candidateIndices = trianglesIt->second;
+            const size_t numCandidates = candidateIndices.size();
 
-            std::vector<IntersectionLine> intersectionLines;
-            intersectionLines.reserve(candidateIndices.size());
-            for (size_t candidateIndex : candidateIndices) {
-                const auto& triCandidate = triangleCandidates[candidateIndex];
+            // Parallel triangle clipping - each thread writes to its own slot
+            std::vector<std::optional<IntersectionLine>> clipResults(numCandidates);
+
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (size_t k = 0; k < numCandidates; ++k) {
+                const auto& triCandidate = _triangleCandidates[candidateIndices[k]];
                 auto segment = SurfacePatchIndex::clipTriangleToPlane(triCandidate, *plane, clipTolerance);
-                if (!segment) {
-                    continue;
+                if (segment) {
+                    IntersectionLine line;
+                    line.world[0] = segment->world[0];
+                    line.world[1] = segment->world[1];
+                    line.surfaceParams[0] = segment->surfaceParams[0];
+                    line.surfaceParams[1] = segment->surfaceParams[1];
+                    clipResults[k] = std::move(line);
                 }
-
-                IntersectionLine line;
-                line.world[0] = segment->world[0];
-                line.world[1] = segment->world[1];
-                line.surfaceParams[0] = segment->surfaceParams[0];
-                line.surfaceParams[1] = segment->surfaceParams[1];
-                intersectionLines.push_back(std::move(line));
             }
+
+            // Collect non-null results
+            std::vector<IntersectionLine> intersectionLines;
+            intersectionLines.reserve(numCandidates);
+            for (auto& result : clipResults) {
+                if (result) {
+                    intersectionLines.push_back(std::move(*result));
+                }
+            }
+
+            // Check if intersection lines match cached - if so, skip expensive recreation
+            auto cachedIt = _cachedIntersectionLines.find(key);
+            const bool hasCache = cachedIt != _cachedIntersectionLines.end();
+            const bool hasExistingItems = _intersect_items.count(key) && !_intersect_items[key].empty();
+            if (hasCache && hasExistingItems && intersectionLinesEqual(intersectionLines, cachedIt->second)) {
+                // Lines unchanged - just update opacity on existing items and continue
+                for (auto* item : _intersect_items[key]) {
+                    item->setOpacity(_intersectionOpacity);
+                }
+                continue;
+            }
+
+            // Update cache
+            _cachedIntersectionLines[key] = intersectionLines;
 
             QColor col;
             float width = 3;
             int z_value = 5;
 
             static const QColor palette[] = {
-                QColor(255, 50, 50),
-                QColor(255, 161, 50),
-                QColor(238, 255, 50),
-                QColor(128, 255, 50),
-                QColor(50, 255, 83),
-                QColor(50, 255, 193),
-                QColor(50, 206, 255),
-                QColor(50, 95, 255),
-                QColor(116, 50, 255),
-                QColor(226, 50, 255),
-                QColor(255, 50, 173),
-                QColor(255, 50, 63),
-                QColor(255, 148, 50),
-                QColor(250, 255, 50),
-                QColor(140, 255, 50),
-                QColor(50, 255, 71),
-                QColor(50, 255, 181),
-                QColor(50, 218, 255),
-                QColor(50, 108, 255),
-                QColor(104, 50, 255),
-                QColor(214, 50, 255),
-                QColor(255, 50, 185),
-                QColor(255, 50, 75),
-                QColor(255, 136, 50),
-                QColor(255, 246, 50),
-                QColor(153, 255, 50),
-                QColor(50, 255, 59),
-                QColor(50, 255, 169),
-                QColor(50, 230, 255),
-                QColor(50, 120, 255),
-                QColor(91, 50, 255),
-                QColor(201, 50, 255),
+                // Vibrant saturated colors
+                QColor(80, 180, 255),   // sky blue
+                QColor(180, 80, 220),   // violet
+                QColor(80, 220, 200),   // aqua/teal
+                QColor(220, 80, 180),   // magenta
+                QColor(80, 130, 255),   // medium blue
+                QColor(160, 80, 255),   // purple
+                QColor(80, 255, 220),   // cyan
+                QColor(255, 80, 200),   // hot pink
+                QColor(120, 220, 80),   // lime green
+                QColor(80, 180, 120),   // spring green
+
+                // Lighter/pastel variants
+                QColor(150, 200, 255),  // light sky blue
+                QColor(200, 150, 230),  // light violet
+                QColor(150, 230, 210),  // light aqua
+                QColor(230, 150, 200),  // light magenta
+                QColor(150, 170, 255),  // light blue
+                QColor(190, 150, 255),  // light purple
+                QColor(150, 255, 230),  // light cyan
+                QColor(255, 150, 210),  // light pink
+                QColor(180, 240, 150),  // light lime
+                QColor(150, 230, 170),  // light spring green
+
+                // Deeper/darker variants
+                QColor(50, 120, 200),   // deep blue
+                QColor(140, 50, 180),   // deep violet
+                QColor(50, 180, 160),   // deep teal
+                QColor(180, 50, 140),   // deep magenta
+                QColor(50, 90, 200),    // navy blue
+                QColor(120, 50, 200),   // deep purple
+                QColor(50, 200, 180),   // deep cyan
+                QColor(200, 50, 160),   // deep pink
+                QColor(80, 160, 60),    // forest green
+                QColor(50, 140, 100),   // deep sea green
+
+                // Extra variations with different saturation
+                QColor(100, 160, 220),  // muted blue
+                QColor(160, 100, 200),  // muted violet
+                QColor(100, 200, 180),  // muted teal
+                QColor(200, 100, 170),  // muted magenta
+                QColor(120, 180, 240),  // soft blue
+                QColor(180, 120, 220),  // soft purple
+                QColor(120, 220, 200),  // soft cyan
+                QColor(220, 120, 190),  // soft pink
+                QColor(140, 200, 100),  // soft lime
+                QColor(100, 180, 130),  // muted green
             };
+
+            // Persistent color assignment: once a surface gets a color, it keeps it (up to 500 surfaces)
+            size_t colorIndex;
+            auto colorIt = _surfaceColorAssignments.find(key);
+            if (colorIt != _surfaceColorAssignments.end()) {
+                colorIndex = colorIt->second;
+            } else if (_surfaceColorAssignments.size() < 500) {
+                colorIndex = _nextColorIndex++;
+                _surfaceColorAssignments[key] = colorIndex;
+            } else {
+                // Over 500 surfaces - fall back to hash-based assignment
+                colorIndex = std::hash<std::string>{}(key);
+            }
             col = palette[colorIndex % std::size(palette)];
-            ++colorIndex;
 
             const bool isActiveSegmentation =
                 activeSegSurface && segmentation == activeSegSurface;
@@ -265,54 +326,64 @@ void CVolumeViewer::renderIntersections()
             }
             const bool checkApproval = segOverlay && segOverlay->hasApprovalMaskData();
 
-            std::vector<QGraphicsItem*> items;
-            items.reserve(intersectionLines.size());
-            for (const auto& line : intersectionLines) {
-                if (line.world.size() < 2) {
-                    continue;
-                }
+            // Cache surface properties for coordinate conversion (constant for all lines from this surface)
+            float approvalOffsetX = 0.0f;
+            float approvalOffsetY = 0.0f;
+            if (checkApproval) {
+                const cv::Vec3f center = segmentation->center();
+                const cv::Vec2f scale = segmentation->scale();
+                approvalOffsetX = center[0] * scale[0];
+                approvalOffsetY = center[1] * scale[1];
+            }
 
+            // Batch lines by style (color/width/z) to reduce QGraphicsItem count
+            struct LineStyle {
+                QColor color;
+                float width;
+                int z;
+                bool operator==(const LineStyle& o) const {
+                    return color == o.color && width == o.width && z == o.z;
+                }
+            };
+            struct LineStyleHash {
+                size_t operator()(const LineStyle& s) const {
+                    return std::hash<int>()(s.color.rgba()) ^
+                           std::hash<int>()(static_cast<int>(s.width * 100)) ^
+                           std::hash<int>()(s.z);
+                }
+            };
+            std::unordered_map<LineStyle, QPainterPath, LineStyleHash> batchedPaths;
+
+            for (const auto& line : intersectionLines) {
                 // Determine color and width based on approval status
                 QColor lineColor = col;
                 float lineWidth = width;
                 int lineZ = z_value;
 
                 if (checkApproval) {
-                    // surfaceParams stores ptr-space coordinates: (absX - center[0]*scale[0], absY - center[1]*scale[1], 0)
-                    // We need to convert back to absolute grid indices
-                    const cv::Vec3f center = segmentation->center();
-                    const cv::Vec2f scale = segmentation->scale();
+                    const float absCol0 = line.surfaceParams[0][0] + approvalOffsetX;
+                    const float absRow0 = line.surfaceParams[0][1] + approvalOffsetY;
+                    const float absCol1 = line.surfaceParams[1][0] + approvalOffsetX;
+                    const float absRow1 = line.surfaceParams[1][1] + approvalOffsetY;
 
-                    // Convert ptr-space back to absolute grid coords (keep as float for bilinear)
-                    // ptr = abs - center * scale, so abs = ptr + center * scale
-                    const float absCol0 = line.surfaceParams[0][0] + center[0] * scale[0];
-                    const float absRow0 = line.surfaceParams[0][1] + center[1] * scale[1];
-                    const float absCol1 = line.surfaceParams[1][0] + center[0] * scale[0];
-                    const float absRow1 = line.surfaceParams[1][1] + center[1] * scale[1];
-
-                    // Use bilinear interpolation for sub-pixel accuracy
                     int status0 = 0, status1 = 0;
                     const float intensity0 = segOverlay->queryApprovalBilinear(absRow0, absCol0, &status0);
                     const float intensity1 = segOverlay->queryApprovalBilinear(absRow1, absCol1, &status1);
 
-                    // Use max status for color, average intensity for blending
                     const int approvalState = std::max(status0, status1);
                     const float approvalIntensity = std::max(intensity0, intensity1);
 
                     if (approvalState > 0 && approvalIntensity > 0.0f) {
-                        // Select base color based on status
                         QColor baseColor;
                         if (approvalState == 3) {
-                            baseColor = COLOR_PENDING_UNAPPROVE;  // Red for pending unapproval
+                            baseColor = COLOR_PENDING_UNAPPROVE;
                         } else if (approvalState == 2) {
-                            baseColor = COLOR_PENDING;  // Blue for pending approval
+                            baseColor = COLOR_PENDING;
                         } else {
-                            baseColor = COLOR_APPROVED;  // Green for saved
+                            baseColor = COLOR_APPROVED;
                         }
 
-                        // Blend the color based on bilinear intensity (smooth edges)
-                        // At edges (low intensity), blend toward the original line color
-                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);  // Scale up for faster transition
+                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);
                         lineColor = QColor(
                             static_cast<int>(col.red() * (1.0f - blendFactor) + baseColor.red() * blendFactor),
                             static_cast<int>(col.green() * (1.0f - blendFactor) + baseColor.green() * blendFactor),
@@ -320,25 +391,27 @@ void CVolumeViewer::renderIntersections()
                             baseColor.alpha()
                         );
 
-                        // Width scales with intensity for smoother edge appearance
                         const float extraWidth = 6.0f * blendFactor;
                         lineWidth = width + extraWidth;
                         lineZ = z_value + 5;
                     }
                 }
 
-                QPainterPath path;
-                bool first = true;
-                for (const auto& wp : line.world) {
-                    cv::Vec3f p = plane->project(wp, 1.0, _scale);
-                    if (first)
-                        path.moveTo(p[0], p[1]);
-                    else
-                        path.lineTo(p[0], p[1]);
-                    first = false;
-                }
-                auto* item = fGraphicsView->scene()->addPath(path, QPen(lineColor, lineWidth));
-                item->setZValue(lineZ);
+                // Add line to batched path for this style
+                LineStyle style{lineColor, lineWidth, lineZ};
+                QPainterPath& path = batchedPaths[style];
+                cv::Vec3f p0 = plane->project(line.world[0], 1.0, _scale);
+                cv::Vec3f p1 = plane->project(line.world[1], 1.0, _scale);
+                path.moveTo(p0[0], p0[1]);
+                path.lineTo(p1[0], p1[1]);
+            }
+
+            // Create one QGraphicsItem per style batch
+            std::vector<QGraphicsItem*> items;
+            items.reserve(batchedPaths.size());
+            for (const auto& [style, path] : batchedPaths) {
+                auto* item = fGraphicsView->scene()->addPath(path, QPen(style.color, style.width));
+                item->setZValue(style.z);
                 item->setOpacity(_intersectionOpacity);
                 if (fBaseImageItem) {
                     item->setParentItem(fBaseImageItem);
@@ -346,11 +419,10 @@ void CVolumeViewer::renderIntersections()
                 items.push_back(item);
             }
 
+            // Always remove old items before storing new ones (even if empty)
+            removeItemsForKey(key);
             if (!items.empty()) {
-                removeItemsForKey(key);
                 _intersect_items[key] = items;
-            } else {
-                removeItemsForKey(key);
             }
         }
 
@@ -379,6 +451,7 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
             }
         }
         _intersect_items.clear();
+        _cachedIntersectionLines.clear();
     }
     else if (_intersect_items.count(name)) {
         for(auto &item : _intersect_items[name]) {
@@ -386,6 +459,7 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
             delete item;
         }
         _intersect_items.erase(name);
+        _cachedIntersectionLines.erase(name);
     }
 }
 
@@ -393,6 +467,17 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
 void CVolumeViewer::setIntersects(const std::set<std::string> &set)
 {
     _intersect_tgts = set;
+
+    // Rebuild cached surface pointers to avoid string lookups during render
+    _cachedIntersectSurfaces.clear();
+    if (_surf_col) {
+        _cachedIntersectSurfaces.reserve(set.size());
+        for (const auto& key : set) {
+            if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
+                _cachedIntersectSurfaces[key] = surf;
+            }
+        }
+    }
 
     renderIntersections();
 }

@@ -34,6 +34,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <optional>
 #include <unordered_set>
 #include <set>
 #include <filesystem>
@@ -109,6 +110,13 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (reload) {
+        // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
+        if (_surfaces) {
+            auto names = _surfaces->surfaceNames();
+            for (const auto& name : names) {
+                _surfaces->setSurface(name, nullptr, true, false);
+            }
+        }
         _volumePkg->unloadAllSurfaces();
     }
 
@@ -146,22 +154,27 @@ void SurfacePanelController::loadSurfacesIncremental()
     _volumePkg->refreshSegmentations();
     auto changes = detectSurfaceChanges();
 
+    // Suppress signals during batch removal to avoid dangling pointer crashes
     if (_ui.treeWidget) {
         const QSignalBlocker blocker{_ui.treeWidget};
         // Perform UI mutations without emitting per-item signals.
         for (const auto& id : changes.toRemove) {
-            removeSingleSegmentation(id);
+            removeSingleSegmentation(id, true);
         }
         for (const auto& id : changes.toAdd) {
             addSingleSegmentation(id);
         }
     } else {
         for (const auto& id : changes.toRemove) {
-            removeSingleSegmentation(id);
+            removeSingleSegmentation(id, true);
         }
         for (const auto& id : changes.toAdd) {
             addSingleSegmentation(id);
         }
+    }
+    // Emit a single signal after batch removal
+    if (!changes.toRemove.empty() && _surfaces) {
+        _surfaces->emitSurfacesChanged();
     }
 
     if (!changes.toReload.empty()) {
@@ -440,7 +453,7 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
     }
 }
 
-void SurfacePanelController::removeSingleSegmentation(const std::string& segId)
+void SurfacePanelController::removeSingleSegmentation(const std::string& segId, bool suppressSignals)
 {
     std::cout << "Removing segmentation: " << segId << std::endl;
 
@@ -454,9 +467,9 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId)
 
     if (_surfaces) {
         if (removedSurface && activeSegSurface == removedSurface) {
-            _surfaces->setSurface("segmentation", nullptr);
+            _surfaces->setSurface("segmentation", nullptr, suppressSignals);
         }
-        _surfaces->setSurface(segId, nullptr, false);
+        _surfaces->setSurface(segId, nullptr, suppressSignals);
     }
 
     if (_volumePkg) {
@@ -464,12 +477,20 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId)
     }
 
     if (_ui.treeWidget) {
+        // When suppressing signals, also block tree widget signals to prevent
+        // handleTreeSelectionChanged from running during batch deletion.
+        // This avoids accessing surfaces that may have been deleted.
+        std::optional<QSignalBlocker> blocker;
+        if (suppressSignals) {
+            blocker.emplace(_ui.treeWidget);
+        }
+
         QTreeWidgetItemIterator it(_ui.treeWidget);
         while (*it) {
             if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == segId) {
                 const bool wasSelected = (*it)->isSelected();
                 delete *it;
-                if (wasSelected) {
+                if (wasSelected && !suppressSignals) {
                     emit surfaceSelectionCleared();
                 }
                 break;
@@ -773,10 +794,14 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
     for (const auto& id : segmentIds) {
         const std::string idStd = id.toStdString();
         try {
+            // Must clean up CSurfaceCollection before destroying the Surface
+            // to avoid dangling pointers in signal handlers.
+            // Suppress signals during batch deletion to prevent handlers from
+            // iterating over surfaces while we're in the middle of deleting them.
+            removeSingleSegmentation(idStd, true);
             _volumePkg->removeSegmentation(idStd);
             ++successCount;
             anyChanges = true;
-            removeSingleSegmentation(idStd);
         } catch (const std::filesystem::filesystem_error& e) {
             if (e.code() == std::errc::permission_denied) {
                 failedSegments << id + tr(" (permission denied)");
@@ -788,6 +813,11 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
             failedSegments << id;
             std::cerr << "Failed to delete segment " << idStd << ": " << e.what() << std::endl;
         }
+    }
+
+    // After all deletions are done, emit a single signal to trigger surface index rebuild
+    if (anyChanges && _surfaces) {
+        _surfaces->emitSurfacesChanged();
     }
 
     if (anyChanges) {

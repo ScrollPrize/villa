@@ -218,8 +218,8 @@ bool SegmentationModule::ensureHoverTarget()
     if (!_editManager || !_editManager->hasSession()) {
         return false;
     }
-    if (_hoverPreviewEnabled) {
-        return _hover.valid;
+    if (_hoverPreviewEnabled && _hover.valid) {
+        return true;
     }
     if (!_hoverPointer.valid) {
         return false;
@@ -664,7 +664,7 @@ void SegmentationModule::applyEdits()
         if (preview && dirtyBounds) {
             _editManager->publishDirtyBounds(*dirtyBounds);
         }
-        _surfaces->setSurface("segmentation", preview, false, false);
+        _surfaces->setSurface("segmentation", preview, false, false, true);
     }
     emitPendingChanges();
     markAutosaveNeeded(true);
@@ -689,7 +689,7 @@ void SegmentationModule::resetEdits()
     clearLineDragStroke();
     _editManager->resetPreview();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
     }
     refreshOverlay();
     emitPendingChanges();
@@ -1180,9 +1180,10 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
     _drag.lastWorld = worldPos;
     _drag.moved = true;
 
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
-    }
+    // Accumulate dirty bounds during drag, but don't trigger the full signal cascade
+    // on every mouse move. The overlay will update (showing vertex positions),
+    // and the full intersection/R-tree update will happen in finishDrag().
+    _editManager->ensureDirtyBounds();
 
     refreshOverlay();
     emitPendingChanges();
@@ -1206,7 +1207,7 @@ void SegmentationModule::finishDrag()
     if (moved) {
         _editManager->applyPreview();
         if (_surfaces) {
-            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
         }
         markAutosaveNeeded();
     }

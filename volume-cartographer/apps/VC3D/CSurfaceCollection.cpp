@@ -19,7 +19,7 @@ CSurfaceCollection::~CSurfaceCollection()
 
 }
 
-void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership)
+void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership, bool isEditUpdate)
 {
     auto it = _surfs.find(name);
     if (it != _surfs.end()) {
@@ -32,8 +32,15 @@ void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool
         _surfs[name] = {surf, takeOwnership};
     }
     if (!noSignalSend) {
-        sendSurfaceChanged(name, surf);
+        sendSurfaceChanged(name, surf, isEditUpdate);
     }
+}
+
+void CSurfaceCollection::emitSurfacesChanged()
+{
+    // Emit a signal to notify listeners that surfaces have been modified in batch.
+    // Use empty name and nullptr to indicate batch update.
+    sendSurfaceChanged("", nullptr, false);
 }
 
 void CSurfaceCollection::setPOI(const std::string &name, POI *poi)

@@ -195,6 +195,10 @@ void SegmentationEditManager::applyPreview()
         return;
     }
 
+    if (_editedBounds) {
+        publishDirtyBounds(*_editedBounds);
+    }
+
     if (_originalPoints) {
         _previewPoints->copyTo(*_originalPoints);
     }
@@ -204,6 +208,44 @@ void SegmentationEditManager::applyPreview()
     clearActiveDrag();
     _editedBounds.reset();
     _dirty = false;
+}
+
+void SegmentationEditManager::ensureDirtyBounds()
+{
+    if (!_baseSurface) {
+        return;
+    }
+
+    ensureSurfaceMetaObject(_baseSurface);
+    auto& meta = *_baseSurface->meta;
+
+    // Get new bounds from recent touched or edited bounds
+    std::optional<cv::Rect> newBounds;
+    if (auto bounds = recentTouchedBounds()) {
+        newBounds = bounds;
+    } else if (_editedBounds) {
+        newBounds = _editedBounds;
+    }
+
+    if (!newBounds) {
+        return;
+    }
+
+    // If existing bounds are valid, union them with new bounds
+    if (meta.contains("dirty_bounds") && meta["dirty_bounds"].is_object()) {
+        const auto& b = meta["dirty_bounds"];
+        const int rs = b.value("row_start", -1);
+        const int re = b.value("row_end", -1);
+        const int cs = b.value("col_start", -1);
+        const int ce = b.value("col_end", -1);
+        if (rs >= 0 && cs >= 0 && re > rs && ce > cs) {
+            // Union with existing bounds
+            cv::Rect existing(cs, rs, ce - cs, re - rs);
+            *newBounds = existing | *newBounds;
+        }
+    }
+
+    publishDirtyBounds(*newBounds);
 }
 
 void SegmentationEditManager::refreshFromBaseSurface()
@@ -628,6 +670,13 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
     std::vector<GridKey> regionVec(region.begin(), region.end());
     if (regionVec.empty()) {
         return false;
+    }
+
+    // Pre-expand _editedBounds to cover entire smoothing region.
+    // This ensures R-tree updates include all affected cells, even those
+    // where individual vertex changes fall below the 1e-5 threshold.
+    for (const auto& key : regionVec) {
+        expandEditedBounds(key.row, key.col);
     }
 
     std::unordered_map<GridKey, cv::Vec3f, GridKeyHash> currentValues;
@@ -1100,6 +1149,12 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
 
     GridKey key{row, col};
     const float delta = static_cast<float>(cv::norm(newWorld - original));
+
+    // Always expand dirty bounds when vertex is touched (needed for R-tree updates)
+    expandEditedBounds(row, col);
+    _dirty = true;
+
+    // But only track in _editedVertices if change is significant
     if (delta < 1e-4f) {
         _editedVertices.erase(key);
         return;
@@ -1114,9 +1169,6 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
             it->second.isGrowth = true;
         }
     }
-
-    expandEditedBounds(row, col);
-    _dirty = true;
 }
 
 void SegmentationEditManager::expandEditedBounds(int row, int col)

@@ -185,7 +185,7 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
-    void onSurfaceChanged(std::string name, Surface *surf);
+    void onSurfaceChanged(std::string name, Surface *surf, bool isEditUpdate = false);
     void onPOIChanged(std::string name, POI *poi);
     void onScrolled();
     void onResized();
@@ -267,7 +267,12 @@ protected:
     std::vector<QGraphicsItem*> slice_vis_items; 
 
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
+    std::unordered_map<std::string, QuadSurface*> _cachedIntersectSurfaces;
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
+    std::unordered_map<std::string, std::vector<IntersectionLine>> _cachedIntersectionLines;
+    // Reusable buffers to avoid per-frame allocations
+    std::vector<SurfacePatchIndex::TriangleCandidate> _triangleCandidates;
+    std::unordered_map<QuadSurface*, std::vector<size_t>> _trianglesBySurface;
     bool _autoRefocusOnOffscreenIntersections = true;
     bool _hasLastPlaneOrigin = false;
     cv::Vec3f _lastPlaneOrigin = {0.0f, 0.0f, 0.0f};
@@ -280,6 +285,10 @@ protected:
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::unordered_set<std::string> _highlightedSurfaceIds;
+
+    // Persistent color assignments for intersection rendering (up to 500 surfaces)
+    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
+    size_t _nextColorIndex{0};
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;

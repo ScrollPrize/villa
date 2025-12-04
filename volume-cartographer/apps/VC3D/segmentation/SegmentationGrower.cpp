@@ -850,11 +850,8 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (_context.surfaces) {
-        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, false);
-    }
-
-    if (_context.viewerManager && request.segmentationSurface) {
-        _context.viewerManager->refreshSurfacePatchIndex(request.segmentationSurface);
+        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, false, true);
+        // Note: SurfacePatchIndex is automatically updated via handleSurfaceChanged signal
     }
 
     if (!resetDefaults.empty()) {

@@ -101,7 +101,7 @@ public:
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
     void addSingleSegmentation(const std::string& segId);
-    void removeSingleSegmentation(const std::string& segId);
+    void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
 
 signals:
     void surfacesLoaded();
