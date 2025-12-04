@@ -513,7 +513,7 @@ CWindow::CWindow() :
     _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
     int initialStepSize = _viewerManager->sliceStepSize();
     _sliceStepLabel->setText(tr("Step: %1").arg(initialStepSize));
-    _sliceStepLabel->setToolTip(tr("Slice step size for Shift+ScrollWheel\nAlt+ScrollWheel to adjust"));
+    _sliceStepLabel->setToolTip(tr("Slice step size: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sliceStepLabel);
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_point_collection, this);
