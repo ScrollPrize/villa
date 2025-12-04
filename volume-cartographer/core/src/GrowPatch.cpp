@@ -1724,6 +1724,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         (*surf->meta)["max_gen"] = generation;
         (*surf->meta)["seed"] = {origin[0], origin[1], origin[2]};
         (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
+        if (resume_surf && !resume_surf->id.empty()) {
+            (*surf->meta)["seed_surface_id"] = resume_surf->id;
+        }
 
         return surf;
     };

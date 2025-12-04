@@ -2119,6 +2119,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 (*dbg_surf->meta)["area_vx2"] = area_exact_vx2;
                 (*dbg_surf->meta)["area_cm2"] = area_exact_cm2;
                 (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
+                (*dbg_surf->meta)["seed_surface_name"] = seed->name();
+                (*dbg_surf->meta)["seed_surface_id"] = seed->surface()->id;
                 std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str();
                 dbg_surf->save(tgt_dir / uuid, uuid);
                 delete dbg_surf;
@@ -2189,6 +2191,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 (*dbg_surf->meta)["area_vx2"] = area_exact_vx2;
                 (*dbg_surf->meta)["area_cm2"] = area_exact_cm2;
                 (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
+                (*dbg_surf->meta)["seed_surface_name"] = seed->name();
+                (*dbg_surf->meta)["seed_surface_id"] = seed->surface()->id;
                 dbg_surf->save(tgt_dir / uuid, uuid);
                 delete dbg_surf;
             }
@@ -2287,6 +2291,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     (*surf->meta)["area_vx2"] = area_final_vox2;
     (*surf->meta)["area_cm2"] = area_final_cm2;
     (*surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
+    (*surf->meta)["seed_surface_name"] = seed->name();
+    (*surf->meta)["seed_surface_id"] = seed->surface()->id;
 
     return surf;
 }
