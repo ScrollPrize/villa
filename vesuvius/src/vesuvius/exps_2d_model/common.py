@@ -179,3 +179,116 @@ def load_unet(
 			print(f"[load_unet] ignored unexpected checkpoint keys: {sorted(unexpected_keys)}")
 
 	return model
+
+def unet_infer_tiled(
+	model: UNet,
+	image: torch.Tensor,
+	tile_size: int = 512,
+	overlap: int = 128,
+) -> torch.Tensor:
+	"""
+	Run 2D UNet inference on an image using overlapping tiles with linear blending.
+
+	Args:
+		model:
+			UNet model. Assumed to be in eval() mode & run under no_grad() by caller.
+		image:
+			Input tensor of shape (N,C,H,W). Typically N=1, C=1 as used in this repo.
+		tile_size:
+			Spatial size of square tiles (tile_size x tile_size).
+		overlap:
+			Number of pixels of linear-overlap between neighboring tiles along each
+			axis. Effective stride is (tile_size - overlap). Must be < tile_size.
+
+	Returns:
+		Tensor of shape (N, model.out_channels, H, W) with stitched prediction.
+	"""
+	if image.ndim != 4:
+		raise ValueError(f"expected image of shape (N,C,H,W), got {tuple(image.shape)}")
+
+	n, c, h, w = image.shape
+	if n > 1:
+		# Process batch element-wise to keep tiling/simple.
+		outs = []
+		for i in range(n):
+			outs.append(unet_infer_tiled(model, image[i : i + 1], tile_size=tile_size, overlap=overlap))
+		return torch.cat(outs, dim=0)
+
+	if tile_size <= 0:
+		raise ValueError(f"tile_size must be > 0, got {tile_size}")
+	if overlap < 0 or overlap >= tile_size:
+		raise ValueError(f"overlap must satisfy 0 <= overlap < tile_size (got {overlap}, tile_size={tile_size})")
+
+	# Small images: fall back to single forward pass.
+	if h <= tile_size and w <= tile_size and overlap == 0:
+		return model(image)
+
+	device = image.device
+	dtype = image.dtype
+
+	def _build_positions(size: int, tile: int, stride: int) -> list[int]:
+		if size <= tile:
+			return [0]
+		positions = list(range(0, size - tile + 1, stride))
+		last = size - tile
+		if positions[-1] != last:
+			positions.append(last)
+		return positions
+
+	stride = max(1, tile_size - overlap)
+	y_positions = _build_positions(h, tile_size, stride)
+	x_positions = _build_positions(w, tile_size, stride)
+
+	# Precompute separable 2D blending mask for a tile.
+	def _blend_ramp(length: int, ov: int) -> torch.Tensor:
+		if ov <= 0:
+			return torch.ones(length, device=device, dtype=dtype)
+		ov = min(ov, length // 2)
+		ramp = torch.ones(length, device=device, dtype=dtype)
+		if ov > 0:
+			# Linear ramps towards the borders; interior stays at 1.
+			# Values at the outermost ov pixels go from ~0 -> 1 and 1 -> ~0,
+			# but since both numerator & denominator are weighted the same,
+			# absolute scale cancels after division.
+			edges = torch.linspace(0.0, 1.0, steps=ov + 1, device=device, dtype=dtype)[1:]
+			ramp[:ov] = edges
+			ramp[-ov:] = edges.flip(0)
+		return ramp
+
+	ramp_y = _blend_ramp(tile_size, overlap)
+	ramp_x = _blend_ramp(tile_size, overlap)
+	weight_tile = (ramp_y.view(-1, 1) * ramp_x.view(1, -1)).unsqueeze(0).unsqueeze(0)  # (1,1,Th,Tw)
+
+	# Accumulators for blended output & weights.
+	out_channels = getattr(model, "out_channels", None)
+	if out_channels is None:
+		# Fallback: run a tiny dummy forward to infer channel count.
+		with torch.no_grad():
+			dummy = torch.zeros(1, c, min(tile_size, h), min(tile_size, w), device=device, dtype=dtype)
+			out_channels = model(dummy).shape[1]
+
+	acc = torch.zeros(1, out_channels, h, w, device=device, dtype=dtype)
+	wsum = torch.zeros(1, 1, h, w, device=device, dtype=dtype)
+
+	for y0 in y_positions:
+		for x0 in x_positions:
+			y1 = min(y0 + tile_size, h)
+			x1 = min(x0 + tile_size, w)
+			patch = image[:, :, y0:y1, x0:x1]
+			ph = y1 - y0
+			pw = x1 - x0
+
+			# Crop weight mask if we are at the image boundary.
+			w_patch = weight_tile[:, :, :ph, :pw]
+
+			with torch.no_grad():
+				pred = model(patch)  # (1,out_channels,ph,pw)
+
+			acc[:, :, y0:y1, x0:x1] += pred * w_patch
+			wsum[:, :, y0:y1, x0:x1] += w_patch
+
+	# Avoid division by zero; outside any tile wsum is 0, but that should not occur.
+	eps = torch.finfo(dtype).eps if torch.is_floating_point(wsum) else 1e-6
+	wsafe = torch.clamp(wsum, min=eps)
+	out = acc / wsafe
+	return out
