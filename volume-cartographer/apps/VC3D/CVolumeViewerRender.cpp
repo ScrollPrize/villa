@@ -142,6 +142,17 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
         float z_step = z * _ds_scale;  // Scale the step to maintain consistent physical distance
         _surf->gen(&slice_coords, nullptr, roi.size(), _ptr, _scale, {static_cast<float>(-roi.width/2), static_cast<float>(-roi.height/2), _z_off + z_step});
 
+        if (z == z_start) {
+            std::cout << "[render_composite] z=" << z << ", roi=" << roi.width << "x" << roi.height
+                      << ", _scale=" << _scale << ", _ds_scale=" << _ds_scale
+                      << ", slice_coords size=" << slice_coords.cols << "x" << slice_coords.rows << std::endl;
+            if (slice_coords.rows > 4 && slice_coords.cols > 4) {
+                std::cout << "[render_composite] coords[0,0]: " << slice_coords(4,4)
+                          << ", coords[center]: " << slice_coords(slice_coords.rows/2, slice_coords.cols/2)
+                          << ", coords[end]: " << slice_coords(slice_coords.rows-5, slice_coords.cols-5) << std::endl;
+            }
+        }
+
         readInterpolated3D(slice_img, volume->zarrDataset(_ds_sd_idx), slice_coords*_ds_scale, cache, _useFastInterpolation);
 
         // Convert to float for accumulation
@@ -239,19 +250,42 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
     float oldDsScale = _ds_scale;
     int oldDsSdIdx = _ds_sd_idx;
 
-    // Set up for surface rendering at 1:1 scale
+    // Render at 1:1 with the surface's internal grid (raw points size)
+    // Use surface's scale so that gen() computes sx = _scale/_scale = 1.0,
+    // sampling 1:1 from the raw points grid
+    cv::Size rawPointsSize = surface->rawPointsPtr()->size();
+    float surfScale = surface->_scale[0];
+
+    std::cout << "[renderCompositeForSurface] outputSize: " << outputSize.width << "x" << outputSize.height
+              << ", rawPointsSize: " << rawPointsSize.width << "x" << rawPointsSize.height
+              << ", surface->_scale: " << surface->_scale[0] << "x" << surface->_scale[1] << std::endl;
+
     _surf = surface;
-    _scale = 1.0f;
+    _scale = surfScale;  // Use surface's scale so gen() samples 1:1 from raw points
     _z_off = 0.0f;
 
     recalcScales();
+
+    std::cout << "[renderCompositeForSurface] after recalcScales: _scale=" << _scale
+              << ", _ds_scale=" << _ds_scale << ", _ds_sd_idx=" << _ds_sd_idx << std::endl;
+
     _ptr = _surf->pointer();
-    cv::Rect roi(-outputSize.width/2, -outputSize.height/2,
-                 outputSize.width, outputSize.height);
+    // Use raw points size for the ROI so we cover the whole surface
+    cv::Rect roi(-rawPointsSize.width/2, -rawPointsSize.height/2,
+                 rawPointsSize.width, rawPointsSize.height);
 
     _vis_center = cv::Vec2f(0, 0);
 
     cv::Mat_<uint8_t> result = render_composite(roi);
+
+    std::cout << "[renderCompositeForSurface] result size: " << result.cols << "x" << result.rows << std::endl;
+
+    // Resize to requested output size if different
+    if (result.size() != outputSize) {
+        std::cout << "[renderCompositeForSurface] resizing from " << result.cols << "x" << result.rows
+                  << " to " << outputSize.width << "x" << outputSize.height << std::endl;
+        cv::resize(result, result, outputSize, 0, 0, cv::INTER_LINEAR);
+    }
 
     _surf = oldSurf;
     _scale = oldScale;

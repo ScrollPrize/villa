@@ -2355,22 +2355,35 @@ void CWindow::onAppendMaskPressed(void)
                 // Use composite rendering from the segmentation viewer
                 img = segViewer->renderCompositeForSurface(_surf, maskSize);
             } else {
-                // Original single-layer rendering
-                cv::Size nominalSize = _surf->size();
-
+                // Original single-layer rendering - use same approach as render_binary_mask
+                cv::Size rawSize = _surf->rawPointsPtr()->size();
                 cv::Vec3f ptr = _surf->pointer();
-                // Offset is in PIXEL coordinates (gets multiplied by scale internally)
-                cv::Vec3f offset(-maskSize.width/2.0f, -maskSize.height/2.0f, 0);
+                cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
 
-                // Calculate pixel size in UV space from mask size vs nominal size
-                float pixelSizeInUV = static_cast<float>(nominalSize.width) / static_cast<float>(maskSize.width);
-
+                // Use surface's scale so sx = _scale/_scale = 1.0, sampling 1:1 from raw points
+                float surfScale = _surf->scale()[0];
                 cv::Mat_<cv::Vec3f> coords;
-                _surf->gen(&coords, nullptr, maskSize, ptr, pixelSizeInUV, offset);
+                _surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
+
+                std::cout << "[AppendMask non-composite] rawSize: " << rawSize.width << "x" << rawSize.height
+                          << ", maskSize: " << maskSize.width << "x" << maskSize.height
+                          << ", coords size: " << coords.cols << "x" << coords.rows
+                          << ", surface._scale: " << _surf->scale()[0] << std::endl;
+
+                // Sample a few coords to verify they're in native voxel space
+                if (coords.rows > 4 && coords.cols > 4) {
+                    std::cout << "[AppendMask non-composite] coords[0,0]: " << coords(4,4)
+                              << ", coords[center]: " << coords(coords.rows/2, coords.cols/2)
+                              << ", coords[end]: " << coords(coords.rows-5, coords.cols-5) << std::endl;
+                }
 
                 render_image_from_coords(coords, img, ds, chunk_cache);
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+            std::cout << "[AppendMask] maskSize: " << maskSize.width << "x" << maskSize.height
+                      << ", img size: " << img.cols << "x" << img.rows
+                      << ", useComposite: " << useComposite << std::endl;
 
             // Append the new image layer to existing layers
             existing_layers.push_back(img);
