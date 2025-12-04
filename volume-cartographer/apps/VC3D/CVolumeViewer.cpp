@@ -671,6 +671,13 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
         markActiveSegmentationDirty();
     }
 
+    // When active segmentation changes, force re-render of intersections
+    // so the highlight colors update immediately (old segment loses highlight,
+    // new segment gains it)
+    if (name == "segmentation") {
+        renderIntersections();
+    }
+
     if (_surf_name == name) {
         _surf = surf;
         if (!_surf) {

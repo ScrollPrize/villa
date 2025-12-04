@@ -206,9 +206,9 @@ void CVolumeViewer::renderIntersections()
             int z_value = 5;
 
             static const QColor palette[] = {
-                QColor(255, 50, 50),
-                QColor(255, 161, 50),
-                QColor(238, 255, 50),
+                QColor(50, 150, 255),   // sky blue (was red)
+                QColor(150, 50, 200),   // violet (was orange)
+                QColor(50, 220, 180),   // aqua (was yellow)
                 QColor(128, 255, 50),
                 QColor(50, 255, 83),
                 QColor(50, 255, 193),
@@ -217,9 +217,9 @@ void CVolumeViewer::renderIntersections()
                 QColor(116, 50, 255),
                 QColor(226, 50, 255),
                 QColor(255, 50, 173),
-                QColor(255, 50, 63),
-                QColor(255, 148, 50),
-                QColor(250, 255, 50),
+                QColor(0, 200, 150),    // teal (was red-ish)
+                QColor(100, 180, 255),  // light blue (was orange-ish)
+                QColor(180, 100, 220),  // light purple (was yellow-ish)
                 QColor(140, 255, 50),
                 QColor(50, 255, 71),
                 QColor(50, 255, 181),
@@ -228,9 +228,9 @@ void CVolumeViewer::renderIntersections()
                 QColor(104, 50, 255),
                 QColor(214, 50, 255),
                 QColor(255, 50, 185),
-                QColor(255, 50, 75),
-                QColor(255, 136, 50),
-                QColor(255, 246, 50),
+                QColor(50, 180, 130),   // sea green (was red-ish)
+                QColor(130, 100, 255),  // periwinkle (was orange-ish)
+                QColor(255, 100, 200),  // pink (was yellow-ish)
                 QColor(153, 255, 50),
                 QColor(50, 255, 59),
                 QColor(50, 255, 169),
