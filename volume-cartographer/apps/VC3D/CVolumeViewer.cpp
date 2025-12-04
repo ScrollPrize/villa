@@ -692,7 +692,7 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
     // Skip if _intersect_tgts contains "segmentation" since it will be handled
     // by the intersection target logic below (avoids create-delete-create race
     // that can confuse Qt's scene invalidation)
-    if (name == "segmentation" && !_intersect_tgts.count("segmentation")) {
+    if (name == "segmentation")  {
         renderIntersections();
     }
 

@@ -621,15 +621,9 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf)
                         cellRegion->rowEnd,
                         cellRegion->colStart,
                         cellRegion->colEnd);
-                    if (regionUpdated) {
-                        qCInfo(lcViewerManager)
-                            << "Updated SurfacePatchIndex region for surface" << quad->id.c_str()
-                            << "rows" << cellRegion->rowStart << "to" << cellRegion->rowEnd
-                            << "cols" << cellRegion->colStart << "to" << cellRegion->colEnd;
-                    }
                 }
             }
-            if (!regionUpdated && (!alreadyIndexed || dirtyBoundsRegressed || dirtyVertices)) {
+            if (!regionUpdated && (!alreadyIndexed || dirtyBoundsRegressed)) {
                 // Fall back to full surface reindex if:
                 // - Surface not yet indexed, OR
                 // - Dirty bounds regressed (version went backwards), OR
@@ -640,7 +634,7 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf)
                         << "Rebuilt SurfacePatchIndex entries for surface" << quad->id.c_str()
                         << (dirtyVertices ? "due to failed region update" : "due to missing or regressed dirty bounds");
                 }
-            } else if (!regionUpdated && alreadyIndexed && !dirtyBoundsRegressed && !dirtyVertices) {
+            } else if (!regionUpdated && alreadyIndexed && !dirtyBoundsRegressed) {
                 // Only skip update if no dirty vertices were reported - existing index is truly valid
                 skippedDueToExistingIndex = true;
             }
