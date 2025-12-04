@@ -111,6 +111,7 @@ void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* s
     qCInfo(lcSegModule) << "Segmentation surface changed externally; disabling editing.";
     emit statusMessageRequested(tr("Segmentation editing disabled because the surface changed."),
                                 kStatusMedium);
+    endEditingSession();
     setEditingEnabled(false);
 }
 
