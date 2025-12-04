@@ -4,6 +4,8 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
+
+#include <opencv2/imgproc.hpp>
 #include "vc/core/util/SurfaceMeta.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
@@ -18,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -637,6 +640,45 @@ int main(int argc, char *argv[])
             }
         }
 
+        // Calculate scale factor by measuring actual spacing changes between adjacent points
+        // This directly measures how much the grid has stretched/compressed after projection
+        double sum_scale_ratio = 0;
+        int scale_count = 0;
+
+        // Check horizontal neighbors (along columns)
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols - 1; ++c) {
+                if (!is_valid_vertex(src_points(r, c)) || !is_valid_vertex(src_points(r, c + 1))) continue;
+                if (!is_valid_vertex(new_points(r, c)) || !is_valid_vertex(new_points(r, c + 1))) continue;
+
+                double src_dist = cv::norm(src_points(r, c) - src_points(r, c + 1));
+                double new_dist = cv::norm(new_points(r, c) - new_points(r, c + 1));
+
+                if (src_dist > 0.1) {  // Avoid division by very small numbers
+                    sum_scale_ratio += new_dist / src_dist;
+                    scale_count++;
+                }
+            }
+        }
+
+        // Check vertical neighbors (along rows)
+        for (int r = 0; r < rows - 1; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (!is_valid_vertex(src_points(r, c)) || !is_valid_vertex(src_points(r + 1, c))) continue;
+                if (!is_valid_vertex(new_points(r, c)) || !is_valid_vertex(new_points(r + 1, c))) continue;
+
+                double src_dist = cv::norm(src_points(r, c) - src_points(r + 1, c));
+                double new_dist = cv::norm(new_points(r, c) - new_points(r + 1, c));
+
+                if (src_dist > 0.1) {  // Avoid division by very small numbers
+                    sum_scale_ratio += new_dist / src_dist;
+                    scale_count++;
+                }
+            }
+        }
+
+        double measured_scale_factor = (scale_count > 0) ? (sum_scale_ratio / scale_count) : 1.0;
+
         cv::Mat_<cv::Vec3f> row_interp;
         cv::Mat_<cv::Vec3f> col_interp;
         if (neighbor_fill) {
@@ -847,8 +889,54 @@ int main(int argc, char *argv[])
             }
         }
 
+        // Apply measured scale factor (clamped to reasonable range)
+        const bool neighbor_auto_scale = params.value("neighbor_auto_scale", true);
+        double scale_factor = 1.0;
+        if (neighbor_auto_scale && scale_count > 10) {
+            scale_factor = std::clamp(measured_scale_factor, 0.5, 2.0);
+        }
+
+        // Resize grid if scale factor is significantly different from 1.0
+        cv::Mat_<cv::Vec3f> final_points = dst_points;
+        if (std::abs(scale_factor - 1.0) > 0.01) {
+            int new_cols = static_cast<int>(std::round(cols * scale_factor));
+            int new_rows = static_cast<int>(std::round(rows * scale_factor));
+
+            std::cout << "Scaling neighbor grid by " << scale_factor
+                      << " (measured from " << scale_count << " adjacent point pairs)"
+                      << " from " << cols << "x" << rows
+                      << " to " << new_cols << "x" << new_rows << std::endl;
+
+            // Create mask for valid points (for proper interpolation boundary handling)
+            cv::Mat valid_mask(rows, cols, CV_8U);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    valid_mask.at<uchar>(r, c) = is_valid_vertex(dst_points(r, c)) ? 255 : 0;
+                }
+            }
+
+            // Resize points grid with linear interpolation
+            cv::Mat_<cv::Vec3f> resized_points;
+            cv::resize(dst_points, resized_points, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
+
+            // Resize validity mask with nearest neighbor to avoid edge blending
+            cv::Mat resized_mask;
+            cv::resize(valid_mask, resized_mask, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_NEAREST);
+
+            // Invalidate points where the original was invalid
+            for (int r = 0; r < new_rows; ++r) {
+                for (int c = 0; c < new_cols; ++c) {
+                    if (resized_mask.at<uchar>(r, c) == 0) {
+                        resized_points(r, c) = invalid_marker;
+                    }
+                }
+            }
+
+            final_points = resized_points;
+        }
+
         // Prepare output surface and save
-        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(dst_points, src_surface->scale()));
+        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(final_points, src_surface->scale()));
         // Prepare naming
         std::string neighbor_prefix = std::string("neighbor_") + (cast_out ? "out_" : "in_");
         std::string uuid_local = neighbor_prefix + time_str();
