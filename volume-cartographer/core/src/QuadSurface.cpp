@@ -465,7 +465,7 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
     return pointTo_(loc, points, tgt, th, max_iters, scale);
 }
 
-//search the surface point that is closest to th tgt coord
+//search the surface point that is closest to the target coord
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
