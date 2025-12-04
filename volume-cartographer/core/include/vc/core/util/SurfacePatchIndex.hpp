@@ -68,6 +68,10 @@ public:
                         QuadSurface* targetSurface,
                         std::vector<TriangleCandidate>& outCandidates) const;
 
+    void queryTriangles(const Rect3D& bounds,
+                        const std::unordered_set<QuadSurface*>& targetSurfaces,
+                        std::vector<TriangleCandidate>& outCandidates) const;
+
     void forEachTriangle(const Rect3D& bounds,
                          QuadSurface* targetSurface,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;

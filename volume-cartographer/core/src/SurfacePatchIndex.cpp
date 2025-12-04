@@ -668,6 +668,19 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
     });
 }
 
+void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
+                                       const std::unordered_set<QuadSurface*>& targetSurfaces,
+                                       std::vector<TriangleCandidate>& outCandidates) const
+{
+    outCandidates.clear();
+    if (targetSurfaces.empty()) {
+        return;
+    }
+    forEachTriangle(bounds, targetSurfaces, [&](const TriangleCandidate& candidate) {
+        outCandidates.push_back(candidate);
+    });
+}
+
 void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         QuadSurface* targetSurface,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const
@@ -708,20 +721,43 @@ void SurfacePatchIndex::forEachTriangleImpl(
             return;
         }
 
-        Impl::TriangleRecord triRec;
-        triRec.surface = rec.surface;
-        triRec.i = rec.i;
-        triRec.j = rec.j;
+        // Load corners once for both triangles (avoids redundant matrix reads)
+        std::array<cv::Vec3f, 4> corners;
+        if (!Impl::loadPatchCorners(rec, corners)) {
+            return;
+        }
 
+        // Precompute surface params for the quad (avoids redundant center/scale lookups)
+        const float baseX = static_cast<float>(rec.i);
+        const float baseY = static_cast<float>(rec.j);
+        const cv::Vec3f center = rec.surface->center();
+        const cv::Vec2f scale = rec.surface->scale();
+        const float cx = center[0] * scale[0];
+        const float cy = center[1] * scale[1];
+        // Params for corners: [0]=(0,0), [1]=(1,0), [2]=(1,1), [3]=(0,1)
+        std::array<cv::Vec3f, 4> params = {
+            cv::Vec3f(baseX - cx, baseY - cy, 0.0f),
+            cv::Vec3f(baseX + 1.0f - cx, baseY - cy, 0.0f),
+            cv::Vec3f(baseX + 1.0f - cx, baseY + 1.0f - cy, 0.0f),
+            cv::Vec3f(baseX - cx, baseY + 1.0f - cy, 0.0f)
+        };
+
+        // Emit both triangles from cached corners/params
+        // Triangle 0: corners[0,1,3], params[0,1,3]
+        // Triangle 1: corners[1,2,3], params[1,2,3]
         for (int triIdx = 0; triIdx < 2; ++triIdx) {
             TriangleCandidate candidate;
             candidate.surface = rec.surface;
             candidate.i = rec.i;
             candidate.j = rec.j;
             candidate.triangleIndex = triIdx;
-            triRec.triangleIndex = triIdx;
-            if (!Impl::loadTriangleGeometry(triRec, candidate.world, candidate.surfaceParams)) {
-                continue;
+
+            if (triIdx == 0) {
+                candidate.world = {corners[0], corners[1], corners[3]};
+                candidate.surfaceParams = {params[0], params[1], params[3]};
+            } else {
+                candidate.world = {corners[1], corners[2], corners[3]};
+                candidate.surfaceParams = {params[1], params[2], params[3]};
             }
 
             Rect3D triBounds;
@@ -790,7 +826,8 @@ struct IntersectionEndpoint {
 
 bool pointsApproximatelyEqual(const cv::Vec3f& a, const cv::Vec3f& b, float epsilon)
 {
-    return cv::norm(a - b) <= epsilon;
+    // Use squared distance to avoid expensive sqrt
+    return cv::norm(a - b, cv::NORM_L2SQR) <= epsilon * epsilon;
 }
 } // namespace
 
@@ -896,13 +933,14 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
     }
 
     if (endpointCount > 2) {
-        float bestDist = -1.0f;
+        // Use squared distance for comparison to avoid sqrt
+        float bestDistSq = -1.0f;
         std::pair<size_t, size_t> bestPair = {0, 1};
         for (size_t a = 0; a < endpointCount; ++a) {
             for (size_t b = a + 1; b < endpointCount; ++b) {
-                float dist = cv::norm(endpoints[a].world - endpoints[b].world);
-                if (dist > bestDist) {
-                    bestDist = dist;
+                float distSq = cv::norm(endpoints[a].world - endpoints[b].world, cv::NORM_L2SQR);
+                if (distSq > bestDistSq) {
+                    bestDistSq = distSq;
                     bestPair = {a, b};
                 }
             }

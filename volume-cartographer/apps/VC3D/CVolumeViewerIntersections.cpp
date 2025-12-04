@@ -132,8 +132,15 @@ void CVolumeViewer::renderIntersections()
             intersectCandidates.emplace_back(key, segmentation);
         }
 
+        // Build set of surfaces to filter query (avoids processing irrelevant triangles)
+        std::unordered_set<QuadSurface*> targetSurfaces;
+        targetSurfaces.reserve(intersectCandidates.size());
+        for (const auto& candidate : intersectCandidates) {
+            targetSurfaces.insert(candidate.second);
+        }
+
         std::vector<SurfacePatchIndex::TriangleCandidate> triangleCandidates;
-        patchIndex->queryTriangles(view_bbox, nullptr, triangleCandidates);
+        patchIndex->queryTriangles(view_bbox, targetSurfaces, triangleCandidates);
 
         std::unordered_map<QuadSurface*, std::vector<size_t>> trianglesBySurface;
         trianglesBySurface.reserve(intersectCandidates.size());
