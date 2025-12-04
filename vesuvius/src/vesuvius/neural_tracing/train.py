@@ -413,9 +413,9 @@ def train(config_path):
             if bidirectional:
 
                 # Take steps back along the chain. current_center_in_outer_crop is the output point from the last forward
-                # step (i.e. what would be the next center if we took more steps forward); it becomes the first center for
+                # step (i.e. what would be the next center if we took more steps forward); it becomes the first conditioning for
                 # the reverse direction. prev_center_in_outer_crop is the previous point of the forward chain, i.e. the last
-                # center point at which the model was evaluation
+                # center point at which the model was evaluated (and also the first center for the reverse direction)
 
                 assert multistep_count > 1  # FIXME: in principle we could support the 1-step case, but need to get the gt (unperturbed) target
 
@@ -433,7 +433,7 @@ def train(config_path):
         # later_step_idx is the index into losses_by_sample_by_later_step (which excludes first step)
         later_step_loss = torch.zeros([], device=mask.device)
         cumulative_weights = [1] * sample_count
-        for later_step_idx in range(multistep_count - 1):
+        for later_step_idx in range((multistep_count - 1) * (2 if bidirectional else 1)):
 
             # Update cumulative importance weights
             for sample_idx in range(sample_count):
