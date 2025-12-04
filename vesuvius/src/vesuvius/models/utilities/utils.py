@@ -407,40 +407,57 @@ class DropPath(nn.Module):
         return output
 
 
+def _make_divisible(v, divisor=8, min_value=None, round_limit=0.9):
+    min_value = min_value or divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    if new_v < round_limit * v:
+        new_v += divisor
+    return new_v
+
+
 class SqueezeExcite(nn.Module):
-    """Squeeze and Excitation block."""
-    def __init__(self, channels, conv_op, rd_ratio=1./16, rd_divisor=8):
+    """Squeeze-and-Excitation module for channel attention.
+
+    See https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/building_blocks/regularization.py
+    """
+    def __init__(
+            self,
+            channels,
+            conv_op,
+            rd_ratio=1./16,
+            rd_channels=None,
+            rd_divisor=8,
+            add_maxpool=False,
+            act_layer=nn.ReLU,
+            norm_layer=None,
+            gate_layer=nn.Sigmoid):
         super(SqueezeExcite, self).__init__()
-        self.channels = channels
-        self.rd_ratio = rd_ratio
-        self.rd_divisor = rd_divisor
+        self.add_maxpool = add_maxpool
+        if not rd_channels:
+            rd_channels = _make_divisible(channels * rd_ratio, rd_divisor, round_limit=0.)
+        self.fc1 = conv_op(channels, rd_channels, kernel_size=1, bias=True)
+        self.bn = norm_layer(rd_channels) if norm_layer else nn.Identity()
+        self.act = act_layer(inplace=True)
+        self.fc2 = conv_op(rd_channels, channels, kernel_size=1, bias=True)
+        self.gate = gate_layer()
 
-        # Calculate reduction channels
-        rd_channels = max(1, int(channels * rd_ratio))
-        rd_channels = max(1, rd_channels // rd_divisor * rd_divisor)
-
-        # Global average pooling
         if conv_op == nn.Conv3d:
-            self.global_pool = nn.AdaptiveAvgPool3d(1)
+            self._spatial_dims = (2, 3, 4)
         elif conv_op == nn.Conv2d:
-            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            self._spatial_dims = (2, 3)
         elif conv_op == nn.Conv1d:
-            self.global_pool = nn.AdaptiveAvgPool1d(1)
+            self._spatial_dims = (2,)
         else:
             raise RuntimeError(f"Invalid conv op: {conv_op}")
 
-        self.fc1 = nn.Linear(channels, rd_channels)
-        self.fc2 = nn.Linear(rd_channels, channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
     def forward(self, x):
-        b, c = x.shape[:2]
-        y = self.global_pool(x).view(b, c)
-        y = self.relu(self.fc1(y))
-        y = self.sigmoid(self.fc2(y))
-        y = y.view(b, c, *([1] * (x.ndim - 2)))
-        return x * y
+        x_se = x.mean(self._spatial_dims, keepdim=True)
+        if self.add_maxpool:
+            x_se = 0.5 * x_se + 0.5 * x.amax(self._spatial_dims, keepdim=True)
+        x_se = self.fc1(x_se)
+        x_se = self.act(self.bn(x_se))
+        x_se = self.fc2(x_se)
+        return x * self.gate(x_se)
 
 
 def determine_dimensionality(patch_size, pool_type='avg', verbose=False):

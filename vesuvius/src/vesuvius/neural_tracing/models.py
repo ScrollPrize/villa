@@ -45,7 +45,7 @@ def _config_dict_to_mgr(config_dict):
     mgr.autoconfigure = True  # explicit per request
     mgr.spacing = model_config.get('spacing', [1, 1, 1])
     mgr.targets = targets
-    mgr.enable_deep_supervision = bool(config_dict.get('enable_deep_supervision', True))
+    mgr.enable_deep_supervision = bool(config_dict.get('enable_deep_supervision', False))
     # Explicitly mark dimensionality so NetworkFromConfig skips guessing
     mgr.op_dims = 3
     return mgr
