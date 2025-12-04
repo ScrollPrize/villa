@@ -75,9 +75,15 @@ def tiled_unet_infer(
 	layer: Optional[int] = None,
 	tile_size: int = 512,
 	overlap: int = 128,
+	border: int = 0,
 ) -> None:
 	"""
 	Run UNet inference with overlapping 2D tiles on a single TIFF image/stack.
+
+	border:
+		Number of pixels at each tile border that are fully discarded (blend
+		weight 0) before linear ramping begins. Useful to drop unreliable
+		boundary predictions from each tile.
 
 	Saves three float32 TIFFs (LZW) in `out_dir`:
 	  - <stem>[_layerXXXX]_cos.tif  : channel 0 (cosine branch)
@@ -117,6 +123,7 @@ def tiled_unet_infer(
 			raw,
 			tile_size=tile_size,
 			overlap=overlap,
+			border=border,
 		)  # (1,3,H,W)
 
 	pred_np = pred[0].detach().cpu().numpy().astype("float32")  # (3,H,W)
@@ -195,6 +202,12 @@ def main() -> None:
 		default=128,
 		help="Overlap between neighboring tiles in pixels (per axis).",
 	)
+	parser.add_argument(
+		"--border",
+		type=int,
+		default=0,
+		help="Border pixels per tile to discard completely (blend weight 0).",
+	)
 
 	args = parser.parse_args()
 
@@ -206,6 +219,7 @@ def main() -> None:
 		layer=args.layer,
 		tile_size=args.tile_size,
 		overlap=args.overlap,
+		border=args.border,
 	)
 
 
