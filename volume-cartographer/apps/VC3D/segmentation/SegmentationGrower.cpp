@@ -125,7 +125,8 @@ bool isInvalidPoint(const cv::Vec3f& value)
 std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
                                                           const cv::Vec3f& worldPos,
                                                           cv::Vec3f& pointerSeed,
-                                                          bool& pointerSeedValid)
+                                                          bool& pointerSeedValid,
+                                                          SurfacePatchIndex* patchIndex = nullptr)
 {
     if (!surface) {
         return std::nullopt;
@@ -141,7 +142,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
         pointerSeedValid = true;
     }
 
-    surface->pointTo(pointerSeed, worldPos, std::numeric_limits<float>::max(), 400);
+    surface->pointTo(pointerSeed, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
     cv::Vec3f raw = surface->loc_raw(pointerSeed);
 
     const int rows = points->rows;
@@ -233,7 +234,7 @@ std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* su
         }
     }
 
-    return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid);
+    return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid, patchIndex);
 }
 
 std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,

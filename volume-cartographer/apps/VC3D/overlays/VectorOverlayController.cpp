@@ -3,6 +3,7 @@
 #include "../CVolumeViewer.hpp"
 #include "../CSurfaceCollection.hpp"
 #include "../VCSettings.hpp"
+#include "../ViewerManager.hpp"
 
 #include "vc/core/util/Surface.hpp"
 
@@ -138,7 +139,8 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         }
         if (auto* poi = _surfaces->poi("focus")) {
             auto ptr = segSurface->pointer();
-            float dist = segSurface->pointTo(ptr, poi->p, 4.0, 100);
+            auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+            float dist = segSurface->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
             if (dist >= 0 && dist < 20.0f / scale) {
                 cv::Vec3f sp = segSurface->loc(ptr) * scale;
                 anchor = QPointF(sp[0], sp[1]);
@@ -166,7 +168,8 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         auto ptr = quad->pointer();
         if (_surfaces) {
             if (auto* poi = _surfaces->poi("focus")) {
-                quad->pointTo(ptr, poi->p, 4.0, 100);
+                auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+                quad->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
             }
         }
 
@@ -219,7 +222,8 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         }
 
         auto segPtr = segSurface->pointer();
-        segSurface->pointTo(segPtr, targetWP, 4.0, 100);
+        auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+        segSurface->pointTo(segPtr, targetWP, 4.0, 100, patchIndex);
 
         cv::Vec3f p0 = segSurface->coord(segPtr, {0, 0, 0});
         if (p0[0] == -1.0f) {

@@ -12,6 +12,7 @@
 #include <opencv2/core.hpp>
 
 class QuadSurface;
+class ViewerManager;
 
 class SegmentationEditManager : public QObject
 {
@@ -73,6 +74,9 @@ public:
     };
 
     explicit SegmentationEditManager(QObject* parent = nullptr);
+
+    void setViewerManager(ViewerManager* manager) { _viewerManager = manager; }
+    [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
 
     bool beginSession(QuadSurface* baseSurface);
     void endSession();
@@ -141,6 +145,7 @@ private:
     void publishDirtyBoundsFromRecentTouched();
 
     QuadSurface* _baseSurface{nullptr};
+    ViewerManager* _viewerManager{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
     cv::Mat_<cv::Vec3f>* _previewPoints{nullptr};
 

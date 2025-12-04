@@ -1,6 +1,7 @@
 #include "SegmentationPushPullTool.hpp"
 
 #include "SegmentationModule.hpp"
+#include "ViewerManager.hpp"
 #include "CVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
@@ -86,7 +87,8 @@ std::optional<cv::Vec3f> averageNormals(const std::vector<cv::Vec3f>& normals)
 
 std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
                                                         const cv::Vec3f& basePtr,
-                                                        const SegmentationEditManager::ActiveDrag& drag)
+                                                        const SegmentationEditManager::ActiveDrag& drag,
+                                                        SurfacePatchIndex* patchIndex = nullptr)
 {
     if (!surface || !drag.active) {
         return std::nullopt;
@@ -98,7 +100,7 @@ std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
     // Try the center first, then nearby samples in order of proximity.
     const auto collectNormalAt = [&](const cv::Vec3f& worldPoint) {
         cv::Vec3f ptrCandidate = basePtr;
-        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200);
+        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200, patchIndex);
         const cv::Vec3f candidateNormal = surface->normal(ptrCandidate);
         if (isValidNormal(candidateNormal)) {
             normals.push_back(candidateNormal);
@@ -328,13 +330,14 @@ std::optional<cv::Vec3f> fitPlaneNormal(const SegmentationEditManager::ActiveDra
 std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
                                              const cv::Vec3f& centerPtr,
                                              const cv::Vec3f& centerWorld,
-                                             const SegmentationEditManager::ActiveDrag& drag)
+                                             const SegmentationEditManager::ActiveDrag& drag,
+                                             SurfacePatchIndex* patchIndex = nullptr)
 {
     if (!surface || !drag.active) {
         return std::nullopt;
     }
 
-    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag);
+    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag, patchIndex);
     const auto rowVec = axisVectorFromSamples(AxisDirection::Row, drag);
     const auto colVec = axisVectorFromSamples(AxisDirection::Column, drag);
 
@@ -580,11 +583,12 @@ bool SegmentationPushPullTool::applyStepInternal()
         return false;
     }
 
+    auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
     cv::Vec3f ptr = baseSurface->pointer();
-    baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400);
+    baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
     cv::Vec3f normal = baseSurface->normal(ptr);
     if (std::isnan(normal[0]) || std::isnan(normal[1]) || std::isnan(normal[2])) {
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag())) {
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
@@ -594,7 +598,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     }
 
     if (!isValidNormal(normal)) {
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag())) {
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
@@ -637,7 +641,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                 const cv::Vec3f& baseWorld = sample.baseWorld;
                 cv::Vec3f sampleNormal = normal;
                 cv::Vec3f samplePtr = baseSurface->pointer();
-                baseSurface->pointTo(samplePtr, baseWorld, std::numeric_limits<float>::max(), 400);
+                baseSurface->pointTo(samplePtr, baseWorld, std::numeric_limits<float>::max(), 400, patchIndex);
                 cv::Vec3f candidateNormal = baseSurface->normal(samplePtr);
                 if (std::isfinite(candidateNormal[0]) &&
                     std::isfinite(candidateNormal[1]) &&

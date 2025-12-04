@@ -541,8 +541,8 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
             defaultStride = 4;
             _targetRefinedStride = 2;
         } else {
-            // < 500: build at 2x and keep at 2x
-            defaultStride = 2;
+            // < 500: build at 1x (full resolution), no progressive loading
+            defaultStride = 1;
         }
         setSurfacePatchSamplingStride(defaultStride, false);
     }
@@ -811,6 +811,11 @@ void ViewerManager::setSegmentationCursorMirroring(bool enabled)
             viewer->setSegmentationCursorMirroring(enabled);
         }
     }
+}
+
+void ViewerManager::setSliceStepSize(int size)
+{
+    _sliceStepSize = std::max(1, size);
 }
 
 void ViewerManager::forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const

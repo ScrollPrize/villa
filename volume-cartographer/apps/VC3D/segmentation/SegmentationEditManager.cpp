@@ -1,5 +1,6 @@
 #include "SegmentationEditManager.hpp"
 
+#include "ViewerManager.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -377,7 +378,8 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
         _pointerSeed = ptr;
         _pointerSeedValid = true;
     }
-    const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400);
+    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+    const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
     _pointerSeed = ptr;
     cv::Vec3f raw = _baseSurface->loc_raw(ptr);
 

@@ -88,6 +88,7 @@ public:
     void setApprovalMaskBrushRadius(float radiusSteps);
     void setApprovalBrushDepth(float depth);
     [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
+    [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
     [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     void undoApprovalStroke();
