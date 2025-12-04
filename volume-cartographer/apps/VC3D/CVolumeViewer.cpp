@@ -680,7 +680,7 @@ void CVolumeViewer::fitSurfaceInView()
 }
 
 
-void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
+void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEditUpdate)
 {
     if (name == "segmentation" || name == _surf_name) {
         markActiveSegmentationDirty();
@@ -708,7 +708,9 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf)
         }
         else {
             invalidateVis();
-            _z_off = 0.0f;
+            if (!isEditUpdate) {
+                _z_off = 0.0f;
+            }
             if (name == "segmentation" && _resetViewOnSurfaceChange) {
                 fitSurfaceInView();
             }

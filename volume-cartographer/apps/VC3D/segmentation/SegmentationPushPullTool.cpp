@@ -769,7 +769,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     _editManager->applyPreview();
 
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
     }
 
     _module.refreshOverlay();

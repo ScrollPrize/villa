@@ -185,7 +185,7 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
-    void onSurfaceChanged(std::string name, Surface *surf);
+    void onSurfaceChanged(std::string name, Surface *surf, bool isEditUpdate = false);
     void onPOIChanged(std::string name, POI *poi);
     void onScrolled();
     void onResized();

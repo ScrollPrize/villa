@@ -19,7 +19,7 @@ CSurfaceCollection::~CSurfaceCollection()
 
 }
 
-void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership)
+void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership, bool isEditUpdate)
 {
     auto it = _surfs.find(name);
     if (it != _surfs.end()) {
@@ -32,7 +32,7 @@ void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool
         _surfs[name] = {surf, takeOwnership};
     }
     if (!noSignalSend) {
-        sendSurfaceChanged(name, surf);
+        sendSurfaceChanged(name, surf, isEditUpdate);
     }
 }
 
