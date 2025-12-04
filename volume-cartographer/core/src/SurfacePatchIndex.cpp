@@ -4,7 +4,6 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -946,9 +945,7 @@ bool SurfacePatchIndex::updateSurfaceRegion(QuadSurface* surface,
         return false;
     }
 
-    size_t countBefore = impl_->tree ? impl_->tree->size() : 0;
     impl_->removeCells(surface, rowStart, rowEnd, colStart, colEnd);
-    size_t countAfterRemove = impl_->tree ? impl_->tree->size() : 0;
 
     int samplingStride = impl_->samplingStride;
     const int rowSpan = rowEnd - rowStart;
