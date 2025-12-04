@@ -464,7 +464,12 @@ void MenuActionController::showKeybindings()
             "Left Drag: Drag surface point or draw with active tool\n"
             "Right Drag: Pan slice image\n"
             "Middle Drag: Pan (if enabled)\n"
-            "Mouse Wheel: Zoom in/out (when editing: adjust tool radius)\n"));
+            "Mouse Wheel: Zoom in/out (when editing: adjust tool radius)\n"
+            "Shift+Scroll Wheel: Pan through slices\n"
+            "\n"
+            "=== Slice Step Size ===\n"
+            "Shift+G: Decrease slice step size\n"
+            "Shift+H: Increase slice step size\n"));
 }
 
 void MenuActionController::exitApplication()

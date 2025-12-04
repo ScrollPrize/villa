@@ -168,6 +168,7 @@ private slots:
     void onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onSegmentationGrowthStatusChanged(bool running);
     void processPendingInotifyEvents();
+    void onSliceStepSizeChanged(int newSize);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -203,6 +204,7 @@ private:
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;
 
 
