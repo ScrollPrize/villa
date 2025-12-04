@@ -21,13 +21,6 @@ public:
         float distance = -1.0f;
     };
 
-    struct PatchCandidate {
-        QuadSurface* surface = nullptr;
-        int i = 0;
-        int j = 0;
-        std::array<cv::Vec3f, 4> corners{};
-    };
-
     struct TriangleCandidate {
         QuadSurface* surface = nullptr;
         int i = 0;
@@ -59,10 +52,6 @@ public:
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,
                                        QuadSurface* targetSurface = nullptr) const;
-
-    void queryBox(const Rect3D& bounds,
-                  QuadSurface* targetSurface,
-                  std::vector<PatchCandidate>& outCandidates) const;
 
     void queryTriangles(const Rect3D& bounds,
                         QuadSurface* targetSurface,

@@ -362,9 +362,9 @@ struct SurfacePatchIndex::Impl {
                                CellEntry& outEntry);
     static bool loadPatchCorners(const PatchRecord& rec,
                                  std::array<cv::Vec3f, 4>& outCorners);
-    static bool loadTriangleGeometry(const TriangleRecord& rec,
-                                     std::array<cv::Vec3f, 3>& world,
-                                     std::array<cv::Vec3f, 3>& surfaceParams);
+    static Entry buildEntryFromCorners(const PatchRecord& rec,
+                                       const std::array<cv::Vec3f, 4>& corners,
+                                       float bboxPadding);
     void removeCellEntry(SurfaceCellMask& mask,
                          QuadSurface* surface,
                          int row,
@@ -495,7 +495,6 @@ void SurfacePatchIndex::rebuild(const std::vector<QuadSurface*>& surfaces, float
     impl_->bboxPadding = bboxPadding;
     impl_->surfaceCellRecords.clear();
     impl_->patchCount = 0;
-    impl_->surfaceCellRecords.clear();
 
     const size_t surfaceCount = surfaces.size();
     if (surfaceCount == 0) {
@@ -623,39 +622,6 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, QuadSurf
 
     best.distance = std::sqrt(bestDistSq);
     return best;
-}
-
-void SurfacePatchIndex::queryBox(const Rect3D& bounds,
-                                 QuadSurface* targetSurface,
-                                 std::vector<PatchCandidate>& outCandidates) const
-{
-    outCandidates.clear();
-    if (!impl_ || !impl_->tree) {
-        return;
-    }
-
-    Impl::Point3 min_pt(bounds.low[0], bounds.low[1], bounds.low[2]);
-    Impl::Point3 max_pt(bounds.high[0], bounds.high[1], bounds.high[2]);
-    Impl::Box3 query(min_pt, max_pt);
-
-    auto emitCandidate = [&](const Impl::Entry& entry) {
-        const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface != targetSurface) {
-            return;
-        }
-
-        PatchCandidate candidate;
-        candidate.surface = rec.surface;
-        candidate.i = rec.i;
-        candidate.j = rec.j;
-        if (!Impl::loadPatchCorners(rec, candidate.corners)) {
-            return;
-        }
-        outCandidates.push_back(std::move(candidate));
-    };
-
-    impl_->tree->query(bgi::intersects(query),
-                       boost::make_function_output_iterator(emitCandidate));
 }
 
 void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
@@ -1073,6 +1039,15 @@ SurfacePatchIndex::Impl::makePatchEntry(const CellKey& key) const
         return std::nullopt;
     }
 
+    return buildEntryFromCorners(rec, corners, bboxPadding);
+}
+
+// Static helper to build an R-tree Entry from 4 corners
+SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromCorners(
+    const PatchRecord& rec,
+    const std::array<cv::Vec3f, 4>& corners,
+    float bboxPadding)
+{
     cv::Vec3f low = corners[0];
     cv::Vec3f high = corners[0];
     for (const cv::Vec3f& c : corners) {
@@ -1140,48 +1115,6 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     return true;
 }
 
-bool SurfacePatchIndex::Impl::loadTriangleGeometry(const TriangleRecord& rec,
-                                                   std::array<cv::Vec3f, 3>& world,
-                                                   std::array<cv::Vec3f, 3>& surfaceParams)
-{
-    if (!rec.surface) {
-        return false;
-    }
-
-    PatchRecord patch{rec.surface, rec.i, rec.j};
-    std::array<cv::Vec3f, 4> corners;
-    if (!loadPatchCorners(patch, corners)) {
-        return false;
-    }
-
-    const float baseX = static_cast<float>(rec.i);
-    const float baseY = static_cast<float>(rec.j);
-
-    auto makeParam = [&](float dx, float dy) {
-        return makePtrFromAbsCoord(rec.surface, baseX + dx, baseY + dy);
-    };
-
-    if (rec.triangleIndex == 0) {
-        world = {corners[0], corners[1], corners[3]};
-        surfaceParams = {
-            makeParam(0.0f, 0.0f),
-            makeParam(1.0f, 0.0f),
-            makeParam(0.0f, 1.0f)
-        };
-    } else if (rec.triangleIndex == 1) {
-        world = {corners[1], corners[2], corners[3]};
-        surfaceParams = {
-            makeParam(1.0f, 0.0f),
-            makeParam(1.0f, 1.0f),
-            makeParam(0.0f, 1.0f)
-        };
-    } else {
-        return false;
-    }
-
-    return true;
-}
-
 bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
                                              const cv::Mat_<cv::Vec3f>& points,
                                              int col,
@@ -1204,26 +1137,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(QuadSurface* surface,
     rec.j = row;
 
     std::array<cv::Vec3f, 4> corners = {p00, p10, p11, p01};
-    cv::Vec3f low = corners[0];
-    cv::Vec3f high = corners[0];
-    for (const cv::Vec3f& c : corners) {
-        low[0] = std::min(low[0], c[0]);
-        low[1] = std::min(low[1], c[1]);
-        low[2] = std::min(low[2], c[2]);
-        high[0] = std::max(high[0], c[0]);
-        high[1] = std::max(high[1], c[1]);
-        high[2] = std::max(high[2], c[2]);
-    }
-
-    if (bboxPadding > 0.0f) {
-        low -= cv::Vec3f(bboxPadding, bboxPadding, bboxPadding);
-        high += cv::Vec3f(bboxPadding, bboxPadding, bboxPadding);
-    }
-
-    Point3 min_pt(low[0], low[1], low[2]);
-    Point3 max_pt(high[0], high[1], high[2]);
-
-    outEntry.patch = std::make_pair(Box3(min_pt, max_pt), rec);
+    outEntry.patch = buildEntryFromCorners(rec, corners, bboxPadding);
     outEntry.hasPatch = true;
 
     return true;

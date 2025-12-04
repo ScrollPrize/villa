@@ -272,6 +272,16 @@ void CVolumeViewer::renderIntersections()
             }
             const bool checkApproval = segOverlay && segOverlay->hasApprovalMaskData();
 
+            // Cache surface properties for coordinate conversion (constant for all lines from this surface)
+            float approvalOffsetX = 0.0f;
+            float approvalOffsetY = 0.0f;
+            if (checkApproval) {
+                const cv::Vec3f center = segmentation->center();
+                const cv::Vec2f scale = segmentation->scale();
+                approvalOffsetX = center[0] * scale[0];
+                approvalOffsetY = center[1] * scale[1];
+            }
+
             std::vector<QGraphicsItem*> items;
             items.reserve(intersectionLines.size());
             for (const auto& line : intersectionLines) {
@@ -287,15 +297,11 @@ void CVolumeViewer::renderIntersections()
                 if (checkApproval) {
                     // surfaceParams stores ptr-space coordinates: (absX - center[0]*scale[0], absY - center[1]*scale[1], 0)
                     // We need to convert back to absolute grid indices
-                    const cv::Vec3f center = segmentation->center();
-                    const cv::Vec2f scale = segmentation->scale();
-
-                    // Convert ptr-space back to absolute grid coords (keep as float for bilinear)
                     // ptr = abs - center * scale, so abs = ptr + center * scale
-                    const float absCol0 = line.surfaceParams[0][0] + center[0] * scale[0];
-                    const float absRow0 = line.surfaceParams[0][1] + center[1] * scale[1];
-                    const float absCol1 = line.surfaceParams[1][0] + center[0] * scale[0];
-                    const float absRow1 = line.surfaceParams[1][1] + center[1] * scale[1];
+                    const float absCol0 = line.surfaceParams[0][0] + approvalOffsetX;
+                    const float absRow0 = line.surfaceParams[0][1] + approvalOffsetY;
+                    const float absCol1 = line.surfaceParams[1][0] + approvalOffsetX;
+                    const float absRow1 = line.surfaceParams[1][1] + approvalOffsetY;
 
                     // Use bilinear interpolation for sub-pixel accuracy
                     int status0 = 0, status1 = 0;
