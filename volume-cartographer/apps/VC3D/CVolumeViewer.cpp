@@ -689,7 +689,10 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
     // When active segmentation changes, force re-render of intersections
     // so the highlight colors update immediately (old segment loses highlight,
     // new segment gains it)
-    if (name == "segmentation") {
+    // Skip if _intersect_tgts contains "segmentation" since it will be handled
+    // by the intersection target logic below (avoids create-delete-create race
+    // that can confuse Qt's scene invalidation)
+    if (name == "segmentation" && !_intersect_tgts.count("segmentation")) {
         renderIntersections();
     }
 
@@ -720,6 +723,9 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
     if (name == _surf_name) {
         curr_img_area = {0,0,0,0};
         renderVisible(true); // Immediate render of slice
+        // When the slice plane itself moves, re-render intersections since
+        // the view_bbox will be at the new position
+        renderIntersections();
     }
 
     if (_intersect_tgts.count(name)) {

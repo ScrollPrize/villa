@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -37,17 +38,6 @@ inline bool shouldSampleIndex(int idx, int count, int stride)
     }
     const int lastIndex = count - 1;
     return (idx % stride == 0) || (idx == lastIndex);
-}
-
-cv::Vec3f makePtrFromAbsCoord(const QuadSurface* surface, float absX, float absY)
-{
-    const cv::Vec3f center = surface->center();
-    const cv::Vec2f scale = surface->scale();
-    return cv::Vec3f(
-        absX - center[0] * scale[0],
-        absY - center[1] * scale[1],
-        0.0f
-    );
 }
 
 struct TriangleHit {
@@ -187,20 +177,6 @@ struct SurfacePatchIndex::Impl {
             return surface == other.surface &&
                    i == other.i &&
                    j == other.j;
-        }
-    };
-
-    struct TriangleRecord {
-        QuadSurface* surface = nullptr;
-        int i = 0;
-        int j = 0;
-        int triangleIndex = 0;
-
-        bool operator==(const TriangleRecord& other) const noexcept {
-            return surface == other.surface &&
-                   i == other.i &&
-                   j == other.j &&
-                   triangleIndex == other.triangleIndex;
         }
     };
 
@@ -970,7 +946,10 @@ bool SurfacePatchIndex::updateSurfaceRegion(QuadSurface* surface,
         return false;
     }
 
+    size_t countBefore = impl_->tree ? impl_->tree->size() : 0;
     impl_->removeCells(surface, rowStart, rowEnd, colStart, colEnd);
+    size_t countAfterRemove = impl_->tree ? impl_->tree->size() : 0;
+
     int samplingStride = impl_->samplingStride;
     const int rowSpan = rowEnd - rowStart;
     const int colSpan = colEnd - colStart;
@@ -1019,7 +998,7 @@ int SurfacePatchIndex::samplingStride() const
     if (!impl_) {
         return 1;
     }
-    return std::max(1, impl_->samplingStride);
+    return impl_->samplingStride;  // Invariant: always >= 1 (enforced by setter)
 }
 
 std::optional<SurfacePatchIndex::Impl::Entry>

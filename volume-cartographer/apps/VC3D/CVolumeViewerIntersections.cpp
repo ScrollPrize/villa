@@ -20,6 +20,7 @@
 
 #include <omp.h>
 
+#include <iostream>
 #include <optional>
 #include <cstdlib>
 #include <unordered_map>
@@ -152,32 +153,6 @@ void CVolumeViewer::renderIntersections()
             trianglesBySurface[surface].push_back(idx);
         }
 
-        auto intersectionLinesEqual = [](const std::vector<IntersectionLine>& lhs,
-                                         const std::vector<IntersectionLine>& rhs) {
-            if (lhs.size() != rhs.size()) {
-                return false;
-            }
-            for (size_t idx = 0; idx < lhs.size(); ++idx) {
-                const auto& a = lhs[idx];
-                const auto& b = rhs[idx];
-                if (a.world.size() != b.world.size() ||
-                    a.surfaceParams.size() != b.surfaceParams.size()) {
-                    return false;
-                }
-                for (size_t pointIdx = 0; pointIdx < a.world.size(); ++pointIdx) {
-                    if (a.world[pointIdx] != b.world[pointIdx]) {
-                        return false;
-                    }
-                }
-                for (size_t pointIdx = 0; pointIdx < a.surfaceParams.size(); ++pointIdx) {
-                    if (a.surfaceParams[pointIdx] != b.surfaceParams[pointIdx]) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        };
-
         size_t colorIndex = 0;
         for (const auto& candidate : intersectCandidates) {
             const auto& key = candidate.first;
@@ -285,10 +260,6 @@ void CVolumeViewer::renderIntersections()
             std::vector<QGraphicsItem*> items;
             items.reserve(intersectionLines.size());
             for (const auto& line : intersectionLines) {
-                if (line.world.size() < 2) {
-                    continue;
-                }
-
                 // Determine color and width based on approval status
                 QColor lineColor = col;
                 float lineWidth = width;
