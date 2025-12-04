@@ -5,6 +5,7 @@
 #include <QKeySequence>
 #include <QHBoxLayout>
 #include <QKeyEvent>
+#include <QWheelEvent>
 #include <QSettings>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -506,6 +507,14 @@ CWindow::CWindow() :
     connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CVolumeViewer* viewer) {
         configureViewerConnections(viewer);
     });
+
+    // Slice step size label in status bar
+    _sliceStepLabel = new QLabel(this);
+    _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
+    int initialStepSize = _viewerManager->sliceStepSize();
+    _sliceStepLabel->setText(tr("Step: %1").arg(initialStepSize));
+    _sliceStepLabel->setToolTip(tr("Slice step size: use Shift+G / Shift+H to adjust"));
+    statusBar()->addPermanentWidget(_sliceStepLabel);
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_point_collection, this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
@@ -1225,6 +1234,7 @@ void CWindow::CreateWidgets(void)
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
+    _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
     _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
@@ -1540,6 +1550,26 @@ void CWindow::CreateWidgets(void)
         QSignalBlocker blocker(spinAxisOverlayOpacity);
         spinAxisOverlayOpacity->setValue(storedOpacity);
         connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
+    }
+
+    if (auto* spinSliceStep = ui.spinSliceStepSize) {
+        int savedStep = settings.value("viewer/slice_step_size", 1).toInt();
+        savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
+        QSignalBlocker blocker(spinSliceStep);
+        spinSliceStep->setValue(savedStep);
+        if (_viewerManager) {
+            _viewerManager->setSliceStepSize(savedStep);
+        }
+        connect(spinSliceStep, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+            if (_viewerManager) {
+                _viewerManager->setSliceStepSize(value);
+            }
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue("viewer/slice_step_size", value);
+            if (_sliceStepLabel) {
+                _sliceStepLabel->setText(tr("Step: %1").arg(value));
+            }
+        });
     }
 
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
@@ -1896,6 +1926,25 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
+    // Shift+G decreases slice step size, Shift+H increases it
+    if (event->modifiers() == Qt::ShiftModifier && _viewerManager) {
+        if (event->key() == Qt::Key_G) {
+            int currentStep = _viewerManager->sliceStepSize();
+            int newStep = std::max(1, currentStep - 1);
+            _viewerManager->setSliceStepSize(newStep);
+            onSliceStepSizeChanged(newStep);
+            event->accept();
+            return;
+        } else if (event->key() == Qt::Key_H) {
+            int currentStep = _viewerManager->sliceStepSize();
+            int newStep = std::min(100, currentStep + 1);
+            _viewerManager->setSliceStepSize(newStep);
+            onSliceStepSizeChanged(newStep);
+            event->accept();
+            return;
+        }
+    }
+
     if (_segmentationModule && _segmentationModule->handleKeyPress(event)) {
         return;
     }
@@ -2031,6 +2080,24 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
             statusBar()->clearMessage();
         }
         _segmentationGrowthStatusText.clear();
+    }
+}
+
+void CWindow::onSliceStepSizeChanged(int newSize)
+{
+    // Update status bar label
+    if (_sliceStepLabel) {
+        _sliceStepLabel->setText(tr("Step: %1").arg(newSize));
+    }
+
+    // Save to settings
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue("viewer/slice_step_size", newSize);
+
+    // Update View dock widget spinbox
+    if (auto* spinSliceStep = ui.spinSliceStepSize) {
+        QSignalBlocker blocker(spinSliceStep);
+        spinSliceStep->setValue(newSize);
     }
 }
 
@@ -2641,7 +2708,8 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
         Surface* seg_surface = _surf_col->surface("segmentation");
         if (auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface)) {
             auto ptr = quad_surface->pointer();
-            quad_surface->pointTo(ptr, point_opt->p, 4.0, 100);
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            quad_surface->pointTo(ptr, point_opt->p, 4.0, 100, patchIndex);
             poi->n = quad_surface->normal(ptr, quad_surface->loc(ptr));
         } else {
             poi->n = cv::Vec3f(0, 0, 1); // Default normal if no surface
@@ -3229,7 +3297,8 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         segYZ->setOrigin(origin);
 
         auto ptr = segment->pointer();
-        segment->pointTo(ptr, origin, 1.0f);
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        segment->pointTo(ptr, origin, 1.0f, 1000, patchIndex);
 
         cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
         cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});

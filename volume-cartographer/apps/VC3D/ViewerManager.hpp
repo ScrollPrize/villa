@@ -89,6 +89,9 @@ public:
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
 
+    void setSliceStepSize(int size);
+    int sliceStepSize() const { return _sliceStepSize; }
+
     void forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
@@ -133,6 +136,7 @@ private:
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
+    int _sliceStepSize{1};
     int _surfacePatchSamplingStride{1};
     bool _surfacePatchStrideUserSet{false};
     int _targetRefinedStride{0};  // 0 = no refinement pending

@@ -231,6 +231,8 @@ protected:
 
     void clearOverlay(CVolumeViewer* viewer) const;
 
+    ViewerManager* manager() const { return _manager; }
+
 private:
     struct ViewerEntry {
         CVolumeViewer* viewer{nullptr};

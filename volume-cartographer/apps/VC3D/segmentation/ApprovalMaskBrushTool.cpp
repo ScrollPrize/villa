@@ -3,6 +3,7 @@
 #include "SegmentationEditManager.hpp"
 #include "SegmentationModule.hpp"
 #include "SegmentationWidget.hpp"
+#include "ViewerManager.hpp"
 #include "../overlays/SegmentationOverlayController.hpp"
 
 #include <QCoreApplication>
@@ -431,7 +432,8 @@ std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInSphere(co
     // Use pointTo to find the approximate grid center for the world position.
     // This gives us a starting point for a local search instead of scanning all points.
     cv::Vec3f ptr{0, 0, 0};
-    const float dist = _surface->pointTo(ptr, worldPos, radius * 2.0f, 100);
+    auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
+    const float dist = _surface->pointTo(ptr, worldPos, radius * 2.0f, 100, patchIndex);
 
     // If pointTo failed to find a close point, fall back to full scan
     // (this should be rare - only if the worldPos is far from the surface)
@@ -551,7 +553,8 @@ std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInCylinder(
     // If cache miss or first call, use pointTo to find the grid center
     if (!foundCenter) {
         cv::Vec3f ptr{0, 0, 0};
-        const float dist = _surface->pointTo(ptr, worldPos, searchDist, 100);
+        auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
+        const float dist = _surface->pointTo(ptr, worldPos, searchDist, 100, patchIndex);
 
         if (dist >= 0 && dist <= searchDist * 2.0f) {
             const float locX = ptr[0] + center[0] * scale[0];

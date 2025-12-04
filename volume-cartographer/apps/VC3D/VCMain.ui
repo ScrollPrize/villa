@@ -1032,6 +1032,29 @@
        </property>
       </widget>
      </item>
+     <item row="10" column="0">
+      <widget class="QLabel" name="labelSliceStepSize">
+       <property name="text">
+        <string>Slice step size</string>
+       </property>
+      </widget>
+     </item>
+     <item row="10" column="1" colspan="2">
+      <widget class="QSpinBox" name="spinSliceStepSize">
+       <property name="minimum">
+        <number>1</number>
+       </property>
+       <property name="maximum">
+        <number>100</number>
+       </property>
+       <property name="value">
+        <number>1</number>
+       </property>
+       <property name="toolTip">
+        <string>Number of slices to pan with Shift+ScrollWheel. Adjust step size with Shift+G and Shift+H.</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </widget>
   </widget>

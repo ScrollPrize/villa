@@ -2,7 +2,9 @@
 
 #include "vc/core/util/ChunkCache.hpp"
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -463,8 +465,9 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
     return pointTo_(loc, points, tgt, th, max_iters, scale);
 }
 
-//search the surface point that is closest to th tgt coord
-float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters)
+//search the surface point that is closest to the target coord
+float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
+                           SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
@@ -473,6 +476,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     float min_mul = std::min(0.1*_points->cols/_scale[0], 0.1*_points->rows/_scale[1]);
     cv::Vec2f step_large = {min_mul*_scale[0], min_mul*_scale[1]};
 
+    // Try initial location first
     float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
 
     if (dist < th && dist >= 0) {
@@ -485,6 +489,71 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     if (min_dist < 0)
         min_dist = 10*(_points->cols/_scale[0]+_points->rows/_scale[1]);
 
+    // Try accelerated search using spatial indices
+    if (surfaceIndex && !surfaceIndex->empty()) {
+        // Use R-tree to find candidate triangles near target
+        const float searchRadius = std::max(th * 4.0f, 100.0f);
+        Rect3D bounds;
+        bounds.low = tgt - cv::Vec3f(searchRadius, searchRadius, searchRadius);
+        bounds.high = tgt + cv::Vec3f(searchRadius, searchRadius, searchRadius);
+
+        std::vector<std::pair<int, int>> candidateCells;
+        surfaceIndex->forEachTriangle(bounds, this, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+            candidateCells.emplace_back(tri.j, tri.i);
+        });
+
+        // Search from each candidate cell
+        for (const auto& [row, col] : candidateCells) {
+            if (col < 1 || col >= _points->cols - 1 || row < 1 || row >= _points->rows - 1) {
+                continue;
+            }
+            if ((*_points)(row, col)[0] == -1) {
+                continue;
+            }
+
+            loc = {static_cast<float>(col), static_cast<float>(row)};
+            dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
+
+            if (dist < th && dist >= 0) {
+                ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+                return dist;
+            } else if (dist >= 0 && dist < min_dist) {
+                min_loc = loc;
+                min_dist = dist;
+            }
+        }
+
+        // If we found something decent with R-tree, return it
+        if (min_dist < th * 2.0f) {
+            ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+            return min_dist;
+        }
+    }
+
+    // Try point index for a better starting hint
+    if (pointIndex && !pointIndex->empty()) {
+        auto nearest = pointIndex->nearest(tgt, th * 4.0f);
+        if (nearest) {
+            // Use nearest point as starting location hint
+            cv::Vec3f hint_ptr{0, 0, 0};
+            // Recursively call without indices to avoid infinite loop
+            float hint_dist = pointTo(hint_ptr, nearest->position, th, std::max(1, max_iters / 4), nullptr, nullptr);
+            if (hint_dist >= 0 && hint_dist < min_dist) {
+                // Now search from this hint toward our actual target
+                loc = cv::Vec2f(hint_ptr[0], hint_ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
+                dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
+                if (dist < th && dist >= 0) {
+                    ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
+                    return dist;
+                } else if (dist >= 0 && dist < min_dist) {
+                    min_loc = loc;
+                    min_dist = dist;
+                }
+            }
+        }
+    }
+
+    // Fall back to random sampling if indices didn't help
     int r_full = 0;
     int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {

@@ -180,7 +180,8 @@ QPointF CVolumeViewer::volumeToScene(const cv::Vec3f& vol_point)
         p = plane->project(vol_point, 1.0, _scale);
     } else if (quad) {
         auto ptr = quad->pointer();
-        _surf->pointTo(ptr, vol_point, 4.0, 100);
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        _surf->pointTo(ptr, vol_point, 4.0, 100, patchIndex);
         p = _surf->loc(ptr) * _scale;
     }
 
@@ -334,7 +335,8 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
         }
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(_surf);
-        int adjustedSteps = steps;
+        int stepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+        int adjustedSteps = steps * stepSize;
 
         if (_surf_name != "segmentation" && plane && _surf_col) {
             POI* focus = _surf_col->poi("focus");
@@ -374,10 +376,6 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             }
             handled = true;
         } else {
-            if (_surf_name == "segmentation") {
-                adjustedSteps = (steps > 0) ? 1 : -1;
-            }
-
             _z_off += adjustedSteps;
 
             if (volume && plane) {
@@ -421,7 +419,8 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
                 POI* focus = _surf_col->poi("focus");
                 if (focus) {
                     auto ptr = quad->pointer();
-                    float dist = quad->pointTo(ptr, focus->p, 4.0, 100);
+                    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+                    float dist = quad->pointTo(ptr, focus->p, 4.0, 100, patchIndex);
                     if (dist < 4.0) {
                         cv::Vec3f sp = quad->loc(ptr) * _scale;
                         _center_marker->setPos(sp[0], sp[1]);
@@ -835,8 +834,9 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
             _surf_col->setSurface(_surf_name, plane);
         } else if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
             auto ptr = quad->pointer();
-            float dist = quad->pointTo(ptr, poi->p, 4.0, 100);
-            
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            float dist = quad->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
+
             if (dist < 4.0) {
                 cv::Vec3f sp = quad->loc(ptr) * _scale;
                 if (_center_marker) {
@@ -878,7 +878,8 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         else if (segmentation.viewerIsSegmentationView && crop)
         {
             auto ptr = crop->pointer();
-            dist = crop->pointTo(ptr, poi->p, 2.0);
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            dist = crop->pointTo(ptr, poi->p, 2.0, 1000, patchIndex);
             sp = crop->loc(ptr)*_scale ;//+ cv::Vec3f(_vis_center[0],_vis_center[1],0);
         }
         
@@ -947,7 +948,8 @@ void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::
             auto* quad = dynamic_cast<QuadSurface*>(_surf);
             if (!quad) return;
             auto ptr = quad->pointer();
-            quad->pointTo(ptr, p, 2.0f, 100);
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            quad->pointTo(ptr, p, 2.0f, 100, patchIndex);
             cv::Vec3f sp = quad->loc(ptr); // unscaled surface coords
             _bboxStart = QPointF(sp[0], sp[1]);
             QRectF r(QPointF(_bboxStart.x()*_scale, _bboxStart.y()*_scale), QPointF(_bboxStart.x()*_scale, _bboxStart.y()*_scale));
@@ -988,7 +990,8 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
             auto* quad = dynamic_cast<QuadSurface*>(_surf);
             if (!quad) return;
             auto ptr = quad->pointer();
-            quad->pointTo(ptr, p, 2.0f, 100);
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            quad->pointTo(ptr, p, 2.0f, 100, patchIndex);
             cv::Vec3f sp = quad->loc(ptr); // unscaled
             QPointF cur(sp[0], sp[1]);
             QRectF r(QPointF(_bboxStart.x()*_scale, _bboxStart.y()*_scale), QPointF(cur.x()*_scale, cur.y()*_scale));

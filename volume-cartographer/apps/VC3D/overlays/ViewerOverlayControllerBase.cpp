@@ -358,6 +358,7 @@ ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
     auto* surface = viewer->currentSurface();
     auto* planeSurface = options.clipToSurface ? dynamic_cast<PlaneSurface*>(surface) : nullptr;
     auto* quadSurface = options.clipToSurface ? dynamic_cast<QuadSurface*>(surface) : nullptr;
+    auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
 
     QRectF visibleRect;
     if (options.requireSceneVisibility) {
@@ -378,7 +379,7 @@ ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
 
         if (keep && quadSurface) {
             auto ptr = quadSurface->pointer();
-            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100);
+            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100, patchIndex);
             if (res > options.quadDistanceTolerance) {
                 keep = false;
             }
