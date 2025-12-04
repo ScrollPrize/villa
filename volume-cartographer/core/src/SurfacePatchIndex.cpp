@@ -441,6 +441,14 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(QuadSurface* surface,
 
     samplingStride = std::max(1, samplingStride);
 
+    // Estimate capacity to avoid repeated reallocations
+    const int rowSpan = rowEnd - rowStart;
+    const int colSpan = colEnd - colStart;
+    const size_t estimatedCells =
+        static_cast<size_t>((rowSpan + samplingStride - 1) / samplingStride) *
+        static_cast<size_t>((colSpan + samplingStride - 1) / samplingStride);
+    result.reserve(estimatedCells);
+
     for (int j = rowStart; j < rowEnd; ++j) {
         if (!shouldSampleIndex(j, cellRowCount, samplingStride)) {
             continue;
@@ -653,6 +661,14 @@ void SurfacePatchIndex::forEachTriangleImpl(
     Impl::Point3 max_pt(bounds.high[0], bounds.high[1], bounds.high[2]);
     Impl::Box3 query(min_pt, max_pt);
 
+    // Cache center*scale per surface to avoid redundant lookups across patches
+    struct SurfaceOffset {
+        float cx;
+        float cy;
+    };
+    std::unordered_map<QuadSurface*, SurfaceOffset> surfaceOffsetCache;
+    surfaceOffsetCache.reserve(filterSurfaces ? filterSurfaces->size() : 4);
+
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
         if (targetSurface && rec.surface != targetSurface) {
@@ -668,13 +684,18 @@ void SurfacePatchIndex::forEachTriangleImpl(
             return;
         }
 
-        // Precompute surface params for the quad (avoids redundant center/scale lookups)
+        // Precompute surface params for the quad (use cached center*scale offsets)
         const float baseX = static_cast<float>(rec.i);
         const float baseY = static_cast<float>(rec.j);
-        const cv::Vec3f center = rec.surface->center();
-        const cv::Vec2f scale = rec.surface->scale();
-        const float cx = center[0] * scale[0];
-        const float cy = center[1] * scale[1];
+        auto cacheIt = surfaceOffsetCache.find(rec.surface);
+        if (cacheIt == surfaceOffsetCache.end()) {
+            const cv::Vec3f center = rec.surface->center();
+            const cv::Vec2f scale = rec.surface->scale();
+            cacheIt = surfaceOffsetCache.emplace(rec.surface,
+                SurfaceOffset{center[0] * scale[0], center[1] * scale[1]}).first;
+        }
+        const float cx = cacheIt->second.cx;
+        const float cy = cacheIt->second.cy;
         // Params for corners: [0]=(0,0), [1]=(1,0), [2]=(1,1), [3]=(0,1)
         std::array<cv::Vec3f, 4> params = {
             cv::Vec3f(baseX - cx, baseY - cy, 0.0f),
@@ -701,12 +722,16 @@ void SurfacePatchIndex::forEachTriangleImpl(
                 candidate.surfaceParams = {params[1], params[2], params[3]};
             }
 
-            Rect3D triBounds;
-            triBounds.low = candidate.world[0];
-            triBounds.high = candidate.world[0];
-            triBounds = expand_rect(triBounds, candidate.world[1]);
-            triBounds = expand_rect(triBounds, candidate.world[2]);
-            if (!intersect(bounds, triBounds)) {
+            // Inline triangle-AABB intersection check (avoids function call overhead)
+            const auto& w0 = candidate.world[0];
+            const auto& w1 = candidate.world[1];
+            const auto& w2 = candidate.world[2];
+            if (std::max({w0[0], w1[0], w2[0]}) < bounds.low[0] ||
+                std::min({w0[0], w1[0], w2[0]}) > bounds.high[0] ||
+                std::max({w0[1], w1[1], w2[1]}) < bounds.low[1] ||
+                std::min({w0[1], w1[1], w2[1]}) > bounds.high[1] ||
+                std::max({w0[2], w1[2], w2[2]}) < bounds.low[2] ||
+                std::min({w0[2], w1[2], w2[2]}) > bounds.high[2]) {
                 continue;
             }
 
@@ -1150,6 +1175,10 @@ void SurfacePatchIndex::Impl::removeCellEntry(SurfaceCellMask& mask,
 
 void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, CellEntry>>& cells)
 {
+    // Collect entries for batch insertion (more efficient than one-by-one)
+    std::vector<Entry> toInsert;
+    toInsert.reserve(cells.size());
+
     for (const auto& cell : cells) {
         QuadSurface* surface = cell.first.surface;
         if (!surface) {
@@ -1160,17 +1189,25 @@ void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, C
         const int col = cell.first.colIndex();
 
         if (cell.second.hasPatch) {
-            if (!tree) {
-                tree = std::make_unique<PatchTree>();
-            }
-            tree->insert(*cell.second.patch);
-            ++patchCount;
+            toInsert.push_back(*cell.second.patch);
             mask.setActive(row, col, true);
             mask.storeEntry(row, col, *cell.second.patch);
         } else {
             mask.setActive(row, col, false);
             mask.eraseEntry(row, col);
         }
+    }
+
+    // Batch insert into R-tree
+    if (!toInsert.empty()) {
+        if (!tree) {
+            // Use range constructor for optimal packing when tree is empty
+            tree = std::make_unique<PatchTree>(toInsert.begin(), toInsert.end());
+        } else {
+            // Range insert is still more efficient than individual inserts
+            tree->insert(toInsert.begin(), toInsert.end());
+        }
+        patchCount += toInsert.size();
     }
 }
 

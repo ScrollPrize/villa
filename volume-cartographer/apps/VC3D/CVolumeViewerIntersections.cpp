@@ -65,6 +65,17 @@ void CVolumeViewer::renderIntersections()
     if (!volume || !volume->zarrDataset() || !_surf)
         return;
 
+    // Lazy refresh of cached surface pointers if needed
+    if (_cachedIntersectSurfaces.size() != _intersect_tgts.size() && _surf_col) {
+        _cachedIntersectSurfaces.clear();
+        _cachedIntersectSurfaces.reserve(_intersect_tgts.size());
+        for (const auto& key : _intersect_tgts) {
+            if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
+                _cachedIntersectSurfaces[key] = surf;
+            }
+        }
+    }
+
     const QRectF viewRect = fGraphicsView
         ? fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect()
         : QRectF(curr_img_area);
@@ -125,16 +136,9 @@ void CVolumeViewer::renderIntersections()
 
         using IntersectionCandidate = std::pair<std::string, QuadSurface*>;
         std::vector<IntersectionCandidate> intersectCandidates;
-        intersectCandidates.reserve(_intersect_tgts.size());
-        for (const auto& key : _intersect_tgts) {
-            Surface* surfacePtr = _surf_col->surface(key);
-            if (!surfacePtr) {
-                std::cout << "[CVolumeViewer] skip candidate '" << key << "' (surface missing)\n";
-                continue;
-            }
-            auto* segmentation = dynamic_cast<QuadSurface*>(surfacePtr);
+        intersectCandidates.reserve(_cachedIntersectSurfaces.size());
+        for (const auto& [key, segmentation] : _cachedIntersectSurfaces) {
             if (!segmentation) {
-                std::cout << "[CVolumeViewer] skip candidate '" << key << "' (not QuadSurface)\n";
                 continue;
             }
 
@@ -188,22 +192,32 @@ void CVolumeViewer::renderIntersections()
             }
 
             const auto& candidateIndices = trianglesIt->second;
+            const size_t numCandidates = candidateIndices.size();
 
-            std::vector<IntersectionLine> intersectionLines;
-            intersectionLines.reserve(candidateIndices.size());
-            for (size_t candidateIndex : candidateIndices) {
-                const auto& triCandidate = triangleCandidates[candidateIndex];
+            // Parallel triangle clipping - each thread writes to its own slot
+            std::vector<std::optional<IntersectionLine>> clipResults(numCandidates);
+
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (size_t k = 0; k < numCandidates; ++k) {
+                const auto& triCandidate = triangleCandidates[candidateIndices[k]];
                 auto segment = SurfacePatchIndex::clipTriangleToPlane(triCandidate, *plane, clipTolerance);
-                if (!segment) {
-                    continue;
+                if (segment) {
+                    IntersectionLine line;
+                    line.world[0] = segment->world[0];
+                    line.world[1] = segment->world[1];
+                    line.surfaceParams[0] = segment->surfaceParams[0];
+                    line.surfaceParams[1] = segment->surfaceParams[1];
+                    clipResults[k] = std::move(line);
                 }
+            }
 
-                IntersectionLine line;
-                line.world[0] = segment->world[0];
-                line.world[1] = segment->world[1];
-                line.surfaceParams[0] = segment->surfaceParams[0];
-                line.surfaceParams[1] = segment->surfaceParams[1];
-                intersectionLines.push_back(std::move(line));
+            // Collect non-null results
+            std::vector<IntersectionLine> intersectionLines;
+            intersectionLines.reserve(numCandidates);
+            for (auto& result : clipResults) {
+                if (result) {
+                    intersectionLines.push_back(std::move(*result));
+                }
             }
 
             // Check if intersection lines match cached - if so, skip expensive recreation
@@ -418,6 +432,17 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
 void CVolumeViewer::setIntersects(const std::set<std::string> &set)
 {
     _intersect_tgts = set;
+
+    // Rebuild cached surface pointers to avoid string lookups during render
+    _cachedIntersectSurfaces.clear();
+    if (_surf_col) {
+        _cachedIntersectSurfaces.reserve(set.size());
+        for (const auto& key : set) {
+            if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
+                _cachedIntersectSurfaces[key] = surf;
+            }
+        }
+    }
 
     renderIntersections();
 }

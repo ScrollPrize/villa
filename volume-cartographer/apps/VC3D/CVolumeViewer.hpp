@@ -267,6 +267,7 @@ protected:
     std::vector<QGraphicsItem*> slice_vis_items; 
 
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
+    std::unordered_map<std::string, QuadSurface*> _cachedIntersectSurfaces;
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
     std::unordered_map<std::string, std::vector<IntersectionLine>> _cachedIntersectionLines;
     bool _autoRefocusOnOffscreenIntersections = true;

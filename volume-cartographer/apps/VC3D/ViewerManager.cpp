@@ -669,7 +669,6 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool is
     }
     if (regionUpdated || indexUpdated) {
         _indexedSurfaces.insert(quad);
-        qCInfo(lcViewerManager) << "SurfacePatchIndex updated for surface" << quad->id.c_str();
     }
 
     _surfacePatchIndexDirty = _surfacePatchIndexDirty || !(regionUpdated || indexUpdated);
