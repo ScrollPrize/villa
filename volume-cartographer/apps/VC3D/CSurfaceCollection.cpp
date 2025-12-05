@@ -31,7 +31,9 @@ void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool
     } else {
         _surfs[name] = {surf, takeOwnership};
     }
-    if (!noSignalSend) {
+    // Always emit signal when surface is deleted (nullptr) to prevent dangling pointers
+    // Only suppress signal for non-deletion updates
+    if (!noSignalSend || surf == nullptr) {
         sendSurfaceChanged(name, surf, isEditUpdate);
     }
 }

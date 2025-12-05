@@ -116,6 +116,11 @@ const std::vector<CVolumeViewer::OverlayColormapEntry>& CVolumeViewer::overlayCo
 
 void CVolumeViewer::updateAllOverlays()
 {
+    // Validate _surf against collection to prevent use-after-free
+    if (!currentSurface()) {
+        return;
+    }
+
     if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
         POI *poi = _surf_col->poi("focus");
         if (poi) {

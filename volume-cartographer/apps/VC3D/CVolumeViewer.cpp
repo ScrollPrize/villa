@@ -854,8 +854,8 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         }
     }
     else if (name == "cursor") {
-        // Add safety check before dynamic_cast
-        if (!_surf) {
+        // Validate _surf against collection to prevent use-after-free
+        if (!currentSurface()) {
             return;
         }
 
