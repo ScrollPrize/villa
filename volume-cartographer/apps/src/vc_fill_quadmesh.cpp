@@ -901,20 +901,16 @@ int main(int argc, char *argv[])
     for(int s=0;s<1;s++) { //TODO winding number is too inaccurate - we could use the normals to refine it (but for now we just use the first trace)
         normals.setTo(0);
         normals_w.setTo(0);
-        for(int j=0;j<surf_points[s].rows;j++)
-            for(int i=0;i<surf_points[s].cols;i++) {
-                if (surf_points[s](j, i)[0] == -1)
-                    continue;
-                cv::Vec3f n = surfs[s]->gridNormal(j, i);
-                cv::Vec3f p = surf_points[s](j,i);
-                if (std::isnan(n[0]))
-                    continue;
-                
-                int zi = p[2]*mul_z;
-                int wi = (winds[s](j,i)-_min_w)/num_winds*normals.cols;
-                normals(zi, wi) += n;
-                normals_w(zi, wi) ++;
-            }
+        for (auto [j, i, p] : surfs[s]->validPoints()) {
+            cv::Vec3f n = surfs[s]->gridNormal(j, i);
+            if (std::isnan(n[0]))
+                continue;
+
+            int zi = p[2]*mul_z;
+            int wi = (winds[s](j,i)-_min_w)/num_winds*normals.cols;
+            normals(zi, wi) += n;
+            normals_w(zi, wi) ++;
+        }
             
 //             for(int j=0;j<normals.rows;j++)
 //                 for(int i=0;i<normals.cols;i++)
