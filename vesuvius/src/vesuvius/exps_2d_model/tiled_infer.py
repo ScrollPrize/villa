@@ -79,18 +79,20 @@ def tiled_unet_infer(
 ) -> None:
 	"""
 	Run UNet inference with overlapping 2D tiles on a single TIFF image/stack.
-
+ 
 	border:
 		Number of pixels at each tile border that are fully discarded (blend
 		weight 0) before linear ramping begins. Useful to drop unreliable
 		boundary predictions from each tile.
-
-	Saves three float32 TIFFs (LZW) in `out_dir`:
-	  - <stem>[_layerXXXX]_cos.tif  : channel 0 (cosine branch)
-	  - ..._mag.tif                    : channel 1 (gradient magnitude branch)
-	  - ..._dir.tif                    : channel 2 (direction branch, 0.5 + 0.5*cos(2*theta))
-
-	Additionally saves 8-bit JPGs for fast visualization with the same base names.
+ 
+	Saves four float32 TIFFs (LZW) in `out_dir`:
+	  - <stem>[_layerXXXX]_cos.tif   : channel 0 (cosine branch)
+	  - ..._mag.tif                 : channel 1 (gradient magnitude branch)
+	  - ..._dir0.tif                : channel 2 (direction branch, 0.5 + 0.5*cos(2*theta))
+	  - ..._dir1.tif                : channel 3 (direction branch, 0.5 + 0.5*cos(2*theta + pi/4))
+ 
+	Additionally saves 8-bit JPGs for fast visualization with the same base names
+	(where applicable).
 	"""
 	img_path = Path(image_path)
 	if device is None:
@@ -110,7 +112,7 @@ def tiled_unet_infer(
 		device=torch_device,
 		weights=unet_checkpoint,
 		in_channels=1,
-		out_channels=3,
+		out_channels=4,
 		base_channels=32,
 		num_levels=6,
 		max_channels=1024,
@@ -126,34 +128,40 @@ def tiled_unet_infer(
 			border=border,
 		)  # (1,3,H,W)
 
-	pred_np = pred[0].detach().cpu().numpy().astype("float32")  # (3,H,W)
-
+	pred_np = pred[0].detach().cpu().numpy().astype("float32")  # (C,H,W)
+	
 	if layer is not None:
 		base = f"{img_path.stem}_layer{int(layer):04d}"
 	else:
 		base = img_path.stem
 	prefix = out_dir_path / base
-
+	
 	cos_np = pred_np[0]
 	mag_np = pred_np[1] if pred_np.shape[0] > 1 else None
-	dir_np = pred_np[2] if pred_np.shape[0] > 2 else None
-
+	dir0_np = pred_np[2] if pred_np.shape[0] > 2 else None
+	dir1_np = pred_np[3] if pred_np.shape[0] > 3 else None
+	
 	# Float32 TIFFs.
 	tifffile.imwrite(f"{prefix}_cos.tif", cos_np, compression="lzw")
 	if mag_np is not None:
 		tifffile.imwrite(f"{prefix}_mag.tif", mag_np, compression="lzw")
-	if dir_np is not None:
-		tifffile.imwrite(f"{prefix}_dir.tif", dir_np, compression="lzw")
-
+	if dir0_np is not None:
+		tifffile.imwrite(f"{prefix}_dir0.tif", dir0_np, compression="lzw")
+	if dir1_np is not None:
+		tifffile.imwrite(f"{prefix}_dir1.tif", dir1_np, compression="lzw")
+	
 	# 8-bit JPGs for fast visualization.
 	cos_u8 = _to_uint8(cos_np)
 	cv2.imwrite(str(prefix) + "_cos.jpg", cos_u8)
 	if mag_np is not None:
 		mag_u8 = _to_uint8(mag_np)
 		cv2.imwrite(str(prefix) + "_mag.jpg", mag_u8)
-	if dir_np is not None:
-		dir_u8 = _to_uint8(dir_np)
-		cv2.imwrite(str(prefix) + "_dir.jpg", dir_u8)
+	if dir0_np is not None:
+		dir0_u8 = _to_uint8(dir0_np)
+		cv2.imwrite(str(prefix) + "_dir0.jpg", dir0_u8)
+	if dir1_np is not None:
+		dir1_u8 = _to_uint8(dir1_np)
+		cv2.imwrite(str(prefix) + "_dir1.jpg", dir1_u8)
 
 
 def main() -> None:
