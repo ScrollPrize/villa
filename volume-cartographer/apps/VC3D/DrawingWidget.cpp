@@ -629,11 +629,9 @@ bool DrawingWidget::isValidVolumePoint(const cv::Vec3f& point) const
     }
     
     // Check if the point is within volume bounds
-    const float width = static_cast<float>(currentVolume->sliceWidth());
-    const float height = static_cast<float>(currentVolume->sliceHeight());
-    const float depth = static_cast<float>(currentVolume->numSlices());
-    
-    if (point[0] >= width || point[1] >= height || point[2] >= depth) {
+    auto [w, h, d] = currentVolume->shape();
+
+    if (point[0] >= w || point[1] >= h || point[2] >= d) {
         return false;
     }
     

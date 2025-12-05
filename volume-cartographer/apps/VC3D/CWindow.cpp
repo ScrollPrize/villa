@@ -875,9 +875,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     sendVolumeChanged(currentVolume, currentVolumeId);
 
     if (currentVolume && _surf_col) {
-        const int w = currentVolume->sliceWidth();
-        const int h = currentVolume->sliceHeight();
-        const int d = currentVolume->numSlices();
+        auto [w, h, d] = currentVolume->shape();
 
         POI* poi = existingFocusPoi;
         const bool createdPoi = (poi == nullptr);
@@ -2633,9 +2631,7 @@ void CWindow::onManualLocationChanged()
     }
 
     // Clamp values to volume bounds
-    int w = currentVolume->sliceWidth();
-    int h = currentVolume->sliceHeight();
-    int d = currentVolume->numSlices();
+    auto [w, h, d] = currentVolume->shape();
 
     x = std::max(0, std::min(x, w - 1));
     y = std::max(0, std::min(y, h - 1));

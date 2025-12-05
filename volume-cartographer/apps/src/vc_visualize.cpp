@@ -239,8 +239,8 @@ public:
         }
         volume_ = vpkg_->volume(volume_id);
         std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
-        std::cout << "Volume dimensions: " << volume_->sliceWidth() << "x"
-                  << volume_->sliceHeight() << "x" << volume_->numSlices() << std::endl;
+        auto [w, h, d] = volume_->shape();
+        std::cout << "Volume dimensions: " << w << "x" << h << "x" << d << std::endl;
         cache_ = new ChunkCache<uint8_t>(1ULL * 1024ULL * 1024ULL * 1024ULL);
     }
 

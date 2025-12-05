@@ -138,6 +138,7 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path, std::string uuid
 int Volume::sliceWidth() const { return _width; }
 int Volume::sliceHeight() const { return _height; }
 int Volume::numSlices() const { return _slices; }
+std::array<int, 3> Volume::shape() const { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
     return metadata_["voxelsize"].get<double>();

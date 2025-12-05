@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -41,6 +42,7 @@ public:
     [[nodiscard]] int sliceWidth() const;
     [[nodiscard]] int sliceHeight() const;
     [[nodiscard]] int numSlices() const;
+    [[nodiscard]] std::array<int, 3> shape() const;
     [[nodiscard]] double voxelSize() const;
 
     [[nodiscard]] z5::Dataset *zarrDataset(int level = 0) const;

@@ -247,9 +247,8 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     }
     cv::normalize(normal, normal);
 
-    cv::Vec3f volumeCenter(static_cast<float>(volume->sliceWidth()) * 0.5f,
-                           static_cast<float>(volume->sliceHeight()) * 0.5f,
-                           static_cast<float>(volume->numSlices()) * 0.5f);
+    auto [w, h, d] = volume->shape();
+    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
     cv::Vec3f toCenter = volumeCenter - p;
     toCenter[2] = 0.0f;
 

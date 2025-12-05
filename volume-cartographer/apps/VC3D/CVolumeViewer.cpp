@@ -355,13 +355,10 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             cv::Vec3f newPosition = focus->p + normal * static_cast<float>(adjustedSteps);
 
             if (volume) {
-                const float maxX = static_cast<float>(volume->sliceWidth() - 1);
-                const float maxY = static_cast<float>(volume->sliceHeight() - 1);
-                const float maxZ = static_cast<float>(volume->numSlices() - 1);
-
-                newPosition[0] = std::clamp(newPosition[0], 0.0f, maxX);
-                newPosition[1] = std::clamp(newPosition[1], 0.0f, maxY);
-                newPosition[2] = std::clamp(newPosition[2], 0.0f, maxZ);
+                auto [w, h, d] = volume->shape();
+                newPosition[0] = std::clamp(newPosition[0], 0.0f, static_cast<float>(w - 1));
+                newPosition[1] = std::clamp(newPosition[1], 0.0f, static_cast<float>(h - 1));
+                newPosition[2] = std::clamp(newPosition[2], 0.0f, static_cast<float>(d - 1));
             }
 
             focus->p = newPosition;
