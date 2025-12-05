@@ -29,8 +29,9 @@ struct Rect3D {
 bool intersect(const Rect3D &a, const Rect3D &b);
 Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p);
 
-// Forward declaration
+// Forward declarations
 class QuadSurface;
+class SurfacePatchIndex;
 
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
@@ -295,8 +296,6 @@ public:
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
     Rect3D bbox();
-
-    bool containsPoint(const cv::Vec3f& point, float tolerance) const;
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { return _points; }
