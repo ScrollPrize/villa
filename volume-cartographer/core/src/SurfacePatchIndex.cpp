@@ -183,6 +183,7 @@ struct SurfacePatchIndex::Impl {
         int activeCount = 0;
         std::vector<uint8_t> states;
         std::unordered_map<std::size_t, Entry> cachedEntries;
+        std::unordered_set<std::size_t> pendingCells;  // Cells needing R-tree update
 
         void clear()
         {
@@ -191,6 +192,7 @@ struct SurfacePatchIndex::Impl {
             activeCount = 0;
             states.clear();
             cachedEntries.clear();
+            pendingCells.clear();
         }
 
         void ensureSize(int rowCount, int colCount)
@@ -210,6 +212,7 @@ struct SurfacePatchIndex::Impl {
             activeCount = 0;
             states.assign(required, 0);
             cachedEntries.clear();
+            pendingCells.clear();
         }
 
         bool validIndex(int row, int col) const
@@ -289,6 +292,41 @@ struct SurfacePatchIndex::Impl {
         {
             return activeCount == 0;
         }
+
+        // Pending update tracking methods
+        void queueUpdate(int row, int col)
+        {
+            if (!validIndex(row, col)) {
+                return;
+            }
+            pendingCells.insert(index(row, col));
+        }
+
+        void clearPending(int row, int col)
+        {
+            if (!validIndex(row, col)) {
+                return;
+            }
+            pendingCells.erase(index(row, col));
+        }
+
+        bool isPending(int row, int col) const
+        {
+            if (!validIndex(row, col)) {
+                return false;
+            }
+            return pendingCells.count(index(row, col)) > 0;
+        }
+
+        bool hasPending() const
+        {
+            return !pendingCells.empty();
+        }
+
+        void clearAllPending()
+        {
+            pendingCells.clear();
+        }
     };
 
     size_t patchCount = 0;
@@ -296,6 +334,7 @@ struct SurfacePatchIndex::Impl {
     int samplingStride = 1;
 
     std::unordered_map<QuadSurface*, SurfaceCellMask> surfaceCellRecords;
+    std::unordered_map<QuadSurface*, uint64_t> surfaceGenerations;  // For undo/redo detection
 
     SurfaceCellMask& ensureMask(QuadSurface* surface);
 
@@ -343,6 +382,10 @@ struct SurfacePatchIndex::Impl {
                                std::vector<std::pair<CellKey, CellEntry>>&& newCells);
 
     bool removeSurfaceEntries(QuadSurface* surface);
+
+    void removeSurfaceEntriesFromTree(QuadSurface* surface, SurfaceCellMask& mask);
+
+    bool flushPendingSurface(QuadSurface* surface, SurfaceCellMask& mask);
 
     static PatchHit evaluatePatch(const PatchRecord& rec, const cv::Vec3f& point) {
         PatchHit best;
@@ -796,6 +839,25 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(QuadSurface* surface)
     return true;
 }
 
+void SurfacePatchIndex::Impl::removeSurfaceEntriesFromTree(QuadSurface* surface, SurfaceCellMask& mask)
+{
+    if (!surface || mask.cachedEntries.empty()) {
+        return;
+    }
+
+    if (tree) {
+        for (const auto& [idx, entry] : mask.cachedEntries) {
+            if (tree->remove(entry) && patchCount > 0) {
+                --patchCount;
+            }
+        }
+    }
+
+    if (tree && patchCount == 0) {
+        tree.reset();
+    }
+}
+
 bool SurfacePatchIndex::Impl::replaceSurfaceEntries(
     QuadSurface* surface,
     std::vector<std::pair<CellKey, CellEntry>>&& newCells)
@@ -806,7 +868,10 @@ bool SurfacePatchIndex::Impl::replaceSurfaceEntries(
 
     removeSurfaceEntries(surface);
     insertCells(newCells);
-    return !newCells.empty();
+    // Return true even if newCells is empty - the surface was successfully processed.
+    // An empty surface (all invalid points) is still a valid state, not an error.
+    // Returning false would incorrectly trigger a global index rebuild.
+    return true;
 }
 
 namespace {
@@ -995,22 +1060,33 @@ bool SurfacePatchIndex::updateSurfaceRegion(QuadSurface* surface,
         return false;
     }
 
-    impl_->removeCells(surface, rowStart, rowEnd, colStart, colEnd);
+    const int stride = impl_->samplingStride;
 
-    int samplingStride = impl_->samplingStride;
-    const int rowSpan = rowEnd - rowStart;
-    const int colSpan = colEnd - colStart;
+    // When sampling stride > 1, entries at stride-aligned positions cover multiple
+    // cells. An entry at row R covers rows [R, R+stride). To find all entries whose
+    // coverage overlaps the update region [rowStart, rowEnd), we need to expand the
+    // removal bounds to include entries up to (stride-1) positions before the update
+    // region start. For example, with stride=4 and rowStart=5, an entry at
+    // row 4 covers rows 4-7 and must be removed and re-inserted with updated bbox.
+    const int expandedRowStart = std::max(0, rowStart - (stride - 1));
+    const int expandedColStart = std::max(0, colStart - (stride - 1));
+
+    impl_->removeCells(surface, expandedRowStart, rowEnd, expandedColStart, colEnd);
+
+    int samplingStride = stride;
+    const int rowSpan = rowEnd - expandedRowStart;
+    const int colSpan = colEnd - expandedColStart;
     if (samplingStride > 1 && (rowSpan < samplingStride || colSpan < samplingStride)) {
-        // Small dirty regions can otherwise end up deleting sampled cells without
+        // Small update regions can otherwise end up deleting sampled cells without
         // re-inserting replacements because the stride skips every local index.
         samplingStride = 1;
     }
     auto cells = Impl::collectEntriesForSurface(surface,
                                                 impl_->bboxPadding,
                                                 samplingStride,
-                                                rowStart,
+                                                expandedRowStart,
                                                 rowEnd,
-                                                colStart,
+                                                expandedColStart,
                                                 colEnd);
     impl_->insertCells(cells);
     return !cells.empty();
@@ -1098,10 +1174,27 @@ SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromCorners(
 SurfacePatchIndex::Impl::SurfaceCellMask&
 SurfacePatchIndex::Impl::ensureMask(QuadSurface* surface)
 {
-    auto& mask = surfaceCellRecords[surface];
     const cv::Mat_<cv::Vec3f>* points = surface ? surface->rawPointsPtr() : nullptr;
     const int rowCount = points ? std::max(0, points->rows - 1) : 0;
     const int colCount = points ? std::max(0, points->cols - 1) : 0;
+
+    auto it = surfaceCellRecords.find(surface);
+    if (it != surfaceCellRecords.end()) {
+        SurfaceCellMask& mask = it->second;
+        // Check if dimensions are changing for an existing mask
+        const bool dimensionsChanging = (mask.rows > 0 || mask.cols > 0) &&
+                                        (mask.rows != rowCount || mask.cols != colCount);
+        if (dimensionsChanging) {
+            // Remove old R-tree entries BEFORE clearing the mask
+            // This prevents orphaned entries when surface grows/shrinks
+            removeSurfaceEntriesFromTree(surface, mask);
+        }
+        mask.ensureSize(rowCount, colCount);
+        return mask;
+    }
+
+    // New surface - create fresh mask
+    SurfaceCellMask& mask = surfaceCellRecords[surface];
     mask.ensureSize(rowCount, colCount);
     return mask;
 }
@@ -1298,4 +1391,222 @@ void SurfacePatchIndex::Impl::removeCells(QuadSurface* surface,
         mask.clear();
         surfaceCellRecords.erase(surfaceIt);
     }
+}
+
+// ============================================================================
+// Pending update tracking implementation
+// ============================================================================
+
+void SurfacePatchIndex::queueCellUpdateForVertex(QuadSurface* surface, int vertexRow, int vertexCol)
+{
+    if (!impl_ || !surface) {
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->rows < 2 || points->cols < 2) {
+        return;
+    }
+
+    // A vertex at (row, col) affects cells at:
+    // (row-1, col-1), (row-1, col), (row, col-1), (row, col)
+    // Cells are indexed by their top-left vertex
+    const int cellRowCount = points->rows - 1;
+    const int cellColCount = points->cols - 1;
+
+    const int rowStart = std::max(0, vertexRow - 1);
+    const int rowEnd = std::min(cellRowCount, vertexRow + 1);
+    const int colStart = std::max(0, vertexCol - 1);
+    const int colEnd = std::min(cellColCount, vertexCol + 1);
+
+    queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd);
+}
+
+void SurfacePatchIndex::queueCellRangeUpdate(QuadSurface* surface,
+                                           int rowStart,
+                                           int rowEnd,
+                                           int colStart,
+                                           int colEnd)
+{
+    if (!impl_ || !surface) {
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->rows < 2 || points->cols < 2) {
+        return;
+    }
+
+    const int cellRowCount = points->rows - 1;
+    const int cellColCount = points->cols - 1;
+
+    // Clamp to valid cell range
+    rowStart = std::max(0, rowStart);
+    rowEnd = std::min(cellRowCount, rowEnd);
+    colStart = std::max(0, colStart);
+    colEnd = std::min(cellColCount, colEnd);
+
+    if (rowStart >= rowEnd || colStart >= colEnd) {
+        return;
+    }
+
+    // Handle stride expansion: entries at stride-aligned positions cover multiple cells
+    const int stride = impl_->samplingStride;
+    const int expandedRowStart = std::max(0, rowStart - (stride - 1));
+    const int expandedColStart = std::max(0, colStart - (stride - 1));
+
+    auto& mask = impl_->ensureMask(surface);
+    for (int row = expandedRowStart; row < rowEnd; ++row) {
+        for (int col = expandedColStart; col < colEnd; ++col) {
+            mask.queueUpdate(row, col);
+        }
+    }
+}
+
+bool SurfacePatchIndex::flushPendingUpdates(QuadSurface* surface)
+{
+    if (!impl_) {
+        return false;
+    }
+
+    bool anyFlushed = false;
+
+    if (surface) {
+        // Flush single surface
+        auto it = impl_->surfaceCellRecords.find(surface);
+        if (it != impl_->surfaceCellRecords.end() && it->second.hasPending()) {
+            if (impl_->flushPendingSurface(surface, it->second)) {
+                anyFlushed = true;
+                // Increment generation after successful flush
+                ++impl_->surfaceGenerations[surface];
+            }
+        }
+    } else {
+        // Flush all surfaces
+        for (auto& [surf, mask] : impl_->surfaceCellRecords) {
+            if (mask.hasPending()) {
+                if (impl_->flushPendingSurface(surf, mask)) {
+                    anyFlushed = true;
+                    // Increment generation after successful flush
+                    ++impl_->surfaceGenerations[surf];
+                }
+            }
+        }
+    }
+
+    return anyFlushed;
+}
+
+bool SurfacePatchIndex::Impl::flushPendingSurface(QuadSurface* surface, SurfaceCellMask& mask)
+{
+    if (!surface || !mask.hasPending()) {
+        return false;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->rows < 2 || points->cols < 2) {
+        mask.clearAllPending();
+        return false;
+    }
+
+    // Collect pending cells and process them
+    std::vector<Entry> toRemove;
+    std::vector<std::pair<CellKey, CellEntry>> toInsert;
+    toRemove.reserve(mask.pendingCells.size());
+    toInsert.reserve(mask.pendingCells.size());
+
+    const int stride = samplingStride;
+    int usedStride = stride;
+
+    // For small pending regions, use stride 1 to avoid gaps
+    if (mask.pendingCells.size() < static_cast<size_t>(stride * stride)) {
+        usedStride = 1;
+    }
+
+    for (std::size_t idx : mask.pendingCells) {
+        const int row = static_cast<int>(idx / mask.cols);
+        const int col = static_cast<int>(idx % mask.cols);
+
+        // Remove old entry if it exists
+        if (mask.isActive(row, col)) {
+            if (const Entry* cachedEntry = mask.entryAt(row, col)) {
+                toRemove.push_back(*cachedEntry);
+            }
+            mask.setActive(row, col, false);
+            mask.eraseEntry(row, col);
+            if (patchCount > 0) {
+                --patchCount;
+            }
+        }
+
+        // Build new entry
+        CellEntry entry;
+        if (buildCellEntry(surface, *points, col, row, usedStride, bboxPadding, entry)) {
+            toInsert.emplace_back(CellKey(surface, row, col), std::move(entry));
+        }
+    }
+
+    // Batch remove from R-tree
+    if (tree && !toRemove.empty()) {
+        for (const auto& entry : toRemove) {
+            tree->remove(entry);
+        }
+    }
+
+    // Batch insert into R-tree
+    if (!toInsert.empty()) {
+        insertCells(toInsert);
+    }
+
+    mask.clearAllPending();
+    return !toInsert.empty() || !toRemove.empty();
+}
+
+bool SurfacePatchIndex::hasPendingUpdates(QuadSurface* surface) const
+{
+    if (!impl_) {
+        return false;
+    }
+
+    if (surface) {
+        auto it = impl_->surfaceCellRecords.find(surface);
+        return it != impl_->surfaceCellRecords.end() && it->second.hasPending();
+    }
+
+    // Check all surfaces
+    for (const auto& [surf, mask] : impl_->surfaceCellRecords) {
+        if (mask.hasPending()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Generation tracking for undo/redo detection
+// ============================================================================
+
+void SurfacePatchIndex::incrementGeneration(QuadSurface* surface)
+{
+    if (!impl_ || !surface) {
+        return;
+    }
+    ++impl_->surfaceGenerations[surface];
+}
+
+uint64_t SurfacePatchIndex::generation(QuadSurface* surface) const
+{
+    if (!impl_ || !surface) {
+        return 0;
+    }
+    auto it = impl_->surfaceGenerations.find(surface);
+    return it != impl_->surfaceGenerations.end() ? it->second : 0;
+}
+
+void SurfacePatchIndex::setGeneration(QuadSurface* surface, uint64_t gen)
+{
+    if (!impl_ || !surface) {
+        return;
+    }
+    impl_->surfaceGenerations[surface] = gen;
 }

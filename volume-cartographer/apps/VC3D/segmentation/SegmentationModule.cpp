@@ -669,13 +669,9 @@ void SegmentationModule::applyEdits()
         }
     }
     clearInvalidationBrush();
-    auto dirtyBounds = _editManager->takeEditedBounds();
     _editManager->applyPreview();
     if (_surfaces) {
         auto* preview = _editManager->previewSurface();
-        if (preview && dirtyBounds) {
-            _editManager->publishDirtyBounds(*dirtyBounds);
-        }
         _surfaces->setSurface("segmentation", preview, false, false, true);
     }
     emitPendingChanges();
@@ -1191,11 +1187,6 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
 
     _drag.lastWorld = worldPos;
     _drag.moved = true;
-
-    // Accumulate dirty bounds during drag, but don't trigger the full signal cascade
-    // on every mouse move. The overlay will update (showing vertex positions),
-    // and the full intersection/R-tree update will happen in finishDrag().
-    _editManager->ensureDirtyBounds();
 
     refreshOverlay();
     emitPendingChanges();

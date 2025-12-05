@@ -78,7 +78,7 @@ private:
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
         bool inpaintOnly{false};
-        std::optional<cv::Rect> correctionsDirtyBounds;
+        std::optional<cv::Rect> correctionsAffectedBounds;
     };
 
     void finalize(bool ok);

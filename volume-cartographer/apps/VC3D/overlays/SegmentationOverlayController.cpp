@@ -178,6 +178,9 @@ void SegmentationOverlayController::applyState(const State& state)
 
 void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
 {
+    // Clear undo stack - old entries are for a different surface
+    clearApprovalMaskUndoHistory();
+
     if (!surface) {
         _savedApprovalMaskImage = QImage();
         _pendingApprovalMaskImage = QImage();
@@ -284,7 +287,7 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
 
         // Limit undo stack size
         if (_approvalMaskUndoStack.size() > kMaxUndoEntries) {
-            _approvalMaskUndoStack.erase(_approvalMaskUndoStack.begin());
+            _approvalMaskUndoStack.pop_front();
         }
     }
 

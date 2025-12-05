@@ -3,11 +3,13 @@
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
 #include "ApprovalMaskBrushTool.hpp"
+#include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include <QLoggingCategory>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 bool SegmentationModule::beginEditingSession(QuadSurface* surface)
 {
@@ -163,9 +165,18 @@ bool SegmentationModule::restoreUndoSnapshot()
         _editManager->applyPreview();
         if (_surfaces) {
             auto* preview = _editManager->previewSurface();
-            if (preview && undoBounds && undoBounds->width > 0 && undoBounds->height > 0) {
-                _editManager->publishDirtyBounds(*undoBounds);
+
+            // Queue affected cells for incremental R-tree update
+            if (preview && undoBounds && undoBounds->width > 0 && undoBounds->height > 0 && _viewerManager) {
+                if (auto* index = _viewerManager->surfacePatchIndex()) {
+                    index->queueCellRangeUpdate(preview,
+                                              undoBounds->y,
+                                              undoBounds->y + undoBounds->height,
+                                              undoBounds->x,
+                                              undoBounds->x + undoBounds->width);
+                }
             }
+
             _surfaces->setSurface("segmentation", preview, false, false, true);
         }
         clearInvalidationBrush();

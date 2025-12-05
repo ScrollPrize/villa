@@ -120,7 +120,7 @@ Returns the segment where the triangle crosses the plane, or empty if no interse
 
 | Method | Description |
 |--------|-------------|
-| `updateSurface(surface)` | Reindex a surface after its geometry changed |
+| `updateSurface(surface)` | Reindex a surface after its geometry changed (full rebuild) |
 | `updateSurfaceRegion(surface, rowStart, rowEnd, colStart, colEnd)` | Reindex only a rectangular region |
 | `removeSurface(surface)` | Remove a surface from the index |
 
@@ -133,6 +133,57 @@ index.updateSurfaceRegion(surf, 10, 20, 30, 40);
 
 // Remove a surface
 index.removeSurface(surf);
+```
+
+### Pending Update Tracking
+
+For interactive editing workflows, the index supports queuing cell updates and flushing them in batches. This is more efficient than calling `updateSurfaceRegion()` for each individual edit.
+
+| Method | Description |
+|--------|-------------|
+| `queueCellUpdateForVertex(surface, row, col)` | Queue the 4 cells sharing a vertex for update |
+| `queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd)` | Queue a range of cells for update |
+| `flushPendingUpdates(surface)` | Apply all pending cell updates to the R-tree |
+| `hasPendingUpdates(surface)` | Check if a surface has pending cell updates |
+
+**Typical workflow:**
+
+```cpp
+// During editing: queue cell updates as vertices are modified
+for (auto& [row, col, newPos] : edits) {
+    surface->setPoint(row, col, newPos);
+    index.queueCellUpdateForVertex(surface, row, col);
+}
+
+// After editing: flush all pending updates in one batch
+if (index.hasPendingUpdates(surface)) {
+    index.flushPendingUpdates(surface);
+}
+```
+
+**Vertex-to-cell relationship:** Each vertex is shared by up to 4 cells (the quads to its upper-left, upper-right, lower-left, and lower-right). When a vertex moves, all 4 cells need to be reindexed. `queueCellUpdateForVertex()` handles this automatically.
+
+**Stride handling:** When the sampling stride is > 1, queued updates automatically expand to cover all affected stride-aligned cells.
+
+### Generation Tracking
+
+The index maintains a generation counter per surface that increments each time pending updates are flushed. This can be used to detect when a surface's index has been updated.
+
+| Method | Description |
+|--------|-------------|
+| `generation(surface)` | Get the current generation counter for a surface |
+| `incrementGeneration(surface)` | Manually increment the generation |
+| `setGeneration(surface, gen)` | Set the generation to a specific value |
+
+```cpp
+// Track generations to detect updates
+uint64_t lastKnownGen = index.generation(surface);
+
+// ... later ...
+if (index.generation(surface) != lastKnownGen) {
+    // Surface index was updated
+    lastKnownGen = index.generation(surface);
+}
 ```
 
 ### Sampling Configuration

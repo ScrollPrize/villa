@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -82,6 +83,25 @@ public:
     bool removeSurface(QuadSurface* surface);
     bool setSamplingStride(int stride);
     int samplingStride() const;
+
+    // Pending update tracking for incremental R-tree updates
+    // Queue the 4 cells surrounding a vertex for update
+    void queueCellUpdateForVertex(QuadSurface* surface, int vertexRow, int vertexCol);
+    // Queue a range of cells for update
+    void queueCellRangeUpdate(QuadSurface* surface,
+                              int rowStart,
+                              int rowEnd,
+                              int colStart,
+                              int colEnd);
+    // Apply all pending cell updates to R-tree (nullptr = all surfaces)
+    bool flushPendingUpdates(QuadSurface* surface = nullptr);
+    // Check if surface has pending cell updates
+    bool hasPendingUpdates(QuadSurface* surface = nullptr) const;
+
+    // Generation tracking for undo/redo detection
+    void incrementGeneration(QuadSurface* surface);
+    uint64_t generation(QuadSurface* surface) const;
+    void setGeneration(QuadSurface* surface, uint64_t gen);
 
 private:
     void forEachTriangleImpl(const Rect3D& bounds,

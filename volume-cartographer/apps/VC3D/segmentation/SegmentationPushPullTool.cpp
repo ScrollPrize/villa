@@ -530,7 +530,6 @@ void SegmentationPushPullTool::stopAll()
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
         _editManager->applyPreview();
-        _editManager->ensureDirtyBounds();
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
         _module.emitPendingChanges();
     }
@@ -806,8 +805,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     // Final cleanup happens in stopAll()
     _editManager->refreshActiveDragBasePositions();
 
-    // Update dirty bounds and trigger visual refresh
-    _editManager->ensureDirtyBounds();
+    // Trigger visual refresh
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
     }
