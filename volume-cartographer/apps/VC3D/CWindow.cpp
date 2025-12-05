@@ -1,5 +1,7 @@
 #include "CWindow.hpp"
 
+#include <cstdlib>
+
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include <QKeySequence>
@@ -1966,7 +1968,7 @@ void CWindow::closeEvent(QCloseEvent* event)
     settings.setValue("mainWin/geometry", saveGeometry());
     settings.setValue("mainWin/state", saveState());
 
-    QMainWindow::closeEvent(event);
+    std::quick_exit(0);
 }
 
 void CWindow::setWidgetsEnabled(bool state)
