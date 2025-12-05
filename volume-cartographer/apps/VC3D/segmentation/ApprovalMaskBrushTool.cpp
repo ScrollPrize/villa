@@ -60,6 +60,19 @@ void ApprovalMaskBrushTool::setSurface(QuadSurface* surface)
     _surface = surface;
     // Clear the search cache when surface changes
     _hasLastSearchCache = false;
+
+    // Build spatial index for fast 3D queries
+    _pointIndex.clear();
+    _pointIndexCols = 0;
+    if (surface) {
+        const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+        if (points && !points->empty()) {
+            _pointIndex.buildFromMat(*points);
+            _pointIndexCols = points->cols;
+            qCDebug(lcApprovalMask) << "Built PointIndex with" << _pointIndex.size() << "points";
+        }
+    }
+
     qCDebug(lcApprovalMask) << "Surface set on approval tool:" << (surface ? "valid" : "null");
 }
 
@@ -416,80 +429,19 @@ std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInSphere(co
 {
     std::vector<std::pair<int, int>> result;
 
-    if (!_surface) {
+    if (!_surface || _pointIndex.empty() || _pointIndexCols <= 0) {
         return result;
     }
 
-    const cv::Mat_<cv::Vec3f>* points = _surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return result;
-    }
+    // Use PointIndex for O(log n + k) spatial query instead of grid window iteration
+    auto queryResults = _pointIndex.queryRadius(worldPos, radius);
 
-    const float radiusSq = radius * radius;
-    const int rows = points->rows;
-    const int cols = points->cols;
-
-    // Use pointTo to find the approximate grid center for the world position.
-    // This gives us a starting point for a local search instead of scanning all points.
-    cv::Vec3f ptr{0, 0, 0};
-    auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
-    const float dist = _surface->pointTo(ptr, worldPos, radius * 2.0f, 100, patchIndex);
-
-    // If pointTo failed to find a close point, fall back to full scan
-    // (this should be rare - only if the worldPos is far from the surface)
-    if (dist < 0 || dist > radius * 4.0f) {
-        // Fallback: scan all points (old behavior)
-        for (int row = 0; row < rows; ++row) {
-            for (int col = 0; col < cols; ++col) {
-                const cv::Vec3f& pt = (*points)(row, col);
-                if (isInvalidPoint(pt)) {
-                    continue;
-                }
-                const cv::Vec3f delta = pt - worldPos;
-                const float distSq = delta.dot(delta);
-                if (distSq <= radiusSq) {
-                    result.emplace_back(row, col);
-                }
-            }
-        }
-        return result;
-    }
-
-    // ptr is in "pointer" space: ptr = loc - center*scale
-    // So loc (actual grid position) = ptr + center*scale
-    const cv::Vec2f scale = _surface->scale();
-    const cv::Vec3f center = _surface->center();
-    const float locX = ptr[0] + center[0] * scale[0];  // column in grid space
-    const float locY = ptr[1] + center[1] * scale[1];  // row in grid space
-    const int centerCol = static_cast<int>(std::round(locX));
-    const int centerRow = static_cast<int>(std::round(locY));
-
-    // Estimate the search window size based on brush radius and surface scale
-    // Add extra margin to ensure we don't miss edge cases
-    const int windowRadius = static_cast<int>(std::ceil(radius * std::max(scale[0], scale[1]))) + 5;
-
-    const int rowStart = std::max(0, centerRow - windowRadius);
-    const int rowEnd = std::min(rows, centerRow + windowRadius + 1);
-    const int colStart = std::max(0, centerCol - windowRadius);
-    const int colEnd = std::min(cols, centerCol + windowRadius + 1);
-
-    // Search only within the local window
-    for (int row = rowStart; row < rowEnd; ++row) {
-        for (int col = colStart; col < colEnd; ++col) {
-            const cv::Vec3f& pt = (*points)(row, col);
-
-            // Skip invalid points
-            if (isInvalidPoint(pt)) {
-                continue;
-            }
-
-            // Check if point is within sphere
-            const cv::Vec3f delta = pt - worldPos;
-            const float distSq = delta.dot(delta);
-            if (distSq <= radiusSq) {
-                result.emplace_back(row, col);
-            }
-        }
+    result.reserve(queryResults.size());
+    for (const auto& qr : queryResults) {
+        // Decode ID back to grid position: id = row * cols + col
+        const int row = static_cast<int>(qr.id / _pointIndexCols);
+        const int col = static_cast<int>(qr.id % _pointIndexCols);
+        result.emplace_back(row, col);
     }
 
     return result;
@@ -508,12 +460,7 @@ std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInCylinder(
         *outMinDist = std::numeric_limits<float>::max();
     }
 
-    if (!_surface) {
-        return result;
-    }
-
-    const cv::Mat_<cv::Vec3f>* points = _surface->rawPointsPtr();
-    if (!points || points->empty()) {
+    if (!_surface || _pointIndex.empty() || _pointIndexCols <= 0) {
         return result;
     }
 
@@ -525,113 +472,40 @@ std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInCylinder(
     const float normalLen = std::sqrt(planeNormal.dot(planeNormal));
     const cv::Vec3f normal = (normalLen > 1e-6f) ? planeNormal / normalLen : cv::Vec3f(0, 0, 1);
 
-    const int rows = points->rows;
-    const int cols = points->cols;
+    // Query bounding sphere that contains the cylinder
+    // Bounding radius = sqrt(radius² + halfDepth²)
+    const float boundingRadius = std::sqrt(radiusSq + halfDepth * halfDepth);
+    auto queryResults = _pointIndex.queryRadius(worldPos, boundingRadius);
 
-    const float searchDist = std::max(radius, depth) * 2.0f;
-    const cv::Vec2f scale = _surface->scale();
-    const cv::Vec3f center = _surface->center();
-
-    int centerRow = -1, centerCol = -1;
-    bool foundCenter = false;
-
-    // Optimization: if we have a cached search position close to the current one,
-    // skip the expensive pointTo call and reuse the cached grid center
-    constexpr float kCacheDistanceThreshold = 50.0f; // Max distance to reuse cache
-    if (_hasLastSearchCache) {
-        const cv::Vec3f cacheDelta = worldPos - _lastSearchWorldPos;
-        const float cacheDistSq = cacheDelta.dot(cacheDelta);
-        if (cacheDistSq < kCacheDistanceThreshold * kCacheDistanceThreshold) {
-            // Close enough to last search - estimate new center based on world position delta
-            // This avoids the expensive pointTo call during continuous brush strokes
-            centerRow = _lastSearchGridRow;
-            centerCol = _lastSearchGridCol;
-            foundCenter = true;
-        }
-    }
-
-    // If cache miss or first call, use pointTo to find the grid center
-    if (!foundCenter) {
-        cv::Vec3f ptr{0, 0, 0};
-        auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
-        const float dist = _surface->pointTo(ptr, worldPos, searchDist, 100, patchIndex);
-
-        if (dist >= 0 && dist <= searchDist * 2.0f) {
-            const float locX = ptr[0] + center[0] * scale[0];
-            const float locY = ptr[1] + center[1] * scale[1];
-            centerCol = static_cast<int>(std::round(locX));
-            centerRow = static_cast<int>(std::round(locY));
-            foundCenter = true;
-
-            // Update cache
-            _lastSearchWorldPos = worldPos;
-            _lastSearchGridRow = centerRow;
-            _lastSearchGridCol = centerCol;
-            _hasLastSearchCache = true;
-        }
-    }
-
-    int rowStart = 0, rowEnd = rows;
-    int colStart = 0, colEnd = cols;
-
-    if (foundCenter) {
-        // Use larger window to account for cylinder extent
-        const int windowRadius = static_cast<int>(std::ceil(searchDist * std::max(scale[0], scale[1]))) + 5;
-
-        rowStart = std::max(0, centerRow - windowRadius);
-        rowEnd = std::min(rows, centerRow + windowRadius + 1);
-        colStart = std::max(0, centerCol - windowRadius);
-        colEnd = std::min(cols, centerCol + windowRadius + 1);
-    }
-
-    // Cylinder intersection: find all surface points within the cylinder
-    // Point is inside cylinder if:
-    // 1. Distance along normal (axis) <= halfDepth
-    // 2. Distance perpendicular to normal <= radius
+    // Filter by cylinder test and track minimum distance
     float minDistSq = std::numeric_limits<float>::max();
-    int bestRow = -1, bestCol = -1;
 
-    for (int row = rowStart; row < rowEnd; ++row) {
-        for (int col = colStart; col < colEnd; ++col) {
-            const cv::Vec3f& pt = (*points)(row, col);
+    for (const auto& qr : queryResults) {
+        // Track minimum distance for outMinDist
+        if (qr.distanceSq < minDistSq) {
+            minDistSq = qr.distanceSq;
+        }
 
-            if (isInvalidPoint(pt)) {
-                continue;
-            }
+        // Cylinder test: check axial and perpendicular distance
+        const cv::Vec3f delta = qr.position - worldPos;
 
-            const cv::Vec3f delta = pt - worldPos;
-            const float distSq = delta.dot(delta);
+        // Project delta onto the normal (axial distance)
+        const float axialDist = std::abs(delta.dot(normal));
 
-            if (distSq < minDistSq) {
-                minDistSq = distSq;
-                bestRow = row;
-                bestCol = col;
-            }
+        // Perpendicular distance squared = total distance squared - axial distance squared
+        const float perpDistSq = qr.distanceSq - axialDist * axialDist;
 
-            // Project delta onto the normal (axial distance)
-            const float axialDist = std::abs(delta.dot(normal));
-
-            // Perpendicular distance squared = total distance squared - axial distance squared
-            const float perpDistSq = distSq - axialDist * axialDist;
-
-            // Check if point is within the cylinder
-            if (axialDist <= halfDepth && perpDistSq <= radiusSq) {
-                result.emplace_back(row, col);
-            }
+        // Check if point is within the cylinder
+        if (axialDist <= halfDepth && perpDistSq <= radiusSq) {
+            // Decode ID back to grid position: id = row * cols + col
+            const int row = static_cast<int>(qr.id / _pointIndexCols);
+            const int col = static_cast<int>(qr.id % _pointIndexCols);
+            result.emplace_back(row, col);
         }
     }
 
-    // Update cache with the closest point found (better approximation for next call)
-    if (bestRow >= 0 && bestCol >= 0) {
-        _lastSearchWorldPos = worldPos;
-        _lastSearchGridRow = bestRow;
-        _lastSearchGridCol = bestCol;
-        _hasLastSearchCache = true;
-    }
-
-    const float minDist = std::sqrt(minDistSq);
-    if (outMinDist) {
-        *outMinDist = minDist;
+    if (outMinDist && minDistSq < std::numeric_limits<float>::max()) {
+        *outMinDist = std::sqrt(minDistSq);
     }
 
     return result;

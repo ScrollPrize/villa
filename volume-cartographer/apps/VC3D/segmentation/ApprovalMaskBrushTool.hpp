@@ -6,6 +6,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vc/core/util/PointIndex.hpp"
+
 class QuadSurface;
 class SegmentationModule;
 class SegmentationWidget;
@@ -139,4 +141,8 @@ private:
     mutable int _lastSearchGridRow{-1};
     mutable int _lastSearchGridCol{-1};
     mutable bool _hasLastSearchCache{false};
+
+    // Spatial index for fast 3D point queries - built when surface is set
+    PointIndex _pointIndex;
+    int _pointIndexCols{0};  // Needed to decode ID back to (row, col)
 };
