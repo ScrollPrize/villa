@@ -2942,6 +2942,23 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         }
     }
 
+    // Set flag BEFORE beginEditingSession so the surface change doesn't reset view
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([this, enabled](CVolumeViewer* viewer) {
+            if (!viewer) {
+                return;
+            }
+            if (viewer->surfName() == "segmentation") {
+                bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+                if (enabled) {
+                    viewer->setResetViewOnSurfaceChange(false);
+                } else {
+                    viewer->setResetViewOnSurfaceChange(defaultReset);
+                }
+            }
+        });
+    }
+
     if (enabled) {
         QuadSurface* activeSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
 
@@ -2974,22 +2991,6 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
     statusBar()->showMessage(message, 2000);
-
-    if (_viewerManager) {
-        _viewerManager->forEachViewer([this, enabled](CVolumeViewer* viewer) {
-            if (!viewer) {
-                return;
-            }
-            if (viewer->surfName() == "segmentation") {
-                bool defaultReset = _viewerManager->resetDefaultFor(viewer);
-                if (enabled) {
-                    viewer->setResetViewOnSurfaceChange(false);
-                } else {
-                    viewer->setResetViewOnSurfaceChange(defaultReset);
-                }
-            }
-        });
-    }
 }
 
 void CWindow::onSegmentationStopToolsRequested()
