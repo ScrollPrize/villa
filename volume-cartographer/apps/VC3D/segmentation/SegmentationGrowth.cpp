@@ -19,7 +19,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/JsonSafe.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -521,8 +521,8 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
-    const double previousAreaVx2 = vc::json_safe::number_or(surface->meta, "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json_safe::number_or(surface->meta, "area_cm2", -1.0);
+    const double previousAreaVx2 = vc::json::number_or(surface->meta, "area_vx2", -1.0);
+    const double previousAreaCm2 = vc::json::number_or(surface->meta, "area_cm2", -1.0);
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {

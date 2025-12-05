@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "vc/core/util/DateTime.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
 constexpr auto CONFIG = "config.json";
@@ -12,17 +13,8 @@ constexpr auto CONFIG = "config.json";
 VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileLocation}
 {
     auto configPath = fileLocation / ::CONFIG;
-    if (!std::filesystem::exists(configPath)) {
-        throw std::runtime_error("could not find config file '" + configPath.string() + "'");
-    }
-    std::ifstream configFile(configPath.string());
-    if (!configFile) {
-        throw std::runtime_error("could not open config file '" + configPath.string() + "'");
-    }
-    configFile >> config_;
-    if (configFile.bad()) {
-        throw std::runtime_error("could not read config file '" + configPath.string() + "'");
-    }
+    config_ = vc::json::load_json_file(configPath);
+    vc::json::require_fields(config_, {"name", "version"}, configPath.string());
 
     std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders","backups"};
 

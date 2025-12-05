@@ -1,4 +1,5 @@
 #include "vc/core/util/SurfaceMeta.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <nlohmann/json.hpp>
@@ -107,19 +108,8 @@ SurfaceMeta::SurfaceMeta(const std::filesystem::path &path_, const nlohmann::jso
 
 SurfaceMeta::SurfaceMeta(const std::filesystem::path &path_) : path(path_)
 {
-    std::ifstream meta_f(path_/"meta.json");
-    if (!meta_f.is_open() || !meta_f.good()) {
-        throw std::runtime_error("Cannot open meta.json file at: " + path_.string());
-    }
-
-    meta = new nlohmann::json;
-    try {
-        *meta = nlohmann::json::parse(meta_f);
-    } catch (const nlohmann::json::parse_error& e) {
-        delete meta;
-        meta = nullptr;
-        throw std::runtime_error("Invalid JSON in meta.json at: " + path_.string() + " - " + e.what());
-    }
+    auto metaPath = path_ / "meta.json";
+    meta = new nlohmann::json(vc::json::load_json_file(metaPath));
 
     if (meta->contains("bbox"))
         bbox = rect_from_json((*meta)["bbox"]);
