@@ -294,8 +294,6 @@ public:
     void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
-    // Configure how TIFFs are written
-    void setTiffWriteOptions(const TiffWriteOptions& opt) { _tiff_opts = opt; }
     Rect3D bbox();
 
     bool containsPoint(const cv::Vec3f& point, float tolerance) const;
@@ -333,6 +331,12 @@ public:
     int countValidPoints() const;
     int countValidQuads() const;
 
+    // Generate validity mask at native resolution (255=valid, 0=invalid)
+    cv::Mat_<uint8_t> validMask() const;
+
+    // Write validity mask to path/mask.tif. If img is provided, writes multi-layer TIFF.
+    void writeValidMask(const cv::Mat& img = cv::Mat());
+
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
@@ -346,7 +350,6 @@ protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     cv::Mat_<cv::Vec3f>* _points = nullptr;
     cv::Rect _bounds;
-    TiffWriteOptions _tiff_opts;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
 

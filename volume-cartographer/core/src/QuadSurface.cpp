@@ -228,6 +228,43 @@ int QuadSurface::countValidQuads() const
     return static_cast<int>(std::distance(range.begin(), range.end()));
 }
 
+cv::Mat_<uint8_t> QuadSurface::validMask() const
+{
+    if (!_points || _points->empty()) {
+        return cv::Mat_<uint8_t>();
+    }
+    const int rows = _points->rows;
+    const int cols = _points->cols;
+    cv::Mat_<uint8_t> mask(rows, cols);
+
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int j = 0; j < rows; ++j) {
+        for (int i = 0; i < cols; ++i) {
+            const cv::Vec3f& p = (*_points)(j, i);
+            const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+                           !(p[0] == -1.f && p[1] == -1.f && p[2] == -1.f);
+            mask(j, i) = ok ? 255 : 0;
+        }
+    }
+    return mask;
+}
+
+void QuadSurface::writeValidMask(const cv::Mat& img)
+{
+    if (path.empty()) {
+        return;
+    }
+    std::filesystem::path maskPath = path / "mask.tif";
+    cv::Mat_<uint8_t> mask = validMask();
+
+    if (img.empty()) {
+        writeTiff(maskPath, mask);
+    } else {
+        std::vector<cv::Mat> layers = {mask, img};
+        cv::imwritemulti(maskPath.string(), layers);
+    }
+}
+
 void QuadSurface::invalidateCache()
 {
     if (_points) {
@@ -282,17 +319,8 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
 
     cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
 
-    // --- build a source validity mask (1 if point is valid) -------------
-    cv::Mat valid_src(_points->size(), CV_8U, cv::Scalar(0));
-    for (int y = 0; y < _points->rows; ++y) {
-        for (int x = 0; x < _points->cols; ++x) {
-            const cv::Vec3f& p = (*_points)(y, x);
-            // treat -1/-1/-1 or NaNs as invalid
-            const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-                            !(p[0] == -1.f && p[1] == -1.f && p[2] == -1.f);
-            valid_src.at<uint8_t>(y, x) = ok ? 255 : 0;
-        }
-    }
+    // --- build a source validity mask (255 if point is valid) -------------
+    cv::Mat valid_src = validMask();
 
     // --- warp coords with seam-safe border (replicate) -------------------
     cv::Mat_<cv::Vec3f> coords_big;
@@ -675,10 +703,10 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
 
-    // Write x/y/z as 32-bit float tiled BigTIFF with LZW
-    writeFloatBigTiff(dir / "x.tif", xyz[0]);
-    writeFloatBigTiff(dir / "y.tif", xyz[1]);
-    writeFloatBigTiff(dir / "z.tif", xyz[2]);
+    // Write x/y/z as 32-bit float tiled TIFF with LZW
+    writeTiff(dir / "x.tif", xyz[0]);
+    writeTiff(dir / "y.tif", xyz[1]);
+    writeTiff(dir / "z.tif", xyz[2]);
 
     // OpenCV compression params for fallback
     std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
@@ -688,12 +716,12 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
         if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
             bool wrote = false;
 
-            // Try BigTIFF for large single-channel ancillary data (8U/16U/32F)
+            // Try tiled TIFF for single-channel ancillary data (8U/16U/32F)
             if (mat.channels() == 1 &&
                 (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
             {
                 try {
-                    writeSingleChannelBigTiff(dir / (name + ".tif"), mat);
+                    writeTiff(dir / (name + ".tif"), mat);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV

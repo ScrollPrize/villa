@@ -1,6 +1,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/Tiff.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 
@@ -14,7 +15,6 @@
 #include <algorithm>
 #include <atomic>
 #include <boost/program_options.hpp>
-#include <tiffio.h>
 #include <mutex>
 #include <cmath>
 #include <set>
@@ -1426,28 +1426,17 @@ int main(int argc, char *argv[])
                 const size_t totalTiles = static_cast<size_t>(tilesX_src) * static_cast<size_t>(tilesY_src);
                 std::atomic<size_t> tilesDone{0};
 
-                std::vector<TIFF*> tiffs(Z, nullptr);
-                std::vector<std::mutex> tiffLocks(Z); // per-slice locks
+                std::vector<TiffWriter> writers;
+                std::vector<std::mutex> writerLocks(Z);
+                writers.reserve(Z);
+                const int cvType = output_is_u16 ? CV_16UC1 : CV_8UC1;
                 for (size_t z = 0; z < Z; ++z) {
                     std::ostringstream fn;
                     fn << std::setw(pad) << std::setfill('0') << z;
                     std::filesystem::path outPath = layers_dir / (fn.str() + std::string(".tif"));
-                    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8");
-                    if (!tf) throw std::runtime_error("failed to open TIFF for writing: " + outPath.string());
-                    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, outW);
-                    TIFFSetField(tf, TIFFTAG_IMAGELENGTH, outH);
-                    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, output_is_u16 ? 16 : 8);
-                    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-                    TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-                    TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
-                    TIFFSetField(tf, TIFFTAG_PREDICTOR, 2);
-                    TIFFSetField(tf, TIFFTAG_TILEWIDTH, tileW);
-                    TIFFSetField(tf, TIFFTAG_TILELENGTH, tileH);
-                    tiffs[z] = tf;
+                    writers.emplace_back(outPath, outW, outH, cvType, tileW, tileH, 0.0f);
                 }
 
-                // Per-thread tile buffer padded to tile size
                 #pragma omp parallel for schedule(dynamic) collapse(2)
                 for (long long ty = 0; ty < static_cast<long long>(tilesY_src); ++ty) {
                     for (long long tx = 0; tx < static_cast<long long>(tilesX_src); ++tx) {
@@ -1455,64 +1444,34 @@ int main(int argc, char *argv[])
                         const uint32_t y0_src = static_cast<uint32_t>(ty) * tileH;
                         const uint32_t dx = std::min<uint32_t>(tileW, static_cast<uint32_t>(X) - x0_src);
                         const uint32_t dy = std::min<uint32_t>(tileH, static_cast<uint32_t>(Y) - y0_src);
+                        const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
+                        const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
 
                         if (output_is_u16) {
                             xt::xarray<uint16_t> tile = xt::empty<uint16_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
                             z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
                             z5::multiarray::readSubarray<uint16_t>(dsL0, tile, off.begin());
-                            std::vector<uint16_t> tileBuf(tileW * tileH, 0);
                             for (size_t z = 0; z < Z; ++z) {
                                 cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_16UC1);
                                 for (uint32_t yy = 0; yy < dy; ++yy) {
                                     uint16_t* dst = srcTile.ptr<uint16_t>(static_cast<int>(yy));
                                     for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
                                 }
-                                cv::Mat& dstTile = srcTile;
-                                const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
-                                const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
-                                const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
-                                const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
-                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                                for (uint32_t yy = 0; yy < ddy; ++yy) {
-                                    const uint16_t* src = dstTile.ptr<uint16_t>(static_cast<int>(yy));
-                                    std::memcpy(tileBuf.data() + yy * tileW, src, ddx * sizeof(uint16_t));
-                                }
-                                {
-                                    std::lock_guard<std::mutex> guard(tiffLocks[z]);
-                                    TIFF* tf = tiffs[z];
-                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
-                                                         static_cast<tmsize_t>(tileBuf.size() * sizeof(uint16_t)));
-                                }
+                                std::lock_guard<std::mutex> guard(writerLocks[z]);
+                                writers[z].writeTile(x0_dst, y0_dst, srcTile);
                             }
                         } else {
                             xt::xarray<uint8_t> tile = xt::empty<uint8_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
                             z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
                             z5::multiarray::readSubarray<uint8_t>(dsL0, tile, off.begin());
-                            std::vector<uint8_t> tileBuf(tileW * tileH, 0);
                             for (size_t z = 0; z < Z; ++z) {
                                 cv::Mat srcTile(static_cast<int>(dy), static_cast<int>(dx), CV_8UC1);
                                 for (uint32_t yy = 0; yy < dy; ++yy) {
                                     uint8_t* dst = srcTile.ptr<uint8_t>(static_cast<int>(yy));
                                     for (uint32_t xx = 0; xx < dx; ++xx) dst[xx] = tile(z, yy, xx);
                                 }
-                                cv::Mat& dstTile = srcTile;
-                                const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
-                                const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
-                                const uint32_t ddy = static_cast<uint32_t>(dstTile.rows);
-                                const uint32_t ddx = static_cast<uint32_t>(dstTile.cols);
-                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                                for (uint32_t yy = 0; yy < ddy; ++yy) {
-                                    const uint8_t* src = dstTile.ptr<uint8_t>(static_cast<int>(yy));
-                                    std::memcpy(tileBuf.data() + yy * tileW, src, ddx);
-                                }
-                                {
-                                    std::lock_guard<std::mutex> guard(tiffLocks[z]);
-                                    TIFF* tf = tiffs[z];
-                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
-                                                         static_cast<tmsize_t>(tileBuf.size()));
-                                }
+                                std::lock_guard<std::mutex> guard(writerLocks[z]);
+                                writers[z].writeTile(x0_dst, y0_dst, srcTile);
                             }
                         }
 
@@ -1526,9 +1485,7 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                for (auto* tf : tiffs) {
-                    TIFFClose(tf);
-                }
+                writers.clear(); // Explicitly close all writers
 
                 std::cout << std::endl;
             } catch (const std::exception& e) {
@@ -1555,12 +1512,8 @@ int main(int argc, char *argv[])
                 const uint32_t tileH = 128;
                 const double num_slices_center = 0.5 * (static_cast<double>(std::max(1, num_slices)) - 1.0);
 
-                std::vector<TIFF*> tiffs(static_cast<size_t>(num_slices), nullptr);
-                std::vector<std::mutex> tiffLocks(static_cast<size_t>(num_slices));
-
                 auto make_out_path = [&](int sliceIdx) -> std::filesystem::path {
                     if (output_path_local.string().find('%') == std::string::npos) {
-                        //
                         int pad = 2; int v = std::max(0, num_slices-1);
                         while (v >= 100) { pad++; v /= 10; }
                         std::ostringstream fn;
@@ -1587,21 +1540,14 @@ int main(int argc, char *argv[])
                     }
                 }
 
+                std::vector<TiffWriter> writers;
+                std::vector<std::mutex> writerLocks(static_cast<size_t>(num_slices));
+                writers.reserve(static_cast<size_t>(num_slices));
+                const int cvType = output_is_u16 ? CV_16UC1 : CV_8UC1;
                 for (int z = 0; z < num_slices; ++z) {
                     std::filesystem::path outPath = make_out_path(z);
-                    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w8");
-                    if (!tf) throw std::runtime_error(std::string("failed to open TIFF for writing: ") + outPath.string());
-                    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(outW));
-                    TIFFSetField(tf, TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(outH));
-                    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-                    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, output_is_u16 ? 16 : 8);
-                    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-                    TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-                    TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
-                    TIFFSetField(tf, TIFFTAG_PREDICTOR, 2);
-                    TIFFSetField(tf, TIFFTAG_TILEWIDTH, tileW);
-                    TIFFSetField(tf, TIFFTAG_TILELENGTH, tileH);
-                    tiffs[static_cast<size_t>(z)] = tf;
+                    writers.emplace_back(outPath, static_cast<uint32_t>(outW), static_cast<uint32_t>(outH),
+                                         cvType, tileW, tileH, 0.0f);
                 }
 
                 {
@@ -1653,8 +1599,7 @@ int main(int argc, char *argv[])
                                 renderSliceFromBase16(dst, ds.get(), &chunk_cache_u16,
                                                       basePoints, stepDirs, offset, static_cast<float>(ds_scale));
                             };
-                            std::vector<uint16_t> tileBuf(tileW * tileH, 0);
-                            cv::Mat tileOut; // CV_16UC1
+                            cv::Mat tileOut;
                             for (int zi = 0; zi < num_slices; ++zi) {
                                 const float off = static_cast<float>(
                                     (static_cast<double>(zi) - num_slices_center) * slice_step);
@@ -1662,13 +1607,6 @@ int main(int argc, char *argv[])
                                     tileOut, renderOne16, off, accumOffsets, accumType, CV_16UC1);
                                 cv::Mat tileTransformed = tileOut;
                                 rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
-                                const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
-                                const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
-                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                                for (uint32_t yy = 0; yy < dty; ++yy) {
-                                    const uint16_t* src = tileTransformed.ptr<uint16_t>(static_cast<int>(yy));
-                                    std::memcpy(tileBuf.data() + yy * tileW, src, dtx * sizeof(uint16_t));
-                                }
                                 int dstTx, dstTy, rTilesX, rTilesY;
                                 mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
                                              static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
@@ -1676,21 +1614,15 @@ int main(int argc, char *argv[])
                                              dstTx, dstTy, rTilesX, rTilesY);
                                 const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
                                 const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
-                                {
-                                    std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
-                                    TIFF* tf = tiffs[static_cast<size_t>(zi)];
-                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
-                                                         static_cast<tmsize_t>(tileBuf.size() * sizeof(uint16_t)));
-                                }
+                                std::lock_guard<std::mutex> guard(writerLocks[static_cast<size_t>(zi)]);
+                                writers[static_cast<size_t>(zi)].writeTile(x0_dst, y0_dst, tileTransformed);
                             }
                         } else {
                             auto renderOne8 = [&](cv::Mat& dst, float offset) {
                                 renderSliceFromBase(dst, ds.get(), &chunk_cache_u8,
                                                     basePoints, stepDirs, offset, static_cast<float>(ds_scale));
                             };
-                            std::vector<uint8_t> tileBuf(tileW * tileH, 0);
-                            cv::Mat tileOut; // CV_8UC1
+                            cv::Mat tileOut;
                             for (int zi = 0; zi < num_slices; ++zi) {
                                 const float off = static_cast<float>(
                                     (static_cast<double>(zi) - num_slices_center) * slice_step);
@@ -1698,13 +1630,6 @@ int main(int argc, char *argv[])
                                     tileOut, renderOne8, off, accumOffsets, accumType, CV_8UC1);
                                 cv::Mat tileTransformed = tileOut;
                                 rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
-                                const uint32_t dty = static_cast<uint32_t>(tileTransformed.rows);
-                                const uint32_t dtx = static_cast<uint32_t>(tileTransformed.cols);
-                                std::fill(tileBuf.begin(), tileBuf.end(), 0);
-                                for (uint32_t yy = 0; yy < dty; ++yy) {
-                                    const uint8_t* src = tileTransformed.ptr<uint8_t>(static_cast<int>(yy));
-                                    std::memcpy(tileBuf.data() + yy * tileW, src, dtx);
-                                }
                                 int dstTx, dstTy, rTilesX, rTilesY;
                                 mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
                                              static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
@@ -1712,13 +1637,8 @@ int main(int argc, char *argv[])
                                              dstTx, dstTy, rTilesX, rTilesY);
                                 const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
                                 const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
-                                {
-                                    std::lock_guard<std::mutex> guard(tiffLocks[static_cast<size_t>(zi)]);
-                                    TIFF* tf = tiffs[static_cast<size_t>(zi)];
-                                    const uint32_t tileIndex = TIFFComputeTile(tf, x0_dst, y0_dst, 0, 0);
-                                    TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(),
-                                                         static_cast<tmsize_t>(tileBuf.size()));
-                                }
+                                std::lock_guard<std::mutex> guard(writerLocks[static_cast<size_t>(zi)]);
+                                writers[static_cast<size_t>(zi)].writeTile(x0_dst, y0_dst, tileTransformed);
                             }
                         }
 
@@ -1732,9 +1652,7 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                for (auto* tf : tiffs) {
-                    TIFFClose(tf);
-                }
+                writers.clear(); // Explicitly close all writers
                 std::cout << std::endl;
 
 
