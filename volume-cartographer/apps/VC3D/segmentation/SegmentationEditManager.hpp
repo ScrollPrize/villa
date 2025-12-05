@@ -94,16 +94,15 @@ public:
     [[nodiscard]] float radius() const { return _radiusSteps; }
     [[nodiscard]] float sigma() const { return _sigmaSteps; }
 
-    [[nodiscard]] bool hasPendingChanges() const { return _dirty; }
+    [[nodiscard]] bool hasPendingChanges() const { return _hasPendingEdits; }
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const;
     bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                          bool dirtyState,
+                          bool markAsPendingEdit,
                           std::optional<cv::Rect>* outDiffBounds = nullptr);
 
     void resetPreview();
     void applyPreview();
     void refreshFromBaseSurface();
-    void ensureDirtyBounds();
 
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,
@@ -124,14 +123,12 @@ public:
     [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
-    void publishDirtyBounds(const cv::Rect& vertexRect);
     void markNextEditsAsGrowth();
 
     void bakePreviewToOriginal();
     bool invalidateRegion(int centerRow, int centerCol, int radius);
     bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
-    std::optional<cv::Rect> takeEditedBounds();
 
 private:
     static bool isInvalidPoint(const cv::Vec3f& value);
@@ -142,8 +139,6 @@ private:
     void clearActiveDrag();
     float stepNormalization() const;
     void resetPointerSeed();
-    void expandEditedBounds(int row, int col);
-    void publishDirtyBoundsFromRecentTouched();
 
     QuadSurface* _baseSurface{nullptr};
     ViewerManager* _viewerManager{nullptr};
@@ -152,14 +147,13 @@ private:
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};
-    bool _dirty{false};
+    bool _hasPendingEdits{false};
     bool _pendingGrowthMarking{false};
 
     std::unordered_map<GridKey, VertexEdit, GridKeyHash> _editedVertices;
     std::vector<GridKey> _recentTouched;
     ActiveDrag _activeDrag;
     cv::Vec2f _gridScale{1.0f, 1.0f};
-    std::optional<cv::Rect> _editedBounds;
 
     mutable bool _pointerSeedValid{false};
     mutable cv::Vec3f _pointerSeed{0.0f, 0.0f, 0.0f};

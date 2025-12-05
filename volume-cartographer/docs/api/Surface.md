@@ -78,7 +78,6 @@ QuadSurface(cv::Mat_<cv::Vec3f>* points, const cv::Vec2f& scale);
 | `scale()` | Returns the scale factor `{x, y}` |
 | `center()` | Returns the center point in internal coordinates |
 | `bbox()` | Computes and caches the 3D bounding box of all valid points |
-| `containsPoint(point, tolerance)` | Checks if a 3D point lies on the surface within tolerance |
 
 ### Persistence
 

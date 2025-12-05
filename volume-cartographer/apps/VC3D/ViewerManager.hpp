@@ -7,7 +7,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -143,8 +142,7 @@ private:
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
-    bool _surfacePatchIndexDirty{true};
-    std::unordered_map<const QuadSurface*, int> _surfaceDirtyBoundsVersions;
+    bool _surfacePatchIndexNeedsRebuild{true};
     std::unordered_set<QuadSurface*> _indexedSurfaces;
     std::vector<QuadSurface*> _pendingSurfacePatchIndexSurfaces;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};

@@ -4,6 +4,7 @@
 
 #include <QColor>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <optional>
 #include <vector>
@@ -179,6 +180,6 @@ private:
         QImage savedRegion;  // Copy of the affected region before painting
         QPoint topLeft;      // Position of the saved region in the full image
     };
-    std::vector<ApprovalMaskUndoEntry> _approvalMaskUndoStack;
-    static constexpr size_t kMaxUndoEntries = 1000;
+    std::deque<ApprovalMaskUndoEntry> _approvalMaskUndoStack;
+    static constexpr size_t kMaxUndoEntries = 100;
 };

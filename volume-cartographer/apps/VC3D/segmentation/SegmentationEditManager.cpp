@@ -3,6 +3,7 @@
 #include "ViewerManager.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,8 +11,6 @@
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
-
-#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -65,9 +64,8 @@ bool SegmentationEditManager::beginSession(QuadSurface* baseSurface)
     _recentTouched.clear();
     clearActiveDrag();
     rebuildPreviewFromOriginal();
-    _editedBounds.reset();
 
-    _dirty = false;
+    _hasPendingEdits = false;
     _pendingGrowthMarking = false;
     return true;
 }
@@ -77,13 +75,12 @@ void SegmentationEditManager::endSession()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _editedBounds.reset();
 
     _previewPoints = nullptr;
     _originalPoints.reset();
     _baseSurface = nullptr;
     resetPointerSeed();
-    _dirty = false;
+    _hasPendingEdits = false;
     _pendingGrowthMarking = false;
 }
 
@@ -113,7 +110,7 @@ const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
 }
 
 bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                                               bool dirtyState,
+                                               bool markAsPendingEdit,
                                                std::optional<cv::Rect>* outDiffBounds)
 {
     if (outDiffBounds) {
@@ -163,8 +160,7 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
         points.copyTo(*_originalPoints);
     }
     _editedVertices.clear();
-    _dirty = dirtyState;
-    _editedBounds.reset();
+    _hasPendingEdits = markAsPendingEdit;
 
     if (outDiffBounds) {
         if (diffFound) {
@@ -186,18 +182,13 @@ void SegmentationEditManager::resetPreview()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _editedBounds.reset();
-    _dirty = false;
+    _hasPendingEdits = false;
 }
 
 void SegmentationEditManager::applyPreview()
 {
     if (!_previewPoints) {
         return;
-    }
-
-    if (_editedBounds) {
-        publishDirtyBounds(*_editedBounds);
     }
 
     if (_originalPoints) {
@@ -207,46 +198,7 @@ void SegmentationEditManager::applyPreview()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _editedBounds.reset();
-    _dirty = false;
-}
-
-void SegmentationEditManager::ensureDirtyBounds()
-{
-    if (!_baseSurface) {
-        return;
-    }
-
-    ensureSurfaceMetaObject(_baseSurface);
-    auto& meta = *_baseSurface->meta;
-
-    // Get new bounds from recent touched or edited bounds
-    std::optional<cv::Rect> newBounds;
-    if (auto bounds = recentTouchedBounds()) {
-        newBounds = bounds;
-    } else if (_editedBounds) {
-        newBounds = _editedBounds;
-    }
-
-    if (!newBounds) {
-        return;
-    }
-
-    // If existing bounds are valid, union them with new bounds
-    if (meta.contains("dirty_bounds") && meta["dirty_bounds"].is_object()) {
-        const auto& b = meta["dirty_bounds"];
-        const int rs = b.value("row_start", -1);
-        const int re = b.value("row_end", -1);
-        const int cs = b.value("col_start", -1);
-        const int ce = b.value("col_end", -1);
-        if (rs >= 0 && cs >= 0 && re > rs && ce > cs) {
-            // Union with existing bounds
-            cv::Rect existing(cs, rs, ce - cs, re - rs);
-            *newBounds = existing | *newBounds;
-        }
-    }
-
-    publishDirtyBounds(*newBounds);
+    _hasPendingEdits = false;
 }
 
 void SegmentationEditManager::refreshFromBaseSurface()
@@ -266,12 +218,12 @@ void SegmentationEditManager::refreshFromBaseSurface()
 
     _previewPoints = _baseSurface->rawPointsPtr();
     if (!_previewPoints) {
-        _dirty = !_editedVertices.empty();
+        _hasPendingEdits = !_editedVertices.empty();
         return;
     }
 
     rebuildPreviewFromOriginal();
-    _dirty = !_editedVertices.empty();
+    _hasPendingEdits = !_editedVertices.empty();
 }
 
 bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexRect)
@@ -323,11 +275,7 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     }
 
     if (removedEdits) {
-        _editedBounds.reset();
-        for (const auto& entry : _editedVertices) {
-            expandEditedBounds(entry.first.row, entry.first.col);
-        }
-        _dirty = !_editedVertices.empty();
+        _hasPendingEdits = !_editedVertices.empty();
     }
 
     if (!_recentTouched.empty()) {
@@ -608,12 +556,11 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
         _activeDrag.targetWorld = newWorldPositions.front();
     }
 
-    _dirty = true;
+    _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
         _pendingGrowthMarking = false;
     }
 
-    publishDirtyBoundsFromRecentTouched();
     return true;
 }
 
@@ -672,13 +619,6 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
     std::vector<GridKey> regionVec(region.begin(), region.end());
     if (regionVec.empty()) {
         return false;
-    }
-
-    // Pre-expand _editedBounds to cover entire smoothing region.
-    // This ensures R-tree updates include all affected cells, even those
-    // where individual vertex changes fall below the 1e-5 threshold.
-    for (const auto& key : regionVec) {
-        expandEditedBounds(key.row, key.col);
     }
 
     std::unordered_map<GridKey, cv::Vec3f, GridKeyHash> currentValues;
@@ -765,8 +705,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
     }
 
     _recentTouched.assign(regionVec.begin(), regionVec.end());
-    _dirty = true;
-    publishDirtyBoundsFromRecentTouched();
+    _hasPendingEdits = true;
     return true;
 }
 
@@ -846,44 +785,6 @@ std::optional<cv::Rect> SegmentationEditManager::recentTouchedBounds() const
     return rect;
 }
 
-void SegmentationEditManager::publishDirtyBounds(const cv::Rect& vertexRect)
-{
-    if (!_baseSurface || vertexRect.width <= 0 || vertexRect.height <= 0) {
-        return;
-    }
-
-    ensureSurfaceMetaObject(_baseSurface);
-
-    auto& meta = *_baseSurface->meta;
-    int version = 0;
-    if (meta.contains("dirty_bounds_version") && meta["dirty_bounds_version"].is_number_integer()) {
-        version = meta["dirty_bounds_version"].get<int>();
-    }
-    if (version == std::numeric_limits<int>::max()) {
-        version = 0;
-    }
-    ++version;
-
-    meta["dirty_bounds_version"] = version;
-    nlohmann::json bounds = {
-        {"row_start", vertexRect.y},
-        {"row_end", vertexRect.y + vertexRect.height},
-        {"col_start", vertexRect.x},
-        {"col_end", vertexRect.x + vertexRect.width},
-        {"version", version}
-    };
-    meta["dirty_bounds"] = std::move(bounds);
-}
-
-void SegmentationEditManager::publishDirtyBoundsFromRecentTouched()
-{
-    auto bounds = recentTouchedBounds();
-    if (!bounds) {
-        return;
-    }
-    publishDirtyBounds(*bounds);
-}
-
 void SegmentationEditManager::markNextEditsAsGrowth()
 {
     _pendingGrowthMarking = true;
@@ -899,7 +800,7 @@ void SegmentationEditManager::bakePreviewToOriginal()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _dirty = false;
+    _hasPendingEdits = false;
 }
 
 bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int radius)
@@ -933,7 +834,7 @@ bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int
     }
 
     if (changed) {
-        _dirty = true;
+        _hasPendingEdits = true;
     }
 
     return changed;
@@ -993,7 +894,6 @@ bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, fl
 
     if (changed) {
         _recentTouched = std::move(touched);
-        publishDirtyBoundsFromRecentTouched();
     } else {
         _recentTouched.clear();
     }
@@ -1021,14 +921,7 @@ void SegmentationEditManager::clearInvalidatedEdits()
         _recentTouched.clear();
     }
 
-    _dirty = !_editedVertices.empty();
-}
-
-std::optional<cv::Rect> SegmentationEditManager::takeEditedBounds()
-{
-    auto bounds = _editedBounds;
-    _editedBounds.reset();
-    return bounds;
+    _hasPendingEdits = !_editedVertices.empty();
 }
 
 bool SegmentationEditManager::isInvalidPoint(const cv::Vec3f& value)
@@ -1146,12 +1039,10 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
         _recentTouched.push_back(GridKey{sample.row, sample.col});
     }
 
-    _dirty = true;
+    _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
         _pendingGrowthMarking = false;
     }
-
-    publishDirtyBoundsFromRecentTouched();
 }
 
 void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f& newWorld)
@@ -1171,9 +1062,13 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     GridKey key{row, col};
     const float delta = static_cast<float>(cv::norm(newWorld - original));
 
-    // Always expand dirty bounds when vertex is touched (needed for R-tree updates)
-    expandEditedBounds(row, col);
-    _dirty = true;
+    // Queue cell updates in SurfacePatchIndex for R-tree sync
+    if (_viewerManager && _baseSurface) {
+        if (auto* index = _viewerManager->surfacePatchIndex()) {
+            index->queueCellUpdateForVertex(_baseSurface, row, col);
+        }
+    }
+    _hasPendingEdits = true;
 
     // But only track in _editedVertices if change is significant
     if (delta < 1e-4f) {
@@ -1190,25 +1085,6 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
             it->second.isGrowth = true;
         }
     }
-}
-
-void SegmentationEditManager::expandEditedBounds(int row, int col)
-{
-    cv::Rect rect(col, row, 1, 1);
-    if (!_editedBounds) {
-        _editedBounds = rect;
-        return;
-    }
-
-    auto& bounds = *_editedBounds;
-    const int left = std::min(bounds.x, rect.x);
-    const int top = std::min(bounds.y, rect.y);
-    const int right = std::max(bounds.x + bounds.width, rect.x + rect.width);
-    const int bottom = std::max(bounds.y + bounds.height, rect.y + rect.height);
-    bounds.x = left;
-    bounds.y = top;
-    bounds.width = right - left;
-    bounds.height = bottom - top;
 }
 
 void SegmentationEditManager::clearActiveDrag()

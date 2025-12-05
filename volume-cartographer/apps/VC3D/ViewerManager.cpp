@@ -36,72 +36,6 @@ struct CellRegion {
     int colEnd = 0;
 };
 
-struct DirtyBoundsInfo {
-    cv::Rect rect;
-    int version = 0;
-};
-
-std::optional<DirtyBoundsInfo> readDirtyBounds(QuadSurface* surface)
-{
-    if (!surface || !surface->meta || !surface->meta->is_object()) {
-        return std::nullopt;
-    }
-
-    nlohmann::json& meta = *surface->meta;
-    auto it = meta.find("dirty_bounds");
-    if (it == meta.end() || !it->is_object()) {
-        return std::nullopt;
-    }
-
-    const int rowStart = it->value("row_start", -1);
-    const int rowEnd = it->value("row_end", -1);
-    const int colStart = it->value("col_start", -1);
-    const int colEnd = it->value("col_end", -1);
-
-    if (rowStart < 0 || colStart < 0 || rowEnd <= rowStart || colEnd <= colStart) {
-        return std::nullopt;
-    }
-
-    int version = it->value("version", 0);
-    if (version <= 0) {
-        auto versionIt = meta.find("dirty_bounds_version");
-        if (versionIt != meta.end() && versionIt->is_number_integer()) {
-            version = versionIt->get<int>();
-        }
-    }
-
-    DirtyBoundsInfo info;
-    info.rect = cv::Rect(colStart, rowStart, colEnd - colStart, rowEnd - rowStart);
-    info.version = std::max(version, 1);
-    return info;
-}
-
-std::optional<CellRegion> vertexRectToCellRegion(const cv::Rect& vertexRect,
-                                                 QuadSurface* surface)
-{
-    if (!surface) {
-        return std::nullopt;
-    }
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->rows < 2 || points->cols < 2) {
-        return std::nullopt;
-    }
-
-    const int cellRowCount = points->rows - 1;
-    const int cellColCount = points->cols - 1;
-
-    CellRegion region;
-    region.rowStart = std::max(0, vertexRect.y - 1);
-    region.rowEnd = std::min(cellRowCount, vertexRect.y + vertexRect.height);
-    region.colStart = std::max(0, vertexRect.x - 1);
-    region.colEnd = std::min(cellColCount, vertexRect.x + vertexRect.width);
-
-    if (region.rowStart >= region.rowEnd || region.colStart >= region.colEnd) {
-        return std::nullopt;
-    }
-
-    return region;
-}
 } // namespace
 
 ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
@@ -452,7 +386,7 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     settings.setValue("viewer/intersection_sampling_stride", _surfacePatchSamplingStride);
 
     if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
-        _surfacePatchIndexDirty = true;
+        _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaces.clear();
     }
 
@@ -479,8 +413,8 @@ void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface)
     if (!surface) {
         return;
     }
-    if (_surfacePatchIndexDirty || _surfacePatchIndex.empty()) {
-        _surfacePatchIndexDirty = true;
+    if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex.empty()) {
+        _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaces.erase(surface);
         qCInfo(lcViewerManager) << "Deferred surface index refresh for" << surface->id.c_str()
                                 << "(global rebuild pending)";
@@ -493,10 +427,10 @@ void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface)
         return;
     }
 
-    _surfacePatchIndexDirty = true;
+    _surfacePatchIndexNeedsRebuild = true;
     _indexedSurfaces.erase(surface);
     qCInfo(lcViewerManager) << "Failed to rebuild SurfacePatchIndex for surface" << surface->id.c_str()
-                            << "- marking index dirty";
+                            << "- marking index for rebuild";
 }
 
 void ViewerManager::primeSurfacePatchIndicesAsync()
@@ -522,7 +456,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     if (_pendingSurfacePatchIndexSurfaces.empty()) {
         _surfacePatchIndex.clear();
         _indexedSurfaces.clear();
-        _surfacePatchIndexDirty = false;
+        _surfacePatchIndexNeedsRebuild = false;
         return;
     }
 
@@ -547,9 +481,9 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         setSurfacePatchSamplingStride(defaultStride, false);
     }
 
-    // Clear dirty flag since we're about to do an async build
+    // Clear rebuild flag since we're about to do an async build
     // (prevents rebuildSurfacePatchIndexIfNeeded from triggering a synchronous build)
-    _surfacePatchIndexDirty = false;
+    _surfacePatchIndexNeedsRebuild = false;
 
     auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
     const int stride = _surfacePatchSamplingStride;
@@ -564,10 +498,10 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
 
 void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
 {
-    if (!_surfacePatchIndexDirty) {
+    if (!_surfacePatchIndexNeedsRebuild) {
         return;
     }
-    _surfacePatchIndexDirty = false;
+    _surfacePatchIndexNeedsRebuild = false;
 
     if (!_surfaces) {
         _surfacePatchIndex.clear();
@@ -607,7 +541,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
         return;
     }
     _surfacePatchIndex = std::move(*result);
-    _surfacePatchIndexDirty = false;
+    _surfacePatchIndexNeedsRebuild = false;
     _indexedSurfaces.clear();
     _indexedSurfaces.insert(_pendingSurfacePatchIndexSurfaces.begin(),
                             _pendingSurfacePatchIndexSurfaces.end());
@@ -650,95 +584,39 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     }
 }
 
-bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate)
+bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool /*isEditUpdate*/)
 {
     if (!quad) {
         return false;
     }
 
-    bool regionUpdated = false;
-    bool indexUpdated = false;
-
-    std::optional<cv::Rect> dirtyVertices;
-    bool dirtyBoundsRegressed = false;
     const bool alreadyIndexed = _indexedSurfaces.count(quad) != 0;
-    if (auto dirtyInfo = readDirtyBounds(quad)) {
-        int lastVersion = 0;
-        auto it = _surfaceDirtyBoundsVersions.find(quad);
-        if (it != _surfaceDirtyBoundsVersions.end()) {
-            lastVersion = it->second;
+
+    // Flush any pending cell updates
+    if (_surfacePatchIndex.hasPendingUpdates(quad)) {
+        bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
+        if (flushed) {
+            _indexedSurfaces.insert(quad);
         }
-        if (dirtyInfo->version > lastVersion) {
-            dirtyVertices = dirtyInfo->rect;
-        } else if (dirtyInfo->version < lastVersion) {
-            dirtyBoundsRegressed = true;
-        }
-        _surfaceDirtyBoundsVersions[quad] = dirtyInfo->version;
-    } else {
-        _surfaceDirtyBoundsVersions.erase(quad);
+        _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
+        return flushed;
     }
 
-    // Fast-path: already indexed, nothing dirty, and global index is clean.
-    // Note: We no longer force full rebuild just because isEditUpdate=true without dirty bounds.
-    // If no dirty bounds are provided, we trust the existing index is still valid.
-    if (!_surfacePatchIndexDirty && alreadyIndexed && !dirtyVertices && !dirtyBoundsRegressed) {
-        return true; // Index already up-to-date for this surface.
+    // First-time indexing
+    if (!alreadyIndexed) {
+        bool updated = _surfacePatchIndex.updateSurface(quad);
+        if (updated) {
+            _indexedSurfaces.insert(quad);
+            qCInfo(lcViewerManager)
+                << "Indexed surface" << quad->id.c_str()
+                << "into SurfacePatchIndex (first time)";
+        }
+        _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !updated;
+        return updated;
     }
 
-    bool skippedDueToExistingIndex = false;
-    if (!_surfacePatchIndexDirty) {
-        if (dirtyVertices) {
-            if (auto cellRegion = vertexRectToCellRegion(*dirtyVertices, quad)) {
-                regionUpdated = _surfacePatchIndex.updateSurfaceRegion(
-                    quad,
-                    cellRegion->rowStart,
-                    cellRegion->rowEnd,
-                    cellRegion->colStart,
-                    cellRegion->colEnd);
-            }
-        }
-        if (!regionUpdated && (!alreadyIndexed || dirtyBoundsRegressed)) {
-            // Fall back to full surface reindex if:
-            // - Surface not yet indexed, OR
-            // - Dirty bounds regressed (version went backwards), OR
-            // - We had dirty vertices but region update failed (cells may have been removed)
-            indexUpdated = _surfacePatchIndex.updateSurface(quad);
-            if (indexUpdated) {
-                std::string rebuildReason;
-                if (dirtyBoundsRegressed) {
-                    rebuildReason = "due to regressed dirty bounds";
-                } else if (dirtyVertices) {
-                    rebuildReason = "due to failed region update";
-                } else {
-                    rebuildReason = "because surface was not yet indexed";
-                }
-                qCInfo(lcViewerManager)
-                    << "Rebuilt SurfacePatchIndex entries for surface" << quad->id.c_str()
-                    << rebuildReason.c_str();
-            }
-        } else if (!regionUpdated && alreadyIndexed && !dirtyBoundsRegressed) {
-            // Only skip update if no dirty vertices were reported - existing index is truly valid
-            skippedDueToExistingIndex = true;
-        }
-    }
-    if (dirtyBoundsRegressed) {
-        // When version regresses (e.g., after undo), we only need to rebuild this surface.
-        // The full surface rebuild was already triggered above when dirtyBoundsRegressed=true.
-        // Don't mark the global index dirty - other surfaces are still valid.
-        _indexedSurfaces.erase(quad);
-        qCInfo(lcViewerManager)
-            << "Dirty bounds regressed for surface" << quad->id.c_str()
-            << "- rebuilt this surface only";
-    }
-    if (skippedDueToExistingIndex) {
-        regionUpdated = true;
-    }
-    if (regionUpdated || indexUpdated) {
-        _indexedSurfaces.insert(quad);
-    }
-
-    _surfacePatchIndexDirty = _surfacePatchIndexDirty || !(regionUpdated || indexUpdated);
-    return regionUpdated || indexUpdated;
+    // Already indexed and no pending updates - nothing to do
+    return true;
 }
 
 void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bool isEditUpdate)
@@ -750,7 +628,7 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bo
     if (auto* quad = dynamic_cast<QuadSurface*>(surf)) {
         affectsSurfaceIndex = true;
         if (updateSurfacePatchIndexForSurface(quad, isEditUpdate)) {
-            regionUpdated = true;  // Signal that work was done (prevents marking index dirty)
+            regionUpdated = true;  // Signal that work was done (prevents marking index for rebuild)
         }
     } else if (!surf) {
         affectsSurfaceIndex = true;
@@ -763,14 +641,6 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bo
                     liveSurfaces.insert(quadSurface);
                 }
             }
-            for (auto it = _surfaceDirtyBoundsVersions.begin();
-                 it != _surfaceDirtyBoundsVersions.end();) {
-                if (!liveSurfaces.count(it->first)) {
-                    it = _surfaceDirtyBoundsVersions.erase(it);
-                } else {
-                    ++it;
-                }
-            }
             for (auto it = _indexedSurfaces.begin(); it != _indexedSurfaces.end();) {
                 if (!liveSurfaces.count(*it)) {
                     it = _indexedSurfaces.erase(it);
@@ -779,13 +649,12 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bo
                 }
             }
         } else {
-            _surfaceDirtyBoundsVersions.clear();
             _indexedSurfaces.clear();
         }
     }
 
     if (affectsSurfaceIndex) {
-        _surfacePatchIndexDirty = _surfacePatchIndexDirty || !(regionUpdated || indexUpdated);
+        _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild || !(regionUpdated || indexUpdated);
     }
 }
 

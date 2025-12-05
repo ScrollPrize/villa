@@ -13,6 +13,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QtConcurrent/QtConcurrent>
 
@@ -81,41 +82,6 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     surface->meta = new nlohmann::json(nlohmann::json::object());
 }
 
-int readDirtyBoundsVersion(const nlohmann::json* meta)
-{
-    if (!meta || !meta->is_object()) {
-        return 0;
-    }
-
-    if (auto versionIt = meta->find("dirty_bounds_version");
-        versionIt != meta->end() && versionIt->is_number_integer()) {
-        return versionIt->get<int>();
-    }
-
-    if (auto boundsIt = meta->find("dirty_bounds");
-        boundsIt != meta->end() && boundsIt->is_object()) {
-        if (auto versionIt = boundsIt->find("version");
-            versionIt != boundsIt->end() && versionIt->is_number_integer()) {
-            return versionIt->get<int>();
-        }
-    }
-
-    return 0;
-}
-
-void restoreDirtyBoundsVersion(nlohmann::json& meta, int version)
-{
-    if (version <= 0) {
-        return;
-    }
-
-    meta["dirty_bounds_version"] = version;
-
-    if (auto boundsIt = meta.find("dirty_bounds");
-        boundsIt != meta.end() && boundsIt->is_object()) {
-        (*boundsIt)["version"] = version;
-    }
-}
 
 bool isInvalidPoint(const cv::Vec3f& value)
 {
@@ -238,7 +204,7 @@ std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* su
     return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid, patchIndex);
 }
 
-std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,
+std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
                                                       const SegmentationCorrectionsPayload& corrections,
                                                       ViewerManager* viewerManager)
 {
@@ -322,38 +288,20 @@ std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,
     return cv::Rect(unionColStart, unionRowStart, width, height);
 }
 
-void applyDirtyBoundsToSurface(QuadSurface* surface, const cv::Rect& vertexRect)
+void queueIndexUpdateForBounds(SurfacePatchIndex* index,
+                               QuadSurface* surface,
+                               const cv::Rect& vertexRect)
 {
-    if (!surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
+    if (!index || !surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
         return;
     }
 
-    ensureSurfaceMetaObject(surface);
-    nlohmann::json& meta = *surface->meta;
+    const int rowStart = vertexRect.y;
+    const int rowEnd = vertexRect.y + vertexRect.height;
+    const int colStart = vertexRect.x;
+    const int colEnd = vertexRect.x + vertexRect.width;
 
-    int version = 0;
-    if (meta.contains("dirty_bounds_version") && meta["dirty_bounds_version"].is_number_integer()) {
-        version = meta["dirty_bounds_version"].get<int>();
-    } else if (meta.contains("dirty_bounds")) {
-        const auto& boundsObj = meta["dirty_bounds"];
-        if (boundsObj.contains("version") && boundsObj["version"].is_number_integer()) {
-            version = boundsObj["version"].get<int>();
-        }
-    }
-    if (version == std::numeric_limits<int>::max()) {
-        version = 0;
-    }
-    ++version;
-
-    meta["dirty_bounds_version"] = version;
-    nlohmann::json bounds = {
-        {"row_start", vertexRect.y},
-        {"row_end", vertexRect.y + vertexRect.height},
-        {"col_start", vertexRect.x},
-        {"col_end", vertexRect.x + vertexRect.width},
-        {"version", version}
-    };
-    meta["dirty_bounds"] = std::move(bounds);
+    index->queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd);
 }
 
 void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
@@ -573,19 +521,19 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
     }
 
-    std::optional<cv::Rect> correctionDirtyBounds;
+    std::optional<cv::Rect> correctionAffectedBounds;
     if (usingCorrections) {
-        correctionDirtyBounds = computeCorrectionsDirtyBounds(segmentationSurface,
-                                                              corrections,
-                                                              _context.viewerManager);
-        if (correctionDirtyBounds) {
-            const int rowEnd = correctionDirtyBounds->y + correctionDirtyBounds->height;
-            const int colEnd = correctionDirtyBounds->x + correctionDirtyBounds->width;
-            qCInfo(lcSegGrowth) << "Computed correction dirty bounds:"
-                                << "rows" << correctionDirtyBounds->y << "to" << rowEnd
-                                << "cols" << correctionDirtyBounds->x << "to" << colEnd;
+        correctionAffectedBounds = computeCorrectionsAffectedBounds(segmentationSurface,
+                                                                    corrections,
+                                                                    _context.viewerManager);
+        if (correctionAffectedBounds) {
+            const int rowEnd = correctionAffectedBounds->y + correctionAffectedBounds->height;
+            const int colEnd = correctionAffectedBounds->x + correctionAffectedBounds->width;
+            qCInfo(lcSegGrowth) << "Computed correction affected bounds:"
+                                << "rows" << correctionAffectedBounds->y << "to" << rowEnd
+                                << "cols" << correctionAffectedBounds->x << "to" << colEnd;
         } else {
-            qCInfo(lcSegGrowth) << "Unable to compute correction dirty bounds; falling back to full surface rebuild.";
+            qCInfo(lcSegGrowth) << "Unable to compute correction affected bounds; falling back to full surface rebuild.";
         }
     }
 
@@ -641,7 +589,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     pending.growthVoxelSize = growthVolume->voxelSize();
     pending.usingCorrections = usingCorrections;
     pending.inpaintOnly = inpaintOnly;
-    pending.correctionsDirtyBounds = correctionDirtyBounds;
+    pending.correctionsAffectedBounds = correctionAffectedBounds;
     _activeRequest = std::move(pending);
 
     auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
@@ -762,10 +710,6 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
-        const int existingDirtyBoundsVersion = readDirtyBoundsVersion(targetSurface->meta);
-        const int resultDirtyBoundsVersion =
-            readDirtyBoundsVersion(result.surface ? result.surface->meta : nullptr);
-
         nlohmann::json preservedTags = nlohmann::json::object();
         bool hadPreservedTags = false;
         if (targetSurface->meta && targetSurface->meta->is_object()) {
@@ -796,11 +740,6 @@ void SegmentationGrower::onFutureFinished()
             ensureSurfaceMetaObject(targetSurface);
         }
 
-        if (targetSurface->meta && targetSurface->meta->is_object()) {
-            const int restoredVersion = std::max(existingDirtyBoundsVersion, resultDirtyBoundsVersion);
-            restoreDirtyBoundsVersion(*targetSurface->meta, restoredVersion);
-        }
-
         if (hadPreservedTags && targetSurface->meta && targetSurface->meta->is_object()) {
             nlohmann::json mergedTags = preservedTags;
             auto tagsIt = targetSurface->meta->find("tags");
@@ -811,8 +750,10 @@ void SegmentationGrower::onFutureFinished()
         }
 
         updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
-        if (request.usingCorrections && request.correctionsDirtyBounds) {
-            applyDirtyBoundsToSurface(targetSurface, *request.correctionsDirtyBounds);
+
+        // Refresh intersection index for this surface so renderIntersections() has up-to-date data
+        if (_context.viewerManager) {
+            _context.viewerManager->refreshSurfacePatchIndex(targetSurface);
         }
     }
 
@@ -880,8 +821,8 @@ void SegmentationGrower::onFutureFinished()
     if (sessionActive && _context.module) {
         _context.module->markNextHandlesFromGrowth();
         bool appliedIncremental = false;
-        if (request.correctionsDirtyBounds) {
-            appliedIncremental = _context.module->applySurfaceUpdateFromGrowth(*request.correctionsDirtyBounds);
+        if (request.correctionsAffectedBounds) {
+            appliedIncremental = _context.module->applySurfaceUpdateFromGrowth(*request.correctionsAffectedBounds);
         }
         if (!appliedIncremental) {
             qCInfo(lcSegGrowth) << "Refreshing active segmentation session after tracer growth";

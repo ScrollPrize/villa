@@ -65,15 +65,34 @@ void CVolumeViewer::renderIntersections()
     if (!volume || !volume->zarrDataset() || !_surf)
         return;
 
-    // Lazy refresh of cached surface pointers if needed
-    if (_cachedIntersectSurfaces.size() != _intersect_tgts.size() && _surf_col) {
+    // Refresh cached surface pointers if targets changed or if a surface object
+    // was swapped out during an edit (common for segmentation updates).
+    auto rebuildCachedIntersectSurfaces = [&]() {
         _cachedIntersectSurfaces.clear();
+        if (!_surf_col) {
+            return;
+        }
         _cachedIntersectSurfaces.reserve(_intersect_tgts.size());
         for (const auto& key : _intersect_tgts) {
             if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
                 _cachedIntersectSurfaces[key] = surf;
             }
         }
+    };
+
+    bool refreshCachedSurfaces = _cachedIntersectSurfaces.size() != _intersect_tgts.size();
+    if (!refreshCachedSurfaces && _surf_col) {
+        for (const auto& key : _intersect_tgts) {
+            auto* current = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
+            const auto cachedIt = _cachedIntersectSurfaces.find(key);
+            if (cachedIt == _cachedIntersectSurfaces.end() || cachedIt->second != current) {
+                refreshCachedSurfaces = true;
+                break;
+            }
+        }
+    }
+    if (refreshCachedSurfaces) {
+        rebuildCachedIntersectSurfaces();
     }
 
     const QRectF viewRect = fGraphicsView
@@ -453,14 +472,21 @@ void CVolumeViewer::invalidateIntersect(const std::string &name)
         }
         _intersect_items.clear();
         _cachedIntersectionLines.clear();
+        _cachedIntersectSurfaces.clear();
     }
-    else if (_intersect_items.count(name)) {
-        for(auto &item : _intersect_items[name]) {
-            fScene->removeItem(item);
-            delete item;
+    else if (_intersect_tgts.count(name)) {
+        // Clear items and caches for this intersection target
+        if (_intersect_items.count(name)) {
+            for(auto &item : _intersect_items[name]) {
+                fScene->removeItem(item);
+                delete item;
+            }
+            _intersect_items.erase(name);
         }
-        _intersect_items.erase(name);
         _cachedIntersectionLines.erase(name);
+        // Also clear the surface cache for this key to force re-lookup
+        // This handles cases where the surface object changed (e.g., switching segments)
+        _cachedIntersectSurfaces.erase(name);
     }
 }
 
