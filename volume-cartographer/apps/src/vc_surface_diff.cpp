@@ -201,20 +201,10 @@ int main(int argc, char *argv[])
         std::cout << "Result saved to: " << output_path << std::endl;
 
         // Print statistics
-        cv::Mat_<cv::Vec3f> result_points = result->rawPoints();
-        int valid_count = 0;
-        for (int j = 0; j < result_points.rows; j++) {
-            for (int i = 0; i < result_points.cols; i++) {
-                if (result_points(j, i)[0] != -1) {
-                    ++valid_count;
-                }
-            }
-        }
-
-        std::cout << "Result surface contains " << valid_count << " valid points" << std::endl;
+        std::cout << "Result surface contains " << result->countValidPoints() << " valid points" << std::endl;
 
         if (result->meta) {
-            const double area_vx2 = vc::surface::computeSurfaceAreaVox2(result_points);
+            const double area_vx2 = vc::surface::computeSurfaceAreaVox2(result->rawPoints());
             (*result->meta)["area_vx2"] = area_vx2;
 
             if (params.contains("voxelsize")) {

@@ -136,37 +136,27 @@ cv::Mat_<cv::Vec3f> points_hr_grounding(cv::Mat_<float> wind_lr, const cv::Mat_<
     
     for(int n=0;n<points_hr_src.size();n++) {
         int succ = 0;
-        for(int j=0;j<points_lr.rows-1;j++)
-            for(int i=0;i<points_lr.cols-1;i++) {
-                if (points_lr(j,i)[0] == -1)
-                    continue;
-                if (points_lr(j,i+1)[0] == -1)
-                    continue;
-                if (points_lr(j+1,i)[0] == -1)
-                    continue;
-                if (points_lr(j+1,i+1)[0] == -1)
-                    continue;
-                
+        for (auto [j, i, q00, q01, q10, q11] : ValidQuadRange<const cv::Vec3f>(&points_lr)) {
                 cv::Vec2f l00, l01, l10, l11;
-                
+
                 float hr_th = 20.0;
                 float res;
                 cv::Vec3f out_;
 
-                res = find_loc_wind_slow(l00, wind_lr(j,i), points_hr_src[n], wind_hr_src[n], points_lr(j,i), hr_th*hr_th);
+                res = find_loc_wind_slow(l00, wind_lr(j,i), points_hr_src[n], wind_hr_src[n], q00, hr_th*hr_th);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l00[1],l00[0]}))
                     continue;
 
                 l01 = l00;
-                res = min_loc_plain(points_hr_src[n], l01, out_, points_lr(j,i+1), 1.0, 0.01);
+                res = min_loc_plain(points_hr_src[n], l01, out_, q01, 1.0, 0.01);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l01[1],l01[0]}))
                     continue;
                 l10 = l00;
-                res = min_loc_plain(points_hr_src[n], l10, out_, points_lr(j+1,i), 1.0, 0.01);
+                res = min_loc_plain(points_hr_src[n], l10, out_, q10, 1.0, 0.01);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l10[1],l10[0]}))
                     continue;
                 l11 = l00;
-                res = min_loc_plain(points_hr_src[n], l11, out_, points_lr(j+1,i+1), 1.0, 0.01);
+                res = min_loc_plain(points_hr_src[n], l11, out_, q11, 1.0, 0.01);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l11[1],l11[0]}))
                     continue;
                 

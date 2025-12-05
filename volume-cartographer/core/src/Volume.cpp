@@ -3,6 +3,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 
+#include "vc/core/util/LoadJson.hpp"
+
 #include "z5/attributes.hxx"
 #include "z5/dataset.hxx"
 #include "z5/filesystem/handle.hxx"
@@ -16,10 +18,6 @@ static const std::filesystem::path METADATA_FILE = "meta.json";
 Volume::Volume(std::filesystem::path path) : path_(std::move(path))
 {
     loadMetadata();
-
-    if (metadata_["type"].get<std::string>() != "vol") {
-        throw std::runtime_error("File not of type: vol");
-    }
 
     _width = metadata_["width"].get<int>();
     _height = metadata_["height"].get<int>();
@@ -53,18 +51,9 @@ Volume::~Volume() = default;
 void Volume::loadMetadata()
 {
     auto metaPath = path_ / METADATA_FILE;
-    if (!std::filesystem::exists(metaPath)) {
-        throw std::runtime_error("could not find json file '" + metaPath.string() + "'");
-    }
-    std::ifstream jsonFile(metaPath.string());
-    if (!jsonFile) {
-        throw std::runtime_error("could not open json file '" + metaPath.string() + "'");
-    }
-
-    jsonFile >> metadata_;
-    if (jsonFile.bad()) {
-        throw std::runtime_error("could not read json file '" + metaPath.string() + "'");
-    }
+    metadata_ = vc::json::load_json_file(metaPath);
+    vc::json::require_type(metadata_, "type", "vol", metaPath.string());
+    vc::json::require_fields(metadata_, {"uuid", "width", "height", "slices"}, metaPath.string());
 }
 
 std::string Volume::id() const
@@ -119,17 +108,17 @@ void Volume::zarrOpen()
             throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets incompatible type found in "+path_.string()+" / " +name);
 
         // Verify level 0 shape matches meta.json dimensions
-        // zarr shape is [slices, width, height]
-        if (zarrDs_.size() == 1) {
+        // zarr shape is [z, y, x] = [slices, height, width]
+        if (zarrDs_.size() == 1 && !skipShapeCheck) {
             const auto& shape = zarrDs_[0]->shape();
             if (static_cast<int>(shape[0]) != _slices ||
-                static_cast<int>(shape[1]) != _width ||
-                static_cast<int>(shape[2]) != _height) {
+                static_cast<int>(shape[1]) != _height ||
+                static_cast<int>(shape[2]) != _width) {
                 throw std::runtime_error(
-                    "zarr level 0 shape [slices,width,height]=(" + std::to_string(shape[0]) + ", " +
+                    "zarr level 0 shape [z,y,x]=(" + std::to_string(shape[0]) + ", " +
                     std::to_string(shape[1]) + ", " + std::to_string(shape[2]) +
                     ") does not match meta.json dimensions (slices=" + std::to_string(_slices) +
-                    ", width=" + std::to_string(_width) + ", height=" + std::to_string(_height) +
+                    ", height=" + std::to_string(_height) + ", width=" + std::to_string(_width) +
                     ") in " + path_.string());
             }
         }
@@ -149,6 +138,7 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path, std::string uuid
 int Volume::sliceWidth() const { return _width; }
 int Volume::sliceHeight() const { return _height; }
 int Volume::numSlices() const { return _slices; }
+std::array<int, 3> Volume::shape() const { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
     return metadata_["voxelsize"].get<double>();

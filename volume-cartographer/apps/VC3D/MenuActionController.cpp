@@ -16,7 +16,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/JsonSafe.hpp"
+#include "vc/core/util/LoadJson.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -537,7 +537,7 @@ void MenuActionController::generateReviewReport()
         }
 
         nlohmann::json* meta = surfMeta->surface()->meta;
-        const auto tags = vc::json_safe::tags_or_empty(meta);
+        const auto tags = vc::json::tags_or_empty(meta);
         const auto itReviewed = tags.find("reviewed");
         if (itReviewed == tags.end() || !itReviewed->is_object()) {
             continue;
@@ -546,7 +546,7 @@ void MenuActionController::generateReviewReport()
         const nlohmann::json& reviewed = *itReviewed;
 
         QString reviewDate = "Unknown";
-        const std::string reviewDateRaw = vc::json_safe::string_or(&reviewed, "date", std::string{});
+        const std::string reviewDateRaw = vc::json::string_or(&reviewed, "date", std::string{});
         if (!reviewDateRaw.empty()) {
             reviewDate = QString::fromStdString(reviewDateRaw).left(10);
         } else {
@@ -557,12 +557,12 @@ void MenuActionController::generateReviewReport()
         }
 
         QString username = "Unknown";
-        const std::string reviewerUser = vc::json_safe::string_or(&reviewed, "user", std::string{});
+        const std::string reviewerUser = vc::json::string_or(&reviewed, "user", std::string{});
         if (!reviewerUser.empty()) {
             username = QString::fromStdString(reviewerUser);
         }
 
-        const double area = vc::json_safe::number_or(meta, "area_cm2", 0.0);
+        const double area = vc::json::number_or(meta, "area_cm2", 0.0);
 
         dailyStats[reviewDate][username].totalArea += area;
         dailyStats[reviewDate][username].surfaceCount++;

@@ -1,4 +1,5 @@
 #include "vc/core/util/PointIndex.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <unordered_map>
@@ -68,6 +69,49 @@ void PointIndex::insert(uint64_t id, uint64_t collectionId, const cv::Vec3f& pos
 
     impl_->pointData[id] = {position, collectionId};
     impl_->tree.insert(std::make_pair(Impl::toBoost(position), id));
+}
+
+void PointIndex::bulkInsert(const std::vector<std::tuple<uint64_t, uint64_t, cv::Vec3f>>& points)
+{
+    clear();
+
+    if (points.empty()) {
+        return;
+    }
+
+    // Build entries vector for packing algorithm
+    std::vector<Impl::Entry> entries;
+    entries.reserve(points.size());
+
+    for (const auto& [id, collectionId, position] : points) {
+        impl_->pointData[id] = {position, collectionId};
+        entries.emplace_back(Impl::toBoost(position), id);
+    }
+
+    // Construct tree using packing algorithm (much faster than individual inserts)
+    impl_->tree = Impl::Tree(entries.begin(), entries.end());
+}
+
+void PointIndex::buildFromMat(const cv::Mat_<cv::Vec3f>& points, uint64_t collectionId)
+{
+    clear();
+
+    if (points.empty()) {
+        return;
+    }
+
+    std::vector<Impl::Entry> entries;
+    entries.reserve(static_cast<size_t>(points.rows) * points.cols);
+
+    for (auto [j, i, p] : ValidPointRange<const cv::Vec3f>(&points)) {
+        uint64_t id = static_cast<uint64_t>(j) * points.cols + i;
+        impl_->pointData[id] = {p, collectionId};
+        entries.emplace_back(Impl::toBoost(p), id);
+    }
+
+    if (!entries.empty()) {
+        impl_->tree = Impl::Tree(entries.begin(), entries.end());
+    }
 }
 
 void PointIndex::remove(uint64_t id)

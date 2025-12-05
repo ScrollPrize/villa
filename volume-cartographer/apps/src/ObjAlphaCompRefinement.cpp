@@ -327,9 +327,7 @@ int process_tifxyz(const std::filesystem::path& src,
                 if (!loc_valid(original, cv::Vec2d(y, x))) {
                     continue;
                 }
-                const cv::Vec3f normal = grid_normal(original, cv::Vec3f(static_cast<float>(x),
-                                                                         static_cast<float>(y),
-                                                                         0.0f));
+                const cv::Vec3f normal = surf->gridNormal(y, x);
                 if (!normal_is_valid(normal)) {
                     continue;
                 }

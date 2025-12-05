@@ -1,4 +1,5 @@
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(generators, xbuilder.hpp)
@@ -196,22 +197,18 @@ cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, fl
     all_neighbor_dists.reserve(points.rows * points.cols);
 
     // First pass: gather neighbor distances
-    for (int j = 0; j < points.rows; ++j) {
-        for (int i = 0; i < points.cols; ++i) {
-            if (points(j, i)[0] == -1.f) continue;
-            const cv::Vec3f& center = points(j, i);
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) continue;
-                    const int ny = j + dy;
-                    const int nx = i + dx;
-                    if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
-                        if (points(ny, nx)[0] != -1.f) {
-                            const cv::Vec3f& neighbor = points(ny, nx);
-                            const float dist = cv::norm(center - neighbor);
-                            if (std::isfinite(dist) && dist > 0.f) {
-                                all_neighbor_dists.push_back(dist);
-                            }
+    for (auto [j, i, center] : ValidPointRange<const cv::Vec3f>(&points)) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                const int ny = j + dy;
+                const int nx = i + dx;
+                if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
+                    if (points(ny, nx)[0] != -1.f) {
+                        const cv::Vec3f& neighbor = points(ny, nx);
+                        const float dist = cv::norm(center - neighbor);
+                        if (std::isfinite(dist) && dist > 0.f) {
+                            all_neighbor_dists.push_back(dist);
                         }
                     }
                 }
@@ -244,32 +241,28 @@ cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, fl
 
     // Second pass: invalidate isolated/far points
     int removed_count = 0;
-    for (int j = 0; j < points.rows; ++j) {
-        for (int i = 0; i < points.cols; ++i) {
-            if (points(j, i)[0] == -1.f) continue;
-            const cv::Vec3f& center = points(j, i);
-            float min_neighbor = std::numeric_limits<float>::infinity();
-            int neighbor_count = 0;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) continue;
-                    const int ny = j + dy;
-                    const int nx = i + dx;
-                    if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
-                        if (points(ny, nx)[0] != -1.f) {
-                            const float dist = cv::norm(center - points(ny, nx));
-                            if (std::isfinite(dist)) {
-                                min_neighbor = std::min(min_neighbor, dist);
-                                neighbor_count++;
-                            }
+    for (auto [j, i, center] : ValidPointRange<const cv::Vec3f>(&points)) {
+        float min_neighbor = std::numeric_limits<float>::infinity();
+        int neighbor_count = 0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                const int ny = j + dy;
+                const int nx = i + dx;
+                if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
+                    if (points(ny, nx)[0] != -1.f) {
+                        const float dist = cv::norm(center - points(ny, nx));
+                        if (std::isfinite(dist)) {
+                            min_neighbor = std::min(min_neighbor, dist);
+                            neighbor_count++;
                         }
                     }
                 }
             }
-            if (neighbor_count == 0 || (min_neighbor > threshold && threshold > 0.f)) {
-                cleaned(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
-                if (print_stats) removed_count++;
-            }
+        }
+        if (neighbor_count == 0 || (min_neighbor > threshold && threshold > 0.f)) {
+            cleaned(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
+            if (print_stats) removed_count++;
         }
     }
 

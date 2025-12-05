@@ -3,6 +3,7 @@
 #include "ViewerOverlayControllerBase.hpp"
 
 #include <QColor>
+#include <chrono>
 #include <map>
 #include <optional>
 #include <vector>
@@ -148,6 +149,7 @@ private:
     ViewerManager* _viewerManager{nullptr};
     bool _editingEnabled{false};
     std::optional<State> _currentState;
+    std::chrono::steady_clock::time_point _lastRefreshTime;
 
     // Approval mask images - separate saved and pending
     QImage _savedApprovalMaskImage;   // Dark green: what's saved to disk

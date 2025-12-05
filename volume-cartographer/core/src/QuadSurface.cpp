@@ -158,6 +158,15 @@ cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
     return grid_normal((*_points), p);
 }
 
+cv::Vec3f QuadSurface::gridNormal(int row, int col) const
+{
+    if (!_points) {
+        return {NAN, NAN, NAN};
+    }
+    // grid_normal expects (col, row) order in the Vec3f
+    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col), static_cast<float>(row), 0.0f));
+}
+
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
 {
     _channels[name] = channel;
@@ -203,6 +212,57 @@ std::vector<std::string> QuadSurface::channelNames() const
         names.push_back(pair.first);
     }
     return names;
+}
+
+int QuadSurface::countValidPoints() const
+{
+    if (!_points) return 0;
+    auto range = validPoints();
+    return static_cast<int>(std::distance(range.begin(), range.end()));
+}
+
+int QuadSurface::countValidQuads() const
+{
+    if (!_points) return 0;
+    auto range = validQuads();
+    return static_cast<int>(std::distance(range.begin(), range.end()));
+}
+
+cv::Mat_<uint8_t> QuadSurface::validMask() const
+{
+    if (!_points || _points->empty()) {
+        return cv::Mat_<uint8_t>();
+    }
+    const int rows = _points->rows;
+    const int cols = _points->cols;
+    cv::Mat_<uint8_t> mask(rows, cols);
+
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int j = 0; j < rows; ++j) {
+        for (int i = 0; i < cols; ++i) {
+            const cv::Vec3f& p = (*_points)(j, i);
+            const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+                           !(p[0] == -1.f && p[1] == -1.f && p[2] == -1.f);
+            mask(j, i) = ok ? 255 : 0;
+        }
+    }
+    return mask;
+}
+
+void QuadSurface::writeValidMask(const cv::Mat& img)
+{
+    if (path.empty()) {
+        return;
+    }
+    std::filesystem::path maskPath = path / "mask.tif";
+    cv::Mat_<uint8_t> mask = validMask();
+
+    if (img.empty()) {
+        writeTiff(maskPath, mask);
+    } else {
+        std::vector<cv::Mat> layers = {mask, img};
+        cv::imwritemulti(maskPath.string(), layers);
+    }
 }
 
 void QuadSurface::invalidateCache()
@@ -259,17 +319,8 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
 
     cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
 
-    // --- build a source validity mask (1 if point is valid) -------------
-    cv::Mat valid_src(_points->size(), CV_8U, cv::Scalar(0));
-    for (int y = 0; y < _points->rows; ++y) {
-        for (int x = 0; x < _points->cols; ++x) {
-            const cv::Vec3f& p = (*_points)(y, x);
-            // treat -1/-1/-1 or NaNs as invalid
-            const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-                            !(p[0] == -1.f && p[1] == -1.f && p[2] == -1.f);
-            valid_src.at<uint8_t>(y, x) = ok ? 255 : 0;
-        }
-    }
+    // --- build a source validity mask (255 if point is valid) -------------
+    cv::Mat valid_src = validMask();
 
     // --- warp coords with seam-safe border (replicate) -------------------
     cv::Mat_<cv::Vec3f> coords_big;
@@ -652,10 +703,10 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
 
-    // Write x/y/z as 32-bit float tiled BigTIFF with LZW
-    writeFloatBigTiff(dir / "x.tif", xyz[0]);
-    writeFloatBigTiff(dir / "y.tif", xyz[1]);
-    writeFloatBigTiff(dir / "z.tif", xyz[2]);
+    // Write x/y/z as 32-bit float tiled TIFF with LZW
+    writeTiff(dir / "x.tif", xyz[0]);
+    writeTiff(dir / "y.tif", xyz[1]);
+    writeTiff(dir / "z.tif", xyz[2]);
 
     // OpenCV compression params for fallback
     std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
@@ -665,12 +716,12 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
         if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
             bool wrote = false;
 
-            // Try BigTIFF for large single-channel ancillary data (8U/16U/32F)
+            // Try tiled TIFF for single-channel ancillary data (8U/16U/32F)
             if (mat.channels() == 1 &&
                 (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
             {
                 try {
-                    writeSingleChannelBigTiff(dir / (name + ".tif"), mat);
+                    writeTiff(dir / (name + ".tif"), mat);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV
@@ -1227,24 +1278,27 @@ QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
         return new QuadSurface(diff_points, a->scale());
     }
 
+    // Build spatial index for surface b
+    PointIndex bIndex;
+    bIndex.buildFromMat(b->rawPoints());
+
     int removed_count = 0;
     int total_valid = 0;
+    const float toleranceSq = tolerance * tolerance;
 
     #pragma omp parallel for reduction(+:removed_count,total_valid)
     for (int j = 0; j < height; j++) {
         for (int i = 0; i < width; i++) {
             cv::Vec3f point = (*diff_points)(j, i);
 
-            if (point[0] == -1 && point[1] == -1 && point[2] == -1) {
+            if (point[0] == -1.f) {
                 continue;
             }
 
             total_valid++;
 
-            cv::Vec3f ptr = {0,0,0};
-            float dist = b->pointTo(ptr, point, tolerance, 100);
-
-            if (dist >= 0 && dist <= tolerance) {
+            auto result = bIndex.nearest(point, tolerance);
+            if (result && result->distanceSq <= toleranceSq) {
                 (*diff_points)(j, i) = {-1, -1, -1};
                 removed_count++;
             }
@@ -1261,33 +1315,36 @@ QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
 QuadSurface* surface_union(QuadSurface* a, QuadSurface* b, float tolerance) {
     cv::Mat_<cv::Vec3f>* union_points = new cv::Mat_<cv::Vec3f>(a->rawPoints().clone());
 
-    cv::Mat_<cv::Vec3f> b_points = b->rawPoints();
+    // Build spatial index for surface a
+    PointIndex aIndex;
+    aIndex.buildFromMat(*union_points);
+
+    const cv::Mat_<cv::Vec3f>& b_points = b->rawPoints();
+    const float toleranceSq = tolerance * tolerance;
 
     int added_count = 0;
 
     // Add points from b that don't exist in a
     for (int j = 0; j < b_points.rows; j++) {
         for (int i = 0; i < b_points.cols; i++) {
-            cv::Vec3f point_b = b_points(j, i);
+            const cv::Vec3f& point_b = b_points(j, i);
 
-            // Skip invalid points
-            if (point_b[0] == -1) {
+            if (point_b[0] == -1.f) {
                 continue;
             }
 
             // Check if this point exists in a
-            cv::Vec2f loc_a;
-            float dist = pointTo(loc_a, *union_points, point_b, tolerance, 10, a->scale()[0]);
+            auto result = aIndex.nearest(point_b, tolerance);
 
             // If point is not found in a, we need to add it
-            if (dist < 0 || dist > tolerance) {
+            if (!result || result->distanceSq > toleranceSq) {
                 int grid_x = std::round(i * b->scale()[0] / a->scale()[0]);
                 int grid_y = std::round(j * b->scale()[1] / a->scale()[1]);
 
                 if (grid_x >= 0 && grid_x < union_points->cols &&
                     grid_y >= 0 && grid_y < union_points->rows) {
 
-                    if ((*union_points)(grid_y, grid_x)[0] == -1) {
+                    if ((*union_points)(grid_y, grid_x)[0] == -1.f) {
                         (*union_points)(grid_y, grid_x) = point_b;
                         added_count++;
                     }
@@ -1307,28 +1364,28 @@ QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float toleranc
     int width = intersect_points->cols;
     int height = intersect_points->rows;
 
-    cv::Mat_<cv::Vec3f> b_points = b->rawPoints();
+    // Build spatial index for surface b
+    PointIndex bIndex;
+    bIndex.buildFromMat(b->rawPoints());
 
     int kept_count = 0;
     int total_valid = 0;
+    const float toleranceSq = tolerance * tolerance;
 
     // Keep only points that exist in both surfaces
+    #pragma omp parallel for reduction(+:kept_count,total_valid)
     for (int j = 0; j < height; j++) {
         for (int i = 0; i < width; i++) {
             cv::Vec3f point_a = (*intersect_points)(j, i);
 
-            // Skip invalid points
-            if (point_a[0] == -1) {
+            if (point_a[0] == -1.f) {
                 continue;
             }
 
             total_valid++;
 
-            // Check if this point exists in b
-            cv::Vec2f loc_b;
-            float dist = pointTo(loc_b, b_points, point_a, tolerance, 10, b->scale()[0]);
-
-            if (dist >= 0 && dist <= tolerance) {
+            auto result = bIndex.nearest(point_a, tolerance);
+            if (result && result->distanceSq <= toleranceSq) {
                 // Point exists in both - keep it
                 kept_count++;
             } else {

@@ -24,20 +24,8 @@ void render_binary_mask(QuadSurface* surf,
               << " scale=" << scale << std::endl;
 
     // Create mask from raw points at their native resolution
-    cv::Mat_<uint8_t> rawMask(rawSize);
-    int rawValid = 0;
-
-#pragma omp parallel for schedule(dynamic, 1) reduction(+:rawValid)
-    for(int j = 0; j < rawSize.height; j++) {
-        for(int i = 0; i < rawSize.width; i++) {
-            const cv::Vec3f& pt = rawPts(j, i);
-            // Check for undefined vertices: either NaN/inf OR the sentinel value [-1, -1, -1]
-            bool isValid = std::isfinite(pt[0]) && std::isfinite(pt[1]) && std::isfinite(pt[2]) &&
-                          !(pt[0] == -1.0f && pt[1] == -1.0f && pt[2] == -1.0f);
-            rawMask(j, i) = isValid ? 255 : 0;
-            if (isValid) rawValid++;
-        }
-    }
+    cv::Mat_<uint8_t> rawMask = surf->validMask();
+    int rawValid = cv::countNonZero(rawMask);
 
     // Upscale the mask using nearest neighbor to target resolution
     cv::resize(rawMask, mask, targetSize, 0, 0, cv::INTER_NEAREST);

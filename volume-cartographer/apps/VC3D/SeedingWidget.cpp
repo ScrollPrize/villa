@@ -481,9 +481,7 @@ void SeedingWidget::findPeaksAlongRay(
     }
     
     const int maxRadius = maxRadiusSpinBox->value();
-    const int width = currentVolume->sliceWidth();
-    const int height = currentVolume->sliceHeight();
-    const int depth = currentVolume->numSlices();
+    auto [width, height, depth] = currentVolume->shape();
     
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
@@ -939,13 +937,11 @@ void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
         return;
     }
     
-    // densify the path so we don't skip over small surfaces when drawing 
+    // densify the path so we don't skip over small surfaces when drawing
     PathPrimitive densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
-    
+
     // Get volume dimensions for bounds checking
-    const int width = currentVolume->sliceWidth();
-    const int height = currentVolume->sliceHeight();
-    const int depth = currentVolume->numSlices();
+    auto [width, height, depth] = currentVolume->shape();
     
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
@@ -1154,9 +1150,7 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
 
     PathPrimitive densifiedPath = path.densify(0.5f);
 
-    const int width = currentVolume->sliceWidth();
-    const int height = currentVolume->sliceHeight();
-    const int depth = currentVolume->numSlices();
+    auto [width, height, depth] = currentVolume->shape();
 
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;

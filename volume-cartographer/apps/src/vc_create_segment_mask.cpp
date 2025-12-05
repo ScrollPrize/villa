@@ -16,6 +16,7 @@ void generate_mask(QuadSurface* surf,
                             z5::Dataset* ds_low = nullptr,
                             ChunkCache<uint8_t>* cache = nullptr) {
     cv::Mat_<cv::Vec3f> points = surf->rawPoints();
+    cv::Mat_<uint8_t> rawMask = surf->validMask();
 
     // Choose resolution based on surface size
     if (points.cols >= 4000) {
@@ -26,13 +27,7 @@ void generate_mask(QuadSurface* surf,
             img.create(points.size());
             img.setTo(0);
         }
-
-        mask.create(img.size());
-        for(int j = 0; j < img.rows; j++) {
-            for(int i = 0; i < img.cols; i++) {
-                mask(j,i) = (points(j,i)[0] == -1) ? 0 : 255;
-            }
-        }
+        mask = rawMask;
     } else {
         // Small surface: resize and downsample
         cv::Mat_<cv::Vec3f> scaled;
@@ -47,14 +42,8 @@ void generate_mask(QuadSurface* surf,
             img.setTo(0);
         }
 
-        mask.create(img.size());
-        for(int j = 0; j < img.rows; j++) {
-            for(int i = 0; i < img.cols; i++) {
-                int orig_j = j * 4 * scale[1];
-                int orig_i = i * 4 * scale[0];
-                mask(j,i) = (points(orig_j, orig_i)[0] == -1) ? 0 : 255;
-            }
-        }
+        // Resize mask to match output image size
+        cv::resize(rawMask, mask, img.size(), 0, 0, cv::INTER_NEAREST);
     }
 }
 

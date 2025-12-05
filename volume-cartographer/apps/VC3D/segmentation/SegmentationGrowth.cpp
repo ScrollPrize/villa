@@ -19,7 +19,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/JsonSafe.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -247,9 +247,8 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     }
     cv::normalize(normal, normal);
 
-    cv::Vec3f volumeCenter(static_cast<float>(volume->sliceWidth()) * 0.5f,
-                           static_cast<float>(volume->sliceHeight()) * 0.5f,
-                           static_cast<float>(volume->numSlices()) * 0.5f);
+    auto [w, h, d] = volume->shape();
+    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
     cv::Vec3f toCenter = volumeCenter - p;
     toCenter[2] = 0.0f;
 
@@ -521,8 +520,8 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
-    const double previousAreaVx2 = vc::json_safe::number_or(surface->meta, "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json_safe::number_or(surface->meta, "area_cm2", -1.0);
+    const double previousAreaVx2 = vc::json::number_or(surface->meta, "area_vx2", -1.0);
+    const double previousAreaCm2 = vc::json::number_or(surface->meta, "area_cm2", -1.0);
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {

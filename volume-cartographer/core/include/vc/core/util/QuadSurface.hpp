@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <iterator>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -27,7 +29,241 @@ struct Rect3D {
 bool intersect(const Rect3D &a, const Rect3D &b);
 Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p);
 
+// Forward declaration
+class QuadSurface;
 
+// Reference to a valid point in the grid (for iteration)
+template<typename PointType>
+struct PointRef {
+    int row;
+    int col;
+    PointType& point;
+
+    // Enable structured bindings - return by value for int, by ref for point
+    template<std::size_t I>
+    auto get() const -> decltype(auto) {
+        if constexpr (I == 0) return row;
+        else if constexpr (I == 1) return col;
+        else return (point);  // parentheses ensure lvalue reference return
+    }
+};
+
+// Reference to a valid quad (2x2 cell) in the grid
+template<typename PointType>
+struct QuadRef {
+    int row;
+    int col;
+    PointType& p00;  // (row, col)
+    PointType& p01;  // (row, col+1)
+    PointType& p10;  // (row+1, col)
+    PointType& p11;  // (row+1, col+1)
+
+    template<std::size_t I>
+    auto get() const -> decltype(auto) {
+        if constexpr (I == 0) return row;
+        else if constexpr (I == 1) return col;
+        else if constexpr (I == 2) return (p00);
+        else if constexpr (I == 3) return (p01);
+        else if constexpr (I == 4) return (p10);
+        else return (p11);
+    }
+};
+
+// Structured binding support for PointRef
+namespace std {
+template<typename T>
+struct tuple_size<PointRef<T>> : std::integral_constant<std::size_t, 3> {};
+
+template<typename T>
+struct tuple_element<0, PointRef<T>> { using type = int; };
+template<typename T>
+struct tuple_element<1, PointRef<T>> { using type = int; };
+template<typename T>
+struct tuple_element<2, PointRef<T>> { using type = T&; };
+
+template<typename T>
+struct tuple_size<QuadRef<T>> : std::integral_constant<std::size_t, 6> {};
+
+template<typename T>
+struct tuple_element<0, QuadRef<T>> { using type = int; };
+template<typename T>
+struct tuple_element<1, QuadRef<T>> { using type = int; };
+template<typename T>
+struct tuple_element<2, QuadRef<T>> { using type = T&; };
+template<typename T>
+struct tuple_element<3, QuadRef<T>> { using type = T&; };
+template<typename T>
+struct tuple_element<4, QuadRef<T>> { using type = T&; };
+template<typename T>
+struct tuple_element<5, QuadRef<T>> { using type = T&; };
+}
+
+// Range for iterating over valid points
+template<typename PointType>
+class ValidPointRange {
+    // Use const Mat* when PointType is const, non-const Mat* otherwise
+    using MatPtr = std::conditional_t<std::is_const_v<PointType>,
+                                      const cv::Mat_<cv::Vec3f>*,
+                                      cv::Mat_<cv::Vec3f>*>;
+public:
+    class Iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = PointRef<PointType>;
+        using difference_type = std::ptrdiff_t;
+        using pointer = value_type*;
+        using reference = value_type;
+
+        Iterator(MatPtr points, int row, int col)
+            : _points(points), _row(row), _col(col) {
+            advanceToValid();
+        }
+
+        reference operator*() const {
+            return PointRef<PointType>{_row, _col, (*_points)(_row, _col)};
+        }
+
+        Iterator& operator++() {
+            advance();
+            advanceToValid();
+            return *this;
+        }
+
+        Iterator operator++(int) {
+            Iterator tmp = *this;
+            ++(*this);
+            return tmp;
+        }
+
+        bool operator==(const Iterator& other) const {
+            return _row == other._row && _col == other._col;
+        }
+
+        bool operator!=(const Iterator& other) const {
+            return !(*this == other);
+        }
+
+    private:
+        void advance() {
+            ++_col;
+            if (_col >= _points->cols) {
+                _col = 0;
+                ++_row;
+            }
+        }
+
+        void advanceToValid() {
+            while (_row < _points->rows) {
+                if ((*_points)(_row, _col)[0] != -1.f) {
+                    return;
+                }
+                advance();
+            }
+        }
+
+        MatPtr _points;
+        int _row;
+        int _col;
+    };
+
+    ValidPointRange(MatPtr points) : _points(points) {}
+
+    Iterator begin() { return Iterator(_points, 0, 0); }
+    Iterator end() { return Iterator(_points, _points->rows, 0); }
+
+private:
+    MatPtr _points;
+};
+
+// Range for iterating over valid quads (2x2 cells where all 4 corners are valid)
+template<typename PointType>
+class ValidQuadRange {
+    // Use const Mat* when PointType is const, non-const Mat* otherwise
+    using MatPtr = std::conditional_t<std::is_const_v<PointType>,
+                                      const cv::Mat_<cv::Vec3f>*,
+                                      cv::Mat_<cv::Vec3f>*>;
+public:
+    class Iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = QuadRef<PointType>;
+        using difference_type = std::ptrdiff_t;
+        using pointer = value_type*;
+        using reference = value_type;
+
+        Iterator(MatPtr points, int row, int col)
+            : _points(points), _row(row), _col(col) {
+            advanceToValid();
+        }
+
+        reference operator*() const {
+            return QuadRef<PointType>{
+                _row, _col,
+                (*_points)(_row, _col),
+                (*_points)(_row, _col + 1),
+                (*_points)(_row + 1, _col),
+                (*_points)(_row + 1, _col + 1)
+            };
+        }
+
+        Iterator& operator++() {
+            advance();
+            advanceToValid();
+            return *this;
+        }
+
+        Iterator operator++(int) {
+            Iterator tmp = *this;
+            ++(*this);
+            return tmp;
+        }
+
+        bool operator==(const Iterator& other) const {
+            return _row == other._row && _col == other._col;
+        }
+
+        bool operator!=(const Iterator& other) const {
+            return !(*this == other);
+        }
+
+    private:
+        void advance() {
+            ++_col;
+            if (_col >= _points->cols - 1) {
+                _col = 0;
+                ++_row;
+            }
+        }
+
+        void advanceToValid() {
+            while (_row < _points->rows - 1) {
+                if (isQuadValid()) {
+                    return;
+                }
+                advance();
+            }
+        }
+
+        bool isQuadValid() const {
+            return (*_points)(_row, _col)[0] != -1.f &&
+                   (*_points)(_row, _col + 1)[0] != -1.f &&
+                   (*_points)(_row + 1, _col)[0] != -1.f &&
+                   (*_points)(_row + 1, _col + 1)[0] != -1.f;
+        }
+
+        MatPtr _points;
+        int _row;
+        int _col;
+    };
+
+    ValidQuadRange(MatPtr points) : _points(points) {}
+
+    Iterator begin() { return Iterator(_points, 0, 0); }
+    Iterator end() { return Iterator(_points, _points->rows - 1, 0); }
+
+private:
+    MatPtr _points;
+};
 
 //quads based surface class with a pointer implementing a nominal scale of 1 voxel
 class QuadSurface : public Surface
@@ -46,6 +282,8 @@ public:
     cv::Vec3f loc_raw(const cv::Vec3f &ptr);
     cv::Vec3f coord(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     cv::Vec3f normal(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
+    // Get normal directly from grid coordinates (avoids expensive pointTo lookup)
+    cv::Vec3f gridNormal(int row, int col) const;
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) override;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
                   class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override;
@@ -56,8 +294,6 @@ public:
     void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
-    // Configure how TIFFs are written
-    void setTiffWriteOptions(const TiffWriteOptions& opt) { _tiff_opts = opt; }
     Rect3D bbox();
 
     bool containsPoint(const cv::Vec3f& point, float tolerance) const;
@@ -65,6 +301,41 @@ public:
     virtual cv::Mat_<cv::Vec3f> rawPoints() { return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { return _points; }
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { return _points; }
+
+    // Grid iteration helpers
+    ValidPointRange<cv::Vec3f> validPoints() { return ValidPointRange<cv::Vec3f>(_points); }
+    ValidPointRange<const cv::Vec3f> validPoints() const {
+        return ValidPointRange<const cv::Vec3f>(_points);
+    }
+    ValidQuadRange<cv::Vec3f> validQuads() { return ValidQuadRange<cv::Vec3f>(_points); }
+    ValidQuadRange<const cv::Vec3f> validQuads() const {
+        return ValidQuadRange<const cv::Vec3f>(_points);
+    }
+
+    // Single-point validity checks
+    bool isPointValid(int row, int col) const {
+        if (!_points || row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
+            return false;
+        return (*_points)(row, col)[0] != -1.f;
+    }
+    bool isQuadValid(int row, int col) const {
+        if (!_points || row < 0 || row >= _points->rows - 1 || col < 0 || col >= _points->cols - 1)
+            return false;
+        return (*_points)(row, col)[0] != -1.f &&
+               (*_points)(row, col + 1)[0] != -1.f &&
+               (*_points)(row + 1, col)[0] != -1.f &&
+               (*_points)(row + 1, col + 1)[0] != -1.f;
+    }
+
+    // Counting helpers
+    int countValidPoints() const;
+    int countValidQuads() const;
+
+    // Generate validity mask at native resolution (255=valid, 0=invalid)
+    cv::Mat_<uint8_t> validMask() const;
+
+    // Write validity mask to path/mask.tif. If img is provided, writes multi-layer TIFF.
+    void writeValidMask(const cv::Mat& img = cv::Mat());
 
     cv::Vec2f _scale;
 
@@ -79,7 +350,6 @@ protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     cv::Mat_<cv::Vec3f>* _points = nullptr;
     cv::Rect _bounds;
-    TiffWriteOptions _tiff_opts;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -19,6 +20,9 @@ namespace z5 {
 class Volume
 {
 public:
+    // Static flag to skip zarr shape validation against meta.json
+    static inline bool skipShapeCheck = false;
+
     Volume() = delete;
 
     explicit Volume(std::filesystem::path path);
@@ -41,6 +45,7 @@ public:
     [[nodiscard]] int sliceWidth() const;
     [[nodiscard]] int sliceHeight() const;
     [[nodiscard]] int numSlices() const;
+    [[nodiscard]] std::array<int, 3> shape() const;
     [[nodiscard]] double voxelSize() const;
 
     [[nodiscard]] z5::Dataset *zarrDataset(int level = 0) const;

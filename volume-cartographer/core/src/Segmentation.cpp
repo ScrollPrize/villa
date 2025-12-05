@@ -1,4 +1,5 @@
 #include "vc/core/types/Segmentation.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
@@ -7,10 +8,6 @@ Segmentation::Segmentation(std::filesystem::path path)
     : path_(std::move(path))
 {
     loadMetadata();
-
-    if (metadata_["type"].get<std::string>() != "seg") {
-        throw std::runtime_error("File not of type: seg");
-    }
 }
 
 Segmentation::Segmentation(std::filesystem::path path, std::string uuid, std::string name)
@@ -26,18 +23,9 @@ Segmentation::Segmentation(std::filesystem::path path, std::string uuid, std::st
 void Segmentation::loadMetadata()
 {
     auto metaPath = path_ / METADATA_FILE;
-    if (!std::filesystem::exists(metaPath)) {
-        throw std::runtime_error("could not find json file '" + metaPath.string() + "'");
-    }
-    std::ifstream jsonFile(metaPath.string());
-    if (!jsonFile) {
-        throw std::runtime_error("could not open json file '" + metaPath.string() + "'");
-    }
-
-    jsonFile >> metadata_;
-    if (jsonFile.bad()) {
-        throw std::runtime_error("could not read json file '" + metaPath.string() + "'");
-    }
+    metadata_ = vc::json::load_json_file(metaPath);
+    vc::json::require_type(metadata_, "type", "seg", metaPath.string());
+    vc::json::require_fields(metadata_, {"uuid"}, metaPath.string());
 }
 
 std::string Segmentation::id() const

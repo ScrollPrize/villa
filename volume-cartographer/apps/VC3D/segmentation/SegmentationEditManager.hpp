@@ -117,6 +117,7 @@ public:
     bool smoothRecentTouched(float strength = 0.35f, int iterations = 1);
     void commitActiveDrag();
     void cancelActiveDrag();
+    void refreshActiveDragBasePositions();
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }

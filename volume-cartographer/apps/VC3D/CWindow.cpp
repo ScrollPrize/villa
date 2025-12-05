@@ -875,9 +875,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     sendVolumeChanged(currentVolume, currentVolumeId);
 
     if (currentVolume && _surf_col) {
-        const int w = currentVolume->sliceWidth();
-        const int h = currentVolume->sliceHeight();
-        const int d = currentVolume->numSlices();
+        auto [w, h, d] = currentVolume->shape();
 
         POI* poi = existingFocusPoi;
         const bool createdPoi = (poi == nullptr);
@@ -2633,9 +2631,7 @@ void CWindow::onManualLocationChanged()
     }
 
     // Clamp values to volume bounds
-    int w = currentVolume->sliceWidth();
-    int h = currentVolume->sliceHeight();
-    int d = currentVolume->numSlices();
+    auto [w, h, d] = currentVolume->shape();
 
     x = std::max(0, std::min(x, w - 1));
     y = std::max(0, std::min(y, h - 1));
@@ -2946,6 +2942,23 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         }
     }
 
+    // Set flag BEFORE beginEditingSession so the surface change doesn't reset view
+    if (_viewerManager) {
+        _viewerManager->forEachViewer([this, enabled](CVolumeViewer* viewer) {
+            if (!viewer) {
+                return;
+            }
+            if (viewer->surfName() == "segmentation") {
+                bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+                if (enabled) {
+                    viewer->setResetViewOnSurfaceChange(false);
+                } else {
+                    viewer->setResetViewOnSurfaceChange(defaultReset);
+                }
+            }
+        });
+    }
+
     if (enabled) {
         QuadSurface* activeSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
 
@@ -2978,22 +2991,6 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
     statusBar()->showMessage(message, 2000);
-
-    if (_viewerManager) {
-        _viewerManager->forEachViewer([this, enabled](CVolumeViewer* viewer) {
-            if (!viewer) {
-                return;
-            }
-            if (viewer->surfName() == "segmentation") {
-                bool defaultReset = _viewerManager->resetDefaultFor(viewer);
-                if (enabled) {
-                    viewer->setResetViewOnSurfaceChange(false);
-                } else {
-                    viewer->setResetViewOnSurfaceChange(defaultReset);
-                }
-            }
-        });
-    }
 }
 
 void CWindow::onSegmentationStopToolsRequested()
@@ -3216,24 +3213,14 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
-        auto logPlaneShift = [](const char* label, const cv::Vec3f& prevOrigin, const cv::Vec3f& nextOrigin) {
-            if (cv::norm(prevOrigin - nextOrigin) > 1e-3f) {
-                std::cout << "[CWindow] applySlicePlaneOrientation moved " << label
-                          << " origin from [" << prevOrigin[0] << ", " << prevOrigin[1] << ", " << prevOrigin[2]
-                          << "] to [" << nextOrigin[0] << ", " << nextOrigin[1] << ", " << nextOrigin[2] << "]"
-                          << std::endl;
-            }
-        };
 
-        const auto configurePlane = [&](const char* label,
-                                        PlaneSurface* plane,
+        const auto configurePlane = [&](PlaneSurface* plane,
                                         float degrees,
                                         const cv::Vec3f& baseNormal) {
             if (!plane) {
                 return;
             }
 
-            cv::Vec3f previousOrigin = plane->origin();
             plane->setOrigin(origin);
             plane->setInPlaneRotation(0.0f);
 
@@ -3254,12 +3241,10 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             } else {
                 plane->setInPlaneRotation(0.0f);
             }
-
-            logPlaneShift(label, previousOrigin, plane->origin());
         };
 
-        configurePlane("seg xz", segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
-        configurePlane("seg yz", segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
+        configurePlane(segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
+        configurePlane(segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
 
         if (segXZ) {
             segXZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
@@ -3290,9 +3275,6 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
-        cv::Vec3f prevXZOrigin = segXZ->origin();
-        cv::Vec3f prevYZOrigin = segYZ->origin();
-
         segXZ->setOrigin(origin);
         segYZ->setOrigin(origin);
 
@@ -3308,17 +3290,6 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         segYZ->setInPlaneRotation(0.0f);
         segXZ->setAxisAlignedRotationKey(-1);
         segYZ->setAxisAlignedRotationKey(-1);
-
-        auto logPlaneShift = [](const char* label, const cv::Vec3f& prevOrigin, const cv::Vec3f& nextOrigin) {
-            if (cv::norm(prevOrigin - nextOrigin) > 1e-3f) {
-                std::cout << "[CWindow] applySlicePlaneOrientation moved " << label
-                          << " origin from [" << prevOrigin[0] << ", " << prevOrigin[1] << ", " << prevOrigin[2]
-                          << "] to [" << nextOrigin[0] << ", " << nextOrigin[1] << ", " << nextOrigin[2] << "]"
-                          << std::endl;
-            }
-        };
-        logPlaneShift("seg xz", prevXZOrigin, segXZ->origin());
-        logPlaneShift("seg yz", prevYZOrigin, segYZ->origin());
 
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);

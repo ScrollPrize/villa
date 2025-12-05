@@ -93,10 +93,12 @@ using IntersectVec = std::vector<std::pair<float,cv::Vec2f>>;
 
 float surf_th = 0.5;
 
-IntersectVec getIntersects(const cv::Vec2i &seed, const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &step)
+IntersectVec getIntersects(const cv::Vec2i &seed, QuadSurface* surface)
 {
+    const cv::Mat_<cv::Vec3f>& points = surface->rawPoints();
+    const cv::Vec2f& step = surface->scale();
     cv::Vec3f o = points(seed[1],seed[0]);
-    cv::Vec3f n = grid_normal(points, {static_cast<float>(seed[0]),static_cast<float>(seed[1]),0});
+    cv::Vec3f n = surface->gridNormal(seed[1], seed[0]);
     if (std::isnan(n[0]))
         return {};
     std::vector<cv::Vec2f> locs = {seed};
@@ -319,7 +321,7 @@ int main(int argc, char *argv[])
             while (points(seed[1],seed[0])[0] == -1)
                 seed = {rand_r(&sr) % points.cols, rand_r(&sr) % points.rows};
 
-            intersects[i] = getIntersects(seed, points, surf->_scale);
+            intersects[i] = getIntersects(seed, surf);
         }
     }
     
