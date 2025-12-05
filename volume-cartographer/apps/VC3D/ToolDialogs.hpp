@@ -296,3 +296,18 @@ private:
     QSpinBox* spResumeMaxIters_{nullptr};
     QCheckBox* chkResumeDenseQr_{nullptr};
 };
+
+class ExportChunksDialog : public QDialog {
+    Q_OBJECT
+public:
+    ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale);
+
+    int chunkWidth() const;
+    int overlapPerSide() const;
+    bool overwrite() const;
+
+private:
+    QSpinBox* spChunkWidth_{nullptr};
+    QSpinBox* spOverlap_{nullptr};
+    QCheckBox* chkOverwrite_{nullptr};
+};

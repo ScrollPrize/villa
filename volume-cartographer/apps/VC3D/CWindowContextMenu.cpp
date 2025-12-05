@@ -1641,12 +1641,31 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
         return;
     }
 
-    // Settings with sensible defaults (chunk width is in REAL UV pixels)
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const int  chunkWidthReal = std::max(1, settings.value("export/chunk_width_px", 40000).toInt());
-    const bool overwrite      = settings.value("export/overwrite", true).toBool();
+    // Pull points and get dimensions early so we can show them in the dialog
+    cv::Mat_<cv::Vec3f> points = surf->rawPoints();
+    const int W = points.cols;
+    const int H = points.rows;
+    const cv::Vec2f sc = surf->scale();
+    const double sx = (std::isfinite(sc[0]) && sc[0] > 0.0f) ? double(sc[0]) : 1.0; // guard
+
+    if (W <= 0 || H <= 0) {
+        QMessageBox::warning(this, tr("Error"),
+                             tr("Surface has invalid dimensions (%1 x %2)").arg(W).arg(H));
+        return;
+    }
+
+    // Show dialog to get export parameters
+    ExportChunksDialog dlg(this, W, sx);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const int chunkWidthReal = dlg.chunkWidth();
+    const int overlapReal = dlg.overlapPerSide();
+    const bool overwrite = dlg.overwrite();
 
     // Determine export root directory: <volpkg>/export (not inside paths)
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QString configuredRoot = settings.value("export/dir", "").toString().trimmed();
     const QString segDir  = QString::fromStdString(surfMeta->path.string());
     const QString segName = QString::fromStdString(segmentId);
@@ -1669,22 +1688,13 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
         return;
     }
 
-    // Pull points; ROI will be taken from this matrix.
-    cv::Mat_<cv::Vec3f> points = surf->rawPoints();
-    const int W = points.cols;
-    const int H = points.rows;
-    const cv::Vec2f sc = surf->scale();
-    const double sx = (std::isfinite(sc[0]) && sc[0] > 0.0f) ? double(sc[0]) : 1.0; // guard
-
-    // Convert desired real-pixel chunk width → grid columns
+    // Convert real pixels to grid columns
     // Example: 40k real px with scale 0.05 → 2,000 columns per chunk
     const int chunkCols = std::max(1, int(std::llround(double(chunkWidthReal) * sx)));
-    const int nChunks   = (W + chunkCols - 1) / chunkCols; // ceil-div purely in grid space
-    if (W <= 0 || H <= 0) {
-        QMessageBox::warning(this, tr("Error"),
-                             tr("Surface has invalid dimensions (%1 x %2)").arg(W).arg(H));
-        return;
-    }
+    const int overlapCols = int(std::llround(double(overlapReal) * sx));
+
+    // Calculate number of chunks: step through by chunkCols (the core width)
+    const int nChunks = (W + chunkCols - 1) / chunkCols; // ceil-div purely in grid space
 
     if (nChunks <= 0) {
         QMessageBox::information(this, tr("Export"), tr("Nothing to export."));
@@ -1719,15 +1729,30 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
 
     for (int c = 0; c < nChunks; ++c) {
         if (prog.wasCanceled()) break;
-        prog.setLabelText(tr("Exporting slice %1 / %2…").arg(c+1).arg(nChunks));
+        prog.setLabelText(tr("Exporting chunk %1 / %2…").arg(c+1).arg(nChunks));
         prog.setValue(c);
         QCoreApplication::processEvents();
 
-        const int x0 = c * chunkCols;
-        const int dx = std::min(chunkCols, W - x0);
+        // Core region for chunk c starts at c * chunkCols
+        const int coreStart = c * chunkCols;
 
-        // ROI [all rows, x0:x0+dx)
-        cv::Mat_<cv::Vec3f> roi(points, cv::Range::all(), cv::Range(x0, x0 + dx));
+        // Calculate actual region with overlap:
+        // - Left overlap: only if not the first chunk
+        // - Right overlap: only if not the last chunk
+        const int leftOverlap = (c == 0) ? 0 : overlapCols;
+        const int rightOverlap = (c == nChunks - 1) ? 0 : overlapCols;
+
+        // x0 = start of region (core start minus left overlap, clamped to 0)
+        const int x0 = std::max(0, coreStart - leftOverlap);
+        // x1 = end of region (core end plus right overlap, clamped to W)
+        const int coreEnd = std::min(coreStart + chunkCols, W);
+        const int x1 = std::min(coreEnd + rightOverlap, W);
+        const int dx = x1 - x0;
+
+        if (dx <= 0) continue;
+
+        // ROI [all rows, x0:x1)
+        cv::Mat_<cv::Vec3f> roi(points, cv::Range::all(), cv::Range(x0, x1));
         cv::Mat_<cv::Vec3f> roiCopy = roi.clone();  // ensure contiguous, independent buffer
 
         // Create a temp surface for this chunk; scale is preserved.
@@ -1763,22 +1788,22 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
     // Summarize
     if (exported > 0 && failures.isEmpty()) {
         QMessageBox::information(this, tr("Export complete"),
-                                 tr("Exported %1 slice(s) to:\n%2")
+                                 tr("Exported %1 chunk(s) to:\n%2")
                                  .arg(exported)
                                  .arg(QDir::toNativeSeparators(exportRoot)));
-        statusBar()->showMessage(tr("Exported %1 slice(s) → %2")
+        statusBar()->showMessage(tr("Exported %1 chunk(s) → %2")
                                  .arg(exported)
                                  .arg(QDir::toNativeSeparators(exportRoot)),
                                  5000);
     } else if (exported > 0 && !failures.isEmpty()) {
         QMessageBox::warning(this, tr("Partial export"),
-                             tr("Exported %1 slice(s), but failed:\n\n%2")
+                             tr("Exported %1 chunk(s), but failed:\n\n%2")
                              .arg(exported)
                              .arg(failures.join('\n')));
         statusBar()->showMessage(tr("Export partially complete"), 5000);
     } else if (!failures.isEmpty()) {
         QMessageBox::critical(this, tr("Export failed"),
-                              tr("All slices failed:\n\n%1").arg(failures.join('\n')));
+                              tr("All chunks failed:\n\n%1").arg(failures.join('\n')));
         statusBar()->showMessage(tr("Export failed"), 5000);
     } else {
         statusBar()->showMessage(tr("Export cancelled"), 3000);

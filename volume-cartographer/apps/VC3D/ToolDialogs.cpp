@@ -1114,3 +1114,94 @@ bool NeighborCopyDialog::resumeLocalDenseQr() const
 {
     return chkResumeDenseQr_ ? chkResumeDenseQr_->isChecked() : false;
 }
+
+// ================= ExportChunksDialog =================
+ExportChunksDialog::ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("Export Width Chunks"));
+    auto main = new QVBoxLayout(this);
+
+    // Info label about the surface
+    const int realWidth = scale > 0 ? static_cast<int>(surfaceWidth / scale) : surfaceWidth;
+    auto infoLabel = new QLabel(tr("Surface width: %1 px (real)").arg(realWidth), this);
+    main->addWidget(infoLabel);
+
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    // Load defaults from settings
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int defaultChunkWidth = settings.value("export/chunk_width_px", 40000).toInt();
+    const int defaultOverlap = settings.value("export/chunk_overlap_px", 0).toInt();
+    const bool defaultOverwrite = settings.value("export/overwrite", true).toBool();
+
+    spChunkWidth_ = new QSpinBox(this);
+    spChunkWidth_->setRange(100, 1000000);
+    spChunkWidth_->setSingleStep(1000);
+    spChunkWidth_->setValue(defaultChunkWidth);
+    spChunkWidth_->setSuffix(tr(" px"));
+    spChunkWidth_->setToolTip(tr("Width of each exported chunk in real (output) pixels"));
+    form->addRow(tr("Chunk width:"), spChunkWidth_);
+
+    spOverlap_ = new QSpinBox(this);
+    spOverlap_->setRange(0, 100000);
+    spOverlap_->setSingleStep(500);
+    spOverlap_->setValue(defaultOverlap);
+    spOverlap_->setSuffix(tr(" px"));
+    spOverlap_->setToolTip(tr("Overlap per side in real pixels.\n"
+                              "Each chunk extends this far into adjacent chunks.\n"
+                              "First chunk has no left overlap, last has no right overlap."));
+    form->addRow(tr("Overlap (per side):"), spOverlap_);
+
+    chkOverwrite_ = new QCheckBox(tr("Overwrite existing exports"), this);
+    chkOverwrite_->setChecked(defaultOverwrite);
+    form->addRow(chkOverwrite_);
+
+    // Preview info that updates when values change
+    auto previewLabel = new QLabel(this);
+    auto updatePreview = [this, previewLabel, realWidth, scale]() {
+        const int chunkW = spChunkWidth_->value();
+        const int overlap = spOverlap_->value();
+        // Step is chunk width (so overlap extends beyond)
+        const int step = chunkW;
+        int nChunks = 0;
+        if (step > 0 && realWidth > 0) {
+            // Each chunk covers [i*step - overlap, i*step + chunkW + overlap]
+            // But first starts at 0 and last ends at realWidth
+            nChunks = (realWidth + step - 1) / step;
+        }
+        previewLabel->setText(tr("Estimated chunks: %1").arg(nChunks));
+    };
+    connect(spChunkWidth_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
+    connect(spOverlap_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
+    updatePreview();
+    main->addWidget(previewLabel);
+
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(buttons, &QDialogButtonBox::accepted, this, [this, &settings]() {
+        // Save settings for next time
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+        s.setValue("export/chunk_width_px", spChunkWidth_->value());
+        s.setValue("export/chunk_overlap_px", spOverlap_->value());
+        s.setValue("export/overwrite", chkOverwrite_->isChecked());
+        accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(buttons);
+}
+
+int ExportChunksDialog::chunkWidth() const
+{
+    return spChunkWidth_ ? spChunkWidth_->value() : 40000;
+}
+
+int ExportChunksDialog::overlapPerSide() const
+{
+    return spOverlap_ ? spOverlap_->value() : 0;
+}
+
+bool ExportChunksDialog::overwrite() const
+{
+    return chkOverwrite_ ? chkOverwrite_->isChecked() : true;
+}

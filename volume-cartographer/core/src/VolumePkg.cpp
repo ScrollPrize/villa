@@ -145,21 +145,39 @@ void VolumePkg::loadSegmentationsFromDirectory(const std::string& dirName)
     }
 
     // Load segmentations from the specified directory
+    int loadedCount = 0;
+    int skippedCount = 0;
+    int failedCount = 0;
     for (const auto& entry : std::filesystem::directory_iterator(segDir)) {
         std::filesystem::path dirpath = std::filesystem::canonical(entry);
         if (std::filesystem::is_directory(dirpath)) {
+            // Skip hidden directories and .tmp folders
+            const auto dirName_ = dirpath.filename().string();
+            if (dirName_.empty() || dirName_[0] == '.' || dirName_ == ".tmp") {
+                skippedCount++;
+                continue;
+            }
             try {
                 auto s = Segmentation::New(dirpath);
-                segmentations_.emplace(s->id(), s);
-                // Track which directory this segmentation came from
-                segmentationDirectories_[s->id()] = dirName;
+                auto result = segmentations_.emplace(s->id(), s);
+                if (result.second) {
+                    // Track which directory this segmentation came from
+                    segmentationDirectories_[s->id()] = dirName;
+                    loadedCount++;
+                } else {
+                    Logger()->warn("Duplicate segment ID '{}' - already loaded from different path, skipping: {}",
+                                   s->id(), dirpath.string());
+                    skippedCount++;
+                }
             }
             catch (const std::exception &exc) {
-                std::cout << "WARNING: some exception occured, skipping segment dir: " << dirpath << std::endl;
-                std::cerr << exc.what();
+                Logger()->warn("Failed to load segment dir: {} - {}", dirpath.string(), exc.what());
+                failedCount++;
             }
         }
     }
+    Logger()->info("Loaded {} segments from '{}' (skipped={}, failed={})",
+                   loadedCount, dirName, skippedCount, failedCount);
 }
 
 void VolumePkg::setSegmentationDirectory(const std::string& dirName)
@@ -229,6 +247,11 @@ void VolumePkg::refreshSegmentations()
     for (const auto& entry : std::filesystem::directory_iterator(segDir)) {
         std::filesystem::path dirpath = std::filesystem::canonical(entry);
         if (std::filesystem::is_directory(dirpath)) {
+            // Skip hidden directories and .tmp folders
+            const auto dirName = dirpath.filename().string();
+            if (dirName.empty() || dirName[0] == '.' || dirName == ".tmp") {
+                continue;
+            }
             diskPaths.insert(dirpath);
         }
     }
