@@ -32,9 +32,9 @@ Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
 
 namespace
 {
-constexpr int kPushPullIntervalMs = 30;
-constexpr int kPushPullIntervalMsFast = 30;   // Non-alpha mode: faster feedback
-constexpr int kPushPullIntervalMsSlow = 150;  // Alpha mode: more time for computation
+constexpr int kPushPullIntervalMs = 16;       // ~60fps for smooth feedback
+constexpr int kPushPullIntervalMsFast = 16;   // Non-alpha mode: faster feedback
+constexpr int kPushPullIntervalMsSlow = 100;  // Alpha mode: more time for computation
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -474,6 +474,12 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     _state.active = true;
     _state.direction = direction;
     _undoCaptured = false;
+
+    // Reset cached position for new operation
+    _cachedRow = -1;
+    _cachedCol = -1;
+    _samplesValid = false;
+
     _module.useFalloff(SegmentationModule::FalloffTool::PushPull);
 
     // Set adaptive timer interval based on alpha mode
@@ -485,11 +491,7 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
         }
     }
 
-    if (!applyStepInternal()) {
-        stopAll();
-        return false;
-    }
-
+    // Let the timer handle the first step asynchronously to avoid blocking the UI
     return true;
 }
 
@@ -515,13 +517,19 @@ void SegmentationPushPullTool::stopAll()
     _undoCaptured = false;
     _alphaOverrideActive = false;
     _activeAlphaEnabled = false;
+
+    // Clear cached position
+    _cachedRow = -1;
+    _cachedCol = -1;
+    _samplesValid = false;
+
     if (_module._activeFalloff == SegmentationModule::FalloffTool::PushPull) {
         _module.useFalloff(SegmentationModule::FalloffTool::Drag);
     }
 
-    // Trigger final surface update after all push/pull steps are complete.
-    // This is the batched update - individual steps only accumulate dirty bounds.
+    // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
+        _editManager->applyPreview();
         _editManager->ensureDirtyBounds();
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
         _module.emitPendingChanges();
@@ -563,18 +571,28 @@ bool SegmentationPushPullTool::applyStepInternal()
         }
     }
 
-    if (!_editManager->beginActiveDrag({row, col})) {
-        if (snapshotCapturedThisStep) {
-            _module.discardLastUndoSnapshot();
-            _undoCaptured = false;
+    // Check if we can reuse existing samples (position unchanged and samples still valid)
+    const bool positionChanged = (row != _cachedRow || col != _cachedCol);
+    const bool needRebuild = positionChanged || !_samplesValid || !_editManager->activeDrag().active;
+
+    if (needRebuild) {
+        if (!_editManager->beginActiveDrag({row, col})) {
+            if (snapshotCapturedThisStep) {
+                _module.discardLastUndoSnapshot();
+                _undoCaptured = false;
+            }
+            logFailure("Push/pull aborted: beginActiveDrag failed");
+            return false;
         }
-        logFailure("Push/pull aborted: beginActiveDrag failed");
-        return false;
+        _cachedRow = row;
+        _cachedCol = col;
+        _samplesValid = true;
     }
 
     auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
     if (!centerWorldOpt) {
         _editManager->cancelActiveDrag();
+        _samplesValid = false;
         if (snapshotCapturedThisStep) {
             _module.discardLastUndoSnapshot();
             _undoCaptured = false;
@@ -587,6 +605,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     QuadSurface* baseSurface = _editManager->baseSurface();
     if (!baseSurface) {
         _editManager->cancelActiveDrag();
+        _samplesValid = false;
         logFailure("Push/pull aborted: base surface missing");
         return false;
     }
@@ -603,6 +622,7 @@ bool SegmentationPushPullTool::applyStepInternal()
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
+            _samplesValid = false;
             logFailure("Push/pull aborted: surface normal lookup failed");
             return false;
         }
@@ -611,6 +631,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     const float norm = cv::norm(normal);
     if (norm <= 1e-4f) {
         _editManager->cancelActiveDrag();
+        _samplesValid = false;
         logFailure("Push/pull aborted: surface normal magnitude too small");
         return false;
     }
@@ -698,6 +719,7 @@ bool SegmentationPushPullTool::applyStepInternal()
 
             if (alphaUnavailable) {
                 _editManager->cancelActiveDrag();
+                _samplesValid = false;
                 if (snapshotCapturedThisStep) {
                     _module.discardLastUndoSnapshot();
                     _undoCaptured = false;
@@ -708,6 +730,7 @@ bool SegmentationPushPullTool::applyStepInternal()
 
             if (!anyMovement) {
                 _editManager->cancelActiveDrag();
+                _samplesValid = false;
                 if (snapshotCapturedThisStep) {
                     _module.discardLastUndoSnapshot();
                     _undoCaptured = false;
@@ -718,6 +741,7 @@ bool SegmentationPushPullTool::applyStepInternal()
 
             if (!_editManager->updateActiveDragTargets(perVertexTargets)) {
                 _editManager->cancelActiveDrag();
+                _samplesValid = false;
                 if (snapshotCapturedThisStep) {
                     _module.discardLastUndoSnapshot();
                     _undoCaptured = false;
@@ -742,6 +766,7 @@ bool SegmentationPushPullTool::applyStepInternal()
             usedAlphaPushPull = true;
         } else if (!alphaUnavailable) {
             _editManager->cancelActiveDrag();
+            _samplesValid = false;
             if (snapshotCapturedThisStep) {
                 _module.discardLastUndoSnapshot();
                 _undoCaptured = false;
@@ -755,6 +780,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         const float stepWorld = _module.gridStepWorld() * _stepMultiplier;
         if (stepWorld <= 0.0f) {
             _editManager->cancelActiveDrag();
+            _samplesValid = false;
             logFailure("Push/pull aborted: computed step size non-positive");
             return false;
         }
@@ -764,6 +790,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     if (!usedAlphaPushPullPerVertex) {
         if (!_editManager->updateActiveDrag(targetWorld)) {
             _editManager->cancelActiveDrag();
+            _samplesValid = false;
             if (snapshotCapturedThisStep) {
                 _module.discardLastUndoSnapshot();
                 _undoCaptured = false;
@@ -773,12 +800,17 @@ bool SegmentationPushPullTool::applyStepInternal()
         }
     }
 
-    _editManager->commitActiveDrag();
-    _editManager->applyPreview();
+    // Update sample base positions for next tick (allows reusing samples)
+    // Skip commitActiveDrag() and applyPreview() during continuous operation
+    // - they clear samples, causing expensive rebuilds every tick
+    // Final cleanup happens in stopAll()
+    _editManager->refreshActiveDragBasePositions();
 
-    // Accumulate dirty bounds during push/pull steps, but don't trigger the full
-    // signal cascade on every step. setSurface() is called once in stopAll().
+    // Update dirty bounds and trigger visual refresh
     _editManager->ensureDirtyBounds();
+    if (_surfaces) {
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+    }
 
     _module.refreshOverlay();
     // Note: emitPendingChanges() removed here for performance - called in stopAll() instead

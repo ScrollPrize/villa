@@ -795,6 +795,25 @@ void SegmentationEditManager::cancelActiveDrag()
     clearActiveDrag();
 }
 
+void SegmentationEditManager::refreshActiveDragBasePositions()
+{
+    if (!_activeDrag.active || !_previewPoints) {
+        return;
+    }
+
+    // Update each sample's baseWorld to current preview position
+    // This allows reusing samples across continuous push/pull ticks
+    for (auto& sample : _activeDrag.samples) {
+        sample.baseWorld = (*_previewPoints)(sample.row, sample.col);
+    }
+
+    // Also update the center baseWorld
+    if (!_activeDrag.samples.empty()) {
+        const auto& center = _activeDrag.center;
+        _activeDrag.baseWorld = (*_previewPoints)(center.row, center.col);
+    }
+}
+
 std::vector<SegmentationEditManager::VertexEdit> SegmentationEditManager::editedVertices() const
 {
     std::vector<VertexEdit> result;
