@@ -750,11 +750,10 @@ void SegmentationGrower::onFutureFinished()
         }
 
         updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
-        if (request.usingCorrections && request.correctionsAffectedBounds) {
-            SurfacePatchIndex* index = _context.viewerManager
-                ? _context.viewerManager->surfacePatchIndex()
-                : nullptr;
-            queueIndexUpdateForBounds(index, targetSurface, *request.correctionsAffectedBounds);
+
+        // Refresh intersection index for this surface so renderIntersections() has up-to-date data
+        if (_context.viewerManager) {
+            _context.viewerManager->refreshSurfacePatchIndex(targetSurface);
         }
     }
 
