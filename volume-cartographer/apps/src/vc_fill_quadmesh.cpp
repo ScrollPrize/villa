@@ -669,45 +669,35 @@ cv::Mat_<cv::Vec3f> points_hr_grounding(const cv::Mat_<uint8_t> &state, std::vec
     
     cv::Mat_<cv::Vec3f> points_tgt = points_tgt_in.clone();
 
-    for(int j=0;j<points_tgt.rows-1;j++)
-        for(int i=0;i<points_tgt.cols-1;i++) {
-            if (points_tgt(j,i)[0] == -1)
-                continue;
-            if (points_tgt(j,i+1)[0] == -1)
-                continue;
-            if (points_tgt(j+1,i)[0] == -1)
-                continue;
-            if (points_tgt(j+1,i+1)[0] == -1)
-                continue;
-            
+    for (auto [j, i, q00, q01, q10, q11] : ValidQuadRange<cv::Vec3f>(&points_tgt)) {
             cv::Vec2f l00, l01, l10, l11;
-            
+
             float hr_th = 20.0;
             float res;
             cv::Vec3f out_;
 
-            res = find_loc_wind_slow(l00, tgt_wind[i], points_src, winding, points_tgt(j,i), hr_th*hr_th);
+            res = find_loc_wind_slow(l00, tgt_wind[i], points_src, winding, q00, hr_th*hr_th);
             if (res < 0 || res > hr_th*hr_th)
                 continue;
 
             l01 = l00;
-            res = min_loc(points_src, l01, out_, {points_tgt(j,i+1)}, {0}, nullptr, 1.0, 0.01);
+            res = min_loc(points_src, l01, out_, {q01}, {0}, nullptr, 1.0, 0.01);
             if (res < 0 || res > hr_th*hr_th)
                 continue;
             l10 = l00;
-            res = min_loc(points_src, l10, out_, {points_tgt(j+1,i)}, {0}, nullptr, 1.0, 0.01);
+            res = min_loc(points_src, l10, out_, {q10}, {0}, nullptr, 1.0, 0.01);
             if (res < 0 || res > hr_th*hr_th)
                 continue;
             l11 = l00;
-            res = min_loc(points_src, l11, out_, {points_tgt(j+1,i+1)}, {0}, nullptr, 1.0, 0.01);
+            res = min_loc(points_src, l11, out_, {q11}, {0}, nullptr, 1.0, 0.01);
             if (res < 0 || res > hr_th*hr_th)
                 continue;
-            
+
             //FIXME should also re-use already found corners for interpolation!
-            points_tgt(j, i) = at_int(points_src, l00);
-            points_tgt(j, i+1) = at_int(points_src, l01);
-            points_tgt(j+1, i) = at_int(points_src, l10);
-            points_tgt(j+1, i+1) = at_int(points_src, l11);
+            q00 = at_int(points_src, l00);
+            q01 = at_int(points_src, l01);
+            q10 = at_int(points_src, l10);
+            q11 = at_int(points_src, l11);
             
             l00 = {l00[1],l00[0]};
             l01 = {l01[1],l01[0]};

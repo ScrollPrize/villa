@@ -1,4 +1,5 @@
 #include "vc/core/util/PointIndex.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <unordered_map>
@@ -102,15 +103,10 @@ void PointIndex::buildFromMat(const cv::Mat_<cv::Vec3f>& points, uint64_t collec
     std::vector<Impl::Entry> entries;
     entries.reserve(static_cast<size_t>(points.rows) * points.cols);
 
-    for (int j = 0; j < points.rows; ++j) {
-        for (int i = 0; i < points.cols; ++i) {
-            const cv::Vec3f& p = points(j, i);
-            if (p[0] != -1.f) {
-                uint64_t id = static_cast<uint64_t>(j) * points.cols + i;
-                impl_->pointData[id] = {p, collectionId};
-                entries.emplace_back(Impl::toBoost(p), id);
-            }
-        }
+    for (auto [j, i, p] : ValidPointRange<const cv::Vec3f>(&points)) {
+        uint64_t id = static_cast<uint64_t>(j) * points.cols + i;
+        impl_->pointData[id] = {p, collectionId};
+        entries.emplace_back(Impl::toBoost(p), id);
     }
 
     if (!entries.empty()) {

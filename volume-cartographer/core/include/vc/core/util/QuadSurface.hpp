@@ -101,6 +101,10 @@ struct tuple_element<5, QuadRef<T>> { using type = T&; };
 // Range for iterating over valid points
 template<typename PointType>
 class ValidPointRange {
+    // Use const Mat* when PointType is const, non-const Mat* otherwise
+    using MatPtr = std::conditional_t<std::is_const_v<PointType>,
+                                      const cv::Mat_<cv::Vec3f>*,
+                                      cv::Mat_<cv::Vec3f>*>;
 public:
     class Iterator {
     public:
@@ -110,7 +114,7 @@ public:
         using pointer = value_type*;
         using reference = value_type;
 
-        Iterator(cv::Mat_<cv::Vec3f>* points, int row, int col)
+        Iterator(MatPtr points, int row, int col)
             : _points(points), _row(row), _col(col) {
             advanceToValid();
         }
@@ -157,23 +161,27 @@ public:
             }
         }
 
-        cv::Mat_<cv::Vec3f>* _points;
+        MatPtr _points;
         int _row;
         int _col;
     };
 
-    ValidPointRange(cv::Mat_<cv::Vec3f>* points) : _points(points) {}
+    ValidPointRange(MatPtr points) : _points(points) {}
 
     Iterator begin() { return Iterator(_points, 0, 0); }
     Iterator end() { return Iterator(_points, _points->rows, 0); }
 
 private:
-    cv::Mat_<cv::Vec3f>* _points;
+    MatPtr _points;
 };
 
 // Range for iterating over valid quads (2x2 cells where all 4 corners are valid)
 template<typename PointType>
 class ValidQuadRange {
+    // Use const Mat* when PointType is const, non-const Mat* otherwise
+    using MatPtr = std::conditional_t<std::is_const_v<PointType>,
+                                      const cv::Mat_<cv::Vec3f>*,
+                                      cv::Mat_<cv::Vec3f>*>;
 public:
     class Iterator {
     public:
@@ -183,7 +191,7 @@ public:
         using pointer = value_type*;
         using reference = value_type;
 
-        Iterator(cv::Mat_<cv::Vec3f>* points, int row, int col)
+        Iterator(MatPtr points, int row, int col)
             : _points(points), _row(row), _col(col) {
             advanceToValid();
         }
@@ -243,18 +251,18 @@ public:
                    (*_points)(_row + 1, _col + 1)[0] != -1.f;
         }
 
-        cv::Mat_<cv::Vec3f>* _points;
+        MatPtr _points;
         int _row;
         int _col;
     };
 
-    ValidQuadRange(cv::Mat_<cv::Vec3f>* points) : _points(points) {}
+    ValidQuadRange(MatPtr points) : _points(points) {}
 
     Iterator begin() { return Iterator(_points, 0, 0); }
     Iterator end() { return Iterator(_points, _points->rows - 1, 0); }
 
 private:
-    cv::Mat_<cv::Vec3f>* _points;
+    MatPtr _points;
 };
 
 //quads based surface class with a pointer implementing a nominal scale of 1 voxel
@@ -299,11 +307,11 @@ public:
     // Grid iteration helpers
     ValidPointRange<cv::Vec3f> validPoints() { return ValidPointRange<cv::Vec3f>(_points); }
     ValidPointRange<const cv::Vec3f> validPoints() const {
-        return ValidPointRange<const cv::Vec3f>(const_cast<cv::Mat_<cv::Vec3f>*>(_points));
+        return ValidPointRange<const cv::Vec3f>(_points);
     }
     ValidQuadRange<cv::Vec3f> validQuads() { return ValidQuadRange<cv::Vec3f>(_points); }
     ValidQuadRange<const cv::Vec3f> validQuads() const {
-        return ValidQuadRange<const cv::Vec3f>(const_cast<cv::Mat_<cv::Vec3f>*>(_points));
+        return ValidQuadRange<const cv::Vec3f>(_points);
     }
 
     // Single-point validity checks
