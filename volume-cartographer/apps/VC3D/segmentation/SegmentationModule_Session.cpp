@@ -209,6 +209,17 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
     }
+
+    // Update approval tool surface if editing approval mask
+    if (isEditingApprovalMask() && _approvalTool) {
+        _approvalTool->setSurface(surface);
+    }
+
+    // Reload approval mask image if showing approval mask
+    if (_showApprovalMask && _overlay) {
+        _overlay->loadApprovalMaskImage(surface);
+    }
+
     refreshOverlay();
     emitPendingChanges();
 }
@@ -221,6 +232,17 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
     if (!_editManager->applyExternalSurfaceUpdate(vertexRect)) {
         return false;
     }
+
+    // Update approval tool surface if editing approval mask
+    if (isEditingApprovalMask() && _approvalTool) {
+        _approvalTool->setSurface(_editManager->baseSurface());
+    }
+
+    // Reload approval mask image if showing approval mask
+    if (_showApprovalMask && _overlay) {
+        _overlay->loadApprovalMaskImage(_editManager->baseSurface());
+    }
+
     refreshOverlay();
     emitPendingChanges();
     return true;
@@ -229,4 +251,31 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
 void SegmentationModule::requestAutosaveFromGrowth()
 {
     markAutosaveNeeded();
+}
+
+void SegmentationModule::updateApprovalToolAfterGrowth(QuadSurface* surface)
+{
+    if (!surface) {
+        return;
+    }
+
+    // Use base surface if there's an active editing session, otherwise use the provided surface
+    QuadSurface* approvalSurface = surface;
+    if (_editManager && _editManager->hasSession()) {
+        approvalSurface = _editManager->baseSurface();
+    }
+
+    if (!approvalSurface) {
+        return;
+    }
+
+    // Update approval tool surface if editing approval mask
+    if (isEditingApprovalMask() && _approvalTool) {
+        _approvalTool->setSurface(approvalSurface);
+    }
+
+    // Reload approval mask image if showing approval mask
+    if (_showApprovalMask && _overlay) {
+        _overlay->loadApprovalMaskImage(approvalSurface);
+    }
 }
