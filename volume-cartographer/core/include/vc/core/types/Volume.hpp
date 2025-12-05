@@ -20,6 +20,9 @@ namespace z5 {
 class Volume
 {
 public:
+    // Static flag to skip zarr shape validation against meta.json
+    static inline bool skipShapeCheck = false;
+
     Volume() = delete;
 
     explicit Volume(std::filesystem::path path);

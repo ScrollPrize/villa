@@ -109,7 +109,7 @@ void Volume::zarrOpen()
 
         // Verify level 0 shape matches meta.json dimensions
         // zarr shape is [z, y, x] = [slices, height, width]
-        if (zarrDs_.size() == 1) {
+        if (zarrDs_.size() == 1 && !skipShapeCheck) {
             const auto& shape = zarrDs_[0]->shape();
             if (static_cast<int>(shape[0]) != _slices ||
                 static_cast<int>(shape[1]) != _height ||
