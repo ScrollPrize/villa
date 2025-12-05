@@ -11,6 +11,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 
 #include <QtConcurrent/QtConcurrent>
@@ -779,6 +780,12 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->setChannel("generations", generations);
         }
 
+        // Copy preserved approval mask from result surface
+        cv::Mat approval = result.surface->channel("approval", SURF_CHANNEL_NORESIZE);
+        if (!approval.empty()) {
+            targetSurface->setChannel("approval", approval);
+        }
+
         if (result.surface->meta) {
             if (targetSurface->meta) {
                 delete targetSurface->meta;
@@ -888,6 +895,11 @@ void SegmentationGrower::onFutureFinished()
     }
     if (!currentSegSurface) {
         currentSegSurface = request.segmentationSurface;
+    }
+
+    // Update approval tool after surface replacement (handles case with no active editing session)
+    if (_context.module) {
+        _context.module->updateApprovalToolAfterGrowth(currentSegSurface);
     }
 
     QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface;

@@ -104,6 +104,7 @@ public:
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
+    void updateApprovalToolAfterGrowth(QuadSurface* surface);
 
     void attachViewer(CVolumeViewer* viewer);
     void updateViewerCursors();

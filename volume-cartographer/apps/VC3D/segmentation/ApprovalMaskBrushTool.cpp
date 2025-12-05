@@ -365,6 +365,7 @@ void ApprovalMaskBrushTool::clear()
 void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
 {
     if (_accumulatedGridPositions.empty()) {
+        qCDebug(lcApprovalMask) << "paintAccumulatedPointsToImage: no accumulated positions";
         return;
     }
 

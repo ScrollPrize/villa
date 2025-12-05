@@ -502,16 +502,22 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
             _approvalTool->setActive(true);
             _approvalTool->setPaintMode(ApprovalMaskBrushTool::PaintMode::Approve);
 
-            // Set surface on approval tool
+            // Set surface on approval tool - prefer surface from collection since it has
+            // the most up-to-date approval mask (preserved after tracer growth)
             QuadSurface* surface = nullptr;
-            if (_editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface();
-            } else if (_surfaces) {
+            if (_surfaces) {
                 surface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+            }
+            if (!surface && _editManager && _editManager->hasSession()) {
+                surface = _editManager->baseSurface();
             }
 
             if (surface) {
                 _approvalTool->setSurface(surface);
+                // Reload approval mask image to ensure dimensions match current surface
+                if (_overlay) {
+                    _overlay->loadApprovalMaskImage(surface);
+                }
             }
         }
 
@@ -557,16 +563,22 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
             _approvalTool->setActive(true);
             _approvalTool->setPaintMode(ApprovalMaskBrushTool::PaintMode::Unapprove);
 
-            // Set surface on approval tool
+            // Set surface on approval tool - prefer surface from collection since it has
+            // the most up-to-date approval mask (preserved after tracer growth)
             QuadSurface* surface = nullptr;
-            if (_editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface();
-            } else if (_surfaces) {
+            if (_surfaces) {
                 surface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+            }
+            if (!surface && _editManager && _editManager->hasSession()) {
+                surface = _editManager->baseSurface();
             }
 
             if (surface) {
                 _approvalTool->setSurface(surface);
+                // Reload approval mask image to ensure dimensions match current surface
+                if (_overlay) {
+                    _overlay->loadApprovalMaskImage(surface);
+                }
             }
         }
 

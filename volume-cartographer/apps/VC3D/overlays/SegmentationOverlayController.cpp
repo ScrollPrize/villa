@@ -235,7 +235,11 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     float widthSteps,
     float heightSteps)
 {
-    if (_pendingApprovalMaskImage.isNull() || gridPositions.empty()) {
+    if (_pendingApprovalMaskImage.isNull()) {
+        qWarning() << "paintApprovalMaskDirect: pending image is NULL!";
+        return;
+    }
+    if (gridPositions.empty()) {
         return;
     }
 
