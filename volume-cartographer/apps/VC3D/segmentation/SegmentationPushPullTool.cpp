@@ -33,6 +33,8 @@ Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
 namespace
 {
 constexpr int kPushPullIntervalMs = 100;
+constexpr int kPushPullIntervalMsFast = 50;   // Non-alpha mode: faster feedback
+constexpr int kPushPullIntervalMsSlow = 150;  // Alpha mode: more time for computation
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -474,8 +476,13 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     _undoCaptured = false;
     _module.useFalloff(SegmentationModule::FalloffTool::PushPull);
 
-    if (_timer && !_timer->isActive()) {
-        _timer->start();
+    // Set adaptive timer interval based on alpha mode
+    if (_timer) {
+        const int interval = _activeAlphaEnabled ? kPushPullIntervalMsSlow : kPushPullIntervalMsFast;
+        _timer->setInterval(interval);
+        if (!_timer->isActive()) {
+            _timer->start();
+        }
     }
 
     if (!applyStepInternal()) {
@@ -517,6 +524,7 @@ void SegmentationPushPullTool::stopAll()
     if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
         _editManager->ensureDirtyBounds();
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+        _module.emitPendingChanges();
     }
 }
 
@@ -584,33 +592,20 @@ bool SegmentationPushPullTool::applyStepInternal()
     }
 
     auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
-    cv::Vec3f ptr = baseSurface->pointer();
-    baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
-    cv::Vec3f normal = baseSurface->normal(ptr);
-    if (std::isnan(normal[0]) || std::isnan(normal[1]) || std::isnan(normal[2])) {
+
+    // Get normal directly from grid position (avoids expensive pointTo lookup)
+    cv::Vec3f normal = baseSurface->gridNormal(row, col);
+    if (!isValidNormal(normal)) {
+        // Fallback to robust normal computation if direct lookup fails
+        cv::Vec3f ptr = baseSurface->pointer();
+        baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
         if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
-            logFailure("Push/pull aborted: surface normal lookup returned NaN and fallback failed");
+            logFailure("Push/pull aborted: surface normal lookup failed");
             return false;
         }
-    }
-
-    if (!isValidNormal(normal)) {
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
-            normal = *fallbackNormal;
-        } else {
-            _editManager->cancelActiveDrag();
-            logFailure("Push/pull aborted: surface normal invalid and fallback failed");
-            return false;
-        }
-    }
-
-    if (!isValidNormal(normal)) {
-        _editManager->cancelActiveDrag();
-        logFailure("Push/pull aborted: surface normal remained invalid after fallback");
-        return false;
     }
 
     const float norm = cv::norm(normal);
@@ -639,16 +634,17 @@ bool SegmentationPushPullTool::applyStepInternal()
 
             for (const auto& sample : activeSamples) {
                 const cv::Vec3f& baseWorld = sample.baseWorld;
-                cv::Vec3f sampleNormal = normal;
-                cv::Vec3f samplePtr = baseSurface->pointer();
-                baseSurface->pointTo(samplePtr, baseWorld, std::numeric_limits<float>::max(), 400, patchIndex);
-                cv::Vec3f candidateNormal = baseSurface->normal(samplePtr);
-                if (std::isfinite(candidateNormal[0]) &&
-                    std::isfinite(candidateNormal[1]) &&
-                    std::isfinite(candidateNormal[2])) {
-                    const float candidateNorm = cv::norm(candidateNormal);
-                    if (candidateNorm > 1e-4f) {
-                        sampleNormal = candidateNormal / candidateNorm;
+
+                // Get normal directly from grid position (fast, no pointTo needed)
+                cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
+                if (!isValidNormal(sampleNormal)) {
+                    sampleNormal = normal;  // Fallback to center normal
+                } else {
+                    const float sampleNorm = cv::norm(sampleNormal);
+                    if (sampleNorm > 1e-4f) {
+                        sampleNormal /= sampleNorm;
+                    } else {
+                        sampleNormal = normal;
                     }
                 }
 
@@ -785,7 +781,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     _editManager->ensureDirtyBounds();
 
     _module.refreshOverlay();
-    _module.emitPendingChanges();
+    // Note: emitPendingChanges() removed here for performance - called in stopAll() instead
     _module.markAutosaveNeeded();
     return true;
 }

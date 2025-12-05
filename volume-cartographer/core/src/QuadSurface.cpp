@@ -158,6 +158,15 @@ cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
     return grid_normal((*_points), p);
 }
 
+cv::Vec3f QuadSurface::gridNormal(int row, int col) const
+{
+    if (!_points) {
+        return {NAN, NAN, NAN};
+    }
+    // grid_normal expects (col, row) order in the Vec3f
+    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col), static_cast<float>(row), 0.0f));
+}
+
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
 {
     _channels[name] = channel;

@@ -157,6 +157,21 @@ void SegmentationOverlayController::applyState(const State& state)
     sanitized.displayRadiusSteps = std::max(sanitized.displayRadiusSteps, 0.0f);
     sanitized.gridStepWorld = std::max(sanitized.gridStepWorld, 1e-4f);
 
+    // skip refresh if state hasn't changed
+    if (_currentState && *_currentState == sanitized) {
+        return;
+    }
+
+    // throttle the overlay refresh a bit
+    static constexpr auto kMinRefreshInterval = std::chrono::milliseconds(32);
+    auto now = std::chrono::steady_clock::now();
+    if (now - _lastRefreshTime < kMinRefreshInterval) {
+        // state changed but we're throttling - save state for next refresh
+        _currentState = std::move(sanitized);
+        return;
+    }
+    _lastRefreshTime = now;
+
     _currentState = std::move(sanitized);
     refreshAll();
 }

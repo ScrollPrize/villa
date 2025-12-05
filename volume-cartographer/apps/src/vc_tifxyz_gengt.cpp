@@ -83,10 +83,12 @@ float line_off(const E &p, const cv::Vec3f &tgt_o, const cv::Vec3f &tgt_v)
 
 using IntersectVec = std::vector<std::pair<float,cv::Vec2f>>;
 
-IntersectVec getIntersects(const cv::Vec2i &seed, const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &step)
+IntersectVec getIntersects(const cv::Vec2i &seed, QuadSurface* surface)
 {
+    const cv::Mat_<cv::Vec3f>& points = surface->rawPoints();
+    const cv::Vec2f& step = surface->scale();
     cv::Vec3f o = points(seed[1],seed[0]);
-    cv::Vec3f n = grid_normal(points, {(float)seed[0],(float)seed[1],0});
+    cv::Vec3f n = surface->gridNormal(seed[1], seed[0]);
     if (std::isnan(n[0]))
         return {};
     std::vector<cv::Vec2f> locs = {seed};
@@ -180,7 +182,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        IntersectVec intersects = getIntersects({seed_loc.x, seed_loc.y}, points, surface->scale());
+        IntersectVec intersects = getIntersects({seed_loc.x, seed_loc.y}, surface);
 
         std::cout << "got " << intersects.size() << std::endl;
 

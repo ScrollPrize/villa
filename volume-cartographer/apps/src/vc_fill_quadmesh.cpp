@@ -905,7 +905,7 @@ int main(int argc, char *argv[])
             for(int i=0;i<surf_points[s].cols;i++) {
                 if (surf_points[s](j, i)[0] == -1)
                     continue;
-                cv::Vec3f n = grid_normal(surf_points[s], {static_cast<float>(i),static_cast<float>(j),0});
+                cv::Vec3f n = surfs[s]->gridNormal(j, i);
                 cv::Vec3f p = surf_points[s](j,i);
                 if (std::isnan(n[0]))
                     continue;

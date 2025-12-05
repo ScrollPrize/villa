@@ -584,8 +584,8 @@ int main(int argc, char *argv[])
                     continue;
                 }
 
-                // Compute grid normal at this grid location (c=x, r=y)
-                cv::Vec3f n = grid_normal(src_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
+                // Compute grid normal at this grid location
+                cv::Vec3f n = src_surface->gridNormal(r, c);
                 if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                     continue; // leave invalid
                 }
