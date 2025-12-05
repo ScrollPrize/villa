@@ -3212,24 +3212,14 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
-        auto logPlaneShift = [](const char* label, const cv::Vec3f& prevOrigin, const cv::Vec3f& nextOrigin) {
-            if (cv::norm(prevOrigin - nextOrigin) > 1e-3f) {
-                std::cout << "[CWindow] applySlicePlaneOrientation moved " << label
-                          << " origin from [" << prevOrigin[0] << ", " << prevOrigin[1] << ", " << prevOrigin[2]
-                          << "] to [" << nextOrigin[0] << ", " << nextOrigin[1] << ", " << nextOrigin[2] << "]"
-                          << std::endl;
-            }
-        };
 
-        const auto configurePlane = [&](const char* label,
-                                        PlaneSurface* plane,
+        const auto configurePlane = [&](PlaneSurface* plane,
                                         float degrees,
                                         const cv::Vec3f& baseNormal) {
             if (!plane) {
                 return;
             }
 
-            cv::Vec3f previousOrigin = plane->origin();
             plane->setOrigin(origin);
             plane->setInPlaneRotation(0.0f);
 
@@ -3250,12 +3240,10 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             } else {
                 plane->setInPlaneRotation(0.0f);
             }
-
-            logPlaneShift(label, previousOrigin, plane->origin());
         };
 
-        configurePlane("seg xz", segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
-        configurePlane("seg yz", segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
+        configurePlane(segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
+        configurePlane(segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
 
         if (segXZ) {
             segXZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
@@ -3286,9 +3274,6 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             segYZ = new PlaneSurface();
         }
 
-        cv::Vec3f prevXZOrigin = segXZ->origin();
-        cv::Vec3f prevYZOrigin = segYZ->origin();
-
         segXZ->setOrigin(origin);
         segYZ->setOrigin(origin);
 
@@ -3304,17 +3289,6 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         segYZ->setInPlaneRotation(0.0f);
         segXZ->setAxisAlignedRotationKey(-1);
         segYZ->setAxisAlignedRotationKey(-1);
-
-        auto logPlaneShift = [](const char* label, const cv::Vec3f& prevOrigin, const cv::Vec3f& nextOrigin) {
-            if (cv::norm(prevOrigin - nextOrigin) > 1e-3f) {
-                std::cout << "[CWindow] applySlicePlaneOrientation moved " << label
-                          << " origin from [" << prevOrigin[0] << ", " << prevOrigin[1] << ", " << prevOrigin[2]
-                          << "] to [" << nextOrigin[0] << ", " << nextOrigin[1] << ", " << nextOrigin[2] << "]"
-                          << std::endl;
-            }
-        };
-        logPlaneShift("seg xz", prevXZOrigin, segXZ->origin());
-        logPlaneShift("seg yz", prevYZOrigin, segYZ->origin());
 
         _surf_col->setSurface("seg xz", segXZ);
         _surf_col->setSurface("seg yz", segYZ);

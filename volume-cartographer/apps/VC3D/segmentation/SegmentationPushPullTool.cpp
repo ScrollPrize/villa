@@ -32,8 +32,8 @@ Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
 
 namespace
 {
-constexpr int kPushPullIntervalMs = 100;
-constexpr int kPushPullIntervalMsFast = 50;   // Non-alpha mode: faster feedback
+constexpr int kPushPullIntervalMs = 30;
+constexpr int kPushPullIntervalMsFast = 30;   // Non-alpha mode: faster feedback
 constexpr int kPushPullIntervalMsSlow = 150;  // Alpha mode: more time for computation
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
