@@ -16,6 +16,7 @@
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -24,104 +25,6 @@
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-
-
-class MultiSurfaceIndex {
-private:
-    struct Cell {
-        std::vector<int> patch_indices;
-    };
-
-    std::unordered_map<uint64_t, Cell> grid;
-    float cell_size;
-    std::vector<Rect3D> patch_bboxes;
-
-    uint64_t hash(int x, int y, int z) const {
-        // Ensure non-negative values for hashing
-        uint32_t ux = static_cast<uint32_t>(x + 1000000);
-        uint32_t uy = static_cast<uint32_t>(y + 1000000);
-        uint32_t uz = static_cast<uint32_t>(z + 1000000);
-        return (static_cast<uint64_t>(ux) << 40) |
-               (static_cast<uint64_t>(uy) << 20) |
-               static_cast<uint64_t>(uz);
-    }
-
-public:
-    MultiSurfaceIndex(float cell_sz = 100.0f) : cell_size(cell_sz) {}
-
-    void addPatch(int idx, QuadSurface* patch) {
-        Rect3D bbox = patch->bbox();
-        patch_bboxes.push_back(bbox);
-
-        // Expand bbox slightly to handle edge cases
-        int x0 = std::floor((bbox.low[0] - cell_size) / cell_size);
-        int y0 = std::floor((bbox.low[1] - cell_size) / cell_size);
-        int z0 = std::floor((bbox.low[2] - cell_size) / cell_size);
-        int x1 = std::ceil((bbox.high[0] + cell_size) / cell_size);
-        int y1 = std::ceil((bbox.high[1] + cell_size) / cell_size);
-        int z1 = std::ceil((bbox.high[2] + cell_size) / cell_size);
-
-        for (int z = z0; z <= z1; z++) {
-            for (int y = y0; y <= y1; y++) {
-                for (int x = x0; x <= x1; x++) {
-                    grid[hash(x, y, z)].patch_indices.push_back(idx);
-                }
-            }
-        }
-    }
-
-    std::vector<int> getCandidatePatches(const cv::Vec3f& point, float tolerance = 0.0f) const {
-        // Get the cell containing this point
-        int x = std::floor(point[0] / cell_size);
-        int y = std::floor(point[1] / cell_size);
-        int z = std::floor(point[2] / cell_size);
-
-        // If tolerance is specified, check neighboring cells too
-        std::set<int> unique_patches;
-
-        if (tolerance > 0) {
-            int cell_radius = std::ceil(tolerance / cell_size);
-            for (int dz = -cell_radius; dz <= cell_radius; dz++) {
-                for (int dy = -cell_radius; dy <= cell_radius; dy++) {
-                    for (int dx = -cell_radius; dx <= cell_radius; dx++) {
-                        auto it = grid.find(hash(x + dx, y + dy, z + dz));
-                        if (it != grid.end()) {
-                            for (int idx : it->second.patch_indices) {
-                                unique_patches.insert(idx);
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            auto it = grid.find(hash(x, y, z));
-            if (it != grid.end()) {
-                for (int idx : it->second.patch_indices) {
-                    unique_patches.insert(idx);
-                }
-            }
-        }
-
-        // Filter by bounding box for extra safety
-        std::vector<int> result;
-        for (int idx : unique_patches) {
-            const Rect3D& bbox = patch_bboxes[idx];
-            if (point[0] >= bbox.low[0] - tolerance &&
-                point[0] <= bbox.high[0] + tolerance &&
-                point[1] >= bbox.low[1] - tolerance &&
-                point[1] <= bbox.high[1] + tolerance &&
-                point[2] >= bbox.low[2] - tolerance &&
-                point[2] <= bbox.high[2] + tolerance) {
-                result.push_back(idx);
-            }
-        }
-
-        return result;
-    }
-
-    size_t getCellCount() const { return grid.size(); }
-    size_t getPatchCount() const { return patch_bboxes.size(); }
-};
 
 
 class SegmentRenderer {
@@ -145,21 +48,6 @@ class SegmentRenderer {
 
         cv::applyColorMap(gray, colored, cv::COLORMAP_HSV);
         return colored.at<cv::Vec3b>(0, 0);
-    }
-
-    float estimateCellSize(const std::vector<QuadSurface*>& surfaces) {
-        if (surfaces.empty()) return 100.0f;
-
-        float avg_dimension = 0;
-        int count = 0;
-        for (auto* surf : surfaces) {
-            Rect3D bbox = surf->bbox();
-            avg_dimension += (bbox.high[0] - bbox.low[0]);
-            avg_dimension += (bbox.high[1] - bbox.low[1]);
-            avg_dimension += (bbox.high[2] - bbox.low[2]);
-            count += 3;
-        }
-        return (count > 0) ? (avg_dimension / count) * 2.0f : 100.0f;
     }
 
     cv::Mat generateLegend(const fs::path& output_path) {
@@ -321,21 +209,15 @@ private:
             return output;
         }
 
-        // Build spatial index
+        // Build spatial index using SurfacePatchIndex
+        SurfacePatchIndex patchIndex;
         std::vector<QuadSurface*> surface_ptrs;
         for (const auto& info : surfaces) {
             surface_ptrs.push_back(info.surface);
         }
+        patchIndex.rebuild(surface_ptrs);
 
-        float cell_size = estimateCellSize(surface_ptrs);
-        MultiSurfaceIndex spatial_index(cell_size);
-
-        for (size_t i = 0; i < surfaces.size(); i++) {
-            spatial_index.addPatch(i, surfaces[i].surface);
-        }
-
-        std::cout << "Spatial index built with " << spatial_index.getCellCount()
-                  << " cells, cell size: " << cell_size << std::endl;
+        std::cout << "SurfacePatchIndex built for " << surfaces.size() << " surfaces" << std::endl;
 
         // Process with optional stride for performance
         if (stride <= 0) {
@@ -384,20 +266,19 @@ private:
 
                 valid_count++;
 
-                // Get candidate surfaces from spatial index
-                std::vector<int> candidates = spatial_index.getCandidatePatches(point, tolerance);
-
+                // Direct lookup using SurfacePatchIndex
                 bool found_match = false;
                 int matched_idx = -1;
 
-                // Check each candidate
-                for (int surf_idx : candidates) {
-                    bool contained = surfaces[surf_idx].surface->containsPoint(point, tolerance);
-
-                    if (contained) {
-                        matched_idx = surf_idx;
-                        found_match = true;
-                        break;
+                auto result = patchIndex.locate(point, tolerance);
+                if (result.has_value()) {
+                    // Find matching surface index
+                    for (size_t idx = 0; idx < surfaces.size(); idx++) {
+                        if (surfaces[idx].surface == result->surface) {
+                            matched_idx = static_cast<int>(idx);
+                            found_match = true;
+                            break;
+                        }
                     }
                 }
 
