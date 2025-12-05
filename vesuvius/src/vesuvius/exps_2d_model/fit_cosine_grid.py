@@ -154,7 +154,7 @@ class CosineGridModel(nn.Module):
         # This shifts all sampling points along the canonical cosine axis.
         # Initialize s so that the source image initially covers only the
         # central third of the sample-space along x (s = 3).
-        self.theta = nn.Parameter(torch.zeros(1)+0.5)
+        self.theta = nn.Parameter(torch.zeros(1)-0.5)
         self.log_s = nn.Parameter(torch.zeros(1) + math.log(3.0))
         self.phase = nn.Parameter(torch.zeros(1))
 
@@ -1842,6 +1842,7 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
+        "grad_mag": 0.1,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
         # "smooth_x": 10.0,
@@ -1852,8 +1853,8 @@ def fit_cosine_grid(
     stage3_modifiers: dict[str, float] = {
         # Stage 3: enable data and grad_data terms in addition to stage-2 regularization.
         # No explicit overrides: all lambda_global weights are used as-is.
-        "data": 0.0,
-        "grad_data": 0.0,
+        # "data": 0.0,
+        # "grad_data": 0.0,
     }
  
     def _need_term(name: str, stage_modifiers: dict[str, float]) -> float:
@@ -2076,8 +2077,11 @@ def fit_cosine_grid(
                 grad_loss = terms["grad_data"]
                 gradmag_loss = terms["grad_mag"]
                 dir_loss = terms["dir_unet"]
+                # Report global step across all stages instead of per-stage step.
+                global_step = global_step_offset + step + 1
+                total_steps_all = total_stage1 + total_stage2 + total_stage3
                 msg = (
-                    f"stage{stage}(step {step+1}/{total_steps}): "
+                    f"stage{stage}(step {global_step}/{total_steps_all}): "
                     f"loss={loss.item():.6f}, data={data_loss.item():.6f}, "
                     f"grad={grad_loss.item():.6f}, gmag={gradmag_loss.item():.6f}, "
                     f"dir={dir_loss.item():.6f}"

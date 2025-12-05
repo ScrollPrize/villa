@@ -52,3 +52,15 @@ python batch_fit_cosine_grid.py \
 excellent!
 time python fit_cosine_grid.py --image ../data/kaggle_dataset/images/sample_00001.tif --layer 0 --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 5000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
 
+#cont with two dir outputs
+python train_unet.py --images-dir ../../../../../data/kaggle_dataset/images/ --labels-dir ../../../../../data/kaggle_dataset/labels/ --log-dir ../../../../../exps_2d/logs/ --run-name test_newgrad_lr1e-3 --batch-size 32 --lr 1e-3 --epochs 100 --weights ../../../../../exps_2d/snapshots/20251129_161224_test_newgrad_lr1e-3/unet_2025-11-29.pt
+
+#build ext
+python setup.py build_ext --inplace
+
+#new inference
+time python /home/hendrik/business/aiconsulting/vesuviuschallenge/villa/vesuvius/src/vesuvius/exps_2d_model/tiled_infer.py --image s5_6000.tif --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --out-dir res2/ --tile-size 320 --overlap 128 --border 32
+
+
+#fit large in vesuviuschallenge/data/model2d_fullsize_exps
+time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit_cosine_grid.py --input res2 --layer 0 --output-prefix res_fit/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --crop 4000 4000 2000 1000 --steps-stage2 5000
