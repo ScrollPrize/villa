@@ -327,9 +327,14 @@ def fit_cosine_grid(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_device = torch.device(device)
 
-    # Optional UNet direction map (channel 2), kept at the same resolution as `image`
-    # so we can define a directional loss in sample space.
-    unet_dir_img: torch.Tensor | None = None
+    # Optional UNet direction maps (channels 2 & 3), kept at the same resolution as
+    # `image` so we can define directional losses in sample space. Channel 2 encodes
+    #   dir0 = 0.5 + 0.5*cos(2*theta)
+    # Channel 3 encodes
+    #   dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
+    # matching the training targets used in train_unet.
+    unet_dir0_img: torch.Tensor | None = None
+    unet_dir1_img: torch.Tensor | None = None
     # Optional UNet magnitude map (channel 1), kept at the same resolution as `image`
     # so we can define a gradient-magnitude period-sum loss in sample space.
     unet_mag_img: torch.Tensor | None = None
@@ -338,7 +343,7 @@ def fit_cosine_grid(
     p_input = Path(image_path)
     if p_input.is_dir():
     	# Directory mode: interpret --input as a directory containing precomputed
-    	# tiled UNet outputs (_cos/_mag/_dir). In this mode no UNet checkpoint
+    	# tiled UNet outputs (_cos/_mag/_dir0/_dir1). In this mode no UNet checkpoint
     	# should be provided.
     	if unet_checkpoint is not None:
     		raise ValueError(
@@ -349,7 +354,7 @@ def fit_cosine_grid(
     
     	# There should be exactly one cosine TIFF in the directory. We ignore
     	# --layer here and always use that single *_cos.tif as the intensity
-    	# source, together with its matching *_mag/_dir files.
+    	# source, together with its matching *_mag/_dir0/_dir1 files.
     	cos_files = sorted(p_input.glob("*_cos.tif"))
     	if len(cos_files) != 1:
     		raise ValueError(
@@ -362,19 +367,36 @@ def fit_cosine_grid(
     	if base_stem.endswith("_cos"):
     		base_stem = base_stem[:-4]
     	mag_path = cos_path.with_name(f"{base_stem}_mag.tif")
-    	dir_path = cos_path.with_name(f"{base_stem}_dir.tif")
-    
+    	# New tiled UNet outputs use explicit dir0/dir1 naming to avoid mixing
+    	# with older single-channel direction files.
+    	dir0_path = cos_path.with_name(f"{base_stem}_dir0.tif")
+    	dir1_path = cos_path.with_name(f"{base_stem}_dir1.tif")
+    	
     	cos_np = tifffile.imread(str(cos_path)).astype("float32")
     	mag_np = tifffile.imread(str(mag_path)).astype("float32")
-    	dir_np = tifffile.imread(str(dir_path)).astype("float32")
     
+    	dir0_np = None
+    	dir1_np = None
+    	if dir0_path.is_file():
+    		dir0_np = tifffile.imread(str(dir0_path)).astype("float32")
+    	if dir1_path.is_file():
+    		dir1_np = tifffile.imread(str(dir1_path)).astype("float32")
+    	
     	cos_t = torch.from_numpy(cos_np).unsqueeze(0).unsqueeze(0).to(torch_device)
     	mag_t = torch.from_numpy(mag_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-    	dir_t = torch.from_numpy(dir_np).unsqueeze(0).unsqueeze(0).to(torch_device)
     
+    	dir0_t: torch.Tensor | None = None
+    	dir1_t: torch.Tensor | None = None
+    	if dir0_np is not None:
+    		dir0_t = torch.from_numpy(dir0_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    	if dir1_np is not None:
+    		dir1_t = torch.from_numpy(dir1_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    	
     	image = torch.clamp(cos_t, 0.0, 1.0)
     	unet_mag_img = torch.clamp(mag_t, 0.0, 1.0)
-    	unet_dir_img = torch.clamp(dir_t, 0.0, 1.0)
+    	# Use dir0/dir1 as the primary & secondary direction channels matching training.
+    	unet_dir0_img = torch.clamp(dir0_t, 0.0, 1.0) if dir0_t is not None else None
+    	unet_dir1_img = torch.clamp(dir1_t, 0.0, 1.0) if dir1_t is not None else None
     elif unet_checkpoint is not None:
     	# Use UNet inference on the specified TIFF layer, then fit the cosine grid
     	# directly to the UNet cosine output (channel 0).
@@ -387,7 +409,7 @@ def fit_cosine_grid(
     		device=torch_device,
     		weights=unet_checkpoint,
     		in_channels=1,
-    		out_channels=3,
+    		out_channels=4,
     		base_channels=32,
     		num_levels=6,
     		max_channels=1024,
@@ -403,24 +425,32 @@ def fit_cosine_grid(
     		if h_u > 2 * c and w_u > 2 * c:
     			pred_unet = pred_unet[:, :, c:-c, c:-c]
     
-    	# Optionally visualize all three UNet outputs at the beginning (after crop).
+    	# Optionally visualize all UNet outputs at the beginning (after crop).
     	if output_prefix is not None:
     		p = Path(output_prefix)
-    		unet_np = pred_unet[0].detach().cpu().numpy()  # (3,H,W)
+    		unet_np = pred_unet[0].detach().cpu().numpy()  # (C,H,W)
     		cos_np = unet_np[0]
-    		mag_np = unet_np[1]
-    		dir_np = unet_np[2]
+    		mag_np = unet_np[1] if unet_np.shape[0] > 1 else None
+    		dir0_np = unet_np[2] if unet_np.shape[0] > 2 else None
+    		dir1_np = unet_np[3] if unet_np.shape[0] > 3 else None
     		tifffile.imwrite(f"{p}_unet_cos.tif", cos_np.astype("float32"), compression="lzw")
-    		tifffile.imwrite(f"{p}_unet_mag.tif", mag_np.astype("float32"), compression="lzw")
-    		tifffile.imwrite(f"{p}_unet_dir.tif", dir_np.astype("float32"), compression="lzw")
+    		if mag_np is not None:
+    			tifffile.imwrite(f"{p}_unet_mag.tif", mag_np.astype("float32"), compression="lzw")
+    		if dir0_np is not None:
+    			tifffile.imwrite(f"{p}_unet_dir0.tif", dir0_np.astype("float32"), compression="lzw")
+    		if dir1_np is not None:
+    			tifffile.imwrite(f"{p}_unet_dir1.tif", dir1_np.astype("float32"), compression="lzw")
     
     	# Cosine output (channel 0) is the main intensity target for the fit.
     	image = torch.clamp(pred_unet[:, 0:1], 0.0, 1.0)
     	# Magnitude branch (channel 1) encodes gradient magnitude; kept for period-sum loss.
     	unet_mag_img = torch.clamp(pred_unet[:, 1:2], 0.0, 1.0)
-    	# Direction branch (channel 2) encodes 0.5 + 0.5*cos(2*theta); we keep it
-    	# for an auxiliary directional loss in sample space.
-    	unet_dir_img = torch.clamp(pred_unet[:, 2:3], 0.0, 1.0)
+    	# Direction branches:
+    	#   channel 2: dir0 = 0.5 + 0.5*cos(2*theta)
+    	#   channel 3: dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
+    	# We keep both for an auxiliary directional loss in sample space.
+    	unet_dir0_img = torch.clamp(pred_unet[:, 2:3], 0.0, 1.0)
+    	unet_dir1_img = torch.clamp(pred_unet[:, 3:4], 0.0, 1.0) if pred_unet.size(1) > 3 else None
     else:
     	# If a specific TIFF layer is requested, mirror the UNet branch behavior
     	# and load only that layer; otherwise fall back to generic image loading.
@@ -442,8 +472,10 @@ def fit_cosine_grid(
     	x1 = max(x0, min(x + w_c, w_img0))
     	y1 = max(y0, min(y + h_c, h_img0))
     	image = image[:, :, y0:y1, x0:x1]
-    	if unet_dir_img is not None:
-    		unet_dir_img = unet_dir_img[:, :, y0:y1, x0:x1]
+    	if unet_dir0_img is not None:
+    		unet_dir0_img = unet_dir0_img[:, :, y0:y1, x0:x1]
+    	if unet_dir1_img is not None:
+    		unet_dir1_img = unet_dir1_img[:, :, y0:y1, x0:x1]
     	if unet_mag_img is not None:
     		unet_mag_img = unet_mag_img[:, :, y0:y1, x0:x1]
     
@@ -457,9 +489,16 @@ def fit_cosine_grid(
             mode="bilinear",
             align_corners=True,
         )
-        if unet_dir_img is not None:
-            unet_dir_img = F.interpolate(
-                unet_dir_img,
+        if unet_dir0_img is not None:
+            unet_dir0_img = F.interpolate(
+                unet_dir0_img,
+                scale_factor=scale,
+                mode="bilinear",
+                align_corners=True,
+            )
+        if unet_dir1_img is not None:
+            unet_dir1_img = F.interpolate(
+                unet_dir1_img,
                 scale_factor=scale,
                 mode="bilinear",
                 align_corners=True,
@@ -841,6 +880,8 @@ def fit_cosine_grid(
             grid_vis_np = None
             dir_model_np = None
             dir_unet_np = None
+            dir1_model_np = None
+            dir1_unet_np = None
             gradmag_vis_np = None
             gradmag_raw_np = None
             if dbg:
@@ -878,27 +919,47 @@ def fit_cosine_grid(
                     )
                 mask_np = mask_hr.cpu().squeeze(0).squeeze(0).numpy()
  
-                # Direction maps (model vs UNet) in sample space.
-                if unet_dir_img is not None:
-                    dir_model_hr, dir_unet_hr = _direction_maps(grid_dbg)
-                    if dir_model_hr is not None and dir_unet_hr is not None:
-                        dir_model_vis = dir_model_hr
-                        dir_unet_vis = dir_unet_hr
+                # Direction maps (model vs UNet) in sample space (dir0 & dir1).
+                if unet_dir0_img is not None or unet_dir1_img is not None:
+                    dir0_model_hr, dir0_unet_hr, dir1_model_hr, dir1_unet_hr = _direction_maps(grid_dbg)
+    
+                    if dir0_model_hr is not None and dir0_unet_hr is not None:
+                        dir0_model_vis = dir0_model_hr
+                        dir0_unet_vis = dir0_unet_hr
                         if eff_output_scale is not None and eff_output_scale > 1:
-                            dir_model_vis = F.interpolate(
-                                dir_model_vis,
+                            dir0_model_vis = F.interpolate(
+                                dir0_model_vis,
                                 scale_factor=eff_output_scale,
                                 mode="bicubic",
                                 align_corners=True,
                             )
-                            dir_unet_vis = F.interpolate(
-                                dir_unet_vis,
+                            dir0_unet_vis = F.interpolate(
+                                dir0_unet_vis,
                                 scale_factor=eff_output_scale,
                                 mode="bicubic",
                                 align_corners=True,
                             )
-                        dir_model_np = dir_model_vis.cpu().squeeze(0).squeeze(0).numpy()
-                        dir_unet_np = dir_unet_vis.cpu().squeeze(0).squeeze(0).numpy()
+                        dir_model_np = dir0_model_vis.cpu().squeeze(0).squeeze(0).numpy()
+                        dir_unet_np = dir0_unet_vis.cpu().squeeze(0).squeeze(0).numpy()
+    
+                    if dir1_model_hr is not None and dir1_unet_hr is not None:
+                        dir1_model_vis = dir1_model_hr
+                        dir1_unet_vis = dir1_unet_hr
+                        if eff_output_scale is not None and eff_output_scale > 1:
+                            dir1_model_vis = F.interpolate(
+                                dir1_model_vis,
+                                scale_factor=eff_output_scale,
+                                mode="bicubic",
+                                align_corners=True,
+                            )
+                            dir1_unet_vis = F.interpolate(
+                                dir1_unet_vis,
+                                scale_factor=eff_output_scale,
+                                mode="bicubic",
+                                align_corners=True,
+                            )
+                        dir1_model_np = dir1_model_vis.cpu().squeeze(0).squeeze(0).numpy()
+                        dir1_unet_np = dir1_unet_vis.cpu().squeeze(0).squeeze(0).numpy()
  
                 # Gradient-magnitude visualizations in sample space:
                 # - raw resampled UNet magnitude (no period-averaging),
@@ -1008,10 +1069,17 @@ def fit_cosine_grid(
                 cv2.imwrite(grid_path, np.flip(grid_vis_np, -1))
             # Save direction maps (model vs UNet) if available.
             if dir_model_np is not None and dir_unet_np is not None:
+                # Primary encoding (dir0): keep legacy filenames for compatibility.
                 dir_model_path = f"{p}_dir_model_step{global_step_idx:06d}.tif"
                 dir_unet_path = f"{p}_dir_unet_step{global_step_idx:06d}.tif"
                 tifffile.imwrite(dir_model_path, _to_uint8(dir_model_np), compression="lzw")
                 tifffile.imwrite(dir_unet_path, _to_uint8(dir_unet_np), compression="lzw")
+            if dir1_model_np is not None and dir1_unet_np is not None:
+                # Secondary encoding (dir1) with explicit names.
+                dir1_model_path = f"{p}_dir1_model_step{global_step_idx:06d}.tif"
+                dir1_unet_path = f"{p}_dir1_unet_step{global_step_idx:06d}.tif"
+                tifffile.imwrite(dir1_model_path, _to_uint8(dir1_model_np), compression="lzw")
+                tifffile.imwrite(dir1_unet_path, _to_uint8(dir1_unet_np), compression="lzw")
             # Save raw gradient-magnitude (resampled UNet mag) as 8-bit JPG.
             if gradmag_raw_np is not None:
                 graw = np.clip(gradmag_raw_np, 0.0, 1.0) * 255.0
@@ -1386,93 +1454,147 @@ def fit_cosine_grid(
 
     def _direction_maps(
         grid: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """
-        Compute direction encodings for model & UNet in sample space.
-
+        Compute direction encodings for model & UNet in sample space for both
+        dir0 and dir1 encodings.
+    
         Model direction is derived from the mapping (u,v) -> (x,y) represented
         by the sampling grid. Let J be the Jacobian of this mapping:
-
+    
             J = [ dx/du  dx/dv ]
                 [ dy/du  dy/dv ]
-
+    
         The cosine phase varies along u, so in image space the phase field is
         φ(x,y) = k * u(x,y). Its gradient is ∇φ ∝ ∇u, and
-
+    
             [du, dv]^T = J^{-1} [dx, dy]^T
-
+    
         so the gradient of u in (x,y) is the first row of J^{-1}:
-
+    
             ∇u = (∂u/∂x, ∂u/∂y) = row_0(J^{-1})
-
-        We encode orientation as 0.5 + 0.5*cos(2*theta) where theta is the
-        angle of ∇u, matching the UNet training target.
-
+    
+        From ∇u we form:
+    
+            cos(2*theta) = (ux^2 - uy^2) / (ux^2 + uy^2)
+            sin(2*theta) = 2*ux*uy / (ux^2 + uy^2)
+    
+        and encode two directional maps matching train_unet:
+    
+            dir0 = 0.5 + 0.5*cos(2*theta)
+            dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
+                 = 0.5 + 0.5*((cos(2*theta) - sin(2*theta)) / sqrt(2)).
+    
         Returns:
-            dir_model:  (1,1,hr,wr) or None
-            dir_unet:   (1,1,hr,wr) or None
+            dir0_model: (1,1,hr,wr) or None
+            dir0_unet:  (1,1,hr,wr) or None
+            dir1_model: (1,1,hr,wr) or None
+            dir1_unet:  (1,1,hr,wr) or None
         """
-        if unet_dir_img is None:
-            return None, None
-
+        if unet_dir0_img is None and unet_dir1_img is None:
+            return None, None, None, None
+    
         # grid: (1,hr,wr,2) in normalized image coords.
         x = grid[..., 0].unsqueeze(1)  # (1,1,hr,wr)
         y = grid[..., 1].unsqueeze(1)
-
+    
         # Finite-difference Jacobian of (u,v) -> (x,y).
         # Treat width as u-direction and height as v-direction.
         xu = torch.zeros_like(x)
         xv = torch.zeros_like(x)
         yu = torch.zeros_like(y)
         yv = torch.zeros_like(y)
-
+    
         # Forward differences along u (width).
         xu[:, :, :, :-1] = x[:, :, :, 1:] - x[:, :, :, :-1]
         yu[:, :, :, :-1] = y[:, :, :, 1:] - y[:, :, :, :-1]
-
+    
         # Forward differences along v (height).
         xv[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
         yv[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
-
+    
         # Jacobian determinant.
         det = xu * yv - xv * yu
         eps = 1e-8
         det_safe = det + (det.abs() < eps).float() * eps
-
+    
         # First row of J^{-1} gives gradient of u in image space: (du/dx, du/dy).
         ux = yv / det_safe
         uy = -xv / det_safe
-
+    
         r2 = ux * ux + uy * uy + eps
         cos2theta = (ux * ux - uy * uy) / r2
-        dir_model = 0.5 + 0.5 * cos2theta  # (1,1,hr,wr)
-
-        # Warp UNet direction channel into sample space using the same grid.
-        dir_unet_hr = F.grid_sample(
-            unet_dir_img,
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        return dir_model, dir_unet_hr
+        sin2theta = (2.0 * ux * uy) / r2
+    
+        # Primary encoding: 0.5 + 0.5*cos(2*theta).
+        dir0_model = 0.5 + 0.5 * cos2theta  # (1,1,hr,wr)
+    
+        # Secondary encoding shifted by 45 degrees:
+        # cos(2*theta + pi/4) = (cos(2*theta) - sin(2*theta)) / sqrt(2).
+        inv_sqrt2 = 1.0 / math.sqrt(2.0)
+        cos2theta_shift = (cos2theta - sin2theta) * inv_sqrt2
+        dir1_model = 0.5 + 0.5 * cos2theta_shift
+    
+        # Warp UNet direction channels into sample space using the same grid.
+        dir0_unet_hr: torch.Tensor | None = None
+        dir1_unet_hr: torch.Tensor | None = None
+        if unet_dir0_img is not None:
+            dir0_unet_hr = F.grid_sample(
+                unet_dir0_img,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+        if unet_dir1_img is not None:
+            dir1_unet_hr = F.grid_sample(
+                unet_dir1_img,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+    
+        return dir0_model, dir0_unet_hr, dir1_model, dir1_unet_hr
 
     def _directional_alignment_loss(
         grid: torch.Tensor
     ) -> torch.Tensor:
         """
         Directional alignment loss between the mapped cosine axis and the UNet
-        direction branch, encoded as 0.5 + 0.5*cos(2*theta) in sample space.
+        direction branches, encoded as dir0 & dir1 in sample space.
+    
+        We compute MSE for each available encoding and combine them as:
+    
+            loss_dir = 0.5 * (loss_dir0 + loss_dir1)
+    
+        when both are present, or just loss_dir0 when only dir0 is available.
         """
-        if unet_dir_img is None:
+        if unet_dir0_img is None and unet_dir1_img is None:
             return torch.zeros((), device=torch_device, dtype=torch.float32)
- 
-        dir_model, dir_unet_hr = _direction_maps(grid)
-        if dir_model is None or dir_unet_hr is None:
-            return torch.zeros((), device=torch_device, dtype=torch.float32)
- 
-        diff_dir = dir_model - dir_unet_hr
-        return (diff_dir * diff_dir).mean()
+    
+        dir0_model, dir0_unet_hr, dir1_model, dir1_unet_hr = _direction_maps(grid)
+        device = torch_device
+        dtype = torch.float32
+    
+        if dir0_model is None or dir0_unet_hr is None:
+            return torch.zeros((), device=device, dtype=dtype)
+    
+        diff_dir0 = dir0_model - dir0_unet_hr
+        loss_dir0 = (diff_dir0 * diff_dir0).mean()
+    
+        if dir1_model is not None and dir1_unet_hr is not None:
+            diff_dir1 = dir1_model - dir1_unet_hr
+            loss_dir1 = (diff_dir1 * diff_dir1).mean()
+            return 0.5 * (loss_dir0 + loss_dir1)
+    
+        # Fallback: only dir0 available.
+        return loss_dir0
  
     def _gradient_data_loss(
         pred: torch.Tensor,
@@ -1720,12 +1842,18 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
+        # "grad_mag" : 0.001,
+        # "dir_unet": 10.0,
+        # "smooth_x": 10.0,
+        # "smooth_y": 0.0,
         # other terms default to 1.0 (enabled).
     }
  
     stage3_modifiers: dict[str, float] = {
         # Stage 3: enable data and grad_data terms in addition to stage-2 regularization.
         # No explicit overrides: all lambda_global weights are used as-is.
+        "data": 0.0,
+        "grad_data": 0.0,
     }
  
     def _need_term(name: str, stage_modifiers: dict[str, float]) -> float:
@@ -2092,7 +2220,7 @@ def main() -> None:
     	required=True,
     	help=(
     		"Path to input TIFF image (stack) or directory containing precomputed "
-    		"tiled UNet outputs (_cos/_mag/_dir)."
+    		"tiled UNet outputs (_cos/_mag/_dir0/_dir1)."
     	),
     )
     parser.add_argument(
@@ -2174,7 +2302,7 @@ def main() -> None:
     	help=(
     		"Layer index of the input TIFF stack (when --input is a file), or the "
     		"layer suffix to select in a directory of tiled UNet outputs "
-    		"(filenames of the form *_layerXXXX_{cos,mag,dir}.tif)."
+    		"(filenames of the form *_layerXXXX_{cos,mag,dir0,dir1}.tif)."
     	),
     )
     parser.add_argument(
