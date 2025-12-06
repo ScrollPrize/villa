@@ -673,7 +673,57 @@ def fit_cosine_grid(
             return gauss_min_img
  
         return torch.exp(-0.5 * window_r2 / (sigma * sigma))
-
+ 
+    def _coarse_geom_mask(
+        stage: int,
+        stage_progress: float,
+    ) -> torch.Tensor:
+        """
+        Build a per-vertex coarse-grid mask in [0,1] for geometry losses.
+ 
+        The mask is obtained by sampling an image-space mask (either an all-ones
+        map or the current Gaussian loss mask) at the mapped coarse-grid
+        coordinates. Points that map outside the image receive weight 0 via
+        grid_sample's zero padding.
+ 
+        Returns:
+            (1,1,gh,gw) tensor aligned with model.base_grid/model.offset.
+        """
+        with torch.no_grad():
+            coords = model.base_grid + model.offset  # (1,2,gh,gw)
+            u = coords[:, 0:1]
+            v = coords[:, 1:2]
+ 
+            # Map to normalized image coordinates.
+            x_norm, y_norm = model._apply_global_transform(u, v)
+            grid_coarse = torch.stack(
+                [x_norm.squeeze(1), y_norm.squeeze(1)],
+                dim=-1,
+            )  # (1,gh,gw,2)
+ 
+            # Image-space loss mask:
+            # - stages 1 & 2: all-ones
+            # - stage 3: current Gaussian schedule, or all-ones when disabled.
+            gauss_img = _gaussian_mask(stage, stage_progress)
+            if gauss_img is None:
+                mask_img = torch.ones(
+                    (1, 1, h_img, w_img),
+                    device=torch_device,
+                    dtype=torch.float32,
+                )
+            else:
+                mask_img = gauss_img
+ 
+            mask_coarse = F.grid_sample(
+                mask_img,
+                grid_coarse,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )  # (1,1,gh,gw)
+ 
+        return mask_coarse
+ 
     def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
         """
         Convert a float or integer image array to uint8 [0,255].
@@ -714,7 +764,7 @@ def fit_cosine_grid(
             norm = np.zeros_like(arr_f, dtype="float32")
         return (np.clip(norm, 0.0, 1.0) * 255.0).astype("uint8")
  
-    def _draw_grid_vis(scale_factor: int = 4) -> "np.ndarray":
+    def _draw_grid_vis(scale_factor: int = 4, mask_coarse: torch.Tensor | None = None) -> "np.ndarray":
         """
         Draw the coarse sample-space grid mapped into (an upscaled) image space.
  
@@ -723,6 +773,13 @@ def fit_cosine_grid(
         image; in video mode we draw on a black background instead.
         Vertical lines whose coarse x-position coincides with cosine peaks in
         the ground-truth design are highlighted in a different color.
+ 
+        If a coarse-grid mask is provided (1,1,gh,gw), edge brightness is scaled
+        linearly with the corresponding edge weights:
+ 
+            w_edge in [0,1] -> brightness = 0.1 + 0.9 * w_edge
+ 
+        so edges in low-weight regions appear darker while still remaining visible.
         """
         import numpy as np
         import cv2
@@ -792,18 +849,46 @@ def fit_cosine_grid(
  
             gh, gw = x_pix.shape
  
+            # Optional coarse mask to modulate edge brightness.
+            mask_arr = None
+            m_h = None
+            m_v = None
+            if mask_coarse is not None:
+                mask_arr = mask_coarse[0, 0].detach().cpu().numpy().astype(np.float32)
+                mask_arr = np.clip(mask_arr, 0.0, 1.0)
+                if mask_arr.shape == x_pix.shape:
+                    if gw > 1:
+                        m_h = np.minimum(mask_arr[:, :-1], mask_arr[:, 1:])  # (gh,gw-1)
+                    if gh > 1:
+                        m_v = np.minimum(mask_arr[:-1, :], mask_arr[1:, :])  # (gh-1,gw)
+ 
+            def edge_brightness(w_edge: float) -> float:
+                """
+                Map edge/vertex weight w ∈ [0,1] to brightness in [0.2,1.0].
+                """
+                w = max(0.0, min(1.0, float(w_edge)))
+                return 0.2 + 0.8 * w
+ 
             def in_bounds(px: int, py: int) -> bool:
                 return 0 <= px < w_vis and 0 <= py < h_vis
  
-            # Draw corner points.
+            # Draw corner points (small green dots) with brightness from the
+            # per-vertex mask when available.
             for iy in range(gh):
                 for ix in range(gw):
                     px = int(round(float(x_pix[iy, ix])))
                     py = int(round(float(y_pix[iy, ix])))
-                    if in_bounds(px, py):
-                        cv2.circle(bg_color, (px, py), 1, (0, 255, 0), -1)
+                    if not in_bounds(px, py):
+                        continue
+                    if mask_arr is not None:
+                        w_v = mask_arr[iy, ix]
+                        b_v = edge_brightness(w_v)
+                    else:
+                        b_v = 1.0
+                    color_v = (0, int(255 * b_v), 0)
+                    cv2.circle(bg_color, (px, py), 1, color_v, -1)
  
-            # Draw horizontal lines (all in red).
+            # Draw horizontal lines (base color blue, brightness from m_h).
             for iy in range(gh):
                 for ix in range(gw - 1):
                     x0 = int(round(float(x_pix[iy, ix])))
@@ -811,8 +896,13 @@ def fit_cosine_grid(
                     x1 = int(round(float(x_pix[iy, ix + 1])))
                     y1 = int(round(float(y_pix[iy, ix + 1])))
                     if in_bounds(x0, y0) and in_bounds(x1, y1):
-                        cv2.line(bg_color, (x0, y0), (x1, y1), (0, 0, 255), 1)
-
+                        if m_h is not None:
+                            b = edge_brightness(m_h[iy, ix])
+                        else:
+                            b = 1.0
+                        color = (int(0 * b), int(0 * b), int(255 * b))
+                        cv2.line(bg_color, (x0, y0), (x1, y1), color, 1)
+ 
             # Visualize new horizontal connectivity with line offsets.
             #
             # We work in the same visualization coordinate space (x_pix,y_pix)
@@ -826,25 +916,32 @@ def fit_cosine_grid(
             src_conn, nbr_conn = _coarse_x_line_pairs(coords_vis_t)  # (1,2,2,gh,gw-1)
             src_conn_np = src_conn[0].detach().cpu().numpy()  # (2,2,gh,gw-1)
             nbr_conn_np = nbr_conn[0].detach().cpu().numpy()  # (2,2,gh,gw-1)
-
+ 
             for iy in range(gh):
                 for ix in range(gw - 1):
+                    if m_h is not None:
+                        b_edge = edge_brightness(m_h[iy, ix])
+                    else:
+                        b_edge = 1.0
+ 
                     # Left -> right (dir=0): cyan
                     x0_lr = int(round(float(src_conn_np[0, 0, iy, ix])))
                     y0_lr = int(round(float(src_conn_np[1, 0, iy, ix])))
                     x1_lr = int(round(float(nbr_conn_np[0, 0, iy, ix])))
                     y1_lr = int(round(float(nbr_conn_np[1, 0, iy, ix])))
                     if in_bounds(x0_lr, y0_lr) and in_bounds(x1_lr, y1_lr):
-                        cv2.line(bg_color, (x0_lr, y0_lr), (x1_lr, y1_lr), (255, 255, 0), 1)
-
+                        color_lr = (int(255 * b_edge), int(255 * b_edge), int(0 * b_edge))
+                        cv2.line(bg_color, (x0_lr, y0_lr), (x1_lr, y1_lr), color_lr, 1)
+ 
                     # Right -> left (dir=1): yellow
                     x0_rl = int(round(float(src_conn_np[0, 1, iy, ix])))
                     y0_rl = int(round(float(src_conn_np[1, 1, iy, ix])))
                     x1_rl = int(round(float(nbr_conn_np[0, 1, iy, ix])))
                     y1_rl = int(round(float(nbr_conn_np[1, 1, iy, ix])))
                     if in_bounds(x0_rl, y0_rl) and in_bounds(x1_rl, y1_rl):
-                        cv2.line(bg_color, (x0_rl, y0_rl), (x1_rl, y1_rl), (0, 255, 255), 1)
-
+                        color_rl = (int(0 * b_edge), int(255 * b_edge), int(255 * b_edge))
+                        cv2.line(bg_color, (x0_rl, y0_rl), (x1_rl, y1_rl), color_rl, 1)
+ 
             # Determine "cos-peak" columns in the coarse canonical grid based on
             # the ground-truth cosine design. The cosine target is defined over
             # sample-space x in [-1,1], with `cosine_periods` periods across the
@@ -858,7 +955,7 @@ def fit_cosine_grid(
                 ix_peak = int(np.argmin(np.abs(base_u_row - x_norm_k)))
                 peak_cols.add(ix_peak)
  
-            # Draw vertical lines: highlight peak columns in red.
+            # Draw vertical lines: highlight peak columns in red, brightness from m_v.
             for iy in range(gh - 1):
                 for ix in range(gw):
                     x0 = int(round(float(x_pix[iy, ix])))
@@ -867,11 +964,19 @@ def fit_cosine_grid(
                     y1 = int(round(float(y_pix[iy + 1, ix])))
                     if not (in_bounds(x0, y0) and in_bounds(x1, y1)):
                         continue
+                    if m_v is not None:
+                        b = edge_brightness(m_v[iy, ix])
+                    else:
+                        b = 1.0
                     if ix in peak_cols:
                         # Cos-peak line: draw in red and slightly thicker.
-                        cv2.line(bg_color, (x0, y0), (x1, y1), (255, 0, 0), 2)
+                        base_color = (255, 0, 0)
+                        thickness = 2
                     else:
-                        cv2.line(bg_color, (x0, y0), (x1, y1), (0, 0, 255), 1)
+                        base_color = (0, 0, 255)
+                        thickness = 1
+                    color = (int(base_color[0] * b), int(base_color[1] * b), int(base_color[2] * b))
+                    cv2.line(bg_color, (x0, y0), (x1, y1), color, thickness)
  
             return bg_color
      
@@ -1064,10 +1169,13 @@ def fit_cosine_grid(
  
                 # Grid visualization: heavily upscaled relative to output_scale,
                 # always using the same large size; in video mode the background
-                # is black instead of the image.
+                # is black instead of the image. Edge brightness is modulated
+                # by the same coarse-grid mask used for geometry losses so that
+                # low-weight regions appear darker.
                 base_scale = output_scale if output_scale is not None else 4
                 vis_scale = base_scale * 2
-                grid_vis_np = _draw_grid_vis(scale_factor=vis_scale)
+                geom_mask_vis = _coarse_geom_mask(stage, stage_progress)
+                grid_vis_np = _draw_grid_vis(scale_factor=vis_scale, mask_coarse=geom_mask_vis)
  
         p = Path(output_prefix)
  
@@ -1165,9 +1273,10 @@ def fit_cosine_grid(
         interpolated in the neighbor column. This means that losses that look
         along x will in general be evaluated twice per row.
     
-        If an image-space mask is provided (shape (1,1,hr,wr)), we scale both
-        directional penalties by the average mask value downsampled to the
-        coarse grid.
+        If a coarse-grid mask is provided (shape (1,1,gh,gw)), we weight each
+        horizontal/vertical edge by the minimum of its endpoint weights and
+        normalize by the sum of weights. Edges whose endpoints lie completely
+        outside the image (mask=0) therefore do not contribute.
         """
         off = model.offset  # (1,2,gh,gw)  2 = (u_offset, v_offset)
         _, _, gh, gw = off.shape
@@ -1188,53 +1297,77 @@ def fit_cosine_grid(
         if gh >= 2:
             dy = off[:, :, 1:, :] - off[:, :, :-1, :]  # (1,2,gh-1,gw)
             dy_sq = (dy * dy).sum(dim=1, keepdim=True)
-            smooth_y = dy_sq
+            smooth_y = dy_sq  # (1,1,gh-1,gw)
         else:
             smooth_y = torch.zeros((), device=off.device, dtype=off.dtype)
     
         if mask is None:
             return smooth_x.mean(), smooth_y.mean()
     
-        # Downsample image-space mask to coarse grid
-        with torch.no_grad():
-            m = F.interpolate(
-                mask,
-                size=(gh, gw),
-                mode="bilinear",
-                align_corners=True,
-            )*0.5+0.5
-        return (smooth_x * m[...,:-1]).mean(), (smooth_y * m[...,:-1,:]).mean()
+        # mask: (1,1,gh,gw) -> per-edge weights via min of endpoints.
+        m = mask
+        # Horizontal edges: between (y,x) and (y,x+1).
+        if isinstance(smooth_x, torch.Tensor) and smooth_x.numel() > 0:
+            m_h = torch.minimum(m[:, :, :, :-1], m[:, :, :, 1:])  # (1,1,gh,gw-1)
+            wsum_h = m_h.sum()
+            if wsum_h > 0:
+                loss_x = (smooth_x * m_h).sum() / wsum_h
+            else:
+                loss_x = smooth_x.mean()
+        else:
+            loss_x = smooth_x
+    
+        # Vertical edges: between (y,x) and (y+1,x).
+        if isinstance(smooth_y, torch.Tensor) and smooth_y.numel() > 0:
+            m_v = torch.minimum(m[:, :, :-1, :], m[:, :, 1:, :])  # (1,1,gh-1,gw)
+            wsum_v = m_v.sum()
+            if wsum_v > 0:
+                loss_y = (smooth_y * m_v).sum() / wsum_v
+            else:
+                loss_y = smooth_y.mean()
+        else:
+            loss_y = smooth_y
+    
+        return loss_x, loss_y
  
     def _mod_smooth_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Smoothness penalty on modulation parameters (amp, bias) on the coarse grid.
- 
-        We only regularize variation along y for modulation. If an image-space
-        mask is provided, we scale the penalty by the average mask value
-        downsampled to the modulation grid.
+   
+        We only regularize variation along y for modulation. If a coarse-grid
+        mask is provided, we weight each vertical difference by the minimum of
+        its endpoint weights (after resampling the mask to the modulation grid
+        in x) and normalize by the sum of weights.
         """
         # Stack amp and bias so both are regularized consistently.
-        mods = torch.cat([model.amp_coarse, model.bias_coarse], dim=1)  # (1,2,gh,gw)
- 
+        mods = torch.cat([model.amp_coarse, model.bias_coarse], dim=1)  # (1,2,gh,gw_mod)
+   
         # First-order differences along y in coarse grid index space.
-        dy = mods[:, :, 1:, :] - mods[:, :, :-1, :]   # (N,2,gh-1,gw)
- 
-        if dy.numel() == 0:
+        dy = mods[:, :, 1:, :] - mods[:, :, :-1, :]   # (1,2,gh-1,gw_mod)
+        dy_sq = dy * dy
+   
+        if dy_sq.numel() == 0:
             base = torch.zeros((), device=mods.device, dtype=mods.dtype)
-        else:
-            base = (dy * dy).mean()
-        if mask is None:
             return base
-        gh, gw = mods.shape[2], mods.shape[3]
+   
+        if mask is None:
+            return dy_sq.mean()
+   
+        gh_m, gw_m = mods.shape[2], mods.shape[3]
         with torch.no_grad():
-            mask_coarse = F.interpolate(
+            # Resample coarse grid mask (defined on coord grid width) to modulation width.
+            mask_mod = F.interpolate(
                 mask,
-                size=(gh, gw),
+                size=(gh_m, gw_m),
                 mode="bilinear",
                 align_corners=True,
             )
-            scale = mask_coarse.mean()
-        return base * scale
+            # Vertical edges: between rows j and j+1.
+            m_v = torch.minimum(mask_mod[:, :, :-1, :], mask_mod[:, :, 1:, :])  # (1,1,gh-1,gw_mod)
+        wsum = m_v.sum()
+        if wsum > 0:
+            return (dy_sq.mean(dim=1, keepdim=True) * m_v).sum() / wsum
+        return dy_sq.mean()
     
     def _step_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
         """
@@ -1256,8 +1389,9 @@ def fit_cosine_grid(
         - enforce each distance to be at least 0.5 * the average vertical distance
           and encourage distances to be close to that average.
     
-        If an image-space mask is provided, we scale the regularizer by the
-        average mask value downsampled to the coarse grid.
+        If a coarse-grid mask is provided, we weight horizontal/vertical edges
+        by the minimum of their endpoint weights and normalize by the sum of
+        weights, so that edges lying fully outside the image do not contribute.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
@@ -1280,16 +1414,35 @@ def fit_cosine_grid(
         # Average over the two directions for each horizontal edge.
         dist_h = dist_h.mean(dim=2)  # (1,1,gh,gw-1)
     
-        # Vertical neighbor distances (steps along coarse y index), unchanged.
+        # Vertical neighbor distances (steps along coarse y index).
         dx_v = x_pix[:, :, 1:, :] - x_pix[:, :, :-1, :]
         dy_v = y_pix[:, :, 1:, :] - y_pix[:, :, :-1, :]
-        dist_v = torch.sqrt(dx_v * dx_v + dy_v * dy_v + 1e-12)
+        dist_v = torch.sqrt(dx_v * dx_v + dy_v * dy_v + 1e-12)  # (1,1,gh-1,gw)
     
-        # Average horizontal & vertical distance in image-space units.
-        avg_h = dist_h.mean()
+        if mask is not None:
+            # Per-edge masks via min of endpoint weights.
+            m = mask  # (1,1,gh,gw)
+            m_h = torch.minimum(m[:, :, :, :-1], m[:, :, :, 1:])    # (1,1,gh,gw-1)
+            m_v = torch.minimum(m[:, :, :-1, :], m[:, :, 1:, :])    # (1,1,gh-1,gw)
+    
+            # Weighted averages for reference distances.
+            wsum_h = m_h.sum()
+            if wsum_h > 0:
+                avg_h = (dist_h * m_h).sum() / wsum_h
+            else:
+                avg_h = dist_h.mean()
+    
+            wsum_v = m_v.sum()
+            if wsum_v > 0:
+                avg_v = (dist_v * m_v).sum() / wsum_v
+            else:
+                avg_v = dist_v.mean()
+        else:
+            # Unweighted averages over all edges.
+            avg_h = dist_h.mean()
+            avg_v = dist_v.mean()
+    
         avg_h_det = avg_h.detach()
-    
-        avg_v = dist_v.mean()
         avg_v_det = avg_v.detach()
     
         # Horizontal: enforce each distance to be at least 0.1 * avg horizontal.
@@ -1298,54 +1451,61 @@ def fit_cosine_grid(
             loss_h = torch.zeros((), device=coords.device, dtype=coords.dtype)
         else:
             shortfall_h = torch.clamp(min_h - dist_h, min=0.0) / min_h
-            loss_h = (shortfall_h * shortfall_h).mean()
+            if mask is not None:
+                wsum_h = m_h.sum()
+                if wsum_h > 0:
+                    loss_h = ((shortfall_h * shortfall_h) * m_h).sum() / wsum_h
+                else:
+                    loss_h = (shortfall_h * shortfall_h).mean()
+            else:
+                loss_h = (shortfall_h * shortfall_h).mean()
     
         # Vertical: encourage each distance to be close to avg distance.
         target_v = avg_v_det
         diff_v = dist_v - target_v
-        loss_v_avg = (diff_v * diff_v).mean()
+        if mask is not None:
+            wsum_v = m_v.sum()
+            if wsum_v > 0:
+                loss_v_avg = ((diff_v * diff_v) * m_v).sum() / wsum_v
+            else:
+                loss_v_avg = (diff_v * diff_v).mean()
+        else:
+            loss_v_avg = (diff_v * diff_v).mean()
     
         base = 1 * loss_h + 0.1 * loss_v_avg
-        if mask is None:
-            return base
-        # Downsample image-space mask to coarse grid and scale by its mean.
-        gh, gw = coords.shape[2], coords.shape[3]
-        with torch.no_grad():
-            mask_coarse = F.interpolate(
-                mask,
-                size=(gh, gw),
-                mode="bilinear",
-                align_corners=True,
-            )
-            scale = mask_coarse.mean()
-        return base * scale
+        return base
      
     def _angle_symmetry_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Angle-symmetry regularizer on coarse coords in image space.
-
+ 
         For each horizontal edge between neighboring coarse grid columns, we
         compare the horizontal edge direction to the local vertical direction
         (along coarse y). The loss penalizes deviations from orthogonality:
-
+ 
             L = mean( cos(theta)^2 )
-
+ 
         where theta is the angle between the horizontal edge and the vertical
         direction in image space. This encourages the "rungs" that connect
         neighboring vertical lines to be straight relative to the vertical
         grid lines, while still allowing bending along y.
+ 
+        If a coarse-grid mask is provided, each (row,col) location contributing
+        to the comparison is weighted by the minimum of the corresponding
+        horizontal and vertical edge weights, so that comparisons involving
+        points outside the image are ignored.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
         v = coords[:, 1:2]
-
+ 
         # Apply same x-only scale-then-rotation as in _build_sampling_grid, but on the coarse grid.
         x_norm, y_norm = model._apply_global_transform(u, v)
-
+ 
         # Map normalized coords to pixel coordinates.
         x_pix = (x_norm + 1.0) * 0.5 * float(max(1, w_img - 1))
         y_pix = (y_norm + 1.0) * 0.5 * float(max(1, h_img - 1))
-
+ 
         # Build 2D coarse coordinate field in pixel space for connectivity.
         coords_pix = torch.cat([x_pix, y_pix], dim=1)  # (1,2,gh,gw)
         _, _, gh, gw = coords_pix.shape
@@ -1359,7 +1519,7 @@ def fit_cosine_grid(
         hvx = hvec[:, 0:1]                               # (1,1,2,gh,gw-1)
         hvy = hvec[:, 1:2]                               # (1,1,2,gh,gw-1)
  
-        # Vertical edge vectors between neighboring rows (top -> bottom), unchanged.
+        # Vertical edge vectors between neighboring rows (top -> bottom).
         dx_v = x_pix[:, :, 1:, :] - x_pix[:, :, :-1, :]   # (1,1,gh-1,gw)
         dy_v = y_pix[:, :, 1:, :] - y_pix[:, :, :-1, :]   # (1,1,gh-1,gw)
  
@@ -1383,46 +1543,56 @@ def fit_cosine_grid(
  
         # Penalize squared cosine -> encourages orthogonality. This implicitly
         # averages over both connectivity directions per horizontal edge.
-        base = (cos_theta * cos_theta).mean()
-
+        base_unweighted = cos_theta * cos_theta  # (1,1,2,gh-1,gw-1)
+ 
         if mask is None:
-            return base
-
-        # As in other regularizers, scale by the mean value of the mask
-        # downsampled to the coarse grid.
-        with torch.no_grad():
-            mask_coarse = F.interpolate(
-                mask,
-                size=(gh, gw),
-                mode="bilinear",
-                align_corners=True,
-            )
-            scale = mask_coarse.mean()
-        return base * scale
+            return base_unweighted.mean()
+ 
+        # Build per-location weights from coarse mask: combine horizontal and
+        # vertical edge masks so that locations involving out-of-image points
+        # are downweighted/ignored.
+        m = mask  # (1,1,gh,gw)
+        m_h = torch.minimum(m[:, :, :, :-1], m[:, :, :, 1:])     # (1,1,gh,gw-1)
+        m_v = torch.minimum(m[:, :, :-1, :], m[:, :, 1:, :])     # (1,1,gh-1,gw)
+ 
+        # Restrict to the (gh-1,gw-1) region used above.
+        m_h_use = m_h[:, :, 0:gh-1, 0:gw-1]   # (1,1,gh-1,gw-1)
+        m_v_use = m_v[:, :, 0:gh-1, 0:gw-1]   # (1,1,gh-1,gw-1)
+        m_loc = torch.minimum(m_h_use, m_v_use).unsqueeze(2)     # (1,1,1,gh-1,gw-1)
+        m_loc = m_loc.expand_as(base_unweighted)                 # (1,1,2,gh-1,gw-1)
+ 
+        wsum = m_loc.sum()
+        if wsum > 0:
+            return (base_unweighted * m_loc).sum() / wsum
+        return base_unweighted.mean()
      
     def _quad_triangle_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Quad-based triangle-area regularizer in image space.
-
+ 
         For each quad in the coarse grid, we form four corner-based triangles
         using the direct neighboring quad corners and compute signed areas via
         the 2D cross product.
-
+ 
         We:
         - penalize triangle area magnitude being less than 1/4 of the average,
         - strongly penalize negative (flipped) triangle areas.
+ 
+        If a coarse-grid mask is provided, each quad is weighted by the minimum
+        of its four corner weights so that quads lying fully outside the image
+        do not contribute.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
         v = coords[:, 1:2]
-
+ 
         # Apply same x-only scale-then-rotation as in _build_sampling_grid, but on the coarse grid.
         x_norm, y_norm = model._apply_global_transform(u, v)
-
+ 
         # Map normalized coords to pixel coordinates of the target image.
         x_pix = (x_norm + 1.0) * 0.5 * float(max(1, w_img - 1))
         y_pix = (y_norm + 1.0) * 0.5 * float(max(1, h_img - 1))
-
+ 
         # Quad corners: p00 (y,x), p01 (y,x+1), p11 (y+1,x+1), p10 (y+1,x).
         px00 = x_pix[:, :, :-1, :-1]
         py00 = y_pix[:, :, :-1, :-1]
@@ -1432,44 +1602,44 @@ def fit_cosine_grid(
         py11 = y_pix[:, :, 1:, 1:]
         px10 = x_pix[:, :, 1:, :-1]
         py10 = y_pix[:, :, 1:, :-1]
-
+ 
         # Four corner-based triangles per quad, signed area via cross product.
-
+ 
         # Triangle at p00: (p00, p01, p10)
         ax0 = px01 - px00
         ay0 = py01 - py00
         bx0 = px10 - px00
         by0 = py10 - py00
         A0 = 0.5 * (ax0 * by0 - ay0 * bx0)
-
+ 
         # Triangle at p01: (p01, p11, p00)
         ax1 = px11 - px01
         ay1 = py11 - py01
         bx1 = px00 - px01
         by1 = py00 - py01
         A1 = 0.5 * (ax1 * by1 - ay1 * bx1)
-
+ 
         # Triangle at p11: (p11, p10, p01)
         ax2 = px10 - px11
         ay2 = py10 - py11
         bx2 = px01 - px11
         by2 = py01 - py11
         A2 = 0.5 * (ax2 * by2 - ay2 * bx2)
-
+ 
         # Triangle at p10: (p10, p00, p11)
         ax3 = px00 - px10
         ay3 = py00 - py10
         bx3 = px11 - px10
         by3 = py11 - py10
         A3 = 0.5 * (ax3 * by3 - ay3 * bx3)
-
+ 
         areas = torch.stack([A0, A1, A2, A3], dim=0)  # (4,1,gh-1,gw-1)
         areas_abs = areas.abs()
         avg_area_abs = areas_abs.mean().detach()
-
+ 
         if float(avg_area_abs) <= 0.0:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
-
+ 
         # Magnitude: piecewise penalty on |A| relative to avg|A|:
         # - 0 for |A| >= avg|A|,
         # - linear from |A| = avg|A| down to |A| = 0.25 * avg|A|,
@@ -1477,7 +1647,7 @@ def fit_cosine_grid(
         #
         # Implemented without masks/conditionals, using clamp so everything
         # is expressed as smooth elementwise ops.
-        A = 0.1*avg_area_abs
+        A = 0.1 * avg_area_abs
         A_quarter = 0.05 * avg_area_abs
         eps = 1e-12
  
@@ -1491,26 +1661,37 @@ def fit_cosine_grid(
         quad_term = (low_def / (A_quarter + eps)) ** 2
  
         size_pen = lin_term + quad_term
-        tri_size_loss = size_pen.mean()
-
-        # Orientation: strongly penalize negative signed area.
+        tri_size_loss_unweighted = size_pen  # (4,1,gh-1,gw-1)
+ 
+        # Orientation: strongly penalize negative signed area (kept for completeness).
         neg = torch.clamp(-areas, min=0.0) / (avg_area_abs + 1e-12)
-        tri_neg_loss = (neg * neg).mean()
-
-        # Return combined triangle-area loss; external lambda scales overall strength.
-        base = tri_size_loss #+ 10.0 * tri_neg_loss
+        tri_neg_loss_unweighted = neg * neg
+ 
         if mask is None:
+            tri_size_loss = tri_size_loss_unweighted.mean()
+            base = tri_size_loss
             return base
-        gh, gw = coords.shape[2], coords.shape[3]
-        with torch.no_grad():
-            mask_coarse = F.interpolate(
-                mask,
-                size=(gh, gw),
-                mode="bilinear",
-                align_corners=True,
-            )
-            scale = mask_coarse.mean()
-        return base * scale
+ 
+        # Per-quad mask from four corners.
+        m = mask  # (1,1,gh,gw)
+        m00 = m[:, :, :-1, :-1]
+        m01 = m[:, :, :-1, 1:]
+        m11 = m[:, :, 1:, 1:]
+        m10 = m[:, :, 1:, :-1]
+        m_quad = torch.minimum(torch.minimum(m00, m01), torch.minimum(m10, m11))  # (1,1,gh-1,gw-1)
+ 
+        # Broadcast to 4 triangles per quad.
+        m_tri = m_quad.unsqueeze(0).expand_as(tri_size_loss_unweighted)  # (4,1,gh-1,gw-1)
+ 
+        wsum = m_tri.sum()
+        if wsum > 0:
+            tri_size_loss = (tri_size_loss_unweighted * m_tri).sum() / wsum
+        else:
+            tri_size_loss = tri_size_loss_unweighted.mean()
+ 
+        # Return combined triangle-area loss; external lambda scales overall strength.
+        base = tri_size_loss
+        return base
 
     def _coarse_x_line_pairs(
         coords: torch.Tensor,
@@ -2037,7 +2218,8 @@ def fit_cosine_grid(
         # Prediction in sample space.
         pred = model(image)
  
-        # Build validity mask and Gaussian loss mask in sample space (no grad).
+        # Build validity mask and Gaussian loss mask in sample space (no grad),
+        # and a coarse-grid mask for geometry-based losses.
         with torch.no_grad():
             grid_ng = model._build_sampling_grid()
             gx = grid_ng[..., 0]
@@ -2066,6 +2248,11 @@ def fit_cosine_grid(
                         align_corners=True,
                     )
                 weight_full = valid * w_sample
+ 
+            # Coarse-grid mask for geometry losses: sample the same image-space
+            # mask (ones or Gaussian) at the coarse-grid coordinates so that
+            # steps/triangles fully outside the image do not contribute.
+            geom_mask_coarse = _coarse_geom_mask(stage, stage_progress)
  
         # Grid with gradients for geometry-based losses.
         grid = model._build_sampling_grid()
@@ -2133,7 +2320,7 @@ def fit_cosine_grid(
         need_sx = _need_term("smooth_x", stage_modifiers) != 0.0
         need_sy = _need_term("smooth_y", stage_modifiers) != 0.0
         if need_sx or need_sy:
-            smooth_x_val, smooth_y_val = _smoothness_reg(valid)
+            smooth_x_val, smooth_y_val = _smoothness_reg(geom_mask_coarse)
         else:
             smooth_x_val = torch.zeros((), device=device, dtype=dtype)
             smooth_y_val = torch.zeros((), device=device, dtype=dtype)
@@ -2143,38 +2330,38 @@ def fit_cosine_grid(
             total_loss = total_loss + _need_term("smooth_x", stage_modifiers) * smooth_x_val
         if need_sy:
             total_loss = total_loss + _need_term("smooth_y", stage_modifiers) * smooth_y_val
- 
+  
         # Step regularizer.
         w_step = _need_term("step", stage_modifiers)
         if w_step != 0.0 and lambda_xygrad > 0.0:
-            step_reg = _step_reg()
+            step_reg = _step_reg(geom_mask_coarse)
             total_loss = total_loss + w_step * step_reg
         else:
             step_reg = torch.zeros((), device=device, dtype=dtype)
         terms["step"] = step_reg
- 
+  
         # Modulation smoothness.
         w_mod_smooth = _need_term("mod_smooth", stage_modifiers)
         if w_mod_smooth != 0.0:
-            mod_smooth = _mod_smooth_reg()
+            mod_smooth = _mod_smooth_reg(geom_mask_coarse)
             total_loss = total_loss + w_mod_smooth * mod_smooth
         else:
             mod_smooth = torch.zeros((), device=device, dtype=dtype)
         terms["mod_smooth"] = mod_smooth
- 
+  
         # Triangle-area regularizer.
         w_quad = _need_term("quad_tri", stage_modifiers)
         if w_quad != 0.0 and lambda_xygrad > 0.0:
-            quad_tri_reg = _quad_triangle_reg()
+            quad_tri_reg = _quad_triangle_reg(geom_mask_coarse)
             total_loss = total_loss + w_quad * quad_tri_reg
         else:
             quad_tri_reg = torch.zeros((), device=device, dtype=dtype)
         terms["quad_tri"] = quad_tri_reg
-
+ 
         # Angle-symmetry regularizer between horizontal connections and vertical lines.
         w_angle = _need_term("angle_sym", stage_modifiers)
         if w_angle != 0.0:
-            angle_reg = _angle_symmetry_reg()
+            angle_reg = _angle_symmetry_reg(geom_mask_coarse)
             total_loss = total_loss + w_angle * angle_reg
         else:
             angle_reg = torch.zeros((), device=device, dtype=dtype)
