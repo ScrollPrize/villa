@@ -665,9 +665,8 @@ class ABFJob : public QObject {
     Q_OBJECT
 public:
     ABFJob(CWindow* win, SurfacePanelController* surfacePanel, const QString& segDir, const QString& segmentStem, int iterations, int downsampleFactor = 1)
-        : QObject(win)
+        : QObject(nullptr)  // No parent - self-managed via deleteLater()
         , w_(win)
-        , surfacePanel_(surfacePanel)
         , segDir_(segDir)
         , stem_(segmentStem)
         , outDir_(segDir.endsWith("_abf") ? segDir : (segDir + "_abf"))
@@ -676,21 +675,41 @@ public:
         , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, win))
         , worker_(new ABFWorker(segDir, outDir_, iterations, downsampleFactor))
     {
-        progress_->setWindowModality(Qt::WindowModal);
+        progress_->setWindowModality(Qt::NonModal);
         progress_->setMinimumDuration(0);
         progress_->setRange(0, 0); // indeterminate
         progress_->setAttribute(Qt::WA_DeleteOnClose);
 
         connect(progress_, &QProgressDialog::canceled, this, &ABFJob::onCanceled_);
-        connect(worker_, &ABFWorker::progressUpdate, this, &ABFJob::onProgressUpdate_);
-        connect(worker_, &QThread::finished, this, &ABFJob::onFinished_);
+        // Run UI updates on the GUI thread; signals are emitted from the worker thread.
+        connect(worker_, &ABFWorker::progressUpdate, this, &ABFJob::onProgressUpdate_, Qt::QueuedConnection);
+        connect(worker_, &QThread::finished, this, &ABFJob::onFinished_, Qt::QueuedConnection);
+        if (surfacePanel) {
+            connect(this,
+                    &ABFJob::requestReloadSurfaces,
+                    surfacePanel,
+                    &SurfacePanelController::reloadSurfacesFromDisk,
+                    Qt::QueuedConnection);
+        }
 
         worker_->start();
     }
 
+    ~ABFJob() override {
+        // Ensure worker is stopped and deleted
+        if (worker_) {
+            if (worker_->isRunning()) {
+                worker_->requestInterruption();
+                worker_->wait(3000);
+            }
+            delete worker_;
+            worker_ = nullptr;
+        }
+    }
+
 private slots:
     void onCanceled_() {
-        if (worker_->isRunning()) {
+        if (worker_ && worker_->isRunning()) {
             worker_->requestInterruption();
             worker_->wait(3000);
         }
@@ -700,12 +719,13 @@ private slots:
         if (progress_) {
             progress_->close();
         }
-        worker_->deleteLater();
         deleteLater();
     }
 
     void onProgressUpdate_(const QString& message) {
-        progress_->setLabelText(message);
+        if (progress_) {
+            progress_->setLabelText(message);
+        }
     }
 
     void onFinished_() {
@@ -713,34 +733,34 @@ private slots:
             progress_->close();
         }
 
-        if (worker_->success()) {
+        // Cache results before any modal dialog (which may trigger deleteLater processing)
+        const bool success = worker_ && worker_->success();
+        const QString errorMsg = worker_ ? worker_->errorMessage() : QString();
+
+        if (success) {
             if (w_) {
                 w_->statusBar()->showMessage(QObject::tr("ABF++ flatten complete: %1").arg(outDir_), 5000);
                 QMessageBox::information(w_, QObject::tr("ABF++ Flatten Complete"),
                     QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
             }
 
-            // Reload surfaces to show the new one
-            // Use invokeMethod with QueuedConnection to defer to next event loop iteration
-            // This avoids re-entrancy issues from the modal dialog's event processing
-            if (surfacePanel_) {
-                QMetaObject::invokeMethod(surfacePanel_, "reloadSurfacesFromDisk", Qt::QueuedConnection);
-            }
+            // Reload surfaces to show the new one; queued connection auto-disconnects if panel is gone.
+            emit requestReloadSurfaces();
         } else {
             if (w_) {
                 w_->statusBar()->showMessage(QObject::tr("ABF++ flatten failed"), 5000);
-                QMessageBox::critical(w_, QObject::tr("ABF++ Flatten Failed"),
-                    worker_->errorMessage());
+                QMessageBox::critical(w_, QObject::tr("ABF++ Flatten Failed"), errorMsg);
             }
         }
 
-        worker_->deleteLater();
         deleteLater();
     }
 
+signals:
+    void requestReloadSurfaces();
+
 private:
     QPointer<CWindow> w_;
-    QPointer<SurfacePanelController> surfacePanel_;
     QString segDir_;
     QString stem_;
     QString outDir_;

@@ -1305,6 +1305,31 @@ void CVolumeViewer::onVolumeClosing()
     }
 }
 
+void CVolumeViewer::onSurfaceWillBeDeleted(std::string /*name*/, Surface* surf)
+{
+    // Called BEFORE surface deletion - clear all cached references to prevent use-after-free
+    auto* quad = dynamic_cast<QuadSurface*>(surf);
+
+    // Clear if this is our current surface
+    if (_surf == surf) {
+        _surf = nullptr;
+    }
+
+    // Clear from intersection cache
+    for (auto it = _cachedIntersectSurfaces.begin(); it != _cachedIntersectSurfaces.end();) {
+        if (it->second == quad) {
+            it = _cachedIntersectSurfaces.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Clear from triangles cache
+    if (quad) {
+        _trianglesBySurface.erase(quad);
+    }
+}
+
 void CVolumeViewer::onDrawingModeActive(bool active, float brushSize, bool isSquare)
 {
     _drawingModeActive = active;

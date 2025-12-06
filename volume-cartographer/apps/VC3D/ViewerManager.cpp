@@ -75,6 +75,10 @@ ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
                 &CSurfaceCollection::sendSurfaceChanged,
                 this,
                 &ViewerManager::handleSurfaceChanged);
+        connect(_surfaces,
+                &CSurfaceCollection::sendSurfaceWillBeDeleted,
+                this,
+                &ViewerManager::handleSurfaceWillBeDeleted);
     }
 }
 
@@ -96,6 +100,7 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
 
     if (_surfaces) {
         connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged, viewer, &CVolumeViewer::onSurfaceChanged);
+        connect(_surfaces, &CSurfaceCollection::sendSurfaceWillBeDeleted, viewer, &CVolumeViewer::onSurfaceWillBeDeleted);
         connect(_surfaces, &CSurfaceCollection::sendPOIChanged, viewer, &CVolumeViewer::onPOIChanged);
     }
 
@@ -708,6 +713,29 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bo
     if (affectsSurfaceIndex) {
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild || !(regionUpdated || indexUpdated);
     }
+}
+
+void ViewerManager::handleSurfaceWillBeDeleted(std::string /*name*/, Surface* surf)
+{
+    // Called BEFORE surface deletion - clear all references to prevent use-after-free
+    auto* quad = dynamic_cast<QuadSurface*>(surf);
+    if (!quad) {
+        return;
+    }
+
+    // Remove from indexed surfaces set
+    _indexedSurfaces.erase(quad);
+
+    // Remove from pending surfaces vector
+    auto removeFromVector = [quad](std::vector<QuadSurface*>& vec) {
+        vec.erase(std::remove(vec.begin(), vec.end(), quad), vec.end());
+    };
+    removeFromVector(_pendingSurfacePatchIndexSurfaces);
+    removeFromVector(_surfacesQueuedDuringRebuild);
+    removeFromVector(_surfacesQueuedForRemovalDuringRebuild);
+
+    // Remove from the R-tree index
+    _surfacePatchIndex.removeSurface(quad);
 }
 
 bool ViewerManager::resetDefaultFor(CVolumeViewer* viewer) const

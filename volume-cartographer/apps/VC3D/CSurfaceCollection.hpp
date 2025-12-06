@@ -50,6 +50,7 @@ public:
     
 signals:
     void sendSurfaceChanged(std::string, Surface*, bool isEditUpdate = false);
+    void sendSurfaceWillBeDeleted(std::string name, Surface* surf);
     void sendPOIChanged(std::string, POI*);
     
 protected:

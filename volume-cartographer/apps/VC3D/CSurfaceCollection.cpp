@@ -24,6 +24,8 @@ void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool
     auto it = _surfs.find(name);
     if (it != _surfs.end()) {
         if (it->second.owns && it->second.ptr && it->second.ptr != surf) {
+            // Notify listeners BEFORE deletion so they can clear their references
+            emit sendSurfaceWillBeDeleted(name, it->second.ptr);
             delete it->second.ptr;
         }
         it->second.ptr = surf;

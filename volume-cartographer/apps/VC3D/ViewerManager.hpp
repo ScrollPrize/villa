@@ -109,6 +109,7 @@ signals:
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
     void handleSurfaceChanged(std::string name, Surface* surf, bool isEditUpdate = false);
+    void handleSurfaceWillBeDeleted(std::string name, Surface* surf);
 
 private:
     bool updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate);

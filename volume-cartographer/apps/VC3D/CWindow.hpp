@@ -170,6 +170,7 @@ private slots:
     void onSegmentationGrowthStatusChanged(bool running);
     void processPendingInotifyEvents();
     void onSliceStepSizeChanged(int newSize);
+    void onSurfaceWillBeDeleted(std::string name, Surface* surf);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);

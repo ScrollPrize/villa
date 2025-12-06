@@ -4,6 +4,7 @@
 
 #include <QFutureWatcher>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 
 #include <functional>
@@ -87,7 +88,7 @@ private:
 
     Context _context;
     UiCallbacks _callbacks;
-    SurfacePanelController* _surfacePanel{nullptr};
+    QPointer<SurfacePanelController> _surfacePanel;
     bool _running{false};
     std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
     std::optional<ActiveRequest> _activeRequest;

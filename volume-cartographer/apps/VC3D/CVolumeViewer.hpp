@@ -199,6 +199,7 @@ public slots:
     void onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onVolumeClosing(); // Clear surface pointers when volume is closing
+    void onSurfaceWillBeDeleted(std::string name, Surface* surf); // Clear references before surface deletion
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onDrawingModeActive(bool active, float brushSize = 3.0f, bool isSquare = false);
 

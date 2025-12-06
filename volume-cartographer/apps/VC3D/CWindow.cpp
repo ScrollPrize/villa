@@ -503,6 +503,7 @@ CWindow::CWindow() :
     _surf_col->setSurface("yz plane", new PlaneSurface({2000,2000,2000},{1,0,0}));
 
     connect(_surf_col, &CSurfaceCollection::sendPOIChanged, this, &CWindow::onFocusPOIChanged);
+    connect(_surf_col, &CSurfaceCollection::sendSurfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
     _viewerManager = std::make_unique<ViewerManager>(_surf_col, _point_collection, chunk_cache, this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
@@ -2398,6 +2399,24 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
 
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
         _surfacePanel->refreshFiltersOnly();
+    }
+}
+
+void CWindow::onSurfaceWillBeDeleted(std::string /*name*/, Surface* surf)
+{
+    // Called BEFORE surface deletion - clear all references to prevent use-after-free
+
+    // Clear if this is our current active surface
+    if (_surf == surf) {
+        _surf = nullptr;
+        _surfID.clear();
+    }
+
+    // Clear from focus history
+    for (auto& entry : _focusHistory) {
+        if (entry.source == surf) {
+            entry.source = nullptr;
+        }
     }
 }
 
