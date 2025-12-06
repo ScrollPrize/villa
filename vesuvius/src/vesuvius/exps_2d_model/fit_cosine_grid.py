@@ -386,26 +386,22 @@ def fit_cosine_grid(
     	# with older single-channel direction files.
     	dir0_path = cos_path.with_name(f"{base_stem}_dir0.tif")
     	dir1_path = cos_path.with_name(f"{base_stem}_dir1.tif")
+    	# All tiled UNet outputs are required in directory mode.
+    	if (not mag_path.is_file()) or (not dir0_path.is_file()) or (not dir1_path.is_file()):
+    		raise FileNotFoundError(
+    			f"Missing required tiled UNet file(s) for base '{base_stem}' in {p_input}. "
+    			f"Expected files: {cos_path.name}, {mag_path.name}, {dir0_path.name}, {dir1_path.name}."
+    		)
     	
     	cos_np = tifffile.imread(str(cos_path)).astype("float32")
     	mag_np = tifffile.imread(str(mag_path)).astype("float32")
-    
-    	dir0_np = None
-    	dir1_np = None
-    	if dir0_path.is_file():
-    		dir0_np = tifffile.imread(str(dir0_path)).astype("float32")
-    	if dir1_path.is_file():
-    		dir1_np = tifffile.imread(str(dir1_path)).astype("float32")
+    	dir0_np = tifffile.imread(str(dir0_path)).astype("float32")
+    	dir1_np = tifffile.imread(str(dir1_path)).astype("float32")
     	
     	cos_t = torch.from_numpy(cos_np).unsqueeze(0).unsqueeze(0).to(torch_device)
     	mag_t = torch.from_numpy(mag_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-    
-    	dir0_t: torch.Tensor | None = None
-    	dir1_t: torch.Tensor | None = None
-    	if dir0_np is not None:
-    		dir0_t = torch.from_numpy(dir0_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-    	if dir1_np is not None:
-    		dir1_t = torch.from_numpy(dir1_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    	dir0_t = torch.from_numpy(dir0_np).unsqueeze(0).unsqueeze(0).to(torch_device)
+    	dir1_t = torch.from_numpy(dir1_np).unsqueeze(0).unsqueeze(0).to(torch_device)
     	
     	image = torch.clamp(cos_t, 0.0, 1.0)
     	unet_mag_img = torch.clamp(mag_t, 0.0, 1.0)
