@@ -1551,7 +1551,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     TraceParameters trace_params;
     int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
-    float step = params.value("step_size", 20.0f);
+    float step;
+    if (resume_surf && !params.contains("step_size")) {
+        step = 1.0f / resume_surf->scale()[0];
+    } else {
+        step = params.value("step_size", 20.0f);
+    }
     trace_params.unit = step*scale;
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
