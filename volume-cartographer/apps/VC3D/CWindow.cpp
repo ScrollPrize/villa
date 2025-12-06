@@ -1161,6 +1161,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onSlimFlatten(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::abfFlattenRequested,
+            this, [this](const QString& segmentId) {
+                onABFFlatten(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::awsUploadRequested,
             this, [this](const QString& segmentId) {
                 onAWSUpload(segmentId.toStdString());

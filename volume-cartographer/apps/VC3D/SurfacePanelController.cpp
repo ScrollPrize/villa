@@ -703,6 +703,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit slimFlattenRequested(segmentId);
     });
 
+    QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
+    connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
+        emit abfFlattenRequested(segmentId);
+    });
+
     QAction* awsUploadAction = contextMenu.addAction(tr("Upload artifacts to AWS"));
     connect(awsUploadAction, &QAction::triggered, this, [this, segmentId]() {
         emit awsUploadRequested(segmentId);

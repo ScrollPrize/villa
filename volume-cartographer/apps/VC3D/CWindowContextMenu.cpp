@@ -39,8 +39,11 @@
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include <nlohmann/json.hpp>
+#include <QThread>
 
 // --------- local helpers for running external tools -------------------------
 static bool runProcessBlocking(const QString& program,
@@ -596,6 +599,140 @@ static QSet<QString> snapshotDirectoryEntries(const QString& dirPath)
     return entries;
 }
 
+// ABF++ flattening job - runs in a background thread
+class ABFWorker : public QThread {
+    Q_OBJECT
+public:
+    ABFWorker(const QString& inputPath, const QString& outputPath, int iterations)
+        : inputPath_(inputPath.toStdString())
+        , outputPath_(outputPath.toStdString())
+        , iterations_(iterations) {}
+
+    bool success() const { return success_; }
+    QString errorMessage() const { return errorMsg_; }
+
+signals:
+    void progressUpdate(const QString& message);
+
+protected:
+    void run() override {
+        try {
+            emit progressUpdate(QObject::tr("Loading surface..."));
+            QuadSurface* surf = load_quad_from_tifxyz(inputPath_);
+            if (!surf) {
+                errorMsg_ = QObject::tr("Failed to load surface from: %1").arg(QString::fromStdString(inputPath_));
+                return;
+            }
+
+            emit progressUpdate(QObject::tr("Running ABF++ flattening..."));
+            vc::ABFConfig config;
+            config.maxIterations = static_cast<std::size_t>(iterations_);
+            config.useABF = true;
+            config.scaleToOriginalArea = true;
+
+            QuadSurface* flatSurf = vc::abfFlattenToNewSurface(*surf, config);
+            delete surf;
+
+            if (!flatSurf) {
+                errorMsg_ = QObject::tr("ABF++ flattening failed");
+                return;
+            }
+
+            emit progressUpdate(QObject::tr("Saving flattened surface..."));
+            std::filesystem::path outPath(outputPath_);
+            std::filesystem::create_directories(outPath);
+            flatSurf->save(outPath, true);
+            delete flatSurf;
+
+            success_ = true;
+        } catch (const std::exception& e) {
+            errorMsg_ = QObject::tr("Error: %1").arg(e.what());
+        }
+    }
+
+private:
+    std::string inputPath_;
+    std::string outputPath_;
+    int iterations_;
+    bool success_ = false;
+    QString errorMsg_;
+};
+
+class ABFJob : public QObject {
+    Q_OBJECT
+public:
+    ABFJob(CWindow* win, SurfacePanelController* surfacePanel, const QString& segDir, const QString& segmentStem, int iterations)
+        : QObject(win)
+        , w_(win)
+        , surfacePanel_(surfacePanel)
+        , segDir_(segDir)
+        , stem_(segmentStem)
+        , outDir_(segDir.endsWith("_abf") ? segDir : (segDir + "_abf"))
+        , iterations_(iterations)
+        , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, win))
+        , worker_(new ABFWorker(segDir, outDir_, iterations))
+    {
+        progress_->setWindowModality(Qt::WindowModal);
+        progress_->setMinimumDuration(0);
+        progress_->setRange(0, 0); // indeterminate
+        progress_->setAttribute(Qt::WA_DeleteOnClose);
+
+        connect(progress_, &QProgressDialog::canceled, this, &ABFJob::onCanceled_);
+        connect(worker_, &ABFWorker::progressUpdate, this, &ABFJob::onProgressUpdate_);
+        connect(worker_, &QThread::finished, this, &ABFJob::onFinished_);
+
+        worker_->start();
+    }
+
+private slots:
+    void onCanceled_() {
+        if (worker_->isRunning()) {
+            worker_->requestInterruption();
+            worker_->wait(3000);
+        }
+        w_->statusBar()->showMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
+        progress_->close();
+        worker_->deleteLater();
+        deleteLater();
+    }
+
+    void onProgressUpdate_(const QString& message) {
+        progress_->setLabelText(message);
+    }
+
+    void onFinished_() {
+        progress_->close();
+
+        if (worker_->success()) {
+            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten complete: %1").arg(outDir_), 5000);
+            QMessageBox::information(w_, QObject::tr("ABF++ Flatten Complete"),
+                QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
+
+            // Reload surfaces to show the new one
+            if (surfacePanel_) {
+                surfacePanel_->reloadSurfacesFromDisk();
+            }
+        } else {
+            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten failed"), 5000);
+            QMessageBox::critical(w_, QObject::tr("ABF++ Flatten Failed"),
+                worker_->errorMessage());
+        }
+
+        worker_->deleteLater();
+        deleteLater();
+    }
+
+private:
+    CWindow* w_ = nullptr;
+    SurfacePanelController* surfacePanel_ = nullptr;
+    QString segDir_;
+    QString stem_;
+    QString outDir_;
+    int iterations_;
+    QPointer<QProgressDialog> progress_;
+    ABFWorker* worker_;
+};
+
 } // -------------------- end anonymous namespace ------------------------------
 
 // ====================== CWindow member functions ==============================
@@ -676,6 +813,30 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
     }
 
     new SlimJob(this, segDir, segmentStem, flatboiExe);
+}
+
+void CWindow::onABFFlatten(const std::string& segmentId)
+{
+    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (!surfMeta) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot ABF++ flatten: Invalid segment selected"));
+        return;
+    }
+
+    const std::filesystem::path segDirFs = surfMeta->path;
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
+
+    // Ask user for number of iterations
+    bool ok;
+    int iterations = QInputDialog::getInt(this, tr("ABF++ Flatten"),
+                                          tr("Number of ABF++ iterations:"),
+                                          10, 1, 100, 1, &ok);
+    if (!ok) {
+        return;
+    }
+
+    new ABFJob(this, _surfacePanel.get(), segDir, segmentStem, iterations);
 }
 
 void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
@@ -1810,3 +1971,6 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
         statusBar()->showMessage(tr("Export cancelled"), 3000);
     }
 }
+
+// Include the MOC file for Q_OBJECT classes in anonymous namespace
+#include "CWindowContextMenu.moc"
