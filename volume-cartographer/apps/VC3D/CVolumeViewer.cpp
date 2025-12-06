@@ -66,7 +66,11 @@ const CVolumeViewer::ActiveSegmentationHandle& CVolumeViewer::activeSegmentation
          : _surf_name == "seg xz" ? COLOR_SEG_XZ
                                    : COLOR_SEG_XY);
     if (_surf_col) {
-        handle.surface = dynamic_cast<QuadSurface*>(_surf_col->surface(handle.slotName));
+        // Note: handle.surface is a raw pointer used for quick access. The surface is
+        // owned by _surf_col. The handle is invalidated when surfaces change via
+        // markActiveSegmentationDirty() called from surface change signals.
+        auto surfaceHolder = _surf_col->surface(handle.slotName);
+        handle.surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
     }
     if (!handle.surface) {
         handle.slotName.clear();
@@ -172,8 +176,12 @@ QPointF visible_center(QGraphicsView *view)
 
 QPointF CVolumeViewer::volumeToScene(const cv::Vec3f& vol_point)
 {
-    PlaneSurface* plane = dynamic_cast<PlaneSurface*>(_surf);
-    QuadSurface* quad = dynamic_cast<QuadSurface*>(_surf);
+    auto surf = _surf_weak.lock();
+    if (!surf)
+        return QPointF();
+
+    PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
+    QuadSurface* quad = dynamic_cast<QuadSurface*>(surf.get());
     cv::Vec3f p;
 
     if (plane) {
@@ -181,8 +189,8 @@ QPointF CVolumeViewer::volumeToScene(const cv::Vec3f& vol_point)
     } else if (quad) {
         auto ptr = quad->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        _surf->pointTo(ptr, vol_point, 4.0, 100, patchIndex);
-        p = _surf->loc(ptr) * _scale;
+        surf->pointTo(ptr, vol_point, 4.0, 100, patchIndex);
+        p = surf->loc(ptr) * _scale;
     }
 
     return QPointF(p[0], p[1]);
@@ -212,9 +220,10 @@ bool scene2vol(cv::Vec3f &p, cv::Vec3f &n, Surface *_surf, const std::string &_s
 
 cv::Vec3f CVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
 {
+    auto surf = _surf_weak.lock();
     cv::Vec3f p, n;
     if (scene2vol(p, n,
-                  const_cast<Surface*>(_surf),
+                  surf.get(),
                   _surf_name,
                   const_cast<CSurfaceCollection*>(_surf_col),
                   scenePoint,
@@ -227,17 +236,18 @@ cv::Vec3f CVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
 
 void CVolumeViewer::onCursorMove(QPointF scene_loc)
 {
-    if (!_surf || !_surf_col)
+    auto surf = _surf_weak.lock();
+    if (!surf || !_surf_col)
         return;
 
     cv::Vec3f p, n;
-    if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
+    if (!scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
         if (_cursor) _cursor->hide();
     } else {
         if (_cursor) {
             _cursor->show();
-            PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
-            QuadSurface *quad = dynamic_cast<QuadSurface*>(_surf);
+            PlaneSurface *plane = dynamic_cast<PlaneSurface*>(surf.get());
+            QuadSurface *quad = dynamic_cast<QuadSurface*>(surf.get());
             if (plane) {
                 const cv::Vec3f sp = plane->project(p, 1.0, _scale);
                 _cursor->setPos(sp[0], sp[1]);
@@ -253,7 +263,7 @@ void CVolumeViewer::onCursorMove(QPointF scene_loc)
             cursor = new POI;
         cursor->p = p;
         cursor->n = n;
-        cursor->src = _surf;
+        cursor->surfaceId = _surf_name;  // Store surface ID for lookup
         _surf_col->setPOI("cursor", cursor);
     }
 
@@ -314,7 +324,8 @@ void CVolumeViewer::recalcScales()
 
 void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers modifiers)
 {
-    if (!_surf)
+    auto surf = _surf_weak.lock();
+    if (!surf)
         return;
 
     if (_segmentationEditActive && (modifiers & Qt::ControlModifier)) {
@@ -334,7 +345,7 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             return;
         }
 
-        PlaneSurface* plane = dynamic_cast<PlaneSurface*>(_surf);
+        PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
         int stepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
         int adjustedSteps = steps * stepSize;
 
@@ -365,7 +376,7 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
             if (length > 0.0) {
                 focus->n = normal;
             }
-            focus->src = plane;
+            focus->surfaceId = _surf_name;  // Store surface ID for lookup
 
             {
                 QScopedValueRollback<bool> focusGuard(_suppressFocusRecentering, true);
@@ -412,7 +423,7 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
 
         // Update center marker position after zoom for QuadSurface
         if (_center_marker && _center_marker->isVisible()) {
-            if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
+            if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
                 POI* focus = _surf_col->poi("focus");
                 if (focus) {
                     auto ptr = quad->pointer();
@@ -470,7 +481,8 @@ void CVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> volume_)
 
 void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)
 {
-    if (!_surf)
+    auto surf = _surf_weak.lock();
+    if (!surf)
         return;
 
     // If a point was being dragged, don't do anything on release
@@ -479,7 +491,7 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
     }
 
     cv::Vec3f p, n;
-    if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale))
+    if (!scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale))
         return;
 
     if (buttons == Qt::LeftButton) {
@@ -508,8 +520,8 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
     const auto& segmentation = activeSegmentationHandle();
 
     // Forward the click for focus
-    if (dynamic_cast<PlaneSurface*>(_surf)) {
-        sendVolumeClicked(p, n, _surf, buttons, modifiers);
+    if (dynamic_cast<PlaneSurface*>(surf.get())) {
+        sendVolumeClicked(p, n, surf.get(), buttons, modifiers);
     }
     else if (segmentation.viewerIsSegmentationView && segmentation.surface) {
         sendVolumeClicked(p, n, segmentation.surface, buttons, modifiers);
@@ -533,21 +545,17 @@ void CVolumeViewer::setPointCollection(VCCollection* point_collection)
 Surface* CVolumeViewer::currentSurface() const
 {
     if (!_surf_col) {
-        return _surf;
+        auto shared = _surf_weak.lock();
+        return shared ? shared.get() : nullptr;
     }
 
-    Surface* surface = _surf_col->surface(_surf_name);
-    if (surface != _surf) {
-        const_cast<CVolumeViewer*>(this)->_surf = surface;
-    }
-
-    return surface;
+    return _surf_col->surfaceRaw(_surf_name);
 }
 
 void CVolumeViewer::setSurface(const std::string &name)
 {
     _surf_name = name;
-    _surf = nullptr;
+    _surf_weak.reset();
     markActiveSegmentationDirty();
     onSurfaceChanged(name, _surf_col->surface(name));
 }
@@ -618,14 +626,15 @@ void CVolumeViewer::setVolumeWindow(float low, float high)
 
 void CVolumeViewer::fitSurfaceInView()
 {
-    if (!_surf || !fGraphicsView) {
+    auto surf = _surf_weak.lock();
+    if (!surf || !fGraphicsView) {
         return;
     }
 
     Rect3D bbox;
     bool haveBounds = false;
 
-    if (auto* quadSurf = dynamic_cast<QuadSurface*>(_surf)) {
+    if (auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get())) {
         bbox = quadSurf->bbox();
         haveBounds = true;
     }
@@ -676,7 +685,7 @@ void CVolumeViewer::fitSurfaceInView()
 }
 
 
-void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEditUpdate)
+void CVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)
 {
     if (name == "segmentation" || name == _surf_name) {
         markActiveSegmentationDirty();
@@ -696,8 +705,8 @@ void CVolumeViewer::onSurfaceChanged(std::string name, Surface *surf, bool isEdi
     }
 
     if (_surf_name == name) {
-        _surf = surf;
-        if (!_surf) {
+        _surf_weak = surf;  // Store weak reference
+        if (!surf) {
             clearAllOverlayGroups();
             fScene->clear();
             _intersect_items.clear();
@@ -808,28 +817,24 @@ QGraphicsItem *crossItem()
 
 //TODO make poi tracking optional and configurable
 void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
-{    
-    if (!poi || !_surf)
+{
+    auto surf = _surf_weak.lock();
+    if (!poi || !surf)
         return;
-    
+
     if (name == "focus") {
-        // Add safety check before dynamic_cast
-        if (!_surf) {
-            return;
-        }
-        
-        if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
             if (!_suppressFocusRecentering) {
                 fGraphicsView->centerOn(0, 0);
             }
             if (poi->p == plane->origin())
                 return;
-            
+
             plane->setOrigin(poi->p);
             emit overlaysUpdated();
-            
-            _surf_col->setSurface(_surf_name, plane);
-        } else if (auto* quad = dynamic_cast<QuadSurface*>(_surf)) {
+
+            _surf_col->setSurface(_surf_name, surf);
+        } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
             auto ptr = quad->pointer();
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
             float dist = quad->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
@@ -851,18 +856,20 @@ void CVolumeViewer::onPOIChanged(std::string name, POI *poi)
         }
     }
     else if (name == "cursor") {
-        // Validate _surf against collection to prevent use-after-free
-        if (!currentSurface()) {
+        // Validate current surface against collection to prevent use-after-free
+        Surface* currentSurf = currentSurface();
+        if (!currentSurf) {
             return;
         }
 
         if (_surf_name == "segmentation" && !_mirrorCursorToSegmentation) {
-            if (!poi->src || poi->src != _surf) {
+            // Compare surface IDs instead of raw pointers
+            if (poi->surfaceId.empty() || poi->surfaceId != _surf_name) {
                 return;
             }
         }
 
-        PlaneSurface *slice_plane = dynamic_cast<PlaneSurface*>(_surf);
+        PlaneSurface *slice_plane = dynamic_cast<PlaneSurface*>(currentSurf);
         const auto& segmentation = activeSegmentationHandle();
         QuadSurface *crop = segmentation.surface;
         
@@ -936,13 +943,14 @@ void CVolumeViewer::onPathsChanged(const QList<PathPrimitive>& paths)
 
 void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
+    auto surf = _surf_weak.lock();
     // BBox drawing consumes mouse events on segmentation view
     if (_bboxMode && _surf_name == "segmentation") {
         if (button == Qt::LeftButton) {
             // Convert to surface parameter coords (unscaled)
             cv::Vec3f p, n;
-            if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) return;
-            auto* quad = dynamic_cast<QuadSurface*>(_surf);
+            if (!scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale)) return;
+            auto* quad = dynamic_cast<QuadSurface*>(surf.get());
             if (!quad) return;
             auto ptr = quad->pointer();
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
@@ -955,7 +963,7 @@ void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::
         }
         return; // consume in bbox mode
     }
-    if (!_point_collection || !_surf) return;
+    if (!_point_collection || !surf) return;
 
     if (button == Qt::LeftButton) {
         if (_highlighted_point_id != 0 && !modifiers.testFlag(Qt::ControlModifier)) {
@@ -971,7 +979,7 @@ void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::
 
     // Forward for drawing widgets
     cv::Vec3f p, n;
-    if (scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
+    if (scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
         _lastScenePos = scene_loc;  // Track for grid coordinate lookups
         sendMousePressVolume(p, n, button, modifiers);
     }
@@ -979,12 +987,13 @@ void CVolumeViewer::onMousePress(QPointF scene_loc, Qt::MouseButton button, Qt::
 
 void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
+    auto surf = _surf_weak.lock();
     // BBox drawing consumes mouse events on segmentation view
     if (_bboxMode && _surf_name == "segmentation") {
         if (_activeBBoxSceneRect && (buttons & Qt::LeftButton)) {
             cv::Vec3f p, n;
-            if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) return;
-            auto* quad = dynamic_cast<QuadSurface*>(_surf);
+            if (!scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale)) return;
+            auto* quad = dynamic_cast<QuadSurface*>(surf.get());
             if (!quad) return;
             auto ptr = quad->pointer();
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
@@ -1001,7 +1010,7 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
 
     if ((buttons & Qt::LeftButton) && _dragged_point_id != 0) {
         cv::Vec3f p, n;
-        if (scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
+        if (scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
             if (auto point_opt = _point_collection->getPoint(_dragged_point_id)) {
                 ColPoint updated_point = *point_opt;
                 updated_point.p = p;
@@ -1009,12 +1018,12 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
             }
         }
     } else {
-        if (!_surf) {
+        if (!surf) {
             return;
         }
-        
+
         cv::Vec3f p, n;
-        if (!scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale))
+        if (!scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale))
             return;
 
         _lastScenePos = scene_loc;  // Track for grid coordinate lookups
@@ -1024,6 +1033,7 @@ void CVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt:
 
 void CVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
+    auto surf = _surf_weak.lock();
     // BBox drawing consumes mouse events on segmentation view
     if (_bboxMode && _surf_name == "segmentation") {
         if (button == Qt::LeftButton && _activeBBoxSceneRect) {
@@ -1048,9 +1058,9 @@ void CVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt
 
     // Forward for drawing widgets
     cv::Vec3f p, n;
-    if (scene2vol(p, n, _surf, _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
+    if (scene2vol(p, n, surf.get(), _surf_name, _surf_col, scene_loc, _vis_center, _scale)) {
         const auto& segmentation = activeSegmentationHandle();
-        if (dynamic_cast<PlaneSurface*>(_surf)) {
+        if (dynamic_cast<PlaneSurface*>(surf.get())) {
             emit sendMouseReleaseVolume(p, button, modifiers);
         }
         else if (segmentation.viewerIsSegmentationView) {
@@ -1074,7 +1084,8 @@ void CVolumeViewer::setBBoxMode(bool enabled)
 QuadSurface* CVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect)
 {
     if (_surf_name != "segmentation") return nullptr;
-    auto* quad = dynamic_cast<QuadSurface*>(_surf);
+    auto surf = _surf_weak.lock();
+    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
     if (!quad) return nullptr;
 
     const cv::Mat_<cv::Vec3f> src = quad->rawPoints();
@@ -1302,6 +1313,32 @@ void CVolumeViewer::onVolumeClosing()
     else {
         // For other surface types (seg xz, seg yz), clear them
         onSurfaceChanged(_surf_name, nullptr);
+    }
+}
+
+void CVolumeViewer::onSurfaceWillBeDeleted(std::string /*name*/, std::shared_ptr<Surface> surf)
+{
+    // Called BEFORE surface deletion - clear all cached references to prevent use-after-free
+    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+
+    // Clear if this is our current surface
+    auto current = _surf_weak.lock();
+    if (current && current == surf) {
+        _surf_weak.reset();
+    }
+
+    // Clear from intersection cache
+    for (auto it = _cachedIntersectSurfaces.begin(); it != _cachedIntersectSurfaces.end();) {
+        if (it->second == quad) {
+            it = _cachedIntersectSurfaces.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Clear from triangles cache
+    if (quad) {
+        _trianglesBySurface.erase(quad);
     }
 }
 

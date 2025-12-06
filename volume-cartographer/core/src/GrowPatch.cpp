@@ -1496,7 +1496,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
         if (!ref_path.empty()) {
             try {
-                reference_surface.reset(load_quad_from_tifxyz(ref_path));
+                reference_surface = load_quad_from_tifxyz(ref_path);
                 trace_data.reference_raycast.surface = reference_surface.get();
                 std::cout << "Loaded reference surface from " << ref_path << std::endl;
             } catch (const std::exception& e) {
@@ -1551,8 +1551,36 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     TraceParameters trace_params;
     int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
-    float step = params.value("step_size", 20.0f);
+
+    // Load normal grid first if provided, so we can use its spiral-step
+    std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
+    if (params.contains("normal_grid_path")) {
+        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
+    }
+
+    // Determine step size with priority: explicit param > normal_grid > resume_surf > default
+    float step;
+    if (params.contains("step_size")) {
+        step = params.value("step_size", 20.0f);
+    } else if (ngv) {
+        // Use normal grid's spiral-step as authoritative (handles legacy surfaces with wrong scale)
+        step = ngv->metadata()["spiral-step"].get<float>();
+    } else if (resume_surf) {
+        step = 1.0f / resume_surf->scale()[0];
+    } else {
+        step = 20.0f;
+    }
     trace_params.unit = step*scale;
+
+    // Validate step matches normal grid if explicit step_size was provided
+    if (ngv && params.contains("step_size")) {
+        float ngv_step = ngv->metadata()["spiral-step"].get<float>();
+        if (std::abs(ngv_step - step) > 1e-6) {
+            throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
+        }
+    }
+    trace_data.ngv = ngv.get();
+
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
               << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
@@ -1565,15 +1593,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
     ALifeTime f_timer("empty space tracing\n");
-    // DSReader reader = {ds,scale,cache};
-    std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
-    if (params.contains("normal_grid_path")) {
-        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
-        if (ngv->metadata()["spiral-step"] != step) {
-            throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
-        }
-    }
-    trace_data.ngv = ngv.get();
 
 
 
@@ -1718,7 +1737,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         const double voxel_size_d = static_cast<double>(voxelsize);
         const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
 
-        surf->meta = new nlohmann::json(meta_params);
+        surf->meta = std::make_unique<nlohmann::json>(meta_params);
         (*surf->meta)["area_vx2"] = area_est_vx2;
         (*surf->meta)["area_cm2"] = area_est_cm2;
         (*surf->meta)["max_gen"] = generation;
@@ -1748,7 +1767,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     if (resume_surf) {
         std::cout << "resuime! " << std::endl;
         float resume_step = 1.0 / resume_surf->scale()[0];
-        if (std::abs(resume_step - step) > 1e-6) {
+        // Only validate step match if not using normal_grid (which is authoritative for legacy surfaces)
+        if (!ngv && std::abs(resume_step - step) > 1e-6) {
             throw std::runtime_error("Step size parameter mismatch between new trace and resume surface.");
         }
 

@@ -8,7 +8,10 @@
 #include <iostream>
 #include <cmath>
 #include <optional>
+#include <atomic>
 #include <vector>
+#include <memory>
+#include <filesystem>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -27,11 +30,13 @@
 #include <QtGlobal>
 #include <QProcessEnvironment>
 #include <QProgressDialog>
+#include <QFutureWatcher>
 #include <QPointer>
 #include <QTimer>
 #include <QTemporaryFile>
 #include <QSet>
 #include <QVector>
+#include <QtConcurrent/QtConcurrentRun>
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
 #include <QStandardPaths>
 #endif
@@ -39,6 +44,8 @@
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include <nlohmann/json.hpp>
 
@@ -596,14 +603,218 @@ static QSet<QString> snapshotDirectoryEntries(const QString& dirPath)
     return entries;
 }
 
+using ProgressCallback = std::function<void(const QString&)>;
+
+struct ABFFlattenTaskConfig {
+    QString inputPath;
+    QString outputPath;
+    int iterations{10};
+    int downsampleFactor{1};
+    std::shared_ptr<std::atomic_bool> cancelFlag;
+};
+
+struct ABFFlattenResult {
+    bool success{false};
+    bool canceled{false};
+    QString errorMsg;
+};
+
+static ABFFlattenResult runAbfFlattenTask(const ABFFlattenTaskConfig& cfg, const ProgressCallback& onProgress)
+{
+    auto emitProgress = [&](const QString& msg) {
+        if (onProgress) onProgress(msg);
+    };
+    auto isCanceled = [&]() -> bool {
+        return cfg.cancelFlag && cfg.cancelFlag->load(std::memory_order_relaxed);
+    };
+
+    ABFFlattenResult result;
+    try {
+        if (isCanceled()) {
+            result.canceled = true;
+            return result;
+        }
+
+        emitProgress(QObject::tr("Loading surface..."));
+        auto surf = load_quad_from_tifxyz(cfg.inputPath.toStdString());
+        if (!surf) {
+            result.errorMsg = QObject::tr("Failed to load surface from: %1").arg(cfg.inputPath);
+            return result;
+        }
+
+        if (isCanceled()) {
+            result.canceled = true;
+            return result;
+        }
+
+        emitProgress(QObject::tr("Running ABF++ flattening..."));
+        vc::ABFConfig config;
+        config.maxIterations = static_cast<std::size_t>(std::max(1, cfg.iterations));
+        config.downsampleFactor = std::max(1, cfg.downsampleFactor);
+        config.useABF = true;
+        config.scaleToOriginalArea = true;
+
+        std::unique_ptr<QuadSurface> flatSurf(vc::abfFlattenToNewSurface(*surf, config));
+        if (!flatSurf) {
+            result.errorMsg = QObject::tr("ABF++ flattening failed");
+            return result;
+        }
+
+        if (isCanceled()) {
+            result.canceled = true;
+            return result;
+        }
+
+        emitProgress(QObject::tr("Saving flattened surface..."));
+        std::filesystem::path outPath(cfg.outputPath.toStdString());
+        std::filesystem::create_directories(outPath);
+        flatSurf->save(outPath, true);
+
+        result.success = true;
+    } catch (const std::exception& e) {
+        result.errorMsg = QObject::tr("Error: %1").arg(e.what());
+    }
+
+    return result;
+}
+
+class ABFJob : public QObject {
+    Q_OBJECT
+public:
+    ABFJob(CWindow* win, SurfacePanelController* surfacePanel, const QString& segDir, const QString& segmentStem, int iterations, int downsampleFactor = 1)
+        : QObject(win)
+        , w_(win)
+        , surfacePanel_(surfacePanel)
+        , segDir_(segDir)
+        , stem_(segmentStem)
+        , outDir_(segDir.endsWith("_abf") ? segDir : (segDir + "_abf"))
+        , iterations_(std::max(1, iterations))
+        , downsampleFactor_(std::max(1, downsampleFactor))
+        , cancelFlag_(std::make_shared<std::atomic_bool>(false))
+        , watcher_(this)
+        , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, win))
+    {
+        progress_->setWindowModality(Qt::NonModal);
+        progress_->setMinimumDuration(0);
+        progress_->setRange(0, 0); // indeterminate
+        progress_->setAttribute(Qt::WA_DeleteOnClose);
+
+        connect(progress_, &QProgressDialog::canceled, this, &ABFJob::onCanceledRequested_);
+        connect(&watcher_, &QFutureWatcher<ABFFlattenResult>::finished, this, &ABFJob::onFinished_);
+
+        startTask_();
+    }
+
+    ~ABFJob() override {
+        if (cancelFlag_) {
+            cancelFlag_->store(true, std::memory_order_relaxed);
+        }
+    }
+
+private slots:
+    void onCanceledRequested_() {
+        if (cancelFlag_) {
+            cancelFlag_->store(true, std::memory_order_relaxed);
+        }
+        if (progress_) {
+            progress_->setLabelText(QObject::tr("Canceling…"));
+        }
+    }
+
+    void onFinished_() {
+        if (progress_) {
+            progress_->close();
+        }
+
+        if (!watcher_.isFinished()) {
+            deleteLater();
+            return;
+        }
+
+        const ABFFlattenResult result = watcher_.result();
+
+        if (result.canceled) {
+            if (w_) {
+                w_->statusBar()->showMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
+            }
+            deleteLater();
+            return;
+        }
+
+        if (!result.success) {
+            if (w_) {
+                w_->statusBar()->showMessage(QObject::tr("ABF++ flatten failed"), 5000);
+                const QString errorMsg = result.errorMsg.isEmpty()
+                    ? QObject::tr("ABF++ flattening failed")
+                    : result.errorMsg;
+                QMessageBox::critical(w_, QObject::tr("ABF++ Flatten Failed"), errorMsg);
+            }
+            deleteLater();
+            return;
+        }
+
+        const QString label = !stem_.isEmpty() ? stem_ : outDir_;
+
+        if (w_) {
+            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten complete: %1").arg(label), 5000);
+            QMessageBox::information(w_, QObject::tr("ABF++ Flatten Complete"),
+                QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
+        }
+
+        if (surfacePanel_) {
+            QMetaObject::invokeMethod(surfacePanel_.data(),
+                                      &SurfacePanelController::reloadSurfacesFromDisk,
+                                      Qt::QueuedConnection);
+        }
+
+        deleteLater();
+    }
+
+private:
+    void startTask_() {
+        const ABFFlattenTaskConfig cfg{
+            segDir_,
+            outDir_,
+            iterations_,
+            downsampleFactor_,
+            cancelFlag_
+        };
+
+        QPointer<ABFJob> guard(this);
+        auto progressCb = [guard](const QString& msg) {
+            if (!guard) return;
+            QMetaObject::invokeMethod(guard, [guard, msg]() {
+                if (guard && guard->progress_) {
+                    guard->progress_->setLabelText(msg);
+                }
+            }, Qt::QueuedConnection);
+        };
+
+        watcher_.setFuture(QtConcurrent::run([cfg, progressCb]() {
+            return runAbfFlattenTask(cfg, progressCb);
+        }));
+    }
+
+    QPointer<CWindow> w_;
+    QPointer<SurfacePanelController> surfacePanel_;
+    QString segDir_;
+    QString stem_;
+    QString outDir_;
+    int iterations_;
+    int downsampleFactor_;
+    std::shared_ptr<std::atomic_bool> cancelFlag_;
+    QFutureWatcher<ABFFlattenResult> watcher_;
+    QPointer<QProgressDialog> progress_;
+};
+
 } // -------------------- end anonymous namespace ------------------------------
 
 // ====================== CWindow member functions ==============================
 
 void CWindow::onRenderSegment(const std::string& segmentId)
 {
-    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
-    if (currentVolume == nullptr || !surfMeta) {
+    auto surf = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot render segment: No volume or invalid segment selected"));
         return;
     }
@@ -611,8 +822,8 @@ void CWindow::onRenderSegment(const std::string& segmentId)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     const QString volumePath = getCurrentVolumePath();
-    const QString segmentPath = QString::fromStdString(surfMeta->path.string());
-    const QString segmentOutDir = QString::fromStdString(surfMeta->path.string());
+    const QString segmentPath = QString::fromStdString(surf->path.string());
+    const QString segmentOutDir = QString::fromStdString(surf->path.string());
     const QString outputFormat = "%s/layers/%02d.tif";
     const float scale = 1.0f;
     const int resolution = 0;
@@ -642,6 +853,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
         dlg.affinePath(), dlg.invertAffine(),
         static_cast<float>(dlg.scaleSegmentation()), dlg.rotateDegrees(), dlg.flipAxis());
     _cmdRunner->setIncludeTifs(dlg.includeTifs());
+    _cmdRunner->setFlattenOptions(dlg.flatten(), dlg.flattenIterations(), dlg.flattenDownsample());
 
     _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
     statusBar()->showMessage(tr("Rendering segment: %1").arg(QString::fromStdString(segmentId)), 5000);
@@ -649,8 +861,8 @@ void CWindow::onRenderSegment(const std::string& segmentId)
 
 void CWindow::onSlimFlatten(const std::string& segmentId)
 {
-    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
-    if (currentVolume == nullptr || !surfMeta) {
+    auto surf = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot SLIM-flatten: No volume or invalid segment selected"));
         return;
     }
@@ -659,7 +871,7 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
         return;
     }
 
-    const std::filesystem::path segDirFs = surfMeta->path; // tifxyz folder
+    const std::filesystem::path segDirFs = surf->path; // tifxyz folder
     const QString segDir = QString::fromStdString(segDirFs.string());
     const QString segmentStem = QString::fromStdString(segmentId);
 
@@ -677,6 +889,27 @@ void CWindow::onSlimFlatten(const std::string& segmentId)
     new SlimJob(this, segDir, segmentStem, flatboiExe);
 }
 
+void CWindow::onABFFlatten(const std::string& segmentId)
+{
+    auto surf = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot ABF++ flatten: Invalid segment selected"));
+        return;
+    }
+
+    const std::filesystem::path segDirFs = surf->path;
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
+
+    // Show ABF++ flatten dialog
+    ABFFlattenDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    new ABFJob(this, _surfacePanel.get(), segDir, segmentStem, dlg.iterations(), dlg.downsampleFactor());
+}
+
 void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
 {
     if (currentVolume == nullptr || !fVpkg) {
@@ -684,8 +917,8 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
         return;
     }
 
-    auto surfMeta = fVpkg->getSurface(segmentId);
-    if (!surfMeta) {
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot grow segment: Invalid segment or segment not loaded"));
         return;
     }
@@ -696,7 +929,7 @@ void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)
         return;
     }
 
-    QString srcSegment = QString::fromStdString(surfMeta->path.string());
+    QString srcSegment = QString::fromStdString(surf->path.string());
 
     std::filesystem::path volpkgPath = std::filesystem::path(fVpkgPath.toStdString());
     std::filesystem::path tracesDir = volpkgPath / "traces";
@@ -772,8 +1005,8 @@ void CWindow::onAddOverlap(const std::string& segmentId)
         return;
     }
 
-    auto surfMeta = fVpkg->getSurface(segmentId);
-    if (!surfMeta) {
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot add overlap: Invalid segment or segment not loaded"));
         return;
     }
@@ -786,7 +1019,7 @@ void CWindow::onAddOverlap(const std::string& segmentId)
 
     std::filesystem::path volpkgPath = std::filesystem::path(fVpkgPath.toStdString());
     std::filesystem::path pathsDir = volpkgPath / "paths";
-    QString tifxyzPath = QString::fromStdString(surfMeta->path.string());
+    QString tifxyzPath = QString::fromStdString(surf->path.string());
 
     _cmdRunner->setAddOverlapParams(QString::fromStdString(pathsDir.string()), tifxyzPath);
     _cmdRunner->execute(CommandLineToolRunner::Tool::SegAddOverlap);
@@ -811,8 +1044,8 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
         return;
     }
 
-    auto surfMeta = fVpkg->getSurface(segmentId.toStdString());
-    if (!surfMeta) {
+    auto surf = fVpkg->getSurface(segmentId.toStdString());
+    if (!surf) {
         QMessageBox::warning(this, tr("Error"), tr("Invalid surface selected."));
         return;
     }
@@ -846,7 +1079,7 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
         }
     }
 
-    const QString surfacePath = QString::fromStdString(surfMeta->path.string());
+    const QString surfacePath = QString::fromStdString(surf->path.string());
     QString volpkgRoot = fVpkgPath;
     if (volpkgRoot.isEmpty()) {
         volpkgRoot = QString::fromStdString(fVpkg->getVolpkgDirectory());
@@ -955,8 +1188,8 @@ void CWindow::onConvertToObj(const std::string& segmentId)
         return;
     }
 
-    auto surfMeta = fVpkg->getSurface(segmentId);
-    if (!surfMeta) {
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot convert to OBJ: Invalid segment or segment not loaded"));
         return;
     }
@@ -967,7 +1200,7 @@ void CWindow::onConvertToObj(const std::string& segmentId)
         return;
     }
 
-    std::filesystem::path tifxyzPath = surfMeta->path;
+    std::filesystem::path tifxyzPath = surf->path;
     std::filesystem::path objPath = tifxyzPath / (segmentId + ".obj");
 
     ConvertToObjDialog dlg(this,
@@ -992,17 +1225,13 @@ void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
         return;
     }
 
-    auto surfMeta = fVpkg->getSurface(segmentId);
-    if (!surfMeta) {
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Invalid segment or segment not loaded"));
         return;
     }
 
-    QuadSurface* surface = surfMeta->surface();
-    if (!surface) {
-        QMessageBox::warning(this, tr("Error"), tr("Cannot crop surface: Failed to load data"));
-        return;
-    }
+    QuadSurface* surface = surf.get();
 
     cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (!points || points->empty()) {
@@ -1085,7 +1314,7 @@ void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
         tempSurface->path = surface->path;
         tempSurface->id = surface->id;
         if (surface->meta) {
-            tempSurface->meta = new nlohmann::json(*surface->meta);
+            tempSurface->meta = std::make_unique<nlohmann::json>(*surface->meta);
         }
         for (const auto& ch : croppedChannels) {
             tempSurface->setChannel(ch.name, ch.data);
@@ -1108,25 +1337,25 @@ void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
 
     if (tempSurface && tempSurface->meta) {
         if (!surface->meta) {
-            surface->meta = new nlohmann::json(*tempSurface->meta);
+            surface->meta = std::make_unique<nlohmann::json>(*tempSurface->meta);
         } else {
             *surface->meta = *tempSurface->meta;
         }
         if (surface->meta) {
-            if (surfMeta->meta) {
-                *surfMeta->meta = *surface->meta;
+            if (surf->meta) {
+                *surf->meta = *surface->meta;
             } else {
-                surfMeta->meta = new nlohmann::json(*surface->meta);
+                surf->meta = std::make_unique<nlohmann::json>(*surface->meta);
             }
         }
     }
 
-    surfMeta->bbox = surface->bbox();
+    // Bbox will be recalculated lazily (invalidateCache was already called)
 
     if (_surf_col) {
-        _surf_col->setSurface(segmentId, surface, false, false);
+        _surf_col->setSurface(segmentId, surf, false, false);
         if (_surfID == segmentId) {
-            _surf_col->setSurface("segmentation", surface, false, false);
+            _surf_col->setSurface("segmentation", surf, false, false);
         }
     }
     if (_surfacePanel) {
@@ -1153,8 +1382,8 @@ void CWindow::onAlphaCompRefine(const std::string& segmentId)
         return;
     }
 
-    auto surfMeta = fVpkg->getSurface(segmentId);
-    if (!surfMeta) {
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot refine surface: Invalid segment or segment not loaded"));
         return;
     }
@@ -1171,7 +1400,7 @@ void CWindow::onAlphaCompRefine(const std::string& segmentId)
         return;
     }
 
-    QString srcPath = QString::fromStdString(surfMeta->path.string());
+    QString srcPath = QString::fromStdString(surf->path.string());
     QFileInfo srcInfo(srcPath);
 
     QString defaultOutput;
@@ -1454,8 +1683,8 @@ void CWindow::launchNeighborCopySecondPass()
 
 void CWindow::onAWSUpload(const std::string& segmentId)
 {
-    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
-    if (currentVolume == nullptr || !surfMeta) {
+    auto surf = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surf) {
         QMessageBox::warning(this, tr("Error"), tr("Cannot upload to AWS: No volume or invalid segment selected"));
         return;
     }
@@ -1464,7 +1693,7 @@ void CWindow::onAWSUpload(const std::string& segmentId)
         return;
     }
 
-    const std::filesystem::path segDirFs = surfMeta->path;
+    const std::filesystem::path segDirFs = surf->path;
     const QString  segDir   = QString::fromStdString(segDirFs.string());
     const QString  objPath  = QDir(segDir).filePath(QString::fromStdString(segmentId) + ".obj");
     const QString  flatObj  = QDir(segDir).filePath(QString::fromStdString(segmentId) + "_flatboi.obj");
@@ -1627,17 +1856,10 @@ void CWindow::onAWSUpload(const std::string& segmentId)
 
 void CWindow::onExportWidthChunks(const std::string& segmentId)
 {
-    auto surfMeta = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
-    if (currentVolume == nullptr || !surfMeta) {
+    auto surf = fVpkg ? fVpkg->getSurface(segmentId) : nullptr;
+    if (currentVolume == nullptr || !surf) {
         QMessageBox::warning(this, tr("Error"),
                              tr("Cannot export: No volume or invalid segment selected"));
-        return;
-    }
-
-    QuadSurface* surf = surfMeta->surface();
-    if (!surf) {
-        QMessageBox::warning(this, tr("Error"),
-                             tr("Cannot export: Failed to load segment surface"));
         return;
     }
 
@@ -1667,7 +1889,7 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
     // Determine export root directory: <volpkg>/export (not inside paths)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QString configuredRoot = settings.value("export/dir", "").toString().trimmed();
-    const QString segDir  = QString::fromStdString(surfMeta->path.string());
+    const QString segDir  = QString::fromStdString(surf->path.string());
     const QString segName = QString::fromStdString(segmentId);
 
     QString volpkgRoot = fVpkg ? QString::fromStdString(fVpkg->getVolpkgDirectory()) : QString();
@@ -1809,3 +2031,6 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
         statusBar()->showMessage(tr("Export cancelled"), 3000);
     }
 }
+
+// Include the MOC file for Q_OBJECT classes in anonymous namespace
+#include "CWindowContextMenu.moc"

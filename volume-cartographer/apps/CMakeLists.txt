@@ -34,6 +34,9 @@ target_link_libraries(vc_obj2tifxyz vc_core)
 add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 
+add_executable(vc_flatten src/vc_flatten.cpp)
+target_link_libraries(vc_flatten vc_core Boost::program_options)
+
 add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
 target_link_libraries(vc_tifxyz_inp_mask vc_core)
 
@@ -153,6 +156,7 @@ install(
         vc_tifxyz2obj
         vc_obj2tifxyz
         vc_obj2tifxyz_legacy
+        vc_flatten
         vc_tifxyz2rgb
         vc_rgb2tifxyz
         vc_tifxyz_winding

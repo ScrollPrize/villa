@@ -531,12 +531,12 @@ void MenuActionController::generateReviewReport()
     double grandTotalArea = 0.0;
 
     for (const auto& id : _window->fVpkg->getLoadedSurfaceIDs()) {
-        auto surfMeta = _window->fVpkg->getSurface(id);
-        if (!surfMeta || !surfMeta->surface() || !surfMeta->surface()->meta) {
+        auto surf = _window->fVpkg->getSurface(id);
+        if (!surf || !surf->meta) {
             continue;
         }
 
-        nlohmann::json* meta = surfMeta->surface()->meta;
+        nlohmann::json* meta = surf->meta.get();
         const auto tags = vc::json::tags_or_empty(meta);
         const auto itReviewed = tags.find("reviewed");
         if (itReviewed == tags.end() || !itReviewed->is_object()) {
@@ -550,7 +550,7 @@ void MenuActionController::generateReviewReport()
         if (!reviewDateRaw.empty()) {
             reviewDate = QString::fromStdString(reviewDateRaw).left(10);
         } else {
-            QFileInfo metaFile(QString::fromStdString(surfMeta->path.string()) + "/meta.json");
+            QFileInfo metaFile(QString::fromStdString(surf->path.string()) + "/meta.json");
             if (metaFile.exists()) {
                 reviewDate = metaFile.lastModified().toString("yyyy-MM-dd");
             }
@@ -659,8 +659,8 @@ void MenuActionController::surfaceFromSelection()
         return;
     }
 
-    auto surfMeta = _window->fVpkg->getSurface(_window->_surfID);
-    std::filesystem::path baseSegPath = surfMeta->path;
+    auto surf = _window->fVpkg->getSurface(_window->_surfID);
+    std::filesystem::path baseSegPath = surf->path;
     std::filesystem::path parentDir = baseSegPath.parent_path();
 
     int idx = 1;
@@ -733,13 +733,13 @@ void MenuActionController::runTeleaInpaint()
 
     for (QTreeWidgetItem* item : selectedItems) {
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-        auto surfMeta = _window->fVpkg ? _window->fVpkg->getSurface(id) : nullptr;
-        if (!surfMeta) {
+        auto surf = _window->fVpkg ? _window->fVpkg->getSurface(id) : nullptr;
+        if (!surf) {
             ++failCount;
             continue;
         }
 
-        const std::filesystem::path segDir = surfMeta->path;
+        const std::filesystem::path segDir = surf->path;
         const std::filesystem::path parentDir = segDir.parent_path();
         const std::filesystem::path metaJson = segDir / "meta.json";
 

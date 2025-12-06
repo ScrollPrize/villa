@@ -117,6 +117,7 @@ signals:
     void convertToObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
+    void abfFlattenRequested(const QString& segmentId);
     void awsUploadRequested(const QString& segmentId);
     void growSeedsRequested(const QString& segmentId, bool isExpand, bool isRandomSeed);
     void teleaInpaintRequested();

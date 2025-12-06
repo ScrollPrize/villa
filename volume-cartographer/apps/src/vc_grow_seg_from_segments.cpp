@@ -66,7 +66,7 @@ int main(int argc, char *argv[])
     float voxelsize = json::parse(std::ifstream(vol_path/"meta.json"))["voxelsize"];
 
     std::string name_prefix = "auto_grown_";
-    std::vector<SurfaceMeta*> surfaces;
+    std::vector<QuadSurface*> surfaces;
 
     std::filesystem::path meta_fn = src_path / "meta.json";
     if (!std::filesystem::exists(meta_fn)) {
@@ -81,8 +81,7 @@ int main(int argc, char *argv[])
     }
 
     json meta = json::parse(meta_f);
-    SurfaceMeta *src = new SurfaceMeta(src_path, meta);
-    src->readOverlapping();
+    QuadSurface *src = new QuadSurface(src_path, meta);
 
     for (const auto& entry : std::filesystem::directory_iterator(src_dir))
         if (std::filesystem::is_directory(entry)) {
@@ -103,12 +102,11 @@ int main(int argc, char *argv[])
             if (meta.value("format","NONE") != "tifxyz")
                 continue;
 
-            SurfaceMeta *sm;
-            if (entry.path().filename() == src->name())
+            QuadSurface *sm;
+            if (entry.path().filename() == src->id)
                 sm = src;
             else {
-                sm = new SurfaceMeta(entry.path(), meta);
-                sm->readOverlapping();
+                sm = new QuadSurface(entry.path(), meta);
             }
 
             surfaces.push_back(sm);

@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <arpa/inet.h>
 
-#include <opencv2/ximgproc.hpp>
+#include <omp.h>
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xarray.hpp)
@@ -24,23 +24,38 @@
 
 #include "vc/core/util/Slicing.hpp"
 #include <vc/core/util/GridStore.hpp>
+#include "vc/core/util/Thinning.hpp"
 #include "support.hpp"
 #include "vc/core/util/LifeTime.hpp"
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
-static std::pair<SkeletonGraph, cv::Mat> generate_skeleton_graph(const cv::Mat& binary_slice, const po::variables_map& vm) {
-    cv::Mat skeleton_img;
-    cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
-    SkeletonGraph skeleton_graph = trace_skeleton_segments(skeleton_img, vm);
-    return {std::move(skeleton_graph), std::move(skeleton_img)};
-}
-
 enum class SliceDirection { XY, XZ, YZ };
 
 void run_generate(const po::variables_map& vm);
 void run_convert(const po::variables_map& vm);
+
+static void print_usage() {
+    std::cout << "vc_gen_normalgrids: Generate and manage normal grids for volume data.\n\n"
+              << "Usage: vc_gen_normalgrids [command] [options]\n\n"
+              << "Commands:\n"
+              << "  generate   Generate normal grids for all slices in a Zarr volume (default).\n"
+              << "  convert    Recursively find and convert GridStore files to the latest version.\n\n"
+              << "Examples:\n"
+              << "  vc_gen_normalgrids -i /path/to/volume.zarr -o /path/to/output/\n"
+              << "  vc_gen_normalgrids -i vol.zarr -o out/ --sparse-volume 4\n"
+              << "  vc_gen_normalgrids convert -i /path/to/grids/\n\n"
+              << "Generate options:\n"
+              << "  -i, --input         Input Zarr volume path (required)\n"
+              << "  -o, --output        Output directory path (required)\n"
+              << "  --spiral-step       Spiral step for resampling paths (default: 20.0)\n"
+              << "  --grid-step         Grid cell size for spatial indexing (default: 64)\n"
+              << "  --sparse-volume     Process every N-th slice, 1 = all (default: 1)\n\n"
+              << "Convert options:\n"
+              << "  -i, --input         Input directory to scan for .grid files (required)\n"
+              << "  --grid-step         New grid cell size (default: 64)\n";
+}
 
 int main(int argc, char* argv[]) {
     po::options_description global("Global options");
@@ -58,51 +73,104 @@ int main(int argc, char* argv[]) {
         positional(pos).
         allow_unregistered().
         run();
-    
+
     po::store(parsed, vm);
 
-    if (vm.count("help") || !vm.count("command")) {
-        std::cout << "Usage: vc_gen_normalgrids <command> [options]\n\n"
-                  << "Commands:\n"
-                  << "  generate   Generate normal grids for all slices in a Zarr volume.\n"
-                  << "  convert    Recursively find and convert GridStore files to the latest version.\n\n";
+    // Determine command - default to "generate" if not specified or not recognized
+    std::string cmd = "generate";
+    bool explicit_command = false;
+    if (vm.count("command")) {
+        std::string maybe_cmd = vm["command"].as<std::string>();
+        if (maybe_cmd == "generate" || maybe_cmd == "convert") {
+            cmd = maybe_cmd;
+            explicit_command = true;
+        }
+        // Otherwise treat it as an option for generate (e.g., user typed -i directly)
+    }
+
+    // Show help if no args or if explicitly requested with --help only
+    if (argc == 1 || (vm.count("help") && argc == 2)) {
+        print_usage();
         return 0;
     }
 
-    std::string cmd = vm["command"].as<std::string>();
-    
     if (cmd == "generate") {
-        po::options_description generate_desc("`generate` options");
+        po::options_description generate_desc(
+            "vc_gen_normalgrids generate: Generate normal grids for all slices in a Zarr volume.\n\n"
+            "Uses chunked I/O for efficient processing of large volumes. Processes slices\n"
+            "in all three directions (XY, XZ, YZ) and generates .grid files containing\n"
+            "traced skeleton paths with normal information.\n\n"
+            "Options");
         generate_desc.add_options()
+            ("help,h", "Print this help message")
             ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
             ("output,o", po::value<std::string>()->required(), "Output directory path")
-            ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling")
-            ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore");
+            ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling paths")
+            ("grid-step", po::value<int>()->default_value(64), "Grid cell size for spatial indexing")
+            ("sparse-volume", po::value<int>()->default_value(1), "Process every N-th slice (1 = all slices)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
-        opts.erase(opts.begin()); // Erase the command
-        
+        if (explicit_command && !opts.empty()) {
+            opts.erase(opts.begin()); // Erase the command only if explicitly given
+        }
+
+        // Check for help before parsing required options
+        for (const auto& opt : opts) {
+            if (opt == "-h" || opt == "--help") {
+                std::cout << generate_desc << std::endl;
+                return 0;
+            }
+        }
+
         po::variables_map generate_vm;
-        po::store(po::command_line_parser(opts).options(generate_desc).run(), generate_vm);
-        po::notify(generate_vm);
+        try {
+            po::store(po::command_line_parser(opts).options(generate_desc).run(), generate_vm);
+            po::notify(generate_vm);
+        } catch (const po::error& e) {
+            std::cerr << "Error: " << e.what() << "\n\n";
+            std::cout << generate_desc << std::endl;
+            return 1;
+        }
         run_generate(generate_vm);
 
     } else if (cmd == "convert") {
-        po::options_description convert_desc("`convert` options");
+        po::options_description convert_desc(
+            "vc_gen_normalgrids convert: Convert GridStore files to the latest format.\n\n"
+            "Recursively scans a directory for .grid files and converts any older\n"
+            "format versions to the current version.\n\n"
+            "Options");
         convert_desc.add_options()
+            ("help,h", "Print this help message")
             ("input,i", po::value<std::string>()->required(), "Input directory to scan for GridStore files")
             ("grid-step", po::value<int>()->default_value(64), "New grid cell size for the GridStore");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
-        opts.erase(opts.begin());
+        if (explicit_command && !opts.empty()) {
+            opts.erase(opts.begin()); // Erase the command only if explicitly given
+        }
+
+        // Check for help before parsing required options
+        for (const auto& opt : opts) {
+            if (opt == "-h" || opt == "--help") {
+                std::cout << convert_desc << std::endl;
+                return 0;
+            }
+        }
 
         po::variables_map convert_vm;
-        po::store(po::command_line_parser(opts).options(convert_desc).run(), convert_vm);
-        po::notify(convert_vm);
+        try {
+            po::store(po::command_line_parser(opts).options(convert_desc).run(), convert_vm);
+            po::notify(convert_vm);
+        } catch (const po::error& e) {
+            std::cerr << "Error: " << e.what() << "\n\n";
+            std::cout << convert_desc << std::endl;
+            return 1;
+        }
         run_convert(convert_vm);
 
     } else {
-        std::cerr << "Error: Unknown command '" << cmd << "'" << std::endl;
+        std::cerr << "Error: Unknown command '" << cmd << "'\n\n";
+        print_usage();
         return 1;
     }
 
@@ -209,6 +277,9 @@ void run_generate(const po::variables_map& vm) {
     auto shape = ds->shape();
 
     double spiral_step = vm["spiral-step"].as<double>();
+    int grid_step = vm["grid-step"].as<int>();
+    int sparse_volume = vm["sparse-volume"].as<int>();
+    if (sparse_volume < 1) sparse_volume = 1;
 
     fs::path output_fs_path(output_path);
     fs::create_directories(output_fs_path / "xy");
@@ -220,14 +291,20 @@ void run_generate(const po::variables_map& vm) {
 
     nlohmann::json metadata;
     metadata["spiral-step"] = spiral_step;
-    metadata["grid-step"] = vm["grid-step"].as<int>();
+    metadata["grid-step"] = grid_step;
+    metadata["sparse-volume"] = sparse_volume;
     std::ofstream o(output_fs_path / "metadata.json");
     o << std::setw(4) << metadata << std::endl;
 
     ChunkCache<uint8_t> cache(10llu*1024*1024*1024);
 
+    int num_threads = omp_get_max_threads();
+    if (num_threads == 0) num_threads = 1;
+    int chunk_size_tgt = num_threads * sparse_volume;
+
     size_t total_slices_all_dirs = shape[0] + shape[1] + shape[2];
     std::atomic<size_t> total_processed_all_dirs = 0;
+    std::atomic<size_t> total_skipped_all_dirs = 0;
 
     for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
         std::atomic<size_t> processed = 0;
@@ -235,7 +312,7 @@ void run_generate(const po::variables_map& vm) {
         std::atomic<size_t> total_size = 0;
         std::atomic<size_t> total_segments = 0;
         std::atomic<size_t> total_buckets = 0;
-        
+
         struct TimingStats {
             std::atomic<size_t> count;
             std::atomic<double> total_time;
@@ -255,130 +332,204 @@ void run_generate(const po::variables_map& vm) {
             case SliceDirection::YZ: num_slices = shape[2]; dir_str = "yz"; break;
         }
 
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t i = 0; i < num_slices; ++i) {
-            std::vector<size_t> slice_shape;
-            cv::Vec3i offset;
-            cv::Mat slice_mat;
+        // Chunked I/O processing - read batches of slices at once
+        for (size_t chunk_start = 0; chunk_start < num_slices; chunk_start += chunk_size_tgt) {
+            size_t chunk_end = std::min(chunk_start + static_cast<size_t>(chunk_size_tgt), num_slices);
+            size_t chunk_size = chunk_end - chunk_start;
 
-            switch (dir) {
-                case SliceDirection::XY:
-                    slice_shape = {1, shape[1], shape[2]};
-                    offset = {(int)i, 0, 0};
-                    slice_mat = cv::Mat(shape[1], shape[2], CV_8U);
+            // Check if all sparse-sampled files in this chunk already exist
+            bool all_exist = true;
+            for (size_t i = chunk_start; i < chunk_end; ++i) {
+                if (i % sparse_volume != 0) continue;
+                char filename[256];
+                snprintf(filename, sizeof(filename), "%06zu.grid", i);
+                std::string out_path = (output_fs_path / dir_str / filename).string();
+                if (!fs::exists(out_path)) {
+                    all_exist = false;
                     break;
-                case SliceDirection::XZ:
-                    slice_shape = {shape[0], 1, shape[2]};
-                    offset = {0, (int)i, 0};
-                    slice_mat = cv::Mat(shape[0], shape[2], CV_8U);
-                    break;
-                case SliceDirection::YZ:
-                    slice_shape = {shape[0], shape[1], 1};
-                    offset = {0, 0, (int)i};
-                    slice_mat = cv::Mat(shape[0], shape[1], CV_8U);
-                    break;
+                }
             }
 
-            char filename[256];
-            snprintf(filename, sizeof(filename), "%06zu.grid", i);
-            std::string out_path = (output_fs_path / dir_str / filename).string();
-            std::string tmp_path = out_path + ".tmp";
-
-            if (fs::exists(out_path)) {
-                skipped++;
-                processed++;
-                total_processed_all_dirs++;
+            if (all_exist) {
+                skipped += chunk_size;
+                processed += chunk_size;
+                total_processed_all_dirs += chunk_size;
+                total_skipped_all_dirs += chunk_size;
                 continue;
             }
 
-            xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
-            
-            ALifeTime t;
-            readArea3D(slice_data, offset, ds.get(), &cache);
-            t.mark("read");
+            // Build chunk shape and offset based on direction
+            std::vector<size_t> chunk_shape;
+            cv::Vec3i chunk_offset;
 
-            for (int z = 0; z < slice_mat.rows; ++z) {
-                for (int y = 0; y < slice_mat.cols; ++y) {
-                    switch (dir) {
-                        case SliceDirection::XY: slice_mat.at<uint8_t>(z, y) = slice_data(0, z, y); break;
-                        case SliceDirection::XZ: slice_mat.at<uint8_t>(z, y) = slice_data(z, 0, y); break;
-                        case SliceDirection::YZ: slice_mat.at<uint8_t>(z, y) = slice_data(z, y, 0); break;
-                    }
-                }
-            }
-            
-            cv::Mat binary_slice = slice_mat > 0;
-
-            if (cv::countNonZero(binary_slice) == 0) {
-                std::ofstream ofs(out_path); // Create empty file
-                processed++;
-            } else {
-                auto skeleton_res = generate_skeleton_graph(binary_slice, vm);
-                t.mark("skeleton");
-                auto& skeleton_graph = skeleton_res.first;
-
-                vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), vm["grid-step"].as<int>());
-                populate_normal_grid(skeleton_graph, grid_store, spiral_step);
-                grid_store.save(tmp_path);
-                fs::rename(tmp_path, out_path);
-                t.mark("grid");
-
-                if (i % 100 == 0) {
-                    snprintf(filename, sizeof(filename), "%06zu.jpg", i);
-                    cv::imwrite((output_fs_path / (dir_str + "_img") / filename).string(), binary_slice);
-                }
-                
-                size_t file_size = fs::file_size(out_path);
-                size_t num_segments = grid_store.numSegments();
-                size_t num_buckets = grid_store.numNonEmptyBuckets();
-
-                std::cout << dir_str << " Slice " << i << ": " << t.report() << std::endl;
-
-                for(const auto& mark : t.getMarks()) {
-                    timings[mark.first].count++;
-                    timings[mark.first].total_time += mark.second;
-                }
-
-                total_size += file_size;
-                total_segments += num_segments;
-                total_buckets += num_buckets;
-                processed++;
-                total_processed_all_dirs++;
+            switch (dir) {
+                case SliceDirection::XY:
+                    chunk_shape = {chunk_size, shape[1], shape[2]};
+                    chunk_offset = {(int)chunk_start, 0, 0};
+                    break;
+                case SliceDirection::XZ:
+                    chunk_shape = {shape[0], chunk_size, shape[2]};
+                    chunk_offset = {0, (int)chunk_start, 0};
+                    break;
+                case SliceDirection::YZ:
+                    chunk_shape = {shape[0], shape[1], chunk_size};
+                    chunk_offset = {0, 0, (int)chunk_start};
+                    break;
             }
 
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
-                std::lock_guard<std::mutex> lock(report_mutex);
-                // Re-check in case another thread just reported
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
-                    last_report_time = now;
-                    size_t p = processed; // Read atomic once
-                    size_t total_p = total_processed_all_dirs;
-                    auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-                    double slices_per_second = (p > skipped) ? (p - skipped) / elapsed_seconds : 0.0;
-                    if (slices_per_second == 0) slices_per_second = 1; // Avoid division by zero
-                    double remaining_seconds = (total_slices_all_dirs - total_p) / slices_per_second;
-                    
-                    int rem_min = static_cast<int>(remaining_seconds) / 60;
-                    int rem_sec = static_cast<int>(remaining_seconds) % 60;
+            // Read entire chunk at once (KEY OPTIMIZATION)
+            ALifeTime chunk_timer;
+            xt::xtensor<uint8_t, 3, xt::layout_type::column_major> chunk_data =
+                xt::xtensor<uint8_t, 3, xt::layout_type::column_major>::from_shape(chunk_shape);
+            chunk_timer.mark("xtensor init");
+            readArea3D(chunk_data, chunk_offset, ds.get(), &cache);
+            chunk_timer.mark("read_chunk");
 
-                    std::cout << dir_str << " " << p << "/" << num_slices
-                                << " | Total " << total_p << "/" << total_slices_all_dirs
-                                << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
-                                << ", skipped: " << skipped
-                                << ", ETA: " << rem_min << "m " << rem_sec << "s";
-                    if (p > skipped) {
-                        std::cout << ", avg size: " << (total_size / (p - skipped))
-                                  << ", avg segments: " << (total_segments / (p - skipped))
-                                  << ", avg buckets: " << (total_buckets / (p - skipped));
-                    }
+            for (const auto& mark : chunk_timer.getMarks()) {
+                timings[mark.first].count++;
+                timings[mark.first].total_time += mark.second;
+            }
 
-                    for(auto const& [key, val] : timings) {
-                        if (val.count > 0) {
-                            std::cout << ", avg " << key << ": " << (val.total_time / val.count) << "s";
+            // Process slices in parallel from pre-loaded chunk
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t i_chunk = 0; i_chunk < chunk_size; ++i_chunk) {
+                size_t i = chunk_start + i_chunk;
+
+                // Skip slices not in sparse sampling
+                if (i % sparse_volume != 0) {
+                    processed++;
+                    total_processed_all_dirs++;
+                    continue;
+                }
+
+                char filename[256];
+                snprintf(filename, sizeof(filename), "%06zu.grid", i);
+                std::string out_path = (output_fs_path / dir_str / filename).string();
+                std::string tmp_path = out_path + ".tmp";
+
+                if (fs::exists(out_path)) {
+                    skipped++;
+                    processed++;
+                    total_processed_all_dirs++;
+                    total_skipped_all_dirs++;
+                    continue;
+                }
+
+                // Extract slice from chunk_data into cv::Mat
+                cv::Mat slice_mat;
+                switch (dir) {
+                    case SliceDirection::XY:
+                        slice_mat = cv::Mat(shape[1], shape[2], CV_8U);
+                        for (int z = 0; z < slice_mat.rows; ++z) {
+                            for (int y = 0; y < slice_mat.cols; ++y) {
+                                slice_mat.at<uint8_t>(z, y) = chunk_data(i_chunk, z, y);
+                            }
                         }
+                        break;
+                    case SliceDirection::XZ:
+                        slice_mat = cv::Mat(shape[0], shape[2], CV_8U);
+                        for (int z = 0; z < slice_mat.rows; ++z) {
+                            for (int y = 0; y < slice_mat.cols; ++y) {
+                                slice_mat.at<uint8_t>(z, y) = chunk_data(z, i_chunk, y);
+                            }
+                        }
+                        break;
+                    case SliceDirection::YZ:
+                        slice_mat = cv::Mat(shape[0], shape[1], CV_8U);
+                        for (int z = 0; z < slice_mat.rows; ++z) {
+                            for (int y = 0; y < slice_mat.cols; ++y) {
+                                slice_mat.at<uint8_t>(z, y) = chunk_data(z, y, i_chunk);
+                            }
+                        }
+                        break;
+                }
+
+                cv::Mat binary_slice = slice_mat > 0;
+
+                ALifeTime t;
+                if (cv::countNonZero(binary_slice) == 0) {
+                    std::ofstream ofs(out_path); // Create empty file
+                    processed++;
+                    total_processed_all_dirs++;
+                } else {
+                    // Use customThinning for direct trace output
+                    cv::Mat thinned_slice;
+                    std::vector<std::vector<cv::Point>> traces;
+                    customThinning(binary_slice, thinned_slice, &traces);
+                    t.mark("thinning");
+
+                    if (traces.empty()) {
+                        std::ofstream ofs(out_path); // Create empty file for empty traces
+                        processed++;
+                        total_processed_all_dirs++;
+                    } else {
+                        vc::core::util::GridStore grid_store(cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), grid_step);
+                        populate_normal_grid(traces, grid_store, spiral_step);
+                        grid_store.save(tmp_path);
+                        fs::rename(tmp_path, out_path);
+                        t.mark("grid");
+
+                        if (i % 100 == 0) {
+                            snprintf(filename, sizeof(filename), "%06zu.jpg", i);
+                            cv::imwrite((output_fs_path / (dir_str + "_img") / filename).string(), binary_slice);
+                        }
+
+                        size_t file_size = fs::file_size(out_path);
+                        size_t num_segments = grid_store.numSegments();
+                        size_t num_buckets = grid_store.numNonEmptyBuckets();
+
+                        for (const auto& mark : t.getMarks()) {
+                            timings[mark.first].count++;
+                            timings[mark.first].total_time += mark.second;
+                        }
+
+                        total_size += file_size;
+                        total_segments += num_segments;
+                        total_buckets += num_buckets;
+                        processed++;
+                        total_processed_all_dirs++;
                     }
-                    std::cout << std::endl;
+                }
+
+                // Periodic status reporting
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
+                    std::lock_guard<std::mutex> lock(report_mutex);
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
+                        last_report_time = now;
+                        size_t p = processed;
+                        size_t s = skipped;
+                        size_t total_p = total_processed_all_dirs;
+                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+                        double slices_per_second = (p > s) ? (p - s) / elapsed_seconds : 0.0;
+                        if (slices_per_second == 0) slices_per_second = 1;
+                        double remaining_seconds = (total_slices_all_dirs - total_p) / slices_per_second;
+
+                        int rem_min = static_cast<int>(remaining_seconds) / 60;
+                        int rem_sec = static_cast<int>(remaining_seconds) % 60;
+
+                        std::cout << dir_str << " " << p << "/" << num_slices
+                                  << " | Total " << total_p << "/" << total_slices_all_dirs
+                                  << " (" << std::fixed << std::setprecision(1) << (100.0 * total_p / total_slices_all_dirs) << "%)"
+                                  << ", skipped: " << s
+                                  << ", ETA: " << rem_min << "m " << rem_sec << "s";
+                        if (p > s) {
+                            std::cout << ", avg size: " << (total_size / (p - s))
+                                      << ", avg segments: " << (total_segments / (p - s))
+                                      << ", avg buckets: " << (total_buckets / (p - s));
+                        }
+
+                        for (const auto& [key, val] : timings) {
+                            if (val.count > 0) {
+                                double avg_time = val.total_time / val.count;
+                                if (key == "read_chunk") {
+                                    avg_time /= num_threads;
+                                }
+                                std::cout << ", avg " << key << ": " << avg_time << "s";
+                            }
+                        }
+                        std::cout << std::endl;
+                    }
                 }
             }
         }

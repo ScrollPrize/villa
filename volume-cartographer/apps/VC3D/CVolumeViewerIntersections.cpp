@@ -62,7 +62,8 @@ static bool intersectionLinesEqual(const std::vector<IntersectionLine>& a,
 
 void CVolumeViewer::renderIntersections()
 {
-    if (!volume || !volume->zarrDataset() || !_surf)
+    auto surf = _surf_weak.lock();
+    if (!volume || !volume->zarrDataset() || !surf)
         return;
 
     // Refresh cached surface pointers if targets changed or if a surface object
@@ -74,8 +75,8 @@ void CVolumeViewer::renderIntersections()
         }
         _cachedIntersectSurfaces.reserve(_intersect_tgts.size());
         for (const auto& key : _intersect_tgts) {
-            if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
-                _cachedIntersectSurfaces[key] = surf;
+            if (auto* qs = dynamic_cast<QuadSurface*>(_surf_col->surface(key).get())) {
+                _cachedIntersectSurfaces[key] = qs;
             }
         }
     };
@@ -83,7 +84,7 @@ void CVolumeViewer::renderIntersections()
     bool refreshCachedSurfaces = _cachedIntersectSurfaces.size() != _intersect_tgts.size();
     if (!refreshCachedSurfaces && _surf_col) {
         for (const auto& key : _intersect_tgts) {
-            auto* current = dynamic_cast<QuadSurface*>(_surf_col->surface(key));
+            auto* current = dynamic_cast<QuadSurface*>(_surf_col->surface(key).get());
             const auto cachedIt = _cachedIntersectSurfaces.find(key);
             if (cachedIt == _cachedIntersectSurfaces.end() || cachedIt->second != current) {
                 refreshCachedSurfaces = true;
@@ -122,9 +123,13 @@ void CVolumeViewer::renderIntersections()
         }
     };
 
-    PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf);
-    QuadSurface* activeSegSurface =
-        _surf_col ? dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation")) : nullptr;
+    PlaneSurface *plane = dynamic_cast<PlaneSurface*>(surf.get());
+    std::shared_ptr<Surface> activeSegSurfaceHolder;  // Keep surface alive during this scope
+    QuadSurface* activeSegSurface = nullptr;
+    if (_surf_col) {
+        activeSegSurfaceHolder = _surf_col->surface("segmentation");
+        activeSegSurface = dynamic_cast<QuadSurface*>(activeSegSurfaceHolder.get());
+    }
     const bool segmentationAliasRequested = _intersect_tgts.count("segmentation") > 0;
 
 
@@ -500,8 +505,8 @@ void CVolumeViewer::setIntersects(const std::set<std::string> &set)
     if (_surf_col) {
         _cachedIntersectSurfaces.reserve(set.size());
         for (const auto& key : set) {
-            if (auto* surf = dynamic_cast<QuadSurface*>(_surf_col->surface(key))) {
-                _cachedIntersectSurfaces[key] = surf;
+            if (auto* qs = dynamic_cast<QuadSurface*>(_surf_col->surface(key).get())) {
+                _cachedIntersectSurfaces[key] = qs;
             }
         }
     }

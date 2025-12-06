@@ -91,7 +91,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/SurfaceMeta.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
 
@@ -498,11 +497,12 @@ CWindow::CWindow() :
     _surf_col = new CSurfaceCollection();
 
     //_surf_col->setSurface("manual plane", new PlaneSurface({2000,2000,2000},{1,1,1}));
-    _surf_col->setSurface("xy plane", new PlaneSurface({2000,2000,2000},{0,0,1}));
-    _surf_col->setSurface("xz plane", new PlaneSurface({2000,2000,2000},{0,1,0}));
-    _surf_col->setSurface("yz plane", new PlaneSurface({2000,2000,2000},{1,0,0}));
+    _surf_col->setSurface("xy plane", std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,0,1}));
+    _surf_col->setSurface("xz plane", std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,1,0}));
+    _surf_col->setSurface("yz plane", std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
 
     connect(_surf_col, &CSurfaceCollection::sendPOIChanged, this, &CWindow::onFocusPOIChanged);
+    connect(_surf_col, &CSurfaceCollection::sendSurfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
     _viewerManager = std::make_unique<ViewerManager>(_surf_col, _point_collection, chunk_cache, this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
@@ -823,7 +823,7 @@ CVolumeViewer* CWindow::segmentationViewer() const
 
 void CWindow::clearSurfaceSelection()
 {
-    _surf = nullptr;
+    _surf_weak.reset();
     _surfID.clear();
 
     if (_surfacePanel) {
@@ -906,7 +906,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     }
 
     onManualPlaneChanged();
-    applySlicePlaneOrientation(_surf_col ? _surf_col->surface("segmentation") : nullptr);
+    applySlicePlaneOrientation(_surf_col ? _surf_col->surface("segmentation").get() : nullptr);
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -948,14 +948,14 @@ void CWindow::recordFocusHistory(const POI& poi)
     FocusHistoryEntry entry;
     entry.position = poi.p;
     entry.normal = poi.n;
-    entry.source = poi.src;
+    entry.surfaceId = poi.surfaceId;
 
     if (_focusHistoryIndex >= 0 &&
         _focusHistoryIndex < static_cast<int>(_focusHistory.size())) {
         const auto& current = _focusHistory[_focusHistoryIndex];
         const float positionDelta = cv::norm(current.position - entry.position);
         const float normalDelta = cv::norm(current.normal - entry.normal);
-        if (positionDelta < 1e-4f && normalDelta < 1e-4f && current.source == entry.source) {
+        if (positionDelta < 1e-4f && normalDelta < 1e-4f && current.surfaceId == entry.surfaceId) {
             return;
         }
     }
@@ -995,12 +995,12 @@ bool CWindow::stepFocusHistory(int direction)
     _focusHistoryIndex = targetIndex;
     _navigatingFocusHistory = true;
     const auto& entry = _focusHistory[_focusHistoryIndex];
-    centerFocusAt(entry.position, entry.normal, entry.source, false);
+    centerFocusAt(entry.position, entry.normal, entry.surfaceId, false);
     _navigatingFocusHistory = false;
     return true;
 }
 
-bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory)
+bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory)
 {
     if (!_surf_col) {
         return false;
@@ -1015,10 +1015,10 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
     if (cv::norm(normal) > 0.0) {
         focus->n = normal;
     }
-    if (source) {
-        focus->src = source;
-    } else if (!focus->src) {
-        focus->src = _surf_col->surface("segmentation");
+    if (!sourceId.empty()) {
+        focus->surfaceId = sourceId;
+    } else if (focus->surfaceId.empty()) {
+        focus->surfaceId = "segmentation";
     }
 
     _surf_col->setPOI("focus", focus);
@@ -1027,7 +1027,11 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
         recordFocusHistory(*focus);
     }
 
-    Surface* orientationSource = focus->src ? focus->src : _surf_col->surface("segmentation");
+    // Get surface for orientation - look up by ID
+    Surface* orientationSource = _surf_col->surfaceRaw(focus->surfaceId);
+    if (!orientationSource) {
+        orientationSource = _surf_col->surfaceRaw("segmentation");
+    }
     applySlicePlaneOrientation(orientationSource);
 
     return true;
@@ -1044,7 +1048,7 @@ bool CWindow::centerFocusOnCursor()
         return false;
     }
 
-    return centerFocusAt(cursor->p, cursor->n, cursor->src, true);
+    return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId, true);
 }
 
 void CWindow::setSegmentationCursorMirroring(bool enabled)
@@ -1121,11 +1125,11 @@ void CWindow::CreateWidgets(void)
                 if (!fVpkg) {
                     return;
                 }
-                auto surfMeta = fVpkg->getSurface(segmentId.toStdString());
-                if (!surfMeta) {
+                auto surf = fVpkg->getSurface(segmentId.toStdString());
+                if (!surf) {
                     return;
                 }
-                const QString path = QString::fromStdString(surfMeta->path.string());
+                const QString path = QString::fromStdString(surf->path.string());
                 QApplication::clipboard()->setText(path);
                 statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
@@ -1160,6 +1164,10 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::slimFlattenRequested,
             this, [this](const QString& segmentId) {
                 onSlimFlatten(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::abfFlattenRequested,
+            this, [this](const QString& segmentId) {
+                onABFFlatten(segmentId.toStdString());
             });
     connect(_surfacePanel.get(), &SurfacePanelController::awsUploadRequested,
             this, [this](const QString& segmentId) {
@@ -2344,7 +2352,12 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
     }
     else if (modifiers & Qt::ControlModifier) {
         std::cout << "clicked on vol loc " << vol_loc << std::endl;
-        centerFocusAt(vol_loc, normal, surf, true);
+        // Get the surface ID from the surface collection
+        std::string surfId;
+        if (_surf_col && surf) {
+            surfId = _surf_col->findSurfaceId(surf);
+        }
+        centerFocusAt(vol_loc, normal, surfId, true);
     }
     else {
     }
@@ -2358,20 +2371,29 @@ void CWindow::onManualPlaneChanged(void)
         normal[i] = spNorm[i]->value();
     }
 
-    PlaneSurface *plane = dynamic_cast<PlaneSurface*>(_surf_col->surface("manual plane"));
+    auto planeShared = _surf_col->surface("manual plane");
+    PlaneSurface *plane = dynamic_cast<PlaneSurface*>(planeShared.get());
 
     if (!plane)
         return;
 
     plane->setNormal(normal);
-    _surf_col->setSurface("manual plane", plane);
+    _surf_col->setSurface("manual plane", planeShared);
 }
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
 {
     const std::string previousSurfId = _surfID;
     _surfID = surfaceId.toStdString();
-    _surf = surface;
+
+    // Look up the shared_ptr by ID
+    if (fVpkg && !_surfID.empty()) {
+        _surf_weak = fVpkg->getSurface(_surfID);
+    } else {
+        _surf_weak.reset();
+    }
+
+    auto surf = _surf_weak.lock();
 
     if (_surfID != previousSurfId) {
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -2382,12 +2404,12 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
 
         // Handle approval mask when switching segments
         if (_segmentationModule) {
-            _segmentationModule->onActiveSegmentChanged(_surf);
+            _segmentationModule->onActiveSegmentChanged(surf.get());
         }
     }
 
-    if (_surf) {
-        applySlicePlaneOrientation(_surf);
+    if (surf) {
+        applySlicePlaneOrientation(surf.get());
     } else {
         applySlicePlaneOrientation();
     }
@@ -2397,26 +2419,42 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     }
 }
 
+void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
+{
+    // Called BEFORE surface deletion - clear all references to prevent use-after-free
+
+    // Clear if this is our current active surface
+    auto currentSurf = _surf_weak.lock();
+    if (currentSurf && currentSurf == surf) {
+        _surf_weak.reset();
+        _surfID.clear();
+    }
+
+    // Focus history uses string IDs now, so no cleanup needed for surface pointers
+    // (the ID remains valid for lookup - will just return nullptr if surface is gone)
+}
+
 void CWindow::onEditMaskPressed(void)
 {
-    if (!_surf)
+    auto surf = _surf_weak.lock();
+    if (!surf)
         return;
 
-    std::filesystem::path path = _surf->path/"mask.tif";
+    std::filesystem::path path = surf->path/"mask.tif";
 
     if (!std::filesystem::exists(path)) {
         cv::Mat_<uint8_t> mask;
         cv::Mat_<cv::Vec3f> coords; // Not used after generation
 
         // Generate the binary mask at raw points resolution
-        render_binary_mask(_surf, mask, coords, 1.0f);
+        render_binary_mask(surf.get(), mask, coords, 1.0f);
 
         // Save just the mask as single layer
         cv::imwrite(path.string(), mask);
 
         // Update metadata
-        (*_surf->meta)["date_last_modified"] = get_surface_time_str();
-        _surf->save_meta();
+        (*surf->meta)["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
     }
 
     QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
@@ -2424,8 +2462,9 @@ void CWindow::onEditMaskPressed(void)
 
 void CWindow::onAppendMaskPressed(void)
 {
-    if (!_surf || !currentVolume) {
-        if (!_surf) {
+    auto surf = _surf_weak.lock();
+    if (!surf || !currentVolume) {
+        if (!surf) {
             QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
         } else {
             QMessageBox::warning(this, tr("Error"), tr("No volume loaded."));
@@ -2433,7 +2472,7 @@ void CWindow::onAppendMaskPressed(void)
         return;
     }
 
-    std::filesystem::path path = _surf->path/"mask.tif";
+    std::filesystem::path path = surf->path/"mask.tif";
 
     cv::Mat_<uint8_t> mask;
     cv::Mat_<uint8_t> img;
@@ -2462,22 +2501,22 @@ void CWindow::onAppendMaskPressed(void)
 
             if (useComposite) {
                 // Use composite rendering from the segmentation viewer
-                img = segViewer->renderCompositeForSurface(_surf, maskSize);
+                img = segViewer->renderCompositeForSurface(surf, maskSize);
             } else {
                 // Original single-layer rendering - use same approach as render_binary_mask
-                cv::Size rawSize = _surf->rawPointsPtr()->size();
-                cv::Vec3f ptr = _surf->pointer();
+                cv::Size rawSize = surf->rawPointsPtr()->size();
+                cv::Vec3f ptr = surf->pointer();
                 cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
 
                 // Use surface's scale so sx = _scale/_scale = 1.0, sampling 1:1 from raw points
-                float surfScale = _surf->scale()[0];
+                float surfScale = surf->scale()[0];
                 cv::Mat_<cv::Vec3f> coords;
-                _surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
+                surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
 
                 std::cout << "[AppendMask non-composite] rawSize: " << rawSize.width << "x" << rawSize.height
                           << ", maskSize: " << maskSize.width << "x" << maskSize.height
                           << ", coords size: " << coords.cols << "x" << coords.rows
-                          << ", surface._scale: " << _surf->scale()[0] << std::endl;
+                          << ", surface._scale: " << surf->scale()[0] << std::endl;
 
                 // Sample a few coords to verify they're in native voxel space
                 if (coords.rows > 4 && coords.cols > 4) {
@@ -2508,15 +2547,15 @@ void CWindow::onAppendMaskPressed(void)
         } else {
             // No existing mask, generate both mask and image at raw points resolution
             cv::Mat_<cv::Vec3f> coords;
-            render_binary_mask(_surf, mask, coords, 1.0f);
+            render_binary_mask(surf.get(), mask, coords, 1.0f);
             cv::Size maskSize = mask.size();
 
             if (useComposite) {
                 // Use composite rendering for image
-                img = segViewer->renderCompositeForSurface(_surf, maskSize);
+                img = segViewer->renderCompositeForSurface(surf, maskSize);
             } else {
                 // Original rendering
-                render_surface_image(_surf, mask, img, ds, chunk_cache, 1.0f);
+                render_surface_image(surf.get(), mask, img, ds, chunk_cache, 1.0f);
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
@@ -2531,8 +2570,8 @@ void CWindow::onAppendMaskPressed(void)
         }
 
         // Update metadata
-        (*_surf->meta)["date_last_modified"] = get_surface_time_str();
-        _surf->save_meta();
+        (*surf->meta)["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
 
         QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
 
@@ -2564,7 +2603,7 @@ void CWindow::onSegmentationDirChanged(int index)
         _surf_col->setSurface("segmentation", nullptr, true);
 
         // Clear current surface selection
-        _surf = nullptr;
+        _surf_weak.reset();
         _surfID.clear();
         treeWidgetSurfaces->clearSelection();
 
@@ -2703,8 +2742,8 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
         poi->p = point_opt->p;
 
         // Find the closest normal on the segmentation surface
-        Surface* seg_surface = _surf_col->surface("segmentation");
-        if (auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface)) {
+        auto seg_surface = _surf_col->surface("segmentation");
+        if (auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get())) {
             auto ptr = quad_surface->pointer();
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
             quad_surface->pointTo(ptr, point_opt->p, 4.0, 100, patchIndex);
@@ -2796,11 +2835,11 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
 
     for (const auto& id : ids) {
         auto sm = fVpkg->getSurface(id);
-        if (!sm || !sm->surface()) {
+        if (!sm) {
             ++failCount; skippedIds << QString::fromStdString(id) + " (missing surface)";
             continue;
         }
-        auto* surf = sm->surface(); // QuadSurface*
+        auto* surf = sm.get(); // QuadSurface* - sm is already shared_ptr<QuadSurface>
 
         // --- Load mask (robust multi-page handling) ----------------------
         const std::filesystem::path maskPath = sm->path / "mask.tif";
@@ -2864,7 +2903,7 @@ void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
 
         // --- Persist & UI update --------------------------------------------
         try {
-            if (!surf->meta) surf->meta = new nlohmann::json();
+            if (!surf->meta) surf->meta = std::make_unique<nlohmann::json>();
             (*surf->meta)["area_vx2"] = area_vx2;
             (*surf->meta)["area_cm2"] = area_cm2;
             (*surf->meta)["date_last_modified"] = get_surface_time_str();
@@ -2962,9 +3001,9 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
     }
 
     if (enabled) {
-        QuadSurface* activeSurface = dynamic_cast<QuadSurface*>(_surf_col->surface("segmentation"));
+        auto activeSurfaceShared = std::dynamic_pointer_cast<QuadSurface>(_surf_col->surface("segmentation"));
 
-        if (!_segmentationModule->beginEditingSession(activeSurface)) {
+        if (!_segmentationModule->beginEditingSession(activeSurfaceShared)) {
             statusBar()->showMessage(tr("Unable to start segmentation editing"), 3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
                 QSignalBlocker blocker(_segmentationWidget);
@@ -3205,14 +3244,14 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
     cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
 
     if (_useAxisAlignedSlices) {
-        PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
-        PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
+        auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface("seg xz"));
+        auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface("seg yz"));
 
-        if (!segXZ) {
-            segXZ = new PlaneSurface();
+        if (!segXZShared) {
+            segXZShared = std::make_shared<PlaneSurface>();
         }
-        if (!segYZ) {
-            segYZ = new PlaneSurface();
+        if (!segYZShared) {
+            segYZShared = std::make_shared<PlaneSurface>();
         }
 
 
@@ -3245,40 +3284,47 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
             }
         };
 
-        configurePlane(segXZ, _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
-        configurePlane(segYZ, _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
+        configurePlane(segXZShared.get(), _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
+        configurePlane(segYZShared.get(), _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
 
-        if (segXZ) {
-            segXZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
+        if (segXZShared) {
+            segXZShared->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
         }
-        if (segYZ) {
-            segYZ->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegYZRotationDeg));
+        if (segYZShared) {
+            segYZShared->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegYZRotationDeg));
         }
 
-        _surf_col->setSurface("seg xz", segXZ);
-        _surf_col->setSurface("seg yz", segYZ);
+        _surf_col->setSurface("seg xz", segXZShared);
+        _surf_col->setSurface("seg yz", segYZShared);
         if (_planeSlicingOverlay) {
             _planeSlicingOverlay->refreshAll();
         }
         return;
     } else {
-        auto* segment = dynamic_cast<QuadSurface*>(sourceOverride ? sourceOverride : _surf_col->surface("segmentation"));
+        QuadSurface* segment = nullptr;
+        std::shared_ptr<Surface> segmentHolder;  // Keep surface alive during this scope
+        if (sourceOverride) {
+            segment = dynamic_cast<QuadSurface*>(sourceOverride);
+        } else {
+            segmentHolder = _surf_col->surface("segmentation");
+            segment = dynamic_cast<QuadSurface*>(segmentHolder.get());
+        }
         if (!segment) {
             return;
         }
 
-        PlaneSurface *segXZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg xz"));
-        PlaneSurface *segYZ = dynamic_cast<PlaneSurface*>(_surf_col->surface("seg yz"));
+        auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface("seg xz"));
+        auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface("seg yz"));
 
-        if (!segXZ) {
-            segXZ = new PlaneSurface();
+        if (!segXZShared) {
+            segXZShared = std::make_shared<PlaneSurface>();
         }
-        if (!segYZ) {
-            segYZ = new PlaneSurface();
+        if (!segYZShared) {
+            segYZShared = std::make_shared<PlaneSurface>();
         }
 
-        segXZ->setOrigin(origin);
-        segYZ->setOrigin(origin);
+        segXZShared->setOrigin(origin);
+        segYZShared->setOrigin(origin);
 
         auto ptr = segment->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
@@ -3286,15 +3332,15 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
 
         cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
         cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
-        segXZ->setNormal(xDir - origin);
-        segYZ->setNormal(yDir - origin);
-        segXZ->setInPlaneRotation(0.0f);
-        segYZ->setInPlaneRotation(0.0f);
-        segXZ->setAxisAlignedRotationKey(-1);
-        segYZ->setAxisAlignedRotationKey(-1);
+        segXZShared->setNormal(xDir - origin);
+        segYZShared->setNormal(yDir - origin);
+        segXZShared->setInPlaneRotation(0.0f);
+        segYZShared->setInPlaneRotation(0.0f);
+        segXZShared->setAxisAlignedRotationKey(-1);
+        segYZShared->setAxisAlignedRotationKey(-1);
 
-        _surf_col->setSurface("seg xz", segXZ);
-        _surf_col->setSurface("seg yz", segYZ);
+        _surf_col->setSurface("seg xz", segXZShared);
+        _surf_col->setSurface("seg yz", segYZShared);
         if (_planeSlicingOverlay) {
             _planeSlicingOverlay->refreshAll();
         }
@@ -3542,16 +3588,10 @@ void CWindow::processInotifySegmentUpdate(const std::string& dirName, const std:
     // Reload the segmentation
     if (fVpkg->reloadSingleSegmentation(segmentId)) {
         try {
-            auto surfMeta = fVpkg->loadSurface(segmentId);
-            if (surfMeta) {
-                QuadSurface* reloadedSurface = surfMeta->surface();
-                if (!reloadedSurface) {
-                    Logger()->warn("Reloaded segment {} returned null surface", segmentId);
-                    return;
-                }
-
+            auto reloadedSurf = fVpkg->loadSurface(segmentId);
+            if (reloadedSurf) {
                 if (_surf_col) {
-                    _surf_col->setSurface(segmentId, reloadedSurface, false, false);
+                    _surf_col->setSurface(segmentId, reloadedSurf, false, false);
                 }
 
                 if (_surfacePanel) {
@@ -3562,14 +3602,14 @@ void CWindow::processInotifySegmentUpdate(const std::string& dirName, const std:
 
                 if (wasSelected) {
                     _surfID = segmentId;
-                    _surf = reloadedSurface;
+                    _surf_weak = reloadedSurf;
 
                     if (_surf_col) {
-                        _surf_col->setSurface("segmentation", _surf, false, false);
+                        _surf_col->setSurface("segmentation", reloadedSurf, false, false);
                     }
 
                     if (_surfacePanel) {
-                        _surfacePanel->syncSelectionUi(segmentId, _surf);
+                        _surfacePanel->syncSelectionUi(segmentId, reloadedSurf.get());
                     }
                 }
             }
@@ -3618,10 +3658,10 @@ void CWindow::processInotifySegmentRename(const std::string& dirName,
     if (fVpkg->addSingleSegmentation(newDirName)) {
         // The UUID in meta.json will be updated when the segment is saved/loaded
         try {
-            auto surfMeta = fVpkg->loadSurface(newId);
+            auto loadedSurf = fVpkg->loadSurface(newId);
 
-            if (surfMeta && isCurrentDir) {
-                _surf_col->setSurface(newId, surfMeta->surface(), true);
+            if (loadedSurf && isCurrentDir) {
+                _surf_col->setSurface(newId, loadedSurf, true);
                 if (_surfacePanel) {
                     _surfacePanel->addSingleSegmentation(newId);
                 }
@@ -3633,9 +3673,9 @@ void CWindow::processInotifySegmentRename(const std::string& dirName,
                 // Reselect if it was selected
                 if (wasSelected) {
                     _surfID = newId;
-                    auto surface = _surf_col->surface(newId);  // Changed from getSurface to surface
-                    if (surface && _surfacePanel) {
-                        _surfacePanel->syncSelectionUi(newId, dynamic_cast<QuadSurface*>(surface));
+                    auto surf = _surf_col->surface(newId);
+                    if (surf && _surfacePanel) {
+                        _surfacePanel->syncSelectionUi(newId, dynamic_cast<QuadSurface*>(surf.get()));
                     }
                 }
 
@@ -3680,9 +3720,9 @@ void CWindow::processInotifySegmentAddition(const std::string& dirName, const st
     if (fVpkg->addSingleSegmentation(segmentName)) {
         if (isCurrentDir) {
             try {
-                auto surfMeta = fVpkg->loadSurface(segmentId);
-                if (surfMeta) {
-                    _surf_col->setSurface(segmentId, surfMeta->surface(), true);
+                auto loadedSurf = fVpkg->loadSurface(segmentId);
+                if (loadedSurf) {
+                    _surf_col->setSurface(segmentId, loadedSurf, true);
                     if (_surfacePanel) {
                         _surfacePanel->addSingleSegmentation(segmentId);
                     }
@@ -3749,7 +3789,7 @@ void CWindow::processPendingInotifyEvents()
 
     // Store current selection to restore later
     std::string previousSelection = _surfID;
-    QuadSurface* previousSurface = _surf;
+    auto previousSurface = _surf_weak.lock();
 
     // Track if the previously selected segment gets removed
     bool previousSelectionRemoved = false;
@@ -3885,12 +3925,12 @@ void CWindow::processPendingInotifyEvents()
                 auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
                 if (seg) {
                     _surfID = previousSelection;
-                    auto surfMeta = fVpkg->getSurface(previousSelection);
-                    if (surfMeta) {
-                        _surf = surfMeta->surface();
+                    auto surf = fVpkg->getSurface(previousSelection);
+                    if (surf) {
+                        _surf_weak = surf;
 
                         if (_surf_col) {
-                            _surf_col->setSurface("segmentation", _surf, false, false);
+                            _surf_col->setSurface("segmentation", surf, false, false);
                         }
 
                         if (treeWidgetSurfaces) {
@@ -3908,7 +3948,7 @@ void CWindow::processPendingInotifyEvents()
                         }
 
                         if (_surfacePanel) {
-                            _surfacePanel->syncSelectionUi(previousSelection, _surf);
+                            _surfacePanel->syncSelectionUi(previousSelection, surf.get());
                         }
 
                         if (auto* viewer = segmentationViewer()) {
@@ -3923,12 +3963,12 @@ void CWindow::processPendingInotifyEvents()
         auto seg = fVpkg ? fVpkg->segmentation(previousSelection) : nullptr;
         if (seg) {
             _surfID = previousSelection;
-            _surf = previousSurface;
+            _surf_weak = previousSurface;
 
             if (_surfacePanel) {
                 auto surface = _surf_col->surface(previousSelection);
                 if (surface) {
-                    _surfacePanel->syncSelectionUi(previousSelection, dynamic_cast<QuadSurface*>(surface));
+                    _surfacePanel->syncSelectionUi(previousSelection, dynamic_cast<QuadSurface*>(surface.get()));
                 }
             }
         }
@@ -3976,7 +4016,7 @@ bool CWindow::shouldSkipInotifyForSegment(const std::string& segmentId, const ch
     if (_segmentationModule && _segmentationModule->isEditingApprovalMask()) {
         // Get the segment being used for approval mask (the active segmentation surface)
         if (_surf_col) {
-            Surface* segSurface = _surf_col->surface("segmentation");
+            auto segSurface = _surf_col->surface("segmentation");
             if (segSurface && segSurface->id == segmentId) {
                 Logger()->info("Skipping {} for {} - approval mask being edited", category, segmentId);
                 return true;
@@ -4116,8 +4156,8 @@ void CWindow::onMoveSegmentToPaths(const QString& segmentId)
 
     // Clear from surface collection (including "segmentation" if it matches)
     if (_surf_col) {
-        Surface* currentSurface = _surf_col->surface(idStd);
-        Surface* segmentationSurface = _surf_col->surface("segmentation");
+        auto currentSurface = _surf_col->surface(idStd);
+        auto segmentationSurface = _surf_col->surface("segmentation");
 
         // If this surface is currently shown as "segmentation", clear it
         if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
@@ -4186,8 +4226,8 @@ void CWindow::updateSurfaceOverlayDropdown()
 
         for (const auto& name : names) {
             // Only add QuadSurfaces (actual segmentations), skip PlaneSurfaces (xy, xz, yz, etc.)
-            Surface* surf = _surf_col->surface(name);
-            if (surf && dynamic_cast<QuadSurface*>(surf)) {
+            auto surf = _surf_col->surface(name);
+            if (surf && dynamic_cast<QuadSurface*>(surf.get())) {
                 ui.surfaceOverlaySelect->addItem(QString::fromStdString(name), QString::fromStdString(name));
 
                 // Restore previous selection if it still exists

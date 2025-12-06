@@ -199,6 +199,13 @@ void CommandLineToolRunner::setOmpThreads(int threads)
     _ompThreads = threads;
 }
 
+void CommandLineToolRunner::setFlattenOptions(bool flatten, int iterations, int downsample)
+{
+    _flatten = flatten;
+    _flattenIters = iterations;
+    _flattenDownsample = downsample;
+}
+
 void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
 {
     _optNormalizeUV = normalizeUV;
@@ -601,6 +608,11 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             }
             if (_includeTifs) {
                 args << "--include-tifs";
+            }
+            if (_flatten) {
+                args << "--flatten";
+                args << "--flatten-iterations" << QString::number(_flattenIters);
+                args << "--flatten-downsample" << QString::number(_flattenDownsample);
             }
             break;
 

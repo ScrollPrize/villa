@@ -4,6 +4,7 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
+#include "vc/core/util/ABFFlattening.hpp"
 
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
@@ -721,7 +722,13 @@ int main(int argc, char *argv[])
         ("flip", po::value<int>()->default_value(-1),
             "Flip output image. 0=Vertical, 1=Horizontal, 2=Both")
         ("include-tifs", po::bool_switch()->default_value(false),
-            "If output is Zarr, also export per-Z TIFF slices to layers_{zarrname}");
+            "If output is Zarr, also export per-Z TIFF slices to layers_{zarrname}")
+        ("flatten", po::bool_switch()->default_value(false),
+            "Apply ABF++ flattening to the surface before rendering")
+        ("flatten-iterations", po::value<int>()->default_value(10),
+            "Maximum ABF++ iterations when --flatten is enabled")
+        ("flatten-downsample", po::value<int>()->default_value(1),
+            "Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality");
     // clang-format on
 
     po::options_description all("Usage");
@@ -961,13 +968,32 @@ int main(int argc, char *argv[])
                   << (output_is_zarr?" (zarr)":" (tif)")
                   << std::endl;
 
-        QuadSurface *surf = nullptr;
+        std::unique_ptr<QuadSurface> surf;
         try {
             surf = load_quad_from_tifxyz(seg_folder);
         }
         catch (...) {
             std::cout << "error when loading: " << seg_folder << std::endl;
             return;
+        }
+
+        // Apply ABF++ flattening if requested
+        if (parsed["flatten"].as<bool>()) {
+            std::cout << "Applying ABF++ flattening..." << std::endl;
+            vc::ABFConfig flatConfig;
+            flatConfig.maxIterations = static_cast<std::size_t>(parsed["flatten-iterations"].as<int>());
+            flatConfig.downsampleFactor = parsed["flatten-downsample"].as<int>();
+            flatConfig.useABF = true;
+            flatConfig.scaleToOriginalArea = true;
+
+            QuadSurface* flatSurf = vc::abfFlattenToNewSurface(*surf, flatConfig);
+            if (flatSurf) {
+                surf.reset(flatSurf);
+                std::cout << "Flattening complete. New grid: "
+                          << surf->rawPointsPtr()->cols << " x " << surf->rawPointsPtr()->rows << std::endl;
+            } else {
+                std::cerr << "Warning: ABF++ flattening failed, using original mesh" << std::endl;
+            }
         }
 
     cv::Mat_<cv::Vec3f> *raw_points = surf->rawPointsPtr();
@@ -1027,7 +1053,6 @@ int main(int argc, char *argv[])
         if (crop.width <= 0 || crop.height <= 0) {
             std::cerr << "Error: crop rectangle " << req
                       << " lies outside the render canvas " << canvasROI << std::endl;
-            delete surf;
             return;
         }
         tgt_size = crop.size();
@@ -1056,7 +1081,7 @@ int main(int argc, char *argv[])
         float u0, v0; computeCanvasOrigin(full_size, u0, v0);
         u0 += static_cast<float>(crop.x);
         v0 += static_cast<float>(crop.y);
-        genTile(surf, tgt_size, static_cast<float>(render_scale), u0, v0, points, normals);
+        genTile(surf.get(), tgt_size, static_cast<float>(render_scale), u0, v0, points, normals);
     }
 
     if (output_is_zarr) {
@@ -1114,7 +1139,7 @@ int main(int argc, char *argv[])
             const float u0 = u0_base;
             const float v0 = v0_base;
             globalFlipDecision = computeGlobalFlipDecision(
-                surf, dx0, dy0, u0, v0,
+                surf.get(), dx0, dy0, u0, v0,
                 static_cast<float>(render_scale_zarr),
                 scale_seg, hasAffine, affineTransform,
                 meshCentroid);
@@ -1138,7 +1163,7 @@ int main(int argc, char *argv[])
                                       u0, v0);
 
                     cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
-                    genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
+                    genTile(surf.get(), cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
                             static_cast<float>(render_scale_zarr), u0, v0, tilePoints, tileNormals);
 
                     cv::Mat_<cv::Vec3f> basePoints, stepDirs;
@@ -1411,8 +1436,6 @@ int main(int argc, char *argv[])
                 }
                 if (all_exist) {
                     std::cout << "[tif export] all slices exist in " << layers_dir.string() << ", skipping." << std::endl;
-                    // Nothing else to do
-                    delete surf;
                     return;
                 }
 
@@ -1493,7 +1516,6 @@ int main(int argc, char *argv[])
             }
         }
 
-        delete surf;
         return;
     }
 
@@ -1535,7 +1557,6 @@ int main(int argc, char *argv[])
                     }
                     if (all_exist) {
                         std::cout << "[tif tiled] all slices exist in " << output_path_local.string() << ", skipping." << std::endl;
-                        delete surf;
                         return;
                     }
                 }
@@ -1557,7 +1578,7 @@ int main(int argc, char *argv[])
                     u0 += static_cast<float>(crop.x);
                     v0 += static_cast<float>(crop.y);
                     globalFlipDecision = computeGlobalFlipDecision(
-                        surf, dx0, dy0, u0, v0,
+                        surf.get(), dx0, dy0, u0, v0,
                         static_cast<float>(render_scale),
                         scale_seg, hasAffine, affineTransform,
                         meshCentroid);
@@ -1583,7 +1604,7 @@ int main(int argc, char *argv[])
                                           y0_src + static_cast<size_t>(crop.y),
                                           u0, v0);
                         cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
-                        genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
+                        genTile(surf.get(), cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
                                 static_cast<float>(render_scale), u0, v0, tilePoints, tileNormals);
 
                         cv::Mat_<cv::Vec3f> basePoints, stepDirs;
@@ -1655,19 +1676,14 @@ int main(int argc, char *argv[])
                 writers.clear(); // Explicitly close all writers
                 std::cout << std::endl;
 
-
-                delete surf;
                 return;
             } catch (const std::exception& e) {
                 std::cerr << "[tif tiled] error: " << e.what() << std::endl;
-                delete surf;
                 return;
             }
         }
 
         }
-
-    delete surf;
     };
 
 

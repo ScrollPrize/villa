@@ -46,7 +46,7 @@ public:
     void renderIntersections();
     cv::Mat render_area(const cv::Rect &roi);
     cv::Mat_<uint8_t> render_composite(const cv::Rect &roi);
-    cv::Mat_<uint8_t> renderCompositeForSurface(QuadSurface* surface, cv::Size outputSize);
+    cv::Mat_<uint8_t> renderCompositeForSurface(std::shared_ptr<QuadSurface> surface, cv::Size outputSize);
     void invalidateVis();
     void invalidateIntersect(const std::string &name = "");
     
@@ -185,7 +185,7 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
-    void onSurfaceChanged(std::string name, Surface *surf, bool isEditUpdate = false);
+    void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
     void onPOIChanged(std::string name, POI *poi);
     void onScrolled();
     void onResized();
@@ -199,6 +199,7 @@ public slots:
     void onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onVolumeClosing(); // Clear surface pointers when volume is closing
+    void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf); // Clear references before surface deletion
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onDrawingModeActive(bool active, float brushSize = 3.0f, bool isSquare = false);
 
@@ -228,9 +229,9 @@ protected:
     bool fSkipImageFormatConv;
 
     QGraphicsPixmapItem* fBaseImageItem;
-    
+
     std::shared_ptr<Volume> volume = nullptr;
-    Surface *_surf = nullptr;
+    std::weak_ptr<Surface> _surf_weak;  // Non-owning reference to current surface
     cv::Vec3f _ptr = cv::Vec3f(0,0,0);
     cv::Vec2f _vis_center = {0,0};
     std::string _surf_name;

@@ -111,6 +111,10 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (reload) {
+        // Wait for any pending index rebuild before deleting surfaces
+        if (_viewerManager) {
+            _viewerManager->waitForPendingIndexRebuild();
+        }
         // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
         if (_surfaces) {
             auto names = _surfaces->surfaceNames();
@@ -126,9 +130,9 @@ void SurfacePanelController::loadSurfaces(bool reload)
 
     if (_surfaces) {
         for (const auto& id : segIds) {
-            auto surfMeta = _volumePkg->getSurface(id);
-            if (surfMeta) {
-                _surfaces->setSurface(id, surfMeta->surface(), true, false);
+            auto surf = _volumePkg->getSurface(id);
+            if (surf) {
+                _surfaces->setSurface(id, surf, true, false);
             }
         }
     }
@@ -179,14 +183,19 @@ void SurfacePanelController::loadSurfacesIncremental()
     }
 
     if (!changes.toReload.empty()) {
+        // Wait for any pending index rebuild before deleting surfaces for reload
+        if (_viewerManager) {
+            _viewerManager->waitForPendingIndexRebuild();
+        }
+
         std::vector<std::string> reloadedIds;
         reloadedIds.reserve(changes.toReload.size());
 
         for (const auto& id : changes.toReload) {
             std::cout << "Queueing for reload: " << id << std::endl;
-            Surface* currentSurface = _surfaces ? _surfaces->surface(id) : nullptr;
-            Surface* activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
-            const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface == currentSurface);
+            auto currentSurface = _surfaces ? _surfaces->surface(id) : nullptr;
+            auto activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+            const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface.get() == currentSurface.get());
 
             if (_surfaces) {
                 _surfaces->setSurface(id, nullptr, true, false);
@@ -202,15 +211,14 @@ void SurfacePanelController::loadSurfacesIncremental()
         _volumePkg->loadSurfacesBatch(reloadedIds);
 
         for (const auto& id : reloadedIds) {
-            auto surfMeta = _volumePkg->getSurface(id);
-            if (!surfMeta) {
+            auto reloadedSurface = _volumePkg->getSurface(id);
+            if (!reloadedSurface) {
                 continue;
             }
 
-            QuadSurface* reloadedSurface = surfMeta->surface();
             if (_surfaces) {
                 _surfaces->setSurface(id, reloadedSurface, true, false);
-                Surface* activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+                auto activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
                 if (activeSegSurface == nullptr) {
                     _surfaces->setSurface("segmentation", reloadedSurface, false, false);
                 }
@@ -218,7 +226,7 @@ void SurfacePanelController::loadSurfacesIncremental()
 
             refreshSurfaceMetrics(id);
             if (_currentSurfaceId == id) {
-                syncSelectionUi(id, reloadedSurface);
+                syncSelectionUi(id, reloadedSurface.get());
             }
         }
     }
@@ -302,12 +310,12 @@ SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChan
             if (!_volumePkg->isSurfaceLoaded(uiId)) {
                 continue;
             }
-            auto surfMeta = _volumePkg->getSurface(uiId);
-            if (!surfMeta) {
+            auto surf = _volumePkg->getSurface(uiId);
+            if (!surf) {
                 continue;
             }
-            const auto storedTs = surfMeta->maskTimestamp();
-            const auto currentTs = SurfaceMeta::readMaskTimestamp(surfMeta->path);
+            const auto storedTs = surf->maskTimestamp();
+            const auto currentTs = QuadSurface::readMaskTimestamp(surf->path);
             if (storedTs != currentTs) {
                 changes.toReload.push_back(uiId);
             }
@@ -332,22 +340,22 @@ void SurfacePanelController::populateSurfaceTree()
     _ui.treeWidget->clear();
 
     for (const auto& id : _volumePkg->segmentationIDs()) {
-        auto surfMeta = _volumePkg->getSurface(id);
-        if (!surfMeta) {
+        auto surf = _volumePkg->getSurface(id);
+        if (!surf) {
             continue;
         }
 
         auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
         item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
-        const double areaCm2 = vc::json::number_or(surfMeta->meta, "area_cm2", -1.0);
-        const double avgCost = vc::json::number_or(surfMeta->meta, "avg_cost", -1.0);
+        const double areaCm2 = vc::json::number_or(surf->meta.get(), "area_cm2", -1.0);
+        const double avgCost = vc::json::number_or(surf->meta.get(), "avg_cost", -1.0);
         item->setText(2, QString::number(areaCm2, 'f', 3));
         item->setText(3, QString::number(avgCost, 'f', 3));
-        item->setText(4, QString::number(surfMeta->overlapping_str.size()));
+        item->setText(4, QString::number(surf->overlappingIds().size()));
         QString timestamp;
-        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
-            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+        if (surf->meta && surf->meta->contains("date_last_modified")) {
+            timestamp = QString::fromStdString((*surf->meta)["date_last_modified"].get<std::string>());
         }
         item->setText(5, timestamp);
         updateTreeItemIcon(item);
@@ -376,18 +384,18 @@ void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
         ++iterator;
     }
 
-    auto surfMeta = _volumePkg ? _volumePkg->getSurface(surfaceId) : nullptr;
+    auto surf = _volumePkg ? _volumePkg->getSurface(surfaceId) : nullptr;
     double areaCm2 = -1.0;
     double avgCost = -1.0;
     int overlapCount = 0;
     QString timestamp;
 
-    if (surfMeta) {
-        areaCm2 = vc::json::number_or(surfMeta->meta, "area_cm2", -1.0);
-        avgCost = vc::json::number_or(surfMeta->meta, "avg_cost", -1.0);
-        overlapCount = static_cast<int>(surfMeta->overlapping_str.size());
-        if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
-            timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+    if (surf) {
+        areaCm2 = vc::json::number_or(surf->meta.get(), "area_cm2", -1.0);
+        avgCost = vc::json::number_or(surf->meta.get(), "avg_cost", -1.0);
+        overlapCount = static_cast<int>(surf->overlappingIds().size());
+        if (surf->meta && surf->meta->contains("date_last_modified")) {
+            timestamp = QString::fromStdString((*surf->meta)["date_last_modified"].get<std::string>());
         }
     }
 
@@ -409,12 +417,12 @@ void SurfacePanelController::updateTreeItemIcon(SurfaceTreeWidgetItem* item)
     }
 
     const auto id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-    auto surfMeta = _volumePkg->getSurface(id);
-    if (!surfMeta || !surfMeta->surface() || !surfMeta->surface()->meta) {
+    auto surf = _volumePkg->getSurface(id);
+    if (!surf || !surf->meta) {
         return;
     }
 
-    const auto tags = vc::json::tags_or_empty(surfMeta->surface()->meta);
+    const auto tags = vc::json::tags_or_empty(surf->meta.get());
     item->updateItemIcon(tags.contains("approved"), tags.contains("defective"));
 }
 
@@ -426,25 +434,25 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
 
     std::cout << "Adding segmentation: " << segId << std::endl;
     try {
-        auto surfMeta = _volumePkg->loadSurface(segId);
-        if (!surfMeta) {
+        auto surf = _volumePkg->loadSurface(segId);
+        if (!surf) {
             return;
         }
         if (_surfaces) {
-            _surfaces->setSurface(segId, surfMeta->surface(), true, false);
+            _surfaces->setSurface(segId, surf, true, false);
         }
         if (_ui.treeWidget) {
             auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
             item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
-            const double areaCm2 = vc::json::number_or(surfMeta->meta, "area_cm2", -1.0);
-            const double avgCost = vc::json::number_or(surfMeta->meta, "avg_cost", -1.0);
+            const double areaCm2 = vc::json::number_or(surf->meta.get(), "area_cm2", -1.0);
+            const double avgCost = vc::json::number_or(surf->meta.get(), "avg_cost", -1.0);
             item->setText(2, QString::number(areaCm2, 'f', 3));
             item->setText(3, QString::number(avgCost, 'f', 3));
-            item->setText(4, QString::number(surfMeta->overlapping_str.size()));
+            item->setText(4, QString::number(surf->overlappingIds().size()));
             QString timestamp;
-            if (surfMeta->meta && surfMeta->meta->contains("date_last_modified")) {
-                timestamp = QString::fromStdString((*surfMeta->meta)["date_last_modified"].get<std::string>());
+            if (surf->meta && surf->meta->contains("date_last_modified")) {
+                timestamp = QString::fromStdString((*surf->meta)["date_last_modified"].get<std::string>());
             }
             item->setText(5, timestamp);
             updateTreeItemIcon(item);
@@ -458,8 +466,14 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId, 
 {
     std::cout << "Removing segmentation: " << segId << std::endl;
 
-    Surface* removedSurface = nullptr;
-    Surface* activeSegSurface = nullptr;
+    // Wait for any pending index rebuild to finish before deleting surfaces
+    // to avoid use-after-free in the background rebuild thread
+    if (_viewerManager) {
+        _viewerManager->waitForPendingIndexRebuild();
+    }
+
+    std::shared_ptr<Surface> removedSurface;
+    std::shared_ptr<Surface> activeSegSurface;
 
     if (_surfaces) {
         removedSurface = _surfaces->surface(segId);
@@ -467,7 +481,7 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId, 
     }
 
     if (_surfaces) {
-        if (removedSurface && activeSegSurface == removedSurface) {
+        if (removedSurface && activeSegSurface.get() == removedSurface.get()) {
             _surfaces->setSurface("segmentation", nullptr, suppressSignals);
         }
         _surfaces->setSurface(segId, nullptr, suppressSignals);
@@ -568,13 +582,11 @@ void SurfacePanelController::handleTreeSelectionChanged()
     const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     const std::string id = idQString.toStdString();
 
-    QuadSurface* surface = nullptr;
+    std::shared_ptr<QuadSurface> surface;
     bool surfaceJustLoaded = false;
     if (_volumePkg) {
-        if (auto surfMeta = _volumePkg->getSurface(id)) {
-            surface = surfMeta->surface();
-            surfaceJustLoaded = (surface != nullptr);
-        }
+        surface = _volumePkg->getSurface(id);
+        surfaceJustLoaded = (surface != nullptr);
     }
 
     if (surface && _surfaces) {
@@ -585,7 +597,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
         _surfaces->setSurface("segmentation", surface, false, false);
     }
 
-    syncSelectionUi(id, surface);
+    syncSelectionUi(id, surface.get());
 
     if (_segmentationViewerProvider) {
         if (auto* viewer = _segmentationViewerProvider()) {
@@ -594,7 +606,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
         }
     }
 
-    emit surfaceActivated(idQString, surface);
+    emit surfaceActivated(idQString, surface.get());
 
     if (surfaceJustLoaded) {
         applyFilters();
@@ -701,6 +713,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     QAction* slimFlattenAction = contextMenu.addAction(tr("SLIM-flatten"));
     connect(slimFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit slimFlattenRequested(segmentId);
+    });
+
+    QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
+    connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
+        emit abfFlattenRequested(segmentId);
     });
 
     QAction* awsUploadAction = contextMenu.addAction(tr("Upload artifacts to AWS"));
@@ -1224,14 +1241,7 @@ void SurfacePanelController::onTagCheckboxToggled()
         }
 
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-        QuadSurface* surface = nullptr;
-
-        if (_volumePkg) {
-            auto meta = _volumePkg->getSurface(id);
-            if (meta) {
-                surface = meta->surface();
-            }
-        }
+        auto surface = _volumePkg ? _volumePkg->getSurface(id) : nullptr;
 
         if (!surface || !surface->meta) {
             continue;
@@ -1292,35 +1302,31 @@ void SurfacePanelController::onTagCheckboxToggled()
         }
 
         if (reviewedJustAdded && _volumePkg) {
-            auto surfMeta = _volumePkg->getSurface(id);
-            if (surfMeta) {
-                for (const auto& overlapId : surfMeta->overlapping_str) {
+            auto surf = _volumePkg->getSurface(id);
+            if (surf) {
+                for (const auto& overlapId : surf->overlappingIds()) {
                     auto overlapMeta = _volumePkg->getSurface(overlapId);
-                    if (!overlapMeta) {
-                        continue;
-                    }
-                    QuadSurface* overlapSurf = overlapMeta->surface();
-                    if (!overlapSurf || !overlapSurf->meta) {
+                    if (!overlapMeta || !overlapMeta->meta) {
                         continue;
                     }
 
-                    const bool alreadyReviewed = overlapSurf->meta->contains("tags") &&
-                                                 overlapSurf->meta->at("tags").contains("reviewed");
+                    const bool alreadyReviewed = overlapMeta->meta->contains("tags") &&
+                                                 overlapMeta->meta->at("tags").contains("reviewed");
                     if (alreadyReviewed) {
                         continue;
                     }
 
-                    if (!overlapSurf->meta->contains("tags")) {
-                        (*overlapSurf->meta)["tags"] = nlohmann::json::object();
+                    if (!overlapMeta->meta->contains("tags")) {
+                        (*overlapMeta->meta)["tags"] = nlohmann::json::object();
                     }
 
-                    auto& overlapTags = (*overlapSurf->meta)["tags"];
+                    auto& overlapTags = (*overlapMeta->meta)["tags"];
                     overlapTags["partial_review"] = nlohmann::json::object();
                     if (!username.empty()) {
                         overlapTags["partial_review"]["user"] = username;
                     }
                     overlapTags["partial_review"]["source"] = id;
-                    overlapSurf->save_meta();
+                    overlapMeta->save_meta();
                 }
             }
         }
@@ -1385,9 +1391,7 @@ void SurfacePanelController::applyFiltersInternal()
                 if (meta) {
                     out.insert(id);
                     if (_surfaces && !_surfaces->surface(id)) {
-                        if (auto* quad = meta->surface()) {
-                            _surfaces->setSurface(id, quad, true, false);
-                        }
+                        _surfaces->setSurface(id, meta, true, false);
                     }
                 }
             }
@@ -1429,14 +1433,12 @@ void SurfacePanelController::applyFiltersInternal()
         std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
 
         bool show = true;
-        auto surfMeta = _volumePkg->getSurface(id);
-        if (!surfMeta) {
-            surfMeta = _volumePkg->loadSurface(id);
+        auto surf = _volumePkg->getSurface(id);
+        if (!surf) {
+            surf = _volumePkg->loadSurface(id);
         }
-        if (surfMeta && _surfaces && !_surfaces->surface(id)) {
-            if (auto* quad = surfMeta->surface()) {
-                _surfaces->setSurface(id, quad, true, false);
-            }
+        if (surf && _surfaces && !_surfaces->surface(id)) {
+            _surfaces->setSurface(id, surf, true, false);
         }
 
         if (restrictToCurrent && !id.empty()) {
@@ -1447,9 +1449,9 @@ void SurfacePanelController::applyFiltersInternal()
             show = show && QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
         }
 
-        if (surfMeta) {
+        if (surf) {
             if (isChecked(_filters.focusPoints) && poi) {
-                show = show && contains(*surfMeta, poi->p);
+                show = show && contains(*surf, poi->p);
             }
 
             if (model) {
@@ -1468,10 +1470,10 @@ void SurfacePanelController::applyFiltersInternal()
                                 points.push_back(p.p);
                             }
                         }
-                        if (allMatch && !contains(*surfMeta, points)) {
+                        if (allMatch && !contains(*surf, points)) {
                             allMatch = false;
                         }
-                        if (!anyMatches && contains_any(*surfMeta, points)) {
+                        if (!anyMatches && contains_any(*surf, points)) {
                             anyMatches = true;
                         }
                     }
@@ -1487,17 +1489,15 @@ void SurfacePanelController::applyFiltersInternal()
             }
 
             if (isChecked(_filters.unreviewed)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto tags = vc::json::tags_or_empty(surface->meta);
+                if (surf->meta) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
                     show = show && !tags.contains("reviewed");
                 }
             }
 
             if (isChecked(_filters.revisit)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto tags = vc::json::tags_or_empty(surface->meta);
+                if (surf->meta) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
                     show = show && tags.contains("revisit");
                 } else {
                     show = false;
@@ -1505,33 +1505,29 @@ void SurfacePanelController::applyFiltersInternal()
             }
 
             if (isChecked(_filters.noExpansion)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto mode = vc::json::string_or(surface->meta, "vc_gsfs_mode", std::string{});
+                if (surf->meta) {
+                    const auto mode = vc::json::string_or(surf->meta.get(), "vc_gsfs_mode", std::string{});
                     show = show && (mode != "expansion");
                 }
             }
 
             if (isChecked(_filters.noDefective)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto tags = vc::json::tags_or_empty(surface->meta);
+                if (surf->meta) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
                     show = show && !tags.contains("defective");
                 }
             }
 
             if (isChecked(_filters.partialReview)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto tags = vc::json::tags_or_empty(surface->meta);
+                if (surf->meta) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
                     show = show && !tags.contains("partial_review");
                 }
             }
 
             if (isChecked(_filters.hideUnapproved)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto tags = vc::json::tags_or_empty(surface->meta);
+                if (surf->meta) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
                     show = show && tags.contains("approved");
                 } else {
                     show = false;
@@ -1539,9 +1535,8 @@ void SurfacePanelController::applyFiltersInternal()
             }
 
             if (isChecked(_filters.inspectOnly)) {
-                const auto* surface = surfMeta->surface();
-                if (surface && surface->meta) {
-                    const auto tags = vc::json::tags_or_empty(surface->meta);
+                if (surf->meta) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
                     show = show && tags.contains("inspect");
                 } else {
                     show = false;
@@ -1608,7 +1603,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
         return;
     }
 
-    const auto tags = vc::json::tags_or_empty(surface->meta);
+    const auto tags = vc::json::tags_or_empty(surface->meta.get());
 
     auto applyTag = [&tags](QCheckBox* box, const char* name) {
         if (!box) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 
 #include <QObject>
 #include <opencv2/core.hpp>
@@ -11,7 +12,7 @@
 struct POI
 {
     cv::Vec3f p = {0,0,0};
-    Surface *src = nullptr;
+    std::string surfaceId;  // ID of the source surface (for lookup, not ownership)
     cv::Vec3f n = {0,0,0};
 };
 
@@ -35,30 +36,35 @@ struct Intersection
 class CSurfaceCollection : public QObject
 {
     Q_OBJECT
-    
+
 public:
     ~CSurfaceCollection();
-    void setSurface(const std::string &name, Surface*, bool noSignalSend = false, bool takeOwnership = true, bool isEditUpdate = false);
+
+    // Surface management with shared_ptr
+    void setSurface(const std::string &name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    std::shared_ptr<Surface> surface(const std::string &name);
+    std::vector<std::shared_ptr<Surface>> surfaces();
+    std::vector<std::string> surfaceNames();
+
+    // Convenience for raw pointer access (for gradual migration)
+    Surface* surfaceRaw(const std::string &name);
+
+    // Find the ID for a given surface pointer
+    std::string findSurfaceId(Surface* surf);
+
     void emitSurfacesChanged();  // Emit signal to notify listeners of batch surface changes
     void setPOI(const std::string &name, POI *poi);
-    Surface *surface(const std::string &name);
     POI *poi(const std::string &name);
-    std::vector<Surface*> surfaces();
     std::vector<POI*> pois();
-    std::vector<std::string> surfaceNames();
     std::vector<std::string> poiNames();
-    
-signals:
-    void sendSurfaceChanged(std::string, Surface*, bool isEditUpdate = false);
-    void sendPOIChanged(std::string, POI*);
-    
-protected:
-    struct SurfaceEntry {
-        Surface* ptr = nullptr;
-        bool owns = true;
-    };
 
+signals:
+    void sendSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
+    void sendSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
+    void sendPOIChanged(std::string, POI*);
+
+protected:
     bool _regular_pan = false;
-    std::unordered_map<std::string, SurfaceEntry> _surfs;
+    std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, POI*> _pois;
 };

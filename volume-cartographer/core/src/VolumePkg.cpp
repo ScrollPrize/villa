@@ -319,7 +319,7 @@ bool VolumePkg::isSurfaceLoaded(const std::string& id) const
     return segIt->second->isSurfaceLoaded();
 }
 
-std::shared_ptr<SurfaceMeta> VolumePkg::loadSurface(const std::string& id)
+std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
 {
     auto segIt = segmentations_.find(id);
     if (segIt == segmentations_.end()) {
@@ -329,7 +329,7 @@ std::shared_ptr<SurfaceMeta> VolumePkg::loadSurface(const std::string& id)
     return segIt->second->loadSurface();
 }
 
-std::shared_ptr<SurfaceMeta> VolumePkg::getSurface(const std::string& id)
+std::shared_ptr<QuadSurface> VolumePkg::getSurface(const std::string& id)
 {
     auto segIt = segmentations_.find(id);
     if (segIt == segmentations_.end()) {

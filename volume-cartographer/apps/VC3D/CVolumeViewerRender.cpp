@@ -60,16 +60,18 @@ namespace
 
 void CVolumeViewer::renderVisible(bool force)
 {
-    if (_surf && _surf_col) {
-        Surface* currentSurface = _surf_col->surface(_surf_name);
+    auto surf = _surf_weak.lock();
+    if (surf && _surf_col) {
+        auto currentSurface = _surf_col->surface(_surf_name);
         if (!currentSurface) {
             // Surface was cleared (e.g. during volume reload) without a change signal
             // reaching this viewer yet; drop the dangling pointer before rendering.
-            _surf = nullptr;
+            _surf_weak.reset();
+            surf.reset();
         }
     }
 
-    if (!volume || !volume->zarrDataset() || !_surf)
+    if (!volume || !volume->zarrDataset() || !surf)
         return;
 
     QRectF bbox = fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect();
@@ -112,6 +114,10 @@ void CVolumeViewer::renderVisible(bool force)
 cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
     cv::Mat_<uint8_t> img;
 
+    auto surf = _surf_weak.lock();
+    if (!surf)
+        return img;
+
     // Composite rendering for segmentation view
     cv::Mat_<float> accumulator;
     int count = 0;
@@ -135,12 +141,12 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
         cv::Mat_<uint8_t> slice_img;
 
         cv::Vec2f roi_c = {static_cast<float>(roi.x+roi.width/2), static_cast<float>(roi.y + roi.height/2)};
-        _ptr = _surf->pointer();
+        _ptr = surf->pointer();
         cv::Vec3f diff = {roi_c[0],roi_c[1],0};
-        _surf->move(_ptr, diff/_scale);
+        surf->move(_ptr, diff/_scale);
         _vis_center = roi_c;
         float z_step = z * _ds_scale;  // Scale the step to maintain consistent physical distance
-        _surf->gen(&slice_coords, nullptr, roi.size(), _ptr, _scale, {static_cast<float>(-roi.width/2), static_cast<float>(-roi.height/2), _z_off + z_step});
+        surf->gen(&slice_coords, nullptr, roi.size(), _ptr, _scale, {static_cast<float>(-roi.width/2), static_cast<float>(-roi.height/2), _z_off + z_step});
 
         if (z == z_start) {
             std::cout << "[render_composite] z=" << z << ", roi=" << roi.width << "x" << roi.height
@@ -235,7 +241,7 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
     return img;
 }
 
-cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface, cv::Size outputSize)
+cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(std::shared_ptr<QuadSurface> surface, cv::Size outputSize)
 {
     if (!surface || !_composite_enabled || !volume) {
         return cv::Mat_<uint8_t>();
@@ -244,7 +250,7 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
     // Save current state
     float oldScale = _scale;
     cv::Vec2f oldVisCenter = _vis_center;
-    Surface* oldSurf = _surf;
+    auto oldSurf = _surf_weak.lock();
     float oldZOff = _z_off;
     cv::Vec3f oldPtr = _ptr;
     float oldDsScale = _ds_scale;
@@ -260,7 +266,7 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
               << ", rawPointsSize: " << rawPointsSize.width << "x" << rawPointsSize.height
               << ", surface->_scale: " << surface->_scale[0] << "x" << surface->_scale[1] << std::endl;
 
-    _surf = surface;
+    _surf_weak = surface;
     _scale = surfScale;  // Use surface's scale so gen() samples 1:1 from raw points
     _z_off = 0.0f;
 
@@ -269,7 +275,7 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
     std::cout << "[renderCompositeForSurface] after recalcScales: _scale=" << _scale
               << ", _ds_scale=" << _ds_scale << ", _ds_sd_idx=" << _ds_sd_idx << std::endl;
 
-    _ptr = _surf->pointer();
+    _ptr = surface->pointer();
     // Use raw points size for the ROI so we cover the whole surface
     cv::Rect roi(-rawPointsSize.width/2, -rawPointsSize.height/2,
                  rawPointsSize.width, rawPointsSize.height);
@@ -287,7 +293,7 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
         cv::resize(result, result, outputSize, 0, 0, cv::INTER_LINEAR);
     }
 
-    _surf = oldSurf;
+    _surf_weak = oldSurf;
     _scale = oldScale;
     _vis_center = oldVisCenter;
     _z_off = oldZOff;
@@ -301,6 +307,10 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(QuadSurface* surface,
 
 cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 {
+    auto surf = _surf_weak.lock();
+    if (!surf)
+        return cv::Mat();
+
     cv::Mat_<cv::Vec3f> coords;
     cv::Mat_<uint8_t> baseGray;
     const int baseWindowLowInt = static_cast<int>(std::clamp(_baseWindowLow, 0.0f, 255.0f));
@@ -326,8 +336,8 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     if (useComposite) {
         baseGray = render_composite(roi);
     } else {
-        if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-            _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+            surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
 
             uint8_t planeId = 0;
             if (plane->axisAlignedRotationKey() >= 0 && cache && baseDataset &&
@@ -361,11 +371,11 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             }
         } else {
             cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
-            _ptr = _surf->pointer();
+            _ptr = surf->pointer();
             cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
-            _surf->move(_ptr, diff / _scale);
+            surf->move(_ptr, diff / _scale);
             _vis_center = roi_c;
-            _surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
+            surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
         }
 
         if (!usedCache) {
@@ -425,15 +435,15 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 
     if (_overlayVolume && _overlayOpacity > 0.0f) {
         if (coords.empty()) {
-            if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
-                _surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
+            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+                surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
             } else {
                 cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
-                _ptr = _surf->pointer();
+                _ptr = surf->pointer();
                 cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
-                _surf->move(_ptr, diff / _scale);
+                surf->move(_ptr, diff / _scale);
                 _vis_center = roi_c;
-                _surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
+                surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
             }
         }
 
@@ -498,12 +508,12 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 
     // Surface overlap detection
     if (_surfaceOverlayEnabled && !_surfaceOverlayName.empty() && _surf_col && !baseColor.empty()) {
-        Surface* overlaySurf = _surf_col->surface(_surfaceOverlayName);
-        if (overlaySurf && overlaySurf != _surf) {
+        auto overlaySurf = _surf_col->surface(_surfaceOverlayName);
+        if (overlaySurf && overlaySurf != surf) {
             cv::Mat_<cv::Vec3f> overlayCoords;
 
             // Generate coordinates for overlay surface using the same ROI parameters
-            if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
+            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
                 overlaySurf->gen(&overlayCoords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale,
                                {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
             } else {

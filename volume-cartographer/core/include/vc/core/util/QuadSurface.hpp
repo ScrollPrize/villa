@@ -2,6 +2,8 @@
 
 #include <filesystem>
 #include <iterator>
+#include <optional>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -276,7 +278,14 @@ public:
     QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale);
     // points will not be cloned in constructor, but pointer stored
     QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale);
+    // Load from path with meta.json - lazy loading (only loads meta, loads points on first access)
+    explicit QuadSurface(const std::filesystem::path &path_);
+    // Load from path with provided meta json - lazy loading
+    QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json);
     ~QuadSurface() override;
+
+    // Ensure points are loaded (for lazy loading constructors)
+    void ensureLoaded();
     void move(cv::Vec3f &ptr, const cv::Vec3f &offset) override;
     bool valid(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
     cv::Vec3f loc(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;
@@ -297,18 +306,18 @@ public:
     void save_meta();
     Rect3D bbox();
 
-    virtual cv::Mat_<cv::Vec3f> rawPoints() { return *_points; }
-    virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { return _points; }
-    virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { return _points; }
+    virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
+    virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
+    virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }
 
     // Grid iteration helpers
-    ValidPointRange<cv::Vec3f> validPoints() { return ValidPointRange<cv::Vec3f>(_points); }
+    ValidPointRange<cv::Vec3f> validPoints() { return ValidPointRange<cv::Vec3f>(_points.get()); }
     ValidPointRange<const cv::Vec3f> validPoints() const {
-        return ValidPointRange<const cv::Vec3f>(_points);
+        return ValidPointRange<const cv::Vec3f>(_points.get());
     }
-    ValidQuadRange<cv::Vec3f> validQuads() { return ValidQuadRange<cv::Vec3f>(_points); }
+    ValidQuadRange<cv::Vec3f> validQuads() { return ValidQuadRange<cv::Vec3f>(_points.get()); }
     ValidQuadRange<const cv::Vec3f> validQuads() const {
-        return ValidQuadRange<const cv::Vec3f>(_points);
+        return ValidQuadRange<const cv::Vec3f>(_points.get());
     }
 
     // Single-point validity checks
@@ -345,27 +354,64 @@ public:
     void saveSnapshot(int maxBackups = 10);
     void invalidateMask();
     std::vector<std::string> channelNames() const;
+
+    /** Rotate the surface by arbitrary angle (degrees). Expands canvas to fit. */
+    void rotate(float angleDeg);
+
+    /** Compute optimal rotation angle to place highest Z values at row 0 */
+    float computeZOrientationAngle() const;
+
+    /** Rotate to place highest Z values at top (row 0) */
+    void orientZUp();
+
+    // Overlapping surfaces management (by ID/name)
+    const std::set<std::string>& overlappingIds() const { return _overlappingIds; }
+    void setOverlappingIds(const std::set<std::string>& ids) { _overlappingIds = ids; }
+    void addOverlappingId(const std::string& id) { _overlappingIds.insert(id); }
+    void removeOverlappingId(const std::string& id) { _overlappingIds.erase(id); }
+    void readOverlappingJson();   // Load from path/overlapping.json
+    void writeOverlappingJson() const;
+
+    // Mask timestamp caching
+    std::optional<std::filesystem::file_time_type> maskTimestamp() const { return _maskTimestamp; }
+    void refreshMaskTimestamp();
+    static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
+
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
-    cv::Mat_<cv::Vec3f>* _points = nullptr;
+    std::unique_ptr<cv::Mat_<cv::Vec3f>> _points;
     cv::Rect _bounds;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
+    std::set<std::string> _overlappingIds;
+    std::optional<std::filesystem::file_time_type> _maskTimestamp;
 
 private:
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
+    // Flag for lazy loading - true if points need to be loaded from path
+    bool _needsLoad = false;
 };
 
-QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags = 0);
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags = 0);
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 
-QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-QuadSurface* surface_union(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
+std::unique_ptr<QuadSurface> surface_diff(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
+std::unique_ptr<QuadSurface> surface_union(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
+std::unique_ptr<QuadSurface> surface_intersection(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
 
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
 void set_space_tracing_use_cuda(bool enable);
+
+// Overlapping JSON file utilities
+void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names);
+std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path);
+
+// Surface overlap/containment tests
+bool overlap(QuadSurface& a, QuadSurface& b, int max_iters = 1000);
+bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
+bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
+bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
 

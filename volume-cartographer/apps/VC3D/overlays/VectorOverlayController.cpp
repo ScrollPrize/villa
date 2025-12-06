@@ -8,6 +8,7 @@
 #include "vc/core/util/Surface.hpp"
 
 #include <QSettings>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -129,9 +130,14 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         builder.addCircle(center, radius, true, style);
     };
 
-    auto* segSurface = dynamic_cast<QuadSurface*>(viewer->surfName() == "segmentation"
-                                                      ? currentSurface
-                                                      : (_surfaces ? dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation")) : nullptr));
+    QuadSurface* segSurface = nullptr;
+    std::shared_ptr<Surface> segSurfaceHolder;  // Keep surface alive during this scope
+    if (viewer->surfName() == "segmentation") {
+        segSurface = dynamic_cast<QuadSurface*>(currentSurface);
+    } else if (_surfaces) {
+        segSurfaceHolder = _surfaces->surface("segmentation");
+        segSurface = dynamic_cast<QuadSurface*>(segSurfaceHolder.get());
+    }
 
     auto fetchFocusScene = [&](QPointF& anchor) {
         if (!segSurface || !_surfaces) {

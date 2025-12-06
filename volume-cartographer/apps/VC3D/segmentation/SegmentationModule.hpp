@@ -97,7 +97,7 @@ public:
     void resetEdits();
     void stopTools();
 
-    bool beginEditingSession(QuadSurface* surface);
+    bool beginEditingSession(std::shared_ptr<QuadSurface> surface);
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
@@ -233,7 +233,7 @@ private:
                      int deltaSteps,
                      const QPointF& scenePos,
                      const cv::Vec3f& worldPos);
-    void onSurfaceCollectionChanged(std::string name, Surface* surface);
+    void onSurfaceCollectionChanged(std::string name, std::shared_ptr<Surface> surface);
 
     [[nodiscard]] bool captureUndoSnapshot();
     void discardLastUndoSnapshot();

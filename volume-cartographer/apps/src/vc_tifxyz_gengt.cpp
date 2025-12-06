@@ -155,7 +155,7 @@ int main(int argc, char** argv) {
     std::string output_path = vm["output"].as<std::string>();
     int num_collections = vm["num-collections"].as<int>();
 
-    QuadSurface* surface = load_quad_from_tifxyz(input_path);
+    auto surface = load_quad_from_tifxyz(input_path);
     if (!surface) {
         std::cerr << "Error: Failed to load surface from " << input_path << std::endl;
         return 1;
@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        IntersectVec intersects = getIntersects({seed_loc.x, seed_loc.y}, surface);
+        IntersectVec intersects = getIntersects({seed_loc.x, seed_loc.y}, surface.get());
 
         std::cout << "got " << intersects.size() << std::endl;
 
@@ -224,8 +224,6 @@ int main(int argc, char** argv) {
     }
     
     collection.saveToJSON(output_path);
-
-    delete surface;
 
     std::cout << "Successfully generated annotations and saved to " << output_path << std::endl;
 

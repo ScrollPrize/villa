@@ -83,7 +83,7 @@ int main(int argc, char *argv[])
     }
 
     // Load the surface
-    QuadSurface *surf = nullptr;
+    std::unique_ptr<QuadSurface> surf;
     try {
         surf = load_quad_from_tifxyz(seg_path);
     }
@@ -104,7 +104,7 @@ int main(int argc, char *argv[])
             volume = Volume::New(volume_path);
             cache = new ChunkCache<uint8_t>(1ULL * 1024ULL * 1024ULL * 1024ULL);
 
-            generate_mask(surf, mask, img,
+            generate_mask(surf.get(), mask, img,
                          volume->zarrDataset(0),
                          volume->zarrDataset(2),
                          cache);
@@ -114,7 +114,6 @@ int main(int argc, char *argv[])
             if (!cv::imwritemulti(mask_path.string(), layers)) {
                 std::cerr << "Error writing mask to " << mask_path << std::endl;
                 delete cache;
-                delete surf;
                 return EXIT_FAILURE;
             }
 
@@ -123,16 +122,14 @@ int main(int argc, char *argv[])
         catch (const std::exception& e) {
             std::cerr << "Error processing volume: " << e.what() << std::endl;
             if (cache) delete cache;
-            delete surf;
             return EXIT_FAILURE;
         }
     } else {
         // Generate mask only
-        generate_mask(surf, mask, img);
+        generate_mask(surf.get(), mask, img);
 
         if (!cv::imwrite(mask_path.string(), mask)) {
             std::cerr << "Error writing mask to " << mask_path << std::endl;
-            delete surf;
             return EXIT_FAILURE;
         }
     }
@@ -147,6 +144,5 @@ int main(int argc, char *argv[])
     std::cout << "  Valid pixels: " << valid_count << " / " << total_count
               << " (" << std::fixed << std::setprecision(1) << valid_percent << "%)" << std::endl;
 
-    delete surf;
     return EXIT_SUCCESS;
 }

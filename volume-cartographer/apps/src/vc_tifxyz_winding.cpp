@@ -285,7 +285,7 @@ int main(int argc, char *argv[])
     
     std::filesystem::path seg_path = argv[1];
     
-    QuadSurface *surf = nullptr;
+    std::unique_ptr<QuadSurface> surf;
     try {
         surf = load_quad_from_tifxyz(seg_path);
     }
@@ -321,7 +321,7 @@ int main(int argc, char *argv[])
             while (points(seed[1],seed[0])[0] == -1)
                 seed = {rand_r(&sr) % points.cols, rand_r(&sr) % points.rows};
 
-            intersects[i] = getIntersects(seed, surf);
+            intersects[i] = getIntersects(seed, surf.get());
         }
     }
     
@@ -574,7 +574,5 @@ int main(int argc, char *argv[])
             break;
     }
 
-    delete surf;
-    
     return EXIT_SUCCESS;
 }

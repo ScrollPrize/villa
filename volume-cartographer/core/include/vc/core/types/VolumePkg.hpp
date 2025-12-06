@@ -39,10 +39,10 @@ public:
     void refreshSegmentations();
 
 
-    // Surface management
+    // Surface management - returns QuadSurface directly (no SurfaceMeta wrapper)
     [[nodiscard]] bool isSurfaceLoaded(const std::string& id) const;
-    std::shared_ptr<SurfaceMeta> loadSurface(const std::string& id);
-    std::shared_ptr<SurfaceMeta> getSurface(const std::string& id);
+    std::shared_ptr<QuadSurface> loadSurface(const std::string& id);
+    std::shared_ptr<QuadSurface> getSurface(const std::string& id);
     bool unloadSurface(const std::string& id);
     [[nodiscard]] std::vector<std::string> getLoadedSurfaceIDs() const;
     void unloadAllSurfaces();

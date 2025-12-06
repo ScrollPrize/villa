@@ -3,6 +3,7 @@
 #include <QString>
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <utility>
@@ -156,6 +157,10 @@ struct TracerGrowthContext {
     QString cacheRoot;
     double voxelSize{1.0};
     QString normalGridPath;
+    // For corrections annotation saving
+    std::filesystem::path volpkgRoot;
+    std::vector<std::string> volumeIds;
+    std::string growthVolumeId;
 };
 
 struct TracerGrowthResult {

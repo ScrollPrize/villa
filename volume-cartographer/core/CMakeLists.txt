@@ -14,13 +14,13 @@ add_library(vc_core
         src/ChunkCache.cpp
         src/Slicing.cpp
         src/PlaneSurface.cpp
-        src/SurfaceMeta.cpp
         src/QuadSurface.cpp
         src/Render.cpp
         src/Tiff.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/ABFFlattening.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
@@ -36,6 +36,7 @@ target_link_libraries(vc_core
         z5
         OpenMP::OpenMP_CXX
         tiff
+        OpenABF
         #${CURL_LIBRARIES}
         #${OPENSSL_LIBRARIES}
         #${ZLIB_LIBRARIES}

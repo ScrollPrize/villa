@@ -91,6 +91,7 @@ public slots:
     void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
+    void onABFFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
@@ -139,7 +140,7 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
-    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory = false);
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory = false);
     bool centerFocusOnCursor();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
@@ -169,6 +170,7 @@ private slots:
     void onSegmentationGrowthStatusChanged(bool running);
     void processPendingInotifyEvents();
     void onSliceStepSizeChanged(int newSize);
+    void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -181,7 +183,7 @@ private:
 
     QComboBox* volSelect;
     QComboBox* cmbSegmentationDir;
-    QuadSurface *_surf;
+    std::weak_ptr<QuadSurface> _surf_weak;  // Non-owning reference to active surface
     std::string _surfID;
     
   
@@ -240,7 +242,7 @@ private:
     struct FocusHistoryEntry {
         cv::Vec3f position;
         cv::Vec3f normal;
-        Surface* source{nullptr};
+        std::string surfaceId;  // Store ID instead of raw pointer
     };
     std::deque<FocusHistoryEntry> _focusHistory;
     int _focusHistoryIndex{-1};

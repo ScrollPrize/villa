@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     }
 
     // 1) Load tifxyz as QuadSurface
-    std::unique_ptr<QuadSurface> surf(load_quad_from_tifxyz(in_path.string()));
+    auto surf = load_quad_from_tifxyz(in_path.string());
     if (!surf) {
         std::cerr << "Error: failed to load tifxyz: " << in_path << "\n";
         return 2;

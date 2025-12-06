@@ -2,6 +2,7 @@
 
 #include "vc/core/util/ChunkCache.hpp"
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -78,26 +79,87 @@ static cv::Vec3f nominal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal
     return nominal + cv::Vec3f(internal[0]/scale[0], internal[1]/scale[1], internal[2]);
 }
 
-QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale) :
-    QuadSurface(new cv::Mat_<cv::Vec3f>(points.clone()), scale)
+QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale)
 {
+    _points = std::make_unique<cv::Mat_<cv::Vec3f>>(points.clone());
+    _bounds = {0,0,_points->cols-1,_points->rows-1};
+    _scale = scale;
+    _center = {static_cast<float>(_points->cols/2.0/_scale[0]), static_cast<float>(_points->rows/2.0/_scale[1]), 0.f};
 }
 
 QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
 {
-    _points = points;
+    _points.reset(points);
     //-1 as many times we read with linear interpolation and access +1 locations
     _bounds = {0,0,_points->cols-1,_points->rows-1};
     _scale = scale;
     _center = {static_cast<float>(_points->cols/2.0/_scale[0]), static_cast<float>(_points->rows/2.0/_scale[1]), 0.f};
 }
 
-QuadSurface::~QuadSurface()
+namespace {
+static Rect3D rect_from_json(const nlohmann::json &json)
 {
-    if (_points) {
-        delete _points;
-    }
+    return {{json[0][0],json[0][1],json[0][2]},{json[1][0],json[1][1],json[1][2]}};
 }
+} // anonymous namespace
+
+QuadSurface::QuadSurface(const std::filesystem::path &path_)
+{
+    path = path_;
+    id = path_.filename().string();
+    auto metaPath = path_ / "meta.json";
+    meta = std::make_unique<nlohmann::json>(vc::json::load_json_file(metaPath));
+
+    if (meta->contains("bbox"))
+        _bbox = rect_from_json((*meta)["bbox"]);
+
+    _maskTimestamp = readMaskTimestamp(path);
+    _needsLoad = true;  // Points will be loaded lazily
+}
+
+QuadSurface::QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json)
+{
+    path = path_;
+    id = path_.filename().string();
+    meta = std::make_unique<nlohmann::json>(json);
+
+    if (json.contains("bbox"))
+        _bbox = rect_from_json(json["bbox"]);
+
+    _maskTimestamp = readMaskTimestamp(path);
+    _needsLoad = true;  // Points will be loaded lazily
+}
+
+void QuadSurface::ensureLoaded()
+{
+    if (!_needsLoad) {
+        return;
+    }
+
+    _needsLoad = false;
+
+    auto loaded = load_quad_from_tifxyz(path.string());
+    if (!loaded) {
+        throw std::runtime_error("Failed to load surface from: " + path.string());
+    }
+
+    // Transfer ownership of points and other data from loaded surface
+    _points = std::move(loaded->_points);
+
+    _bounds = loaded->_bounds;
+    _scale = loaded->_scale;
+    _center = loaded->_center;
+    _channels = std::move(loaded->_channels);
+
+    // Keep existing bbox and meta if already set, otherwise take from loaded
+    if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
+        _bbox = loaded->_bbox;
+    }
+
+    _maskTimestamp = readMaskTimestamp(path);
+}
+
+QuadSurface::~QuadSurface() = default;
 
 cv::Vec3f QuadSurface::pointer()
 {
@@ -880,7 +942,7 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
 
     // Prepare and write metadata
     if (!meta)
-        meta = new nlohmann::json;
+        meta = std::make_unique<nlohmann::json>();
 
     (*meta)["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
                        {bbox().high[0], bbox().high[1], bbox().high[2]}};
@@ -965,7 +1027,7 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags)
 {
     auto read_band_into = [](const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,
@@ -1097,7 +1159,7 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
     nlohmann::json metadata = nlohmann::json::parse(meta_f);
     cv::Vec2f scale = {metadata["scale"][0].get<float>(), metadata["scale"][1].get<float>()};
 
-    cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>();
+    auto points = std::make_unique<cv::Mat_<cv::Vec3f>>();
     int W=0, H=0;
     read_band_into(std::filesystem::path(path)/"x.tif", *points, 0, W, H);
     read_band_into(std::filesystem::path(path)/"y.tif", *points, 1, W, H);
@@ -1227,10 +1289,10 @@ QuadSurface *load_quad_from_tifxyz(const std::string &path, int flags)
         }
     }
 
-    QuadSurface *surf = new QuadSurface(points, scale);
+    auto surf = std::make_unique<QuadSurface>(points.release(), scale);
     surf->path = path;
     surf->id   = metadata["uuid"];
-    surf->meta = new nlohmann::json(metadata);
+    surf->meta = std::make_unique<nlohmann::json>(metadata);
 
     // Register extra channels lazily (left as OpenCV-based on-demand load).
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
@@ -1268,14 +1330,14 @@ bool intersect(const Rect3D &a, const Rect3D &b)
     return true;
 }
 
-QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
-    cv::Mat_<cv::Vec3f>* diff_points = new cv::Mat_<cv::Vec3f>(a->rawPoints().clone());
+std::unique_ptr<QuadSurface> surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
+    auto diff_points = std::make_unique<cv::Mat_<cv::Vec3f>>(a->rawPoints().clone());
 
     int width = diff_points->cols;
     int height = diff_points->rows;
 
     if (!intersect(a->bbox(), b->bbox())) {
-        return new QuadSurface(diff_points, a->scale());
+        return std::make_unique<QuadSurface>(diff_points.release(), a->scale());
     }
 
     // Build spatial index for surface b
@@ -1308,12 +1370,11 @@ QuadSurface* surface_diff(QuadSurface* a, QuadSurface* b, float tolerance) {
     std::cout << "Surface diff: removed " << removed_count
               << " points out of " << total_valid << " valid points" << std::endl;
 
-    QuadSurface* result = new QuadSurface(diff_points, a->scale());
-    return result;
+    return std::make_unique<QuadSurface>(diff_points.release(), a->scale());
 }
 
-QuadSurface* surface_union(QuadSurface* a, QuadSurface* b, float tolerance) {
-    cv::Mat_<cv::Vec3f>* union_points = new cv::Mat_<cv::Vec3f>(a->rawPoints().clone());
+std::unique_ptr<QuadSurface> surface_union(QuadSurface* a, QuadSurface* b, float tolerance) {
+    auto union_points = std::make_unique<cv::Mat_<cv::Vec3f>>(a->rawPoints().clone());
 
     // Build spatial index for surface a
     PointIndex aIndex;
@@ -1355,11 +1416,11 @@ QuadSurface* surface_union(QuadSurface* a, QuadSurface* b, float tolerance) {
 
     std::cout << "Surface union: added " << added_count << " points from surface b" << std::endl;
 
-    return new QuadSurface(union_points, a->scale());
+    return std::make_unique<QuadSurface>(union_points.release(), a->scale());
 }
 
-QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float tolerance) {
-    cv::Mat_<cv::Vec3f>* intersect_points = new cv::Mat_<cv::Vec3f>(a->rawPoints().clone());
+std::unique_ptr<QuadSurface> surface_intersection(QuadSurface* a, QuadSurface* b, float tolerance) {
+    auto intersect_points = std::make_unique<cv::Mat_<cv::Vec3f>>(a->rawPoints().clone());
 
     int width = intersect_points->cols;
     int height = intersect_points->rows;
@@ -1398,5 +1459,288 @@ QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float toleranc
     std::cout << "Surface intersection: kept " << kept_count
               << " points out of " << total_valid << " valid points" << std::endl;
 
-    return new QuadSurface(intersect_points, a->scale());
+    return std::make_unique<QuadSurface>(intersect_points.release(), a->scale());
+}
+
+void QuadSurface::rotate(float angleDeg)
+{
+    if (!_points || _points->empty() || std::abs(angleDeg) < 0.01f) {
+        return;
+    }
+
+    // Compute rotation center (center of the image)
+    cv::Point2f center(
+        static_cast<float>(_points->cols - 1) / 2.0f,
+        static_cast<float>(_points->rows - 1) / 2.0f
+    );
+
+    // Get rotation matrix
+    cv::Mat rotMat = cv::getRotationMatrix2D(center, angleDeg, 1.0);
+
+    // Calculate bounding box of rotated image
+    cv::Rect2f bbox = cv::RotatedRect(center, _points->size(), angleDeg).boundingRect2f();
+
+    // Adjust rotation matrix to translate image to center of new canvas
+    rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
+    rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
+
+    // Rotate points
+    cv::Mat rotatedMat;
+    cv::warpAffine(
+        *_points,
+        rotatedMat,
+        rotMat,
+        bbox.size(),
+        cv::INTER_LINEAR,
+        cv::BORDER_CONSTANT,
+        cv::Scalar(-1.f, -1.f, -1.f)
+    );
+
+    // Clean up edge artifacts from interpolation: dilate invalid region by 1 pixel
+    cv::Mat mask;
+    cv::inRange(rotatedMat, cv::Scalar(-1, -1, -1), cv::Scalar(-1, -1, -1), mask);
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::dilate(mask, mask, kernel, cv::Point(-1, -1), 1);
+    rotatedMat.setTo(cv::Scalar(-1.f, -1.f, -1.f), mask);
+
+    // Update points
+    *_points = rotatedMat;
+
+    // Rotate all channels
+    for (auto& [name, channel] : _channels) {
+        if (channel.empty()) continue;
+
+        cv::Mat rotatedChannel;
+        cv::Scalar borderValue = (name == "normals") ? cv::Scalar(0, 0, 0) : cv::Scalar(0, 0, 0);
+        cv::warpAffine(
+            channel,
+            rotatedChannel,
+            rotMat,
+            bbox.size(),
+            cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT,
+            borderValue
+        );
+        channel = rotatedChannel;
+    }
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
+float QuadSurface::computeZOrientationAngle() const
+{
+    if (!_points || _points->empty()) {
+        return 0.0f;
+    }
+
+    // Find Z range for normalization
+    float minZ = std::numeric_limits<float>::max();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    for (int row = 0; row < _points->rows; ++row) {
+        for (int col = 0; col < _points->cols; ++col) {
+            const cv::Vec3f& pt = (*_points)(row, col);
+            if (pt[0] != -1.f) {
+                float z = pt[2];
+                minZ = std::min(minZ, z);
+                maxZ = std::max(maxZ, z);
+            }
+        }
+    }
+
+    if (maxZ <= minZ) {
+        // No valid Z variation - no rotation needed
+        return 0.0f;
+    }
+
+    float zRange = maxZ - minZ;
+
+    // Compute Z-weighted centroid
+    // Weight = ((z - minZ) / zRange)^2, so higher Z = higher weight
+    double sumRow = 0.0, sumCol = 0.0, sumWeight = 0.0;
+
+    for (int row = 0; row < _points->rows; ++row) {
+        for (int col = 0; col < _points->cols; ++col) {
+            const cv::Vec3f& pt = (*_points)(row, col);
+            if (pt[0] != -1.f) {
+                float z = pt[2];
+                double weight = static_cast<double>(z - minZ) / zRange;
+                weight = weight * weight;  // Square to emphasize high-Z regions
+
+                sumRow += row * weight;
+                sumCol += col * weight;
+                sumWeight += weight;
+            }
+        }
+    }
+
+    if (sumWeight < 1e-10) {
+        return 0.0f;
+    }
+
+    // Z-weighted centroid position
+    double centroidRow = sumRow / sumWeight;
+    double centroidCol = sumCol / sumWeight;
+
+    // Grid center
+    double centerRow = (_points->rows - 1) / 2.0;
+    double centerCol = (_points->cols - 1) / 2.0;
+
+    // Vector from center to Z-centroid
+    double dRow = centroidRow - centerRow;
+    double dCol = centroidCol - centerCol;
+
+    // If centroid is at center, no rotation needed
+    if (std::abs(dRow) < 1e-6 && std::abs(dCol) < 1e-6) {
+        return 0.0f;
+    }
+
+    // Compute angle of this vector
+    // atan2(dCol, dRow) gives angle where:
+    //   0 degrees = pointing down (positive row direction)
+    //   90 degrees = pointing right (positive col direction)
+    double angleRad = std::atan2(dCol, dRow);
+    double angleDeg = angleRad * 180.0 / M_PI;
+
+    // We want the Z-centroid to end up at row 0 (top)
+    // "Up" in image coordinates is -row direction, which is 180 degrees
+    // So we need to rotate by: 180 - angleDeg
+    float rotationDeg = static_cast<float>(angleDeg + 180.0);
+
+    // Normalize to [-180, 180] range
+    while (rotationDeg > 180.0f) rotationDeg -= 360.0f;
+    while (rotationDeg < -180.0f) rotationDeg += 360.0f;
+
+    return rotationDeg;
+}
+
+void QuadSurface::orientZUp()
+{
+    float angle = computeZOrientationAngle();
+    if (std::abs(angle) > 0.5f) {
+        std::cout << "QuadSurface::orientZUp: Rotating by " << angle
+                  << " degrees to place high-Z at top" << std::endl;
+        rotate(angle);
+    }
+}
+
+// Overlapping JSON file utilities
+void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
+    nlohmann::json overlap_json;
+    overlap_json["overlapping"] = std::vector<std::string>(overlapping_names.begin(), overlapping_names.end());
+
+    std::ofstream o(seg_path / "overlapping.json");
+    o << std::setw(4) << overlap_json << std::endl;
+}
+
+std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path) {
+    std::set<std::string> overlapping;
+    std::filesystem::path json_path = seg_path / "overlapping.json";
+
+    if (std::filesystem::exists(json_path)) {
+        std::ifstream i(json_path);
+        nlohmann::json overlap_json;
+        i >> overlap_json;
+
+        if (overlap_json.contains("overlapping")) {
+            for (const auto& name : overlap_json["overlapping"]) {
+                overlapping.insert(name.get<std::string>());
+            }
+        }
+    }
+
+    return overlapping;
+}
+
+void QuadSurface::readOverlappingJson()
+{
+    if (path.empty()) {
+        return;
+    }
+    if (std::filesystem::exists(path / "overlapping")) {
+        throw std::runtime_error(
+            "Found overlapping directory at: " + (path / "overlapping").string() +
+            "\nPlease run overlapping_to_json.py on " + path.parent_path().string() + " to convert it to JSON format"
+        );
+    }
+    _overlappingIds = read_overlapping_json(path);
+}
+
+void QuadSurface::writeOverlappingJson() const
+{
+    if (path.empty()) {
+        return;
+    }
+    write_overlapping_json(path, _overlappingIds);
+}
+
+std::optional<std::filesystem::file_time_type> QuadSurface::readMaskTimestamp(const std::filesystem::path& dir)
+{
+    const std::filesystem::path maskPath = dir / "mask.tif";
+    std::error_code ec;
+    if (!std::filesystem::exists(maskPath, ec) || ec) {
+        return std::nullopt;
+    }
+    auto ts = std::filesystem::last_write_time(maskPath, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return ts;
+}
+
+void QuadSurface::refreshMaskTimestamp()
+{
+    _maskTimestamp = readMaskTimestamp(path);
+}
+
+// Surface overlap/containment tests
+bool overlap(QuadSurface& a, QuadSurface& b, int max_iters)
+{
+    if (!intersect(a.bbox(), b.bbox()))
+        return false;
+
+    cv::Mat_<cv::Vec3f> points = a.rawPoints();
+    for(int r=0; r<std::max(10, max_iters/10); r++) {
+        cv::Vec2f p = {static_cast<float>(rand() % points.cols), static_cast<float>(rand() % points.rows)};
+        cv::Vec3f loc = points(p[1], p[0]);
+        if (loc[0] == -1)
+            continue;
+
+        cv::Vec3f ptr = b.pointer();
+        if (b.pointTo(ptr, loc, 2.0, max_iters) <= 2.0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters)
+{
+    if (!intersect(a.bbox(), {loc,loc}))
+        return false;
+
+    cv::Vec3f ptr = a.pointer();
+    if (a.pointTo(ptr, loc, 2.0, max_iters) <= 2.0) {
+        return true;
+    }
+    return false;
+}
+
+bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs)
+{
+    for(auto& p : locs)
+        if (!contains(a, p))
+            return false;
+
+    return true;
+}
+
+bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs)
+{
+    for(auto& p : locs)
+        if (contains(a, p))
+            return true;
+
+    return false;
 }

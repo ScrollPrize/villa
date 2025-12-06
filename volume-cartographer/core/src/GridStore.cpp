@@ -21,16 +21,12 @@ constexpr uint32_t GRIDSTORE_VERSION = 3;
 }
 
 struct MmappedData {
-    int fd = -1;
     void* data = MAP_FAILED;
     size_t size = 0;
 
     ~MmappedData() {
         if (data != MAP_FAILED) {
             munmap(data, size);
-        }
-        if (fd != -1) {
-            close(fd);
         }
     }
 };
@@ -335,19 +331,21 @@ public:
     void load_mmap(const std::string& path) {
         read_only_ = true;
         mmapped_data_ = std::make_unique<MmappedData>();
- 
-        mmapped_data_->fd = open(path.c_str(), O_RDONLY);
-        if (mmapped_data_->fd == -1) {
+
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd == -1) {
             throw std::runtime_error("Failed to open file: " + path);
         }
 
         struct stat sb;
-        if (fstat(mmapped_data_->fd, &sb) == -1) {
+        if (fstat(fd, &sb) == -1) {
+            close(fd);
             throw std::runtime_error("Failed to stat file: " + path);
         }
         mmapped_data_->size = sb.st_size;
 
         if (mmapped_data_->size == 0) {
+            close(fd);
             // Handle empty file: Grid is already empty, just set bounds and return.
             bounds_ = cv::Rect();
             cell_size_ = 1; // Avoid division by zero
@@ -355,7 +353,8 @@ public:
             return;
         }
 
-        mmapped_data_->data = mmap(NULL, mmapped_data_->size, PROT_READ, MAP_PRIVATE, mmapped_data_->fd, 0);
+        mmapped_data_->data = mmap(NULL, mmapped_data_->size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);  // Close immediately after mmap - mapping remains valid on Linux
         if (mmapped_data_->data == MAP_FAILED) {
             throw std::runtime_error("Failed to mmap file: " + path);
         }

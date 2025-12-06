@@ -63,7 +63,7 @@ QuadSurface* load_surface(const std::filesystem::path& path) {
     std::string format = meta.value("format", "unknown");
 
     if (format == "tifxyz") {
-        return load_quad_from_tifxyz(path.string());
+        return load_quad_from_tifxyz(path.string()).release();
     } else {
         throw std::runtime_error("Unknown surface format: " + format);
     }
@@ -151,7 +151,7 @@ int main(int argc, char *argv[])
                   << " scale: [" << surf_b->scale()[0] << ", " << surf_b->scale()[1] << "]" << std::endl;
 
         // Perform the operation
-        QuadSurface* result = nullptr;
+        std::unique_ptr<QuadSurface> result;
         std::cout << "Performing " << operation << " operation with tolerance=" << tolerance << std::endl;
 
         {
@@ -175,7 +175,7 @@ int main(int argc, char *argv[])
 
         // Prepare metadata
         if (!result->meta) {
-            result->meta = new json();
+            result->meta = std::make_unique<json>();
         }
 
         // Generate output path - append operation and timestamp to the base name
@@ -219,11 +219,6 @@ int main(int argc, char *argv[])
 
         // Update metadata with final statistics
         result->save_meta();
-
-        // Cleanup
-        delete surf_a;
-        delete surf_b;
-        delete result;
 
         std::cout << "Operation completed successfully!" << std::endl;
 

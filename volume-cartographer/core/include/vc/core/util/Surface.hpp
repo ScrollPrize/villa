@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include <opencv2/core.hpp>
@@ -10,7 +11,7 @@
 class Surface
 {
 public:
-    virtual ~Surface() { delete meta; }
+    virtual ~Surface() = default;
 
     // get a central location point
     virtual cv::Vec3f pointer() = 0;
@@ -29,7 +30,7 @@ public:
     //coordgenerator relative to ptr&offset
     //needs to be deleted after use
     virtual void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) = 0;
-    nlohmann::json *meta = nullptr;
+    std::unique_ptr<nlohmann::json> meta;
     std::filesystem::path path;
     std::string id;
 };
