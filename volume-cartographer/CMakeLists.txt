@@ -157,6 +157,7 @@ if(VC_DEVELOPER_WARNINGS)
 endif()
 
 add_subdirectory(misc)
+add_subdirectory(libs/OpenABF)
 add_subdirectory(core)
 add_subdirectory(apps)
 

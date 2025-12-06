@@ -4,6 +4,7 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
+#include "vc/core/util/ABFFlattening.hpp"
 
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
@@ -721,7 +722,11 @@ int main(int argc, char *argv[])
         ("flip", po::value<int>()->default_value(-1),
             "Flip output image. 0=Vertical, 1=Horizontal, 2=Both")
         ("include-tifs", po::bool_switch()->default_value(false),
-            "If output is Zarr, also export per-Z TIFF slices to layers_{zarrname}");
+            "If output is Zarr, also export per-Z TIFF slices to layers_{zarrname}")
+        ("flatten", po::bool_switch()->default_value(false),
+            "Apply ABF++ flattening to the surface before rendering")
+        ("flatten-iterations", po::value<int>()->default_value(10),
+            "Maximum ABF++ iterations when --flatten is enabled");
     // clang-format on
 
     po::options_description all("Usage");
@@ -968,6 +973,25 @@ int main(int argc, char *argv[])
         catch (...) {
             std::cout << "error when loading: " << seg_folder << std::endl;
             return;
+        }
+
+        // Apply ABF++ flattening if requested
+        if (parsed["flatten"].as<bool>()) {
+            std::cout << "Applying ABF++ flattening..." << std::endl;
+            vc::ABFConfig flatConfig;
+            flatConfig.maxIterations = static_cast<std::size_t>(parsed["flatten-iterations"].as<int>());
+            flatConfig.useABF = true;
+            flatConfig.scaleToOriginalArea = true;
+
+            QuadSurface* flatSurf = vc::abfFlattenToNewSurface(*surf, flatConfig);
+            if (flatSurf) {
+                delete surf;
+                surf = flatSurf;
+                std::cout << "Flattening complete. New grid: "
+                          << surf->rawPointsPtr()->cols << " x " << surf->rawPointsPtr()->rows << std::endl;
+            } else {
+                std::cerr << "Warning: ABF++ flattening failed, using original mesh" << std::endl;
+            }
         }
 
     cv::Mat_<cv::Vec3f> *raw_points = surf->rawPointsPtr();
