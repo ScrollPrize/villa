@@ -43,6 +43,8 @@ public:
     double rotateDegrees() const;
     int flipAxis() const; // -1 none, 0 vertical, 1 horizontal, 2 both
     bool includeTifs() const; // when output is .zarr
+    bool flatten() const; // ABF++ flattening
+    int flattenIterations() const;
 
 private:
     // Session defaults (optional-only; exclude paths and output pattern)
@@ -54,6 +56,8 @@ private:
     static double s_rotateDeg;
     static int  s_flipAxis;
     static int  s_ompThreads;
+    static bool s_flatten;
+    static int  s_flattenIters;
 
     void applyCodeDefaults();
     void applySavedDefaults();
@@ -79,6 +83,8 @@ private:
     QDoubleSpinBox* spRotate_{nullptr};
     QComboBox* cmbFlip_{nullptr};
     QCheckBox* chkIncludeTifs_{nullptr};
+    QCheckBox* chkFlatten_{nullptr};
+    QSpinBox* spFlattenIters_{nullptr};
 };
 
 class TraceParamsDialog : public QDialog {

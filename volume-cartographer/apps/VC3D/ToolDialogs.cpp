@@ -136,6 +136,17 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     adv->addRow("Rotate (deg):", spRotate_);
     adv->addRow("Flip:", cmbFlip_);
 
+    // ABF++ flattening options
+    chkFlatten_ = new QCheckBox("Enable ABF++ flattening", this);
+    chkFlatten_->setToolTip("Apply ABF++ mesh flattening before rendering to reduce texture distortion");
+    spFlattenIters_ = new QSpinBox(this);
+    spFlattenIters_->setRange(1, 100);
+    spFlattenIters_->setValue(10);
+    spFlattenIters_->setEnabled(false);
+    connect(chkFlatten_, &QCheckBox::toggled, spFlattenIters_, &QSpinBox::setEnabled);
+    adv->addRow("Flatten:", chkFlatten_);
+    adv->addRow("Flatten iterations:", spFlattenIters_);
+
     // Buttons
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     auto btnReset = btns->addButton("Reset to Defaults", QDialogButtonBox::ResetRole);
@@ -194,6 +205,8 @@ double RenderParamsDialog::scaleSegmentation() const { return spScaleSeg_->value
 double RenderParamsDialog::rotateDegrees() const { return spRotate_->value(); }
 int RenderParamsDialog::flipAxis() const { return cmbFlip_->currentData().toInt(); }
 bool RenderParamsDialog::includeTifs() const { return chkIncludeTifs_->isChecked(); }
+bool RenderParamsDialog::flatten() const { return chkFlatten_->isChecked(); }
+int RenderParamsDialog::flattenIterations() const { return spFlattenIters_->value(); }
 
 // ---- RenderParamsDialog: defaults + session helpers ----
 bool RenderParamsDialog::s_haveSession = false;
@@ -207,6 +220,8 @@ double RenderParamsDialog::s_scaleSeg = 1.0;
 double RenderParamsDialog::s_rotateDeg = 0.0;
 int  RenderParamsDialog::s_flipAxis = -1;
 int  RenderParamsDialog::s_ompThreads = -1;
+bool RenderParamsDialog::s_flatten = false;
+int  RenderParamsDialog::s_flattenIters = 10;
 
 void RenderParamsDialog::applyCodeDefaults() {
     chkIncludeTifs_->setChecked(false);
@@ -222,6 +237,8 @@ void RenderParamsDialog::applyCodeDefaults() {
     int idx = cmbFlip_->findData(-1);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     edtThreads_->setText("");
+    chkFlatten_->setChecked(false);
+    spFlattenIters_->setValue(10);
 }
 
 void RenderParamsDialog::applySavedDefaults() {
@@ -241,6 +258,8 @@ void RenderParamsDialog::applySavedDefaults() {
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     const int th = s.value("omp_threads", -1).toInt();
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
+    chkFlatten_->setChecked(s.value("flatten", chkFlatten_->isChecked()).toBool());
+    spFlattenIters_->setValue(s.value("flatten_iterations", spFlattenIters_->value()).toInt());
     s.endGroup();
 }
 
@@ -257,6 +276,8 @@ void RenderParamsDialog::applySessionDefaults() {
     int idx = cmbFlip_->findData(s_flipAxis);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
+    chkFlatten_->setChecked(s_flatten);
+    spFlattenIters_->setValue(s_flattenIters);
 }
 
 void RenderParamsDialog::saveDefaults() const {
@@ -272,6 +293,8 @@ void RenderParamsDialog::saveDefaults() const {
     s.setValue("rotate_deg", spRotate_->value());
     s.setValue("flip_axis", cmbFlip_->currentData().toInt());
     s.setValue("omp_threads", ompThreads());
+    s.setValue("flatten", chkFlatten_->isChecked());
+    s.setValue("flatten_iterations", spFlattenIters_->value());
     s.endGroup();
 }
 
@@ -287,6 +310,8 @@ void RenderParamsDialog::updateSessionFromUI() {
     s_rotateDeg = spRotate_->value();
     s_flipAxis = cmbFlip_->currentData().toInt();
     s_ompThreads = ompThreads();
+    s_flatten = chkFlatten_->isChecked();
+    s_flattenIters = spFlattenIters_->value();
 }
 
 // ================= TraceParamsDialog =================

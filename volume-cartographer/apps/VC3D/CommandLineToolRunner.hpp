@@ -78,6 +78,7 @@ public:
     void setIterationCount(int count);
     void setIncludeTifs(bool include);
     void setOmpThreads(int threads);
+    void setFlattenOptions(bool flatten, int iterations);
 
 signals:
     void toolStarted(Tool tool, const QString& message);
@@ -137,6 +138,10 @@ private:
     double _rotateDeg{0.0};
     int _flipAxis{-1};
     bool _includeTifs{false};
+
+    // ABF++ flattening options
+    bool _flatten{false};
+    int _flattenIters{10};
 
     // vc_tifxyz2obj options
     bool _optNormalizeUV{false};

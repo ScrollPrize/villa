@@ -642,6 +642,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
         dlg.affinePath(), dlg.invertAffine(),
         static_cast<float>(dlg.scaleSegmentation()), dlg.rotateDegrees(), dlg.flipAxis());
     _cmdRunner->setIncludeTifs(dlg.includeTifs());
+    _cmdRunner->setFlattenOptions(dlg.flatten(), dlg.flattenIterations());
 
     _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
     statusBar()->showMessage(tr("Rendering segment: %1").arg(QString::fromStdString(segmentId)), 5000);
