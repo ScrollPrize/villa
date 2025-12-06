@@ -1042,7 +1042,7 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
 
     spResumeStep_ = new QSpinBox(this);
     spResumeStep_->setRange(1, 512);
-    spResumeStep_->setValue(16);
+    spResumeStep_->setValue(20);
     spResumeStep_->setToolTip(tr("Stride applied when selecting cells for resume-local optimization during pass 2."));
     pass2Form->addRow(tr("Local step:"), spResumeStep_);
 
@@ -1122,7 +1122,7 @@ QString NeighborCopyDialog::outputPath() const
 
 int NeighborCopyDialog::resumeLocalOptStep() const
 {
-    return spResumeStep_ ? spResumeStep_->value() : 16;
+    return spResumeStep_ ? spResumeStep_->value() : 20;
 }
 
 int NeighborCopyDialog::resumeLocalOptRadius() const
