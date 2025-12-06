@@ -2271,9 +2271,9 @@ def fit_cosine_grid(
         # together with the coarse grid offsets and modulation fields (no data terms).
         opt2 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
+                # model.theta,
+                # model.log_s,
+                # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
@@ -2295,9 +2295,9 @@ def fit_cosine_grid(
     if total_stage3 > 0:
         opt3 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
+                # model.theta,
+                # model.log_s,
+                # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
