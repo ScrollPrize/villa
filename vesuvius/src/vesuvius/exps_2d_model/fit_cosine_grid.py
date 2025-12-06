@@ -124,6 +124,21 @@ class CosineGridModel(nn.Module):
         # during stage 2.
         self.offset = nn.Parameter(torch.zeros_like(self.base_grid))
 
+        # Line offsets for horizontal connectivity.
+        #
+        # For each coarse grid point (y,x) we store two scalar offsets along the
+        # *row index* direction which describe how connections to the left and
+        # right neighbor columns are vertically displaced:
+        #
+        #   line_offset[:, 0, y, x]  -> offset towards left column  (x-1)
+        #   line_offset[:, 1, y, x]  -> offset towards right column (x+1)
+        #
+        # These offsets are expressed in coarse-row units (float, in "pixels" of
+        # the coarse grid). When forming horizontal relations we do not connect
+        # directly to (y,x±1); instead we interpolate along the neighbor column
+        # in y according to the corresponding offset.
+        self.line_offset = nn.Parameter(torch.zeros(1, 2, gh, gw))
+ 
         # Per-sample modulation parameters defined on a *separate* coarse grid:
         # - amp_coarse: contrast-like multiplier applied to (cosine - 0.5)
         # - bias_coarse: offset added after the contrast term
@@ -801,7 +816,39 @@ def fit_cosine_grid(
                     y1 = int(round(float(y_pix[iy, ix + 1])))
                     if in_bounds(x0, y0) and in_bounds(x1, y1):
                         cv2.line(bg_color, (x0, y0), (x1, y1), (0, 0, 255), 1)
- 
+
+            # Visualize new horizontal connectivity with line offsets.
+            #
+            # We work in the same visualization coordinate space (x_pix,y_pix)
+            # and use _coarse_x_line_pairs on a 2-channel coordinate field to
+            # obtain both directed connections for each horizontal edge:
+            #   0: left -> right  (cyan)
+            #   1: right -> left  (yellow)
+            coords_vis_t = torch.from_numpy(
+                np.stack([x_pix, y_pix], axis=0)
+            ).unsqueeze(0)  # (1,2,gh,gw)
+            src_conn, nbr_conn = _coarse_x_line_pairs(coords_vis_t)  # (1,2,2,gh,gw-1)
+            src_conn_np = src_conn[0].detach().cpu().numpy()  # (2,2,gh,gw-1)
+            nbr_conn_np = nbr_conn[0].detach().cpu().numpy()  # (2,2,gh,gw-1)
+
+            for iy in range(gh):
+                for ix in range(gw - 1):
+                    # Left -> right (dir=0): cyan
+                    x0_lr = int(round(float(src_conn_np[0, 0, iy, ix])))
+                    y0_lr = int(round(float(src_conn_np[1, 0, iy, ix])))
+                    x1_lr = int(round(float(nbr_conn_np[0, 0, iy, ix])))
+                    y1_lr = int(round(float(nbr_conn_np[1, 0, iy, ix])))
+                    if in_bounds(x0_lr, y0_lr) and in_bounds(x1_lr, y1_lr):
+                        cv2.line(bg_color, (x0_lr, y0_lr), (x1_lr, y1_lr), (255, 255, 0), 1)
+
+                    # Right -> left (dir=1): yellow
+                    x0_rl = int(round(float(src_conn_np[0, 1, iy, ix])))
+                    y0_rl = int(round(float(src_conn_np[1, 1, iy, ix])))
+                    x1_rl = int(round(float(nbr_conn_np[0, 1, iy, ix])))
+                    y1_rl = int(round(float(nbr_conn_np[1, 1, iy, ix])))
+                    if in_bounds(x0_rl, y0_rl) and in_bounds(x1_rl, y1_rl):
+                        cv2.line(bg_color, (x0_rl, y0_rl), (x1_rl, y1_rl), (0, 255, 255), 1)
+
             # Determine "cos-peak" columns in the coarse canonical grid based on
             # the ground-truth cosine design. The cosine target is defined over
             # sample-space x in [-1,1], with `cosine_periods` periods across the
@@ -1115,6 +1162,13 @@ def fit_cosine_grid(
         directions; the split into smooth_x / smooth_y is only by *index
         direction*, not by coordinate component.
     
+        Horizontal relations use the line-offset connectivity field: for each
+        edge between columns (x,x+1) we form *two* connections, one from the
+        left column towards the right and one from the right column towards the
+        left, each vertically displaced according to its own offset and
+        interpolated in the neighbor column. This means that losses that look
+        along x will in general be evaluated twice per row.
+    
         If an image-space mask is provided (shape (1,1,hr,wr)), we scale both
         directional penalties by the average mask value downsampled to the
         coarse grid.
@@ -1122,12 +1176,14 @@ def fit_cosine_grid(
         off = model.offset  # (1,2,gh,gw)  2 = (u_offset, v_offset)
         _, _, gh, gw = off.shape
     
-        # First-order differences along x index: o[..., i+1] - o[..., i].
-        # This is a 2D vector (Δu, Δv); we regularize its squared L2 norm.
+        # Horizontal smoothness using line-offset connectivity. For each
+        # horizontal edge we build two connections (left->right and right->left)
+        # and average the squared L2 differences over both directions.
         if gw >= 2:
-            dx = off[:, :, :, 1:] - off[:, :, :, :-1]  # (1,2,gh,gw-1)
-            dx_sq = (dx * dx).sum(dim=1, keepdim=True)  # sum over (u,v) components
-            smooth_x = dx_sq
+            src_x, nbr_x = _coarse_x_line_pairs(off)  # (1,2,2,gh,gw-1)
+            dx_vec = nbr_x - src_x                   # (1,2,2,gh,gw-1)
+            dx_sq = (dx_vec * dx_vec).sum(dim=1, keepdim=True)  # (1,1,2,gh,gw-1)
+            smooth_x = dx_sq.mean(dim=2)  # average over the two directions -> (1,1,gh,gw-1)
         else:
             smooth_x = torch.zeros((), device=off.device, dtype=off.dtype)
     
@@ -1151,7 +1207,6 @@ def fit_cosine_grid(
                 mode="bilinear",
                 align_corners=True,
             )*0.5+0.5
-            # scale = mask_coarse.mean()
         return (smooth_x * m[...,:-1]).mean(), (smooth_y * m[...,:-1,:]).mean()
  
     def _mod_smooth_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -1188,52 +1243,59 @@ def fit_cosine_grid(
     def _step_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Regularization on coarse *rotated* coords in target-image space.
- 
+    
         For each step along the cosine grid we consider the distance between
         neighboring sample positions after mapping into image space.
- 
+    
         We compute:
         - horizontal neighbor distances (along coarse x),
         - vertical neighbor distances (along coarse y).
- 
-        Horizontally:
-        - enforce each distance to be at least 0.1 * the average horizontal distance.
- 
+    
+        Horizontally we use the line-offset connectivity: each edge between
+        columns (x,x+1) is represented by two connections (left->right and
+        right->left) with vertical displacement given by the corresponding
+        offsets and interpolation along the neighbor column.
+    
         Vertically:
         - enforce each distance to be at least 0.5 * the average vertical distance
           and encourage distances to be close to that average.
- 
+    
         If an image-space mask is provided, we scale the regularizer by the
         average mask value downsampled to the coarse grid.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
         v = coords[:, 1:2]
- 
+    
         # Apply same x-only scale-then-rotation as in _build_sampling_grid, but on the coarse grid.
         x_norm, y_norm = model._apply_global_transform(u, v)
- 
+    
         # Map normalized coords to pixel coordinates of the target image.
         x_pix = (x_norm + 1.0) * 0.5 * float(max(1, w_img - 1))
         y_pix = (y_norm + 1.0) * 0.5 * float(max(1, h_img - 1))
- 
-        # Horizontal neighbor distances (steps along coarse x index).
-        dx_h = x_pix[:, :, :, 1:] - x_pix[:, :, :, :-1]
-        dy_h = y_pix[:, :, :, 1:] - y_pix[:, :, :, :-1]
-        dist_h = torch.sqrt(dx_h * dx_h + dy_h * dy_h + 1e-12)
- 
-        # Vertical neighbor distances (steps along coarse y index).
+    
+        # Horizontal neighbor distances using line-offset connectivity. Work in
+        # pixel space by treating (x_pix,y_pix) as a 2D coordinate field on the
+        # coarse grid and building left/right connections via interpolation.
+        coords_pix = torch.cat([x_pix, y_pix], dim=1)  # (1,2,gh,gw)
+        src_h, nbr_h = _coarse_x_line_pairs(coords_pix)  # (1,2,2,gh,gw-1)
+        delta_h = nbr_h - src_h
+        dist_h = torch.sqrt((delta_h * delta_h).sum(dim=1, keepdim=True) + 1e-12)  # (1,1,2,gh,gw-1)
+        # Average over the two directions for each horizontal edge.
+        dist_h = dist_h.mean(dim=2)  # (1,1,gh,gw-1)
+    
+        # Vertical neighbor distances (steps along coarse y index), unchanged.
         dx_v = x_pix[:, :, 1:, :] - x_pix[:, :, :-1, :]
         dy_v = y_pix[:, :, 1:, :] - y_pix[:, :, :-1, :]
         dist_v = torch.sqrt(dx_v * dx_v + dy_v * dy_v + 1e-12)
- 
+    
         # Average horizontal & vertical distance in image-space units.
         avg_h = dist_h.mean()
         avg_h_det = avg_h.detach()
- 
+    
         avg_v = dist_v.mean()
         avg_v_det = avg_v.detach()
- 
+    
         # Horizontal: enforce each distance to be at least 0.1 * avg horizontal.
         min_h = 0.1 * avg_h_det
         if float(min_h) <= 0.0:
@@ -1241,20 +1303,12 @@ def fit_cosine_grid(
         else:
             shortfall_h = torch.clamp(min_h - dist_h, min=0.0) / min_h
             loss_h = (shortfall_h * shortfall_h).mean()
- 
-        # Vertical: enforce each distance to be at least 0.5 * avg vertical.
-        # min_v = 0.5 * avg_v_det
-        # if float(min_v) <= 0.0:
-        #     loss_v = torch.zeros((), device=coords.device, dtype=coords.dtype)
-        # else:
-        #     shortfall_v = torch.clamp(min_v - dist_v, min=0.0) / min_v
-        #     loss_v = (shortfall_v * shortfall_v).mean()
- 
+    
         # Vertical: encourage each distance to be close to avg distance.
         target_v = avg_v_det
         diff_v = dist_v - target_v
         loss_v_avg = (diff_v * diff_v).mean()
- 
+    
         base = 1 * loss_h + 0.1 * loss_v_avg
         if mask is None:
             return base
@@ -1451,6 +1505,90 @@ def fit_cosine_grid(
             )
             scale = mask_coarse.mean()
         return base * scale
+
+    def _coarse_x_line_pairs(
+        coords: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build horizontally connected coarse-grid pairs using the line-offset field.
+    
+        Args:
+            coords:
+                (1,C,gh,gw) tensor defined at each coarse grid point.
+    
+        Returns:
+            src:
+                (1,C,2,gh,gw-1) source points for each horizontal connection.
+                src[:,:,0,y,x] = coords at (y,x)       (left anchor)
+                src[:,:,1,y,x] = coords at (y,x+1)     (right anchor)
+    
+            nbr:
+                (1,C,2,gh,gw-1) neighbor points on the *other* column, interpolated
+                along y according to the corresponding line offsets:
+    
+                nbr[:,:,0,y,x] = coords on column x+1 at y + off_right[y,x]
+                nbr[:,:,1,y,x] = coords on column x   at y + off_left[y,x+1]
+    
+        where off_right/off_left are taken from model.line_offset in units of
+        coarse-row indices.
+        """
+        off_line = model.line_offset  # (1,2,gh,gw)
+
+        # Ensure coords lives on the same device/dtype as the connectivity field,
+        # since this helper may be called from CPU-only visualization code.
+        coords = coords.to(device=off_line.device, dtype=off_line.dtype)
+
+        _, c, gh, gw = coords.shape
+     
+        # Anchors on left / right columns for each horizontal edge (x,x+1).
+        left_anchors = coords[:, :, :, :-1]   # (1,C,gh,gw-1)
+        right_anchors = coords[:, :, :, 1:]   # (1,C,gh,gw-1)
+     
+        # Base row indices as float.
+        j_base = torch.arange(gh, device=off_line.device, dtype=off_line.dtype).view(1, 1, gh, 1)
+    
+        # Offsets towards right neighbor from the left column (channel 1).
+        off_r = off_line[:, 1:2, :, :-1]  # (1,1,gh,gw-1)
+        # Offsets towards left neighbor from the right column (channel 0).
+        off_l = off_line[:, 0:1, :, 1:]   # (1,1,gh,gw-1)
+    
+        # Target row positions in coarse index space.
+        r_r = j_base + off_r  # (1,1,gh,gw-1)
+        r_l = j_base + off_l  # (1,1,gh,gw-1)
+    
+        # Integer neighbors for interpolation, clamped to valid range.
+        i0_r = torch.floor(r_r).clamp(0, gh - 2).long()
+        i1_r = i0_r + 1
+        i0_l = torch.floor(r_l).clamp(0, gh - 2).long()
+        i1_l = i0_l + 1
+    
+        # Neighbor columns.
+        coords_right = coords[:, :, :, 1:]   # (1,C,gh,gw-1)
+        coords_left = coords[:, :, :, :-1]   # (1,C,gh,gw-1)
+    
+        # Gather along y for right neighbors (column x+1).
+        idx0_r = i0_r.expand(1, c, gh, gw - 1)
+        idx1_r = i1_r.expand(1, c, gh, gw - 1)
+        val0_r = torch.gather(coords_right, 2, idx0_r)
+        val1_r = torch.gather(coords_right, 2, idx1_r)
+    
+        # Gather along y for left neighbors (column x).
+        idx0_l = i0_l.expand(1, c, gh, gw - 1)
+        idx1_l = i1_l.expand(1, c, gh, gw - 1)
+        val0_l = torch.gather(coords_left, 2, idx0_l)
+        val1_l = torch.gather(coords_left, 2, idx1_l)
+    
+        # Linear interpolation weights.
+        w_r = (r_r - i0_r.to(coords.dtype)).expand(1, c, gh, gw - 1)
+        w_l = (r_l - i0_l.to(coords.dtype)).expand(1, c, gh, gw - 1)
+    
+        nbr_from_left = val0_r * (1.0 - w_r) + val1_r * w_r  # (1,C,gh,gw-1)
+        nbr_from_right = val0_l * (1.0 - w_l) + val1_l * w_l  # (1,C,gh,gw-1)
+    
+        # Stack along a small "direction" dimension: 0 = left->right, 1 = right->left.
+        src = torch.stack([left_anchors, right_anchors], dim=2)        # (1,C,2,gh,gw-1)
+        nbr = torch.stack([nbr_from_left, nbr_from_right], dim=2)      # (1,C,2,gh,gw-1)
+        return src, nbr
 
     def _direction_maps(
         grid: torch.Tensor,
@@ -2133,6 +2271,7 @@ def fit_cosine_grid(
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
+                model.line_offset,
             ],
             lr=lr,
         )
@@ -2156,6 +2295,7 @@ def fit_cosine_grid(
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
+                model.line_offset,
             ],
             lr=lr,
         )
