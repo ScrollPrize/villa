@@ -516,7 +516,7 @@ bool SegmentationOverlayController::shouldShowMask(const State& state) const
     return state.maskVisible && !state.maskPoints.empty();
 }
 
-void SegmentationOverlayController::onSurfaceChanged(std::string name, Surface* surface)
+void SegmentationOverlayController::onSurfaceChanged(std::string name, std::shared_ptr<Surface> surface)
 {
     Q_UNUSED(surface);
     if (name == "segmentation") {

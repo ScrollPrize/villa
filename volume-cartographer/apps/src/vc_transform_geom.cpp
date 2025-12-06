@@ -93,7 +93,7 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         }
     }
 
-    QuadSurface* surf = nullptr;
+    std::unique_ptr<QuadSurface> surf;
     try { surf = load_quad_from_tifxyz(inDir.string()); }
     catch (const std::exception& e) {
         std::cerr << "failed to load tifxyz: " << e.what() << std::endl; return 3;
@@ -114,9 +114,8 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         std::filesystem::path out = outDir;
         surf->save(out);
     } catch (const std::exception& e) {
-        std::cerr << "failed to save tifxyz: " << e.what() << std::endl; delete surf; return 4;
+        std::cerr << "failed to save tifxyz: " << e.what() << std::endl; return 4;
     }
-    delete surf;
     return 0;
 }
 

@@ -28,10 +28,7 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (surface->meta && surface->meta->is_object()) {
         return;
     }
-    if (surface->meta) {
-        delete surface->meta;
-    }
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
 }
 
@@ -40,13 +37,13 @@ SegmentationEditManager::SegmentationEditManager(QObject* parent)
 {
 }
 
-bool SegmentationEditManager::beginSession(QuadSurface* baseSurface)
+bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurface)
 {
     if (!baseSurface) {
         return false;
     }
 
-    ensureSurfaceMetaObject(baseSurface);
+    ensureSurfaceMetaObject(baseSurface.get());
 
     auto* basePoints = baseSurface->rawPointsPtr();
     if (!basePoints || basePoints->empty()) {
@@ -78,7 +75,7 @@ void SegmentationEditManager::endSession()
 
     _previewPoints = nullptr;
     _originalPoints.reset();
-    _baseSurface = nullptr;
+    _baseSurface.reset();
     resetPointerSeed();
     _hasPendingEdits = false;
     _pendingGrowthMarking = false;
@@ -1065,7 +1062,7 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     // Queue cell updates in SurfacePatchIndex for R-tree sync
     if (_viewerManager && _baseSurface) {
         if (auto* index = _viewerManager->surfacePatchIndex()) {
-            index->queueCellUpdateForVertex(_baseSurface, row, col);
+            index->queueCellUpdateForVertex(_baseSurface.get(), row, col);
         }
     }
     _hasPendingEdits = true;

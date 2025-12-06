@@ -303,7 +303,7 @@ int process_tifxyz(const std::filesystem::path& src,
 {
     std::unique_ptr<QuadSurface> surf;
     try {
-        surf.reset(load_quad_from_tifxyz(src.string()));
+        surf = load_quad_from_tifxyz(src.string());
     } catch (const std::exception& e) {
         std::cerr << "failed to load tifxyz: " << e.what() << std::endl;
         return EXIT_FAILURE;
@@ -354,7 +354,7 @@ int process_tifxyz(const std::filesystem::path& src,
     outSurf.id = uuid;
 
     if (surf->meta) {
-        outSurf.meta = new nlohmann::json(*surf->meta);
+        outSurf.meta = std::make_unique<nlohmann::json>(*surf->meta);
     }
 
     try {

@@ -6,7 +6,6 @@
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
-#include "vc/core/util/SurfaceMeta.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
@@ -79,7 +78,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
             continue;
         }
 
-        SurfaceMeta other(entry.path(), meta);
+        QuadSurface other(entry.path(), meta);
         if (contains(other, origin, search_effort)) {
             std::cout << "Found overlapping segment at location: " << entry.path() << std::endl;
             return true;
@@ -295,9 +294,9 @@ int main(int argc, char *argv[])
 
     auto direction_fields = load_direction_fields(params, &chunk_cache, cache_root);
 
-    std::unordered_map<std::string,SurfaceMeta*> surfs;
-    std::vector<SurfaceMeta*> surfs_v;
-    SurfaceMeta *src;
+    std::unordered_map<std::string,QuadSurface*> surfs;
+    std::vector<QuadSurface*> surfs_v;
+    QuadSurface *src;
 
     //expansion mode
     int count_overlap = 0;
@@ -333,8 +332,7 @@ int main(int argc, char *argv[])
                 if (meta.value("format","NONE") != "tifxyz")
                     continue;
 
-                SurfaceMeta *sm = new SurfaceMeta(entry.path(), meta);
-                sm->readOverlapping();
+                QuadSurface *sm = new QuadSurface(entry.path(), meta);
 
                 surfs[name] = sm;
                 surfs_v.push_back(sm);
@@ -351,7 +349,7 @@ int main(int argc, char *argv[])
 
         for(auto &it : surfs_v) {
             src = it;
-            cv::Mat_<cv::Vec3f> points = src->surface()->rawPoints();
+            cv::Mat_<cv::Vec3f> points = src->rawPoints();
             int w = points.cols;
             int h = points.rows;
 
@@ -484,7 +482,7 @@ int main(int argc, char *argv[])
     if (thread_limit)
         omp_set_num_threads(thread_limit);
 
-    QuadSurface* resume_surf = nullptr;
+    std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
         if (corrections.getAllCollections().empty())
            resume_surf = load_quad_from_tifxyz(resume_path);
@@ -518,7 +516,7 @@ int main(int argc, char *argv[])
         // Load source surface
         std::unique_ptr<QuadSurface> src_surface;
         try {
-            src_surface.reset(load_quad_from_tifxyz(resume_path));
+            src_surface = load_quad_from_tifxyz(resume_path);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
             return EXIT_FAILURE;
@@ -949,18 +947,14 @@ int main(int argc, char *argv[])
         neighbor_meta["vc_gsfs_mode"] = mode;
         neighbor_meta["vc_gsfs_version"] = "dev";
 
-        out_surf->meta = new nlohmann::json(std::move(neighbor_meta));
+        out_surf->meta = std::make_unique<nlohmann::json>(std::move(neighbor_meta));
         out_surf->save(out_dir, uuid_local, true);
 
         // Done
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
- 
-    if (resume_surf) {
-        delete resume_surf;
-    }
+    QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections);
 
     double area_cm2 = (*surf->meta)["area_cm2"].get<double>();
     if (area_cm2 < min_area_cm) {
@@ -972,32 +966,27 @@ int main(int argc, char *argv[])
 
     std::cout << "saving " << seg_dir << std::endl;
     surf->save(seg_dir, uuid, true);
-
-    SurfaceMeta current;
+    surf->path = seg_dir;
 
     if (mode == "expansion" && !skip_overlap_check) {
-        current.path = seg_dir;
-        current.setSurface(surf);
-        current.bbox = surf->bbox();
-
         // Read existing overlapping data
-        std::set<std::string> current_overlapping = read_overlapping_json(current.path);
+        std::set<std::string> current_overlapping = read_overlapping_json(surf->path);
 
         // Add the source segment
-        current_overlapping.insert(src->name());
+        current_overlapping.insert(src->id);
 
         // Update source's overlapping data
         std::set<std::string> src_overlapping = read_overlapping_json(src->path);
-        src_overlapping.insert(current.name());
+        src_overlapping.insert(surf->id);
         write_overlapping_json(src->path, src_overlapping);
 
         // Check overlaps with existing surfaces
         for(auto &s : surfs_v)
-            if (overlap(current, *s, search_effort)) {
-                current_overlapping.insert(s->name());
+            if (overlap(*surf, *s, search_effort)) {
+                current_overlapping.insert(s->id);
 
                 std::set<std::string> s_overlapping = read_overlapping_json(s->path);
-                s_overlapping.insert(current.name());
+                s_overlapping.insert(surf->id);
                 write_overlapping_json(s->path, s_overlapping);
             }
 
@@ -1009,7 +998,7 @@ int main(int argc, char *argv[])
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
-                if (name == current.name())
+                if (name == surf->id)
                     continue;
 
                 std::filesystem::path meta_fn = entry.path() / "meta.json";
@@ -1025,20 +1014,19 @@ int main(int argc, char *argv[])
                 if (meta.value("format","NONE") != "tifxyz")
                     continue;
 
-                SurfaceMeta other = SurfaceMeta(entry.path(), meta);
-                other.readOverlapping();
+                QuadSurface other = QuadSurface(entry.path(), meta);
 
-                if (overlap(current, other, search_effort)) {
-                    current_overlapping.insert(other.name());
+                if (overlap(*surf, other, search_effort)) {
+                    current_overlapping.insert(other.id);
 
                     std::set<std::string> other_overlapping = read_overlapping_json(other.path);
-                    other_overlapping.insert(current.name());
+                    other_overlapping.insert(surf->id);
                     write_overlapping_json(other.path, other_overlapping);
                 }
             }
 
         // Write final overlapping data for current
-        write_overlapping_json(current.path, current_overlapping);
+        write_overlapping_json(surf->path, current_overlapping);
     }
 
     delete surf;

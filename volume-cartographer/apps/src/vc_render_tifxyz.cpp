@@ -968,7 +968,7 @@ int main(int argc, char *argv[])
                   << (output_is_zarr?" (zarr)":" (tif)")
                   << std::endl;
 
-        QuadSurface *surf = nullptr;
+        std::unique_ptr<QuadSurface> surf;
         try {
             surf = load_quad_from_tifxyz(seg_folder);
         }
@@ -988,8 +988,7 @@ int main(int argc, char *argv[])
 
             QuadSurface* flatSurf = vc::abfFlattenToNewSurface(*surf, flatConfig);
             if (flatSurf) {
-                delete surf;
-                surf = flatSurf;
+                surf.reset(flatSurf);
                 std::cout << "Flattening complete. New grid: "
                           << surf->rawPointsPtr()->cols << " x " << surf->rawPointsPtr()->rows << std::endl;
             } else {
@@ -1054,7 +1053,6 @@ int main(int argc, char *argv[])
         if (crop.width <= 0 || crop.height <= 0) {
             std::cerr << "Error: crop rectangle " << req
                       << " lies outside the render canvas " << canvasROI << std::endl;
-            delete surf;
             return;
         }
         tgt_size = crop.size();
@@ -1083,7 +1081,7 @@ int main(int argc, char *argv[])
         float u0, v0; computeCanvasOrigin(full_size, u0, v0);
         u0 += static_cast<float>(crop.x);
         v0 += static_cast<float>(crop.y);
-        genTile(surf, tgt_size, static_cast<float>(render_scale), u0, v0, points, normals);
+        genTile(surf.get(), tgt_size, static_cast<float>(render_scale), u0, v0, points, normals);
     }
 
     if (output_is_zarr) {
@@ -1141,7 +1139,7 @@ int main(int argc, char *argv[])
             const float u0 = u0_base;
             const float v0 = v0_base;
             globalFlipDecision = computeGlobalFlipDecision(
-                surf, dx0, dy0, u0, v0,
+                surf.get(), dx0, dy0, u0, v0,
                 static_cast<float>(render_scale_zarr),
                 scale_seg, hasAffine, affineTransform,
                 meshCentroid);
@@ -1165,7 +1163,7 @@ int main(int argc, char *argv[])
                                       u0, v0);
 
                     cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
-                    genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
+                    genTile(surf.get(), cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
                             static_cast<float>(render_scale_zarr), u0, v0, tilePoints, tileNormals);
 
                     cv::Mat_<cv::Vec3f> basePoints, stepDirs;
@@ -1438,8 +1436,6 @@ int main(int argc, char *argv[])
                 }
                 if (all_exist) {
                     std::cout << "[tif export] all slices exist in " << layers_dir.string() << ", skipping." << std::endl;
-                    // Nothing else to do
-                    delete surf;
                     return;
                 }
 
@@ -1520,7 +1516,6 @@ int main(int argc, char *argv[])
             }
         }
 
-        delete surf;
         return;
     }
 
@@ -1562,7 +1557,6 @@ int main(int argc, char *argv[])
                     }
                     if (all_exist) {
                         std::cout << "[tif tiled] all slices exist in " << output_path_local.string() << ", skipping." << std::endl;
-                        delete surf;
                         return;
                     }
                 }
@@ -1584,7 +1578,7 @@ int main(int argc, char *argv[])
                     u0 += static_cast<float>(crop.x);
                     v0 += static_cast<float>(crop.y);
                     globalFlipDecision = computeGlobalFlipDecision(
-                        surf, dx0, dy0, u0, v0,
+                        surf.get(), dx0, dy0, u0, v0,
                         static_cast<float>(render_scale),
                         scale_seg, hasAffine, affineTransform,
                         meshCentroid);
@@ -1610,7 +1604,7 @@ int main(int argc, char *argv[])
                                           y0_src + static_cast<size_t>(crop.y),
                                           u0, v0);
                         cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
-                        genTile(surf, cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
+                        genTile(surf.get(), cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
                                 static_cast<float>(render_scale), u0, v0, tilePoints, tileNormals);
 
                         cv::Mat_<cv::Vec3f> basePoints, stepDirs;
@@ -1682,19 +1676,14 @@ int main(int argc, char *argv[])
                 writers.clear(); // Explicitly close all writers
                 std::cout << std::endl;
 
-
-                delete surf;
                 return;
             } catch (const std::exception& e) {
                 std::cerr << "[tif tiled] error: " << e.what() << std::endl;
-                delete surf;
                 return;
             }
         }
 
         }
-
-    delete surf;
     };
 
 

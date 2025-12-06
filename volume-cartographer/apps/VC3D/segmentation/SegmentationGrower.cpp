@@ -78,11 +78,7 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
         return;
     }
 
-    if (surface->meta) {
-        delete surface->meta;
-    }
-
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
 
 
@@ -562,26 +558,24 @@ void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
         return;
     }
 
+    // getSurface now returns the QuadSurface directly, so we just need to refresh the panel
     const auto loadedIds = pkg->getLoadedSurfaceIDs();
     for (const auto& id : loadedIds) {
-        auto surfMeta = pkg->getSurface(id);
-        if (!surfMeta) {
+        auto loadedSurface = pkg->getSurface(id);
+        if (!loadedSurface) {
             continue;
         }
 
-        if (surfMeta->path == surface->path) {
-            if (!surfMeta->meta) {
-                surfMeta->meta = new nlohmann::json(nlohmann::json::object());
-            }
-
+        if (loadedSurface->path == surface->path) {
+            // Sync metadata if needed
             if (surface->meta) {
-                *surfMeta->meta = *surface->meta;
-            } else {
-                surfMeta->meta->clear();
+                if (!loadedSurface->meta) {
+                    loadedSurface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+                }
+                *loadedSurface->meta = *surface->meta;
+            } else if (loadedSurface->meta) {
+                loadedSurface->meta->clear();
             }
-
-            surfMeta->bbox = surface->bbox();
-            surfMeta->setSurface(surface);
 
             if (panel) {
                 panel->refreshSurfaceMetrics(id);
@@ -656,14 +650,14 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return false;
     }
 
-    auto* segmentationSurface = dynamic_cast<QuadSurface*>(_context.surfaces->surface("segmentation"));
+    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.surfaces->surface("segmentation"));
     if (!segmentationSurface) {
         qCInfo(lcSegGrowth) << "Rejecting growth because segmentation surface is missing";
         showStatus(tr("Segmentation surface is not available."), kStatusMedium);
         return false;
     }
 
-    ensureGenerationsChannel(segmentationSurface);
+    ensureGenerationsChannel(segmentationSurface.get());
 
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;
@@ -773,7 +767,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     std::optional<cv::Rect> correctionAffectedBounds;
     if (usingCorrections) {
-        correctionAffectedBounds = computeCorrectionsAffectedBounds(segmentationSurface,
+        correctionAffectedBounds = computeCorrectionsAffectedBounds(segmentationSurface.get(),
                                                                     corrections,
                                                                     _context.viewerManager);
         if (correctionAffectedBounds) {
@@ -788,7 +782,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
 
     TracerGrowthContext ctx;
-    ctx.resumeSurface = segmentationSurface;
+    ctx.resumeSurface = segmentationSurface.get();
     ctx.volume = growthVolume.get();
     ctx.cache = _context.chunkCache;
     ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
@@ -851,10 +845,10 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     // Compute corrections bounds and snapshot "before" surface for annotation saving
     if (usingCorrections) {
         pending.corrections = corrections;
-        auto bounds = computeCorrectionsBounds(corrections, segmentationSurface);
+        auto bounds = computeCorrectionsBounds(corrections, segmentationSurface.get());
         if (bounds) {
             pending.correctionsBounds = bounds;
-            pending.beforeCrop = cropSurfaceToGridRegion(segmentationSurface, bounds->gridRegion);
+            pending.beforeCrop = cropSurfaceToGridRegion(segmentationSurface.get(), bounds->gridRegion);
             if (pending.beforeCrop) {
                 qCInfo(lcSegGrowth) << "Captured before-crop for corrections annotation:"
                                     << bounds->gridRegion.width << "x" << bounds->gridRegion.height;
@@ -947,7 +941,7 @@ void SegmentationGrower::onFutureFinished()
         }
     };
 
-    appendUniqueSurface(request.segmentationSurface);
+    appendUniqueSurface(request.segmentationSurface.get());
     if (_context.module && _context.module->hasActiveSession()) {
         appendUniqueSurface(_context.module->activeBaseSurface());
     }
@@ -1003,11 +997,7 @@ void SegmentationGrower::onFutureFinished()
         }
 
         if (result.surface->meta) {
-            if (targetSurface->meta) {
-                delete targetSurface->meta;
-                targetSurface->meta = nullptr;
-            }
-            targetSurface->meta = new nlohmann::json(*result.surface->meta);
+            targetSurface->meta = std::make_unique<nlohmann::json>(*result.surface->meta);
         } else {
             ensureSurfaceMetaObject(targetSurface);
         }
@@ -1035,7 +1025,7 @@ void SegmentationGrower::onFutureFinished()
         surfaceToPersist = _context.module->activeBaseSurface();
     }
     if (!surfaceToPersist) {
-        surfaceToPersist = request.segmentationSurface;
+        surfaceToPersist = request.segmentationSurface.get();
     }
 
     // Mask is no longer valid after growth/inpainting
@@ -1071,7 +1061,7 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (_context.surfaces) {
-        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, false, true);
+        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, true);
         // Note: SurfacePatchIndex is automatically updated via handleSurfaceChanged signal
     }
 
@@ -1103,11 +1093,13 @@ void SegmentationGrower::onFutureFinished()
     }
 
     QuadSurface* currentSegSurface = nullptr;
+    std::shared_ptr<Surface> currentSegSurfaceHolder;  // Keep surface alive during this scope
     if (_context.surfaces) {
-        currentSegSurface = dynamic_cast<QuadSurface*>(_context.surfaces->surface("segmentation"));
+        currentSegSurfaceHolder = _context.surfaces->surface("segmentation");
+        currentSegSurface = dynamic_cast<QuadSurface*>(currentSegSurfaceHolder.get());
     }
     if (!currentSegSurface) {
-        currentSegSurface = request.segmentationSurface;
+        currentSegSurface = request.segmentationSurface.get();
     }
 
     // Update approval tool after surface replacement (handles case with no active editing session)
@@ -1115,7 +1107,7 @@ void SegmentationGrower::onFutureFinished()
         _context.module->updateApprovalToolAfterGrowth(currentSegSurface);
     }
 
-    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface;
+    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface.get();
     synchronizeSurfaceMeta(request.volumeContext.package, metaSurface, _surfacePanel);
 
     if (_surfacePanel) {
@@ -1157,7 +1149,7 @@ void SegmentationGrower::onFutureFinished()
     // Save corrections annotation if we have a before-crop and bounds
     if (request.usingCorrections && request.beforeCrop && request.correctionsBounds) {
         // Crop the "after" surface using the same grid region
-        auto afterCrop = cropSurfaceToGridRegion(primarySurface ? primarySurface : request.segmentationSurface,
+        auto afterCrop = cropSurfaceToGridRegion(primarySurface ? primarySurface : request.segmentationSurface.get(),
                                                   request.correctionsBounds->gridRegion);
         if (afterCrop) {
             // Get volpkg root from the package

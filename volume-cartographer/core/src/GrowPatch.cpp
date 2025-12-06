@@ -1496,7 +1496,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
         if (!ref_path.empty()) {
             try {
-                reference_surface.reset(load_quad_from_tifxyz(ref_path));
+                reference_surface = load_quad_from_tifxyz(ref_path);
                 trace_data.reference_raycast.surface = reference_surface.get();
                 std::cout << "Loaded reference surface from " << ref_path << std::endl;
             } catch (const std::exception& e) {
@@ -1737,7 +1737,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         const double voxel_size_d = static_cast<double>(voxelsize);
         const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
 
-        surf->meta = new nlohmann::json(meta_params);
+        surf->meta = std::make_unique<nlohmann::json>(meta_params);
         (*surf->meta)["area_vx2"] = area_est_vx2;
         (*surf->meta)["area_cm2"] = area_est_cm2;
         (*surf->meta)["max_gen"] = generation;

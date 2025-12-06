@@ -83,7 +83,7 @@ private:
         VolumeContext volumeContext;
         std::shared_ptr<Volume> growthVolume;
         std::string growthVolumeId;
-        QuadSurface* segmentationSurface{nullptr};
+        std::shared_ptr<QuadSurface> segmentationSurface;
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
         bool inpaintOnly{false};

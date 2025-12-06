@@ -87,7 +87,7 @@ int main(int argc, char* argv[]) {
 
     // Load surface
     std::cout << "Loading surface: " << inputPath << std::endl;
-    QuadSurface* surf = load_quad_from_tifxyz(inputPath.string());
+    auto surf = load_quad_from_tifxyz(inputPath.string());
     if (!surf) {
         std::cerr << "Failed to load surface: " << inputPath << std::endl;
         return 1;
@@ -111,7 +111,6 @@ int main(int argc, char* argv[]) {
         std::cout << "\nComputing UV coordinates..." << std::endl;
         if (!vc::abfFlattenInPlace(*surf, config)) {
             std::cerr << "Flattening failed" << std::endl;
-            delete surf;
             return 1;
         }
 
@@ -124,7 +123,6 @@ int main(int argc, char* argv[]) {
         QuadSurface* flatSurf = vc::abfFlattenToNewSurface(*surf, config);
         if (!flatSurf) {
             std::cerr << "Flattening failed" << std::endl;
-            delete surf;
             return 1;
         }
 
@@ -143,6 +141,5 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Done!" << std::endl;
 
-    delete surf;
     return 0;
 }

@@ -54,10 +54,7 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (surface->meta && surface->meta->is_object()) {
         return;
     }
-    if (surface->meta) {
-        delete surface->meta;
-    }
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
 }
 
@@ -407,12 +404,14 @@ void SegmentationModule::setShowApprovalMask(bool enabled)
     if (_showApprovalMask) {
         // Showing approval mask - load it for display
         QuadSurface* surface = nullptr;
+        std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
         if (_editManager && _editManager->hasSession()) {
             qCInfo(lcSegModule) << "  Loading approval mask (has active session)";
-            surface = _editManager->baseSurface();
+            surface = _editManager->baseSurface().get();
         } else if (_surfaces) {
             qCInfo(lcSegModule) << "  Loading approval mask (from surfaces collection)";
-            surface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+            surfaceHolder = _surfaces->surface("segmentation");
+            surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
         }
 
         if (surface && _overlay) {
@@ -505,11 +504,13 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
             // Set surface on approval tool - prefer surface from collection since it has
             // the most up-to-date approval mask (preserved after tracer growth)
             QuadSurface* surface = nullptr;
+            std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
             if (_surfaces) {
-                surface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+                surfaceHolder = _surfaces->surface("segmentation");
+                surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
             }
             if (!surface && _editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface();
+                surface = _editManager->baseSurface().get();
             }
 
             if (surface) {
@@ -566,11 +567,13 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
             // Set surface on approval tool - prefer surface from collection since it has
             // the most up-to-date approval mask (preserved after tracer growth)
             QuadSurface* surface = nullptr;
+            std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
             if (_surfaces) {
-                surface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+                surfaceHolder = _surfaces->surface("segmentation");
+                surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
             }
             if (!surface && _editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface();
+                surface = _editManager->baseSurface().get();
             }
 
             if (surface) {
@@ -607,10 +610,12 @@ void SegmentationModule::saveApprovalMaskToDisk()
     qCInfo(lcSegModule) << "Saving approval mask to disk...";
 
     QuadSurface* surface = nullptr;
+    std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
     if (_editManager && _editManager->hasSession()) {
-        surface = _editManager->baseSurface();
+        surface = _editManager->baseSurface().get();
     } else if (_surfaces) {
-        surface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+        surfaceHolder = _surfaces->surface("segmentation");
+        surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
     }
 
     if (_overlay && surface) {
@@ -671,8 +676,8 @@ void SegmentationModule::applyEdits()
     clearInvalidationBrush();
     _editManager->applyPreview();
     if (_surfaces) {
-        auto* preview = _editManager->previewSurface();
-        _surfaces->setSurface("segmentation", preview, false, false, true);
+        auto preview = _editManager->previewSurface();
+        _surfaces->setSurface("segmentation", preview, false, true);
     }
     emitPendingChanges();
     markAutosaveNeeded(true);
@@ -697,7 +702,7 @@ void SegmentationModule::resetEdits()
     clearLineDragStroke();
     _editManager->resetPreview();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
     refreshOverlay();
     emitPendingChanges();
@@ -792,10 +797,12 @@ void SegmentationModule::refreshOverlay()
 
     // Get surface for approval mask - from edit session if available, otherwise from surfaces collection
     QuadSurface* approvalSurface = nullptr;
+    std::shared_ptr<Surface> approvalSurfaceHolder;  // Keep surface alive during this scope
     if (hasSession && _editManager) {
-        approvalSurface = _editManager->baseSurface();
+        approvalSurface = _editManager->baseSurface().get();
     } else if (_surfaces) {
-        approvalSurface = dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation"));
+        approvalSurfaceHolder = _surfaces->surface("segmentation");
+        approvalSurface = dynamic_cast<QuadSurface*>(approvalSurfaceHolder.get());
     }
 
     // Set approval mask state even without editing session (for view-only mode)
@@ -1140,13 +1147,13 @@ float SegmentationModule::gridStepWorld() const
     if (!_editManager || !_editManager->hasSession()) {
         // For approval mask mode, try to get base surface scale even without active session
         if (_editManager && _editManager->baseSurface()) {
-            surface = _editManager->baseSurface();
+            surface = _editManager->baseSurface().get();
             result = averageScale(surface->scale());
         }
     } else {
-        surface = _editManager->previewSurface();
+        surface = _editManager->previewSurface().get();
         if (!surface) {
-            surface = _editManager->baseSurface();
+            surface = _editManager->baseSurface().get();
         }
         if (surface) {
             result = averageScale(surface->scale());
@@ -1210,7 +1217,7 @@ void SegmentationModule::finishDrag()
     if (moved) {
         _editManager->applyPreview();
         if (_surfaces) {
-            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
         markAutosaveNeeded();
     }
@@ -1418,7 +1425,7 @@ void SegmentationModule::performAutosave()
     if (!_editManager) {
         return;
     }
-    QuadSurface* surface = _editManager->baseSurface();
+    QuadSurface* surface = _editManager->baseSurface().get();
     if (!surface) {
         return;
     }

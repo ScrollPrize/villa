@@ -79,7 +79,7 @@ bool Segmentation::canLoadSurface() const
            metadata_["format"].get<std::string>() == "tifxyz";
 }
 
-std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()
+std::shared_ptr<QuadSurface> Segmentation::loadSurface()
 {
     if (surface_) {
         return surface_;
@@ -90,9 +90,13 @@ std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()
     }
 
     try {
-        surface_ = std::make_shared<SurfaceMeta>(path_);
-        surface_->surface();
-        surface_->readOverlapping();
+        // Load the surface directly (no SurfaceMeta wrapper)
+        surface_ = load_quad_from_tifxyz(path_.string());
+
+        // Load overlapping info and cache mask timestamp
+        surface_->readOverlappingJson();
+        surface_->refreshMaskTimestamp();
+
         return surface_;
     } catch (const std::exception& e) {
         Logger()->error("Failed to load surface for {}: {}", id(), e.what());
@@ -101,7 +105,7 @@ std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()
     }
 }
 
-std::shared_ptr<SurfaceMeta> Segmentation::getSurface() const
+std::shared_ptr<QuadSurface> Segmentation::getSurface() const
 {
     return surface_;
 }

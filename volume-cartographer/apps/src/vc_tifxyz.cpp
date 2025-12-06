@@ -48,7 +48,7 @@ int main(int argc, char* argv[]) {
     float rotation_angle = vm["rotate"].as<float>();
 
     // Load the surface
-    QuadSurface* surf = nullptr;
+    std::unique_ptr<QuadSurface> surf;
     try {
         surf = load_quad_from_tifxyz(input_path);
     } catch (const std::exception& e) {
@@ -70,13 +70,12 @@ int main(int argc, char* argv[]) {
     // Recalculate and update the surface area
     double area = vc::surface::computeSurfaceAreaVox2(surf->rawPoints());
     if (!surf->meta) {
-        surf->meta = new nlohmann::json();
+        surf->meta = std::make_unique<nlohmann::json>();
     }
     (*surf->meta)["area"] = area;
 
     surf->save(output_path, true);
     std::cout << "Saved rotated surface to: " << output_path << std::endl;
 
-    delete surf;
     return EXIT_SUCCESS;
 }

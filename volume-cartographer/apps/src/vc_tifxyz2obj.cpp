@@ -347,7 +347,7 @@ int main(int argc, char *argv[])
     const std::filesystem::path seg_path = argv[1];
     const std::filesystem::path obj_path = argv[2];
 
-    QuadSurface *surf = nullptr;
+    std::unique_ptr<QuadSurface> surf;
     try {
         surf = load_quad_from_tifxyz(seg_path);
     }
@@ -356,8 +356,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    surf_write_obj(surf, obj_path, normalize_uv, align_grid, decimate_iterations, clean_surface, clean_sigma_k);
+    surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, decimate_iterations, clean_surface, clean_sigma_k);
 
-    delete surf;
     return EXIT_SUCCESS;
 }

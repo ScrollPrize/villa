@@ -1,6 +1,6 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/SurfaceMeta.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 
@@ -22,7 +22,7 @@ int main(int argc, char *argv[])
     int search_iters = 10;
     srand(clock());
 
-    SurfaceMeta current(seg_dir);
+    QuadSurface current(seg_dir);
 
     // Read existing overlapping data for current segment
     std::set<std::string> current_overlapping = read_overlapping_json(current.path);
@@ -33,7 +33,7 @@ int main(int argc, char *argv[])
         if (std::filesystem::is_directory(entry))
         {
             std::string name = entry.path().filename();
-            if (name == current.name())
+            if (name == current.id)
                 continue;
 
             std::filesystem::path meta_fn = entry.path() / "meta.json";
@@ -55,28 +55,27 @@ int main(int argc, char *argv[])
             if (meta.value("format","NONE") != "tifxyz")
                 continue;
 
-            SurfaceMeta other = SurfaceMeta(entry.path(), meta);
-            other.readOverlapping();
+            QuadSurface other = QuadSurface(entry.path(), meta);
 
             if (overlap(current, other, search_iters)) {
                 found_overlaps = true;
 
                 // Add to current's overlapping set
-                current_overlapping.insert(other.name());
+                current_overlapping.insert(other.id);
 
                 // Read and update other's overlapping set
                 std::set<std::string> other_overlapping = read_overlapping_json(other.path);
-                other_overlapping.insert(current.name());
+                other_overlapping.insert(current.id);
                 write_overlapping_json(other.path, other_overlapping);
 
-                std::cout << "Found overlap: " << current.name() << " <-> " << other.name() << std::endl;
+                std::cout << "Found overlap: " << current.id << " <-> " << other.id << std::endl;
             }
         }
 
     // Write current's overlapping data
     if (found_overlaps || !current_overlapping.empty()) {
         write_overlapping_json(current.path, current_overlapping);
-        std::cout << "Updated overlapping data for " << current.name()
+        std::cout << "Updated overlapping data for " << current.id
                   << " (" << current_overlapping.size() << " overlaps)" << std::endl;
     }
 

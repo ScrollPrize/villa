@@ -22,7 +22,7 @@ int main(int argc, char *argv[])
     std::filesystem::path mask_path = argv[2];
     std::filesystem::path tgt_path = argv[3];
     
-    QuadSurface *surf = nullptr;
+    std::unique_ptr<QuadSurface> surf;
     try {
         surf = load_quad_from_tifxyz(seg_path);
     }
@@ -66,7 +66,5 @@ int main(int argc, char *argv[])
 
     surf->save(tgt_path);
 
-    delete surf;
-    
     return EXIT_SUCCESS;
 }

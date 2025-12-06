@@ -53,10 +53,7 @@ void ensureMetaObject(QuadSurface* surface)
     if (surface->meta && surface->meta->is_object()) {
         return;
     }
-    if (surface->meta) {
-        delete surface->meta;
-    }
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
 
 bool ensureGenerationsChannel(QuadSurface* surface)
@@ -520,8 +517,8 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
-    const double previousAreaVx2 = vc::json::number_or(surface->meta, "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json::number_or(surface->meta, "area_cm2", -1.0);
+    const double previousAreaVx2 = vc::json::number_or(surface->meta.get(), "area_vx2", -1.0);
+    const double previousAreaCm2 = vc::json::number_or(surface->meta.get(), "area_cm2", -1.0);
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {

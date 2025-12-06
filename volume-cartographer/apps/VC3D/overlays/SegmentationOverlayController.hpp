@@ -129,7 +129,7 @@ protected:
                            ViewerOverlayControllerBase::OverlayBuilder& builder) override;
 
 private slots:
-    void onSurfaceChanged(std::string name, Surface* surface);
+    void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surface);
 
 private:
     void buildRadiusOverlay(const State& state,

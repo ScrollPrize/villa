@@ -78,12 +78,12 @@ public:
     void setViewerManager(ViewerManager* manager) { _viewerManager = manager; }
     [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
 
-    bool beginSession(QuadSurface* baseSurface);
+    bool beginSession(std::shared_ptr<QuadSurface> baseSurface);
     void endSession();
 
     [[nodiscard]] bool hasSession() const { return static_cast<bool>(_baseSurface); }
-    [[nodiscard]] QuadSurface* baseSurface() const { return _baseSurface; }
-    [[nodiscard]] QuadSurface* previewSurface() const { return _baseSurface; }
+    [[nodiscard]] std::shared_ptr<QuadSurface> baseSurface() const { return _baseSurface; }
+    [[nodiscard]] std::shared_ptr<QuadSurface> previewSurface() const { return _baseSurface; }
 
     // Synchronize a rectangular region with the latest base-surface data without rebuilding the session.
     bool applyExternalSurfaceUpdate(const cv::Rect& vertexRect);
@@ -140,7 +140,7 @@ private:
     float stepNormalization() const;
     void resetPointerSeed();
 
-    QuadSurface* _baseSurface{nullptr};
+    std::shared_ptr<QuadSurface> _baseSurface;
     ViewerManager* _viewerManager{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
     cv::Mat_<cv::Vec3f>* _previewPoints{nullptr};

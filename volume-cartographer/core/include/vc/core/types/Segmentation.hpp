@@ -4,7 +4,7 @@
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
-#include "vc/core/util/SurfaceMeta.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 class Segmentation
 {
@@ -20,11 +20,11 @@ public:
     [[nodiscard]] std::filesystem::path path() const { return path_; }
     void saveMetadata();
 
-    // Surface management
+    // Surface management - returns QuadSurface directly (no SurfaceMeta wrapper)
     [[nodiscard]] bool isSurfaceLoaded() const;
     [[nodiscard]] bool canLoadSurface() const;
-    std::shared_ptr<SurfaceMeta> loadSurface();
-    [[nodiscard]] std::shared_ptr<SurfaceMeta> getSurface() const;
+    std::shared_ptr<QuadSurface> loadSurface();
+    [[nodiscard]] std::shared_ptr<QuadSurface> getSurface() const;
     void unloadSurface();
 
     static bool checkDir(std::filesystem::path path);
@@ -32,7 +32,7 @@ public:
 private:
     std::filesystem::path path_;
     nlohmann::json metadata_;
-    std::shared_ptr<SurfaceMeta> surface_;
+    std::shared_ptr<QuadSurface> surface_;
 
     void loadMetadata();
 };

@@ -108,7 +108,7 @@ int main(int argc, char *argv[])
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 
     for(auto &path : seg_dirs) {
-        QuadSurface *surf = nullptr;
+        std::unique_ptr<QuadSurface> surf;
         try {
             surf = load_quad_from_tifxyz(path);
         }
@@ -138,8 +138,6 @@ int main(int argc, char *argv[])
 
         vid << col;
         cv::imwrite("col.tif", col);
-
-        delete surf;
     }
 
     return EXIT_SUCCESS;

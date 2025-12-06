@@ -48,7 +48,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    QuadSurface* surface = load_quad_from_tifxyz(surface_path);
+    auto surface = load_quad_from_tifxyz(surface_path);
     if (!surface) {
         std::cerr << "Error: Failed to load surface from " << surface_path << std::endl;
         return 1;
@@ -58,7 +58,7 @@ int main(int argc, char** argv)
     if (z_max == -1)
         z_min = (int)surface->bbox().high[2];
 
-    nlohmann::json metrics = calc_point_metrics(collection, surface, z_min, z_max);
+    nlohmann::json metrics = calc_point_metrics(collection, surface.get(), z_min, z_max);
 
     if (vm.count("winding")) {
         std::string winding_path = vm["winding"].as<std::string>();
@@ -67,11 +67,9 @@ int main(int argc, char** argv)
             std::cerr << "Error: Failed to load winding from " << winding_path << std::endl;
             return 1;
         }
-        nlohmann::json winding_metrics = calc_point_winding_metrics(collection, surface, winding, z_min, z_max);
+        nlohmann::json winding_metrics = calc_point_winding_metrics(collection, surface.get(), winding, z_min, z_max);
         metrics.update(winding_metrics);
     }
-
-    delete surface;
 
     std::ofstream o(output_path);
     if (!o.is_open()) {

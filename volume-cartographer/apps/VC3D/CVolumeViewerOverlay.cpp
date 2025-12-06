@@ -117,11 +117,12 @@ const std::vector<CVolumeViewer::OverlayColormapEntry>& CVolumeViewer::overlayCo
 void CVolumeViewer::updateAllOverlays()
 {
     // Validate _surf against collection to prevent use-after-free
-    if (!currentSurface()) {
+    auto surf = _surf_weak.lock();
+    if (!surf) {
         return;
     }
 
-    if (auto* plane = dynamic_cast<PlaneSurface*>(_surf)) {
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         POI *poi = _surf_col->poi("focus");
         if (poi) {
             cv::Vec3f planeOrigin = plane->origin();
@@ -138,7 +139,7 @@ void CVolumeViewer::updateAllOverlays()
     QPointF scenePos = fGraphicsView->mapToScene(viewportPos);
 
     cv::Vec3f p, n;
-    if (scene2vol(p, n, _surf, _surf_name, _surf_col, scenePos, _vis_center, _scale)) {
+    if (scene2vol(p, n, surf.get(), _surf_name, _surf_col, scenePos, _vis_center, _scale)) {
         POI *cursor = _surf_col->poi("cursor");
         if (!cursor)
             cursor = new POI;

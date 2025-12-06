@@ -108,8 +108,8 @@ signals:
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
-    void handleSurfaceChanged(std::string name, Surface* surf, bool isEditUpdate = false);
-    void handleSurfaceWillBeDeleted(std::string name, Surface* surf);
+    void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
+    void handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
     bool updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate);
@@ -145,10 +145,11 @@ private:
     VolumeOverlayController* _volumeOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
     bool _surfacePatchIndexNeedsRebuild{true};
-    std::unordered_set<QuadSurface*> _indexedSurfaces;
-    std::vector<QuadSurface*> _pendingSurfacePatchIndexSurfaces;
-    std::vector<QuadSurface*> _surfacesQueuedDuringRebuild;
-    std::vector<QuadSurface*> _surfacesQueuedForRemovalDuringRebuild;
+    // Use string IDs for surface tracking to avoid dangling pointers in async operations
+    std::unordered_set<std::string> _indexedSurfaceIds;
+    std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
+    std::vector<std::string> _surfacesQueuedDuringRebuildIds;
+    std::vector<std::string> _surfacesQueuedForRemovalDuringRebuildIds;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
 
     void rebuildSurfacePatchIndexIfNeeded();

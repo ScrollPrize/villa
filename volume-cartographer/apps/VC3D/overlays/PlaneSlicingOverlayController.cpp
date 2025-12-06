@@ -181,7 +181,8 @@ void PlaneSlicingOverlayController::collectPrimitives(CVolumeViewer* viewer,
     };
 
     for (const auto& def : planeDefs) {
-        auto* plane = dynamic_cast<PlaneSurface*>(_surfaces->surface(def.name));
+        auto planeHolder = _surfaces->surface(def.name);  // Keep surface alive during this iteration
+        auto* plane = dynamic_cast<PlaneSurface*>(planeHolder.get());
         if (!plane) {
             continue;
         }
@@ -354,7 +355,8 @@ void PlaneSlicingOverlayController::handleMouseMove(CVolumeViewer* viewer,
         float candidate = normalizeDegrees(angle - visual.baseAngleDegrees);
 
         float currentAngle = 0.0f;
-        if (auto* planeSurface = dynamic_cast<PlaneSurface*>(_surfaces->surface(_activeDrag.planeName))) {
+        auto planeSurfaceHolder = _surfaces->surface(_activeDrag.planeName);  // Keep surface alive
+        if (auto* planeSurface = dynamic_cast<PlaneSurface*>(planeSurfaceHolder.get())) {
             cv::Vec3f currentNormal = planeSurface->normal({}, {});
             cv::Vec3f currentDir3D = currentNormal.cross(cv::Vec3f(0.0f, 0.0f, 1.0f));
             if (cv::norm(currentDir3D) > 1e-5f) {

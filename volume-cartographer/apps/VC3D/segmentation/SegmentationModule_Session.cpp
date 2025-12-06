@@ -11,7 +11,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
-bool SegmentationModule::beginEditingSession(QuadSurface* surface)
+bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surface)
 {
     if (!_editManager || !surface) {
         return false;
@@ -30,7 +30,7 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
     }
 
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     if (_overlay) {
@@ -41,7 +41,7 @@ bool SegmentationModule::beginEditingSession(QuadSurface* surface)
 
     // Set surface on approval tool if edit approval mask mode is active
     if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(_editManager->baseSurface());
+        _approvalTool->setSurface(_editManager->baseSurface().get());
     }
 
     if (_overlay) {
@@ -68,15 +68,15 @@ void SegmentationModule::endEditingSession()
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
     refreshOverlay();
-    QuadSurface* baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
-    QuadSurface* previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
+    auto baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
+    auto previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
 
     if (_surfaces && previewSurface) {
-        Surface* currentSurface = _surfaces->surface("segmentation");
-        if (currentSurface == previewSurface) {
+        auto currentSurface = _surfaces->surface("segmentation");
+        if (currentSurface.get() == previewSurface.get()) {
             const bool previousGuard = _ignoreSegSurfaceChange;
             _ignoreSegSurfaceChange = true;
-            _surfaces->setSurface("segmentation", baseSurface, false, false, true);
+            _surfaces->setSurface("segmentation", baseSurface, false, true);
             _ignoreSegSurfaceChange = previousGuard;
         }
     }
@@ -92,7 +92,7 @@ void SegmentationModule::endEditingSession()
     updateAutosaveState();
 }
 
-void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* surface)
+void SegmentationModule::onSurfaceCollectionChanged(std::string name, std::shared_ptr<Surface> surface)
 {
     if (name != "segmentation" || !_editingEnabled || _ignoreSegSurfaceChange) {
         return;
@@ -103,10 +103,10 @@ void SegmentationModule::onSurfaceCollectionChanged(std::string name, Surface* s
         return;
     }
 
-    QuadSurface* previewSurface = _editManager->previewSurface();
-    QuadSurface* baseSurface = _editManager->baseSurface();
+    auto previewSurface = _editManager->previewSurface();
+    auto baseSurface = _editManager->baseSurface();
 
-    if (surface == previewSurface || surface == baseSurface) {
+    if (surface.get() == previewSurface.get() || surface.get() == baseSurface.get()) {
         return;
     }
 
@@ -164,12 +164,12 @@ bool SegmentationModule::restoreUndoSnapshot()
     if (applied) {
         _editManager->applyPreview();
         if (_surfaces) {
-            auto* preview = _editManager->previewSurface();
+            auto preview = _editManager->previewSurface();
 
             // Queue affected cells for incremental R-tree update
             if (preview && undoBounds && undoBounds->width > 0 && undoBounds->height > 0 && _viewerManager) {
                 if (auto* index = _viewerManager->surfacePatchIndex()) {
-                    index->queueCellRangeUpdate(preview,
+                    index->queueCellRangeUpdate(preview.get(),
                                               undoBounds->y,
                                               undoBounds->y + undoBounds->height,
                                               undoBounds->x,
@@ -177,7 +177,7 @@ bool SegmentationModule::restoreUndoSnapshot()
                 }
             }
 
-            _surfaces->setSurface("segmentation", preview, false, false, true);
+            _surfaces->setSurface("segmentation", preview, false, true);
         }
         clearInvalidationBrush();
         refreshOverlay();
@@ -203,7 +203,7 @@ bool SegmentationModule::hasActiveSession() const
 
 QuadSurface* SegmentationModule::activeBaseSurface() const
 {
-    return _editManager ? _editManager->baseSurface() : nullptr;
+    return _editManager ? _editManager->baseSurface().get() : nullptr;
 }
 
 void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
@@ -211,14 +211,14 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     if (!_editManager || !surface) {
         return;
     }
-    if (_editManager->baseSurface() != surface) {
+    if (_editManager->baseSurface().get() != surface) {
         return;
     }
     cancelDrag();
     _editManager->clearInvalidatedEdits();
     _editManager->refreshFromBaseSurface();
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     // Update approval tool surface if editing approval mask
@@ -246,12 +246,12 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
 
     // Update approval tool surface if editing approval mask
     if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(_editManager->baseSurface());
+        _approvalTool->setSurface(_editManager->baseSurface().get());
     }
 
     // Reload approval mask image if showing approval mask
     if (_showApprovalMask && _overlay) {
-        _overlay->loadApprovalMaskImage(_editManager->baseSurface());
+        _overlay->loadApprovalMaskImage(_editManager->baseSurface().get());
     }
 
     refreshOverlay();
@@ -273,7 +273,7 @@ void SegmentationModule::updateApprovalToolAfterGrowth(QuadSurface* surface)
     // Use base surface if there's an active editing session, otherwise use the provided surface
     QuadSurface* approvalSurface = surface;
     if (_editManager && _editManager->hasSession()) {
-        approvalSurface = _editManager->baseSurface();
+        approvalSurface = _editManager->baseSurface().get();
     }
 
     if (!approvalSurface) {

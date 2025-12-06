@@ -766,7 +766,7 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
     
-    std::vector<QuadSurface*> surfs;
+    std::vector<std::unique_ptr<QuadSurface>> surfs;
     std::vector<cv::Mat_<cv::Vec3f>> surf_points;
     std::vector<cv::Mat_<float>> winds;
     std::vector<cv::Mat_<uint8_t>> supports;
@@ -791,18 +791,18 @@ int main(int argc, char *argv[])
     int large_opt_every = 8;
     
     for(int n=0;n<argc/3;n++) {
-        QuadSurface *surf = load_quad_from_tifxyz(argv[n*3+2]);
-        
+        auto surf = load_quad_from_tifxyz(argv[n*3+2]);
+
         cv::Mat_<float> wind = cv::imread(argv[n*3+3], cv::IMREAD_UNCHANGED);
-                    
+
         cv::Mat_<cv::Vec3f> points = surf->rawPoints();
-        
+
         for(int j=0;j<wind.rows;j++)
             for(int i=0;i<wind.cols;i++)
                 if (points(j,i)[0] == -1)
                     wind(j,i) = NAN;
-        
-        surfs.push_back(surf);
+
+        surfs.push_back(std::move(surf));
         winds.push_back(wind);
         surf_points.push_back(points);
         weights.push_back(atof(argv[n*3+4]));
@@ -1435,7 +1435,7 @@ int main(int argc, char *argv[])
     {
         QuadSurface *surf_full = new QuadSurface(points(bbox), surfs[0]->_scale/trace_mul);
         std::filesystem::path tgt_dir = "./";
-        surf_full->meta = new nlohmann::json;
+        surf_full->meta = std::make_unique<nlohmann::json>();
         (*surf_full->meta)["vc_fill_quadmesh_params"] = params;
         std::string name_prefix = "fuse_fill_";
         std::string uuid = name_prefix + time_str();
@@ -1464,9 +1464,5 @@ int main(int argc, char *argv[])
     //     surf_hr->save(seg_dir, uuid);
     // }
 
-    for (auto sm : surfs) {
-        delete sm;
-    }
-    
     return EXIT_SUCCESS;
 }

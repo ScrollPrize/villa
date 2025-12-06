@@ -530,7 +530,7 @@ void SegmentationPushPullTool::stopAll()
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
         _editManager->applyPreview();
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
     }
 }
@@ -601,7 +601,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     }
     const cv::Vec3f centerWorld = *centerWorldOpt;
 
-    QuadSurface* baseSurface = _editManager->baseSurface();
+    auto baseSurface = _editManager->baseSurface();
     if (!baseSurface) {
         _editManager->cancelActiveDrag();
         _samplesValid = false;
@@ -617,7 +617,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         // Fallback to robust normal computation if direct lookup fails
         cv::Vec3f ptr = baseSurface->pointer();
         baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
@@ -672,7 +672,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                 auto sampleTarget = computeAlphaTarget(baseWorld,
                                  sampleNormal,
                                  _state.direction,
-                                 baseSurface,
+                                 baseSurface.get(),
                                  hover.viewer,
                                  &sampleUnavailable);
                 if (sampleUnavailable) {
@@ -757,7 +757,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         auto alphaTarget = computeAlphaTarget(centerWorld,
                           normal,
                           _state.direction,
-                          baseSurface,
+                          baseSurface.get(),
                           hover.viewer,
                           &alphaUnavailable);
         if (alphaTarget) {
@@ -807,7 +807,7 @@ bool SegmentationPushPullTool::applyStepInternal()
 
     // Trigger visual refresh
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false, true);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     _module.refreshOverlay();
