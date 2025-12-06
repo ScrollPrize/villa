@@ -858,9 +858,12 @@ def fit_cosine_grid(
                 mask_arr = np.clip(mask_arr, 0.0, 1.0)
                 if mask_arr.shape == x_pix.shape:
                     if gw > 1:
-                        m_h = np.minimum(mask_arr[:, :-1], mask_arr[:, 1:])  # (gh,gw-1)
+                        # Horizontal edges: average of endpoint weights so that edges
+                        # with at least one in-image vertex still contribute.
+                        m_h = 0.5 * (mask_arr[:, :-1] + mask_arr[:, 1:])  # (gh,gw-1)
                     if gh > 1:
-                        m_v = np.minimum(mask_arr[:-1, :], mask_arr[1:, :])  # (gh-1,gw)
+                        # Vertical edges: average of endpoint weights.
+                        m_v = 0.5 * (mask_arr[:-1, :] + mask_arr[1:, :])  # (gh-1,gw)
  
             def edge_brightness(w_edge: float) -> float:
                 """
@@ -1304,11 +1307,11 @@ def fit_cosine_grid(
         if mask is None:
             return smooth_x.mean(), smooth_y.mean()
     
-        # mask: (1,1,gh,gw) -> per-edge weights via min of endpoints.
+        # mask: (1,1,gh,gw) -> per-edge weights via average of endpoints.
         m = mask
         # Horizontal edges: between (y,x) and (y,x+1).
         if isinstance(smooth_x, torch.Tensor) and smooth_x.numel() > 0:
-            m_h = torch.minimum(m[:, :, :, :-1], m[:, :, :, 1:])  # (1,1,gh,gw-1)
+            m_h = 0.5 * (m[:, :, :, :-1] + m[:, :, :, 1:])  # (1,1,gh,gw-1)
             wsum_h = m_h.sum()
             if wsum_h > 0:
                 loss_x = (smooth_x * m_h).sum() / wsum_h
@@ -1319,7 +1322,7 @@ def fit_cosine_grid(
     
         # Vertical edges: between (y,x) and (y+1,x).
         if isinstance(smooth_y, torch.Tensor) and smooth_y.numel() > 0:
-            m_v = torch.minimum(m[:, :, :-1, :], m[:, :, 1:, :])  # (1,1,gh-1,gw)
+            m_v = 0.5 * (m[:, :, :-1, :] + m[:, :, 1:, :])  # (1,1,gh-1,gw)
             wsum_v = m_v.sum()
             if wsum_v > 0:
                 loss_y = (smooth_y * m_v).sum() / wsum_v
@@ -1335,9 +1338,11 @@ def fit_cosine_grid(
         Smoothness penalty on modulation parameters (amp, bias) on the coarse grid.
    
         We only regularize variation along y for modulation. If a coarse-grid
-        mask is provided, we weight each vertical difference by the minimum of
+        mask is provided, we weight each vertical difference by the average of
         its endpoint weights (after resampling the mask to the modulation grid
-        in x) and normalize by the sum of weights.
+        in x) and normalize by the sum of weights so that differences with one
+        in-image endpoint still contribute while fully out-of-image connections
+        (both endpoints 0) are ignored.
         """
         # Stack amp and bias so both are regularized consistently.
         mods = torch.cat([model.amp_coarse, model.bias_coarse], dim=1)  # (1,2,gh,gw_mod)
@@ -1362,8 +1367,8 @@ def fit_cosine_grid(
                 mode="bilinear",
                 align_corners=True,
             )
-            # Vertical edges: between rows j and j+1.
-            m_v = torch.minimum(mask_mod[:, :, :-1, :], mask_mod[:, :, 1:, :])  # (1,1,gh-1,gw_mod)
+            # Vertical edges: between rows j and j+1; use average of endpoint weights.
+            m_v = 0.5 * (mask_mod[:, :, :-1, :] + mask_mod[:, :, 1:, :])  # (1,1,gh-1,gw_mod)
         wsum = m_v.sum()
         if wsum > 0:
             return (dy_sq.mean(dim=1, keepdim=True) * m_v).sum() / wsum
@@ -1390,8 +1395,10 @@ def fit_cosine_grid(
           and encourage distances to be close to that average.
     
         If a coarse-grid mask is provided, we weight horizontal/vertical edges
-        by the minimum of their endpoint weights and normalize by the sum of
-        weights, so that edges lying fully outside the image do not contribute.
+        by the average of their endpoint weights and normalize by the sum of
+        weights, so that edges lying fully outside the image (both endpoints 0)
+        do not contribute while edges with one in-image endpoint still receive
+        a non-zero weight.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
@@ -1420,10 +1427,10 @@ def fit_cosine_grid(
         dist_v = torch.sqrt(dx_v * dx_v + dy_v * dy_v + 1e-12)  # (1,1,gh-1,gw)
     
         if mask is not None:
-            # Per-edge masks via min of endpoint weights.
+            # Per-edge masks via average of endpoint weights.
             m = mask  # (1,1,gh,gw)
-            m_h = torch.minimum(m[:, :, :, :-1], m[:, :, :, 1:])    # (1,1,gh,gw-1)
-            m_v = torch.minimum(m[:, :, :-1, :], m[:, :, 1:, :])    # (1,1,gh-1,gw)
+            m_h = 0.5 * (m[:, :, :, :-1] + m[:, :, :, 1:])    # (1,1,gh,gw-1)
+            m_v = 0.5 * (m[:, :, :-1, :] + m[:, :, 1:, :])    # (1,1,gh-1,gw)
     
             # Weighted averages for reference distances.
             wsum_h = m_h.sum()
@@ -1491,9 +1498,10 @@ def fit_cosine_grid(
         grid lines, while still allowing bending along y.
  
         If a coarse-grid mask is provided, each (row,col) location contributing
-        to the comparison is weighted by the minimum of the corresponding
-        horizontal and vertical edge weights, so that comparisons involving
-        points outside the image are ignored.
+        to the comparison is weighted by an average of the corresponding
+        horizontal and vertical edge weights, so that configurations with at
+        least one in-image vertex still contribute, while locations whose
+        participating edges are fully outside the image receive zero weight.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
@@ -1552,14 +1560,15 @@ def fit_cosine_grid(
         # vertical edge masks so that locations involving out-of-image points
         # are downweighted/ignored.
         m = mask  # (1,1,gh,gw)
-        m_h = torch.minimum(m[:, :, :, :-1], m[:, :, :, 1:])     # (1,1,gh,gw-1)
-        m_v = torch.minimum(m[:, :, :-1, :], m[:, :, 1:, :])     # (1,1,gh-1,gw)
+        m_h = 0.5 * (m[:, :, :, :-1] + m[:, :, :, 1:])     # (1,1,gh,gw-1)
+        m_v = 0.5 * (m[:, :, :-1, :] + m[:, :, 1:, :])     # (1,1,gh-1,gw)
  
         # Restrict to the (gh-1,gw-1) region used above.
         m_h_use = m_h[:, :, 0:gh-1, 0:gw-1]   # (1,1,gh-1,gw-1)
         m_v_use = m_v[:, :, 0:gh-1, 0:gw-1]   # (1,1,gh-1,gw-1)
-        m_loc = torch.minimum(m_h_use, m_v_use).unsqueeze(2)     # (1,1,1,gh-1,gw-1)
-        m_loc = m_loc.expand_as(base_unweighted)                 # (1,1,2,gh-1,gw-1)
+        # Average horizontal/vertical contributions at each location.
+        m_loc = 0.5 * (m_h_use + m_v_use)
+        m_loc = m_loc.unsqueeze(2).expand_as(base_unweighted)    # (1,1,2,gh-1,gw-1)
  
         wsum = m_loc.sum()
         if wsum > 0:
@@ -1578,9 +1587,10 @@ def fit_cosine_grid(
         - penalize triangle area magnitude being less than 1/4 of the average,
         - strongly penalize negative (flipped) triangle areas.
  
-        If a coarse-grid mask is provided, each quad is weighted by the minimum
-        of its four corner weights so that quads lying fully outside the image
-        do not contribute.
+        If a coarse-grid mask is provided, each quad is weighted by the average
+        of its four corner weights so that quads fully outside the image
+        (all four corners 0) do not contribute, while quads with at least one
+        in-image corner still receive a non-zero weight.
         """
         coords = model.base_grid + model.offset  # (1,2,gh,gw)
         u = coords[:, 0:1]
@@ -1678,7 +1688,10 @@ def fit_cosine_grid(
         m01 = m[:, :, :-1, 1:]
         m11 = m[:, :, 1:, 1:]
         m10 = m[:, :, 1:, :-1]
-        m_quad = torch.minimum(torch.minimum(m00, m01), torch.minimum(m10, m11))  # (1,1,gh-1,gw-1)
+        # Use average of the four corner weights so that quads with at least one
+        # in-image corner still contribute while fully out-of-image quads (all 0)
+        # are ignored.
+        m_quad = 0.25 * (m00 + m01 + m10 + m11)  # (1,1,gh-1,gw-1)
  
         # Broadcast to 4 triangles per quad.
         m_tri = m_quad.unsqueeze(0).expand_as(tri_size_loss_unweighted)  # (4,1,gh-1,gw-1)
