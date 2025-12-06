@@ -38,13 +38,13 @@ void run_convert(const po::variables_map& vm);
 
 static void print_usage() {
     std::cout << "vc_gen_normalgrids: Generate and manage normal grids for volume data.\n\n"
-              << "Usage: vc_gen_normalgrids <command> [options]\n\n"
+              << "Usage: vc_gen_normalgrids [command] [options]\n\n"
               << "Commands:\n"
-              << "  generate   Generate normal grids for all slices in a Zarr volume.\n"
+              << "  generate   Generate normal grids for all slices in a Zarr volume (default).\n"
               << "  convert    Recursively find and convert GridStore files to the latest version.\n\n"
               << "Examples:\n"
-              << "  vc_gen_normalgrids generate -i /path/to/volume.zarr -o /path/to/output/\n"
-              << "  vc_gen_normalgrids generate -i vol.zarr -o out/ --sparse-volume 4\n"
+              << "  vc_gen_normalgrids -i /path/to/volume.zarr -o /path/to/output/\n"
+              << "  vc_gen_normalgrids -i vol.zarr -o out/ --sparse-volume 4\n"
               << "  vc_gen_normalgrids convert -i /path/to/grids/\n\n"
               << "Generate options:\n"
               << "  -i, --input         Input Zarr volume path (required)\n"
@@ -76,12 +76,23 @@ int main(int argc, char* argv[]) {
 
     po::store(parsed, vm);
 
-    if (vm.count("help") || !vm.count("command")) {
+    // Determine command - default to "generate" if not specified or not recognized
+    std::string cmd = "generate";
+    bool explicit_command = false;
+    if (vm.count("command")) {
+        std::string maybe_cmd = vm["command"].as<std::string>();
+        if (maybe_cmd == "generate" || maybe_cmd == "convert") {
+            cmd = maybe_cmd;
+            explicit_command = true;
+        }
+        // Otherwise treat it as an option for generate (e.g., user typed -i directly)
+    }
+
+    // Show help if no args or if explicitly requested with --help only
+    if (argc == 1 || (vm.count("help") && argc == 2)) {
         print_usage();
         return 0;
     }
-
-    std::string cmd = vm["command"].as<std::string>();
 
     if (cmd == "generate") {
         po::options_description generate_desc(
@@ -99,7 +110,9 @@ int main(int argc, char* argv[]) {
             ("sparse-volume", po::value<int>()->default_value(1), "Process every N-th slice (1 = all slices)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
-        opts.erase(opts.begin()); // Erase the command
+        if (explicit_command && !opts.empty()) {
+            opts.erase(opts.begin()); // Erase the command only if explicitly given
+        }
 
         // Check for help before parsing required options
         for (const auto& opt : opts) {
@@ -132,7 +145,9 @@ int main(int argc, char* argv[]) {
             ("grid-step", po::value<int>()->default_value(64), "New grid cell size for the GridStore");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
-        opts.erase(opts.begin());
+        if (explicit_command && !opts.empty()) {
+            opts.erase(opts.begin()); // Erase the command only if explicitly given
+        }
 
         // Check for help before parsing required options
         for (const auto& opt : opts) {
