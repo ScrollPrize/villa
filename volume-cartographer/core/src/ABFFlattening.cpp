@@ -619,7 +619,14 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     // as input ensures consistent rendering behavior.
     cv::Vec2f outScale = surface._scale;
 
-    return new QuadSurface(outPoints, outScale);
+    QuadSurface* result = new QuadSurface(outPoints, outScale);
+
+    // Step 7: Optionally rotate to place highest Z values at top (row 0)
+    if (config.rotateHighZToTop) {
+        result->orientZUp();
+    }
+
+    return result;
 }
 
 } // namespace vc

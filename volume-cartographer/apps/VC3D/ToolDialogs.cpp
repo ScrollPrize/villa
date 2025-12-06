@@ -143,9 +143,16 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     spFlattenIters_->setRange(1, 100);
     spFlattenIters_->setValue(10);
     spFlattenIters_->setEnabled(false);
+    spFlattenDownsample_ = new QSpinBox(this);
+    spFlattenDownsample_->setRange(1, 8);
+    spFlattenDownsample_->setValue(1);
+    spFlattenDownsample_->setEnabled(false);
+    spFlattenDownsample_->setToolTip("Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality");
     connect(chkFlatten_, &QCheckBox::toggled, spFlattenIters_, &QSpinBox::setEnabled);
+    connect(chkFlatten_, &QCheckBox::toggled, spFlattenDownsample_, &QSpinBox::setEnabled);
     adv->addRow("Flatten:", chkFlatten_);
     adv->addRow("Flatten iterations:", spFlattenIters_);
+    adv->addRow("Flatten downsample:", spFlattenDownsample_);
 
     // Buttons
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -207,6 +214,7 @@ int RenderParamsDialog::flipAxis() const { return cmbFlip_->currentData().toInt(
 bool RenderParamsDialog::includeTifs() const { return chkIncludeTifs_->isChecked(); }
 bool RenderParamsDialog::flatten() const { return chkFlatten_->isChecked(); }
 int RenderParamsDialog::flattenIterations() const { return spFlattenIters_->value(); }
+int RenderParamsDialog::flattenDownsample() const { return spFlattenDownsample_->value(); }
 
 // ---- RenderParamsDialog: defaults + session helpers ----
 bool RenderParamsDialog::s_haveSession = false;
@@ -222,6 +230,7 @@ int  RenderParamsDialog::s_flipAxis = -1;
 int  RenderParamsDialog::s_ompThreads = -1;
 bool RenderParamsDialog::s_flatten = false;
 int  RenderParamsDialog::s_flattenIters = 10;
+int  RenderParamsDialog::s_flattenDownsample = 1;
 
 void RenderParamsDialog::applyCodeDefaults() {
     chkIncludeTifs_->setChecked(false);
@@ -239,6 +248,7 @@ void RenderParamsDialog::applyCodeDefaults() {
     edtThreads_->setText("");
     chkFlatten_->setChecked(false);
     spFlattenIters_->setValue(10);
+    spFlattenDownsample_->setValue(1);
 }
 
 void RenderParamsDialog::applySavedDefaults() {
@@ -260,6 +270,7 @@ void RenderParamsDialog::applySavedDefaults() {
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
     chkFlatten_->setChecked(s.value("flatten", chkFlatten_->isChecked()).toBool());
     spFlattenIters_->setValue(s.value("flatten_iterations", spFlattenIters_->value()).toInt());
+    spFlattenDownsample_->setValue(s.value("flatten_downsample", spFlattenDownsample_->value()).toInt());
     s.endGroup();
 }
 
@@ -278,6 +289,7 @@ void RenderParamsDialog::applySessionDefaults() {
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
     chkFlatten_->setChecked(s_flatten);
     spFlattenIters_->setValue(s_flattenIters);
+    spFlattenDownsample_->setValue(s_flattenDownsample);
 }
 
 void RenderParamsDialog::saveDefaults() const {
@@ -295,6 +307,7 @@ void RenderParamsDialog::saveDefaults() const {
     s.setValue("omp_threads", ompThreads());
     s.setValue("flatten", chkFlatten_->isChecked());
     s.setValue("flatten_iterations", spFlattenIters_->value());
+    s.setValue("flatten_downsample", spFlattenDownsample_->value());
     s.endGroup();
 }
 
@@ -312,6 +325,7 @@ void RenderParamsDialog::updateSessionFromUI() {
     s_ompThreads = ompThreads();
     s_flatten = chkFlatten_->isChecked();
     s_flattenIters = spFlattenIters_->value();
+    s_flattenDownsample = spFlattenDownsample_->value();
 }
 
 // ================= TraceParamsDialog =================
@@ -1229,4 +1243,68 @@ int ExportChunksDialog::overlapPerSide() const
 bool ExportChunksDialog::overwrite() const
 {
     return chkOverwrite_ ? chkOverwrite_->isChecked() : true;
+}
+
+// ================= ABFFlattenDialog =================
+bool ABFFlattenDialog::s_haveSession = false;
+int ABFFlattenDialog::s_iterations = 10;
+int ABFFlattenDialog::s_downsample = 1;
+
+ABFFlattenDialog::ABFFlattenDialog(QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("ABF++ Flatten"));
+    auto main = new QVBoxLayout(this);
+
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    spIterations_ = new QSpinBox(this);
+    spIterations_->setRange(1, 100);
+    spIterations_->setValue(10);
+    spIterations_->setToolTip(tr("Maximum number of ABF++ optimization iterations"));
+    form->addRow(tr("Iterations:"), spIterations_);
+
+    spDownsample_ = new QSpinBox(this);
+    spDownsample_->setRange(1, 8);
+    spDownsample_->setValue(1);
+    spDownsample_->setToolTip(tr("Downsample factor for faster computation (1=full, 2=half, 4=quarter).\n"
+                                  "Higher values are faster but may reduce quality."));
+    form->addRow(tr("Downsample factor:"), spDownsample_);
+
+    // Buttons
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(btns);
+
+    // Apply session defaults
+    applySessionDefaults();
+
+    // Save session on accept
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
+}
+
+void ABFFlattenDialog::applySessionDefaults()
+{
+    if (!s_haveSession) return;
+    spIterations_->setValue(s_iterations);
+    spDownsample_->setValue(s_downsample);
+}
+
+void ABFFlattenDialog::updateSessionFromUI()
+{
+    s_haveSession = true;
+    s_iterations = spIterations_->value();
+    s_downsample = spDownsample_->value();
+}
+
+int ABFFlattenDialog::iterations() const
+{
+    return spIterations_ ? spIterations_->value() : 10;
+}
+
+int ABFFlattenDialog::downsampleFactor() const
+{
+    return spDownsample_ ? spDownsample_->value() : 1;
 }

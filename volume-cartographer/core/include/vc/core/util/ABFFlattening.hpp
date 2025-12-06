@@ -28,6 +28,9 @@ struct ABFConfig {
      * Factor 2 = half resolution (4x faster), Factor 4 = quarter (16x faster).
      */
     int downsampleFactor = 1;
+
+    /** If true, rotate output so highest Z values are at row 0 (default: true) */
+    bool rotateHighZToTop = true;
 };
 
 /**

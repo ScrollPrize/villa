@@ -345,6 +345,16 @@ public:
     void saveSnapshot(int maxBackups = 10);
     void invalidateMask();
     std::vector<std::string> channelNames() const;
+
+    /** Rotate the surface by arbitrary angle (degrees). Expands canvas to fit. */
+    void rotate(float angleDeg);
+
+    /** Compute optimal rotation angle to place highest Z values at row 0 */
+    float computeZOrientationAngle() const;
+
+    /** Rotate to place highest Z values at top (row 0) */
+    void orientZUp();
+
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     cv::Mat_<cv::Vec3f>* _points = nullptr;

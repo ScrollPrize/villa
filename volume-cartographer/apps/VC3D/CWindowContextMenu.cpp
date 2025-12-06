@@ -603,10 +603,11 @@ static QSet<QString> snapshotDirectoryEntries(const QString& dirPath)
 class ABFWorker : public QThread {
     Q_OBJECT
 public:
-    ABFWorker(const QString& inputPath, const QString& outputPath, int iterations)
+    ABFWorker(const QString& inputPath, const QString& outputPath, int iterations, int downsampleFactor = 1)
         : inputPath_(inputPath.toStdString())
         , outputPath_(outputPath.toStdString())
-        , iterations_(iterations) {}
+        , iterations_(iterations)
+        , downsampleFactor_(downsampleFactor) {}
 
     bool success() const { return success_; }
     QString errorMessage() const { return errorMsg_; }
@@ -627,6 +628,7 @@ protected:
             emit progressUpdate(QObject::tr("Running ABF++ flattening..."));
             vc::ABFConfig config;
             config.maxIterations = static_cast<std::size_t>(iterations_);
+            config.downsampleFactor = downsampleFactor_;
             config.useABF = true;
             config.scaleToOriginalArea = true;
 
@@ -654,6 +656,7 @@ private:
     std::string inputPath_;
     std::string outputPath_;
     int iterations_;
+    int downsampleFactor_;
     bool success_ = false;
     QString errorMsg_;
 };
@@ -661,7 +664,7 @@ private:
 class ABFJob : public QObject {
     Q_OBJECT
 public:
-    ABFJob(CWindow* win, SurfacePanelController* surfacePanel, const QString& segDir, const QString& segmentStem, int iterations)
+    ABFJob(CWindow* win, SurfacePanelController* surfacePanel, const QString& segDir, const QString& segmentStem, int iterations, int downsampleFactor = 1)
         : QObject(win)
         , w_(win)
         , surfacePanel_(surfacePanel)
@@ -669,8 +672,9 @@ public:
         , stem_(segmentStem)
         , outDir_(segDir.endsWith("_abf") ? segDir : (segDir + "_abf"))
         , iterations_(iterations)
+        , downsampleFactor_(downsampleFactor)
         , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, win))
-        , worker_(new ABFWorker(segDir, outDir_, iterations))
+        , worker_(new ABFWorker(segDir, outDir_, iterations, downsampleFactor))
     {
         progress_->setWindowModality(Qt::WindowModal);
         progress_->setMinimumDuration(0);
@@ -690,8 +694,12 @@ private slots:
             worker_->requestInterruption();
             worker_->wait(3000);
         }
-        w_->statusBar()->showMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
-        progress_->close();
+        if (w_) {
+            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
+        }
+        if (progress_) {
+            progress_->close();
+        }
         worker_->deleteLater();
         deleteLater();
     }
@@ -701,21 +709,29 @@ private slots:
     }
 
     void onFinished_() {
-        progress_->close();
+        if (progress_) {
+            progress_->close();
+        }
 
         if (worker_->success()) {
-            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten complete: %1").arg(outDir_), 5000);
-            QMessageBox::information(w_, QObject::tr("ABF++ Flatten Complete"),
-                QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
+            if (w_) {
+                w_->statusBar()->showMessage(QObject::tr("ABF++ flatten complete: %1").arg(outDir_), 5000);
+                QMessageBox::information(w_, QObject::tr("ABF++ Flatten Complete"),
+                    QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
+            }
 
             // Reload surfaces to show the new one
+            // Use invokeMethod with QueuedConnection to defer to next event loop iteration
+            // This avoids re-entrancy issues from the modal dialog's event processing
             if (surfacePanel_) {
-                surfacePanel_->reloadSurfacesFromDisk();
+                QMetaObject::invokeMethod(surfacePanel_, "reloadSurfacesFromDisk", Qt::QueuedConnection);
             }
         } else {
-            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten failed"), 5000);
-            QMessageBox::critical(w_, QObject::tr("ABF++ Flatten Failed"),
-                worker_->errorMessage());
+            if (w_) {
+                w_->statusBar()->showMessage(QObject::tr("ABF++ flatten failed"), 5000);
+                QMessageBox::critical(w_, QObject::tr("ABF++ Flatten Failed"),
+                    worker_->errorMessage());
+            }
         }
 
         worker_->deleteLater();
@@ -723,12 +739,13 @@ private slots:
     }
 
 private:
-    CWindow* w_ = nullptr;
-    SurfacePanelController* surfacePanel_ = nullptr;
+    QPointer<CWindow> w_;
+    QPointer<SurfacePanelController> surfacePanel_;
     QString segDir_;
     QString stem_;
     QString outDir_;
     int iterations_;
+    int downsampleFactor_;
     QPointer<QProgressDialog> progress_;
     ABFWorker* worker_;
 };
@@ -779,7 +796,7 @@ void CWindow::onRenderSegment(const std::string& segmentId)
         dlg.affinePath(), dlg.invertAffine(),
         static_cast<float>(dlg.scaleSegmentation()), dlg.rotateDegrees(), dlg.flipAxis());
     _cmdRunner->setIncludeTifs(dlg.includeTifs());
-    _cmdRunner->setFlattenOptions(dlg.flatten(), dlg.flattenIterations());
+    _cmdRunner->setFlattenOptions(dlg.flatten(), dlg.flattenIterations(), dlg.flattenDownsample());
 
     _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
     statusBar()->showMessage(tr("Rendering segment: %1").arg(QString::fromStdString(segmentId)), 5000);
@@ -827,16 +844,13 @@ void CWindow::onABFFlatten(const std::string& segmentId)
     const QString segDir = QString::fromStdString(segDirFs.string());
     const QString segmentStem = QString::fromStdString(segmentId);
 
-    // Ask user for number of iterations
-    bool ok;
-    int iterations = QInputDialog::getInt(this, tr("ABF++ Flatten"),
-                                          tr("Number of ABF++ iterations:"),
-                                          10, 1, 100, 1, &ok);
-    if (!ok) {
+    // Show ABF++ flatten dialog
+    ABFFlattenDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted) {
         return;
     }
 
-    new ABFJob(this, _surfacePanel.get(), segDir, segmentStem, iterations);
+    new ABFJob(this, _surfacePanel.get(), segDir, segmentStem, dlg.iterations(), dlg.downsampleFactor());
 }
 
 void CWindow::onGrowSegmentFromSegment(const std::string& segmentId)

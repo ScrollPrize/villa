@@ -21,6 +21,8 @@
 
 #include "vc/core/util/LifeTime.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <unordered_set>   // [APPROVED] track approved (surface, location) pairs
@@ -958,6 +960,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
     std::shared_mutex mutex;
 
+    double pointTo_total_ms = 0.0;
+
     SurfTrackerData data_new;
     data_new._data = data._data;
 
@@ -1219,7 +1223,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         const bool is_locally_approved = approved_neighborhood.contains(s);
                         const float thr = same_surface_th * (is_locally_approved ? approved_attach_relax : 1.0f);
                         // use relaxed thr also inside pointTo
+                        auto _t0 = std::chrono::steady_clock::now();
                         float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10);
+                        double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                        #pragma omp atomic
+                        pointTo_total_ms += _elapsed;
                         if (res <= thr) {
                             mutex.lock();
                             data_out.surfs({j,i}).insert(s);
@@ -1239,7 +1247,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         for (auto s : approved_neighborhood) {
                             auto ptr = s->surface()->pointer();
                             float thr = same_surface_th * approved_attach_relax;
+                            auto _t0 = std::chrono::steady_clock::now();
                             float res = s->surface()->pointTo(ptr, points_out(j, i), thr, 10); //
+                            double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                            #pragma omp atomic
+                            pointTo_total_ms += _elapsed;
                             if (res < best_res) {
                                 best_res = res;
                                 best_s = s;
@@ -1305,7 +1317,12 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         mutex.unlock_shared();
 
                         auto ptr = test_surf->surface()->pointer();
-                        if (test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10) > same_surface_th)
+                        auto _t0 = std::chrono::steady_clock::now();
+                        float _res = test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10);
+                        double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                        #pragma omp atomic
+                        pointTo_total_ms += _elapsed;
+                        if (_res > same_surface_th)
                             continue;
 
                         int count = 0;
@@ -1398,6 +1415,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
 QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMeta*> &surfs_v, const nlohmann::json &params, float voxelsize)
 {
+    // Timing accumulator for pointTo calls (thread-safe via omp atomic)
+    double pointTo_total_ms = 0.0;
+
     bool flip_x = params.value("flip_x", 0);
     int global_steps_per_window = params.value("global_steps_per_window", 0);
 
@@ -1600,7 +1620,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         std::cout << "testing " << p << " from cands: " << seed->overlapping.size() << coord << std::endl;
         for(auto s : seed->overlapping) {
             auto ptr = s->surface()->pointer();
-            if (s->surface()->pointTo(ptr, coord, same_surface_th) <= same_surface_th) {
+            auto _t0 = std::chrono::steady_clock::now();
+            float _res = s->surface()->pointTo(ptr, coord, same_surface_th);
+            double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+            pointTo_total_ms += _elapsed;
+            if (_res <= same_surface_th) {
                 cv::Vec3f loc = s->surface()->loc_raw(ptr);
                 data.surfs(p).insert(s);
                 data.loc(s, p) = {loc[1], loc[0]};
@@ -1837,7 +1861,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 for(auto test_surf : test_surfs) {
                     auto ptr = test_surf->surface()->pointer();
                     //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
-                    if (test_surf->surface()->pointTo(ptr, coord, same_surface_th, 10) <= same_surface_th) {
+                    auto _t0 = std::chrono::steady_clock::now();
+                    float _res = test_surf->surface()->pointTo(ptr, coord, same_surface_th, 10);
+                    double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                    #pragma omp atomic
+                    pointTo_total_ms += _elapsed;
+                    if (_res <= same_surface_th) {
                         int count = 0;
                         int straight_count = 0;
                         state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -1921,7 +1950,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                         continue;
 
                     auto ptr = test_surf->surface()->pointer();
-                    if (test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10) <= same_surface_th) {
+                    auto _t0 = std::chrono::steady_clock::now();
+                    float _res = test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10);
+                    double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                    #pragma omp atomic
+                    pointTo_total_ms += _elapsed;
+                    if (_res <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
                         cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
                         if (coord[0] == -1) {
@@ -1947,7 +1981,11 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 //TODO only add/test if we have 2 neighs which both find locations
                 for(auto test_surf : test_surfs) {
                     auto ptr = test_surf->surface()->pointer();
+                    auto _t0 = std::chrono::steady_clock::now();
                     float res = test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10);
+                    double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                    #pragma omp atomic
+                    pointTo_total_ms += _elapsed;
                     if (res <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
                         cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
@@ -2293,6 +2331,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     (*surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
     (*surf->meta)["seed_surface_name"] = seed->name();
     (*surf->meta)["seed_surface_id"] = seed->surface()->id;
+
+    std::cout << "pointTo total time: " << pointTo_total_ms << " ms" << std::endl;
 
     return surf;
 }

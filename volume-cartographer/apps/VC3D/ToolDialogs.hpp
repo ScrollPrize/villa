@@ -45,6 +45,7 @@ public:
     bool includeTifs() const; // when output is .zarr
     bool flatten() const; // ABF++ flattening
     int flattenIterations() const;
+    int flattenDownsample() const;
 
 private:
     // Session defaults (optional-only; exclude paths and output pattern)
@@ -58,6 +59,7 @@ private:
     static int  s_ompThreads;
     static bool s_flatten;
     static int  s_flattenIters;
+    static int  s_flattenDownsample;
 
     void applyCodeDefaults();
     void applySavedDefaults();
@@ -85,6 +87,7 @@ private:
     QCheckBox* chkIncludeTifs_{nullptr};
     QCheckBox* chkFlatten_{nullptr};
     QSpinBox* spFlattenIters_{nullptr};
+    QSpinBox* spFlattenDownsample_{nullptr};
 };
 
 class TraceParamsDialog : public QDialog {
@@ -316,4 +319,25 @@ private:
     QSpinBox* spChunkWidth_{nullptr};
     QSpinBox* spOverlap_{nullptr};
     QCheckBox* chkOverwrite_{nullptr};
+};
+
+class ABFFlattenDialog : public QDialog {
+    Q_OBJECT
+public:
+    ABFFlattenDialog(QWidget* parent);
+
+    int iterations() const;
+    int downsampleFactor() const;
+
+private:
+    // Session defaults (in-memory)
+    static bool s_haveSession;
+    static int s_iterations;
+    static int s_downsample;
+
+    void applySessionDefaults();
+    void updateSessionFromUI();
+
+    QSpinBox* spIterations_{nullptr};
+    QSpinBox* spDownsample_{nullptr};
 };

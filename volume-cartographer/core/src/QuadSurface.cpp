@@ -1400,3 +1400,166 @@ QuadSurface* surface_intersection(QuadSurface* a, QuadSurface* b, float toleranc
 
     return new QuadSurface(intersect_points, a->scale());
 }
+
+void QuadSurface::rotate(float angleDeg)
+{
+    if (!_points || _points->empty() || std::abs(angleDeg) < 0.01f) {
+        return;
+    }
+
+    // Compute rotation center (center of the image)
+    cv::Point2f center(
+        static_cast<float>(_points->cols - 1) / 2.0f,
+        static_cast<float>(_points->rows - 1) / 2.0f
+    );
+
+    // Get rotation matrix
+    cv::Mat rotMat = cv::getRotationMatrix2D(center, angleDeg, 1.0);
+
+    // Calculate bounding box of rotated image
+    cv::Rect2f bbox = cv::RotatedRect(center, _points->size(), angleDeg).boundingRect2f();
+
+    // Adjust rotation matrix to translate image to center of new canvas
+    rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
+    rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
+
+    // Rotate points
+    cv::Mat rotatedMat;
+    cv::warpAffine(
+        *_points,
+        rotatedMat,
+        rotMat,
+        bbox.size(),
+        cv::INTER_LINEAR,
+        cv::BORDER_CONSTANT,
+        cv::Scalar(-1.f, -1.f, -1.f)
+    );
+
+    // Clean up edge artifacts from interpolation: dilate invalid region by 1 pixel
+    cv::Mat mask;
+    cv::inRange(rotatedMat, cv::Scalar(-1, -1, -1), cv::Scalar(-1, -1, -1), mask);
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::dilate(mask, mask, kernel, cv::Point(-1, -1), 1);
+    rotatedMat.setTo(cv::Scalar(-1.f, -1.f, -1.f), mask);
+
+    // Update points
+    *_points = rotatedMat;
+
+    // Rotate all channels
+    for (auto& [name, channel] : _channels) {
+        if (channel.empty()) continue;
+
+        cv::Mat rotatedChannel;
+        cv::Scalar borderValue = (name == "normals") ? cv::Scalar(0, 0, 0) : cv::Scalar(0, 0, 0);
+        cv::warpAffine(
+            channel,
+            rotatedChannel,
+            rotMat,
+            bbox.size(),
+            cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT,
+            borderValue
+        );
+        channel = rotatedChannel;
+    }
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
+float QuadSurface::computeZOrientationAngle() const
+{
+    if (!_points || _points->empty()) {
+        return 0.0f;
+    }
+
+    // Find Z range for normalization
+    float minZ = std::numeric_limits<float>::max();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    for (int row = 0; row < _points->rows; ++row) {
+        for (int col = 0; col < _points->cols; ++col) {
+            const cv::Vec3f& pt = (*_points)(row, col);
+            if (pt[0] != -1.f) {
+                float z = pt[2];
+                minZ = std::min(minZ, z);
+                maxZ = std::max(maxZ, z);
+            }
+        }
+    }
+
+    if (maxZ <= minZ) {
+        // No valid Z variation - no rotation needed
+        return 0.0f;
+    }
+
+    float zRange = maxZ - minZ;
+
+    // Compute Z-weighted centroid
+    // Weight = ((z - minZ) / zRange)^2, so higher Z = higher weight
+    double sumRow = 0.0, sumCol = 0.0, sumWeight = 0.0;
+
+    for (int row = 0; row < _points->rows; ++row) {
+        for (int col = 0; col < _points->cols; ++col) {
+            const cv::Vec3f& pt = (*_points)(row, col);
+            if (pt[0] != -1.f) {
+                float z = pt[2];
+                double weight = static_cast<double>(z - minZ) / zRange;
+                weight = weight * weight;  // Square to emphasize high-Z regions
+
+                sumRow += row * weight;
+                sumCol += col * weight;
+                sumWeight += weight;
+            }
+        }
+    }
+
+    if (sumWeight < 1e-10) {
+        return 0.0f;
+    }
+
+    // Z-weighted centroid position
+    double centroidRow = sumRow / sumWeight;
+    double centroidCol = sumCol / sumWeight;
+
+    // Grid center
+    double centerRow = (_points->rows - 1) / 2.0;
+    double centerCol = (_points->cols - 1) / 2.0;
+
+    // Vector from center to Z-centroid
+    double dRow = centroidRow - centerRow;
+    double dCol = centroidCol - centerCol;
+
+    // If centroid is at center, no rotation needed
+    if (std::abs(dRow) < 1e-6 && std::abs(dCol) < 1e-6) {
+        return 0.0f;
+    }
+
+    // Compute angle of this vector
+    // atan2(dCol, dRow) gives angle where:
+    //   0 degrees = pointing down (positive row direction)
+    //   90 degrees = pointing right (positive col direction)
+    double angleRad = std::atan2(dCol, dRow);
+    double angleDeg = angleRad * 180.0 / M_PI;
+
+    // We want the Z-centroid to end up at row 0 (top)
+    // "Up" in image coordinates is -row direction, which is 180 degrees
+    // So we need to rotate by: 180 - angleDeg
+    float rotationDeg = static_cast<float>(angleDeg + 180.0);
+
+    // Normalize to [-180, 180] range
+    while (rotationDeg > 180.0f) rotationDeg -= 360.0f;
+    while (rotationDeg < -180.0f) rotationDeg += 360.0f;
+
+    return rotationDeg;
+}
+
+void QuadSurface::orientZUp()
+{
+    float angle = computeZOrientationAngle();
+    if (std::abs(angle) > 0.5f) {
+        std::cout << "QuadSurface::orientZUp: Rotating by " << angle
+                  << " degrees to place high-Z at top" << std::endl;
+        rotate(angle);
+    }
+}
