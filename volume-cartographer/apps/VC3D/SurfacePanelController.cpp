@@ -111,6 +111,10 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (reload) {
+        // Wait for any pending index rebuild before deleting surfaces
+        if (_viewerManager) {
+            _viewerManager->waitForPendingIndexRebuild();
+        }
         // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
         if (_surfaces) {
             auto names = _surfaces->surfaceNames();
@@ -179,6 +183,11 @@ void SurfacePanelController::loadSurfacesIncremental()
     }
 
     if (!changes.toReload.empty()) {
+        // Wait for any pending index rebuild before deleting surfaces for reload
+        if (_viewerManager) {
+            _viewerManager->waitForPendingIndexRebuild();
+        }
+
         std::vector<std::string> reloadedIds;
         reloadedIds.reserve(changes.toReload.size());
 
@@ -457,6 +466,12 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
 void SurfacePanelController::removeSingleSegmentation(const std::string& segId, bool suppressSignals)
 {
     std::cout << "Removing segmentation: " << segId << std::endl;
+
+    // Wait for any pending index rebuild to finish before deleting surfaces
+    // to avoid use-after-free in the background rebuild thread
+    if (_viewerManager) {
+        _viewerManager->waitForPendingIndexRebuild();
+    }
 
     Surface* removedSurface = nullptr;
     Surface* activeSegSurface = nullptr;
