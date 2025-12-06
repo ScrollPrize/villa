@@ -1,17 +1,12 @@
-#include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <filesystem>
-#include <unordered_map>
-#include <map>
 #include <algorithm>
 #include <limits>
-
-#include <opencv2/imgproc.hpp>
+#include <cmath>
 
 
 
@@ -33,11 +28,12 @@ private:
     std::vector<Vertex> vertices;
     std::vector<UV> uvs;
     std::vector<Face> faces;
-    
+
     cv::Vec2f uv_min, uv_max;
     cv::Vec2i grid_size;
-    cv::Vec2f scale;
-    
+    cv::Vec2d full_resolution;  // Full voxel resolution before downsampling
+    float step_size;
+
 public:
     bool loadObj(const std::string& filename) {
         std::ifstream file(filename);
@@ -103,76 +99,113 @@ public:
         return !vertices.empty() && !faces.empty() && !uvs.empty();
     }
     
-    void determineGridDimensions(float stretch_factor = 1000.0f) {
+    void determineGridDimensions(float step = 20.0f) {
+        step_size = step;
+
         // Find UV bounds from all UVs used in faces
         uv_min = cv::Vec2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
         uv_max = cv::Vec2f(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
-        
+
+        // Compute directional scale factors by analyzing UV-to-3D mapping gradients
+        // For each triangle, compute the Jacobian of the mapping to get stretch in U and V
+        double sum_scale_u = 0.0, sum_scale_v = 0.0;
+        double sum_weight = 0.0;
+
         for (const auto& face : faces) {
+            // Check valid indices
+            bool valid = true;
             for (int i = 0; i < 3; i++) {
-                if (face.vt[i] >= 0 && face.vt[i] < uvs.size()) {
-                    cv::Vec2f uv = uvs[face.vt[i]].coord;
-                    uv_min[0] = std::min(uv_min[0], uv[0]);
-                    uv_min[1] = std::min(uv_min[1], uv[1]);
-                    uv_max[0] = std::max(uv_max[0], uv[0]);
-                    uv_max[1] = std::max(uv_max[1], uv[1]);
+                if (face.v[i] < 0 || face.v[i] >= (int)vertices.size() ||
+                    face.vt[i] < 0 || face.vt[i] >= (int)uvs.size()) {
+                    valid = false;
+                    break;
                 }
             }
+            if (!valid) continue;
+
+            // Update UV bounds
+            for (int i = 0; i < 3; i++) {
+                cv::Vec2f uv = uvs[face.vt[i]].coord;
+                uv_min[0] = std::min(uv_min[0], uv[0]);
+                uv_min[1] = std::min(uv_min[1], uv[1]);
+                uv_max[0] = std::max(uv_max[0], uv[0]);
+                uv_max[1] = std::max(uv_max[1], uv[1]);
+            }
+
+            // Get triangle vertices and UVs
+            cv::Vec3f p0 = vertices[face.v[0]].pos;
+            cv::Vec3f p1 = vertices[face.v[1]].pos;
+            cv::Vec3f p2 = vertices[face.v[2]].pos;
+            cv::Vec2f uv0 = uvs[face.vt[0]].coord;
+            cv::Vec2f uv1 = uvs[face.vt[1]].coord;
+            cv::Vec2f uv2 = uvs[face.vt[2]].coord;
+
+            // Compute edge vectors in UV and 3D
+            cv::Vec2f e1_uv = uv1 - uv0;
+            cv::Vec2f e2_uv = uv2 - uv0;
+            cv::Vec3f e1_3d = p1 - p0;
+            cv::Vec3f e2_3d = p2 - p0;
+
+            // Compute UV triangle area for weighting
+            double uv_cross = e1_uv[0] * e2_uv[1] - e1_uv[1] * e2_uv[0];
+            double uv_area = 0.5 * std::abs(uv_cross);
+            if (uv_area < 1e-12) continue;  // Skip degenerate triangles
+
+            // Solve for the Jacobian: [dp/du, dp/dv] = [e1_3d, e2_3d] * inv([e1_uv, e2_uv]^T)
+            // inv([a b; c d]) = 1/(ad-bc) * [d -b; -c a]
+            double det = uv_cross;
+            double inv_det = 1.0 / det;
+
+            // dp/du = (e2_uv[1] * e1_3d - e1_uv[1] * e2_3d) / det
+            // dp/dv = (-e2_uv[0] * e1_3d + e1_uv[0] * e2_3d) / det
+            cv::Vec3f dp_du = (e2_uv[1] * e1_3d - e1_uv[1] * e2_3d) * inv_det;
+            cv::Vec3f dp_dv = (-e2_uv[0] * e1_3d + e1_uv[0] * e2_3d) * inv_det;
+
+            // Scale factors are the magnitudes of the gradients
+            double scale_u = std::sqrt(dp_du.dot(dp_du));
+            double scale_v = std::sqrt(dp_dv.dot(dp_dv));
+
+            // Weight by triangle area
+            sum_scale_u += scale_u * uv_area;
+            sum_scale_v += scale_v * uv_area;
+            sum_weight += uv_area;
         }
-        
-        std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to [" 
-                  << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
-        
-        // Two-pass approach:
-        // Pass 1: Create preliminary grid to measure scale
+
+        // Average scale factors
+        double avg_scale_u = (sum_weight > 0) ? sum_scale_u / sum_weight : 1.0;
+        double avg_scale_v = (sum_weight > 0) ? sum_scale_v / sum_weight : 1.0;
+
         cv::Vec2f uv_range = uv_max - uv_min;
-        cv::Vec2i preliminary_grid_size;
-        preliminary_grid_size[0] = static_cast<int>(std::ceil(uv_range[0] * stretch_factor)) + 1;
-        preliminary_grid_size[1] = static_cast<int>(std::ceil(uv_range[1] * stretch_factor)) + 1;
-        
-        std::cout << "Creating preliminary grid: " << preliminary_grid_size[0] << " x " << preliminary_grid_size[1] << " to measure scale..." << std::endl;
-        
-        // Temporary scale for preliminary rasterization
-        cv::Vec2f temp_scale;
-        temp_scale[0] = uv_range[0] * stretch_factor / (preliminary_grid_size[0] - 1);
-        temp_scale[1] = uv_range[1] * stretch_factor / (preliminary_grid_size[1] - 1);
-        
-        // Create preliminary grid
-        cv::Mat_<cv::Vec3f> preliminary_points(preliminary_grid_size[1], preliminary_grid_size[0], cv::Vec3f(-1, -1, -1));
-        
-        // Rasterize with temporary scale
-        scale = temp_scale;
-        grid_size = preliminary_grid_size;
-        for (const auto& face : faces) {
-            rasterizeTriangle(preliminary_points, face);
-        }
-        
-        // Calculate actual scale from preliminary grid
-        calculateScaleFromGrid(preliminary_points);
-        cv::Vec2f measured_scale = scale;
-        
-        // Pass 2: Calculate final grid dimensions from measured scale
-        // The measured scale tells us the physical distance between adjacent grid points
-        // We multiply by stretch_factor to get the number of grid points needed
-        grid_size[0] = static_cast<int>(std::round(measured_scale[0] * stretch_factor)) + 1;
-        grid_size[1] = static_cast<int>(std::round(measured_scale[1] * stretch_factor)) + 1;
-        
-        std::cout << "Final grid dimensions: " << grid_size[0] << " x " << grid_size[1] << std::endl;
-        std::cout << "Scale factors: " << measured_scale[0] << ", " << measured_scale[1] << std::endl;
-        
-        // Set final scale
-        scale = measured_scale;
+
+        std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to ["
+                  << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
+        std::cout << "Directional scales: U=" << avg_scale_u << ", V=" << avg_scale_v << std::endl;
+
+        // Compute full voxel resolution
+        double full_res_u = uv_range[0] * avg_scale_u;
+        double full_res_v = uv_range[1] * avg_scale_v;
+
+        // Store for UV-to-grid mapping in rasterization
+        full_resolution = cv::Vec2d(full_res_u, full_res_v);
+
+        // Downsample by step_size for actual grid/tif dimensions
+        grid_size[0] = static_cast<int>(std::ceil(full_res_u / step_size)) + 1;
+        grid_size[1] = static_cast<int>(std::ceil(full_res_v / step_size)) + 1;
+
+        std::cout << "Full resolution: " << full_res_u << " x " << full_res_v << std::endl;
+        std::cout << "Grid dimensions: " << grid_size[0] << " x " << grid_size[1] << std::endl;
+        std::cout << "Step size: " << step_size << ", Scale: " << (1.0f / step_size) << std::endl;
     }
     
-    QuadSurface* createQuadSurface(float mesh_units = 1.0f, int step = 1) {
+    QuadSurface* createQuadSurface() {
         // Create points matrix initialized with invalid values
         cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
-        
+
         // Rasterize triangles onto the grid
         for (const auto& face : faces) {
             rasterizeTriangle(*points, face);
         }
-        
+
         // Count valid points
         int valid_count = 0;
         for (int y = 0; y < grid_size[1]; y++) {
@@ -182,110 +215,45 @@ public:
                 }
             }
         }
-        
-        std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
+
+        std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1])
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
-        
-        // Always calculate scale from the grid to preserve anisotropic scaling
-        calculateScaleFromGrid(*points, mesh_units);
 
-        if (step != 1) {
+        // Scale = 1/step_size (matching GrowPatch.cpp pattern)
+        cv::Vec2f scale = {1.0f / step_size, 1.0f / step_size};
 
-            cv::Size small = cv::Size(points->cols/step, points->rows/step);
-            //crop to nearest multiple
-            *points = points->operator()(cv::Rect(0,0,small.width*step, small.height*step));
-            cv::resize(*points, *points, small, 0, 0, cv::INTER_NEAREST);
-
-            scale /= step;
-        }
-        
         return new QuadSurface(points, scale);
     }
-    
-    void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
-        // Based on vc_segmentation_scales from Slicing.cpp
-        double sum_x = 0;
-        double sum_y = 0;
-        int count = 0;
-        
-        // Skip borders (10% on each side) to avoid artifacts
-        int jmin = points.rows * 0.1 + 1;
-        int jmax = points.rows * 0.9;
-        int imin = points.cols * 0.1 + 1;
-        int imax = points.cols * 0.9;
-        int step = 4;
-        
-        // For small grids, use all points
-        if (points.rows < 20 || points.cols < 20) {
-            jmin = 1;
-            jmax = points.rows;
-            imin = 1;
-            imax = points.cols;
-            step = 1;
-        }
-        
-        // Calculate average distance between adjacent points
-        for (int j = jmin; j < jmax; j += step) {
-            for (int i = imin; i < imax; i += step) {
-                // Skip invalid points
-                if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
-                    continue;
-                
-                // Distance to neighbor in X direction
-                cv::Vec3f v = points(j, i) - points(j, i-1);
-                double dist_x = std::sqrt(v.dot(v));
-                if (dist_x > 0) {
-                    sum_x += dist_x;
-                }
-                
-                // Distance to neighbor in Y direction
-                v = points(j, i) - points(j-1, i);
-                double dist_y = std::sqrt(v.dot(v));
-                if (dist_y > 0) {
-                    sum_y += dist_y;
-                }
-                count++;
-            }
-        }
-        
-        if (count > 0 && sum_x > 0 && sum_y > 0) {
-            // Scale is the average distance between points, adjusted by mesh units
-            scale[0] = (sum_x / count) * mesh_units;
-            scale[1] = (sum_y / count) * mesh_units;
-        } else {
-            // Fallback to UV-based scale if we couldn't calculate from grid
-            std::cerr << "Warning: Could not calculate scale from grid, using UV-based fallback" << std::endl;
-            // scale already set in determineGridDimensions
-        }
-        
-        std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
-    }
-    
+
+
 private:
     void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const Face& face) {
         // Get triangle vertices and UVs
         cv::Vec3f v0 = vertices[face.v[0]].pos;
         cv::Vec3f v1 = vertices[face.v[1]].pos;
         cv::Vec3f v2 = vertices[face.v[2]].pos;
-        
+
         cv::Vec2f uv0 = uvs[face.vt[0]].coord;
         cv::Vec2f uv1 = uvs[face.vt[1]].coord;
         cv::Vec2f uv2 = uvs[face.vt[2]].coord;
-        
-        // Transform UVs to grid coordinates
-        // Map from [uv_min, uv_max] to [0, grid_size-1]
+
+        // Transform UVs to grid coordinates (downsampled)
+        // 1. Map UV from [uv_min, uv_max] to full voxel resolution [0, full_resolution]
+        // 2. Divide by step_size to get grid coordinates
         cv::Vec2f uv_range = uv_max - uv_min;
+
+        // Map to full resolution, then downsample to grid coordinates
         uv0 = (uv0 - uv_min);
-        uv0[0] = uv0[0] / uv_range[0] * (grid_size[0] - 1);
-        uv0[1] = uv0[1] / uv_range[1] * (grid_size[1] - 1);
-        
+        uv0[0] = uv0[0] / uv_range[0] * full_resolution[0] / step_size;
+        uv0[1] = uv0[1] / uv_range[1] * full_resolution[1] / step_size;
+
         uv1 = (uv1 - uv_min);
-        uv1[0] = uv1[0] / uv_range[0] * (grid_size[0] - 1);
-        uv1[1] = uv1[1] / uv_range[1] * (grid_size[1] - 1);
-        
+        uv1[0] = uv1[0] / uv_range[0] * full_resolution[0] / step_size;
+        uv1[1] = uv1[1] / uv_range[1] * full_resolution[1] / step_size;
+
         uv2 = (uv2 - uv_min);
-        uv2[0] = uv2[0] / uv_range[0] * (grid_size[0] - 1);
-        uv2[1] = uv2[1] / uv_range[1] * (grid_size[1] - 1);
+        uv2[0] = uv2[0] / uv_range[0] * full_resolution[0] / step_size;
+        uv2[1] = uv2[1] / uv_range[1] * full_resolution[1] / step_size;
         
         // Find bounding box in grid coordinates
         int min_x = std::max(0, static_cast<int>(std::floor(std::min({uv0[0], uv1[0], uv2[0]}))) - 1);
@@ -336,46 +304,27 @@ private:
 
 int main(int argc, char *argv[])
 {
-    if (argc < 3 || argc > 6) {
-        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [stretch_factor] [mesh_units] [step_size]" << std::endl;
+    if (argc < 3 || argc > 4) {
+        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [step_size]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
-        std::cout << "  stretch_factor: UV scaling factor (default: 1000.0)" << std::endl;
-        std::cout << "  mesh_units: Units of the mesh coordinates in micrometers (default: 1.0)" << std::endl;
-        std::cout << "  step size: quadmesh stepping factor (default 20)" << std::endl;
+        std::cout << "  step_size: UV units per grid cell (default: 20)" << std::endl;
+        std::cout << "             Scale will be 1/step_size (default: 0.05)" << std::endl;
         std::cout << std::endl;
-        std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Example: " << argv[0] << " mesh.obj output_dir" << std::endl;
+        std::cout << "Example: " << argv[0] << " mesh.obj output_dir 10" << std::endl;
         return EXIT_SUCCESS;
     }
 
     std::filesystem::path obj_path = argv[1];
     std::filesystem::path output_dir = argv[2];
-    float stretch_factor = 1000.0f;
-    float mesh_units = 1.0f;  // mesh units in micrometers
-    int step = 20;
-    
-    if (argc >= 4) {
-        stretch_factor = std::atof(argv[3]);
-        if (stretch_factor <= 0) {
-            std::cerr << "Invalid stretch factor: " << stretch_factor << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
-    
-    if (argc >= 5) {
-        mesh_units = std::atof(argv[4]);
-        if (mesh_units <= 0) {
-            std::cerr << "Invalid mesh units: " << mesh_units << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
+    float step_size = 20.0f;
 
-    if (argc >= 6) {
-        step = std::atoi(argv[5]);
-        if (mesh_units <= 0) {
-            std::cerr << "invalid step size: " << step << std::endl;
+    if (argc >= 4) {
+        step_size = std::atof(argv[3]);
+        if (step_size <= 0) {
+            std::cerr << "Invalid step size: " << step_size << std::endl;
             return EXIT_FAILURE;
         }
     }
@@ -388,23 +337,21 @@ int main(int argc, char *argv[])
     std::cout << "Converting OBJ to tifxyz format" << std::endl;
     std::cout << "Input: " << obj_path << std::endl;
     std::cout << "Output: " << output_dir << std::endl;
-    std::cout << "Stretch factor: " << stretch_factor << std::endl;
-    std::cout << "Mesh units: " << mesh_units << " micrometers" << std::endl;
-    std::cout << "Step size: " << step << std::endl;
-    
+    std::cout << "Step size: " << step_size << " (scale: " << (1.0f / step_size) << ")" << std::endl;
+
     ObjToTifxyzConverter converter;
-    
+
     // Load OBJ file
     if (!converter.loadObj(obj_path.string())) {
         std::cerr << "Failed to load OBJ file" << std::endl;
         return EXIT_FAILURE;
     }
-    
+
     // Determine grid dimensions from UV coordinates
-    converter.determineGridDimensions(stretch_factor);
-    
+    converter.determineGridDimensions(step_size);
+
     // Create quad surface
-    QuadSurface* surf = converter.createQuadSurface(mesh_units, step);
+    QuadSurface* surf = converter.createQuadSurface();
     if (!surf) {
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;
