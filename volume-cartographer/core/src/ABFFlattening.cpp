@@ -19,12 +19,13 @@ using ABF = OpenABF::ABFPlusPlus<double>;
 using LSCM = OpenABF::AngleBasedLSCM<double, HalfEdgeMesh>;
 
 /**
- * @brief Compute 3D surface area using triangulation of valid quads
+ * @brief Compute 3D surface area using triangulation of valid quads (parallelized)
  */
 static double computeSurfaceArea3D(const QuadSurface& surface) {
     double area = 0.0;
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
 
+    #pragma omp parallel for collapse(2) reduction(+:area)
     for (int row = 0; row < points->rows - 1; ++row) {
         for (int col = 0; col < points->cols - 1; ++col) {
             const cv::Vec3f& p00 = (*points)(row, col);
@@ -61,12 +62,13 @@ static double computeSurfaceArea3D(const QuadSurface& surface) {
 }
 
 /**
- * @brief Compute 2D area from UV coordinates
+ * @brief Compute 2D area from UV coordinates (parallelized)
  */
 static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const QuadSurface& surface) {
     double area = 0.0;
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
 
+    #pragma omp parallel for collapse(2) reduction(+:area)
     for (int row = 0; row < points->rows - 1; ++row) {
         for (int col = 0; col < points->cols - 1; ++col) {
             const cv::Vec3f& p00 = (*points)(row, col);
@@ -275,29 +277,51 @@ bool abfFlattenInPlace(QuadSurface& surface, const ABFConfig& config) {
 }
 
 /**
- * @brief Compute barycentric coordinates for point p in triangle (a, b, c)
+ * @brief Precomputed triangle invariants for fast barycentric computation
+ *
+ * These values only depend on the triangle vertices and can be computed once
+ * per triangle instead of once per pixel.
  */
-static cv::Vec3f computeBarycentric(const cv::Vec2f& p, const cv::Vec2f& a,
-                                     const cv::Vec2f& b, const cv::Vec2f& c) {
-    cv::Vec2f v0 = c - a;
-    cv::Vec2f v1 = b - a;
-    cv::Vec2f v2 = p - a;
+struct TriangleInvariants {
+    cv::Vec2f a;        // First vertex (reference point)
+    cv::Vec2f v0, v1;   // Edge vectors: v0 = c - a, v1 = b - a
+    float dot00, dot01, dot11;
+    float invDenom;
+    bool degenerate;
+};
 
-    float dot00 = v0.dot(v0);
-    float dot01 = v0.dot(v1);
-    float dot02 = v0.dot(v2);
-    float dot11 = v1.dot(v1);
-    float dot12 = v1.dot(v2);
+/**
+ * @brief Precompute triangle invariants for fast barycentric testing
+ */
+static TriangleInvariants precomputeTriangle(const cv::Vec2f& a,
+                                              const cv::Vec2f& b,
+                                              const cv::Vec2f& c) {
+    TriangleInvariants inv;
+    inv.a = a;
+    inv.v0 = c - a;
+    inv.v1 = b - a;
+    inv.dot00 = inv.v0.dot(inv.v0);
+    inv.dot01 = inv.v0.dot(inv.v1);
+    inv.dot11 = inv.v1.dot(inv.v1);
+    float denom = inv.dot00 * inv.dot11 - inv.dot01 * inv.dot01;
+    inv.degenerate = (std::fabs(denom) < 1e-20f || !std::isfinite(denom));
+    inv.invDenom = inv.degenerate ? 0.0f : (1.0f / denom);
+    return inv;
+}
 
-    const float denom = (dot00 * dot11 - dot01 * dot01);
-    if (std::fabs(denom) < 1e-20f || !std::isfinite(denom)) {
-        // Degenerate triangle in UV space
+/**
+ * @brief Fast barycentric computation using precomputed triangle invariants
+ */
+static cv::Vec3f computeBarycentricFast(const cv::Vec2f& p,
+                                         const TriangleInvariants& inv) {
+    if (inv.degenerate) {
         return cv::Vec3f(-1.f, -1.f, -1.f);
     }
-    float invDenom = 1.0f / denom;
-    float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
-    float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
-
+    cv::Vec2f v2 = p - inv.a;
+    float dot02 = inv.v0.dot(v2);
+    float dot12 = inv.v1.dot(v2);
+    float u = (inv.dot11 * dot02 - inv.dot01 * dot12) * inv.invDenom;
+    float v = (inv.dot00 * dot12 - inv.dot01 * dot02) * inv.invDenom;
     return cv::Vec3f(1.0f - u - v, v, u);
 }
 
@@ -310,51 +334,59 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
     const cv::Mat_<cv::Vec3f>* srcPoints = surface.rawPointsPtr();
 
-    // Step 2: Find UV bounds
-    cv::Vec2f uvMin(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-    cv::Vec2f uvMax(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
+    // Step 2: Find UV bounds (parallelized)
+    float uvMinX = std::numeric_limits<float>::max();
+    float uvMinY = std::numeric_limits<float>::max();
+    float uvMaxX = std::numeric_limits<float>::lowest();
+    float uvMaxY = std::numeric_limits<float>::lowest();
 
+    #pragma omp parallel for collapse(2) reduction(min:uvMinX,uvMinY) reduction(max:uvMaxX,uvMaxY)
     for (int row = 0; row < uvs.rows; ++row) {
         for (int col = 0; col < uvs.cols; ++col) {
             const cv::Vec2f& uv = uvs(row, col);
             if (uv[0] != -1.f) {
-                uvMin[0] = std::min(uvMin[0], uv[0]);
-                uvMin[1] = std::min(uvMin[1], uv[1]);
-                uvMax[0] = std::max(uvMax[0], uv[0]);
-                uvMax[1] = std::max(uvMax[1], uv[1]);
+                uvMinX = std::min(uvMinX, uv[0]);
+                uvMinY = std::min(uvMinY, uv[1]);
+                uvMaxX = std::max(uvMaxX, uv[0]);
+                uvMaxY = std::max(uvMaxY, uv[1]);
             }
         }
     }
+    cv::Vec2f uvMin(uvMinX, uvMinY);
+    cv::Vec2f uvMax(uvMaxX, uvMaxY);
 
     cv::Vec2f uvRange = uvMax - uvMin;
     std::cout << "ABF++: UV bounds: [" << uvMin[0] << ", " << uvMin[1] << "] to ["
               << uvMax[0] << ", " << uvMax[1] << "]" << std::endl;
 
     // Step 3: Determine output grid size
-    // Use the original scale to maintain similar pixel density
-    cv::Vec2f origScale = surface.scale();
-    int gridW = std::max(2, static_cast<int>(std::ceil(uvRange[0] / origScale[0])) + 1);
-    int gridH = std::max(2, static_cast<int>(std::ceil(uvRange[1] / origScale[1])) + 1);
+    // The stored tifxyz grid is a downsampled representation. The scale factor
+    // indicates how many voxels each grid cell represents (e.g., scale=0.05 means
+    // 1 grid cell = 0.05 voxels, or equivalently, 20 grid cells per voxel).
+    // When rendering, gen() upscales by 1/scale to get full resolution.
+    //
+    // UV coordinates after ABF++ (with scaleToOriginalArea=true) are in voxel units.
+    // To get the output grid size, multiply UV range by input scale.
+    float inputScaleX = surface._scale[0];
+    float inputScaleY = surface._scale[1];
 
-    // Cap at reasonable size
-    const int maxDim = 16384;
-    if (gridW > maxDim || gridH > maxDim) {
-        float downsample = std::max(
-            static_cast<float>(gridW) / maxDim,
-            static_cast<float>(gridH) / maxDim
-        );
-        gridW = std::max(2, static_cast<int>(gridW / downsample));
-        gridH = std::max(2, static_cast<int>(gridH / downsample));
-        std::cout << "ABF++: Capped output grid to " << gridW << " x " << gridH << std::endl;
-    }
+    int gridW = std::max(2, static_cast<int>(std::ceil(uvRange[0] * inputScaleX)) + 1);
+    int gridH = std::max(2, static_cast<int>(std::ceil(uvRange[1] * inputScaleY)) + 1);
 
-    std::cout << "ABF++: Creating output grid " << gridW << " x " << gridH << std::endl;
+    std::cout << "ABF++: Creating output grid " << gridW << " x " << gridH
+              << " (input scale=" << inputScaleX << "x" << inputScaleY
+              << ", UV range=" << uvRange[0] << "x" << uvRange[1] << ")" << std::endl;
 
     // Step 4: Create output points grid
     cv::Mat_<cv::Vec3f>* outPoints = new cv::Mat_<cv::Vec3f>(gridH, gridW, cv::Vec3f(-1.f, -1.f, -1.f));
 
-    // Step 5: Rasterize triangles onto the output grid
+    // Step 5: Rasterize triangles onto the output grid (parallelized)
+    // Precompute UV-to-grid transform factors
+    const float rxInv = (gridW - 1) / std::max(uvRange[0], 1e-12f);
+    const float ryInv = (gridH - 1) / std::max(uvRange[1], 1e-12f);
+
     // For each valid quad in the source, triangulate and rasterize
+    #pragma omp parallel for collapse(2) schedule(dynamic, 64)
     for (int row = 0; row < srcPoints->rows - 1; ++row) {
         for (int col = 0; col < srcPoints->cols - 1; ++col) {
             const cv::Vec3f& p00 = (*srcPoints)(row, col);
@@ -370,37 +402,32 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
             const cv::Vec2f& uv10 = uvs(row + 1, col);
             const cv::Vec2f& uv11 = uvs(row + 1, col + 1);
 
-            // Transform UVs to grid coordinates
-            auto uvToGrid = [&](const cv::Vec2f& uv) -> cv::Vec2f {
-                float rx = std::max(uvRange[0], 1e-12f);
-                float ry = std::max(uvRange[1], 1e-12f);
-                return cv::Vec2f(
-                    (uv[0] - uvMin[0]) / rx * (gridW - 1),
-                    (uv[1] - uvMin[1]) / ry * (gridH - 1)
-                );
-            };
-
-            cv::Vec2f guv00 = uvToGrid(uv00);
-            cv::Vec2f guv01 = uvToGrid(uv01);
-            cv::Vec2f guv10 = uvToGrid(uv10);
-            cv::Vec2f guv11 = uvToGrid(uv11);
+            // Transform UVs to grid coordinates (inlined for performance)
+            cv::Vec2f guv00((uv00[0] - uvMin[0]) * rxInv, (uv00[1] - uvMin[1]) * ryInv);
+            cv::Vec2f guv01((uv01[0] - uvMin[0]) * rxInv, (uv01[1] - uvMin[1]) * ryInv);
+            cv::Vec2f guv10((uv10[0] - uvMin[0]) * rxInv, (uv10[1] - uvMin[1]) * ryInv);
+            cv::Vec2f guv11((uv11[0] - uvMin[0]) * rxInv, (uv11[1] - uvMin[1]) * ryInv);
 
             // Rasterize Triangle 1: (p10, p00, p01) with UVs (guv10, guv00, guv01)
             {
-                int minX = std::max(0, static_cast<int>(std::floor(std::min({guv10[0], guv00[0], guv01[0]}))) - 1);
-                int maxX = std::min(gridW - 1, static_cast<int>(std::ceil(std::max({guv10[0], guv00[0], guv01[0]}))) + 1);
-                int minY = std::max(0, static_cast<int>(std::floor(std::min({guv10[1], guv00[1], guv01[1]}))) - 1);
-                int maxY = std::min(gridH - 1, static_cast<int>(std::ceil(std::max({guv10[1], guv00[1], guv01[1]}))) + 1);
+                // Precompute triangle invariants ONCE per triangle
+                TriangleInvariants inv1 = precomputeTriangle(guv10, guv00, guv01);
+                if (!inv1.degenerate) {
+                    int minX = std::max(0, static_cast<int>(std::floor(std::min({guv10[0], guv00[0], guv01[0]}))) - 1);
+                    int maxX = std::min(gridW - 1, static_cast<int>(std::ceil(std::max({guv10[0], guv00[0], guv01[0]}))) + 1);
+                    int minY = std::max(0, static_cast<int>(std::floor(std::min({guv10[1], guv00[1], guv01[1]}))) - 1);
+                    int maxY = std::min(gridH - 1, static_cast<int>(std::ceil(std::max({guv10[1], guv00[1], guv01[1]}))) + 1);
 
-                for (int y = minY; y <= maxY; ++y) {
-                    for (int x = minX; x <= maxX; ++x) {
-                        cv::Vec2f gridPt(static_cast<float>(x), static_cast<float>(y));
-                        cv::Vec3f bary = computeBarycentric(gridPt, guv10, guv00, guv01);
+                    for (int y = minY; y <= maxY; ++y) {
+                        for (int x = minX; x <= maxX; ++x) {
+                            cv::Vec2f gridPt(static_cast<float>(x), static_cast<float>(y));
+                            cv::Vec3f bary = computeBarycentricFast(gridPt, inv1);
 
-                        if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
-                            cv::Vec3f pos = bary[0] * p10 + bary[1] * p00 + bary[2] * p01;
-                            if ((*outPoints)(y, x)[0] == -1.f) {
-                                (*outPoints)(y, x) = pos;
+                            if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
+                                cv::Vec3f pos = bary[0] * p10 + bary[1] * p00 + bary[2] * p01;
+                                if ((*outPoints)(y, x)[0] == -1.f) {
+                                    (*outPoints)(y, x) = pos;
+                                }
                             }
                         }
                     }
@@ -409,20 +436,24 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
             // Rasterize Triangle 2: (p10, p01, p11) with UVs (guv10, guv01, guv11)
             {
-                int minX = std::max(0, static_cast<int>(std::floor(std::min({guv10[0], guv01[0], guv11[0]}))) - 1);
-                int maxX = std::min(gridW - 1, static_cast<int>(std::ceil(std::max({guv10[0], guv01[0], guv11[0]}))) + 1);
-                int minY = std::max(0, static_cast<int>(std::floor(std::min({guv10[1], guv01[1], guv11[1]}))) - 1);
-                int maxY = std::min(gridH - 1, static_cast<int>(std::ceil(std::max({guv10[1], guv01[1], guv11[1]}))) + 1);
+                // Precompute triangle invariants ONCE per triangle
+                TriangleInvariants inv2 = precomputeTriangle(guv10, guv01, guv11);
+                if (!inv2.degenerate) {
+                    int minX = std::max(0, static_cast<int>(std::floor(std::min({guv10[0], guv01[0], guv11[0]}))) - 1);
+                    int maxX = std::min(gridW - 1, static_cast<int>(std::ceil(std::max({guv10[0], guv01[0], guv11[0]}))) + 1);
+                    int minY = std::max(0, static_cast<int>(std::floor(std::min({guv10[1], guv01[1], guv11[1]}))) - 1);
+                    int maxY = std::min(gridH - 1, static_cast<int>(std::ceil(std::max({guv10[1], guv01[1], guv11[1]}))) + 1);
 
-                for (int y = minY; y <= maxY; ++y) {
-                    for (int x = minX; x <= maxX; ++x) {
-                        cv::Vec2f gridPt(static_cast<float>(x), static_cast<float>(y));
-                        cv::Vec3f bary = computeBarycentric(gridPt, guv10, guv01, guv11);
+                    for (int y = minY; y <= maxY; ++y) {
+                        for (int x = minX; x <= maxX; ++x) {
+                            cv::Vec2f gridPt(static_cast<float>(x), static_cast<float>(y));
+                            cv::Vec3f bary = computeBarycentricFast(gridPt, inv2);
 
-                        if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
-                            cv::Vec3f pos = bary[0] * p10 + bary[1] * p01 + bary[2] * p11;
-                            if ((*outPoints)(y, x)[0] == -1.f) {
-                                (*outPoints)(y, x) = pos;
+                            if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
+                                cv::Vec3f pos = bary[0] * p10 + bary[1] * p01 + bary[2] * p11;
+                                if ((*outPoints)(y, x)[0] == -1.f) {
+                                    (*outPoints)(y, x) = pos;
+                                }
                             }
                         }
                     }
@@ -443,12 +474,10 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     std::cout << "ABF++: Rasterized " << validCount << " / " << (gridW * gridH)
               << " points (" << (100.0f * validCount / (gridW * gridH)) << "%)" << std::endl;
 
-    // Step 6: Compute output scale
-    // The scale should match the UV coordinate spacing
-    cv::Vec2f outScale(
-        uvRange[0] / (gridW - 1),
-        uvRange[1] / (gridH - 1)
-    );
+    // Step 6: Use input scale for output
+    // The scale determines how gen() upscales the grid. Using the same scale
+    // as input ensures consistent rendering behavior.
+    cv::Vec2f outScale = surface._scale;
 
     return new QuadSurface(outPoints, outScale);
 }
