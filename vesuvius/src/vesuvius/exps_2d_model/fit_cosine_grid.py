@@ -1350,33 +1350,43 @@ def fit_cosine_grid(
         x_pix = (x_norm + 1.0) * 0.5 * float(max(1, w_img - 1))
         y_pix = (y_norm + 1.0) * 0.5 * float(max(1, h_img - 1))
 
-        _, _, gh, gw = x_pix.shape
+        # Build 2D coarse coordinate field in pixel space for connectivity.
+        coords_pix = torch.cat([x_pix, y_pix], dim=1)  # (1,2,gh,gw)
+        _, _, gh, gw = coords_pix.shape
         if gh < 2 or gw < 2:
             return torch.zeros((), device=coords.device, dtype=coords.dtype)
-
-        # Horizontal edge vectors between neighboring columns (left -> right).
-        dx_h = x_pix[:, :, :, 1:] - x_pix[:, :, :, :-1]   # (1,1,gh,gw-1)
-        dy_h = y_pix[:, :, :, 1:] - y_pix[:, :, :, :-1]   # (1,1,gh,gw-1)
-
-        # Vertical edge vectors between neighboring rows (top -> bottom).
+ 
+        # Horizontal edge vectors using line-offset connectivity. For each
+        # horizontal edge (x,x+1) we have two directions (left->right, right->left).
+        src_h, nbr_h = _coarse_x_line_pairs(coords_pix)  # (1,2,2,gh,gw-1)
+        hvec = nbr_h - src_h                             # (1,2,2,gh,gw-1)
+        hvx = hvec[:, 0:1]                               # (1,1,2,gh,gw-1)
+        hvy = hvec[:, 1:2]                               # (1,1,2,gh,gw-1)
+ 
+        # Vertical edge vectors between neighboring rows (top -> bottom), unchanged.
         dx_v = x_pix[:, :, 1:, :] - x_pix[:, :, :-1, :]   # (1,1,gh-1,gw)
         dy_v = y_pix[:, :, 1:, :] - y_pix[:, :, :-1, :]   # (1,1,gh-1,gw)
-
+ 
         # We only compare where both directions are defined:
         # rows 0..gh-2 for vertical, and cols 0..gw-2 for horizontal.
-        hvx = dx_h[:, :, 0:gh-1, 0:gw-1]  # (1,1,gh-1,gw-1)
-        hvy = dy_h[:, :, 0:gh-1, 0:gw-1]
-        vvx = dx_v[:, :, :, 0:gw-1]       # (1,1,gh-1,gw-1)
-        vvy = dy_v[:, :, :, 0:gw-1]
-
-        # Cosine of angle between horizontal and vertical directions.
+        hvx_use = hvx[:, :, :, 0:gh-1, 0:gw-1]           # (1,1,2,gh-1,gw-1)
+        hvy_use = hvy[:, :, :, 0:gh-1, 0:gw-1]
+        vvx_base = dx_v[:, :, 0:gh-1, 0:gw-1]            # (1,1,gh-1,gw-1)
+        vvy_base = dy_v[:, :, 0:gh-1, 0:gw-1]
+ 
+        # Broadcast vertical vectors across the two horizontal directions.
+        vvx = vvx_base.unsqueeze(2).expand_as(hvx_use)   # (1,1,2,gh-1,gw-1)
+        vvy = vvy_base.unsqueeze(2).expand_as(hvy_use)
+ 
+        # Cosine of angle between horizontal connections and vertical direction.
         eps = 1e-12
-        h_norm = torch.sqrt(hvx * hvx + hvy * hvy + eps)
+        h_norm = torch.sqrt(hvx_use * hvx_use + hvy_use * hvy_use + eps)
         v_norm = torch.sqrt(vvx * vvx + vvy * vvy + eps)
-        dot = hvx * vvx + hvy * vvy
+        dot = hvx_use * vvx + hvy_use * vvy
         cos_theta = dot / (h_norm * v_norm + eps)
-
-        # Penalize squared cosine -> encourages orthogonality.
+ 
+        # Penalize squared cosine -> encourages orthogonality. This implicitly
+        # averages over both connectivity directions per horizontal edge.
         base = (cos_theta * cos_theta).mean()
 
         if mask is None:
