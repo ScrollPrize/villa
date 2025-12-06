@@ -726,7 +726,9 @@ int main(int argc, char *argv[])
         ("flatten", po::bool_switch()->default_value(false),
             "Apply ABF++ flattening to the surface before rendering")
         ("flatten-iterations", po::value<int>()->default_value(10),
-            "Maximum ABF++ iterations when --flatten is enabled");
+            "Maximum ABF++ iterations when --flatten is enabled")
+        ("flatten-downsample", po::value<int>()->default_value(1),
+            "Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality");
     // clang-format on
 
     po::options_description all("Usage");
@@ -980,6 +982,7 @@ int main(int argc, char *argv[])
             std::cout << "Applying ABF++ flattening..." << std::endl;
             vc::ABFConfig flatConfig;
             flatConfig.maxIterations = static_cast<std::size_t>(parsed["flatten-iterations"].as<int>());
+            flatConfig.downsampleFactor = parsed["flatten-downsample"].as<int>();
             flatConfig.useABF = true;
             flatConfig.scaleToOriginalArea = true;
 

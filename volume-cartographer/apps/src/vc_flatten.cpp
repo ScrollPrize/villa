@@ -30,6 +30,8 @@ int main(int argc, char* argv[]) {
             "Output TIFXYZ directory (default: <input>_flat)")
         ("iterations", po::value<int>()->default_value(10),
             "Maximum ABF++ iterations (default: 10)")
+        ("downsample", po::value<int>()->default_value(1),
+            "Downsample factor for faster computation (1=full, 2=half, 4=quarter)")
         ("lscm-only", po::bool_switch()->default_value(false),
             "Use only LSCM, skip ABF++ angle optimization")
         ("no-scale", po::bool_switch()->default_value(false),
@@ -77,6 +79,7 @@ int main(int argc, char* argv[]) {
     // Configure ABF++
     vc::ABFConfig config;
     config.maxIterations = static_cast<std::size_t>(vm["iterations"].as<int>());
+    config.downsampleFactor = vm["downsample"].as<int>();
     config.useABF = !vm["lscm-only"].as<bool>();
     config.scaleToOriginalArea = !vm["no-scale"].as<bool>();
 
@@ -98,6 +101,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\nFlattening configuration:" << std::endl;
     std::cout << "  Max iterations: " << config.maxIterations << std::endl;
+    std::cout << "  Downsample factor: " << config.downsampleFactor << std::endl;
     std::cout << "  Use ABF++: " << (config.useABF ? "yes" : "no (LSCM only)") << std::endl;
     std::cout << "  Scale to original area: " << (config.scaleToOriginalArea ? "yes" : "no") << std::endl;
     std::cout << "  Mode: " << (uvOnly ? "UV channel only" : "create new surface") << std::endl;

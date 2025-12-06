@@ -101,7 +101,104 @@ static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const QuadSurface& s
     return area;
 }
 
-cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& config) {
+/**
+ * @brief Downsample a grid by taking every Nth row and column
+ *
+ * @param grid Input grid
+ * @param factor Downsample factor (2 = half, 4 = quarter, etc.)
+ * @return Downsampled grid
+ */
+static cv::Mat_<cv::Vec3f> downsampleGrid(const cv::Mat_<cv::Vec3f>& grid, int factor) {
+    if (factor <= 1) {
+        return grid.clone();
+    }
+
+    int outRows = (grid.rows + factor - 1) / factor;
+    int outCols = (grid.cols + factor - 1) / factor;
+
+    cv::Mat_<cv::Vec3f> result(outRows, outCols);
+
+    #pragma omp parallel for collapse(2)
+    for (int outRow = 0; outRow < outRows; ++outRow) {
+        for (int outCol = 0; outCol < outCols; ++outCol) {
+            int inRow = outRow * factor;
+            int inCol = outCol * factor;
+            result(outRow, outCol) = grid(inRow, inCol);
+        }
+    }
+
+    return result;
+}
+
+/**
+ * @brief Upsample UV coordinates from coarse grid to fine grid using bilinear interpolation
+ *
+ * @param coarseUVs UV coordinates on downsampled grid
+ * @param originalRows Original grid height
+ * @param originalCols Original grid width
+ * @param factor Downsample factor used
+ * @return Upsampled UVs matching original grid dimensions
+ */
+static cv::Mat_<cv::Vec2f> upsampleUVs(const cv::Mat_<cv::Vec2f>& coarseUVs,
+                                        int originalRows, int originalCols,
+                                        int factor) {
+    cv::Mat_<cv::Vec2f> result(originalRows, originalCols, cv::Vec2f(-1.f, -1.f));
+
+    #pragma omp parallel for collapse(2)
+    for (int row = 0; row < originalRows; ++row) {
+        for (int col = 0; col < originalCols; ++col) {
+            // Map to coarse grid coordinates (floating point)
+            float coarseRowF = static_cast<float>(row) / factor;
+            float coarseColF = static_cast<float>(col) / factor;
+
+            // Get integer indices and fractional parts
+            int r0 = static_cast<int>(coarseRowF);
+            int c0 = static_cast<int>(coarseColF);
+            int r1 = std::min(r0 + 1, coarseUVs.rows - 1);
+            int c1 = std::min(c0 + 1, coarseUVs.cols - 1);
+
+            float fr = coarseRowF - r0;
+            float fc = coarseColF - c0;
+
+            // Get the four corner UVs
+            const cv::Vec2f& uv00 = coarseUVs(r0, c0);
+            const cv::Vec2f& uv01 = coarseUVs(r0, c1);
+            const cv::Vec2f& uv10 = coarseUVs(r1, c0);
+            const cv::Vec2f& uv11 = coarseUVs(r1, c1);
+
+            // Check if any corner is invalid
+            if (uv00[0] == -1.f || uv01[0] == -1.f ||
+                uv10[0] == -1.f || uv11[0] == -1.f) {
+                // If any corner is invalid, try to use nearest valid sample
+                if (uv00[0] != -1.f) {
+                    result(row, col) = uv00;
+                } else if (uv01[0] != -1.f) {
+                    result(row, col) = uv01;
+                } else if (uv10[0] != -1.f) {
+                    result(row, col) = uv10;
+                } else if (uv11[0] != -1.f) {
+                    result(row, col) = uv11;
+                }
+                // Otherwise leave as invalid
+                continue;
+            }
+
+            // Bilinear interpolation
+            cv::Vec2f uv = (1 - fr) * (1 - fc) * uv00 +
+                           (1 - fr) * fc * uv01 +
+                           fr * (1 - fc) * uv10 +
+                           fr * fc * uv11;
+            result(row, col) = uv;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * @brief Internal ABF++ flattening on the provided surface (no downsampling)
+ */
+static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface, const ABFConfig& config) {
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
     if (!points || points->empty()) {
         std::cerr << "ABF++: Empty surface" << std::endl;
@@ -264,6 +361,49 @@ cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& conf
 
     std::cout << "ABF++: Flattening complete" << std::endl;
     return uvs;
+}
+
+cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& config) {
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->empty()) {
+        std::cerr << "ABF++: Empty surface" << std::endl;
+        return cv::Mat_<cv::Vec2f>();
+    }
+
+    // If no downsampling requested, run directly
+    if (config.downsampleFactor <= 1) {
+        return abfFlattenInternal(surface, config);
+    }
+
+    // Downsample the grid
+    int originalRows = points->rows;
+    int originalCols = points->cols;
+
+    std::cout << "ABF++: Downsampling grid by factor " << config.downsampleFactor
+              << " (" << originalRows << "x" << originalCols << " -> ";
+
+    cv::Mat_<cv::Vec3f> coarseGrid = downsampleGrid(*points, config.downsampleFactor);
+
+    std::cout << coarseGrid.rows << "x" << coarseGrid.cols << ")" << std::endl;
+
+    // Create a temporary coarse surface for ABF
+    // Note: We need to allocate this on the heap and manage it carefully
+    cv::Mat_<cv::Vec3f>* coarsePointsPtr = new cv::Mat_<cv::Vec3f>(coarseGrid);
+    cv::Vec2f coarseScale = surface._scale * static_cast<float>(config.downsampleFactor);
+    QuadSurface coarseSurface(coarsePointsPtr, coarseScale);
+
+    // Run ABF on coarse grid
+    cv::Mat_<cv::Vec2f> coarseUVs = abfFlattenInternal(coarseSurface, config);
+
+    if (coarseUVs.empty()) {
+        return cv::Mat_<cv::Vec2f>();
+    }
+
+    // Upsample UVs back to original resolution
+    std::cout << "ABF++: Upsampling UVs from " << coarseUVs.rows << "x" << coarseUVs.cols
+              << " to " << originalRows << "x" << originalCols << std::endl;
+
+    return upsampleUVs(coarseUVs, originalRows, originalCols, config.downsampleFactor);
 }
 
 bool abfFlattenInPlace(QuadSurface& surface, const ABFConfig& config) {

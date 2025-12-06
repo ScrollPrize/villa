@@ -20,6 +20,14 @@ struct ABFConfig {
 
     /** If true, scale the output to match the original 3D surface area */
     bool scaleToOriginalArea = true;
+
+    /**
+     * Downsample factor for ABF++ computation (default: 1 = full resolution).
+     * Higher values (2, 4, 8) reduce grid resolution before ABF++ for faster
+     * computation, then interpolate UVs back to full resolution.
+     * Factor 2 = half resolution (4x faster), Factor 4 = quarter (16x faster).
+     */
+    int downsampleFactor = 1;
 };
 
 /**
