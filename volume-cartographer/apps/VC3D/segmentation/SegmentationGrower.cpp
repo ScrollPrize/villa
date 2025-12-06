@@ -21,8 +21,11 @@
 #include <QLoggingCategory>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <utility>
 #include <cstdint>
@@ -288,6 +291,253 @@ std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
     return cv::Rect(unionColStart, unionRowStart, width, height);
 }
 
+// Compute 3D world-space bounding box from correction points (min 512^3, centered)
+// Returns the world-space box and the corresponding 2D grid region
+std::optional<CorrectionsBounds> computeCorrectionsBounds(
+    const SegmentationCorrectionsPayload& corrections,
+    QuadSurface* surface,
+    float minWorldSize = 512.0f)
+{
+    if (!surface || corrections.empty()) {
+        return std::nullopt;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+
+    // Find min/max of all correction point positions (3D world coords)
+    cv::Vec3f worldMin(std::numeric_limits<float>::max(),
+                       std::numeric_limits<float>::max(),
+                       std::numeric_limits<float>::max());
+    cv::Vec3f worldMax(std::numeric_limits<float>::lowest(),
+                       std::numeric_limits<float>::lowest(),
+                       std::numeric_limits<float>::lowest());
+
+    bool hasPoints = false;
+    for (const auto& collection : corrections.collections) {
+        for (const auto& colPoint : collection.points) {
+            hasPoints = true;
+            worldMin[0] = std::min(worldMin[0], colPoint.p[0]);
+            worldMin[1] = std::min(worldMin[1], colPoint.p[1]);
+            worldMin[2] = std::min(worldMin[2], colPoint.p[2]);
+            worldMax[0] = std::max(worldMax[0], colPoint.p[0]);
+            worldMax[1] = std::max(worldMax[1], colPoint.p[1]);
+            worldMax[2] = std::max(worldMax[2], colPoint.p[2]);
+        }
+    }
+
+    if (!hasPoints) {
+        return std::nullopt;
+    }
+
+    // Compute center and expand to at least minWorldSize in each dimension
+    cv::Vec3f center = (worldMin + worldMax) * 0.5f;
+    cv::Vec3f halfSize;
+    for (int i = 0; i < 3; ++i) {
+        float extent = worldMax[i] - worldMin[i];
+        halfSize[i] = std::max(extent * 0.5f, minWorldSize * 0.5f);
+    }
+
+    worldMin = center - halfSize;
+    worldMax = center + halfSize;
+
+    // Find all grid cells whose 3D positions fall within this world-space box
+    const int rows = points->rows;
+    const int cols = points->cols;
+
+    int gridRowMin = rows;
+    int gridRowMax = -1;
+    int gridColMin = cols;
+    int gridColMax = -1;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const cv::Vec3f& pt = (*points)(r, c);
+            if (isInvalidPoint(pt)) {
+                continue;
+            }
+
+            // Check if point is within the world-space bounding box
+            if (pt[0] >= worldMin[0] && pt[0] <= worldMax[0] &&
+                pt[1] >= worldMin[1] && pt[1] <= worldMax[1] &&
+                pt[2] >= worldMin[2] && pt[2] <= worldMax[2]) {
+                gridRowMin = std::min(gridRowMin, r);
+                gridRowMax = std::max(gridRowMax, r);
+                gridColMin = std::min(gridColMin, c);
+                gridColMax = std::max(gridColMax, c);
+            }
+        }
+    }
+
+    if (gridRowMin > gridRowMax || gridColMin > gridColMax) {
+        // No grid cells found within bounds, return full grid
+        return CorrectionsBounds{worldMin, worldMax, cv::Rect(0, 0, cols, rows)};
+    }
+
+    // Clip to surface grid bounds (already implicitly done by loop bounds)
+    int width = gridColMax - gridColMin + 1;
+    int height = gridRowMax - gridRowMin + 1;
+
+    CorrectionsBounds bounds;
+    bounds.worldMin = worldMin;
+    bounds.worldMax = worldMax;
+    bounds.gridRegion = cv::Rect(gridColMin, gridRowMin, width, height);
+
+    return bounds;
+}
+
+// Crop a QuadSurface to a 2D grid region
+std::unique_ptr<QuadSurface> cropSurfaceToGridRegion(
+    const QuadSurface* surface,
+    const cv::Rect& gridRegion)
+{
+    if (!surface) {
+        return nullptr;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return nullptr;
+    }
+
+    const int rows = points->rows;
+    const int cols = points->cols;
+
+    // Clamp region to valid bounds
+    int x0 = std::clamp(gridRegion.x, 0, cols - 1);
+    int y0 = std::clamp(gridRegion.y, 0, rows - 1);
+    int x1 = std::clamp(gridRegion.x + gridRegion.width, 1, cols);
+    int y1 = std::clamp(gridRegion.y + gridRegion.height, 1, rows);
+
+    if (x1 <= x0 || y1 <= y0) {
+        return nullptr;
+    }
+
+    // Extract ROI
+    cv::Mat_<cv::Vec3f> roi(*points, cv::Range(y0, y1), cv::Range(x0, x1));
+    cv::Mat_<cv::Vec3f> roiClone = roi.clone();
+
+    // Create new QuadSurface with the cropped data
+    auto cropped = std::make_unique<QuadSurface>(roiClone, surface->scale());
+
+    return cropped;
+}
+
+// Generate ISO 8601 timestamp string for folder naming
+std::string generateTimestampString()
+{
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&time, &tm);
+
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H-%M-%S", &tm);
+    return std::string(buffer);
+}
+
+// Save correction annotation data
+void saveCorrectionsAnnotation(
+    const std::filesystem::path& volpkgRoot,
+    const std::string& segmentId,
+    const QuadSurface* beforeCrop,
+    const QuadSurface* afterCrop,
+    const SegmentationCorrectionsPayload& corrections,
+    const std::vector<std::string>& volumeIds,
+    const std::string& growthVolumeId,
+    const CorrectionsBounds& bounds)
+{
+    if (!beforeCrop || !afterCrop || corrections.empty()) {
+        return;
+    }
+
+    // Create timestamped folder
+    std::string timestamp = generateTimestampString();
+    std::filesystem::path correctionsDir = volpkgRoot / "corrections" / timestamp;
+
+    std::error_code ec;
+    std::filesystem::create_directories(correctionsDir, ec);
+    if (ec) {
+        qCWarning(lcSegGrowth) << "Failed to create corrections directory:" << ec.message().c_str();
+        return;
+    }
+
+    // Save before tifxyz
+    std::filesystem::path beforePath = correctionsDir / "before";
+    try {
+        auto* mutableBefore = const_cast<QuadSurface*>(beforeCrop);
+        mutableBefore->save(beforePath.string(), "before", true);
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegGrowth) << "Failed to save before tifxyz:" << ex.what();
+    }
+
+    // Save after tifxyz
+    std::filesystem::path afterPath = correctionsDir / "after";
+    try {
+        auto* mutableAfter = const_cast<QuadSurface*>(afterCrop);
+        mutableAfter->save(afterPath.string(), "after", true);
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegGrowth) << "Failed to save after tifxyz:" << ex.what();
+    }
+
+    // Build corrections.json
+    nlohmann::json j;
+    j["timestamp"] = timestamp;
+    j["segment_id"] = segmentId;
+    j["volumes"] = volumeIds;
+    j["volume_used"] = growthVolumeId;
+    j["bbox"] = {
+        {"min", {bounds.worldMin[0], bounds.worldMin[1], bounds.worldMin[2]}},
+        {"max", {bounds.worldMax[0], bounds.worldMax[1], bounds.worldMax[2]}}
+    };
+
+    // Build collections array with points sorted by creation_time
+    nlohmann::json collectionsJson = nlohmann::json::array();
+    for (const auto& collection : corrections.collections) {
+        nlohmann::json collJson;
+        collJson["id"] = collection.id;
+        collJson["name"] = collection.name;
+        collJson["color"] = {collection.color[0], collection.color[1], collection.color[2]};
+
+        // Sort points by creation_time to preserve placement order
+        std::vector<ColPoint> sortedPoints = collection.points;
+        std::sort(sortedPoints.begin(), sortedPoints.end(),
+                  [](const ColPoint& a, const ColPoint& b) {
+                      return a.creation_time < b.creation_time;
+                  });
+
+        nlohmann::json pointsJson = nlohmann::json::array();
+        for (const auto& pt : sortedPoints) {
+            nlohmann::json ptJson;
+            ptJson["id"] = pt.id;
+            ptJson["position"] = {pt.p[0], pt.p[1], pt.p[2]};
+            ptJson["creation_time"] = pt.creation_time;
+            pointsJson.push_back(ptJson);
+        }
+        collJson["points"] = pointsJson;
+
+        collectionsJson.push_back(collJson);
+    }
+    j["collections"] = collectionsJson;
+
+    // Write corrections.json
+    std::filesystem::path jsonPath = correctionsDir / "corrections.json";
+    try {
+        std::ofstream ofs(jsonPath);
+        if (ofs.is_open()) {
+            ofs << j.dump(2);
+            ofs.close();
+            qCInfo(lcSegGrowth) << "Saved corrections annotation to" << jsonPath.c_str();
+        } else {
+            qCWarning(lcSegGrowth) << "Failed to open corrections.json for writing";
+        }
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegGrowth) << "Failed to write corrections.json:" << ex.what();
+    }
+}
+
 void queueIndexUpdateForBounds(SurfacePatchIndex* index,
                                QuadSurface* surface,
                                const cv::Rect& vertexRect)
@@ -545,6 +795,13 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
 
+    // Populate fields for corrections annotation saving
+    if (volumeContext.package) {
+        ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
+        ctx.volumeIds = volumeContext.package->volumeIDs();
+    }
+    ctx.growthVolumeId = growthVolumeId;
+
     if (ctx.cacheRoot.isEmpty()) {
         const auto volumePath = growthVolume->path();
         ctx.cacheRoot = QDir(QString::fromStdString(volumePath.parent_path().string()))
@@ -590,6 +847,21 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     pending.usingCorrections = usingCorrections;
     pending.inpaintOnly = inpaintOnly;
     pending.correctionsAffectedBounds = correctionAffectedBounds;
+
+    // Compute corrections bounds and snapshot "before" surface for annotation saving
+    if (usingCorrections) {
+        pending.corrections = corrections;
+        auto bounds = computeCorrectionsBounds(corrections, segmentationSurface);
+        if (bounds) {
+            pending.correctionsBounds = bounds;
+            pending.beforeCrop = cropSurfaceToGridRegion(segmentationSurface, bounds->gridRegion);
+            if (pending.beforeCrop) {
+                qCInfo(lcSegGrowth) << "Captured before-crop for corrections annotation:"
+                                    << bounds->gridRegion.width << "x" << bounds->gridRegion.height;
+            }
+        }
+    }
+
     _activeRequest = std::move(pending);
 
     auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
@@ -881,6 +1153,34 @@ void SegmentationGrower::onFutureFinished()
     }
 
     refreshSegmentationViewers(_context.viewerManager);
+
+    // Save corrections annotation if we have a before-crop and bounds
+    if (request.usingCorrections && request.beforeCrop && request.correctionsBounds) {
+        // Crop the "after" surface using the same grid region
+        auto afterCrop = cropSurfaceToGridRegion(primarySurface ? primarySurface : request.segmentationSurface,
+                                                  request.correctionsBounds->gridRegion);
+        if (afterCrop) {
+            // Get volpkg root from the package
+            std::filesystem::path volpkgRoot;
+            std::vector<std::string> volumeIds;
+            if (request.volumeContext.package) {
+                volpkgRoot = std::filesystem::path(request.volumeContext.package->getVolpkgDirectory());
+                volumeIds = request.volumeContext.package->volumeIDs();
+            }
+
+            if (!volpkgRoot.empty()) {
+                saveCorrectionsAnnotation(
+                    volpkgRoot,
+                    request.segmentationSurface ? request.segmentationSurface->id : "",
+                    request.beforeCrop.get(),
+                    afterCrop.get(),
+                    request.corrections,
+                    volumeIds,
+                    request.growthVolumeId,
+                    *request.correctionsBounds);
+            }
+        }
+    }
 
     if (request.usingCorrections && _context.module) {
         _context.module->clearPendingCorrections();
