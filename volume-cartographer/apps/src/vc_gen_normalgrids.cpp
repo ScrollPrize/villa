@@ -36,6 +36,27 @@ enum class SliceDirection { XY, XZ, YZ };
 void run_generate(const po::variables_map& vm);
 void run_convert(const po::variables_map& vm);
 
+static void print_usage() {
+    std::cout << "vc_gen_normalgrids: Generate and manage normal grids for volume data.\n\n"
+              << "Usage: vc_gen_normalgrids <command> [options]\n\n"
+              << "Commands:\n"
+              << "  generate   Generate normal grids for all slices in a Zarr volume.\n"
+              << "  convert    Recursively find and convert GridStore files to the latest version.\n\n"
+              << "Examples:\n"
+              << "  vc_gen_normalgrids generate -i /path/to/volume.zarr -o /path/to/output/\n"
+              << "  vc_gen_normalgrids generate -i vol.zarr -o out/ --sparse-volume 4\n"
+              << "  vc_gen_normalgrids convert -i /path/to/grids/\n\n"
+              << "Generate options:\n"
+              << "  -i, --input         Input Zarr volume path (required)\n"
+              << "  -o, --output        Output directory path (required)\n"
+              << "  --spiral-step       Spiral step for resampling paths (default: 20.0)\n"
+              << "  --grid-step         Grid cell size for spatial indexing (default: 64)\n"
+              << "  --sparse-volume     Process every N-th slice, 1 = all (default: 1)\n\n"
+              << "Convert options:\n"
+              << "  -i, --input         Input directory to scan for .grid files (required)\n"
+              << "  --grid-step         New grid cell size (default: 64)\n";
+}
+
 int main(int argc, char* argv[]) {
     po::options_description global("Global options");
     global.add_options()
@@ -52,52 +73,89 @@ int main(int argc, char* argv[]) {
         positional(pos).
         allow_unregistered().
         run();
-    
+
     po::store(parsed, vm);
 
     if (vm.count("help") || !vm.count("command")) {
-        std::cout << "Usage: vc_gen_normalgrids <command> [options]\n\n"
-                  << "Commands:\n"
-                  << "  generate   Generate normal grids for all slices in a Zarr volume.\n"
-                  << "  convert    Recursively find and convert GridStore files to the latest version.\n\n";
+        print_usage();
         return 0;
     }
 
     std::string cmd = vm["command"].as<std::string>();
-    
+
     if (cmd == "generate") {
-        po::options_description generate_desc("`generate` options");
+        po::options_description generate_desc(
+            "vc_gen_normalgrids generate: Generate normal grids for all slices in a Zarr volume.\n\n"
+            "Uses chunked I/O for efficient processing of large volumes. Processes slices\n"
+            "in all three directions (XY, XZ, YZ) and generates .grid files containing\n"
+            "traced skeleton paths with normal information.\n\n"
+            "Options");
         generate_desc.add_options()
+            ("help,h", "Print this help message")
             ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
             ("output,o", po::value<std::string>()->required(), "Output directory path")
-            ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling")
-            ("grid-step", po::value<int>()->default_value(64), "Grid cell size for the GridStore")
+            ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling paths")
+            ("grid-step", po::value<int>()->default_value(64), "Grid cell size for spatial indexing")
             ("sparse-volume", po::value<int>()->default_value(1), "Process every N-th slice (1 = all slices)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
         opts.erase(opts.begin()); // Erase the command
-        
+
+        // Check for help before parsing required options
+        for (const auto& opt : opts) {
+            if (opt == "-h" || opt == "--help") {
+                std::cout << generate_desc << std::endl;
+                return 0;
+            }
+        }
+
         po::variables_map generate_vm;
-        po::store(po::command_line_parser(opts).options(generate_desc).run(), generate_vm);
-        po::notify(generate_vm);
+        try {
+            po::store(po::command_line_parser(opts).options(generate_desc).run(), generate_vm);
+            po::notify(generate_vm);
+        } catch (const po::error& e) {
+            std::cerr << "Error: " << e.what() << "\n\n";
+            std::cout << generate_desc << std::endl;
+            return 1;
+        }
         run_generate(generate_vm);
 
     } else if (cmd == "convert") {
-        po::options_description convert_desc("`convert` options");
+        po::options_description convert_desc(
+            "vc_gen_normalgrids convert: Convert GridStore files to the latest format.\n\n"
+            "Recursively scans a directory for .grid files and converts any older\n"
+            "format versions to the current version.\n\n"
+            "Options");
         convert_desc.add_options()
+            ("help,h", "Print this help message")
             ("input,i", po::value<std::string>()->required(), "Input directory to scan for GridStore files")
             ("grid-step", po::value<int>()->default_value(64), "New grid cell size for the GridStore");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
         opts.erase(opts.begin());
 
+        // Check for help before parsing required options
+        for (const auto& opt : opts) {
+            if (opt == "-h" || opt == "--help") {
+                std::cout << convert_desc << std::endl;
+                return 0;
+            }
+        }
+
         po::variables_map convert_vm;
-        po::store(po::command_line_parser(opts).options(convert_desc).run(), convert_vm);
-        po::notify(convert_vm);
+        try {
+            po::store(po::command_line_parser(opts).options(convert_desc).run(), convert_vm);
+            po::notify(convert_vm);
+        } catch (const po::error& e) {
+            std::cerr << "Error: " << e.what() << "\n\n";
+            std::cout << convert_desc << std::endl;
+            return 1;
+        }
         run_convert(convert_vm);
 
     } else {
-        std::cerr << "Error: Unknown command '" << cmd << "'" << std::endl;
+        std::cerr << "Error: Unknown command '" << cmd << "'\n\n";
+        print_usage();
         return 1;
     }
 
