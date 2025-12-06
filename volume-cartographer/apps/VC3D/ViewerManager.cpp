@@ -708,19 +708,24 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
     // Called BEFORE surface deletion - remove from R-tree index
     auto* quad = dynamic_cast<QuadSurface*>(surf.get());
 
-    // Remove from indexed surface IDs
-    _indexedSurfaceIds.erase(name);
+    // Only process cleanup if we're deleting under the surface's actual ID.
+    // Aliases like "segmentation" just point to surfaces that exist under their
+    // own IDs - we don't want to remove from the index when an alias changes.
+    const bool isDeletingByActualId = quad && (name == quad->id);
 
-    // Remove from queued IDs (strings are safe, but clean them up anyway)
-    auto removeFromVector = [&name](std::vector<std::string>& vec) {
-        vec.erase(std::remove(vec.begin(), vec.end(), name), vec.end());
-    };
-    removeFromVector(_pendingSurfacePatchIndexSurfaceIds);
-    removeFromVector(_surfacesQueuedDuringRebuildIds);
-    removeFromVector(_surfacesQueuedForRemovalDuringRebuildIds);
+    if (isDeletingByActualId) {
+        // Remove from indexed surface IDs
+        _indexedSurfaceIds.erase(name);
 
-    // Remove from the R-tree index (this is the critical part - must happen before deletion)
-    if (quad) {
+        // Remove from queued IDs
+        auto removeFromVector = [&name](std::vector<std::string>& vec) {
+            vec.erase(std::remove(vec.begin(), vec.end(), name), vec.end());
+        };
+        removeFromVector(_pendingSurfacePatchIndexSurfaceIds);
+        removeFromVector(_surfacesQueuedDuringRebuildIds);
+        removeFromVector(_surfacesQueuedForRemovalDuringRebuildIds);
+
+        // Remove from the R-tree index
         _surfacePatchIndex.removeSurface(quad);
     }
 }
