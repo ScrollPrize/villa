@@ -433,6 +433,13 @@ void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface)
                             << "- marking index for rebuild";
 }
 
+void ViewerManager::waitForPendingIndexRebuild()
+{
+    if (_surfacePatchIndexWatcher && _surfacePatchIndexWatcher->isRunning()) {
+        _surfacePatchIndexWatcher->waitForFinished();
+    }
+}
+
 void ViewerManager::primeSurfacePatchIndicesAsync()
 {
     if (!_surfacePatchIndexWatcher) {
@@ -484,6 +491,10 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     // Clear rebuild flag since we're about to do an async build
     // (prevents rebuildSurfacePatchIndexIfNeeded from triggering a synchronous build)
     _surfacePatchIndexNeedsRebuild = false;
+
+    // Clear any surfaces queued from a previous rebuild cycle
+    _surfacesQueuedDuringRebuild.clear();
+    _surfacesQueuedForRemovalDuringRebuild.clear();
 
     auto surfacesForTask = _pendingSurfacePatchIndexSurfaces;
     const int stride = _surfacePatchSamplingStride;
@@ -545,6 +556,24 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _indexedSurfaces.clear();
     _indexedSurfaces.insert(_pendingSurfacePatchIndexSurfaces.begin(),
                             _pendingSurfacePatchIndexSurfaces.end());
+
+    // Process any surfaces that were removed during the async rebuild
+    for (QuadSurface* toRemove : _surfacesQueuedForRemovalDuringRebuild) {
+        _surfacePatchIndex.removeSurface(toRemove);
+        _indexedSurfaces.erase(toRemove);
+    }
+    _surfacesQueuedForRemovalDuringRebuild.clear();
+
+    // Merge any surfaces that were added during the async rebuild
+    for (QuadSurface* queued : _surfacesQueuedDuringRebuild) {
+        if (_surfacePatchIndex.updateSurface(queued)) {
+            _indexedSurfaces.insert(queued);
+            qCInfo(lcViewerManager) << "Indexed queued surface" << queued->id.c_str()
+                                    << "after async rebuild";
+        }
+    }
+    _surfacesQueuedDuringRebuild.clear();
+
     qCInfo(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
                             << _indexedSurfaces.size() << "surfaces"
                             << "at stride" << _surfacePatchSamplingStride;
@@ -592,6 +621,10 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool /*
 
     const bool alreadyIndexed = _indexedSurfaces.count(quad) != 0;
 
+    // Check if async rebuild is in progress
+    const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
+                                        _surfacePatchIndexWatcher->isRunning();
+
     // Flush any pending cell updates
     if (_surfacePatchIndex.hasPendingUpdates(quad)) {
         bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
@@ -604,6 +637,16 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool /*
 
     // First-time indexing
     if (!alreadyIndexed) {
+        // If async rebuild is in progress, queue this surface for later
+        // Don't add to current tree - it will be replaced when rebuild finishes
+        if (asyncRebuildInProgress) {
+            _surfacesQueuedDuringRebuild.push_back(quad);
+            qCInfo(lcViewerManager)
+                << "Queued surface" << quad->id.c_str()
+                << "for indexing after async rebuild completes";
+            return true;
+        }
+
         bool updated = _surfacePatchIndex.updateSurface(quad);
         if (updated) {
             _indexedSurfaces.insert(quad);
@@ -632,6 +675,8 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bo
         }
     } else if (!surf) {
         affectsSurfaceIndex = true;
+        const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
+                                            _surfacePatchIndexWatcher->isRunning();
         if (_surfaces) {
             std::unordered_set<const QuadSurface*> liveSurfaces;
             auto surfaces = _surfaces->surfaces();
@@ -643,7 +688,14 @@ void ViewerManager::handleSurfaceChanged(std::string /*name*/, Surface* surf, bo
             }
             for (auto it = _indexedSurfaces.begin(); it != _indexedSurfaces.end();) {
                 if (!liveSurfaces.count(*it)) {
+                    QuadSurface* toRemove = *it;
                     it = _indexedSurfaces.erase(it);
+                    // Remove from the R-tree (queue if async rebuild in progress)
+                    if (asyncRebuildInProgress) {
+                        _surfacesQueuedForRemovalDuringRebuild.push_back(toRemove);
+                    } else {
+                        _surfacePatchIndex.removeSurface(toRemove);
+                    }
                 } else {
                     ++it;
                 }

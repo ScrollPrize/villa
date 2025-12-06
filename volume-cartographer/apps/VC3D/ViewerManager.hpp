@@ -97,6 +97,7 @@ public:
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
     void refreshSurfacePatchIndex(QuadSurface* surface);
+    void waitForPendingIndexRebuild();
 
 signals:
     void viewerCreated(CVolumeViewer* viewer);
@@ -145,6 +146,8 @@ private:
     bool _surfacePatchIndexNeedsRebuild{true};
     std::unordered_set<QuadSurface*> _indexedSurfaces;
     std::vector<QuadSurface*> _pendingSurfacePatchIndexSurfaces;
+    std::vector<QuadSurface*> _surfacesQueuedDuringRebuild;
+    std::vector<QuadSurface*> _surfacesQueuedForRemovalDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
 
     void rebuildSurfacePatchIndexIfNeeded();
