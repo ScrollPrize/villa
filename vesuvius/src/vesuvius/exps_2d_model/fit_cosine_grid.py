@@ -729,31 +729,34 @@ def fit_cosine_grid(
     def _coarse_geom_mask(
         stage: int,
         stage_progress: float,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Build a per-vertex coarse-grid mask in [0,1] for geometry losses.
- 
-        The mask is obtained by sampling an image-space mask (either an all-ones
-        map or the current Gaussian loss mask) at the mapped coarse-grid
-        coordinates, and multiplying it by a cosine-domain mask defined in
-        sample space. Points that map outside the image receive weight 0 via
-        grid_sample's zero padding.
- 
+        Build per-vertex coarse-grid masks in [0,1] for geometry losses.
+    
+        The image-space mask is obtained by sampling either an all-ones map or
+        the current Gaussian loss mask at the mapped coarse-grid coordinates.
+    
+        A separate cosine-domain mask is defined in coarse sample space using
+        the canonical (u,v) grid. The combined mask is the product of the image
+        mask and the cosine-domain mask.
+    
         Returns:
-            (1,1,gh,gw) tensor aligned with model.base_grid/model.offset.
+            mask_coarse:      (1,1,gh,gw) image * cosine mask (for most geometry losses)
+            mask_img_coarse:  (1,1,gh,gw) image mask only
+            mask_cosine_coarse:(1,1,gh,gw) cosine-domain mask only
         """
         with torch.no_grad():
             coords = model.base_grid + model.offset  # (1,2,gh,gw)
             u = coords[:, 0:1]
             v = coords[:, 1:2]
- 
+    
             # Map to normalized image coordinates.
             x_norm, y_norm = model._apply_global_transform(u, v)
             grid_coarse = torch.stack(
                 [x_norm.squeeze(1), y_norm.squeeze(1)],
                 dim=-1,
             )  # (1,gh,gw,2)
- 
+    
             # Image-space loss mask:
             # - stages 1 & 2: all-ones
             # - stage 3: current Gaussian schedule, or all-ones when disabled.
@@ -766,32 +769,32 @@ def fit_cosine_grid(
                 )
             else:
                 mask_img = gauss_img
- 
-            mask_coarse = F.grid_sample(
+    
+            mask_img_coarse = F.grid_sample(
                 mask_img,
                 grid_coarse,
                 mode="bilinear",
                 padding_mode="zeros",
                 align_corners=True,
             )  # (1,1,gh,gw)
-
+ 
             # Cosine-domain band mask in coarse sample space: same definition as
             # mask_cosine_hr, but evaluated on the canonical (u,v) grid.
             base_coords = model.base_grid  # (1,2,gh,gw)
             u_c = base_coords[:, 0:1]      # [-1,1] horizontally
             # v spans [-2,2]; normalize to [-1,1] for the vertical extent test.
             v_c = base_coords[:, 1:2] * 0.5
-
+ 
             mask_x_c = (u_c.abs() <= u_band_half)
             if cos_mask_v_extent_f >= 1.0:
                 mask_y_c = torch.ones_like(v_c, dtype=torch.bool)
             else:
                 mask_y_c = (v_c.abs() <= cos_mask_v_extent_f)
             mask_cosine_coarse = (mask_x_c & mask_y_c).float()
-
-            mask_coarse = mask_coarse * mask_cosine_coarse
  
-        return mask_coarse
+            mask_coarse = mask_img_coarse * mask_cosine_coarse
+    
+        return mask_coarse, mask_img_coarse, mask_cosine_coarse
  
     def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
         """
@@ -1249,7 +1252,7 @@ def fit_cosine_grid(
                 # low-weight regions appear darker.
                 base_scale = output_scale if output_scale is not None else 4
                 vis_scale = base_scale * 2
-                geom_mask_vis = _coarse_geom_mask(stage, stage_progress)
+                geom_mask_vis, _, _ = _coarse_geom_mask(stage, stage_progress)
                 grid_vis_np = _draw_grid_vis(scale_factor=vis_scale, mask_coarse=geom_mask_vis)
  
         p = Path(output_prefix)
@@ -1329,7 +1332,10 @@ def fit_cosine_grid(
                 # print("write ", gmag_path, gmag_u8.shape, gmag_u8.strides, gmag_u8.dtype)
                 cv2.imwrite(gmag_path, gradmag_vis_arr.squeeze(0).squeeze(0))
  
-    def _smoothness_reg(mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _smoothness_reg(
+        mask_cosine: torch.Tensor | None = None,
+        mask_img: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Smoothness penalty on the *offset* field in coarse grid index space.
     
@@ -1342,16 +1348,22 @@ def fit_cosine_grid(
         direction*, not by coordinate component.
     
         Horizontal relations use the line-offset connectivity field: for each
-        edge between columns (x,x+1) we form *two* connections, one from the
+        edge between columns (x,x+1) we build two connections, one from the
         left column towards the right and one from the right column towards the
         left, each vertically displaced according to its own offset and
-        interpolated in the neighbor column. This means that losses that look
-        along x will in general be evaluated twice per row.
+        interpolated in the neighbor column.
     
-        If a coarse-grid mask is provided (shape (1,1,gh,gw)), we weight each
-        horizontal/vertical edge by the minimum of its endpoint weights and
-        normalize by the sum of weights. Edges whose endpoints lie completely
-        outside the image (mask=0) therefore do not contribute.
+        If coarse-grid masks are provided (shape (1,1,gh,gw)), we build per-edge
+        weights from:
+    
+            mask_img:      image / validity weighting
+            mask_cosine:   cosine-domain band in coarse space
+    
+        Inside the cosine band we use full weight (mask_img). Outside the band
+        we keep only smoothness, but downweighted:
+    
+            - smooth_x: 1/16 of its in-band weight
+            - smooth_y: 1/4  of its in-band weight
         """
         off = model.offset  # (1,2,gh,gw)  2 = (u_offset, v_offset)
         _, _, gh, gw = off.shape
@@ -1363,7 +1375,7 @@ def fit_cosine_grid(
             src_x, nbr_x = _coarse_x_line_pairs(off)  # (1,2,2,gh,gw-1)
             dx_vec = nbr_x - src_x                   # (1,2,2,gh,gw-1)
             dx_sq = (dx_vec * dx_vec).sum(dim=1, keepdim=True)  # (1,1,2,gh,gw-1)
-            smooth_x = dx_sq.mean(dim=2)  # average over the two directions -> (1,1,gh,gw-1)
+            smooth_x = dx_sq.mean(dim=2)  # (1,1,gh,gw-1)
         else:
             smooth_x = torch.zeros((), device=off.device, dtype=off.dtype)
     
@@ -1376,17 +1388,30 @@ def fit_cosine_grid(
         else:
             smooth_y = torch.zeros((), device=off.device, dtype=off.dtype)
     
-        if mask is None:
+        # No masks: use global mean.
+        if mask_img is None and mask_cosine is None:
             return smooth_x.mean(), smooth_y.mean()
     
-        # mask: (1,1,gh,gw) -> per-edge weights via average of endpoints.
-        m = mask
+        # Prepare per-vertex masks.
+        if mask_img is None:
+            m_img = torch.ones((1, 1, gh, gw), device=off.device, dtype=off.dtype)
+        else:
+            m_img = mask_img.to(device=off.device, dtype=off.dtype)
+    
+        if mask_cosine is None:
+            m_cos = torch.ones_like(m_img)
+        else:
+            m_cos = mask_cosine.to(device=off.device, dtype=off.dtype)
+    
         # Horizontal edges: between (y,x) and (y,x+1).
         if isinstance(smooth_x, torch.Tensor) and smooth_x.numel() > 0:
-            m_h = 0.5 * (m[:, :, :, :-1] + m[:, :, :, 1:])  # (1,1,gh,gw-1)
-            wsum_h = m_h.sum()
+            m_img_h = 0.5 * (m_img[:, :, :, :-1] + m_img[:, :, :, 1:])  # (1,1,gh,gw-1)
+            m_cos_h = 0.5 * (m_cos[:, :, :, :-1] + m_cos[:, :, :, 1:])  # (1,1,gh,gw-1)
+            alpha_x = 1.0 / 16.0
+            w_h = m_img_h * (m_cos_h + alpha_x * (1.0 - m_cos_h))
+            wsum_h = w_h.sum()
             if wsum_h > 0:
-                loss_x = (smooth_x * m_h).sum() / wsum_h
+                loss_x = (smooth_x * w_h).sum() / wsum_h
             else:
                 loss_x = smooth_x.mean()
         else:
@@ -1394,10 +1419,13 @@ def fit_cosine_grid(
     
         # Vertical edges: between (y,x) and (y+1,x).
         if isinstance(smooth_y, torch.Tensor) and smooth_y.numel() > 0:
-            m_v = 0.5 * (m[:, :, :-1, :] + m[:, :, 1:, :])  # (1,1,gh-1,gw)
-            wsum_v = m_v.sum()
+            m_img_v = 0.5 * (m_img[:, :, :-1, :] + m_img[:, :, 1:, :])  # (1,1,gh-1,gw)
+            m_cos_v = 0.5 * (m_cos[:, :, :-1, :] + m_cos[:, :, 1:, :])  # (1,1,gh-1,gw)
+            alpha_y = 1.0 / 4.0
+            w_v = m_img_v * (m_cos_v + alpha_y * (1.0 - m_cos_v))
+            wsum_v = w_v.sum()
             if wsum_v > 0:
-                loss_y = (smooth_y * m_v).sum() / wsum_v
+                loss_y = (smooth_y * w_v).sum() / wsum_v
             else:
                 loss_y = smooth_y.mean()
         else:
@@ -2354,10 +2382,11 @@ def fit_cosine_grid(
             # periods/rows contribute to the loss.
             weight_full = weight_full * mask_cosine_hr
  
-            # Coarse-grid mask for geometry losses: sample the same image-space
-            # mask (ones or Gaussian) at the coarse-grid coordinates so that
-            # steps/triangles fully outside the image do not contribute.
-            geom_mask_coarse = _coarse_geom_mask(stage, stage_progress)
+            # Coarse-grid masks for geometry losses: sample the same image-space
+            # mask (ones or Gaussian) at the coarse-grid coordinates, and keep
+            # the cosine-domain band separate so we can treat in-band vs
+            # out-of-band regions differently for smoothness.
+            geom_mask_coarse, geom_mask_img, geom_mask_cos = _coarse_geom_mask(stage, stage_progress)
  
         # Grid with gradients for geometry-based losses.
         grid = model._build_sampling_grid()
@@ -2427,7 +2456,12 @@ def fit_cosine_grid(
         need_sx = _need_term("smooth_x", stage_modifiers) != 0.0
         need_sy = _need_term("smooth_y", stage_modifiers) != 0.0
         if need_sx or need_sy:
-            smooth_x_val, smooth_y_val = _smoothness_reg(geom_mask_coarse)
+            # Inside the cosine band we use full smoothness; outside the band
+            # we keep only smoothness with reduced weights (x: 1/16, y: 1/4).
+            smooth_x_val, smooth_y_val = _smoothness_reg(
+                mask_cosine=geom_mask_cos,
+                mask_img=geom_mask_img,
+            )
         else:
             smooth_x_val = torch.zeros((), device=device, dtype=dtype)
             smooth_y_val = torch.zeros((), device=device, dtype=dtype)
