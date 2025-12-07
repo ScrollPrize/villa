@@ -96,6 +96,12 @@ void CVolumeViewer::renderIntersections()
         rebuildCachedIntersectSurfaces();
     }
 
+    // Invalidate cached intersection graphics if scale changed (lines are projected using _scale)
+    if (_cachedIntersectionScale != _scale) {
+        _cachedIntersectionLines.clear();
+        _cachedIntersectionScale = _scale;
+    }
+
     const QRectF viewRect = fGraphicsView
         ? fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect()
         : QRectF(curr_img_area);
@@ -438,9 +444,6 @@ void CVolumeViewer::renderIntersections()
                 auto* item = fGraphicsView->scene()->addPath(path, QPen(style.color, style.width));
                 item->setZValue(style.z);
                 item->setOpacity(_intersectionOpacity);
-                if (fBaseImageItem) {
-                    item->setParentItem(fBaseImageItem);
-                }
                 items.push_back(item);
             }
 

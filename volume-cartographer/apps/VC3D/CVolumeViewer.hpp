@@ -271,6 +271,7 @@ protected:
     std::unordered_map<std::string, QuadSurface*> _cachedIntersectSurfaces;
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
     std::unordered_map<std::string, std::vector<IntersectionLine>> _cachedIntersectionLines;
+    float _cachedIntersectionScale = 0.0f;  // Scale used when caching intersection lines
     // Reusable buffers to avoid per-frame allocations
     std::vector<SurfacePatchIndex::TriangleCandidate> _triangleCandidates;
     std::unordered_map<QuadSurface*, std::vector<size_t>> _trianglesBySurface;
