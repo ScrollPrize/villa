@@ -322,6 +322,7 @@ def fit_cosine_grid(
 	final_float: bool = False,
 	cos_mask_periods: float = 5.0,
 	cos_mask_v_extent: float = 0.1,
+	cos_mask_v_ramp: float = 0.05,
 	use_image_mask: bool = False,
 ) -> None:
     """
@@ -567,7 +568,9 @@ def fit_cosine_grid(
     cos_mask_periods_f = max(0.0, cos_mask_periods_f)
     cos_mask_v_extent_f = float(cos_mask_v_extent)
     cos_mask_v_extent_f = max(0.0, min(1.0, cos_mask_v_extent_f))
-
+    cos_mask_v_ramp_f = float(cos_mask_v_ramp)
+    cos_mask_v_ramp_f = max(1e-6, min(2.0, cos_mask_v_ramp_f))
+ 
     if float(cosine_periods) > 0.0 and cos_mask_periods_f > 0.0:
         u_band_half = min(cos_mask_periods_f / float(cosine_periods), 1.0)
     else:
@@ -610,7 +613,9 @@ def fit_cosine_grid(
         if cos_v >= 1.0:
             mask_y = torch.ones_like(v_hr, dtype=torch.float32)
         else:
-            mask_y = (v_hr.abs() <= cos_v).float()
+            abs_v = v_hr.abs()
+            dist_v = abs_v - cos_v
+            mask_y = torch.clamp(1.0 - dist_v / cos_mask_v_ramp_f, min=0.0, max=1.0)
         return mask_x_hr * mask_y
  
     def _current_cos_v_extent(stage: int, step_stage: int, total_stage_steps: int) -> float:
@@ -832,7 +837,9 @@ def fit_cosine_grid(
             if cos_v >= 1.0:
                 mask_y_c = torch.ones_like(v_c, dtype=torch.float32)
             else:
-                mask_y_c = (v_c.abs() <= cos_v).float()
+                abs_v_c = v_c.abs()
+                dist_v_c = abs_v_c - cos_v
+                mask_y_c = torch.clamp(1.0 - dist_v_c / cos_mask_v_ramp_f, min=0.0, max=1.0)
             mask_cosine_coarse = mask_x_c * mask_y_c
  
             mask_coarse = mask_img_coarse * mask_cosine_coarse
@@ -1182,13 +1189,6 @@ def fit_cosine_grid(
                 mask_cosine_dbg = _build_mask_cosine_hr(cos_v_eff_dbg)
                 mask_hr = mask_hr * mask_cosine_dbg
  
-                if eff_output_scale is not None and eff_output_scale > 1:
-                    mask_hr = F.interpolate(
-                        mask_hr,
-                        scale_factor=eff_output_scale,
-                        mode="bicubic",
-                        align_corners=True,
-                    )
                 mask_np = mask_hr.cpu().squeeze(0).squeeze(0).numpy()
  
                 # Direction maps (model vs UNet) in sample space (dir0 & dir1).
@@ -2599,7 +2599,7 @@ def fit_cosine_grid(
                     half_period_u = 0.5 * period_u
                     model.phase.data = ((model.phase.data + half_period_u) % period_u) - half_period_u
  
-            if stage == 4 or (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
+            if (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
                 theta_val = float(model.theta.detach().cpu())
                 sx_val = float(model.log_s.detach().exp().cpu())
                 data_loss = terms["data"]
@@ -2871,6 +2871,12 @@ def main() -> None:
         help="Vertical half-extent in normalized sample-space v (in [0,1]) of the cosine loss band (default: 0.1).",
     )
     parser.add_argument(
+        "--cos-mask-v-ramp",
+        type=float,
+        default=0.05,
+        help="Vertical ramp width in normalized sample-space v for the cosine loss band (linear fade-out to 0 outside the band).",
+    )
+    parser.add_argument(
     	"--unet-checkpoint",
     	type=str,
     	default=None,
@@ -3039,6 +3045,7 @@ def main() -> None:
     	final_float=args.final_float,
     	cos_mask_periods=args.cos_mask_periods,
     	cos_mask_v_extent=args.cos_mask_v_extent,
+    	cos_mask_v_ramp=args.cos_mask_v_ramp,
     	use_image_mask=args.use_image_mask,
     )
 
