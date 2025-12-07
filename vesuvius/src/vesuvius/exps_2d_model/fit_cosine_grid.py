@@ -320,7 +320,7 @@ def fit_cosine_grid(
 	compile_model: bool = False,
 	final_float: bool = False,
 	cos_mask_periods: float = 5.0,
-	cos_mask_v_extent: float = 1.0,
+	cos_mask_v_extent: float = 0.1,
 	use_image_mask: bool = False,
 ) -> None:
     """
@@ -1973,7 +1973,8 @@ def fit_cosine_grid(
         return dir0_model, dir0_unet_hr, dir1_model, dir1_unet_hr
 
     def _directional_alignment_loss(
-        grid: torch.Tensor
+        grid: torch.Tensor,
+        mask_sample: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Directional alignment loss between the mapped cosine axis and the UNet
@@ -1984,6 +1985,9 @@ def fit_cosine_grid(
             loss_dir = 0.5 * (loss_dir0 + loss_dir1)
     
         when both are present, or just loss_dir0 when only dir0 is available.
+    
+        If `mask_sample` is provided (1,1,H,W), it is used as a spatial weight
+        so that only the masked sample-space region contributes to the loss.
         """
         if unet_dir0_img is None and unet_dir1_img is None:
             return torch.zeros((), device=torch_device, dtype=torch.float32)
@@ -1995,12 +1999,24 @@ def fit_cosine_grid(
         if dir0_model is None or dir0_unet_hr is None:
             return torch.zeros((), device=device, dtype=dtype)
     
-        diff_dir0 = dir0_model - dir0_unet_hr
-        loss_dir0 = (diff_dir0 * diff_dir0).mean()
+        def _masked_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            diff = a - b
+            diff2 = diff * diff
+            if mask_sample is None:
+                return diff2.mean()
+            if mask_sample.shape[-2:] != diff2.shape[-2:]:
+                # Safety: fall back to unweighted if spatial sizes mismatch.
+                return diff2.mean()
+            w = mask_sample
+            wsum = w.sum()
+            if wsum > 0:
+                return (diff2 * w).sum() / wsum
+            return diff2.mean()
+    
+        loss_dir0 = _masked_mse(dir0_model, dir0_unet_hr)
     
         if dir1_model is not None and dir1_unet_hr is not None:
-            diff_dir1 = dir1_model - dir1_unet_hr
-            loss_dir1 = (diff_dir1 * diff_dir1).mean()
+            loss_dir1 = _masked_mse(dir1_model, dir1_unet_hr)
             return 0.5 * (loss_dir0 + loss_dir1)
     
         # Fallback: only dir0 available.
@@ -2384,7 +2400,9 @@ def fit_cosine_grid(
         # Directional alignment (UNet dir vs mapped cosine axis).
         w_dir = _need_term("dir_unet", stage_modifiers)
         if w_dir != 0.0:
-            dir_loss = _directional_alignment_loss(grid)
+            # Use the same sample-space mask as the data term so that
+            # directional alignment is only enforced inside the cosine band.
+            dir_loss = _directional_alignment_loss(grid, mask_sample=weight_full)
             total_loss = total_loss + w_dir * dir_loss
         else:
             dir_loss = torch.zeros((), device=device, dtype=dtype)
@@ -2719,8 +2737,8 @@ def main() -> None:
     parser.add_argument(
         "--cos-mask-v-extent",
         type=float,
-        default=1.0,
-        help="Vertical half-extent in normalized sample-space v (in [0,1]) of the cosine loss band.",
+        default=0.1,
+        help="Vertical half-extent in normalized sample-space v (in [0,1]) of the cosine loss band (default: 0.1).",
     )
     parser.add_argument(
     	"--unet-checkpoint",
