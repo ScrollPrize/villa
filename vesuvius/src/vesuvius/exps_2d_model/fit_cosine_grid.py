@@ -298,6 +298,7 @@ def fit_cosine_grid(
 	lambda_angle_sym: float = 1.0,
 	lambda_mod_h: float = 0.0,
 	lambda_mod_v: float = 0.0,
+	lambda_line_smooth_y: float = 0.0,
 	lambda_grad_data: float = 0.0,
 	lambda_grad_mag: float = 0.0,
 	min_dx_grad: float = 0.0,
@@ -628,7 +629,7 @@ def fit_cosine_grid(
           optimization step within stage 4, clamped to 1.0.
         """
         if stage == 4:
-            return float(cos_mask_v_extent_f + 0.00001 * float(step_stage))
+            return float(cos_mask_v_extent_f + 0.0001 * float(step_stage))
         return float(cos_mask_v_extent_f)
 
     # Effective output scale: in video mode we disable all upscaling.
@@ -1479,6 +1480,42 @@ def fit_cosine_grid(
     
         return loss_x, loss_y
  
+    def _line_offset_smooth_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Smoothness penalty on the line_offset field along y for each direction.
+ 
+        line_offset has shape (1,2,gh,gw), channels:
+            0: offset towards left neighbor
+            1: offset towards right neighbor
+ 
+        We regularize first-order differences along the coarse y index for each
+        direction channel separately:
+            dy = line_offset[:, :, j+1, :] - line_offset[:, :, j, :].
+ 
+        If a coarse-grid mask is provided (1,1,gh,gw), we weight vertical
+        differences by the average of their endpoint weights and normalize by
+        the sum of weights. The same mask is broadcast to both directions.
+        """
+        lo = model.line_offset  # (1,2,gh,gw)
+        _, _, gh, gw = lo.shape
+        if gh < 2:
+            return torch.zeros((), device=lo.device, dtype=lo.dtype)
+ 
+        dy = lo[:, :, 1:, :] - lo[:, :, :-1, :]  # (1,2,gh-1,gw)
+        dy_sq = dy * dy                          # (1,2,gh-1,gw)
+ 
+        if mask is None:
+            return dy_sq.mean()
+ 
+        m = mask.to(device=lo.device, dtype=lo.dtype)  # (1,1,gh,gw)
+        m_v = 0.5 * (m[:, :, 1:, :] + m[:, :, :-1, :])  # (1,1,gh-1,gw)
+        wsum = m_v.sum()
+        if wsum <= 0:
+            return dy_sq.mean()
+ 
+        w = m_v.expand(1, 2, gh - 1, gw)  # broadcast to both directions
+        return (dy_sq * w).sum() / wsum
+  
     def _mod_smooth_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Smoothness penalty on modulation parameters (amp, bias) on the coarse grid.
@@ -2327,6 +2364,7 @@ def fit_cosine_grid(
         "quad_tri": 1.0,
         "angle_sym": lambda_angle_sym,
         "dir_unet": lambda_dir_unet,
+        "line_smooth_y": lambda_line_smooth_y,
     }
  
     # Per-stage modifiers. Keys omitted imply modifier 1.0.
@@ -2555,11 +2593,24 @@ def fit_cosine_grid(
         else:
             quad_tri_reg = torch.zeros((), device=device, dtype=dtype)
         terms["quad_tri"] = quad_tri_reg
- 
+
+        # Line-offset smoothness in y-direction (per direction channel).
+        w_line_smooth = _need_term("line_smooth_y", stage_modifiers)
+        if w_line_smooth != 0.0:
+            # Use only the image/validity coarse mask so line-offset smoothing
+            # is not restricted by the cosine-domain band.
+            line_smooth = _line_offset_smooth_reg(geom_mask_img)
+            total_loss = total_loss + w_line_smooth * line_smooth
+        else:
+            line_smooth = torch.zeros((), device=device, dtype=dtype)
+        terms["line_smooth_y"] = line_smooth
+
         # Angle-symmetry regularizer between horizontal connections and vertical lines.
         w_angle = _need_term("angle_sym", stage_modifiers)
         if w_angle != 0.0:
-            angle_reg = _angle_symmetry_reg(geom_mask_coarse)
+            # Apply without the cosine-domain mask so symmetry is encouraged
+            # also outside the active cosine loss band.
+            angle_reg = _angle_symmetry_reg(None)
             total_loss = total_loss + w_angle * angle_reg
         else:
             angle_reg = torch.zeros((), device=device, dtype=dtype)
@@ -2620,25 +2671,18 @@ def fit_cosine_grid(
                     smooth_y = terms["smooth_y"]
                     step_reg = terms["step"]
                     quad_tri_reg = terms["quad_tri"]
+                    line_sy = terms["line_smooth_y"]
                     msg += (
                         f", sx_smooth={smooth_x.item():.6f}, sy_smooth={smooth_y.item():.6f}, "
-                        f"step={step_reg.item():.6f}, tri={quad_tri_reg.item():.6f}"
+                        f"step={step_reg.item():.6f}, tri={quad_tri_reg.item():.6f}, "
+                        f"line_sy={line_sy.item():.6f}"
                     )
                 msg += f", theta={theta_val:.4f}, sx={sx_val:.4f}"
                 print(msg)
  
             if snapshot is not None and snapshot > 0 and output_prefix is not None:
                 global_step = global_step_offset + step + 1
-                if stage == 4:
-                    # In stage 4 we want per-step visualization: save a snapshot
-                    # at every optimization step (as long as snapshot & output_prefix are set).
-                    _save_snapshot(
-                        stage=stage,
-                        step_stage=step,
-                        total_stage_steps=total_steps,
-                        global_step_idx=global_step,
-                    )
-                elif global_step % snapshot == 0:
+                if global_step % snapshot == 0:
                     _save_snapshot(
                         stage=stage,
                         step_stage=step,
@@ -2920,6 +2964,12 @@ def main() -> None:
     parser.add_argument("--lambda-mono", type=float, default=1e-3)
     parser.add_argument("--lambda-xygrad", type=float, default=1)
     parser.add_argument(
+        "--lambda-line-smooth-y",
+        type=float,
+        default=0.0,
+        help="Smoothness weight along y for line_offset (neighbor offsets) per direction.",
+    )
+    parser.add_argument(
         "--lambda-angle-sym",
         type=float,
         default=1.0,
@@ -3021,6 +3071,7 @@ def main() -> None:
     	lambda_angle_sym=args.lambda_angle_sym,
     	lambda_mod_h=args.lambda_mod_h,
     	lambda_mod_v=args.lambda_mod_v,
+    	lambda_line_smooth_y=args.lambda_line_smooth_y,
     	lambda_grad_data=args.lambda_grad_data,
     	lambda_grad_mag=args.lambda_grad_mag,
     	min_dx_grad=args.min_dx_grad,
