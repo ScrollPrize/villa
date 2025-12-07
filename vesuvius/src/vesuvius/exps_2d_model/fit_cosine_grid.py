@@ -589,12 +589,23 @@ def fit_cosine_grid(
         dtype=torch.float32,
     ).view(1, 1, hr, 1).expand(1, 1, hr, wr)
 
-    mask_x_hr = (u_hr.abs() <= u_band_half)
-    if cos_mask_v_extent_f >= 1.0:
-        mask_y_hr = torch.ones_like(v_hr, dtype=torch.bool)
+    # Horizontal mask with linear ramps over two cosine peaks (periods) at both sides.
+    # Full weight inside |u| <= u_band_half, then linearly decays to 0 over
+    # u_ramp corresponding to 2 cosine periods.
+    u_ramp = 2.0 * period_u  # 2 peaks = 2 full cosine periods
+    abs_u = u_hr.abs()
+    if u_ramp > 0.0:
+        dist = abs_u - u_band_half
+        mask_x_hr = torch.clamp(1.0 - dist / u_ramp, min=0.0, max=1.0)
     else:
-        mask_y_hr = (v_hr.abs() <= cos_mask_v_extent_f)
-    mask_cosine_hr = (mask_x_hr & mask_y_hr).float()
+        mask_x_hr = (abs_u <= u_band_half).float()
+
+    if cos_mask_v_extent_f >= 1.0:
+        mask_y_hr = torch.ones_like(v_hr, dtype=torch.float32)
+    else:
+        mask_y_hr = (v_hr.abs() <= cos_mask_v_extent_f).float()
+
+    mask_cosine_hr = mask_x_hr * mask_y_hr
 
     # Effective output scale: in video mode we disable all upscaling.
     eff_output_scale = 1 if for_video else output_scale
@@ -785,12 +796,21 @@ def fit_cosine_grid(
             # v spans [-2,2]; normalize to [-1,1] for the vertical extent test.
             v_c = base_coords[:, 1:2] * 0.5
  
-            mask_x_c = (u_c.abs() <= u_band_half)
-            if cos_mask_v_extent_f >= 1.0:
-                mask_y_c = torch.ones_like(v_c, dtype=torch.bool)
+            # Horizontal cosine-domain mask with linear ramps over two periods,
+            # matching the high-resolution definition.
+            abs_u_c = u_c.abs()
+            u_ramp_c = 2.0 * period_u
+            if u_ramp_c > 0.0:
+                dist_c = abs_u_c - u_band_half
+                mask_x_c = torch.clamp(1.0 - dist_c / u_ramp_c, min=0.0, max=1.0)
             else:
-                mask_y_c = (v_c.abs() <= cos_mask_v_extent_f)
-            mask_cosine_coarse = (mask_x_c & mask_y_c).float()
+                mask_x_c = (abs_u_c <= u_band_half).float()
+
+            if cos_mask_v_extent_f >= 1.0:
+                mask_y_c = torch.ones_like(v_c, dtype=torch.float32)
+            else:
+                mask_y_c = (v_c.abs() <= cos_mask_v_extent_f).float()
+            mask_cosine_coarse = mask_x_c * mask_y_c
  
             mask_coarse = mask_img_coarse * mask_cosine_coarse
     
@@ -2316,6 +2336,7 @@ def fit_cosine_grid(
         # No explicit overrides: all lambda_global weights are used as-is.
         # "data": 0.0,
         "quad_tri": 0.0,
+        "grad_data": 0.0,
         # "grad_data": 0.0,
     }
  
@@ -2604,9 +2625,9 @@ def fit_cosine_grid(
         # together with the coarse grid offsets and modulation fields (no data terms).
         opt2 = torch.optim.Adam(
             [
-                # model.theta,
-                # model.log_s,
-                # model.phase,
+                model.theta,
+                model.log_s,
+                model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
@@ -2628,9 +2649,9 @@ def fit_cosine_grid(
     if total_stage3 > 0:
         opt3 = torch.optim.Adam(
             [
-                # model.theta,
-                # model.log_s,
-                # model.phase,
+                model.theta,
+                model.log_s,
+                model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
