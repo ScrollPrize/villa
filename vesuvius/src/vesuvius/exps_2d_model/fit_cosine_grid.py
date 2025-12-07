@@ -319,6 +319,9 @@ def fit_cosine_grid(
 	crop: tuple[int, int, int, int] | None = None,
 	compile_model: bool = False,
 	final_float: bool = False,
+	cos_mask_periods: float = 5.0,
+	cos_mask_v_extent: float = 1.0,
+	use_image_mask: bool = False,
 ) -> None:
     """
     Reverse cosine fit: map from cosine-sample space into the image.
@@ -548,6 +551,51 @@ def fit_cosine_grid(
     # so a shift of Δu = 2.0 / cosine_periods corresponds to one cosine period.
     period_u = 2.0 / float(cosine_periods)
 
+    # Cosine-domain loss mask in sample space: restrict losses to a fixed number
+    # of cosine periods along u and a vertical band in v.
+    #
+    # We define a symmetric band around u = 0 whose total width corresponds to
+    # `cos_mask_periods` cosine periods. One full period in u has length
+    #   period_u = 2 / cosine_periods
+    # so a band covering `cos_mask_periods` periods has width
+    #   width_u = cos_mask_periods * period_u
+    # and half-width
+    #   half_u = width_u / 2 = cos_mask_periods / cosine_periods.
+    # We clamp this half-width to 1 so the band never exceeds [-1,1].
+    cos_mask_periods_f = float(cos_mask_periods)
+    cos_mask_periods_f = max(0.0, cos_mask_periods_f)
+    cos_mask_v_extent_f = float(cos_mask_v_extent)
+    cos_mask_v_extent_f = max(0.0, min(1.0, cos_mask_v_extent_f))
+
+    if float(cosine_periods) > 0.0 and cos_mask_periods_f > 0.0:
+        u_band_half = min(cos_mask_periods_f / float(cosine_periods), 1.0)
+    else:
+        # Degenerate: disable banding along u.
+        u_band_half = 1.0
+
+    # High-resolution sample-space coordinates used only for the loss mask.
+    u_hr = torch.linspace(
+        -1.0,
+        1.0,
+        wr,
+        device=torch_device,
+        dtype=torch.float32,
+    ).view(1, 1, 1, wr).expand(1, 1, hr, wr)
+    v_hr = torch.linspace(
+        -1.0,
+        1.0,
+        hr,
+        device=torch_device,
+        dtype=torch.float32,
+    ).view(1, 1, hr, 1).expand(1, 1, hr, wr)
+
+    mask_x_hr = (u_hr.abs() <= u_band_half)
+    if cos_mask_v_extent_f >= 1.0:
+        mask_y_hr = torch.ones_like(v_hr, dtype=torch.bool)
+    else:
+        mask_y_hr = (v_hr.abs() <= cos_mask_v_extent_f)
+    mask_cosine_hr = (mask_x_hr & mask_y_hr).float()
+
     # Effective output scale: in video mode we disable all upscaling.
     eff_output_scale = 1 if for_video else output_scale
  
@@ -644,6 +692,9 @@ def fit_cosine_grid(
         Generate a Gaussian mask in image space (1,1,H,W) for the given stage
         and normalized progress value, or None when full-image loss is used
         (no Gaussian).
+
+        When `use_image_mask` is False, this function always returns None so
+        that only the cosine-domain sample-space mask is active.
  
         Args:
             stage:
@@ -654,7 +705,8 @@ def fit_cosine_grid(
                 stage. 0 = stage start, 1 = stage end.
         """
         # Stages 1 and 2 use global optimization without a Gaussian mask.
-        if stage != 3:
+        # When use_image_mask is False we disable the Gaussian entirely.
+        if (not use_image_mask) or stage != 3:
             return None
  
         # Stage 3: grow sigma from sigma_min to sigma_max over the first 90% of
@@ -683,7 +735,8 @@ def fit_cosine_grid(
  
         The mask is obtained by sampling an image-space mask (either an all-ones
         map or the current Gaussian loss mask) at the mapped coarse-grid
-        coordinates. Points that map outside the image receive weight 0 via
+        coordinates, and multiplying it by a cosine-domain mask defined in
+        sample space. Points that map outside the image receive weight 0 via
         grid_sample's zero padding.
  
         Returns:
@@ -721,6 +774,22 @@ def fit_cosine_grid(
                 padding_mode="zeros",
                 align_corners=True,
             )  # (1,1,gh,gw)
+
+            # Cosine-domain band mask in coarse sample space: same definition as
+            # mask_cosine_hr, but evaluated on the canonical (u,v) grid.
+            base_coords = model.base_grid  # (1,2,gh,gw)
+            u_c = base_coords[:, 0:1]      # [-1,1] horizontally
+            # v spans [-2,2]; normalize to [-1,1] for the vertical extent test.
+            v_c = base_coords[:, 1:2] * 0.5
+
+            mask_x_c = (u_c.abs() <= u_band_half)
+            if cos_mask_v_extent_f >= 1.0:
+                mask_y_c = torch.ones_like(v_c, dtype=torch.bool)
+            else:
+                mask_y_c = (v_c.abs() <= cos_mask_v_extent_f)
+            mask_cosine_coarse = (mask_x_c & mask_y_c).float()
+
+            mask_coarse = mask_coarse * mask_cosine_coarse
  
         return mask_coarse
  
@@ -1060,6 +1129,9 @@ def fit_cosine_grid(
                         padding_mode="zeros",
                         align_corners=True,
                     )
+
+                # Apply the same cosine-domain band mask used for training.
+                mask_hr = mask_hr * mask_cosine_hr
  
                 if eff_output_scale is not None and eff_output_scale > 1:
                     mask_hr = F.interpolate(
@@ -2261,6 +2333,10 @@ def fit_cosine_grid(
                         align_corners=True,
                     )
                 weight_full = valid * w_sample
+
+            # Apply cosine-domain band mask in sample space so that only selected
+            # periods/rows contribute to the loss.
+            weight_full = weight_full * mask_cosine_hr
  
             # Coarse-grid mask for geometry losses: sample the same image-space
             # mask (ones or Gaussian) at the coarse-grid coordinates so that
@@ -2320,7 +2396,7 @@ def fit_cosine_grid(
             # Stages 1 and 2: use only the valid region for period-sum weighting.
             # Stage 3: use the full scheduled mask in sample space.
             if stage in (1, 2):
-                mask_for_gradmag = valid
+                mask_for_gradmag = valid * mask_cosine_hr
             else:
                 mask_for_gradmag = weight_full
             gradmag_loss = _gradmag_period_loss(grid, img_downscale_factor, mask_for_gradmag)
@@ -2635,6 +2711,18 @@ def main() -> None:
         help="Downscale factor for internal resolution relative to avg image size.",
     )
     parser.add_argument(
+        "--cos-mask-periods",
+        type=float,
+        default=5.0,
+        help="Number of cosine periods from the left edge of sample space used for the loss mask.",
+    )
+    parser.add_argument(
+        "--cos-mask-v-extent",
+        type=float,
+        default=1.0,
+        help="Vertical half-extent in normalized sample-space v (in [0,1]) of the cosine loss band.",
+    )
+    parser.add_argument(
     	"--unet-checkpoint",
     	type=str,
     	default=None,
@@ -2758,6 +2846,11 @@ def main() -> None:
             "background, save masks as JPG, and use LZW compression for TIFFs."
         ),
     )
+    parser.add_argument(
+        "--use-image-mask",
+        action="store_true",
+        help="Enable image-space Gaussian loss mask in stage 3 in addition to the cosine-domain mask.",
+    )
     args = parser.parse_args()
     fit_cosine_grid(
     	image_path=args.input,
@@ -2795,6 +2888,9 @@ def main() -> None:
     	crop=tuple(args.crop) if args.crop is not None else None,
     	compile_model=args.compile_model,
     	final_float=args.final_float,
+    	cos_mask_periods=args.cos_mask_periods,
+    	cos_mask_v_extent=args.cos_mask_v_extent,
+    	use_image_mask=args.use_image_mask,
     )
 
 
