@@ -680,7 +680,7 @@ def fit_cosine_grid(
     # modulation parameters on the fixed coarse grid (no coordinate offsets yet).
     opt = torch.optim.Adam(
         [model.theta, model.log_s, model.phase], #model.amp_coarse, model.bias_coarse
-        lr=lr,
+        lr=10*lr,
     )
  
     total_stage1 = max(0, int(steps_stage1))
@@ -1362,8 +1362,8 @@ def fit_cosine_grid(
         Inside the cosine band we use full weight (mask_img). Outside the band
         we keep only smoothness, but downweighted:
     
-            - smooth_x: 1/16 of its in-band weight
-            - smooth_y: 1/4  of its in-band weight
+            - smooth_x: 1/10 of its in-band weight
+            - smooth_y: 1/10  of its in-band weight
         """
         off = model.offset  # (1,2,gh,gw)  2 = (u_offset, v_offset)
         _, _, gh, gw = off.shape
@@ -1407,7 +1407,7 @@ def fit_cosine_grid(
         if isinstance(smooth_x, torch.Tensor) and smooth_x.numel() > 0:
             m_img_h = 0.5 * (m_img[:, :, :, :-1] + m_img[:, :, :, 1:])  # (1,1,gh,gw-1)
             m_cos_h = 0.5 * (m_cos[:, :, :, :-1] + m_cos[:, :, :, 1:])  # (1,1,gh,gw-1)
-            alpha_x = 1.0 / 16.0
+            alpha_x = 1.0
             w_h = m_img_h * (m_cos_h + alpha_x * (1.0 - m_cos_h))
             wsum_h = w_h.sum()
             if wsum_h > 0:
@@ -1421,7 +1421,7 @@ def fit_cosine_grid(
         if isinstance(smooth_y, torch.Tensor) and smooth_y.numel() > 0:
             m_img_v = 0.5 * (m_img[:, :, :-1, :] + m_img[:, :, 1:, :])  # (1,1,gh-1,gw)
             m_cos_v = 0.5 * (m_cos[:, :, :-1, :] + m_cos[:, :, 1:, :])  # (1,1,gh-1,gw)
-            alpha_y = 1.0 / 4.0
+            alpha_y = 1.0
             w_v = m_img_v * (m_cos_v + alpha_y * (1.0 - m_cos_v))
             wsum_v = w_v.sum()
             if wsum_v > 0:
@@ -2203,7 +2203,7 @@ def fit_cosine_grid(
         """
         if unet_mag_img is None:
             return torch.zeros((), device=torch_device, dtype=torch.float32)
-
+ 
         # Sample UNet magnitude into sample space.
         mag_hr = F.grid_sample(
             unet_mag_img,
@@ -2212,10 +2212,16 @@ def fit_cosine_grid(
             padding_mode="zeros",
             align_corners=True,
         )  # (1,1,hr,wr)
-
+ 
         # Per-sample distance along the horizontal index direction of the sampling grid.
         dist_x_hr = _grid_segment_length_x(grid)
-
+ 
+        # If a sample-space mask is provided with matching spatial size, apply it
+        # directly to the magnitude so that samples outside the mask contribute
+        # zero to the period sums, independent of later weighting.
+        if mask_sample is not None and mask_sample.shape[-2:] == mag_hr.shape[-2:]:
+            mag_hr = mag_hr * mask_sample
+ 
         sum_period_scaled, samples_per, max_cols, hh, ww, periods_int = _gradmag_period_core(
             mag_hr, dist_x_hr, img_downscale_factor
         )
@@ -2297,6 +2303,7 @@ def fit_cosine_grid(
         "data": 0.0,
         "grad_data": 0.0,
         "grad_mag": 0.1,
+        "quad_tri": 0.0,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
         # "smooth_x": 10.0,
@@ -2308,6 +2315,7 @@ def fit_cosine_grid(
         # Stage 3: enable data and grad_data terms in addition to stage-2 regularization.
         # No explicit overrides: all lambda_global weights are used as-is.
         # "data": 0.0,
+        "quad_tri": 0.0,
         # "grad_data": 0.0,
     }
  
@@ -2440,12 +2448,9 @@ def fit_cosine_grid(
         # Gradient-magnitude period-sum loss.
         w_grad_mag = _need_term("grad_mag", stage_modifiers)
         if w_grad_mag != 0.0:
-            # Stages 1 and 2: use only the valid region for period-sum weighting.
-            # Stage 3: use the full scheduled mask in sample space.
-            if stage in (1, 2):
-                mask_for_gradmag = valid * mask_cosine_hr
-            else:
-                mask_for_gradmag = weight_full
+            # All stages: use the same sample-space mask as the data term so that
+            # grad_mag is restricted to the cosine band (and optional image mask).
+            mask_for_gradmag = weight_full
             gradmag_loss = _gradmag_period_loss(grid, img_downscale_factor, mask_for_gradmag)
             total_loss = total_loss + w_grad_mag * gradmag_loss
         else:
@@ -2806,13 +2811,13 @@ def main() -> None:
     parser.add_argument(
         "--lambda-smooth-x",
         type=float,
-        default=1,
+        default=100,
         help="Smoothness weight along x (cosine direction) for the coarse grid.",
     )
     parser.add_argument(
         "--lambda-smooth-y",
         type=float,
-        default=10,
+        default=100,
         help="Smoothness weight along y (ridge direction) for the coarse grid.",
     )
     parser.add_argument("--lambda-mono", type=float, default=1e-3)
