@@ -288,6 +288,7 @@ def fit_cosine_grid(
 	steps: int = 5000,
 	steps_stage1: int = 500,
 	steps_stage2: int = 1000,
+	steps_stage4: int = 10000,
 	lr: float = 1e-2,
 	grid_step: int = 4,
 	lambda_smooth_x: float = 1e-3,
@@ -588,7 +589,7 @@ def fit_cosine_grid(
         device=torch_device,
         dtype=torch.float32,
     ).view(1, 1, hr, 1).expand(1, 1, hr, wr)
-
+ 
     # Horizontal mask with linear ramps over two cosine peaks (periods) at both sides.
     # Full weight inside |u| <= u_band_half, then linearly decays to 0 over
     # u_ramp corresponding to 2 cosine periods.
@@ -599,13 +600,31 @@ def fit_cosine_grid(
         mask_x_hr = torch.clamp(1.0 - dist / u_ramp, min=0.0, max=1.0)
     else:
         mask_x_hr = (abs_u <= u_band_half).float()
-
-    if cos_mask_v_extent_f >= 1.0:
-        mask_y_hr = torch.ones_like(v_hr, dtype=torch.float32)
-    else:
-        mask_y_hr = (v_hr.abs() <= cos_mask_v_extent_f).float()
-
-    mask_cosine_hr = mask_x_hr * mask_y_hr
+ 
+    def _build_mask_cosine_hr(cos_v_extent: float) -> torch.Tensor:
+        """
+        Build the current cosine-domain mask in sample space for a given vertical
+        half-extent cos_v_extent in normalized v ∈ [0,1].
+        """
+        cos_v = float(max(0.0, min(1.0, cos_v_extent)))
+        if cos_v >= 1.0:
+            mask_y = torch.ones_like(v_hr, dtype=torch.float32)
+        else:
+            mask_y = (v_hr.abs() <= cos_v).float()
+        return mask_x_hr * mask_y
+ 
+    def _current_cos_v_extent(stage: int, step_stage: int, total_stage_steps: int) -> float:
+        """
+        Effective vertical half-extent for the cosine-domain mask for a given
+        stage and per-stage step index.
+ 
+        - Stages 1–3: keep the initial extent cos_mask_v_extent_f constant.
+        - Stage 4: start from cos_mask_v_extent_f and increase by 0.001 per
+          optimization step within stage 4, clamped to 1.0.
+        """
+        if stage == 4:
+            return float(min(1.0, cos_mask_v_extent_f + 0.00001 * float(step_stage)))
+        return float(cos_mask_v_extent_f)
 
     # Effective output scale: in video mode we disable all upscaling.
     eff_output_scale = 1 if for_video else output_scale
@@ -697,6 +716,7 @@ def fit_cosine_grid(
     total_stage1 = max(0, int(steps_stage1))
     total_stage2 = max(0, int(steps_stage2))
     total_stage3 = max(0, int(steps))
+    total_stage4 = max(0, int(steps_stage4))
  
     def _gaussian_mask(stage: int, stage_progress: float) -> torch.Tensor | None:
         """
@@ -717,7 +737,7 @@ def fit_cosine_grid(
         """
         # Stages 1 and 2 use global optimization without a Gaussian mask.
         # When use_image_mask is False we disable the Gaussian entirely.
-        if (not use_image_mask) or stage != 3:
+        if (not use_image_mask) or stage < 3:
             return None
  
         # Stage 3: grow sigma from sigma_min to sigma_max over the first 90% of
@@ -740,6 +760,7 @@ def fit_cosine_grid(
     def _coarse_geom_mask(
         stage: int,
         stage_progress: float,
+        cos_v_extent: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Build per-vertex coarse-grid masks in [0,1] for geometry losses.
@@ -790,7 +811,7 @@ def fit_cosine_grid(
             )  # (1,1,gh,gw)
  
             # Cosine-domain band mask in coarse sample space: same definition as
-            # mask_cosine_hr, but evaluated on the canonical (u,v) grid.
+            # the high-resolution mask, but evaluated on the canonical (u,v) grid.
             base_coords = model.base_grid  # (1,2,gh,gw)
             u_c = base_coords[:, 0:1]      # [-1,1] horizontally
             # v spans [-2,2]; normalize to [-1,1] for the vertical extent test.
@@ -805,11 +826,13 @@ def fit_cosine_grid(
                 mask_x_c = torch.clamp(1.0 - dist_c / u_ramp_c, min=0.0, max=1.0)
             else:
                 mask_x_c = (abs_u_c <= u_band_half).float()
-
-            if cos_mask_v_extent_f >= 1.0:
+ 
+            # Clamp vertical extent to [0,1] per step.
+            cos_v = float(max(0.0, min(1.0, cos_v_extent)))
+            if cos_v >= 1.0:
                 mask_y_c = torch.ones_like(v_c, dtype=torch.float32)
             else:
-                mask_y_c = (v_c.abs() <= cos_mask_v_extent_f).float()
+                mask_y_c = (v_c.abs() <= cos_v).float()
             mask_cosine_coarse = mask_x_c * mask_y_c
  
             mask_coarse = mask_img_coarse * mask_cosine_coarse
@@ -1153,8 +1176,11 @@ def fit_cosine_grid(
                         align_corners=True,
                     )
 
-                # Apply the same cosine-domain band mask used for training.
-                mask_hr = mask_hr * mask_cosine_hr
+                # Apply the same cosine-domain band mask used for training,
+                # including the stage-4 vertical growth schedule.
+                cos_v_eff_dbg = _current_cos_v_extent(stage, step_stage, total_stage_steps)
+                mask_cosine_dbg = _build_mask_cosine_hr(cos_v_eff_dbg)
+                mask_hr = mask_hr * mask_cosine_dbg
  
                 if eff_output_scale is not None and eff_output_scale > 1:
                     mask_hr = F.interpolate(
@@ -1272,7 +1298,7 @@ def fit_cosine_grid(
                 # low-weight regions appear darker.
                 base_scale = output_scale if output_scale is not None else 4
                 vis_scale = base_scale * 2
-                geom_mask_vis, _, _ = _coarse_geom_mask(stage, stage_progress)
+                geom_mask_vis, _, _ = _coarse_geom_mask(stage, stage_progress, cos_v_eff_dbg)
                 grid_vis_np = _draw_grid_vis(scale_factor=vis_scale, mask_coarse=geom_mask_vis)
  
         p = Path(output_prefix)
@@ -2373,6 +2399,9 @@ def fit_cosine_grid(
         else:
             stage_progress = 0.0
  
+        # Effective vertical half-extent for cosine-domain mask for this step.
+        cos_v_eff = _current_cos_v_extent(stage, step_stage, total_stage_steps)
+ 
         # Prediction in sample space.
         pred = model(image)
  
@@ -2406,16 +2435,18 @@ def fit_cosine_grid(
                         align_corners=True,
                     )
                 weight_full = valid * w_sample
-
-            # Apply cosine-domain band mask in sample space so that only selected
-            # periods/rows contribute to the loss.
-            weight_full = weight_full * mask_cosine_hr
  
+            # Apply cosine-domain band mask in sample space so that only selected
+            # periods/rows contribute to the loss, with vertical extent possibly
+            # growing during stage 4.
+            mask_cosine_cur = _build_mask_cosine_hr(cos_v_eff)
+            weight_full = weight_full * mask_cosine_cur
+  
             # Coarse-grid masks for geometry losses: sample the same image-space
             # mask (ones or Gaussian) at the coarse-grid coordinates, and keep
             # the cosine-domain band separate so we can treat in-band vs
             # out-of-band regions differently for smoothness.
-            geom_mask_coarse, geom_mask_img, geom_mask_cos = _coarse_geom_mask(stage, stage_progress)
+            geom_mask_coarse, geom_mask_img, geom_mask_cos = _coarse_geom_mask(stage, stage_progress, cos_v_eff)
  
         # Grid with gradients for geometry-based losses.
         grid = model._build_sampling_grid()
@@ -2577,7 +2608,7 @@ def fit_cosine_grid(
                 dir_loss = terms["dir_unet"]
                 # Report global step across all stages instead of per-stage step.
                 global_step = global_step_offset + step + 1
-                total_steps_all = total_stage1 + total_stage2 + total_stage3
+                total_steps_all = total_stage1 + total_stage2 + total_stage3 + total_stage4
                 msg = (
                     f"stage{stage}(step {global_step}/{total_steps_all}): "
                     f"loss={loss.item():.6f}, data={data_loss.item():.6f}, "
@@ -2667,6 +2698,30 @@ def fit_cosine_grid(
             global_step_offset=total_stage1 + total_stage2,
         )
  
+    # ---------------------------------------------------------
+    # Stage 4: like stage 3 but with expanding vertical cos mask.
+    # ---------------------------------------------------------
+    if total_stage4 > 0:
+        opt4 = torch.optim.Adam(
+            [
+                model.theta,
+                model.log_s,
+                model.phase,
+                model.amp_coarse,
+                model.bias_coarse,
+                model.offset,
+                model.line_offset,
+            ],
+            lr=lr,
+        )
+        _optimize_stage(
+            stage=4,
+            total_steps=total_stage4,
+            optimizer=opt4,
+            stage_modifiers=stage3_modifiers,
+            global_step_offset=total_stage1 + total_stage2 + total_stage3,
+        )
+  
     # Save final outputs: sampled map, plain ground-truth cosine map, and
     # modulation-adjusted ground-truth map.
     if output_prefix is not None:
@@ -2744,6 +2799,12 @@ def main() -> None:
         type=int,
         default=1000,
         help="Number of optimization steps for stage 2 (global + coord grid, no data terms).",
+    )
+    parser.add_argument(
+        "--steps-stage4",
+        type=int,
+        default=10000,
+        help="Number of optimization steps for stage 4 (like stage 3, but with growing vertical cosine mask).",
     )
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument(
@@ -2935,6 +2996,7 @@ def main() -> None:
     	steps=args.steps,
     	steps_stage1=args.steps_stage1,
     	steps_stage2=args.steps_stage2,
+    	steps_stage4=args.steps_stage4,
     	lr=args.lr,
     	grid_step=args.grid_step,
     	lambda_smooth_x=args.lambda_smooth_x,
