@@ -695,6 +695,7 @@ void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surfa
     } else if (!surf) {
         // Surface was removed - the handleSurfaceWillBeDeleted already cleaned up the index
         affectsSurfaceIndex = true;
+        regionUpdated = true;  // Incremental removal already done - don't trigger full rebuild
         _indexedSurfaceIds.erase(name);
     }
 
