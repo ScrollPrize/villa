@@ -623,7 +623,7 @@ def fit_cosine_grid(
           optimization step within stage 4, clamped to 1.0.
         """
         if stage == 4:
-            return float(min(1.0, cos_mask_v_extent_f + 0.00001 * float(step_stage)))
+            return float(cos_mask_v_extent_f + 0.00001 * float(step_stage))
         return float(cos_mask_v_extent_f)
 
     # Effective output scale: in video mode we disable all upscaling.
@@ -1326,7 +1326,7 @@ def fit_cosine_grid(
                     mask_path = f"{p}_mask_step{global_step_idx:06d}.jpg"
                     cv2.imwrite(mask_path, mask_u8)
                 else:
-                    mask_path = f"{p}_mask_step{global_step_idx:06d}.jpg"
+                    mask_path = f"{p}_mask_step{global_step_idx:06d}.tif"
                     # tifffile.imwrite(mask_path, _to_uint8(mask_np), compression="lzw")
                     cv2.imwrite(mask_path, _to_uint8(mask_np))
             # Save diff as |diff|, with 0 -> black and max |diff| -> white.
@@ -2599,7 +2599,7 @@ def fit_cosine_grid(
                     half_period_u = 0.5 * period_u
                     model.phase.data = ((model.phase.data + half_period_u) % period_u) - half_period_u
  
-            if (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
+            if stage == 4 or (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
                 theta_val = float(model.theta.detach().cpu())
                 sx_val = float(model.log_s.detach().exp().cpu())
                 data_loss = terms["data"]
@@ -2629,7 +2629,16 @@ def fit_cosine_grid(
  
             if snapshot is not None and snapshot > 0 and output_prefix is not None:
                 global_step = global_step_offset + step + 1
-                if global_step % snapshot == 0:
+                if stage == 4:
+                    # In stage 4 we want per-step visualization: save a snapshot
+                    # at every optimization step (as long as snapshot & output_prefix are set).
+                    _save_snapshot(
+                        stage=stage,
+                        step_stage=step,
+                        total_stage_steps=total_steps,
+                        global_step_idx=global_step,
+                    )
+                elif global_step % snapshot == 0:
                     _save_snapshot(
                         stage=stage,
                         step_stage=step,
@@ -2712,7 +2721,7 @@ def fit_cosine_grid(
                 model.offset,
                 model.line_offset,
             ],
-            lr=lr,
+            lr=0.1*lr,
         )
         _optimize_stage(
             stage=4,
