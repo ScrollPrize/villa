@@ -101,6 +101,12 @@ public:
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
 
+    // Edit mask getters and setters
+    [[nodiscard]] bool showEditMask() const { return _showEditMask; }
+    void setShowEditMask(bool enabled);
+    void setEditMaskExists(bool exists);
+    void setEditMaskThreshold(float threshold);
+
 signals:
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
@@ -133,6 +139,10 @@ signals:
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
     void approvalStrokesUndoRequested();
+    void showEditMaskChanged(bool enabled);
+    void generateEditMaskRequested();
+    void deleteEditMaskRequested();
+    void editMaskThresholdChanged(float threshold);
 
 private:
     void buildUi();
@@ -289,4 +299,14 @@ private:
     QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
     QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
     QPushButton* _btnUndoApprovalStroke{nullptr};
+
+    // Edit mask state and UI - shows differences from a baseline snapshot
+    bool _showEditMask{false};
+    bool _editMaskExists{false};
+    float _editMaskThreshold{1.0f};  // Distance threshold for highlighting differences
+    CollapsibleSettingsGroup* _groupEditMask{nullptr};
+    QCheckBox* _chkShowEditMask{nullptr};
+    QPushButton* _btnGenerateEditMask{nullptr};
+    QPushButton* _btnDeleteEditMask{nullptr};
+    QDoubleSpinBox* _spinEditMaskThreshold{nullptr};
 };

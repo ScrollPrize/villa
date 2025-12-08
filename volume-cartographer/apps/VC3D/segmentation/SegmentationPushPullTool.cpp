@@ -514,7 +514,6 @@ void SegmentationPushPullTool::stopAll()
     if (_timer && _timer->isActive()) {
         _timer->stop();
     }
-    _undoCaptured = false;
     _alphaOverrideActive = false;
     _activeAlphaEnabled = false;
 
@@ -529,10 +528,33 @@ void SegmentationPushPullTool::stopAll()
 
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
+        // Capture delta for undo before applyPreview() clears edited vertices
+        _module.captureUndoDelta();
+
+        // Auto-approve edited regions before applyPreview() clears them
+        if (_overlay && _overlay->hasApprovalMaskData()) {
+            const auto editedVerts = _editManager->editedVertices();
+            if (!editedVerts.empty()) {
+                std::vector<std::pair<int, int>> gridPositions;
+                gridPositions.reserve(editedVerts.size());
+                for (const auto& edit : editedVerts) {
+                    gridPositions.emplace_back(edit.row, edit.col);
+                }
+                constexpr uint8_t kApproved = 255;
+                constexpr float kRadius = 1.0f;
+                constexpr bool kIsAutoApproval = true;
+                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+                _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+                qCInfo(lcSegPushPull) << "Auto-approved" << gridPositions.size() << "push/pull edited vertices";
+            }
+        }
+
         _editManager->applyPreview();
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
     }
+
+    _undoCaptured = false;
 }
 
 bool SegmentationPushPullTool::applyStep()
@@ -562,24 +584,12 @@ bool SegmentationPushPullTool::applyStepInternal()
         qCWarning(lcSegPushPull) << reason << "(row" << row << ", col" << col << ")";
     };
 
-    bool snapshotCapturedThisStep = false;
-    if (!_undoCaptured) {
-        snapshotCapturedThisStep = _module.captureUndoSnapshot();
-        if (snapshotCapturedThisStep) {
-            _undoCaptured = true;
-        }
-    }
-
     // Check if we can reuse existing samples (position unchanged and samples still valid)
     const bool positionChanged = (row != _cachedRow || col != _cachedCol);
     const bool needRebuild = positionChanged || !_samplesValid || !_editManager->activeDrag().active;
 
     if (needRebuild) {
         if (!_editManager->beginActiveDrag({row, col})) {
-            if (snapshotCapturedThisStep) {
-                _module.discardLastUndoSnapshot();
-                _undoCaptured = false;
-            }
             logFailure("Push/pull aborted: beginActiveDrag failed");
             return false;
         }
@@ -592,10 +602,6 @@ bool SegmentationPushPullTool::applyStepInternal()
     if (!centerWorldOpt) {
         _editManager->cancelActiveDrag();
         _samplesValid = false;
-        if (snapshotCapturedThisStep) {
-            _module.discardLastUndoSnapshot();
-            _undoCaptured = false;
-        }
         logFailure("Push/pull aborted: vertex world position unavailable");
         return false;
     }
@@ -719,10 +725,6 @@ bool SegmentationPushPullTool::applyStepInternal()
             if (alphaUnavailable) {
                 _editManager->cancelActiveDrag();
                 _samplesValid = false;
-                if (snapshotCapturedThisStep) {
-                    _module.discardLastUndoSnapshot();
-                    _undoCaptured = false;
-                }
                 logFailure("Push/pull aborted: alpha push/pull unavailable for per-vertex samples");
                 return false;
             }
@@ -730,10 +732,6 @@ bool SegmentationPushPullTool::applyStepInternal()
             if (!anyMovement) {
                 _editManager->cancelActiveDrag();
                 _samplesValid = false;
-                if (snapshotCapturedThisStep) {
-                    _module.discardLastUndoSnapshot();
-                    _undoCaptured = false;
-                }
                 logFailure("Push/pull aborted: alpha push/pull produced no movement for per-vertex samples");
                 return false;
             }
@@ -741,10 +739,6 @@ bool SegmentationPushPullTool::applyStepInternal()
             if (!_editManager->updateActiveDragTargets(perVertexTargets)) {
                 _editManager->cancelActiveDrag();
                 _samplesValid = false;
-                if (snapshotCapturedThisStep) {
-                    _module.discardLastUndoSnapshot();
-                    _undoCaptured = false;
-                }
                 logFailure("Push/pull aborted: failed to update per-vertex drag targets");
                 return false;
             }
@@ -766,10 +760,6 @@ bool SegmentationPushPullTool::applyStepInternal()
         } else if (!alphaUnavailable) {
             _editManager->cancelActiveDrag();
             _samplesValid = false;
-            if (snapshotCapturedThisStep) {
-                _module.discardLastUndoSnapshot();
-                _undoCaptured = false;
-            }
             logFailure("Push/pull aborted: alpha push/pull target unavailable");
             return false;
         }
@@ -790,10 +780,6 @@ bool SegmentationPushPullTool::applyStepInternal()
         if (!_editManager->updateActiveDrag(targetWorld)) {
             _editManager->cancelActiveDrag();
             _samplesValid = false;
-            if (snapshotCapturedThisStep) {
-                _module.discardLastUndoSnapshot();
-                _undoCaptured = false;
-            }
             logFailure("Push/pull aborted: failed to update drag target");
             return false;
         }
