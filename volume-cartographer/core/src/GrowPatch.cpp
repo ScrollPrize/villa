@@ -1299,22 +1299,29 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     int r_outer = radius+3;
 
-    for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++)
-            loss_status(oy,ox) = 0;
+    // Reset loss_status ROI efficiently using setTo()
+    int roi_y = std::max(p[0]-r_outer, 0);
+    int roi_x = std::max(p[1]-r_outer, 0);
+    int roi_h = std::min(p[0]+r_outer, params.dpoints.rows-1) - roi_y + 1;
+    int roi_w = std::min(p[1]+r_outer, params.dpoints.cols-1) - roi_x + 1;
+    loss_status(cv::Rect(roi_x, roi_y, roi_w, roi_h)).setTo(0);
 
+    int radius_sq = radius * radius;
     for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
         for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
-            cv::Vec2i op = {oy, ox};
-            if (cv::norm(p-op) <= radius) {
+            int dy = p[0] - oy;
+            int dx = p[1] - ox;
+            if (dy*dy + dx*dx <= radius_sq) {
+                cv::Vec2i op = {oy, ox};
                 add_missing_losses(problem, loss_status, op, params, trace_data, settings);
             }
         }
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++) {
-            cv::Vec2i op = {oy, ox};
-            if (cv::norm(p-op) > radius && problem.HasParameterBlock(&params.dpoints(op)[0]))
-                problem.SetParameterBlockConstant(&params.dpoints(op)[0]);
+            int dy = p[0] - oy;
+            int dx = p[1] - ox;
+            if (dy*dy + dx*dx > radius_sq && problem.HasParameterBlock(&params.dpoints(oy, ox)[0]))
+                problem.SetParameterBlockConstant(&params.dpoints(oy, ox)[0]);
         }
 
     ceres::Solver::Options options;
@@ -1980,10 +1987,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             local_optimization(100, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
         }
         else if (params.value("resume_opt", "skip") == "local") {
-            int opt_step = params.value("resume_local_opt_step", 16);
+            int opt_step = params.value("resume_local_opt_step", 20);
             if (opt_step <= 0) {
-                std::cerr << "WARNING: resume_local_opt_step must be > 0; defaulting to 16" << std::endl;
-                opt_step = 16;
+                std::cerr << "WARNING: resume_local_opt_step must be > 0; defaulting to 20" << std::endl;
+                opt_step = 20;
             }
 
             int default_radius = opt_step * 2;

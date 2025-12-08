@@ -1,75 +1,72 @@
 #pragma once
 #include <vector>
+#include <cmath>
 #include <opencv2/core/matx.hpp>
 
 #include "omp.h"
 
-
-static float min_dist(const cv::Vec2i &p, const std::vector<cv::Vec2i> &list)
-{
-    double dist = 10000000000;
-    for(auto &o : list) {
-        if (o[0] == -1 || o == p)
-            continue;
-        dist = std::min(cv::norm(o-p), dist);
-    }
-
-    return dist;
-}
-
-static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands, const std::vector<cv::Vec2i> &blocked, int &idx, float dist)
-{
-    for(int i=0;i<cands.size();i++) {
-        cv::Vec2i p = cands[(i + idx) % cands.size()];
-
-        if (p[0] == -1)
-            continue;
-
-        if (min_dist(p, blocked) >= dist) {
-            cands[(i + idx) % cands.size()] = {-1,-1};
-            idx = (i + idx + 1) % cands.size();
-
-            return p;
-        }
-    }
-
-    return {-1,-1};
-}
-
-//collection of points which can be retrieved with minimum distance requirement
+// Collection of points which can be retrieved with minimum distance requirement.
+// Uses phase-based partitioning to ensure points returned concurrently are at least
+// 'dist' apart, without expensive runtime distance checking.
 class OmpThreadPointCol
 {
 public:
     OmpThreadPointCol(float dist, const std::vector<cv::Vec2i> &src) :
-        _thread_count(omp_get_max_threads()),
         _dist(dist),
-        _points(src),
-        _thread_points(_thread_count,{-1,-1}),
-        _thread_idx(_thread_count, -1) {};
+        _current_phase(0)
+    {
+        partition_into_phases(src);
+    }
 
     template <typename T>
     OmpThreadPointCol(float dist, T src) :
-        _thread_count(omp_get_max_threads()),
         _dist(dist),
-        _points(src.begin(), src.end()),
-        _thread_points(_thread_count,{-1,-1}),
-        _thread_idx(_thread_count, -1) {};
+        _current_phase(0)
+    {
+        std::vector<cv::Vec2i> points(src.begin(), src.end());
+        partition_into_phases(points);
+    }
 
     cv::Point2i next()
     {
-        int t_id = omp_get_thread_num();
-        if (_thread_idx[t_id] == -1)
-            _thread_idx[t_id] = rand() % _thread_count;
-        _thread_points[t_id] = {-1,-1};
-#pragma omp critical
-        _thread_points[t_id] = extract_point_min_dist(_points, _thread_points, _thread_idx[t_id], _dist);
-        return _thread_points[t_id];
+        cv::Vec2i result = {-1, -1};
+
+        #pragma omp critical
+        {
+            // Try to get a point from current phase
+            while (_current_phase < _phases.size()) {
+                if (_phase_indices[_current_phase] < _phases[_current_phase].size()) {
+                    result = _phases[_current_phase][_phase_indices[_current_phase]++];
+                    break;
+                }
+                _current_phase++;
+            }
+        }
+
+        return result;
     }
 
-protected:
-    int _thread_count;
+private:
+    void partition_into_phases(const std::vector<cv::Vec2i> &src)
+    {
+        // Pre-partition points into phases using a checkerboard pattern.
+        // Points in the same phase are guaranteed to be at least 'dist' apart.
+        int cell_size = std::max(1, static_cast<int>(std::ceil(_dist)));
+        const int num_phases = 4;  // 2x2 checkerboard pattern
+
+        _phases.resize(num_phases);
+        for (const auto& p : src) {
+            int cell_row = p[0] / cell_size;
+            int cell_col = p[1] / cell_size;
+            int phase = (cell_row % 2) * 2 + (cell_col % 2);
+            _phases[phase].push_back(p);
+        }
+
+        _phase_indices.resize(num_phases, 0);
+    }
+
     float _dist;
-    std::vector<cv::Vec2i> _points;
-    std::vector<cv::Vec2i> _thread_points;
-    std::vector<int> _thread_idx;
+    std::vector<std::vector<cv::Vec2i>> _phases;
+    std::vector<size_t> _phase_indices;
+    size_t _current_phase;
 };

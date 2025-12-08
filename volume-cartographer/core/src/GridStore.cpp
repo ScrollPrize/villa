@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>
+#include <shared_mutex>
 
 #include <arpa/inet.h>
 
@@ -503,16 +504,14 @@ private:
     }
 
     std::shared_ptr<std::vector<size_t>> get_bucket_offsets(int index) const {
-        // Acquire lock to check for existence
-        bucket_mutex_.lock();
-        auto it = grid_offsets_.find(index);
-        if (it != grid_offsets_.end()) {
-            auto ptr = it->second;
-            bucket_mutex_.unlock();
-            return ptr;
+        // Use shared_lock for read-only cache lookup (hot path)
+        {
+            std::shared_lock<std::shared_mutex> lock(bucket_mutex_);
+            auto it = grid_offsets_.find(index);
+            if (it != grid_offsets_.end()) {
+                return it->second;
+            }
         }
-        // If not found, release the lock before loading
-        bucket_mutex_.unlock();
 
         // Perform expensive I/O without holding the lock
         auto bucket_ptr = std::make_shared<std::vector<size_t>>();
@@ -563,8 +562,8 @@ private:
         }
         
         // Re-acquire lock to safely insert the new bucket
-        std::lock_guard<std::mutex> lock(bucket_mutex_);
-        it = grid_offsets_.find(index);
+        std::unique_lock<std::shared_mutex> lock(bucket_mutex_);
+        auto it = grid_offsets_.find(index);
         if (it != grid_offsets_.end()) {
             // Another thread created it. Use the existing one.
             return it->second;
@@ -607,7 +606,7 @@ private:
     uint32_t paths_offset_in_file_;
     uint32_t buckets_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
-    mutable std::mutex bucket_mutex_;
+    mutable std::shared_mutex bucket_mutex_;
     mutable std::mutex seglist_mutex_;
 };
  
