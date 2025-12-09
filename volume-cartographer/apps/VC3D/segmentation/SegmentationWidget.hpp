@@ -22,6 +22,7 @@ class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
 class QPushButton;
+class QSlider;
 class QSpinBox;
 class QToolButton;
 class CollapsibleSettingsGroup;
@@ -93,6 +94,7 @@ public:
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
     [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
+    [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
 
     // Approval mask setters
     void setShowApprovalMask(bool enabled);
@@ -100,6 +102,7 @@ public:
     void setEditUnapprovedMask(bool enabled);
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
+    void setApprovalMaskOpacity(int opacity);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -132,6 +135,7 @@ signals:
     void editUnapprovedMaskChanged(bool enabled);
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
+    void approvalMaskOpacityChanged(int opacity);
     void approvalStrokesUndoRequested();
 
 private:
@@ -282,11 +286,14 @@ private:
     bool _editUnapprovedMask{false};  // Editing in unapprove mode (mutually exclusive with approve)
     float _approvalBrushRadius{50.0f};     // Cylinder radius (circle in plane views, rect width in flattened)
     float _approvalBrushDepth{15.0f};      // Cylinder depth (rect height in flattened view)
+    int _approvalMaskOpacity{50};          // Mask overlay opacity (0-100, default 50%)
     CollapsibleSettingsGroup* _groupApprovalMask{nullptr};
     QCheckBox* _chkShowApprovalMask{nullptr};
     QCheckBox* _chkEditApprovedMask{nullptr};
     QCheckBox* _chkEditUnapprovedMask{nullptr};
     QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
     QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
+    QSlider* _sliderApprovalMaskOpacity{nullptr};
+    QLabel* _lblApprovalMaskOpacity{nullptr};
     QPushButton* _btnUndoApprovalStroke{nullptr};
 };

@@ -408,7 +408,9 @@ void CVolumeViewer::renderIntersections()
                             baseColor = COLOR_APPROVED;
                         }
 
-                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);
+                        // Apply user-configured opacity to the blend factor
+                        const float opacityFactor = static_cast<float>(segOverlay->approvalMaskOpacity()) / 100.0f;
+                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f) * opacityFactor;
                         lineColor = QColor(
                             static_cast<int>(col.red() * (1.0f - blendFactor) + baseColor.red() * blendFactor),
                             static_cast<int>(col.green() * (1.0f - blendFactor) + baseColor.green() * blendFactor),

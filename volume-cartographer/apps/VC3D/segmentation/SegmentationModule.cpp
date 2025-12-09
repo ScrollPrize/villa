@@ -125,6 +125,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_overlay) {
         _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
+        if (_widget) {
+            _overlay->setApprovalMaskOpacity(_widget->approvalMaskOpacity());
+        }
     }
 
     _brushTool = std::make_unique<SegmentationBrushTool>(*this, _editManager, _widget, _surfaces);
@@ -304,6 +307,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setApprovalMaskBrushRadius);
     connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
             this, &SegmentationModule::setApprovalBrushDepth);
+    connect(_widget, &SegmentationWidget::approvalMaskOpacityChanged,
+            _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
             this, &SegmentationModule::undoApprovalStroke);
 

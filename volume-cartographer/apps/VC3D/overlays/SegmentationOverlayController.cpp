@@ -817,6 +817,19 @@ void SegmentationOverlayController::invalidatePlaneIntersections()
     });
 }
 
+void SegmentationOverlayController::setApprovalMaskOpacity(int opacity)
+{
+    const int clamped = std::clamp(opacity, 0, 100);
+    if (_approvalMaskOpacity == clamped) {
+        return;
+    }
+    _approvalMaskOpacity = clamped;
+    // Trigger redraw by invalidating all viewer caches
+    ++_savedImageVersion;
+    invalidatePlaneIntersections();
+    refreshAll();
+}
+
 void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
                                                               CVolumeViewer* viewer,
                                                               ViewerOverlayControllerBase::OverlayBuilder& builder) const
@@ -1021,6 +1034,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     // Render the composite image as a single scaled image overlay
     // This is much faster than rendering individual rectangles
     QPointF topLeft = gridToScene(0, 0);
-    builder.addImage(cache.compositeImage, topLeft, gridToSceneScale, 1.0, kApprovalMaskZ);
+    const qreal opacity = static_cast<qreal>(_approvalMaskOpacity) / 100.0;
+    builder.addImage(cache.compositeImage, topLeft, gridToSceneScale, opacity, kApprovalMaskZ);
 }
 

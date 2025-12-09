@@ -123,6 +123,10 @@ public:
     // Trigger re-rendering of intersections on all plane viewers
     void invalidatePlaneIntersections();
 
+    // Set the opacity of the approval mask overlay (0-100, where 0 is transparent and 100 is opaque)
+    void setApprovalMaskOpacity(int opacity);
+    [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
+
 protected:
     bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
     void collectPrimitives(CVolumeViewer* viewer,
@@ -182,4 +186,7 @@ private:
     };
     std::deque<ApprovalMaskUndoEntry> _approvalMaskUndoStack;
     static constexpr size_t kMaxUndoEntries = 100;
+
+    // Approval mask overlay opacity (0-100, where 50 is default)
+    int _approvalMaskOpacity{50};
 };
