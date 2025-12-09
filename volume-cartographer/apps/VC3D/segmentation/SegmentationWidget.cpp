@@ -603,6 +603,47 @@ void SegmentationWidget::buildUi()
 
     layout->addWidget(_groupApprovalMask);
 
+    // Edit Mask Group - for showing differences from a baseline snapshot
+    _groupEditMask = new CollapsibleSettingsGroup(tr("Edit Mask"), this);
+    auto* editMaskLayout = _groupEditMask->contentLayout();
+    auto* editMaskParent = _groupEditMask->contentWidget();
+
+    // Show edit mask checkbox
+    _chkShowEditMask = new QCheckBox(tr("Show Edit Mask"), editMaskParent);
+    _chkShowEditMask->setToolTip(tr("Highlight regions that differ from the baseline snapshot."));
+    _chkShowEditMask->setEnabled(false);  // Only enabled when edit mask exists
+    editMaskLayout->addWidget(_chkShowEditMask);
+
+    // Threshold spinner
+    auto* thresholdRow = new QHBoxLayout();
+    thresholdRow->setSpacing(8);
+    auto* thresholdLabel = new QLabel(tr("Threshold:"), editMaskParent);
+    _spinEditMaskThreshold = new QDoubleSpinBox(editMaskParent);
+    _spinEditMaskThreshold->setDecimals(1);
+    _spinEditMaskThreshold->setRange(0.1, 100.0);
+    _spinEditMaskThreshold->setSingleStep(0.5);
+    _spinEditMaskThreshold->setValue(_editMaskThreshold);
+    _spinEditMaskThreshold->setToolTip(tr("Distance threshold (voxels) for highlighting differences."));
+    thresholdRow->addWidget(thresholdLabel);
+    thresholdRow->addWidget(_spinEditMaskThreshold);
+    thresholdRow->addStretch(1);
+    editMaskLayout->addLayout(thresholdRow);
+
+    // Generate/Delete buttons
+    auto* editMaskButtonRow = new QHBoxLayout();
+    editMaskButtonRow->setSpacing(8);
+    _btnGenerateEditMask = new QPushButton(tr("Generate Baseline"), editMaskParent);
+    _btnGenerateEditMask->setToolTip(tr("Save current surface as baseline for edit comparison."));
+    _btnDeleteEditMask = new QPushButton(tr("Delete Baseline"), editMaskParent);
+    _btnDeleteEditMask->setToolTip(tr("Remove the baseline snapshot files."));
+    _btnDeleteEditMask->setEnabled(false);  // Only enabled when edit mask exists
+    editMaskButtonRow->addWidget(_btnGenerateEditMask);
+    editMaskButtonRow->addWidget(_btnDeleteEditMask);
+    editMaskButtonRow->addStretch(1);
+    editMaskLayout->addLayout(editMaskButtonRow);
+
+    layout->addWidget(_groupEditMask);
+
     _groupDirectionField = new CollapsibleSettingsGroup(tr("Direction Fields"), this);
 
     auto* directionParent = _groupDirectionField->contentWidget();
@@ -789,6 +830,18 @@ void SegmentationWidget::buildUi()
     });
 
     connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
+
+    // Edit mask connections
+    connect(_chkShowEditMask, &QCheckBox::toggled, this, [this](bool checked) {
+        setShowEditMask(checked);
+    });
+
+    connect(_spinEditMaskThreshold, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setEditMaskThreshold(static_cast<float>(value));
+    });
+
+    connect(_btnGenerateEditMask, &QPushButton::clicked, this, &SegmentationWidget::generateEditMaskRequested);
+    connect(_btnDeleteEditMask, &QPushButton::clicked, this, &SegmentationWidget::deleteEditMaskRequested);
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
@@ -1286,6 +1339,23 @@ void SegmentationWidget::syncUiState()
         _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
     }
 
+    // Edit mask UI state
+    if (_chkShowEditMask) {
+        const QSignalBlocker blocker(_chkShowEditMask);
+        _chkShowEditMask->setChecked(_showEditMask);
+        _chkShowEditMask->setEnabled(_editMaskExists);
+    }
+    if (_spinEditMaskThreshold) {
+        const QSignalBlocker blocker(_spinEditMaskThreshold);
+        _spinEditMaskThreshold->setValue(static_cast<double>(_editMaskThreshold));
+    }
+    if (_btnGenerateEditMask) {
+        _btnGenerateEditMask->setEnabled(!_editMaskExists);
+    }
+    if (_btnDeleteEditMask) {
+        _btnDeleteEditMask->setEnabled(_editMaskExists);
+    }
+
     updateGrowthUiState();
 }
 
@@ -1383,6 +1453,13 @@ void SegmentationWidget::restoreSettings()
     _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
     _approvalBrushDepth = settings.value(QStringLiteral("approval_brush_depth"), _approvalBrushDepth).toFloat();
     _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
+    // Don't restore approval mask show/edit states - user must explicitly enable each session
+
+    // Edit mask settings
+    _editMaskThreshold = settings.value(QStringLiteral("edit_mask_threshold"), _editMaskThreshold).toFloat();
+    _editMaskThreshold = std::clamp(_editMaskThreshold, 0.1f, 100.0f);
+    // Don't restore show state - will be set when surface is loaded based on whether baseline exists
+
     _approvalMaskOpacity = settings.value(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity).toInt();
     _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
     _showApprovalMask = settings.value(QStringLiteral("show_approval_mask"), _showApprovalMask).toBool();
@@ -1565,6 +1642,61 @@ void SegmentationWidget::setApprovalBrushDepth(float depth)
     if (_spinApprovalBrushDepth) {
         const QSignalBlocker blocker(_spinApprovalBrushDepth);
         _spinApprovalBrushDepth->setValue(static_cast<double>(_approvalBrushDepth));
+    }
+}
+
+void SegmentationWidget::setShowEditMask(bool enabled)
+{
+    if (_showEditMask == enabled) {
+        return;
+    }
+    _showEditMask = enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("show_edit_mask"), _showEditMask);
+        emit showEditMaskChanged(_showEditMask);
+    }
+    if (_chkShowEditMask) {
+        const QSignalBlocker blocker(_chkShowEditMask);
+        _chkShowEditMask->setChecked(_showEditMask);
+    }
+}
+
+void SegmentationWidget::setEditMaskExists(bool exists)
+{
+    if (_editMaskExists == exists) {
+        return;
+    }
+    _editMaskExists = exists;
+
+    // Update UI state based on whether edit mask exists
+    if (_chkShowEditMask) {
+        _chkShowEditMask->setEnabled(_editMaskExists);
+        if (!_editMaskExists && _showEditMask) {
+            setShowEditMask(false);  // Turn off show if mask no longer exists
+        }
+    }
+    if (_btnGenerateEditMask) {
+        _btnGenerateEditMask->setEnabled(!_editMaskExists);
+    }
+    if (_btnDeleteEditMask) {
+        _btnDeleteEditMask->setEnabled(_editMaskExists);
+    }
+}
+
+void SegmentationWidget::setEditMaskThreshold(float threshold)
+{
+    const float sanitized = std::clamp(threshold, 0.1f, 100.0f);
+    if (std::abs(_editMaskThreshold - sanitized) < 1e-4f) {
+        return;
+    }
+    _editMaskThreshold = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("edit_mask_threshold"), static_cast<double>(_editMaskThreshold));
+        emit editMaskThresholdChanged(_editMaskThreshold);
+    }
+    if (_spinEditMaskThreshold) {
+        const QSignalBlocker blocker(_spinEditMaskThreshold);
+        _spinEditMaskThreshold->setValue(static_cast<double>(_editMaskThreshold));
     }
 }
 

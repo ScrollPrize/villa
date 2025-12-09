@@ -134,6 +134,30 @@ bool SegmentationModule::captureUndoSnapshot()
     return _undoHistory.capture(previewPoints);
 }
 
+bool SegmentationModule::captureUndoDelta()
+{
+    if (_suppressUndoCapture) {
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
+    }
+
+    const auto editedVerts = _editManager->editedVertices();
+    if (editedVerts.empty()) {
+        return false;
+    }
+
+    // Convert to delta format (storing original positions for undo)
+    std::vector<segmentation::VertexDelta> deltas;
+    deltas.reserve(editedVerts.size());
+    for (const auto& edit : editedVerts) {
+        deltas.push_back({edit.row, edit.col, edit.originalWorld});
+    }
+
+    return _undoHistory.captureDelta(deltas);
+}
+
 void SegmentationModule::discardLastUndoSnapshot()
 {
     _undoHistory.discardLast();
@@ -148,21 +172,55 @@ bool SegmentationModule::restoreUndoSnapshot()
         return false;
     }
 
-    auto state = _undoHistory.takeLast();
-    if (!state) {
-        return false;
-    }
-
-    cv::Mat_<cv::Vec3f> points = std::move(*state);
-    if (points.empty()) {
+    if (_undoHistory.empty()) {
         return false;
     }
 
     _suppressUndoCapture = true;
+    bool applied = false;
     std::optional<cv::Rect> undoBounds;
-    bool applied = _editManager->setPreviewPoints(points, false, &undoBounds);
+
+    // Check if this is a delta-based entry or full snapshot
+    if (_undoHistory.lastIsDelta()) {
+        auto deltas = _undoHistory.takeLastDelta();
+        if (deltas && !deltas->empty()) {
+            // Apply deltas to restore previous positions
+            auto& previewPoints = _editManager->previewPointsMutable();
+            int minRow = INT_MAX, maxRow = INT_MIN;
+            int minCol = INT_MAX, maxCol = INT_MIN;
+
+            for (const auto& delta : *deltas) {
+                if (delta.row >= 0 && delta.row < previewPoints.rows &&
+                    delta.col >= 0 && delta.col < previewPoints.cols) {
+                    previewPoints(delta.row, delta.col) = delta.previousWorld;
+                    minRow = std::min(minRow, delta.row);
+                    maxRow = std::max(maxRow, delta.row);
+                    minCol = std::min(minCol, delta.col);
+                    maxCol = std::max(maxCol, delta.col);
+                }
+            }
+
+            if (minRow <= maxRow && minCol <= maxCol) {
+                undoBounds = cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
+            }
+
+            _editManager->applyPreview();
+            applied = true;
+        }
+    } else {
+        // Legacy full snapshot restore
+        auto state = _undoHistory.takeLast();
+        if (state && !state->empty()) {
+            applied = _editManager->setPreviewPoints(*state, false, &undoBounds);
+            if (applied) {
+                _editManager->applyPreview();
+            } else {
+                _undoHistory.pushBack(std::move(*state));
+            }
+        }
+    }
+
     if (applied) {
-        _editManager->applyPreview();
         if (_surfaces) {
             auto preview = _editManager->previewSurface();
 
@@ -179,15 +237,23 @@ bool SegmentationModule::restoreUndoSnapshot()
 
             _surfaces->setSurface("segmentation", preview, false, true);
         }
+
+        // Also undo the corresponding auto-approval if approval mask is active
+        if (_overlay && _overlay->hasApprovalMaskData() && _overlay->canUndoAutoApproval()) {
+            _overlay->undoLastAutoApproval();
+            // Schedule save to persist the undo
+            if (_editManager && _editManager->baseSurface()) {
+                _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+            }
+        }
+
         clearInvalidationBrush();
         refreshOverlay();
         emitPendingChanges();
         markAutosaveNeeded();
-    } else {
-        _undoHistory.pushBack(std::move(points));
     }
-    _suppressUndoCapture = false;
 
+    _suppressUndoCapture = false;
     return applied;
 }
 
@@ -244,14 +310,35 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         return false;
     }
 
+    // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected)
+    // We paint into pending, then save immediately so the changes persist after reload
+    auto* baseSurf = _editManager->baseSurface().get();
+    if (_overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
+        std::vector<std::pair<int, int>> gridPositions;
+        gridPositions.reserve(static_cast<size_t>(vertexRect.area()));
+        for (int row = vertexRect.y; row < vertexRect.y + vertexRect.height; ++row) {
+            for (int col = vertexRect.x; col < vertexRect.x + vertexRect.width; ++col) {
+                gridPositions.emplace_back(row, col);
+            }
+        }
+        constexpr uint8_t kApproved = 255;
+        constexpr float kRadius = 1.0f;
+        constexpr bool kIsAutoApproval = true;
+        _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+        // Save immediately to persist through the upcoming reload
+        _overlay->saveApprovalMaskToSurface(baseSurf);
+        _overlay->clearApprovalMaskUndoHistory();
+        qCInfo(lcSegModule) << "Auto-approved growth region:" << vertexRect.width << "x" << vertexRect.height;
+    }
+
     // Update approval tool surface if editing approval mask
     if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(_editManager->baseSurface().get());
+        _approvalTool->setSurface(baseSurf);
     }
 
     // Reload approval mask image if showing approval mask
     if (_showApprovalMask && _overlay) {
-        _overlay->loadApprovalMaskImage(_editManager->baseSurface().get());
+        _overlay->loadApprovalMaskImage(baseSurf);
     }
 
     refreshOverlay();

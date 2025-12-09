@@ -172,7 +172,6 @@ bool SegmentationBrushTool::applyPending(float dragRadiusSteps)
         return false;
     }
 
-    bool snapshotCaptured = _module.captureUndoSnapshot();
     bool anyChanged = false;
     for (const auto& key : targets) {
         if (_editManager->markInvalidRegion(key.row, key.col, brushRadius)) {
@@ -183,11 +182,11 @@ bool SegmentationBrushTool::applyPending(float dragRadiusSteps)
     clear();
 
     if (!anyChanged) {
-        if (snapshotCaptured) {
-            _module.discardLastUndoSnapshot();
-        }
         return false;
     }
+
+    // Capture delta for undo after edits have been tracked
+    (void)_module.captureUndoDelta();
 
     if (_surfaces) {
         _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);

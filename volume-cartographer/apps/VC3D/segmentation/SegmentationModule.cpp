@@ -312,6 +312,16 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
             this, &SegmentationModule::undoApprovalStroke);
 
+    // Edit mask connections
+    connect(_widget, &SegmentationWidget::showEditMaskChanged,
+            this, &SegmentationModule::setShowEditMask);
+    connect(_widget, &SegmentationWidget::generateEditMaskRequested,
+            this, &SegmentationModule::generateEditMask);
+    connect(_widget, &SegmentationWidget::deleteEditMaskRequested,
+            this, &SegmentationModule::deleteEditMask);
+    connect(_widget, &SegmentationWidget::editMaskThresholdChanged,
+            this, &SegmentationModule::setEditMaskThreshold);
+
     _widget->setEraseBrushActive(false);
 }
 
@@ -667,18 +677,113 @@ void SegmentationModule::undoApprovalStroke()
     }
 }
 
+void SegmentationModule::setShowEditMask(bool show)
+{
+    if (_overlay) {
+        _overlay->setShowEditMask(show);
+    }
+}
+
+void SegmentationModule::generateEditMask()
+{
+    qCInfo(lcSegModule) << "Generating edit mask baseline...";
+    auto* surface = activeBaseSurface();
+    if (!surface) {
+        qCWarning(lcSegModule) << "  No surface selected";
+        emit statusMessageRequested(tr("No surface selected."), kStatusShort);
+        return;
+    }
+
+    if (SegmentationOverlayController::editMaskExists(surface)) {
+        qCWarning(lcSegModule) << "  Edit mask already exists";
+        emit statusMessageRequested(tr("Edit mask baseline already exists."), kStatusShort);
+        return;
+    }
+
+    if (SegmentationOverlayController::generateEditMask(surface)) {
+        emit statusMessageRequested(tr("Generated edit mask baseline."), kStatusShort);
+        checkEditMaskExists();
+        // Load the baseline into the overlay
+        if (_overlay) {
+            _overlay->loadEditMaskBaseline(surface);
+        }
+    } else {
+        emit statusMessageRequested(tr("Failed to generate edit mask baseline."), kStatusShort);
+    }
+}
+
+void SegmentationModule::deleteEditMask()
+{
+    qCInfo(lcSegModule) << "Deleting edit mask baseline...";
+    auto* surface = activeBaseSurface();
+    if (!surface) {
+        return;
+    }
+
+    if (SegmentationOverlayController::deleteEditMask(surface)) {
+        emit statusMessageRequested(tr("Deleted edit mask baseline."), kStatusShort);
+        checkEditMaskExists();
+        // Clear the baseline from the overlay
+        if (_overlay) {
+            _overlay->clearEditMaskBaseline();
+            _overlay->setShowEditMask(false);
+        }
+        if (_widget) {
+            _widget->setShowEditMask(false);
+        }
+    } else {
+        emit statusMessageRequested(tr("Failed to delete edit mask baseline."), kStatusShort);
+    }
+}
+
+void SegmentationModule::setEditMaskThreshold(float threshold)
+{
+    if (_overlay) {
+        _overlay->setEditMaskThreshold(threshold);
+    }
+}
+
+void SegmentationModule::checkEditMaskExists()
+{
+    auto* surface = activeBaseSurface();
+    const bool exists = surface && SegmentationOverlayController::editMaskExists(surface);
+    if (_widget) {
+        _widget->setEditMaskExists(exists);
+    }
+}
+
 void SegmentationModule::applyEdits()
 {
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
+    clearInvalidationBrush();
+
+    // Capture delta for undo before applyPreview() clears edited vertices
     if (hadPendingChanges) {
-        if (!captureUndoSnapshot()) {
-            qCWarning(lcSegModule) << "Failed to capture undo snapshot before applying edits.";
+        captureUndoDelta();
+    }
+
+    // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
+    if (_overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
+        const auto editedVerts = _editManager->editedVertices();
+        if (!editedVerts.empty()) {
+            std::vector<std::pair<int, int>> gridPositions;
+            gridPositions.reserve(editedVerts.size());
+            for (const auto& edit : editedVerts) {
+                gridPositions.emplace_back(edit.row, edit.col);
+            }
+            // Paint with value 255 (approved), radius 1 to mark just the edited vertices
+            constexpr uint8_t kApproved = 255;
+            constexpr float kRadius = 1.0f;
+            constexpr bool kIsAutoApproval = true;
+            _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+            _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+            qCInfo(lcSegModule) << "Auto-approved" << gridPositions.size() << "edited vertices";
         }
     }
-    clearInvalidationBrush();
+
     _editManager->applyPreview();
     if (_surfaces) {
         auto preview = _editManager->previewSurface();
@@ -697,11 +802,6 @@ void SegmentationModule::resetEdits()
         return;
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
-    if (hadPendingChanges) {
-        if (!captureUndoSnapshot()) {
-            qCWarning(lcSegModule) << "Failed to capture undo snapshot before resetting edits.";
-        }
-    }
     cancelDrag();
     clearInvalidationBrush();
     clearLineDragStroke();
@@ -1185,15 +1285,7 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
         return;
     }
 
-    bool snapshotCaptured = false;
-    if (!_drag.moved) {
-        snapshotCaptured = captureUndoSnapshot();
-    }
-
     if (!_editManager->updateActiveDrag(worldPos)) {
-        if (!_drag.moved && snapshotCaptured) {
-            discardLastUndoSnapshot();
-        }
         return;
     }
 
@@ -1220,6 +1312,27 @@ void SegmentationModule::finishDrag()
     _drag.reset();
 
     if (moved) {
+        // Capture delta for undo before applyPreview() clears edited vertices
+        captureUndoDelta();
+
+        // Auto-approve edited regions before applyPreview() clears them
+        if (_overlay && _overlay->hasApprovalMaskData()) {
+            const auto editedVerts = _editManager->editedVertices();
+            if (!editedVerts.empty()) {
+                std::vector<std::pair<int, int>> gridPositions;
+                gridPositions.reserve(editedVerts.size());
+                for (const auto& edit : editedVerts) {
+                    gridPositions.emplace_back(edit.row, edit.col);
+                }
+                constexpr uint8_t kApproved = 255;
+                constexpr float kRadius = 1.0f;
+                constexpr bool kIsAutoApproval = true;
+                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+                _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+                qCInfo(lcSegModule) << "Auto-approved" << gridPositions.size() << "drag edited vertices";
+            }
+        }
+
         _editManager->applyPreview();
         if (_surfaces) {
             _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);

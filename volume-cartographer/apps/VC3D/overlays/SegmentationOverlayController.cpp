@@ -8,11 +8,15 @@
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QPainter>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <filesystem>
 #include <limits>
+
+#include <opencv2/imgcodecs.hpp>
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -35,8 +39,16 @@ constexpr qreal kMarkerPenWidth = 2.0;
 constexpr qreal kActivePenWidth = 2.5;
 constexpr qreal kMaskZ = 60.0;
 constexpr qreal kApprovalMaskZ = 50.0;  // Below mask path (60) but above most other overlays
+constexpr qreal kEditMaskZ = 45.0;     // Below approval mask
 constexpr qreal kMarkerZ = 95.0;
 constexpr qreal kRadiusCircleZ = 80.0;
+const QColor kEditMaskColor = QColor(255, 200, 0, 180);  // Yellow/orange for edited regions
+
+// Single unified green color for approval mask (RGBA)
+constexpr int kApprovalGreenR = 0;
+constexpr int kApprovalGreenG = 120;
+constexpr int kApprovalGreenB = 0;
+constexpr int kApprovalGreenA = 153;  // ~60% opacity
 }
 
 bool SegmentationOverlayController::State::operator==(const State& rhs) const
@@ -207,9 +219,7 @@ void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
         for (int col = 0; col < approvalMask.cols; ++col) {
             uint8_t val = maskRow[col];
             if (val > 0) {
-                // GREEN for saved approval: RGB(0, 200, 0) with 60% opacity (alpha = 153)
-                // Premultiply: R=0, G=120, B=0, A=153
-                imageRow[col] = qRgba(0, 120, 0, 153);
+                imageRow[col] = qRgba(kApprovalGreenR, kApprovalGreenG, kApprovalGreenB, kApprovalGreenA);
             } else {
                 imageRow[col] = qRgba(0, 0, 0, 0);  // Fully transparent
             }
@@ -236,7 +246,8 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     uint8_t paintValue,
     bool useRectangle,
     float widthSteps,
-    float heightSteps)
+    float heightSteps,
+    bool isAutoApproval)
 {
     if (_pendingApprovalMaskImage.isNull()) {
         qWarning() << "paintApprovalMaskDirect: pending image is NULL!";
@@ -278,11 +289,15 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     const int regionWidth = maxCol - minCol + 1;
     const int regionHeight = maxRow - minRow + 1;
 
-    // Save the affected region for undo
+    // Save the affected regions for undo (both pending and saved images)
     if (regionWidth > 0 && regionHeight > 0) {
         ApprovalMaskUndoEntry undoEntry;
         undoEntry.topLeft = QPoint(minCol, minRow);
-        undoEntry.savedRegion = _pendingApprovalMaskImage.copy(minCol, minRow, regionWidth, regionHeight);
+        undoEntry.pendingRegion = _pendingApprovalMaskImage.copy(minCol, minRow, regionWidth, regionHeight);
+        if (!_savedApprovalMaskImage.isNull()) {
+            undoEntry.savedRegion = _savedApprovalMaskImage.copy(minCol, minRow, regionWidth, regionHeight);
+        }
+        undoEntry.isAutoApproval = isAutoApproval;
         _approvalMaskUndoStack.push_back(std::move(undoEntry));
 
         // Limit undo stack size
@@ -291,7 +306,7 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
         }
     }
 
-    // Paint directly into the PENDING QImage
+    // Paint directly into the images
     for (const auto& [centerRow, centerCol] : gridPositions) {
         // For rectangle: iterate over explicit width/height
         // For circle: iterate over full radius in both dimensions
@@ -317,17 +332,26 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
                 }
 
                 // Update pixel color based on paint mode:
-                // - Blue for pending approval (paintValue = 255)
-                // - Red for pending unapproval (paintValue = 0)
+                // - Green for approval (paintValue = 255): paint green in pending
+                // - Unapproval (paintValue = 0): clear both saved and pending immediately
                 if (paintValue > 0) {
-                    // Approving: BLUE with 50% opacity
-                    _pendingApprovalMaskImage.setPixel(col, row, qRgba(0, 50, 127, 128));
+                    _pendingApprovalMaskImage.setPixel(col, row, qRgba(kApprovalGreenR, kApprovalGreenG, kApprovalGreenB, kApprovalGreenA));
                 } else {
-                    // Unapproving: RED with 50% opacity
-                    _pendingApprovalMaskImage.setPixel(col, row, qRgba(127, 25, 25, 128));
+                    // Unapproving: Clear both saved and pending images immediately (no red preview)
+                    _pendingApprovalMaskImage.setPixel(col, row, qRgba(0, 0, 0, 0));
+                    if (!_savedApprovalMaskImage.isNull() &&
+                        row < _savedApprovalMaskImage.height() &&
+                        col < _savedApprovalMaskImage.width()) {
+                        _savedApprovalMaskImage.setPixel(col, row, qRgba(0, 0, 0, 0));
+                    }
                 }
             }
         }
+    }
+
+    // If unapproving, also invalidate saved version since we modified it directly
+    if (paintValue == 0) {
+        ++_savedImageVersion;
     }
 
     // Invalidate pending version since we modified the pending image
@@ -343,7 +367,9 @@ void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surfa
         return;
     }
 
-    // Merge pending into saved, then convert to cv::Mat
+    // Merge pending approvals into saved, then convert to cv::Mat
+    // Note: Unapprovals are applied immediately to saved image in paintApprovalMaskDirect(),
+    // so pending only contains green approval pixels
     int width = !_savedApprovalMaskImage.isNull() ? _savedApprovalMaskImage.width() : _pendingApprovalMaskImage.width();
     int height = !_savedApprovalMaskImage.isNull() ? _savedApprovalMaskImage.height() : _pendingApprovalMaskImage.height();
 
@@ -352,41 +378,27 @@ void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surfa
     for (int row = 0; row < height; ++row) {
         uint8_t* maskRow = approvalMask.ptr<uint8_t>(row);
         for (int col = 0; col < width; ++col) {
-            uint8_t savedVal = 0;
+            bool isApproved = false;
 
-            // Get saved value (green channel indicates approval)
+            // Check saved value (green channel indicates approval)
             if (!_savedApprovalMaskImage.isNull() && row < _savedApprovalMaskImage.height() && col < _savedApprovalMaskImage.width()) {
                 const QRgb* savedRow = reinterpret_cast<const QRgb*>(_savedApprovalMaskImage.constScanLine(row));
                 QRgb pixel = savedRow[col];
                 if (qAlpha(pixel) > 0 && qGreen(pixel) > 0) {
-                    savedVal = 255;  // Was approved
+                    isApproved = true;
                 }
             }
 
-            // Check pending state - can be approval (blue) or unapproval (red)
-            bool hasPending = false;
-            bool pendingIsApproval = false;
+            // Check pending for new approvals (green pixels)
             if (!_pendingApprovalMaskImage.isNull() && row < _pendingApprovalMaskImage.height() && col < _pendingApprovalMaskImage.width()) {
                 const QRgb* pendingRow = reinterpret_cast<const QRgb*>(_pendingApprovalMaskImage.constScanLine(row));
                 QRgb pixel = pendingRow[col];
-                if (qAlpha(pixel) > 0) {
-                    hasPending = true;
-                    // Blue (approval) has higher blue than red, Red (unapproval) has higher red than blue
-                    pendingIsApproval = qBlue(pixel) > qRed(pixel);
+                if (qAlpha(pixel) > 0 && qGreen(pixel) > 0) {
+                    isApproved = true;
                 }
             }
 
-            // Apply pending changes
-            if (hasPending) {
-                if (pendingIsApproval) {
-                    maskRow[col] = 255;  // Approve
-                } else {
-                    maskRow[col] = 0;    // Unapprove (clear)
-                }
-            } else {
-                // No pending change, keep saved value
-                maskRow[col] = savedVal;
-            }
+            maskRow[col] = isApproved ? 255 : 0;
         }
     }
 
@@ -394,14 +406,13 @@ void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surfa
     surface->setChannel("approval", approvalMask);
     surface->saveOverwrite();
 
-    // Merge pending into saved and clear pending
+    // Update saved image to match what we just wrote and clear pending
     for (int row = 0; row < height; ++row) {
         QRgb* savedRow = reinterpret_cast<QRgb*>(_savedApprovalMaskImage.scanLine(row));
         for (int col = 0; col < width; ++col) {
             uint8_t mergedVal = approvalMask(row, col);
             if (mergedVal > 0) {
-                // Update saved image with dark green
-                savedRow[col] = qRgba(0, 60, 0, 153);
+                savedRow[col] = qRgba(kApprovalGreenR, kApprovalGreenG, kApprovalGreenB, kApprovalGreenA);
             } else {
                 savedRow[col] = qRgba(0, 0, 0, 0);
             }
@@ -418,8 +429,10 @@ void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surfa
     // Trigger re-rendering of intersection lines on plane viewers
     invalidatePlaneIntersections();
 
-    // Clear undo history since changes are now persisted
-    clearApprovalMaskUndoHistory();
+    // NOTE: We intentionally do NOT clear undo history here.
+    // The undo entries store pre-paint image regions, which remain valid for undo
+    // even after save merges pending into saved. This allows surface edit undo
+    // to also undo the corresponding auto-approval that was painted.
 }
 
 bool SegmentationOverlayController::undoLastApprovalMaskPaint()
@@ -432,15 +445,62 @@ bool SegmentationOverlayController::undoLastApprovalMaskPaint()
     ApprovalMaskUndoEntry entry = std::move(_approvalMaskUndoStack.back());
     _approvalMaskUndoStack.pop_back();
 
-    // Restore the saved region
-    QPainter painter(&_pendingApprovalMaskImage);
-    painter.setCompositionMode(QPainter::CompositionMode_Source);
-    painter.drawImage(entry.topLeft, entry.savedRegion);
-    painter.end();
+    // Restore the pending image region
+    {
+        QPainter painter(&_pendingApprovalMaskImage);
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.drawImage(entry.topLeft, entry.pendingRegion);
+        painter.end();
+    }
+
+    // Restore the saved image region (for unapprovals that modified it directly)
+    if (!entry.savedRegion.isNull() && !_savedApprovalMaskImage.isNull()) {
+        QPainter painter(&_savedApprovalMaskImage);
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.drawImage(entry.topLeft, entry.savedRegion);
+        painter.end();
+        ++_savedImageVersion;
+    }
 
     ++_pendingImageVersion;
     invalidatePlaneIntersections();
+    forceRefreshAllOverlays();
     return true;
+}
+
+bool SegmentationOverlayController::undoLastAutoApproval()
+{
+    // Find and undo the most recent auto-approval entry
+    for (auto it = _approvalMaskUndoStack.rbegin(); it != _approvalMaskUndoStack.rend(); ++it) {
+        if (it->isAutoApproval) {
+            // Found an auto-approval entry - restore it
+            ApprovalMaskUndoEntry entry = std::move(*it);
+            _approvalMaskUndoStack.erase(std::next(it).base());
+
+            // Restore the pending image region
+            {
+                QPainter painter(&_pendingApprovalMaskImage);
+                painter.setCompositionMode(QPainter::CompositionMode_Source);
+                painter.drawImage(entry.topLeft, entry.pendingRegion);
+                painter.end();
+            }
+
+            // Restore the saved image region
+            if (!entry.savedRegion.isNull() && !_savedApprovalMaskImage.isNull()) {
+                QPainter painter(&_savedApprovalMaskImage);
+                painter.setCompositionMode(QPainter::CompositionMode_Source);
+                painter.drawImage(entry.topLeft, entry.savedRegion);
+                painter.end();
+                ++_savedImageVersion;
+            }
+
+            ++_pendingImageVersion;
+            invalidatePlaneIntersections();
+            forceRefreshAllOverlays();
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SegmentationOverlayController::canUndoApprovalMaskPaint() const
@@ -448,9 +508,52 @@ bool SegmentationOverlayController::canUndoApprovalMaskPaint() const
     return !_approvalMaskUndoStack.empty();
 }
 
+bool SegmentationOverlayController::canUndoAutoApproval() const
+{
+    for (const auto& entry : _approvalMaskUndoStack) {
+        if (entry.isAutoApproval) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void SegmentationOverlayController::clearApprovalMaskUndoHistory()
 {
     _approvalMaskUndoStack.clear();
+}
+
+void SegmentationOverlayController::scheduleDebouncedSave(QuadSurface* surface)
+{
+    scheduleApprovalMaskSave(surface);
+}
+
+void SegmentationOverlayController::scheduleApprovalMaskSave(QuadSurface* surface)
+{
+    if (!surface) {
+        return;
+    }
+
+    _approvalSaveSurface = surface;
+
+    if (!_approvalSaveTimer) {
+        _approvalSaveTimer = new QTimer(this);
+        _approvalSaveTimer->setSingleShot(true);
+        connect(_approvalSaveTimer, &QTimer::timeout, this, &SegmentationOverlayController::performDebouncedApprovalSave);
+    }
+
+    // Restart the timer (debounce)
+    _approvalSaveTimer->start(kApprovalSaveDelayMs);
+}
+
+void SegmentationOverlayController::performDebouncedApprovalSave()
+{
+    if (!_approvalSaveSurface) {
+        return;
+    }
+
+    saveApprovalMaskToSurface(_approvalSaveSurface);
+    _approvalSaveSurface = nullptr;
 }
 
 bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
@@ -475,6 +578,11 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
     // (but painting requires editing to be enabled - handled in SegmentationModule)
     if (state.approvalMaskMode && state.surface) {
         buildApprovalMaskOverlay(state, viewer, builder);
+    }
+
+    // Render edit mask overlay if enabled
+    if (_showEditMask && state.surface) {
+        buildEditMaskOverlay(state, viewer, builder);
     }
 
     // Other overlays require editing to be enabled
@@ -690,18 +798,14 @@ void SegmentationOverlayController::rebuildViewerCache(CVolumeViewer* viewer, Qu
 int SegmentationOverlayController::queryApprovalStatus(int row, int col) const
 {
     // Check pending first (takes priority for display)
-    // Returns: 0 = not approved, 1 = saved approved, 2 = pending approved, 3 = pending unapproved
+    // Returns: 0 = not approved, 1 = saved approved, 2 = pending approved
+    // Note: Unapprovals are applied immediately (no pending unapproval state)
     if (!_pendingApprovalMaskImage.isNull() &&
         row >= 0 && row < _pendingApprovalMaskImage.height() &&
         col >= 0 && col < _pendingApprovalMaskImage.width()) {
         QRgb pixel = _pendingApprovalMaskImage.pixel(col, row);
-        if (qAlpha(pixel) > 0) {
-            // Distinguish between pending approve (blue) and pending unapprove (red)
-            // Blue has high blue component, red has high red component
-            if (qRed(pixel) > qBlue(pixel)) {
-                return 3;  // Pending unapproval (red)
-            }
-            return 2;  // Pending approval (blue)
+        if (qAlpha(pixel) > 0 && qGreen(pixel) > 0) {
+            return 2;  // Pending approval (green)
         }
     }
 
@@ -710,7 +814,7 @@ int SegmentationOverlayController::queryApprovalStatus(int row, int col) const
         row >= 0 && row < _savedApprovalMaskImage.height() &&
         col >= 0 && col < _savedApprovalMaskImage.width()) {
         QRgb pixel = _savedApprovalMaskImage.pixel(col, row);
-        if (qAlpha(pixel) > 0) {
+        if (qAlpha(pixel) > 0 && qGreen(pixel) > 0) {
             return 1;  // Saved
         }
     }
@@ -758,19 +862,19 @@ float SegmentationOverlayController::sampleImageBilinear(const QImage& image, fl
 
 float SegmentationOverlayController::queryApprovalBilinear(float row, float col, int* outStatus) const
 {
-    // First check pending mask (takes priority)
+    // First check pending mask (takes priority) - only contains green approvals
+    // Note: Unapprovals are applied immediately (no pending unapproval state)
     const float pendingAlpha = sampleImageBilinear(_pendingApprovalMaskImage, row, col);
     if (pendingAlpha > 0.5f) {  // Threshold to determine if we're "in" pending region
-        // Determine if pending approve or unapprove by checking nearest pixel color
         const int nearestRow = static_cast<int>(std::round(row));
         const int nearestCol = static_cast<int>(std::round(col));
         if (!_pendingApprovalMaskImage.isNull() &&
             nearestRow >= 0 && nearestRow < _pendingApprovalMaskImage.height() &&
             nearestCol >= 0 && nearestCol < _pendingApprovalMaskImage.width()) {
             QRgb pixel = _pendingApprovalMaskImage.pixel(nearestCol, nearestRow);
-            if (qAlpha(pixel) > 0) {
+            if (qAlpha(pixel) > 0 && qGreen(pixel) > 0) {
                 if (outStatus) {
-                    *outStatus = (qRed(pixel) > qBlue(pixel)) ? 3 : 2;  // 3 = unapprove, 2 = approve
+                    *outStatus = 2;  // Pending approval
                 }
                 return pendingAlpha / 255.0f;
             }
@@ -800,6 +904,12 @@ bool SegmentationOverlayController::hasApprovalMaskData() const
     return !_savedApprovalMaskImage.isNull() || !_pendingApprovalMaskImage.isNull();
 }
 
+void SegmentationOverlayController::forceRefreshAllOverlays()
+{
+    // Force rebuild all viewer overlays, bypassing state comparison
+    refreshAll();
+}
+
 void SegmentationOverlayController::invalidatePlaneIntersections()
 {
     if (!_viewerManager) {
@@ -812,6 +922,8 @@ void SegmentationOverlayController::invalidatePlaneIntersections()
         }
         // Only invalidate for plane surface viewers (XY, XZ, YZ)
         if (dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            // Invalidate the intersection cache for segmentation so approval colors get recomputed
+            viewer->invalidateIntersect("segmentation");
             viewer->renderIntersections();
         }
     });
@@ -1036,5 +1148,283 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     QPointF topLeft = gridToScene(0, 0);
     const qreal opacity = static_cast<qreal>(_approvalMaskOpacity) / 100.0;
     builder.addImage(cache.compositeImage, topLeft, gridToSceneScale, opacity, kApprovalMaskZ);
+}
+
+// ============================================================================
+// Edit Mask Implementation
+// ============================================================================
+
+bool SegmentationOverlayController::editMaskExists(QuadSurface* surface)
+{
+    if (!surface) {
+        return false;
+    }
+
+    const auto& surfPath = surface->path;
+    if (surfPath.empty()) {
+        return false;
+    }
+
+    // Check if all three baseline files exist
+    const auto xPath = surfPath / "x_editmask.tif";
+    const auto yPath = surfPath / "y_editmask.tif";
+    const auto zPath = surfPath / "z_editmask.tif";
+
+    return std::filesystem::exists(xPath) &&
+           std::filesystem::exists(yPath) &&
+           std::filesystem::exists(zPath);
+}
+
+bool SegmentationOverlayController::generateEditMask(QuadSurface* surface)
+{
+    if (!surface) {
+        qWarning() << "generateEditMask: no surface provided";
+        return false;
+    }
+
+    const auto& surfPath = surface->path;
+    if (surfPath.empty()) {
+        qWarning() << "generateEditMask: surface has no path";
+        return false;
+    }
+
+    // Source files
+    const auto xSrc = surfPath / "x.tif";
+    const auto ySrc = surfPath / "y.tif";
+    const auto zSrc = surfPath / "z.tif";
+
+    // Destination files
+    const auto xDst = surfPath / "x_editmask.tif";
+    const auto yDst = surfPath / "y_editmask.tif";
+    const auto zDst = surfPath / "z_editmask.tif";
+
+    // Check source files exist
+    if (!std::filesystem::exists(xSrc) ||
+        !std::filesystem::exists(ySrc) ||
+        !std::filesystem::exists(zSrc)) {
+        qWarning() << "generateEditMask: source x/y/z.tif files not found";
+        return false;
+    }
+
+    try {
+        std::filesystem::copy_file(xSrc, xDst, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(ySrc, yDst, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(zSrc, zDst, std::filesystem::copy_options::overwrite_existing);
+        qInfo() << "Generated edit mask baseline at" << QString::fromStdString(surfPath.string());
+        return true;
+    } catch (const std::filesystem::filesystem_error& e) {
+        qWarning() << "generateEditMask: failed to copy files:" << e.what();
+        return false;
+    }
+}
+
+bool SegmentationOverlayController::deleteEditMask(QuadSurface* surface)
+{
+    if (!surface) {
+        return false;
+    }
+
+    const auto& surfPath = surface->path;
+    if (surfPath.empty()) {
+        return false;
+    }
+
+    const auto xPath = surfPath / "x_editmask.tif";
+    const auto yPath = surfPath / "y_editmask.tif";
+    const auto zPath = surfPath / "z_editmask.tif";
+
+    bool success = true;
+    try {
+        if (std::filesystem::exists(xPath)) {
+            std::filesystem::remove(xPath);
+        }
+        if (std::filesystem::exists(yPath)) {
+            std::filesystem::remove(yPath);
+        }
+        if (std::filesystem::exists(zPath)) {
+            std::filesystem::remove(zPath);
+        }
+        qInfo() << "Deleted edit mask baseline from" << QString::fromStdString(surfPath.string());
+    } catch (const std::filesystem::filesystem_error& e) {
+        qWarning() << "deleteEditMask: failed to delete files:" << e.what();
+        success = false;
+    }
+
+    return success;
+}
+
+void SegmentationOverlayController::loadEditMaskBaseline(QuadSurface* surface)
+{
+    _editMaskBaseline = cv::Mat_<cv::Vec3f>();
+    _editMaskOverlayImage = QImage();
+    ++_editMaskVersion;
+
+    if (!surface || !editMaskExists(surface)) {
+        return;
+    }
+
+    const auto& surfPath = surface->path;
+
+    // Load the three coordinate TIFFs
+    const auto xPath = surfPath / "x_editmask.tif";
+    const auto yPath = surfPath / "y_editmask.tif";
+    const auto zPath = surfPath / "z_editmask.tif";
+
+    cv::Mat xMat = cv::imread(xPath.string(), cv::IMREAD_UNCHANGED);
+    cv::Mat yMat = cv::imread(yPath.string(), cv::IMREAD_UNCHANGED);
+    cv::Mat zMat = cv::imread(zPath.string(), cv::IMREAD_UNCHANGED);
+
+    if (xMat.empty() || yMat.empty() || zMat.empty()) {
+        qWarning() << "loadEditMaskBaseline: failed to load one or more baseline TIFFs";
+        return;
+    }
+
+    // Verify dimensions match
+    if (xMat.size() != yMat.size() || xMat.size() != zMat.size()) {
+        qWarning() << "loadEditMaskBaseline: baseline TIFF dimensions don't match";
+        return;
+    }
+
+    // Convert to float if needed and merge into Vec3f
+    if (xMat.type() != CV_32F) {
+        xMat.convertTo(xMat, CV_32F);
+    }
+    if (yMat.type() != CV_32F) {
+        yMat.convertTo(yMat, CV_32F);
+    }
+    if (zMat.type() != CV_32F) {
+        zMat.convertTo(zMat, CV_32F);
+    }
+
+    // Merge into a 3-channel Mat
+    std::vector<cv::Mat> channels = {xMat, yMat, zMat};
+    cv::Mat merged;
+    cv::merge(channels, merged);
+    _editMaskBaseline = merged;
+
+    qInfo() << "Loaded edit mask baseline:" << _editMaskBaseline.cols << "x" << _editMaskBaseline.rows;
+}
+
+void SegmentationOverlayController::clearEditMaskBaseline()
+{
+    _editMaskBaseline = cv::Mat_<cv::Vec3f>();
+    _editMaskOverlayImage = QImage();
+    ++_editMaskVersion;
+}
+
+void SegmentationOverlayController::setShowEditMask(bool show)
+{
+    if (_showEditMask == show) {
+        return;
+    }
+    _showEditMask = show;
+    ++_editMaskVersion;
+    refreshAll();
+}
+
+void SegmentationOverlayController::setEditMaskThreshold(float threshold)
+{
+    const float clamped = std::clamp(threshold, 0.1f, 100.0f);
+    if (std::abs(_editMaskThreshold - clamped) < 1e-4f) {
+        return;
+    }
+    _editMaskThreshold = clamped;
+    ++_editMaskVersion;
+    // Clear cached overlay to force rebuild with new threshold
+    _editMaskOverlayImage = QImage();
+    refreshAll();
+}
+
+void SegmentationOverlayController::buildEditMaskOverlay(
+    const State& state,
+    CVolumeViewer* viewer,
+    ViewerOverlayControllerBase::OverlayBuilder& builder) const
+{
+    if (!_showEditMask || _editMaskBaseline.empty() || !state.surface) {
+        return;
+    }
+
+    // Only show on flattened view for now
+    auto* flatSurf = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    if (!flatSurf || flatSurf != state.surface) {
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3f>* currentPoints = state.surface->rawPointsPtr();
+    if (!currentPoints || currentPoints->empty()) {
+        return;
+    }
+
+    // Check dimensions match
+    if (currentPoints->size() != _editMaskBaseline.size()) {
+        qWarning() << "buildEditMaskOverlay: dimension mismatch between current and baseline";
+        return;
+    }
+
+    const int rows = currentPoints->rows;
+    const int cols = currentPoints->cols;
+
+    // Build or use cached overlay image
+    // For simplicity, rebuild every time (can be optimized with caching later)
+    QImage overlayImage(cols, rows, QImage::Format_ARGB32_Premultiplied);
+    overlayImage.fill(Qt::transparent);
+
+    const float thresholdSq = _editMaskThreshold * _editMaskThreshold;
+
+    for (int row = 0; row < rows; ++row) {
+        QRgb* imageRow = reinterpret_cast<QRgb*>(overlayImage.scanLine(row));
+        for (int col = 0; col < cols; ++col) {
+            const cv::Vec3f& current = (*currentPoints)(row, col);
+            const cv::Vec3f& baseline = _editMaskBaseline(row, col);
+
+            // Skip invalid points
+            if (current[0] < 0 || baseline[0] < 0) {
+                imageRow[col] = qRgba(0, 0, 0, 0);
+                continue;
+            }
+
+            // Calculate squared distance
+            const float dx = current[0] - baseline[0];
+            const float dy = current[1] - baseline[1];
+            const float dz = current[2] - baseline[2];
+            const float distSq = dx * dx + dy * dy + dz * dz;
+
+            if (distSq > thresholdSq) {
+                // Point has moved beyond threshold - highlight it
+                // Scale alpha by how much it exceeds threshold (cap at 2x threshold)
+                const float dist = std::sqrt(distSq);
+                const float excess = std::min(dist / _editMaskThreshold, 2.0f);
+                const int alpha = static_cast<int>(kEditMaskColor.alpha() * (0.5f + 0.5f * (excess - 1.0f)));
+                imageRow[col] = qRgba(kEditMaskColor.red(), kEditMaskColor.green(),
+                                      kEditMaskColor.blue(), std::clamp(alpha, 50, 255));
+            } else {
+                imageRow[col] = qRgba(0, 0, 0, 0);
+            }
+        }
+    }
+
+    // Calculate scene transform (same as approval mask)
+    const cv::Vec3f center = state.surface->center();
+    const cv::Vec2f surfScale = state.surface->scale();
+    const float viewerScale = viewer->getCurrentScale();
+
+    auto gridToScene = [&](int r, int c) -> QPointF {
+        const float surfLocalX = static_cast<float>(c) / surfScale[0] - center[0];
+        const float surfLocalY = static_cast<float>(r) / surfScale[1] - center[1];
+        const float sceneX = surfLocalX * viewerScale;
+        const float sceneY = surfLocalY * viewerScale;
+        return QPointF(sceneX, sceneY);
+    };
+
+    QPointF p0 = gridToScene(0, 0);
+    QPointF p1 = gridToScene(0, 1);
+    qreal gridToSceneScale = std::hypot(p1.x() - p0.x(), p1.y() - p0.y());
+
+    if (gridToSceneScale < 1e-6) {
+        return;
+    }
+
+    QPointF topLeft = gridToScene(0, 0);
+    builder.addImage(overlayImage, topLeft, gridToSceneScale, 1.0, kEditMaskZ);
 }
 

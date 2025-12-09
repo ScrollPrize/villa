@@ -106,6 +106,15 @@ const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
     return kEmpty;
 }
 
+cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPointsMutable()
+{
+    static cv::Mat_<cv::Vec3f> kEmpty;
+    if (_previewPoints) {
+        return *_previewPoints;
+    }
+    return kEmpty;
+}
+
 bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
                                                bool markAsPendingEdit,
                                                std::optional<cv::Rect>* outDiffBounds)
