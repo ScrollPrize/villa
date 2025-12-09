@@ -20,6 +20,8 @@ Usage:
 import os
 import sys
 import json
+import csv
+import tempfile
 import sqlite3
 import argparse
 import subprocess
@@ -37,6 +39,10 @@ BACKUP_PATTERNS = [
     '_bak',
     '.bak',
 ]
+
+# Report configuration
+REPORT_S3_BUCKET = "philodemos"
+REPORT_S3_PREFIX = "david/reports"
 
 
 class SyncAction(Enum):
@@ -289,6 +295,121 @@ class S3SyncManager:
 
         print(f"Found {len(files)} S3 files")
         return files
+
+    def _get_report_csv_path(self):
+        """Return the S3 URL and filename for the report based on the volume package name"""
+        pkg_name = Path(self.local_dir).resolve().parent.name
+        if pkg_name.endswith(".volpkg"):
+            pkg_name = pkg_name[:-7]
+        filename = f"{pkg_name}.csv"
+        return f"s3://{REPORT_S3_BUCKET}/{REPORT_S3_PREFIX}/{filename}", filename
+
+    def _collect_segment_areas(self):
+        """Collect segment names and area_cm2 values from meta.json files"""
+        segments = {}
+        for root, dirs, filenames in os.walk(self.local_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and 'layers' not in d.lower() and d != 'backups']
+            if 'meta.json' in filenames:
+                meta_path = os.path.join(root, 'meta.json')
+                try:
+                    with open(meta_path, 'r') as f:
+                        meta_data = json.load(f)
+                    segment_name = meta_data.get('uuid', os.path.basename(root))
+                    area_cm2 = meta_data.get('area_cm2', 0.0)
+                    segments[segment_name] = area_cm2
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"  Warning: Could not read {meta_path}: {e}")
+                    continue
+        return segments
+
+    def generate_segment_report(self):
+        """Generate or update the segment area CSV report and upload to S3"""
+        print("\nGenerating report...")
+        s3_csv_path, report_filename = self._get_report_csv_path()
+        current_datetime = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        current_segments = self._collect_segment_areas()
+        if not current_segments:
+            print("  No segments found with meta.json files")
+            return
+
+        print(f"  Found {len(current_segments)} segments")
+
+        existing_data = {}
+        existing_datetimes = []
+
+        # Try to download existing CSV
+        download_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        download_tmp_path = download_tmp.name
+        download_tmp.close()
+
+        try:
+            cmd = ['aws', 's3', 'cp', s3_csv_path, download_tmp_path]
+            if self.aws_profile:
+                cmd.extend(['--profile', self.aws_profile])
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+            with open(download_tmp_path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+
+            if rows:
+                existing_datetimes = rows[0][1:] if len(rows[0]) > 1 else []
+                for row in rows[1:]:
+                    if not row:
+                        continue
+                    segment_name = row[0]
+                    values = [float(val) if val else 0.0 for val in row[1:]]
+                    # Pad to header length if necessary
+                    if len(values) < len(existing_datetimes):
+                        values.extend([0.0] * (len(existing_datetimes) - len(values)))
+                    existing_data[segment_name] = values
+
+                print(f"  Loaded existing report ({report_filename})")
+        except subprocess.CalledProcessError:
+            print(f"  No existing report found at {s3_csv_path}, creating new one")
+        except Exception as e:
+            print(f"  Warning: Could not read existing report: {e}")
+        finally:
+            try:
+                os.unlink(download_tmp_path)
+            except OSError:
+                pass
+
+        # Only include segments that currently exist (remove deleted segments)
+        all_segments = set(current_segments.keys())
+        header_row = ["Segment Name"] + existing_datetimes + [current_datetime]
+        csv_rows = [header_row]
+
+        for segment_name in sorted(all_segments):
+            row = [segment_name]
+            previous_values = existing_data.get(segment_name, [0.0] * len(existing_datetimes))
+            if len(previous_values) < len(existing_datetimes):
+                previous_values.extend([0.0] * (len(existing_datetimes) - len(previous_values)))
+            row.extend(previous_values)
+            row.append(current_segments.get(segment_name, 0.0))
+            csv_rows.append(row)
+
+        # Write new CSV
+        upload_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        upload_tmp_path = upload_tmp.name
+        try:
+            with open(upload_tmp_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(csv_rows)
+
+            cmd = ['aws', 's3', 'cp', upload_tmp_path, s3_csv_path]
+            if self.aws_profile:
+                cmd.extend(['--profile', self.aws_profile])
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"  ✓ Report uploaded")
+        except subprocess.CalledProcessError as e:
+            print(f"  ❌ Failed to upload report: {e}")
+        finally:
+            try:
+                os.unlink(upload_tmp_path)
+            except OSError:
+                pass
 
     def update_files(self, include_backups=False):
         """Update file tracking with current state"""
@@ -854,6 +975,8 @@ def main():
 
         elif args.command == 'sync':
             manager.sync(args.dry_run, getattr(args, 'sync_backups', False))
+            if not args.dry_run:
+                manager.generate_segment_report()
 
         elif args.command == 'update':
             manager.update_files(getattr(args, 'sync_backups', False))
