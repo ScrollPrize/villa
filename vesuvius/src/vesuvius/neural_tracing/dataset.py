@@ -520,7 +520,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         suppress_out_u=None,
         suppress_out_v=None,
         diag_zyx=None,
-        include_center=False,
+        center_zyx_unperturbed=None,
     ):
         """Build heatmaps using u/v direction conditioning."""
 
@@ -554,9 +554,9 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         condition_channels = uv_heatmaps_in_all.shape[0]
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
 
-        if include_center:
+        if center_zyx_unperturbed is not None:
             maybe_center_heatmap = {
-                'center_heatmap': self.make_heatmaps([torch.full([1, 3], crop_size / 2)], torch.zeros([3]), crop_size, sigma=heatmap_sigma)
+                'center_heatmap': self.make_heatmaps([center_zyx_unperturbed[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma)
             }
         else:
             maybe_center_heatmap = {}
@@ -581,7 +581,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         seg_mask,
         normals,
         normals_mask,
-        center_heatmaps,
+        center_heatmap,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -589,7 +589,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             'localiser': localiser,
             'uv_heatmaps_in': uv_heatmaps_in,
             'uv_heatmaps_out': uv_heatmaps_out,
-            **({'center_heatmaps': center_heatmaps} if center_heatmaps is not None else {}),
+            **({'center_heatmap': center_heatmap} if center_heatmap is not None else {}),
         }
 
         if self._config.get("aux_segmentation", False) and seg is not None:
@@ -807,11 +807,12 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 suppress_out_u=suppress_out_u,
                 suppress_out_v=suppress_out_v,
                 diag_zyx=diag_zyx,
-                include_center=self._config.get('bidirectional', False),
+                center_zyx_unperturbed=center_zyx_unperturbed if self._config.get('bidirectional', False) else None,
             )
 
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
             heatmap_num_in_channels = heatmap_result['condition_channels']
+            maybe_center_heatmap = heatmap_result['center_heatmap'] if 'center_heatmap' in heatmap_result else None
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -825,7 +826,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
             #  ok since it's 'just more augmentation' that won't be applied during tracing
             uv_channels = uv_heatmaps_both.shape[0]
-            regression_target = uv_heatmaps_both
+            regression_target = torch.cat([uv_heatmaps_both] + [maybe_center_heatmap if maybe_center_heatmap is not None else []], dim=0)
             seg_for_aug = seg[None] if seg is not None else None
             while True:
                 augmented = self._augmentations(
@@ -842,6 +843,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
+            maybe_center_heatmap = regression_aug[..., uv_channels] if uv_channels < regression_aug.shape[-1] else None
             if seg is not None:
                 seg_aug = augmented.get('segmentation', None)
                 if seg_aug is None:
@@ -871,9 +873,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_heatmaps_in = uv_heatmaps_both[..., :heatmap_num_in_channels]
             uv_heatmaps_out = uv_heatmaps_both[..., heatmap_num_in_channels:]
 
-            # Note this isn't augmented (which is a problem if we add spatial augmentations)
-            maybe_center_heatmaps = rearrange(torch.tile(heatmap_result['center_heatmap'], [2, 1, 1, 1]), 'uv z y x -> z y x uv') if 'center_heatmap' in heatmap_result else None
-
             if multistep_count > 1 and not use_multistep:
                 # Allocate blank channels in output heatmaps
                 # FIXME: if we supported multi-step loss for non-chain cases, then we could always enable it hence wouldn't need this
@@ -902,7 +901,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 seg_mask=seg_mask,
                 normals=normals,
                 normals_mask=normals_mask,
-                center_heatmaps=maybe_center_heatmaps,
+                center_heatmap=maybe_center_heatmap,
             )
 
             yield batch_dict

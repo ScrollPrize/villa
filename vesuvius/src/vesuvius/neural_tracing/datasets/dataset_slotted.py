@@ -58,7 +58,7 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         suppress_out_u=None,
         suppress_out_v=None,
         diag_zyx=None,
-        include_center=False,
+        center_zyx_unperturbed=None,
     ):
         """Build slot-based heatmaps with masking."""
         # Retrieve stored data from _decide_conditioning

@@ -365,7 +365,7 @@ def train(config_path):
                 else:
                     # When reversing the first step, the target is the initial center, i.e. center of the outer
                     # crop, which isn't a standard target
-                    step_targets = batch['center_heatmaps']
+                    step_targets = batch['center_heatmap'].unsqueeze(-1).expand(-1, -1, -1, -1, 2)
                 step_targets = rearrange(
                     safe_crop_with_padding(
                         step_targets,
