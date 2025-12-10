@@ -115,6 +115,7 @@ public:
 protected:
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     void CreateWidgets(void);
@@ -297,6 +298,11 @@ private:
 
     // Periodic timer for inotify events
     QTimer* _inotifyProcessTimer;
+
+    // Timer for debounced window state saving
+    QTimer* _windowStateSaveTimer{nullptr};
+    void scheduleWindowStateSave();
+    void saveWindowState();
 
     struct InotifyEvent {
         enum Type { Addition, Removal, Rename, Update };

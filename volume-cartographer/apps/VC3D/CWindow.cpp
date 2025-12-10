@@ -7,6 +7,7 @@
 #include <QKeySequence>
 #include <QHBoxLayout>
 #include <QKeyEvent>
+#include <QResizeEvent>
 #include <QWheelEvent>
 #include <QSettings>
 #include <QMdiArea>
@@ -484,6 +485,12 @@ CWindow::CWindow() :
     _inotifyProcessTimer = new QTimer(this);
     connect(_inotifyProcessTimer, &QTimer::timeout, this, &CWindow::processPendingInotifyEvents);
 
+    // Initialize timer for debounced window state saving (500ms delay)
+    _windowStateSaveTimer = new QTimer(this);
+    _windowStateSaveTimer->setSingleShot(true);
+    _windowStateSaveTimer->setInterval(500);
+    connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
+
     _point_collection = new VCCollection(this);
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _mirrorCursorToSegmentation = settings.value(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION,
@@ -599,6 +606,11 @@ CWindow::CWindow() :
     const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
     if (!savedState.isEmpty()) {
         restoreState(savedState);
+    } else {
+        // No saved state - set sensible default sizes for dock widgets
+        // The Volume Package dock (left side) should have a reasonable width and height
+        resizeDocks({ui.dockWidgetVolumes}, {300}, Qt::Horizontal);
+        resizeDocks({ui.dockWidgetVolumes}, {400}, Qt::Vertical);
     }
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
@@ -610,8 +622,13 @@ CWindow::CWindow() :
                                ui.dockWidgetOverlay,
                                ui.dockWidgetRenderSettings  }) {
         ensureDockWidgetFeatures(dock);
+        // Connect dock widget signals to trigger state saving
+        connect(dock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+        connect(dock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
     }
     ensureDockWidgetFeatures(_point_collection_widget);
+    connect(_point_collection_widget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_point_collection_widget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
 
     const QSize minWindowSize(960, 640);
     setMinimumSize(minWindowSize);
@@ -1977,14 +1994,32 @@ void CWindow::keyReleaseEvent(QKeyEvent* event)
     QMainWindow::keyReleaseEvent(event);
 }
 
-// Asks User to Save Data Prior to VC.app Exit
-void CWindow::closeEvent(QCloseEvent* event)
+void CWindow::resizeEvent(QResizeEvent* event)
+{
+    QMainWindow::resizeEvent(event);
+    scheduleWindowStateSave();
+}
+
+void CWindow::scheduleWindowStateSave()
+{
+    // Restart the timer - this debounces rapid changes
+    if (_windowStateSaveTimer) {
+        _windowStateSaveTimer->start();
+    }
+}
+
+void CWindow::saveWindowState()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::window::GEOMETRY, saveGeometry());
     settings.setValue(vc3d::settings::window::STATE, saveState());
-    settings.sync();  // Ensure settings are flushed to disk before quick_exit
+    settings.sync();
+}
 
+// Asks User to Save Data Prior to VC.app Exit
+void CWindow::closeEvent(QCloseEvent* event)
+{
+    saveWindowState();
     std::quick_exit(0);
 }
 
