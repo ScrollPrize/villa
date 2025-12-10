@@ -68,6 +68,7 @@ public:
         float approvalBrushDepth{15.0f};      // Cylinder depth (native voxels)
         float approvalEffectiveRadius{0.0f};  // For plane viewers: brush radius adjusted for distance
         bool paintingApproval{true};
+        QColor approvalBrushColor{0, 255, 0};  // Current painting color (default pure green)
         QuadSurface* surface{nullptr};
         std::optional<cv::Vec3f> approvalHoverWorld;  // Current hover position for brush circle
         std::optional<QPointF> approvalHoverScenePos; // Scene position (avoids expensive pointTo)
@@ -92,9 +93,11 @@ public:
     // If useRectangle is true, paints a rectangle using widthSteps x heightSteps dimensions
     // If useRectangle is false, paints a circle using radiusSteps
     // If isAutoApproval is true, marks this as auto-approval from surface edit (for separate undo)
+    // brushColor specifies the RGB color to paint (only used when paintValue > 0)
     void paintApprovalMaskDirect(const std::vector<std::pair<int, int>>& gridPositions,
                                   float radiusSteps,
                                   uint8_t paintValue,
+                                  const QColor& brushColor,
                                   bool useRectangle = false,
                                   float widthSteps = 0.0f,
                                   float heightSteps = 0.0f,
@@ -126,6 +129,10 @@ public:
     // Returns approval intensity 0.0-1.0 using bilinear interpolation for smooth edges
     // Also returns status: 0 = not approved, 1 = saved, 2 = pending approve, 3 = pending unapprove
     float queryApprovalBilinear(float row, float col, int* outStatus = nullptr) const;
+
+    // Query approval color at a grid position (nearest neighbor)
+    // Returns the RGB color of the approval mask at that position, or invalid QColor if not approved
+    QColor queryApprovalColor(int row, int col) const;
 
     // Check if approval mask mode is active and we have mask data
     bool hasApprovalMaskData() const;
@@ -169,9 +176,9 @@ private:
     std::optional<State> _currentState;
     std::chrono::steady_clock::time_point _lastRefreshTime;
 
-    // Approval mask images - separate saved and pending
-    QImage _savedApprovalMaskImage;   // Dark green: what's saved to disk
-    QImage _pendingApprovalMaskImage; // Light green: pending strokes
+    // Approval mask images - separate saved and pending (RGB colors, ARGB32 format)
+    QImage _savedApprovalMaskImage;   // RGB colors from disk, with alpha for overlay
+    QImage _pendingApprovalMaskImage; // RGB colors from pending strokes
 
     // Per-viewer cached scene-space rasterized images
     struct ViewerImageCache {

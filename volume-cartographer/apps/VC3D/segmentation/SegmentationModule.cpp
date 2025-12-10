@@ -307,6 +307,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setApprovalMaskBrushRadius);
     connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
             this, &SegmentationModule::setApprovalBrushDepth);
+    connect(_widget, &SegmentationWidget::approvalBrushColorChanged,
+            this, &SegmentationModule::setApprovalBrushColor);
     connect(_widget, &SegmentationWidget::approvalMaskOpacityChanged,
             _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
@@ -644,6 +646,13 @@ void SegmentationModule::setApprovalMaskBrushRadius(float radiusSteps)
 void SegmentationModule::setApprovalBrushDepth(float depth)
 {
     _approvalBrushDepth = std::clamp(depth, 1.0f, 500.0f);
+}
+
+void SegmentationModule::setApprovalBrushColor(const QColor& color)
+{
+    if (color.isValid()) {
+        _approvalBrushColor = color;
+    }
 }
 
 void SegmentationModule::undoApprovalStroke()

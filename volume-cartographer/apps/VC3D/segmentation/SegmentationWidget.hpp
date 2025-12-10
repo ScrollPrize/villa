@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QVector>
 #include <QWidget>
 
@@ -95,6 +96,7 @@ public:
     [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
+    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
 
     // Approval mask setters
     void setShowApprovalMask(bool enabled);
@@ -103,6 +105,7 @@ public:
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
     void setApprovalMaskOpacity(int opacity);
+    void setApprovalBrushColor(const QColor& color);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -136,6 +139,7 @@ signals:
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
     void approvalMaskOpacityChanged(int opacity);
+    void approvalBrushColorChanged(QColor color);
     void approvalStrokesUndoRequested();
 
 private:
@@ -287,6 +291,7 @@ private:
     float _approvalBrushRadius{50.0f};     // Cylinder radius (circle in plane views, rect width in flattened)
     float _approvalBrushDepth{15.0f};      // Cylinder depth (rect height in flattened view)
     int _approvalMaskOpacity{50};          // Mask overlay opacity (0-100, default 50%)
+    QColor _approvalBrushColor{0, 255, 0}; // RGB color for approval painting (default pure green)
     CollapsibleSettingsGroup* _groupApprovalMask{nullptr};
     QCheckBox* _chkShowApprovalMask{nullptr};
     QCheckBox* _chkEditApprovedMask{nullptr};
@@ -295,5 +300,6 @@ private:
     QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
     QSlider* _sliderApprovalMaskOpacity{nullptr};
     QLabel* _lblApprovalMaskOpacity{nullptr};
+    QPushButton* _btnApprovalColor{nullptr};
     QPushButton* _btnUndoApprovalStroke{nullptr};
 };

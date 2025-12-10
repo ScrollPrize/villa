@@ -543,7 +543,8 @@ void SegmentationPushPullTool::stopAll()
                 constexpr uint8_t kApproved = 255;
                 constexpr float kRadius = 1.0f;
                 constexpr bool kIsAutoApproval = true;
-                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+                const QColor brushColor = _module.approvalBrushColor();
+                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
                 _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
                 qCInfo(lcSegPushPull) << "Auto-approved" << gridPositions.size() << "push/pull edited vertices";
             }

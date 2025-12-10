@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QObject>
 #include <QElapsedTimer>
 #include <QPointer>
@@ -87,10 +88,12 @@ public:
     [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
     void setApprovalMaskBrushRadius(float radiusSteps);
     void setApprovalBrushDepth(float depth);
+    void setApprovalBrushColor(const QColor& color);
     [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
     [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
     [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
+    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
     void undoApprovalStroke();
 
     void applyEdits();
@@ -313,6 +316,7 @@ private:
     bool _editUnapprovedMask{false};
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
     float _approvalBrushDepth{15.0f};       // Cylinder depth
+    QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};
