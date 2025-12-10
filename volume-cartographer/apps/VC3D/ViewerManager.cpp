@@ -416,7 +416,7 @@ SurfacePatchIndex* ViewerManager::surfacePatchIndex()
     return &_surfacePatchIndex;
 }
 
-void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface)
+void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface)
 {
     if (!surface) {
         return;
@@ -442,7 +442,7 @@ void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface)
                             << "- marking index for rebuild";
 }
 
-void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface, const cv::Rect& changedRegion)
+void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion)
 {
     if (!surface) {
         return;
@@ -500,12 +500,12 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         return;
     }
     auto allSurfaces = _surfaces->surfaces();
-    std::vector<QuadSurface*> quadSurfaces;
+    std::vector<SurfacePatchIndex::SurfacePtr> quadSurfaces;
     std::vector<std::string> surfaceIds;
     quadSurfaces.reserve(allSurfaces.size());
     surfaceIds.reserve(allSurfaces.size());
     for (const auto& surface : allSurfaces) {
-        if (auto* quad = dynamic_cast<QuadSurface*>(surface.get())) {
+        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surface)) {
             quadSurfaces.push_back(quad);
             surfaceIds.push_back(surface->id);
         }
@@ -547,13 +547,12 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     _surfacesQueuedDuringRebuildIds.clear();
     _surfacesQueuedForRemovalDuringRebuildIds.clear();
 
-    // Build task uses raw pointers (safe since we wait for completion before any deletion)
-    auto surfacesForTask = quadSurfaces;
+    // Build task captures shared_ptrs - surfaces stay alive throughout async operation
     const int stride = _surfacePatchSamplingStride;
-    auto future = QtConcurrent::run([surfacesForTask, stride]() mutable -> std::shared_ptr<SurfacePatchIndex> {
+    auto future = QtConcurrent::run([quadSurfaces, stride]() -> std::shared_ptr<SurfacePatchIndex> {
         auto index = std::make_shared<SurfacePatchIndex>();
         index->setSamplingStride(stride);
-        index->rebuild(surfacesForTask);
+        index->rebuild(quadSurfaces);
         return index;
     });
     _surfacePatchIndexWatcher->setFuture(future);
@@ -573,10 +572,10 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
         return;
     }
 
-    std::vector<QuadSurface*> surfaces;
+    std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
     std::vector<std::string> surfaceIds;
     for (const auto& surf : _surfaces->surfaces()) {
-        if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             surfaces.push_back(quad);
             surfaceIds.push_back(surf->id);
         }
@@ -615,7 +614,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     for (const std::string& idToRemove : _surfacesQueuedForRemovalDuringRebuildIds) {
         // Look up the surface by ID to remove from index
         auto surf = _surfaces ? _surfaces->surface(idToRemove) : nullptr;
-        if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             _surfacePatchIndex.removeSurface(quad);
         }
         _indexedSurfaceIds.erase(idToRemove);
@@ -625,7 +624,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     // Merge any surfaces that were added during the async rebuild
     for (const std::string& queuedId : _surfacesQueuedDuringRebuildIds) {
         auto surf = _surfaces ? _surfaces->surface(queuedId) : nullptr;
-        if (auto* queued = dynamic_cast<QuadSurface*>(surf.get())) {
+        if (auto queued = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             if (_surfacePatchIndex.updateSurface(queued)) {
                 _indexedSurfaceIds.insert(queuedId);
                 qCInfo(lcViewerManager) << "Indexed queued surface" << queuedId.c_str()
@@ -649,12 +648,12 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
         setSurfacePatchSamplingStride(targetStride, false);
 
         // Trigger another async rebuild at the refined stride
-        // Collect current surfaces
-        std::vector<QuadSurface*> surfacesForTask;
+        // Collect current surfaces - shared_ptrs keep surfaces alive
+        std::vector<SurfacePatchIndex::SurfacePtr> surfacesForTask;
         std::vector<std::string> surfaceIdsForTask;
         if (_surfaces) {
             for (const auto& surf : _surfaces->surfaces()) {
-                if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+                if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
                     surfacesForTask.push_back(quad);
                     surfaceIdsForTask.push_back(surf->id);
                 }
@@ -662,7 +661,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
         }
         _pendingSurfacePatchIndexSurfaceIds = surfaceIdsForTask;
 
-        auto future = QtConcurrent::run([surfacesForTask, targetStride]() mutable -> std::shared_ptr<SurfacePatchIndex> {
+        auto future = QtConcurrent::run([surfacesForTask, targetStride]() -> std::shared_ptr<SurfacePatchIndex> {
             auto index = std::make_shared<SurfacePatchIndex>();
             index->setSamplingStride(targetStride);
             index->rebuild(surfacesForTask);
@@ -674,7 +673,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     }
 }
 
-bool ViewerManager::updateSurfacePatchIndexForSurface(QuadSurface* quad, bool /*isEditUpdate*/)
+bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool /*isEditUpdate*/)
 {
     if (!quad) {
         return false;
@@ -729,7 +728,7 @@ void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surfa
     bool affectsSurfaceIndex = false;
     bool regionUpdated = false;
 
-    if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+    if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
         affectsSurfaceIndex = true;
         if (updateSurfacePatchIndexForSurface(quad, isEditUpdate)) {
             regionUpdated = true;  // Signal that work was done (prevents marking index for rebuild)
@@ -749,7 +748,7 @@ void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surfa
 void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
 {
     // Called BEFORE surface deletion - remove from R-tree index
-    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    auto quad = std::dynamic_pointer_cast<QuadSurface>(surf);
 
     // Only process cleanup if we're deleting under the surface's actual ID.
     // Aliases like "segmentation" just point to surfaces that exist under their

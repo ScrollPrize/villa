@@ -1320,7 +1320,7 @@ void CVolumeViewer::onVolumeClosing()
 void CVolumeViewer::onSurfaceWillBeDeleted(std::string /*name*/, std::shared_ptr<Surface> surf)
 {
     // Called BEFORE surface deletion - clear all cached references to prevent use-after-free
-    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    auto quad = std::dynamic_pointer_cast<QuadSurface>(surf);
 
     // Clear if this is our current surface
     auto current = _surf_weak.lock();

@@ -611,8 +611,11 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         bounds.high = tgt + cv::Vec3f(searchRadius, searchRadius, searchRadius);
 
         std::vector<std::pair<int, int>> candidateCells;
-        surfaceIndex->forEachTriangle(bounds, this, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            candidateCells.emplace_back(tri.j, tri.i);
+        surfaceIndex->forEachTriangle(bounds, SurfacePatchIndex::SurfacePtr{nullptr}, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+            // Filter to only triangles from this surface
+            if (tri.surface.get() == this) {
+                candidateCells.emplace_back(tri.j, tri.i);
+            }
         });
 
         // Search from each candidate cell

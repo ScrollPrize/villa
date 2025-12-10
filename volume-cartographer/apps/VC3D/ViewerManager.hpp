@@ -98,8 +98,8 @@ public:
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
-    void refreshSurfacePatchIndex(QuadSurface* surface);
-    void refreshSurfacePatchIndex(QuadSurface* surface, const cv::Rect& changedRegion);
+    void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
+    void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
     void waitForPendingIndexRebuild();
 
 signals:
@@ -115,7 +115,7 @@ private slots:
     void handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
-    bool updateSurfacePatchIndexForSurface(QuadSurface* quad, bool isEditUpdate);
+    bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
 
     CSurfaceCollection* _surfaces;
     VCCollection* _points;

@@ -209,9 +209,9 @@ private:
 
         // Build spatial index using SurfacePatchIndex
         SurfacePatchIndex patchIndex;
-        std::vector<QuadSurface*> surface_ptrs;
+        std::vector<SurfacePatchIndex::SurfacePtr> surface_ptrs;
         for (const auto& info : surfaces) {
-            surface_ptrs.push_back(info.surface.get());
+            surface_ptrs.push_back(info.surface);
         }
         patchIndex.rebuild(surface_ptrs);
 
@@ -272,7 +272,7 @@ private:
                 if (result.has_value()) {
                     // Find matching surface index
                     for (size_t idx = 0; idx < surfaces.size(); idx++) {
-                        if (surfaces[idx].surface.get() == result->surface) {
+                        if (surfaces[idx].surface == result->surface) {
                             matched_idx = static_cast<int>(idx);
                             found_match = true;
                             break;

@@ -189,14 +189,17 @@ std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* su
             scale = 1.0f;
         }
         const float tolerance = std::max(8.0f, scale * 8.0f);
-        if (auto hit = patchIndex->locate(worldPos, tolerance, surface)) {
-            const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
-                                       0,
-                                       points->cols - 1);
-            const int row = std::clamp(static_cast<int>(std::round(hit->ptr[1])),
-                                       0,
-                                       points->rows - 1);
-            return std::make_pair(row, col);
+        // Query without surface filter, then verify result matches our surface
+        if (auto hit = patchIndex->locate(worldPos, tolerance)) {
+            if (hit->surface.get() == surface) {
+                const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
+                                           0,
+                                           points->cols - 1);
+                const int row = std::clamp(static_cast<int>(std::round(hit->ptr[1])),
+                                           0,
+                                           points->rows - 1);
+                return std::make_pair(row, col);
+            }
         }
     }
 
@@ -535,7 +538,7 @@ void saveCorrectionsAnnotation(
 }
 
 void queueIndexUpdateForBounds(SurfacePatchIndex* index,
-                               QuadSurface* surface,
+                               const SurfacePatchIndex::SurfacePtr& surface,
                                const cv::Rect& vertexRect)
 {
     if (!index || !surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
@@ -1017,9 +1020,9 @@ void SegmentationGrower::onFutureFinished()
     const double voxelSize = request.growthVoxelSize;
     cv::Mat generations = result.surface->channel("generations");
 
-    std::vector<QuadSurface*> surfacesToUpdate;
+    std::vector<SurfacePatchIndex::SurfacePtr> surfacesToUpdate;
     surfacesToUpdate.reserve(3);
-    auto appendUniqueSurface = [&](QuadSurface* surface) {
+    auto appendUniqueSurface = [&](const SurfacePatchIndex::SurfacePtr& surface) {
         if (!surface) {
             return;
         }
@@ -1028,12 +1031,12 @@ void SegmentationGrower::onFutureFinished()
         }
     };
 
-    appendUniqueSurface(request.segmentationSurface.get());
+    appendUniqueSurface(request.segmentationSurface);
     if (_context.module && _context.module->hasActiveSession()) {
-        appendUniqueSurface(_context.module->activeBaseSurface());
+        appendUniqueSurface(_context.module->activeBaseSurfaceShared());
     }
 
-    QuadSurface* primarySurface = surfacesToUpdate.empty() ? nullptr : surfacesToUpdate.front();
+    QuadSurface* primarySurface = surfacesToUpdate.empty() ? nullptr : surfacesToUpdate.front().get();
     cv::Mat_<cv::Vec3f>* primaryPoints = primarySurface ? primarySurface->rawPointsPtr() : nullptr;
     cv::Mat_<cv::Vec3f>* resultPoints = result.surface->rawPointsPtr();
 
@@ -1063,7 +1066,8 @@ void SegmentationGrower::onFutureFinished()
         primarySurface->invalidateCache();
     }
 
-    for (QuadSurface* targetSurface : surfacesToUpdate) {
+    for (const auto& targetSurfacePtr : surfacesToUpdate) {
+        QuadSurface* targetSurface = targetSurfacePtr.get();
         if (!targetSurface) {
             continue;
         }
@@ -1121,9 +1125,9 @@ void SegmentationGrower::onFutureFinished()
         // Refresh intersection index for this surface so renderIntersections() has up-to-date data
         if (_context.viewerManager) {
             if (!changedBounds.empty()) {
-                _context.viewerManager->refreshSurfacePatchIndex(targetSurface, changedBounds);
+                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr, changedBounds);
             } else {
-                _context.viewerManager->refreshSurfacePatchIndex(targetSurface);
+                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr);
             }
         }
     }
@@ -1236,12 +1240,12 @@ void SegmentationGrower::onFutureFinished()
             }
         };
 
-        for (QuadSurface* surface : surfacesToUpdate) {
-            maybeAddId(surface);
+        for (const auto& surface : surfacesToUpdate) {
+            maybeAddId(surface.get());
         }
         maybeAddId(currentSegSurface);
         if (_context.module && _context.module->hasActiveSession()) {
-            maybeAddId(_context.module->activeBaseSurface());
+            maybeAddId(_context.module->activeBaseSurfaceShared().get());
         }
 
         for (const auto& id : idsToRefresh) {
