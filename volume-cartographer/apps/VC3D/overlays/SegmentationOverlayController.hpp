@@ -136,24 +136,6 @@ public:
     // Trigger re-rendering of intersections on all plane viewers
     void invalidatePlaneIntersections();
 
-    // Edit mask functionality - shows differences from a baseline snapshot
-    // Check if baseline edit mask files exist for the given surface
-    static bool editMaskExists(QuadSurface* surface);
-    // Generate baseline edit mask by copying current x/y/z.tif to x_editmask.tif etc
-    static bool generateEditMask(QuadSurface* surface);
-    // Delete the baseline edit mask files
-    static bool deleteEditMask(QuadSurface* surface);
-    // Load the baseline points for comparison
-    void loadEditMaskBaseline(QuadSurface* surface);
-    // Clear the loaded baseline
-    void clearEditMaskBaseline();
-    // Set whether to show the edit mask overlay
-    void setShowEditMask(bool show);
-    // Set the distance threshold for highlighting differences
-    void setEditMaskThreshold(float threshold);
-    [[nodiscard]] bool showEditMask() const { return _showEditMask; }
-    [[nodiscard]] float editMaskThreshold() const { return _editMaskThreshold; }
-
     // Set the opacity of the approval mask overlay (0-100, where 0 is transparent and 100 is opaque)
     void setApprovalMaskOpacity(int opacity);
     [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
@@ -176,9 +158,6 @@ private:
     void buildApprovalMaskOverlay(const State& state,
                                   CVolumeViewer* viewer,
                                   ViewerOverlayControllerBase::OverlayBuilder& builder) const;
-    void buildEditMaskOverlay(const State& state,
-                              CVolumeViewer* viewer,
-                              ViewerOverlayControllerBase::OverlayBuilder& builder) const;
 
     ViewerOverlayControllerBase::PathPrimitive buildMaskPrimitive(const State& state) const;
     bool shouldShowMask(const State& state) const;
@@ -231,13 +210,6 @@ private:
     static constexpr int kApprovalSaveDelayMs = 500;
     void scheduleApprovalMaskSave(QuadSurface* surface);
     void performDebouncedApprovalSave();
-
-    // Edit mask state - baseline points for comparison
-    bool _showEditMask{false};
-    float _editMaskThreshold{1.0f};
-    cv::Mat_<cv::Vec3f> _editMaskBaseline;  // Baseline points loaded from x_editmask.tif etc
-    QImage _editMaskOverlayImage;           // Cached overlay showing differences
-    mutable uint64_t _editMaskVersion{0};   // Version counter for cache invalidation
 
     // Approval mask overlay opacity (0-100, where 50 is default)
     int _approvalMaskOpacity{50};

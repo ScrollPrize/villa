@@ -93,13 +93,6 @@ public:
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     void undoApprovalStroke();
 
-    // Edit mask methods
-    void setShowEditMask(bool show);
-    void generateEditMask();
-    void deleteEditMask();
-    void setEditMaskThreshold(float threshold);
-    void checkEditMaskExists();
-
     void applyEdits();
     void resetEdits();
     void stopTools();
