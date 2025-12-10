@@ -324,7 +324,8 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         constexpr uint8_t kApproved = 255;
         constexpr float kRadius = 1.0f;
         constexpr bool kIsAutoApproval = true;
-        _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+        const QColor brushColor = approvalBrushColor();
+        _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
         // Save immediately to persist through the upcoming reload
         _overlay->saveApprovalMaskToSurface(baseSurf);
         _overlay->clearApprovalMaskUndoHistory();

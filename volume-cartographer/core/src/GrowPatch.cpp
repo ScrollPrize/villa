@@ -1668,6 +1668,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     int generation = 1;
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
 
+    int resume_pad_y = 0;
+    int resume_pad_x = 0;
+
     auto create_surface_from_state = [&, &f_timer = *timer]() {
         cv::Rect used_area_safe = used_area;
         used_area_safe.x -= 2;
@@ -1747,6 +1750,95 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             (*surf->meta)["seed_surface_id"] = resume_surf->id;
         }
 
+        // Preserve approval and mask channels from resume surface with correct offset
+        // Note: These channels are stored at raw points resolution, not scaled size
+        if (resume_surf) {
+            const int offset_row = resume_pad_y - used_area_safe.y;
+            const int offset_col = resume_pad_x - used_area_safe.x;
+
+            // Get raw points size (channels are stored at this resolution)
+            const cv::Mat_<cv::Vec3f>* new_points = surf->rawPointsPtr();
+            if (!new_points || new_points->empty()) {
+                return surf;
+            }
+            const cv::Size raw_size = new_points->size();
+
+            // Preserve approval channel (3-channel BGR image)
+            cv::Mat old_approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
+            if (!old_approval.empty()) {
+                // Create new approval mask matching old format at raw points resolution
+                cv::Mat new_approval;
+                if (old_approval.channels() == 3) {
+                    new_approval = cv::Mat_<cv::Vec3b>(raw_size, cv::Vec3b(0, 0, 0));
+                    for (int r = 0; r < old_approval.rows; ++r) {
+                        for (int c = 0; c < old_approval.cols; ++c) {
+                            int new_r = r + offset_row;
+                            int new_c = c + offset_col;
+                            if (new_r >= 0 && new_r < new_approval.rows &&
+                                new_c >= 0 && new_c < new_approval.cols) {
+                                new_approval.at<cv::Vec3b>(new_r, new_c) = old_approval.at<cv::Vec3b>(r, c);
+                            }
+                        }
+                    }
+                } else {
+                    // Single channel fallback
+                    new_approval = cv::Mat_<uint8_t>(raw_size, static_cast<uint8_t>(0));
+                    for (int r = 0; r < old_approval.rows; ++r) {
+                        for (int c = 0; c < old_approval.cols; ++c) {
+                            int new_r = r + offset_row;
+                            int new_c = c + offset_col;
+                            if (new_r >= 0 && new_r < new_approval.rows &&
+                                new_c >= 0 && new_c < new_approval.cols) {
+                                new_approval.at<uint8_t>(new_r, new_c) = old_approval.at<uint8_t>(r, c);
+                            }
+                        }
+                    }
+                }
+                surf->setChannel("approval", new_approval);
+                std::cout << "Preserved approval mask (" << old_approval.channels() << " channels, "
+                          << old_approval.cols << "x" << old_approval.rows << " -> "
+                          << new_approval.cols << "x" << new_approval.rows
+                          << ") with offset (" << offset_row << ", " << offset_col << ")" << std::endl;
+            }
+
+            // Preserve mask channel (single channel uint8)
+            // Layer 0 of mask.tif is the validity mask - it can mask out points that have
+            // valid coordinates but shouldn't be used (human corrections).
+            // Strategy:
+            // 1. Generate fresh validity mask from new surface points (255 if valid, 0 if -1,-1,-1)
+            // 2. Overlay old mask values at correct offset (preserving human edits)
+            cv::Mat old_mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+            if (!old_mask.empty()) {
+                // Start with validity mask based on actual point data
+                cv::Mat_<uint8_t> new_mask(raw_size, static_cast<uint8_t>(0));
+                for (int r = 0; r < new_points->rows; ++r) {
+                    for (int c = 0; c < new_points->cols; ++c) {
+                        const cv::Vec3f& p = (*new_points)(r, c);
+                        if (p[0] != -1.0f) {
+                            new_mask(r, c) = 255;  // Valid point
+                        }
+                    }
+                }
+
+                // Now overlay the old mask values (preserving human edits that masked out valid points)
+                for (int r = 0; r < old_mask.rows; ++r) {
+                    for (int c = 0; c < old_mask.cols; ++c) {
+                        int new_r = r + offset_row;
+                        int new_c = c + offset_col;
+                        if (new_r >= 0 && new_r < new_mask.rows &&
+                            new_c >= 0 && new_c < new_mask.cols) {
+                            // Preserve the old mask value (including human edits that set 0 on valid points)
+                            new_mask(new_r, new_c) = old_mask.at<uint8_t>(r, c);
+                        }
+                    }
+                }
+                surf->setChannel("mask", new_mask);
+                std::cout << "Preserved mask (" << old_mask.cols << "x" << old_mask.rows << " -> "
+                          << new_mask.cols << "x" << new_mask.rows
+                          << ") with offset (" << offset_row << ", " << offset_col << ")" << std::endl;
+            }
+        }
+
         return surf;
     };
 
@@ -1758,9 +1850,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
     int start_gen = 0;
-
-    int resume_pad_y = 0;
-    int resume_pad_x = 0;
 
     std::cout << "lets go! " << std::endl;
 

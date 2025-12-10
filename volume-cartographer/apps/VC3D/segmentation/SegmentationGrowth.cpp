@@ -76,48 +76,6 @@ bool ensureGenerationsChannel(QuadSurface* surface)
     return true;
 }
 
-void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
-{
-    if (!oldSurface || !newSurface) {
-        return;
-    }
-
-    // Load old approval mask without auto-resize
-    cv::Mat old_approval = oldSurface->channel("approval", SURF_CHANNEL_NORESIZE);
-    if (old_approval.empty()) {
-        return;  // No approval mask to preserve
-    }
-
-    // Get new surface dimensions
-    const cv::Mat_<cv::Vec3f>* new_points = newSurface->rawPointsPtr();
-    if (!new_points || new_points->empty()) {
-        return;
-    }
-
-    cv::Size new_size = new_points->size();
-
-    // Create new approval mask with default value (0 = unapproved)
-    cv::Mat_<uint8_t> new_approval(new_size, static_cast<uint8_t>(0));
-
-    // Copy old approval values to same grid positions
-    // Grid expansion preserves old point indices, so old[r,c] == new[r,c]
-    int copy_rows = std::min(old_approval.rows, new_approval.rows);
-    int copy_cols = std::min(old_approval.cols, new_approval.cols);
-
-    if (copy_rows > 0 && copy_cols > 0) {
-        cv::Rect src_roi(0, 0, copy_cols, copy_rows);
-        cv::Rect dst_roi(0, 0, copy_cols, copy_rows);
-        old_approval(src_roi).copyTo(new_approval(dst_roi));
-
-        qCInfo(lcSegGrowth) << "Preserved approval mask from"
-                            << old_approval.cols << "x" << old_approval.rows
-                            << "to" << new_approval.cols << "x" << new_approval.rows;
-    }
-
-    // Set preserved approval mask on new surface
-    newSurface->setChannel("approval", new_approval);
-}
-
 QString directionToString(SegmentationGrowthDirection direction)
 {
     switch (direction) {
@@ -496,8 +454,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       nlohmann::json{},
                                       correctionCollection);
 
-        // Preserve approval mask through growth
-        preserveApprovalMask(context.resumeSurface, surface);
+        // Note: approval and mask channels are preserved inside the tracer
 
         result.surface = surface;
         result.statusMessage = QStringLiteral("Tracer growth completed");
