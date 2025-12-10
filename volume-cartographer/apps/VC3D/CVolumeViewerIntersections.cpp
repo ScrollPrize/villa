@@ -73,7 +73,7 @@ void CVolumeViewer::renderIntersections()
         }
         _cachedIntersectSurfaces.reserve(_intersect_tgts.size());
         for (const auto& key : _intersect_tgts) {
-            if (auto* qs = dynamic_cast<QuadSurface*>(_surf_col->surface(key).get())) {
+            if (auto qs = std::dynamic_pointer_cast<QuadSurface>(_surf_col->surface(key))) {
                 _cachedIntersectSurfaces[key] = qs;
             }
         }
@@ -82,7 +82,7 @@ void CVolumeViewer::renderIntersections()
     bool refreshCachedSurfaces = _cachedIntersectSurfaces.size() != _intersect_tgts.size();
     if (!refreshCachedSurfaces && _surf_col) {
         for (const auto& key : _intersect_tgts) {
-            auto* current = dynamic_cast<QuadSurface*>(_surf_col->surface(key).get());
+            auto current = std::dynamic_pointer_cast<QuadSurface>(_surf_col->surface(key));
             const auto cachedIt = _cachedIntersectSurfaces.find(key);
             if (cachedIt == _cachedIntersectSurfaces.end() || cachedIt->second != current) {
                 refreshCachedSurfaces = true;
@@ -92,6 +92,12 @@ void CVolumeViewer::renderIntersections()
     }
     if (refreshCachedSurfaces) {
         rebuildCachedIntersectSurfaces();
+    }
+
+    // Invalidate cached intersection graphics if scale changed (lines are projected using _scale)
+    if (_cachedIntersectionScale != _scale) {
+        _cachedIntersectionLines.clear();
+        _cachedIntersectionScale = _scale;
     }
 
     const QRectF viewRect = fGraphicsView
@@ -122,11 +128,9 @@ void CVolumeViewer::renderIntersections()
     };
 
     PlaneSurface *plane = dynamic_cast<PlaneSurface*>(surf.get());
-    std::shared_ptr<Surface> activeSegSurfaceHolder;  // Keep surface alive during this scope
-    QuadSurface* activeSegSurface = nullptr;
+    SurfacePatchIndex::SurfacePtr activeSegSurface;
     if (_surf_col) {
-        activeSegSurfaceHolder = _surf_col->surface("segmentation");
-        activeSegSurface = dynamic_cast<QuadSurface*>(activeSegSurfaceHolder.get());
+        activeSegSurface = std::dynamic_pointer_cast<QuadSurface>(_surf_col->surface("segmentation"));
     }
     const bool segmentationAliasRequested = _intersect_tgts.count("segmentation") > 0;
 
@@ -156,7 +160,7 @@ void CVolumeViewer::renderIntersections()
         view_bbox.low -= cv::Vec3f(viewPadding, viewPadding, viewPadding);
         view_bbox.high += cv::Vec3f(viewPadding, viewPadding, viewPadding);
 
-        using IntersectionCandidate = std::pair<std::string, QuadSurface*>;
+        using IntersectionCandidate = std::pair<std::string, SurfacePatchIndex::SurfacePtr>;
         std::vector<IntersectionCandidate> intersectCandidates;
         intersectCandidates.reserve(_cachedIntersectSurfaces.size());
         for (const auto& [key, segmentation] : _cachedIntersectSurfaces) {
@@ -174,7 +178,7 @@ void CVolumeViewer::renderIntersections()
         }
 
         // Build set of surfaces to filter query (avoids processing irrelevant triangles)
-        std::unordered_set<QuadSurface*> targetSurfaces;
+        std::unordered_set<SurfacePatchIndex::SurfacePtr> targetSurfaces;
         targetSurfaces.reserve(intersectCandidates.size());
         for (const auto& candidate : intersectCandidates) {
             targetSurfaces.insert(candidate.second);
@@ -197,7 +201,7 @@ void CVolumeViewer::renderIntersections()
             indices.clear();
         }
         for (size_t idx = 0; idx < _triangleCandidates.size(); ++idx) {
-            auto* surface = _triangleCandidates[idx].surface;
+            const auto& surface = _triangleCandidates[idx].surface;
             if (surface) {
                 _trianglesBySurface[surface].push_back(idx);
             }
@@ -205,7 +209,7 @@ void CVolumeViewer::renderIntersections()
 
         for (const auto& candidate : intersectCandidates) {
             const auto& key = candidate.first;
-            QuadSurface* segmentation = candidate.second;
+            const auto& segmentation = candidate.second;
 
             const auto trianglesIt = _trianglesBySurface.find(segmentation);
             if (trianglesIt == _trianglesBySurface.end()) {
@@ -438,9 +442,6 @@ void CVolumeViewer::renderIntersections()
                 auto* item = fGraphicsView->scene()->addPath(path, QPen(style.color, style.width));
                 item->setZValue(style.z);
                 item->setOpacity(_intersectionOpacity);
-                if (fBaseImageItem) {
-                    item->setParentItem(fBaseImageItem);
-                }
                 items.push_back(item);
             }
 
@@ -505,7 +506,7 @@ void CVolumeViewer::setIntersects(const std::set<std::string> &set)
     if (_surf_col) {
         _cachedIntersectSurfaces.reserve(set.size());
         for (const auto& key : set) {
-            if (auto* qs = dynamic_cast<QuadSurface*>(_surf_col->surface(key).get())) {
+            if (auto qs = std::dynamic_pointer_cast<QuadSurface>(_surf_col->surface(key))) {
                 _cachedIntersectSurfaces[key] = qs;
             }
         }

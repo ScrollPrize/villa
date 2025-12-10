@@ -8,7 +8,9 @@
 #include <random>
 #include <chrono>
 #include <atomic>
- 
+#include <mutex>
+#include <shared_mutex>
+
  namespace fs = std::filesystem;
  
  namespace vc::core::util {
@@ -22,7 +24,7 @@
          std::string base_path;
          int sparse_volume;
          nlohmann::json metadata;
-         mutable std::mutex mutex;
+         mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
          size_t max_cache_size = 4096;
@@ -86,13 +88,14 @@
         std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const {
             cv::Vec2i key(plane_idx, slice_idx);
 
+            // Use shared_lock for read-only cache lookup (hot path)
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::shared_lock<std::shared_mutex> lock(mutex);
                 auto it = grid_cache.find(key);
                 if (it != grid_cache.end()) {
                     cache_hits++;
-                    it->second.generation = ++generation_counter;
-                    check_print_stats();
+                    // Note: Removed generation update from hot path to avoid write contention
+                    // LRU eviction will still work reasonably well without per-access updates
                     return it->second.grid_store;
                 }
             }
@@ -104,7 +107,7 @@
             std::string grid_path = (fs::path(base_path) / dir / filename).string();
 
             if (!fs::exists(grid_path)) {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::unique_lock<std::shared_mutex> lock(mutex);
                 grid_cache[key] = {nullptr, ++generation_counter};
                 return nullptr;
             }
@@ -121,7 +124,7 @@
             // }
 
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::unique_lock<std::shared_mutex> lock(mutex);
 
                 auto it = grid_cache.find(key);
                 if (it != grid_cache.end()) {

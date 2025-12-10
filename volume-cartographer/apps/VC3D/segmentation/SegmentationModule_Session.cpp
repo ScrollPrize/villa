@@ -227,7 +227,7 @@ bool SegmentationModule::restoreUndoSnapshot()
             // Queue affected cells for incremental R-tree update
             if (preview && undoBounds && undoBounds->width > 0 && undoBounds->height > 0 && _viewerManager) {
                 if (auto* index = _viewerManager->surfacePatchIndex()) {
-                    index->queueCellRangeUpdate(preview.get(),
+                    index->queueCellRangeUpdate(preview,
                                               undoBounds->y,
                                               undoBounds->y + undoBounds->height,
                                               undoBounds->x,
@@ -270,6 +270,11 @@ bool SegmentationModule::hasActiveSession() const
 QuadSurface* SegmentationModule::activeBaseSurface() const
 {
     return _editManager ? _editManager->baseSurface().get() : nullptr;
+}
+
+std::shared_ptr<QuadSurface> SegmentationModule::activeBaseSurfaceShared() const
+{
+    return _editManager ? _editManager->baseSurface() : nullptr;
 }
 
 void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)

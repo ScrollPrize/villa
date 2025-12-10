@@ -79,6 +79,7 @@ public:
     void setIncludeTifs(bool include);
     void setOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
+    void setPreserveConsoleOutput(bool preserve);
 
 signals:
     void toolStarted(Tool tool, const QString& message);
@@ -161,4 +162,5 @@ private:
     float _objMeshUnits = 1.0f;
     int _objStepSize = 20;
     QString _refineDst;
+    bool _preserveConsoleOutput{false};
 };

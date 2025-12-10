@@ -125,12 +125,13 @@ CVolumeViewer::CVolumeViewer(CSurfaceCollection *col, ViewerManager* manager, QW
     // Set the scene
     fGraphicsView->setScene(fScene);
 
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    // fCenterOnZoomEnabled = settings.value("viewer/center_on_zoom", false).toInt() != 0;
-    // fScrollSpeed = settings.value("viewer/scroll_speed", false).toInt();
-    fSkipImageFormatConv = settings.value("perf/chkSkipImageFormatConvExp", false).toBool();
-    _downscale_override = settings.value("perf/downscale_override", 0).toInt();
-    _useFastInterpolation = settings.value("perf/fast_interpolation", false).toBool();
+    // fCenterOnZoomEnabled = settings.value(viewer::CENTER_ON_ZOOM, viewer::CENTER_ON_ZOOM_DEFAULT).toInt() != 0;
+    // fScrollSpeed = settings.value(viewer::SCROLL_SPEED, viewer::SCROLL_SPEED_DEFAULT).toInt();
+    fSkipImageFormatConv = settings.value(perf::SKIP_IMAGE_FORMAT_CONV, perf::SKIP_IMAGE_FORMAT_CONV_DEFAULT).toBool();
+    _downscale_override = settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt();
+    _useFastInterpolation = settings.value(perf::FAST_INTERPOLATION, perf::FAST_INTERPOLATION_DEFAULT).toBool();
     if (_useFastInterpolation) {
         std::cout << "using nearest neighbor interpolation" << std::endl;
     }
@@ -1319,7 +1320,7 @@ void CVolumeViewer::onVolumeClosing()
 void CVolumeViewer::onSurfaceWillBeDeleted(std::string /*name*/, std::shared_ptr<Surface> surf)
 {
     // Called BEFORE surface deletion - clear all cached references to prevent use-after-free
-    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    auto quad = std::dynamic_pointer_cast<QuadSurface>(surf);
 
     // Clear if this is our current surface
     auto current = _surf_weak.lock();

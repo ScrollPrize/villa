@@ -1071,7 +1071,7 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     // Queue cell updates in SurfacePatchIndex for R-tree sync
     if (_viewerManager && _baseSurface) {
         if (auto* index = _viewerManager->surfacePatchIndex()) {
-            index->queueCellUpdateForVertex(_baseSurface.get(), row, col);
+            index->queueCellUpdateForVertex(_baseSurface, row, col);
         }
     }
     _hasPendingEdits = true;

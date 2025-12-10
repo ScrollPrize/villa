@@ -638,44 +638,33 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Calculate scale factor by measuring actual spacing changes between adjacent points
-        // This directly measures how much the grid has stretched/compressed after projection
-        double sum_scale_ratio = 0;
-        int scale_count = 0;
-
-        // Check horizontal neighbors (along columns)
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols - 1; ++c) {
-                if (!is_valid_vertex(src_points(r, c)) || !is_valid_vertex(src_points(r, c + 1))) continue;
-                if (!is_valid_vertex(new_points(r, c)) || !is_valid_vertex(new_points(r, c + 1))) continue;
-
-                double src_dist = cv::norm(src_points(r, c) - src_points(r, c + 1));
-                double new_dist = cv::norm(new_points(r, c) - new_points(r, c + 1));
-
-                if (src_dist > 0.1) {  // Avoid division by very small numbers
-                    sum_scale_ratio += new_dist / src_dist;
-                    scale_count++;
+        // Calculate scale factor from world extent change, not point spacing.
+        // Point spacing can increase even when extent decreases (due to grid distortion),
+        // but what we care about is the actual world area covered.
+        auto calc_extent = [&](const cv::Mat_<cv::Vec3f>& pts) -> cv::Vec2d {
+            cv::Vec3f min_pos(FLT_MAX, FLT_MAX, FLT_MAX);
+            cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (int r = 0; r < pts.rows; ++r) {
+                for (int c = 0; c < pts.cols; ++c) {
+                    if (is_valid_vertex(pts(r, c))) {
+                        for (int i = 0; i < 3; ++i) {
+                            min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
+                            max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
+                        }
+                    }
                 }
             }
-        }
+            // Return 2D extent (X and Y dimensions)
+            return cv::Vec2d(max_pos[0] - min_pos[0], max_pos[1] - min_pos[1]);
+        };
 
-        // Check vertical neighbors (along rows)
-        for (int r = 0; r < rows - 1; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                if (!is_valid_vertex(src_points(r, c)) || !is_valid_vertex(src_points(r + 1, c))) continue;
-                if (!is_valid_vertex(new_points(r, c)) || !is_valid_vertex(new_points(r + 1, c))) continue;
+        cv::Vec2d src_extent = calc_extent(src_points);
+        cv::Vec2d dst_extent = calc_extent(new_points);
 
-                double src_dist = cv::norm(src_points(r, c) - src_points(r + 1, c));
-                double new_dist = cv::norm(new_points(r, c) - new_points(r + 1, c));
-
-                if (src_dist > 0.1) {  // Avoid division by very small numbers
-                    sum_scale_ratio += new_dist / src_dist;
-                    scale_count++;
-                }
-            }
-        }
-
-        double measured_scale_factor = (scale_count > 0) ? (sum_scale_ratio / scale_count) : 1.0;
+        // Use geometric mean of X and Y scale changes
+        double x_scale = (src_extent[0] > 0.1) ? (dst_extent[0] / src_extent[0]) : 1.0;
+        double y_scale = (src_extent[1] > 0.1) ? (dst_extent[1] / src_extent[1]) : 1.0;
+        double measured_scale_factor = std::sqrt(x_scale * y_scale);
 
         cv::Mat_<cv::Vec3f> row_interp;
         cv::Mat_<cv::Vec3f> col_interp;
@@ -890,9 +879,36 @@ int main(int argc, char *argv[])
         // Apply measured scale factor (clamped to reasonable range)
         const bool neighbor_auto_scale = params.value("neighbor_auto_scale", true);
         double scale_factor = 1.0;
-        if (neighbor_auto_scale && scale_count > 10) {
+        if (neighbor_auto_scale && src_extent[0] > 0.1 && src_extent[1] > 0.1) {
             scale_factor = std::clamp(measured_scale_factor, 0.5, 2.0);
         }
+
+        // Debug: Calculate bounding box of dst_points before any resize
+        auto calc_bbox = [&](const cv::Mat_<cv::Vec3f>& pts) -> std::pair<cv::Vec3f, cv::Vec3f> {
+            cv::Vec3f min_pos(FLT_MAX, FLT_MAX, FLT_MAX);
+            cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (int r = 0; r < pts.rows; ++r) {
+                for (int c = 0; c < pts.cols; ++c) {
+                    if (is_valid_vertex(pts(r, c))) {
+                        for (int i = 0; i < 3; ++i) {
+                            min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
+                            max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
+                        }
+                    }
+                }
+            }
+            return {min_pos, max_pos};
+        };
+
+        auto [src_min, src_max] = calc_bbox(src_points);
+        auto [dst_min, dst_max] = calc_bbox(dst_points);
+        std::cout << "DEBUG gen_neighbor:" << std::endl;
+        std::cout << "  Source grid: " << cols << "x" << rows << ", scale: " << src_surface->scale() << std::endl;
+        std::cout << "  Source extent: [" << src_extent[0] << ", " << src_extent[1] << "]" << std::endl;
+        std::cout << "  Dst extent: [" << dst_extent[0] << ", " << dst_extent[1] << "]" << std::endl;
+        std::cout << "  x_scale: " << x_scale << ", y_scale: " << y_scale << std::endl;
+        std::cout << "  measured_scale_factor: " << measured_scale_factor << " (from extent ratio)" << std::endl;
+        std::cout << "  scale_factor (after clamp): " << scale_factor << std::endl;
 
         // Resize grid if scale factor is significantly different from 1.0
         cv::Mat_<cv::Vec3f> final_points = dst_points;
@@ -900,38 +916,63 @@ int main(int argc, char *argv[])
             int new_cols = static_cast<int>(std::round(cols * scale_factor));
             int new_rows = static_cast<int>(std::round(rows * scale_factor));
 
-            std::cout << "Scaling neighbor grid by " << scale_factor
-                      << " (measured from " << scale_count << " adjacent point pairs)"
-                      << " from " << cols << "x" << rows
+            std::cout << "  Resizing grid from " << cols << "x" << rows
                       << " to " << new_cols << "x" << new_rows << std::endl;
 
-            // Create mask for valid points (for proper interpolation boundary handling)
-            cv::Mat valid_mask(rows, cols, CV_8U);
-            for (int r = 0; r < rows; ++r) {
-                for (int c = 0; c < cols; ++c) {
-                    valid_mask.at<uchar>(r, c) = is_valid_vertex(dst_points(r, c)) ? 255 : 0;
-                }
-            }
+            // Custom bilinear interpolation that properly handles invalid markers
+            // cv::resize doesn't work because it interpolates invalid (-1,-1,-1) markers
+            // as if they were real coordinates, corrupting the result
+            cv::Mat_<cv::Vec3f> resized_points(new_rows, new_cols);
+            resized_points.setTo(invalid_marker);
 
-            // Resize points grid with linear interpolation
-            cv::Mat_<cv::Vec3f> resized_points;
-            cv::resize(dst_points, resized_points, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
+            #pragma omp parallel for schedule(static)
+            for (int new_r = 0; new_r < new_rows; ++new_r) {
+                for (int new_c = 0; new_c < new_cols; ++new_c) {
+                    // Map back to original grid position (floating point)
+                    // Using (new_idx + 0.5) / scale - 0.5 for proper pixel-center alignment
+                    float orig_r = (static_cast<float>(new_r) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
+                    float orig_c = (static_cast<float>(new_c) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
 
-            // Resize validity mask with nearest neighbor to avoid edge blending
-            cv::Mat resized_mask;
-            cv::resize(valid_mask, resized_mask, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_NEAREST);
+                    // Clamp to valid range
+                    orig_r = std::clamp(orig_r, 0.0f, static_cast<float>(rows - 1));
+                    orig_c = std::clamp(orig_c, 0.0f, static_cast<float>(cols - 1));
 
-            // Invalidate points where the original was invalid
-            for (int r = 0; r < new_rows; ++r) {
-                for (int c = 0; c < new_cols; ++c) {
-                    if (resized_mask.at<uchar>(r, c) == 0) {
-                        resized_points(r, c) = invalid_marker;
+                    // Bilinear interpolation indices
+                    int r0 = static_cast<int>(std::floor(orig_r));
+                    int c0 = static_cast<int>(std::floor(orig_c));
+                    int r1 = std::min(r0 + 1, rows - 1);
+                    int c1 = std::min(c0 + 1, cols - 1);
+
+                    // Check all 4 corners are valid - skip if any are invalid
+                    if (!is_valid_vertex(dst_points(r0, c0)) || !is_valid_vertex(dst_points(r0, c1)) ||
+                        !is_valid_vertex(dst_points(r1, c0)) || !is_valid_vertex(dst_points(r1, c1))) {
+                        continue;  // Leave as invalid marker
                     }
+
+                    float t_r = orig_r - static_cast<float>(r0);
+                    float t_c = orig_c - static_cast<float>(c0);
+
+                    cv::Vec3f p00 = dst_points(r0, c0);
+                    cv::Vec3f p01 = dst_points(r0, c1);
+                    cv::Vec3f p10 = dst_points(r1, c0);
+                    cv::Vec3f p11 = dst_points(r1, c1);
+
+                    // Bilinear interpolation of world coordinates
+                    cv::Vec3f top = p00 * (1.0f - t_c) + p01 * t_c;
+                    cv::Vec3f bot = p10 * (1.0f - t_c) + p11 * t_c;
+                    resized_points(new_r, new_c) = top * (1.0f - t_r) + bot * t_r;
                 }
             }
 
             final_points = resized_points;
+
+            // Debug: Show bbox after resize
+            auto [final_min, final_max] = calc_bbox(final_points);
+            std::cout << "  Final bbox (after resize): [" << final_min << "] to [" << final_max << "]" << std::endl;
         }
+
+        // Debug: Final output info
+        std::cout << "  Output grid: " << final_points.cols << "x" << final_points.rows << std::endl;
 
         // Prepare output surface and save
         std::unique_ptr<QuadSurface> out_surf(new QuadSurface(final_points, src_surface->scale()));

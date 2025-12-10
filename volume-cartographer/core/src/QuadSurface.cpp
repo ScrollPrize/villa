@@ -611,8 +611,11 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         bounds.high = tgt + cv::Vec3f(searchRadius, searchRadius, searchRadius);
 
         std::vector<std::pair<int, int>> candidateCells;
-        surfaceIndex->forEachTriangle(bounds, this, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            candidateCells.emplace_back(tri.j, tri.i);
+        surfaceIndex->forEachTriangle(bounds, SurfacePatchIndex::SurfacePtr{nullptr}, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+            // Filter to only triangles from this surface
+            if (tri.surface.get() == this) {
+                candidateCells.emplace_back(tri.j, tri.i);
+            }
         });
 
         // Search from each candidate cell
@@ -1534,60 +1537,53 @@ float QuadSurface::computeZOrientationAngle() const
         return 0.0f;
     }
 
-    // Find Z range for normalization
-    float minZ = std::numeric_limits<float>::max();
-    float maxZ = std::numeric_limits<float>::lowest();
+    // Find the row with the highest average Z value
+    double maxAvgZ = std::numeric_limits<double>::lowest();
+    int bestRow = -1;
 
     for (int row = 0; row < _points->rows; ++row) {
+        double sumZ = 0.0;
+        int count = 0;
         for (int col = 0; col < _points->cols; ++col) {
             const cv::Vec3f& pt = (*_points)(row, col);
             if (pt[0] != -1.f) {
-                float z = pt[2];
-                minZ = std::min(minZ, z);
-                maxZ = std::max(maxZ, z);
+                sumZ += pt[2];
+                count++;
+            }
+        }
+        if (count > 0) {
+            double avgZ = sumZ / count;
+            if (avgZ > maxAvgZ) {
+                maxAvgZ = avgZ;
+                bestRow = row;
             }
         }
     }
 
-    if (maxZ <= minZ) {
-        // No valid Z variation - no rotation needed
+    if (bestRow < 0) {
         return 0.0f;
     }
 
-    float zRange = maxZ - minZ;
-
-    // Compute Z-weighted centroid
-    // Weight = ((z - minZ) / zRange)^2, so higher Z = higher weight
-    double sumRow = 0.0, sumCol = 0.0, sumWeight = 0.0;
-
-    for (int row = 0; row < _points->rows; ++row) {
-        for (int col = 0; col < _points->cols; ++col) {
-            const cv::Vec3f& pt = (*_points)(row, col);
-            if (pt[0] != -1.f) {
-                float z = pt[2];
-                double weight = static_cast<double>(z - minZ) / zRange;
-                weight = weight * weight;  // Square to emphasize high-Z regions
-
-                sumRow += row * weight;
-                sumCol += col * weight;
-                sumWeight += weight;
-            }
+    // Compute column centroid of valid points in the highest-Z row
+    double sumCol = 0.0;
+    int colCount = 0;
+    for (int col = 0; col < _points->cols; ++col) {
+        const cv::Vec3f& pt = (*_points)(bestRow, col);
+        if (pt[0] != -1.f) {
+            sumCol += col;
+            colCount++;
         }
     }
 
-    if (sumWeight < 1e-10) {
-        return 0.0f;
-    }
-
-    // Z-weighted centroid position
-    double centroidRow = sumRow / sumWeight;
-    double centroidCol = sumCol / sumWeight;
+    // Use the center of the highest-Z row as the target point
+    double centroidRow = static_cast<double>(bestRow);
+    double centroidCol = sumCol / colCount;
 
     // Grid center
     double centerRow = (_points->rows - 1) / 2.0;
     double centerCol = (_points->cols - 1) / 2.0;
 
-    // Vector from center to Z-centroid
+    // Vector from center to highest-Z row centroid
     double dRow = centroidRow - centerRow;
     double dCol = centroidCol - centerCol;
 
@@ -1603,7 +1599,7 @@ float QuadSurface::computeZOrientationAngle() const
     double angleRad = std::atan2(dCol, dRow);
     double angleDeg = angleRad * 180.0 / M_PI;
 
-    // We want the Z-centroid to end up at row 0 (top)
+    // We want the highest-Z row to end up at row 0 (top)
     // "Up" in image coordinates is -row direction, which is 180 degrees
     // So we need to rotate by: 180 - angleDeg
     float rotationDeg = static_cast<float>(angleDeg + 180.0);

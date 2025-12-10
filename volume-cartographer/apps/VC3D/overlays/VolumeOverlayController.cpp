@@ -483,27 +483,28 @@ void VolumeOverlayController::loadState()
         return;
     }
 
+    using namespace vc3d::settings;
     settings.beginGroup(QString::fromLatin1(kOverlaySettingsGroup));
     settings.beginGroup(groupKey);
 
-    const QString storedVolumeId = settings.value(QStringLiteral("volume_id")).toString();
+    const QString storedVolumeId = settings.value(volume_overlay::VOLUME_ID).toString();
     if (!storedVolumeId.isEmpty()) {
         _overlayVolumeId = storedVolumeId.toStdString();
     }
 
-    _overlayOpacity = std::clamp(settings.value(QStringLiteral("opacity"), _overlayOpacity).toFloat(), 0.0f, 1.0f);
+    _overlayOpacity = std::clamp(settings.value(volume_overlay::OPACITY, _overlayOpacity).toFloat(), 0.0f, 1.0f);
     _overlayOpacityBeforeToggle = _overlayOpacity;
 
-    const QVariant storedWindowLow = settings.value(QStringLiteral("window_low"));
+    const QVariant storedWindowLow = settings.value(volume_overlay::WINDOW_LOW);
     if (storedWindowLow.isValid()) {
         _overlayWindowLow = std::clamp(storedWindowLow.toFloat(), 0.0f, 255.0f);
     } else {
         // Fall back to legacy threshold if present.
-        const float legacyThreshold = std::max(0.0f, settings.value(QStringLiteral("threshold"), _overlayWindowLow).toFloat());
+        const float legacyThreshold = std::max(0.0f, settings.value(volume_overlay::THRESHOLD, _overlayWindowLow).toFloat());
         _overlayWindowLow = std::clamp(legacyThreshold, 0.0f, 255.0f);
     }
 
-    const QVariant storedWindowHigh = settings.value(QStringLiteral("window_high"));
+    const QVariant storedWindowHigh = settings.value(volume_overlay::WINDOW_HIGH);
     if (storedWindowHigh.isValid()) {
         _overlayWindowHigh = std::clamp(storedWindowHigh.toFloat(), 0.0f, 255.0f);
     } else {
@@ -514,7 +515,7 @@ void VolumeOverlayController::loadState()
         _overlayWindowHigh = std::min(255.0f, _overlayWindowLow + 1.0f);
     }
 
-    const QString storedColormap = settings.value(QStringLiteral("colormap")).toString();
+    const QString storedColormap = settings.value(volume_overlay::COLORMAP).toString();
     if (!storedColormap.isEmpty()) {
         _overlayColormapName = storedColormap.toStdString();
     }
@@ -534,16 +535,17 @@ void VolumeOverlayController::saveState() const
         return;
     }
 
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(QString::fromLatin1(kOverlaySettingsGroup));
     settings.beginGroup(groupKey);
-    settings.setValue(QStringLiteral("path"), _volpkgPath);
-    settings.setValue(QStringLiteral("volume_id"), QString::fromStdString(_overlayVolumeId));
-    settings.setValue(QStringLiteral("opacity"), _overlayOpacity);
-    settings.setValue(QStringLiteral("window_low"), _overlayWindowLow);
-    settings.setValue(QStringLiteral("window_high"), _overlayWindowHigh);
-    settings.setValue(QStringLiteral("threshold"), _overlayWindowLow); // legacy compatibility
-    settings.setValue(QStringLiteral("colormap"), QString::fromStdString(_overlayColormapName));
+    settings.setValue(volume_overlay::PATH, _volpkgPath);
+    settings.setValue(volume_overlay::VOLUME_ID, QString::fromStdString(_overlayVolumeId));
+    settings.setValue(volume_overlay::OPACITY, _overlayOpacity);
+    settings.setValue(volume_overlay::WINDOW_LOW, _overlayWindowLow);
+    settings.setValue(volume_overlay::WINDOW_HIGH, _overlayWindowHigh);
+    settings.setValue(volume_overlay::THRESHOLD, _overlayWindowLow); // legacy compatibility
+    settings.setValue(volume_overlay::COLORMAP, QString::fromStdString(_overlayColormapName));
     settings.endGroup();
     settings.endGroup();
 }

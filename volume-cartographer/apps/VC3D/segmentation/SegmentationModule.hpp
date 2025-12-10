@@ -104,6 +104,7 @@ public:
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
+    [[nodiscard]] std::shared_ptr<QuadSurface> activeBaseSurfaceShared() const;
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();

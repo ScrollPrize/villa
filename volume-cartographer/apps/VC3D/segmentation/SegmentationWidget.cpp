@@ -1316,29 +1316,30 @@ void SegmentationWidget::syncUiState()
 
 void SegmentationWidget::restoreSettings()
 {
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
 
     _restoringSettings = true;
 
-    if (settings.contains(QStringLiteral("drag_radius_steps"))) {
-        _dragRadiusSteps = settings.value(QStringLiteral("drag_radius_steps"), _dragRadiusSteps).toFloat();
+    if (settings.contains(segmentation::DRAG_RADIUS_STEPS)) {
+        _dragRadiusSteps = settings.value(segmentation::DRAG_RADIUS_STEPS, _dragRadiusSteps).toFloat();
     } else {
-        _dragRadiusSteps = settings.value(QStringLiteral("radius_steps"), _dragRadiusSteps).toFloat();
+        _dragRadiusSteps = settings.value(segmentation::RADIUS_STEPS, _dragRadiusSteps).toFloat();
     }
 
-    if (settings.contains(QStringLiteral("drag_sigma_steps"))) {
-        _dragSigmaSteps = settings.value(QStringLiteral("drag_sigma_steps"), _dragSigmaSteps).toFloat();
+    if (settings.contains(segmentation::DRAG_SIGMA_STEPS)) {
+        _dragSigmaSteps = settings.value(segmentation::DRAG_SIGMA_STEPS, _dragSigmaSteps).toFloat();
     } else {
-        _dragSigmaSteps = settings.value(QStringLiteral("sigma_steps"), _dragSigmaSteps).toFloat();
+        _dragSigmaSteps = settings.value(segmentation::SIGMA_STEPS, _dragSigmaSteps).toFloat();
     }
 
-    _lineRadiusSteps = settings.value(QStringLiteral("line_radius_steps"), _dragRadiusSteps).toFloat();
-    _lineSigmaSteps = settings.value(QStringLiteral("line_sigma_steps"), _dragSigmaSteps).toFloat();
+    _lineRadiusSteps = settings.value(segmentation::LINE_RADIUS_STEPS, _dragRadiusSteps).toFloat();
+    _lineSigmaSteps = settings.value(segmentation::LINE_SIGMA_STEPS, _dragSigmaSteps).toFloat();
 
-    _pushPullRadiusSteps = settings.value(QStringLiteral("push_pull_radius_steps"), _dragRadiusSteps).toFloat();
-    _pushPullSigmaSteps = settings.value(QStringLiteral("push_pull_sigma_steps"), _dragSigmaSteps).toFloat();
-    _showHoverMarker = settings.value(QStringLiteral("show_hover_marker"), _showHoverMarker).toBool();
+    _pushPullRadiusSteps = settings.value(segmentation::PUSH_PULL_RADIUS_STEPS, _dragRadiusSteps).toFloat();
+    _pushPullSigmaSteps = settings.value(segmentation::PUSH_PULL_SIGMA_STEPS, _dragSigmaSteps).toFloat();
+    _showHoverMarker = settings.value(segmentation::SHOW_HOVER_MARKER, _showHoverMarker).toBool();
 
     _dragRadiusSteps = std::clamp(_dragRadiusSteps, 0.25f, 128.0f);
     _dragSigmaSteps = std::clamp(_dragSigmaSteps, 0.05f, 64.0f);
@@ -1347,27 +1348,27 @@ void SegmentationWidget::restoreSettings()
     _pushPullRadiusSteps = std::clamp(_pushPullRadiusSteps, 0.25f, 128.0f);
     _pushPullSigmaSteps = std::clamp(_pushPullSigmaSteps, 0.05f, 64.0f);
 
-    _pushPullStep = settings.value(QStringLiteral("push_pull_step"), _pushPullStep).toFloat();
+    _pushPullStep = settings.value(segmentation::PUSH_PULL_STEP, _pushPullStep).toFloat();
     _pushPullStep = std::clamp(_pushPullStep, 0.05f, 10.0f);
 
     AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
-    storedAlpha.start = settings.value(QStringLiteral("push_pull_alpha_start"), storedAlpha.start).toFloat();
-    storedAlpha.stop = settings.value(QStringLiteral("push_pull_alpha_stop"), storedAlpha.stop).toFloat();
-    storedAlpha.step = settings.value(QStringLiteral("push_pull_alpha_step"), storedAlpha.step).toFloat();
-    storedAlpha.low = settings.value(QStringLiteral("push_pull_alpha_low"), storedAlpha.low).toFloat();
-    storedAlpha.high = settings.value(QStringLiteral("push_pull_alpha_high"), storedAlpha.high).toFloat();
-    storedAlpha.borderOffset = settings.value(QStringLiteral("push_pull_alpha_border"), storedAlpha.borderOffset).toFloat();
-    storedAlpha.blurRadius = settings.value(QStringLiteral("push_pull_alpha_radius"), storedAlpha.blurRadius).toInt();
-    storedAlpha.perVertexLimit = settings.value(QStringLiteral("push_pull_alpha_limit"), storedAlpha.perVertexLimit).toFloat();
-    storedAlpha.perVertex = settings.value(QStringLiteral("push_pull_alpha_per_vertex"), storedAlpha.perVertex).toBool();
+    storedAlpha.start = settings.value(segmentation::PUSH_PULL_ALPHA_START, storedAlpha.start).toFloat();
+    storedAlpha.stop = settings.value(segmentation::PUSH_PULL_ALPHA_STOP, storedAlpha.stop).toFloat();
+    storedAlpha.step = settings.value(segmentation::PUSH_PULL_ALPHA_STEP, storedAlpha.step).toFloat();
+    storedAlpha.low = settings.value(segmentation::PUSH_PULL_ALPHA_LOW, storedAlpha.low).toFloat();
+    storedAlpha.high = settings.value(segmentation::PUSH_PULL_ALPHA_HIGH, storedAlpha.high).toFloat();
+    storedAlpha.borderOffset = settings.value(segmentation::PUSH_PULL_ALPHA_BORDER, storedAlpha.borderOffset).toFloat();
+    storedAlpha.blurRadius = settings.value(segmentation::PUSH_PULL_ALPHA_RADIUS, storedAlpha.blurRadius).toInt();
+    storedAlpha.perVertexLimit = settings.value(segmentation::PUSH_PULL_ALPHA_LIMIT, storedAlpha.perVertexLimit).toFloat();
+    storedAlpha.perVertex = settings.value(segmentation::PUSH_PULL_ALPHA_PER_VERTEX, storedAlpha.perVertex).toBool();
     applyAlphaPushPullConfig(storedAlpha, false, false);
-    _smoothStrength = settings.value(QStringLiteral("smooth_strength"), _smoothStrength).toFloat();
-    _smoothIterations = settings.value(QStringLiteral("smooth_iterations"), _smoothIterations).toInt();
+    _smoothStrength = settings.value(segmentation::SMOOTH_STRENGTH, _smoothStrength).toFloat();
+    _smoothIterations = settings.value(segmentation::SMOOTH_ITERATIONS, _smoothIterations).toInt();
     _smoothStrength = std::clamp(_smoothStrength, 0.0f, 1.0f);
     _smoothIterations = std::clamp(_smoothIterations, 1, 25);
     _growthMethod = segmentationGrowthMethodFromInt(
-        settings.value(QStringLiteral("growth_method"), static_cast<int>(_growthMethod)).toInt());
-    int storedGrowthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
+        settings.value(segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod)).toInt());
+    int storedGrowthSteps = settings.value(segmentation::GROWTH_STEPS, _growthSteps).toInt();
     storedGrowthSteps = std::clamp(storedGrowthSteps, 0, 1024);
     _tracerGrowthSteps = settings
                              .value(QStringLiteral("growth_steps_tracer"),
@@ -1376,9 +1377,9 @@ void SegmentationWidget::restoreSettings()
     _tracerGrowthSteps = std::clamp(_tracerGrowthSteps, 1, 1024);
     applyGrowthSteps(storedGrowthSteps, false, false);
     _growthDirectionMask = normalizeGrowthDirectionMask(
-        settings.value(QStringLiteral("growth_direction_mask"), kGrowDirAllMask).toInt());
+        settings.value(segmentation::GROWTH_DIRECTION_MASK, kGrowDirAllMask).toInt());
 
-    QVariantList serialized = settings.value(QStringLiteral("direction_fields"), QVariantList{}).toList();
+    QVariantList serialized = settings.value(segmentation::DIRECTION_FIELDS, QVariantList{}).toList();
     _directionFields.clear();
     for (const QVariant& entry : serialized) {
         const QVariantMap map = entry.toMap();
@@ -1393,37 +1394,37 @@ void SegmentationWidget::restoreSettings()
         }
     }
 
-    _correctionsEnabled = settings.value(QStringLiteral("corrections_enabled"), false).toBool();
-    _correctionsZRangeEnabled = settings.value(QStringLiteral("corrections_z_range_enabled"), false).toBool();
-    _correctionsZMin = settings.value(QStringLiteral("corrections_z_min"), 0).toInt();
-   _correctionsZMax = settings.value(QStringLiteral("corrections_z_max"), _correctionsZMin).toInt();
+    _correctionsEnabled = settings.value(segmentation::CORRECTIONS_ENABLED, segmentation::CORRECTIONS_ENABLED_DEFAULT).toBool();
+    _correctionsZRangeEnabled = settings.value(segmentation::CORRECTIONS_Z_RANGE_ENABLED, segmentation::CORRECTIONS_Z_RANGE_ENABLED_DEFAULT).toBool();
+    _correctionsZMin = settings.value(segmentation::CORRECTIONS_Z_MIN, segmentation::CORRECTIONS_Z_MIN_DEFAULT).toInt();
+   _correctionsZMax = settings.value(segmentation::CORRECTIONS_Z_MAX, _correctionsZMin).toInt();
     if (_correctionsZMax < _correctionsZMin) {
         _correctionsZMax = _correctionsZMin;
     }
 
-    _customParamsText = settings.value(QStringLiteral("custom_params_text"), QString()).toString();
+    _customParamsText = settings.value(segmentation::CUSTOM_PARAMS_TEXT, QString()).toString();
     validateCustomParamsText();
 
-    _approvalBrushRadius = settings.value(QStringLiteral("approval_brush_radius"), _approvalBrushRadius).toFloat();
+    _approvalBrushRadius = settings.value(segmentation::APPROVAL_BRUSH_RADIUS, _approvalBrushRadius).toFloat();
     _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
-    _approvalBrushDepth = settings.value(QStringLiteral("approval_brush_depth"), _approvalBrushDepth).toFloat();
+    _approvalBrushDepth = settings.value(segmentation::APPROVAL_BRUSH_DEPTH, _approvalBrushDepth).toFloat();
     _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
     // Don't restore approval mask show/edit states - user must explicitly enable each session
 
-    _approvalMaskOpacity = settings.value(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity).toInt();
+    _approvalMaskOpacity = settings.value(segmentation::APPROVAL_MASK_OPACITY, _approvalMaskOpacity).toInt();
     _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
-    const QString colorName = settings.value(QStringLiteral("approval_brush_color"), _approvalBrushColor.name()).toString();
+    const QString colorName = settings.value(segmentation::APPROVAL_BRUSH_COLOR, _approvalBrushColor.name()).toString();
     if (QColor::isValidColorName(colorName)) {
         _approvalBrushColor = QColor::fromString(colorName);
     }
-    _showApprovalMask = settings.value(QStringLiteral("show_approval_mask"), _showApprovalMask).toBool();
+    _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
     // Don't restore edit states - user must explicitly enable editing each session
 
-    const bool editingExpanded = settings.value(QStringLiteral("group_editing_expanded"), true).toBool();
-    const bool dragExpanded = settings.value(QStringLiteral("group_drag_expanded"), true).toBool();
-    const bool lineExpanded = settings.value(QStringLiteral("group_line_expanded"), true).toBool();
-    const bool pushPullExpanded = settings.value(QStringLiteral("group_push_pull_expanded"), true).toBool();
-    const bool directionExpanded = settings.value(QStringLiteral("group_direction_field_expanded"), true).toBool();
+    const bool editingExpanded = settings.value(segmentation::GROUP_EDITING_EXPANDED, segmentation::GROUP_EDITING_EXPANDED_DEFAULT).toBool();
+    const bool dragExpanded = settings.value(segmentation::GROUP_DRAG_EXPANDED, segmentation::GROUP_DRAG_EXPANDED_DEFAULT).toBool();
+    const bool lineExpanded = settings.value(segmentation::GROUP_LINE_EXPANDED, segmentation::GROUP_LINE_EXPANDED_DEFAULT).toBool();
+    const bool pushPullExpanded = settings.value(segmentation::GROUP_PUSH_PULL_EXPANDED, segmentation::GROUP_PUSH_PULL_EXPANDED_DEFAULT).toBool();
+    const bool directionExpanded = settings.value(segmentation::GROUP_DIRECTION_FIELD_EXPANDED, segmentation::GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT).toBool();
 
     if (_groupEditing) {
         _groupEditing->setExpanded(editingExpanded);

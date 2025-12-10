@@ -1232,7 +1232,7 @@ void SurfacePanelController::onTagCheckboxToggled()
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const std::string username = settings.value("viewer/username", "").toString().toStdString();
+    const std::string username = settings.value(vc3d::settings::viewer::USERNAME, vc3d::settings::viewer::USERNAME_DEFAULT).toString().toStdString();
 
     const auto selectedItems = _ui.treeWidget->selectedItems();
     for (auto* item : selectedItems) {

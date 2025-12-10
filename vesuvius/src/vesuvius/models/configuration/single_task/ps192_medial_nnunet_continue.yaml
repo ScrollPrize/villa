@@ -1,0 +1,38 @@
+# Configuration for continuing training of nnUNet model with MedialSurfaceRecall loss
+# This config is designed to match the converted nnUNet checkpoint from Dataset108_kaggle
+
+tr_config:
+  patch_size: [192, 192, 192]
+  batch_size: 2
+  initial_lr: 0.01
+  weight_decay: 3e-5
+  scheduler: poly
+  optimizer: sgd
+
+model_config:
+  # Architecture matches nnUNetResEncUNetXLPlans 3d_fullres
+  features_per_stage: [32, 64, 128, 256, 320, 320]
+  n_stages: 6
+  n_blocks_per_stage: [1, 3, 4, 6, 6, 6]
+  n_conv_per_stage_decoder: [1, 1, 1, 1, 1]
+  kernel_sizes: [[3,3,3], [3,3,3], [3,3,3], [3,3,3], [3,3,3], [3,3,3]]
+  strides: [[1,1,1], [2,2,2], [2,2,2], [2,2,2], [2,2,2], [2,2,2]]
+  separate_decoders: true
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  skip_patch_validation: true
+  normalization_scheme: "zscore"
+  ignore_label: 2
+  targets:
+    segmentation:
+      out_channels: 2
+      activation: "none"
+      ignore_index: 2
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
+          weight_dice: 1.0
+          weight_ce: 1.0
+          weight_srec: 1.0

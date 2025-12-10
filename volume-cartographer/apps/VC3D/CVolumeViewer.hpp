@@ -268,12 +268,13 @@ protected:
     std::vector<QGraphicsItem*> slice_vis_items; 
 
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
-    std::unordered_map<std::string, QuadSurface*> _cachedIntersectSurfaces;
+    std::unordered_map<std::string, SurfacePatchIndex::SurfacePtr> _cachedIntersectSurfaces;
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
     std::unordered_map<std::string, std::vector<IntersectionLine>> _cachedIntersectionLines;
+    float _cachedIntersectionScale = 0.0f;  // Scale used when caching intersection lines
     // Reusable buffers to avoid per-frame allocations
     std::vector<SurfacePatchIndex::TriangleCandidate> _triangleCandidates;
-    std::unordered_map<QuadSurface*, std::vector<size_t>> _trianglesBySurface;
+    std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<size_t>> _trianglesBySurface;
     bool _autoRefocusOnOffscreenIntersections = true;
     bool _hasLastPlaneOrigin = false;
     cv::Vec3f _lastPlaneOrigin = {0.0f, 0.0f, 0.0f};

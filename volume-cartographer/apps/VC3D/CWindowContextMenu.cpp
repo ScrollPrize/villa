@@ -552,8 +552,8 @@ static QString findFlatboiExecutable()
 
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        const QString iniPath = settings.value("tools/flatboi_path",
-                                               settings.value("tools/flatboi")).toString().trimmed();
+        const QString iniPath = settings.value(vc3d::settings::tools::FLATBOI_PATH,
+                                               settings.value(vc3d::settings::tools::FLATBOI)).toString().trimmed();
         if (!iniPath.isEmpty()) {
             QFileInfo fi(iniPath);
             if (fi.exists() && fi.isFile() && fi.isExecutable())
@@ -1507,8 +1507,10 @@ bool CWindow::initializeCommandLineRunner()
         _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
 
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        int parallelProcesses = settings.value("perf/parallel_processes", 8).toInt();
-        int iterationCount = settings.value("perf/iteration_count", 1000).toInt();
+        int parallelProcesses = settings.value(vc3d::settings::perf::PARALLEL_PROCESSES,
+                                               vc3d::settings::perf::PARALLEL_PROCESSES_DEFAULT).toInt();
+        int iterationCount = settings.value(vc3d::settings::perf::ITERATION_COUNT,
+                                            vc3d::settings::perf::ITERATION_COUNT_DEFAULT).toInt();
 
         _cmdRunner->setParallelProcesses(parallelProcesses);
         _cmdRunner->setIterationCount(iterationCount);
@@ -1665,6 +1667,7 @@ void CWindow::launchNeighborCopySecondPass()
         if (!_neighborCopyJob || _neighborCopyJob->stage != NeighborCopyJob::Stage::SecondPass) {
             return;
         }
+        _cmdRunner->setPreserveConsoleOutput(true);
         if (!startNeighborCopyPass(_neighborCopyJob->pass2JsonPath,
                                    resumeSurface,
                                    QStringLiteral("local"),
@@ -1722,7 +1725,8 @@ void CWindow::onAWSUpload(const std::string& segmentId)
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString defaultProfile = settings.value("aws/default_profile", "").toString();
+    QString defaultProfile = settings.value(vc3d::settings::aws::DEFAULT_PROFILE,
+                                            vc3d::settings::aws::DEFAULT_PROFILE_DEFAULT).toString();
 
     QString awsProfile = QInputDialog::getText(
         this, tr("AWS Profile"),
@@ -1735,7 +1739,7 @@ void CWindow::onAWSUpload(const std::string& segmentId)
         return;
     }
 
-    if (!awsProfile.isEmpty()) settings.setValue("aws/default_profile", awsProfile);
+    if (!awsProfile.isEmpty()) settings.setValue(vc3d::settings::aws::DEFAULT_PROFILE, awsProfile);
 
     QStringList uploadedFiles;
     QStringList failedFiles;
@@ -1888,7 +1892,8 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
 
     // Determine export root directory: <volpkg>/export (not inside paths)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const QString configuredRoot = settings.value("export/dir", "").toString().trimmed();
+    const QString configuredRoot = settings.value(vc3d::settings::export_::DIR,
+                                                   vc3d::settings::export_::DIR_DEFAULT).toString().trimmed();
     const QString segDir  = QString::fromStdString(surf->path.string());
     const QString segName = QString::fromStdString(segmentId);
 

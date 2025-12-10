@@ -28,6 +28,8 @@
 #include <limits>
 #include <memory>
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 #include <cmath>
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
@@ -2496,6 +2498,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     delete timer;
 
     QuadSurface* surf = create_surface_from_state();
+
     const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
     const double voxel_size_d = static_cast<double>(voxelsize);
     const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;

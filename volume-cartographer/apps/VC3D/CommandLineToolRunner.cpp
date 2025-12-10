@@ -241,7 +241,12 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    _consoleOutput->clear();
+    if (_preserveConsoleOutput) {
+        _consoleOutput->appendOutput(tr("\n========== Next Pass ==========\n\n"));
+        _preserveConsoleOutput = false;
+    } else {
+        _consoleOutput->clear();
+    }
 
     QString toolCmd = toolName(tool);
     QFileInfo toolInfo(toolCmd);
@@ -444,6 +449,11 @@ void CommandLineToolRunner::hideConsoleOutput()
 void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
 {
     _autoShowConsole = autoShow;
+}
+
+void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
+{
+    _preserveConsoleOutput = preserve;
 }
 
 void CommandLineToolRunner::setParallelProcesses(int count)

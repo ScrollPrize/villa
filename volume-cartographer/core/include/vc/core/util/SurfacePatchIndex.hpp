@@ -16,14 +16,16 @@ struct Rect3D;
 
 class SurfacePatchIndex {
 public:
+    using SurfacePtr = std::shared_ptr<QuadSurface>;
+
     struct LookupResult {
-        QuadSurface* surface = nullptr;
+        SurfacePtr surface;
         cv::Vec3f ptr = {0, 0, 0};
         float distance = -1.0f;
     };
 
     struct TriangleCandidate {
-        QuadSurface* surface = nullptr;
+        SurfacePtr surface;
         int i = 0;
         int j = 0;
         int triangleIndex = 0; // 0 = (p00,p10,p01), 1 = (p10,p11,p01)
@@ -32,7 +34,7 @@ public:
     };
 
     struct TriangleSegment {
-        QuadSurface* surface = nullptr;
+        SurfacePtr surface;
         std::array<cv::Vec3f, 2> world{};
         std::array<cv::Vec3f, 2> surfaceParams{};
     };
@@ -46,67 +48,67 @@ public:
     SurfacePatchIndex(const SurfacePatchIndex&) = delete;
     SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
 
-    void rebuild(const std::vector<QuadSurface*>& surfaces, float bboxPadding = 0.0f);
+    void rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding = 0.0f);
     void clear();
     bool empty() const;
 
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,
-                                       QuadSurface* targetSurface = nullptr) const;
+                                       const SurfacePtr& targetSurface = nullptr) const;
 
     void queryTriangles(const Rect3D& bounds,
-                        QuadSurface* targetSurface,
+                        const SurfacePtr& targetSurface,
                         std::vector<TriangleCandidate>& outCandidates) const;
 
     void queryTriangles(const Rect3D& bounds,
-                        const std::unordered_set<QuadSurface*>& targetSurfaces,
+                        const std::unordered_set<SurfacePtr>& targetSurfaces,
                         std::vector<TriangleCandidate>& outCandidates) const;
 
     void forEachTriangle(const Rect3D& bounds,
-                         QuadSurface* targetSurface,
+                         const SurfacePtr& targetSurface,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     void forEachTriangle(const Rect3D& bounds,
-                         const std::unordered_set<QuadSurface*>& targetSurfaces,
+                         const std::unordered_set<SurfacePtr>& targetSurfaces,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
                                                               const PlaneSurface& plane,
                                                               float epsilon = 1e-4f);
 
-    bool updateSurface(QuadSurface* surface);
-    bool updateSurfaceRegion(QuadSurface* surface,
+    bool updateSurface(const SurfacePtr& surface);
+    bool updateSurfaceRegion(const SurfacePtr& surface,
                              int rowStart,
                              int rowEnd,
                              int colStart,
                              int colEnd);
-    bool removeSurface(QuadSurface* surface);
+    bool removeSurface(const SurfacePtr& surface);
     bool setSamplingStride(int stride);
     int samplingStride() const;
 
     // Pending update tracking for incremental R-tree updates
     // Queue the 4 cells surrounding a vertex for update
-    void queueCellUpdateForVertex(QuadSurface* surface, int vertexRow, int vertexCol);
+    void queueCellUpdateForVertex(const SurfacePtr& surface, int vertexRow, int vertexCol);
     // Queue a range of cells for update
-    void queueCellRangeUpdate(QuadSurface* surface,
+    void queueCellRangeUpdate(const SurfacePtr& surface,
                               int rowStart,
                               int rowEnd,
                               int colStart,
                               int colEnd);
     // Apply all pending cell updates to R-tree (nullptr = all surfaces)
-    bool flushPendingUpdates(QuadSurface* surface = nullptr);
+    bool flushPendingUpdates(const SurfacePtr& surface = nullptr);
     // Check if surface has pending cell updates
-    bool hasPendingUpdates(QuadSurface* surface = nullptr) const;
+    bool hasPendingUpdates(const SurfacePtr& surface = nullptr) const;
 
     // Generation tracking for undo/redo detection
-    void incrementGeneration(QuadSurface* surface);
-    uint64_t generation(QuadSurface* surface) const;
-    void setGeneration(QuadSurface* surface, uint64_t gen);
+    void incrementGeneration(const SurfacePtr& surface);
+    uint64_t generation(const SurfacePtr& surface) const;
+    void setGeneration(const SurfacePtr& surface, uint64_t gen);
 
 private:
     void forEachTriangleImpl(const Rect3D& bounds,
-                             QuadSurface* targetSurface,
-                             const std::unordered_set<QuadSurface*>* filterSurfaces,
+                             const SurfacePtr& targetSurface,
+                             const std::unordered_set<SurfacePtr>* filterSurfaces,
                              const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     struct Impl;
