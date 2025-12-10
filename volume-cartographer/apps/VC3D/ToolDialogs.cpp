@@ -1051,31 +1051,89 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     form->addRow(tr("Output path:"), outPick);
 
     auto pass2Group = new QGroupBox(tr("Second pass resume optimization"), this);
-    auto pass2Form = new QFormLayout(pass2Group);
-    pass2Form->setSpacing(6);
+    auto pass2Layout = new QVBoxLayout(pass2Group);
+    pass2Layout->setSpacing(6);
+
+    // Mode selector
+    auto modeForm = new QFormLayout();
+    cmbResumeOptMode_ = new QComboBox(this);
+    cmbResumeOptMode_->addItem(tr("Local (many small solves)"), QStringLiteral("local"));
+    cmbResumeOptMode_->addItem(tr("Global (one large solve, uses CUDA if available)"), QStringLiteral("global"));
+    cmbResumeOptMode_->setToolTip(tr("Local: optimizes many small overlapping patches. Global: single large optimization using GPU acceleration."));
+    modeForm->addRow(tr("Optimization mode:"), cmbResumeOptMode_);
+    pass2Layout->addLayout(modeForm);
+
+    // Local options widget
+    localOptionsWidget_ = new QWidget(this);
+    auto localForm = new QFormLayout(localOptionsWidget_);
+    localForm->setContentsMargins(0, 0, 0, 0);
+    localForm->setSpacing(6);
 
     spResumeStep_ = new QSpinBox(this);
     spResumeStep_->setRange(1, 512);
     spResumeStep_->setValue(20);
     spResumeStep_->setToolTip(tr("Stride applied when selecting cells for resume-local optimization during pass 2."));
-    pass2Form->addRow(tr("Local step:"), spResumeStep_);
+    localForm->addRow(tr("Local step:"), spResumeStep_);
 
     spResumeRadius_ = new QSpinBox(this);
     spResumeRadius_->setRange(1, 2048);
     spResumeRadius_->setValue(spResumeStep_->value() * 2);
     spResumeRadius_->setToolTip(tr("Radius (in cells) optimized around each resume-local seed during pass 2."));
-    pass2Form->addRow(tr("Local radius:"), spResumeRadius_);
+    localForm->addRow(tr("Local radius:"), spResumeRadius_);
 
     spResumeMaxIters_ = new QSpinBox(this);
     spResumeMaxIters_->setRange(1, 10000);
     spResumeMaxIters_->setSingleStep(50);
     spResumeMaxIters_->setValue(1000);
     spResumeMaxIters_->setToolTip(tr("Maximum Ceres iterations per resume-local solve during pass 2."));
-    pass2Form->addRow(tr("Max iterations:"), spResumeMaxIters_);
+    localForm->addRow(tr("Max iterations:"), spResumeMaxIters_);
 
     chkResumeDenseQr_ = new QCheckBox(tr("Use dense QR solver"), this);
     chkResumeDenseQr_->setToolTip(tr("Switch resume-local solves in pass 2 to the dense QR linear solver."));
-    pass2Form->addRow(tr("Dense QR:"), chkResumeDenseQr_);
+    localForm->addRow(tr("Dense QR:"), chkResumeDenseQr_);
+
+    chkResumeLocalUseCuda_ = new QCheckBox(tr("Use CUDA sparse"), this);
+    chkResumeLocalUseCuda_->setToolTip(tr("Force CUDA sparse solver for each local patch (may be slower for small patches due to GPU overhead)."));
+    localForm->addRow(tr("CUDA:"), chkResumeLocalUseCuda_);
+
+    pass2Layout->addWidget(localOptionsWidget_);
+
+    // Global options widget
+    globalOptionsWidget_ = new QWidget(this);
+    auto globalForm = new QFormLayout(globalOptionsWidget_);
+    globalForm->setContentsMargins(0, 0, 0, 0);
+    globalForm->setSpacing(6);
+
+    spResumeGlobalPatchStep_ = new QSpinBox(this);
+    spResumeGlobalPatchStep_->setRange(1, 512);
+    spResumeGlobalPatchStep_->setValue(20);
+    spResumeGlobalPatchStep_->setToolTip(tr("Stride for selecting patch centers. Patches are optimized every N cells."));
+    globalForm->addRow(tr("Patch step:"), spResumeGlobalPatchStep_);
+
+    spResumeGlobalPatchRadius_ = new QSpinBox(this);
+    spResumeGlobalPatchRadius_->setRange(1, 512);
+    spResumeGlobalPatchRadius_->setValue(40);
+    spResumeGlobalPatchRadius_->setToolTip(tr("Radius of each patch in cells. Larger = more overlap, slower but smoother."));
+    globalForm->addRow(tr("Patch radius:"), spResumeGlobalPatchRadius_);
+
+    spResumeGlobalBatchCount_ = new QSpinBox(this);
+    spResumeGlobalBatchCount_->setRange(1, 1000);
+    spResumeGlobalBatchCount_->setValue(100);
+    spResumeGlobalBatchCount_->setToolTip(tr("Number of batches. More batches = smaller solves, less GPU utilization. Fewer = larger solves, better GPU use."));
+    globalForm->addRow(tr("Batch count:"), spResumeGlobalBatchCount_);
+
+    spResumeGlobalMaxIters_ = new QSpinBox(this);
+    spResumeGlobalMaxIters_->setRange(1, 10000);
+    spResumeGlobalMaxIters_->setSingleStep(50);
+    spResumeGlobalMaxIters_->setValue(500);
+    spResumeGlobalMaxIters_->setToolTip(tr("Maximum Ceres iterations per batch solve."));
+    globalForm->addRow(tr("Max iterations:"), spResumeGlobalMaxIters_);
+
+    pass2Layout->addWidget(globalOptionsWidget_);
+    globalOptionsWidget_->hide();
+
+    connect(cmbResumeOptMode_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &NeighborCopyDialog::onResumeOptModeChanged);
 
     main->addWidget(pass2Group);
 
@@ -1152,6 +1210,50 @@ int NeighborCopyDialog::resumeLocalMaxIters() const
 bool NeighborCopyDialog::resumeLocalDenseQr() const
 {
     return chkResumeDenseQr_ ? chkResumeDenseQr_->isChecked() : false;
+}
+
+bool NeighborCopyDialog::resumeLocalUseCuda() const
+{
+    return chkResumeLocalUseCuda_ ? chkResumeLocalUseCuda_->isChecked() : false;
+}
+
+QString NeighborCopyDialog::resumeOptMode() const
+{
+    if (!cmbResumeOptMode_) {
+        return QStringLiteral("local");
+    }
+    return cmbResumeOptMode_->currentData().toString();
+}
+
+int NeighborCopyDialog::resumeGlobalPatchRadius() const
+{
+    return spResumeGlobalPatchRadius_ ? spResumeGlobalPatchRadius_->value() : 40;
+}
+
+int NeighborCopyDialog::resumeGlobalPatchStep() const
+{
+    return spResumeGlobalPatchStep_ ? spResumeGlobalPatchStep_->value() : 20;
+}
+
+int NeighborCopyDialog::resumeGlobalBatchCount() const
+{
+    return spResumeGlobalBatchCount_ ? spResumeGlobalBatchCount_->value() : 4;
+}
+
+int NeighborCopyDialog::resumeGlobalMaxIters() const
+{
+    return spResumeGlobalMaxIters_ ? spResumeGlobalMaxIters_->value() : 500;
+}
+
+void NeighborCopyDialog::onResumeOptModeChanged(int index)
+{
+    const bool isLocal = (index == 0);
+    if (localOptionsWidget_) {
+        localOptionsWidget_->setVisible(isLocal);
+    }
+    if (globalOptionsWidget_) {
+        globalOptionsWidget_->setVisible(!isLocal);
+    }
 }
 
 // ================= ExportChunksDialog =================

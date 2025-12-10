@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <opencv2/core.hpp>
+
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
@@ -97,6 +99,7 @@ public:
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
     void refreshSurfacePatchIndex(QuadSurface* surface);
+    void refreshSurfacePatchIndex(QuadSurface* surface, const cv::Rect& changedRegion);
     void waitForPendingIndexRebuild();
 
 signals:

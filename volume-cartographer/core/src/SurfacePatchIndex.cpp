@@ -50,7 +50,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
     if (d1 <= 0.0f && d2 <= 0.0f) {
         hit.closest = a;
         hit.bary = {1.0f, 0.0f, 0.0f};
-        hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+        const cv::Vec3f d = p - hit.closest;
+        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
         return hit;
     }
 
@@ -60,7 +61,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
     if (d3 >= 0.0f && d4 <= d3) {
         hit.closest = b;
         hit.bary = {0.0f, 1.0f, 0.0f};
-        hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+        const cv::Vec3f d = p - hit.closest;
+        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
         return hit;
     }
 
@@ -69,7 +71,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
         float v = d1 / (d1 - d3);
         hit.closest = a + v * ab;
         hit.bary = {1.0f - v, v, 0.0f};
-        hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+        const cv::Vec3f d = p - hit.closest;
+        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
         return hit;
     }
 
@@ -79,7 +82,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
     if (d6 >= 0.0f && d5 <= d6) {
         hit.closest = c;
         hit.bary = {0.0f, 0.0f, 1.0f};
-        hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+        const cv::Vec3f d = p - hit.closest;
+        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
         return hit;
     }
 
@@ -88,7 +92,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
         float w = d2 / (d2 - d6);
         hit.closest = a + w * ac;
         hit.bary = {1.0f - w, 0.0f, w};
-        hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+        const cv::Vec3f d = p - hit.closest;
+        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
         return hit;
     }
 
@@ -97,7 +102,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
         float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
         hit.closest = b + w * (c - b);
         hit.bary = {0.0f, 1.0f - w, w};
-        hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+        const cv::Vec3f d = p - hit.closest;
+        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
         return hit;
     }
 
@@ -107,7 +113,8 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
     float u = 1.0f - v - w;
     hit.closest = a + ab * v + ac * w;
     hit.bary = {u, v, w};
-    hit.distSq = cv::norm(p - hit.closest, cv::NORM_L2SQR);
+    const cv::Vec3f d = p - hit.closest;
+    hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
     return hit;
 }
 
@@ -715,13 +722,15 @@ void SurfacePatchIndex::forEachTriangleImpl(
     Impl::Point3 max_pt(bounds.high[0], bounds.high[1], bounds.high[2]);
     Impl::Box3 query(min_pt, max_pt);
 
-    // Cache center*scale per surface to avoid redundant lookups across patches
-    struct SurfaceOffset {
+    // Cache surface metadata to avoid redundant lookups across patches
+    struct SurfaceCache {
         float cx;
         float cy;
+        int rows;
+        int cols;
     };
-    std::unordered_map<QuadSurface*, SurfaceOffset> surfaceOffsetCache;
-    surfaceOffsetCache.reserve(filterSurfaces ? filterSurfaces->size() : 4);
+    std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
+    surfaceCacheMap.reserve(filterSurfaces ? filterSurfaces->size() : 4);
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
@@ -743,28 +752,29 @@ void SurfacePatchIndex::forEachTriangleImpl(
         const float baseY = static_cast<float>(rec.j);
         const int stride = std::max(1, rec.stride);
 
-        // Compute effective stride (clamped at boundaries, matching loadPatchCorners)
-        const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
-        const int cols = points ? points->cols : 0;
-        const int rows = points ? points->rows : 0;
-        const float effectiveStrideX = static_cast<float>(std::min(stride, cols - 1 - rec.i));
-        const float effectiveStrideY = static_cast<float>(std::min(stride, rows - 1 - rec.j));
-
-        auto cacheIt = surfaceOffsetCache.find(rec.surface);
-        if (cacheIt == surfaceOffsetCache.end()) {
+        // Get or create cached surface metadata
+        auto cacheIt = surfaceCacheMap.find(rec.surface);
+        if (cacheIt == surfaceCacheMap.end()) {
             const cv::Vec3f center = rec.surface->center();
             const cv::Vec2f scale = rec.surface->scale();
-            cacheIt = surfaceOffsetCache.emplace(rec.surface,
-                SurfaceOffset{center[0] * scale[0], center[1] * scale[1]}).first;
+            const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+            const int rows = points ? points->rows : 0;
+            const int cols = points ? points->cols : 0;
+            cacheIt = surfaceCacheMap.emplace(rec.surface,
+                SurfaceCache{center[0] * scale[0], center[1] * scale[1], rows, cols}).first;
         }
-        const float cx = cacheIt->second.cx;
-        const float cy = cacheIt->second.cy;
+        const SurfaceCache& cache = cacheIt->second;
+
+        // Compute effective stride (clamped at boundaries, matching loadPatchCorners)
+        const float effectiveStrideX = static_cast<float>(std::min(stride, cache.cols - 1 - rec.i));
+        const float effectiveStrideY = static_cast<float>(std::min(stride, cache.rows - 1 - rec.j));
+
         // Params for corners: [0]=(0,0), [1]=(stride,0), [2]=(stride,stride), [3]=(0,stride)
         std::array<cv::Vec3f, 4> params = {
-            cv::Vec3f(baseX - cx, baseY - cy, 0.0f),
-            cv::Vec3f(baseX + effectiveStrideX - cx, baseY - cy, 0.0f),
-            cv::Vec3f(baseX + effectiveStrideX - cx, baseY + effectiveStrideY - cy, 0.0f),
-            cv::Vec3f(baseX - cx, baseY + effectiveStrideY - cy, 0.0f)
+            cv::Vec3f(baseX - cache.cx, baseY - cache.cy, 0.0f),
+            cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY - cache.cy, 0.0f),
+            cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f),
+            cv::Vec3f(baseX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f)
         };
 
         // Emit both triangles from cached corners/params
@@ -1150,16 +1160,17 @@ SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromCorners(
     const std::array<cv::Vec3f, 4>& corners,
     float bboxPadding)
 {
-    cv::Vec3f low = corners[0];
-    cv::Vec3f high = corners[0];
-    for (const cv::Vec3f& c : corners) {
-        low[0] = std::min(low[0], c[0]);
-        low[1] = std::min(low[1], c[1]);
-        low[2] = std::min(low[2], c[2]);
-        high[0] = std::max(high[0], c[0]);
-        high[1] = std::max(high[1], c[1]);
-        high[2] = std::max(high[2], c[2]);
-    }
+    // Unrolled min/max (avoids loop overhead for 4 corners)
+    cv::Vec3f low{
+        std::min({corners[0][0], corners[1][0], corners[2][0], corners[3][0]}),
+        std::min({corners[0][1], corners[1][1], corners[2][1], corners[3][1]}),
+        std::min({corners[0][2], corners[1][2], corners[2][2], corners[3][2]})
+    };
+    cv::Vec3f high{
+        std::max({corners[0][0], corners[1][0], corners[2][0], corners[3][0]}),
+        std::max({corners[0][1], corners[1][1], corners[2][1], corners[3][1]}),
+        std::max({corners[0][2], corners[1][2], corners[2][2], corners[3][2]})
+    };
 
     if (bboxPadding > 0.0f) {
         low -= cv::Vec3f(bboxPadding, bboxPadding, bboxPadding);

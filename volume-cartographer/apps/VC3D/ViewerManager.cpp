@@ -439,6 +439,45 @@ void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface)
                             << "- marking index for rebuild";
 }
 
+void ViewerManager::refreshSurfacePatchIndex(QuadSurface* surface, const cv::Rect& changedRegion)
+{
+    if (!surface) {
+        return;
+    }
+
+    // Empty rect means no changes
+    if (changedRegion.empty()) {
+        qCInfo(lcViewerManager) << "Skipped SurfacePatchIndex update (no changes)";
+        return;
+    }
+
+    const std::string surfId = surface->id;
+    if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex.empty()) {
+        _surfacePatchIndexNeedsRebuild = true;
+        _indexedSurfaceIds.erase(surfId);
+        qCInfo(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
+                                << "(global rebuild pending)";
+        return;
+    }
+
+    // Use region-based update
+    const int rowStart = changedRegion.y;
+    const int rowEnd = changedRegion.y + changedRegion.height;
+    const int colStart = changedRegion.x;
+    const int colEnd = changedRegion.x + changedRegion.width;
+
+    if (_surfacePatchIndex.updateSurfaceRegion(surface, rowStart, rowEnd, colStart, colEnd)) {
+        _indexedSurfaceIds.insert(surfId);
+        qCInfo(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
+                                << "rows" << rowStart << "-" << rowEnd
+                                << "cols" << colStart << "-" << colEnd;
+        return;
+    }
+
+    // Region update failed, fall back to full surface update
+    refreshSurfacePatchIndex(surface);
+}
+
 void ViewerManager::waitForPendingIndexRebuild()
 {
     if (_surfacePatchIndexWatcher && _surfacePatchIndexWatcher->isRunning()) {

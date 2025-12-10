@@ -288,10 +288,19 @@ public:
     QString selectedVolumeId() const;
     QString selectedVolumePath() const;
     QString outputPath() const;
+    QString resumeOptMode() const;
     int resumeLocalOptStep() const;
     int resumeLocalOptRadius() const;
     int resumeLocalMaxIters() const;
     bool resumeLocalDenseQr() const;
+    bool resumeLocalUseCuda() const;
+    int resumeGlobalPatchRadius() const;
+    int resumeGlobalPatchStep() const;
+    int resumeGlobalBatchCount() const;
+    int resumeGlobalMaxIters() const;
+
+private slots:
+    void onResumeOptModeChanged(int index);
 
 private:
     void populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
@@ -300,10 +309,18 @@ private:
     QLineEdit* edtSurface_{nullptr};
     QComboBox* cmbVolume_{nullptr};
     QLineEdit* edtOutput_{nullptr};
+    QComboBox* cmbResumeOptMode_{nullptr};
     QSpinBox* spResumeStep_{nullptr};
     QSpinBox* spResumeRadius_{nullptr};
     QSpinBox* spResumeMaxIters_{nullptr};
     QCheckBox* chkResumeDenseQr_{nullptr};
+    QCheckBox* chkResumeLocalUseCuda_{nullptr};
+    QSpinBox* spResumeGlobalPatchRadius_{nullptr};
+    QSpinBox* spResumeGlobalPatchStep_{nullptr};
+    QSpinBox* spResumeGlobalBatchCount_{nullptr};
+    QSpinBox* spResumeGlobalMaxIters_{nullptr};
+    QWidget* localOptionsWidget_{nullptr};
+    QWidget* globalOptionsWidget_{nullptr};
 };
 
 class ExportChunksDialog : public QDialog {

@@ -889,6 +889,93 @@ void SegmentationGrower::handleFailure(const QString& message)
     finalize(false);
 }
 
+// Compute bounding box of cells that changed between two point matrices
+// Returns bounds in the NEW surface's coordinate system
+static cv::Rect computeChangedBounds(const cv::Mat_<cv::Vec3f>& oldPts,
+                                     const cv::Mat_<cv::Vec3f>& newPts)
+{
+    // Handle size differences - the new surface may have padding around it
+    // The old content is centered in the new surface
+    const int padX = (newPts.cols - oldPts.cols) / 2;
+    const int padY = (newPts.rows - oldPts.rows) / 2;
+
+    int minRow = newPts.rows, maxRow = -1;
+    int minCol = newPts.cols, maxCol = -1;
+
+    // Compare the overlapping region (old surface embedded in new)
+    for (int oldRow = 0; oldRow < oldPts.rows; ++oldRow) {
+        const int newRow = oldRow + padY;
+        if (newRow < 0 || newRow >= newPts.rows) continue;
+
+        for (int oldCol = 0; oldCol < oldPts.cols; ++oldCol) {
+            const int newCol = oldCol + padX;
+            if (newCol < 0 || newCol >= newPts.cols) continue;
+
+            const auto& o = oldPts(oldRow, oldCol);
+            const auto& n = newPts(newRow, newCol);
+            if (o[0] != n[0] || o[1] != n[1] || o[2] != n[2]) {
+                minRow = std::min(minRow, newRow);
+                maxRow = std::max(maxRow, newRow);
+                minCol = std::min(minCol, newCol);
+                maxCol = std::max(maxCol, newCol);
+            }
+        }
+    }
+
+    // Check padding cells for valid (non-empty) content that was added
+    // Invalid points have x == -1
+    auto isValid = [](const cv::Vec3f& p) { return p[0] != -1.0f; };
+
+    // Check top/bottom padding rows
+    for (int row = 0; row < padY && row < newPts.rows; ++row) {
+        for (int col = 0; col < newPts.cols; ++col) {
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+    }
+    for (int row = newPts.rows - padY; row < newPts.rows; ++row) {
+        if (row < 0) continue;
+        for (int col = 0; col < newPts.cols; ++col) {
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+    }
+    // Check left/right padding cols
+    for (int row = 0; row < newPts.rows; ++row) {
+        for (int col = 0; col < padX && col < newPts.cols; ++col) {
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+        for (int col = newPts.cols - padX; col < newPts.cols; ++col) {
+            if (col < 0) continue;
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+    }
+
+    if (maxRow < 0) {
+        return cv::Rect();  // No changes
+    }
+
+    return cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
+}
+
 void SegmentationGrower::onFutureFinished()
 {
     if (!_watcher) {
@@ -949,6 +1036,24 @@ void SegmentationGrower::onFutureFinished()
     QuadSurface* primarySurface = surfacesToUpdate.empty() ? nullptr : surfacesToUpdate.front();
     cv::Mat_<cv::Vec3f>* primaryPoints = primarySurface ? primarySurface->rawPointsPtr() : nullptr;
     cv::Mat_<cv::Vec3f>* resultPoints = result.surface->rawPointsPtr();
+
+    // Compute the changed region before swapping points (for efficient R-tree update)
+    // Only use region update when sizes match; otherwise grid coordinates shift
+    cv::Rect changedBounds;
+    bool sizeChanged = false;
+    if (primarySurface && primaryPoints && resultPoints) {
+        sizeChanged = (primaryPoints->size() != resultPoints->size());
+        if (!sizeChanged) {
+            changedBounds = computeChangedBounds(*primaryPoints, *resultPoints);
+            qCInfo(lcSegGrowth) << "Changed bounds:" << changedBounds.x << changedBounds.y
+                                << changedBounds.width << "x" << changedBounds.height
+                                << "(surface:" << resultPoints->cols << "x" << resultPoints->rows << ")";
+        } else {
+            qCInfo(lcSegGrowth) << "Surface size changed:" << primaryPoints->cols << "x" << primaryPoints->rows
+                                << "->" << resultPoints->cols << "x" << resultPoints->rows
+                                << "- using full update";
+        }
+    }
 
     if (primarySurface && primaryPoints && resultPoints) {
         std::swap(*primaryPoints, *resultPoints);
@@ -1015,7 +1120,11 @@ void SegmentationGrower::onFutureFinished()
 
         // Refresh intersection index for this surface so renderIntersections() has up-to-date data
         if (_context.viewerManager) {
-            _context.viewerManager->refreshSurfacePatchIndex(targetSurface);
+            if (!changedBounds.empty()) {
+                _context.viewerManager->refreshSurfacePatchIndex(targetSurface, changedBounds);
+            } else {
+                _context.viewerManager->refreshSurfacePatchIndex(targetSurface);
+            }
         }
     }
 

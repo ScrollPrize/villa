@@ -327,6 +327,7 @@ private:
         QString pass1JsonPath;
         QString pass2JsonPath;
         QString directoryPrefix;
+        QString resumeOptMode{QStringLiteral("local")};
         bool copyOut{true};
         QSet<QString> baselineEntries;
         std::unique_ptr<QTemporaryFile> pass1JsonFile;
