@@ -1667,6 +1667,7 @@ void CWindow::launchNeighborCopySecondPass()
         if (!_neighborCopyJob || _neighborCopyJob->stage != NeighborCopyJob::Stage::SecondPass) {
             return;
         }
+        _cmdRunner->setPreserveConsoleOutput(true);
         if (!startNeighborCopyPass(_neighborCopyJob->pass2JsonPath,
                                    resumeSurface,
                                    QStringLiteral("local"),
