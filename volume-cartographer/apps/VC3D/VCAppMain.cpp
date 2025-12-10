@@ -13,6 +13,16 @@ auto main(int argc, char* argv[]) -> int
 {
     cv::setNumThreads(std::thread::hardware_concurrency());
 
+    // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
+    // Floating dock widgets become unmovable after initial drag on Wayland.
+    // Force XCB (X11/XWayland) platform to restore full functionality.
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
+        const char* waylandDisplay = qgetenv("WAYLAND_DISPLAY").constData();
+        if (waylandDisplay && *waylandDisplay) {
+            qputenv("QT_QPA_PLATFORM", "xcb");
+        }
+    }
+
     QApplication app(argc, argv);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
