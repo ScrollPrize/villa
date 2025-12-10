@@ -1131,24 +1131,14 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     pass1JsonFile->write(QJsonDocument(pass1Params).toJson(QJsonDocument::Indented));
     pass1JsonFile->flush();
 
-    const QString resumeOptMode = dlg.resumeOptMode();
-
     QJsonObject pass2Params;
     pass2Params["normal_grid_path"] = normalGridPath;
     pass2Params["max_gen"] = 1;
     pass2Params["generations"] = 1;
-    if (resumeOptMode == QStringLiteral("local")) {
-        pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
-        pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
-        pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
-        pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
-        pass2Params["resume_local_use_cuda"] = dlg.resumeLocalUseCuda();
-    } else {
-        pass2Params["resume_global_patch_radius"] = dlg.resumeGlobalPatchRadius();
-        pass2Params["resume_global_patch_step"] = dlg.resumeGlobalPatchStep();
-        pass2Params["resume_global_batch_count"] = dlg.resumeGlobalBatchCount();
-        pass2Params["resume_global_max_iters"] = dlg.resumeGlobalMaxIters();
-    }
+    pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
+    pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
+    pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
+    pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
 
     auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
     if (!pass2JsonFile->open()) {
@@ -1168,7 +1158,6 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     job.pass1JsonPath = pass1JsonFile->fileName();
     job.pass2JsonPath = pass2JsonFile->fileName();
     job.directoryPrefix = copyOut ? QStringLiteral("neighbor_out_") : QStringLiteral("neighbor_in_");
-    job.resumeOptMode = resumeOptMode;
     job.copyOut = copyOut;
     job.baselineEntries = snapshotDirectoryEntries(outputDirPath);
     job.pass1JsonFile = std::move(pass1JsonFile);
@@ -1671,15 +1660,14 @@ void CWindow::launchNeighborCopySecondPass()
 
     const QString resumeSurface = _neighborCopyJob->generatedSurfacePath;
     const bool copyOut = _neighborCopyJob->copyOut;
-    const QString resumeOptMode = _neighborCopyJob->resumeOptMode;
 
-    QTimer::singleShot(0, this, [this, resumeSurface, copyOut, resumeOptMode]() {
+    QTimer::singleShot(0, this, [this, resumeSurface, copyOut]() {
         if (!_neighborCopyJob || _neighborCopyJob->stage != NeighborCopyJob::Stage::SecondPass) {
             return;
         }
         if (!startNeighborCopyPass(_neighborCopyJob->pass2JsonPath,
                                    resumeSurface,
-                                   resumeOptMode,
+                                   QStringLiteral("local"),
                                    12)) {
             _cmdRunner->setOmpThreads(-1);
             QMessageBox::warning(this, tr("Error"), tr("Failed to launch the second neighbor copy pass."));
@@ -1688,7 +1676,7 @@ void CWindow::launchNeighborCopySecondPass()
         }
 
         statusBar()->showMessage(
-            tr("Copy %1 pass 2 running (%2)").arg(copyOut ? tr("out") : tr("in"), resumeOptMode),
+            tr("Copy %1 pass 2 running").arg(copyOut ? tr("out") : tr("in")),
             3000);
     });
 }

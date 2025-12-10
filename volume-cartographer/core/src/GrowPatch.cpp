@@ -381,7 +381,7 @@ struct LossSettings {
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
-        w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
+        w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
     }
 
@@ -1274,7 +1274,7 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
     }
 
     ceres::Solver::Options options;
-    options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.max_num_iterations = 10000;
     // options.minimizer_progress_to_stdout = true;
     ceres::Solver::Summary summary;
@@ -1288,7 +1288,6 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
 struct LocalOptimizationConfig {
     int max_iterations = 1000;
     bool use_dense_qr = false;
-    bool force_cuda = false;  // Force CUDA even for small problems
 };
 
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
@@ -1325,7 +1324,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
         options.linear_solver_type = ceres::DENSE_QR;
     } else {
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-        options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
     }
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = solver_config ? solver_config->max_iterations : 1000;
@@ -1339,15 +1337,26 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     if (parallel)
         options.num_threads = omp_get_max_threads();
 
-    // Use CUDA sparse for large problems if available, or if forced via config
-    bool force_cuda = solver_config && solver_config->force_cuda;
-    if (g_use_cuda && (force_cuda || problem.NumParameterBlocks() > 5000)) {
-        if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-            options.max_num_refinement_iterations = 3;
-        }
-    }
+//    if (problem.NumParameterBlocks() > 1) {
+//        options.use_inner_iterations = true;
+//    }
+// // NOTE currently CPU seems always faster (40x , AMD 5800H vs RTX 3080 mobile, even a 5090 would probably be slower?)
+// #ifdef VC_USE_CUDA_SPARSE
+//     // Check if Ceres was actually built with CUDA sparse support
+//     if (g_use_cuda) {
+//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
+//             options.linear_solver_type = ceres::SPARSE_SCHUR;
+//             // options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+//
+//             // if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
+//                 options.use_mixed_precision_solves = true;
+//             // }
+//         } else {
+//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
+//         }
+//     }
+// #endif
 
     ceres::Solver::Summary summary;
 
@@ -1969,148 +1978,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     else
     {
         if (params.value("resume_opt", "skip") == "global") {
-            // Batched global optimization: group non-overlapping patches into batches
-            // Each batch is solved as one large problem (good for GPU), and batches are processed sequentially
-            int patch_radius = params.value("resume_global_patch_radius", 40);
-            int patch_step = params.value("resume_global_patch_step", 20);
-            int max_iters = params.value("resume_global_max_iters", 500);
-
-            // Collect all valid points at the step interval
-            std::vector<cv::Vec2i> all_points;
-            for (int j = used_area.y; j < used_area.br().y; ++j) {
-                for (int i = used_area.x; i < used_area.br().x; ++i) {
-                    if ((trace_params.state(j, i) & STATE_LOC_VALID) &&
-                        (j % patch_step == 0) && (i % patch_step == 0)) {
-                        all_points.push_back({j, i});
-                    }
-                }
-            }
-
-            // Minimum spacing between patches in same batch to avoid overlap
-            int min_spacing = 2 * patch_radius + patch_step;
-
-            // Partition points into non-overlapping batches using grid-based assignment
-            // Grid dimension determines tiling pattern: grid_dim x grid_dim = num_batches
-            int requested_batches = params.value("resume_global_batch_count", 4);
-            int grid_dim = std::max(1, (int)std::ceil(std::sqrt((double)requested_batches)));
-            int num_batches = grid_dim * grid_dim;
-
-            std::vector<std::vector<cv::Vec2i>> batches(num_batches);
-            for (const auto& p : all_points) {
-                int gx = (p[1] - used_area.x) / min_spacing;
-                int gy = (p[0] - used_area.y) / min_spacing;
-                int batch_id = (gx % grid_dim) + (gy % grid_dim) * grid_dim;
-                batches[batch_id].push_back(p);
-            }
-
-            std::cout << "global opt: " << all_points.size() << " patches, radius=" << patch_radius
-                      << ", step=" << patch_step << ", " << num_batches << " batches" << std::endl;
-            for (int b = 0; b < num_batches; ++b) {
-                std::cout << "  batch " << b << ": " << batches[b].size() << " patches" << std::endl;
-            }
-
-            LocalOptimizationConfig batch_config;
-            batch_config.max_iterations = max_iters;
-            batch_config.use_dense_qr = false;
-
-            auto total_start = std::chrono::high_resolution_clock::now();
-
-            for (int b = 0; b < num_batches; ++b) {
-                if (batches[b].empty()) continue;
-
-                auto batch_start = std::chrono::high_resolution_clock::now();
-                std::cout << "  batch " << b << "/" << num_batches << " (" << batches[b].size() << " patches): building..." << std::flush;
-
-                // Build one large problem with all patches in this batch
-                ceres::Problem problem;
-                cv::Mat_<uint16_t> loss_status(trace_params.state.size(), (uint16_t)0);
-
-                int r_outer = patch_radius + 3;
-                std::atomic<int> points_added{0};
-                int total_points = batches[b].size();
-
-                // Parallel problem building: each patch's losses are independent
-                // But ceres::Problem::AddResidualBlock is not thread-safe, so we build per-patch
-                // and use critical sections for the actual additions
-                #pragma omp parallel for schedule(dynamic)
-                for (int pi = 0; pi < (int)batches[b].size(); ++pi) {
-                    const cv::Vec2i& center = batches[b][pi];
-
-                    // Thread-local loss additions
-                    std::vector<std::tuple<cv::Vec2i, int>> local_losses;
-
-                    for (int oy = std::max(center[0] - patch_radius, 0);
-                         oy <= std::min(center[0] + patch_radius, trace_params.dpoints.rows - 1); ++oy) {
-                        for (int ox = std::max(center[1] - patch_radius, 0);
-                             ox <= std::min(center[1] + patch_radius, trace_params.dpoints.cols - 1); ++ox) {
-                            cv::Vec2i op = {oy, ox};
-                            if (cv::norm(center - op) <= patch_radius) {
-                                local_losses.push_back({op, 0});
-                            }
-                        }
-                    }
-
-                    #pragma omp critical
-                    {
-                        for (const auto& [op, _] : local_losses) {
-                            add_missing_losses(problem, loss_status, op, trace_params, trace_data, loss_settings);
-                        }
-                        int done = ++points_added;
-                        if (done % 100 == 0 || done == total_points) {
-                            printf("\r  batch %d/%d (%d patches): building... %d/%d",
-                                   b, num_batches, total_points, done, total_points);
-                            fflush(stdout);
-                        }
-                    }
-                }
-
-                // Set boundary points as constant
-                for (int pi = 0; pi < (int)batches[b].size(); ++pi) {
-                    const cv::Vec2i& center = batches[b][pi];
-                    for (int oy = std::max(center[0] - r_outer, 0);
-                         oy <= std::min(center[0] + r_outer, trace_params.dpoints.rows - 1); ++oy) {
-                        for (int ox = std::max(center[1] - r_outer, 0);
-                             ox <= std::min(center[1] + r_outer, trace_params.dpoints.cols - 1); ++ox) {
-                            cv::Vec2i op = {oy, ox};
-                            if (cv::norm(center - op) > patch_radius &&
-                                problem.HasParameterBlock(&trace_params.dpoints(op)[0])) {
-                                problem.SetParameterBlockConstant(&trace_params.dpoints(op)[0]);
-                            }
-                        }
-                    }
-                }
-
-                auto build_end = std::chrono::high_resolution_clock::now();
-                double build_secs = std::chrono::duration<double>(build_end - batch_start).count();
-
-                std::cout << " solving (" << problem.NumParameterBlocks() << " params, "
-                          << problem.NumResidualBlocks() << " residuals)..." << std::flush;
-
-                // Solver options
-                ceres::Solver::Options options;
-                options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-                options.max_num_iterations = batch_config.max_iterations;
-                options.num_threads = omp_get_max_threads();
-                options.minimizer_progress_to_stdout = false;
-
-
-                ceres::Solver::Summary summary;
-                ceres::Solve(options, &problem, &summary);
-
-                auto solve_end = std::chrono::high_resolution_clock::now();
-                double solve_secs = std::chrono::duration<double>(solve_end - build_end).count();
-                double total_secs = std::chrono::duration<double>(solve_end - batch_start).count();
-
-                std::cout << " done!" << std::endl;
-                std::cout << "    build: " << std::fixed << std::setprecision(1) << build_secs << "s, "
-                          << "solve: " << solve_secs << "s (" << summary.iterations.size() << " iters), "
-                          << "total: " << total_secs << "s" << std::endl;
-                std::cout << "    " << summary.BriefReport() << std::endl;
-            }
-
-            auto total_end = std::chrono::high_resolution_clock::now();
-            double total_secs = std::chrono::duration<double>(total_end - total_start).count();
-            std::cout << "global opt complete: " << std::fixed << std::setprecision(1) << total_secs << "s total" << std::endl;
+            std::cout << "global opt" << std::endl;
+            local_optimization(100, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
         }
         else if (params.value("resume_opt", "skip") == "local") {
             int opt_step = params.value("resume_local_opt_step", 16);
@@ -2133,13 +2002,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 resume_local_config.max_iterations = 1000;
             }
             resume_local_config.use_dense_qr = params.value("resume_local_dense_qr", false);
-            resume_local_config.force_cuda = params.value("resume_local_use_cuda", false);
 
             std::cout << "local opt (step=" << opt_step
                       << ", radius=" << opt_radius
                       << ", max_iters=" << resume_local_config.max_iterations
                       << ", dense_qr=" << std::boolalpha << resume_local_config.use_dense_qr
-                      << ", cuda=" << resume_local_config.force_cuda
                       << std::noboolalpha << ")" << std::endl;
             std::vector<cv::Vec2i> opt_local;
             for (int j = used_area.y; j < used_area.br().y; ++j) {
