@@ -96,8 +96,14 @@ void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
 
     cv::Size new_size = new_points->size();
 
-    // Create new approval mask with default value (0 = unapproved)
-    cv::Mat_<uint8_t> new_approval(new_size, static_cast<uint8_t>(0));
+    // Create new approval mask with same type as old mask
+    // Approval masks can be 1-channel (legacy) or 3-channel (RGB)
+    cv::Mat new_approval;
+    if (old_approval.channels() == 3) {
+        new_approval = cv::Mat(new_size, CV_8UC3, cv::Scalar(0, 0, 0));
+    } else {
+        new_approval = cv::Mat(new_size, CV_8UC1, cv::Scalar(0));
+    }
 
     // Copy old approval values to same grid positions
     // Grid expansion preserves old point indices, so old[r,c] == new[r,c]
@@ -111,7 +117,8 @@ void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
 
         qCInfo(lcSegGrowth) << "Preserved approval mask from"
                             << old_approval.cols << "x" << old_approval.rows
-                            << "to" << new_approval.cols << "x" << new_approval.rows;
+                            << "to" << new_approval.cols << "x" << new_approval.rows
+                            << "(channels:" << old_approval.channels() << ")";
     }
 
     // Set preserved approval mask on new surface
