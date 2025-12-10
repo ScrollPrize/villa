@@ -125,6 +125,7 @@ void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
     newSurface->setChannel("approval", new_approval);
 }
 
+
 QString directionToString(SegmentationGrowthDirection direction)
 {
     switch (direction) {
@@ -503,8 +504,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       nlohmann::json{},
                                       correctionCollection);
 
-        // Preserve approval mask through growth
-        preserveApprovalMask(context.resumeSurface, surface);
+        // Note: approval and mask channels are preserved inside the tracer
 
         result.surface = surface;
         result.statusMessage = QStringLiteral("Tracer growth completed");

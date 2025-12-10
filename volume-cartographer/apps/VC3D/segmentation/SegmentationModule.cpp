@@ -702,7 +702,8 @@ void SegmentationModule::applyEdits()
             constexpr uint8_t kApproved = 255;
             constexpr float kRadius = 1.0f;
             constexpr bool kIsAutoApproval = true;
-            _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+            const QColor brushColor = approvalBrushColor();
+            _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
             _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
             qCInfo(lcSegModule) << "Auto-approved" << gridPositions.size() << "edited vertices";
         }
@@ -1251,7 +1252,8 @@ void SegmentationModule::finishDrag()
                 constexpr uint8_t kApproved = 255;
                 constexpr float kRadius = 1.0f;
                 constexpr bool kIsAutoApproval = true;
-                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, false, 0.0f, 0.0f, kIsAutoApproval);
+                const QColor brushColor = approvalBrushColor();
+                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
                 _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
                 qCInfo(lcSegModule) << "Auto-approved" << gridPositions.size() << "drag edited vertices";
             }
