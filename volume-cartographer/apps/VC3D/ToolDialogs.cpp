@@ -1170,10 +1170,11 @@ ExportChunksDialog::ExportChunksDialog(QWidget* parent, int surfaceWidth, double
     main->addLayout(form);
 
     // Load defaults from settings
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const int defaultChunkWidth = settings.value("export/chunk_width_px", 40000).toInt();
-    const int defaultOverlap = settings.value("export/chunk_overlap_px", 0).toInt();
-    const bool defaultOverwrite = settings.value("export/overwrite", true).toBool();
+    const int defaultChunkWidth = settings.value(export_::CHUNK_WIDTH_PX, export_::CHUNK_WIDTH_PX_DEFAULT).toInt();
+    const int defaultOverlap = settings.value(export_::CHUNK_OVERLAP_PX, export_::CHUNK_OVERLAP_PX_DEFAULT).toInt();
+    const bool defaultOverwrite = settings.value(export_::OVERWRITE, export_::OVERWRITE_DEFAULT).toBool();
 
     spChunkWidth_ = new QSpinBox(this);
     spChunkWidth_->setRange(100, 1000000);

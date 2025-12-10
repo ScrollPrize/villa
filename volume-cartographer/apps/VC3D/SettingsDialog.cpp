@@ -12,44 +12,45 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
 {
     setupUi(this);
 
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    edtDefaultPathVolpkg->setText(settings.value("volpkg/default_path").toString());
-    chkAutoOpenVolpkg->setChecked(settings.value("volpkg/auto_open", true).toInt() != 0);
+    edtDefaultPathVolpkg->setText(settings.value(volpkg::DEFAULT_PATH).toString());
+    chkAutoOpenVolpkg->setChecked(settings.value(volpkg::AUTO_OPEN, volpkg::AUTO_OPEN_DEFAULT).toInt() != 0);
 
-    spinFwdBackStepMs->setValue(settings.value("viewer/fwd_back_step_ms", 25).toInt());
-    chkCenterOnZoom->setChecked(settings.value("viewer/center_on_zoom", false).toInt() != 0);
-    edtImpactRange->setText(settings.value("viewer/impact_range_steps", "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200").toString());
-    edtScanRange->setText(settings.value("viewer/scan_range_steps", "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000").toString());
-    spinScrollSpeed->setValue(settings.value("viewer/scroll_speed", -1).toInt());
-    spinDisplayOpacity->setValue(settings.value("viewer/display_segment_opacity", 70).toInt());
-    chkPlaySoundAfterSegRun->setChecked(settings.value("viewer/play_sound_after_seg_run", true).toInt() != 0);
-    edtUsername->setText(settings.value("viewer/username", "").toString());
-    chkResetViewOnSurfaceChange->setChecked(settings.value("viewer/reset_view_on_surface_change", true).toInt() != 0);
+    spinFwdBackStepMs->setValue(settings.value(viewer::FWD_BACK_STEP_MS, viewer::FWD_BACK_STEP_MS_DEFAULT).toInt());
+    chkCenterOnZoom->setChecked(settings.value(viewer::CENTER_ON_ZOOM, viewer::CENTER_ON_ZOOM_DEFAULT).toInt() != 0);
+    edtImpactRange->setText(settings.value(viewer::IMPACT_RANGE_STEPS, viewer::IMPACT_RANGE_STEPS_DEFAULT).toString());
+    edtScanRange->setText(settings.value(viewer::SCAN_RANGE_STEPS, viewer::SCAN_RANGE_STEPS_DEFAULT).toString());
+    spinScrollSpeed->setValue(settings.value(viewer::SCROLL_SPEED, viewer::SCROLL_SPEED_DEFAULT).toInt());
+    spinDisplayOpacity->setValue(settings.value(viewer::DISPLAY_SEGMENT_OPACITY, viewer::DISPLAY_SEGMENT_OPACITY_DEFAULT).toInt());
+    chkPlaySoundAfterSegRun->setChecked(settings.value(viewer::PLAY_SOUND_AFTER_SEG_RUN, viewer::PLAY_SOUND_AFTER_SEG_RUN_DEFAULT).toInt() != 0);
+    edtUsername->setText(settings.value(viewer::USERNAME, viewer::USERNAME_DEFAULT).toString());
+    chkResetViewOnSurfaceChange->setChecked(settings.value(viewer::RESET_VIEW_ON_SURFACE_CHANGE, viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toInt() != 0);
     // Show direction hints (flip_x arrows)
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
-        findChild<QCheckBox*>("chkShowDirectionHints")->setChecked(settings.value("viewer/show_direction_hints", true).toInt() != 0);
+        findChild<QCheckBox*>("chkShowDirectionHints")->setChecked(settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toInt() != 0);
     }
     // Direction step size default
     if (auto* spin = findChild<QDoubleSpinBox*>("spinDirectionStep")) {
-        spin->setValue(settings.value("viewer/direction_step", 10.0).toDouble());
+        spin->setValue(settings.value(viewer::DIRECTION_STEP, viewer::DIRECTION_STEP_DEFAULT).toDouble());
     }
     // Use segmentation step for hints
     if (auto* chk = findChild<QCheckBox*>("chkUseSegStepForHints")) {
-        chk->setChecked(settings.value("viewer/use_seg_step_for_hints", true).toInt() != 0);
+        chk->setChecked(settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toInt() != 0);
     }
     // Number of step points per direction
     if (auto* spin = findChild<QSpinBox*>("spinDirectionStepPoints")) {
-        spin->setValue(settings.value("viewer/direction_step_points", 5).toInt());
+        spin->setValue(settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt());
     }
 
-    spinPreloadedSlices->setValue(settings.value("perf/preloaded_slices", 200).toInt());
-    chkSkipImageFormatConvExp->setChecked(settings.value("perf/chkSkipImageFormatConvExp", false).toBool());
-    spinParallelProcesses->setValue(settings.value("perf/parallel_processes", 8).toInt());
-    spinIterationCount->setValue(settings.value("perf/iteration_count", 1000).toInt());
-    cmbDownscaleOverride->setCurrentIndex(settings.value("perf/downscale_override", 0).toInt());
-    chkFastInterpolation->setChecked(settings.value("perf/fast_interpolation", false).toBool());
-    chkEnableFileWatching->setChecked(settings.value("perf/enable_file_watching", true).toBool());
+    spinPreloadedSlices->setValue(settings.value(perf::PRELOADED_SLICES, perf::PRELOADED_SLICES_DEFAULT).toInt());
+    chkSkipImageFormatConvExp->setChecked(settings.value(perf::SKIP_IMAGE_FORMAT_CONV, perf::SKIP_IMAGE_FORMAT_CONV_DEFAULT).toBool());
+    spinParallelProcesses->setValue(settings.value(perf::PARALLEL_PROCESSES, perf::PARALLEL_PROCESSES_DEFAULT).toInt());
+    spinIterationCount->setValue(settings.value(perf::ITERATION_COUNT, perf::ITERATION_COUNT_DEFAULT).toInt());
+    cmbDownscaleOverride->setCurrentIndex(settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt());
+    chkFastInterpolation->setChecked(settings.value(perf::FAST_INTERPOLATION, perf::FAST_INTERPOLATION_DEFAULT).toBool());
+    chkEnableFileWatching->setChecked(settings.value(perf::ENABLE_FILE_WATCHING, perf::ENABLE_FILE_WATCHING_DEFAULT).toBool());
 
 
     connect(btnHelpDownscaleOverride, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDownscaleOverride->toolTip()); });
@@ -62,40 +63,41 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
 void SettingsDialog::accept()
 {
     // Store the settings
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    settings.setValue("volpkg/default_path", edtDefaultPathVolpkg->text());
-    settings.setValue("volpkg/auto_open", chkAutoOpenVolpkg->isChecked() ? "1" : "0");
+    settings.setValue(volpkg::DEFAULT_PATH, edtDefaultPathVolpkg->text());
+    settings.setValue(volpkg::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
 
-    settings.setValue("viewer/fwd_back_step_ms", spinFwdBackStepMs->value());
-    settings.setValue("viewer/center_on_zoom", chkCenterOnZoom->isChecked() ? "1" : "0");
-    settings.setValue("viewer/impact_range_steps", edtImpactRange->text());
-    settings.setValue("viewer/scan_range_steps", edtScanRange->text());
-    settings.setValue("viewer/scroll_speed", spinScrollSpeed->value());
-    settings.setValue("viewer/display_segment_opacity", spinDisplayOpacity->value());
-    settings.setValue("viewer/play_sound_after_seg_run", chkPlaySoundAfterSegRun->isChecked() ? "1" : "0");
-    settings.setValue("viewer/username", edtUsername->text());
-    settings.setValue("viewer/reset_view_on_surface_change", chkResetViewOnSurfaceChange->isChecked() ? "1" : "0");
+    settings.setValue(viewer::FWD_BACK_STEP_MS, spinFwdBackStepMs->value());
+    settings.setValue(viewer::CENTER_ON_ZOOM, chkCenterOnZoom->isChecked() ? "1" : "0");
+    settings.setValue(viewer::IMPACT_RANGE_STEPS, edtImpactRange->text());
+    settings.setValue(viewer::SCAN_RANGE_STEPS, edtScanRange->text());
+    settings.setValue(viewer::SCROLL_SPEED, spinScrollSpeed->value());
+    settings.setValue(viewer::DISPLAY_SEGMENT_OPACITY, spinDisplayOpacity->value());
+    settings.setValue(viewer::PLAY_SOUND_AFTER_SEG_RUN, chkPlaySoundAfterSegRun->isChecked() ? "1" : "0");
+    settings.setValue(viewer::USERNAME, edtUsername->text());
+    settings.setValue(viewer::RESET_VIEW_ON_SURFACE_CHANGE, chkResetViewOnSurfaceChange->isChecked() ? "1" : "0");
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
-        settings.setValue("viewer/show_direction_hints", findChild<QCheckBox*>("chkShowDirectionHints")->isChecked() ? "1" : "0");
+        settings.setValue(viewer::SHOW_DIRECTION_HINTS, findChild<QCheckBox*>("chkShowDirectionHints")->isChecked() ? "1" : "0");
     }
     if (auto* spin = findChild<QDoubleSpinBox*>("spinDirectionStep")) {
-        settings.setValue("viewer/direction_step", spin->value());
+        settings.setValue(viewer::DIRECTION_STEP, spin->value());
     }
     if (auto* chk = findChild<QCheckBox*>("chkUseSegStepForHints")) {
-        settings.setValue("viewer/use_seg_step_for_hints", chk->isChecked() ? "1" : "0");
+        settings.setValue(viewer::USE_SEG_STEP_FOR_HINTS, chk->isChecked() ? "1" : "0");
     }
     if (auto* spin = findChild<QSpinBox*>("spinDirectionStepPoints")) {
-        settings.setValue("viewer/direction_step_points", spin->value());
+        settings.setValue(viewer::DIRECTION_STEP_POINTS, spin->value());
     }
 
-    settings.setValue("perf/preloaded_slices", spinPreloadedSlices->value());
-    settings.setValue("perf/chkSkipImageFormatConvExp", chkSkipImageFormatConvExp->isChecked() ? "1" : "0");
-    settings.setValue("perf/parallel_processes", spinParallelProcesses->value());
-    settings.setValue("perf/iteration_count", spinIterationCount->value());
-    settings.setValue("perf/downscale_override", cmbDownscaleOverride->currentIndex());
-    settings.setValue("perf/fast_interpolation", chkFastInterpolation->isChecked() ? "1" : "0");
-    settings.setValue("perf/enable_file_watching", chkEnableFileWatching->isChecked() ? "1" : "0");
+    settings.setValue(perf::PRELOADED_SLICES, spinPreloadedSlices->value());
+    settings.setValue(perf::SKIP_IMAGE_FORMAT_CONV, chkSkipImageFormatConvExp->isChecked() ? "1" : "0");
+    settings.setValue(perf::PARALLEL_PROCESSES, spinParallelProcesses->value());
+    settings.setValue(perf::ITERATION_COUNT, spinIterationCount->value());
+    settings.setValue(perf::DOWNSCALE_OVERRIDE, cmbDownscaleOverride->currentIndex());
+    settings.setValue(perf::FAST_INTERPOLATION, chkFastInterpolation->isChecked() ? "1" : "0");
+    settings.setValue(perf::ENABLE_FILE_WATCHING, chkEnableFileWatching->isChecked() ? "1" : "0");
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

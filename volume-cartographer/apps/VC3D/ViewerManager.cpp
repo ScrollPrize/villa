@@ -47,20 +47,21 @@ ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
     , _points(points)
     , _chunkCache(cache)
 {
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const int savedOpacityPercent = settings.value("viewer/intersection_opacity", 100).toInt();
+    const int savedOpacityPercent = settings.value(viewer::INTERSECTION_OPACITY, viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
     const float normalized = static_cast<float>(savedOpacityPercent) / 100.0f;
     _intersectionOpacity = std::clamp(normalized, 0.0f, 1.0f);
 
-    const float storedBaseLow = settings.value("viewer/base_window_low", 0.0f).toFloat();
-    const float storedBaseHigh = settings.value("viewer/base_window_high", 255.0f).toFloat();
+    const float storedBaseLow = settings.value(viewer::BASE_WINDOW_LOW, viewer::BASE_WINDOW_LOW_DEFAULT).toFloat();
+    const float storedBaseHigh = settings.value(viewer::BASE_WINDOW_HIGH, viewer::BASE_WINDOW_HIGH_DEFAULT).toFloat();
     _volumeWindowLow = std::clamp(storedBaseLow, 0.0f, 255.0f);
     const float minHigh = std::min(_volumeWindowLow + 1.0f, 255.0f);
     _volumeWindowHigh = std::clamp(storedBaseHigh, minHigh, 255.0f);
 
-    const int storedSampling = settings.value("viewer/intersection_sampling_stride", 1).toInt();
+    const int storedSampling = settings.value(viewer::INTERSECTION_SAMPLING_STRIDE, viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt();
     _surfacePatchSamplingStride = std::max(1, storedSampling);
-    const float storedThickness = settings.value("viewer/intersection_thickness", 0.0f).toFloat();
+    const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
 
     _surfacePatchIndexWatcher =
@@ -106,14 +107,16 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
 
     // Restore persisted viewer preferences
     {
+        using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool showHints = settings.value("viewer/show_direction_hints", true).toBool();
+        bool showHints = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         viewer->setShowDirectionHints(showHints);
     }
 
     {
+        using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool resetView = settings.value("viewer/reset_view_on_surface_change", true).toBool();
+        bool resetView = settings.value(viewer::RESET_VIEW_ON_SURFACE_CHANGE, viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
         viewer->setResetViewOnSurfaceChange(resetView);
         _resetDefaults[viewer] = resetView;
     }
@@ -239,7 +242,7 @@ void ViewerManager::setIntersectionOpacity(float opacity)
     _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/intersection_opacity",
+    settings.setValue(vc3d::settings::viewer::INTERSECTION_OPACITY,
                       static_cast<int>(std::lround(_intersectionOpacity * 100.0f)));
 
     for (auto* viewer : _viewers) {
@@ -258,7 +261,7 @@ void ViewerManager::setIntersectionThickness(float thickness)
     _intersectionThickness = clamped;
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/intersection_thickness", _intersectionThickness);
+    settings.setValue(vc3d::settings::viewer::INTERSECTION_THICKNESS, _intersectionThickness);
 
     for (auto* viewer : _viewers) {
         if (viewer) {
@@ -364,8 +367,8 @@ void ViewerManager::setVolumeWindow(float low, float high)
     _volumeWindowHigh = clampedHigh;
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/base_window_low", _volumeWindowLow);
-    settings.setValue("viewer/base_window_high", _volumeWindowHigh);
+    settings.setValue(vc3d::settings::viewer::BASE_WINDOW_LOW, _volumeWindowLow);
+    settings.setValue(vc3d::settings::viewer::BASE_WINDOW_HIGH, _volumeWindowHigh);
 
     for (auto* viewer : _viewers) {
         if (viewer) {
@@ -388,7 +391,7 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     _surfacePatchSamplingStride = stride;
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/intersection_sampling_stride", _surfacePatchSamplingStride);
+    settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE, _surfacePatchSamplingStride);
 
     if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
         _surfacePatchIndexNeedsRebuild = true;

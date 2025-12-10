@@ -246,13 +246,13 @@ void MenuActionController::ensureRecentActions()
 QStringList MenuActionController::loadRecentPaths() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    return settings.value("volpkg/recent").toStringList();
+    return settings.value(vc3d::settings::volpkg::RECENT).toStringList();
 }
 
 void MenuActionController::saveRecentPaths(const QStringList& paths)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("volpkg/recent", paths);
+    settings.setValue(vc3d::settings::volpkg::RECENT, paths);
 }
 
 void MenuActionController::refreshRecentMenu()
@@ -369,7 +369,8 @@ void MenuActionController::showSettingsDialog()
     dialog->exec();
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    bool showDirHints = settings.value("viewer/show_direction_hints", true).toBool();
+    bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
+                                       vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
     if (_window->_viewerManager) {
         _window->_viewerManager->forEachViewer([showDirHints](CVolumeViewer* viewer) {
             if (viewer) {

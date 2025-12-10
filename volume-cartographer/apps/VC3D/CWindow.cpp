@@ -486,7 +486,8 @@ CWindow::CWindow() :
 
     _point_collection = new VCCollection(this);
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    _mirrorCursorToSegmentation = settings.value("viewer/mirror_cursor_to_segmentation", false).toBool();
+    _mirrorCursorToSegmentation = settings.value(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION,
+                                                  vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
     // setAttribute(Qt::WA_DeleteOnClose);
@@ -590,12 +591,12 @@ CWindow::CWindow() :
     }
 
     // Restore geometry / sizes
-    const QSettings geometry;
-    const QByteArray savedGeometry = geometry.value("mainWin/geometry").toByteArray();
+    const QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QByteArray savedGeometry = geometry.value(vc3d::settings::window::GEOMETRY).toByteArray();
     if (!savedGeometry.isEmpty()) {
         restoreGeometry(savedGeometry);
     }
-    const QByteArray savedState = geometry.value("mainWin/state").toByteArray();
+    const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
     if (!savedState.isEmpty()) {
         restoreState(savedState);
     }
@@ -620,9 +621,9 @@ CWindow::CWindow() :
     }
 
     // If enabled, auto open the last used volpkg
-    if (settings.value("volpkg/auto_open", false).toInt() != 0) {
+    if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
-        QStringList files = settings.value("volpkg/recent").toStringList();
+        QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             if (_menuController) {
@@ -657,10 +658,11 @@ CWindow::CWindow() :
     fDirectionHintsShortcut = new QShortcut(QKeySequence("Ctrl+T"), this);
     fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
+        using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool current = settings.value("viewer/show_direction_hints", true).toBool();
+        bool current = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         bool next = !current;
-        settings.setValue("viewer/show_direction_hints", next ? "1" : "0");
+        settings.setValue(viewer::SHOW_DIRECTION_HINTS, next ? "1" : "0");
         if (_viewerManager) {
             _viewerManager->forEachViewer([next](CVolumeViewer* viewer) {
                 if (viewer) {
@@ -1059,7 +1061,7 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
 
     _mirrorCursorToSegmentation = enabled;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/mirror_cursor_to_segmentation", enabled ? "1" : "0");
+    settings.setValue(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION, enabled ? "1" : "0");
 
     if (_viewerManager) {
         _viewerManager->setSegmentationCursorMirroring(enabled);
@@ -1547,13 +1549,15 @@ void CWindow::CreateWidgets(void)
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
 
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
-        bool showOverlays = settings.value("viewer/show_axis_overlays", true).toBool();
+        bool showOverlays = settings.value(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS,
+                                           vc3d::settings::viewer::SHOW_AXIS_OVERLAYS_DEFAULT).toBool();
         QSignalBlocker blocker(chkAxisOverlays);
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        int storedOpacity = settings.value("viewer/axis_overlay_opacity", spinAxisOverlayOpacity->value()).toInt();
+        int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                                           spinAxisOverlayOpacity->value()).toInt();
         storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
         QSignalBlocker blocker(spinAxisOverlayOpacity);
         spinAxisOverlayOpacity->setValue(storedOpacity);
@@ -1561,7 +1565,8 @@ void CWindow::CreateWidgets(void)
     }
 
     if (auto* spinSliceStep = ui.spinSliceStepSize) {
-        int savedStep = settings.value("viewer/slice_step_size", 1).toInt();
+        int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
+                                       vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();
         savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
         QSignalBlocker blocker(spinSliceStep);
         spinSliceStep->setValue(savedStep);
@@ -1573,7 +1578,7 @@ void CWindow::CreateWidgets(void)
                 _viewerManager->setSliceStepSize(value);
             }
             QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue("viewer/slice_step_size", value);
+            s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
             if (_sliceStepLabel) {
                 _sliceStepLabel->setText(tr("Step: %1").arg(value));
             }
@@ -1684,7 +1689,7 @@ void CWindow::CreateWidgets(void)
     }
 
     auto* spinIntersectionOpacity = ui.spinIntersectionOpacity;
-    const int savedIntersectionOpacity = settings.value("viewer/intersection_opacity",
+    const int savedIntersectionOpacity = settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
                                                         spinIntersectionOpacity->value()).toInt();
     const int boundedIntersectionOpacity = std::clamp(savedIntersectionOpacity,
                                                       spinIntersectionOpacity->minimum(),
@@ -1703,7 +1708,7 @@ void CWindow::CreateWidgets(void)
     }
 
     if (auto* spinIntersectionThickness = ui.doubleSpinIntersectionThickness) {
-        const double savedThickness = settings.value("viewer/intersection_thickness",
+        const double savedThickness = settings.value(vc3d::settings::viewer::INTERSECTION_THICKNESS,
                                                      spinIntersectionThickness->value()).toDouble();
         const double boundedThickness = std::clamp(savedThickness,
                                                    static_cast<double>(spinIntersectionThickness->minimum()),
@@ -1740,7 +1745,8 @@ void CWindow::CreateWidgets(void)
             comboIntersectionSampling->addItem(tr(opt.label), opt.stride);
         }
 
-        const int savedStride = settings.value("viewer/intersection_sampling_stride", 1).toInt();
+        const int savedStride = settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE,
+                                              vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt();
         int selectedIndex = comboIntersectionSampling->findData(savedStride);
         if (selectedIndex < 0) {
             selectedIndex = comboIntersectionSampling->findData(1);
@@ -1777,7 +1783,8 @@ void CWindow::CreateWidgets(void)
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
     if (chkAxisAlignedSlices) {
-        bool useAxisAligned = settings.value("viewer/use_axis_aligned_slices", true).toBool();
+        bool useAxisAligned = settings.value(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES,
+                                             vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES_DEFAULT).toBool();
         QSignalBlocker blocker(chkAxisAlignedSlices);
         chkAxisAlignedSlices->setChecked(useAxisAligned);
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
@@ -1895,7 +1902,8 @@ void CWindow::CreateWidgets(void)
             }
         }
     });
-    bool resetViewOnSurfaceChange = settings.value("viewer/reset_view_on_surface_change", true).toBool();
+    bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_viewerManager) {
         for (auto* viewer : _viewerManager->viewers()) {
             viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
@@ -1972,9 +1980,10 @@ void CWindow::keyReleaseEvent(QKeyEvent* event)
 // Asks User to Save Data Prior to VC.app Exit
 void CWindow::closeEvent(QCloseEvent* event)
 {
-    QSettings settings;
-    settings.setValue("mainWin/geometry", saveGeometry());
-    settings.setValue("mainWin/state", saveState());
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::window::GEOMETRY, saveGeometry());
+    settings.setValue(vc3d::settings::window::STATE, saveState());
+    settings.sync();  // Ensure settings are flushed to disk before quick_exit
 
     std::quick_exit(0);
 }
@@ -2100,7 +2109,7 @@ void CWindow::onSliceStepSizeChanged(int newSize)
 
     // Save to settings
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/slice_step_size", newSize);
+    settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
 
     // Update View dock widget spinbox
     if (auto* spinSliceStep = ui.spinSliceStepSize) {
@@ -2131,7 +2140,7 @@ void CWindow::OpenVolume(const QString& path)
 
     if (aVpkgPath.isEmpty()) {
         aVpkgPath = QFileDialog::getExistingDirectory(
-            this, tr("Open Directory"), settings.value("volpkg/default_path").toString(),
+            this, tr("Open Directory"), settings.value(vc3d::settings::volpkg::DEFAULT_PATH).toString(),
             QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
         // Dialog box cancelled
         if (aVpkgPath.length() == 0) {
@@ -2804,7 +2813,7 @@ void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
         spinAxisOverlayOpacity->setEnabled(_useAxisAlignedSlices && enabled);
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/show_axis_overlays", enabled ? "1" : "0");
+    settings.setValue(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS, enabled ? "1" : "0");
 }
 
 void CWindow::onAxisOverlayOpacityChanged(int value)
@@ -2814,7 +2823,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
         _planeSlicingOverlay->setAxisAlignedOverlayOpacity(normalized);
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/axis_overlay_opacity", value);
+    settings.setValue(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY, value);
 }
 
 void CWindow::recalcAreaForSegments(const std::vector<std::string>& ids)
@@ -2956,7 +2965,7 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
         spinAxisOverlayOpacity->setEnabled(enabled && (!ui.chkAxisOverlays || ui.chkAxisOverlays->isChecked()));
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("viewer/use_axis_aligned_slices", enabled ? "1" : "0");
+    settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
     updateAxisAlignedSliceInteraction();
     applySlicePlaneOrientation();
 }
@@ -3357,7 +3366,7 @@ void CWindow::startWatchingWithInotify()
 
     // Check if file watching is enabled in settings
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    if (!settings.value("perf/enable_file_watching", true).toBool()) {
+    if (!settings.value(vc3d::settings::perf::ENABLE_FILE_WATCHING, vc3d::settings::perf::ENABLE_FILE_WATCHING_DEFAULT).toBool()) {
         Logger()->info("File watching is disabled in settings");
         return;
     }
