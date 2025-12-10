@@ -96,6 +96,7 @@ public:
 
     [[nodiscard]] bool hasPendingChanges() const { return _hasPendingEdits; }
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const;
+    [[nodiscard]] cv::Mat_<cv::Vec3f>& previewPointsMutable();
     bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
                           bool markAsPendingEdit,
                           std::optional<cv::Rect>* outDiffBounds = nullptr);

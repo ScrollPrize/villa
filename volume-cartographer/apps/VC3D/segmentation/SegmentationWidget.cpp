@@ -7,6 +7,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
@@ -26,6 +27,7 @@
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSpinBox>
 #include <QToolButton>
 #include <QVariant>
@@ -573,6 +575,41 @@ void SegmentationWidget::buildUi()
     approvalBrushRow->addStretch(1);
     approvalLayout->addLayout(approvalBrushRow);
 
+    // Opacity slider row
+    auto* opacityRow = new QHBoxLayout();
+    opacityRow->setSpacing(8);
+
+    auto* opacityLabel = new QLabel(tr("Opacity:"), approvalParent);
+    _sliderApprovalMaskOpacity = new QSlider(Qt::Horizontal, approvalParent);
+    _sliderApprovalMaskOpacity->setRange(0, 100);
+    _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    _sliderApprovalMaskOpacity->setToolTip(tr("Mask overlay transparency (0 = transparent, 100 = opaque)."));
+
+    _lblApprovalMaskOpacity = new QLabel(QString::number(_approvalMaskOpacity) + QStringLiteral("%"), approvalParent);
+    _lblApprovalMaskOpacity->setMinimumWidth(35);
+
+    opacityRow->addWidget(opacityLabel);
+    opacityRow->addWidget(_sliderApprovalMaskOpacity, 1);
+    opacityRow->addWidget(_lblApprovalMaskOpacity);
+    approvalLayout->addLayout(opacityRow);
+
+    // Color picker row
+    auto* colorRow = new QHBoxLayout();
+    colorRow->setSpacing(8);
+
+    auto* colorLabel = new QLabel(tr("Brush Color:"), approvalParent);
+    _btnApprovalColor = new QPushButton(approvalParent);
+    _btnApprovalColor->setFixedSize(60, 24);
+    _btnApprovalColor->setToolTip(tr("Click to choose the color for approval mask painting."));
+    // Set initial color preview
+    _btnApprovalColor->setStyleSheet(
+        QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
+
+    colorRow->addWidget(colorLabel);
+    colorRow->addWidget(_btnApprovalColor);
+    colorRow->addStretch(1);
+    approvalLayout->addLayout(colorRow);
+
     // Undo button
     auto* buttonRow = new QHBoxLayout();
     buttonRow->setSpacing(8);
@@ -763,6 +800,17 @@ void SegmentationWidget::buildUi()
 
     connect(_spinApprovalBrushDepth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setApprovalBrushDepth(static_cast<float>(value));
+    });
+
+    connect(_sliderApprovalMaskOpacity, &QSlider::valueChanged, this, [this](int value) {
+        setApprovalMaskOpacity(value);
+    });
+
+    connect(_btnApprovalColor, &QPushButton::clicked, this, [this]() {
+        QColor newColor = QColorDialog::getColor(_approvalBrushColor, this, tr("Choose Approval Mask Color"));
+        if (newColor.isValid()) {
+            setApprovalBrushColor(newColor);
+        }
     });
 
     connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
@@ -1255,6 +1303,13 @@ void SegmentationWidget::syncUiState()
         // Edit checkboxes only enabled when show is checked
         _chkEditUnapprovedMask->setEnabled(_showApprovalMask);
     }
+    if (_sliderApprovalMaskOpacity) {
+        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
+        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    }
+    if (_lblApprovalMaskOpacity) {
+        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
 
     updateGrowthUiState();
 }
@@ -1353,6 +1408,14 @@ void SegmentationWidget::restoreSettings()
     _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
     _approvalBrushDepth = settings.value(QStringLiteral("approval_brush_depth"), _approvalBrushDepth).toFloat();
     _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
+    // Don't restore approval mask show/edit states - user must explicitly enable each session
+
+    _approvalMaskOpacity = settings.value(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity).toInt();
+    _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
+    const QString colorName = settings.value(QStringLiteral("approval_brush_color"), _approvalBrushColor.name()).toString();
+    if (QColor::isValidColorName(colorName)) {
+        _approvalBrushColor = QColor::fromString(colorName);
+    }
     _showApprovalMask = settings.value(QStringLiteral("show_approval_mask"), _showApprovalMask).toBool();
     // Don't restore edit states - user must explicitly enable editing each session
 
@@ -1533,6 +1596,42 @@ void SegmentationWidget::setApprovalBrushDepth(float depth)
     if (_spinApprovalBrushDepth) {
         const QSignalBlocker blocker(_spinApprovalBrushDepth);
         _spinApprovalBrushDepth->setValue(static_cast<double>(_approvalBrushDepth));
+    }
+}
+
+void SegmentationWidget::setApprovalMaskOpacity(int opacity)
+{
+    const int sanitized = std::clamp(opacity, 0, 100);
+    if (_approvalMaskOpacity == sanitized) {
+        return;
+    }
+    _approvalMaskOpacity = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity);
+        emit approvalMaskOpacityChanged(_approvalMaskOpacity);
+    }
+    if (_sliderApprovalMaskOpacity) {
+        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
+        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    }
+    if (_lblApprovalMaskOpacity) {
+        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
+}
+
+void SegmentationWidget::setApprovalBrushColor(const QColor& color)
+{
+    if (!color.isValid() || _approvalBrushColor == color) {
+        return;
+    }
+    _approvalBrushColor = color;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_color"), _approvalBrushColor.name());
+        emit approvalBrushColorChanged(_approvalBrushColor);
+    }
+    if (_btnApprovalColor) {
+        _btnApprovalColor->setStyleSheet(
+            QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
 }
 

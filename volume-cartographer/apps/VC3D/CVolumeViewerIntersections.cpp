@@ -32,8 +32,6 @@
 #define COLOR_SEG_XZ Qt::red
 #define COLOR_SEG_XY QColor(255, 140, 0)
 #define COLOR_APPROVED QColor(0, 200, 0)
-#define COLOR_PENDING QColor(0, 150, 255)
-#define COLOR_PENDING_UNAPPROVE QColor(255, 50, 50)
 
 #include <algorithm>
 #include <cmath>
@@ -404,25 +402,27 @@ void CVolumeViewer::renderIntersections()
                     const int approvalState = std::max(status0, status1);
                     const float approvalIntensity = std::max(intensity0, intensity1);
 
+                    // Status: 0 = not approved, 1 = saved approved, 2 = pending approved
+                    // Use actual mask color for approved regions (unapprovals are applied immediately)
                     if (approvalState > 0 && approvalIntensity > 0.0f) {
-                        QColor baseColor;
-                        if (approvalState == 3) {
-                            baseColor = COLOR_PENDING_UNAPPROVE;
-                        } else if (approvalState == 2) {
-                            baseColor = COLOR_PENDING;
-                        } else {
-                            baseColor = COLOR_APPROVED;
+                        // Query actual color from the mask at the midpoint of the line segment
+                        const int queryRow = static_cast<int>(std::round((absRow0 + absRow1) * 0.5f));
+                        const int queryCol = static_cast<int>(std::round((absCol0 + absCol1) * 0.5f));
+                        QColor approvalColor = segOverlay->queryApprovalColor(queryRow, queryCol);
+                        if (!approvalColor.isValid()) {
+                            approvalColor = COLOR_APPROVED;  // Fallback to default green
                         }
 
-                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f);
+                        const float opacityFactor = static_cast<float>(segOverlay->approvalMaskOpacity()) / 100.0f;
+                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f) * opacityFactor;
                         lineColor = QColor(
-                            static_cast<int>(col.red() * (1.0f - blendFactor) + baseColor.red() * blendFactor),
-                            static_cast<int>(col.green() * (1.0f - blendFactor) + baseColor.green() * blendFactor),
-                            static_cast<int>(col.blue() * (1.0f - blendFactor) + baseColor.blue() * blendFactor),
-                            baseColor.alpha()
+                            static_cast<int>(col.red() * (1.0f - blendFactor) + approvalColor.red() * blendFactor),
+                            static_cast<int>(col.green() * (1.0f - blendFactor) + approvalColor.green() * blendFactor),
+                            static_cast<int>(col.blue() * (1.0f - blendFactor) + approvalColor.blue() * blendFactor),
+                            approvalColor.alpha()
                         );
 
-                        const float extraWidth = 6.0f * blendFactor;
+                        const float extraWidth = 12.0f * blendFactor;
                         lineWidth = width + extraWidth;
                         lineZ = z_value + 5;
                     }

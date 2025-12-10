@@ -413,10 +413,11 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
         useRectangle = true;
     }
     const float clampedRadius = std::clamp(paintRadius, 0.5f, 500.0f);
+    const QColor brushColor = _module.approvalBrushColor();
 
     // Paint the accumulated points into the QImage
     overlay->paintApprovalMaskDirect(_accumulatedGridPositions, clampedRadius, paintValue,
-                                      useRectangle, paintWidth, paintHeight);
+                                      brushColor, useRectangle, paintWidth, paintHeight);
 
     // Clear for next batch
     _accumulatedGridPositions.clear();
