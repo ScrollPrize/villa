@@ -2499,28 +2499,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
     QuadSurface* surf = create_surface_from_state();
 
-    // If resuming, crop the surface back to the original dimensions
-    // (create_surface_from_state adds +2 padding on each side for safety)
-    if (resume_surf) {
-        cv::Mat_<cv::Vec3f> resume_points = resume_surf->rawPoints();
-        cv::Mat_<cv::Vec3f>* surf_points = surf->rawPointsPtr();
-        if (surf_points && surf_points->cols > resume_points.cols && surf_points->rows > resume_points.rows) {
-            const int cropX = (surf_points->cols - resume_points.cols) / 2;
-            const int cropY = (surf_points->rows - resume_points.rows) / 2;
-            cv::Rect cropRect(cropX, cropY, resume_points.cols, resume_points.rows);
-            cv::Mat_<cv::Vec3f> cropped = (*surf_points)(cropRect).clone();
-            *surf_points = cropped;
-            surf->invalidateCache();
-
-            // Also crop the generations channel if present
-            cv::Mat_<uint16_t> gens = surf->channel("generations");
-            if (!gens.empty() && gens.cols > resume_points.cols && gens.rows > resume_points.rows) {
-                cv::Mat_<uint16_t> gens_cropped = gens(cropRect).clone();
-                surf->setChannel("generations", gens_cropped);
-            }
-        }
-    }
-
     const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
     const double voxel_size_d = static_cast<double>(voxelsize);
     const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
