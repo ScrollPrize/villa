@@ -655,6 +655,14 @@ bool SegmentationOverlayController::shouldShowMask(const State& state) const
 void SegmentationOverlayController::onSurfaceChanged(std::string name, std::shared_ptr<Surface> surface)
 {
     Q_UNUSED(surface);
+
+    // Cancel any pending approval mask save - the surface pointer may become dangling
+    // when surfaces are reloaded (e.g., after copy in/out job completion)
+    if (_approvalSaveTimer && _approvalSaveTimer->isActive()) {
+        _approvalSaveTimer->stop();
+    }
+    _approvalSaveSurface = nullptr;
+
     if (name == "segmentation") {
         refreshAll();
     }
