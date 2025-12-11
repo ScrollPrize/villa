@@ -1426,10 +1426,15 @@ def fit_cosine_grid(
         else:
             smooth_x = torch.zeros((), device=off.device, dtype=off.dtype)
     
-        # First-order differences along y index: o[..., j+1, :] - o[..., j, :].
-        # Again, treat (u_offset, v_offset) symmetrically via ||Δ_off||^2.
+        # Vertical smoothness: act on the coordinates implied by the line offsets
+        # (row-index displacements for horizontal connectivity), not directly on
+        # the raw offset field.
+        #
+        # line_offset has shape (1,2,gh,gw); we regularize its variation along y:
+        #   dy = line_offset[:, :, j+1, :] - line_offset[:, :, j, :].
         if gh >= 2:
-            dy = off[:, :, 1:, :] - off[:, :, :-1, :]  # (1,2,gh-1,gw)
+            lo = model.line_offset  # (1,2,gh,gw)
+            dy = lo[:, :, 1:, :] - lo[:, :, :-1, :]  # (1,2,gh-1,gw)
             dy_sq = (dy * dy).sum(dim=1, keepdim=True)
             smooth_y = dy_sq  # (1,1,gh-1,gw)
         else:
@@ -2349,7 +2354,7 @@ def fit_cosine_grid(
         )
  
     # Shared weight for UNet directional alignment in both stages.
-    lambda_dir_unet = 10.0
+    lambda_dir_unet = 100.0
  
     # Global per-loss base weights (stage independent).
     lambda_global: dict[str, float] = {
@@ -2401,6 +2406,7 @@ def fit_cosine_grid(
         # "data": 0.0,
         "quad_tri": 0.0,
         "grad_data": 0.0,
+        # "dir_unet": 10.0,
         # "grad_data": 0.0,
     }
  
@@ -2529,7 +2535,7 @@ def fit_cosine_grid(
         if w_dir != 0.0:
             # Use the same sample-space mask as the data term so that
             # directional alignment is only enforced inside the cosine band.
-            dir_loss = _directional_alignment_loss(grid, mask_sample=weight_full)
+            dir_loss = _directional_alignment_loss(grid, mask_sample=valid)
             total_loss = total_loss + w_dir * dir_loss
         else:
             dir_loss = torch.zeros((), device=device, dtype=dtype)
@@ -2709,9 +2715,9 @@ def fit_cosine_grid(
         # together with the coarse grid offsets and modulation fields (no data terms).
         opt2 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
+                # model.theta,
+                # model.log_s,
+                # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
@@ -2733,9 +2739,9 @@ def fit_cosine_grid(
     if total_stage3 > 0:
         opt3 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
+                # model.theta,
+                # model.log_s,
+                # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
@@ -2757,9 +2763,9 @@ def fit_cosine_grid(
     if total_stage4 > 0:
         opt4 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
+                # model.theta,
+                # model.log_s,
+                # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
@@ -2952,17 +2958,17 @@ def main() -> None:
     parser.add_argument(
         "--lambda-smooth-x",
         type=float,
-        default=100,
+        default=1000,
         help="Smoothness weight along x (cosine direction) for the coarse grid.",
     )
     parser.add_argument(
         "--lambda-smooth-y",
         type=float,
-        default=100,
+        default=1000,
         help="Smoothness weight along y (ridge direction) for the coarse grid.",
     )
     parser.add_argument("--lambda-mono", type=float, default=1e-3)
-    parser.add_argument("--lambda-xygrad", type=float, default=1)
+    parser.add_argument("--lambda-xygrad", type=float, default=0)
     parser.add_argument(
         "--lambda-line-smooth-y",
         type=float,
