@@ -9,5 +9,6 @@ dependencies:
   - colorcet
   - pip
   - numba
-  - pip:
-      - "napari[all]"
+  - qtpy
+  - pyqt
+  - napari
