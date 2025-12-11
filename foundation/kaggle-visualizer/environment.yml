@@ -1,0 +1,12 @@
+name: kaggle-visualizer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - tifffile
+  - scikit-image
+  - colorcet
+  - pip
+  - pip:
+      - "napari[all]"
