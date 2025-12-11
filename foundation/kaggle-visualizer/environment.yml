@@ -8,5 +8,6 @@ dependencies:
   - scikit-image
   - colorcet
   - pip
+  - numba
   - pip:
       - "napari[all]"
