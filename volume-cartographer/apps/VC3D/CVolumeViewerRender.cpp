@@ -19,6 +19,8 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SliceCache.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "ViewerManager.hpp"
 
 #include <omp.h>
 
@@ -506,42 +508,27 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
         }
     }
 
-    // Surface overlap detection
-    if (_surfaceOverlayEnabled && !_surfaceOverlayName.empty() && _surf_col && !baseColor.empty()) {
-        auto overlaySurf = _surf_col->surface(_surfaceOverlayName);
-        if (overlaySurf && overlaySurf != surf) {
-            cv::Mat_<cv::Vec3f> overlayCoords;
-
-            // Generate coordinates for overlay surface using the same ROI parameters
-            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-                overlaySurf->gen(&overlayCoords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale,
-                               {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
-            } else {
-                cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
-                auto overlayPtr = overlaySurf->pointer();
-                cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
-                overlaySurf->move(overlayPtr, diff / _scale);
-                overlaySurf->gen(&overlayCoords, nullptr, roi.size(), overlayPtr, _scale,
-                               {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
-            }
-
-            // Compute distances and create overlap mask
-            if (!overlayCoords.empty() && overlayCoords.size() == coords.size()) {
+    // Surface overlap detection using SurfacePatchIndex for proper spatial queries
+    if (_surfaceOverlayEnabled && !_surfaceOverlayName.empty() && _surf_col && !baseColor.empty() && _viewerManager) {
+        auto overlaySurfBase = _surf_col->surface(_surfaceOverlayName);
+        auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(overlaySurfBase);
+        if (overlaySurf && overlaySurf.get() != surf.get()) {
+            SurfacePatchIndex* patchIndex = _viewerManager->surfacePatchIndex();
+            if (patchIndex && !patchIndex->empty()) {
                 cv::Mat_<uint8_t> overlapMask(baseColor.size(), uint8_t(0));
 
+                // For each pixel on the base surface, query the patch index
+                // to find the nearest point on the overlay surface
                 #pragma omp parallel for collapse(2)
                 for (int y = 0; y < coords.rows; ++y) {
                     for (int x = 0; x < coords.cols; ++x) {
                         const cv::Vec3f& basePos = coords(y, x);
-                        const cv::Vec3f& overlayPos = overlayCoords(y, x);
 
-                        // Check if both positions are valid (not -1)
-                        if (basePos[0] >= 0 && overlayPos[0] >= 0) {
-                            // Compute Euclidean distance
-                            cv::Vec3f diff = basePos - overlayPos;
-                            float distance = std::sqrt(diff.dot(diff));
-
-                            if (distance < _surfaceOverlapThreshold) {
+                        // Check if position is valid (not -1)
+                        if (basePos[0] >= 0) {
+                            // Use the patch index to find nearest point on the overlay surface
+                            auto result = patchIndex->locate(basePos, _surfaceOverlapThreshold, overlaySurf);
+                            if (result && result->distance >= 0 && result->distance < _surfaceOverlapThreshold) {
                                 overlapMask(y, x) = 255;
                             }
                         }
