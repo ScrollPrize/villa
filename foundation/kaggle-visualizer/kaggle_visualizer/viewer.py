@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from napari.utils.notifications import show_info, show_warning
+from numba import njit
 
 import colorcet
 import napari
@@ -15,6 +16,16 @@ from skimage import measure
 
 
 SUPPORTED_EXTENSIONS = {".tif", ".tiff"}
+OFFSETS_6 = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]])
+OFFSETS_26 = np.array(
+    [
+        [i, j, k]
+        for i in (-1, 0, 1)
+        for j in (-1, 0, 1)
+        for k in (-1, 0, 1)
+        if not (i == 0 and j == 0 and k == 0)
+    ]
+)
 
 
 def _list_tiffs(folder: Path) -> List[Path]:
@@ -66,6 +77,99 @@ def _text_for_sample(name: str, index: int, total: int) -> str:
     return f"{name} ({index + 1}/{total})"
 
 
+@njit(cache=True)
+def _bridge_voxels(mask: np.ndarray, labeled6: np.ndarray, offsets6: np.ndarray, offsets26: np.ndarray) -> np.ndarray:
+    to_remove = np.zeros(mask.shape, dtype=np.uint8)
+    z_max, y_max, x_max = mask.shape
+    coords = np.argwhere(mask)
+
+    for idx in range(coords.shape[0]):
+        z, y, x = coords[idx]
+        base_id = labeled6[z, y, x]
+        if base_id == 0:
+            continue
+
+        # If any 6-neighbor is a different component, keep it.
+        skip = False
+        for k in range(offsets6.shape[0]):
+            dz, dy, dx = offsets6[k]
+            zz = z + dz
+            yy = y + dy
+            xx = x + dx
+            if 0 <= zz < z_max and 0 <= yy < y_max and 0 <= xx < x_max:
+                nid = labeled6[zz, yy, xx]
+                if nid != 0 and nid != base_id:
+                    skip = True
+                    break
+        if skip:
+            continue
+
+        # Count distinct neighboring component ids via 26-neighborhood.
+        neighbor1 = 0
+        neighbor2 = 0
+        for k in range(offsets26.shape[0]):
+            dz, dy, dx = offsets26[k]
+            zz = z + dz
+            yy = y + dy
+            xx = x + dx
+            if 0 <= zz < z_max and 0 <= yy < y_max and 0 <= xx < x_max:
+                nid = labeled6[zz, yy, xx]
+                if nid != 0 and nid != base_id:
+                    if neighbor1 == 0:
+                        neighbor1 = nid
+                    elif nid != neighbor1:
+                        neighbor2 = nid
+                        break
+        if neighbor2 != 0:
+            to_remove[z, y, x] = 1
+
+    return to_remove
+
+
+def _prune_diagonal_bridges(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
+    """
+    Remove voxels that only connect multiple 6-connected components via 26-connectivity.
+    Uses numba-accelerated inner loop for speed.
+    """
+    mask = mask.astype(bool)
+    for _ in range(max(iterations, 1)):
+        labeled6 = measure.label(mask, connectivity=1)
+        to_remove = _bridge_voxels(mask, labeled6.astype(np.int32), OFFSETS_6.astype(np.int32), OFFSETS_26.astype(np.int32))
+        if not np.any(to_remove):
+            break
+        mask[to_remove.astype(bool)] = False
+
+    return mask.astype(np.uint8)
+
+
+def _prune_diagonal_bridges_all_planes(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
+    """
+    Apply diagonal bridge pruning across XY, ZX, and ZY orientations to catch plane-specific connectors.
+    """
+    perms = [
+        (0, 1, 2),  # original Z, Y, X
+        (1, 2, 0),  # rotate so original Z maps to X
+        (0, 2, 1),  # rotate so original Z maps to Y
+    ]
+
+    pruned = mask.astype(np.uint8)
+    for perm in perms:
+        transposed = np.transpose(pruned, perm)
+        cleaned = _prune_diagonal_bridges(transposed, iterations=iterations)
+        # invert permutation to restore original axis order
+        inv_perm = np.argsort(perm)
+        pruned = np.transpose(cleaned, inv_perm)
+    return pruned
+
+
+def _write_fixed_label(output_path: Path, mask: np.ndarray) -> None:
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(output_path, mask.astype(np.uint8))
+    except Exception as exc:
+        show_warning(f"Failed to write fixed label to {output_path}: {exc}")
+
+
 @dataclass
 class SamplePair:
     image_path: Path
@@ -89,6 +193,7 @@ class PairedDatasetViewer:
         self.component_ids: List[int] = []
         self.component_index = 0
         self.isolate_component = False
+        self.label_source: str = "auto"  # auto -> use fixed if available, else raw; can be raw/fixed via toggle
         self.log_path = log_path
         self.logged_ids: Set[str] = self._load_existing_logs(log_path) if log_path else set()
 
@@ -101,6 +206,8 @@ class PairedDatasetViewer:
         self.viewer.bind_key("j")(self._previous_component)
         # Log current sample ID to CSV. Use an unused key (`g` for "flag") with overwrite to avoid conflicts.
         self.viewer.bind_key("g", overwrite=True)(self._log_current_sample)
+        # Cycle label source (auto/raw/fixed) if available.
+        self.viewer.bind_key("c")(self._cycle_label_source)
 
         self._load_current()
         self.viewer.text_overlay.visible = True
@@ -139,7 +246,28 @@ class PairedDatasetViewer:
         pair = self.pairs[self.index]
 
         image_volume = _load_volume(pair.image_path)
-        label_volume = _load_volume(pair.label_path)
+        fixed_label_path = pair.label_path.with_name(f"{pair.label_path.stem}_fixed{pair.label_path.suffix}")
+        raw_label = _load_volume(pair.label_path)
+        raw_mask = (raw_label == 1).astype(np.uint8)
+        fixed_mask = None
+        fixed_used = False
+
+        if fixed_label_path.exists():
+            fixed_mask = (_load_volume(fixed_label_path) == 1).astype(np.uint8)
+            fixed_used = True
+            show_info(f"Using existing fixed label: {fixed_label_path.name}")
+        else:
+            pruned_mask = _prune_diagonal_bridges_all_planes(raw_mask, iterations=2)
+            if not np.array_equal(raw_mask, pruned_mask):
+                fixed_mask = pruned_mask.astype(np.uint8)
+                _write_fixed_label(fixed_label_path, fixed_mask)
+                fixed_used = True
+                show_info(f"Pruned diagonal bridges and saved fixed label: {fixed_label_path.name}")
+
+        label_volume, selected_source = self._select_label_volume(raw_mask, fixed_mask)
+        if selected_source == "fixed" and fixed_used:
+            show_info(f"Using fixed label for {pair.name}")
+
         labeled_components = _connected_components(label_volume, target_value=1)
         self.component_ids = [int(x) for x in np.unique(labeled_components) if x != 0]
         self.component_index = 0 if self.component_ids else -1
@@ -186,6 +314,26 @@ class PairedDatasetViewer:
     def _previous_sample(self, _viewer=None) -> None:
         self.index = (self.index - 1) % len(self.pairs)
         self._load_current()
+
+    def _select_label_volume(self, raw_mask: np.ndarray, fixed_mask: Optional[np.ndarray]) -> Tuple[np.ndarray, str]:
+        if self.label_source == "raw" or (self.label_source == "fixed" and fixed_mask is None):
+            return raw_mask, "raw"
+        if self.label_source == "fixed" and fixed_mask is not None:
+            return fixed_mask, "fixed"
+        # auto: prefer fixed if available
+        if fixed_mask is not None:
+            return fixed_mask, "fixed"
+        return raw_mask, "raw"
+
+    def _cycle_label_source(self, _viewer=None) -> None:
+        if self.label_source == "auto":
+            self.label_source = "raw"
+        elif self.label_source == "raw":
+            self.label_source = "fixed"
+        else:
+            self.label_source = "auto"
+        self._load_current()
+        show_info(f"Label source: {self.label_source}")
 
     def _log_current_sample(self, _viewer=None) -> None:
         if not self.log_path:

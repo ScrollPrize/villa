@@ -24,7 +24,8 @@ Controls:
 - `k` move to the next connected component within the current sample (wraps)
 - `j` move to the previous connected component within the current sample (wraps)
 - `g` append the current sample ID to the log CSV (created if missing; duplicates ignored)
+- `c` cycle label source: auto → raw → fixed (if available)
 
 Notes:
-- Training data is shown in grayscale; labels use connected components (26-connectivity) of voxels with label value `1` colored with the `glasbey` palette from `colorcet` (labels `0` and `2` are treated as background).
+- Training data is shown in grayscale; labels use connected components (26-connectivity) of voxels with label value `1` colored with the `glasbey` palette from `colorcet` (labels `0` and `2` are treated as background). Before labeling, diagonal-only bridges (checked across XY, ZX, and ZY orientations) that merge separate 6-connected components are pruned, and a `_fixed` label volume is written alongside the original when pruning changes the mask.
 - The overlay text shows the current sample name and index.
