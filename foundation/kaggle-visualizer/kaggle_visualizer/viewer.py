@@ -196,6 +196,7 @@ class PairedDatasetViewer:
         self.image_layer = None
         self.label_layer = None
         self.index = 0
+        self.current_sample_id: Optional[str] = None
         self.component_ids: List[int] = []
         self.component_index = 0
         self.isolate_component = False
@@ -253,6 +254,7 @@ class PairedDatasetViewer:
 
     def _load_current(self) -> None:
         pair = self.pairs[self.index]
+        self.current_sample_id = pair.name
 
         image_volume = _load_volume(pair.image_path)
         fixed_label_path = pair.label_path.with_name(f"{pair.label_path.stem}_fixed{pair.label_path.suffix}")
@@ -322,6 +324,9 @@ class PairedDatasetViewer:
 
         self._apply_selected_component()
         self.viewer.text_overlay.text = _text_for_sample(pair.name, self.index, len(self.pairs))
+        # Surface the current ID in the viewer UI.
+        self.viewer.title = f"{pair.name} [{self.index + 1}/{len(self.pairs)}]"
+        self.viewer.status = f"Current sample: {pair.name}"
 
     def _next_sample(self, _viewer=None) -> None:
         self.index = (self.index + 1) % len(self.pairs)
