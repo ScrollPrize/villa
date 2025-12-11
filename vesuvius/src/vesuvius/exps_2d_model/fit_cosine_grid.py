@@ -2386,8 +2386,9 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
-        "grad_mag": 0.1,
+        "grad_mag": 0.0,
         "quad_tri": 0.0,
+        # "dir_unet": 0.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
@@ -2426,7 +2427,7 @@ def fit_cosine_grid(
               use_full = (stage_modifiers["mask_{name}"] != 0)
         - else: use_full = use_full_default
         """
-        key = f"mask_{name}"
+        key = f"use_full_{name}"
         if key in stage_modifiers:
             use_full = bool(stage_modifiers[key])
         else:
@@ -2989,7 +2990,7 @@ def main() -> None:
     parser.add_argument(
         "--lambda-smooth-y",
         type=float,
-        default=1000,
+        default=10000,
         help="Smoothness weight along y (ridge direction) for the coarse grid.",
     )
     parser.add_argument("--lambda-mono", type=float, default=1e-3)
