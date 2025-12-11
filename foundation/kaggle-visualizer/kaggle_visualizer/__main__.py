@@ -21,13 +21,23 @@ def main() -> None:
         help="Folder containing binary label TIFF volumes (uint8) with matching filenames.",
     )
     parser.add_argument(
-        "--log-csv",
+        "--log-mergers-csv",
         type=Path,
-        help="Optional path to a CSV file where flagged sample IDs will be appended (unique).",
+        help="Optional path to a CSV file where merger sample IDs will be appended (unique).",
+    )
+    parser.add_argument(
+        "--log-tiny-csv",
+        type=Path,
+        help="Optional path to a CSV file where tiny-component sample IDs will be appended (unique).",
     )
     args = parser.parse_args()
 
-    launch_viewer(str(args.train_dir), str(args.label_dir), log_csv=args.log_csv)
+    launch_viewer(
+        str(args.train_dir),
+        str(args.label_dir),
+        log_mergers=args.log_mergers_csv,
+        log_tiny=args.log_tiny_csv,
+    )
 
 
 if __name__ == "__main__":

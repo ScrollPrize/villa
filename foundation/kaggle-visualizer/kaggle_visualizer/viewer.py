@@ -181,7 +181,13 @@ class SamplePair:
 
 
 class PairedDatasetViewer:
-    def __init__(self, train_dir: Path, label_dir: Path, log_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        train_dir: Path,
+        label_dir: Path,
+        log_mergers: Optional[Path] = None,
+        log_tiny: Optional[Path] = None,
+    ) -> None:
         self.pairs = self._collect_pairs(train_dir, label_dir)
         if not self.pairs:
             raise ValueError("No matching .tif/.tiff files found between the two folders.")
@@ -194,18 +200,21 @@ class PairedDatasetViewer:
         self.component_index = 0
         self.isolate_component = False
         self.label_source: str = "auto"  # auto -> use fixed if available, else raw; can be raw/fixed via toggle
-        self.log_path = log_path
-        self.logged_ids: Set[str] = self._load_existing_logs(log_path) if log_path else set()
+        self.log_mergers_path = log_mergers
+        self.log_tiny_path = log_tiny
+        self.logged_mergers: Set[str] = self._load_existing_logs(log_mergers) if log_mergers else set()
+        self.logged_tiny: Set[str] = self._load_existing_logs(log_tiny) if log_tiny else set()
 
         # Use letter keys that are broadly available across keyboard layouts.
-        self.viewer.bind_key("n")(self._next_sample)
-        self.viewer.bind_key("b")(self._previous_sample)
+        self.viewer.bind_key("n", overwrite=True)(self._next_sample)
+        self.viewer.bind_key("b", overwrite=True)(self._previous_sample)
         # Component inspection: toggle isolation and cycle components.
         self.viewer.bind_key("v")(self._toggle_isolate_component)
         self.viewer.bind_key("k")(self._next_component)
         self.viewer.bind_key("j")(self._previous_component)
-        # Log current sample ID to CSV. Use an unused key (`g` for "flag") with overwrite to avoid conflicts.
-        self.viewer.bind_key("g", overwrite=True)(self._log_current_sample)
+        # Log current sample ID to CSV for different mistake types.
+        self.viewer.bind_key("g", overwrite=True)(self._log_merger_sample)
+        self.viewer.bind_key("t", overwrite=True)(self._log_tiny_sample)
         # Cycle label source (auto/raw/fixed) if available.
         self.viewer.bind_key("c")(self._cycle_label_source)
 
@@ -281,6 +290,8 @@ class PairedDatasetViewer:
                 contrast_limits=(0, 255),
                 blending="additive",
             )
+            self.image_layer.bind_key("b", self._previous_sample, overwrite=True)
+            self.image_layer.bind_key("n", self._next_sample, overwrite=True)
         else:
             self.image_layer.data = image_volume
 
@@ -292,6 +303,9 @@ class PairedDatasetViewer:
                 opacity=0.5,
             )
             self.label_layer.color = color_mapping
+            # Bind navigation keys on the layer to avoid layer-level defaults overriding viewer bindings.
+            self.label_layer.bind_key("b", self._previous_sample, overwrite=True)
+            self.label_layer.bind_key("n", self._next_sample, overwrite=True)
         else:
             # Recreate the labels layer so napari refreshes internal max labels.
             current_show_selected = self.isolate_component and bool(self.component_ids)
@@ -303,6 +317,8 @@ class PairedDatasetViewer:
             )
             self.label_layer.color = color_mapping
             self.label_layer.show_selected_label = current_show_selected
+            self.label_layer.bind_key("b", self._previous_sample, overwrite=True)
+            self.label_layer.bind_key("n", self._next_sample, overwrite=True)
 
         self._apply_selected_component()
         self.viewer.text_overlay.text = _text_for_sample(pair.name, self.index, len(self.pairs))
@@ -335,29 +351,36 @@ class PairedDatasetViewer:
         self._load_current()
         show_info(f"Label source: {self.label_source}")
 
-    def _log_current_sample(self, _viewer=None) -> None:
-        if not self.log_path:
-            show_warning("No log file configured. Use --log-csv to enable logging.")
+    def _log_sample(self, sample_id: str, path: Optional[Path], cache: Set[str], label: str) -> None:
+        if not path:
+            show_warning(f"No log file configured for {label}. Use the corresponding CLI flag.")
             return
-        sample_id = self.pairs[self.index].name
-        if sample_id in self.logged_ids:
-            show_info(f"Sample already logged: {sample_id}")
+        if sample_id in cache:
+            show_info(f"Sample already logged in {label}: {sample_id}")
             return
         try:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            write_header = not self.log_path.exists() or self.log_path.stat().st_size == 0
-            with self.log_path.open("a", newline="") as f:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not path.exists() or path.stat().st_size == 0
+            with path.open("a", newline="") as f:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow(["sample_id"])
                 writer.writerow([sample_id])
-            self.logged_ids.add(sample_id)
-            msg = f"Logged sample: {sample_id} -> {self.log_path}"
+            cache.add(sample_id)
+            msg = f"Logged {label}: {sample_id} -> {path}"
             show_info(msg)
             print(f"[kaggle-visualizer] {msg}")
         except Exception as exc:
-            show_warning(f"Failed to log sample {sample_id}: {exc}")
-            print(f"[kaggle-visualizer] failed to log sample {sample_id}: {exc}")
+            show_warning(f"Failed to log {label} for {sample_id}: {exc}")
+            print(f"[kaggle-visualizer] failed to log {label} for {sample_id}: {exc}")
+
+    def _log_merger_sample(self, _viewer=None) -> None:
+        sample_id = self.pairs[self.index].name
+        self._log_sample(sample_id, self.log_mergers_path, self.logged_mergers, "merger")
+
+    def _log_tiny_sample(self, _viewer=None) -> None:
+        sample_id = self.pairs[self.index].name
+        self._log_sample(sample_id, self.log_tiny_path, self.logged_tiny, "tiny")
 
     def _apply_selected_component(self) -> None:
         if not self.label_layer:
@@ -399,12 +422,23 @@ class PairedDatasetViewer:
         self._apply_selected_component()
 
 
-def launch_viewer(train_dir: str, label_dir: str, log_csv: Optional[Path] = None) -> None:
+def launch_viewer(
+    train_dir: str,
+    label_dir: str,
+    log_mergers: Optional[Path] = None,
+    log_tiny: Optional[Path] = None,
+) -> None:
     """
     Launch a napari viewer showing 3D TIFF volumes with connected-component labels.
     """
-    resolved_log = Path(log_csv).expanduser() if log_csv else None
-    viewer = PairedDatasetViewer(Path(train_dir), Path(label_dir), log_path=resolved_log)
+    resolved_mergers = Path(log_mergers).expanduser() if log_mergers else None
+    resolved_tiny = Path(log_tiny).expanduser() if log_tiny else None
+    viewer = PairedDatasetViewer(
+        Path(train_dir),
+        Path(label_dir),
+        log_mergers=resolved_mergers,
+        log_tiny=resolved_tiny,
+    )
     viewer.show()
 
 
