@@ -14,7 +14,11 @@ conda activate kaggle-visualizer
 Place training volumes and labels in separate folders with matching filenames (e.g., `train/001.tif` and `labels/001.tif`).
 
 ```
-python -m kaggle_visualizer --train-dir /path/to/train --label-dir /path/to/labels --log-csv /path/to/flagged_samples.csv
+python -m kaggle_visualizer \
+  --train-dir /path/to/train \
+  --label-dir /path/to/labels \
+  --log-mergers-csv /path/to/mergers.csv \
+  --log-tiny-csv /path/to/tiny.csv
 ```
 
 Controls:
@@ -23,7 +27,8 @@ Controls:
 - `v` toggle isolating a single connected component (show only the selected component)
 - `k` move to the next connected component within the current sample (wraps)
 - `j` move to the previous connected component within the current sample (wraps)
-- `g` append the current sample ID to the log CSV (created if missing; duplicates ignored)
+- `g` append the current sample ID to the mergers log CSV (created if missing; duplicates ignored)
+- `t` append the current sample ID to the tiny-components log CSV (created if missing; duplicates ignored)
 - `c` cycle label source: auto → raw → fixed (if available)
 
 Notes:
