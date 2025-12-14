@@ -12,6 +12,7 @@ import colorcet
 import napari
 import numpy as np
 import tifffile
+from scipy import ndimage as ndi
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QColor, QFont, QPainter, QPen
 from qtpy.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
@@ -104,6 +105,17 @@ def _is_direct_color_mode(mode: object) -> bool:
     if hasattr(mode, "name") and isinstance(getattr(mode, "name"), str):
         return getattr(mode, "name").lower() == "direct"
     return "direct" in str(mode).lower()
+
+
+BBox = Tuple[int, int, int, int, int, int]
+
+
+@dataclass
+class ComponentTopology:
+    cavities: int
+    tunnels: int
+    cavity_bboxes: Optional[List[BBox]] = None
+    tunnel_bboxes: Optional[List[BBox]] = None
 
 
 class ComponentPaletteWidget(QWidget):
@@ -253,6 +265,9 @@ class ComponentLegendWidget(QWidget):
         self.count_label.setFont(font)
 
         self.sample_label = QLabel("")
+        self.sample_topology_label = QLabel("")
+        self.selected_topology_label = QLabel("")
+        self.selected_topology_label.setVisible(False)
 
         self.palette_widget = ComponentPaletteWidget()
         scroll = QScrollArea()
@@ -266,6 +281,8 @@ class ComponentLegendWidget(QWidget):
         layout.setSpacing(6)
         layout.addWidget(self.count_label)
         layout.addWidget(self.sample_label)
+        layout.addWidget(self.sample_topology_label)
+        layout.addWidget(self.selected_topology_label)
         layout.addWidget(scroll)
         self.setLayout(layout)
 
@@ -292,6 +309,27 @@ class ComponentLegendWidget(QWidget):
 
     def set_selected_component(self, selected_component: Optional[int]) -> None:
         self.palette_widget.set_selected_component(selected_component)
+
+    def set_topology(
+        self,
+        *,
+        sample_cavities: int,
+        sample_tunnels: int,
+        selected_component: Optional[int],
+        selected_cavities: int,
+        selected_tunnels: int,
+        isolate_mode: bool,
+    ) -> None:
+        self.sample_topology_label.setText(
+            f"Sample — cavities: {sample_cavities} | tunnels: {sample_tunnels}"
+        )
+        if isolate_mode and selected_component:
+            self.selected_topology_label.setText(
+                f"Selected component {selected_component} — cavities: {selected_cavities} | tunnels: {selected_tunnels}"
+            )
+            self.selected_topology_label.setVisible(True)
+        else:
+            self.selected_topology_label.setVisible(False)
 
 
 @njit(cache=True)
@@ -425,8 +463,12 @@ class PairedDatasetViewer:
         self.image_layer = None
         self.label_layer = None
         self.bbox_layer = None
+        self.feature_bbox_layer = None
         self.component_bboxes: Dict[int, Tuple[int, int, int, int, int, int]] = {}
         self.current_volume_shape: Optional[Tuple[int, int, int]] = None
+        self.component_topology: Dict[int, ComponentTopology] = {}
+        self.sample_cavities = 0
+        self.sample_tunnels = 0
         self.index = 0
         self.current_sample_id: Optional[str] = None
         self.component_ids: List[int] = []
@@ -443,9 +485,9 @@ class PairedDatasetViewer:
         self.viewer.bind_key("n", overwrite=True)(self._next_sample)
         self.viewer.bind_key("b", overwrite=True)(self._previous_sample)
         # Component inspection: toggle isolation and cycle components.
-        self.viewer.bind_key("v")(self._toggle_isolate_component)
-        self.viewer.bind_key("k")(self._next_component)
-        self.viewer.bind_key("j")(self._previous_component)
+        self.viewer.bind_key("v", overwrite=True)(self._toggle_isolate_component)
+        self.viewer.bind_key("k", overwrite=True)(self._next_component)
+        self.viewer.bind_key("j", overwrite=True)(self._previous_component)
         # Log current sample ID to CSV for different mistake types.
         self.viewer.bind_key("g", overwrite=True)(self._log_merger_sample)
         self.viewer.bind_key("t", overwrite=True)(self._log_tiny_sample)
@@ -516,6 +558,7 @@ class PairedDatasetViewer:
         self.component_ids = [int(x) for x in np.unique(labeled_components) if x != 0]
         self.component_index = 0 if self.component_ids else -1
         self._compute_component_bboxes(labeled_components)
+        self._compute_component_topology(labeled_components)
 
         if self.image_layer is None:
             self.image_layer = self.viewer.add_image(
@@ -527,10 +570,14 @@ class PairedDatasetViewer:
             )
             self.image_layer.bind_key("b", self._previous_sample, overwrite=True)
             self.image_layer.bind_key("n", self._next_sample, overwrite=True)
+            self.image_layer.bind_key("v", self._toggle_isolate_component, overwrite=True)
+            self.image_layer.bind_key("k", self._next_component, overwrite=True)
+            self.image_layer.bind_key("j", self._previous_component, overwrite=True)
         else:
             self.image_layer.data = image_volume
 
         color_mapping = _glasbey_mapping(np.unique(labeled_components))
+        self._fallback_color_mapping = color_mapping
         if self.label_layer is None:
             self.label_layer = self.viewer.add_labels(
                 labeled_components,
@@ -542,6 +589,9 @@ class PairedDatasetViewer:
             # Bind navigation keys on the layer to avoid layer-level defaults overriding viewer bindings.
             self.label_layer.bind_key("b", self._previous_sample, overwrite=True)
             self.label_layer.bind_key("n", self._next_sample, overwrite=True)
+            self.label_layer.bind_key("v", self._toggle_isolate_component, overwrite=True)
+            self.label_layer.bind_key("k", self._next_component, overwrite=True)
+            self.label_layer.bind_key("j", self._previous_component, overwrite=True)
         else:
             # Recreate the labels layer so napari refreshes internal max labels.
             current_show_selected = self.isolate_component and bool(self.component_ids)
@@ -556,9 +606,11 @@ class PairedDatasetViewer:
             self.label_layer.show_selected_label = current_show_selected
             self.label_layer.bind_key("b", self._previous_sample, overwrite=True)
             self.label_layer.bind_key("n", self._next_sample, overwrite=True)
+            self.label_layer.bind_key("v", self._toggle_isolate_component, overwrite=True)
+            self.label_layer.bind_key("k", self._next_component, overwrite=True)
+            self.label_layer.bind_key("j", self._previous_component, overwrite=True)
 
         self._apply_selected_component()
-        self._fallback_color_mapping = color_mapping
         self._refresh_component_legend()
         component_count = len(self.component_ids)
         self.viewer.text_overlay.text = f"{_text_for_sample(pair.name, self.index, len(self.pairs))}\ncomponents: {component_count}"
@@ -610,9 +662,9 @@ class PairedDatasetViewer:
     def _sync_selected_from_layer(self) -> None:
         if not self.label_layer:
             return
-        selected = int(self.label_layer.selected_label) if self.label_layer.selected_label else None
-        self.component_legend.set_selected_component(selected)
         self._update_bounding_boxes(min_size=10)
+        self._update_feature_bounding_boxes(min_size=10)
+        self._refresh_component_legend()
 
     def _sync_isolate_from_layer(self) -> None:
         if not self.label_layer:
@@ -622,26 +674,45 @@ class PairedDatasetViewer:
         except Exception:
             return
         self._update_bounding_boxes(min_size=10)
+        self._update_feature_bounding_boxes(min_size=10)
+        self._refresh_component_legend()
 
     def _refresh_component_legend(self) -> None:
         if not self.current_sample_id:
             return
         selected = None
         opacity = 1.0
+        isolate_mode = False
         if self.label_layer is not None:
             selected = int(self.label_layer.selected_label) if self.label_layer.selected_label else None
             try:
                 opacity = float(self.label_layer.opacity)
             except Exception:
                 opacity = 1.0
+            try:
+                isolate_mode = bool(self.label_layer.show_selected_label)
+            except Exception:
+                isolate_mode = bool(self.isolate_component)
 
-        layer_colors = self._component_color_mapping_from_layer(self.component_ids, self._fallback_color_mapping)
+        layer_colors = {
+            int(component_id): self._fallback_color_mapping.get(int(component_id), (1.0, 1.0, 1.0, 1.0))
+            for component_id in self.component_ids
+        }
         self.component_legend.set_components(
             sample_id=self.current_sample_id,
             component_ids=self.component_ids,
             color_mapping=layer_colors,
             selected_component=selected,
             label_opacity=opacity,
+        )
+        selected_topology = self.component_topology.get(int(selected)) if (isolate_mode and selected) else None
+        self.component_legend.set_topology(
+            sample_cavities=int(self.sample_cavities),
+            sample_tunnels=int(self.sample_tunnels),
+            selected_component=int(selected) if (isolate_mode and selected) else None,
+            selected_cavities=int(selected_topology.cavities) if selected_topology else 0,
+            selected_tunnels=int(selected_topology.tunnels) if selected_topology else 0,
+            isolate_mode=isolate_mode,
         )
 
     def _component_color_mapping_from_layer(
@@ -695,6 +766,150 @@ class PairedDatasetViewer:
             if bbox is None or len(bbox) != 6:
                 continue
             self.component_bboxes[label_value] = tuple(int(x) for x in bbox)  # type: ignore[assignment]
+
+    def _compute_component_topology(self, labeled_components: np.ndarray) -> None:
+        self.component_topology = {}
+        self.sample_cavities = 0
+        self.sample_tunnels = 0
+
+        for component_id, bbox in self.component_bboxes.items():
+            z0, y0, x0, z1, y1, x1 = bbox
+            component_mask = labeled_components[z0:z1, y0:y1, x0:x1] == component_id
+            cavities = self._count_cavities(component_mask)
+            try:
+                euler = int(measure.euler_number(component_mask.astype(np.uint8), connectivity=3))
+            except Exception:
+                euler = int(measure.euler_number(component_mask.astype(np.uint8)))
+            tunnels = max(0, 1 + int(cavities) - int(euler))
+
+            topology = ComponentTopology(cavities=int(cavities), tunnels=int(tunnels))
+            self.component_topology[int(component_id)] = topology
+            self.sample_cavities += int(cavities)
+            self.sample_tunnels += int(tunnels)
+
+    def _count_cavities(self, component_mask: np.ndarray) -> int:
+        component_mask = component_mask.astype(bool)
+        if not np.any(component_mask):
+            return 0
+        pad = 1
+        padded = np.pad(component_mask, pad_width=pad, mode="constant", constant_values=False)
+        background = ~padded
+        structure = ndi.generate_binary_structure(3, 1)
+        labeled_bg, num = ndi.label(background, structure=structure)
+        if num == 0:
+            return 0
+        border_labels = np.unique(
+            np.concatenate(
+                [
+                    labeled_bg[0, :, :].ravel(),
+                    labeled_bg[-1, :, :].ravel(),
+                    labeled_bg[:, 0, :].ravel(),
+                    labeled_bg[:, -1, :].ravel(),
+                    labeled_bg[:, :, 0].ravel(),
+                    labeled_bg[:, :, -1].ravel(),
+                ]
+            )
+        )
+        outside_nonzero = int(np.count_nonzero(border_labels))
+        return max(0, int(num) - outside_nonzero)
+
+    def _cavity_mask(self, component_mask: np.ndarray) -> np.ndarray:
+        component_mask = component_mask.astype(bool)
+        if not np.any(component_mask):
+            return np.zeros(component_mask.shape, dtype=bool)
+        pad = 1
+        padded = np.pad(component_mask, pad_width=pad, mode="constant", constant_values=False)
+        background = ~padded
+        structure = ndi.generate_binary_structure(3, 1)
+        labeled_bg, num = ndi.label(background, structure=structure)
+        if num == 0:
+            return np.zeros(component_mask.shape, dtype=bool)
+        border_labels = np.unique(
+            np.concatenate(
+                [
+                    labeled_bg[0, :, :].ravel(),
+                    labeled_bg[-1, :, :].ravel(),
+                    labeled_bg[:, 0, :].ravel(),
+                    labeled_bg[:, -1, :].ravel(),
+                    labeled_bg[:, :, 0].ravel(),
+                    labeled_bg[:, :, -1].ravel(),
+                ]
+            )
+        )
+        is_outside = np.zeros(int(num) + 1, dtype=bool)
+        is_outside[border_labels] = True
+        cavity_mask_padded = (labeled_bg != 0) & ~is_outside[labeled_bg]
+        return cavity_mask_padded[pad:-pad, pad:-pad, pad:-pad]
+
+    def _tunnel_proxy_mask(self, filled_component: np.ndarray) -> np.ndarray:
+        """
+        Return a *proxy* voxel mask for tunnels/handles by detecting 2D holes in
+        planar slices of a cavity-filled component.
+
+        This is used only for visualization (blue boxes), not for counting.
+        """
+        filled_component = filled_component.astype(bool)
+        if filled_component.ndim != 3 or not np.any(filled_component):
+            return np.zeros(filled_component.shape, dtype=bool)
+
+        axis = int(np.argmin(np.asarray(filled_component.shape)))
+        perm = {
+            0: (0, 1, 2),  # slice along Z
+            1: (1, 2, 0),  # slice along Y
+            2: (2, 0, 1),  # slice along X
+        }[axis]
+        transposed = np.transpose(filled_component, perm)
+        proxy_t = np.zeros(transposed.shape, dtype=bool)
+        for idx in range(transposed.shape[0]):
+            slice_mask = transposed[idx]
+            filled_2d = ndi.binary_fill_holes(slice_mask)
+            proxy_t[idx] = filled_2d & ~slice_mask
+        inv_perm = np.argsort(perm)
+        return np.transpose(proxy_t, inv_perm)
+
+    def _ensure_topology_bboxes(self, component_id: int) -> None:
+        if self.label_layer is None:
+            return
+        topology = self.component_topology.get(int(component_id))
+        bbox = self.component_bboxes.get(int(component_id))
+        if topology is None or bbox is None:
+            return
+
+        if topology.cavity_bboxes is not None and topology.tunnel_bboxes is not None:
+            return
+
+        z0, y0, x0, z1, y1, x1 = bbox
+        labels = self.label_layer.data
+        component_mask = np.asarray(labels[z0:z1, y0:y1, x0:x1] == int(component_id))
+        cavity_mask = self._cavity_mask(component_mask)
+
+        cavity_bboxes: List[BBox] = []
+        if topology.cavities > 0 and np.any(cavity_mask):
+            cavity_bboxes = self._bboxes_from_mask(cavity_mask, offset=(z0, y0, x0))
+
+        tunnel_bboxes: List[BBox] = []
+        if topology.tunnels > 0:
+            filled = component_mask.astype(bool) | cavity_mask.astype(bool)
+            tunnel_proxy = self._tunnel_proxy_mask(filled)
+            if np.any(tunnel_proxy):
+                tunnel_bboxes = self._bboxes_from_mask(tunnel_proxy, offset=(z0, y0, x0))
+
+        topology.cavity_bboxes = cavity_bboxes
+        topology.tunnel_bboxes = tunnel_bboxes
+
+    def _bboxes_from_mask(self, mask: np.ndarray, *, offset: Tuple[int, int, int]) -> List[BBox]:
+        if not np.any(mask):
+            return []
+        labeled = measure.label(mask.astype(bool), connectivity=1)
+        bboxes: List[BBox] = []
+        dz, dy, dx = offset
+        for prop in measure.regionprops(labeled):
+            bbox = getattr(prop, "bbox", None)
+            if bbox is None or len(bbox) != 6:
+                continue
+            z0, y0, x0, z1, y1, x1 = (int(v) for v in bbox)
+            bboxes.append((z0 + dz, y0 + dy, x0 + dx, z1 + dz, y1 + dy, x1 + dx))
+        return bboxes
 
     def _update_bounding_boxes(self, *, min_size: int = 10) -> None:
         if self.label_layer is None:
@@ -771,13 +986,13 @@ class PairedDatasetViewer:
                 self.bbox_layer.visible = False
             return
 
-        edge_shapes = [(edge, "path") for edge in edges]
         if self.bbox_layer is None:
             self.bbox_layer = self.viewer.add_shapes(
-                edge_shapes,
+                edges,
                 name="bboxes",
+                shape_type="path",
                 edge_color="red",
-                face_color=[0, 0, 0, 0],
+                face_color="transparent",
                 edge_width=3,
                 opacity=1.0,
             )
@@ -785,9 +1000,134 @@ class PairedDatasetViewer:
                 self.bbox_layer.editable = False
             except Exception:
                 pass
+            try:
+                self.bbox_layer.bind_key("v", self._toggle_isolate_component, overwrite=True)
+                self.bbox_layer.bind_key("k", self._next_component, overwrite=True)
+                self.bbox_layer.bind_key("j", self._previous_component, overwrite=True)
+                self.bbox_layer.bind_key("b", self._previous_sample, overwrite=True)
+                self.bbox_layer.bind_key("n", self._next_sample, overwrite=True)
+            except Exception:
+                pass
         else:
-            self.bbox_layer.data = edge_shapes
+            self.bbox_layer.data = edges
+            try:
+                self.bbox_layer.shape_type = ["path"] * len(edges)
+            except Exception:
+                pass
         self.bbox_layer.visible = True
+
+    def _bboxes_to_edge_shapes(self, bboxes: Sequence[BBox], *, min_size: int = 10) -> List[np.ndarray]:
+        if not self.current_volume_shape:
+            return []
+        volume_shape = np.asarray(self.current_volume_shape, dtype=float)
+        edge_pairs = (
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        )
+
+        edges: List[np.ndarray] = []
+        for bbox in bboxes:
+            start = np.asarray(bbox[:3], dtype=float)
+            end = np.asarray(bbox[3:], dtype=float)
+
+            size = end - start
+            target_size = np.maximum(size, float(min_size))
+            center = (start + end) / 2.0
+            start = center - (target_size / 2.0)
+            end = center + (target_size / 2.0)
+
+            start = np.maximum(start, 0.0)
+            end = np.minimum(end, volume_shape)
+
+            z0, y0, x0 = start.tolist()
+            z1, y1, x1 = end.tolist()
+            corners = np.array(
+                [
+                    [z0, y0, x0],
+                    [z0, y0, x1],
+                    [z0, y1, x1],
+                    [z0, y1, x0],
+                    [z1, y0, x0],
+                    [z1, y0, x1],
+                    [z1, y1, x1],
+                    [z1, y1, x0],
+                ],
+                dtype=float,
+            )
+            for a, b in edge_pairs:
+                segment = corners[[a, b], :]
+                if np.allclose(segment[0], segment[1]):
+                    continue
+                edges.append(segment)
+
+        return edges
+
+    def _update_feature_bounding_boxes(self, *, min_size: int = 10) -> None:
+        if self.label_layer is None:
+            return
+        try:
+            show_boxes = bool(self.label_layer.show_selected_label)
+        except Exception:
+            show_boxes = bool(self.isolate_component)
+
+        selected_label = int(self.label_layer.selected_label) if self.label_layer.selected_label else 0
+        topology = self.component_topology.get(int(selected_label))
+        if not show_boxes or selected_label == 0 or topology is None:
+            if self.feature_bbox_layer is not None:
+                self.feature_bbox_layer.visible = False
+            return
+
+        self._ensure_topology_bboxes(int(selected_label))
+        bboxes: List[BBox] = []
+        if topology.cavity_bboxes:
+            bboxes.extend(topology.cavity_bboxes)
+        if topology.tunnel_bboxes:
+            bboxes.extend(topology.tunnel_bboxes)
+        edges = self._bboxes_to_edge_shapes(bboxes, min_size=min_size)
+        if not edges:
+            if self.feature_bbox_layer is not None:
+                self.feature_bbox_layer.visible = False
+            return
+
+        if self.feature_bbox_layer is None:
+            self.feature_bbox_layer = self.viewer.add_shapes(
+                edges,
+                name="topology",
+                shape_type="path",
+                edge_color="blue",
+                face_color="transparent",
+                edge_width=2,
+                opacity=1.0,
+            )
+            try:
+                self.feature_bbox_layer.editable = False
+            except Exception:
+                pass
+            try:
+                self.feature_bbox_layer.bind_key("v", self._toggle_isolate_component, overwrite=True)
+                self.feature_bbox_layer.bind_key("k", self._next_component, overwrite=True)
+                self.feature_bbox_layer.bind_key("j", self._previous_component, overwrite=True)
+                self.feature_bbox_layer.bind_key("b", self._previous_sample, overwrite=True)
+                self.feature_bbox_layer.bind_key("n", self._next_sample, overwrite=True)
+            except Exception:
+                pass
+        else:
+            self.feature_bbox_layer.data = edges
+            try:
+                self.feature_bbox_layer.shape_type = ["path"] * len(edges)
+            except Exception:
+                pass
+        self.feature_bbox_layer.visible = True
 
     def _select_component_from_palette(self, component_id: int) -> None:
         if not self.component_ids or component_id not in self.component_ids:
@@ -863,6 +1203,7 @@ class PairedDatasetViewer:
             int(self.label_layer.selected_label) if self.label_layer.selected_label else None
         )
         self._update_bounding_boxes(min_size=10)
+        self._update_feature_bounding_boxes(min_size=10)
 
     def _toggle_isolate_component(self, _viewer=None) -> None:
         if not self.label_layer:
