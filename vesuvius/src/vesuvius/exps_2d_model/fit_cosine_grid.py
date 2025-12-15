@@ -992,8 +992,9 @@ def fit_cosine_grid(
                 """
                 Map edge/vertex weight w ∈ [0,1] to brightness in [0.2,1.0].
                 """
-                w = max(0.0, min(1.0, float(w_edge)))
-                return 0.2 + 0.8 * w
+                return 1.0
+                # w = max(0.0, min(1.0, float(w_edge)))
+                # return 0.2 + 0.8 * w
  
             def in_bounds(px: int, py: int) -> bool:
                 return 0 <= px < w_vis and 0 <= py < h_vis
@@ -1111,6 +1112,8 @@ def fit_cosine_grid(
         step_stage: int,
         total_stage_steps: int,
         global_step_idx: int,
+        mask_full: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> None:
         """
         Save a snapshot for a given (stage, step) and global step index.
@@ -1151,6 +1154,7 @@ def fit_cosine_grid(
  
             # Warped Gaussian weight mask and direction maps in sample space, for debugging.
             mask_np = None
+            valid_np = None
             grid_vis_np = None
             dir_model_np = None
             dir_unet_np = None
@@ -1160,37 +1164,19 @@ def fit_cosine_grid(
             gradmag_raw_np = None
             if dbg:
                 grid_dbg = model._build_sampling_grid()
- 
+  
                 # Exact mask schedule for this snapshot step using the same
                 # normalized progress convention as in training.
                 if total_stage_steps > 0:
                     stage_progress = float(step_stage) / float(max(total_stage_steps - 1, 1))
                 else:
                     stage_progress = 0.0
-                gauss_dbg = _gaussian_mask(stage, stage_progress)
-                if gauss_dbg is None:
-                    # Full-image loss: visualize as a constant 1 map in sample space.
-                    mask_hr = torch.ones(
-                        (1, 1, hr, wr),
-                        device=torch_device,
-                        dtype=torch.float32,
-                    )
-                else:
-                    mask_hr = F.grid_sample(
-                        gauss_dbg,
-                        grid_dbg,
-                        mode="bilinear",
-                        padding_mode="zeros",
-                        align_corners=True,
-                    )
-
-                # Apply the same cosine-domain band mask used for training,
-                # including the stage-4 vertical growth schedule.
                 cos_v_eff_dbg = _current_cos_v_extent(stage, step_stage, total_stage_steps)
-                mask_cosine_dbg = _build_mask_cosine_hr(cos_v_eff_dbg)
-                mask_hr = mask_hr * mask_cosine_dbg
- 
-                mask_np = mask_hr.cpu().squeeze(0).squeeze(0).numpy()
+
+                if valid_mask is not None:
+                    valid_np = valid_mask.detach().cpu().squeeze(0).squeeze(0).numpy()
+                if mask_full is not None:
+                    mask_np = mask_full.detach().cpu().squeeze(0).squeeze(0).numpy()
  
                 # Direction maps (model vs UNet) in sample space (dir0 & dir1).
                 if unet_dir0_img is not None or unet_dir1_img is not None:
@@ -1330,6 +1316,15 @@ def fit_cosine_grid(
                     mask_path = f"{p}_mask_step{global_step_idx:06d}.tif"
                     # tifffile.imwrite(mask_path, _to_uint8(mask_np), compression="lzw")
                     cv2.imwrite(mask_path, _to_uint8(mask_np))
+
+            if valid_np is not None:
+                if for_video:
+                    valid_u8 = (np.clip(valid_np, 0.0, 1.0) * 255.0).astype("uint8")
+                    valid_path = f"{p}_valid_step{global_step_idx:06d}.jpg"
+                    cv2.imwrite(valid_path, valid_u8)
+                else:
+                    valid_path = f"{p}_valid_step{global_step_idx:06d}.tif"
+                    cv2.imwrite(valid_path, _to_uint8(valid_np))
             # Save diff as |diff|, with 0 -> black and max |diff| -> white.
             diff_abs = np.abs(diff_np)
             maxv = float(diff_abs.max())
@@ -2386,14 +2381,18 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
-        "grad_mag": 0.0,
+        "grad_mag": 1.0,
         "quad_tri": 0.0,
-        # "dir_unet": 0.0,
+        "step": 0.0,
+        "mod_smooth": 0.0,
+        "angle_sym": 0.0,
+        "dir_unet": 0.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
         # "smooth_x": 10.0,
         # "smooth_y": 0.0,
+        # "line_smooth_y": 0.0,
         # other terms default to 1.0 (enabled).
     }
  
@@ -2470,45 +2469,51 @@ def fit_cosine_grid(
         # Build validity mask and Gaussian loss mask in sample space (no grad),
         # and a coarse-grid mask for geometry-based losses.
         with torch.no_grad():
-            grid_ng = model._build_sampling_grid()
-            gx = grid_ng[..., 0]
-            gy = grid_ng[..., 1]
-            valid = (
-                (gx >= -1.0)
-                & (gx <= 1.0)
-                & (gy >= -1.0)
-                & (gy <= 1.0)
-            ).float()
-            valid = valid.unsqueeze(1)  # (1,1,H,W)
- 
-            if stage in (1, 2):
-                # Stages 1 and 2: use only in-bounds validity; ignore Gaussian mask.
-                weight_full = valid
-            else:
-                gauss = _gaussian_mask(stage=stage, stage_progress=stage_progress)
-                if gauss is None:
-                    w_sample = torch.ones_like(valid)
-                else:
-                    w_sample = F.grid_sample(
-                        gauss,
-                        grid_ng,
-                        mode="bilinear",
-                        padding_mode="zeros",
-                        align_corners=True,
-                    )
-                weight_full = valid * w_sample
- 
-            # Apply cosine-domain band mask in sample space so that only selected
-            # periods/rows contribute to the loss, with vertical extent possibly
-            # growing during stage 4.
-            mask_cosine_cur = _build_mask_cosine_hr(cos_v_eff)
-            weight_full = weight_full * mask_cosine_cur
-  
-            # Coarse-grid masks for geometry losses: sample the same image-space
-            # mask (ones or Gaussian) at the coarse-grid coordinates, and keep
-            # the cosine-domain band separate so we can treat in-band vs
-            # out-of-band regions differently for smoothness.
-            geom_mask_coarse, geom_mask_img, geom_mask_cos = _coarse_geom_mask(stage, stage_progress, cos_v_eff)
+        	grid_ng = model._build_sampling_grid()
+        	gx = grid_ng[..., 0]
+        	gy = grid_ng[..., 1]
+        	valid = (
+        		(gx >= -1.0)
+        		& (gx <= 1.0)
+        		& (gy >= -1.0)
+        		& (gy <= 1.0)
+        	).float()
+        	valid = valid.unsqueeze(1)  # (1,1,H,W)
+      
+        	valid_erode_iters = 20
+        	for _ in range(valid_erode_iters):
+        		inv = 1.0 - valid
+        		inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
+        		valid = 1.0 - inv
+      
+        	if stage in (1, 2):
+        		# Stages 1 and 2: use only in-bounds validity; ignore Gaussian mask.
+        		weight_full = valid
+        	else:
+        		gauss = _gaussian_mask(stage=stage, stage_progress=stage_progress)
+        		if gauss is None:
+        			w_sample = torch.ones_like(valid)
+        		else:
+        			w_sample = F.grid_sample(
+        				gauss,
+        				grid_ng,
+        				mode="bilinear",
+        				padding_mode="zeros",
+        				align_corners=True,
+        			)
+        		weight_full = valid * w_sample
+      
+        	# Apply cosine-domain band mask in sample space so that only selected
+        	# periods/rows contribute to the loss, with vertical extent possibly
+        	# growing during stage 4.
+        	mask_cosine_cur = _build_mask_cosine_hr(cos_v_eff)
+        	weight_full = weight_full * mask_cosine_cur
+      
+        	# Coarse-grid masks for geometry losses: sample the same image-space
+        	# mask (ones or Gaussian) at the coarse-grid coordinates, and keep
+        	# the cosine-domain band separate so we can treat in-band vs
+        	# out-of-band regions differently for smoothness.
+        	geom_mask_coarse, geom_mask_img, geom_mask_cos = _coarse_geom_mask(stage, stage_progress, cos_v_eff)
  
         # Grid with gradients for geometry-based losses.
         grid = model._build_sampling_grid()
@@ -2648,6 +2653,10 @@ def fit_cosine_grid(
             angle_reg = torch.zeros((), device=device, dtype=dtype)
         terms["angle_sym"] = angle_reg
 
+        if dbg:
+            terms["_mask_full"] = weight_full.detach()
+            terms["_mask_valid"] = valid.detach()
+
         return total_loss, terms
  
     def _optimize_stage(
@@ -2720,6 +2729,8 @@ def fit_cosine_grid(
                         step_stage=step,
                         total_stage_steps=total_steps,
                         global_step_idx=global_step,
+                        mask_full=terms.get("_mask_full", None),
+                        valid_mask=terms.get("_mask_valid", None),
                     )
  
     # -------------------------
@@ -2741,9 +2752,9 @@ def fit_cosine_grid(
         # together with the coarse grid offsets and modulation fields (no data terms).
         opt2 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
+                # model.theta,
+                # model.log_s,
+                # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
@@ -2990,7 +3001,7 @@ def main() -> None:
     parser.add_argument(
         "--lambda-smooth-y",
         type=float,
-        default=10000,
+        default=100000,
         help="Smoothness weight along y (ridge direction) for the coarse grid.",
     )
     parser.add_argument("--lambda-mono", type=float, default=1e-3)
