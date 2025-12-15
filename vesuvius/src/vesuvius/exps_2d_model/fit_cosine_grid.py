@@ -1439,16 +1439,33 @@ def fit_cosine_grid(
         off = model.offset  # (1,2,gh,gw)  2 = (u_offset, v_offset)
         _, _, gh, gw = off.shape
     
-        # Horizontal smoothness using line-offset connectivity. For each
-        # horizontal edge we build two connections (left->right and right->left)
-        # and average the squared L2 differences over both directions.
+        # Horizontal smoothness using line-offset connectivity.
+        #
+        # We need to compare vectors with the SAME anchor (same coarse vertex).
+        #
+        # _coarse_x_line_pairs gives per-edge directed connections:
+        #   dir=0 (lr): anchor at col x     -> interpolated point on col x+1
+        #   dir=1 (rl): anchor at col x+1   -> interpolated point on col x
+        #
+        # For a vertex at column x (interior 1..gw-2), we have:
+        #   v_right = lr vector from edge (x,x+1)   anchored at x
+        #   v_left  = rl vector from edge (x-1,x)   anchored at x
+        #
+        # And we want them to be opposite (straightness / C1):
+        #   v_right ≈ -v_left  <=>  v_right + v_left ≈ 0.
         if gw >= 2:
-            src_x, nbr_x = _coarse_x_line_pairs(off)  # (1,2,2,gh,gw-1)
-            dx_vec = nbr_x - src_x                   # (1,2,2,gh,gw-1)
-            dx_sq = (dx_vec * dx_vec).sum(dim=1, keepdim=True)  # (1,1,2,gh,gw-1)
-            smooth_x = dx_sq.mean(dim=2)  # (1,1,gh,gw-1)
+        	src_x, nbr_x = _coarse_x_line_pairs(off)  # (1,2,2,gh,gw-1)
+        	v_right = nbr_x[:, :, 0] - src_x[:, :, 0]  # (1,2,gh,gw-1), anchor col: 0..gw-2
+        	v_left = nbr_x[:, :, 1] - src_x[:, :, 1]   # (1,2,gh,gw-1), anchor col: 1..gw-1
+        	if gw >= 3:
+        		v_sum = v_right[:, :, :, 1:] + v_left[:, :, :, :-1]  # anchors aligned: col 1..gw-2
+        		sx_mid = (v_sum * v_sum).mean(dim=1, keepdim=True)    # (1,1,gh,gw-2)
+        		smooth_x = v_right.new_zeros(1, 1, gh, gw - 1)
+        		smooth_x[:, :, :, 1:] = sx_mid
+        	else:
+        		smooth_x = v_right.new_zeros(1, 1, gh, gw - 1)
         else:
-            smooth_x = torch.zeros((), device=off.device, dtype=off.dtype)
+        	smooth_x = torch.zeros((), device=off.device, dtype=off.dtype)
     
         # First-order differences along y index: o[..., j+1, :] - o[..., j, :].
         # Again, treat (u_offset, v_offset) symmetrically via ||Δ_off||^2.
@@ -3074,13 +3091,13 @@ def main() -> None:
     parser.add_argument(
         "--lambda-smooth-x",
         type=float,
-        default=1000,
+        default=10000,
         help="Smoothness weight along x (cosine direction) for the coarse grid.",
     )
     parser.add_argument(
         "--lambda-smooth-y",
         type=float,
-        default=100000,
+        default=10000,
         help="Smoothness weight along y (ridge direction) for the coarse grid.",
     )
     parser.add_argument("--lambda-mono", type=float, default=1e-3)
