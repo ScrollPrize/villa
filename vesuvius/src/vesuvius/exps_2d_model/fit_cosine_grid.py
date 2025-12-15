@@ -2454,7 +2454,7 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
-        "grad_mag": 0.0,
+        "grad_mag": 1.0,
         "quad_tri": 0.0,
         "step": 0.0,
         "mod_smooth": 0.0,
@@ -2473,8 +2473,9 @@ def fit_cosine_grid(
         # Stage 3: enable data and grad_data terms in addition to stage-2 regularization.
         # No explicit overrides: all lambda_global weights are used as-is.
         # "data": 0.0,
-        "quad_tri": 0.0,
-        "grad_data": 0.0,
+        # "quad_tri": 0.0,
+        "dir_unet": 10.0,
+        # "grad_data": 0.0,
         # "grad_data": 0.0,
     }
  
