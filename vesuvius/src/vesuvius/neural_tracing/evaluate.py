@@ -48,7 +48,7 @@ def main(points_path, checkpoint_paths, steps_per_crop, max_size):
             for checkpoint_path in checkpoint_paths:
                 ckpt = Path(checkpoint_path)
                 ckpt_dir = ckpt.parent.name if ckpt.is_file() else ckpt.name
-                uuid = f"nt-eval_{ckpt_dir}_{x}-{y}-{z}"
+                uuid = f"nt-eval_{x}-{y}-{z}_{ckpt_dir}"
                 click.echo(
                     f"Tracing volume={name} "
                     f"point_index={pt_idx} start_xyz=({x}, {y}, {z}) "
