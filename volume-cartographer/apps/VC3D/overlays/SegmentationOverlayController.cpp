@@ -186,6 +186,14 @@ void SegmentationOverlayController::applyState(const State& state)
 
 void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
 {
+    // If there are unsaved pending changes and a debounced save is active,
+    // save immediately before loading new data to avoid losing auto-approvals
+    if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
+        _approvalSaveTimer->stop();
+        saveApprovalMaskToSurface(_approvalSaveSurface);
+        _approvalSaveSurface = nullptr;
+    }
+
     // Clear undo stack - old entries are for a different surface
     clearApprovalMaskUndoHistory();
 
@@ -656,12 +664,13 @@ void SegmentationOverlayController::onSurfaceChanged(std::string name, std::shar
 {
     Q_UNUSED(surface);
 
-    // Cancel any pending approval mask save - the surface pointer may become dangling
-    // when surfaces are reloaded (e.g., after copy in/out job completion)
-    if (_approvalSaveTimer && _approvalSaveTimer->isActive()) {
+    // If there are unsaved pending changes and a debounced save is active,
+    // save immediately before the surface pointer becomes dangling
+    if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
         _approvalSaveTimer->stop();
+        saveApprovalMaskToSurface(_approvalSaveSurface);
+        _approvalSaveSurface = nullptr;
     }
-    _approvalSaveSurface = nullptr;
 
     if (name == "segmentation") {
         refreshAll();

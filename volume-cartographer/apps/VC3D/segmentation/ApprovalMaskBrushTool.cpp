@@ -293,6 +293,13 @@ void ApprovalMaskBrushTool::finishStroke()
         _pendingRefresh = false;
     }
     _module.refreshOverlay();
+
+    // Schedule debounced save to disk so brush strokes auto-persist
+    if (_surface) {
+        if (auto overlay = _module.overlay()) {
+            overlay->scheduleDebouncedSave(_surface);
+        }
+    }
 }
 
 bool ApprovalMaskBrushTool::applyPending(float /*dragRadiusSteps*/)
@@ -796,6 +803,13 @@ void ApprovalMaskBrushTool::finishStrokeFromWorld()
         _pendingRefresh = false;
     }
     _module.refreshOverlay();
+
+    // Schedule debounced save to disk so brush strokes auto-persist
+    if (_surface) {
+        if (auto overlay = _module.overlay()) {
+            overlay->scheduleDebouncedSave(_surface);
+        }
+    }
 }
 
 std::optional<std::pair<int, int>> ApprovalMaskBrushTool::sceneToGridIndex(const QPointF& scenePos, float viewerScale) const
