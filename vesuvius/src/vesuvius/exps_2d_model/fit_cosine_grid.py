@@ -2381,18 +2381,18 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
-        "grad_mag": 1.0,
+        "grad_mag": 0.0,
         "quad_tri": 0.0,
         "step": 0.0,
         "mod_smooth": 0.0,
         "angle_sym": 0.0,
-        "dir_unet": 0.0,
+        "dir_unet": 1.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
         # "smooth_x": 10.0,
         # "smooth_y": 0.0,
-        # "line_smooth_y": 0.0,
+        "line_smooth_y": 0.1,
         # other terms default to 1.0 (enabled).
     }
  
@@ -2480,7 +2480,7 @@ def fit_cosine_grid(
         	).float()
         	valid = valid.unsqueeze(1)  # (1,1,H,W)
       
-        	valid_erode_iters = 20
+        	valid_erode_iters = 0
         	for _ in range(valid_erode_iters):
         		inv = 1.0 - valid
         		inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
@@ -2590,10 +2590,11 @@ def fit_cosine_grid(
         if need_sx or need_sy:
             # Inside the cosine band we use full smoothness; outside the band
             # we keep only smoothness with reduced weights (x: 1/16, y: 1/4).
-            smooth_x_val, smooth_y_val = _smoothness_reg(
-                mask_cosine=geom_mask_cos,
-                mask_img=geom_mask_img,
-            )
+            # smooth_x_val, smooth_y_val = _smoothness_reg(
+            #     mask_cosine=geom_mask_cos,
+            #     mask_img=geom_mask_img,
+            # )
+            smooth_x_val, smooth_y_val = _smoothness_reg()
         else:
             smooth_x_val = torch.zeros((), device=device, dtype=dtype)
             smooth_y_val = torch.zeros((), device=device, dtype=dtype)
@@ -2607,7 +2608,8 @@ def fit_cosine_grid(
         # Step regularizer.
         w_step = _need_term("step", stage_modifiers)
         if w_step != 0.0 and lambda_xygrad > 0.0:
-            step_reg = _step_reg(geom_mask_coarse)
+            # step_reg = _step_reg(geom_mask_coarse)
+            step_reg = _step_reg()
             total_loss = total_loss + w_step * step_reg
         else:
             step_reg = torch.zeros((), device=device, dtype=dtype)
@@ -2616,7 +2618,8 @@ def fit_cosine_grid(
         # Modulation smoothness.
         w_mod_smooth = _need_term("mod_smooth", stage_modifiers)
         if w_mod_smooth != 0.0:
-            mod_smooth = _mod_smooth_reg(geom_mask_coarse)
+            # mod_smooth = _mod_smooth_reg(geom_mask_coarse)
+            mod_smooth = _mod_smooth_reg()
             total_loss = total_loss + w_mod_smooth * mod_smooth
         else:
             mod_smooth = torch.zeros((), device=device, dtype=dtype)
@@ -2625,7 +2628,8 @@ def fit_cosine_grid(
         # Triangle-area regularizer.
         w_quad = _need_term("quad_tri", stage_modifiers)
         if w_quad != 0.0 and lambda_xygrad > 0.0:
-            quad_tri_reg = _quad_triangle_reg(geom_mask_coarse)
+            # quad_tri_reg = _quad_triangle_reg(geom_mask_coarse)
+            quad_tri_reg = _quad_triangle_reg()
             total_loss = total_loss + w_quad * quad_tri_reg
         else:
             quad_tri_reg = torch.zeros((), device=device, dtype=dtype)
@@ -2636,6 +2640,7 @@ def fit_cosine_grid(
         if w_line_smooth != 0.0:
             # Use only the image/validity coarse mask so line-offset smoothing
             # is not restricted by the cosine-domain band.
+            line_smooth = _line_offset_smooth_reg()
             line_smooth = _line_offset_smooth_reg(geom_mask_img)
             total_loss = total_loss + w_line_smooth * line_smooth
         else:
