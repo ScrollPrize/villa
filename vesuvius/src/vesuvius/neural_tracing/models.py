@@ -1,5 +1,6 @@
 import torch
 from types import SimpleNamespace
+from pathlib import Path
 
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.neural_tracing.youssef_mae import Vesuvius3dViTModel
