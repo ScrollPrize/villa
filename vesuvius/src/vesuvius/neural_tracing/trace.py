@@ -233,9 +233,9 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
                 prev_diag = None
 
             return (
-                torch.tensor([prev_u, center_v]) if prev_u is not None else None,
-                torch.tensor([center_u, prev_v]) if prev_v is not None else None,
-                torch.tensor(prev_diag) if prev_diag is not None else None,
+                (prev_u, center_v) if prev_u is not None else None,
+                (center_u, prev_v) if prev_v is not None else None,
+                prev_diag,
             )
 
         def count_conditionings(conditionings):
@@ -250,7 +250,9 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
             # For each center-and-gap, get available conditioning points; choose the center-and-gap
             # with most support that we've not already tried (with its current conditionings)
             cag_to_conditionings = {(center, gap): get_conditioning(center, gap) for center, gap in candidate_centers_and_gaps}
+            num_including_tried = len(cag_to_conditionings)
             cag_to_conditionings = {(center, gap): conditioning for (center, gap), conditioning in cag_to_conditionings.items() if (center, gap, conditioning) not in tried_cag_and_conditionings}
+            print(f'queue size = {num_including_tried} of which {num_including_tried - len(cag_to_conditionings)} already tried')
             if len(cag_to_conditionings) == 0:
                 print('halting: no untried center-gap-conditioning combinations')
                 break
@@ -261,6 +263,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
             assert in_patch(*center_uv)
             assert not in_patch(*gap_uv)
             def get_prev_zyx(uv):
+                uv = np.asarray(uv) if uv is not None else None
                 if uv is None or (uv < 0).any() or (uv >= max_size).any():
                     return None
                 assert in_patch(*uv)
@@ -286,7 +289,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
             enqueue_gaps_around_center(gap_uv)
 
             _, area_cm2 = get_area(patch, step_size, inference.voxel_size_um)
-            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, queue size = {len(candidate_centers_and_gaps)} of which {len(candidate_centers_and_gaps) - len(cag_to_conditionings)} already tried')
+            print(f'vertex count = {num_vertices}, area = {area_cm2:.2f}cm2')
 
             if save_partial and num_vertices > 0 and num_vertices % 1000 == 0:
                 partial_uuid = f'{base_uuid}_{num_vertices//1000:03}Kvert'
