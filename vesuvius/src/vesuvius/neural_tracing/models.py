@@ -80,7 +80,31 @@ def make_model(config):
         raise RuntimeError('unexpected model_type, should be unet or vit')
 
 
-def load_checkpoint(checkpoint_path, model):
+def _resolve_checkpoint_path(checkpoint_path):
+    path = Path(checkpoint_path)
+    if path.is_dir():
+        candidates = list(path.glob("ckpt_*.pth"))
+        if not candidates:
+            raise FileNotFoundError(f"No checkpoints matching 'ckpt_*.pth' found in {path}")
+
+        def iteration(p):
+            stem = p.stem  # e.g. ckpt_000123
+            try:
+                return int(stem.split("_")[-1])
+            except ValueError:
+                return -1
+
+        candidates.sort(key=iteration)
+        return candidates[-1]
+
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    return path
+
+
+def load_checkpoint(checkpoint_path):
+    checkpoint_path = _resolve_checkpoint_path(checkpoint_path)
     print(f'loading checkpoint {checkpoint_path}... ')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     state = checkpoint['model'] if isinstance(checkpoint, dict) else checkpoint
