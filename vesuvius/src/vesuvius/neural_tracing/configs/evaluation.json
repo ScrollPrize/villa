@@ -1,0 +1,20 @@
+[
+    {
+        "name": "PHerc172",
+        "volume_zarr": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/PHerc0172.volpkg/volumes/s5_masked_ome.zarr",
+        "paths_dir": "/mnt/bcache/projects/vesuvius-scrolls/volpkgs/PHerc0172.volpkg/paths_nt-eval",
+        "volume_scale": 1,
+        "point_xyzs": [
+            [2556, 1375, 19374],
+            [5071, 1625, 17342],
+            [6210, 4236, 17342],
+            [1642, 3128, 17146],
+            [5661, 1456, 16575],
+            [6231, 4728, 12085],
+            [3566, 959, 12085],
+            [3269, 3560, 7868],
+            [3287, 964, 5995],
+            [3160, 1014, 3727]
+        ]
+    }
+]
