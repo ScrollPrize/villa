@@ -1180,7 +1180,36 @@ def fit_cosine_grid(
  
                 # Direction maps (model vs UNet) in sample space (dir0 & dir1).
                 if unet_dir0_img is not None or unet_dir1_img is not None:
-                    dir0_model_hr, dir0_unet_hr, dir1_model_hr, dir1_unet_hr = _direction_maps(grid_dbg)
+                    (
+                        dir0_v_hr,
+                        _dir0_u_lr_hr,
+                        _dir0_u_rl_hr,
+                        dir1_v_hr,
+                        _dir1_u_lr_hr,
+                        _dir1_u_rl_hr,
+                    ) = _direction_maps(grid_dbg)
+
+                    dir0_unet_hr: torch.Tensor | None = None
+                    dir1_unet_hr: torch.Tensor | None = None
+                    if unet_dir0_img is not None:
+                        dir0_unet_hr = F.grid_sample(
+                            unet_dir0_img,
+                            grid_dbg,
+                            mode="bilinear",
+                            padding_mode="zeros",
+                            align_corners=True,
+                        )
+                    if unet_dir1_img is not None:
+                        dir1_unet_hr = F.grid_sample(
+                            unet_dir1_img,
+                            grid_dbg,
+                            mode="bilinear",
+                            padding_mode="zeros",
+                            align_corners=True,
+                        )
+
+                    dir0_model_hr = dir0_v_hr
+                    dir1_model_hr = dir1_v_hr
     
                     if dir0_model_hr is not None and dir0_unet_hr is not None:
                         dir0_model_vis = dir0_model_hr
@@ -1975,36 +2004,37 @@ def fit_cosine_grid(
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         """
-        Compute direction encodings for model & UNet in sample space for both
-        dir0 and dir1 encodings.
+        Compute model direction encodings in sample space.
     
-        Model direction is derived from the quad-mesh structure of the sampling
-        grid itself: we take the v-direction edge vector between neighboring
-        quad corners (y -> y+1 at fixed x) and use its *orthogonal* direction
-        (the local normal) as the assumed gradient direction.
+        We return separate estimates:
+        - v-based: from vertical mesh edges (y -> y+1), but using the orthogonal
+          direction as the assumed gradient direction.
+        - u-based: from horizontal mesh edges using line_offset connectivity,
+          returned as two directed estimates:
+            - u_lr: left column -> right column
+            - u_rl: right column -> left column
+          These are assumed PARALLEL to the gradient direction.
     
-        Let the v-direction edge be t = (tx, ty) and the orthogonal direction
-        be n = (-ty, tx). We encode:
-    
-            cos(2*theta) = (nx^2 - ny^2) / (nx^2 + ny^2)
-            sin(2*theta) = 2*nx*ny / (nx^2 + ny^2)
-    
-        matching train_unet targets:
+        Each estimate is encoded in the same "cos(2*theta)" scheme as train_unet:
     
             dir0 = 0.5 + 0.5*cos(2*theta)
             dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
                  = 0.5 + 0.5*((cos(2*theta) - sin(2*theta)) / sqrt(2)).
     
         Returns:
-            dir0_model: (1,1,hr,wr) or None
-            dir0_unet:  (1,1,hr,wr) or None
-            dir1_model: (1,1,hr,wr) or None
-            dir1_unet:  (1,1,hr,wr) or None
+            dir0_v:     (1,1,hr,wr)
+            dir0_u_lr:  (1,1,hr,wr)
+            dir0_u_rl:  (1,1,hr,wr)
+            dir1_v:     (1,1,hr,wr)
+            dir1_u_lr:  (1,1,hr,wr)
+            dir1_u_rl:  (1,1,hr,wr)
         """
         if unet_dir0_img is None and unet_dir1_img is None:
-            return None, None, None, None
+            return None, None, None, None, None, None
     
         # grid: (1,hr,wr,2) in normalized image coords.
         x = grid[..., 0].unsqueeze(1)  # (1,1,hr,wr)
@@ -2012,30 +2042,112 @@ def fit_cosine_grid(
     
         _, _, hh, ww = x.shape
         if hh < 2 or ww < 1:
-            return None, None, None, None
-    
-        # v-direction (row) edge vectors of the grid-as-quad-mesh.
-        tx = torch.zeros_like(x)
-        ty = torch.zeros_like(y)
-        tx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
-        ty[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
-        tx[:, :, -1, :] = tx[:, :, -2, :]
-        ty[:, :, -1, :] = ty[:, :, -2, :]
-    
-        # Use the direction orthogonal to the v-edge as the gradient direction.
-        nx = -ty
-        ny = tx
+            return None, None, None, None, None, None
     
         eps = 1e-8
-        r2 = nx * nx + ny * ny + eps
-        cos2theta = (nx * nx - ny * ny) / r2
-        sin2theta = (2.0 * nx * ny) / r2
-    
-        dir0_model = 0.5 + 0.5 * cos2theta  # (1,1,hr,wr)
-    
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
-        cos2theta_shift = (cos2theta - sin2theta) * inv_sqrt2
-        dir1_model = 0.5 + 0.5 * cos2theta_shift
+    
+        # v-based: vertical mesh edge, gradient is orthogonal to it.
+        tx_v = torch.zeros_like(x)
+        ty_v = torch.zeros_like(y)
+        tx_v[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+        ty_v[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
+        tx_v[:, :, -1, :] = tx_v[:, :, -2, :]
+        ty_v[:, :, -1, :] = ty_v[:, :, -2, :]
+    
+        gx_v = -ty_v
+        gy_v = tx_v
+        r2_v = gx_v * gx_v + gy_v * gy_v + eps
+        cos2_v = (gx_v * gx_v - gy_v * gy_v) / r2_v
+        sin2_v = (2.0 * gx_v * gy_v) / r2_v
+    
+        dir0_v = 0.5 + 0.5 * cos2_v
+        dir1_v = 0.5 + 0.5 * ((cos2_v - sin2_v) * inv_sqrt2)
+    
+        # u-based: horizontal mesh edge using line_offset connectivity on the coarse grid.
+        coords_c = model.base_grid + model.offset  # (1,2,gh,gw)
+        u_c = coords_c[:, 0:1]
+        v_c = coords_c[:, 1:2]
+        x_c, y_c = model._apply_global_transform(u_c, v_c)  # (1,1,gh,gw)
+        xy_c = torch.cat([x_c, y_c], dim=1)  # (1,2,gh,gw)
+    
+        src_u, nbr_u = _coarse_x_line_pairs(xy_c)  # (1,2,2,gh,gw-1)
+        vec_lr = nbr_u[:, :, 0] - src_u[:, :, 0]  # (1,2,gh,gw-1) from col x   -> x+1
+        vec_rl = nbr_u[:, :, 1] - src_u[:, :, 1]  # (1,2,gh,gw-1) from col x+1 -> x
+    
+        _, _, gh_c, gw_c = xy_c.shape
+        vec_u_lr = xy_c.new_zeros(1, 2, gh_c, gw_c)
+        vec_u_rl = xy_c.new_zeros(1, 2, gh_c, gw_c)
+        vec_u_lr[:, :, :, :-1] = vec_lr
+        vec_u_lr[:, :, :, -1] = vec_lr[:, :, :, -1]
+        vec_u_rl[:, :, :, 1:] = vec_rl
+        vec_u_rl[:, :, :, 0] = vec_rl[:, :, :, 0]
+    
+        gx_lr_c = vec_u_lr[:, 0:1]
+        gy_lr_c = vec_u_lr[:, 1:2]
+        r2_lr_c = gx_lr_c * gx_lr_c + gy_lr_c * gy_lr_c + eps
+        cos2_lr_c = (gx_lr_c * gx_lr_c - gy_lr_c * gy_lr_c) / r2_lr_c
+        sin2_lr_c = (2.0 * gx_lr_c * gy_lr_c) / r2_lr_c
+    
+        gx_rl_c = vec_u_rl[:, 0:1]
+        gy_rl_c = vec_u_rl[:, 1:2]
+        r2_rl_c = gx_rl_c * gx_rl_c + gy_rl_c * gy_rl_c + eps
+        cos2_rl_c = (gx_rl_c * gx_rl_c - gy_rl_c * gy_rl_c) / r2_rl_c
+        sin2_rl_c = (2.0 * gx_rl_c * gy_rl_c) / r2_rl_c
+    
+        pack_lr = torch.cat([cos2_lr_c, sin2_lr_c], dim=1)  # (1,2,gh,gw)
+        pack_rl = torch.cat([cos2_rl_c, sin2_rl_c], dim=1)  # (1,2,gh,gw)
+        pack_lr_hr = F.interpolate(pack_lr, size=(hh, ww), mode="bicubic", align_corners=True)
+        pack_rl_hr = F.interpolate(pack_rl, size=(hh, ww), mode="bicubic", align_corners=True)
+        cos2_lr = pack_lr_hr[:, 0:1]
+        sin2_lr = pack_lr_hr[:, 1:2]
+        cos2_rl = pack_rl_hr[:, 0:1]
+        sin2_rl = pack_rl_hr[:, 1:2]
+    
+        dir0_u_lr = 0.5 + 0.5 * cos2_lr
+        dir1_u_lr = 0.5 + 0.5 * ((cos2_lr - sin2_lr) * inv_sqrt2)
+        dir0_u_rl = 0.5 + 0.5 * cos2_rl
+        dir1_u_rl = 0.5 + 0.5 * ((cos2_rl - sin2_rl) * inv_sqrt2)
+    
+        return dir0_v, dir0_u_lr, dir0_u_rl, dir1_v, dir1_u_lr, dir1_u_rl
+
+    def _directional_alignment_loss(
+        grid: torch.Tensor,
+        mask_sample: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Directional alignment loss between model direction estimates and UNet
+        direction branches (dir0 & dir1) in sample space.
+    
+        For now we weight all available components equally.
+        """
+        if unet_dir0_img is None and unet_dir1_img is None:
+            return torch.zeros((), device=torch_device, dtype=torch.float32)
+    
+        device = torch_device
+        dtype = torch.float32
+    
+        (
+            dir0_v,
+            dir0_u_lr,
+            dir0_u_rl,
+            dir1_v,
+            dir1_u_lr,
+            dir1_u_rl,
+        ) = _direction_maps(grid)
+    
+        def _masked_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            diff = a - b
+            diff2 = diff * diff
+            if mask_sample is None:
+                return diff2.mean()
+            if mask_sample.shape[-2:] != diff2.shape[-2:]:
+                return diff2.mean()
+            w = mask_sample
+            wsum = w.sum()
+            if wsum > 0:
+                return (diff2 * w).sum() / wsum
+            return diff2.mean()
     
         # Warp UNet direction channels into sample space using the same grid.
         dir0_unet_hr: torch.Tensor | None = None
@@ -2057,57 +2169,22 @@ def fit_cosine_grid(
                 align_corners=True,
             )
     
-        return dir0_model, dir0_unet_hr, dir1_model, dir1_unet_hr
-
-    def _directional_alignment_loss(
-        grid: torch.Tensor,
-        mask_sample: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Directional alignment loss between the mapped cosine axis and the UNet
-        direction branches, encoded as dir0 & dir1 in sample space.
+        losses: list[torch.Tensor] = []
     
-        We compute MSE for each available encoding and combine them as:
+        if dir0_unet_hr is not None and dir0_v is not None and dir0_u_lr is not None and dir0_u_rl is not None:
+            losses.append(_masked_mse(dir0_v, dir0_unet_hr))
+            # losses.append(_masked_mse(dir0_u_lr, dir0_unet_hr))
+            # losses.append(_masked_mse(dir0_u_rl, dir0_unet_hr))
     
-            loss_dir = 0.5 * (loss_dir0 + loss_dir1)
+        if dir1_unet_hr is not None and dir1_v is not None and dir1_u_lr is not None and dir1_u_rl is not None:
+            losses.append(_masked_mse(dir1_v, dir1_unet_hr))
+            # losses.append(_masked_mse(dir1_u_lr, dir1_unet_hr))
+            # losses.append(_masked_mse(dir1_u_rl, dir1_unet_hr))
     
-        when both are present, or just loss_dir0 when only dir0 is available.
-    
-        If `mask_sample` is provided (1,1,H,W), it is used as a spatial weight
-        so that only the masked sample-space region contributes to the loss.
-        """
-        if unet_dir0_img is None and unet_dir1_img is None:
-            return torch.zeros((), device=torch_device, dtype=torch.float32)
-    
-        dir0_model, dir0_unet_hr, dir1_model, dir1_unet_hr = _direction_maps(grid)
-        device = torch_device
-        dtype = torch.float32
-    
-        if dir0_model is None or dir0_unet_hr is None:
+        if len(losses) == 0:
             return torch.zeros((), device=device, dtype=dtype)
     
-        def _masked_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            diff = a - b
-            diff2 = diff * diff
-            if mask_sample is None:
-                return diff2.mean()
-            if mask_sample.shape[-2:] != diff2.shape[-2:]:
-                # Safety: fall back to unweighted if spatial sizes mismatch.
-                return diff2.mean()
-            w = mask_sample
-            wsum = w.sum()
-            if wsum > 0:
-                return (diff2 * w).sum() / wsum
-            return diff2.mean()
-    
-        loss_dir0 = _masked_mse(dir0_model, dir0_unet_hr)
-    
-        if dir1_model is not None and dir1_unet_hr is not None:
-            loss_dir1 = _masked_mse(dir1_model, dir1_unet_hr)
-            return 0.5 * (loss_dir0 + loss_dir1)
-    
-        # Fallback: only dir0 available.
-        return loss_dir0
+        return torch.stack(losses, dim=0).mean()
  
     def _gradient_data_loss(
         pred: torch.Tensor,
