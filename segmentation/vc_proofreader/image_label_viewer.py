@@ -578,8 +578,32 @@ class ImageLabelViewer:
             show_info("Reached end of images")
             self.current_index = len(self.image_files)
 
+    def copy_label_to_output(self):
+        """Copy the on-disk label file to output directory without modifications."""
+        if self.output_dir is None:
+            return
+
+        if self.current_index >= len(self.image_files):
+            return
+
+        image_path = self.image_files[self.current_index]
+        label_path = self.get_label_path(image_path)
+
+        if label_path is None or not label_path.exists():
+            show_info(f"No label found to copy for {image_path.name}")
+            return
+
+        output_path = self.output_dir / f"{image_path.stem}.tif"
+
+        # Read and write the original label (preserving original data)
+        label_data = io.imread(str(label_path))
+        label_data = label_data.astype(np.uint8)
+        io.imsave(str(output_path), label_data)
+        show_info(f"Copied original label to: {output_path.name}")
+
     def skip_image(self):
-        """Move to next image without saving anything."""
+        """Move to next image, copying the on-disk label to output."""
+        self.copy_label_to_output()
         self.current_index += 1
         # Skip samples that already exist in output dir
         if not self.skip_to_next_unprocessed():
