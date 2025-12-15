@@ -225,7 +225,7 @@ class CosineGridModel(nn.Module):
         uv = F.interpolate(
             uv_coarse,
             size=(self.height, self.width),
-            mode="bicubic",
+            mode="bilinear",
             align_corners=True,
         )
         u = uv[:, 0:1]
@@ -251,13 +251,13 @@ class CosineGridModel(nn.Module):
         amp_hr = F.interpolate(
             self.amp_coarse,
             size=(self.height, self.width),
-            mode="bicubic",
+            mode="bilinear",
             align_corners=True,
         )
         bias_hr = F.interpolate(
             self.bias_coarse,
             size=(self.height, self.width),
-            mode="bicubic",
+            mode="bilinear",
             align_corners=True,
         )
         return amp_hr, bias_hr
@@ -2047,30 +2047,38 @@ def fit_cosine_grid(
         eps = 1e-8
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
     
-        # v-based: vertical mesh edge, gradient is orthogonal to it.
-        tx_v = torch.zeros_like(x)
-        ty_v = torch.zeros_like(y)
-        tx_v[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
-        ty_v[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
-        tx_v[:, :, -1, :] = tx_v[:, :, -2, :]
-        ty_v[:, :, -1, :] = ty_v[:, :, -2, :]
-    
-        gx_v = -ty_v
-        gy_v = tx_v
-        r2_v = gx_v * gx_v + gy_v * gy_v + eps
-        cos2_v = (gx_v * gx_v - gy_v * gy_v) / r2_v
-        sin2_v = (2.0 * gx_v * gy_v) / r2_v
-    
-        dir0_v = 0.5 + 0.5 * cos2_v
-        dir1_v = 0.5 + 0.5 * ((cos2_v - sin2_v) * inv_sqrt2)
-    
-        # u-based: horizontal mesh edge using line_offset connectivity on the coarse grid.
+        # Build mapped coarse coords once. Direction computations are done on this
+        # low-res grid (matching line_offset connectivity semantics), then upsampled.
         coords_c = model.base_grid + model.offset  # (1,2,gh,gw)
         u_c = coords_c[:, 0:1]
         v_c = coords_c[:, 1:2]
         x_c, y_c = model._apply_global_transform(u_c, v_c)  # (1,1,gh,gw)
         xy_c = torch.cat([x_c, y_c], dim=1)  # (1,2,gh,gw)
     
+        # v-based (coarse): vertical mesh edge on coarse grid, gradient is orthogonal to it.
+        tx_v_c = x_c.new_zeros(x_c.shape)
+        ty_v_c = y_c.new_zeros(y_c.shape)
+        tx_v_c[:, :, :-1, :] = x_c[:, :, 1:, :] - x_c[:, :, :-1, :]
+        ty_v_c[:, :, :-1, :] = y_c[:, :, 1:, :] - y_c[:, :, :-1, :]
+        if x_c.shape[2] >= 2:
+            tx_v_c[:, :, -1, :] = tx_v_c[:, :, -2, :]
+            ty_v_c[:, :, -1, :] = ty_v_c[:, :, -2, :]
+    
+        gx_v_c = -ty_v_c
+        gy_v_c = tx_v_c
+        r2_v_c = gx_v_c * gx_v_c + gy_v_c * gy_v_c + eps
+        cos2_v_c = (gx_v_c * gx_v_c - gy_v_c * gy_v_c) / r2_v_c
+        sin2_v_c = (2.0 * gx_v_c * gy_v_c) / r2_v_c
+    
+        pack_v_c = torch.cat([cos2_v_c, sin2_v_c], dim=1)  # (1,2,gh,gw)
+        pack_v_hr = F.interpolate(pack_v_c, size=(hh, ww), mode="bilinear", align_corners=True)
+        cos2_v = pack_v_hr[:, 0:1]
+        sin2_v = pack_v_hr[:, 1:2]
+    
+        dir0_v = 0.5 + 0.5 * cos2_v
+        dir1_v = 0.5 + 0.5 * ((cos2_v - sin2_v) * inv_sqrt2)
+    
+        # u-based: horizontal mesh edge using line_offset connectivity on the coarse grid.
         src_u, nbr_u = _coarse_x_line_pairs(xy_c)  # (1,2,2,gh,gw-1)
         vec_lr = nbr_u[:, :, 0] - src_u[:, :, 0]  # (1,2,gh,gw-1) from col x   -> x+1
         vec_rl = nbr_u[:, :, 1] - src_u[:, :, 1]  # (1,2,gh,gw-1) from col x+1 -> x
@@ -2097,17 +2105,24 @@ def fit_cosine_grid(
     
         pack_lr = torch.cat([cos2_lr_c, sin2_lr_c], dim=1)  # (1,2,gh,gw)
         pack_rl = torch.cat([cos2_rl_c, sin2_rl_c], dim=1)  # (1,2,gh,gw)
-        pack_lr_hr = F.interpolate(pack_lr, size=(hh, ww), mode="bicubic", align_corners=True)
-        pack_rl_hr = F.interpolate(pack_rl, size=(hh, ww), mode="bicubic", align_corners=True)
+        pack_lr_hr = F.interpolate(pack_lr, size=(hh, ww), mode="bilinear", align_corners=True)
+        pack_rl_hr = F.interpolate(pack_rl, size=(hh, ww), mode="bilinear", align_corners=True)
         cos2_lr = pack_lr_hr[:, 0:1]
         sin2_lr = pack_lr_hr[:, 1:2]
         cos2_rl = pack_rl_hr[:, 0:1]
         sin2_rl = pack_rl_hr[:, 1:2]
     
-        dir0_u_lr = 0.5 + 0.5 * cos2_lr
-        dir1_u_lr = 0.5 + 0.5 * ((cos2_lr - sin2_lr) * inv_sqrt2)
-        dir0_u_rl = 0.5 + 0.5 * cos2_rl
-        dir1_u_rl = 0.5 + 0.5 * ((cos2_rl - sin2_rl) * inv_sqrt2)
+        dir0_u_lr_raw = 0.5 + 0.5 * cos2_lr
+        dir1_u_lr_raw = 0.5 + 0.5 * ((cos2_lr - sin2_lr) * inv_sqrt2)
+        dir0_u_rl_raw = 0.5 + 0.5 * cos2_rl
+        dir1_u_rl_raw = 0.5 + 0.5 * ((cos2_rl - sin2_rl) * inv_sqrt2)
+    
+        dir0_u_lr = dir0_u_lr_raw
+        dir1_u_lr = dir1_u_lr_raw
+        dir0_u_rl = dir0_u_rl_raw
+        dir1_u_rl = dir1_u_rl_raw
+
+        # print("sizes ", grid.shape, pack_lr.shape, coords_c.shape, dir0_v.shape, dir0_u_lr.shape)
     
         return dir0_v, dir0_u_lr, dir0_u_rl, dir1_v, dir1_u_lr, dir1_u_rl
 
@@ -2173,13 +2188,13 @@ def fit_cosine_grid(
     
         if dir0_unet_hr is not None and dir0_v is not None and dir0_u_lr is not None and dir0_u_rl is not None:
             losses.append(_masked_mse(dir0_v, dir0_unet_hr))
-            # losses.append(_masked_mse(dir0_u_lr, dir0_unet_hr))
-            # losses.append(_masked_mse(dir0_u_rl, dir0_unet_hr))
+            losses.append(0.1*_masked_mse(dir0_u_lr, dir0_unet_hr))
+            losses.append(0.1*_masked_mse(dir0_u_rl, dir0_unet_hr))
     
         if dir1_unet_hr is not None and dir1_v is not None and dir1_u_lr is not None and dir1_u_rl is not None:
             losses.append(_masked_mse(dir1_v, dir1_unet_hr))
-            # losses.append(_masked_mse(dir1_u_lr, dir1_unet_hr))
-            # losses.append(_masked_mse(dir1_u_rl, dir1_unet_hr))
+            losses.append(0.1*_masked_mse(dir1_u_lr, dir1_unet_hr))
+            losses.append(0.1*_masked_mse(dir1_u_rl, dir1_unet_hr))
     
         if len(losses) == 0:
             return torch.zeros((), device=device, dtype=dtype)
@@ -3058,7 +3073,7 @@ def main() -> None:
     parser.add_argument(
         "--lambda-smooth-x",
         type=float,
-        default=100,
+        default=1000,
         help="Smoothness weight along x (cosine direction) for the coarse grid.",
     )
     parser.add_argument(
