@@ -331,7 +331,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
         start_zyx = torch.tensor(start_xyz).flip(0) / 2 ** volume_scale
 
-        if True:  # strip-then-extrude
+        if False:  # strip-then-extrude
 
             strip_direction = 'u'
             strip_zyxs = trace_strip(start_zyx, num_steps=strip_steps, direction=strip_direction)
@@ -340,7 +340,7 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
 
         else:  # freeform 2D growth
 
-            patch_zyxs = trace_patch_v4(start_zyx, max_size=100)
+            patch_zyxs = trace_patch_v4(start_zyx, max_size=60)
 
         print(f'saving with timestamp {timestamp}')
         save_tifxyz(
