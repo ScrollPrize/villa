@@ -28,7 +28,7 @@ void visualize_spiral(
 #include <sstream>
 
 #include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 
 bool find_intersections(

@@ -1,14 +1,11 @@
 #include <nlohmann/json.hpp>
 
-#include <opencv2/highgui.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 
-#include <unordered_map>
 #include <filesystem>
 #include <chrono>
 #include <iostream>

@@ -8,7 +8,7 @@
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
 
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <omp.h>
 
 

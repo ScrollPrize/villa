@@ -10,9 +10,10 @@
 #include "z5/multiarray/xtensor_access.hxx"
 #include "z5/attributes.hxx"
 
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"

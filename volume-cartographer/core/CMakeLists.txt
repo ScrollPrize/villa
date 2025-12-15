@@ -29,7 +29,6 @@ target_link_libraries(vc_core
         opencv_core
         opencv_imgproc
         opencv_imgcodecs
-        opencv_highgui
         opencv_calib3d
         opencv_video
         nlohmann_json::nlohmann_json
