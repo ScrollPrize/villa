@@ -107,7 +107,11 @@ def load_checkpoint(checkpoint_path):
     checkpoint_path = _resolve_checkpoint_path(checkpoint_path)
     print(f'loading checkpoint {checkpoint_path}... ')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    state = checkpoint['model'] if isinstance(checkpoint, dict) else checkpoint
+
+    state = checkpoint['model']
+    config = checkpoint['config']
+
+    model = make_model(config)
 
     # Checkpoints saved from torch.compile / DDP may prepend wrapper prefixes.
     prefixes = ('module.', '_orig_mod.')
@@ -125,3 +129,4 @@ def load_checkpoint(checkpoint_path):
 
     state = {strip_prefixes(k): v for k, v in state.items()}
     model.load_state_dict(state)
+    return model, config

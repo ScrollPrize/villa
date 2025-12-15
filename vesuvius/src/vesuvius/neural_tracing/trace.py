@@ -14,18 +14,16 @@ from vesuvius.neural_tracing.tifxyz import save_tifxyz, get_area
 
 
 @click.command()
-@click.option('--config_path', type=click.Path(exists=True), required=True, help='Path to config file')
-@click.option('--checkpoint_path', type=click.Path(exists=True), required=True, help='Path to checkpoint file')
+@click.option('--checkpoint_path', type=click.Path(exists=True), required=True, help='Path to checkpoint file or directory')
 @click.option('--out_path', type=click.Path(), required=True, help='Path to write surface to')
 @click.option('--start_xyz', nargs=3, type=int, required=True, help='Starting XYZ coordinates')
 @click.option('--volume_zarr', type=click.Path(exists=True), required=True, help='Path to ome-zarr folder')
 @click.option('--volume_scale', type=int, required=True, help='OME scale to use')
 @click.option('--steps_per_crop', type=int, required=True, help='Number of steps to take before sampling a new crop')
 @click.option('--strip_steps', type=int, default=100, help='Number of steps for strip mode tracing')
-def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps_per_crop, strip_steps):
+def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps_per_crop, strip_steps):
 
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    model, config = load_checkpoint(checkpoint_path)
 
     assert steps_per_crop <= config['step_count']
     step_size = config['step_size'] * 2 ** volume_scale
@@ -35,8 +33,6 @@ def trace(config_path, checkpoint_path, out_path, start_xyz, volume_zarr, volume
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
 
-    model = make_model(config)
-    load_checkpoint(checkpoint_path, model)
     inference = Inference(model, config, volume_zarr, volume_scale)
 
     partial_uuids = []

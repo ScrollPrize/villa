@@ -12,23 +12,19 @@ from vesuvius.neural_tracing.infer import Inference
 
 
 @click.command()
-@click.option('--config_path', type=click.Path(exists=True), required=True, help='Path to config file')
 @click.option('--checkpoint_path', type=click.Path(exists=True), required=True, help='Path to checkpoint file')
 @click.option('--volume_zarr', type=click.Path(exists=True), required=True, help='Path to ome-zarr folder')
 @click.option('--volume_scale', type=int, required=True, help='OME scale to use')
 @click.option('--socket_path', type=click.Path(), required=True, help='Path to Unix domain socket')
-def serve(config_path, checkpoint_path, volume_zarr, volume_scale, socket_path):
+def serve(checkpoint_path, volume_zarr, volume_scale, socket_path):
 
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    model, config = load_checkpoint(checkpoint_path)
 
     random.seed(config['seed'])
     np.random.seed(config['seed'])
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
 
-    model = make_model(config)
-    load_checkpoint(checkpoint_path, model)
     inference = Inference(model, config, volume_zarr, volume_scale)
 
     socket_path = Path(socket_path)
