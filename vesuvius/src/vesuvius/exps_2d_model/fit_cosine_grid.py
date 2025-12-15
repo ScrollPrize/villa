@@ -1980,27 +1980,18 @@ def fit_cosine_grid(
         Compute direction encodings for model & UNet in sample space for both
         dir0 and dir1 encodings.
     
-        Model direction is derived from the mapping (u,v) -> (x,y) represented
-        by the sampling grid. Let J be the Jacobian of this mapping:
+        Model direction is derived from the quad-mesh structure of the sampling
+        grid itself: we take the v-direction edge vector between neighboring
+        quad corners (y -> y+1 at fixed x) and use its *orthogonal* direction
+        (the local normal) as the assumed gradient direction.
     
-            J = [ dx/du  dx/dv ]
-                [ dy/du  dy/dv ]
+        Let the v-direction edge be t = (tx, ty) and the orthogonal direction
+        be n = (-ty, tx). We encode:
     
-        The cosine phase varies along u, so in image space the phase field is
-        φ(x,y) = k * u(x,y). Its gradient is ∇φ ∝ ∇u, and
+            cos(2*theta) = (nx^2 - ny^2) / (nx^2 + ny^2)
+            sin(2*theta) = 2*nx*ny / (nx^2 + ny^2)
     
-            [du, dv]^T = J^{-1} [dx, dy]^T
-    
-        so the gradient of u in (x,y) is the first row of J^{-1}:
-    
-            ∇u = (∂u/∂x, ∂u/∂y) = row_0(J^{-1})
-    
-        From ∇u we form:
-    
-            cos(2*theta) = (ux^2 - uy^2) / (ux^2 + uy^2)
-            sin(2*theta) = 2*ux*uy / (ux^2 + uy^2)
-    
-        and encode two directional maps matching train_unet:
+        matching train_unet targets:
     
             dir0 = 0.5 + 0.5*cos(2*theta)
             dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
@@ -2019,39 +2010,29 @@ def fit_cosine_grid(
         x = grid[..., 0].unsqueeze(1)  # (1,1,hr,wr)
         y = grid[..., 1].unsqueeze(1)
     
-        # Finite-difference Jacobian of (u,v) -> (x,y).
-        # Treat width as u-direction and height as v-direction.
-        xu = torch.zeros_like(x)
-        xv = torch.zeros_like(x)
-        yu = torch.zeros_like(y)
-        yv = torch.zeros_like(y)
+        _, _, hh, ww = x.shape
+        if hh < 2 or ww < 1:
+            return None, None, None, None
     
-        # Forward differences along u (width).
-        xu[:, :, :, :-1] = x[:, :, :, 1:] - x[:, :, :, :-1]
-        yu[:, :, :, :-1] = y[:, :, :, 1:] - y[:, :, :, :-1]
+        # v-direction (row) edge vectors of the grid-as-quad-mesh.
+        tx = torch.zeros_like(x)
+        ty = torch.zeros_like(y)
+        tx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+        ty[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
+        tx[:, :, -1, :] = tx[:, :, -2, :]
+        ty[:, :, -1, :] = ty[:, :, -2, :]
     
-        # Forward differences along v (height).
-        xv[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
-        yv[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
+        # Use the direction orthogonal to the v-edge as the gradient direction.
+        nx = -ty
+        ny = tx
     
-        # Jacobian determinant.
-        det = xu * yv - xv * yu
         eps = 1e-8
-        det_safe = det + (det.abs() < eps).float() * eps
+        r2 = nx * nx + ny * ny + eps
+        cos2theta = (nx * nx - ny * ny) / r2
+        sin2theta = (2.0 * nx * ny) / r2
     
-        # First row of J^{-1} gives gradient of u in image space: (du/dx, du/dy).
-        ux = yv / det_safe
-        uy = -xv / det_safe
-    
-        r2 = ux * ux + uy * uy + eps
-        cos2theta = (ux * ux - uy * uy) / r2
-        sin2theta = (2.0 * ux * uy) / r2
-    
-        # Primary encoding: 0.5 + 0.5*cos(2*theta).
         dir0_model = 0.5 + 0.5 * cos2theta  # (1,1,hr,wr)
     
-        # Secondary encoding shifted by 45 degrees:
-        # cos(2*theta + pi/4) = (cos(2*theta) - sin(2*theta)) / sqrt(2).
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
         cos2theta_shift = (cos2theta - sin2theta) * inv_sqrt2
         dir1_model = 0.5 + 0.5 * cos2theta_shift
