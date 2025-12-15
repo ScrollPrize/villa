@@ -2386,7 +2386,7 @@ def fit_cosine_grid(
         "step": 0.0,
         "mod_smooth": 0.0,
         "angle_sym": 0.0,
-        "dir_unet": 1.0,
+        "dir_unet": 10.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
