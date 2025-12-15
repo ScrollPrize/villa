@@ -826,7 +826,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
             #  ok since it's 'just more augmentation' that won't be applied during tracing
             uv_channels = uv_heatmaps_both.shape[0]
-            regression_target = torch.cat([uv_heatmaps_both] + [maybe_center_heatmap if maybe_center_heatmap is not None else []], dim=0)
+            regression_target = torch.cat([uv_heatmaps_both] + ([maybe_center_heatmap] if maybe_center_heatmap is not None else []), dim=0)
             seg_for_aug = seg[None] if seg is not None else None
             while True:
                 augmented = self._augmentations(
