@@ -7,10 +7,15 @@ import numpy as np
 from skimage import io
 from skimage.segmentation import expand_labels
 import cc3d
-from scipy.ndimage import binary_erosion, binary_dilation, generate_binary_structure
+from scipy.ndimage import binary_erosion, binary_dilation, generate_binary_structure, convolve
 from magicgui import magicgui
 from napari.utils.notifications import show_info
+from napari._qt.qt_viewer import QtViewer
+from napari.components.viewer_model import ViewerModel
 from numba import njit, prange
+from qtpy.QtWidgets import QSplitter, QWidget, QVBoxLayout, QGridLayout, QCheckBox, QShortcut, QApplication, QPushButton
+from qtpy.QtGui import QKeySequence
+from qtpy.QtCore import Qt
 
 # Numba-accelerated function to find voxels touching 2+ different component labels
 @njit(parallel=True, cache=True)
@@ -67,15 +72,245 @@ CORNER_OFFSETS = [
 ]
 
 
+class QtViewerWrap(QtViewer):
+    """Wrapper for secondary QtViewer that delegates file operations to main viewer."""
+    def __init__(self, main_window, viewer_model):
+        super().__init__(viewer_model)
+        self.main_window = main_window
+
+    def _qt_open(self, filenames, stack, plugin=None, layer_type=None, **kwargs):
+        """Delegate drag-and-drop to main viewer."""
+        self.main_window._qt_viewer._qt_open(filenames, stack, plugin, layer_type, **kwargs)
+
+
+class MultiViewerWidget(QWidget):
+    """
+    Widget containing 2 napari viewers side by side:
+    - Left: XY plane (main viewer's canvas) - top-down slice view
+    - Right: 3D view
+    """
+
+    def __init__(self, main_viewer, sync_enabled=True):
+        super().__init__()
+        self.main_viewer = main_viewer
+        self.sync_enabled = sync_enabled
+        self._block = False  # Prevent feedback loops
+
+        # Create 3D viewer model
+        self.viewer_model_3d = ViewerModel(title='3D View')
+
+        # Create QtViewer wrapper for 3D view
+        self.qt_viewer_3d = QtViewerWrap(main_viewer.window, self.viewer_model_3d)
+
+        # Setup layout with QSplitter
+        self._setup_layout()
+
+        # Connect synchronization events
+        self._connect_sync_events()
+
+    def _setup_layout(self):
+        """Create side-by-side layout with resizable splitter."""
+        # Horizontal splitter: main view on left, 3D on right
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Get the main viewer's canvas widget
+        main_canvas = self.main_viewer.window._qt_viewer
+        main_splitter.addWidget(main_canvas)  # XY view (left)
+        main_splitter.addWidget(self.qt_viewer_3d)  # 3D view (right)
+
+        # Set equal sizes
+        main_splitter.setSizes([500, 500])
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(main_splitter)
+
+        self.main_splitter = main_splitter
+
+    def _connect_sync_events(self):
+        """Connect events for layer and dimension synchronization."""
+        # Layer events on main viewer
+        self.main_viewer.layers.events.inserted.connect(self._on_layer_added)
+        self.main_viewer.layers.events.removed.connect(self._on_layer_removed)
+        self.main_viewer.layers.events.moved.connect(self._on_layer_moved)
+
+        # Dimension synchronization
+        self.main_viewer.dims.events.current_step.connect(self._on_dims_changed)
+        self.viewer_model_3d.dims.events.current_step.connect(self._on_dims_changed)
+
+    def _update_orthogonal_orders(self):
+        """Set 3D view to show all dimensions."""
+        order = list(self.main_viewer.dims.order)
+        if len(order) < 3:
+            return
+
+        # 3D view: same order but set ndisplay=3
+        self.viewer_model_3d.dims.order = tuple(order)
+        self.viewer_model_3d.dims.ndisplay = 3
+
+    def _on_dims_changed(self, event):
+        """Synchronize dimension position across viewers."""
+        if not self.sync_enabled or self._block:
+            return
+
+        try:
+            self._block = True
+            source = event.source
+            new_step = event.value
+
+            for model in [self.main_viewer, self.viewer_model_3d]:
+                if model.dims is source:
+                    continue
+                # Only sync if same number of dimensions
+                if len(model.dims.current_step) == len(new_step):
+                    model.dims.current_step = new_step
+        finally:
+            self._block = False
+
+    def _on_layer_added(self, event):
+        """Add layer to 3D viewer when added to main."""
+        layer = event.value
+        index = event.index
+
+        # Create copy for 3D viewer (sharing data array)
+        layer_data = layer.as_layer_data_tuple()
+        from napari.layers import Layer
+        copy = Layer.create(*layer_data)
+        copy.metadata['viewer_name'] = '3d'
+        self.viewer_model_3d.layers.insert(index, copy)
+
+        # Connect data sync for label edits
+        layer.events.set_data.connect(self._on_layer_data_changed)
+        layer.events.data.connect(self._on_layer_data_changed)
+
+        # Sync layer properties (one-way from main to 3D)
+        for prop in ['visible', 'opacity', 'blending']:
+            if hasattr(layer.events, prop):
+                getattr(layer.events, prop).connect(
+                    lambda evt, p=prop: self._sync_property(evt, p)
+                )
+
+        # Sync mode and selected_label bidirectionally (tool changes should sync across all viewers)
+        if hasattr(layer.events, 'mode'):
+            layer.events.mode.connect(self._sync_mode_all)
+        if hasattr(layer.events, 'selected_label'):
+            layer.events.selected_label.connect(self._sync_selected_label_all)
+
+        # Also connect from 3D viewer back
+        for sec_layer in self.viewer_model_3d.layers:
+            if sec_layer.name == layer.name:
+                if hasattr(sec_layer.events, 'mode'):
+                    sec_layer.events.mode.connect(self._sync_mode_all)
+                if hasattr(sec_layer.events, 'selected_label'):
+                    sec_layer.events.selected_label.connect(self._sync_selected_label_all)
+
+        self._update_orthogonal_orders()
+
+    def _on_layer_data_changed(self, event):
+        """Sync data changes (edits) to 3D viewer."""
+        if self._block:
+            return
+        try:
+            self._block = True
+            source_layer = event.source
+            layer_name = source_layer.name
+            for target in self.viewer_model_3d.layers:
+                if target.name == layer_name:
+                    target.data = source_layer.data
+                    target.refresh()
+                    break
+        finally:
+            self._block = False
+
+    def _sync_property(self, event, prop_name):
+        """Sync layer property changes."""
+        if self._block:
+            return
+        try:
+            self._block = True
+            source = event.source
+            value = getattr(source, prop_name)
+            for target in self.viewer_model_3d.layers:
+                if target.name == source.name:
+                    setattr(target, prop_name, value)
+                    break
+        finally:
+            self._block = False
+
+    def _sync_mode_all(self, event):
+        """Sync layer mode (tool) changes across ALL viewers bidirectionally."""
+        if self._block:
+            return
+        try:
+            self._block = True
+            source = event.source
+            mode = source.mode
+            layer_name = source.name
+
+            # Sync to all viewers including main
+            all_models = [self.main_viewer, self.viewer_model_3d]
+            for model in all_models:
+                for target in model.layers:
+                    if target.name == layer_name and target is not source:
+                        target.mode = mode
+                        break
+        finally:
+            self._block = False
+
+    def _sync_selected_label_all(self, event):
+        """Sync selected_label changes across ALL viewers bidirectionally."""
+        if self._block:
+            return
+        try:
+            self._block = True
+            source = event.source
+            selected_label = source.selected_label
+            layer_name = source.name
+
+            # Sync to all viewers including main
+            all_models = [self.main_viewer, self.viewer_model_3d]
+            for model in all_models:
+                for target in model.layers:
+                    if target.name == layer_name and target is not source:
+                        target.selected_label = selected_label
+                        break
+        finally:
+            self._block = False
+
+    def _on_layer_removed(self, event):
+        """Remove layer from 3D viewer."""
+        index = event.index
+        if index < len(self.viewer_model_3d.layers):
+            self.viewer_model_3d.layers.pop(index)
+
+    def _on_layer_moved(self, event):
+        """Sync layer order changes."""
+        dest = event.new_index if event.new_index < event.index else event.new_index + 1
+        if event.index < len(self.viewer_model_3d.layers):
+            self.viewer_model_3d.layers.move(event.index, dest)
+
+    def set_sync_enabled(self, enabled):
+        """Enable or disable position synchronization."""
+        if isinstance(enabled, int):  # Qt checkbox state (0=unchecked, 2=checked)
+            enabled = enabled == 2
+        self.sync_enabled = enabled
+
+    def get_all_viewer_models(self):
+        """Return all viewer models for operations that need to affect all."""
+        return [self.main_viewer, self.viewer_model_3d]
+
+
 class ImageLabelViewer:
     def __init__(self, image_dir, label_dir, label_suffix="", output_dir=None,
-                 mergers_csv=None, tiny_csv=None, zero_ignore_label=True, copy_on_skip=True):
+                 mergers_csv=None, tiny_csv=None, zero_ignore_label=True, copy_on_skip=True,
+                 dust_max_size=250):
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
         self.label_suffix = label_suffix
         self.output_dir = Path(output_dir) if output_dir else None
         self.zero_ignore_label = zero_ignore_label
         self.copy_on_skip = copy_on_skip
+        self.dust_max_size = dust_max_size
 
         # Create output directory if specified
         if self.output_dir:
@@ -98,6 +333,17 @@ class ImageLabelViewer:
         self.current_index = 0
         self.viewer = None
         self.current_label_layer = None
+        self.multi_viewer_widget = None
+        self.viewer_models = []  # [main, xz, yz, 3d]
+        self.sync_enabled = True
+        self.ignore_mask = None  # Store ignore mask for toggle functionality
+        self.ignore_visible = True  # Track ignore label visibility
+
+        # Component navigation state
+        self.component_index = 0  # Current component index (0-based)
+        self.component_list = []  # List of unique component labels
+        self.bbox_layer = None  # Reference to shapes layer for bounding box
+        self.component_counter_label = None  # Label widget for "Component X of Y"
 
     def _load_csv_ids(self, csv_path):
         """Load sample IDs from a CSV file."""
@@ -140,6 +386,27 @@ class ImageLabelViewer:
             else:
                 self.csv_label_widget.setText("(none)")
 
+    def update_component_count_display(self):
+        """Update the component count text overlay in viewer windows."""
+        if self.current_label_layer is None:
+            count = 0
+        else:
+            labels = self.current_label_layer.data
+            unique = np.unique(labels)
+            # Exclude 0 (background) and 150 (ignore label)
+            count = len([l for l in unique if l != 0 and l != 150])
+
+        text = f"Components: {count}"
+
+        # Update main viewer
+        self.viewer.text_overlay.text = text
+        self.viewer.text_overlay.visible = True
+
+        # Update 3D viewer
+        if self.multi_viewer_widget:
+            self.multi_viewer_widget.viewer_model_3d.text_overlay.text = text
+            self.multi_viewer_widget.viewer_model_3d.text_overlay.visible = True
+
     def compute_connected_components(self, label_data):
         """Compute 26-connected components on label volume."""
         # Binarize the label data (non-zero -> 1)
@@ -159,6 +426,147 @@ class ImageLabelViewer:
         self.current_label_layer.data = new_labels
         num_components = len(np.unique(new_labels)) - 1  # Subtract 1 for background (0)
         show_info(f"Recomputed: found {num_components} connected components")
+        self.update_component_count_display()
+        self.update_component_list()
+
+    # ==================== Component Navigation Methods ====================
+
+    def update_component_list(self):
+        """Update the list of unique component labels (excluding background and ignore)."""
+        if self.current_label_layer is None:
+            self.component_list = []
+            self.component_index = 0
+            self.update_component_bbox()
+            return
+
+        labels = self.current_label_layer.data
+        unique = np.unique(labels)
+        # Exclude 0 (background) and 150 (ignore label)
+        self.component_list = sorted([int(l) for l in unique if l != 0 and l != 150])
+
+        # Clamp index to valid range
+        if len(self.component_list) == 0:
+            self.component_index = 0
+        elif self.component_index >= len(self.component_list):
+            self.component_index = len(self.component_list) - 1
+
+        self.update_component_bbox()
+
+    def update_component_bbox(self):
+        """Update the bounding box display for the current component."""
+        # Update counter label
+        if self.component_counter_label is not None:
+            if len(self.component_list) == 0:
+                self.component_counter_label.setText("No components")
+            else:
+                self.component_counter_label.setText(f"Component {self.component_index + 1} of {len(self.component_list)}")
+
+        # Clear bbox if no components
+        if len(self.component_list) == 0 or self.current_label_layer is None:
+            if self.bbox_layer is not None:
+                self.bbox_layer.data = []
+            return
+
+        # Get current component label
+        current_label = self.component_list[self.component_index]
+        label_data = self.current_label_layer.data
+
+        # Find voxels belonging to this component
+        coords = np.where(label_data == current_label)
+        if len(coords[0]) == 0:
+            if self.bbox_layer is not None:
+                self.bbox_layer.data = []
+            return
+
+        # Compute bounding box (z, y, x order for napari)
+        z_min, z_max = coords[0].min(), coords[0].max()
+        y_min, y_max = coords[1].min(), coords[1].max()
+        x_min, x_max = coords[2].min(), coords[2].max()
+
+        # Create 3D bounding box as a rectangular prism (8 corners, 12 edges)
+        # Define the 8 corners of the box
+        corners = np.array([
+            [z_min, y_min, x_min],
+            [z_min, y_min, x_max],
+            [z_min, y_max, x_min],
+            [z_min, y_max, x_max],
+            [z_max, y_min, x_min],
+            [z_max, y_min, x_max],
+            [z_max, y_max, x_min],
+            [z_max, y_max, x_max],
+        ])
+
+        # Define the 12 edges as line segments (pairs of corner indices)
+        edges = [
+            # Bottom face (z_min)
+            [corners[0], corners[1]],
+            [corners[1], corners[3]],
+            [corners[3], corners[2]],
+            [corners[2], corners[0]],
+            # Top face (z_max)
+            [corners[4], corners[5]],
+            [corners[5], corners[7]],
+            [corners[7], corners[6]],
+            [corners[6], corners[4]],
+            # Vertical edges
+            [corners[0], corners[4]],
+            [corners[1], corners[5]],
+            [corners[2], corners[6]],
+            [corners[3], corners[7]],
+        ]
+
+        # Create or update the shapes layer
+        if self.bbox_layer is None:
+            self.bbox_layer = self.viewer.add_shapes(
+                edges,
+                shape_type='line',
+                edge_color='red',
+                edge_width=2,
+                name='component_bbox',
+            )
+        else:
+            self.bbox_layer.data = edges
+
+    def next_component(self):
+        """Navigate to the next component."""
+        if len(self.component_list) == 0:
+            show_info("No components to navigate")
+            return
+
+        self.component_index = (self.component_index + 1) % len(self.component_list)
+        self.update_component_bbox()
+
+    def previous_component(self):
+        """Navigate to the previous component."""
+        if len(self.component_list) == 0:
+            show_info("No components to navigate")
+            return
+
+        self.component_index = (self.component_index - 1) % len(self.component_list)
+        self.update_component_bbox()
+
+    def delete_current_component(self):
+        """Delete the currently selected component."""
+        if len(self.component_list) == 0:
+            show_info("No component selected to delete")
+            return
+
+        if self.current_label_layer is None:
+            return
+
+        current_label = self.component_list[self.component_index]
+        label_data = self.current_label_layer.data.copy()
+
+        # Zero out the current component
+        label_data[label_data == current_label] = 0
+        self.current_label_layer.data = label_data
+
+        show_info(f"Deleted component {current_label}")
+
+        # Recompute connected components (this will also update component list)
+        self.recompute_labels()
+
+    # ==================== End Component Navigation ====================
 
     def find_small_components(self, connectivity, max_size):
         """Find connected components smaller than max_size.
@@ -243,6 +651,8 @@ class ImageLabelViewer:
 
         total_voxels = np.sum(small_mask)
         show_info(f"Removed {len(small_ids)} small components ({total_voxels} voxels)")
+        self.update_component_count_display()
+        self.update_component_list()
 
     def delete_selected_component(self):
         """Delete the currently selected label's 26-connected component."""
@@ -275,6 +685,8 @@ class ImageLabelViewer:
 
         num_voxels = np.sum(mask)
         show_info(f"Deleted label {selected_label} ({num_voxels} voxels)")
+        self.update_component_count_display()
+        self.update_component_list()
 
     def expand_current_labels(self, distance=2):
         """Expand labels and create new 'expanded' layer."""
@@ -347,6 +759,8 @@ class ImageLabelViewer:
         self.viewer.layers.selection.active = self.current_label_layer
 
         show_info(f"Copied label {selected} from expanded layer")
+        self.update_component_count_display()
+        self.update_component_list()
 
     def _shift_labels(self, labels, dz, dy, dx):
         """Shift label array and zero out wrapped boundaries."""
@@ -681,14 +1095,39 @@ class ImageLabelViewer:
 
         return bridge_mask
 
-    def split_merges(self, max_iterations=5):
-        """Find and remove all thin bridges (corner, edge, and minimal erosion-based) in one operation.
+    def find_skeleton_junctions(self, label_data, min_neighbors=3):
+        """Find junction voxels in 1vx skeleton structures by counting 26-connected neighbors.
 
-        Optimized to compute connected components once per iteration and share across stages.
+        For thin skeletons, junction points where separate lines touch/merge will have
+        3+ neighbors, while normal line voxels have only 1-2 neighbors.
 
         Args:
-            max_iterations: Maximum number of passes (default: 5). Each pass removes thin bridges
+            label_data: The label array to analyze
+            min_neighbors: Minimum neighbor count to be considered a junction (default: 3)
+
+        Returns:
+            junction_mask: Binary mask of junction voxels to remove
+        """
+        binary = (label_data > 0).astype(np.uint8)
+
+        # 3x3x3 kernel for 26-connectivity (center=0 to exclude self)
+        struct_26 = generate_binary_structure(3, 3).astype(np.uint8)
+        struct_26[1, 1, 1] = 0
+
+        neighbor_count = convolve(binary, struct_26, mode='constant', cval=0)
+        junction_mask = (binary > 0) & (neighbor_count >= min_neighbors)
+
+        return junction_mask.astype(np.uint8)
+
+    def split_merges(self, max_iterations=5, skeleton_mode=False):
+        """Find and remove thin bridges or junction voxels in one operation.
+
+        Args:
+            max_iterations: Maximum number of passes (default: 5). Each pass removes bridges/junctions
                            that may have been revealed by previous passes.
+            skeleton_mode: If True, use skeleton junction detection for 1vx lines (removes voxels
+                          with 3+ neighbors). If False, use standard bridge detection for thick
+                          structures (compares connectivity levels).
         """
         if self.current_label_layer is None:
             show_info("No label layer loaded")
@@ -696,55 +1135,64 @@ class ImageLabelViewer:
 
         label_data = self.current_label_layer.data.copy()
 
-        # Loop until no more bridges found or max iterations reached
+        # Loop until no more bridges/junctions found or max iterations reached
         total_removed = 0
         iteration = 0
         while iteration < max_iterations:
             iteration += 1
             removed_this_iter = 0
 
-            # Compute all connectivity levels once per iteration
-            binary = (label_data > 0).astype(np.uint8)
-            labeled_6 = cc3d.connected_components(binary, connectivity=6)
-            labeled_18 = cc3d.connected_components(binary, connectivity=18)
-            labeled_26 = cc3d.connected_components(binary, connectivity=26)
-
-            # Try corner bridges (26-but-not-18) with extension
-            bridge_mask, _, _ = self.find_corner_bridges(
-                label_data, labeled_18=labeled_18, labeled_26=labeled_26
-            )
-            corner_removed = np.sum(bridge_mask)
-            if corner_removed > 0:
-                removed_this_iter += corner_removed
-                label_data[bridge_mask > 0] = 0
-                # Recompute only what's needed for next stage
+            if skeleton_mode:
+                # Skeleton mode: find and remove junction voxels (3+ neighbors)
+                junction_mask = self.find_skeleton_junctions(label_data, min_neighbors=3)
+                junctions_removed = np.sum(junction_mask)
+                if junctions_removed > 0:
+                    removed_this_iter += junctions_removed
+                    label_data[junction_mask > 0] = 0
+            else:
+                # Normal mode: detect bridges via connectivity comparison
+                # Compute all connectivity levels once per iteration
                 binary = (label_data > 0).astype(np.uint8)
                 labeled_6 = cc3d.connected_components(binary, connectivity=6)
                 labeled_18 = cc3d.connected_components(binary, connectivity=18)
+                labeled_26 = cc3d.connected_components(binary, connectivity=26)
 
-            # Try edge bridges (18-but-not-6) with extension
-            bridge_mask, _, _ = self.find_edge_bridges(
-                label_data, labeled_6=labeled_6, labeled_18=labeled_18
-            )
-            edge_removed = np.sum(bridge_mask)
-            if edge_removed > 0:
-                removed_this_iter += edge_removed
-                label_data[bridge_mask > 0] = 0
-                # Recompute only what's needed for next stage
-                binary = (label_data > 0).astype(np.uint8)
-                labeled_6 = cc3d.connected_components(binary, connectivity=6)
+                # Try corner bridges (26-but-not-18) with extension
+                bridge_mask, _, _ = self.find_corner_bridges(
+                    label_data, labeled_18=labeled_18, labeled_26=labeled_26
+                )
+                corner_removed = np.sum(bridge_mask)
+                if corner_removed > 0:
+                    removed_this_iter += corner_removed
+                    label_data[bridge_mask > 0] = 0
+                    # Recompute only what's needed for next stage
+                    binary = (label_data > 0).astype(np.uint8)
+                    labeled_6 = cc3d.connected_components(binary, connectivity=6)
+                    labeled_18 = cc3d.connected_components(binary, connectivity=18)
 
-            # NOTE: Erosion-based minimal bridge detection is disabled by default
-            # as it can damage thin sheet-like structures (e.g., papyrus layers).
-            # The corner and edge bridge detection above handles most merge cases.
-            # Uncomment below only for thick/blocky segmentation data:
-            #
-            # if corner_removed + edge_removed < 100:
-            #     bridge_mask = self.find_minimal_bridges(label_data, max_erosion=1, labeled_6=labeled_6)
-            #     minimal_removed = np.sum(bridge_mask)
-            #     if minimal_removed > 0:
-            #         removed_this_iter += minimal_removed
-            #         label_data[bridge_mask > 0] = 0
+                # Try edge bridges (18-but-not-6) with extension
+                bridge_mask, _, _ = self.find_edge_bridges(
+                    label_data, labeled_6=labeled_6, labeled_18=labeled_18
+                )
+                edge_removed = np.sum(bridge_mask)
+                if edge_removed > 0:
+                    removed_this_iter += edge_removed
+                    label_data[bridge_mask > 0] = 0
+                    # Recompute only what's needed for next stage
+                    binary = (label_data > 0).astype(np.uint8)
+                    labeled_6 = cc3d.connected_components(binary, connectivity=6)
+
+                # NOTE: Erosion-based minimal bridge detection is disabled by default
+                # as it can damage thin sheet-like structures (e.g., papyrus layers).
+                # The corner and edge bridge detection above handles most merge cases.
+                # Uncomment below only for thick/blocky segmentation data:
+                #
+                # if corner_removed + edge_removed < 100:
+                #     bridge_mask = self.find_minimal_bridges(label_data, max_erosion=1, labeled_6=labeled_6)
+                #     minimal_removed = np.sum(bridge_mask)
+                #     if minimal_removed > 0:
+                #         removed_this_iter += minimal_removed
+                #         label_data[bridge_mask > 0] = 0
 
             if removed_this_iter == 0:
                 break
@@ -760,6 +1208,8 @@ class ImageLabelViewer:
 
         num_components = len(np.unique(new_labels)) - 1
         show_info(f"Removed {total_removed} bridge voxels in {iteration} passes, now {num_components} components")
+        self.update_component_count_display()
+        self.update_component_list()
 
         # Run dust with current widget parameters
         if hasattr(self, 'small_components_widget'):
@@ -840,9 +1290,28 @@ class ImageLabelViewer:
             show_info("No more images to display")
             return False
 
+        # Save camera/view state before clearing (if we have layers)
+        saved_camera_main = None
+        saved_camera_3d = None
+        saved_dims = None
+        if len(self.viewer.layers) > 0:
+            saved_camera_main = {
+                'center': self.viewer.camera.center,
+                'zoom': self.viewer.camera.zoom,
+                'angles': self.viewer.camera.angles,
+            }
+            saved_dims = self.viewer.dims.current_step
+            if self.multi_viewer_widget:
+                saved_camera_3d = {
+                    'center': self.multi_viewer_widget.viewer_model_3d.camera.center,
+                    'zoom': self.multi_viewer_widget.viewer_model_3d.camera.zoom,
+                    'angles': self.multi_viewer_widget.viewer_model_3d.camera.angles,
+                }
+
         # Clear existing layers
         self.viewer.layers.clear()
         self.current_label_layer = None
+        self.bbox_layer = None  # Reset bbox layer reference
 
         # Load image
         image_path = self.image_files[self.current_index]
@@ -863,12 +1332,18 @@ class ImageLabelViewer:
                 label[label == 2] = 0
                 # Compute 26-connected components
                 label = self.compute_connected_components(label)
+                self.ignore_mask = None  # No ignore mask when zeroing
             else:
                 # Save ignore mask, zero it out for CC computation, then restore as 150
                 ignore_mask = label == 2
                 label[ignore_mask] = 0
                 label = self.compute_connected_components(label)
                 label[ignore_mask] = 150
+                # Store ignore mask for toggle functionality
+                self.ignore_mask = ignore_mask.copy()
+                # Apply current visibility state (don't reset user's selection)
+                if not self.ignore_visible:
+                    label[ignore_mask] = 0
             self.current_label_layer = self.viewer.add_labels(
                 label, name=f"Label: {label_path.name}"
             )
@@ -878,16 +1353,46 @@ class ImageLabelViewer:
             self.current_label_layer.selected_label = 0
             self.current_label_layer.mode = 'fill'
             self.viewer.layers.selection.active = self.current_label_layer
+
+            # Configure 3D viewer's label layer for 3D editing
+            if self.multi_viewer_widget:
+                for layer in self.multi_viewer_widget.viewer_model_3d.layers:
+                    if layer.name == self.current_label_layer.name:
+                        layer.n_edit_dimensions = 3
+                        layer.contiguous = False
+                        layer.mode = 'fill'
+                        break
+
             num_components = len(np.unique(label)) - 1
             show_info(f"Loaded {num_components} connected components")
 
-            # Remove small components (< 250 voxels) on load
-            self.remove_small_components(connectivity=26, max_size=250)
+            # Remove small components on load
+            self.remove_small_components(connectivity=26, max_size=self.dust_max_size)
         else:
             show_info(f"No label found for {image_path.name}")
 
+        # Restore camera/view state if we saved it
+        if saved_camera_main is not None:
+            self.viewer.camera.center = saved_camera_main['center']
+            self.viewer.camera.zoom = saved_camera_main['zoom']
+            self.viewer.camera.angles = saved_camera_main['angles']
+        if saved_dims is not None:
+            # Clamp dims to valid range for new image
+            # dims.range returns list of (min, max, step) tuples
+            new_step = tuple(
+                min(int(s), int(r[1]) - 1) if r[1] > 0 else 0
+                for s, r in zip(saved_dims, self.viewer.dims.range)
+            )
+            self.viewer.dims.current_step = new_step
+        if saved_camera_3d is not None and self.multi_viewer_widget:
+            self.multi_viewer_widget.viewer_model_3d.camera.center = saved_camera_3d['center']
+            self.multi_viewer_widget.viewer_model_3d.camera.zoom = saved_camera_3d['zoom']
+            self.multi_viewer_widget.viewer_model_3d.camera.angles = saved_camera_3d['angles']
+
         # Update title (includes CSV membership)
         self.update_csv_label()
+        self.update_component_count_display()
+        self.update_component_list()  # Initialize component navigation
         return True
 
     def next_image(self):
@@ -954,7 +1459,39 @@ class ImageLabelViewer:
         """Reset current image-label pair by reloading from disk."""
         self.load_current_pair()
         show_info("Reset to original from disk")
-    
+
+    def toggle_ignore_visibility(self, visible):
+        """Toggle visibility of the ignore label (value 150)."""
+        if self.ignore_mask is None or self.current_label_layer is None:
+            return
+
+        label_data = self.current_label_layer.data.copy()
+        if visible:
+            # Restore ignore label
+            label_data[self.ignore_mask] = 150
+            self.ignore_visible = True
+        else:
+            # Hide ignore label
+            label_data[self.ignore_mask] = 0
+            self.ignore_visible = False
+        self.current_label_layer.data = label_data
+
+    def finalize_label(self):
+        """Finalize label by mapping values >100 to 2, and values >0 and <=100 to 1."""
+        if self.current_label_layer is None:
+            show_info("No label layer loaded")
+            return
+
+        label_data = self.current_label_layer.data
+
+        # Create output array
+        finalized = np.zeros_like(label_data)
+        finalized[(label_data > 0) & (label_data <= 100)] = 1
+        finalized[label_data > 100] = 2
+
+        self.current_label_layer.data = finalized
+        show_info("Finalized label: values >100→2, values 1-100→1")
+
     def delete_current(self):
         """Delete current image-label pair from disk."""
         if self.current_index >= len(self.image_files):
@@ -996,8 +1533,22 @@ class ImageLabelViewer:
 
     
     def run(self):
-        """Run the viewer."""
-        self.viewer = napari.Viewer()
+        """Run the viewer with multi-viewer layout."""
+        # Critical: Set OpenGL context sharing BEFORE any viewer creation
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+
+        # Create main viewer (don't show yet - we'll replace central widget)
+        self.viewer = napari.Viewer(show=False)
+
+        # Create multi-viewer widget with 4 views
+        self.multi_viewer_widget = MultiViewerWidget(self.viewer, self.sync_enabled)
+        self.viewer_models = self.multi_viewer_widget.get_all_viewer_models()
+
+        # Configure text overlay appearance for component count display
+        self.viewer.text_overlay.font_size = 20
+        self.viewer.text_overlay.color = 'white'
+        self.multi_viewer_widget.viewer_model_3d.text_overlay.font_size = 20
+        self.multi_viewer_widget.viewer_model_3d.text_overlay.color = 'white'
 
         # Skip to first unprocessed sample
         if not self.skip_to_next_unprocessed():
@@ -1008,42 +1559,30 @@ class ImageLabelViewer:
         if not self.load_current_pair():
             show_info("No images found")
             return
-        
-        # Create buttons widget
-        @magicgui(
-            call_button="Next (Space)",
-            auto_call=False,
-        )
-        def next_button():
-            self.next_image()
-        
-        @magicgui(
-            call_button="Previous (A)",
-            auto_call=False,
-        )
-        def previous_button():
-            self.previous_image()
 
-        @magicgui(
-            call_button="Delete (Ctrl+D)",
-            auto_call=False,
-        )
-        def delete_button():
-            self.delete_current()
+        # Create navigation widget with grid layout
+        nav_widget = QWidget()
+        nav_grid = QGridLayout(nav_widget)
+        nav_grid.setContentsMargins(2, 2, 2, 2)
+        nav_grid.setSpacing(2)
 
-        @magicgui(
-            call_button="Reset (Shift+R)",
-            auto_call=False,
-        )
-        def reset_button():
-            self.reset_current()
+        prev_btn = QPushButton("< Prev (A)")
+        prev_btn.clicked.connect(self.previous_image)
+        next_btn = QPushButton("Next > (Space)")
+        next_btn.clicked.connect(self.next_image)
+        skip_btn = QPushButton("Skip (S)")
+        skip_btn.clicked.connect(self.skip_image)
+        delete_btn = QPushButton("Delete (Ctrl+D)")
+        delete_btn.clicked.connect(self.delete_current)
+        reset_btn = QPushButton("Reset (Shift+R)")
+        reset_btn.clicked.connect(self.reset_current)
 
-        @magicgui(
-            call_button="Skip (S)",
-            auto_call=False,
-        )
-        def skip_button():
-            self.skip_image()
+        # Arrange in 2x3 grid
+        nav_grid.addWidget(prev_btn, 0, 0)
+        nav_grid.addWidget(next_btn, 0, 1)
+        nav_grid.addWidget(skip_btn, 0, 2)
+        nav_grid.addWidget(delete_btn, 1, 0)
+        nav_grid.addWidget(reset_btn, 1, 1)
 
         @magicgui(
             call_button="Recompute (R)",
@@ -1054,7 +1593,7 @@ class ImageLabelViewer:
 
         @magicgui(
             connectivity={"choices": [6, 18, 26], "value": 26, "label": "Connectivity"},
-            max_size={"value": 250, "min": 1, "max": 1000000, "label": "Max Size"},
+            max_size={"value": self.dust_max_size, "min": 1, "max": 1000000, "label": "Max Size"},
             layout="vertical",
         )
         def small_components_widget(connectivity: int, max_size: int):
@@ -1082,9 +1621,21 @@ class ImageLabelViewer:
             self.delete_selected_component()
 
         # Create containers for widget groups
-        from magicgui.widgets import Container
+        from magicgui.widgets import Container, Label
         from qtpy.QtWidgets import QLabel
-        from qtpy.QtCore import Qt
+
+        # Create sync toggle checkbox
+        sync_checkbox = QCheckBox("Sync Position")
+        sync_checkbox.setChecked(self.sync_enabled)
+        sync_checkbox.stateChanged.connect(self.multi_viewer_widget.set_sync_enabled)
+
+        # Create ignore label toggle checkbox (only functional with --keep-ignore-label)
+        self.ignore_checkbox = QCheckBox("Show Ignore Label")
+        self.ignore_checkbox.setChecked(True)
+        self.ignore_checkbox.setEnabled(not self.zero_ignore_label)  # Only enable if keeping ignore
+        self.ignore_checkbox.stateChanged.connect(
+            lambda state: self.toggle_ignore_visibility(state == 2)
+        )
 
         # Create CSV membership label widget (large red text)
         self.csv_label_widget = QLabel("(none)")
@@ -1104,16 +1655,36 @@ class ImageLabelViewer:
             "Shift+F: Expand",
             "Shift+E: Copy Expanded",
             "Shift+S: Split",
+            "Shift+Q: Toggle Ignore",
+            "Shift+Z: Finalize",
+            "Shift+D: Next Component",
+            "Shift+A: Prev Component",
         ])
         keybinds_widget = QLabel(keybinds_text)
         keybinds_widget.setStyleSheet("font-size: 12px; padding: 5px;")
         keybinds_widget.setAlignment(Qt.AlignLeft)
 
-        # Navigation container
-        nav_container = Container(
-            widgets=[previous_button, next_button, skip_button, delete_button, reset_button],
-            labels=False,
-        )
+
+        # Component navigation widget with grid layout
+        component_nav_widget = QWidget()
+        component_nav_grid = QGridLayout(component_nav_widget)
+        component_nav_grid.setContentsMargins(2, 2, 2, 2)
+        component_nav_grid.setSpacing(2)
+
+        self.component_counter_label = QLabel("Component 0 of 0")
+        self.component_counter_label.setAlignment(Qt.AlignCenter)
+        prev_comp_btn = QPushButton("<< Prev (Shift+A)")
+        prev_comp_btn.clicked.connect(self.previous_component)
+        next_comp_btn = QPushButton("Next >> (Shift+D)")
+        next_comp_btn.clicked.connect(self.next_component)
+        delete_comp_btn = QPushButton("Delete Component")
+        delete_comp_btn.clicked.connect(self.delete_current_component)
+
+        # Arrange in grid: label on top, buttons below
+        component_nav_grid.addWidget(self.component_counter_label, 0, 0, 1, 2)
+        component_nav_grid.addWidget(prev_comp_btn, 1, 0)
+        component_nav_grid.addWidget(next_comp_btn, 1, 1)
+        component_nav_grid.addWidget(delete_comp_btn, 2, 0, 1, 2)
 
         small_components_container = Container(
             widgets=[small_components_widget, dust_button, delete_selected_button],
@@ -1134,63 +1705,64 @@ class ImageLabelViewer:
 
         expand_container = Container(widgets=[expand_widget, copy_back_button], labels=False)
 
-        # Create split merges widget
-        @magicgui(call_button="Split Merges (Shift+S)")
-        def split_merges_button():
-            self.split_merges()
+        # Create split merges widget with skeleton mode option
+        @magicgui(
+            skeleton_mode={"value": False, "label": "Skeleton Mode (1vx)"},
+            call_button="Split Merges (Shift+S)",
+        )
+        def split_merges_widget(skeleton_mode: bool):
+            self.split_merges(skeleton_mode=skeleton_mode)
+
+        self.split_merges_widget = split_merges_widget
+
+        @magicgui(call_button="Finalize (Shift+Z)")
+        def finalize_button():
+            self.finalize_label()
 
         # Add widgets to viewer
+        self.viewer.window.add_dock_widget(sync_checkbox, area='right', name='View Sync')
+        self.viewer.window.add_dock_widget(self.ignore_checkbox, area='right', name='Ignore Label')
         self.viewer.window.add_dock_widget(self.csv_label_widget, area='right', name='CSV Membership')
         self.viewer.window.add_dock_widget(keybinds_widget, area='right', name='Keybinds', tabify=True)
-        self.viewer.window.add_dock_widget(nav_container, area='right', name='Navigation')
+        self.viewer.window.add_dock_widget(nav_widget, area='right', name='Navigation')
         self.viewer.window.add_dock_widget(recompute_button, area='right')
+        self.viewer.window.add_dock_widget(
+            component_nav_widget, area='right', name='Component Navigation'
+        )
         self.viewer.window.add_dock_widget(
             small_components_container, area='right', name='Small Components'
         )
         self.viewer.window.add_dock_widget(
             expand_container, area='right', name='Expand Labels'
         )
-        self.viewer.window.add_dock_widget(split_merges_button, area='right')
+        self.viewer.window.add_dock_widget(split_merges_widget, area='right', name='Split Merges')
+        self.viewer.window.add_dock_widget(finalize_button, area='right', name='Finalize')
         # Update CSV label for initial load
         self.update_csv_label()
-        
-        # Add keyboard bindings
-        @self.viewer.bind_key('Space')
-        def next_key(viewer):
-            self.next_image()
 
-        @self.viewer.bind_key('s')
-        def skip_key(viewer):
-            self.skip_image()
+        # Replace main window central widget with multi-viewer
+        main_window = self.viewer.window._qt_window
+        main_window.setCentralWidget(self.multi_viewer_widget)
 
-        @self.viewer.bind_key('Control-d')
-        def delete_key(viewer):
-            self.delete_current()
+        # Add global keyboard shortcuts (work regardless of focused viewer)
+        def make_shortcut(key, callback):
+            shortcut = QShortcut(QKeySequence(key), main_window)
+            shortcut.activated.connect(callback)
+            return shortcut
 
-        @self.viewer.bind_key('d')
-        def dust_key(viewer):
-            connectivity = small_components_widget.connectivity.value
-            max_size = small_components_widget.max_size.value
-            self.remove_small_components(connectivity, max_size)
+        make_shortcut('Space', self.next_image)
+        make_shortcut('S', self.skip_image)
+        make_shortcut('Ctrl+D', self.delete_current)
+        make_shortcut('D', lambda: self.remove_small_components(
+            small_components_widget.connectivity.value,
+            small_components_widget.max_size.value
+        ))
+        make_shortcut('A', self.previous_image)
+        make_shortcut('R', self.recompute_labels)
+        make_shortcut('Shift+R', self.reset_current)
+        make_shortcut('Shift+X', self.delete_selected_component)
 
-        @self.viewer.bind_key('a')
-        def previous_key(viewer):
-            self.previous_image()
-
-        @self.viewer.bind_key('r')
-        def recompute_key(viewer):
-            self.recompute_labels()
-
-        @self.viewer.bind_key('Shift-R')
-        def reset_key(viewer):
-            self.reset_current()
-
-        @self.viewer.bind_key('Shift-X')
-        def delete_selected_key(viewer):
-            self.delete_selected_component()
-
-        @self.viewer.bind_key('Shift-F')
-        def expand_key(viewer):
+        def expand_and_select():
             distance = expand_widget.distance.value
             self.expand_current_labels(distance)
             # Select the expanded layer and configure it
@@ -1202,16 +1774,28 @@ class ImageLabelViewer:
                     layer.n_edit_dimensions = 3
                     layer.contiguous = True
                     break
+        make_shortcut('Shift+F', expand_and_select)
 
-        @self.viewer.bind_key('Shift-E')
-        def copy_from_expanded_key(viewer):
-            self.copy_selected_from_expanded()
+        make_shortcut('Shift+E', self.copy_selected_from_expanded)
+        make_shortcut('Shift+S', lambda: self.split_merges(
+            skeleton_mode=self.split_merges_widget.skeleton_mode.value
+        ))
 
-        @self.viewer.bind_key('Shift-S')
-        def split_merges_key(viewer):
-            self.split_merges()
+        def toggle_ignore_shortcut():
+            if not self.zero_ignore_label and self.ignore_mask is not None:
+                new_state = not self.ignore_visible
+                self.toggle_ignore_visibility(new_state)
+                self.ignore_checkbox.setChecked(new_state)
+        make_shortcut('Shift+Q', toggle_ignore_shortcut)
 
-        # Start the application
+        make_shortcut('Shift+Z', self.finalize_label)
+
+        # Component navigation shortcuts
+        make_shortcut('Shift+D', self.next_component)
+        make_shortcut('Shift+A', self.previous_component)
+
+        # Show window and start application
+        self.viewer.window.show()
         napari.run()
 
 
@@ -1263,6 +1847,17 @@ def main():
         action="store_true",
         help="Don't copy the label to output when using the skip button"
     )
+    parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Disable position synchronization between viewers by default"
+    )
+    parser.add_argument(
+        "--dust-max-size",
+        type=int,
+        default=250,
+        help="Initial max size for dust removal on image load (default: 250)"
+    )
 
     args = parser.parse_args()
     
@@ -1280,8 +1875,10 @@ def main():
         args.image_dir, args.label_dir, args.label_suffix, args.output_dir,
         args.mergers_csv, args.tiny_csv,
         zero_ignore_label=not args.keep_ignore_label,
-        copy_on_skip=not args.no_copy_skip
+        copy_on_skip=not args.no_copy_skip,
+        dust_max_size=args.dust_max_size
     )
+    viewer.sync_enabled = not args.no_sync
     viewer.run()
     
     return 0
