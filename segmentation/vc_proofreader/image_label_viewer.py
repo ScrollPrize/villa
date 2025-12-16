@@ -1429,6 +1429,9 @@ class ImageLabelViewer:
             self.current_label_layer.mode = 'fill'
             self.viewer.layers.selection.active = self.current_label_layer
 
+            # Connect callback to update ignore_mask on any edit
+            self.current_label_layer.events.set_data.connect(self._on_label_data_changed)
+
             # Configure 3D viewer's label layer for 3D editing
             if self.multi_viewer_widget:
                 for layer in self.multi_viewer_widget.viewer_model_3d.layers:
@@ -1554,6 +1557,13 @@ class ImageLabelViewer:
             label_data[self.ignore_mask] = 0
             self.ignore_visible = False
         self.current_label_layer.data = label_data
+
+    def _on_label_data_changed(self, event=None):
+        """Update ignore_mask when label data is modified."""
+        if self.zero_ignore_label or self.current_label_layer is None:
+            return
+        label_data = self.current_label_layer.data
+        self.ignore_mask = label_data >= 150
 
     def finalize_label(self):
         """Finalize label by mapping values >100 to 2, and values >0 and <=100 to 1."""
