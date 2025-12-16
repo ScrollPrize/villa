@@ -345,6 +345,10 @@ class ImageLabelViewer:
         self.bbox_layer = None  # Reference to shapes layer for bounding box
         self.component_counter_label = None  # Label widget for "Component X of Y"
 
+        # Flagged/skipped samples CSV paths (written to output directory)
+        self.flagged_csv_path = self.output_dir / "flagged.csv" if self.output_dir else None
+        self.skipped_csv_path = self.output_dir / "skipped.csv" if self.output_dir else None
+
     def _load_csv_ids(self, csv_path):
         """Load sample IDs from a CSV file."""
         import csv
@@ -567,6 +571,71 @@ class ImageLabelViewer:
         self.recompute_labels()
 
     # ==================== End Component Navigation ====================
+
+    def flag_current_sample(self):
+        """Flag the current sample by appending its ID to flagged.csv."""
+        if self.flagged_csv_path is None:
+            show_info("No output directory specified - cannot flag sample")
+            return
+
+        if self.current_index >= len(self.image_files):
+            show_info("No sample to flag")
+            return
+
+        import csv
+        image_path = self.image_files[self.current_index]
+        sample_id = self._get_sample_id(image_path)
+
+        # Check if file exists and if sample is already flagged
+        existing_ids = set()
+        if self.flagged_csv_path.exists():
+            with open(self.flagged_csv_path, 'r') as f:
+                reader = csv.DictReader(f)
+                existing_ids = {row['sample_id'] for row in reader}
+
+        if sample_id in existing_ids:
+            show_info(f"Sample {sample_id} already flagged")
+            return
+
+        # Append to CSV (create with header if new)
+        write_header = not self.flagged_csv_path.exists()
+        with open(self.flagged_csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['sample_id'])
+            if write_header:
+                writer.writeheader()
+            writer.writerow({'sample_id': sample_id})
+
+        show_info(f"Flagged sample: {sample_id}")
+
+    def record_skipped_sample(self):
+        """Record the current sample as skipped by appending its ID to skipped.csv."""
+        if self.skipped_csv_path is None:
+            return  # Silently skip if no output directory
+
+        if self.current_index >= len(self.image_files):
+            return
+
+        import csv
+        image_path = self.image_files[self.current_index]
+        sample_id = self._get_sample_id(image_path)
+
+        # Check if file exists and if sample is already recorded
+        existing_ids = set()
+        if self.skipped_csv_path.exists():
+            with open(self.skipped_csv_path, 'r') as f:
+                reader = csv.DictReader(f)
+                existing_ids = {row['sample_id'] for row in reader}
+
+        if sample_id in existing_ids:
+            return  # Already recorded
+
+        # Append to CSV (create with header if new)
+        write_header = not self.skipped_csv_path.exists()
+        with open(self.skipped_csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['sample_id'])
+            if write_header:
+                writer.writeheader()
+            writer.writerow({'sample_id': sample_id})
 
     def find_small_components(self, connectivity, max_size):
         """Find connected components smaller than max_size.
@@ -1399,6 +1468,8 @@ class ImageLabelViewer:
         """Move to next image, saving current label first."""
         # Save current label to output directory before moving on
         self.save_current_label()
+        # Auto-flag saved samples
+        self.flag_current_sample()
 
         self.current_index += 1
         # Skip samples that already exist in output dir
@@ -1437,6 +1508,8 @@ class ImageLabelViewer:
         """Move to next image, optionally copying the on-disk label to output."""
         if self.copy_on_skip:
             self.copy_label_to_output()
+        # Record skipped sample
+        self.record_skipped_sample()
         self.current_index += 1
         # Skip samples that already exist in output dir
         if not self.skip_to_next_unprocessed():
@@ -1659,6 +1732,7 @@ class ImageLabelViewer:
             "Shift+Z: Finalize",
             "Shift+D: Next Component",
             "Shift+A: Prev Component",
+            "Shift+T: Flag Sample",
         ])
         keybinds_widget = QLabel(keybinds_text)
         keybinds_widget.setStyleSheet("font-size: 12px; padding: 5px;")
@@ -1719,6 +1793,10 @@ class ImageLabelViewer:
         def finalize_button():
             self.finalize_label()
 
+        @magicgui(call_button="Flag Sample (Shift+T)")
+        def flag_button():
+            self.flag_current_sample()
+
         # Add widgets to viewer
         self.viewer.window.add_dock_widget(sync_checkbox, area='right', name='View Sync')
         self.viewer.window.add_dock_widget(self.ignore_checkbox, area='right', name='Ignore Label')
@@ -1737,6 +1815,7 @@ class ImageLabelViewer:
         )
         self.viewer.window.add_dock_widget(split_merges_widget, area='right', name='Split Merges')
         self.viewer.window.add_dock_widget(finalize_button, area='right', name='Finalize')
+        self.viewer.window.add_dock_widget(flag_button, area='right', name='Flag Sample')
         # Update CSV label for initial load
         self.update_csv_label()
 
@@ -1793,6 +1872,9 @@ class ImageLabelViewer:
         # Component navigation shortcuts
         make_shortcut('Shift+D', self.next_component)
         make_shortcut('Shift+A', self.previous_component)
+
+        # Flag sample shortcut
+        make_shortcut('Shift+T', self.flag_current_sample)
 
         # Show window and start application
         self.viewer.window.show()
