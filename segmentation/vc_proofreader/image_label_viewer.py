@@ -7,8 +7,58 @@ import numpy as np
 from skimage import io
 from skimage.segmentation import expand_labels
 import cc3d
+from scipy.ndimage import binary_erosion, binary_dilation, generate_binary_structure
 from magicgui import magicgui
 from napari.utils.notifications import show_info
+from numba import njit, prange
+
+# Numba-accelerated function to find voxels touching 2+ different component labels
+@njit(parallel=True, cache=True)
+def _find_multi_touching_numba(candidate_coords_z, candidate_coords_y, candidate_coords_x,
+                                component_labels):
+    """Find which candidate voxels touch 2+ different non-zero component labels.
+
+    Args:
+        candidate_coords_z/y/x: Arrays of candidate voxel coordinates
+        component_labels: 3D array of component labels
+
+    Returns:
+        Boolean array indicating which candidates touch 2+ components
+    """
+    n_candidates = len(candidate_coords_z)
+    result = np.zeros(n_candidates, dtype=np.bool_)
+
+    shape_z, shape_y, shape_x = component_labels.shape
+
+    # 6-connected face offsets
+    offsets = np.array([
+        [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0]
+    ], dtype=np.int32)
+
+    for i in prange(n_candidates):
+        z, y, x = candidate_coords_z[i], candidate_coords_y[i], candidate_coords_x[i]
+
+        first_label = 0
+        has_second = False
+
+        for j in range(6):
+            nz = z + offsets[j, 0]
+            ny = y + offsets[j, 1]
+            nx = x + offsets[j, 2]
+
+            if 0 <= nz < shape_z and 0 <= ny < shape_y and 0 <= nx < shape_x:
+                lbl = component_labels[nz, ny, nx]
+                if lbl > 0:
+                    if first_label == 0:
+                        first_label = lbl
+                    elif lbl != first_label:
+                        has_second = True
+                        break
+
+        result[i] = has_second
+
+    return result
+
 
 # 8 corner neighbors in 3D (differ by ±1 in ALL three axes)
 CORNER_OFFSETS = [
@@ -314,7 +364,141 @@ class ImageLabelViewer:
 
         return shifted
 
-    def find_corner_bridges(self, label_data):
+    def _find_multi_component_touching_vectorized(self, candidate_mask, component_labels):
+        """Vectorized detection of voxels touching 2+ different components.
+
+        Uses array shifts instead of per-voxel loops.
+
+        Args:
+            candidate_mask: Boolean mask of candidate voxels to check
+            component_labels: Labeled array of components
+
+        Returns:
+            Boolean mask where candidate voxels touch 2+ different component labels
+        """
+        face_offsets = [(0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0), (1, 0, 0), (-1, 0, 0)]
+
+        # Get neighbor labels at each face direction
+        neighbor_labels = []
+        for dz, dy, dx in face_offsets:
+            shifted = self._shift_labels(component_labels, dz, dy, dx)
+            neighbor_labels.append(shifted)
+
+        # Stack to shape (Z, Y, X, 6)
+        stacked = np.stack(neighbor_labels, axis=-1)
+
+        # Mask to only consider candidate positions
+        candidate_neighbors = stacked * candidate_mask[..., np.newaxis].astype(stacked.dtype)
+
+        # Count unique non-zero labels per voxel using sorting
+        sorted_neighbors = np.sort(candidate_neighbors, axis=-1)
+
+        # A voxel touches multiple components if sorted array has 2+ distinct non-zero values
+        nonzero = sorted_neighbors > 0
+        # Count transitions to different values (excluding 0->nonzero transitions handled separately)
+        changes = np.diff(sorted_neighbors, axis=-1) != 0
+        changes = changes & nonzero[..., 1:]  # Only count changes between non-zero values
+
+        # First non-zero value counts as 1
+        first_nonzero = nonzero[..., 0]
+        unique_count = changes.sum(axis=-1) + first_nonzero.astype(int)
+
+        # Return mask where count >= 2
+        return (unique_count >= 2) & candidate_mask
+
+    def _find_articulation_voxels_batch(self, eroded_labels, candidates_mask):
+        """Find which candidate voxels are true articulation points (bridges).
+
+        Uses dilation: for each eroded component, find candidates that would
+        connect it to other components when re-added.
+
+        Args:
+            eroded_labels: Labeled array of eroded components
+            candidates_mask: Boolean mask of candidate bridge voxels
+
+        Returns:
+            Boolean mask of articulation (bridge) voxels
+        """
+        n_components = eroded_labels.max()
+        articulation = np.zeros_like(candidates_mask, dtype=bool)
+
+        if n_components <= 1:
+            return articulation
+
+        struct_6 = generate_binary_structure(3, 1)  # 6-connectivity
+
+        # Pre-compute dilated masks for each component
+        component_dilated = {}
+        for comp_id in range(1, n_components + 1):
+            comp_mask = eroded_labels == comp_id
+            component_dilated[comp_id] = binary_dilation(comp_mask, structure=struct_6)
+
+        # For each pair of components, find candidates that bridge them
+        for comp_id in range(1, n_components + 1):
+            # Candidates adjacent to this component (but not part of it)
+            comp_mask = eroded_labels == comp_id
+            adjacent_candidates = component_dilated[comp_id] & candidates_mask & ~comp_mask
+
+            # Check if these candidates also touch other components
+            for other_id in range(comp_id + 1, n_components + 1):
+                # Voxels that bridge these two specific components
+                bridges = adjacent_candidates & component_dilated[other_id]
+                articulation |= bridges
+
+        return articulation
+
+    def _extend_bridge_mask(self, bridge_mask, component_labels, binary, max_extensions=1):
+        """Extend bridge mask to include adjacent voxels that also bridge components.
+
+        Uses Numba-accelerated neighbor checking for efficiency.
+
+        Args:
+            bridge_mask: Initial bridge detection mask
+            component_labels: Labeled array from lower connectivity
+            binary: Binary foreground mask
+            max_extensions: Maximum dilation iterations (default: 1, conservative for thin sheets)
+
+        Returns:
+            Extended bridge_mask
+        """
+        struct_6 = generate_binary_structure(3, 1)  # 6-connectivity
+        extended = bridge_mask.copy()
+
+        for _ in range(max_extensions):
+            # Dilate current bridges
+            dilated = binary_dilation(extended > 0, structure=struct_6)
+            candidates = dilated & binary & (extended == 0)
+
+            if not candidates.any():
+                break
+
+            # Get candidate coordinates
+            candidate_coords = np.where(candidates)
+            if len(candidate_coords[0]) == 0:
+                break
+
+            # Numba-accelerated: find candidates that touch 2+ different component labels
+            is_bridge = _find_multi_touching_numba(
+                candidate_coords[0].astype(np.int32),
+                candidate_coords[1].astype(np.int32),
+                candidate_coords[2].astype(np.int32),
+                component_labels
+            )
+
+            if not is_bridge.any():
+                break
+
+            # Mark new bridges
+            new_bridge_coords = (
+                candidate_coords[0][is_bridge],
+                candidate_coords[1][is_bridge],
+                candidate_coords[2][is_bridge]
+            )
+            extended[new_bridge_coords] = 1
+
+        return extended
+
+    def find_corner_bridges(self, label_data, labeled_18=None, labeled_26=None):
         """Find corner-only bridges using vectorized neighbor comparison.
 
         Detects 26-but-not-18 connectivity (corner bridges).
@@ -322,6 +506,8 @@ class ImageLabelViewer:
 
         Args:
             label_data: The label array to analyze
+            labeled_18: Optional pre-computed 18-connected labels
+            labeled_26: Optional pre-computed 26-connected labels
 
         Returns:
             bridge_mask: Binary mask of voxels to remove
@@ -329,7 +515,8 @@ class ImageLabelViewer:
             num_mergers: Count of merged components found
         """
         binary = (label_data > 0).astype(np.uint8)
-        labeled_18 = cc3d.connected_components(binary, connectivity=18)
+        if labeled_18 is None:
+            labeled_18 = cc3d.connected_components(binary, connectivity=18)
 
         bridge_mask = np.zeros_like(binary)
 
@@ -347,8 +534,13 @@ class ImageLabelViewer:
             different = (labeled_18 > 0) & (shifted > 0) & (labeled_18 != shifted)
             bridge_mask[different] = 1
 
+        # Extend bridge mask to catch thicker bridges
+        if np.sum(bridge_mask) > 0:
+            bridge_mask = self._extend_bridge_mask(bridge_mask, labeled_18, binary)
+
         # Find merged components (26-components containing bridge voxels)
-        labeled_26 = cc3d.connected_components(binary, connectivity=26)
+        if labeled_26 is None:
+            labeled_26 = cc3d.connected_components(binary, connectivity=26)
         bridge_labels = np.unique(labeled_26[bridge_mask > 0])
         bridge_labels = bridge_labels[bridge_labels > 0]
 
@@ -357,7 +549,7 @@ class ImageLabelViewer:
 
         return bridge_mask, merged_component_mask, num_mergers
 
-    def find_edge_bridges(self, label_data):
+    def find_edge_bridges(self, label_data, labeled_6=None, labeled_18=None):
         """Find edge-only bridges using vectorized neighbor comparison.
 
         Detects 18-but-not-6 connectivity (diagonal/edge bridges).
@@ -365,6 +557,8 @@ class ImageLabelViewer:
 
         Args:
             label_data: The label array to analyze
+            labeled_6: Optional pre-computed 6-connected labels
+            labeled_18: Optional pre-computed 18-connected labels
 
         Returns:
             bridge_mask: Binary mask of voxels to remove
@@ -372,7 +566,8 @@ class ImageLabelViewer:
             num_mergers: Count of merged components found
         """
         binary = (label_data > 0).astype(np.uint8)
-        labeled_6 = cc3d.connected_components(binary, connectivity=6)
+        if labeled_6 is None:
+            labeled_6 = cc3d.connected_components(binary, connectivity=6)
 
         bridge_mask = np.zeros_like(binary)
 
@@ -391,8 +586,13 @@ class ImageLabelViewer:
             different = (labeled_6 > 0) & (shifted > 0) & (labeled_6 != shifted)
             bridge_mask[different] = 1
 
+        # Extend bridge mask to catch thicker bridges
+        if np.sum(bridge_mask) > 0:
+            bridge_mask = self._extend_bridge_mask(bridge_mask, labeled_6, binary)
+
         # Find merged components (18-components containing bridge voxels)
-        labeled_18 = cc3d.connected_components(binary, connectivity=18)
+        if labeled_18 is None:
+            labeled_18 = cc3d.connected_components(binary, connectivity=18)
         bridge_labels = np.unique(labeled_18[bridge_mask > 0])
         bridge_labels = bridge_labels[bridge_labels > 0]
 
@@ -401,32 +601,146 @@ class ImageLabelViewer:
 
         return bridge_mask, merged_component_mask, num_mergers
 
-    def split_merges(self):
-        """Find and remove all thin bridges (corner and edge) in one operation."""
+    def find_minimal_bridges(self, label_data, max_erosion=3, labeled_6=None):
+        """Find minimal bridge voxels using multi-level erosion + Numba-accelerated detection.
+
+        Algorithm:
+        1. Try multiple erosion levels (1 to max_erosion) to handle varying bridge thickness
+        2. For each level where erosion increases component count, find removed voxels
+        3. Use Numba-accelerated function to find voxels touching 2+ eroded components
+        4. Voxels touching 2+ components ARE bridges - no further verification needed
+
+        Args:
+            label_data: The label array to analyze
+            max_erosion: Maximum number of erosion iterations to try (default: 3)
+            labeled_6: Optional pre-computed 6-connected labels
+
+        Returns:
+            bridge_mask: Binary mask of minimal voxels to remove
+        """
+        binary = (label_data > 0).astype(np.uint8)
+        struct_6 = generate_binary_structure(3, 1)  # 6-connectivity
+
+        # Count initial 6-connected components
+        if labeled_6 is None:
+            initial_labels = cc3d.connected_components(binary, connectivity=6)
+        else:
+            initial_labels = labeled_6
+        n_initial = initial_labels.max()
+
+        if n_initial == 0:
+            return np.zeros_like(binary)
+
+        bridge_mask = np.zeros_like(binary, dtype=np.uint8)
+        working_binary = binary.copy()
+
+        # Try multiple erosion levels to handle varying bridge thickness
+        for erosion_iter in range(1, max_erosion + 1):
+            eroded = binary_erosion(working_binary, structure=struct_6, iterations=erosion_iter)
+
+            if not eroded.any():
+                break
+
+            eroded_labels = cc3d.connected_components(eroded.astype(np.uint8), connectivity=6)
+            n_eroded = eroded_labels.max()
+
+            if n_eroded <= n_initial:
+                continue  # No splits at this erosion level
+
+            # Find removed voxels at this erosion level
+            removed = working_binary.astype(bool) & ~eroded
+
+            # Get coordinates of removed voxels
+            removed_coords = np.where(removed)
+            if len(removed_coords[0]) == 0:
+                continue
+
+            # Numba-accelerated: find which removed voxels touch 2+ different eroded components
+            # Voxels touching 2+ components ARE bridges by definition
+            is_bridge = _find_multi_touching_numba(
+                removed_coords[0].astype(np.int32),
+                removed_coords[1].astype(np.int32),
+                removed_coords[2].astype(np.int32),
+                eroded_labels
+            )
+
+            if is_bridge.any():
+                # Mark bridge voxels
+                bridge_coords = (
+                    removed_coords[0][is_bridge],
+                    removed_coords[1][is_bridge],
+                    removed_coords[2][is_bridge]
+                )
+                bridge_mask[bridge_coords] = 1
+                # Update working binary for next iteration
+                working_binary[bridge_coords] = 0
+
+        return bridge_mask
+
+    def split_merges(self, max_iterations=5):
+        """Find and remove all thin bridges (corner, edge, and minimal erosion-based) in one operation.
+
+        Optimized to compute connected components once per iteration and share across stages.
+
+        Args:
+            max_iterations: Maximum number of passes (default: 5). Each pass removes thin bridges
+                           that may have been revealed by previous passes.
+        """
         if self.current_label_layer is None:
             show_info("No label layer loaded")
             return
 
         label_data = self.current_label_layer.data.copy()
 
-        # Loop until no more bridges found (both corner and edge)
+        # Loop until no more bridges found or max iterations reached
         total_removed = 0
         iteration = 0
-        while True:
+        while iteration < max_iterations:
             iteration += 1
             removed_this_iter = 0
 
-            # Try corner bridges (26-but-not-18)
-            bridge_mask, _, _ = self.find_corner_bridges(label_data)
-            if np.sum(bridge_mask) > 0:
-                removed_this_iter += np.sum(bridge_mask)
-                label_data[bridge_mask > 0] = 0
+            # Compute all connectivity levels once per iteration
+            binary = (label_data > 0).astype(np.uint8)
+            labeled_6 = cc3d.connected_components(binary, connectivity=6)
+            labeled_18 = cc3d.connected_components(binary, connectivity=18)
+            labeled_26 = cc3d.connected_components(binary, connectivity=26)
 
-            # Try edge bridges (18-but-not-6)
-            bridge_mask, _, _ = self.find_edge_bridges(label_data)
-            if np.sum(bridge_mask) > 0:
-                removed_this_iter += np.sum(bridge_mask)
+            # Try corner bridges (26-but-not-18) with extension
+            bridge_mask, _, _ = self.find_corner_bridges(
+                label_data, labeled_18=labeled_18, labeled_26=labeled_26
+            )
+            corner_removed = np.sum(bridge_mask)
+            if corner_removed > 0:
+                removed_this_iter += corner_removed
                 label_data[bridge_mask > 0] = 0
+                # Recompute only what's needed for next stage
+                binary = (label_data > 0).astype(np.uint8)
+                labeled_6 = cc3d.connected_components(binary, connectivity=6)
+                labeled_18 = cc3d.connected_components(binary, connectivity=18)
+
+            # Try edge bridges (18-but-not-6) with extension
+            bridge_mask, _, _ = self.find_edge_bridges(
+                label_data, labeled_6=labeled_6, labeled_18=labeled_18
+            )
+            edge_removed = np.sum(bridge_mask)
+            if edge_removed > 0:
+                removed_this_iter += edge_removed
+                label_data[bridge_mask > 0] = 0
+                # Recompute only what's needed for next stage
+                binary = (label_data > 0).astype(np.uint8)
+                labeled_6 = cc3d.connected_components(binary, connectivity=6)
+
+            # NOTE: Erosion-based minimal bridge detection is disabled by default
+            # as it can damage thin sheet-like structures (e.g., papyrus layers).
+            # The corner and edge bridge detection above handles most merge cases.
+            # Uncomment below only for thick/blocky segmentation data:
+            #
+            # if corner_removed + edge_removed < 100:
+            #     bridge_mask = self.find_minimal_bridges(label_data, max_erosion=1, labeled_6=labeled_6)
+            #     minimal_removed = np.sum(bridge_mask)
+            #     if minimal_removed > 0:
+            #         removed_this_iter += minimal_removed
+            #         label_data[bridge_mask > 0] = 0
 
             if removed_this_iter == 0:
                 break
@@ -441,7 +755,7 @@ class ImageLabelViewer:
         self.current_label_layer.data = new_labels
 
         num_components = len(np.unique(new_labels)) - 1
-        show_info(f"Removed {total_removed} bridge voxels in {iteration-1} passes, now {num_components} components")
+        show_info(f"Removed {total_removed} bridge voxels in {iteration} passes, now {num_components} components")
 
         # Run dust with current widget parameters
         if hasattr(self, 'small_components_widget'):
@@ -537,9 +851,11 @@ class ImageLabelViewer:
         label_path = self.get_label_path(image_path)
         if label_path and label_path.exists():
             label = io.imread(str(label_path))
-            # Set ignore label (2) to background before computing components
+            # Set ignore label (2) to background or 150 before computing components
             if self.zero_ignore_label:
                 label[label == 2] = 0
+            else:
+                label[label == 2] = 150
             # Compute 26-connected components
             label = self.compute_connected_components(label)
             self.current_label_layer = self.viewer.add_labels(
