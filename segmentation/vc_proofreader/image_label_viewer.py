@@ -307,7 +307,13 @@ class ImageLabelViewer:
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
         self.label_suffix = label_suffix
-        self.output_dir = Path(output_dir) if output_dir else None
+        # Default to timestamped folder in cwd if no output dir specified
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_dir = Path.cwd() / f"output_{timestamp}"
         self.zero_ignore_label = zero_ignore_label
         self.copy_on_skip = copy_on_skip
         self.dust_max_size = dust_max_size
