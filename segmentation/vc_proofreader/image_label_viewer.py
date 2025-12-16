@@ -69,12 +69,13 @@ CORNER_OFFSETS = [
 
 class ImageLabelViewer:
     def __init__(self, image_dir, label_dir, label_suffix="", output_dir=None,
-                 mergers_csv=None, tiny_csv=None, zero_ignore_label=True):
+                 mergers_csv=None, tiny_csv=None, zero_ignore_label=True, copy_on_skip=True):
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
         self.label_suffix = label_suffix
         self.output_dir = Path(output_dir) if output_dir else None
         self.zero_ignore_label = zero_ignore_label
+        self.copy_on_skip = copy_on_skip
 
         # Create output directory if specified
         if self.output_dir:
@@ -90,6 +91,9 @@ class ImageLabelViewer:
         if not self.image_files:
             self.image_files = sorted([f for f in self.image_dir.glob("*.tiff")
                                       if f.is_file()])
+
+        # Filter to only images that have corresponding labels
+        self.image_files = [f for f in self.image_files if self.get_label_path(f) is not None]
 
         self.current_index = 0
         self.viewer = None
@@ -812,7 +816,7 @@ class ImageLabelViewer:
 
         label_data = label_data.astype(np.uint8)
 
-        io.imsave(str(output_path), label_data)
+        io.imsave(str(output_path), label_data, compression='lzw')
         show_info(f"Saved label to: {output_path.name}")
 
     def output_exists(self, image_path):
@@ -844,20 +848,27 @@ class ImageLabelViewer:
         image_path = self.image_files[self.current_index]
         image = io.imread(str(image_path))
 
-        # Add image layer
-        self.viewer.add_image(image, name=f"Image: {image_path.name}")
+        # Add image layer with lower 25% of values suppressed to black
+        img_min, img_max = image.min(), image.max()
+        contrast_min = img_min + 0.25 * (img_max - img_min)
+        self.viewer.add_image(image, name=f"Image: {image_path.name}", opacity=0.5,
+                              contrast_limits=(contrast_min, img_max))
 
         # Load and add label if exists
         label_path = self.get_label_path(image_path)
         if label_path and label_path.exists():
             label = io.imread(str(label_path))
-            # Set ignore label (2) to background or 150 before computing components
+            # Handle ignore label (2) before computing components
             if self.zero_ignore_label:
                 label[label == 2] = 0
+                # Compute 26-connected components
+                label = self.compute_connected_components(label)
             else:
-                label[label == 2] = 150
-            # Compute 26-connected components
-            label = self.compute_connected_components(label)
+                # Save ignore mask, zero it out for CC computation, then restore as 150
+                ignore_mask = label == 2
+                label[ignore_mask] = 0
+                label = self.compute_connected_components(label)
+                label[ignore_mask] = 150
             self.current_label_layer = self.viewer.add_labels(
                 label, name=f"Label: {label_path.name}"
             )
@@ -914,12 +925,13 @@ class ImageLabelViewer:
         # Read and write the original label (preserving original data)
         label_data = io.imread(str(label_path))
         label_data = label_data.astype(np.uint8)
-        io.imsave(str(output_path), label_data)
+        io.imsave(str(output_path), label_data, compression='lzw')
         show_info(f"Copied original label to: {output_path.name}")
 
     def skip_image(self):
-        """Move to next image, copying the on-disk label to output."""
-        self.copy_label_to_output()
+        """Move to next image, optionally copying the on-disk label to output."""
+        if self.copy_on_skip:
+            self.copy_label_to_output()
         self.current_index += 1
         # Skip samples that already exist in output dir
         if not self.skip_to_next_unprocessed():
@@ -1246,6 +1258,11 @@ def main():
         action="store_true",
         help="Don't zero out the ignore label (value 2) on load"
     )
+    parser.add_argument(
+        "--no-copy-skip",
+        action="store_true",
+        help="Don't copy the label to output when using the skip button"
+    )
 
     args = parser.parse_args()
     
@@ -1262,7 +1279,8 @@ def main():
     viewer = ImageLabelViewer(
         args.image_dir, args.label_dir, args.label_suffix, args.output_dir,
         args.mergers_csv, args.tiny_csv,
-        zero_ignore_label=not args.keep_ignore_label
+        zero_ignore_label=not args.keep_ignore_label,
+        copy_on_skip=not args.no_copy_skip
     )
     viewer.run()
     
