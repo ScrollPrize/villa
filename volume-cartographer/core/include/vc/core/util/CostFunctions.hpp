@@ -1252,3 +1252,63 @@ struct SymmetricDirichletLoss {
     double _eps_abs;
     double _eps_rel;
 };
+
+// Anti-flipback loss: penalizes movement in the negative normal direction (through the surface)
+// Only applies penalty when inward movement exceeds threshold, allowing curved surface growth
+struct AntiFlipbackLoss {
+    // anchor: position before optimization (the point we're anchoring to)
+    // normal: outward surface normal (unit vector)
+    // threshold: how much inward movement is allowed before penalty kicks in
+    // w: weight of the loss
+    AntiFlipbackLoss(cv::Vec3d anchor, cv::Vec3d normal, double threshold, double w)
+        : _anchor(anchor), _normal(normal), _threshold(threshold), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        // Compute movement from anchor position
+        T dx = p[0] - T(_anchor[0]);
+        T dy = p[1] - T(_anchor[1]);
+        T dz = p[2] - T(_anchor[2]);
+
+        // Project movement onto normal direction
+        // Positive = outward movement (good), Negative = inward movement (potentially bad)
+        T normal_component = dx * T(_normal[0]) + dy * T(_normal[1]) + dz * T(_normal[2]);
+
+        // Inward movement is negative normal_component
+        // We penalize when inward exceeds threshold: -normal_component > threshold
+        // Rearranged: normal_component < -threshold
+        // Penalty amount: (-normal_component - threshold) when triggered
+
+        // Use softplus for smooth gradient: softplus(x) = log(1 + exp(x))
+        // This smoothly approximates max(0, x)
+        T inward_excess = -normal_component - T(_threshold);
+
+        // Softplus with scaling for numerical stability
+        // For large positive x: softplus(x) ≈ x
+        // For large negative x: softplus(x) ≈ 0
+        T softplus_val;
+        if (val(inward_excess) > T(20)) {
+            // Avoid exp overflow
+            softplus_val = inward_excess;
+        } else if (val(inward_excess) < T(-20)) {
+            // Effectively zero
+            softplus_val = T(0);
+        } else {
+            softplus_val = log(T(1) + exp(inward_excess));
+        }
+
+        residual[0] = T(_w) * softplus_val;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(cv::Vec3d anchor, cv::Vec3d normal, double threshold, double w = 1.0)
+    {
+        return new ceres::AutoDiffCostFunction<AntiFlipbackLoss, 1, 3>(
+            new AntiFlipbackLoss(anchor, normal, threshold, w));
+    }
+
+    cv::Vec3d _anchor;
+    cv::Vec3d _normal;
+    double _threshold;
+    double _w;
+};

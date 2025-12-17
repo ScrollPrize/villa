@@ -420,6 +420,9 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+    // Anti-flipback constraint settings
+    float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
+    float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
 };
 
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
@@ -1073,6 +1076,87 @@ static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t>
     return set;
 };
 
+// Compute local surface normal from neighboring 3D points using cross product of tangent vectors.
+// Returns normalized normal vector, or zero vector if insufficient neighbors.
+// If surface_normals is provided and has valid neighbors, orients the result to be consistent.
+static cv::Vec3d compute_surface_normal_at(
+    const cv::Vec2i& p,
+    const cv::Mat_<cv::Vec3d>& dpoints,
+    const cv::Mat_<uchar>& state,
+    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr)
+{
+    auto is_valid = [&](const cv::Vec2i& pt) {
+        return pt[0] >= 0 && pt[0] < dpoints.rows &&
+               pt[1] >= 0 && pt[1] < dpoints.cols &&
+               (state(pt) & STATE_LOC_VALID);
+    };
+
+    // Try to get horizontal and vertical tangents
+    cv::Vec3d tangent_h(0,0,0), tangent_v(0,0,0);
+    bool has_h = false, has_v = false;
+
+    // Horizontal tangent
+    cv::Vec2i left = {p[0], p[1] - 1};
+    cv::Vec2i right = {p[0], p[1] + 1};
+    if (is_valid(left) && is_valid(right)) {
+        tangent_h = dpoints(right) - dpoints(left);
+        has_h = true;
+    }
+
+    // Vertical tangent
+    cv::Vec2i up = {p[0] - 1, p[1]};
+    cv::Vec2i down = {p[0] + 1, p[1]};
+    if (is_valid(up) && is_valid(down)) {
+        tangent_v = dpoints(down) - dpoints(up);
+        has_v = true;
+    }
+
+    if (!has_h || !has_v) {
+        return cv::Vec3d(0,0,0);
+    }
+
+    cv::Vec3d normal = tangent_h.cross(tangent_v);
+    double len = cv::norm(normal);
+    if (len < 1e-9) {
+        return cv::Vec3d(0,0,0);
+    }
+    normal /= len;
+
+    // Orient consistently with neighbors if surface_normals provided
+    if (surface_normals) {
+        static const cv::Vec2i neighbor_offsets[] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+        for (const auto& off : neighbor_offsets) {
+            cv::Vec2i neighbor = p + off;
+            if (is_valid(neighbor)) {
+                cv::Vec3d neighbor_normal = (*surface_normals)(neighbor);
+                if (cv::norm(neighbor_normal) > 0.5) {
+                    // Flip if pointing opposite to neighbor
+                    if (normal.dot(neighbor_normal) < 0) {
+                        normal = -normal;
+                    }
+                    break;  // Use first valid neighbor for orientation
+                }
+            }
+        }
+    }
+
+    return normal;
+}
+
+// Compute and store oriented surface normal for a point
+// Uses existing neighbor normals for consistent orientation
+static void update_surface_normal(
+    const cv::Vec2i& p,
+    const cv::Mat_<cv::Vec3d>& dpoints,
+    const cv::Mat_<uchar>& state,
+    cv::Mat_<cv::Vec3d>& surface_normals)
+{
+    cv::Vec3d normal = compute_surface_normal_at(p, dpoints, state, &surface_normals);
+    if (cv::norm(normal) > 0.5) {
+        surface_normals(p) = normal;
+    }
+}
+
 static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_status, const cv::Vec2i &p,
     TraceParameters &params, TraceData& trace_data,
     const LossSettings &settings)
@@ -1290,9 +1374,19 @@ struct LocalOptimizationConfig {
     bool use_dense_qr = false;
 };
 
+// Configuration for anti-flipback constraint
+// This prevents the surface from flipping back through itself during optimization
+struct AntiFlipbackConfig {
+    const cv::Mat_<cv::Vec3d>* anchors = nullptr;        // Positions before optimization
+    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr; // Consistently oriented surface normals
+    double threshold = 5.0;   // Allow up to this much inward movement (voxels) before penalty kicks in
+    double weight = 1.0;       // Weight of the anti-flipback loss when activated
+};
+
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false,
-    const LocalOptimizationConfig* solver_config = nullptr)
+    const LocalOptimizationConfig* solver_config = nullptr,
+    const AntiFlipbackConfig* flipback_config = nullptr)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
     // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
@@ -1312,6 +1406,27 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
                 add_missing_losses(problem, loss_status, op, params, trace_data, settings);
             }
         }
+
+    // Add anti-flipback loss if configured
+    // This penalizes points that move too far in the inward (negative normal) direction
+    if (flipback_config && flipback_config->anchors && flipback_config->surface_normals) {
+        for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
+            for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
+                cv::Vec2i op = {oy, ox};
+                if (cv::norm(p-op) <= radius && (params.state(op) & STATE_LOC_VALID)) {
+                    cv::Vec3d anchor = (*flipback_config->anchors)(op);
+                    cv::Vec3d normal = (*flipback_config->surface_normals)(op);
+                    // Only add loss if we have valid anchor and normal
+                    if (cv::norm(normal) > 0.5 && anchor[0] >= 0) {
+                        problem.AddResidualBlock(
+                            AntiFlipbackLoss::Create(anchor, normal, flipback_config->threshold, flipback_config->weight),
+                            nullptr,
+                            &params.dpoints(op)[0]);
+                    }
+                }
+            }
+    }
+
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++) {
             cv::Vec2i op = {oy, ox};
@@ -1367,10 +1482,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-
-
-
-
 template <typename E>
 static E _max_d_ign(const E &a, const E &b)
 {
@@ -1594,6 +1705,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
+    loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
+    loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
+    std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
+              << " weight=" << loss_settings.flipback_weight
+              << (loss_settings.flipback_weight == 0 ? " (DISABLED)" : "") << std::endl;
     ALifeTime f_timer("empty space tracing\n");
 
 
@@ -1663,11 +1779,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     trace_params.dpoints = cv::Mat_<cv::Vec3d>(size,cv::Vec3f(-1,-1,-1));
     trace_params.state = cv::Mat_<uint8_t>(size,0);
     cv::Mat_<uint16_t> generations(size, (uint16_t)0);
+    cv::Mat_<cv::Vec3d> surface_normals(size, cv::Vec3d(0,0,0));  // Consistently oriented surface normals
     cv::Mat_<uint8_t> phys_fail(size,0);
     // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
     cv::Rect used_area;
     int generation = 1;
+
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
 
     int resume_pad_y = 0;
@@ -2048,6 +2166,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         generations(y0+1,x0) = 1;
         generations(y0+1,x0+1) = 1;
 
+        // Initialize seed normals with consistent orientation (vx cross vy = +Z direction)
+        cv::Vec3d seed_normal = cv::Vec3d(vx).cross(cv::Vec3d(vy));
+        seed_normal /= cv::norm(seed_normal);
+        surface_normals(y0,x0) = seed_normal;
+        surface_normals(y0,x0+1) = seed_normal;
+        surface_normals(y0+1,x0) = seed_normal;
+        surface_normals(y0+1,x0+1) = seed_normal;
+
         fringe.push_back({y0,x0});
         fringe.push_back({y0+1,x0});
         fringe.push_back({y0,x0+1});
@@ -2325,6 +2451,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         // considering two points that are too close to each other...
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
+        // Snapshot positions before per-point optimization for flip detection
+        cv::Mat_<cv::Vec3d> positions_before_perpoint = trace_params.dpoints.clone();
+
+        // Configure anti-flipback constraint for per-point optimization
+        // Note: new points won't have surface normals yet, but the loss function handles this
+        AntiFlipbackConfig perpoint_flipback_config;
+        perpoint_flipback_config.anchors = &positions_before_perpoint;
+        perpoint_flipback_config.surface_normals = &surface_normals;
+        perpoint_flipback_config.threshold = loss_settings.flipback_threshold;
+        perpoint_flipback_config.weight = loss_settings.flipback_weight;
+
         // ...then start iterating over candidates in parallel using the above to yield points
 #pragma omp parallel
         {
@@ -2414,10 +2551,26 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     succ_gen_ps.push_back(p);
                 }
 
-                local_optimization(1, p, trace_params, trace_data, loss_settings, true);
+                local_optimization(1, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
                 if (local_opt_r > 1)
-                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                    local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
             }  // end parallel iteration over cands
+        }
+
+        // Update surface normals for all newly added points and their neighbors
+        // This must be done after parallel section completes
+        for (const auto& p : succ_gen_ps) {
+            update_surface_normal(p, trace_params.dpoints, trace_params.state, surface_normals);
+            // Also update neighbors since their geometry may have changed
+            static const cv::Vec2i neighbor_offsets[] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+            for (const auto& off : neighbor_offsets) {
+                cv::Vec2i neighbor = p + off;
+                if (neighbor[0] >= 0 && neighbor[0] < trace_params.dpoints.rows &&
+                    neighbor[1] >= 0 && neighbor[1] < trace_params.dpoints.cols &&
+                    (trace_params.state(neighbor) & STATE_LOC_VALID)) {
+                    update_surface_normal(neighbor, trace_params.dpoints, trace_params.state, surface_normals);
+                }
+            }
         }
 
         if (!global_opt) {
@@ -2431,6 +2584,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             int done = 0;
 
             if (!opt_local.empty()) {
+                // Snapshot positions before optimization for flip detection
+                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
+
+                // Configure anti-flipback constraint
+                AntiFlipbackConfig flipback_config;
+                flipback_config.anchors = &positions_before_opt;
+                flipback_config.surface_normals = &surface_normals;
+                flipback_config.threshold = loss_settings.flipback_threshold;
+                flipback_config.weight = loss_settings.flipback_weight;
+
                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
 
 #pragma omp parallel
@@ -2441,7 +2604,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(8, p, trace_params, trace_data, loss_settings, true);
+                    local_optimization(8, p, trace_params, trace_data, loss_settings, true, false, nullptr, &flipback_config);
+
 #pragma omp atomic
                     done++;
                 }
@@ -2450,7 +2614,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
             if (generation % 8 == 0) {
-                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
+                // Snapshot positions before global optimization
+                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
+
+                // Configure anti-flipback constraint
+                AntiFlipbackConfig flipback_config;
+                flipback_config.anchors = &positions_before_opt;
+                flipback_config.surface_normals = &surface_normals;
+                flipback_config.threshold = loss_settings.flipback_threshold;
+                flipback_config.weight = loss_settings.flipback_weight;
+
+                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true, nullptr, &flipback_config);
             }
         }
 
