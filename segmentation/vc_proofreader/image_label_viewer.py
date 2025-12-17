@@ -344,6 +344,7 @@ class ImageLabelViewer:
         self.sync_enabled = True
         self.ignore_mask = None  # Store ignore mask for toggle functionality
         self.ignore_visible = True  # Track ignore label visibility
+        self._toggling_ignore = False  # Flag to prevent mask update during toggle
 
         # Component navigation state
         self.component_index = 0  # Current component index (0-based)
@@ -1550,20 +1551,27 @@ class ImageLabelViewer:
         if self.ignore_mask is None or self.current_label_layer is None:
             return
 
-        label_data = self.current_label_layer.data.copy()
-        if visible:
-            # Restore ignore label
-            label_data[self.ignore_mask] = 150
-            self.ignore_visible = True
-        else:
-            # Hide ignore label
-            label_data[self.ignore_mask] = 0
-            self.ignore_visible = False
-        self.current_label_layer.data = label_data
+        self._toggling_ignore = True  # Prevent _on_label_data_changed from updating mask
+        try:
+            label_data = self.current_label_layer.data.copy()
+            if visible:
+                # Restore ignore label
+                label_data[self.ignore_mask] = 150
+                self.ignore_visible = True
+            else:
+                # Hide ignore label
+                label_data[self.ignore_mask] = 0
+                self.ignore_visible = False
+            self.current_label_layer.data = label_data
+        finally:
+            self._toggling_ignore = False
 
     def _on_label_data_changed(self, event=None):
         """Update ignore_mask when label data is modified."""
         if self.zero_ignore_label or self.current_label_layer is None:
+            return
+        # Don't update mask during toggle operation (would erase the mask we need)
+        if self._toggling_ignore:
             return
         label_data = self.current_label_layer.data
         self.ignore_mask = label_data >= 150
