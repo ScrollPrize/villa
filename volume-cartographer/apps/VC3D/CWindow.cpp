@@ -695,6 +695,67 @@ CWindow::CWindow() :
             chkAxisAlignedSlices->toggle();
         }
     });
+
+    // Zoom shortcuts (Shift+= for zoom in, Shift+- for zoom out)
+    // Use 15% steps for smooth, proportional zooming - only affects active viewer
+    constexpr float ZOOM_FACTOR = 1.15f;
+    fZoomInShortcut = new QShortcut(QKeySequence("Shift+="), this);
+    fZoomInShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fZoomInShortcut, &QShortcut::activated, [this]() {
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->adjustZoomByFactor(ZOOM_FACTOR);
+            }
+        }
+    });
+
+    fZoomOutShortcut = new QShortcut(QKeySequence("Shift+-"), this);
+    fZoomOutShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fZoomOutShortcut, &QShortcut::activated, [this]() {
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->adjustZoomByFactor(1.0f / ZOOM_FACTOR);
+            }
+        }
+    });
+
+    // Reset view shortcut (m to fit surface in view and reset all offsets)
+    fResetViewShortcut = new QShortcut(QKeySequence("m"), this);
+    fResetViewShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fResetViewShortcut, &QShortcut::activated, [this]() {
+        if (!_viewerManager) {
+            return;
+        }
+        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
+            if (viewer) {
+                viewer->resetSurfaceOffsets();
+                viewer->fitSurfaceInView();
+                viewer->renderVisible(true);
+            }
+        });
+    });
+
+    // Z offset: Ctrl+. = +Z (further/deeper), Ctrl+, = -Z (closer)
+    fWorldOffsetZPosShortcut = new QShortcut(QKeySequence("Ctrl+."), this);
+    fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
+            if (viewer) viewer->adjustSurfaceOffset(1.0f);
+        });
+    });
+
+    fWorldOffsetZNegShortcut = new QShortcut(QKeySequence("Ctrl+,"), this);
+    fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
+            if (viewer) viewer->adjustSurfaceOffset(-1.0f);
+        });
+    });
+
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
@@ -1101,6 +1162,15 @@ void CWindow::CreateWidgets(void)
 
     mdiArea = new QMdiArea(ui.tabSegment);
     aWidgetLayout->addWidget(mdiArea);
+
+    // Ensure the viewer's graphics view gets focus when subwindow is activated
+    connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
+        if (subWindow) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->fGraphicsView->setFocus();
+            }
+        }
+    });
 
     // newConnectedCVolumeViewer("manual plane", tr("Manual Plane"), mdiArea);
     newConnectedCVolumeViewer("seg xz", tr("Segmentation XZ"), mdiArea)->setIntersects({"segmentation"});
@@ -2831,11 +2901,117 @@ void CWindow::onResetAxisAlignedRotations()
     _axisAlignedSegXZRotationDeg = 0.0f;
     _axisAlignedSegYZRotationDeg = 0.0f;
     _axisAlignedSliceDrags.clear();
+    resetAllPlaneRotations();
     applySlicePlaneOrientation();
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->refreshAll();
     }
-    statusBar()->showMessage(tr("Axis-aligned rotations reset"), 2000);
+    statusBar()->showMessage(tr("All plane rotations reset"), 2000);
+}
+
+CWindow::PlaneRotation& CWindow::planeRotation(const std::string& planeName)
+{
+    return _planeRotations[planeName];
+}
+
+void CWindow::adjustPlaneRotation(const std::string& planeName, float deltaPitch, float deltaYaw, float deltaRoll)
+{
+    auto& rot = _planeRotations[planeName];
+    rot.pitch = normalizeDegrees(rot.pitch + deltaPitch);
+    rot.yaw = normalizeDegrees(rot.yaw + deltaYaw);
+    rot.roll = normalizeDegrees(rot.roll + deltaRoll);
+
+    // Show feedback in status bar
+    statusBar()->showMessage(
+        tr("%1: pitch=%2 yaw=%3 roll=%4")
+            .arg(QString::fromStdString(planeName))
+            .arg(rot.pitch, 0, 'f', 1)
+            .arg(rot.yaw, 0, 'f', 1)
+            .arg(rot.roll, 0, 'f', 1),
+        2000);
+
+    scheduleAxisAlignedOrientationUpdate();
+}
+
+void CWindow::resetAllPlaneRotations()
+{
+    _planeRotations.clear();
+}
+
+std::string CWindow::focusedPlaneName() const
+{
+    if (!_viewerManager) {
+        return "";
+    }
+
+    // Find the active/focused viewer and return its surface name if it's a plane
+    QWidget* focused = QApplication::focusWidget();
+    if (!focused) {
+        return "";
+    }
+
+    std::string result;
+    _viewerManager->forEachViewer([&](CVolumeViewer* viewer) {
+        if (!viewer || !result.empty()) {
+            return;
+        }
+        // Check if this viewer or any of its children has focus
+        if (viewer->isAncestorOf(focused) || viewer == focused ||
+            (viewer->fGraphicsView && (viewer->fGraphicsView == focused ||
+                                        viewer->fGraphicsView->isAncestorOf(focused)))) {
+            const std::string& name = viewer->surfName();
+            // Only return plane surface names
+            if (name == "xy plane" || name == "seg xz" || name == "seg yz" ||
+                name == "xz plane" || name == "yz plane") {
+                result = name;
+            }
+        }
+    });
+
+    // If no viewer is focused, default to XY plane since it's the most common
+    if (result.empty()) {
+        result = "xy plane";
+    }
+
+    return result;
+}
+
+cv::Vec3f CWindow::applyEulerRotation(const cv::Vec3f& baseNormal, const PlaneRotation& rot) const
+{
+    if (rot.isIdentity()) {
+        return baseNormal;
+    }
+
+    // Apply rotations in order: yaw (Z), pitch (X), roll (Y)
+    // Convert degrees to radians
+    const float yawRad = rot.yaw * static_cast<float>(CV_PI / 180.0);
+    const float pitchRad = rot.pitch * static_cast<float>(CV_PI / 180.0);
+    const float rollRad = rot.roll * static_cast<float>(CV_PI / 180.0);
+
+    // Build rotation matrices
+    const float cy = std::cos(yawRad), sy = std::sin(yawRad);
+    const float cp = std::cos(pitchRad), sp = std::sin(pitchRad);
+    const float cr = std::cos(rollRad), sr = std::sin(rollRad);
+
+    // Combined rotation matrix: R = Rz(yaw) * Rx(pitch) * Ry(roll)
+    // This gives intuitive behavior where yaw rotates in the XY plane
+    cv::Matx33f Rz(cy, -sy, 0,
+                   sy,  cy, 0,
+                    0,   0, 1);
+
+    cv::Matx33f Rx(1,  0,   0,
+                   0, cp, -sp,
+                   0, sp,  cp);
+
+    cv::Matx33f Ry( cr, 0, sr,
+                     0, 1,  0,
+                   -sr, 0, cr);
+
+    cv::Matx33f R = Rz * Rx * Ry;
+
+    cv::Vec3f result = R * baseNormal;
+    cv::normalize(result, result);
+    return result;
 }
 
 void CWindow::onAxisOverlayVisibilityToggled(bool enabled)

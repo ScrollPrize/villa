@@ -148,6 +148,7 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
         surf->move(_ptr, diff/_scale);
         _vis_center = roi_c;
         float z_step = z * _ds_scale;  // Scale the step to maintain consistent physical distance
+
         surf->gen(&slice_coords, nullptr, roi.size(), _ptr, _scale, {static_cast<float>(-roi.width/2), static_cast<float>(-roi.height/2), _z_off + z_step});
 
         if (z == z_start) {
@@ -377,6 +378,7 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
             surf->move(_ptr, diff / _scale);
             _vis_center = roi_c;
+
             surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
         }
 

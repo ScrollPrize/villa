@@ -146,7 +146,8 @@ CVolumeViewer::CVolumeViewer(CSurfaceCollection *col, ViewerManager* manager, QW
     connect(_overlayUpdateTimer, &QTimer::timeout, this, &CVolumeViewer::updateAllOverlays);
 
     _lbl = new QLabel(this);
-    _lbl->setStyleSheet("QLabel { color : white; }");
+    _lbl->setStyleSheet("QLabel { color : #00FF00; background-color: rgba(0,0,0,128); padding: 2px 4px; }");
+    _lbl->setMinimumWidth(300);
     _lbl->move(10,5);
 }
 
@@ -439,10 +440,104 @@ void CVolumeViewer::onZoom(int steps, QPointF scene_loc, Qt::KeyboardModifiers m
         }
     }
 
-    _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
+    updateStatusLabel();
 
     _overlayUpdateTimer->stop();
     _overlayUpdateTimer->start();
+}
+
+void CVolumeViewer::adjustZoomByFactor(float factor)
+{
+    auto surf = _surf_weak.lock();
+    if (!surf)
+        return;
+
+    for (auto& col : _intersect_items)
+        for (auto& item : col.second)
+            item->setVisible(false);
+
+    float newScale = _scale * factor;
+    newScale = round_scale(newScale);
+
+    if (newScale > MIN_ZOOM && newScale < MAX_ZOOM && std::abs(newScale - _scale) > 0.001f) {
+        float zoom = newScale / _scale;
+        _scale = newScale;
+
+        recalcScales();
+
+        // Zoom centered on view center
+        QPointF center = visible_center(fGraphicsView);
+        fGraphicsView->translate(center.x() * (1 - zoom),
+                                 center.y() * (1 - zoom));
+
+        curr_img_area = {0,0,0,0};
+        int max_size = 100000;
+        fGraphicsView->setSceneRect(-max_size/2, -max_size/2, max_size, max_size);
+    }
+
+    renderVisible();
+    emit overlaysUpdated();
+
+    updateStatusLabel();
+
+    _overlayUpdateTimer->stop();
+    _overlayUpdateTimer->start();
+}
+
+void CVolumeViewer::adjustSurfaceOffset(float dn)
+{
+    _z_off += dn;
+
+    renderVisible(true);
+    emit overlaysUpdated();
+
+    updateStatusLabel();
+
+    _overlayUpdateTimer->stop();
+    _overlayUpdateTimer->start();
+}
+
+void CVolumeViewer::resetSurfaceOffsets()
+{
+    _z_off = 0.0f;
+
+    renderVisible(true);
+    emit overlaysUpdated();
+
+    updateStatusLabel();
+
+    _overlayUpdateTimer->stop();
+    _overlayUpdateTimer->start();
+}
+
+void CVolumeViewer::updateStatusLabel()
+{
+    QString status = QString("%1x").arg(_scale, 0, 'f', 2);
+
+    // For plane viewers, show the center position in world coordinates
+    auto surf = _surf_weak.lock();
+    if (surf) {
+        if (dynamic_cast<PlaneSurface*>(surf.get())) {
+            // Plane viewer - show world position of view center
+            cv::Vec3f center = surf->pointer();
+            status += QString(" ctr(%1,%2,%3)")
+                .arg(center[0], 0, 'f', 0)
+                .arg(center[1], 0, 'f', 0)
+                .arg(center[2], 0, 'f', 0);
+        }
+    }
+
+    // Show z offset
+    status += QString(" z=%1").arg(_z_off, 0, 'f', 1);
+
+    // Show composite mode info if enabled
+    if (_composite_enabled) {
+        QString method = QString::fromStdString(_composite_method);
+        method[0] = method[0].toUpper();
+        status += QString(" | %1(%2)").arg(method).arg(_composite_layers_front + _composite_layers_behind);
+    }
+
+    _lbl->setText(status);
 }
 
 void CVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> volume_)
@@ -465,10 +560,10 @@ void CVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> volume_)
         _max_scale = 1.0;
         _min_scale = 1.0;
     }
-    
+
     recalcScales();
 
-    _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
+    updateStatusLabel();
 
     renderVisible(true);
 
@@ -646,7 +741,7 @@ void CVolumeViewer::fitSurfaceInView()
         recalcScales();
         fGraphicsView->resetTransform();
         fGraphicsView->centerOn(0, 0);
-        _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
+        updateStatusLabel();
         return;
     }
 
@@ -681,7 +776,7 @@ void CVolumeViewer::fitSurfaceInView()
     fGraphicsView->resetTransform();
     fGraphicsView->centerOn(0, 0);
 
-    _lbl->setText(QString("%1x %2").arg(_scale).arg(_z_off));
+    updateStatusLabel();
     curr_img_area = {0,0,0,0};
 }
 
@@ -924,7 +1019,7 @@ void CVolumeViewer::onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers 
 
 void CVolumeViewer::onScrolled()
 {
-    // renderVisible();
+    renderVisible(true);  // Force re-render to fill newly visible areas
 }
 
 void CVolumeViewer::onResized()
@@ -1189,15 +1284,7 @@ void CVolumeViewer::setCompositeEnabled(bool enabled)
     if (_composite_enabled != enabled) {
         _composite_enabled = enabled;
         renderVisible(true);
-        
-        // Update status label
-        QString status = QString("%1x %2").arg(_scale).arg(_z_off);
-        if (_composite_enabled) {
-            QString method = QString::fromStdString(_composite_method);
-            method[0] = method[0].toUpper();
-            status += QString(" | Composite: %1(%2)").arg(method).arg(_composite_layers);
-        }
-        _lbl->setText(status);
+        updateStatusLabel();
     }
 }
 void CVolumeViewer::setCompositeLayersInFront(int layers)
@@ -1276,13 +1363,7 @@ void CVolumeViewer::setCompositeMethod(const std::string& method)
         _composite_method = method;
         if (_composite_enabled) {
             renderVisible(true);
-            
-            // Update status label
-            QString status = QString("%1x %2").arg(_scale).arg(_z_off);
-            QString methodDisplay = QString::fromStdString(_composite_method);
-            methodDisplay[0] = methodDisplay[0].toUpper();
-            status += QString(" | Composite: %1(%2)").arg(methodDisplay).arg(_composite_layers);
-            _lbl->setText(status);
+            updateStatusLabel();
         }
     }
 }

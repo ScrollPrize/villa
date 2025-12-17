@@ -257,6 +257,15 @@ private:
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
     QShortcut* fAxisAlignedSlicesShortcut;
+    QShortcut* fZoomInShortcut;
+    QShortcut* fZoomOutShortcut;
+    QShortcut* fResetViewShortcut;
+
+    // Z offset shortcuts (Ctrl+,/. for normal direction)
+    QShortcut* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)
+    QShortcut* fWorldOffsetZNegShortcut;  // Ctrl+, (closer)
+
+    std::string focusedPlaneName() const;
 
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
     void updateAxisAlignedSliceInteraction();
@@ -278,6 +287,24 @@ private:
     float _axisAlignedSegYZRotationDeg = 0.0f;
     QTimer* _axisAlignedRotationTimer{nullptr};
     bool _axisAlignedOrientationDirty{false};
+
+    // Euler rotation state for plane viewers (pitch, yaw, roll in degrees)
+    struct PlaneRotation {
+        float pitch = 0.0f;  // rotation around X axis
+        float yaw = 0.0f;    // rotation around Z axis
+        float roll = 0.0f;   // rotation around Y axis
+
+        bool isIdentity() const {
+            return std::abs(pitch) < 0.001f && std::abs(yaw) < 0.001f && std::abs(roll) < 0.001f;
+        }
+        void reset() { pitch = yaw = roll = 0.0f; }
+    };
+    std::unordered_map<std::string, PlaneRotation> _planeRotations;  // keyed by plane name
+
+    PlaneRotation& planeRotation(const std::string& planeName);
+    void adjustPlaneRotation(const std::string& planeName, float deltaPitch, float deltaYaw, float deltaRoll);
+    void resetAllPlaneRotations();
+    cv::Vec3f applyEulerRotation(const cv::Vec3f& baseNormal, const PlaneRotation& rot) const;
 
     int _inotifyFd;
     QSocketNotifier* _inotifyNotifier;

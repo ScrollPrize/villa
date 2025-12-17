@@ -85,8 +85,8 @@ CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
 
 void CVolumeViewerView::scrollContentsBy(int dx, int dy)
 {
-    sendScrolled();
     QGraphicsView::scrollContentsBy(dx,dy);
+    sendScrolled();  // Emit after scroll so renderVisible sees the new viewport position
 }
 
 void CVolumeViewerView::wheelEvent(QWheelEvent *event)

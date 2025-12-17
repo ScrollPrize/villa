@@ -81,6 +81,13 @@ public:
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
+    // Surface-relative offset controls (normal direction only)
+    void adjustSurfaceOffset(float dn);
+    void resetSurfaceOffsets();
+    float normalOffset() const { return _z_off; }
+
+    void updateStatusLabel();
+
     void setSegmentationEditActive(bool active);
 
     void fitSurfaceInView();
@@ -190,6 +197,7 @@ public slots:
     void onScrolled();
     void onResized();
     void onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers);
+    void adjustZoomByFactor(float factor);  // Adjust zoom by multiplicative factor (e.g., 1.15 for +15%)
     void onCursorMove(QPointF);
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onPointSelected(uint64_t pointId);
@@ -247,7 +255,7 @@ protected:
 
     QLabel *_lbl = nullptr;
 
-    float _z_off = 0.0;
+    float _z_off = 0.0;  // Offset along surface normal (perpendicular to surface)
     QPointF _lastScenePos;  // Last known scene position for grid coordinate lookups
 
     // Composite view settings
