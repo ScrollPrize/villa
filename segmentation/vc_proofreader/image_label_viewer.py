@@ -580,6 +580,7 @@ class ImageLabelViewer:
 
     def flag_current_sample(self):
         """Flag the current sample by appending its ID to flagged.csv."""
+        print(f"flag_current_sample called, flagged_csv_path={self.flagged_csv_path}")
         if self.flagged_csv_path is None:
             show_info("No output directory specified - cannot flag sample")
             return
@@ -591,10 +592,12 @@ class ImageLabelViewer:
         import csv
         image_path = self.image_files[self.current_index]
         sample_id = self._get_sample_id(image_path)
+        print(f"Flagging sample_id={sample_id}")
 
         # Check if file exists and if sample is already flagged
+        file_exists = self.flagged_csv_path.exists()
         existing_ids = set()
-        if self.flagged_csv_path.exists():
+        if file_exists:
             with open(self.flagged_csv_path, 'r') as f:
                 reader = csv.DictReader(f)
                 existing_ids = {row['sample_id'] for row in reader}
@@ -604,13 +607,13 @@ class ImageLabelViewer:
             return
 
         # Append to CSV (create with header if new)
-        write_header = not self.flagged_csv_path.exists()
         with open(self.flagged_csv_path, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['sample_id'])
-            if write_header:
+            if not file_exists:
                 writer.writeheader()
             writer.writerow({'sample_id': sample_id})
 
+        print(f"Wrote {sample_id} to {self.flagged_csv_path}")
         show_info(f"Flagged sample: {sample_id}")
 
     def record_skipped_sample(self):
