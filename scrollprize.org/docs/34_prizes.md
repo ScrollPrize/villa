@@ -116,15 +116,18 @@ We accept submissions for this prize until 11:59pm Pacific, December 31st, 2025!
 
 ## 3D Surface Detection Challenge (hosted on Kaggle)
 
-We are holding a $100,000 prize pool competition for detection of the recto papyrus surfaces in the 3D CT scans.
+We are holding a $200,000 prize pool competition for detection of the recto papyrus surfaces in the 3D CT scans.
 The contest is currently hosted on Kaggle on [this page](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
 
 ### Prizes
-- 1st place: $25,000
-- 2nd place: $20,000
-- 3rd place: $15,000
-- 4th place: $10,000
-- 5th–10th: $5,000
+- 1st place: $60,000
+- 2nd place: $40,000
+- 3rd place: $30,000
+- 4th place: $20,000
+- 5th place: $15,000
+- 6th place: $10,000
+- 7th place: $10,000
+- 8th–10th: $5,000
 
 ### Timeline
 - November 13, 2025 - Start Date.
