@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <tuple>
@@ -395,6 +396,8 @@ private:
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
     // Flag for lazy loading - true if points need to be loaded from path
     bool _needsLoad = false;
+    // Mutex to protect lazy loading from concurrent access
+    mutable std::mutex _loadMutex;
 };
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags = 0);

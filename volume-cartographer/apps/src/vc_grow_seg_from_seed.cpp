@@ -333,6 +333,7 @@ int main(int argc, char *argv[])
                     continue;
 
                 QuadSurface *sm = new QuadSurface(entry.path(), meta);
+                sm->readOverlappingJson();
 
                 surfs[name] = sm;
                 surfs_v.push_back(sm);

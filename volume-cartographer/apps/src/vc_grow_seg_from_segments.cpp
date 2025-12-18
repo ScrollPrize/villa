@@ -82,6 +82,7 @@ int main(int argc, char *argv[])
 
     json meta = json::parse(meta_f);
     QuadSurface *src = new QuadSurface(src_path, meta);
+    src->readOverlappingJson();
 
     for (const auto& entry : std::filesystem::directory_iterator(src_dir))
         if (std::filesystem::is_directory(entry)) {
@@ -107,6 +108,7 @@ int main(int argc, char *argv[])
                 sm = src;
             else {
                 sm = new QuadSurface(entry.path(), meta);
+                sm->readOverlappingJson();
             }
 
             surfaces.push_back(sm);
