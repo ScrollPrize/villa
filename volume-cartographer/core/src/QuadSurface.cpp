@@ -173,6 +173,7 @@ void QuadSurface::move(cv::Vec3f &ptr, const cv::Vec3f &offset)
 
 bool QuadSurface::valid(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
+    ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
     return loc_valid_xy(*_points, {p[0], p[1]});
 }
@@ -180,6 +181,7 @@ bool QuadSurface::valid(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 
 cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
+    ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
     cv::Rect bounds = {0,0,_points->cols-2,_points->rows-2};
@@ -201,6 +203,7 @@ cv::Vec3f QuadSurface::loc_raw(const cv::Vec3f &ptr)
 
 cv::Size QuadSurface::size()
 {
+    ensureLoaded();
     return {static_cast<int>(_points->cols / _scale[0]), static_cast<int>(_points->rows / _scale[1])};
 }
 
@@ -216,12 +219,14 @@ cv::Vec3f QuadSurface::center() const
 
 cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
+    ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
     return grid_normal((*_points), p);
 }
 
 cv::Vec3f QuadSurface::gridNormal(int row, int col) const
 {
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     if (!_points) {
         return {NAN, NAN, NAN};
     }
@@ -236,6 +241,7 @@ void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
 
 cv::Mat QuadSurface::channel(const std::string& name, int flags)
 {
+    ensureLoaded();
     if (_channels.count(name)) {
         cv::Mat& channel = _channels[name];
         if (channel.empty()) {
@@ -278,6 +284,7 @@ std::vector<std::string> QuadSurface::channelNames() const
 
 int QuadSurface::countValidPoints() const
 {
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     if (!_points) return 0;
     auto range = validPoints();
     return static_cast<int>(std::distance(range.begin(), range.end()));
@@ -285,6 +292,7 @@ int QuadSurface::countValidPoints() const
 
 int QuadSurface::countValidQuads() const
 {
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     if (!_points) return 0;
     auto range = validQuads();
     return static_cast<int>(std::distance(range.begin(), range.end()));
@@ -292,6 +300,7 @@ int QuadSurface::countValidQuads() const
 
 cv::Mat_<uint8_t> QuadSurface::validMask() const
 {
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     if (!_points || _points->empty()) {
         return cv::Mat_<uint8_t>();
     }
@@ -351,6 +360,7 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                       float scale,
                       const cv::Vec3f& offset)
 {
+    ensureLoaded();
     const bool need_normals = (normals != nullptr) || offset[2] || ptr[2];
 
     const cv::Vec3f ul = internal_loc(offset/scale + _center, ptr, _scale);
@@ -582,6 +592,7 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
+    ensureLoaded();
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
 
@@ -1015,6 +1026,7 @@ void QuadSurface::save_meta()
 
 Rect3D QuadSurface::bbox()
 {
+    ensureLoaded();
     if (_bbox.low[0] == -1) {
         _bbox.low = (*_points)(0,0);
         _bbox.high = (*_points)(0,0);
@@ -1467,6 +1479,7 @@ std::unique_ptr<QuadSurface> surface_intersection(QuadSurface* a, QuadSurface* b
 
 void QuadSurface::rotate(float angleDeg)
 {
+    ensureLoaded();
     if (!_points || _points->empty() || std::abs(angleDeg) < 0.01f) {
         return;
     }
@@ -1533,6 +1546,7 @@ void QuadSurface::rotate(float angleDeg)
 
 float QuadSurface::computeZOrientationAngle() const
 {
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     if (!_points || _points->empty()) {
         return 0.0f;
     }
