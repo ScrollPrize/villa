@@ -109,6 +109,10 @@ public:
     // Schedule a debounced save of the approval mask (saves after kApprovalSaveDelayMs of inactivity)
     void scheduleDebouncedSave(QuadSurface* surface);
 
+    // Flush any pending approval mask saves immediately (uses the surface from scheduleDebouncedSave)
+    // Call this before segment switching to ensure changes are saved to the correct surface
+    void flushPendingApprovalMaskSave();
+
     // Undo support for approval mask painting
     // Undo the last paint stroke (repaints with inverse value)
     bool undoLastApprovalMaskPaint();

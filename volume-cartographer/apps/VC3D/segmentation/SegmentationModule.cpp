@@ -434,6 +434,15 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
 
+    // Flush any pending approval mask saves and clear images BEFORE turning off editing
+    // loadApprovalMaskImage(nullptr) does both:
+    // 1. Saves pending changes to _approvalSaveSurface (the previous segment)
+    // 2. Clears the mask images so subsequent saveApprovalMaskToDisk() has nothing to save
+    // This prevents the old mask from being incorrectly saved to the new segment
+    if (_overlay) {
+        _overlay->loadApprovalMaskImage(nullptr);
+    }
+
     // Turn off any approval mask editing when switching segments
     if (isEditingApprovalMask()) {
         qCInfo(lcSegModule) << "  Turning off approval mask editing";

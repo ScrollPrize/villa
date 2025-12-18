@@ -569,6 +569,17 @@ void SegmentationOverlayController::scheduleDebouncedSave(QuadSurface* surface)
     scheduleApprovalMaskSave(surface);
 }
 
+void SegmentationOverlayController::flushPendingApprovalMaskSave()
+{
+    // If there's a pending debounced save, execute it immediately
+    // This ensures changes are saved to the correct surface before segment switching
+    if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
+        _approvalSaveTimer->stop();
+        saveApprovalMaskToSurface(_approvalSaveSurface);
+        _approvalSaveSurface = nullptr;
+    }
+}
+
 void SegmentationOverlayController::scheduleApprovalMaskSave(QuadSurface* surface)
 {
     if (!surface) {
