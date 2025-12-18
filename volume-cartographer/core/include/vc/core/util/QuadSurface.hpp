@@ -311,22 +311,26 @@ public:
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }
 
     // Grid iteration helpers
-    ValidPointRange<cv::Vec3f> validPoints() { return ValidPointRange<cv::Vec3f>(_points.get()); }
+    ValidPointRange<cv::Vec3f> validPoints() { ensureLoaded(); return ValidPointRange<cv::Vec3f>(_points.get()); }
     ValidPointRange<const cv::Vec3f> validPoints() const {
+        const_cast<QuadSurface*>(this)->ensureLoaded();
         return ValidPointRange<const cv::Vec3f>(_points.get());
     }
-    ValidQuadRange<cv::Vec3f> validQuads() { return ValidQuadRange<cv::Vec3f>(_points.get()); }
+    ValidQuadRange<cv::Vec3f> validQuads() { ensureLoaded(); return ValidQuadRange<cv::Vec3f>(_points.get()); }
     ValidQuadRange<const cv::Vec3f> validQuads() const {
+        const_cast<QuadSurface*>(this)->ensureLoaded();
         return ValidQuadRange<const cv::Vec3f>(_points.get());
     }
 
     // Single-point validity checks
     bool isPointValid(int row, int col) const {
+        const_cast<QuadSurface*>(this)->ensureLoaded();
         if (!_points || row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
             return false;
         return (*_points)(row, col)[0] != -1.f;
     }
     bool isQuadValid(int row, int col) const {
+        const_cast<QuadSurface*>(this)->ensureLoaded();
         if (!_points || row < 0 || row >= _points->rows - 1 || col < 0 || col >= _points->cols - 1)
             return false;
         return (*_points)(row, col)[0] != -1.f &&
