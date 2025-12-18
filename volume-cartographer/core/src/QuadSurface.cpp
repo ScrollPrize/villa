@@ -132,11 +132,18 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const nlohmann::jso
 
 void QuadSurface::ensureLoaded()
 {
+    // Fast path: already loaded (no lock needed for read)
     if (!_needsLoad) {
         return;
     }
 
-    _needsLoad = false;
+    // Slow path: need to load, acquire lock
+    std::lock_guard<std::mutex> lock(_loadMutex);
+
+    // Double-check after acquiring lock (another thread may have loaded)
+    if (!_needsLoad) {
+        return;
+    }
 
     auto loaded = load_quad_from_tifxyz(path.string());
     if (!loaded) {
@@ -157,6 +164,9 @@ void QuadSurface::ensureLoaded()
     }
 
     _maskTimestamp = readMaskTimestamp(path);
+
+    // Mark as loaded (after all data is set)
+    _needsLoad = false;
 }
 
 QuadSurface::~QuadSurface() = default;
