@@ -22,6 +22,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/ChunkCache.hpp"
+#include "vc/core/util/Slicing.hpp"
 
 class QGraphicsScene;
 class QGraphicsItem;
@@ -46,6 +47,7 @@ public:
     void renderIntersections();
     cv::Mat render_area(const cv::Rect &roi);
     cv::Mat_<uint8_t> render_composite(const cv::Rect &roi);
+    cv::Mat_<uint8_t> render_composite_plane(const cv::Rect &roi, const cv::Mat_<cv::Vec3f> &coords, const cv::Vec3f &planeNormal);
     cv::Mat_<uint8_t> renderCompositeForSurface(std::shared_ptr<QuadSurface> surface, cv::Size outputSize);
     void invalidateVis();
     void invalidateIntersect(const std::string &name = "");
@@ -64,7 +66,32 @@ public:
     void setCompositeAlphaThreshold(int value);
     void setCompositeMaterial(int value);
     void setCompositeReverseDirection(bool reverse);
+    void setCompositeBLExtinction(float value);
+    void setCompositeBLEmission(float value);
+    void setCompositeBLAmbient(float value);
+    void setLightingEnabled(bool enabled);
+    void setLightAzimuth(float degrees);
+    void setLightElevation(float degrees);
+    void setLightDiffuse(float value);
+    void setLightAmbient(float value);
+    void setUseVolumeGradients(bool enabled);
+    void setIsoCutoff(int value);
     void setResetViewOnSurfaceChange(bool reset);
+
+    // Plane composite view methods (for XY/XZ/YZ plane viewers)
+    void setPlaneCompositeEnabled(bool enabled);
+    void setPlaneCompositeLayers(int front, int behind);
+    bool isPlaneCompositeEnabled() const { return _plane_composite_enabled; }
+    int planeCompositeLayersFront() const { return _plane_composite_layers_front; }
+    int planeCompositeLayersBehind() const { return _plane_composite_layers_behind; }
+
+    // Postprocessing settings
+    void setPostStretchValues(bool enabled);
+    bool postStretchValues() const { return _postStretchValues; }
+    void setPostRemoveSmallComponents(bool enabled);
+    bool postRemoveSmallComponents() const { return _postRemoveSmallComponents; }
+    void setPostMinComponentSize(int size);
+    int postMinComponentSize() const { return _postMinComponentSize; }
     bool isCompositeEnabled() const { return _composite_enabled; }
     std::shared_ptr<Volume> currentVolume() const { return volume; }
     ChunkCache<uint8_t>* chunkCachePtr() const { return cache; }
@@ -258,7 +285,7 @@ protected:
     float _z_off = 0.0;  // Offset along surface normal (perpendicular to surface)
     QPointF _lastScenePos;  // Last known scene position for grid coordinate lookups
 
-    // Composite view settings
+    // Composite view settings (for segmentation/QuadSurface)
     bool _composite_enabled = false;
     int _composite_layers = 7;
     int _composite_layers_front = 8;
@@ -269,6 +296,23 @@ protected:
     int _composite_alpha_threshold = 9950;
     int _composite_material = 230;
     bool _composite_reverse_direction = false;
+    float _composite_bl_extinction = 1.5f;
+    float _composite_bl_emission = 1.5f;
+    float _composite_bl_ambient = 0.1f;
+    bool _lighting_enabled = false;
+    float _light_azimuth = 45.0f;
+    float _light_elevation = 45.0f;
+    float _light_diffuse = 0.7f;
+    float _light_ambient = 0.3f;
+    bool _use_volume_gradients = false;
+    int _iso_cutoff = 0;
+
+    // Plane composite view settings (for XY/XZ/YZ plane viewers)
+    // These share the same composite method/parameters as segmentation,
+    // but have separate layer counts and enable flag
+    bool _plane_composite_enabled = false;
+    int _plane_composite_layers_front = 4;
+    int _plane_composite_layers_behind = 4;
     
     QGraphicsItem *_center_marker = nullptr;
     QGraphicsItem *_cursor = nullptr;
@@ -355,5 +399,27 @@ protected:
     bool _surfaceOverlayEnabled{false};
     std::string _surfaceOverlayName;
     float _surfaceOverlapThreshold{5.0f};
+
+    // Postprocessing settings
+    bool _postStretchValues{false};
+    bool _postRemoveSmallComponents{false};
+    int _postMinComponentSize{50};
+
+    // Fast composite rendering cache - no mutex, specialized for composite
+    FastCompositeCache _fastCompositeCache;
+
+    // Cached normals for composite rendering - invalidated on surface/ptr change
+    cv::Mat_<cv::Vec3f> _cachedNormals;
+    cv::Mat_<cv::Vec3f> _cachedBaseCoords;
+    cv::Mat_<cv::Vec3f> _coordsWorkBuffer;  // Reusable buffer for z_off-adjusted coords
+    cv::Size _cachedNormalsSize;
+    float _cachedNormalsScale{0.0f};
+    cv::Vec3f _cachedNormalsPtr{0, 0, 0};
+    float _cachedNormalsZOff{0.0f};
+    std::weak_ptr<Surface> _cachedNormalsSurf;
+
+    // Cached volume gradients for PBR lighting - separate surface tracking
+    cv::Mat_<cv::Vec3f> _cachedNativeVolumeGradients;
+    std::weak_ptr<Surface> _cachedGradientsSurf;
 
 };  // class CVolumeViewer

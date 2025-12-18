@@ -506,7 +506,7 @@
    <property name="minimumSize">
     <size>
      <width>250</width>
-     <height>100</height>
+     <height>40</height>
     </size>
    </property>
    <property name="windowTitle">
@@ -515,20 +515,41 @@
    <attribute name="dockWidgetArea">
     <number>1</number>
    </attribute>
-   <widget class="QWidget" name="dockWidgetCompositeContents">
-    <layout class="QVBoxLayout" name="verticalLayout_16">
-     <property name="leftMargin">
-      <number>3</number>
+   <widget class="QScrollArea" name="scrollAreaComposite">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
+    </property>
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetCompositeContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>400</height>
+      </rect>
      </property>
-     <property name="topMargin">
-      <number>3</number>
-     </property>
-     <property name="rightMargin">
-      <number>3</number>
-     </property>
-     <property name="bottomMargin">
-      <number>9</number>
-     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_16">
+      <property name="spacing">
+       <number>2</number>
+      </property>
+      <property name="leftMargin">
+       <number>2</number>
+      </property>
+      <property name="topMargin">
+       <number>2</number>
+      </property>
+      <property name="rightMargin">
+       <number>2</number>
+      </property>
+      <property name="bottomMargin">
+       <number>2</number>
+      </property>
      <item>
       <widget class="QCheckBox" name="chkCompositeEnabled">
        <property name="text">
@@ -567,12 +588,23 @@
            <string>Alpha</string>
           </property>
          </item>
+         <item>
+          <property name="text">
+           <string>Beer-Lambert</string>
+          </property>
+         </item>
         </widget>
        </item>
       </layout>
      </item>
      <item>
       <layout class="QGridLayout" name="compositeParamsGrid">
+       <property name="horizontalSpacing">
+        <number>4</number>
+       </property>
+       <property name="verticalSpacing">
+        <number>2</number>
+       </property>
        <item row="0" column="0">
         <widget class="QLabel" name="lblLayersInFront">
          <property name="text">
@@ -586,7 +618,7 @@
           <number>0</number>
          </property>
          <property name="maximum">
-          <number>21</number>
+          <number>100</number>
          </property>
          <property name="value">
           <number>8</number>
@@ -606,7 +638,7 @@
           <number>0</number>
          </property>
          <property name="maximum">
-          <number>21</number>
+          <number>100</number>
          </property>
          <property name="value">
           <number>0</number>
@@ -709,6 +741,353 @@
          </property>
         </widget>
        </item>
+       <item row="4" column="0">
+        <widget class="QLabel" name="lblMethodScale">
+         <property name="text">
+          <string>Scale</string>
+         </property>
+        </widget>
+       </item>
+       <item row="5" column="1" colspan="2">
+        <widget class="QSlider" name="sliderMethodScale">
+         <property name="minimum">
+          <number>1</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>20</number>
+         </property>
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+       <item row="5" column="3">
+        <widget class="QLabel" name="lblMethodScaleValue">
+         <property name="text">
+          <string>2.0</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignRight|Qt::AlignVCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item row="6" column="0">
+        <widget class="QLabel" name="lblMethodParam">
+         <property name="text">
+          <string>Parameter</string>
+         </property>
+        </widget>
+       </item>
+       <item row="6" column="1" colspan="2">
+        <widget class="QSlider" name="sliderMethodParam">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>50</number>
+         </property>
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+       <item row="6" column="3">
+        <widget class="QLabel" name="lblMethodParamValue">
+         <property name="text">
+          <string>50</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignRight|Qt::AlignVCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="0">
+        <widget class="QLabel" name="lblBLExtinction">
+         <property name="text">
+          <string>Extinction</string>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="1">
+        <widget class="QDoubleSpinBox" name="spinBLExtinction">
+         <property name="minimum">
+          <double>0.000000000000000</double>
+         </property>
+         <property name="maximum">
+          <double>10.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.100000000000000</double>
+         </property>
+         <property name="value">
+          <double>1.500000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="2">
+        <widget class="QLabel" name="lblBLEmission">
+         <property name="text">
+          <string>Emission</string>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="3">
+        <widget class="QDoubleSpinBox" name="spinBLEmission">
+         <property name="minimum">
+          <double>0.000000000000000</double>
+         </property>
+         <property name="maximum">
+          <double>10.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.100000000000000</double>
+         </property>
+         <property name="value">
+          <double>1.500000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="8" column="0">
+        <widget class="QLabel" name="lblBLAmbient">
+         <property name="text">
+          <string>Ambient</string>
+         </property>
+        </widget>
+       </item>
+       <item row="8" column="1">
+        <widget class="QDoubleSpinBox" name="spinBLAmbient">
+         <property name="minimum">
+          <double>0.000000000000000</double>
+         </property>
+         <property name="maximum">
+          <double>1.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.050000000000000</double>
+         </property>
+         <property name="value">
+          <double>0.100000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="9" column="0" colspan="2">
+        <widget class="QCheckBox" name="chkLightingEnabled">
+         <property name="text">
+          <string>Enable Lighting</string>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="0">
+        <widget class="QLabel" name="lblLightAzimuth">
+         <property name="text">
+          <string>Azimuth</string>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="1">
+        <widget class="QSpinBox" name="spinLightAzimuth">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>360</number>
+         </property>
+         <property name="singleStep">
+          <number>15</number>
+         </property>
+         <property name="value">
+          <number>45</number>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="2">
+        <widget class="QLabel" name="lblLightElevation">
+         <property name="text">
+          <string>Elevation</string>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="3">
+        <widget class="QSpinBox" name="spinLightElevation">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>90</number>
+         </property>
+         <property name="singleStep">
+          <number>5</number>
+         </property>
+         <property name="value">
+          <number>45</number>
+         </property>
+        </widget>
+       </item>
+       <item row="11" column="0">
+        <widget class="QLabel" name="lblLightDiffuse">
+         <property name="text">
+          <string>Diffuse</string>
+         </property>
+        </widget>
+       </item>
+       <item row="11" column="1">
+        <widget class="QDoubleSpinBox" name="spinLightDiffuse">
+         <property name="minimum">
+          <double>0.000000000000000</double>
+         </property>
+         <property name="maximum">
+          <double>1.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.100000000000000</double>
+         </property>
+         <property name="value">
+          <double>0.700000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="11" column="2">
+        <widget class="QLabel" name="lblLightAmbient">
+         <property name="text">
+          <string>Ambient</string>
+         </property>
+        </widget>
+       </item>
+       <item row="11" column="3">
+        <widget class="QDoubleSpinBox" name="spinLightAmbient">
+         <property name="minimum">
+          <double>0.000000000000000</double>
+         </property>
+         <property name="maximum">
+          <double>1.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.100000000000000</double>
+         </property>
+         <property name="value">
+          <double>0.300000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="12" column="0" colspan="4">
+        <widget class="QCheckBox" name="chkUseVolumeGradients">
+         <property name="text">
+          <string>Use Volume Gradients</string>
+         </property>
+         <property name="toolTip">
+          <string>Compute lighting normals from volume data instead of mesh geometry. Reveals texture details but is slower to compute.</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="Line" name="linePlaneComposite">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="lblPlaneCompositeHeader">
+       <property name="text">
+        <string>Plane View Composite (XY/XZ/YZ)</string>
+       </property>
+       <property name="font">
+        <font>
+         <bold>true</bold>
+        </font>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="planeCompositeEnableLayout">
+       <item>
+        <widget class="QCheckBox" name="chkPlaneCompositeXY">
+         <property name="text">
+          <string>XY</string>
+         </property>
+         <property name="toolTip">
+          <string>Enable composite rendering for XY plane viewer</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkPlaneCompositeXZ">
+         <property name="text">
+          <string>XZ</string>
+         </property>
+         <property name="toolTip">
+          <string>Enable composite rendering for XZ plane viewer</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkPlaneCompositeYZ">
+         <property name="text">
+          <string>YZ</string>
+         </property>
+         <property name="toolTip">
+          <string>Enable composite rendering for YZ plane viewer</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QGridLayout" name="planeCompositeGrid">
+       <item row="0" column="0">
+        <widget class="QLabel" name="lblPlaneLayersFront">
+         <property name="text">
+          <string>Layers Front</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QSpinBox" name="spinPlaneLayersFront">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>4</number>
+         </property>
+         <property name="toolTip">
+          <string>Number of layers in front of the plane</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="2">
+        <widget class="QLabel" name="lblPlaneLayersBehind">
+         <property name="text">
+          <string>Behind</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="3">
+        <widget class="QSpinBox" name="spinPlaneLayersBehind">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>4</number>
+         </property>
+         <property name="toolTip">
+          <string>Number of layers behind the plane</string>
+         </property>
+        </widget>
+       </item>
       </layout>
      </item>
      <item>
@@ -726,22 +1105,306 @@
      </item>
     </layout>
    </widget>
+   </widget>
+  </widget>
+  <widget class="QDockWidget" name="dockWidgetPreprocessing">
+   <property name="minimumSize">
+    <size>
+     <width>250</width>
+     <height>40</height>
+    </size>
+   </property>
+   <property name="windowTitle">
+    <string>Preprocessing</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>1</number>
+   </attribute>
+   <widget class="QScrollArea" name="scrollAreaPreprocessing">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
+    </property>
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetPreprocessingContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>100</height>
+      </rect>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayoutPreprocessing">
+      <property name="spacing">
+       <number>2</number>
+      </property>
+      <property name="leftMargin">
+       <number>2</number>
+      </property>
+      <property name="topMargin">
+       <number>2</number>
+      </property>
+      <property name="rightMargin">
+       <number>2</number>
+      </property>
+      <property name="bottomMargin">
+       <number>2</number>
+      </property>
+     <item>
+      <layout class="QHBoxLayout" name="isoCutoffLayout">
+       <item>
+        <widget class="QLabel" name="lblIsoCutoff">
+         <property name="text">
+          <string>ISO Cutoff</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSlider" name="sliderIsoCutoff">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>255</number>
+         </property>
+         <property name="value">
+          <number>0</number>
+         </property>
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lblIsoCutoffValue">
+         <property name="text">
+          <string>0</string>
+         </property>
+         <property name="minimumSize">
+          <size>
+           <width>25</width>
+           <height>0</height>
+          </size>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignRight|Qt::AlignVCenter</set>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <spacer name="verticalSpacerPreprocessing">
+       <property name="orientation">
+        <enum>Qt::Vertical</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>20</width>
+         <height>40</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </widget>
+   </widget>
+  </widget>
+  <widget class="QDockWidget" name="dockWidgetPostprocessing">
+   <property name="minimumSize">
+    <size>
+     <width>250</width>
+     <height>40</height>
+    </size>
+   </property>
+   <property name="windowTitle">
+    <string>Postprocessing</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>1</number>
+   </attribute>
+   <widget class="QScrollArea" name="scrollAreaPostprocessing">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
+    </property>
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetPostprocessingContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>150</height>
+      </rect>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayoutPostprocessing">
+      <property name="spacing">
+       <number>2</number>
+      </property>
+      <property name="leftMargin">
+       <number>2</number>
+      </property>
+      <property name="topMargin">
+       <number>2</number>
+      </property>
+      <property name="rightMargin">
+       <number>2</number>
+      </property>
+      <property name="bottomMargin">
+       <number>2</number>
+      </property>
+     <item>
+      <layout class="QHBoxLayout" name="colormapLayout">
+       <item>
+        <widget class="QLabel" name="labelBaseColormap">
+         <property name="text">
+          <string>Colormap</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QComboBox" name="baseColormapSelect">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="chkStretchValuesPost">
+       <property name="text">
+        <string>Auto-stretch to full range</string>
+       </property>
+       <property name="toolTip">
+        <string>Automatically stretch volume values to 0-255 range</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QFormLayout" name="formLayoutPostprocessing">
+       <item row="0" column="0">
+        <widget class="QCheckBox" name="chkRemoveSmallComponents">
+         <property name="text">
+          <string>Remove small components</string>
+         </property>
+         <property name="toolTip">
+          <string>Remove connected components with fewer pixels than the threshold</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="0">
+        <widget class="QLabel" name="lblMinComponentSize">
+         <property name="text">
+          <string>Min pixels</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QSpinBox" name="spinMinComponentSize">
+         <property name="minimum">
+          <number>1</number>
+         </property>
+         <property name="maximum">
+          <number>10000</number>
+         </property>
+         <property name="value">
+          <number>50</number>
+         </property>
+         <property name="toolTip">
+          <string>Minimum number of connected pixels to keep</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <spacer name="verticalSpacerPostprocessing">
+       <property name="orientation">
+        <enum>Qt::Vertical</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>20</width>
+         <height>40</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </widget>
+   </widget>
   </widget>
   <widget class="QDockWidget" name="dockWidgetView">
+   <property name="minimumSize">
+    <size>
+     <width>250</width>
+     <height>40</height>
+    </size>
+   </property>
    <property name="windowTitle">
     <string>View</string>
    </property>
    <attribute name="dockWidgetArea">
     <number>1</number>
    </attribute>
-   <widget class="QWidget" name="dockWidgetViewContents">
-    <property name="sizePolicy">
-     <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-      <horstretch>0</horstretch>
-      <verstretch>0</verstretch>
-     </sizepolicy>
+   <widget class="QScrollArea" name="scrollAreaView">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
     </property>
-    <layout class="QGridLayout" name="gridLayout">
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetViewContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>350</height>
+      </rect>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+     <layout class="QGridLayout" name="gridLayout">
+      <property name="leftMargin">
+       <number>2</number>
+      </property>
+      <property name="topMargin">
+       <number>2</number>
+      </property>
+      <property name="rightMargin">
+       <number>2</number>
+      </property>
+      <property name="bottomMargin">
+       <number>2</number>
+      </property>
+      <property name="horizontalSpacing">
+       <number>4</number>
+      </property>
+      <property name="verticalSpacing">
+       <number>2</number>
+      </property>
      <item row="1" column="1">
       <layout class="QGridLayout" name="gridLayout_2">
        <item row="0" column="0">
@@ -1055,18 +1718,74 @@
        </property>
       </widget>
      </item>
+     <item row="11" column="0" colspan="4">
+      <spacer name="verticalSpacerView">
+       <property name="orientation">
+        <enum>Qt::Vertical</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>20</width>
+         <height>40</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
     </layout>
+   </widget>
    </widget>
   </widget>
   <widget class="QDockWidget" name="dockWidgetOverlay">
+   <property name="minimumSize">
+    <size>
+     <width>250</width>
+     <height>40</height>
+    </size>
+   </property>
    <property name="windowTitle">
     <string>Overlay</string>
    </property>
    <attribute name="dockWidgetArea">
     <number>1</number>
    </attribute>
-   <widget class="QWidget" name="dockWidgetOverlayContents">
-    <layout class="QGridLayout" name="gridLayoutOverlay">
+   <widget class="QScrollArea" name="scrollAreaOverlay">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
+    </property>
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetOverlayContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>200</height>
+      </rect>
+     </property>
+     <layout class="QGridLayout" name="gridLayoutOverlay">
+      <property name="leftMargin">
+       <number>2</number>
+      </property>
+      <property name="topMargin">
+       <number>2</number>
+      </property>
+     <property name="rightMargin">
+      <number>2</number>
+     </property>
+     <property name="bottomMargin">
+      <number>2</number>
+     </property>
+     <property name="horizontalSpacing">
+      <number>4</number>
+     </property>
+     <property name="verticalSpacing">
+      <number>2</number>
+     </property>
      <item row="0" column="0">
       <widget class="QLabel" name="labelOverlayVolume">
        <property name="text">
@@ -1147,46 +1866,75 @@
        </property>
       </widget>
      </item>
+     <item row="5" column="0" colspan="3">
+      <spacer name="verticalSpacerOverlay">
+       <property name="orientation">
+        <enum>Qt::Vertical</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>20</width>
+         <height>40</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
     </layout>
+   </widget>
    </widget>
   </widget>
    <widget class="QDockWidget" name="dockWidgetRenderSettings">
+     <property name="minimumSize">
+      <size>
+       <width>250</width>
+       <height>40</height>
+      </size>
+     </property>
      <property name="windowTitle">
       <string>Render Settings</string>
      </property>
      <attribute name="dockWidgetArea">
       <number>1</number>
      </attribute>
-     <widget class="QWidget" name="dockWidgetRenderSettingsContents">
-      <layout class="QGridLayout" name="gridLayoutRenderSettings">
-       <item row="0" column="0">
-        <widget class="QLabel" name="labelBaseColormap">
-         <property name="text">
-          <string>Base colormap</string>
-         </property>
-        </widget>
-       </item>
-       <item row="0" column="1" colspan="2">
-        <widget class="QComboBox" name="baseColormapSelect"/>
-       </item>
-       <item row="1" column="0" colspan="3">
-        <widget class="QCheckBox" name="chkStretchValues">
-         <property name="text">
-          <string>Auto-stretch to full range</string>
-         </property>
-         <property name="toolTip">
-          <string>Automatically stretch volume values to 0-255 range before applying colormap</string>
-         </property>
-        </widget>
-       </item>
-       <item row="2" column="0" colspan="3">
-        <widget class="Line" name="line">
-         <property name="orientation">
-          <enum>Qt::Horizontal</enum>
-         </property>
-        </widget>
-       </item>
-       <item row="3" column="0" colspan="3">
+     <widget class="QScrollArea" name="scrollAreaRenderSettings">
+      <property name="frameShape">
+       <enum>QFrame::NoFrame</enum>
+      </property>
+      <property name="widgetResizable">
+       <bool>true</bool>
+      </property>
+      <property name="horizontalScrollBarPolicy">
+       <enum>Qt::ScrollBarAlwaysOff</enum>
+      </property>
+      <widget class="QWidget" name="dockWidgetRenderSettingsContents">
+       <property name="geometry">
+        <rect>
+         <x>0</x>
+         <y>0</y>
+         <width>250</width>
+         <height>150</height>
+        </rect>
+       </property>
+       <layout class="QGridLayout" name="gridLayoutRenderSettings">
+        <property name="leftMargin">
+         <number>2</number>
+        </property>
+        <property name="topMargin">
+         <number>2</number>
+        </property>
+        <property name="rightMargin">
+         <number>2</number>
+        </property>
+        <property name="bottomMargin">
+         <number>2</number>
+        </property>
+        <property name="horizontalSpacing">
+         <number>4</number>
+        </property>
+        <property name="verticalSpacing">
+         <number>2</number>
+        </property>
+       <item row="0" column="0" colspan="3">
         <widget class="QCheckBox" name="chkSurfaceOverlay">
          <property name="text">
           <string>Show surface overlap</string>
@@ -1196,30 +1944,30 @@
          </property>
         </widget>
        </item>
-       <item row="4" column="0">
+       <item row="1" column="0">
         <widget class="QLabel" name="labelOverlaySurface">
          <property name="text">
           <string>Overlay surface</string>
          </property>
         </widget>
        </item>
-       <item row="4" column="1" colspan="2">
+       <item row="1" column="1" colspan="2">
         <widget class="QComboBox" name="surfaceOverlaySelect"/>
        </item>
-       <item row="5" column="0">
+       <item row="2" column="0">
         <widget class="QLabel" name="labelOverlapThreshold">
          <property name="text">
           <string>Threshold</string>
          </property>
         </widget>
        </item>
-       <item row="5" column="1">
+       <item row="2" column="1">
         <widget class="QDoubleSpinBox" name="spinOverlapThreshold">
          <property name="minimum">
           <double>0.100000000000000</double>
          </property>
          <property name="maximum">
-          <double>250.000000000000000</double>
+          <double>50.000000000000000</double>
          </property>
          <property name="singleStep">
           <double>0.500000000000000</double>
@@ -1235,7 +1983,21 @@
          </property>
         </widget>
        </item>
+       <item row="3" column="0" colspan="3">
+        <spacer name="verticalSpacerRenderSettings">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
       </layout>
+     </widget>
      </widget>
     </widget>
   <action name="actionOpen">

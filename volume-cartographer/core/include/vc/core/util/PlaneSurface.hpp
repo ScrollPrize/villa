@@ -32,8 +32,6 @@ public:
     float inPlaneRotation() const { return _inPlaneRotation; }
     cv::Vec3f basisX() const { return _vx; }
     cv::Vec3f basisY() const { return _vy; }
-    void setAxisAlignedRotationKey(int key);
-    int axisAlignedRotationKey() const { return _axisAlignedRotationKey; }
 protected:
     void update();
     cv::Vec3f _normal = {0,0,1};
@@ -43,7 +41,6 @@ protected:
     float _inPlaneRotation = 0.0f;
     cv::Matx33d _M;
     cv::Vec3d _T;
-    int _axisAlignedRotationKey = -1;
 };
 
 float min_loc(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f &loc, cv::Vec3f &out, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds, PlaneSurface *plane, float init_step = 16.0, float min_step = 0.125);

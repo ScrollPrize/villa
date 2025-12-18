@@ -140,11 +140,6 @@ void PlaneSurface::setInPlaneRotation(float radians)
     update();
 }
 
-void PlaneSurface::setAxisAlignedRotationKey(int key)
-{
-    _axisAlignedRotationKey = key;
-}
-
 void PlaneSurface::update()
 {
     cv::Vec3f vx, vy;

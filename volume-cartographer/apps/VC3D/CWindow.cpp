@@ -330,16 +330,6 @@ constexpr float kEpsilon = 1e-6f;
 constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
 constexpr int kAxisAlignedRotationApplyDelayMs = 25;
 
-int axisAlignedRotationCacheKey(float degrees)
-{
-    int key = static_cast<int>(std::lround(degrees));
-    key %= 360;
-    if (key < 0) {
-        key += 360;
-    }
-    return key;
-}
-
 cv::Vec3f rotateAroundZ(const cv::Vec3f& v, float radians)
 {
     const float c = std::cos(radians);
@@ -616,6 +606,7 @@ CWindow::CWindow() :
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
                                ui.dockWidgetComposite,
+                               ui.dockWidgetPostprocessing,
                                ui.dockWidgetVolumes,
                                ui.dockWidgetView,
                                ui.dockWidgetOverlay,
@@ -1486,6 +1477,7 @@ void CWindow::CreateWidgets(void)
     ensureTabified(ui.dockWidgetView, ui.dockWidgetOverlay);
     ensureTabified(ui.dockWidgetView, ui.dockWidgetRenderSettings);
     ensureTabified(ui.dockWidgetView, ui.dockWidgetComposite);
+    ensureTabified(ui.dockWidgetView, ui.dockWidgetPostprocessing);
 
     const auto tabOrder = tabifiedDockWidgets(ui.dockWidgetView);
     for (QDockWidget* dock : tabOrder) {
@@ -1536,13 +1528,6 @@ void CWindow::CreateWidgets(void)
         const QString id = ui.baseColormapSelect->currentData().toString();
         _viewerManager->forEachViewer([&id](CVolumeViewer* viewer) {
             viewer->setBaseColormap(id.toStdString());
-        });
-    });
-
-    connect(ui.chkStretchValues, &QCheckBox::toggled, [this](bool checked) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CVolumeViewer* viewer) {
-            viewer->setStretchValues(checked);
         });
     });
 
@@ -1905,6 +1890,7 @@ void CWindow::CreateWidgets(void)
             case 1: method = "mean"; break;
             case 2: method = "min"; break;
             case 3: method = "alpha"; break;
+            case 4: method = "beerLambert"; break;
         }
 
         if (auto* viewer = segmentationViewer()) {
@@ -1988,6 +1974,228 @@ void CWindow::CreateWidgets(void)
             }
         }
     });
+
+    // Connect Beer-Lambert Extinction control
+    connect(ui.spinBLExtinction, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeBLExtinction(static_cast<float>(value));
+        }
+    });
+
+    // Connect Beer-Lambert Emission control
+    connect(ui.spinBLEmission, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeBLEmission(static_cast<float>(value));
+        }
+    });
+
+    // Connect Beer-Lambert Ambient control
+    connect(ui.spinBLAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setCompositeBLAmbient(static_cast<float>(value));
+        }
+    });
+
+    // Connect Lighting Enable control
+    connect(ui.chkLightingEnabled, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setLightingEnabled(checked);
+        }
+    });
+
+    // Connect Light Azimuth control
+    connect(ui.spinLightAzimuth, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setLightAzimuth(static_cast<float>(value));
+        }
+    });
+
+    // Connect Light Elevation control
+    connect(ui.spinLightElevation, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setLightElevation(static_cast<float>(value));
+        }
+    });
+
+    // Connect Light Diffuse control
+    connect(ui.spinLightDiffuse, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setLightDiffuse(static_cast<float>(value));
+        }
+    });
+
+    // Connect Light Ambient control
+    connect(ui.spinLightAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setLightAmbient(static_cast<float>(value));
+        }
+    });
+
+    // Connect Volume Gradients checkbox
+    connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setUseVolumeGradients(checked);
+        }
+    });
+
+    // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
+    connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
+        ui.lblIsoCutoffValue->setText(QString::number(value));
+        if (!_viewerManager) {
+            return;
+        }
+        _viewerManager->forEachViewer([value](CVolumeViewer* viewer) {
+            viewer->setIsoCutoff(value);
+        });
+    });
+
+    // Connect Method Scale slider (for methods with scale parameters)
+    connect(ui.sliderMethodScale, &QSlider::valueChanged, this, [this](int value) {
+        // Convert slider value (1-100) to scale (0.1-10.0)
+        float scale = value / 10.0f;
+        ui.lblMethodScaleValue->setText(QString::number(scale, 'f', 1));
+
+        if (!_viewerManager) {
+            return;
+        }
+
+        // Currently no methods use the scale parameter
+        (void)scale;
+    });
+
+    // Connect Method Param slider (for methods with threshold/percentile parameters)
+    connect(ui.sliderMethodParam, &QSlider::valueChanged, this, [this](int value) {
+        // Currently no methods use this parameter
+        (void)value;
+    });
+
+    // Helper lambda to update visibility of method-specific parameters
+    auto updateCompositeParamsVisibility = [this](int methodIndex) {
+        // Alpha parameters (row 1, 2 - AlphaMin/Max, AlphaThreshold/Material)
+        bool showAlphaParams = (methodIndex == 3); // Alpha method
+        ui.lblAlphaMin->setVisible(showAlphaParams);
+        ui.spinAlphaMin->setVisible(showAlphaParams);
+        ui.lblAlphaMax->setVisible(showAlphaParams);
+        ui.spinAlphaMax->setVisible(showAlphaParams);
+        ui.lblAlphaThreshold->setVisible(showAlphaParams);
+        ui.spinAlphaThreshold->setVisible(showAlphaParams);
+        ui.lblMaterial->setVisible(showAlphaParams);
+        ui.spinMaterial->setVisible(showAlphaParams);
+
+        // Beer-Lambert parameters (row 7, 8 - Extinction/Emission, Ambient)
+        bool showBLParams = (methodIndex == 4); // Beer-Lambert method
+        ui.lblBLExtinction->setVisible(showBLParams);
+        ui.spinBLExtinction->setVisible(showBLParams);
+        ui.lblBLEmission->setVisible(showBLParams);
+        ui.spinBLEmission->setVisible(showBLParams);
+        ui.lblBLAmbient->setVisible(showBLParams);
+        ui.spinBLAmbient->setVisible(showBLParams);
+
+        // Lighting parameters (rows 9-12) - always shown, works with all methods
+        ui.chkLightingEnabled->setVisible(true);
+        ui.lblLightAzimuth->setVisible(true);
+        ui.spinLightAzimuth->setVisible(true);
+        ui.lblLightElevation->setVisible(true);
+        ui.spinLightElevation->setVisible(true);
+        ui.lblLightDiffuse->setVisible(true);
+        ui.spinLightDiffuse->setVisible(true);
+        ui.lblLightAmbient->setVisible(true);
+        ui.spinLightAmbient->setVisible(true);
+        ui.chkUseVolumeGradients->setVisible(true);
+
+        // No methods currently use scale or param sliders
+        ui.lblMethodScale->setVisible(false);
+        ui.sliderMethodScale->setVisible(false);
+        ui.lblMethodScaleValue->setVisible(false);
+        ui.lblMethodParam->setVisible(false);
+        ui.sliderMethodParam->setVisible(false);
+        ui.lblMethodParamValue->setVisible(false);
+    };
+
+    // Update the cmbCompositeMode connection to also update visibility
+    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateCompositeParamsVisibility);
+
+    // Initialize visibility based on current selection
+    updateCompositeParamsVisibility(ui.cmbCompositeMode->currentIndex());
+
+    // Connect Plane Composite controls (separate enable for XY/XZ/YZ, shared layer counts)
+    connect(ui.chkPlaneCompositeXY, &QCheckBox::toggled, this, [this](bool checked) {
+        if (!_viewerManager) return;
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (viewer->surfName() == "xy plane") {
+                viewer->setPlaneCompositeEnabled(checked);
+            }
+        }
+    });
+
+    connect(ui.chkPlaneCompositeXZ, &QCheckBox::toggled, this, [this](bool checked) {
+        if (!_viewerManager) return;
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (viewer->surfName() == "seg xz") {
+                viewer->setPlaneCompositeEnabled(checked);
+            }
+        }
+    });
+
+    connect(ui.chkPlaneCompositeYZ, &QCheckBox::toggled, this, [this](bool checked) {
+        if (!_viewerManager) return;
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (viewer->surfName() == "seg yz") {
+                viewer->setPlaneCompositeEnabled(checked);
+            }
+        }
+    });
+
+    auto isPlaneViewer = [](const std::string& name) {
+        return name == "seg xz" || name == "seg yz" || name == "xy plane";
+    };
+
+    connect(ui.spinPlaneLayersFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
+        if (!_viewerManager) return;
+        int behind = ui.spinPlaneLayersBehind->value();
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (isPlaneViewer(viewer->surfName())) {
+                viewer->setPlaneCompositeLayers(value, behind);
+            }
+        }
+    });
+
+    connect(ui.spinPlaneLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
+        if (!_viewerManager) return;
+        int front = ui.spinPlaneLayersFront->value();
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (isPlaneViewer(viewer->surfName())) {
+                viewer->setPlaneCompositeLayers(front, value);
+            }
+        }
+    });
+
+    // Connect Postprocessing controls
+    connect(ui.chkStretchValuesPost, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setPostStretchValues(checked);
+        }
+    });
+
+    connect(ui.chkRemoveSmallComponents, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setPostRemoveSmallComponents(checked);
+        }
+        // Enable/disable the min component size spinbox based on checkbox state
+        ui.spinMinComponentSize->setEnabled(checked);
+        ui.lblMinComponentSize->setEnabled(checked);
+    });
+
+    connect(ui.spinMinComponentSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (auto* viewer = segmentationViewer()) {
+            viewer->setPostMinComponentSize(value);
+        }
+    });
+
+    // Initialize min component size controls based on checkbox state
+    ui.spinMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
+    ui.lblMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
+
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_viewerManager) {
@@ -2901,117 +3109,11 @@ void CWindow::onResetAxisAlignedRotations()
     _axisAlignedSegXZRotationDeg = 0.0f;
     _axisAlignedSegYZRotationDeg = 0.0f;
     _axisAlignedSliceDrags.clear();
-    resetAllPlaneRotations();
     applySlicePlaneOrientation();
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->refreshAll();
     }
     statusBar()->showMessage(tr("All plane rotations reset"), 2000);
-}
-
-CWindow::PlaneRotation& CWindow::planeRotation(const std::string& planeName)
-{
-    return _planeRotations[planeName];
-}
-
-void CWindow::adjustPlaneRotation(const std::string& planeName, float deltaPitch, float deltaYaw, float deltaRoll)
-{
-    auto& rot = _planeRotations[planeName];
-    rot.pitch = normalizeDegrees(rot.pitch + deltaPitch);
-    rot.yaw = normalizeDegrees(rot.yaw + deltaYaw);
-    rot.roll = normalizeDegrees(rot.roll + deltaRoll);
-
-    // Show feedback in status bar
-    statusBar()->showMessage(
-        tr("%1: pitch=%2 yaw=%3 roll=%4")
-            .arg(QString::fromStdString(planeName))
-            .arg(rot.pitch, 0, 'f', 1)
-            .arg(rot.yaw, 0, 'f', 1)
-            .arg(rot.roll, 0, 'f', 1),
-        2000);
-
-    scheduleAxisAlignedOrientationUpdate();
-}
-
-void CWindow::resetAllPlaneRotations()
-{
-    _planeRotations.clear();
-}
-
-std::string CWindow::focusedPlaneName() const
-{
-    if (!_viewerManager) {
-        return "";
-    }
-
-    // Find the active/focused viewer and return its surface name if it's a plane
-    QWidget* focused = QApplication::focusWidget();
-    if (!focused) {
-        return "";
-    }
-
-    std::string result;
-    _viewerManager->forEachViewer([&](CVolumeViewer* viewer) {
-        if (!viewer || !result.empty()) {
-            return;
-        }
-        // Check if this viewer or any of its children has focus
-        if (viewer->isAncestorOf(focused) || viewer == focused ||
-            (viewer->fGraphicsView && (viewer->fGraphicsView == focused ||
-                                        viewer->fGraphicsView->isAncestorOf(focused)))) {
-            const std::string& name = viewer->surfName();
-            // Only return plane surface names
-            if (name == "xy plane" || name == "seg xz" || name == "seg yz" ||
-                name == "xz plane" || name == "yz plane") {
-                result = name;
-            }
-        }
-    });
-
-    // If no viewer is focused, default to XY plane since it's the most common
-    if (result.empty()) {
-        result = "xy plane";
-    }
-
-    return result;
-}
-
-cv::Vec3f CWindow::applyEulerRotation(const cv::Vec3f& baseNormal, const PlaneRotation& rot) const
-{
-    if (rot.isIdentity()) {
-        return baseNormal;
-    }
-
-    // Apply rotations in order: yaw (Z), pitch (X), roll (Y)
-    // Convert degrees to radians
-    const float yawRad = rot.yaw * static_cast<float>(CV_PI / 180.0);
-    const float pitchRad = rot.pitch * static_cast<float>(CV_PI / 180.0);
-    const float rollRad = rot.roll * static_cast<float>(CV_PI / 180.0);
-
-    // Build rotation matrices
-    const float cy = std::cos(yawRad), sy = std::sin(yawRad);
-    const float cp = std::cos(pitchRad), sp = std::sin(pitchRad);
-    const float cr = std::cos(rollRad), sr = std::sin(rollRad);
-
-    // Combined rotation matrix: R = Rz(yaw) * Rx(pitch) * Ry(roll)
-    // This gives intuitive behavior where yaw rotates in the XY plane
-    cv::Matx33f Rz(cy, -sy, 0,
-                   sy,  cy, 0,
-                    0,   0, 1);
-
-    cv::Matx33f Rx(1,  0,   0,
-                   0, cp, -sp,
-                   0, sp,  cp);
-
-    cv::Matx33f Ry( cr, 0, sr,
-                     0, 1,  0,
-                   -sr, 0, cr);
-
-    cv::Matx33f R = Rz * Rx * Ry;
-
-    cv::Vec3f result = R * baseNormal;
-    cv::normalize(result, result);
-    return result;
 }
 
 void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
@@ -3462,59 +3564,55 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
     POI *focus = _surf_col->poi("focus");
     cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
 
+    // Helper to configure a plane with optional yaw rotation
+    const auto configurePlane = [&](const std::string& planeName,
+                                    const cv::Vec3f& baseNormal,
+                                    float yawDeg = 0.0f) {
+        auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface(planeName));
+        if (!planeShared) {
+            planeShared = std::make_shared<PlaneSurface>();
+        }
+
+        planeShared->setOrigin(origin);
+        planeShared->setInPlaneRotation(0.0f);
+
+        // Apply yaw rotation if set
+        cv::Vec3f rotatedNormal;
+        if (std::abs(yawDeg) > 0.001f) {
+            const float radians = yawDeg * kDegToRad;
+            rotatedNormal = rotateAroundZ(baseNormal, radians);
+        } else {
+            rotatedNormal = baseNormal;
+        }
+
+        planeShared->setNormal(rotatedNormal);
+
+        // Adjust in-plane rotation so "up" is aligned with volume Z when possible
+        const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
+        const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, rotatedNormal);
+        const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
+
+        if (cv::norm(desiredUp) > kEpsilon) {
+            const cv::Vec3f currentUp = planeShared->basisY();
+            const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
+            if (std::abs(delta) > kEpsilon) {
+                planeShared->setInPlaneRotation(delta);
+            }
+        } else {
+            planeShared->setInPlaneRotation(0.0f);
+        }
+
+        _surf_col->setSurface(planeName, planeShared);
+        return planeShared;
+    };
+
+    // Always update the XY plane
+    auto xyPlane = configurePlane("xy plane", cv::Vec3f(0.0f, 0.0f, 1.0f));
+
     if (_useAxisAlignedSlices) {
-        auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface("seg xz"));
-        auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface("seg yz"));
+        auto segXZShared = configurePlane("seg xz", cv::Vec3f(0.0f, 1.0f, 0.0f), _axisAlignedSegXZRotationDeg);
+        auto segYZShared = configurePlane("seg yz", cv::Vec3f(1.0f, 0.0f, 0.0f), _axisAlignedSegYZRotationDeg);
 
-        if (!segXZShared) {
-            segXZShared = std::make_shared<PlaneSurface>();
-        }
-        if (!segYZShared) {
-            segYZShared = std::make_shared<PlaneSurface>();
-        }
-
-
-        const auto configurePlane = [&](PlaneSurface* plane,
-                                        float degrees,
-                                        const cv::Vec3f& baseNormal) {
-            if (!plane) {
-                return;
-            }
-
-            plane->setOrigin(origin);
-            plane->setInPlaneRotation(0.0f);
-
-            const float radians = degrees * kDegToRad;
-            const cv::Vec3f rotatedNormal = rotateAroundZ(baseNormal, radians);
-            plane->setNormal(rotatedNormal);
-
-            const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
-            const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, rotatedNormal);
-            const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
-
-            if (cv::norm(desiredUp) > kEpsilon) {
-                const cv::Vec3f currentUp = plane->basisY();
-                const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
-                if (std::abs(delta) > kEpsilon) {
-                    plane->setInPlaneRotation(delta);
-                }
-            } else {
-                plane->setInPlaneRotation(0.0f);
-            }
-        };
-
-        configurePlane(segXZShared.get(), _axisAlignedSegXZRotationDeg, cv::Vec3f(0.0f, 1.0f, 0.0f));
-        configurePlane(segYZShared.get(), _axisAlignedSegYZRotationDeg, cv::Vec3f(1.0f, 0.0f, 0.0f));
-
-        if (segXZShared) {
-            segXZShared->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegXZRotationDeg));
-        }
-        if (segYZShared) {
-            segYZShared->setAxisAlignedRotationKey(axisAlignedRotationCacheKey(_axisAlignedSegYZRotationDeg));
-        }
-
-        _surf_col->setSurface("seg xz", segXZShared);
-        _surf_col->setSurface("seg yz", segYZShared);
         if (_planeSlicingOverlay) {
             _planeSlicingOverlay->refreshAll();
         }
@@ -3555,8 +3653,6 @@ void CWindow::applySlicePlaneOrientation(Surface* sourceOverride)
         segYZShared->setNormal(yDir - origin);
         segXZShared->setInPlaneRotation(0.0f);
         segYZShared->setInPlaneRotation(0.0f);
-        segXZShared->setAxisAlignedRotationKey(-1);
-        segYZShared->setAxisAlignedRotationKey(-1);
 
         _surf_col->setSurface("seg xz", segXZShared);
         _surf_col->setSurface("seg yz", segYZShared);

@@ -244,13 +244,6 @@ PlaneSurface(cv::Vec3f origin, cv::Vec3f normal);
 | `basisX()` | Returns the X basis vector in the plane |
 | `basisY()` | Returns the Y basis vector in the plane |
 
-### Axis-Aligned Rotation
-
-| Method | Description |
-|--------|-------------|
-| `setAxisAlignedRotationKey(key)` | Stores a key identifying the current axis-aligned orientation |
-| `axisAlignedRotationKey()` | Returns the stored rotation key (-1 if not set) |
-
 ### Helper Function
 
 ```cpp

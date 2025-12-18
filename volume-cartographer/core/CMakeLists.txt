@@ -13,6 +13,7 @@ add_library(vc_core
         src/Logging.cpp
         src/ChunkCache.cpp
         src/Slicing.cpp
+        src/Compositing.cpp
         src/PlaneSurface.cpp
         src/QuadSurface.cpp
         src/Render.cpp
