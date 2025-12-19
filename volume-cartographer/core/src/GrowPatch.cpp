@@ -16,6 +16,7 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
+#include "vc/core/util/AlphaShape.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
@@ -456,33 +457,41 @@ struct LossSettings {
     float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
 };
 
-static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
-{
-    static const std::vector<cv::Vec2i> kDefaultDirections = {
-        {1, 0},    // down / +row
-        {0, 1},    // right / +col
-        {-1, 0},   // up / -row
-        {0, -1},   // left / -col
-        {1, 1},    // down-right
-        {1, -1},   // down-left
-        {-1, 1},   // up-right
-        {-1, -1}   // up-left
-    };
+// Default growth directions (all 8 cardinal/diagonal)
+static const std::vector<cv::Vec2i> kDefaultDirections = {
+    {1, 0},    // down / +row
+    {0, 1},    // right / +col
+    {-1, 0},   // up / -row
+    {0, -1},   // left / -col
+    {1, 1},    // down-right
+    {1, -1},   // down-left
+    {-1, 1},   // up-right
+    {-1, -1}   // up-left
+};
 
+// Configuration for growth direction behavior
+struct GrowthDirectionConfig {
+    std::vector<cv::Vec2i> directions;  // Directional vectors for outward growth
+    bool inside_mode = false;           // Fill holes only (mutually exclusive with directions)
+};
+
+static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& params)
+{
     const auto it = params.find("growth_directions");
     if (it == params.end()) {
-        return kDefaultDirections;
+        return GrowthDirectionConfig{kDefaultDirections, false};
     }
 
     const nlohmann::json& directions = *it;
     if (!directions.is_array()) {
         std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
-        return kDefaultDirections;
+        return GrowthDirectionConfig{kDefaultDirections, false};
     }
 
     std::vector<cv::Vec2i> custom;
     custom.reserve(kDefaultDirections.size());
     bool any_valid = false;
+    bool inside_mode = false;
 
     auto append_unique = [&custom](const cv::Vec2i& dir) {
         for (const auto& existing : custom) {
@@ -517,7 +526,13 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         }
 
         if (normalized == "all" || normalized == "default") {
-            return kDefaultDirections;
+            return GrowthDirectionConfig{kDefaultDirections, false};
+        }
+
+        if (normalized == "inside") {
+            inside_mode = true;
+            any_valid = true;
+            continue;
         }
 
         auto mark_valid = [&](const cv::Vec2i& dir) {
@@ -561,11 +576,50 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         std::cerr << "Unknown growth direction '" << value << "' ignored" << std::endl;
     }
 
-    if (!any_valid) {
-        return kDefaultDirections;
+    // Check for mutual exclusion: inside mode cannot be combined with directional growth
+    if (inside_mode && !custom.empty()) {
+        throw std::runtime_error(
+            "growth_directions: 'inside' cannot be combined with other directions. "
+            "Use 'inside' alone to fill holes, or use directional growth (up/down/left/right) to expand outward.");
     }
 
-    return custom;
+    if (!any_valid) {
+        return GrowthDirectionConfig{kDefaultDirections, false};
+    }
+
+    return GrowthDirectionConfig{custom, inside_mode};
+}
+
+// Compute a mask of "inside" points: points that are NOT valid but are
+// enclosed by the valid region's concave hull (alpha shape).
+static cv::Mat compute_inside_mask(
+    const cv::Mat_<uint8_t>& state_mat,
+    const cv::Rect& used_area,
+    double alpha = 5.0)
+{
+    // Collect valid points
+    std::vector<cv::Point2f> valid_points;
+    valid_points.reserve(used_area.area());
+    for (int y = used_area.y; y < used_area.br().y; ++y) {
+        for (int x = used_area.x; x < used_area.br().x; ++x) {
+            if (state_mat(y, x) & STATE_LOC_VALID) {
+                valid_points.emplace_back(static_cast<float>(x), static_cast<float>(y));
+            }
+        }
+    }
+
+    // Get alpha shape mask
+    cv::Mat alpha_mask = computeAlphaShapeMask(valid_points, state_mat.size(), alpha);
+
+    // Create valid points mask
+    cv::Mat valid_mask = cv::Mat::zeros(state_mat.size(), CV_8U);
+    for (const auto& pt : valid_points) {
+        valid_mask.at<uchar>(static_cast<int>(pt.y), static_cast<int>(pt.x)) = 255;
+    }
+
+    // Inside = alpha shape minus valid points
+    cv::bitwise_and(alpha_mask, ~valid_mask, alpha_mask);
+    return alpha_mask;
 }
 
 } // namespace
@@ -2468,7 +2522,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     options.max_num_iterations = 200;
     options.function_tolerance = 1e-3;
 
-    auto neighs = parse_growth_directions(params);
+    auto growth_config = parse_growth_directions(params);
 
     int local_opt_r = 3;
 
@@ -2485,17 +2539,36 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         if (stop_gen && generation >= stop_gen)
             break;
 
-        // For every point in the fringe (where we might expand the patch outwards), add to cands all
-        // new 2D points we might add to the patch (and later find the corresponding 3D point for)
-        for(const auto& p : fringe)
-        {
-            for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
-                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
-                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(p+n) |= STATE_PROCESSING;
-                    cands.push_back(p+n);
+        // For every point in the fringe, add candidate 2D points to grow into
+        if (growth_config.inside_mode) {
+            // Inside mode: fill holes using all 8 directions, but only into interior points
+            cv::Mat inside_mask = compute_inside_mask(trace_params.state, used_area);
+
+            for(const auto& p : fringe) {
+                for(const auto& n : kDefaultDirections) {
+                    cv::Vec2i np = p + n;
+                    if (bounds.contains(cv::Point(np[1], np[0]))
+                        && (trace_params.state(np) & STATE_PROCESSING) == 0
+                        && (trace_params.state(np) & STATE_LOC_VALID) == 0
+                        && inside_mask.at<uchar>(np[0], np[1]) != 0) {
+                        trace_params.state(np) |= STATE_PROCESSING;
+                        cands.push_back(np);
+                    }
                 }
+            }
+        } else {
+            // Directional growth: expand outward in configured directions
+            for(const auto& p : fringe) {
+                for(const auto& n : growth_config.directions) {
+                    cv::Vec2i np = p + n;
+                    if (bounds.contains(cv::Point(np[1], np[0]))
+                        && (trace_params.state(np) & STATE_PROCESSING) == 0
+                        && (trace_params.state(np) & STATE_LOC_VALID) == 0) {
+                        trace_params.state(np) |= STATE_PROCESSING;
+                        cands.push_back(np);
+                    }
+                }
+            }
         }
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);
