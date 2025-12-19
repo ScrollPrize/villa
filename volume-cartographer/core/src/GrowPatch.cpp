@@ -16,6 +16,7 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
+#include "vc/core/util/AlphaShape.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
@@ -456,33 +457,44 @@ struct LossSettings {
     float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
 };
 
-static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
-{
-    static const std::vector<cv::Vec2i> kDefaultDirections = {
-        {1, 0},    // down / +row
-        {0, 1},    // right / +col
-        {-1, 0},   // up / -row
-        {0, -1},   // left / -col
-        {1, 1},    // down-right
-        {1, -1},   // down-left
-        {-1, 1},   // up-right
-        {-1, -1}   // up-left
-    };
+// Default growth directions (all 8 cardinal/diagonal)
+static const std::vector<cv::Vec2i> kDefaultDirections = {
+    {1, 0},    // down / +row
+    {0, 1},    // right / +col
+    {-1, 0},   // up / -row
+    {0, -1},   // left / -col
+    {1, 1},    // down-right
+    {1, -1},   // down-left
+    {-1, 1},   // up-right
+    {-1, -1}   // up-left
+};
 
+// Configuration for growth direction behavior
+struct GrowthDirectionConfig {
+    std::vector<cv::Vec2i> directions;  // Directional vectors for outward growth
+    bool inside_mode = false;           // Fill holes only (mutually exclusive with directions)
+    bool fillbounds_mode = false;       // Fill bounding box (mutually exclusive with directions)
+};
+
+static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& params)
+{
     const auto it = params.find("growth_directions");
     if (it == params.end()) {
-        return kDefaultDirections;
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
     }
 
     const nlohmann::json& directions = *it;
     if (!directions.is_array()) {
         std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
-        return kDefaultDirections;
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
     }
 
     std::vector<cv::Vec2i> custom;
     custom.reserve(kDefaultDirections.size());
     bool any_valid = false;
+    bool inside_mode = false;
+    bool fillbounds_mode = false;
+    bool all_mode = false;
 
     auto append_unique = [&custom](const cv::Vec2i& dir) {
         for (const auto& existing : custom) {
@@ -517,7 +529,21 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         }
 
         if (normalized == "all" || normalized == "default") {
-            return kDefaultDirections;
+            all_mode = true;
+            any_valid = true;
+            continue;
+        }
+
+        if (normalized == "inside") {
+            inside_mode = true;
+            any_valid = true;
+            continue;
+        }
+
+        if (normalized == "fillbounds") {
+            fillbounds_mode = true;
+            any_valid = true;
+            continue;
         }
 
         auto mark_valid = [&](const cv::Vec2i& dir) {
@@ -561,11 +587,69 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         std::cerr << "Unknown growth direction '" << value << "' ignored" << std::endl;
     }
 
-    if (!any_valid) {
-        return kDefaultDirections;
+    // Check for mutual exclusion between special modes
+    int special_mode_count = (inside_mode ? 1 : 0) + (fillbounds_mode ? 1 : 0) + (all_mode ? 1 : 0);
+    if (special_mode_count > 1) {
+        throw std::runtime_error(
+            "growth_directions: 'inside', 'fillbounds', and 'all' are mutually exclusive. "
+            "Choose only one of these modes.");
     }
 
-    return custom;
+    // Check that special modes are not combined with directional growth
+    if ((inside_mode || fillbounds_mode || all_mode) && !custom.empty()) {
+        std::string mode_name = inside_mode ? "inside" : (fillbounds_mode ? "fillbounds" : "all");
+        throw std::runtime_error(
+            "growth_directions: '" + mode_name + "' cannot be combined with other directions. "
+            "Use '" + mode_name + "' alone, or use directional growth (up/down/left/right) to expand outward.");
+    }
+
+    if (!any_valid) {
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
+    }
+
+    if (all_mode) {
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
+    }
+
+    return GrowthDirectionConfig{custom, inside_mode, fillbounds_mode};
+}
+
+// Compute a mask of "inside" points: points that are NOT valid but are
+// enclosed by the valid region's concave hull (alpha shape).
+static cv::Mat compute_inside_mask(
+    const cv::Mat_<uint8_t>& state_mat,
+    const cv::Rect& used_area,
+    double alpha = 5.0)
+{
+    // Collect valid points
+    std::vector<cv::Point2f> valid_points;
+    valid_points.reserve(used_area.area());
+    for (int y = used_area.y; y < used_area.br().y; ++y) {
+        for (int x = used_area.x; x < used_area.br().x; ++x) {
+            if (state_mat(y, x) & STATE_LOC_VALID) {
+                valid_points.emplace_back(static_cast<float>(x), static_cast<float>(y));
+            }
+        }
+    }
+
+    if (valid_points.size() < 3) {
+        std::cerr << "[GrowPatch] compute_inside_mask: inside mode requires at least 3 "
+                  << "valid points to compute a concave hull; inside mask will be empty."
+                  << std::endl;
+    }
+
+    // Get alpha shape mask
+    cv::Mat alpha_mask = vc::core::util::computeAlphaShapeMask(valid_points, state_mat.size(), alpha);
+
+    // Create valid points mask
+    cv::Mat valid_mask = cv::Mat::zeros(state_mat.size(), CV_8U);
+    for (const auto& pt : valid_points) {
+        valid_mask.at<uchar>(static_cast<int>(pt.y), static_cast<int>(pt.x)) = 255;
+    }
+
+    // Inside = alpha shape minus valid points
+    cv::bitwise_and(alpha_mask, ~valid_mask, alpha_mask);
+    return alpha_mask;
 }
 
 } // namespace
@@ -2468,7 +2552,26 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     options.max_num_iterations = 200;
     options.function_tolerance = 1e-3;
 
-    auto neighs = parse_growth_directions(params);
+    auto growth_config = parse_growth_directions(params);
+
+    // Cache the initial bounding box for fillbounds mode - this target doesn't change during growth
+    cv::Rect fillbounds_target = used_area;
+    cv::Mat fillbounds_mask_cached;
+    if (growth_config.fillbounds_mode) {
+        std::cout << "fillbounds mode: target area is " << fillbounds_target << std::endl;
+        // Precompute a mask for fast containment checks (O(1) lookup vs multiple comparisons)
+        fillbounds_mask_cached = cv::Mat::zeros(trace_params.state.size(), CV_8U);
+        fillbounds_mask_cached(fillbounds_target) = 255;
+    }
+
+    // Cache the inside mask for inside mode - computed once from initial valid points.
+    // The alpha shape defines the target region to fill; validity checks prevent re-processing.
+    cv::Mat inside_mask_cached;
+    if (growth_config.inside_mode) {
+        inside_mask_cached = compute_inside_mask(trace_params.state, used_area);
+        std::cout << "inside mode: cached inside mask with "
+                  << cv::countNonZero(inside_mask_cached) << " target pixels" << std::endl;
+    }
 
     int local_opt_r = 3;
 
@@ -2485,17 +2588,52 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         if (stop_gen && generation >= stop_gen)
             break;
 
-        // For every point in the fringe (where we might expand the patch outwards), add to cands all
-        // new 2D points we might add to the patch (and later find the corresponding 3D point for)
-        for(const auto& p : fringe)
-        {
-            for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
-                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
-                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(p+n) |= STATE_PROCESSING;
-                    cands.push_back(p+n);
+        // For every point in the fringe, add candidate 2D points to grow into
+        // Coordinate convention: cv::Vec2i uses (row, col) so np[0]=row, np[1]=col.
+        // cv::Point uses (x, y) so we pass (col, row) = (np[1], np[0]).
+        // cv::Mat::at uses (row, col) so we pass (np[0], np[1]).
+        if (growth_config.fillbounds_mode) {
+            // FillBounds mode: fill all invalid points within the cached initial bounding box
+            for(const auto& p : fringe) {
+                for(const auto& n : kDefaultDirections) {
+                    cv::Vec2i np = p + n;
+                    if (bounds.contains(cv::Point(np[1], np[0]))
+                        && fillbounds_mask_cached.at<uchar>(np[0], np[1]) != 0
+                        && (trace_params.state(np) & STATE_PROCESSING) == 0
+                        && (trace_params.state(np) & STATE_LOC_VALID) == 0) {
+                        trace_params.state(np) |= STATE_PROCESSING;
+                        cands.push_back(np);
+                    }
                 }
+            }
+        } else if (growth_config.inside_mode) {
+            // Inside mode: fill holes using all 8 directions, but only into interior points
+            // Uses the cached inside mask computed before the loop
+            for(const auto& p : fringe) {
+                for(const auto& n : kDefaultDirections) {
+                    cv::Vec2i np = p + n;
+                    if (bounds.contains(cv::Point(np[1], np[0]))
+                        && (trace_params.state(np) & STATE_PROCESSING) == 0
+                        && (trace_params.state(np) & STATE_LOC_VALID) == 0
+                        && inside_mask_cached.at<uchar>(np[0], np[1]) != 0) {
+                        trace_params.state(np) |= STATE_PROCESSING;
+                        cands.push_back(np);
+                    }
+                }
+            }
+        } else {
+            // Directional growth: expand outward in configured directions
+            for(const auto& p : fringe) {
+                for(const auto& n : growth_config.directions) {
+                    cv::Vec2i np = p + n;
+                    if (bounds.contains(cv::Point(np[1], np[0]))
+                        && (trace_params.state(np) & STATE_PROCESSING) == 0
+                        && (trace_params.state(np) & STATE_LOC_VALID) == 0) {
+                        trace_params.state(np) |= STATE_PROCESSING;
+                        cands.push_back(np);
+                    }
+                }
+            }
         }
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);
@@ -2594,6 +2732,27 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
+
+                // Check if the optimized 3D point already maps to an existing grid position
+                // This prevents multiple 2D grid locations from converging to the same 3D point
+                if (used_area.width >= 4 && used_area.height >= 4) {
+                    cv::Vec2f found_loc;
+                    cv::Vec3f opt_point(trace_params.dpoints(p));
+                    float collision_th = T * 0.5f;
+                    cv::Rect search_area = used_area;
+                    float dist = pointTo(found_loc, trace_params.dpoints(search_area), opt_point, collision_th, 100, 1.0f / T);
+                    found_loc += cv::Vec2f(search_area.x, search_area.y);
+
+                    if (dist <= collision_th) {
+                        cv::Vec2i found_grid(static_cast<int>(std::round(found_loc[1])), static_cast<int>(std::round(found_loc[0])));
+                        if (found_grid != p) {
+                            // Reject - 3D point already mapped to another grid position
+                            trace_params.state(p) = 0;
+                            trace_params.dpoints(p) = cv::Vec3d(-1, -1, -1);
+                            continue;
+                        }
+                    }
+                }
 
                 generations(p) = generation;
 

@@ -137,6 +137,8 @@ QString directionToString(SegmentationGrowthDirection direction)
         return QStringLiteral("left");
     case SegmentationGrowthDirection::Right:
         return QStringLiteral("right");
+    case SegmentationGrowthDirection::Inside:
+        return QStringLiteral("inside");
     case SegmentationGrowthDirection::All:
     default:
         return QStringLiteral("all");
@@ -282,6 +284,10 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     } else if (request.direction == SegmentationGrowthDirection::Up || request.direction == SegmentationGrowthDirection::Down) {
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = 0;
+    } else if (request.direction == SegmentationGrowthDirection::FillBounds) {
+        // FillBounds doesn't expand outward, only fills within existing bounds
+        params["grow_extra_rows"] = 0;
+        params["grow_extra_cols"] = 0;
     } else {
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = std::max(0, request.steps);
@@ -293,6 +299,8 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     bool allowDown = false;
     bool allowLeft = false;
     bool allowRight = false;
+    bool allowInside = false;
+    bool allowFillBounds = false;
     for (auto dir : request.allowedDirections) {
         switch (dir) {
         case SegmentationGrowthDirection::Up:
@@ -307,6 +315,12 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         case SegmentationGrowthDirection::Right:
             allowRight = true;
             break;
+        case SegmentationGrowthDirection::Inside:
+            allowInside = true;
+            break;
+        case SegmentationGrowthDirection::FillBounds:
+            allowFillBounds = true;
+            break;
         case SegmentationGrowthDirection::All:
         default:
             allowUp = allowDown = allowLeft = allowRight = true;
@@ -317,15 +331,31 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         }
     }
 
-    const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +
-                             static_cast<int>(allowLeft) + static_cast<int>(allowRight);
-    if (allowedCount > 0 && allowedCount < 4) {
-        std::vector<std::string> allowedStrings;
-        if (allowDown) allowedStrings.emplace_back("down");
-        if (allowRight) allowedStrings.emplace_back("right");
-        if (allowUp) allowedStrings.emplace_back("up");
-        if (allowLeft) allowedStrings.emplace_back("left");
-        params["growth_directions"] = allowedStrings;
+    // Inside and FillBounds modes are mutually exclusive with directional growth
+    if (allowInside && (allowUp || allowDown || allowLeft || allowRight)) {
+        qCWarning(lcSegGrowth) << "Inside mode cannot be combined with directional growth, using inside only";
+        allowUp = allowDown = allowLeft = allowRight = false;
+    }
+    if (allowFillBounds && (allowUp || allowDown || allowLeft || allowRight || allowInside)) {
+        qCWarning(lcSegGrowth) << "FillBounds mode cannot be combined with other modes, using fillbounds only";
+        allowUp = allowDown = allowLeft = allowRight = allowInside = false;
+    }
+
+    if (allowFillBounds) {
+        params["growth_directions"] = std::vector<std::string>{"fillbounds"};
+    } else if (allowInside) {
+        params["growth_directions"] = std::vector<std::string>{"inside"};
+    } else {
+        const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +
+                                 static_cast<int>(allowLeft) + static_cast<int>(allowRight);
+        if (allowedCount > 0 && allowedCount < 4) {
+            std::vector<std::string> allowedStrings;
+            if (allowDown) allowedStrings.emplace_back("down");
+            if (allowRight) allowedStrings.emplace_back("right");
+            if (allowUp) allowedStrings.emplace_back("up");
+            if (allowLeft) allowedStrings.emplace_back("left");
+            params["growth_directions"] = allowedStrings;
+        }
     }
     if (request.customParams) {
         for (auto it = request.customParams->begin(); it != request.customParams->end(); ++it) {
