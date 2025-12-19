@@ -218,6 +218,7 @@ private:
     QCheckBox* _chkGrowthDirDown{nullptr};
     QCheckBox* _chkGrowthDirLeft{nullptr};
     QCheckBox* _chkGrowthDirRight{nullptr};
+    QCheckBox* _chkGrowthDirInside{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
     QLabel* _lblAlphaInfo{nullptr};

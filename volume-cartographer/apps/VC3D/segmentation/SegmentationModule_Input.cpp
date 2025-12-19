@@ -182,24 +182,14 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             if (_widget) {
                 _widget->setEditingEnabled(true);
             }
-            setCorrectionsAnnotateMode(true, true);
         } else {
-            // Toggle correction point annotation mode
-            bool currentMode = _corrections && _corrections->annotateMode();
-            setCorrectionsAnnotateMode(!currentMode, true);
+            setCorrectionsAnnotateMode(true, true);
         }
         event->accept();
         return true;
     }
 
     if (event->modifiers() == Qt::NoModifier && !event->isAutoRepeat()) {
-        if (event->key() == Qt::Key_6) {
-            const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
-            handleGrowSurfaceRequested(method, SegmentationGrowthDirection::All, 1, false);
-            event->accept();
-            return true;
-        }
-
         SegmentationGrowthDirection shortcutDirection{SegmentationGrowthDirection::All};
         bool matchedShortcut = true;
         switch (event->key()) {
@@ -217,6 +207,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             break;
         case Qt::Key_5:
             shortcutDirection = SegmentationGrowthDirection::All;
+            break;
+        case Qt::Key_6:
+            shortcutDirection = SegmentationGrowthDirection::Inside;
             break;
         default:
             matchedShortcut = false;
@@ -320,23 +313,10 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         }
         if (modifiers.testFlag(Qt::ControlModifier)) {
             handleCorrectionPointRemove(worldPos);
-            updateCorrectionsWidget();
-            return;
-        }
-        // Start correction drag - find the grid position where user clicked
-        if (_editManager) {
-            auto gridIndex = _editManager->worldToGridIndex(worldPos);
-            if (gridIndex) {
-                beginCorrectionDrag(gridIndex->first, gridIndex->second, viewer, worldPos);
-            } else {
-                // Fallback to old behavior if we can't find grid position
-                handleCorrectionPointAdded(worldPos);
-                updateCorrectionsWidget();
-            }
         } else {
             handleCorrectionPointAdded(worldPos);
-            updateCorrectionsWidget();
         }
+        updateCorrectionsWidget();
         return;
     }
 
