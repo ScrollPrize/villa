@@ -2707,6 +2707,27 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
 
+                // Check if the optimized 3D point already maps to an existing grid position
+                // This prevents multiple 2D grid locations from converging to the same 3D point
+                if (used_area.width >= 4 && used_area.height >= 4) {
+                    cv::Vec2f found_loc;
+                    cv::Vec3f opt_point(trace_params.dpoints(p));
+                    float collision_th = T * 0.5f;
+                    cv::Rect search_area = used_area;
+                    float dist = pointTo(found_loc, trace_params.dpoints(search_area), opt_point, collision_th, 100, 1.0f / T);
+                    found_loc += cv::Vec2f(search_area.x, search_area.y);
+
+                    if (dist <= collision_th) {
+                        cv::Vec2i found_grid(static_cast<int>(std::round(found_loc[1])), static_cast<int>(std::round(found_loc[0])));
+                        if (found_grid != p) {
+                            // Reject - 3D point already mapped to another grid position
+                            trace_params.state(p) = 0;
+                            trace_params.dpoints(p) = cv::Vec3d(-1, -1, -1);
+                            continue;
+                        }
+                    }
+                }
+
                 generations(p) = generation;
 
 #pragma omp critical
