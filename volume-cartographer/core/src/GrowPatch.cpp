@@ -473,19 +473,20 @@ static const std::vector<cv::Vec2i> kDefaultDirections = {
 struct GrowthDirectionConfig {
     std::vector<cv::Vec2i> directions;  // Directional vectors for outward growth
     bool inside_mode = false;           // Fill holes only (mutually exclusive with directions)
+    bool fillbounds_mode = false;       // Fill bounding box (mutually exclusive with directions)
 };
 
 static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& params)
 {
     const auto it = params.find("growth_directions");
     if (it == params.end()) {
-        return GrowthDirectionConfig{kDefaultDirections, false};
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
     }
 
     const nlohmann::json& directions = *it;
     if (!directions.is_array()) {
         std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
-        return GrowthDirectionConfig{kDefaultDirections, false};
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
     }
 
     std::vector<cv::Vec2i> custom;
@@ -526,13 +527,17 @@ static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& param
         }
 
         if (normalized == "all" || normalized == "default") {
-            return GrowthDirectionConfig{kDefaultDirections, false};
+            return GrowthDirectionConfig{kDefaultDirections, false, false};
         }
 
         if (normalized == "inside") {
             inside_mode = true;
             any_valid = true;
             continue;
+        }
+
+        if (normalized == "fillbounds") {
+            return GrowthDirectionConfig{kDefaultDirections, false, true};
         }
 
         auto mark_valid = [&](const cv::Vec2i& dir) {
@@ -584,10 +589,10 @@ static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& param
     }
 
     if (!any_valid) {
-        return GrowthDirectionConfig{kDefaultDirections, false};
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
     }
 
-    return GrowthDirectionConfig{custom, inside_mode};
+    return GrowthDirectionConfig{custom, inside_mode, false};
 }
 
 // Compute a mask of "inside" points: points that are NOT valid but are
@@ -2524,6 +2529,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
     auto growth_config = parse_growth_directions(params);
 
+    // Cache the initial bounding box for fillbounds mode - this target doesn't change during growth
+    cv::Rect fillbounds_target = used_area;
+    if (growth_config.fillbounds_mode) {
+        std::cout << "fillbounds mode: target area is " << fillbounds_target << std::endl;
+    }
+
     int local_opt_r = 3;
 
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
@@ -2540,7 +2551,21 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             break;
 
         // For every point in the fringe, add candidate 2D points to grow into
-        if (growth_config.inside_mode) {
+        if (growth_config.fillbounds_mode) {
+            // FillBounds mode: fill all invalid points within the cached initial bounding box
+            for(const auto& p : fringe) {
+                for(const auto& n : kDefaultDirections) {
+                    cv::Vec2i np = p + n;
+                    if (bounds.contains(cv::Point(np[1], np[0]))
+                        && fillbounds_target.contains(cv::Point(np[1], np[0]))
+                        && (trace_params.state(np) & STATE_PROCESSING) == 0
+                        && (trace_params.state(np) & STATE_LOC_VALID) == 0) {
+                        trace_params.state(np) |= STATE_PROCESSING;
+                        cands.push_back(np);
+                    }
+                }
+            }
+        } else if (growth_config.inside_mode) {
             // Inside mode: fill holes using all 8 directions, but only into interior points
             cv::Mat inside_mask = compute_inside_mask(trace_params.state, used_area);
 
