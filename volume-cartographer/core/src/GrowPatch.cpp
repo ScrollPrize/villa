@@ -2541,6 +2541,15 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         std::cout << "fillbounds mode: target area is " << fillbounds_target << std::endl;
     }
 
+    // Cache the inside mask for inside mode - computed once from initial valid points.
+    // The alpha shape defines the target region to fill; validity checks prevent re-processing.
+    cv::Mat inside_mask_cached;
+    if (growth_config.inside_mode) {
+        inside_mask_cached = compute_inside_mask(trace_params.state, used_area);
+        std::cout << "inside mode: cached inside mask with "
+                  << cv::countNonZero(inside_mask_cached) << " target pixels" << std::endl;
+    }
+
     int local_opt_r = 3;
 
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
@@ -2573,15 +2582,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             }
         } else if (growth_config.inside_mode) {
             // Inside mode: fill holes using all 8 directions, but only into interior points
-            cv::Mat inside_mask = compute_inside_mask(trace_params.state, used_area);
-
+            // Uses the cached inside mask computed before the loop
             for(const auto& p : fringe) {
                 for(const auto& n : kDefaultDirections) {
                     cv::Vec2i np = p + n;
                     if (bounds.contains(cv::Point(np[1], np[0]))
                         && (trace_params.state(np) & STATE_PROCESSING) == 0
                         && (trace_params.state(np) & STATE_LOC_VALID) == 0
-                        && inside_mask.at<uchar>(np[0], np[1]) != 0) {
+                        && inside_mask_cached.at<uchar>(np[0], np[1]) != 0) {
                         trace_params.state(np) |= STATE_PROCESSING;
                         cands.push_back(np);
                     }
