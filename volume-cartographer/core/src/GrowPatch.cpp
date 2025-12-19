@@ -2556,8 +2556,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
     // Cache the initial bounding box for fillbounds mode - this target doesn't change during growth
     cv::Rect fillbounds_target = used_area;
+    cv::Mat fillbounds_mask_cached;
     if (growth_config.fillbounds_mode) {
         std::cout << "fillbounds mode: target area is " << fillbounds_target << std::endl;
+        // Precompute a mask for fast containment checks (O(1) lookup vs multiple comparisons)
+        fillbounds_mask_cached = cv::Mat::zeros(trace_params.state.size(), CV_8U);
+        fillbounds_mask_cached(fillbounds_target) = 255;
     }
 
     // Cache the inside mask for inside mode - computed once from initial valid points.
@@ -2594,7 +2598,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 for(const auto& n : kDefaultDirections) {
                     cv::Vec2i np = p + n;
                     if (bounds.contains(cv::Point(np[1], np[0]))
-                        && fillbounds_target.contains(cv::Point(np[1], np[0]))
+                        && fillbounds_mask_cached.at<uchar>(np[0], np[1]) != 0
                         && (trace_params.state(np) & STATE_PROCESSING) == 0
                         && (trace_params.state(np) & STATE_LOC_VALID) == 0) {
                         trace_params.state(np) |= STATE_PROCESSING;
