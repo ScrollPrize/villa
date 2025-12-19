@@ -493,6 +493,8 @@ static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& param
     custom.reserve(kDefaultDirections.size());
     bool any_valid = false;
     bool inside_mode = false;
+    bool fillbounds_mode = false;
+    bool all_mode = false;
 
     auto append_unique = [&custom](const cv::Vec2i& dir) {
         for (const auto& existing : custom) {
@@ -527,7 +529,9 @@ static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& param
         }
 
         if (normalized == "all" || normalized == "default") {
-            return GrowthDirectionConfig{kDefaultDirections, false, false};
+            all_mode = true;
+            any_valid = true;
+            continue;
         }
 
         if (normalized == "inside") {
@@ -537,7 +541,9 @@ static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& param
         }
 
         if (normalized == "fillbounds") {
-            return GrowthDirectionConfig{kDefaultDirections, false, true};
+            fillbounds_mode = true;
+            any_valid = true;
+            continue;
         }
 
         auto mark_valid = [&](const cv::Vec2i& dir) {
@@ -581,18 +587,31 @@ static GrowthDirectionConfig parse_growth_directions(const nlohmann::json& param
         std::cerr << "Unknown growth direction '" << value << "' ignored" << std::endl;
     }
 
-    // Check for mutual exclusion: inside mode cannot be combined with directional growth
-    if (inside_mode && !custom.empty()) {
+    // Check for mutual exclusion between special modes
+    int special_mode_count = (inside_mode ? 1 : 0) + (fillbounds_mode ? 1 : 0) + (all_mode ? 1 : 0);
+    if (special_mode_count > 1) {
         throw std::runtime_error(
-            "growth_directions: 'inside' cannot be combined with other directions. "
-            "Use 'inside' alone to fill holes, or use directional growth (up/down/left/right) to expand outward.");
+            "growth_directions: 'inside', 'fillbounds', and 'all' are mutually exclusive. "
+            "Choose only one of these modes.");
+    }
+
+    // Check that special modes are not combined with directional growth
+    if ((inside_mode || fillbounds_mode || all_mode) && !custom.empty()) {
+        std::string mode_name = inside_mode ? "inside" : (fillbounds_mode ? "fillbounds" : "all");
+        throw std::runtime_error(
+            "growth_directions: '" + mode_name + "' cannot be combined with other directions. "
+            "Use '" + mode_name + "' alone, or use directional growth (up/down/left/right) to expand outward.");
     }
 
     if (!any_valid) {
         return GrowthDirectionConfig{kDefaultDirections, false, false};
     }
 
-    return GrowthDirectionConfig{custom, inside_mode, false};
+    if (all_mode) {
+        return GrowthDirectionConfig{kDefaultDirections, false, false};
+    }
+
+    return GrowthDirectionConfig{custom, inside_mode, fillbounds_mode};
 }
 
 // Compute a mask of "inside" points: points that are NOT valid but are
