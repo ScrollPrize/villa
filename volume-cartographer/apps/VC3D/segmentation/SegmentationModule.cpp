@@ -755,6 +755,7 @@ void SegmentationModule::stopTools()
     _lineDrawKeyActive = false;
     clearLineDragStroke();
     cancelDrag();
+    cancelCorrectionDrag();
     emit stopToolsRequested();
 }
 
@@ -872,6 +873,13 @@ void SegmentationModule::refreshOverlay()
                 state.approvalEffectiveRadius = _approvalTool->hoverEffectiveRadius();
             }
         }
+    }
+
+    // Add correction drag state (before hasSession check - corrections work without full editing session)
+    if (_correctionDrag.active) {
+        state.correctionDragActive = true;
+        state.correctionDragStart = _correctionDrag.startWorld;
+        state.correctionDragCurrent = _correctionDrag.currentWorld;
     }
 
     if (!hasSession) {
@@ -1017,6 +1025,103 @@ void SegmentationModule::pruneMissingCorrections()
     if (_corrections) {
         _corrections->pruneMissing();
         _corrections->refreshWidget();
+    }
+}
+
+void SegmentationModule::beginCorrectionDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos)
+{
+    _correctionDrag.active = true;
+    _correctionDrag.anchorRow = row;
+    _correctionDrag.anchorCol = col;
+    _correctionDrag.startWorld = worldPos;
+    _correctionDrag.currentWorld = worldPos;
+    _correctionDrag.viewer = viewer;
+    _correctionDrag.moved = false;
+
+    qCInfo(lcSegModule) << "Correction drag started at grid" << row << col << "world" << worldPos[0] << worldPos[1] << worldPos[2];
+    emit statusMessageRequested(tr("Drag to correction target position..."), kStatusShort);
+    refreshOverlay();
+}
+
+void SegmentationModule::updateCorrectionDrag(const cv::Vec3f& worldPos)
+{
+    if (!_correctionDrag.active) {
+        return;
+    }
+
+    const cv::Vec3f delta = worldPos - _correctionDrag.startWorld;
+    const float distance = cv::norm(delta);
+    if (distance > 1.0f) {
+        _correctionDrag.moved = true;
+    }
+    _correctionDrag.currentWorld = worldPos;
+
+    // TODO: Add visual feedback (line from start to current)
+    refreshOverlay();
+}
+
+void SegmentationModule::finishCorrectionDrag()
+{
+    if (!_correctionDrag.active) {
+        return;
+    }
+
+    const bool didMove = _correctionDrag.moved;
+    const cv::Vec3f targetWorld = _correctionDrag.currentWorld;
+    const int anchorRow = _correctionDrag.anchorRow;
+    const int anchorCol = _correctionDrag.anchorCol;
+
+    _correctionDrag.reset();
+
+    if (!didMove) {
+        // User clicked without dragging - fall back to old behavior (add single point)
+        handleCorrectionPointAdded(targetWorld);
+        updateCorrectionsWidget();
+        return;
+    }
+
+    // Create correction with anchor2d
+    if (!_corrections || !_pointCollection) {
+        emit statusMessageRequested(tr("No correction collection available"), kStatusMedium);
+        return;
+    }
+
+    // Ensure we have an active collection
+    uint64_t collectionId = _corrections->activeCollection();
+    if (collectionId == 0) {
+        collectionId = _corrections->createCollection(true);
+        if (collectionId == 0) {
+            emit statusMessageRequested(tr("Failed to create correction collection"), kStatusMedium);
+            return;
+        }
+    }
+
+    // Set anchor2d on the collection (the grid location where user started dragging)
+    cv::Vec2f anchor2d(static_cast<float>(anchorCol), static_cast<float>(anchorRow));
+    _pointCollection->setCollectionAnchor2d(collectionId, anchor2d);
+
+    // Add the correction point (3D world target)
+    _corrections->handlePointAdded(targetWorld);
+
+    qCInfo(lcSegModule) << "Correction drag completed: anchor2d" << anchorCol << anchorRow
+                        << "target" << targetWorld[0] << targetWorld[1] << targetWorld[2];
+
+    updateCorrectionsWidget();
+
+    // Immediately trigger the solver with corrections
+    emit statusMessageRequested(tr("Applying correction..."), kStatusShort);
+    handleGrowSurfaceRequested(SegmentationGrowthMethod::Corrections,
+                               SegmentationGrowthDirection::All,
+                               0,
+                               false);
+}
+
+void SegmentationModule::cancelCorrectionDrag()
+{
+    if (_correctionDrag.active) {
+        _correctionDrag.reset();
+        refreshOverlay();
+        emit statusMessageRequested(tr("Correction drag cancelled"), kStatusShort);
     }
 }
 

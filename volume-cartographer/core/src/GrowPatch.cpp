@@ -104,6 +104,7 @@ public:
     struct CorrectionCollection {
         std::vector<cv::Vec3f> tgts_;
         std::vector<cv::Vec2f> grid_locs_;
+        std::optional<cv::Vec2f> anchor2d_;  // If set, use this as the 2D grid anchor instead of searching from first point
     };
 
     PointCorrection() = default;
@@ -113,9 +114,12 @@ public:
 
         for (const auto& pair : collections) {
             const auto& collection = pair.second;
-            if (collection.points.empty()) continue;
+            // Allow collections with anchor2d set even if they have no points (drag-and-drop case)
+            if (collection.points.empty() && !collection.anchor2d.has_value()) continue;
 
             CorrectionCollection new_collection;
+            new_collection.anchor2d_ = collection.anchor2d;
+
             std::vector<ColPoint> sorted_points;
             sorted_points.reserve(collection.points.size());
             for (const auto& point_pair : collection.points) {
@@ -142,24 +146,51 @@ public:
         }
 
         QuadSurface tmp(points, {1.0f, 1.0f});
-        
+
         for (auto& collection : collections_) {
-            cv::Vec3f ptr = tmp.pointer();
+            if (collection.anchor2d_.has_value()) {
+                // Use the provided 2D anchor directly - this is the drag-and-drop case
+                cv::Vec2f anchor = collection.anchor2d_.value();
+                std::cout << "using provided anchor2d: " << anchor << std::endl;
 
-            // Initialize anchor point (lowest ID)
-            float d = tmp.pointTo(ptr, collection.tgts_[0], 1.0f);
-            cv::Vec3f loc_3d = tmp.loc_raw(ptr);
-            std::cout << "base diff: " << d << loc_3d << std::endl;
-            cv::Vec2f loc(loc_3d[0], loc_3d[1]);
-            collection.grid_locs_.push_back({loc[0], loc[1]});
+                // Convert 2D grid location to pointer coordinates
+                // pointer coords are relative to center: ptr = grid_loc - center
+                // With scale {1,1}, center is {cols/2, rows/2, 0}
+                cv::Vec3f ptr = {
+                    anchor[0] - points.cols / 2.0f,
+                    anchor[1] - points.rows / 2.0f,
+                    0.0f
+                };
 
-            // Initialize other points
-            for (size_t i = 1; i < collection.tgts_.size(); ++i) {
-                d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
-                loc_3d = tmp.loc_raw(ptr);
-                std::cout << "point diff: " << d << loc_3d << std::endl;
-                loc = {loc_3d[0], loc_3d[1]};
+                // Search for all correction points from the anchor position
+                for (size_t i = 0; i < collection.tgts_.size(); ++i) {
+                    float d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
+                    cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+                    std::cout << "point diff: " << d << loc_3d << std::endl;
+                    cv::Vec2f loc = {loc_3d[0], loc_3d[1]};
+                    collection.grid_locs_.push_back(loc);
+                }
+            } else {
+                // Original behavior: use first point as anchor
+                if (collection.tgts_.empty()) continue;
+
+                cv::Vec3f ptr = tmp.pointer();
+
+                // Initialize anchor point (lowest ID)
+                float d = tmp.pointTo(ptr, collection.tgts_[0], 1.0f);
+                cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+                std::cout << "base diff: " << d << loc_3d << std::endl;
+                cv::Vec2f loc(loc_3d[0], loc_3d[1]);
                 collection.grid_locs_.push_back({loc[0], loc[1]});
+
+                // Initialize other points
+                for (size_t i = 1; i < collection.tgts_.size(); ++i) {
+                    d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
+                    loc_3d = tmp.loc_raw(ptr);
+                    std::cout << "point diff: " << d << loc_3d << std::endl;
+                    loc = {loc_3d[0], loc_3d[1]};
+                    collection.grid_locs_.push_back({loc[0], loc[1]});
+                }
             }
         }
     }
@@ -2025,19 +2056,31 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             cv::Mat mask = resume_surf->channel("mask");
             if (!mask.empty()) {
                 std::vector<std::vector<cv::Point2f>> all_hulls;
+                // For single-point collections (e.g., drag-and-drop), store center and radius
+                std::vector<std::pair<cv::Point2f, float>> single_point_regions;
+
                 for (const auto& collection : trace_data.point_correction.collections()) {
                     if (collection.grid_locs_.empty()) continue;
 
-                    std::vector<cv::Point2f> points_for_hull;
-                    points_for_hull.reserve(collection.grid_locs_.size());
-                    for (const auto& loc : collection.grid_locs_) {
-                        points_for_hull.emplace_back(loc[0], loc[1]);
-                    }
-                    
-                    std::vector<cv::Point2f> hull_points;
-                    cv::convexHull(points_for_hull, hull_points);
-                    if (!hull_points.empty()) {
-                        all_hulls.push_back(hull_points);
+                    if (collection.grid_locs_.size() == 1) {
+                        // Single point - use a radius-based region instead of convex hull
+                        // This handles the drag-and-drop case where only one correction point is set
+                        cv::Point2f center(collection.grid_locs_[0][0], collection.grid_locs_[0][1]);
+                        float radius = 8.0f;  // Default radius for single-point corrections
+                        single_point_regions.emplace_back(center, radius);
+                        std::cout << "single-point correction region at " << center << " with radius " << radius << std::endl;
+                    } else {
+                        std::vector<cv::Point2f> points_for_hull;
+                        points_for_hull.reserve(collection.grid_locs_.size());
+                        for (const auto& loc : collection.grid_locs_) {
+                            points_for_hull.emplace_back(loc[0], loc[1]);
+                        }
+
+                        std::vector<cv::Point2f> hull_points;
+                        cv::convexHull(points_for_hull, hull_points);
+                        if (!hull_points.empty()) {
+                            all_hulls.push_back(hull_points);
+                        }
                     }
                 }
 
@@ -2048,12 +2091,27 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                             int target_x = resume_pad_x + i;
                             cv::Point2f p(target_x, target_y);
                             bool keep = false;
+
+                            // Check convex hull regions
                             for (const auto& hull : all_hulls) {
                                 if (cv::pointPolygonTest(hull, p, false) >= 0) {
                                     keep = true;
                                     break;
                                 }
                             }
+
+                            // Check single-point circular regions
+                            if (!keep) {
+                                for (const auto& [center, radius] : single_point_regions) {
+                                    float dx = p.x - center.x;
+                                    float dy = p.y - center.y;
+                                    if (dx * dx + dy * dy <= radius * radius) {
+                                        keep = true;
+                                        break;
+                                    }
+                                }
+                            }
+
                             if (!keep) {
                                 trace_params.state(target_y, target_x) = 0;
                                 trace_params.dpoints(target_y, target_x) = cv::Vec3d(-1,-1,-1);

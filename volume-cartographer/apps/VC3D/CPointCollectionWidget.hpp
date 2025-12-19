@@ -11,6 +11,7 @@
 #include <QCheckBox>
 #include <QItemSelection>
 #include <QDoubleSpinBox>
+#include <QLabel>
 
 
 
@@ -29,6 +30,7 @@ signals:
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
+    void convertPointToAnchorRequested(uint64_t pointId, uint64_t collectionId);
 
 public slots:
     void selectCollection(uint64_t collectionId);
@@ -56,6 +58,8 @@ private slots:
     void onFillWindingEqualsClicked();
     void onSaveClicked();
     void onLoadClicked();
+    void onConvertToAnchorClicked();
+    void onClearAnchorClicked();
   
  private:
     void keyPressEvent(QKeyEvent *event) override;
@@ -82,9 +86,12 @@ private slots:
     QPushButton *_fill_winding_plus_button;
     QPushButton *_fill_winding_minus_button;
     QPushButton *_fill_winding_equals_button;
+    QLabel *_anchor_status_label;
+    QPushButton *_clear_anchor_button;
 
     QGroupBox *_point_metadata_group;
     QCheckBox *_winding_enabled_checkbox;
     QDoubleSpinBox* _winding_spinbox;
+    QPushButton *_convert_to_anchor_button;
 };
 

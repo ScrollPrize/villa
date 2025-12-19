@@ -4,6 +4,7 @@
 #include "CVolumeViewer.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
+#include "overlays/RawPointsOverlayController.hpp"
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
@@ -200,6 +201,15 @@ void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
         return;
     }
     _pointsOverlay->bindToViewerManager(this);
+}
+
+void ViewerManager::setRawPointsOverlay(RawPointsOverlayController* overlay)
+{
+    _rawPointsOverlay = overlay;
+    if (!_rawPointsOverlay) {
+        return;
+    }
+    _rawPointsOverlay->bindToViewerManager(this);
 }
 
 void ViewerManager::setPathsOverlay(PathsOverlayController* overlay)

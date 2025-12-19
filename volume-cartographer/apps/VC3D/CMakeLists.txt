@@ -53,6 +53,8 @@ set(srcs
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
     overlays/PointsOverlayController.hpp
+    overlays/RawPointsOverlayController.cpp
+    overlays/RawPointsOverlayController.hpp
     overlays/BBoxOverlayController.cpp
     overlays/BBoxOverlayController.hpp
     overlays/PathsOverlayController.cpp

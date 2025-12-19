@@ -45,6 +45,7 @@ public:
         std::unordered_map<uint64_t, ColPoint> points;
         CollectionMetadata metadata;
         cv::Vec3f color;
+        std::optional<cv::Vec2f> anchor2d;  // 2D grid anchor for drag-and-drop corrections
     };
 
     explicit VCCollection(QObject* parent = nullptr);
@@ -64,6 +65,8 @@ public:
     const std::unordered_map<uint64_t, Collection>& getAllCollections() const;
     void setCollectionMetadata(uint64_t collectionId, const CollectionMetadata& metadata);
     void setCollectionColor(uint64_t collectionId, const cv::Vec3f& color);
+    void setCollectionAnchor2d(uint64_t collectionId, const std::optional<cv::Vec2f>& anchor);
+    std::optional<cv::Vec2f> getCollectionAnchor2d(uint64_t collectionId) const;
     std::optional<ColPoint> getPoint(uint64_t pointId) const;
     std::vector<ColPoint> getPoints(const std::string& collectionName) const;
     std::string generateNewCollectionName(const std::string& prefix = "col") const;

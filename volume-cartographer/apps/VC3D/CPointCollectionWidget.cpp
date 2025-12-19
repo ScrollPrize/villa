@@ -88,6 +88,18 @@ void CPointCollectionWidget::setupUi()
     fill_layout->addWidget(_fill_winding_equals_button);
     collection_layout->addLayout(fill_layout);
 
+    // Anchor status for drag-and-drop corrections
+    QHBoxLayout *anchor_layout = new QHBoxLayout();
+    _anchor_status_label = new QLabel("Anchor: none");
+    _anchor_status_label->setToolTip("2D grid anchor for correction point application");
+    anchor_layout->addWidget(_anchor_status_label);
+    _clear_anchor_button = new QPushButton("Clear");
+    _clear_anchor_button->setToolTip("Clear the 2D anchor");
+    _clear_anchor_button->setMaximumWidth(60);
+    anchor_layout->addWidget(_clear_anchor_button);
+    collection_layout->addLayout(anchor_layout);
+    connect(_clear_anchor_button, &QPushButton::clicked, this, &CPointCollectionWidget::onClearAnchorClicked);
+
     layout->addWidget(_collection_metadata_group);
  
     connect(_absolute_winding_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
@@ -99,7 +111,7 @@ void CPointCollectionWidget::setupUi()
     // Point Metadata
     _point_metadata_group = new QGroupBox("Point Metadata");
     QVBoxLayout *point_layout = new QVBoxLayout(_point_metadata_group);
-    
+
     QHBoxLayout *winding_layout = new QHBoxLayout();
     _winding_enabled_checkbox = new QCheckBox("Enabled");
     winding_layout->addWidget(_winding_enabled_checkbox);
@@ -110,6 +122,11 @@ void CPointCollectionWidget::setupUi()
     _winding_spinbox->setSingleStep(0.1);
     winding_layout->addWidget(_winding_spinbox);
     point_layout->addLayout(winding_layout);
+
+    _convert_to_anchor_button = new QPushButton("Convert to Anchor");
+    _convert_to_anchor_button->setToolTip("Convert this point's position on the current surface to a 2D anchor for drag-and-drop corrections");
+    point_layout->addWidget(_convert_to_anchor_button);
+    connect(_convert_to_anchor_button, &QPushButton::clicked, this, &CPointCollectionWidget::onConvertToAnchorClicked);
 
     layout->addWidget(_point_metadata_group);
  
@@ -365,7 +382,7 @@ void CPointCollectionWidget::updateMetadataWidgets()
         const auto& collections = _point_collection->getAllCollections();
         if (collections.count(_selected_collection_id)) {
             const auto& collection = collections.at(_selected_collection_id);
-            
+
             // Temporarily block signals to prevent feedback loop
             _collection_name_edit->blockSignals(true);
             _collection_name_edit->setText(QString::fromStdString(collection.name));
@@ -381,11 +398,23 @@ void CPointCollectionWidget::updateMetadataWidgets()
             _color_button->setAutoFillBackground(true);
             _color_button->setPalette(pal);
             _color_button->update();
+
+            // Update anchor status
+            if (collection.anchor2d.has_value()) {
+                cv::Vec2f anchor = collection.anchor2d.value();
+                _anchor_status_label->setText(QString("Anchor: (%1, %2)").arg(anchor[0], 0, 'f', 1).arg(anchor[1], 0, 'f', 1));
+                _clear_anchor_button->setEnabled(true);
+            } else {
+                _anchor_status_label->setText("Anchor: none");
+                _clear_anchor_button->setEnabled(false);
+            }
         }
     } else {
         _collection_name_edit->clear();
         _absolute_winding_checkbox->setChecked(false);
         _color_button->setAutoFillBackground(false);
+        _anchor_status_label->setText("Anchor: none");
+        _clear_anchor_button->setEnabled(false);
     }
 
     if (point_selected) {
@@ -584,6 +613,23 @@ void CPointCollectionWidget::selectPoint(uint64_t pointId)
             }
         }
     }
+}
+
+void CPointCollectionWidget::onConvertToAnchorClicked()
+{
+    if (_selected_point_id == 0 || _selected_collection_id == 0) {
+        return;
+    }
+    emit convertPointToAnchorRequested(_selected_point_id, _selected_collection_id);
+}
+
+void CPointCollectionWidget::onClearAnchorClicked()
+{
+    if (_selected_collection_id == 0) {
+        return;
+    }
+    _point_collection->setCollectionAnchor2d(_selected_collection_id, std::nullopt);
+    updateMetadataWidgets();
 }
 
 void CPointCollectionWidget::keyPressEvent(QKeyEvent *event)

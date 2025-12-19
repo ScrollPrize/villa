@@ -18,6 +18,18 @@ struct adl_serializer<cv::Vec3f> {
         j.at(2).get_to(v[2]);
     }
 };
+
+template <>
+struct adl_serializer<cv::Vec2f> {
+    static void to_json(json& j, const cv::Vec2f& v) {
+        j = {v[0], v[1]};
+    }
+
+    static void from_json(const json& j, cv::Vec2f& v) {
+        j.at(0).get_to(v[0]);
+        j.at(1).get_to(v[1]);
+    }
+};
 NLOHMANN_JSON_NAMESPACE_END
  
 #define VC_POINTCOLLECTIONS_JSON_VERSION "1"
@@ -74,11 +86,15 @@ void to_json(json& j, const VCCollection::Collection& c) {
         {"metadata", c.metadata},
         {"color", c.color}
     };
+
+    if (c.anchor2d.has_value()) {
+        j["anchor2d"] = c.anchor2d.value();
+    }
 }
  
 void from_json(const json& j, VCCollection::Collection& c) {
     j.at("name").get_to(c.name);
-    
+
     json points_obj = j.at("points");
     if (points_obj.is_object()) {
         for (auto& [id_str, point_json] : points_obj.items()) {
@@ -91,6 +107,12 @@ void from_json(const json& j, VCCollection::Collection& c) {
 
     j.at("metadata").get_to(c.metadata);
     j.at("color").get_to(c.color);
+
+    if (j.contains("anchor2d") && !j.at("anchor2d").is_null()) {
+        c.anchor2d = j.at("anchor2d").get<cv::Vec2f>();
+    } else {
+        c.anchor2d = std::nullopt;
+    }
 }
  
 VCCollection::VCCollection(QObject* parent)
@@ -218,6 +240,22 @@ void VCCollection::setCollectionColor(uint64_t collectionId, const cv::Vec3f& co
         _collections.at(collectionId).color = color;
         emit collectionChanged(collectionId);
     }
+}
+
+void VCCollection::setCollectionAnchor2d(uint64_t collectionId, const std::optional<cv::Vec2f>& anchor)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).anchor2d = anchor;
+        emit collectionChanged(collectionId);
+    }
+}
+
+std::optional<cv::Vec2f> VCCollection::getCollectionAnchor2d(uint64_t collectionId) const
+{
+    if (_collections.count(collectionId)) {
+        return _collections.at(collectionId).anchor2d;
+    }
+    return std::nullopt;
 }
 
 std::optional<ColPoint> VCCollection::getPoint(uint64_t pointId) const

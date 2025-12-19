@@ -518,6 +518,9 @@ CWindow::CWindow() :
     _pointsOverlay = std::make_unique<PointsOverlayController>(_point_collection, this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
 
+    _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_surf_col, this);
+    _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
+
     _pathsOverlay = std::make_unique<PathsOverlayController>(this);
     _viewerManager->setPathsOverlay(_pathsOverlay.get());
 
@@ -687,6 +690,19 @@ CWindow::CWindow() :
         }
     });
 
+    // Raw points overlay shortcut (P key)
+    auto* rawPointsShortcut = new QShortcut(QKeySequence("P"), this);
+    rawPointsShortcut->setContext(Qt::ApplicationShortcut);
+    connect(rawPointsShortcut, &QShortcut::activated, [this]() {
+        if (_rawPointsOverlay) {
+            bool newEnabled = !_rawPointsOverlay->isEnabled();
+            _rawPointsOverlay->setEnabled(newEnabled);
+            statusBar()->showMessage(
+                newEnabled ? tr("Raw points overlay enabled") : tr("Raw points overlay disabled"),
+                2000);
+        }
+    });
+
     // Zoom shortcuts (Shift+= for zoom in, Shift+- for zoom out)
     // Use 15% steps for smooth, proportional zooming - only affects active viewer
     constexpr float ZOOM_FACTOR = 1.15f;
@@ -746,7 +762,6 @@ CWindow::CWindow() :
             if (viewer) viewer->adjustSurfaceOffset(-1.0f);
         });
     });
-
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
@@ -1451,6 +1466,7 @@ void CWindow::CreateWidgets(void)
         });
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
+    connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
 
     // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
@@ -3075,6 +3091,45 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
 
         _surf_col->setPOI("focus", poi);
     }
+}
+
+void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
+{
+    auto point_opt = _point_collection->getPoint(pointId);
+    if (!point_opt) {
+        statusBar()->showMessage(tr("Point not found"), 2000);
+        return;
+    }
+
+    // Get the segmentation surface to project the point onto
+    auto seg_surface = _surf_col->surface("segmentation");
+    auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get());
+    if (!quad_surface) {
+        statusBar()->showMessage(tr("No active segmentation surface for anchor conversion"), 3000);
+        return;
+    }
+
+    // Find the 2D grid location of this point on the surface
+    auto ptr = quad_surface->pointer();
+    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+    float dist = quad_surface->pointTo(ptr, point_opt->p, 4.0, 1000, patchIndex);
+
+    if (dist > 10.0) {
+        statusBar()->showMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
+        return;
+    }
+
+    // Get the raw grid location (internal coordinates)
+    cv::Vec3f loc_3d = quad_surface->loc_raw(ptr);
+    cv::Vec2f anchor2d(loc_3d[0], loc_3d[1]);
+
+    // Set the anchor2d on the collection
+    _point_collection->setCollectionAnchor2d(collectionId, anchor2d);
+
+    // Remove the point (it's now represented by the anchor)
+    _point_collection->removePoint(pointId);
+
+    statusBar()->showMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
 }
 
 void CWindow::onZoomOut()

@@ -29,6 +29,7 @@
 #include "segmentation/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
+#include "overlays/RawPointsOverlayController.hpp"
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
@@ -172,6 +173,7 @@ private slots:
     void processPendingInotifyEvents();
     void onSliceStepSizeChanged(int newSize);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
+    void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -228,6 +230,7 @@ private:
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
     std::unique_ptr<PointsOverlayController> _pointsOverlay;
+    std::unique_ptr<RawPointsOverlayController> _rawPointsOverlay;
     std::unique_ptr<PathsOverlayController> _pathsOverlay;
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;

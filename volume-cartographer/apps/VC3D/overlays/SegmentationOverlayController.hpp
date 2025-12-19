@@ -57,6 +57,11 @@ public:
         float displayRadiusSteps{0.0f};
         float gridStepWorld{1.0f};
 
+        // Correction drag state - for drag-and-drop corrections
+        bool correctionDragActive{false};
+        cv::Vec3f correctionDragStart{0.0f, 0.0f, 0.0f};
+        cv::Vec3f correctionDragCurrent{0.0f, 0.0f, 0.0f};
+
         // Approval mask state - cylinder brush model
         // Radius = circle in plane views (XY/XZ/YZ), rectangle width in flattened view
         // Depth = cylinder thickness, rectangle height in flattened view

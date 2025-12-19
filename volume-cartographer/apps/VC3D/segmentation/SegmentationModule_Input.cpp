@@ -141,6 +141,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             cancelDrag();
             return true;
         }
+        if (_correctionDrag.active) {
+            cancelCorrectionDrag();
+            return true;
+        }
     }
 
     const bool pushPullKey = (event->key() == Qt::Key_A || event->key() == Qt::Key_D);
@@ -178,8 +182,11 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             if (_widget) {
                 _widget->setEditingEnabled(true);
             }
-        } else {
             setCorrectionsAnnotateMode(true, true);
+        } else {
+            // Toggle correction point annotation mode
+            bool currentMode = _corrections && _corrections->annotateMode();
+            setCorrectionsAnnotateMode(!currentMode, true);
         }
         event->accept();
         return true;
@@ -313,10 +320,23 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         }
         if (modifiers.testFlag(Qt::ControlModifier)) {
             handleCorrectionPointRemove(worldPos);
+            updateCorrectionsWidget();
+            return;
+        }
+        // Start correction drag - find the grid position where user clicked
+        if (_editManager) {
+            auto gridIndex = _editManager->worldToGridIndex(worldPos);
+            if (gridIndex) {
+                beginCorrectionDrag(gridIndex->first, gridIndex->second, viewer, worldPos);
+            } else {
+                // Fallback to old behavior if we can't find grid position
+                handleCorrectionPointAdded(worldPos);
+                updateCorrectionsWidget();
+            }
         } else {
             handleCorrectionPointAdded(worldPos);
+            updateCorrectionsWidget();
         }
-        updateCorrectionsWidget();
         return;
     }
 
@@ -477,6 +497,11 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
+    if (_correctionDrag.active) {
+        updateCorrectionDrag(worldPos);
+        return;
+    }
+
     if (_corrections && _corrections->annotateMode()) {
         return;
     }
@@ -534,6 +559,12 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
             _brushTool->extendStroke(worldPos, true);
             _brushTool->finishStroke();
         }
+        return;
+    }
+
+    if (_correctionDrag.active && button == Qt::LeftButton) {
+        updateCorrectionDrag(worldPos);
+        finishCorrectionDrag();
         return;
     }
 

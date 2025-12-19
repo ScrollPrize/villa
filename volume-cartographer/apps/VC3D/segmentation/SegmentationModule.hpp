@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -194,6 +195,27 @@ private:
         void clear();
     };
 
+    struct CorrectionDragState
+    {
+        bool active{false};
+        int anchorRow{0};
+        int anchorCol{0};
+        cv::Vec3f startWorld{0.0f, 0.0f, 0.0f};  // Where drag started (on surface)
+        cv::Vec3f currentWorld{0.0f, 0.0f, 0.0f};  // Current drag position
+        QPointer<CVolumeViewer> viewer;
+        bool moved{false};
+
+        void reset() {
+            active = false;
+            anchorRow = 0;
+            anchorCol = 0;
+            startWorld = {0.0f, 0.0f, 0.0f};
+            currentWorld = {0.0f, 0.0f, 0.0f};
+            viewer = nullptr;
+            moved = false;
+        }
+    };
+
     void bindWidgetSignals();
     void bindViewerSignals(CVolumeViewer* viewer);
 
@@ -205,6 +227,11 @@ private:
     uint64_t createCorrectionCollection(bool announce);
     void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
+    void beginCorrectionDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void updateCorrectionDrag(const cv::Vec3f& worldPos);
+    void finishCorrectionDrag();
+    void cancelCorrectionDrag();
+
     void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
@@ -300,6 +327,7 @@ private:
 
     DragState _drag;
     HoverState _hover;
+    CorrectionDragState _correctionDrag;
     QSet<CVolumeViewer*> _attachedViewers;
 
     std::function<bool(CVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;

@@ -20,6 +20,7 @@ class CSurfaceCollection;
 class VCCollection;
 class SegmentationOverlayController;
 class PointsOverlayController;
+class RawPointsOverlayController;
 class PathsOverlayController;
 class BBoxOverlayController;
 class VectorOverlayController;
@@ -51,6 +52,8 @@ public:
     void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);
+    void setRawPointsOverlay(RawPointsOverlayController* overlay);
+    RawPointsOverlayController* rawPointsOverlay() const { return _rawPointsOverlay; }
     void setPathsOverlay(PathsOverlayController* overlay);
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
@@ -122,6 +125,7 @@ private:
     ChunkCache<uint8_t>* _chunkCache;
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
+    RawPointsOverlayController* _rawPointsOverlay{nullptr};
     PathsOverlayController* _pathsOverlay{nullptr};
     BBoxOverlayController* _bboxOverlay{nullptr};
     VectorOverlayController* _vectorOverlay{nullptr};
