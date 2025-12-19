@@ -620,7 +620,7 @@ static cv::Mat compute_inside_mask(
     }
 
     // Get alpha shape mask
-    cv::Mat alpha_mask = computeAlphaShapeMask(valid_points, state_mat.size(), alpha);
+    cv::Mat alpha_mask = vc::core::util::computeAlphaShapeMask(valid_points, state_mat.size(), alpha);
 
     // Create valid points mask
     cv::Mat valid_mask = cv::Mat::zeros(state_mat.size(), CV_8U);

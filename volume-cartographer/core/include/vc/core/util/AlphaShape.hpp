@@ -4,6 +4,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+namespace vc::core::util {
+
 // Compute alpha shape (concave hull) mask from a set of 2D points.
 // Uses Delaunay triangulation with alpha criterion to define the boundary.
 // Returns a binary mask where pixels inside the alpha shape are 255.
@@ -64,3 +66,5 @@ inline cv::Mat computeAlphaShapeMask(
 
     return mask;
 }
+
+} // namespace vc::core::util
