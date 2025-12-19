@@ -44,6 +44,12 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         _approvalTool->setSurface(_editManager->baseSurface().get());
     }
 
+    // Reload approval mask image if showing OR editing approval mask
+    // Ensures dimensions match the session's surface
+    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
+        _overlay->loadApprovalMaskImage(_editManager->baseSurface().get());
+    }
+
     if (_overlay) {
         refreshOverlay();
     }
@@ -297,8 +303,9 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
         _approvalTool->setSurface(surface);
     }
 
-    // Reload approval mask image if showing approval mask
-    if (_showApprovalMask && _overlay) {
+    // Reload approval mask image if showing OR editing approval mask
+    // Both modes need correct dimensions to render/paint properly
+    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
         _overlay->loadApprovalMaskImage(surface);
     }
 
@@ -315,9 +322,20 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         return false;
     }
 
-    // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected)
-    // We paint into pending, then save immediately so the changes persist after reload
     auto* baseSurf = _editManager->baseSurface().get();
+
+    // IMPORTANT: Reload approval mask image FIRST to get correct dimensions.
+    // The surface has already been updated with the preserved approval mask from growth,
+    // but the overlay's QImages still have the old dimensions. We must reload before
+    // doing any auto-approval painting, otherwise we'd paint into wrong-sized images
+    // and overwrite the correctly-preserved mask with garbage.
+    // Reload if showing OR editing - both modes need correct dimensions.
+    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
+        _overlay->loadApprovalMaskImage(baseSurf);
+    }
+
+    // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected)
+    // Now that images are correctly sized, we can safely paint the auto-approval
     if (_overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
         std::vector<std::pair<int, int>> gridPositions;
         gridPositions.reserve(static_cast<size_t>(vertexRect.area()));
@@ -331,7 +349,7 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         constexpr bool kIsAutoApproval = true;
         const QColor brushColor = approvalBrushColor();
         _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
-        // Save immediately to persist through the upcoming reload
+        // Save immediately to persist the auto-approval
         _overlay->saveApprovalMaskToSurface(baseSurf);
         _overlay->clearApprovalMaskUndoHistory();
         qCInfo(lcSegModule) << "Auto-approved growth region:" << vertexRect.width << "x" << vertexRect.height;
@@ -340,11 +358,6 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
     // Update approval tool surface if editing approval mask
     if (isEditingApprovalMask() && _approvalTool) {
         _approvalTool->setSurface(baseSurf);
-    }
-
-    // Reload approval mask image if showing approval mask
-    if (_showApprovalMask && _overlay) {
-        _overlay->loadApprovalMaskImage(baseSurf);
     }
 
     refreshOverlay();
@@ -378,8 +391,9 @@ void SegmentationModule::updateApprovalToolAfterGrowth(QuadSurface* surface)
         _approvalTool->setSurface(approvalSurface);
     }
 
-    // Reload approval mask image if showing approval mask
-    if (_showApprovalMask && _overlay) {
+    // Reload approval mask image if showing OR editing approval mask
+    // Both modes need correct dimensions to render/paint properly
+    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
         _overlay->loadApprovalMaskImage(approvalSurface);
     }
 }
