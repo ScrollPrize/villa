@@ -50,6 +50,7 @@ enum class SegmentationGrowthDirection {
     Left,
     Right,
     Inside,
+    FillBounds,
 };
 
 inline QString segmentationGrowthDirectionToString(SegmentationGrowthDirection direction)
@@ -67,6 +68,8 @@ inline QString segmentationGrowthDirectionToString(SegmentationGrowthDirection d
         return QStringLiteral("Right");
     case SegmentationGrowthDirection::Inside:
         return QStringLiteral("Inside");
+    case SegmentationGrowthDirection::FillBounds:
+        return QStringLiteral("FillBounds");
     }
     return QStringLiteral("All");
 }
@@ -84,6 +87,8 @@ inline SegmentationGrowthDirection segmentationGrowthDirectionFromInt(int value)
         return SegmentationGrowthDirection::Right;
     case static_cast<int>(SegmentationGrowthDirection::Inside):
         return SegmentationGrowthDirection::Inside;
+    case static_cast<int>(SegmentationGrowthDirection::FillBounds):
+        return SegmentationGrowthDirection::FillBounds;
     default:
         return SegmentationGrowthDirection::All;
     }

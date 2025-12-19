@@ -211,6 +211,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         case Qt::Key_6:
             shortcutDirection = SegmentationGrowthDirection::Inside;
             break;
+        case Qt::Key_7:
+            shortcutDirection = SegmentationGrowthDirection::FillBounds;
+            break;
         default:
             matchedShortcut = false;
             break;

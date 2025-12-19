@@ -284,6 +284,10 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     } else if (request.direction == SegmentationGrowthDirection::Up || request.direction == SegmentationGrowthDirection::Down) {
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = 0;
+    } else if (request.direction == SegmentationGrowthDirection::FillBounds) {
+        // FillBounds doesn't expand outward, only fills within existing bounds
+        params["grow_extra_rows"] = 0;
+        params["grow_extra_cols"] = 0;
     } else {
         params["grow_extra_rows"] = std::max(0, request.steps);
         params["grow_extra_cols"] = std::max(0, request.steps);
@@ -296,6 +300,7 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     bool allowLeft = false;
     bool allowRight = false;
     bool allowInside = false;
+    bool allowFillBounds = false;
     for (auto dir : request.allowedDirections) {
         switch (dir) {
         case SegmentationGrowthDirection::Up:
@@ -313,6 +318,9 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         case SegmentationGrowthDirection::Inside:
             allowInside = true;
             break;
+        case SegmentationGrowthDirection::FillBounds:
+            allowFillBounds = true;
+            break;
         case SegmentationGrowthDirection::All:
         default:
             allowUp = allowDown = allowLeft = allowRight = true;
@@ -323,13 +331,19 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
         }
     }
 
-    // Inside mode is mutually exclusive with directional growth
+    // Inside and FillBounds modes are mutually exclusive with directional growth
     if (allowInside && (allowUp || allowDown || allowLeft || allowRight)) {
         qCWarning(lcSegGrowth) << "Inside mode cannot be combined with directional growth, using inside only";
         allowUp = allowDown = allowLeft = allowRight = false;
     }
+    if (allowFillBounds && (allowUp || allowDown || allowLeft || allowRight || allowInside)) {
+        qCWarning(lcSegGrowth) << "FillBounds mode cannot be combined with other modes, using fillbounds only";
+        allowUp = allowDown = allowLeft = allowRight = allowInside = false;
+    }
 
-    if (allowInside) {
+    if (allowFillBounds) {
+        params["growth_directions"] = std::vector<std::string>{"fillbounds"};
+    } else if (allowInside) {
         params["growth_directions"] = std::vector<std::string>{"inside"};
     } else {
         const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +

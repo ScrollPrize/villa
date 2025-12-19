@@ -49,6 +49,7 @@ constexpr int kGrowDirDownBit = 1 << 1;
 constexpr int kGrowDirLeftBit = 1 << 2;
 constexpr int kGrowDirRightBit = 1 << 3;
 constexpr int kGrowDirInsideBit = 1 << 4;
+constexpr int kGrowDirFillBoundsBit = 1 << 5;
 constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
 constexpr int kCompactDirectionFieldRowLimit = 3;
 
@@ -265,6 +266,8 @@ void SegmentationWidget::buildUi()
     dirRow->addSpacing(12);
     _chkGrowthDirInside = addDirectionCheckbox(tr("Inside"));
     _chkGrowthDirInside->setToolTip(tr("Fill holes within the surface boundary without expanding outward."));
+    _chkGrowthDirFillBounds = addDirectionCheckbox(tr("FillBounds"));
+    _chkGrowthDirFillBounds->setToolTip(tr("Fill all invalid points within the bounding box of the surface."));
     dirRow->addStretch(1);
     growthLayout->addLayout(dirRow);
 
@@ -832,6 +835,7 @@ void SegmentationWidget::buildUi()
     connectDirectionCheckbox(_chkGrowthDirLeft);
     connectDirectionCheckbox(_chkGrowthDirRight);
     connectDirectionCheckbox(_chkGrowthDirInside);
+    connectDirectionCheckbox(_chkGrowthDirFillBounds);
 
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this](int value) { applyGrowthSteps(value, true, true); });
@@ -2117,9 +2121,13 @@ std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirect
 {
     std::vector<SegmentationGrowthDirection> dirs;
 
-    // Inside is mutually exclusive with directional growth
+    // Inside and FillBounds are mutually exclusive with directional growth
     if (_growthDirectionMask & kGrowDirInsideBit) {
         dirs.push_back(SegmentationGrowthDirection::Inside);
+        return dirs;
+    }
+    if (_growthDirectionMask & kGrowDirFillBoundsBit) {
+        dirs.push_back(SegmentationGrowthDirection::FillBounds);
         return dirs;
     }
 
@@ -2399,12 +2407,14 @@ void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheck
 {
     int mask = 0;
 
-    // Handle mutual exclusivity: Inside vs directional checkboxes
+    // Handle mutual exclusivity: Inside/FillBounds vs directional checkboxes
     const bool insideChecked = _chkGrowthDirInside && _chkGrowthDirInside->isChecked();
+    const bool fillBoundsChecked = _chkGrowthDirFillBounds && _chkGrowthDirFillBounds->isChecked();
     const bool isInsideCheckbox = (changedCheckbox == _chkGrowthDirInside);
+    const bool isFillBoundsCheckbox = (changedCheckbox == _chkGrowthDirFillBounds);
 
-    if (insideChecked && isInsideCheckbox) {
-        // Inside was just checked - uncheck all directional checkboxes
+    // Helper to uncheck all directional checkboxes
+    auto uncheckDirectionalCheckboxes = [this]() {
         if (_chkGrowthDirUp) {
             const QSignalBlocker blocker(_chkGrowthDirUp);
             _chkGrowthDirUp->setChecked(false);
@@ -2421,9 +2431,26 @@ void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheck
             const QSignalBlocker blocker(_chkGrowthDirRight);
             _chkGrowthDirRight->setChecked(false);
         }
+    };
+
+    if (fillBoundsChecked && isFillBoundsCheckbox) {
+        // FillBounds was just checked - uncheck all other checkboxes
+        uncheckDirectionalCheckboxes();
+        if (_chkGrowthDirInside) {
+            const QSignalBlocker blocker(_chkGrowthDirInside);
+            _chkGrowthDirInside->setChecked(false);
+        }
+        mask = kGrowDirFillBoundsBit;
+    } else if (insideChecked && isInsideCheckbox) {
+        // Inside was just checked - uncheck all directional and FillBounds checkboxes
+        uncheckDirectionalCheckboxes();
+        if (_chkGrowthDirFillBounds) {
+            const QSignalBlocker blocker(_chkGrowthDirFillBounds);
+            _chkGrowthDirFillBounds->setChecked(false);
+        }
         mask = kGrowDirInsideBit;
     } else {
-        // Directional mode - uncheck Inside if any direction is checked
+        // Directional mode - uncheck Inside and FillBounds if any direction is checked
         if (_chkGrowthDirUp && _chkGrowthDirUp->isChecked()) {
             mask |= kGrowDirUpBit;
         }
@@ -2437,9 +2464,15 @@ void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheck
             mask |= kGrowDirRightBit;
         }
 
-        if (mask != 0 && _chkGrowthDirInside) {
-            const QSignalBlocker blocker(_chkGrowthDirInside);
-            _chkGrowthDirInside->setChecked(false);
+        if (mask != 0) {
+            if (_chkGrowthDirInside) {
+                const QSignalBlocker blocker(_chkGrowthDirInside);
+                _chkGrowthDirInside->setChecked(false);
+            }
+            if (_chkGrowthDirFillBounds) {
+                const QSignalBlocker blocker(_chkGrowthDirFillBounds);
+                _chkGrowthDirFillBounds->setChecked(false);
+            }
         }
 
         if (mask == 0) {
@@ -2476,6 +2509,10 @@ void SegmentationWidget::applyGrowthDirectionMaskToUi()
         const QSignalBlocker blocker(_chkGrowthDirInside);
         _chkGrowthDirInside->setChecked((_growthDirectionMask & kGrowDirInsideBit) != 0);
     }
+    if (_chkGrowthDirFillBounds) {
+        const QSignalBlocker blocker(_chkGrowthDirFillBounds);
+        _chkGrowthDirFillBounds->setChecked((_growthDirectionMask & kGrowDirFillBoundsBit) != 0);
+    }
 }
 
 void SegmentationWidget::updateGrowthUiState()
@@ -2505,6 +2542,9 @@ void SegmentationWidget::updateGrowthUiState()
     }
     if (_chkGrowthDirInside) {
         _chkGrowthDirInside->setEnabled(enableDirCheckbox);
+    }
+    if (_chkGrowthDirFillBounds) {
+        _chkGrowthDirFillBounds->setEnabled(enableDirCheckbox);
     }
     if (_directionFieldAddButton) {
         _directionFieldAddButton->setEnabled(_editingEnabled);
