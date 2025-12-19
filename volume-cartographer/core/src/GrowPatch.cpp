@@ -613,6 +613,12 @@ static cv::Mat compute_inside_mask(
         }
     }
 
+    if (valid_points.size() < 3) {
+        std::cerr << "[GrowPatch] compute_inside_mask: inside mode requires at least 3 "
+                  << "valid points to compute a concave hull; inside mask will be empty."
+                  << std::endl;
+    }
+
     // Get alpha shape mask
     cv::Mat alpha_mask = computeAlphaShapeMask(valid_points, state_mat.size(), alpha);
 
