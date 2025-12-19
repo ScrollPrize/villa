@@ -2585,6 +2585,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             break;
 
         // For every point in the fringe, add candidate 2D points to grow into
+        // Coordinate convention: cv::Vec2i uses (row, col) so np[0]=row, np[1]=col.
+        // cv::Point uses (x, y) so we pass (col, row) = (np[1], np[0]).
+        // cv::Mat::at uses (row, col) so we pass (np[0], np[1]).
         if (growth_config.fillbounds_mode) {
             // FillBounds mode: fill all invalid points within the cached initial bounding box
             for(const auto& p : fringe) {
