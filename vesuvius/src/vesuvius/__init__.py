@@ -18,6 +18,10 @@ try:
     from . import structure_tensor  # heavy segmentation extras
 except Exception:
     structure_tensor = None  # type: ignore
+try:
+    from . import tifxyz  # tifxyz format I/O (requires tifffile, scipy)
+except Exception:
+    tifxyz = None  # type: ignore
 
 # Attempt to import utils.  utils requires aiohttp and nest_asyncio; if they aren't
 # installed (e.g. when you install with [volume-only] or without extras), we silently
@@ -41,6 +45,7 @@ __all__ = [
     "utils",
     "models",
     "structure_tensor",
+    "tifxyz",
     "is_aws_ec2_instance",
     "list_cubes",
     "list_files",
