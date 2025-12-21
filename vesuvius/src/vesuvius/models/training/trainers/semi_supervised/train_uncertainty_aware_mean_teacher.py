@@ -36,6 +36,15 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         self.uncertainty_threshold_start = getattr(mgr, 'uncertainty_threshold_start', 0.75)
         self.uncertainty_threshold_end = getattr(mgr, 'uncertainty_threshold_end', 1.0)
         self.uncertainty_T = getattr(mgr, 'uncertainty_T', 4)  # Number of stochastic forward passes
+
+        # Validate uncertainty_T is even (required for paired forward passes)
+        if self.uncertainty_T % 2 != 0:
+            old_T = self.uncertainty_T
+            self.uncertainty_T = self.uncertainty_T - 1
+            if self.uncertainty_T < 2:
+                self.uncertainty_T = 2
+            print(f"Warning: uncertainty_T={old_T} is odd. Adjusted to {self.uncertainty_T} for paired forward passes.")
+
         self.noise_scale = getattr(mgr, 'noise_scale', 0.1)  # Noise scale for stochastic augmentation
         self.labeled_batch_size = getattr(mgr, 'labeled_batch_size', mgr.train_batch_size // 2)
         
@@ -122,6 +131,11 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         self.labeled_indices = labeled_idx[:num_labeled]
         self.unlabeled_indices = unlabeled_idx
 
+        # Ensure we have enough labeled samples for batch composition
+        if len(self.labeled_indices) < self.labeled_batch_size and len(labeled_idx) > len(self.labeled_indices):
+            extra = self.labeled_batch_size - len(self.labeled_indices)
+            self.labeled_indices = self.labeled_indices + labeled_idx[len(self.labeled_indices):len(self.labeled_indices)+extra]
+
         unlabeled_batch_size = self.mgr.train_batch_size - self.labeled_batch_size
         if len(self.unlabeled_indices) < unlabeled_batch_size:
             raise ValueError(
@@ -157,11 +171,17 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # If an external validation dataset is provided (e.g., via --val-dir),
         # its indices are independent from the training dataset. In that case
         # evaluate over the full validation set (or a sampler can downselect later).
-        if val_dataset is not train_dataset:
+        # Check if datasets share the same source (not just object identity)
+        train_path = getattr(train_dataset, 'data_path', None)
+        val_path = getattr(val_dataset, 'data_path', None)
+        same_source = (train_path == val_path) if (train_path and val_path) else False
+
+        if val_dataset is not train_dataset and not same_source:
             if self.mgr.verbose:
                 print("Using external validation dataset for uncertainty-aware mean teacher; evaluating on full validation set")
             val_indices = list(range(len(val_dataset)))
         else:
+            # Same source - use only labeled indices for validation
             train_val_split = self.mgr.tr_val_split
             val_split = int(np.floor((1 - train_val_split) * max(1, len(self.labeled_indices))))
             val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
@@ -334,19 +354,26 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # Apply uncertainty-based weighting
         # Use sigmoid ramp-up for threshold
         current_iter = self.global_step
-        
+
         max_steps_per_epoch = getattr(self.mgr, 'max_steps_per_epoch', 100)
         max_epochs = getattr(self.mgr, 'max_epoch', 100)
         max_iterations = max_steps_per_epoch * max_epochs
-        threshold = (0.75 + 0.25 * ramps.sigmoid_rampup(current_iter, max_iterations)) * np.log(2)
-        
+
+        # Use num_classes for max entropy threshold (not hardcoded log(2) for binary)
+        num_classes = self.mgr.out_channels[0] if isinstance(self.mgr.out_channels, tuple) else self.mgr.out_channels
+        max_entropy = np.log(max(num_classes, 2))  # Ensure at least log(2)
+        threshold = (0.75 + 0.25 * ramps.sigmoid_rampup(current_iter, max_iterations)) * max_entropy
+
         mask = (uncertainty < threshold).float()
         while mask.dim() < consistency_dist.dim():
             mask = mask.unsqueeze(1)
-        
+
         masked_loss = mask * consistency_dist
-        consistency_loss = torch.sum(masked_loss) / (2 * torch.sum(mask) + 1e-16)
-        consistency_weight = self._get_current_consistency_weight(self.global_step // 150)
+        consistency_loss = torch.sum(masked_loss) / (torch.sum(mask) + 1e-8)
+
+        # Compute effective epoch from global_step for rampup
+        effective_epoch = self.global_step / max(max_steps_per_epoch, 1)
+        consistency_weight = self._get_current_consistency_weight(effective_epoch)
         
         weighted_consistency_loss = consistency_weight * consistency_loss
         total_loss = total_loss + weighted_consistency_loss
@@ -381,7 +408,25 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             
             # Update EMA model after optimizer step
             self._update_ema_variables(model, self.ema_model, self.ema_decay, self.global_step)
-        
+
+        # Capture unlabeled debug sample on first step of each epoch
+        if step == 0 and hasattr(self, 'labeled_batch_size'):
+            unlabeled_start = self.labeled_batch_size
+            if inputs.shape[0] > unlabeled_start:
+                # Capture first unlabeled sample
+                self._debug_unlabeled_input = inputs[unlabeled_start:unlabeled_start+1].detach().clone()
+                self._debug_unlabeled_student_pred = {
+                    k: v[unlabeled_start:unlabeled_start+1].detach().clone()
+                    for k, v in outputs.items() if k != '_inputs'
+                }
+                # Get teacher (EMA) predictions for pseudo-labels
+                with torch.no_grad():
+                    with autocast_ctx:
+                        teacher_out = self.ema_model(self._debug_unlabeled_input)
+                        self._debug_unlabeled_pseudo_label = {
+                            k: v.detach().clone() for k, v in teacher_out.items()
+                        }
+
         # Remove _inputs from outputs to avoid issues downstream
         outputs.pop('_inputs', None)
         
@@ -391,15 +436,33 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
 
         return total_loss, task_losses, inputs, targets_dict_clean, outputs, optimizer_stepped
     
+    def _get_additional_checkpoint_data(self):
+        """Return EMA model state for checkpoint saving."""
+        if self.ema_model is not None:
+            return {'ema_model': self.ema_model.state_dict()}
+        return {}
+
     def _initialize_training(self):
         """Override to initialize EMA model after base initialization"""
         training_state = super()._initialize_training()
-        
+
         # Create EMA model after the student model is initialized
         model = training_state['model']
         self.ema_model = self._create_ema_model(model)
-        print(f"Created EMA model with decay factor: {self.ema_decay}")
+
+        # Restore EMA model from checkpoint if available
+        if hasattr(self, '_checkpoint_ema_state') and self._checkpoint_ema_state is not None:
+            try:
+                self.ema_model.load_state_dict(self._checkpoint_ema_state)
+                print("Restored EMA model from checkpoint")
+                del self._checkpoint_ema_state
+            except Exception as e:
+                print(f"Warning: Failed to restore EMA model from checkpoint: {e}")
+                print("Using freshly initialized EMA model")
+        else:
+            print(f"Created fresh EMA model with decay factor: {self.ema_decay}")
+
         print(f"Uncertainty estimation using {self.uncertainty_T} forward passes")
         print(f"Consistency weight ramp-up over {self.consistency_rampup} epochs")
-        
+
         return training_state
