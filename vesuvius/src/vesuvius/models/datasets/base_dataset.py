@@ -13,21 +13,9 @@ import zarr
 from torch.utils.data import Dataset
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
-# Augmentations will be handled directly in this file
-from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
-from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar
-from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
-from vesuvius.models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
-from vesuvius.models.augmentation.transforms.intensity.gamma import GammaTransform
-from vesuvius.models.augmentation.transforms.intensity.gaussian_noise import GaussianNoiseTransform
-from vesuvius.models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
-from vesuvius.models.augmentation.transforms.spatial.low_resolution import SimulateLowResolutionTransform
-from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
-from vesuvius.models.augmentation.transforms.spatial.spatial import SpatialTransform
+# Augmentation pipeline
+from vesuvius.models.augmentation.pipelines import create_training_transforms
 from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
-from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform, RicianNoiseTransform, SmearTransform
-from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
 from ..training.normalization import get_normalization
 from .intensity_properties import initialize_intensity_properties
@@ -358,6 +346,15 @@ class BaseDataset(Dataset):
 
         channel_selector = self._resolve_label_channel_selector(target_names)
         ignore_map = self._resolve_target_ignore_labels(target_names)
+        valid_patch_value = self._resolve_valid_patch_value(target_names)
+
+        # Get unlabeled foreground config
+        unlabeled_fg_enabled = bool(getattr(self.mgr, 'unlabeled_foreground_enabled', False))
+        unlabeled_fg_threshold = float(getattr(self.mgr, 'unlabeled_foreground_threshold', 0.05))
+        unlabeled_fg_bbox_threshold = float(getattr(self.mgr, 'unlabeled_foreground_bbox_threshold', 0.15))
+        unlabeled_fg_image_path = getattr(self.mgr, 'unlabeled_foreground_image_path', None)
+        if unlabeled_fg_image_path is not None:
+            unlabeled_fg_image_path = Path(unlabeled_fg_image_path)
 
         config = ChunkSliceConfig(
             patch_size=patch_size,
@@ -365,14 +362,39 @@ class BaseDataset(Dataset):
             min_labeled_ratio=float(self.min_labeled_ratio),
             min_bbox_percent=float(self.min_bbox_percent),
             allow_unlabeled=bool(self.allow_unlabeled_data),
-            downsample_level=int(getattr(self.mgr, 'downsample_level', 1)),
+            valid_patch_find_resolution=int(getattr(self.mgr, 'valid_patch_find_resolution', 1)),
             num_workers=int(getattr(self.mgr, 'num_workers', 8)),
             cache_enabled=bool(self.cache_enabled),
             cache_dir=self.cache_dir,
             label_channel_selector=channel_selector,
+            valid_patch_value=valid_patch_value,
+            bg_sampling_enabled=bool(getattr(self.mgr, 'bg_sampling_enabled', False)),
+            bg_to_fg_ratio=float(getattr(self.mgr, 'bg_to_fg_ratio', 0.5)),
+            # Unlabeled foreground detection for semi-supervised learning
+            unlabeled_fg_enabled=unlabeled_fg_enabled,
+            unlabeled_fg_threshold=unlabeled_fg_threshold,
+            unlabeled_fg_bbox_threshold=unlabeled_fg_bbox_threshold,
+            unlabeled_fg_image_path=unlabeled_fg_image_path,
         )
 
         slicer = ChunkSlicer(config=config, target_names=target_names)
+
+        # Open image source zarr for unlabeled foreground validation if configured
+        unlabeled_fg_image_source = None
+        if unlabeled_fg_enabled and unlabeled_fg_image_path is not None:
+            try:
+                import zarr
+                unlabeled_fg_image_source = zarr.open(str(unlabeled_fg_image_path), mode='r')
+                self.logger.info(
+                    "Opened image zarr for unlabeled FG validation: %s",
+                    unlabeled_fg_image_path,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to open unlabeled_foreground_image_path %s: %s",
+                    unlabeled_fg_image_path,
+                    e,
+                )
 
         first_target = target_names[0]
         reference_volumes = self.target_volumes[first_target]
@@ -420,6 +442,7 @@ class BaseDataset(Dataset):
                     cache_key_path=cache_key_path,
                     label_ignore_value=label_ignore_value,
                     meshes=reference_info.get('meshes', {}),
+                    image_source=unlabeled_fg_image_source,
                 )
             )
 
@@ -448,6 +471,21 @@ class BaseDataset(Dataset):
                         ignore_map[target_name] = value  # store first non-null alias per target
                         break
         return ignore_map
+
+    def _resolve_valid_patch_value(
+        self, target_names: Sequence[str]
+    ) -> Optional[Union[int, float]]:
+        """Resolve valid_patch_value from target config.
+
+        When set, only voxels matching this value count as labeled for patch validation
+        (instead of all non-zero values).
+        """
+        for target_name in target_names:
+            info = self.targets.get(target_name) or {}
+            value = info.get('valid_patch_value')
+            if value is not None:
+                return value
+        return None
 
     @staticmethod
     def _normalize_channel_selector(
@@ -571,6 +609,13 @@ class BaseDataset(Dataset):
 
     def __len__(self):
         return len(self.valid_patches)
+
+    @property
+    def n_fg(self) -> int:
+        """Number of foreground patches (patches with labels)."""
+        if hasattr(self, 'chunk_slicer') and hasattr(self.chunk_slicer, 'n_fg'):
+            return self.chunk_slicer.n_fg
+        return len(self)
 
     def _resolve_spatial_shape(self, source) -> Tuple[int, ...]:
         if hasattr(source, 'spatial_shape'):
@@ -726,204 +771,35 @@ class BaseDataset(Dataset):
         return data_dict
 
     def _create_training_transforms(self):
+        """
+        Create training augmentation transforms using the standard pipeline.
+        """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
         only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
-            
-        dimension = len(self.mgr.train_patch_size)
+        allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
 
-        if dimension == 2:
-            patch_h, patch_w = self.mgr.train_patch_size
-            patch_d = None  # Not used for 2D
-        elif dimension == 3:
-            patch_d, patch_h, patch_w = self.mgr.train_patch_size
-        else:
-            raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
-
-        transforms = []
-
-        if not no_spatial:
-            # Configure rotation based on patch aspect ratio
-            if dimension == 2:
-                if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
-                    rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
-                else:
-                    rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
-                mirror_axes = (0, 1)
-            else:  # 3D
-                rotation_for_DA = (-np.pi, np.pi)
-                mirror_axes = (0, 1, 2)
-
-            allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
-            # Add SpatialTransform for rotations, scaling, elastic deformations
-            transforms.append(
-                SpatialTransform(
-                    self.mgr.train_patch_size,
-                    patch_center_dist_from_border=0,
-                    random_crop=False,
-                    p_elastic_deform=0,
-                    p_rotation=0.5,
-                    rotation=rotation_for_DA,
-                    p_scaling=0.2,
-                    scaling=(0.7, 1.4),
-                    p_synchronize_scaling_across_axes=1,
-                    bg_style_seg_sampling=False,  # =, mode_seg='nearest'
-                    elastic_deform_magnitude=(5, 25),
-                    allowed_rotation_axes=allowed_rotation_axes
-                )
-            )
-
-            if mirror_axes is not None and len(mirror_axes) > 0:
-                transforms.append(MirrorTransform(allowed_axes=mirror_axes))
-
-        # Build shared intensity transforms once to keep 2D/3D lists aligned.
-        # Some transforms are conditional so we cache their ready-to-use wrappers.
-        blank_rectangle = None
-        if not only_spatial_and_intensity:
-            blank_rectangle = RandomTransform(
-                BlankRectangleTransform(
-                    rectangle_size=tuple(
-                        (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
-                    ),
-                    rectangle_value=np.mean,
-                    num_rectangles=(1, 5),
-                    force_square=False,
-                    p_per_sample=0.4,
-                    p_per_channel=0.5
-                ),
-                apply_probability=0.5
-            )
-
-        common_transforms = []
-        if not only_spatial_and_intensity:
-            common_transforms.append(RandomTransform(
-                GaussianNoiseTransform(
-                    noise_variance=(0, 0.15),
-                    p_per_channel=1,
-                    synchronize_channels=True
-                ), apply_probability=0.4
-            ))
-            common_transforms.append(RandomTransform(
-                GaussianBlurTransform(
-                    blur_sigma=(0.5, 1.5),
-                    synchronize_channels=False,
-                    synchronize_axes=False,
-                    p_per_channel=0.5,
-                    benchmark=False
-                ), apply_probability=0.4
-            ))
-
-        common_transforms.append(RandomTransform(
-            MultiplicativeBrightnessTransform(
-                multiplier_range=BGContrast((0.5, 1.5)),
-                synchronize_channels=False,
-                p_per_channel=1
-            ), apply_probability=0.3
-        ))
-        common_transforms.append(RandomTransform(
-            ContrastTransform(
-                contrast_range=BGContrast((0.5, 1.5)),
-                preserve_range=True,
-                synchronize_channels=False,
-                p_per_channel=1
-            ), apply_probability=0.3
-        ))
-
-        if not only_spatial_and_intensity:
-            common_transforms.append(RandomTransform(
-                SimulateLowResolutionTransform(
-                    scale=(0.25, 1),
-                    synchronize_channels=False,
-                    synchronize_axes=True,
-                    ignore_axes=None,
-                    allowed_channels=None,
-                    p_per_channel=0.5
-                ), apply_probability=0.4
-            ))
-
-        common_transforms.append(RandomTransform(
-            GammaTransform(
-                gamma=BGContrast((0.7, 1.5)),
-                p_invert_image=1,
-                synchronize_channels=False,
-                p_per_channel=1,
-                p_retain_stats=1
-            ), apply_probability=0.2
-        ))
-        common_transforms.append(RandomTransform(
-            GammaTransform(
-                gamma=BGContrast((0.7, 1.5)),
-                p_invert_image=0,
-                synchronize_channels=False,
-                p_per_channel=1,
-                p_retain_stats=1
-            ), apply_probability=0.4
-        ))
-
-        if dimension == 2:
-            if blank_rectangle is not None:
-                transforms.append(blank_rectangle)
-            transforms.extend(common_transforms)
-        else:
-            if not no_spatial and patch_d == patch_h == patch_w:
-                transforms.append(RandomTransform(
-                    TransposeAxesTransform(allowed_axes={0, 1, 2}),
-                    apply_probability=0.2
-                ))
-
-            if blank_rectangle is not None:
-                transforms.append(blank_rectangle)
-                transforms.append(RandomTransform(
-                    SmearTransform(
-                        shift=(5, 0),
-                        alpha=0.2,
-                        num_prev_slices=3,
-                        smear_axis=3
-                    ), apply_probability=0.3
-                ))
-
-            transforms.append(RandomTransform(
-                InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),
-                    defect_width=(25, 50),
-                    mult_brightness_reduction_at_defect=(0.3, 1.5),
-                    base_p=(0.2, 0.4),
-                    base_red=(0.5, 0.9),
-                    p_per_sample=1.0,
-                    per_channel=True,
-                    p_per_channel=0.5
-                ), apply_probability=0.4
-            ))
-
-            transforms.extend(common_transforms)
-
-        if no_spatial:
-            print("Spatial transformations disabled (no_spatial=True)")
-        
-        if only_spatial_and_intensity:
-            print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
-
+        # Get skeleton targets and their ignore values
         skeleton_targets = self._skeleton_loss_targets()
+        skeleton_ignore_values = None
         if skeleton_targets:
-            from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
-            ignore_values = {}
+            skeleton_ignore_values = {}
             for target_name in skeleton_targets:
                 cfg = self.targets.get(target_name, {}) if isinstance(self.targets, dict) else {}
                 for alias in ("ignore_index", "ignore_label", "ignore_value"):
                     value = cfg.get(alias)
                     if value is not None:
-                        ignore_values[target_name] = value
+                        skeleton_ignore_values[target_name] = value
                         break
-            transforms.append(
-                MedialSurfaceTransform(
-                    do_tube=False,
-                    target_keys=skeleton_targets,
-                    ignore_values=ignore_values or None,
-                )
-            )
-            print(f"Added MedialSurfaceTransform to training pipeline for targets: {', '.join(skeleton_targets)}")
 
-        return ComposeTransforms(transforms)
-    
+        return create_training_transforms(
+            patch_size=self.mgr.train_patch_size,
+            no_spatial=no_spatial,
+            only_spatial_and_intensity=only_spatial_and_intensity,
+            allowed_rotation_axes=allowed_rotation_axes,
+            skeleton_targets=skeleton_targets,
+            skeleton_ignore_values=skeleton_ignore_values,
+        )
+
     def _create_validation_transforms(self):
         """
         Create validation transforms.

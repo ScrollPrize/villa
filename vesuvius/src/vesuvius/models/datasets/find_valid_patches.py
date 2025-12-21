@@ -177,6 +177,7 @@ def check_patch_chunk(
     label_threshold=0.05,
     channel_selector: Union[int, Sequence[int], None] = None,
     ignore_label: Optional[Union[int, float]] = None,
+    valid_patch_value: Optional[Union[int, float]] = None,
 ):
     """Identify valid label patches within a chunk of candidate positions."""
 
@@ -212,7 +213,10 @@ def check_patch_chunk(
                 spatial_ndim=2,
                 channel_selector=collapse_selector,
             )
-            mask = np.abs(patch) > 0
+            if valid_patch_value is not None:
+                mask = (patch == valid_patch_value)
+            else:
+                mask = np.abs(patch) > 0
             bbox = compute_bounding_box_3d(mask)
             if bbox is None:
                 continue
@@ -242,7 +246,10 @@ def check_patch_chunk(
                 spatial_ndim=3,
                 channel_selector=collapse_selector,
             )
-            mask = np.abs(patch) > 0
+            if valid_patch_value is not None:
+                mask = (patch == valid_patch_value)
+            else:
+                mask = np.abs(patch) > 0
             bbox = compute_bounding_box_3d(mask)
             if bbox is None:
                 continue
@@ -273,15 +280,22 @@ def find_valid_patches(
     max_y=None,
     max_x=None,
     num_workers=4,
-    downsample_level=1,
+    valid_patch_find_resolution=1,
     channel_selectors: Sequence[Union[int, Sequence[int], None]] | None = None,
     ignore_labels: Sequence[Optional[Union[int, float]]] | None = None,
+    valid_patch_values: Sequence[Optional[Union[int, float]]] | None = None,
+    collect_bg_only: bool = False,
+    # Unlabeled foreground detection for semi-supervised learning
+    image_arrays: Sequence[object] | None = None,
+    collect_unlabeled_fg: bool = False,
+    unlabeled_fg_threshold: float = 0.05,  # Min fraction of non-zero image voxels
+    unlabeled_fg_bbox_threshold: float = 0.15,  # Min bbox coverage for image data
 ):
     """
     Finds patches that contain:
       - a bounding box of labeled voxels >= bbox_threshold fraction of the patch volume
       - an overall labeled voxel fraction >= label_threshold
-    
+
     Args:
         label_arrays: List of zarr arrays (label volumes) - should be OME-ZARR root groups
         label_names: List of names for each volume (filename without suffix)
@@ -291,24 +305,46 @@ def find_valid_patches(
         min_z, min_y, min_x: minimum coordinates for patch extraction (full resolution)
         max_z, max_y, max_x: maximum coordinates for patch extraction (full resolution)
         num_workers: number of processes for parallel processing
-        downsample_level: Resolution level to use for patch finding (0=full res, 1=2x downsample, etc.)
+        valid_patch_find_resolution: Resolution level to use for patch finding (0=full res, 1=2x downsample, etc.)
         ignore_labels: Optional per-volume ignore values that should be treated as background.
-    
+        valid_patch_values: Optional per-volume values to use for valid patch detection.
+            When set, only voxels matching this value count as labeled (instead of all non-zero).
+        collect_bg_only: When True and ignore_label is set, collect background-only patches
+            (patches where all labeled voxels are 0 after masking ignore labels).
+        image_arrays: Optional list of zarr arrays (image volumes) for unlabeled foreground detection.
+            Must match length of label_arrays when provided.
+        collect_unlabeled_fg: When True and image_arrays provided, collect patches that are
+            effectively unlabeled (no valid labels after ignore masking) but have image data.
+            These are used for semi-supervised learning (unlabeled samples with data).
+        unlabeled_fg_threshold: Minimum fraction of non-zero image voxels for a patch to qualify
+            as unlabeled foreground.
+        unlabeled_fg_bbox_threshold: Minimum bounding box coverage of non-zero image voxels.
+
     Returns:
-        List of dictionaries with 'volume_idx', 'volume_name', and 'start_pos' (coordinates at full resolution)
+        Dictionary with 'fg_patches', 'bg_patches', and 'unlabeled_fg_patches' lists,
+        each containing dictionaries with 'volume_idx', 'volume_name', and 'start_pos'
+        (coordinates at full resolution)
     """
     if len(label_arrays) != len(label_names):
         raise ValueError("Number of label arrays must match number of label names")
     if ignore_labels is not None and len(ignore_labels) != len(label_arrays):
         raise ValueError("ignore_labels must match number of label arrays when provided")
-    
+    if valid_patch_values is not None and len(valid_patch_values) != len(label_arrays):
+        raise ValueError("valid_patch_values must match number of label arrays when provided")
+    if collect_unlabeled_fg and image_arrays is None:
+        raise ValueError("image_arrays must be provided when collect_unlabeled_fg=True")
+    if image_arrays is not None and len(image_arrays) != len(label_arrays):
+        raise ValueError("image_arrays must match number of label arrays when provided")
+
     all_valid_patches = []
+    all_bg_patches = []
+    all_unlabeled_fg_patches = []
     
     # Calculate downsampled patch size
-    downsample_factor = 2 ** downsample_level
+    downsample_factor = 2 ** valid_patch_find_resolution
     downsampled_patch_size = tuple(p // downsample_factor for p in patch_size)
     
-    if downsample_level == 0:
+    if valid_patch_find_resolution == 0:
         print(
             f"Finding valid patches of size: {patch_size} at full resolution "
             f"with bounding box coverage >= {bbox_threshold} and labeled fraction >= {label_threshold}."
@@ -317,7 +353,7 @@ def find_valid_patches(
         print(
             f"Finding valid patches with bounding box coverage >= {bbox_threshold} and labeled fraction >= {label_threshold}.\n"
             f"Target patch size: {patch_size} (full resolution)\n"
-            f"Will attempt to use downsample level {downsample_level} for faster processing (would use patch size {downsampled_patch_size})"
+            f"Will attempt to use downsample level {valid_patch_find_resolution} for faster processing (would use patch size {downsampled_patch_size})"
         )
     
     # Outer progress bar for volumes
@@ -338,6 +374,14 @@ def find_valid_patches(
         ignore_label = None
         if ignore_labels is not None:
             ignore_label = ignore_labels[vol_idx]
+        valid_patch_value = None
+        if valid_patch_values is not None:
+            valid_patch_value = valid_patch_values[vol_idx]
+
+        # Get image array for unlabeled foreground detection
+        image_array = None
+        if image_arrays is not None:
+            image_array = image_arrays[vol_idx]
 
         if label_array is None:
             logger.warning(
@@ -352,61 +396,56 @@ def find_valid_patches(
         actual_downsampled_patch_size = downsampled_patch_size
 
         def _resolve_resolution(array_obj, level_key):
-            """Best-effort accessor for multi-resolution zarr groups."""
-
+            """Access resolution level from a zarr group or return array directly."""
             key = str(level_key)
 
-            # Attribute access (zarr Groups expose arrays as attributes)
-            try:
-                candidate = getattr(array_obj, key)
-            except AttributeError:
-                candidate = None
-            except Exception:
-                candidate = None
-            else:
-                if candidate is not None:
-                    return candidate
+            # If it's already an array (not a group), return it
+            if hasattr(array_obj, 'shape') and hasattr(array_obj, 'dtype'):
+                if not hasattr(array_obj, 'keys'):
+                    return array_obj
 
-            # Mapping-style / __getitem__ access
+            # Try accessing as group[level]
             try:
-                return array_obj[key]
+                candidate = array_obj[key]
+                if hasattr(candidate, 'shape'):
+                    return candidate
             except Exception:
-                return None
+                pass
+
+            return None
 
         logger.info(
-            "Resolving downsample level %s for volume '%s' (fallback level 0 if unavailable)",
-            downsample_level,
+            "Resolving downsample level %s for volume '%s'",
+            valid_patch_find_resolution,
             label_name,
         )
 
         try:
-            if downsample_level == 0:
-                # Use full resolution
-                candidate = _resolve_resolution(label_array, '0')
-                downsampled_array = candidate if candidate is not None else label_array
+            # Try to get the requested resolution level
+            candidate = _resolve_resolution(label_array, valid_patch_find_resolution)
+            if candidate is not None:
+                downsampled_array = candidate
+                logger.info(
+                    "Using level %s for '%s' with patch size %s",
+                    valid_patch_find_resolution,
+                    label_name,
+                    actual_downsampled_patch_size,
+                )
             else:
-                candidate = _resolve_resolution(label_array, downsample_level)
-                if candidate is not None:
-                    downsampled_array = candidate
-                    logger.info(
-                        "Using downsample level %s for '%s' with patch size %s",
-                        downsample_level,
-                        label_name,
-                        actual_downsampled_patch_size,
-                    )
+                # Fall back to level 0 or the array itself
+                candidate_full = _resolve_resolution(label_array, '0')
+                if candidate_full is not None:
+                    downsampled_array = candidate_full
                 else:
-                    # For non-multi-resolution zarrs, fall back to full resolution
-                    candidate_full = _resolve_resolution(label_array, '0')
-                    downsampled_array = candidate_full if candidate_full is not None else label_array
-                    # Update factors since we're using full resolution
-                    actual_downsample_factor = 1
-                    actual_downsampled_patch_size = patch_size
-                    print(f"Using full resolution for {label_name} (patch size {actual_downsampled_patch_size})")
-                    logger.info(
-                        "Falling back to full resolution for '%s' (patch size %s)",
-                        label_name,
-                        actual_downsampled_patch_size,
-                    )
+                    downsampled_array = label_array
+                actual_downsample_factor = 1
+                actual_downsampled_patch_size = patch_size
+                logger.info(
+                    "Level %s unavailable for '%s', using full resolution (patch size %s)",
+                    valid_patch_find_resolution,
+                    label_name,
+                    actual_downsampled_patch_size,
+                )
             if downsampled_array is None:
                 logger.warning(
                     "Volume '%s': unable to resolve label data for validation; skipping",
@@ -414,25 +453,18 @@ def find_valid_patches(
                 )
                 continue
         except Exception as e:
-            print(f"Error accessing resolution level {downsample_level} for {label_name}: {e}")
-            # Fallback to the array itself at full resolution
+            logger.warning(
+                "Error resolving level %s for '%s': %s. Using array directly.",
+                valid_patch_find_resolution, label_name, e,
+            )
             downsampled_array = label_array
             actual_downsample_factor = 1
             actual_downsampled_patch_size = patch_size
-            print(f"Using full resolution for {label_name} (patch size {actual_downsampled_patch_size})")
-            logger.info(
-                "Exception while resolving level %s for '%s': %s. Falling back to full resolution.",
-                downsample_level,
-                label_name,
-                e,
-            )
-            if downsampled_array is None:
-                logger.warning(
-                    "Volume '%s': no label data available after fallback; skipping",
-                    label_name,
-                )
-                continue
-        
+
+        if downsampled_array is None:
+            logger.warning("Volume '%s': no usable label data; skipping", label_name)
+            continue
+
         # Check if data is 2D or 3D based on patch dimensionality
         spatial_ndim = len(actual_downsampled_patch_size)
         is_2d = spatial_ndim == 2
@@ -494,6 +526,30 @@ def find_valid_patches(
         patch_volume = int(np.prod(actual_downsampled_patch_size))
 
         valid_positions_vol = []
+        bg_positions_vol = []
+        unlabeled_fg_positions_vol = []
+        # BG collection is only valid when ignore_label is set
+        should_collect_bg = collect_bg_only and ignore_label is not None
+        # Unlabeled FG collection requires image array
+        should_collect_unlabeled_fg = collect_unlabeled_fg and image_array is not None
+
+        # Resolve image array for unlabeled FG detection
+        downsampled_image_array = None
+        if should_collect_unlabeled_fg:
+            try:
+                candidate = _resolve_resolution(image_array, valid_patch_find_resolution)
+                if candidate is not None:
+                    downsampled_image_array = candidate
+                else:
+                    candidate_full = _resolve_resolution(image_array, '0')
+                    downsampled_image_array = candidate_full if candidate_full is not None else image_array
+            except Exception as e:
+                logger.warning(
+                    "Error resolving image level %s for '%s': %s. Using array directly.",
+                    valid_patch_find_resolution, label_name, e,
+                )
+                downsampled_image_array = image_array
+
         block_start = time.perf_counter()
 
         if is_2d:
@@ -502,7 +558,8 @@ def find_valid_patches(
             chunk_y_patches = min(chunk_y_patches, len(y_starts))
             chunk_x_patches = min(chunk_x_patches, len(x_starts))
 
-            for yi in range(0, len(y_starts), chunk_y_patches):
+            y_blocks = list(range(0, len(y_starts), chunk_y_patches))
+            for yi in tqdm(y_blocks, desc=f"  {label_name} blocks", position=1, leave=False):
                 y_group = y_starts[yi: yi + chunk_y_patches]
                 y_start = y_group[0]
                 y_stop = y_group[-1] + dpY
@@ -513,6 +570,18 @@ def find_valid_patches(
                     x_stop = x_group[-1] + dpX
 
                     block = np.asarray(downsampled_array[y_start:y_stop, x_start:x_stop])
+                    # Check BG criteria on original block before zeroing ignore labels
+                    if should_collect_bg:
+                        block_for_bg = reduce_block_to_scalar(
+                            block, spatial_ndim=2, channel_selector=selector
+                        )
+                        has_fg = np.any(block_for_bg == valid_patch_value)
+                        has_ignore = np.any(block_for_bg == ignore_label)
+                        has_bg = np.any(block_for_bg == 0)
+                        if has_ignore and has_bg and not has_fg:
+                            for yy in range(len(y_group)):
+                                for xx in range(len(x_group)):
+                                    bg_positions_vol.append((y_group[yy], x_group[xx]))
                     if ignore_label is not None:
                         block = zero_ignore_labels(block, ignore_label)
                     block = reduce_block_to_scalar(
@@ -520,7 +589,10 @@ def find_valid_patches(
                         spatial_ndim=2,
                         channel_selector=selector,
                     )
-                    block_mask = np.asarray(block != 0)
+                    if valid_patch_value is not None:
+                        block_mask = np.asarray(block == valid_patch_value)
+                    else:
+                        block_mask = np.asarray(block != 0)
                     if not np.any(block_mask):
                         continue
 
@@ -557,14 +629,69 @@ def find_valid_patches(
 
                     valid_mask = (label_fraction >= label_threshold) & (bbox_fraction >= bbox_threshold)
 
-                    if not np.any(valid_mask):
-                        continue
+                    # Collect valid (labeled) patches
+                    if np.any(valid_mask):
+                        valid_idx = np.argwhere(valid_mask)
+                        for (yy, xx) in valid_idx:
+                            pos_y = y_group[yy]
+                            pos_x = x_group[xx]
+                            valid_positions_vol.append((pos_y, pos_x))
 
-                    valid_idx = np.argwhere(valid_mask)
-                    for (yy, xx) in valid_idx:
-                        pos_y = y_group[yy]
-                        pos_x = x_group[xx]
-                        valid_positions_vol.append((pos_y, pos_x))
+                    # Collect unlabeled foreground patches (labels fail, but image has data)
+                    if should_collect_unlabeled_fg and downsampled_image_array is not None:
+                        # Patches that are effectively unlabeled (fail label threshold)
+                        unlabeled_mask = ~valid_mask
+                        if np.any(unlabeled_mask):
+                            # Load corresponding image block
+                            image_block = np.asarray(
+                                downsampled_image_array[y_start:y_stop, x_start:x_stop]
+                            )
+                            # Reduce to scalar (handle multi-channel)
+                            if image_block.ndim > 2:
+                                image_block = image_block.reshape(image_block.shape[-2:])
+                            image_nonzero = np.asarray(image_block != 0)
+                            if np.any(image_nonzero):
+                                image_nonzero = np.ascontiguousarray(image_nonzero)
+                                img_patches_view = as_strided(
+                                    image_nonzero,
+                                    shape=(y_len, x_len, dpY, dpX),
+                                    strides=(
+                                        image_nonzero.strides[0] * dpY,
+                                        image_nonzero.strides[1] * dpX,
+                                        image_nonzero.strides[0],
+                                        image_nonzero.strides[1],
+                                    ),
+                                    writeable=False,
+                                )
+                                img_patches_flat = img_patches_view.reshape(y_len, x_len, -1)
+                                img_nonzero_counts = img_patches_flat.sum(axis=-1)
+                                img_fraction = img_nonzero_counts / patch_volume
+
+                                # Compute image bbox coverage
+                                img_y_any = img_patches_view.any(axis=-1)
+                                img_x_any = img_patches_view.any(axis=-2)
+                                img_y_has = img_y_any.any(axis=-1)
+                                img_x_has = img_x_any.any(axis=-1)
+                                img_y_first = np.argmax(img_y_any, axis=-1)
+                                img_y_last = img_y_any.shape[-1] - 1 - np.argmax(img_y_any[..., ::-1], axis=-1)
+                                img_y_width = np.where(img_y_has, (img_y_last - img_y_first + 1), 0)
+                                img_x_first = np.argmax(img_x_any, axis=-1)
+                                img_x_last = img_x_any.shape[-1] - 1 - np.argmax(img_x_any[..., ::-1], axis=-1)
+                                img_x_width = np.where(img_x_has, (img_x_last - img_x_first + 1), 0)
+                                img_bbox_fraction = (img_y_width * img_x_width) / patch_volume
+
+                                # Unlabeled FG: unlabeled AND image has data
+                                unlabeled_fg_mask = (
+                                    unlabeled_mask &
+                                    (img_fraction >= unlabeled_fg_threshold) &
+                                    (img_bbox_fraction >= unlabeled_fg_bbox_threshold)
+                                )
+                                if np.any(unlabeled_fg_mask):
+                                    unlabeled_fg_idx = np.argwhere(unlabeled_fg_mask)
+                                    for (yy, xx) in unlabeled_fg_idx:
+                                        pos_y = y_group[yy]
+                                        pos_x = x_group[xx]
+                                        unlabeled_fg_positions_vol.append((pos_y, pos_x))
         else:
             chunk_z_patches = max(1, chunk_shape[0] // dpZ)
             chunk_y_patches = max(1, chunk_shape[1] // dpY)
@@ -573,7 +700,8 @@ def find_valid_patches(
             chunk_y_patches = min(chunk_y_patches, len(y_starts))
             chunk_x_patches = min(chunk_x_patches, len(x_starts))
 
-            for zi in range(0, len(z_starts), chunk_z_patches):
+            z_blocks = list(range(0, len(z_starts), chunk_z_patches))
+            for zi in tqdm(z_blocks, desc=f"  {label_name} blocks", position=1, leave=False):
                 z_group = z_starts[zi: zi + chunk_z_patches]
                 z_start = z_group[0]
                 z_stop = z_group[-1] + dpZ
@@ -591,6 +719,19 @@ def find_valid_patches(
                         block = np.asarray(
                             downsampled_array[z_start:z_stop, y_start:y_stop, x_start:x_stop]
                         )
+                        # Check BG criteria on original block before zeroing ignore labels
+                        if should_collect_bg:
+                            block_for_bg = reduce_block_to_scalar(
+                                block, spatial_ndim=3, channel_selector=selector
+                            )
+                            has_fg = np.any(block_for_bg == valid_patch_value)
+                            has_ignore = np.any(block_for_bg == ignore_label)
+                            has_bg = np.any(block_for_bg == 0)
+                            if has_ignore and has_bg and not has_fg:
+                                for zz in range(len(z_group)):
+                                    for yy in range(len(y_group)):
+                                        for xx in range(len(x_group)):
+                                            bg_positions_vol.append((z_group[zz], y_group[yy], x_group[xx]))
                         if ignore_label is not None:
                             block = zero_ignore_labels(block, ignore_label)
                         block = reduce_block_to_scalar(
@@ -598,7 +739,10 @@ def find_valid_patches(
                             spatial_ndim=3,
                             channel_selector=selector,
                         )
-                        block_mask = np.asarray(block != 0)
+                        if valid_patch_value is not None:
+                            block_mask = np.asarray(block == valid_patch_value)
+                        else:
+                            block_mask = np.asarray(block != 0)
                         if not np.any(block_mask):
                             continue
 
@@ -651,15 +795,78 @@ def find_valid_patches(
                             bbox_fraction >= bbox_threshold
                         )
 
-                        if not np.any(valid_mask):
-                            continue
+                        # Collect valid (labeled) patches
+                        if np.any(valid_mask):
+                            valid_idx = np.argwhere(valid_mask)
+                            for (zz, yy, xx) in valid_idx:
+                                pos_z = z_group[zz]
+                                pos_y = y_group[yy]
+                                pos_x = x_group[xx]
+                                valid_positions_vol.append((pos_z, pos_y, pos_x))
 
-                        valid_idx = np.argwhere(valid_mask)
-                        for (zz, yy, xx) in valid_idx:
-                            pos_z = z_group[zz]
-                            pos_y = y_group[yy]
-                            pos_x = x_group[xx]
-                            valid_positions_vol.append((pos_z, pos_y, pos_x))
+                        # Collect unlabeled foreground patches (labels fail, but image has data)
+                        if should_collect_unlabeled_fg and downsampled_image_array is not None:
+                            # Patches that are effectively unlabeled (fail label threshold)
+                            unlabeled_mask = ~valid_mask
+                            if np.any(unlabeled_mask):
+                                # Load corresponding image block
+                                image_block = np.asarray(
+                                    downsampled_image_array[z_start:z_stop, y_start:y_stop, x_start:x_stop]
+                                )
+                                # Reduce to scalar (handle multi-channel)
+                                if image_block.ndim > 3:
+                                    image_block = image_block.reshape(image_block.shape[-3:])
+                                image_nonzero = np.asarray(image_block != 0)
+                                if np.any(image_nonzero):
+                                    image_nonzero = np.ascontiguousarray(image_nonzero)
+                                    img_patches_view = as_strided(
+                                        image_nonzero,
+                                        shape=(z_len, y_len, x_len, dpZ, dpY, dpX),
+                                        strides=(
+                                            image_nonzero.strides[0] * dpZ,
+                                            image_nonzero.strides[1] * dpY,
+                                            image_nonzero.strides[2] * dpX,
+                                            image_nonzero.strides[0],
+                                            image_nonzero.strides[1],
+                                            image_nonzero.strides[2],
+                                        ),
+                                        writeable=False,
+                                    )
+                                    img_patches_flat = img_patches_view.reshape(z_len, y_len, x_len, -1)
+                                    img_nonzero_counts = img_patches_flat.sum(axis=-1)
+                                    img_fraction = img_nonzero_counts / patch_volume
+
+                                    # Compute image bbox coverage (3D)
+                                    img_z_any = img_patches_view.any(axis=(4, 5))
+                                    img_y_any = img_patches_view.any(axis=(3, 5))
+                                    img_x_any = img_patches_view.any(axis=(3, 4))
+                                    img_z_has = img_z_any.any(axis=-1)
+                                    img_y_has = img_y_any.any(axis=-1)
+                                    img_x_has = img_x_any.any(axis=-1)
+                                    img_z_first = np.argmax(img_z_any, axis=-1)
+                                    img_z_last = img_z_any.shape[-1] - 1 - np.argmax(img_z_any[..., ::-1], axis=-1)
+                                    img_z_width = np.where(img_z_has, (img_z_last - img_z_first + 1), 0)
+                                    img_y_first = np.argmax(img_y_any, axis=-1)
+                                    img_y_last = img_y_any.shape[-1] - 1 - np.argmax(img_y_any[..., ::-1], axis=-1)
+                                    img_y_width = np.where(img_y_has, (img_y_last - img_y_first + 1), 0)
+                                    img_x_first = np.argmax(img_x_any, axis=-1)
+                                    img_x_last = img_x_any.shape[-1] - 1 - np.argmax(img_x_any[..., ::-1], axis=-1)
+                                    img_x_width = np.where(img_x_has, (img_x_last - img_x_first + 1), 0)
+                                    img_bbox_fraction = (img_z_width * img_y_width * img_x_width) / patch_volume
+
+                                    # Unlabeled FG: unlabeled AND image has data
+                                    unlabeled_fg_mask = (
+                                        unlabeled_mask &
+                                        (img_fraction >= unlabeled_fg_threshold) &
+                                        (img_bbox_fraction >= unlabeled_fg_bbox_threshold)
+                                    )
+                                    if np.any(unlabeled_fg_mask):
+                                        unlabeled_fg_idx = np.argwhere(unlabeled_fg_mask)
+                                        for (zz, yy, xx) in unlabeled_fg_idx:
+                                            pos_z = z_group[zz]
+                                            pos_y = y_group[yy]
+                                            pos_x = x_group[xx]
+                                            unlabeled_fg_positions_vol.append((pos_z, pos_y, pos_x))
 
         elapsed = time.perf_counter() - block_start
         logger.info(
@@ -669,7 +876,7 @@ def find_valid_patches(
             (len(valid_positions_vol) / candidate_count * 100.0) if candidate_count else 0.0,
             elapsed,
         )
-        
+
         # Add results with proper volume tracking - scale coordinates back to full resolution
         for pos in valid_positions_vol:
             if is_2d:
@@ -677,7 +884,7 @@ def find_valid_patches(
                 y, x = pos
                 full_res_y = y * actual_downsample_factor
                 full_res_x = x * actual_downsample_factor
-                
+
                 all_valid_patches.append({
                     'volume_idx': vol_idx,
                     'volume_name': label_name,
@@ -689,16 +896,76 @@ def find_valid_patches(
                 full_res_z = z * actual_downsample_factor
                 full_res_y = y * actual_downsample_factor
                 full_res_x = x * actual_downsample_factor
-                
+
                 all_valid_patches.append({
                     'volume_idx': vol_idx,
                     'volume_name': label_name,
                     'start_pos': [full_res_z, full_res_y, full_res_x]
                 })
-        
+
+        # Add BG-only patches if collected
+        for pos in bg_positions_vol:
+            if is_2d:
+                y, x = pos
+                full_res_y = y * actual_downsample_factor
+                full_res_x = x * actual_downsample_factor
+
+                all_bg_patches.append({
+                    'volume_idx': vol_idx,
+                    'volume_name': label_name,
+                    'start_pos': [full_res_y, full_res_x]
+                })
+            else:
+                z, y, x = pos
+                full_res_z = z * actual_downsample_factor
+                full_res_y = y * actual_downsample_factor
+                full_res_x = x * actual_downsample_factor
+
+                all_bg_patches.append({
+                    'volume_idx': vol_idx,
+                    'volume_name': label_name,
+                    'start_pos': [full_res_z, full_res_y, full_res_x]
+                })
+
+        # Add unlabeled FG patches if collected
+        for pos in unlabeled_fg_positions_vol:
+            if is_2d:
+                y, x = pos
+                full_res_y = y * actual_downsample_factor
+                full_res_x = x * actual_downsample_factor
+
+                all_unlabeled_fg_patches.append({
+                    'volume_idx': vol_idx,
+                    'volume_name': label_name,
+                    'start_pos': [full_res_y, full_res_x]
+                })
+            else:
+                z, y, x = pos
+                full_res_z = z * actual_downsample_factor
+                full_res_y = y * actual_downsample_factor
+                full_res_x = x * actual_downsample_factor
+
+                all_unlabeled_fg_patches.append({
+                    'volume_idx': vol_idx,
+                    'volume_name': label_name,
+                    'start_pos': [full_res_z, full_res_y, full_res_x]
+                })
+
         print(f"Found {len(valid_positions_vol)} valid patches in '{label_name}'")
-    
+        if bg_positions_vol:
+            print(f"Found {len(bg_positions_vol)} BG-only patches in '{label_name}'")
+        if unlabeled_fg_positions_vol:
+            print(f"Found {len(unlabeled_fg_positions_vol)} unlabeled foreground patches in '{label_name}'")
+
     # Final summary
     print(f"\nTotal valid patches found across all {len(label_arrays)} volumes: {len(all_valid_patches)}")
-    
-    return all_valid_patches
+    if all_bg_patches:
+        print(f"Total BG-only patches found: {len(all_bg_patches)}")
+    if all_unlabeled_fg_patches:
+        print(f"Total unlabeled foreground patches found: {len(all_unlabeled_fg_patches)}")
+
+    return {
+        'fg_patches': all_valid_patches,
+        'bg_patches': all_bg_patches,
+        'unlabeled_fg_patches': all_unlabeled_fg_patches,
+    }
