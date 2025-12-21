@@ -74,7 +74,6 @@ def make_canvas(
 
     log_image_max_samples = config['log_image_max_samples']
     log_image_grid_cols = config['log_image_grid_cols']
-    multistep_count = int(config.get('multistep_count', 1))
 
     sample_count = min(inputs.shape[0], log_image_max_samples)
     inputs = inputs[:sample_count]
@@ -93,7 +92,7 @@ def make_canvas(
 
     # For non-slotted multistep, collapse step dimension for visualization
     # Slotted variant uses fixed slots, not (uv, steps) organization
-    if multistep_count > 1 and config.get('dataset_variant') != 'slotted':
+    if config.get('dataset_variant') != 'slotted':
         targets = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
         target_pred = rearrange(target_pred, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
 

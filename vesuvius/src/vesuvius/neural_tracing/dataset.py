@@ -47,9 +47,11 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     _kernel_value_cache = {}
     _quad_weight_cache = {}
 
-    def __init__(self, config, patches_for_split):
+    def __init__(self, config, patches_for_split, multistep_count, bidirectional):
         self._config = config
         self._patches = patches_for_split
+        self._multistep_count = multistep_count
+        self._bidirectional = bidirectional
         self._heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
         self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'],config['augmentation']['allow_mirroring'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
@@ -606,7 +608,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         crop_size = torch.tensor(self._config['crop_size'])
         step_size = torch.tensor(self._config['step_size'])
         multistep_prob = float(self._config.get('multistep_prob', 0.0))
-        multistep_count = int(self._config.get('multistep_count', 1))
+        multistep_count = self._multistep_count
         heatmap_sigma = self._heatmap_sigma
 
         crop_size += step_size * torch.tensor(self._config['step_count']) * (multistep_count - 1) * 2
@@ -807,7 +809,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 suppress_out_u=suppress_out_u,
                 suppress_out_v=suppress_out_v,
                 diag_zyx=diag_zyx,
-                center_zyx_unperturbed=center_zyx_unperturbed if self._config.get('bidirectional', False) else None,
+                center_zyx_unperturbed=center_zyx_unperturbed if self._bidirectional else None,
             )
 
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']

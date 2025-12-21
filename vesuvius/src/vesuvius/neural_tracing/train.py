@@ -58,16 +58,32 @@ def train(config_path):
 
     if 'wandb_project' in config and accelerator.is_main_process:
         wandb.init(project=config['wandb_project'], entity=config.get('wandb_entity', None), config=config)
+    
+    if 'multistep_max_count' in config:
+        multistep_increase_iters = np.asarray(config['multistep_count_increase_iters'], dtype=np.int64)
+        assert len(multistep_increase_iters) == config['multistep_max_count'] - 1
+        assert np.all(multistep_increase_iters >= 0) and np.all(multistep_increase_iters < config['num_iterations'])
+        assert np.all(np.diff(multistep_increase_iters) > 0)
+    else:
+        assert 'multistep_count_increase_iters' not in config
+        multistep_increase_iters = []
+    multistep_count = 1
+    bidirectional = False  # ...since at first we're single-step for which bidirectional is not supported
 
     if config['representation'] == 'heatmap':
         train_patches, val_patches = load_datasets(config)
-        train_dataset = HeatmapDatasetV2(config, train_patches)
-        val_dataset = HeatmapDatasetV2(config, val_patches)
-    else:
-        train_dataset = val_dataset = PatchInCubeDataset(config)
-        
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
+
+    def make_dataloaders():
+        if config['representation'] == 'heatmap':
+            train_dataset = HeatmapDatasetV2(config, train_patches, multistep_count=multistep_count, bidirectional=bidirectional)
+            val_dataset = HeatmapDatasetV2(config, val_patches, multistep_count=multistep_count, bidirectional=bidirectional)
+        else:
+            train_dataset = val_dataset = PatchInCubeDataset(config)
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
+        return accelerator.prepare(train_dataloader, val_dataloader)
+
+    train_dataloader, val_dataloader = make_dataloaders()
 
     model = make_model(config)
     config.setdefault('compile_model', config.get('compile', True))
@@ -112,13 +128,14 @@ def train(config_path):
         optimizer.load_state_dict(ckpt['optimizer'])
         # Note we don't load the lr_scheduler state (i.e. training starts 'hot'), nor any config
 
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    model, optimizer, lr_scheduler = accelerator.prepare(
+        model, optimizer, lr_scheduler  # note we do the dataloaders in make_dataloaders
     )
 
     if accelerator.is_main_process:
         print_training_config(config, accelerator)
 
+    train_iterator = iter(train_dataloader)
     val_iterator = iter(val_dataloader)
 
     def prepare_inputs(batch, min_corner_in_outer, prev_uvd_cropped):
@@ -164,11 +181,9 @@ def train(config_path):
 
     def compute_loss_and_pred(batch):
 
-        multistep_count = config.get('multistep_count', 1)
         sample_count = config.get('multistep_samples', 1)
         sampling_mode = config.get('multistep_sampling_mode', 'categorical')
         assert sampling_mode in ['categorical', 'expectation']
-        bidirectional = config.get('bidirectional', False)
 
         outer_crop_shape = torch.tensor(batch['volume'].shape[-3:], device=accelerator.device)
         outer_crop_center = outer_crop_shape // 2
@@ -495,7 +510,17 @@ def train(config_path):
         return loss, pred_for_vis
 
     progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
-    for iteration, batch in enumerate(train_dataloader):
+    for iteration in range(config['num_iterations'] + 1):
+
+        if iteration in multistep_increase_iters:
+            multistep_count += 1
+            bidirectional = config.get('bidirectional', False)
+            print(f'increasing multistep_count to {multistep_count}')
+            train_dataloader, val_dataloader = make_dataloaders()
+            train_iterator = iter(train_dataloader)
+            val_iterator = iter(val_dataloader)
+
+        batch = next(train_iterator)
 
         wandb_log = {}
         with accelerator.accumulate(model):
@@ -517,7 +542,7 @@ def train(config_path):
 
         wandb_log['loss'] = total_loss.detach().item()
         wandb_log['first_step_heatmap_loss'] = first_step_heatmap_loss.detach().item()
-        if config.get('multistep_count', 1) > 1:
+        if multistep_count > 1:
             wandb_log['later_step_loss'] = later_step_loss.detach().item()
         if use_seg:
             wandb_log['seg_loss'] = seg_loss.detach().item()
@@ -540,7 +565,7 @@ def train(config_path):
 
                 wandb_log['val_loss'] = total_val_loss.item()
                 wandb_log['val_first_step_heatmap_loss'] = val_first_step_heatmap_loss.item()
-                if config.get('multistep_count', 1) > 1:
+                if multistep_count > 1:
                     wandb_log['val_later_step_loss'] = val_later_step_loss.item()
                 if use_seg:
                     wandb_log['val_seg_loss'] = val_seg_loss.item()
@@ -570,9 +595,6 @@ def train(config_path):
 
         if wandb.run is not None:
             wandb.log(wandb_log)
-
-        if iteration == config['num_iterations']:
-            break
 
 
 if __name__ == '__main__':
