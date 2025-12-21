@@ -1,0 +1,35 @@
+# LeJEPA pretraining configuration with Primus-M encoder
+# Uses SIGReg (Sketched Isotropic Gaussian Regularization) for unsupervised learning
+
+
+tr_config:
+  patch_size: [128, 128, 128]  # D, H, W - must be divisible by patch_embed_size
+  initial_lr: 5e-4
+  weight_decay: 0.05
+  max_epoch: 100
+  warmup_duration: 1  # 1 epoch warmup (matching original LeJEPA paper)
+
+model_config:
+  architecture_type: "primus_m"
+  patch_embed_size: [8, 8, 8]  # Patch size for ViT embedding
+  drop_path_rate: 0.1
+  proj_drop_rate: 0.0
+  attn_drop_rate: 0.0
+  patch_drop_rate: 0.0  # No masking for LeJEPA
+
+# LeJEPA-specific parameters
+lejepa_config:
+  lambda: 0.02  # Balance between invariance and SIGReg loss (original paper uses 0.02)
+  num_global_views: 2  # Views with lighter augmentation (full resolution)
+  num_local_views: 6  # Views with stronger augmentation (cropped + resized)
+  sigreg_num_slices: 256  # Random projection directions for SIGReg
+  proj_dim: 128  # Projection dimension (128-512 range recommended)
+  local_crop_size: [64, 64, 64]  # Size for local view crops (multi-scale)
+  primus_variant: "M"  # S, B, M, or L
+
+dataset_config:
+  min_labeled_ratio: 0          # No minimum labeled voxel ratio
+  min_bbox_percent: 0           # No bounding box coverage requirement
+  skip_patch_validation: true   # Enumerate ALL patches, don't filter by labels
+  allow_unlabeled_data: true    # Accept volumes without labels
+  normalization_scheme: "zscore"  # z-score normalization per volume

@@ -2154,6 +2154,11 @@ def main():
         from vesuvius.models.training.trainers.self_supervised.train_finetune_mae_unet import TrainFineTuneMAEUNet
         trainer = TrainFineTuneMAEUNet(mgr=mgr, verbose=args.verbose)
         print("Using Fine-Tune MAE->UNet Trainer (NetworkFromConfig)")
+    elif trainer_name == "lejepa":
+        mgr.allow_unlabeled_data = True
+        from vesuvius.models.training.trainers.self_supervised.train_lejepa import TrainLeJEPA
+        trainer = TrainLeJEPA(mgr=mgr, verbose=args.verbose)
+        print("Using LeJEPA Trainer (Primus + SIGReg) for unsupervised pretraining")
     elif trainer_name == "mutex_affinity":
         from vesuvius.models.training.trainers.mutex_affinity_trainer import MutexAffinityTrainer
         trainer = MutexAffinityTrainer(mgr=mgr, verbose=args.verbose)
@@ -2169,7 +2174,7 @@ def main():
     else:
         raise ValueError(
             "Unknown trainer: {trainer}. Available options: base, surface_frame, mutex_affinity, mean_teacher, "
-            "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet".format(trainer=trainer_name)
+            "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet, lejepa".format(trainer=trainer_name)
         )
 
     print("Starting training...")
