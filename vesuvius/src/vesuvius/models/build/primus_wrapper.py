@@ -207,9 +207,6 @@ class PrimusDecoder(nn.Module):
     ):
         super().__init__()
 
-        if decoder_depth > 0:
-            print(f"Warning: decoder_depth={decoder_depth} is deprecated and ignored. "
-                  "Official Primus uses only PatchDecode without transformer decoder layers.")
 
         # Store encoder reference without registering as submodule to avoid
         # duplicate state_dict keys when decoder is used with separate_decoders=True
