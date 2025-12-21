@@ -169,6 +169,15 @@ class BaseTrainer:
         model = NetworkFromConfig(self.mgr)
         return model
 
+    def _get_additional_checkpoint_data(self):
+        """
+        Return additional data to include in checkpoint saves.
+
+        Subclasses can override this to save extra state (e.g., EMA model).
+        Returns a dict that will be merged into the checkpoint.
+        """
+        return {}
+
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
         dataset = self._build_dataset_for_mgr(self.mgr, is_training=is_training)
@@ -388,8 +397,16 @@ class BaseTrainer:
                 self.mgr.model_config["targets"] = deepcopy(targets)
             if isinstance(getattr(self.mgr, 'dataset_config', None), dict):
                 self.mgr.dataset_config["targets"] = deepcopy(targets)
-            if getattr(self.mgr, 'verbose', False):
-                print("Applied loss configuration overrides after loading checkpoint.")
+            # Always print when config overrides checkpoint loss values
+            print("Config loss parameters override checkpoint values:")
+            for target_name, override in overrides.items():
+                if target_name in targets and override.get("losses"):
+                    for loss_cfg in override["losses"]:
+                        loss_name = loss_cfg.get("name", "unknown")
+                        params = {k: v for k, v in loss_cfg.items()
+                                  if k not in ("name", "weight", "kwargs")}
+                        if params:
+                            print(f"  {target_name}/{loss_name}: {params}")
 
     # --- deep supervision helpers --- #
     def _set_deep_supervision_enabled(self, model, enabled: bool):
@@ -674,20 +691,36 @@ class BaseTrainer:
 
         if val_dataset is None or val_dataset is train_dataset or same_source:
             dataset_size = len(train_dataset)
-            indices = list(range(dataset_size))
+
+            # Get number of FG patches (patches with labels) - BG patches go to training only
+            n_fg = getattr(train_dataset, 'n_fg', dataset_size)
+            fg_indices = list(range(n_fg))
+            bg_indices = list(range(n_fg, dataset_size))
 
             if hasattr(self.mgr, 'seed'):
                 np.random.seed(self.mgr.seed)
                 if self.mgr.verbose:
                     print(f"Using seed {self.mgr.seed} for train/val split")
 
-            np.random.shuffle(indices)
+            np.random.shuffle(fg_indices)
 
             train_val_split = self.mgr.tr_val_split
-            split = int(np.floor(train_val_split * dataset_size))
-            train_indices, val_indices = indices[:split], indices[split:]
+            split = int(np.floor(train_val_split * len(fg_indices)))
+
+            # Train gets split FG + ALL BG patches, val only gets FG patches
+            train_fg = fg_indices[:split]
+            val_fg = fg_indices[split:]
+            train_indices = train_fg + bg_indices
+            val_indices = val_fg
+
+            # Store counts for weighted sampling epoch size calculation
+            n_train_fg = len(train_fg)
+            n_train_bg = len(bg_indices)
+
             if same_source and self.mgr.verbose:
                 print("Validation dataset shares the same source as training; using random split")
+            if self.mgr.verbose:
+                print(f"Split: {len(train_fg)} FG + {len(bg_indices)} BG patches for training, {len(val_fg)} FG patches for validation")
         else:
             # Separate validation dataset provided. Use full validation set, and
             # exclude any training patches whose volume_name appears in validation.
@@ -705,6 +738,11 @@ class BaseTrainer:
                 name = vp.get('volume_name')
                 if name is None or name not in val_volume_names:
                     train_indices.append(i)
+
+            # Count FG/BG in training indices for weighted sampling
+            n_fg_dataset = getattr(train_dataset, 'n_fg', len(train_dataset))
+            n_train_fg = sum(1 for i in train_indices if i < n_fg_dataset)
+            n_train_bg = len(train_indices) - n_train_fg
 
             if self.mgr.verbose:
                 print(f"Using external validation set: {len(val_indices)} val patches")
@@ -736,14 +774,27 @@ class BaseTrainer:
                         if hasattr(self.mgr, 'seed') and self.mgr.seed is not None:
                             generator = torch.Generator()
                             generator.manual_seed(int(self.mgr.seed))
+
+                        # Calculate epoch size: all FG patches + enough BG so that BG is bg_to_fg_ratio of total
+                        # If bg_to_fg_ratio=0.1, we want 10% of total samples to be BG
+                        # bg_samples = n_fg * ratio / (1 - ratio)
+                        bg_to_fg_ratio = float(getattr(self.mgr, 'bg_to_fg_ratio', 0.5))
+                        if bg_to_fg_ratio < 1.0:
+                            n_bg_samples = int(n_train_fg * bg_to_fg_ratio / (1.0 - bg_to_fg_ratio))
+                        else:
+                            n_bg_samples = n_train_bg  # ratio >= 1 means use all BG
+                        n_bg_samples = min(n_bg_samples, n_train_bg)  # Can't sample more BG than exists
+                        num_samples = n_train_fg + n_bg_samples
+
                         train_sampler = WeightedRandomSampler(
                             weights=weight_tensor,
-                            num_samples=len(subset_weights),
-                            replacement=True,
+                            num_samples=num_samples,
+                            replacement=False,
                             generator=generator
                         )
                         if self.mgr.verbose:
-                            print("Using WeightedRandomSampler with slice sampling weights")
+                            bg_percent = 100.0 * n_bg_samples / num_samples if num_samples > 0 else 0
+                            print(f"Using WeightedRandomSampler: {n_train_fg} FG + {n_bg_samples} BG = {num_samples} samples/epoch ({bg_percent:.1f}% BG)")
                     else:
                         train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
                 else:
@@ -905,6 +956,15 @@ class BaseTrainer:
 
             if checkpoint_loaded:
                 self._apply_loss_overrides(loss_overrides)
+                # Store any additional state (e.g., EMA model) for subclasses to use
+                try:
+                    ckpt = torch.load(self.mgr.checkpoint_path, map_location=self.device, weights_only=False)
+                    if isinstance(ckpt, dict) and 'ema_model' in ckpt:
+                        self._checkpoint_ema_state = ckpt['ema_model']
+                        print("Found EMA model state in checkpoint")
+                    del ckpt
+                except Exception:
+                    pass
 
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
@@ -1231,7 +1291,8 @@ class BaseTrainer:
             epoch=epoch,
             checkpoint_path=ckpt_path,
             model_config=getattr(model, 'final_config', None),
-            train_dataset=train_dataset
+            train_dataset=train_dataset,
+            additional_data=self._get_additional_checkpoint_data()
         )
 
         checkpoint_history.append((epoch, ckpt_path))
@@ -1625,6 +1686,11 @@ class BaseTrainer:
                                         if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
+                                    # Get unlabeled debug samples if available (for semi-supervised trainers)
+                                    unlabeled_input = getattr(self, '_debug_unlabeled_input', None)
+                                    unlabeled_pseudo = getattr(self, '_debug_unlabeled_pseudo_label', None)
+                                    unlabeled_pred = getattr(self, '_debug_unlabeled_student_pred', None)
+
                                     _, debug_preview_image = save_debug(
                                         input_volume=inputs_first,
                                         targets_dict=targets_dict_first,
@@ -1637,7 +1703,10 @@ class BaseTrainer:
                                         train_targets_dict=train_sample_targets,
                                         train_outputs_dict=train_sample_outputs,
                                         skeleton_dict=skeleton_dict,
-                                        train_skeleton_dict=train_skeleton_dict
+                                        train_skeleton_dict=train_skeleton_dict,
+                                        unlabeled_input=unlabeled_input,
+                                        unlabeled_pseudo_dict=unlabeled_pseudo,
+                                        unlabeled_outputs_dict=unlabeled_pred
                                     )
                                     debug_gif_history.append((epoch, debug_img_path))
 
