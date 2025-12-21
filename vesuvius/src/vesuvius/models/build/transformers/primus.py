@@ -125,31 +125,21 @@ class Primus(AbstractDynamicNetworkArchitectures):
         """
         if keep_indices is None:
             return x, None
+
         B, num_kept, C = x.shape
         device = x.device
 
-        # Create mask tokens for missing patches
-        num_masked = num_patches - num_kept
-        mask_tokens = self.mask_token.repeat(B, num_masked, 1)
-
-        # Prepare an empty tensor for the restored sequence
-        restored = torch.zeros(B, num_patches, C, device=device)
+        # Initialize with mask tokens expanded to full sequence
+        restored = self.mask_token.expand(B, num_patches, -1).clone()
         restored_mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
 
-        # Assign the kept patches and mask tokens in the correct positions
-        for i in range(B):
-            kept_pos = keep_indices[i]
-            # masked_pos_prior = torch.tensor([j for j in range(num_patches) if j not in kept_pos], device=device)
-            # replacement of list comprehension
-            # kept_pos_tensor = torch.tensor(kept_pos, device=device)  # Ensure kept_pos is a tensor
-            all_indices = torch.arange(num_patches, device=device)  # Create tensor of all indices
-            mask = torch.ones(num_patches, device=device, dtype=torch.bool)  # Start with all True
-            mask[kept_pos] = False  # Set kept positions to False
-            masked_pos = all_indices[mask]  # Extract indices not in kept_pos
 
-            restored[i, kept_pos] = x[i]
-            restored[i, masked_pos] = mask_tokens[i, : len(masked_pos)]
-            restored_mask[i, kept_pos] = True
+        # keep_indices shape: (B, num_kept)
+        batch_indices = torch.arange(B, device=device)[:, None].expand(-1, num_kept)
+
+        # Assign kept patches to their positions
+        restored[batch_indices, keep_indices] = x
+        restored_mask[batch_indices, keep_indices] = True
 
         return (restored, restored_mask)
 

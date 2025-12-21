@@ -421,8 +421,7 @@ class NetworkFromConfig(nn.Module):
             "in_channels": self.in_channels,
             "autoconfigure": self.autoconfigure,
             "targets": self.targets,
-            "separate_decoders": separate_decoders_default,
-            # Include autoconfiguration results if available
+            "separate_decoders": len(tasks_using_separate) > 0,
             "num_pool_per_axis": getattr(self, 'num_pool_per_axis', None),
             "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None)
         }
@@ -522,9 +521,11 @@ class NetworkFromConfig(nn.Module):
             else:
                 tasks_using_shared.add(target_name)
 
+        # Get decoder drop path rate (used by both shared and separate decoders)
+        decoder_drop_path_rate = model_config.get("decoder_drop_path_rate", model_config.get("drop_path_rate", 0.0))
+
         # Shared Primus decoder trunk
         if len(tasks_using_shared) > 0:
-            decoder_drop_path_rate = model_config.get("decoder_drop_path_rate", model_config.get("drop_path_rate", 0.0))
             self.shared_decoder = PrimusDecoder(
                 encoder=self.shared_encoder,
                 num_classes=decoder_head_channels,
@@ -569,7 +570,7 @@ class NetworkFromConfig(nn.Module):
             "targets": self.targets,
             "decoder_norm": decoder_norm_str,
             "decoder_act": decoder_act_str,
-            "separate_decoders": separate_decoders_default,
+            "separate_decoders": len(tasks_using_separate) > 0,
             "decoder_head_channels": decoder_head_channels,
             **primus_kwargs
         }

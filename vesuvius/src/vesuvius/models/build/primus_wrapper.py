@@ -118,30 +118,21 @@ class PrimusEncoder(nn.Module):
         """
         if keep_indices is None:
             return x, None
-            
+
         B, num_kept, C = x.shape
         device = x.device
-        
-        # Create mask tokens for missing patches
-        num_masked = num_patches - num_kept
-        mask_tokens = self.mask_token.repeat(B, num_masked, 1)
-        
-        # Prepare an empty tensor for the restored sequence
-        restored = torch.zeros(B, num_patches, C, device=device)
+
+        # Initialize with mask tokens expanded to full sequence
+        restored = self.mask_token.expand(B, num_patches, -1).clone()
         restored_mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
-        
-        # Assign the kept patches and mask tokens in the correct positions
-        for i in range(B):
-            kept_pos = keep_indices[i]
-            all_indices = torch.arange(num_patches, device=device)
-            mask = torch.ones(num_patches, device=device, dtype=torch.bool)
-            mask[kept_pos] = False
-            masked_pos = all_indices[mask]
-            
-            restored[i, kept_pos] = x[i]
-            restored[i, masked_pos] = mask_tokens[i, : len(masked_pos)]
-            restored_mask[i, kept_pos] = True
-            
+
+        # keep_indices shape: (B, num_kept)
+        batch_indices = torch.arange(B, device=device)[:, None].expand(-1, num_kept)
+
+        # Assign kept patches to their positions
+        restored[batch_indices, keep_indices] = x
+        restored_mask[batch_indices, keep_indices] = True
+
         return restored, restored_mask
     
     def forward(self, x, ret_mask=False):
@@ -202,55 +193,35 @@ class PrimusEncoder(nn.Module):
 
 class PrimusDecoder(nn.Module):
     """
-    Decoder wrapper for Primus that uses Eva decoder layers followed by PatchDecode for upsampling.
+    Decoder wrapper for Primus using PatchDecode for upsampling.
+    Matches official MIC-DKFZ implementation (no transformer decoder layers).
     Compatible with NetworkFromConfig's decoder interface.
     """
-    
+
     def __init__(
         self,
         encoder: PrimusEncoder,
         num_classes: int,
         norm="LayerNormNd",
         activation="GELU",
-        decoder_depth: int = 2,  # Number of Eva decoder layers
-        decoder_num_heads: int = 12,  # Number of heads in decoder
-        drop_path_rate: float = 0.0,  # Stochastic depth in decoder blocks (align with encoder by default)
     ):
         super().__init__()
-        
-        self.encoder = encoder
+
+        if decoder_depth > 0:
+            print(f"Warning: decoder_depth={decoder_depth} is deprecated and ignored. "
+                  "Official Primus uses only PatchDecode without transformer decoder layers.")
+
+        # Store encoder reference without registering as submodule to avoid
+        # duplicate state_dict keys when decoder is used with separate_decoders=True
+        object.__setattr__(self, '_encoder_ref', encoder)
         self.num_classes = num_classes
-        self.decoder_depth = decoder_depth
-        
+
         # Parse normalization layer
         norm_layer = self._get_norm_layer(norm)
-        
-        # Parse activation function  
+
+        # Parse activation function
         act_fn = self._get_activation(activation)
-        
-        # Initialize Eva decoder layers if depth > 0
-        if decoder_depth > 0:
-            self.eva_decoder = Eva(
-                embed_dim=encoder.embed_dim,
-                depth=decoder_depth,
-                num_heads=decoder_num_heads,
-                ref_feat_shape=encoder.patch_grid,
-                num_reg_tokens=0,  # No register tokens in decoder
-                use_rot_pos_emb=True,
-                use_abs_pos_emb=True,
-                mlp_ratio=4 * 2 / 3,
-                drop_path_rate=drop_path_rate,
-                patch_drop_rate=0.0,  # No patch drop in decoder
-                proj_drop_rate=0.0,
-                attn_drop_rate=0.0,
-                rope_impl=RotaryEmbeddingCat,
-                rope_kwargs=None,
-                init_values=0.1,
-                scale_attn_inner=True,
-            )
-        else:
-            self.eva_decoder = None
-        
+
         # Initialize PatchDecode for upsampling
         self.patch_decoder = PatchDecode(
             patch_size=encoder.patch_embed_size,
@@ -305,37 +276,28 @@ class PrimusDecoder(nn.Module):
             # Default to GELU
             print(f"Unknown activation type '{activation}', defaulting to GELU")
             return nn.GELU
-        
+
+    @property
+    def encoder(self):
+        """Access the encoder reference (not a submodule to avoid duplicate state_dict keys)."""
+        return self._encoder_ref
+
     def forward(self, features: List[torch.Tensor]):
         """
         Forward pass through the Primus decoder.
-        
+
         Args:
             features: List of feature maps from encoder (expects single element for Primus)
-        
+
         Returns:
             Upsampled segmentation map
         """
         # Primus encoder returns a single feature map
         x = features[0] if isinstance(features, list) else features
-        
-        # Get spatial dimensions from feature map
-        B, C, W, H, D = x.shape
-        
-        # Apply Eva decoder layers if present
-        if self.eva_decoder is not None:
-            # Reshape to sequence format for Eva
-            x = rearrange(x, "b c w h d -> b (w h d) c")
-            
-            # Process through Eva decoder
-            x, _ = self.eva_decoder(x)
-            
-            # Reshape back to spatial format
-            x = rearrange(x, "b (w h d) c -> b c w h d", h=H, w=W, d=D).contiguous()
-        
+
         # Apply patch decoder for upsampling
         output = self.patch_decoder(x)
-        
+
         return output
 
 
