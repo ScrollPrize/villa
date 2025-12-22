@@ -779,9 +779,9 @@ class ChunkSlicer:
             'global_end': [
                 int(start + size) for start, size in zip(patch.position, patch.patch_size)
             ],
-            'source_path': str(getattr(volume.image, 'path', None)) if hasattr(volume.image, 'path') else None,
+            'source_path': str(getattr(volume.image, 'path', '')) if hasattr(volume.image, 'path') else '',
             'label_source_paths': {
-                name: str(getattr(handle, 'path', None)) if hasattr(handle, 'path') else None
+                name: str(getattr(handle, 'path', '')) if hasattr(handle, 'path') else ''
                 for name, handle in volume.labels.items()
             },
         }

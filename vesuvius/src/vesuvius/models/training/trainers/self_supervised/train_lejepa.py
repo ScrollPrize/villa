@@ -206,7 +206,7 @@ class TrainLeJEPA(BaseTrainer):
         patch_embed_size = self.mgr.model_config.get(
             "patch_embed_size", self.vit_patch_size
         )
-        input_shape = tuple(self.mgr.patch_size)
+        input_shape = tuple(self.mgr.train_patch_size)
 
         # Build encoder
         self.encoder = PrimusEncoder(

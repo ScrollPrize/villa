@@ -1127,9 +1127,9 @@ class PlaneSlicer:
                     int(pos0 + patch_size[0]) if plane == "z" else (int(slice_idx + 1) if plane == "y" else int(pos1 + patch_size[1])),
                     int(pos1 + patch_size[1]) if plane == "z" or plane == "y" else int(slice_idx + 1),
                 ],
-                "source_path": str(getattr(volume.image, "path", None)) if hasattr(volume.image, "path") else None,
+                "source_path": str(getattr(volume.image, "path", "")) if hasattr(volume.image, "path") else "",
                 "label_source_paths": {
-                    name: str(getattr(handle, "path", None)) if hasattr(handle, "path") else None
+                    name: str(getattr(handle, "path", "")) if hasattr(handle, "path") else ""
                     for name, handle in volume.labels.items()
                 },
             },
