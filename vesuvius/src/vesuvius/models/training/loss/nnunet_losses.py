@@ -240,9 +240,9 @@ class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
 
         target = target.long()
 
-        # When using label_smoothing with ignore_index, we need to handle manually
+        # When using ignore_index, we need to handle manually
         # because PyTorch CE can crash if target values >= num_classes even with ignore_index set
-        if self.label_smoothing > 0 and self.ignore_index is not None and self.ignore_index >= 0:
+        if self.ignore_index is not None and self.ignore_index >= 0:
             num_classes = input.shape[1]
             # Create mask of valid (non-ignored) pixels
             valid_mask = target != self.ignore_index
