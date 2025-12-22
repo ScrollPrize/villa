@@ -1703,7 +1703,8 @@ def fit_cosine_grid(
         else:
             loss_v_avg = (diff_v * diff_v).mean()
     
-        base = 1 * loss_h + 0.1 * loss_v_avg
+        base = 1 * loss_h + 10 * loss_v_avg
+        # base = loss_v_avg
         return base
      
     def _angle_symmetry_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -2473,9 +2474,9 @@ def fit_cosine_grid(
         "grad_data": 0.0,
         "grad_mag": 1.0,
         "quad_tri": 0.0,
-        "step": 0.0,
+        "step": 1.0,
         "mod_smooth": 0.0,
-        "angle_sym": 0.0,
+        "angle_sym": 1.0,
         "dir_unet": 10.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
@@ -2487,13 +2488,19 @@ def fit_cosine_grid(
     }
  
     stage3_modifiers: dict[str, float] = {
-        # Stage 3: enable data and grad_data terms in addition to stage-2 regularization.
-        # No explicit overrides: all lambda_global weights are used as-is.
-        # "data": 0.0,
-        # "quad_tri": 0.0,
+        "grad_mag": 1.0,
+        "quad_tri": 0.0,
+        "step": 1.0,
+        "mod_smooth": 0.0,
+        "angle_sym": 1.0,
         "dir_unet": 10.0,
-        # "grad_data": 0.0,
-        # "grad_data": 0.0,
+        "use_full_dir_unet" : False,
+        # "grad_mag" : 0.001,
+        # "dir_unet": 10.0,
+        # "smooth_x": 10.0,
+        # "smooth_y": 0.0,
+        "line_smooth_y": 0.1,
+        # other terms default to 1.0 (enabled).
     }
  
     def _need_term(name: str, stage_modifiers: dict[str, float]) -> float:
