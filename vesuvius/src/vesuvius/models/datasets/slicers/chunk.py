@@ -353,7 +353,9 @@ class ChunkSlicer:
                     )
                 )
 
-        if not validate or any(v.label_source is None for v in self._volumes):
+        # Add unvalidated patches for volumes without labels (unless unlabeled_fg_enabled,
+        # in which case the filtered patches are already in unlabeled_fg_patches)
+        if not validate or (any(v.label_source is None for v in self._volumes) and not self.config.unlabeled_fg_enabled):
             for volume in self._volumes:
                 if not validate or volume.label_source is None:
                     fg_patches.extend(self.enumerate(volume, stride=self.config.stride))
@@ -523,16 +525,32 @@ class ChunkSlicer:
 
         for labeled_idx, volume in enumerate(labeled_volumes):
             label_array = volume.label_source
+
+            # Unlabeled FG collection requires image source
+            should_collect_unlabeled_fg = (
+                self.config.unlabeled_fg_enabled and volume.image_source is not None
+            )
+
+            # Handle volumes with NO labels (e.g., self-supervised training)
             if label_array is None:
+                if should_collect_unlabeled_fg:
+                    # Enumerate all positions and check image content only
+                    candidate_patches = self.enumerate(volume, stride=self.config.stride)
+                    for candidate in candidate_patches:
+                        position = tuple(int(v) for v in candidate.position)
+                        patch_vol = int(np.prod(candidate.patch_size))
+                        if self._check_image_has_data(volume.image_source, position, patch_vol):
+                            unlabeled_fg_positions.append((labeled_idx, position))
+                            unlabeled_fg_entries.append({
+                                'volume_idx': labeled_idx,
+                                'volume_name': volume.name,
+                                'start_pos': list(position),
+                            })
                 continue
 
             ignore_value = volume.label_ignore_value
             # BG collection only valid when ignore_value is set
             should_collect_bg = self.config.bg_sampling_enabled and ignore_value is not None
-            # Unlabeled FG collection requires image source
-            should_collect_unlabeled_fg = (
-                self.config.unlabeled_fg_enabled and volume.image_source is not None
-            )
 
             candidate_patches = self.enumerate(volume, stride=self.config.stride)
             for candidate in candidate_patches:
