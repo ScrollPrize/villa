@@ -811,6 +811,7 @@ class BaseDataset(Dataset):
         Create training augmentation transforms using the standard pipeline.
         """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
+        no_scaling = getattr(self.mgr, 'no_scaling', False)
         only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
         allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
 
@@ -830,6 +831,7 @@ class BaseDataset(Dataset):
         return create_training_transforms(
             patch_size=self.mgr.train_patch_size,
             no_spatial=no_spatial,
+            no_scaling=no_scaling,
             only_spatial_and_intensity=only_spatial_and_intensity,
             allowed_rotation_axes=allowed_rotation_axes,
             skeleton_targets=skeleton_targets,

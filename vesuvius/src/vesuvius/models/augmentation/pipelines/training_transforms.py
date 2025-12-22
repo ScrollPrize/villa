@@ -57,6 +57,7 @@ ENABLE_BLANK_RECTANGLE = False
 def create_training_transforms(
     patch_size: Tuple[int, ...],
     no_spatial: bool = False,
+    no_scaling: bool = False,
     only_spatial_and_intensity: bool = False,
     allowed_rotation_axes: Optional[List[int]] = None,
     skeleton_targets: Optional[List[str]] = None,
@@ -71,6 +72,9 @@ def create_training_transforms(
         The patch size (z, y, x) for 3D or (y, x) for 2D.
     no_spatial : bool
         If True, disable all spatial transforms (rotations, scaling, mirroring).
+    no_scaling : bool
+        If True, disable scaling augmentation (which requires padding and can cause
+        issues with semi-supervised trainers like mean teacher).
     only_spatial_and_intensity : bool
         If True, only use spatial and basic intensity transforms (skip noise, blur, etc.).
     allowed_rotation_axes : Optional[List[int]]
@@ -119,6 +123,9 @@ def create_training_transforms(
             mirror_axes = (0, 1, 2)
 
         # SpatialTransform for scaling (rotation handled by Rot90 + Transpose)
+        # Scaling can be disabled for semi-supervised trainers (mean teacher) since
+        # scaling requires padding which causes issues with consistency loss.
+        scaling_prob = 0 if no_scaling else 0.2
         transforms.append(
             SpatialTransform(
                 patch_size,
@@ -127,7 +134,7 @@ def create_training_transforms(
                 p_elastic_deform=0,
                 p_rotation=0,
                 rotation=rotation_for_DA,
-                p_scaling=0.2,
+                p_scaling=scaling_prob,
                 scaling=(0.7, 1.4),
                 p_synchronize_scaling_across_axes=1,
                 bg_style_seg_sampling=False,
@@ -425,6 +432,9 @@ def create_training_transforms(
 
     if no_spatial:
         print("Spatial transformations disabled (no_spatial=True)")
+
+    if no_scaling:
+        print("Scaling augmentation disabled (no_scaling=True)")
 
     if only_spatial_and_intensity:
         print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")

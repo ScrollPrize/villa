@@ -43,6 +43,11 @@ class TrainMeanTeacher(BaseTrainer):
         self.unlabeled_indices = None
 
         mgr.enable_deep_supervision = False
+
+        # Disable scaling augmentation - it requires padding which causes issues
+        # with consistency loss (padded regions get different noise, creating fake disagreement)
+        mgr.no_scaling = True
+
         # One-time validation debug flag
         self._val_debug_done = False
 

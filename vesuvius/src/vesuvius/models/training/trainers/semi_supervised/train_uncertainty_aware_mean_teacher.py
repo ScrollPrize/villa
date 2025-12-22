@@ -55,6 +55,10 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # Deep supervision complicates per-sample masking; keep it off for SSL trainers
         self.mgr.enable_deep_supervision = False
 
+        # Disable scaling augmentation - it requires padding which causes issues
+        # with consistency loss (padded regions get different noise, creating fake disagreement)
+        self.mgr.no_scaling = True
+
         self.ema_model = None
         self.global_step = 0
         self.labeled_indices = None
@@ -80,7 +84,20 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
     def _get_current_consistency_weight(self, epoch):
         # Consistency ramp-up from https://arxiv.org/abs/1610.02242
         return self.consistency_weight * ramps.sigmoid_rampup(epoch, self.consistency_rampup)
-    
+
+    def _get_noise_bounds(self, inputs):
+        """Compute noise clamp bounds relative to input statistics.
+
+        The original hardcoded ±0.2 clamp assumes z-score normalized data (std~1).
+        This method adapts the bounds to the actual input scale, so the noise
+        remains proportionally meaningful regardless of normalization scheme.
+        """
+        input_std = inputs.std()
+        # Clamp noise to roughly 2x noise_scale * std
+        # For z-score data with std~1, this gives ~0.2 matching original behavior
+        bound = 2.0 * self.noise_scale * max(input_std.item(), 0.1)
+        return bound
+
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
         """
         Override to use TwoStreamBatchSampler for semi-supervised learning.
@@ -255,11 +272,12 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             _, c, h, w = unlabeled_inputs.shape
             preds = torch.zeros([stride * T, num_classes, h, w]).to(self.device)
         
+        noise_bound = self._get_noise_bounds(volume_batch_r)
         with torch.no_grad():
             for i in range(T // 2):
                 noise = torch.clamp(
                     torch.randn_like(volume_batch_r) * self.noise_scale,
-                    -0.2, 0.2
+                    -noise_bound, noise_bound
                 )
                 ema_inputs = volume_batch_r + noise
                 with autocast_ctx:
@@ -330,10 +348,11 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         
         uncertainty, mean_pred = self._compute_uncertainty(unlabeled_inputs, autocast_ctx)
         
+        noise_bound = self._get_noise_bounds(unlabeled_inputs)
         with torch.no_grad():
             noise = torch.clamp(
                 torch.randn_like(unlabeled_inputs) * self.noise_scale,
-                -0.2, 0.2
+                -noise_bound, noise_bound
             )
             teacher_inputs = unlabeled_inputs + noise
             with autocast_ctx:
