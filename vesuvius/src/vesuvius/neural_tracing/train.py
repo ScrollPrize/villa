@@ -74,9 +74,12 @@ def train(config_path):
     def make_dataloaders():
         train_dataset = HeatmapDatasetV2(config, train_patches, multistep_count=multistep_count, bidirectional=bidirectional)
         val_dataset = HeatmapDatasetV2(config, val_patches, multistep_count=multistep_count, bidirectional=bidirectional)
-        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
-        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
-        return accelerator.prepare(train_dataloader, val_dataloader)
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'], pin_memory=True)
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1, pin_memory=True)
+        def to_gpu(dataloader):  # we don't use accelerator.prepare since we handle sharding ourselves
+            for batch in dataloader:
+                yield {k: v.to(accelerator.device) for k, v in batch.items()}
+        return to_gpu(train_dataloader), to_gpu(val_dataloader)
 
     train_dataloader, val_dataloader = make_dataloaders()
 
