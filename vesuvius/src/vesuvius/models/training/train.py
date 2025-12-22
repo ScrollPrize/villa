@@ -1686,29 +1686,36 @@ class BaseTrainer:
                                         if t_name not in ['skel', 'is_unlabeled']:
                                             targets_dict_first[t_name] = t_tensor
                                     
-                                    # Get unlabeled debug samples if available (for semi-supervised trainers)
-                                    unlabeled_input = getattr(self, '_debug_unlabeled_input', None)
-                                    unlabeled_pseudo = getattr(self, '_debug_unlabeled_pseudo_label', None)
-                                    unlabeled_pred = getattr(self, '_debug_unlabeled_student_pred', None)
+                                    # Check for custom debug visualization (e.g., self-supervised trainers)
+                                    custom_debug_method = getattr(self, '_save_lejepa_debug', None)
+                                    if custom_debug_method is not None:
+                                        saved_path = custom_debug_method(debug_img_path, epoch)
+                                        if saved_path:
+                                            debug_gif_history.append((epoch, saved_path))
+                                    else:
+                                        # Get unlabeled debug samples if available (for semi-supervised trainers)
+                                        unlabeled_input = getattr(self, '_debug_unlabeled_input', None)
+                                        unlabeled_pseudo = getattr(self, '_debug_unlabeled_pseudo_label', None)
+                                        unlabeled_pred = getattr(self, '_debug_unlabeled_student_pred', None)
 
-                                    _, debug_preview_image = save_debug(
-                                        input_volume=inputs_first,
-                                        targets_dict=targets_dict_first,
-                                        outputs_dict=outputs_dict_first,
-                                        tasks_dict=self.mgr.targets,
-                                        # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
-                                        epoch=epoch,
-                                        save_path=debug_img_path,
-                                        train_input=train_sample_input,
-                                        train_targets_dict=train_sample_targets,
-                                        train_outputs_dict=train_sample_outputs,
-                                        skeleton_dict=skeleton_dict,
-                                        train_skeleton_dict=train_skeleton_dict,
-                                        unlabeled_input=unlabeled_input,
-                                        unlabeled_pseudo_dict=unlabeled_pseudo,
-                                        unlabeled_outputs_dict=unlabeled_pred
-                                    )
-                                    debug_gif_history.append((epoch, debug_img_path))
+                                        _, debug_preview_image = save_debug(
+                                            input_volume=inputs_first,
+                                            targets_dict=targets_dict_first,
+                                            outputs_dict=outputs_dict_first,
+                                            tasks_dict=self.mgr.targets,
+                                            # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
+                                            epoch=epoch,
+                                            save_path=debug_img_path,
+                                            train_input=train_sample_input,
+                                            train_targets_dict=train_sample_targets,
+                                            train_outputs_dict=train_sample_outputs,
+                                            skeleton_dict=skeleton_dict,
+                                            train_skeleton_dict=train_skeleton_dict,
+                                            unlabeled_input=unlabeled_input,
+                                            unlabeled_pseudo_dict=unlabeled_pseudo,
+                                            unlabeled_outputs_dict=unlabeled_pred
+                                        )
+                                        debug_gif_history.append((epoch, debug_img_path))
 
                         loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
                                                for t in self.mgr.targets if len(val_losses[t]) > 0])

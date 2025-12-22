@@ -1,6 +1,12 @@
 # LeJEPA pretraining configuration with Primus-M encoder
 # Uses SIGReg (Sketched Isotropic Gaussian Regularization) for unsupervised learning
 
+# Placeholder target for compatibility with base trainer
+# (LeJEPA is self-supervised and doesn't use traditional targets)
+targets:
+  lejepa:
+    activation: none
+    weight: 1.0
 
 tr_config:
   patch_size: [128, 128, 128]  # D, H, W - must be divisible by patch_embed_size
