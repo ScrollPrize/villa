@@ -205,6 +205,10 @@ class Eva(nn.Module):
                 self.rope.get_embed() if self.rope is not None else None
             )
 
+        # Ensure RoPE embeddings are on the same device as input
+        if rot_pos_embed is not None:
+            rot_pos_embed = rot_pos_embed.to(x.device)
+
         if pos_embed is not None:
             x = x + pos_embed
         x = self.pos_drop(x)
