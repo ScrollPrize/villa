@@ -136,7 +136,7 @@ class TrainLeJEPA(BaseTrainer):
             mgr.allow_unlabeled_data = True  # Accept volumes without labels
             mgr.min_labeled_ratio = 0  # No minimum labeled voxel requirement
             mgr.min_bbox_percent = 0  # No bounding box coverage requirement
-            mgr.skip_patch_validation = True  # Enumerate all patches, don't filter
+            mgr.skip_patch_validation = False  # Enumerate all patches, don't filter
 
         super().__init__(mgr, verbose)
 
