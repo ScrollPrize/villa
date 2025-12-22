@@ -521,9 +521,6 @@ class NetworkFromConfig(nn.Module):
             else:
                 tasks_using_shared.add(target_name)
 
-        # Get decoder drop path rate (used by both shared and separate decoders)
-        decoder_drop_path_rate = model_config.get("decoder_drop_path_rate", model_config.get("drop_path_rate", 0.0))
-
         # Shared Primus decoder trunk
         if len(tasks_using_shared) > 0:
             self.shared_decoder = PrimusDecoder(
@@ -531,9 +528,6 @@ class NetworkFromConfig(nn.Module):
                 num_classes=decoder_head_channels,
                 norm=decoder_norm_str,
                 activation=decoder_act_str,
-                decoder_depth=model_config.get("decoder_depth", 2),
-                decoder_num_heads=model_config.get("decoder_num_heads", 12),
-                drop_path_rate=decoder_drop_path_rate,
             )
             for target_name in tasks_using_shared:
                 out_ch = self.targets[target_name]["out_channels"]
@@ -552,9 +546,6 @@ class NetworkFromConfig(nn.Module):
                 num_classes=out_channels,
                 norm=decoder_norm_str,
                 activation=decoder_act_str,
-                decoder_depth=model_config.get("decoder_depth", 2),
-                decoder_num_heads=model_config.get("decoder_num_heads", 12),
-                drop_path_rate=decoder_drop_path_rate,
             )
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"Primus task '{target_name}' configured with separate decoder ({out_channels} channels)")

@@ -227,7 +227,7 @@ def create_training_transforms(
                         p_same_for_each_channel=0.5,
                         p_per_channel=0.5,
                     ),
-                    apply_probability=0.2,
+                    apply_probability=0.0,
                 ),
                 RandomTransform(
                     GaussianBlurTransform(
@@ -237,7 +237,7 @@ def create_training_transforms(
                         p_per_channel=0.5,
                         benchmark=True,
                     ),
-                    apply_probability=0.2,
+                    apply_probability=0.3,
                 ),
             ])
         )

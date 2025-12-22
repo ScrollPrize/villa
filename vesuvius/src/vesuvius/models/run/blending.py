@@ -12,8 +12,81 @@ from functools import partial
 import numcodecs
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
+from collections import defaultdict
 from vesuvius.data.utils import open_zarr
+from vesuvius.data.chunks_filter import load_chunks_json, compute_touched_chunks
 import traceback
+
+
+# --- Worker State (initialized once per process) ---
+_worker_state = {}
+
+
+def init_worker(part_files, output_path, weights_path, is_s3):
+    """
+    Initialize worker process with cached zarr store handles.
+    Called once per worker process at pool creation.
+
+    This avoids repeatedly opening zarr stores for each chunk,
+    providing significant speedup especially for many chunks.
+    """
+    global _worker_state
+
+    storage_opts = {'anon': False} if is_s3 else None
+
+    _worker_state['output'] = open_zarr(output_path, mode='r+', storage_options=storage_opts)
+    _worker_state['weights'] = open_zarr(weights_path, mode='r+', storage_options=storage_opts)
+    _worker_state['logits'] = {}
+
+    for part_id, paths in part_files.items():
+        logits_path = paths['logits']
+        _worker_state['logits'][part_id] = open_zarr(
+            logits_path, mode='r',
+            storage_options={'anon': False} if logits_path.startswith('s3://') else None
+        )
+
+
+def build_chunk_to_patches_index(all_coords_by_part, patch_size, chunk_size, volume_shape):
+    """
+    Pre-compute which patches touch which chunks.
+
+    This changes complexity from O(chunks × total_patches) to O(total_patches),
+    which is a dramatic improvement for large numbers of patches and chunks.
+
+    Args:
+        all_coords_by_part: Dict mapping part_id -> numpy array of shape (N, 3) with (z, y, x) coords
+        patch_size: (pZ, pY, pX) patch dimensions
+        chunk_size: (cZ, cY, cX) processing chunk dimensions
+        volume_shape: (Z, Y, X) total volume shape
+
+    Returns:
+        Dict mapping (cz, cy, cx) chunk index -> list of (part_id, patch_idx, (z, y, x))
+    """
+    pZ, pY, pX = patch_size
+    cZ, cY, cX = chunk_size
+
+    chunk_to_patches = defaultdict(list)
+
+    for part_id, coords in all_coords_by_part.items():
+        for patch_idx in range(coords.shape[0]):
+            z, y, x = coords[patch_idx].tolist()
+
+            # Find all chunks this patch intersects
+            # Chunk indices for the start and end of the patch
+            cz_start = z // cZ
+            cz_end = (z + pZ - 1) // cZ
+            cy_start = y // cY
+            cy_end = (y + pY - 1) // cY
+            cx_start = x // cX
+            cx_end = (x + pX - 1) // cX
+
+            # Add this patch to all chunks it touches
+            for cz in range(cz_start, cz_end + 1):
+                for cy in range(cy_start, cy_end + 1):
+                    for cx in range(cx_start, cx_end + 1):
+                        chunk_to_patches[(cz, cy, cx)].append((part_id, patch_idx, (z, y, x)))
+
+    return chunk_to_patches
 
 
 def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.float32) -> np.ndarray:
@@ -35,11 +108,135 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     return gaussian_map_np
 
 
-def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_map, 
+def process_chunk_optimized(chunk_info, gaussian_map, patch_size, chunk_patches,
+                             normalize=True, epsilon=1e-8):
+    """
+    Process a single chunk using pre-computed patch list and cached stores.
+
+    This optimized version:
+    1. Uses worker-cached zarr stores (no repeated opens)
+    2. Only processes patches known to intersect this chunk (pre-filtered)
+    3. Optionally fuses normalization into the same pass (saves a second I/O pass)
+
+    Args:
+        chunk_info: Dict with chunk boundaries and indices
+        gaussian_map: Pre-computed Gaussian map (1, pZ, pY, pX)
+        patch_size: (pZ, pY, pX)
+        chunk_patches: List of (part_id, patch_idx, (z, y, x)) for patches intersecting this chunk
+        normalize: If True, normalize in-place before writing (fused operation)
+        epsilon: Small value to avoid division by zero during normalization
+    """
+    global _worker_state
+
+    # Extract chunk boundaries
+    z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
+    y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
+    x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
+
+    pZ, pY, pX = patch_size
+    gaussian_map_spatial = gaussian_map[0]  # Shape (pZ, pY, pX)
+
+    # Use cached stores from worker initialization
+    output_store = _worker_state['output']
+    weights_store = _worker_state['weights']
+
+    # Create local accumulators
+    num_classes = output_store.shape[0]
+    chunk_shape = (num_classes, z_end - z_start, y_end - y_start, x_end - x_start)
+    weights_shape = (z_end - z_start, y_end - y_start, x_end - x_start)
+
+    chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
+    chunk_weights = np.zeros(weights_shape, dtype=np.float32)
+    patches_processed = 0
+
+    # Group patches by part_id for better cache locality
+    patches_by_part = defaultdict(list)
+    for part_id, patch_idx, coords in chunk_patches:
+        patches_by_part[part_id].append((patch_idx, coords))
+
+    for part_id, patch_list in patches_by_part.items():
+        logits_store = _worker_state['logits'][part_id]
+
+        for patch_idx, (z, y, x) in patch_list:
+            # Calculate intersection between patch and chunk (in chunk-local coords)
+            iz_start = max(z, z_start) - z_start
+            iz_end = min(z + pZ, z_end) - z_start
+            iy_start = max(y, y_start) - y_start
+            iy_end = min(y + pY, y_end) - y_start
+            ix_start = max(x, x_start) - x_start
+            ix_end = min(x + pX, x_end) - x_start
+
+            # Calculate which part of patch to use (in patch-local coords)
+            pz_start = max(z_start - z, 0)
+            pz_end = pZ - max(z + pZ - z_end, 0)
+            py_start = max(y_start - y, 0)
+            py_end = pY - max(y + pY - y_end, 0)
+            px_start = max(x_start - x, 0)
+            px_end = pX - max(x + pX - x_end, 0)
+
+            patch_slice = (
+                slice(None),  # All classes
+                slice(pz_start, pz_end),
+                slice(py_start, py_end),
+                slice(px_start, px_end)
+            )
+
+            logit_patch = logits_store[patch_idx][patch_slice]
+
+            # Skip empty patches
+            if not np.any(logit_patch != 0):
+                continue
+
+            weight_patch = gaussian_map_spatial[pz_start:pz_end, py_start:py_end, px_start:px_end]
+
+            # Accumulate weighted logits
+            chunk_logits[:, iz_start:iz_end, iy_start:iy_end, ix_start:ix_end] += \
+                logit_patch * weight_patch[np.newaxis, :, :, :]
+
+            chunk_weights[iz_start:iz_end, iy_start:iy_end, ix_start:ix_end] += weight_patch
+
+            patches_processed += 1
+
+    if patches_processed > 0:
+        # Fused normalization: normalize in-place before writing
+        if normalize:
+            mask = chunk_weights > epsilon
+            if np.any(mask):
+                # Broadcast division across classes
+                chunk_logits[:, mask] /= chunk_weights[mask]
+
+        output_slice = (
+            slice(None),
+            slice(z_start, z_end),
+            slice(y_start, y_end),
+            slice(x_start, x_end)
+        )
+
+        output_store[output_slice] = chunk_logits
+
+        # Only write weights if not normalizing (for debugging or if user wants to keep them)
+        if not normalize:
+            weight_slice = (
+                slice(z_start, z_end),
+                slice(y_start, y_end),
+                slice(x_start, x_end)
+            )
+            weights_store[weight_slice] = chunk_weights
+
+    return {
+        'chunk': chunk_info,
+        'patches_processed': patches_processed
+    }
+
+
+# Legacy function for backwards compatibility (if needed)
+def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_map,
                 patch_size, part_files):
     """
     Process a single chunk of the volume, handling all patches that intersect with this chunk.
-    
+
+    DEPRECATED: This is the legacy version. Use process_chunk_optimized for better performance.
+
     Args:
         chunk_info: Dictionary with chunk boundaries {'z_start', 'z_end', 'y_start', 'y_end', 'x_start', 'x_end'}
         parent_dir: Directory containing part files
@@ -49,79 +246,83 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
         patch_size: Size of patches (pZ, pY, pX)
         part_files: Dictionary of part files
     """
-    
+
     # Extract chunk boundaries
     z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
     y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
     x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
-    
+
     pZ, pY, pX = patch_size
-    
+
     gaussian_map_spatial_np = gaussian_map[0]  # Shape (pZ, pY, pX)
-    
+
     output_store = open_zarr(output_path, mode='r+', storage_options={'anon': False} if output_path.startswith('s3://') else None)
     weights_store = open_zarr(weights_path, mode='r+', storage_options={'anon': False} if weights_path.startswith('s3://') else None)
-    
+
     # Create local accumulators for this chunk - initialize with zeros
     # Shape: (C, chunk_z, chunk_y, chunk_x)
     num_classes = output_store.shape[0]
     chunk_shape = (num_classes, z_end - z_start, y_end - y_start, x_end - x_start)
     weights_shape = (z_end - z_start, y_end - y_start, x_end - x_start)
-    
+
     chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
     chunk_weights = np.zeros(weights_shape, dtype=np.float32)
     patches_processed = 0
-    
+
     for part_id in part_files:
         logits_path = part_files[part_id]['logits']
         coords_path = part_files[part_id]['coordinates']
-        
+
         coords_store = open_zarr(coords_path, mode='r', storage_options={'anon': False} if coords_path.startswith('s3://') else None)
         logits_store = open_zarr(logits_path, mode='r', storage_options={'anon': False} if logits_path.startswith('s3://') else None)
-        
+
         coords_np = coords_store[:]
         num_patches_in_part = coords_np.shape[0]
-        
+
         for patch_idx in range(num_patches_in_part):
             z, y, x = coords_np[patch_idx].tolist()
-            
+
             if (z + pZ <= z_start or z >= z_end or
                 y + pY <= y_start or y >= y_end or
                 x + pX <= x_start or x >= x_end):
                 continue  # Skip patches that don't intersect with this chunk
-                
+
             iz_start = max(z, z_start) - z_start
             iz_end = min(z + pZ, z_end) - z_start
             iy_start = max(y, y_start) - y_start
             iy_end = min(y + pY, y_end) - y_start
             ix_start = max(x, x_start) - x_start
             ix_end = min(x + pX, x_end) - x_start
-            
+
             pz_start = max(z_start - z, 0)
             pz_end = pZ - max(z + pZ - z_end, 0)
             py_start = max(y_start - y, 0)
             py_end = pY - max(y + pY - y_end, 0)
             px_start = max(x_start - x, 0)
             px_end = pX - max(x + pX - x_end, 0)
-            
+
             patch_slice = (
                 slice(None),  # All classes
                 slice(pz_start, pz_end),
                 slice(py_start, py_end),
                 slice(px_start, px_end)
             )
-            
+
             logit_patch = logits_store[patch_idx][patch_slice]
-            
+
+            # Skip patches with no values - don't let empty patches contribute to weights
+            if not np.any(logit_patch != 0):
+                continue
+
             weight_patch = gaussian_map_spatial_np[
                 slice(pz_start, pz_end),
                 slice(py_start, py_end),
                 slice(px_start, px_end)
             ]
-            
+
             # Apply weights to logits (broadcasting along class dimension)
             weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]
-            
+
             # Accumulate into local arrays
             chunk_logits[
                 :,  # All classes
@@ -129,32 +330,32 @@ def process_chunk(chunk_info, parent_dir, output_path, weights_path, gaussian_ma
                 iy_start:iy_end,
                 ix_start:ix_end
             ] += weighted_patch
-            
+
             chunk_weights[
                 iz_start:iz_end,
                 iy_start:iy_end,
                 ix_start:ix_end
             ] += weight_patch
-            
+
             patches_processed += 1
-    
+
     if patches_processed > 0:
         output_slice = (
-            slice(None), 
+            slice(None),
             slice(z_start, z_end),
             slice(y_start, y_end),
             slice(x_start, x_end)
         )
-        
+
         weight_slice = (
             slice(z_start, z_end),
             slice(y_start, y_end),
             slice(x_start, x_end)
         )
-        
+
         output_store[output_slice] = chunk_logits
         weights_store[weight_slice] = chunk_weights
-    
+
     return {
         'chunk': chunk_info,
         'patches_processed': patches_processed
@@ -210,15 +411,37 @@ def normalize_chunk(chunk_info, output_path, weights_path, epsilon=1e-8):
     }
 
 # --- Utility Functions ---
-def calculate_chunks(volume_shape, output_chunks=None):
+def calculate_chunks(volume_shape, output_chunks=None, valid_chunk_indices=None, zarr_chunk_size=None):
+    """
+    Calculate processing chunks for the volume.
 
+    Args:
+        volume_shape: (Z, Y, X) shape of the volume
+        output_chunks: (z, y, x) chunk size for processing. Defaults to (256, 256, 256).
+        valid_chunk_indices: Optional list of [z, y, x] chunk indices from chunks.json.
+                            If provided, only chunks overlapping with these will be returned.
+        zarr_chunk_size: (z, y, x) zarr chunk size. Required if valid_chunk_indices is provided.
+
+    Returns:
+        List of chunk info dicts with z_start, z_end, y_start, y_end, x_start, x_end
+    """
     Z, Y, X = volume_shape
 
     if output_chunks is None:
         z_chunk, y_chunk, x_chunk = 256, 256, 256
     else:
         z_chunk, y_chunk, x_chunk = output_chunks
-    
+
+    # Build set of valid voxel regions if chunks.json filtering is enabled
+    valid_regions = None
+    if valid_chunk_indices is not None and zarr_chunk_size is not None:
+        cZ, cY, cX = zarr_chunk_size
+        valid_regions = set()
+        for chunk_idx in valid_chunk_indices:
+            ci_z, ci_y, ci_x = chunk_idx
+            # Store the chunk index tuple for fast lookup
+            valid_regions.add((ci_z, ci_y, ci_x))
+
     chunks = []
     for z_start in range(0, Z, z_chunk):
         for y_start in range(0, Y, y_chunk):
@@ -226,13 +449,40 @@ def calculate_chunks(volume_shape, output_chunks=None):
                 z_end = min(z_start + z_chunk, Z)
                 y_end = min(y_start + y_chunk, Y)
                 x_end = min(x_start + x_chunk, X)
-                
+
+                # If filtering by chunks.json, check if this chunk overlaps with any valid region
+                if valid_regions is not None:
+                    cZ, cY, cX = zarr_chunk_size
+                    # Find which zarr chunks this processing chunk overlaps with
+                    ci_z_start = z_start // cZ
+                    ci_z_end = (z_end - 1) // cZ + 1
+                    ci_y_start = y_start // cY
+                    ci_y_end = (y_end - 1) // cY + 1
+                    ci_x_start = x_start // cX
+                    ci_x_end = (x_end - 1) // cX + 1
+
+                    # Check if any overlapping zarr chunk is in the valid set
+                    overlaps_valid = False
+                    for ci_z in range(ci_z_start, ci_z_end):
+                        for ci_y in range(ci_y_start, ci_y_end):
+                            for ci_x in range(ci_x_start, ci_x_end):
+                                if (ci_z, ci_y, ci_x) in valid_regions:
+                                    overlaps_valid = True
+                                    break
+                            if overlaps_valid:
+                                break
+                        if overlaps_valid:
+                            break
+
+                    if not overlaps_valid:
+                        continue  # Skip this chunk
+
                 chunks.append({
                     'z_start': z_start, 'z_end': z_end,
                     'y_start': y_start, 'y_end': y_end,
                     'x_start': x_start, 'x_end': x_end
                 })
-    
+
     return chunks
 
 # --- Main Merging Function ---
@@ -245,7 +495,10 @@ def merge_inference_outputs(
         num_workers: int = None,  # Number of worker processes to use
         compression_level: int = 1,  # Compression level (0-9, 0=none)
         delete_weights: bool = True,  # Delete weight accumulator after merge
-        verbose: bool = True):
+        verbose: bool = True,
+        input_zarr_path: str = None,  # Optional: Path to input zarr for chunks.json detection
+        chunks_filter_mode: str = 'auto',  # 'auto', 'disabled'
+        ):
     """
     Args:
         parent_dir: Directory containing logits_part_X.zarr and coordinates_part_X.zarr.
@@ -260,9 +513,39 @@ def merge_inference_outputs(
         compression_level: Zarr compression level (0-9, 0=none)
         delete_weights: Whether to delete the weight accumulator Zarr after completion.
         verbose: Print progress messages.
+        input_zarr_path: Path to original input zarr for chunks.json detection.
+        chunks_filter_mode: 'auto' (use chunks.json if present) or 'disabled'.
     """
 
-    # blosc has an issuse with threading , so we disable it
+    # --- Safety check: prevent overwriting input logits ---
+    # Normalize paths for comparison
+    parent_dir_abs = os.path.abspath(parent_dir.rstrip('/'))
+    output_path_abs = os.path.abspath(output_path.rstrip('/'))
+
+    # Check if output would overwrite or be inside the input directory
+    if output_path_abs == parent_dir_abs:
+        raise ValueError(
+            f"Output path cannot be the same as input directory!\n"
+            f"  Input (parent_dir): {parent_dir}\n"
+            f"  Output (output_path): {output_path}\n"
+            f"This would delete your logits files. Use a different output path."
+        )
+    if output_path_abs.startswith(parent_dir_abs + os.sep):
+        raise ValueError(
+            f"Output path cannot be inside the input directory!\n"
+            f"  Input (parent_dir): {parent_dir}\n"
+            f"  Output (output_path): {output_path}\n"
+            f"This could corrupt your logits files. Use a different output path."
+        )
+    if parent_dir_abs.startswith(output_path_abs + os.sep):
+        raise ValueError(
+            f"Input directory cannot be inside the output path!\n"
+            f"  Input (parent_dir): {parent_dir}\n"
+            f"  Output (output_path): {output_path}\n"
+            f"This would delete your logits files. Use a different output path."
+        )
+
+    # blosc has an issue with threading, so we disable it
     numcodecs.blosc.use_threads = False
     if weight_accumulator_path is None:
         base, _ = os.path.splitext(output_path)
@@ -420,35 +703,137 @@ def merge_inference_outputs(
     # --- 4. Generate Gaussian Map ---
     gaussian_map = generate_gaussian_map(patch_size, sigma_scale=sigma_scale)
 
-    # --- 5. Calculate Processing Chunks ---
-    chunks = calculate_chunks(
-        original_volume_shape,
-        output_chunks=output_chunks[1:]  # Skip the class dimension from output_chunks
-    )
-    
-    print(f"Divided volume into {len(chunks)} chunks for parallel processing")
-    
-    # --- 6. Process Chunks in Parallel ---
-    print("\n--- Accumulating Weighted Patches ---")
-    
-    process_chunk_partial = partial(
-        process_chunk,
-        parent_dir=parent_dir,
-        output_path=output_path,
-        weights_path=weight_accumulator_path,
-        gaussian_map=gaussian_map,
+    # --- 4.5. Read coordinates and build spatial index ---
+    # Read all coordinates from all parts and build chunk-to-patches mapping
+    # This is the key optimization: O(patches) instead of O(chunks × patches)
+    print("\nReading coordinates and building spatial index...")
+    all_coords_by_part = {}
+    total_patches = 0
+
+    for part_id in part_ids:
+        coords_path = part_files[part_id]['coordinates']
+        coords_store = open_zarr(
+            coords_path, mode='r',
+            storage_options={'anon': False} if coords_path.startswith('s3://') else None
+        )
+        coords_np = coords_store[:]
+        all_coords_by_part[part_id] = coords_np
+        total_patches += coords_np.shape[0]
+
+    if verbose:
+        print(f"  Read {total_patches} patch positions from {len(part_ids)} parts")
+
+    # Build the chunk-to-patches spatial index
+    spatial_chunk_size = output_chunks[1:]  # (cZ, cY, cX)
+    chunk_to_patches_index = build_chunk_to_patches_index(
+        all_coords_by_part=all_coords_by_part,
         patch_size=patch_size,
-        part_files=part_files
+        chunk_size=spatial_chunk_size,
+        volume_shape=original_volume_shape
     )
+
+    if verbose:
+        print(f"  Built spatial index: {len(chunk_to_patches_index)} chunks have patches")
+
+    # Determine touched chunks (for filtering)
+    touched_chunk_indices = None
+    if chunks_filter_mode != 'disabled':
+        # Extract positions for compute_touched_chunks (used for metadata)
+        all_positions = []
+        for coords_np in all_coords_by_part.values():
+            for i in range(coords_np.shape[0]):
+                all_positions.append(tuple(coords_np[i].tolist()))
+
+        if all_positions:
+            touched_chunk_indices = compute_touched_chunks(
+                positions=all_positions,
+                patch_size=patch_size,
+                output_chunk_size=spatial_chunk_size
+            )
+            if verbose:
+                print(f"  Patches touch {len(touched_chunk_indices)} output chunks")
+
+    # --- 5. Calculate Processing Chunks ---
+    if touched_chunk_indices is not None:
+        # Convert touched chunk indices to chunk_info format expected by calculate_chunks
+        spatial_chunks = output_chunks[1:]  # (cZ, cY, cX)
+        chunks = []
+        for (cz, cy, cx) in touched_chunk_indices:
+            z_start = cz * spatial_chunks[0]
+            z_end = min((cz + 1) * spatial_chunks[0], original_volume_shape[0])
+            y_start = cy * spatial_chunks[1]
+            y_end = min((cy + 1) * spatial_chunks[1], original_volume_shape[1])
+            x_start = cx * spatial_chunks[2]
+            x_end = min((cx + 1) * spatial_chunks[2], original_volume_shape[2])
+            chunks.append({
+                'z_start': z_start, 'z_end': z_end,
+                'y_start': y_start, 'y_end': y_end,
+                'x_start': x_start, 'x_end': x_end,
+                'indices': (cz, cy, cx)
+            })
+        full_chunks = calculate_chunks(original_volume_shape, output_chunks=output_chunks[1:])
+        print(f"Filtered to {len(chunks)} chunks (from {len(full_chunks)} total) based on patch coordinates")
+    else:
+        chunks = calculate_chunks(
+            original_volume_shape,
+            output_chunks=output_chunks[1:]
+        )
+        print(f"Divided volume into {len(chunks)} chunks for parallel processing")
     
+    # --- 6. Process Chunks in Parallel (with fused normalization) ---
+    print("\n--- Processing and Normalizing Patches ---")
+
+    # Determine if S3 is being used
+    is_s3 = output_path.startswith('s3://')
+
+    # Prepare chunk tasks with their pre-filtered patch lists
+    chunk_tasks = []
+    for chunk in chunks:
+        # Get chunk indices
+        if 'indices' in chunk:
+            chunk_idx = chunk['indices']
+        else:
+            # Calculate indices from start positions
+            chunk_idx = (
+                chunk['z_start'] // spatial_chunk_size[0],
+                chunk['y_start'] // spatial_chunk_size[1],
+                chunk['x_start'] // spatial_chunk_size[2]
+            )
+
+        # Get pre-filtered patches for this chunk from the spatial index
+        chunk_patches = chunk_to_patches_index.get(chunk_idx, [])
+
+        # Only process chunks that have patches
+        if chunk_patches:
+            chunk_tasks.append((chunk, chunk_patches))
+
+    if verbose:
+        print(f"  Processing {len(chunk_tasks)} chunks with patches (skipping {len(chunks) - len(chunk_tasks)} empty chunks)")
+
     total_patches_processed = 0
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunks}
-        
+
+    # Use worker initializer to cache zarr stores per worker process
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=init_worker,
+        initargs=(part_files, output_path, weight_accumulator_path, is_s3)
+    ) as executor:
+        # Submit all chunk tasks
+        future_to_chunk = {}
+        for chunk, chunk_patches in chunk_tasks:
+            future = executor.submit(
+                process_chunk_optimized,
+                chunk_info=chunk,
+                gaussian_map=gaussian_map,
+                patch_size=patch_size,
+                chunk_patches=chunk_patches,
+                normalize=True  # Fused normalization
+            )
+            future_to_chunk[future] = chunk
+
         for future in tqdm(
             as_completed(future_to_chunk),
-            total=len(chunks),
+            total=len(chunk_tasks),
             desc="Processing Chunks",
             disable=not verbose
         ):
@@ -457,38 +842,12 @@ def merge_inference_outputs(
                 total_patches_processed += result['patches_processed']
             except Exception as e:
                 print(f"Error processing chunk: {e}")
+                traceback.print_exc()
                 raise e
-    
-    print(f"\nAccumulation complete. Processed {total_patches_processed} patches total.")
-    
-    # --- 7. Normalize in Parallel ---
-    print("\n--- Normalizing Output ---")
-    
-    normalize_chunk_partial = partial(
-        normalize_chunk,
-        output_path=output_path,
-        weights_path=weight_accumulator_path
-    )
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
 
-        futures = {executor.submit(normalize_chunk_partial, chunk): chunk for chunk in chunks}
-        
-        for future in tqdm(
-            as_completed(futures),
-            total=len(chunks),
-            desc="Normalizing Chunks",
-            disable=not verbose
-        ):
-            try:
-                result = future.result() 
-            except Exception as e:
-                print(f"Error normalizing chunk: {e}")
-                raise e
-    
-    print("\nNormalization complete.")
-    
-    # --- 8. Save Metadata ---
+    print(f"\nProcessing complete. Processed {total_patches_processed} patch contributions.")
+
+    # --- 7. Save Metadata ---
     output_zarr = open_zarr(
         path=output_path,
         mode='r+',
@@ -508,8 +867,12 @@ def merge_inference_outputs(
             pmode = meta_attrs.get('processing_mode')
             if pmode is not None:
                 output_zarr.attrs['processing_mode'] = pmode
-    
-    # --- 9. Cleanup ---
+        # Save touched chunk indices for finalization step
+        if touched_chunk_indices is not None:
+            output_zarr.attrs['touched_chunk_indices'] = [list(idx) for idx in touched_chunk_indices]
+            output_zarr.attrs['output_chunk_size'] = list(output_chunks[1:])
+
+    # --- 8. Cleanup ---
     if delete_weights:
         print(f"Deleting weight accumulator: {weight_accumulator_path}")
         try:
@@ -550,6 +913,11 @@ def main():
                         help='Do not delete the weight accumulator Zarr after merging.')
     parser.add_argument('--quiet', action='store_true',
                         help='Disable verbose progress messages (tqdm bars still show).')
+    parser.add_argument('--input-zarr', type=str, default=None,
+                        help='Path to original input zarr for chunks.json detection (auto-detected from logits metadata if not provided)')
+    parser.add_argument('--chunks-filter-mode', type=str, default='auto',
+                        choices=['auto', 'disabled'],
+                        help='Chunk filtering: auto (use chunks.json if present), disabled (process full volume)')
 
     args = parser.parse_args()
 
@@ -571,7 +939,9 @@ def main():
             num_workers=args.num_workers,
             compression_level=args.compression_level,
             delete_weights=not args.keep_weights,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            input_zarr_path=args.input_zarr,
+            chunks_filter_mode=args.chunks_filter_mode,
         )
         return 0
     except Exception as e:
