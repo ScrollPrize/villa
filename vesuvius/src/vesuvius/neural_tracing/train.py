@@ -13,7 +13,6 @@ from einops import rearrange
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, load_datasets, make_heatmaps
-from vesuvius.neural_tracing.datasets.PatchInCubeDataset import PatchInCubeDataset
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
@@ -70,15 +69,11 @@ def train(config_path):
     multistep_count = 1
     bidirectional = False  # ...since at first we're single-step for which bidirectional is not supported
 
-    if config['representation'] == 'heatmap':
-        train_patches, val_patches = load_datasets(config)
+    train_patches, val_patches = load_datasets(config)
 
     def make_dataloaders():
-        if config['representation'] == 'heatmap':
-            train_dataset = HeatmapDatasetV2(config, train_patches, multistep_count=multistep_count, bidirectional=bidirectional)
-            val_dataset = HeatmapDatasetV2(config, val_patches, multistep_count=multistep_count, bidirectional=bidirectional)
-        else:
-            train_dataset = val_dataset = PatchInCubeDataset(config)
+        train_dataset = HeatmapDatasetV2(config, train_patches, multistep_count=multistep_count, bidirectional=bidirectional)
+        val_dataset = HeatmapDatasetV2(config, val_patches, multistep_count=multistep_count, bidirectional=bidirectional)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], num_workers=config['num_workers'])
         val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1)
         return accelerator.prepare(train_dataloader, val_dataloader)

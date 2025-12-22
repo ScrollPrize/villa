@@ -46,7 +46,6 @@
         "w_max_perturbation": 24,
         "main_component_distance_factor": 0.45
       },
-      "representation": "heatmap",
       "step_size": 10,
       "step_count": 1,
       "binary": true,
