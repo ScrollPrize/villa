@@ -81,7 +81,7 @@ class SIGRegLoss(nn.Module):
         proj = x @ A
 
         # Compute x*t for all evaluation points: (N, M, T)
-        x_t = proj.unsqueeze(-1) * self.t.to(dtype=dtype)
+        x_t = proj.unsqueeze(-1) * self.t.to(device=device, dtype=dtype)
 
         # Empirical characteristic function via cos/sin (real arithmetic, ~2x faster)
         # ECF(t) = E[exp(i*t*X)] = E[cos(t*X)] + i*E[sin(t*X)]
@@ -98,11 +98,13 @@ class SIGRegLoss(nn.Module):
 
         # Squared error between empirical and theoretical CF
         # For N(0,1): theoretical CF is exp(-t^2/2) (real part) with 0 imaginary part
-        err = (cos_mean - self.phi).square() + sin_mean.square()
+        phi = self.phi.to(device=device, dtype=dtype)
+        err = (cos_mean - phi).square() + sin_mean.square()
 
         # Weighted integration over t dimension
         # Scale by total batch size (N * world_size) as per paper
-        statistic = (err @ self.weights) * (N * world_size)
+        weights = self.weights.to(device=device, dtype=dtype)
+        statistic = (err @ weights) * (N * world_size)
 
         return statistic  # (M,)
 
