@@ -161,7 +161,8 @@ class ConfigManager:
         self.unlabeled_foreground_enabled = bool(self.dataset_config.get("unlabeled_foreground_enabled", False))
         self.unlabeled_foreground_threshold = float(self.dataset_config.get("unlabeled_foreground_threshold", 0.05))
         self.unlabeled_foreground_bbox_threshold = float(self.dataset_config.get("unlabeled_foreground_bbox_threshold", 0.15))
-        self.unlabeled_foreground_image_path = self.dataset_config.get("unlabeled_foreground_image_path", None)
+        # List of volume IDs to scan for unlabeled foreground (opt-in)
+        self.unlabeled_foreground_volumes = self.dataset_config.get("unlabeled_foreground_volumes", None)
 
         rotation_axes_cfg = self.dataset_config.get("rotation_axes", None)
         axis_name_to_index = {

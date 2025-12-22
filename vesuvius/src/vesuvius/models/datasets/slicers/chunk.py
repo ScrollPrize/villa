@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -45,7 +45,7 @@ class ChunkSliceConfig:
     unlabeled_fg_enabled: bool = False
     unlabeled_fg_threshold: float = 0.05  # Min fraction of non-zero image voxels
     unlabeled_fg_bbox_threshold: float = 0.15  # Min bbox coverage for image data
-    unlabeled_fg_image_path: Optional[Path] = None  # Path to image volume for validation
+    unlabeled_fg_volume_ids: Optional[Set[str]] = None  # Volume IDs to scan for unlabeled FG
 
 
 @dataclass

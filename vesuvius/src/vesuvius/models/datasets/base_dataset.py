@@ -352,9 +352,10 @@ class BaseDataset(Dataset):
         unlabeled_fg_enabled = bool(getattr(self.mgr, 'unlabeled_foreground_enabled', False))
         unlabeled_fg_threshold = float(getattr(self.mgr, 'unlabeled_foreground_threshold', 0.05))
         unlabeled_fg_bbox_threshold = float(getattr(self.mgr, 'unlabeled_foreground_bbox_threshold', 0.15))
-        unlabeled_fg_image_path = getattr(self.mgr, 'unlabeled_foreground_image_path', None)
-        if unlabeled_fg_image_path is not None:
-            unlabeled_fg_image_path = Path(unlabeled_fg_image_path)
+        unlabeled_fg_volumes = getattr(self.mgr, 'unlabeled_foreground_volumes', None)
+        unlabeled_fg_volume_ids: Optional[Set[str]] = None
+        if unlabeled_fg_volumes is not None:
+            unlabeled_fg_volume_ids = set(unlabeled_fg_volumes)
 
         config = ChunkSliceConfig(
             patch_size=patch_size,
@@ -374,27 +375,10 @@ class BaseDataset(Dataset):
             unlabeled_fg_enabled=unlabeled_fg_enabled,
             unlabeled_fg_threshold=unlabeled_fg_threshold,
             unlabeled_fg_bbox_threshold=unlabeled_fg_bbox_threshold,
-            unlabeled_fg_image_path=unlabeled_fg_image_path,
+            unlabeled_fg_volume_ids=unlabeled_fg_volume_ids,
         )
 
         slicer = ChunkSlicer(config=config, target_names=target_names)
-
-        # Open image source zarr for unlabeled foreground validation if configured
-        unlabeled_fg_image_source = None
-        if unlabeled_fg_enabled and unlabeled_fg_image_path is not None:
-            try:
-                import zarr
-                unlabeled_fg_image_source = zarr.open(str(unlabeled_fg_image_path), mode='r')
-                self.logger.info(
-                    "Opened image zarr for unlabeled FG validation: %s",
-                    unlabeled_fg_image_path,
-                )
-            except Exception as e:
-                self.logger.warning(
-                    "Failed to open unlabeled_foreground_image_path %s: %s",
-                    unlabeled_fg_image_path,
-                    e,
-                )
 
         first_target = target_names[0]
         reference_volumes = self.target_volumes[first_target]
@@ -432,6 +416,31 @@ class BaseDataset(Dataset):
                     if path_candidate:
                         cache_key_path = Path(path_candidate)
 
+            # Assign per-volume image source for unlabeled FG detection
+            image_source = None
+            if (unlabeled_fg_enabled and unlabeled_fg_volume_ids
+                    and volume_name in unlabeled_fg_volume_ids and cache_key_path):
+                # Derive image path from label path
+                image_path = self._derive_image_path_from_label(cache_key_path, first_target)
+                if image_path.exists():
+                    try:
+                        import zarr
+                        image_source = zarr.open(str(image_path), mode='r')
+                        self.logger.info(
+                            "Opened image zarr for unlabeled FG (volume=%s): %s",
+                            volume_name, image_path
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            "Failed to open derived image path %s for volume %s: %s",
+                            image_path, volume_name, e
+                        )
+                else:
+                    self.logger.warning(
+                        "Derived image path does not exist for volume %s: %s",
+                        volume_name, image_path
+                    )
+
             slicer.register_volume(
                 ChunkVolume(
                     index=idx,
@@ -442,7 +451,7 @@ class BaseDataset(Dataset):
                     cache_key_path=cache_key_path,
                     label_ignore_value=label_ignore_value,
                     meshes=reference_info.get('meshes', {}),
-                    image_source=unlabeled_fg_image_source,
+                    image_source=image_source,
                 )
             )
 
@@ -486,6 +495,33 @@ class BaseDataset(Dataset):
             if value is not None:
                 return value
         return None
+
+    def _derive_image_path_from_label(self, label_path: Path, target_name: str) -> Path:
+        """Derive image zarr path from label path.
+
+        Transforms: labels/sample_ink.zarr -> images/sample.zarr
+        Uses configured label_dirname and image_dirname for directory swap.
+        """
+        label_dirname = getattr(self.mgr, "label_dirname", "labels")
+        image_dirname = getattr(self.mgr, "image_dirname", "images")
+
+        # Swap label dir -> image dir
+        parts = list(label_path.parts)
+        try:
+            idx = parts.index(label_dirname)
+            parts[idx] = image_dirname
+        except ValueError:
+            pass  # No label dir found, keep as-is
+
+        # Remove target suffix from stem
+        stem = label_path.stem
+        suffix = f"_{target_name}"
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+
+        # Reconstruct path
+        new_path = Path(*parts[:-1]) / f"{stem}{label_path.suffix}"
+        return new_path
 
     @staticmethod
     def _normalize_channel_selector(
