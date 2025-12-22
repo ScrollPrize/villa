@@ -951,7 +951,7 @@ def make_heatmaps(all_zyxs, min_corner_zyx, crop_size, sigma: float = 2.0):
     return HeatmapDatasetV2.make_heatmaps(all_zyxs, min_corner_zyx, crop_size, apply_gaussian=True, sigma=sigma)
 
 
-def load_datasets(config):
+def load_datasets(config, shard_idx=None, total_shards=None):
     train_patches = []
     val_patches = []
     for dataset in config['datasets']:
@@ -992,6 +992,14 @@ def load_datasets(config):
         val_patches.extend(patches[:num_val_per_volume])
         
     print(f'loaded {len(train_patches)} train patches and {len(val_patches)} val patches')
+
+    if shard_idx is not None and total_shards > 1:
+        assert shard_idx < total_shards
+        assert len(train_patches) >= total_shards and len(val_patches) >= total_shards
+        train_patches = train_patches[shard_idx::total_shards]
+        val_patches = val_patches[shard_idx::total_shards]
+        print(f'shard #{shard_idx}: retaining {len(train_patches)} train patches and {len(val_patches)} val patches')
+
     return train_patches, val_patches
 
 

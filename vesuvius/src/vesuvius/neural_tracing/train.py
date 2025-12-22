@@ -69,7 +69,7 @@ def train(config_path):
     multistep_count = 1
     bidirectional = False  # ...since at first we're single-step for which bidirectional is not supported
 
-    train_patches, val_patches = load_datasets(config)
+    train_patches, val_patches = load_datasets(config, shard_idx=accelerator.process_index, total_shards=accelerator.num_processes)
 
     def make_dataloaders():
         train_dataset = HeatmapDatasetV2(config, train_patches, multistep_count=multistep_count, bidirectional=bidirectional)
