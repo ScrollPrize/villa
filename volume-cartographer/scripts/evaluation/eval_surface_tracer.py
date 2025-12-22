@@ -7,7 +7,7 @@ This script orchestrates a multi-stage pipeline:
   1) Seed discovery
   2) Seeding (process-managed with optional watchdog)
   3) Expansion (process-managed with optional watchdog)
-  4) Patch selection for tracing  <-- PRIORITIZES z-boundary touches, then overlap count, then area
+  4) Patch selection for tracing  <-- PRIORITIZES boxes hit, then target_bboxes face touches, overlap count, area
   5) Tracing (two flip_x variants per patch) with salvage of the last complete trace (ignoring *_opt)
   6) Winding number computation
   7) Metrics calculation
@@ -17,7 +17,7 @@ Changes vs your previous "new" version:
   • TMPDIR override is DISABLED by default (restores old behavior). Opt-in via "use_scratch_tmpdir": true.
   • Watchdog is OPT-IN via "watchdog_enabled": true. Default false to avoid killing long but valid jobs.
   • Safer directory creation with exist_ok=True (avoids re-run failures).
-  • Patch selection implements your boundary+overlap priority.
+  • Patch selection ranks by boxes hit, target_bboxes face coverage, overlap count, then area.
 """
 
 import os
@@ -46,12 +46,10 @@ logger = logging.getLogger(__name__)
 class PatchInfo:
     path: Path
     area: float
-    # Fields for selection policy:
-    # 0: touches neither z_min nor z_max
-    # 1: touches either z_min or z_max
-    # 2: touches both z_min and z_max
-    z_touch_score: int = 0
     overlap_count: int = 0
+    target_faces_total: int = 0
+    target_boxes_hit: int = 0
+    box_mask: int = 0
 
 
 class SurfaceTracerEvaluation:
@@ -468,97 +466,234 @@ class SurfaceTracerEvaluation:
         """
         Read meta.json & overlapping.json for each patch and compute:
           • area (area_vx2)
-          • z-touch score (touches z_min and/or z_max)
+          • target bbox coverage:
+              - boxes_hit (how many bboxes intersected)
+              - box_mask (bitmask of intersected bboxes)
+              - faces_total (0–6 per box: how many bbox face-plane coordinates fall within patch extent)
           • overlap_count (len(overlapping))
 
-        Selection policy (default 'boundary_overlap'):
-          prioritize: z-touch (both > one > none), then overlap_count desc, then area desc.
-        Falls back to 'top_k' or 'quantiles' if explicitly requested.
+        Selection policy:
+          prioritize: boxes_hit, then target bbox faces_total, then overlap_count desc, then area desc.
+        Optional: set starting_traces_selection_mode to "mask" to enforce per-bbox coverage diversity.
         """
         patch_infos: List[PatchInfo] = []
 
-        # Determine if z_range is usable for "touch" semantics.
-        z_range = self.config.get("z_range")
-        z_touch_enabled = False
-        z_min_val = z_max_val = 0.0
-        if (
-            isinstance(z_range, (list, tuple))
-            and len(z_range) == 2
-            and all(isinstance(v, (int, float)) for v in z_range)
-            and float(z_range[0]) < float(z_range[1])
-        ):
-            z_min_val = float(z_range[0])
-            z_max_val = float(z_range[1])
-            z_touch_enabled = True
-        tol = float(self.config.get("z_touch_tolerance", 0.0))
+        target_bboxes_cfg = self.config["target_bboxes"]
+        if not isinstance(target_bboxes_cfg, list) or len(target_bboxes_cfg) == 0:
+            raise ValueError("config.target_bboxes must be a non-empty list")
 
-        def _touch_score(bbox) -> int:
-            """
-            bbox is [[xmin, ymin, zmin], [xmax, ymax, zmax]] as in meta.json.
-            A patch 'touches' if it meets or exceeds the boundary within tolerance.
-            """
-            if not z_touch_enabled:
-                return 0
-            try:
-                z0 = float(bbox[0][2])
-                z1 = float(bbox[1][2])
-                lo = min(z0, z1)
-                hi = max(z0, z1)
-            except Exception:
-                return 0
-            touch_lo = lo <= (z_min_val + tol)
-            touch_hi = hi >= (z_max_val - tol)
-            return int(touch_lo) + int(touch_hi)
+        target_boxes: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = []
+        for idx, entry in enumerate(target_bboxes_cfg):
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 6):
+                raise ValueError(f"target_bboxes[{idx}] must be [x, y, z, sx, sy, sz]")
+
+            coords: List[float] = []
+            for v in entry:
+                if not self._is_finite_number(v):
+                    raise ValueError(f"target_bboxes[{idx}] contains non-numeric coordinate: {v}")
+                coords.append(float(v))
+
+            ox, oy, oz, sx, sy, sz = coords
+            if sx <= 0 or sy <= 0 or sz <= 0:
+                raise ValueError(f"target_bboxes[{idx}] size components must be > 0")
+
+            lo = (ox, oy, oz)
+            hi = (ox + sx, oy + sy, oz + sz)
+            target_boxes.append((lo, hi))
 
         def _overlap_count(pdir: Path) -> int:
             try:
                 with open(pdir / "overlapping.json", "r") as f:
                     data = json.load(f)
-                arr = data.get("overlapping", [])
-                return int(len(arr)) if isinstance(arr, list) else 0
-            except Exception:
+                overlapping = data.get("overlapping", [])
+                if not isinstance(overlapping, list):
+                    logger.warning(f"Skipping overlap list in {pdir}: 'overlapping' must be a list")
+                    return 0
+                return len(overlapping)
+            except FileNotFoundError:
+                logger.warning(f"overlapping.json missing in {pdir}, treating overlap_count=0")
                 return 0
+            except Exception as e:
+                logger.warning(f"Error reading overlapping.json in {pdir}: {e}; treating overlap_count=0")
+                return 0
+
+        def _target_bbox_face_score(bbox) -> Tuple[int, int, int]:
+            if not (isinstance(bbox, (list, tuple)) and len(bbox) == 2):
+                raise ValueError("patch bbox must be [[x,y,z],[x,y,z]]")
+            if not all(isinstance(corner, (list, tuple)) and len(corner) == 3 for corner in bbox):
+                raise ValueError("patch bbox corners must be length-3 sequences")
+
+            p_lo = [float(min(bbox[0][i], bbox[1][i])) for i in range(3)]
+            p_hi = [float(max(bbox[0][i], bbox[1][i])) for i in range(3)]
+
+            faces_total = 0
+            boxes_hit = 0
+            box_mask = 0
+
+            for bi, (b_lo, b_hi) in enumerate(target_boxes):
+                intersects = (
+                    p_hi[0] >= b_lo[0] and p_lo[0] <= b_hi[0]
+                    and p_hi[1] >= b_lo[1] and p_lo[1] <= b_hi[1]
+                    and p_hi[2] >= b_lo[2] and p_lo[2] <= b_hi[2]
+                )
+                if not intersects:
+                    continue
+
+                boxes_hit += 1
+                box_mask |= (1 << bi)
+                box_faces = 0
+
+                for axis in range(3):
+                    if p_lo[axis] <= b_lo[axis] <= p_hi[axis]:
+                        box_faces += 1
+                    if p_lo[axis] <= b_hi[axis] <= p_hi[axis]:
+                        box_faces += 1
+
+                faces_total += box_faces
+
+            return faces_total, boxes_hit, box_mask
 
         for patch_dir in patches:
             try:
                 with open(patch_dir / "meta.json", "r") as f:
                     meta = json.load(f)
-                area = float(meta.get("area_vx2", 0.0) or 0.0)
-                tscore = _touch_score(meta.get("bbox"))
+
+                bbox = meta.get("bbox")
+                area_val = meta.get("area_vx2", 0.0)
+                if bbox is None or not self._is_finite_number(area_val):
+                    raise ValueError("missing or invalid bbox/area_vx2")
+
+                faces_total, boxes_hit, box_mask = _target_bbox_face_score(bbox)
                 ocount = _overlap_count(patch_dir)
-                patch_infos.append(PatchInfo(path=patch_dir, area=area,
-                                             z_touch_score=tscore, overlap_count=ocount))
+
+                patch_infos.append(
+                    PatchInfo(
+                        path=patch_dir,
+                        area=float(area_val),
+                        overlap_count=ocount,
+                        target_faces_total=faces_total,
+                        target_boxes_hit=boxes_hit,
+                        box_mask=box_mask,
+                    )
+                )
+            except FileNotFoundError:
+                logger.warning(f"meta.json missing for patch {patch_dir}, skipping")
+                continue
             except Exception as e:
-                logger.warning(f"Error reading meta.json from {patch_dir}: {e}")
+                logger.warning(f"Skipping patch {patch_dir} due to meta/score error: {e}")
                 continue
 
         min_size = float(self.config.get("min_trace_starting_patch_size", 0.0))
-        filtered = [p for p in patch_infos if p.area >= min_size]
+        filtered = [p for p in patch_infos if p.area >= min_size and p.target_boxes_hit > 0]
         if not filtered:
-            logger.warning(f"No patches found with area >= {min_size}")
+            logger.warning(
+                f"No patches found with area >= {min_size} that intersect target_bboxes"
+            )
             return []
+
+        def _base_key(p: PatchInfo) -> Tuple[int, int, int, float]:
+            # Higher is better for all entries.
+            return (p.target_boxes_hit, p.target_faces_total, p.overlap_count, p.area)
+
+        def _select_traces_by_mode(ranked: List[PatchInfo], k: int) -> List[PatchInfo]:
+            """
+            Selection mode pass (default passthrough).
+
+            Enable mask mode with:
+              "starting_traces_selection_mode": "mask"
+
+            Optional knobs:
+              - starting_traces_top_m: only diversify among top-M ranked candidates (0 = use all; default 40_000)
+              - starting_traces_max_per_mask: cap picks per exact box_mask (0 = no cap, default 1; cap relaxes if k not reached)
+
+            Selection priority (mask-level, for each next pick):
+              1) prefer unused masks (new combos)
+              2) prefer masks that add new bbox bits not yet covered
+              3) prefer masks with fewer picks so far (balances across combos)
+              4) prefer richer masks (higher popcount)
+              5) prefer higher-quality next patch within that mask (face touches, overlap, area)
+            """
+            mode = str(self.config.get("starting_traces_selection_mode", "none")).strip().lower()
+            if mode != "mask":
+                return ranked[:k]
+
+            top_m = int(self.config.get("starting_traces_top_m", 40000))
+            candidates = ranked[: min(top_m, len(ranked))] if top_m > 0 else ranked
+
+            max_per_mask = int(self.config.get("starting_traces_max_per_mask", 1))
+
+            groups: Dict[int, List[PatchInfo]] = defaultdict(list)
+            for p in candidates:
+                if p.box_mask != 0:
+                    groups[p.box_mask].append(p)
+            if not groups:
+                return ranked[:k]
+
+            for lst in groups.values():
+                lst.sort(key=_base_key, reverse=True)
+
+            masks = sorted(groups.keys(), key=lambda m: (m.bit_count(), _base_key(groups[m][0])), reverse=True)
+
+            picked_per_mask: Dict[int, int] = defaultdict(int)
+            next_idx: Dict[int, int] = defaultdict(int)
+            covered_boxes_mask = 0
+            selected: List[PatchInfo] = []
+            per_mask_cap = k if max_per_mask <= 0 else min(k, max_per_mask)
+
+            while len(selected) < k:
+                best_m = None
+                best_pri = None
+                for m in masks:
+                    i = next_idx[m]
+                    if i >= len(groups[m]):
+                        continue
+                    if picked_per_mask[m] >= per_mask_cap:
+                        continue
+
+                    unused = 1 if picked_per_mask[m] == 0 else 0
+                    adds_new_boxes = (m & ~covered_boxes_mask).bit_count()
+                    balance = -picked_per_mask[m]
+                    richness = m.bit_count()
+                    pk = _base_key(groups[m][i])
+                    pri = (unused, adds_new_boxes, balance, richness) + pk
+                    if best_pri is None or pri > best_pri:
+                        best_pri = pri
+                        best_m = m
+
+                if best_m is None:
+                    if max_per_mask > 0 and per_mask_cap < k:
+                        per_mask_cap = min(k, per_mask_cap + 1)
+                        continue
+                    break
+
+                p = groups[best_m][next_idx[best_m]]
+                next_idx[best_m] += 1
+                picked_per_mask[best_m] += 1
+                covered_boxes_mask |= best_m
+                selected.append(p)
+
+            if len(selected) < k:
+                selected_paths = {p.path for p in selected}
+                for p in ranked:
+                    if len(selected) >= k:
+                        break
+                    if p.path in selected_paths:
+                        continue
+                    selected.append(p)
+                    selected_paths.add(p.path)
+
+            return selected[:k]
 
         k = max(0, int(self.config.get("num_trace_starting_patches", 1)))
         n = len(filtered)
         if k <= 1:
-            # single best under the new ranking
-            filtered.sort(key=lambda p: (p.z_touch_score, p.overlap_count, p.area), reverse=True)
-            return filtered[:min(1, n)]
+            ranked = sorted(filtered, key=_base_key, reverse=True)
+            return ranked[:min(1, n)]
         if k >= n:
             return filtered
 
-        strategy = str(self.config.get("trace_starting_selection", "boundary_overlap")).lower()
-        if strategy == "boundary_overlap":
-            ranked = sorted(filtered, key=lambda p: (p.z_touch_score, p.overlap_count, p.area), reverse=True)
-            return ranked[:k]
-        elif strategy == "top_k":
-            filtered.sort(key=lambda p: p.area, reverse=True)
-            return filtered[:k]
-        else:
-            # "quantiles": evenly spaced indices across [0, n-1] using the new pre-ranking
-            ranked = sorted(filtered, key=lambda p: (p.z_touch_score, p.overlap_count, p.area), reverse=True)
-            idxs = [(i * (n - 1)) // (k - 1) for i in range(k)]
-            return [ranked[i] for i in idxs]
+        ranked = sorted(filtered, key=_base_key, reverse=True)
+        return _select_traces_by_mode(ranked, k)
 
     # -------------------------------
     # Tracing (both flip_x variants)

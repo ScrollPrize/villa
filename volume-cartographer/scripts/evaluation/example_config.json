@@ -11,10 +11,13 @@
   "num_expansion_patches": 250,
   "num_trace_starting_patches": 3,
   "min_trace_starting_patch_size": 7.0,
+  "target_bboxes": [
+    [3549, 1216, 6282, 1000, 1000, 500]
+  ],
   "num_best_traces_to_average": 2,
   "trace_ranking_metric": "winding_valid_fraction",
   "wandb_project": "surface-tracer-evaluation-debug",
-  
+
   "vc_grow_seg_from_seed_params": {
     "seeding": {
       "step_size": 20,
@@ -40,7 +43,7 @@
       "direction_fields": []
     }
   },
-  
+
   "vc_grow_seg_from_segments_params": {
     "flip_x": true,
     "global_steps_per_window": 1,
