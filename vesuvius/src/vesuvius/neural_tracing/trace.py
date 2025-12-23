@@ -145,6 +145,9 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
         center_uv = np.array([max_size // 2, max_size // 2])
         patch[*center_uv] = start_zyx
 
+        gens = np.zeros([max_size, max_size], dtype=np.int32)
+        gens[*center_uv] = 1
+
         def in_patch(u, v):
             return 0 <= u < max_size and 0 <= v < max_size and not (patch[u, v] == -1).all()
 
@@ -303,7 +306,156 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
                     {'seed': start_xyz}
                 )
 
-        return patch
+        return patch, gens
+
+    def trace_patch_v5(start_zyx, max_size):
+
+        patch = np.full([max_size, max_size, 3], -1.)
+        start_ij = np.array([max_size // 2, max_size // 2])
+        patch[*start_ij] = start_zyx
+
+        gens = np.zeros([max_size, max_size], dtype=np.int32)
+        gens[*start_ij] = 1
+
+        def in_patch(ij):
+            i, j = ij
+            return 0 <= i < max_size and 0 <= j < max_size and not (patch[i, j] == -1).all()
+
+        # Bootstrap the first quad -- c.f. trace_strip and trace_patch above. We already have the
+        # top-left point; we construct top-right, bottom-left and bottom-right
+
+        # Get hopefully-4 adjacent points; take the one with min or max z-displacement depending on required direction
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at(start_zyx, prev_u=None, prev_v=None, prev_diag=None)
+        coordinates = inference.get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
+        if len(coordinates) == 0 or coordinates[0].isnan().any():
+            print('no blobs found while bootstrapping (vertex #1, top-right)')
+            return torch.empty([0, 0, 3])
+        best_idx = torch.argmin((coordinates - start_zyx)[:, 0].abs())  # use minimum delta-z; this choice orients the patch
+        patch[start_ij[0], start_ij[1] + 1] = coordinates[best_idx]
+
+        # Conditioned on center and right, predict below & above (choosing one arbitarily)
+        prev_v = torch.from_numpy(patch[start_ij[0], start_ij[1] + 1])
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at(start_zyx, prev_u=None, prev_v=prev_v, prev_diag=None)
+        coordinates = inference.get_blob_coordinates(heatmaps[0, 0], min_corner_zyx)
+        if len(coordinates) == 0 or coordinates[0].isnan().any():
+            print('no blobs found while bootstrapping (vertex #2, bottom-left)')
+            return torch.empty([0, 0, 3])
+        patch[start_ij[0] + 1, start_ij[1]] = coordinates[0]
+
+        # Conditioned on center (top-right of the quad!) and left and below-left, predict below
+        center_zyx = torch.from_numpy(patch[start_ij[0], start_ij[1] + 1])
+        prev_v = torch.from_numpy(patch[start_ij[0], start_ij[1]])
+        prev_diag = torch.from_numpy(patch[start_ij[0] + 1, start_ij[1]])
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at(center_zyx, prev_u=None, prev_v=prev_v, prev_diag=prev_diag)
+        coordinates = inference.get_blob_coordinates(heatmaps[0, 0], min_corner_zyx)
+        if len(coordinates) == 0 or coordinates[0].isnan().any():
+            print('no blobs found while bootstrapping (vertex #3, bottom-right)')
+            return torch.empty([0, 0, 3])
+        patch[start_ij[0] + 1, start_ij[1] + 1] = coordinates[0]
+
+        num_vertices = 4
+        print(f'bootstrapped: vertex count = {num_vertices}')
+
+        def maybe_add_point(gap_i, gap_j):
+            nonlocal num_vertices
+
+            gap_ij = np.array([gap_i, gap_j])
+            assert not in_patch(gap_ij)
+
+            max_score = -1
+
+            # dir is ij-vector pointing from center to gap (or equivalently prev_u to center)
+            for dir in np.array([[1, 0], [0, 1], [-1, 0], [0, -1]]):
+                if not in_patch(gap_ij - dir) or not in_patch(gap_ij - 2 * dir):
+                    continue
+
+                center_ij = gap_ij - dir
+
+                # ortho_dir is ij-vector pointing from prev_v to center
+                for ortho_dir in np.array([[-dir[1], dir[0]], [dir[1], -dir[0]]]):
+
+                    maybe_ortho_pos = center_ij - ortho_dir if in_patch(center_ij - ortho_dir) else None
+                    # diag_dir is ij-vector pointing from prev_diag to center
+                    if maybe_ortho_pos is not None:
+                        # if prev_u and prev_v both given, then prev_diag should be adjacent to the gap p (not to center)
+                        diag_dir = dir - ortho_dir
+                    else:
+                        # if only prev_u not prev_v given, then prev_diag should be opposite to the gap p along ortho_dir
+                        diag_dir = dir + ortho_dir
+                    maybe_diag_pos = center_ij - diag_dir if in_patch(center_ij - diag_dir) else None
+
+                    score = (
+                        3 if maybe_ortho_pos is not None and maybe_diag_pos is not None
+                        else 2 if maybe_ortho_pos is not None
+                        else 1 if maybe_diag_pos is not None
+                        else 0
+                    )
+
+                    if score > max_score:
+                        max_score = score
+                        best_dir = dir
+                        best_prev_v_ij = maybe_ortho_pos
+                        best_prev_diag_ij = maybe_diag_pos
+
+            if max_score == -1:
+                print(f'warning: no support points found for {gap_ij}')
+                return
+
+            center_zyx = torch.from_numpy(patch[*(gap_ij - best_dir)])
+            prev_u_zyx = torch.from_numpy(patch[*(gap_ij - 2 * best_dir)])
+            prev_v_zyx = torch.from_numpy(patch[*best_prev_v_ij]) if best_prev_v_ij is not None else None
+            prev_diag_zyx = torch.from_numpy(patch[*best_prev_diag_ij]) if best_prev_diag_ij is not None else None
+
+            # Query model at this point; take the largest (0th) blob centroid to fill the gap-point
+            heatmaps, min_corner_zyx = inference.get_heatmaps_at(center_zyx, prev_u=prev_u_zyx, prev_v=prev_v_zyx, prev_diag=prev_diag_zyx)
+            coordinates = inference.get_blob_coordinates(heatmaps[0, 0], min_corner_zyx)
+            if len(coordinates) == 0 or coordinates[0].isnan().any():
+                print(f'warning: no point found for {gap_ij}')
+                return
+            patch[*gap_ij] = coordinates[0]
+            num_vertices += 1
+            gens[*gap_ij] = num_vertices
+
+        for radius in range(1, max_size // 2 - 1):
+
+            # size of square patch is always even; side is (radius + 1) * 2
+
+            # right edge (and bottom-right diagonal)
+            j = start_ij[1] + radius + 1
+            for i in range(start_ij[0] - radius + 1, start_ij[0] + radius + 2):
+                maybe_add_point(i, j)
+
+            # bottom edge (and bottom-left diagonal)
+            i = start_ij[0] + radius + 1
+            for j in range(start_ij[1] + radius, start_ij[1] - radius - 1, -1):
+                maybe_add_point(i, j)
+
+            # left edge (and top-left diagonal)
+            j = start_ij[1] - radius
+            for i in range(start_ij[0] + radius, start_ij[0] - radius - 1, -1):
+                maybe_add_point(i, j)
+
+            # top edge (and top-right diagonal)
+            i = start_ij[0] - radius
+            for j in range(start_ij[1] - radius + 1, start_ij[1] + radius + 2):
+                maybe_add_point(i, j)
+
+            _, area_cm2 = get_area(patch, step_size, inference.voxel_size_um)
+            print(f'radius = {radius}, vertex count = {num_vertices}, area = {area_cm2:.2f}cm2')
+
+            if save_partial and num_vertices > 0 and num_vertices % 1000 == 0:
+                partial_uuid = f'{base_uuid}_r{radius:03}'
+                save_tifxyz(
+                    (np.where((patch == -1).all(-1, keepdims=True), -1, patch * 2 ** volume_scale)),
+                    f'{out_path}',
+                    partial_uuid,
+                    step_size,
+                    inference.voxel_size_um,
+                    'neural-tracer',
+                    {'seed': start_xyz}
+                )
+
+        return patch, gens
 
     def save_point_collection(filename, zyxs):
         with open(filename, 'wt') as fp:
@@ -339,7 +491,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
 
         else:  # freeform 2D growth
 
-            patch_zyxs = trace_patch_v4(start_zyx, max_size=max_size)
+            patch_zyxs, gens = trace_patch_v5(start_zyx, max_size=max_size)
 
         print(f'saving with uuid {base_uuid}')
         save_tifxyz(
@@ -356,6 +508,10 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
             plt.plot(*patch_zyxs.view(-1, 3)[:, [0, 1]].T, 'r.')
             plt.show()
             plt.savefig('patch.png')
+            plt.close()
+            plt.imshow(gens)
+            plt.show()
+            plt.savefig('gens.png')
             plt.close()
 
 
