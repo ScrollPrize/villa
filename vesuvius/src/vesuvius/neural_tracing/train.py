@@ -124,7 +124,19 @@ def train(config_path):
         ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
-        # Note we don't load the lr_scheduler state (i.e. training starts 'hot'), nor any config
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+        first_iteration = ckpt['step']
+        # Note we don't load the config saved with the ckpt!
+
+        if len(multistep_increase_iters) > 0:
+            multistep_count = 1 + np.searchsorted(multistep_increase_iters, first_iteration)
+            print(f'resuming with multistep_count = {multistep_count}')
+            if multistep_count > 1:
+                bidirectional = config.get('bidirectional', False)
+                train_dataloader, val_dataloader = make_dataloaders()
+
+    else:
+        first_iteration = 0
 
     model, optimizer, lr_scheduler = accelerator.prepare(
         model, optimizer, lr_scheduler  # note we do the dataloaders in make_dataloaders
@@ -507,8 +519,8 @@ def train(config_path):
             pred_for_vis = pred
         return loss, pred_for_vis
 
-    progress_bar = tqdm(total=config['num_iterations'], disable=not accelerator.is_local_main_process)
-    for iteration in range(config['num_iterations'] + 1):
+    progress_bar = tqdm(total=config['num_iterations'], initial=first_iteration, disable=not accelerator.is_local_main_process)
+    for iteration in range(first_iteration, config['num_iterations'] + 1):
 
         if iteration in multistep_increase_iters:
             multistep_count += 1
