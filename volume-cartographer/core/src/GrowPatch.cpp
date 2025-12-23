@@ -544,97 +544,78 @@ static bool call_neural_tracer_for_point(
         return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
     };
 
-    cv::Vec2i best_dir(-2, -2);
-    cv::Vec2i best_ortho_dir(0, 0);
+    cv::Vec2i best_dir;
+    std::optional<cv::Vec2i> best_ortho_pos;
     std::optional<cv::Vec2i> best_diag_pos;
     int max_score = -1;
 
     const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
     for (const auto& dir : dirs) {
-        if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {
+        if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {  // check if center and prev_u (where u is dir-direction) are valid
             continue;
         }
 
         const cv::Vec2i center_pos = p - dir;
-        const cv::Vec2i prev_u_pos = p - 2 * dir;
 
         const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
 
         for (const auto& ortho_dir : ortho_dirs) {
-            int current_score = 2; // center + prev_u
-            std::optional<cv::Vec2i> current_diag_pos;
 
-            bool v_valid = false;
-            cv::Vec2i prev_v_pos;
-            if (ortho_dir[0] != 0 || ortho_dir[1] != 0) {
-                if (is_valid(center_pos - ortho_dir)) {
-                    v_valid = true;
-                    prev_v_pos = center_pos - ortho_dir;
-                    current_score++;
-                }
+            auto current_ortho_pos = is_valid(center_pos - ortho_dir) ? std::optional{center_pos - ortho_dir} : std::nullopt;
+            cv::Vec2i diag_dir;  // vector from prev_diag to center
+            if (current_ortho_pos) {
+                // if prev_u and prev_v both given, then prev_diag should be adjacent to the gap p (not to center)
+                diag_dir = dir - ortho_dir;
+            } else {
+                // if only prev_u not prev_v given, then prev_diag should be opposite to the gap p along ortho_dir
+                diag_dir = dir + ortho_dir;
             }
+            auto current_diag_pos = is_valid(center_pos - diag_dir) ? std::optional{center_pos - diag_dir} : std::nullopt;
 
-            // if (current_diag_pos.has_value()) {
-            //     current_score++;
-            // }
+            int current_score =
+                current_ortho_pos && current_diag_pos ? 3 :
+                current_ortho_pos ? 2 :
+                current_diag_pos ? 1 :
+                0;  // only prev_u & center valid
 
             if (current_score > max_score) {
                 max_score = current_score;
                 best_dir = dir;
-                best_ortho_dir = ortho_dir;
+                best_ortho_pos = current_ortho_pos;
                 best_diag_pos = current_diag_pos;
             }
         }
     }
 
-    if (max_score == -1) {
+    if (max_score < 1) {
+        // we disallow score = -1 since this implies no neighbors found, and score = 0 since this is likely to create long, poorly-supported tendrils
+        std::cout << "warning: max_score = " << max_score << std::endl;
         return false;
     }
 
-    const cv::Vec2i center_pos = p - best_dir;
-    const auto& center_p_double = trace_params.dpoints(center_pos);
-    cv::Vec3f center_xyz(center_p_double[0], center_p_double[1], center_p_double[2]);
-
-    auto get_point = [&](const cv::Vec2i& pos) -> std::optional<cv::Vec3f> {
-        if (is_valid(pos)) {
-            const auto& p_double_neighbor = trace_params.dpoints(pos);
-            return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
-        }
-        return std::nullopt;
+    auto get_point = [&](const cv::Vec2i& pos) {
+        assert(is_valid(pos));
+        const auto& p_double_neighbor = trace_params.dpoints(pos);
+        return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
     };
 
-    std::optional<cv::Vec3f> prev_u = get_point(p - 2 * best_dir);
-    std::optional<cv::Vec3f> prev_v;
-    std::optional<cv::Vec3f> prev_diag;
+    auto center_xyz = get_point(p - best_dir);
+    auto prev_u_xyz = get_point(p - 2 * best_dir);
+    auto prev_v_xyz = best_ortho_pos.transform(get_point);
+    auto prev_diag_xyz = best_diag_pos.transform(get_point);
 
-    if (best_ortho_dir[0] != 0 || best_ortho_dir[1] != 0) {
-        prev_v = get_point(center_pos - best_ortho_dir);
-    }
-    if (best_diag_pos.has_value()) {
-        prev_diag = get_point(*best_diag_pos);
-    }
-
-    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u, prev_v, prev_diag);
+    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u_xyz, prev_v_xyz, prev_diag_xyz);
 
     const auto& candidates = next_uvs.next_u_xyzs;
-    cv::Vec3f best_prediction;
-    bool found_prediction = false;
-
-    if (!candidates.empty()) {
-        if (cv::norm(candidates[0]) > 1e-6) {
-            best_prediction = candidates[0];
-            found_prediction = true;
-        }
-    }
-
-    if (found_prediction) {
-        trace_params.dpoints(p) = {best_prediction[0], best_prediction[1], best_prediction[2]};
+    if (!candidates.empty() && cv::norm(candidates[0]) > 1e-6) {
+        trace_params.dpoints(p) = {candidates[0][0], candidates[0][1], candidates[0][2]};
         trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
         return true;
+    } else {
+        std::cout << "warning: no valid next point found at " << p << std::endl;
+        return false;
     }
-
-    return false;
 }
 
 // global CUDA to allow use to set to false globally
@@ -1585,6 +1566,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 std::cout << "Neural tracer connection enabled on " << socket_path << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "Failed to connect neural tracer: " << e.what() << std::endl;
+                throw;
             }
         }
     }
