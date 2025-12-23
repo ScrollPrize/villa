@@ -329,7 +329,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
         coordinates = inference.get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
         if len(coordinates) == 0 or coordinates[0].isnan().any():
             print('no blobs found while bootstrapping (vertex #1, top-right)')
-            return torch.empty([0, 0, 3])
+            return patch, gens
         best_idx = torch.argmin((coordinates - start_zyx)[:, 0].abs())  # use minimum delta-z; this choice orients the patch
         patch[start_ij[0], start_ij[1] + 1] = coordinates[best_idx]
 
@@ -339,7 +339,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
         coordinates = inference.get_blob_coordinates(heatmaps[0, 0], min_corner_zyx)
         if len(coordinates) == 0 or coordinates[0].isnan().any():
             print('no blobs found while bootstrapping (vertex #2, bottom-left)')
-            return torch.empty([0, 0, 3])
+            return patch, gens
         patch[start_ij[0] + 1, start_ij[1]] = coordinates[0]
 
         # Conditioned on center (top-right of the quad!) and left and below-left, predict below
@@ -350,7 +350,7 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
         coordinates = inference.get_blob_coordinates(heatmaps[0, 0], min_corner_zyx)
         if len(coordinates) == 0 or coordinates[0].isnan().any():
             print('no blobs found while bootstrapping (vertex #3, bottom-right)')
-            return torch.empty([0, 0, 3])
+            return patch, gens
         patch[start_ij[0] + 1, start_ij[1] + 1] = coordinates[0]
 
         num_vertices = 4
