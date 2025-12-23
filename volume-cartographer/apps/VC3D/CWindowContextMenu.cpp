@@ -1375,6 +1375,55 @@ void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
     }
 }
 
+void CWindow::onFlipSurface(const std::string& segmentId, bool flipU)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot flip surface: No volume package loaded"));
+        return;
+    }
+
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot flip surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    QuadSurface* surface = surf.get();
+
+    if (flipU) {
+        surface->flipU();
+    } else {
+        surface->flipV();
+    }
+
+    try {
+        surface->save(surface->path.string(), surface->id, true);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this,
+                              tr("Flip failed"),
+                              tr("Failed to save flipped surface %1: %2")
+                                  .arg(QString::fromStdString(segmentId))
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    if (_surf_col) {
+        _surf_col->setSurface(segmentId, surf, false, false);
+        if (_surfID == segmentId) {
+            _surf_col->setSurface("segmentation", surf, false, false);
+        }
+    }
+
+    const QString axisLabel = flipU ? tr("U") : tr("V");
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Flipped %1 over %2 axis")
+                .arg(QString::fromStdString(segmentId))
+                .arg(axisLabel),
+            5000);
+    }
+}
+
 void CWindow::onAlphaCompRefine(const std::string& segmentId)
 {
     if (currentVolume == nullptr || !fVpkg) {

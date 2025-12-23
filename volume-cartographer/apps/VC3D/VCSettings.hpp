@@ -56,6 +56,7 @@ namespace viewer {
     // Display & Appearance
     constexpr auto DISPLAY_SEGMENT_OPACITY = "viewer/display_segment_opacity";
     constexpr auto SHOW_DIRECTION_HINTS = "viewer/show_direction_hints";
+    constexpr auto SHOW_SURFACE_NORMALS = "viewer/show_surface_normals";
     constexpr auto DIRECTION_STEP = "viewer/direction_step";
     constexpr auto USE_SEG_STEP_FOR_HINTS = "viewer/use_seg_step_for_hints";
     constexpr auto DIRECTION_STEP_POINTS = "viewer/direction_step_points";
@@ -64,6 +65,7 @@ namespace viewer {
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
     constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
+    constexpr bool SHOW_SURFACE_NORMALS_DEFAULT = false;
     constexpr double DIRECTION_STEP_DEFAULT = 10.0;
     constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
     constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;

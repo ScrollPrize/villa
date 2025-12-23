@@ -705,6 +705,16 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit cropBoundsRequested(segmentId);
     });
 
+    QMenu* flipMenu = contextMenu.addMenu(tr("Flip Surface"));
+    QAction* flipUAction = flipMenu->addAction(tr("Flip over U axis (reverse V)"));
+    connect(flipUAction, &QAction::triggered, this, [this, segmentId]() {
+        emit flipURequested(segmentId);
+    });
+    QAction* flipVAction = flipMenu->addAction(tr("Flip over V axis (reverse U)"));
+    connect(flipVAction, &QAction::triggered, this, [this, segmentId]() {
+        emit flipVRequested(segmentId);
+    });
+
     QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
     connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
         emit alphaCompRefineRequested(segmentId);

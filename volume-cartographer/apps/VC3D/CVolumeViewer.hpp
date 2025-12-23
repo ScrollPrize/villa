@@ -108,6 +108,10 @@ public:
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
+    // Surface normals visualization toggle
+    void setShowSurfaceNormals(bool on) { _showSurfaceNormals = on; updateAllOverlays(); }
+    bool isShowSurfaceNormals() const { return _showSurfaceNormals; }
+
     // Surface-relative offset controls (normal direction only)
     void adjustSurfaceOffset(float dn);
     void resetSurfaceOffsets();
@@ -361,6 +365,7 @@ protected:
     bool _brushIsSquare = false;
     bool _resetViewOnSurfaceChange = true;
     bool _showDirectionHints = true;
+    bool _showSurfaceNormals = false;
     bool _segmentationEditActive = false;
     bool _suppressFocusRecentering = false;
 
