@@ -81,7 +81,7 @@ def make_model(config):
         raise RuntimeError('unexpected model_type, should be unet or vit')
 
 
-def _resolve_checkpoint_path(checkpoint_path):
+def resolve_checkpoint_path(checkpoint_path):
     path = Path(checkpoint_path)
     if path.is_dir():
         candidates = list(path.glob("ckpt_*.pth"))
@@ -105,7 +105,7 @@ def _resolve_checkpoint_path(checkpoint_path):
 
 
 def load_checkpoint(checkpoint_path):
-    checkpoint_path = _resolve_checkpoint_path(checkpoint_path)
+    checkpoint_path = resolve_checkpoint_path(checkpoint_path)
     print(f'loading checkpoint {checkpoint_path}... ')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
@@ -113,6 +113,14 @@ def load_checkpoint(checkpoint_path):
     config = checkpoint['config']
 
     model = make_model(config)
+
+    state = strip_state(state)
+
+    model.load_state_dict(state)
+    return model, config
+
+
+def strip_state(state):
 
     # Checkpoints saved from torch.compile / DDP may prepend wrapper prefixes.
     prefixes = ('module.', '_orig_mod.')
@@ -128,6 +136,5 @@ def load_checkpoint(checkpoint_path):
                     changed = True
         return key
 
-    state = {strip_prefixes(k): v for k, v in state.items()}
-    model.load_state_dict(state)
-    return model, config
+    return {strip_prefixes(k): v for k, v in state.items()}
+

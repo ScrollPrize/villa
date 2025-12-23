@@ -17,7 +17,7 @@ from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, 
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
-from vesuvius.neural_tracing.models import make_model
+from vesuvius.neural_tracing.models import make_model, strip_state, resolve_checkpoint_path
 from vesuvius.neural_tracing.cropping import safe_crop_with_padding, transform_to_first_crop_space
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
 from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
@@ -120,9 +120,11 @@ def train(config_path):
     grad_clip = config.setdefault('grad_clip', 5)
 
     if 'load_ckpt' in config:
-        print(f'loading checkpoint {config["load_ckpt"]}')
-        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
-        model.load_state_dict(ckpt['model'])
+        ckpt_path = resolve_checkpoint_path(config['load_ckpt'])
+        print(f'loading checkpoint {ckpt_path}')
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+        model.load_state_dict(strip_state(ckpt['model']))
         optimizer.load_state_dict(ckpt['optimizer'])
         lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
         first_iteration = ckpt['step']
