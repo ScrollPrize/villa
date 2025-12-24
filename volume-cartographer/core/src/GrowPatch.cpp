@@ -1558,6 +1558,7 @@ struct thresholdedDistance
 QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
+    int pre_neural_gens = 0;
     if (params.contains("neural_socket")) {
         std::string socket_path = params["neural_socket"];
         if (!socket_path.empty()) {
@@ -1569,6 +1570,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 throw;
             }
         }
+        pre_neural_gens = params.value("pre_neural_generations", 0);
     }
     if (!neural_tracer) {
         std::cout << "Neural tracer not active" << std::endl;
@@ -2016,9 +2018,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
 
     } else {
-        if (neural_tracer) {
+        if (neural_tracer && pre_neural_gens == 0) {
             std::cout << "Initializing with neural tracer..." << std::endl;
-            
+
+            // TODO: change this to work like the python trace_patch_v5
+            throw std::runtime_error("Neural tracer in VC3D does not support growing from scratch yet");
+
             trace_params.dpoints(y0, x0) = origin;
             trace_params.state(y0, x0) = STATE_LOC_VALID | STATE_COORD_VALID;
             generations(y0, x0) = 1;
@@ -2112,7 +2117,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     ceres::Solver::Summary big_summary;
     //just continue on resume no additional global opt	
     if (!resume_surf) {
-        local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
+        if (!neural_tracer) {
+            local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
+        }
     }
     else
     {
@@ -2425,13 +2432,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
                 avg /= ref_count;
 
+                // FIXME: for the neural case, only need avg for the z-bounds check, and don't need best_l / best_ref_l at all
+
                 //"fast" skip based on avg z value out of limits
                 if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
                     continue;
 
                 bool point_was_placed = false;
-                const int CERES_GENS = 4;
-                if (neural_tracer && generation > CERES_GENS) {
+                if (neural_tracer && generation > pre_neural_gens) {
                     point_was_placed = call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
                 } else {
                     // Standard Ceres optimization path
@@ -2477,7 +2485,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             }  // end parallel iteration over cands
         }
 
-        if (generation > 4 && neural_tracer) {
+        if (neural_tracer && generation > pre_neural_gens) {
             // Skip optimizations
         } else if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
