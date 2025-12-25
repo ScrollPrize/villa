@@ -45,6 +45,10 @@ dataset_config:
       losses:
         - name: "nnUNet_DC_and_CE_loss"
           weight: 1.0
+          dice_label_smoothing: 0.001
+          ce_kwargs:
+            label_smoothing: 0.001
+
 
 
 # Mean Teacher hyperparameters
@@ -52,5 +56,6 @@ mean_teacher_config:
   consistency_rampup: 200.0               # Epochs for consistency ramp-up
   uncertainty_T: 6                        # Number of stochastic forward passes (must be even)
   uncertainty_weight: 0.1
+  uncertainty_threshold_end: 0.65
 
 
