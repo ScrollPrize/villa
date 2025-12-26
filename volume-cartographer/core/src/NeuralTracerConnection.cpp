@@ -99,6 +99,10 @@ std::vector<NeuralTracerConnection::NextUvs> NeuralTracerConnection::get_next_po
 
     nlohmann::json response = process_json_request(req, sock);
 
+    if (response.contains("error")) {
+        throw std::runtime_error("Neural tracer returned error: " + response["error"].get<std::string>());
+    }
+
     auto get_float_or_nan = [](const nlohmann::json& j) {
         return j.is_null() ? std::numeric_limits<float>::quiet_NaN() : j.get<float>();
     };
