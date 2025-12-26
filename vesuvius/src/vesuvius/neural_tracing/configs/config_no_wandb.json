@@ -1,0 +1,64 @@
+{
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/test",
+    "seed": 0,
+    "batch_size": 2,
+    "num_workers": 6,
+    "cache_max_gb": 6,
+    "log_frequency": 200,
+    "ckpt_frequency": 5000,
+    "mixed_precision": "fp16",
+
+    "num_iterations": 250000,
+    "datasets": [
+              {
+                  "volume_path": "/mnt/raid_nvme/volpkgs/PHercParis4.volpkg/volumes/Scroll1_8um_uint8.zarr",
+                  "volume_scale": 0,
+                  "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/PHercParis4/fixed"
+              },
+              {
+                  "volume_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_rewindowed.zarr",
+                  "volume_scale": 0,
+                  "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/PHerc0172/cropped"
+              },
+            {
+                  "volume_path": "/mnt/raid_nvme/volpkgs/Scroll4.volpkg/volumes/s4.zarr",
+                  "volume_scale": 0,
+                  "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/PHerc1667/cropped"
+            },
+            {
+                  "volume_path": "/mnt/raid_nvme/volpkgs/PHerc0139.volpkg/volumes/4.681um_113keV_1.2m_binmean_2_PHerc_0139.zarr",
+                  "volume_scale": 0,
+                  "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/PHerec0139/cropped"
+            }
+          ],
+"num_val_segments_per_volume": 1,
+"augmentation": {
+  "allow_transposes": true,
+  "only_spatial_and_intensity": false
+},
+  "multistep_mode": "chain",
+  "multistep_count": 2,
+  "multistep_prob":  1,
+  "multistep_samples": 8,
+  "heatmap_sigma": 3,
+  "point_perturbation": {
+    "perturb_probability": 0.95,
+    "uv_max_perturbation": 6,
+    "w_max_perturbation": 16,
+    "main_component_distance_factor": 0.45
+  },
+  "enable_deep_supervision": false,
+  "learning_rate": 1e-3,
+  "weight_decay": 1e-4,
+  "lr_warmup_steps": 1000,
+  "grad_clip": 5,
+  "step_size": 20,
+  "step_count": 1,
+  "binary": true,
+  "crop_size": 128,
+  "model_type": "unet",
+  "model_config": {
+    "basic_decoder_block": "BasicBlockD",
+    "squeeze_excitation": true
+  }
+  }

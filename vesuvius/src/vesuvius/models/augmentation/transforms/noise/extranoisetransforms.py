@@ -138,7 +138,6 @@ class BlankRectangleTransform(BasicTransform):
 import numpy as np
 import torch
 from typing import Union, Tuple
-from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
 
 def augment_rician_noise(data: torch.Tensor, noise_variance: Tuple[float, float]) -> torch.Tensor:
     """

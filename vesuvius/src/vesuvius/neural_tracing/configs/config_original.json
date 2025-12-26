@@ -1,0 +1,59 @@
+{
+    "out_dir": "/scratch/sean/data/results/default",
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "neural-tracing",
+    "seed": 0,
+    "batch_size": 32,
+    "num_workers": 32,
+    "log_frequency": 200,
+    "ckpt_frequency": 5000,
+    "mixed_precision": "fp16",
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-4,
+    "lr_warmup_steps": 1000,
+    "num_iterations": 250000,
+    "datasets": [
+              {
+                  "volume_path": "/scratch/sean/data/s1.zarr",
+                  "volume_scale": 1,
+                  "segments_path": "/scratch/sean/data/segments/PHercParis4/fixed"
+              },
+              {
+                  "volume_path": "/scratch/sean/data/s5_rewindowed.zarr",
+                  "volume_scale": 1,
+                  "segments_path": "/scratch/sean/data/segments/PHerc0172/cropped"
+              },
+            {
+                  "volume_path": "/scratch/sean/data/s4.zarr",
+                  "volume_scale": 1,
+                  "segments_path": "/scratch/sean/data/segments/PHerc1667/cropped"
+            },
+            {
+                  "volume_path": "/scratch/sean/data/0139_9um.zarr",
+                  "volume_scale": 1,
+                  "segments_path": "/scratch/sean/data/segments/PHerec0139/cropped"
+            }
+          ],
+  "num_val_segments_per_volume": 1,
+    "augmentation": {
+      "allow_transposes": false,
+      "only_spatial_and_intensity": false
+    },
+    "enable_deep_supervision": false,
+    "grad_clip": 5,
+    "heatmap_sigma": 3,
+    "point_perturbation": {
+      "perturb_probability": 0.95,
+      "uv_max_perturbation": 8,
+      "w_max_perturbation": 24,
+      "main_component_distance_factor": 0.45
+    },
+    "representation": "heatmap",
+    "step_size": 20,
+    "step_count": 1,
+    "binary": true,
+    "crop_size": 128,
+    "model_type": "unet",
+    "model_config": {
+    }
+}

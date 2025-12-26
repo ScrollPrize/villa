@@ -362,7 +362,7 @@ class NetworkFromConfig(nn.Module):
             )
             # Heads map from decoder feature channels at highest resolution to task outputs
             head_in_ch = self.shared_encoder.output_channels[0]
-            for target_name in tasks_using_shared:
+            for target_name in sorted(tasks_using_shared):
                 out_ch = self.targets[target_name]["out_channels"]
                 self.task_heads[target_name] = self.conv_op(head_in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
                 activation_str = self.targets[target_name].get("activation", "none")
@@ -370,7 +370,7 @@ class NetworkFromConfig(nn.Module):
                 print(f"Task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
 
         # Build separate decoders for tasks that requested them
-        for target_name in tasks_using_separate:
+        for target_name in sorted(tasks_using_separate):
             out_channels = self.targets[target_name]["out_channels"]
             activation_str = self.targets[target_name].get("activation", "none")
             self.task_decoders[target_name] = Decoder(
@@ -474,7 +474,7 @@ class NetworkFromConfig(nn.Module):
             "num_register_tokens": model_config.get("num_register_tokens", 0),
             "use_rot_pos_emb": model_config.get("use_rot_pos_emb", True),
             "use_abs_pos_embed": model_config.get("use_abs_pos_embed", True),
-            "pos_emb_type": model_config.get("pos_emb_type", "pope"),
+            "pos_emb_type": model_config.get("pos_emb_type", "rope"),
             "mlp_ratio": model_config.get("mlp_ratio", 4 * 2 / 3),
             "init_values": model_config.get("init_values", 0.1 if config_name != "S" else 0.1),
             "scale_attn_inner": model_config.get("scale_attn_inner", True),
@@ -530,7 +530,7 @@ class NetworkFromConfig(nn.Module):
                 norm=decoder_norm_str,
                 activation=decoder_act_str,
             )
-            for target_name in tasks_using_shared:
+            for target_name in sorted(tasks_using_shared):
                 out_ch = self.targets[target_name]["out_channels"]
                 head_conv = nn.Conv2d if self.shared_encoder.ndim == 2 else nn.Conv3d
                 self.task_heads[target_name] = head_conv(
@@ -541,7 +541,7 @@ class NetworkFromConfig(nn.Module):
                 print(f"Primus task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
 
         # Separate Primus decoders per task
-        for target_name in tasks_using_separate:
+        for target_name in sorted(tasks_using_separate):
             out_channels = self.targets[target_name]["out_channels"]
             activation_str = self.targets[target_name].get("activation", "none")
             self.task_decoders[target_name] = PrimusDecoder(
@@ -652,7 +652,10 @@ class NetworkFromConfig(nn.Module):
                 logits = logits[0]
             activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
             if activation_fn is not None and not self.training:
-                logits = activation_fn(logits)
+                if isinstance(logits, (list, tuple)):
+                    logits = type(logits)(activation_fn(l) for l in logits)
+                else:
+                    logits = activation_fn(logits)
             results[task_name] = logits
 
         # Handle tasks that use shared decoder + heads
@@ -663,7 +666,10 @@ class NetworkFromConfig(nn.Module):
                 logits = head(shared_features)
                 activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
                 if activation_fn is not None and not self.training:
-                    logits = activation_fn(logits)
+                    if isinstance(logits, (list, tuple)):
+                        logits = type(logits)(activation_fn(l) for l in logits)
+                    else:
+                        logits = activation_fn(logits)
                 results[task_name] = logits
         
         # Return MAE mask if requested (for MAE training)

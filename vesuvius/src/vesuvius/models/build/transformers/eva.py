@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn import LayerNorm
 from torch.utils.checkpoint import checkpoint
 from .pope import PoPEEmbedding, PoPEBlock
+from .flash_rope import FlashRoPEBlock
 
 set_fused_attn(True)
 
@@ -107,6 +108,8 @@ class Eva(nn.Module):
             rope_impl = PoPEEmbedding
         if pos_emb_type == "pope" and block_fn is EvaBlock:
             block_fn = PoPEBlock
+        if pos_emb_type == "rope" and block_fn is EvaBlock:
+            block_fn = FlashRoPEBlock
 
         # Determine RoPE configuration based on spatial dimensions
         self.head_dim = embed_dim // num_heads

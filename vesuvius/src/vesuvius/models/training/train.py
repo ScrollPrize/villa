@@ -611,7 +611,7 @@ class BaseTrainer:
         print(f"Using {scheduler_type} learning rate scheduler")
         
         # set some per iteration schedulers so we can easily step them once per iter vs once per epoch
-        per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup']
+        per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup', 'diffusers_cosine_warmup']
         is_per_iteration = scheduler_type.lower() in per_iter_schedulers
         
         return scheduler, is_per_iteration

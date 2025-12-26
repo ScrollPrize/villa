@@ -6,8 +6,7 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
-from dynamic_network_architectures.building_blocks.helper import maybe_convert_scalar_to_list, get_matching_pool_op
-from dynamic_network_architectures.building_blocks.regularization import DropPath, SqueezeExcite
+from vesuvius.models.utilities.utils import maybe_convert_scalar_to_list, get_matching_pool_op, DropPath, SqueezeExcite
 from .simple_conv_blocks import ConvDropoutNormReLU
 from .activations import SwiGLUBlock, GLUBlock
 import numpy as np

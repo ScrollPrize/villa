@@ -46,7 +46,7 @@ qt6_wrap_cpp(metrics_moc include/vc/ui/VCCollection.hpp)
 add_library(vc_ui src/VCCollection.cpp src/UDataManipulateUtils.cpp src/surface_metrics.cpp ${metrics_moc})
 target_link_libraries(vc_ui PUBLIC vc_core Qt6::Core Qt6::Gui Qt6::Widgets)
 
-add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp)
+add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp)
 target_link_libraries(vc_tracer PUBLIC vc_core vc_ui Ceres::ceres Qt6::Core)
 
 

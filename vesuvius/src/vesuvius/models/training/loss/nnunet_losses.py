@@ -330,23 +330,23 @@ class DC_and_BCE_loss(nn.Module):
         self.ce = nn.BCEWithLogitsLoss(**bce_kwargs)
         self.dc = dice_class(apply_nonlin=torch.sigmoid, **soft_dice_kwargs)
 
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor = None):
+        # If use_ignore_label is set, derive the mask from the ignore channel
         if self.use_ignore_label:
-            # target is one hot encoded here. invert it so that it is True wherever we can compute the loss
             if target.dtype == torch.bool:
                 mask = ~target[:, -1:]
             else:
                 mask = (1 - target[:, -1:]).bool()
-            # remove ignore channel now that we have the mask
             target_regions = target[:, :-1]
         else:
             target_regions = target
-            mask = None
+            mask = loss_mask
 
         dc_loss = self.dc(net_output, target_regions, loss_mask=mask)
         target_regions = target_regions.float()
         if mask is not None:
-            ce_loss = (self.ce(net_output, target_regions) * mask).sum() / torch.clip(mask.sum(), min=1e-8)
+            denom = torch.clip(mask.sum(), min=1e-8)
+            ce_loss = (self.ce(net_output, target_regions) * mask).sum() / denom
         else:
             ce_loss = self.ce(net_output, target_regions)
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss

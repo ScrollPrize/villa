@@ -390,6 +390,76 @@ def get_n_blocks_per_stage(num_stages):
             blocks.append(6)
     return blocks
 
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
+def _make_divisible(v, divisor=8, min_value=None, round_limit=0.9):
+    min_value = min_value or divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    if new_v < round_limit * v:
+        new_v += divisor
+    return new_v
+
+
+class SqueezeExcite(nn.Module):
+    """Squeeze-and-Excitation module for channel attention.
+
+    See https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/building_blocks/regularization.py
+    """
+    def __init__(
+            self,
+            channels,
+            conv_op,
+            rd_ratio=1./16,
+            rd_channels=None,
+            rd_divisor=8,
+            add_maxpool=False,
+            act_layer=nn.ReLU,
+            norm_layer=None,
+            gate_layer=nn.Sigmoid):
+        super(SqueezeExcite, self).__init__()
+        self.add_maxpool = add_maxpool
+        if not rd_channels:
+            rd_channels = _make_divisible(channels * rd_ratio, rd_divisor, round_limit=0.)
+        self.fc1 = conv_op(channels, rd_channels, kernel_size=1, bias=True)
+        self.bn = norm_layer(rd_channels) if norm_layer else nn.Identity()
+        self.act = act_layer(inplace=True)
+        self.fc2 = conv_op(rd_channels, channels, kernel_size=1, bias=True)
+        self.gate = gate_layer()
+
+        if conv_op == nn.Conv3d:
+            self._spatial_dims = (2, 3, 4)
+        elif conv_op == nn.Conv2d:
+            self._spatial_dims = (2, 3)
+        elif conv_op == nn.Conv1d:
+            self._spatial_dims = (2,)
+        else:
+            raise RuntimeError(f"Invalid conv op: {conv_op}")
+
+    def forward(self, x):
+        x_se = x.mean(self._spatial_dims, keepdim=True)
+        if self.add_maxpool:
+            x_se = 0.5 * x_se + 0.5 * x.amax(self._spatial_dims, keepdim=True)
+        x_se = self.fc1(x_se)
+        x_se = self.act(self.bn(x_se))
+        x_se = self.fc2(x_se)
+        return x * self.gate(x_se)
+
+
 def determine_dimensionality(patch_size, pool_type='avg', verbose=False):
     """
     Centralized function to determine dimensionality and set appropriate operations

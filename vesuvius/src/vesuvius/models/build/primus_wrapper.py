@@ -36,7 +36,7 @@ class PrimusEncoder(nn.Module):
         num_register_tokens: int = 0,
         use_rot_pos_emb: bool = True,
         use_abs_pos_embed: bool = True,
-        pos_emb_type: str = "pope",
+        pos_emb_type: str = "rope",
         mlp_ratio=4 * 2 / 3,
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,

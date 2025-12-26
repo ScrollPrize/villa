@@ -60,33 +60,3 @@ class SimulateLowResolutionTransform(ImageOnlyTransform):
             downsampled = interpolate(img[c][None, None], new_shape, mode='nearest-exact')
             img[c] = interpolate(downsampled, orig_shape, mode=self.upmodes[img.ndim - 1])[0, 0]
         return img
-
-
-if __name__ == '__main__':
-    from time import time
-    import numpy as np
-    import os
-
-    os.environ['OMP_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-
-    mbt = SimulateLowResolutionTransform((0.1, 1.), synchronize_channels=False, synchronize_axes=False, ignore_axes=None, allowed_channels=None, p_per_channel=1)
-
-    times_torch = []
-    for _ in range(30):
-        data_dict = {'image': torch.ones((3, 128, 192, 64))}
-        st = time()
-        out = mbt(**data_dict)
-        times_torch.append(time() - st)
-    print('torch', np.mean(times_torch))
-
-    from batchgenerators.transforms.resample_transforms import SimulateLowResolutionTransform as SLRT
-
-    gnt_bg = SLRT((0.1, 1), True, p_per_channel=1, order_downsample=0, order_upsample=1, p_per_sample=1)
-    times_bg = []
-    for _ in range(30):
-        data_dict = {'data': np.ones((1, 3, 128, 192, 64))}
-        st = time()
-        out = gnt_bg(**data_dict)
-        times_bg.append(time() - st)
-    print('bg', np.mean(times_bg))
