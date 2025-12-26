@@ -1,0 +1,54 @@
+python train_unet.py --images-dir ../data/kaggle_dataset/images/ --labels-dir ../data/kaggle_dataset/labels/ --log-dir logs/ --run-name init_lr1e-5 --bench --batch-size 32
+
+
+[hendrik@staticsheep exps_2d]$ python gen_post_data.py --out vis.tif --layer 1 ../data/kaggle_dataset/images/sample_00706.tif 
+
+
+python fit_cosine_grid.py --image inf_sample1.tif --output-prefix res --downscale 4 --lambda-smooth 100 --device cuda --snapshot 100 --lr 0.001 --steps 10000
+
+[hendrik@staticsheep exps_2d]$ python fit_cosine_grid.py --image inf_sample1.tif --output-prefix res/res --downscale 4 --lambda-smooth 10 --device cuda --snapshot 1000 --lr 0.01 --steps 10000 --lambda-mono 100
+
+
+d84de2791046f9abf2949e54b3656b6cfcee252c
+python fit_cosine_grid.py --image inf_sample1_q.tif --output-prefix res/res --downscale 1 --lambda-smooth 10 --device cuda --snapshot 1000 --lr 0.1 --steps 5000 --lambda-mono 0 --dbg
+near-perfect results!
+
+nice!
+[hendrik@staticsheep exps_2d]$ time python fit_cosine_grid.py --image inf_sample3_q.tif --output-prefix res/res --grid-step 4 --lambda-smooth 10000 --device cuda --snapshot 1000 --lr 0.001 --steps 10000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 2
+605691e11626963002b2978fadff7ec393188d8e
+
+time python fit_cosine_grid.py --image inf_sample1_q.tif --output-prefix res/res --grid-step 2 --lambda-smooth 10000 --device cuda --snapshot 1000 --lr 0.001 --steps 10000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 2
+ec6669b41f999c9f82585a58ff5f954c5fe5175f
+very excellent
+
+
+time python fit_cosine_grid.py --image inf_sample3_q.tif --output-prefix res/res --grid-step 2 --lambda-smooth 10000 --device cuda --snapshot 1000 --lr 0.001 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 2
+
+time python fit_cosine_grid.py --image inf_sample2_q.tif --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.01 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 2
+time python fit_cosine_grid.py --image inf_sample4_q.tif --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 2
+
+[hendrik@staticsheep exps_2d]$ python review_tiffs.py --in-dir ../data/kaggle_dataset/images --out-dir review --img-step 16 --layer-step 512
+
+f763bf9d3df50bec30f63274fb7b5db2f7dc79ce
+time python fit_cosine_grid.py --image ../data/kaggle_dataset/images/sample_00657.tif --layer 0 --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
+interesting 2025-11-30
+
+time python fit_cosine_grid.py --image ../data/kaggle_dataset/images/sample_00657.tif --layer 0 --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 5000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
+
+time python fit_cosine_grid.py --image ../data/kaggle_dataset/images/sample_00658.tif --layer 0 --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 5000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
+
+python batch_fit_cosine_grid.py \
+  --in-dir ../data/kaggle_dataset/images \
+  --out-dir res_batch_unet \
+  --img-step 16 \
+  --layer-step 512 \
+  --steps 5000 \
+  --steps-stage1 1000 \
+  --grid-step 2 \
+  --lr 1e-3 \
+  --device cuda \
+  --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
+
+excellent!
+time python fit_cosine_grid.py --image ../data/kaggle_dataset/images/sample_00001.tif --layer 0 --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 5000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
+

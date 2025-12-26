@@ -1,11 +1,9 @@
 #include "vc/ui/surface_metrics.hpp"
-#include <iostream>
+#include "vc/core/util/QuadSurface.hpp"
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <iomanip>
-#include <opencv2/imgproc.hpp>
 #include <nlohmann/json.hpp>
 
 // Helper to get point-to-line-segment squared distance

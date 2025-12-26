@@ -60,11 +60,15 @@ class Inferer():
                  resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
+                 fast_compression: bool = True,  # Use LZ4 for faster writes (2-3x faster than zstd)
                  hf_token: str = None,
                  # optional fallback when .pth lacks embedded model_config
                  config_yaml: str = None,
                  slicewise_axes=None,
-                 output_mode: str = 'binary'
+                 output_mode: str = 'binary',
+                 # Chunk filtering parameters
+                 chunks_filter_mode: str = 'auto',
+                 auto_detect_chunks_json: bool = True,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -98,6 +102,7 @@ class Inferer():
         self.resolution = resolution
         self.compressor_name = compressor_name
         self.compression_level = compression_level
+        self.fast_compression = fast_compression
         self.hf_token = hf_token
         self.config_yaml = config_yaml
         valid_modes = {'binary', 'multiclass', 'surface_frame'}
@@ -112,6 +117,10 @@ class Inferer():
         self.model_patch_size = None
         self.num_classes = None
         self.intensity_props = None
+
+        # Chunk filtering parameters
+        self.chunks_filter_mode = chunks_filter_mode
+        self.auto_detect_chunks_json = auto_detect_chunks_json
 
         # Configure slicewise axes for 2D volume inference
         allowed_axes = {'z', 'y', 'x'}
@@ -378,21 +387,41 @@ class Inferer():
         
         # Load weights
         model_state_dict = checkpoint_data.get('model', checkpoint_data)
-        
-        # Check if this is a compiled model state dict
-        is_compiled = any("_orig_mod." in key for key in model_state_dict.keys())
-        
-        # Compile model if needed
-        if self.device.type == 'cuda' and is_compiled:
-            if self.verbose:
-                print("Compiling model to match checkpoint format")
-            model = torch.compile(model)
-        
-        # Load state dict
+
+        # Strip wrapper prefixes (DDP 'module.' and torch.compile '_orig_mod.')
+        # This ensures checkpoint compatibility regardless of how it was saved
+        def strip_wrapper_prefixes(sd):
+            prefixes = ('module.', '_orig_mod.')
+            def strip_key(k: str) -> str:
+                changed = True
+                while changed:
+                    changed = False
+                    for p in prefixes:
+                        if k.startswith(p):
+                            k = k[len(p):]
+                            changed = True
+                return k
+            return {strip_key(k): v for k, v in sd.items()}
+
+        model_state_dict = strip_wrapper_prefixes(model_state_dict)
+
+        # Load state dict BEFORE compiling (compiled models wrap keys with _orig_mod.)
         model.load_state_dict(model_state_dict, strict=True)
         if self.verbose:
             print("Model weights loaded successfully")
-        
+
+        # Compile model for CUDA inference (provides 10-30% speedup via kernel fusion)
+        # Note: 'reduce-overhead' mode uses CUDA graphs which can cause tensor reuse issues
+        # when outputs are accessed after subsequent runs. Using 'default' mode instead.
+        if self.device.type == 'cuda':
+            try:
+                if self.verbose:
+                    print("Compiling model with torch.compile for inference optimization")
+                model = torch.compile(model, mode='default')
+            except Exception as e:
+                if self.verbose:
+                    print(f"torch.compile failed, using eager mode: {e}")
+
         # Handle multi-target models
         if len(mgr.targets) > 1:
             if self.verbose:
@@ -511,7 +540,10 @@ class Inferer():
             scroll_id=self.scroll_id,
             segment_id=self.segment_id,
             energy=self.energy,
-            resolution=self.resolution
+            resolution=self.resolution,
+            # Chunk filtering parameters
+            chunks_filter_mode=self.chunks_filter_mode,
+            auto_detect_chunks_json=self.auto_detect_chunks_json,
         )
 
         expected_attr_name = 'all_positions'
@@ -540,8 +572,10 @@ class Inferer():
             shuffle=False,
             num_workers=self.num_dataloader_workers,
             pin_memory=True if self.device != torch.device('cpu') else False,
-            collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros 
-                                             # so we don't run them through the model 
+            collate_fn=VCDataset.collate_fn,  # we use custom collate fn here to tag patches that contain only zeros
+                                              # so we don't run them through the model
+            prefetch_factor=4 if self.num_dataloader_workers > 0 else None,  # Prefetch more batches for better overlap
+            persistent_workers=True if self.num_dataloader_workers > 0 else False,  # Keep workers alive between batches
         )
         return self.dataset, self.dataloader
     
@@ -575,6 +609,9 @@ class Inferer():
         return concatenated
         
     def _get_zarr_compressor(self):
+        # fast_compression overrides compressor_name to use LZ4 (2-3x faster writes than zstd)
+        if self.fast_compression:
+            return zarr.Blosc(cname='lz4', clevel=1, shuffle=zarr.Blosc.BITSHUFFLE)
         if self.compressor_name.lower() == 'zstd':
             return zarr.Blosc(cname='zstd', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
         elif self.compressor_name.lower() == 'lz4':
@@ -714,40 +751,66 @@ class Inferer():
         return self.output_store
 
     def _process_batches(self):
+        """Process batches with async write queue for better I/O throughput."""
+        import queue as queue_module
+
         numcodecs.blosc.use_threads = False
-        
         self.current_patch_write_index = 0
-        max_workers = min(16, os.cpu_count() or 4)
-        
+
         zarr_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-        
+
         if not zarr_path:
             error_msg = f"Error: Empty zarr_path generated from output_dir='{self.output_dir}'"
             print(error_msg)
             raise ValueError(error_msg)
-        
+
         # Verify we have a valid output store from _create_output_stores()
         if self.output_store is None:
             raise RuntimeError(f"Error: output_store is None. Make sure _create_output_stores() was called successfully.")
-            
+
         if self.verbose:
             print(f"Using existing output store: {zarr_path}")
             print(f"Output store shape: {self.output_store.shape}")
-        
-        # reference to the output store that will be shared by all threads
+
+        # Async write queue setup
         output_store = self.output_store
-        
-        def write_patch(write_index, patch_data):
-            try:
-                output_store[write_index] = patch_data
-                return write_index
-            except Exception as e:
-                raise RuntimeError(f"Failed to write patch at index {write_index}: {str(e)}")
-            
-        with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}") as pbar:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                
+        write_queue = queue_module.Queue(maxsize=64)  # Buffer up to 64 batches
+        completed_count = [0]  # Use list for mutable reference in threads
+        write_errors = []
+        write_lock = threading.Lock()
+        stop_event = threading.Event()
+
+        def writer_loop():
+            """Writer thread loop - processes batches from queue."""
+            numcodecs.blosc.use_threads = False
+            while not stop_event.is_set() or not write_queue.empty():
+                try:
+                    indices, data, batch_count = write_queue.get(timeout=0.1)
+                except queue_module.Empty:
+                    continue
+                try:
+                    for i, idx in enumerate(indices):
+                        output_store[idx] = data[i]
+                    with write_lock:
+                        completed_count[0] += batch_count
+                except Exception as e:
+                    with write_lock:
+                        write_errors.append(str(e))
+                finally:
+                    write_queue.task_done()
+
+        # Start writer threads
+        num_writers = min(8, os.cpu_count() or 4)
+        writer_threads = []
+        for i in range(num_writers):
+            t = threading.Thread(target=writer_loop, name=f"AsyncWriter-{i}", daemon=True)
+            t.start()
+            writer_threads.append(t)
+
+        last_progress_update = 0
+
+        try:
+            with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}") as pbar:
                 for batch_data in self.dataloader:
                     if isinstance(batch_data, dict):
                         input_batch = batch_data['data'].to(self.device)
@@ -758,24 +821,23 @@ class Inferer():
                     else:
                         input_batch = batch_data.to(self.device)
                         is_empty_flags = [False] * input_batch.shape[0]
-                    
-                    # the case that the batch is empty is valid, e.g. when the input volume is smaller than the patch size
+
                     if input_batch is None or input_batch.shape[0] == 0:
                         if self.verbose:
                             print("Skipping batch with no valid data")
                         continue
-                    
+
                     batch_size = input_batch.shape[0]
                     output_shape = (batch_size, self.num_classes, *self.patch_size)
                     output_batch = torch.zeros(output_shape, device=self.device, dtype=input_batch.dtype)
-                    
+
                     # Find non-empty patches that need model inference
                     non_empty_indices = [i for i, is_empty in enumerate(is_empty_flags) if not is_empty]
-                    
+
                     # Only perform inference if there are non-empty patches
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
-                        
+
                         with torch.no_grad(), torch.autocast(device_type=self.device.type):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
@@ -789,53 +851,61 @@ class Inferer():
                                 non_empty_output = self.model(non_empty_input)
                                 if self.is_multi_task:
                                     non_empty_output = self._concat_multi_task_outputs(non_empty_output)
-                                # Convert dict outputs to concatenated tensors if multi-task
-                                if self.is_multi_task:
-                                    non_empty_output = self._concat_multi_task_outputs(non_empty_output) 
-                        
-                        # Place non-empty patch outputs in the correct positions in output_batch
+
+                        # Place non-empty patch outputs in the correct positions
                         for idx, original_idx in enumerate(non_empty_indices):
                             output_batch[original_idx] = non_empty_output[idx]
-                    
+
                     else:
                         if self.verbose:
                             print("Batch contains only empty patches, skipping model inference")
-                    
+
                     output_np = output_batch.cpu().numpy().astype(np.float16)
                     current_batch_size = output_np.shape[0]
-                    
+
                     patch_indices = batch_data.get('index', list(range(current_batch_size)))
-                    
-                    for i in range(current_batch_size):
-                        patch_data = output_np[i]  # Shape: (C, Z, Y, X)
-                        write_index = patch_indices[i] if i < len(patch_indices) else i
-                        future = executor.submit(write_patch, write_index, patch_data)
-                        futures.append(future)
-                        
-                    completed = [f for f in futures if f.done()]
-                    for future in completed:
-                        try:
-                            result = future.result() 
-                            if result is not None:  # Only update if write was successful
-                                pbar.update(1)
-                                self.current_patch_write_index += 1
-                        except Exception as e:
-                            print(f"Error processing future result: {e}")
-                    
-                    futures = [f for f in futures if not f.done()]
-                
-                for future in futures:
-                    try:
-                        result = future.result()
-                        if result is not None: 
-                            pbar.update(1)
-                            self.current_patch_write_index += 1
-                    except Exception as e:
-                        print(f"Error processing future result: {e}")
-        
+
+                    # Submit batch to async writer (non-blocking)
+                    indices = [patch_indices[i] if i < len(patch_indices) else i for i in range(current_batch_size)]
+                    write_queue.put((indices, output_np.copy(), current_batch_size))
+
+                    # Update progress bar based on completed writes (non-blocking)
+                    with write_lock:
+                        completed = completed_count[0]
+                    if completed > last_progress_update:
+                        pbar.update(completed - last_progress_update)
+                        last_progress_update = completed
+
+                # Wait for all writes to complete
+                if self.verbose:
+                    print("Waiting for async writes to complete...")
+                write_queue.join()
+
+                # Final progress update
+                with write_lock:
+                    completed = completed_count[0]
+                if completed > last_progress_update:
+                    pbar.update(completed - last_progress_update)
+
+                self.current_patch_write_index = completed
+
+                # Check for errors
+                if write_errors:
+                    print(f"Warning: {len(write_errors)} write errors occurred:")
+                    for err in write_errors[:5]:
+                        print(f"  - {err}")
+                    if len(write_errors) > 5:
+                        print(f"  ... and {len(write_errors) - 5} more")
+
+        finally:
+            # Signal threads to stop and wait
+            stop_event.set()
+            for t in writer_threads:
+                t.join(timeout=5.0)
+
         if self.verbose:
             print(f"Finished writing {self.current_patch_write_index} patches.")
-        
+
         if self.current_patch_write_index != self.num_total_patches:
             print(f"Warning: Expected {self.num_total_patches} patches, but wrote {self.current_patch_write_index}.")
 
@@ -2030,7 +2100,16 @@ def main():
     
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    
+
+    # Chunk filtering arguments
+    parser.add_argument('--chunks-filter-mode', type=str, default='auto',
+                        choices=['auto', 'exact_chunk', 'sliding_window', 'disabled'],
+                        help='Chunk filtering mode when chunks.json exists: '
+                             'auto (use exact_chunk if present), exact_chunk (one patch per chunk), '
+                             'sliding_window (overlap within bounds), disabled (ignore chunks.json)')
+    parser.add_argument('--no-auto-detect-chunks', action='store_true',
+                        help='Disable auto-detection of chunks.json in zarr directory')
+
     args = parser.parse_args()
     
     # Parse optional patch size if provided
@@ -2103,7 +2182,10 @@ def main():
         # Fallback config for train.py checkpoints without embedded model_config
         config_yaml=args.config_yaml,
         slicewise_axes=slicewise_axes,
-        output_mode=args.mode
+        output_mode=args.mode,
+        # Chunk filtering parameters
+        chunks_filter_mode=args.chunks_filter_mode.replace('-', '_'),
+        auto_detect_chunks_json=not args.no_auto_detect_chunks,
     )
 
     try:

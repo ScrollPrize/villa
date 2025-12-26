@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QObject>
 #include <QElapsedTimer>
 #include <QPointer>
@@ -10,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,6 +48,7 @@ class QTimer;
 class SegmentationBrushTool;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
+class ApprovalMaskBrushTool;
 
 class SegmentationModule : public QObject
 {
@@ -76,17 +79,37 @@ public:
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
     void setHoverPreviewEnabled(bool enabled);
 
+    void setShowApprovalMask(bool enabled);
+    void setEditApprovedMask(bool enabled);
+    void setEditUnapprovedMask(bool enabled);
+    void onActiveSegmentChanged(QuadSurface* newSurface);
+    [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
+    [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
+    [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
+    [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
+    void setApprovalMaskBrushRadius(float radiusSteps);
+    void setApprovalBrushDepth(float depth);
+    void setApprovalBrushColor(const QColor& color);
+    [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
+    [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
+    [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
+    [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
+    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
+    void undoApprovalStroke();
+
     void applyEdits();
     void resetEdits();
     void stopTools();
 
-    bool beginEditingSession(QuadSurface* surface);
+    bool beginEditingSession(std::shared_ptr<QuadSurface> surface);
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
+    [[nodiscard]] std::shared_ptr<QuadSurface> activeBaseSurfaceShared() const;
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
+    void updateApprovalToolAfterGrowth(QuadSurface* surface);
 
     void attachViewer(CVolumeViewer* viewer);
     void updateViewerCursors();
@@ -131,11 +154,13 @@ signals:
                               int steps,
                               bool inpaintOnly);
     void growthInProgressChanged(bool running);
+    void approvalMaskSaved(const std::string& segmentId);
 
 private:
     friend class SegmentationBrushTool;
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
+    friend class ApprovalMaskBrushTool;
     friend class segmentation::CorrectionsState;
 
     enum class FalloffTool
@@ -170,6 +195,27 @@ private:
         void clear();
     };
 
+    struct CorrectionDragState
+    {
+        bool active{false};
+        int anchorRow{0};
+        int anchorCol{0};
+        cv::Vec3f startWorld{0.0f, 0.0f, 0.0f};  // Where drag started (on surface)
+        cv::Vec3f currentWorld{0.0f, 0.0f, 0.0f};  // Current drag position
+        QPointer<CVolumeViewer> viewer;
+        bool moved{false};
+
+        void reset() {
+            active = false;
+            anchorRow = 0;
+            anchorCol = 0;
+            startWorld = {0.0f, 0.0f, 0.0f};
+            currentWorld = {0.0f, 0.0f, 0.0f};
+            viewer = nullptr;
+            moved = false;
+        }
+    };
+
     void bindWidgetSignals();
     void bindViewerSignals(CVolumeViewer* viewer);
 
@@ -181,6 +227,11 @@ private:
     uint64_t createCorrectionCollection(bool announce);
     void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
+    void beginCorrectionDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void updateCorrectionDrag(const cv::Vec3f& worldPos);
+    void finishCorrectionDrag();
+    void cancelCorrectionDrag();
+
     void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
@@ -213,9 +264,10 @@ private:
                      int deltaSteps,
                      const QPointF& scenePos,
                      const cv::Vec3f& worldPos);
-    void onSurfaceCollectionChanged(std::string name, Surface* surface);
+    void onSurfaceCollectionChanged(std::string name, std::shared_ptr<Surface> surface);
 
     [[nodiscard]] bool captureUndoSnapshot();
+    [[nodiscard]] bool captureUndoDelta();  // Capture delta from current edited vertices
     void discardLastUndoSnapshot();
     bool restoreUndoSnapshot();
     void clearUndoStack();
@@ -246,6 +298,7 @@ private:
     void performAutosave();
     void ensureAutosaveTimer();
     void updateAutosaveState();
+    void saveApprovalMaskToDisk();
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -274,6 +327,7 @@ private:
 
     DragState _drag;
     HoverState _hover;
+    CorrectionDragState _correctionDrag;
     QSet<CVolumeViewer*> _attachedViewers;
 
     std::function<bool(CVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;
@@ -284,6 +338,14 @@ private:
     std::unique_ptr<SegmentationBrushTool> _brushTool;
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
+    std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
+
+    bool _showApprovalMask{false};
+    bool _editApprovedMask{false};
+    bool _editUnapprovedMask{false};
+    float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
+    float _approvalBrushDepth{15.0f};       // Cylinder depth
+    QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};

@@ -1,5 +1,7 @@
 #include "vc/ui/VCCollection.hpp"
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include <opencv2/imgcodecs.hpp>
 #include <boost/program_options.hpp>
@@ -81,17 +83,19 @@ float line_off(const E &p, const cv::Vec3f &tgt_o, const cv::Vec3f &tgt_v)
 
 using IntersectVec = std::vector<std::pair<float,cv::Vec2f>>;
 
-IntersectVec getIntersects(const cv::Vec2i &seed, const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &step)
+IntersectVec getIntersects(const cv::Vec2i &seed, QuadSurface* surface)
 {
+    const cv::Mat_<cv::Vec3f>& points = surface->rawPoints();
+    const cv::Vec2f& step = surface->scale();
     cv::Vec3f o = points(seed[1],seed[0]);
-    cv::Vec3f n = grid_normal(points, {(float)seed[0],(float)seed[1],0});
+    cv::Vec3f n = surface->gridNormal(seed[1], seed[0]);
     if (std::isnan(n[0]))
         return {};
     std::vector<cv::Vec2f> locs = {seed};
     uint32_t sr = seed[1];
     for(int i=0;i<1000;i++)
     {
-        cv::Vec2f loc = {rand_r(&sr) % points.cols, seed[1] - 50 + (rand_r(&sr) % 100)};
+        cv::Vec2f loc = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(seed[1] - 50 + (rand_r(&sr) % 100))};
         cv::Vec3f res;
         float dist = search_min_line(points, loc, res, o, n, step, 0.01);
 
@@ -151,7 +155,7 @@ int main(int argc, char** argv) {
     std::string output_path = vm["output"].as<std::string>();
     int num_collections = vm["num-collections"].as<int>();
 
-    QuadSurface* surface = load_quad_from_tifxyz(input_path);
+    auto surface = load_quad_from_tifxyz(input_path);
     if (!surface) {
         std::cerr << "Error: Failed to load surface from " << input_path << std::endl;
         return 1;
@@ -178,7 +182,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        IntersectVec intersects = getIntersects({seed_loc.x, seed_loc.y}, points, surface->scale());
+        IntersectVec intersects = getIntersects({seed_loc.x, seed_loc.y}, surface.get());
 
         std::cout << "got " << intersects.size() << std::endl;
 
@@ -220,8 +224,6 @@ int main(int argc, char** argv) {
     }
     
     collection.saveToJSON(output_path);
-
-    delete surface;
 
     std::cout << "Successfully generated annotations and saved to " << output_path << std::endl;
 

@@ -48,16 +48,23 @@ class TwoStreamBatchSampler(Sampler):
     def __iter__(self):
         primary_iter = iterate_once(self.primary_indices)
         secondary_iter = iterate_eternally(self.secondary_indices)
-        return (
-            primary_batch + secondary_batch
-            for (primary_batch, secondary_batch)
-            in zip(grouper(primary_iter, self.primary_batch_size),
-                   grouper(secondary_iter, self.secondary_batch_size))
-        )
-    
+
+        for primary_batch in grouper(primary_iter, self.primary_batch_size):
+            # Pad incomplete primary batch with random samples from primary_indices
+            # This ensures all labeled samples are seen while maintaining batch size
+            if len(primary_batch) < self.primary_batch_size:
+                pad_count = self.primary_batch_size - len(primary_batch)
+                padding = tuple(np.random.choice(self.primary_indices, size=pad_count, replace=True))
+                primary_batch = primary_batch + padding
+
+            # Get corresponding secondary batch
+            secondary_batch = tuple(itertools.islice(secondary_iter, self.secondary_batch_size))
+
+            yield list(primary_batch) + list(secondary_batch)
+
     def __len__(self):
-        """Number of batches per epoch (based on labeled data)"""
-        return len(self.primary_indices) // self.primary_batch_size
+        """Number of batches per epoch (based on labeled data, ceiling division)"""
+        return (len(self.primary_indices) + self.primary_batch_size - 1) // self.primary_batch_size
 
 
 def iterate_once(iterable):
@@ -74,7 +81,17 @@ def iterate_eternally(indices):
 
 
 def grouper(iterable, n):
-    """Collect data into fixed-length chunks or blocks"""
-    # grouper('ABCDEFG', 3) --> ABC DEF
-    args = [iter(iterable)] * n
-    return zip(*args)
+    """
+    Collect data into fixed-length chunks or blocks.
+
+    Unlike the traditional zip-based grouper, this version yields
+    the final incomplete chunk if present, ensuring all samples are used.
+
+    grouper('ABCDEFG', 3) --> ABC DEF G
+    """
+    it = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(it, n))
+        if not chunk:
+            return
+        yield chunk

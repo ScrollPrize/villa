@@ -36,6 +36,7 @@ class PrimusEncoder(nn.Module):
         num_register_tokens: int = 0,
         use_rot_pos_emb: bool = True,
         use_abs_pos_embed: bool = True,
+        pos_emb_type: str = "rope",
         mlp_ratio=4 * 2 / 3,
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -56,10 +57,11 @@ class PrimusEncoder(nn.Module):
         self.num_register_tokens = num_register_tokens
         
         # Check input shape compatibility
-        assert len(input_shape) == 3, "Currently only 3D is supported"
+        assert len(input_shape) in (2, 3), "Only 2D and 3D inputs are supported"
         assert all([j % i == 0 for i, j in zip(patch_embed_size, input_shape)]), \
             f"Input shape {input_shape} must be divisible by patch_embed_size {patch_embed_size}"
-        
+        self.ndim = len(input_shape)
+
         # Calculate patch grid dimensions
         self.patch_grid = tuple([i // ds for i, ds in zip(input_shape, patch_embed_size)])
         
@@ -75,6 +77,7 @@ class PrimusEncoder(nn.Module):
             num_reg_tokens=num_register_tokens,
             use_rot_pos_emb=use_rot_pos_emb,
             use_abs_pos_emb=use_abs_pos_embed,
+            pos_emb_type=pos_emb_type,
             mlp_ratio=mlp_ratio,
             drop_path_rate=drop_path_rate,
             patch_drop_rate=patch_drop_rate,
@@ -102,15 +105,21 @@ class PrimusEncoder(nn.Module):
         self.strides = [patch_embed_size]  # Stride is the patch embedding size
         
         # These are for compatibility with existing decoder interface
-        self.conv_op = nn.Conv3d  # Default 3D
+        # Set dimension-aware ops
+        if self.ndim == 2:
+            self.conv_op = nn.Conv2d
+            self.norm_op = nn.InstanceNorm2d
+            self.kernel_sizes = [[3, 3]]
+        else:
+            self.conv_op = nn.Conv3d
+            self.norm_op = nn.InstanceNorm3d
+            self.kernel_sizes = [[3, 3, 3]]
         self.conv_bias = True
-        self.norm_op = nn.InstanceNorm3d
         self.norm_op_kwargs = {"affine": True, "eps": 1e-5}
         self.dropout_op = None
         self.dropout_op_kwargs = None
         self.nonlin = nn.GELU
         self.nonlin_kwargs = {}
-        self.kernel_sizes = [[3, 3, 3]]  # Default kernel size
         
     def restore_full_sequence(self, x, keep_indices, num_patches):
         """
@@ -118,30 +127,21 @@ class PrimusEncoder(nn.Module):
         """
         if keep_indices is None:
             return x, None
-            
+
         B, num_kept, C = x.shape
         device = x.device
-        
-        # Create mask tokens for missing patches
-        num_masked = num_patches - num_kept
-        mask_tokens = self.mask_token.repeat(B, num_masked, 1)
-        
-        # Prepare an empty tensor for the restored sequence
-        restored = torch.zeros(B, num_patches, C, device=device)
+
+        # Initialize with mask tokens expanded to full sequence
+        restored = self.mask_token.expand(B, num_patches, -1).clone()
         restored_mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
-        
-        # Assign the kept patches and mask tokens in the correct positions
-        for i in range(B):
-            kept_pos = keep_indices[i]
-            all_indices = torch.arange(num_patches, device=device)
-            mask = torch.ones(num_patches, device=device, dtype=torch.bool)
-            mask[kept_pos] = False
-            masked_pos = all_indices[mask]
-            
-            restored[i, kept_pos] = x[i]
-            restored[i, masked_pos] = mask_tokens[i, : len(masked_pos)]
-            restored_mask[i, kept_pos] = True
-            
+
+        # keep_indices shape: (B, num_kept)
+        batch_indices = torch.arange(B, device=device)[:, None].expand(-1, num_kept)
+
+        # Assign kept patches to their positions
+        restored[batch_indices, keep_indices] = x
+        restored_mask[batch_indices, keep_indices] = True
+
         return restored, restored_mask
     
     def forward(self, x, ret_mask=False):
@@ -149,51 +149,70 @@ class PrimusEncoder(nn.Module):
         Forward pass through the Primus encoder.
         Returns a list with a single feature map to maintain compatibility.
         If ret_mask is True, also returns the full resolution mask for MAE training.
+
+        Supports both 2D (B, C, H, W) and 3D (B, C, D, H, W) inputs.
         """
         # Store original shape for mask expansion
-        FW, FH, FD = x.shape[2:]  # Full resolution W, H, D
-        
+        full_spatial = x.shape[2:]  # Full resolution spatial dims
+
         # Apply patch embedding
         x = self.patch_embed(x)
-        B, C, W, H, D = x.shape
-        num_patches = W * H * D
-        
+        B, C = x.shape[:2]
+        spatial_shape = x.shape[2:]
+        num_patches = int(torch.tensor(spatial_shape).prod().item())
+
         # Rearrange to sequence format
-        x = rearrange(x, "b c w h d -> b (w h d) c")
-        
+        if self.ndim == 2:
+            x = rearrange(x, "b c h w -> b (h w) c")
+        else:
+            x = rearrange(x, "b c d h w -> b (d h w) c")
+
         # Add register tokens if present
         if self.register_tokens is not None:
             x = torch.cat(
                 (self.register_tokens.expand(x.shape[0], -1, -1), x),
                 dim=1,
             )
-        
+
         # Pass through EVA transformer
         x, keep_indices = self.eva(x)
-        
+
         # Remove register tokens if they were added
         if self.register_tokens is not None:
             x = x[:, self.register_tokens.shape[1]:]
-        
+
         # Restore full sequence with mask tokens
         restored_x, restoration_mask = self.restore_full_sequence(x, keep_indices, num_patches)
-        
+
         # Reshape back to spatial format
-        x = rearrange(restored_x, "b (w h d) c -> b c w h d", h=H, w=W, d=D).contiguous()
-        
-        # Prepare full resolution mask if requested (following original Primus)
-        if ret_mask and restoration_mask is not None:
-            mask = rearrange(restoration_mask, "b (w h d) -> b w h d", h=H, w=W, d=D)
-            # Expand mask to full resolution
-            full_mask = (
-                mask.repeat_interleave(FW // W, dim=1)
-                .repeat_interleave(FH // H, dim=2)
-                .repeat_interleave(FD // D, dim=3)
-            )
-            full_mask = full_mask[:, None, ...]  # Add channel dimension [B, 1, W, H, D]
+        if self.ndim == 2:
+            H, W = spatial_shape
+            x = rearrange(restored_x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
+            # Prepare full resolution mask if requested
+            if ret_mask and restoration_mask is not None:
+                mask = rearrange(restoration_mask, "b (h w) -> b h w", h=H, w=W)
+                full_mask = (
+                    mask.repeat_interleave(full_spatial[0] // H, dim=1)
+                    .repeat_interleave(full_spatial[1] // W, dim=2)
+                )
+                full_mask = full_mask[:, None, ...]  # [B, 1, H, W]
+            else:
+                full_mask = None
         else:
-            full_mask = None
-        
+            D, H, W = spatial_shape
+            x = rearrange(restored_x, "b (d h w) c -> b c d h w", d=D, h=H, w=W).contiguous()
+            # Prepare full resolution mask if requested
+            if ret_mask and restoration_mask is not None:
+                mask = rearrange(restoration_mask, "b (d h w) -> b d h w", d=D, h=H, w=W)
+                full_mask = (
+                    mask.repeat_interleave(full_spatial[0] // D, dim=1)
+                    .repeat_interleave(full_spatial[1] // H, dim=2)
+                    .repeat_interleave(full_spatial[2] // W, dim=3)
+                )
+                full_mask = full_mask[:, None, ...]  # [B, 1, D, H, W]
+            else:
+                full_mask = None
+
         # Return as a list to maintain compatibility with skip connection interface
         if ret_mask:
             return [x], full_mask
@@ -202,55 +221,33 @@ class PrimusEncoder(nn.Module):
 
 class PrimusDecoder(nn.Module):
     """
-    Decoder wrapper for Primus that uses Eva decoder layers followed by PatchDecode for upsampling.
+    Decoder wrapper for Primus using PatchDecode for upsampling.
+    Matches official MIC-DKFZ implementation (no transformer decoder layers).
     Compatible with NetworkFromConfig's decoder interface.
     """
-    
+
     def __init__(
         self,
         encoder: PrimusEncoder,
         num_classes: int,
         norm="LayerNormNd",
         activation="GELU",
-        decoder_depth: int = 2,  # Number of Eva decoder layers
-        decoder_num_heads: int = 12,  # Number of heads in decoder
-        drop_path_rate: float = 0.0,  # Stochastic depth in decoder blocks (align with encoder by default)
+        **_unused,
     ):
         super().__init__()
-        
-        self.encoder = encoder
+
+
+        # Store encoder reference without registering as submodule to avoid
+        # duplicate state_dict keys when decoder is used with separate_decoders=True
+        object.__setattr__(self, '_encoder_ref', encoder)
         self.num_classes = num_classes
-        self.decoder_depth = decoder_depth
-        
+
         # Parse normalization layer
         norm_layer = self._get_norm_layer(norm)
-        
-        # Parse activation function  
+
+        # Parse activation function
         act_fn = self._get_activation(activation)
-        
-        # Initialize Eva decoder layers if depth > 0
-        if decoder_depth > 0:
-            self.eva_decoder = Eva(
-                embed_dim=encoder.embed_dim,
-                depth=decoder_depth,
-                num_heads=decoder_num_heads,
-                ref_feat_shape=encoder.patch_grid,
-                num_reg_tokens=0,  # No register tokens in decoder
-                use_rot_pos_emb=True,
-                use_abs_pos_emb=True,
-                mlp_ratio=4 * 2 / 3,
-                drop_path_rate=drop_path_rate,
-                patch_drop_rate=0.0,  # No patch drop in decoder
-                proj_drop_rate=0.0,
-                attn_drop_rate=0.0,
-                rope_impl=RotaryEmbeddingCat,
-                rope_kwargs=None,
-                init_values=0.1,
-                scale_attn_inner=True,
-            )
-        else:
-            self.eva_decoder = None
-        
+
         # Initialize PatchDecode for upsampling
         self.patch_decoder = PatchDecode(
             patch_size=encoder.patch_embed_size,
@@ -266,14 +263,24 @@ class PrimusDecoder(nn.Module):
             return norm
             
         norm_lower = norm.lower()
+        ndim = getattr(self.encoder, "ndim", 3)
         if "layernorm" in norm_lower:
             return LayerNormNd
-        elif "batchnorm3d" in norm_lower or "batchnorm" in norm_lower:
+        elif "batchnorm" in norm_lower:
+            if "2d" in norm_lower or ndim == 2:
+                return nn.BatchNorm2d
             return nn.BatchNorm3d
-        elif "instancenorm3d" in norm_lower or "instancenorm" in norm_lower:
+        elif "instancenorm" in norm_lower:
+            if "2d" in norm_lower or ndim == 2:
+                return nn.InstanceNorm2d
             return nn.InstanceNorm3d
         elif "groupnorm" in norm_lower:
-            return nn.GroupNorm
+            def _group_norm(num_channels):
+                num_groups = 8
+                if num_channels % num_groups != 0:
+                    num_groups = 1
+                return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+            return _group_norm
         else:
             # Default to LayerNormNd
             print(f"Unknown norm type '{norm}', defaulting to LayerNormNd")
@@ -305,37 +312,28 @@ class PrimusDecoder(nn.Module):
             # Default to GELU
             print(f"Unknown activation type '{activation}', defaulting to GELU")
             return nn.GELU
-        
+
+    @property
+    def encoder(self):
+        """Access the encoder reference (not a submodule to avoid duplicate state_dict keys)."""
+        return self._encoder_ref
+
     def forward(self, features: List[torch.Tensor]):
         """
         Forward pass through the Primus decoder.
-        
+
         Args:
             features: List of feature maps from encoder (expects single element for Primus)
-        
+
         Returns:
             Upsampled segmentation map
         """
         # Primus encoder returns a single feature map
         x = features[0] if isinstance(features, list) else features
-        
-        # Get spatial dimensions from feature map
-        B, C, W, H, D = x.shape
-        
-        # Apply Eva decoder layers if present
-        if self.eva_decoder is not None:
-            # Reshape to sequence format for Eva
-            x = rearrange(x, "b c w h d -> b (w h d) c")
-            
-            # Process through Eva decoder
-            x, _ = self.eva_decoder(x)
-            
-            # Reshape back to spatial format
-            x = rearrange(x, "b (w h d) c -> b c w h d", h=H, w=W, d=D).contiguous()
-        
+
         # Apply patch decoder for upsampling
         output = self.patch_decoder(x)
-        
+
         return output
 
 

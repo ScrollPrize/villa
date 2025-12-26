@@ -1,11 +1,12 @@
 #pragma once
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
-#include "vc/core/types/DiskBasedObjectBaseClass.hpp"
-#include "vc/core/util/Surface.hpp"
+#include <nlohmann/json.hpp>
+#include "vc/core/util/QuadSurface.hpp"
 
-class Segmentation : public DiskBasedObjectBaseClass
+class Segmentation
 {
 public:
     explicit Segmentation(std::filesystem::path path);
@@ -13,13 +14,25 @@ public:
     static std::shared_ptr<Segmentation> New(const std::filesystem::path& path);
     static std::shared_ptr<Segmentation> New(const std::filesystem::path& path, const std::string& uuid, const std::string& name);
 
-    // Surface management
+    [[nodiscard]] std::string id() const;
+    [[nodiscard]] std::string name() const;
+    void setName(const std::string& n);
+    [[nodiscard]] std::filesystem::path path() const { return path_; }
+    void saveMetadata();
+
+    // Surface management - returns QuadSurface directly (no SurfaceMeta wrapper)
     [[nodiscard]] bool isSurfaceLoaded() const;
     [[nodiscard]] bool canLoadSurface() const;
-    std::shared_ptr<SurfaceMeta> loadSurface();
-    [[nodiscard]] std::shared_ptr<SurfaceMeta> getSurface() const;
+    std::shared_ptr<QuadSurface> loadSurface();
+    [[nodiscard]] std::shared_ptr<QuadSurface> getSurface() const;
     void unloadSurface();
 
+    static bool checkDir(std::filesystem::path path);
+
 private:
-    std::shared_ptr<SurfaceMeta> surface_;
+    std::filesystem::path path_;
+    nlohmann::json metadata_;
+    std::shared_ptr<QuadSurface> surface_;
+
+    void loadMetadata();
 };

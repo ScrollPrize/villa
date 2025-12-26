@@ -2,6 +2,10 @@
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Geometry.hpp"
+
+#include <opencv2/imgproc.hpp>
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
@@ -15,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -73,7 +78,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
             continue;
         }
 
-        SurfaceMeta other(entry.path(), meta);
+        QuadSurface other(entry.path(), meta);
         if (contains(other, origin, search_effort)) {
             std::cout << "Found overlapping segment at location: " << entry.path() << std::endl;
             return true;
@@ -82,7 +87,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
     return false;
 }
 
-static auto load_direction_fields(json const&params, ChunkCache *chunk_cache, std::filesystem::path const &cache_root)
+static auto load_direction_fields(json const&params, ChunkCache<uint8_t> *chunk_cache, std::filesystem::path const &cache_root)
 {
     std::vector<DirectionField> direction_fields;
     if (params.contains("direction_fields")) {
@@ -255,7 +260,7 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
 
-    ChunkCache chunk_cache(params.value("cache_size", 1e9));
+    ChunkCache<uint8_t> chunk_cache(params.value("cache_size", 1e9));
 
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> tensor(pass, ds.get(), &chunk_cache);
@@ -289,9 +294,9 @@ int main(int argc, char *argv[])
 
     auto direction_fields = load_direction_fields(params, &chunk_cache, cache_root);
 
-    std::unordered_map<std::string,SurfaceMeta*> surfs;
-    std::vector<SurfaceMeta*> surfs_v;
-    SurfaceMeta *src;
+    std::unordered_map<std::string,QuadSurface*> surfs;
+    std::vector<QuadSurface*> surfs_v;
+    QuadSurface *src;
 
     //expansion mode
     int count_overlap = 0;
@@ -327,8 +332,8 @@ int main(int argc, char *argv[])
                 if (meta.value("format","NONE") != "tifxyz")
                     continue;
 
-                SurfaceMeta *sm = new SurfaceMeta(entry.path(), meta);
-                sm->readOverlapping();
+                QuadSurface *sm = new QuadSurface(entry.path(), meta);
+                sm->readOverlappingJson();
 
                 surfs[name] = sm;
                 surfs_v.push_back(sm);
@@ -345,7 +350,7 @@ int main(int argc, char *argv[])
 
         for(auto &it : surfs_v) {
             src = it;
-            cv::Mat_<cv::Vec3f> points = src->surface()->rawPoints();
+            cv::Mat_<cv::Vec3f> points = src->rawPoints();
             int w = points.cols;
             int h = points.rows;
 
@@ -365,13 +370,13 @@ int main(int argc, char *argv[])
                     cv::Vec2f p;
                     int side = rand() % 4;
                     if (side == 0)
-                        p = {rand() % h, 0};
+                        p = {static_cast<float>(rand() % h), 0};
                     else if (side == 1)
-                        p = {0, rand() % w};
+                        p = {0, static_cast<float>(rand() % w)};
                     else if (side == 2)
-                        p = {rand() % h, w-1};
+                        p = {static_cast<float>(rand() % h), static_cast<float>(w-1)};
                     else if (side == 3)
-                        p = {h-1, rand() % w};
+                        p = {static_cast<float>(h-1), static_cast<float>(rand() % w)};
 
                     cv::Vec2f searchdir = cv::Vec2f(h/2,w/2) - p;
                     cv::normalize(searchdir, searchdir);
@@ -434,9 +439,9 @@ int main(int argc, char *argv[])
             int max_attempts = 1000;
             
             while(count < max_attempts && !succ) {
-                origin = {128 + (rand() % (ds->shape(2)-384)), 
-                         128 + (rand() % (ds->shape(1)-384)), 
-                         128 + (rand() % (ds->shape(0)-384))};
+                origin = {static_cast<double>(128 + (rand() % (ds->shape(2)-384))),
+                         static_cast<double>(128 + (rand() % (ds->shape(1)-384))),
+                         static_cast<double>(128 + (rand() % (ds->shape(0)-384)))};
 
                 count++;
                 auto chunk_id = chunk_size;
@@ -447,9 +452,9 @@ int main(int argc, char *argv[])
                 if (!ds->chunkExists(chunk_id))
                     continue;
 
-                cv::Vec3d dir = {(rand() % 1024) - 512,
-                                (rand() % 1024) - 512,
-                                (rand() % 1024) - 512};
+                cv::Vec3d dir = {static_cast<double>((rand() % 1024) - 512),
+                                static_cast<double>((rand() % 1024) - 512),
+                                static_cast<double>((rand() % 1024) - 512)};
                 cv::normalize(dir, dir);
 
                 for(int i=0;i<128;i++) {
@@ -478,7 +483,7 @@ int main(int argc, char *argv[])
     if (thread_limit)
         omp_set_num_threads(thread_limit);
 
-    QuadSurface* resume_surf = nullptr;
+    std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
         if (corrections.getAllCollections().empty())
            resume_surf = load_quad_from_tifxyz(resume_path);
@@ -512,7 +517,7 @@ int main(int argc, char *argv[])
         // Load source surface
         std::unique_ptr<QuadSurface> src_surface;
         try {
-            src_surface.reset(load_quad_from_tifxyz(resume_path));
+            src_surface = load_quad_from_tifxyz(resume_path);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
             return EXIT_FAILURE;
@@ -578,8 +583,8 @@ int main(int argc, char *argv[])
                     continue;
                 }
 
-                // Compute grid normal at this grid location (c=x, r=y)
-                cv::Vec3f n = grid_normal(src_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
+                // Compute grid normal at this grid location
+                cv::Vec3f n = src_surface->gridNormal(r, c);
                 if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                     continue; // leave invalid
                 }
@@ -633,6 +638,34 @@ int main(int argc, char *argv[])
                 (void)placed; // silences unused warning in some builds
             }
         }
+
+        // Calculate scale factor from world extent change, not point spacing.
+        // Point spacing can increase even when extent decreases (due to grid distortion),
+        // but what we care about is the actual world area covered.
+        auto calc_extent = [&](const cv::Mat_<cv::Vec3f>& pts) -> cv::Vec2d {
+            cv::Vec3f min_pos(FLT_MAX, FLT_MAX, FLT_MAX);
+            cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (int r = 0; r < pts.rows; ++r) {
+                for (int c = 0; c < pts.cols; ++c) {
+                    if (is_valid_vertex(pts(r, c))) {
+                        for (int i = 0; i < 3; ++i) {
+                            min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
+                            max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
+                        }
+                    }
+                }
+            }
+            // Return 2D extent (X and Y dimensions)
+            return cv::Vec2d(max_pos[0] - min_pos[0], max_pos[1] - min_pos[1]);
+        };
+
+        cv::Vec2d src_extent = calc_extent(src_points);
+        cv::Vec2d dst_extent = calc_extent(new_points);
+
+        // Use geometric mean of X and Y scale changes
+        double x_scale = (src_extent[0] > 0.1) ? (dst_extent[0] / src_extent[0]) : 1.0;
+        double y_scale = (src_extent[1] > 0.1) ? (dst_extent[1] / src_extent[1]) : 1.0;
+        double measured_scale_factor = std::sqrt(x_scale * y_scale);
 
         cv::Mat_<cv::Vec3f> row_interp;
         cv::Mat_<cv::Vec3f> col_interp;
@@ -844,8 +877,106 @@ int main(int argc, char *argv[])
             }
         }
 
+        // Apply measured scale factor (clamped to reasonable range)
+        const bool neighbor_auto_scale = params.value("neighbor_auto_scale", true);
+        double scale_factor = 1.0;
+        if (neighbor_auto_scale && src_extent[0] > 0.1 && src_extent[1] > 0.1) {
+            scale_factor = std::clamp(measured_scale_factor, 0.5, 2.0);
+        }
+
+        // Debug: Calculate bounding box of dst_points before any resize
+        auto calc_bbox = [&](const cv::Mat_<cv::Vec3f>& pts) -> std::pair<cv::Vec3f, cv::Vec3f> {
+            cv::Vec3f min_pos(FLT_MAX, FLT_MAX, FLT_MAX);
+            cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (int r = 0; r < pts.rows; ++r) {
+                for (int c = 0; c < pts.cols; ++c) {
+                    if (is_valid_vertex(pts(r, c))) {
+                        for (int i = 0; i < 3; ++i) {
+                            min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
+                            max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
+                        }
+                    }
+                }
+            }
+            return {min_pos, max_pos};
+        };
+
+        auto [src_min, src_max] = calc_bbox(src_points);
+        auto [dst_min, dst_max] = calc_bbox(dst_points);
+        std::cout << "DEBUG gen_neighbor:" << std::endl;
+        std::cout << "  Source grid: " << cols << "x" << rows << ", scale: " << src_surface->scale() << std::endl;
+        std::cout << "  Source extent: [" << src_extent[0] << ", " << src_extent[1] << "]" << std::endl;
+        std::cout << "  Dst extent: [" << dst_extent[0] << ", " << dst_extent[1] << "]" << std::endl;
+        std::cout << "  x_scale: " << x_scale << ", y_scale: " << y_scale << std::endl;
+        std::cout << "  measured_scale_factor: " << measured_scale_factor << " (from extent ratio)" << std::endl;
+        std::cout << "  scale_factor (after clamp): " << scale_factor << std::endl;
+
+        // Resize grid if scale factor is significantly different from 1.0
+        cv::Mat_<cv::Vec3f> final_points = dst_points;
+        if (std::abs(scale_factor - 1.0) > 0.01) {
+            int new_cols = static_cast<int>(std::round(cols * scale_factor));
+            int new_rows = static_cast<int>(std::round(rows * scale_factor));
+
+            std::cout << "  Resizing grid from " << cols << "x" << rows
+                      << " to " << new_cols << "x" << new_rows << std::endl;
+
+            // Custom bilinear interpolation that properly handles invalid markers
+            // cv::resize doesn't work because it interpolates invalid (-1,-1,-1) markers
+            // as if they were real coordinates, corrupting the result
+            cv::Mat_<cv::Vec3f> resized_points(new_rows, new_cols);
+            resized_points.setTo(invalid_marker);
+
+            #pragma omp parallel for schedule(static)
+            for (int new_r = 0; new_r < new_rows; ++new_r) {
+                for (int new_c = 0; new_c < new_cols; ++new_c) {
+                    // Map back to original grid position (floating point)
+                    // Using (new_idx + 0.5) / scale - 0.5 for proper pixel-center alignment
+                    float orig_r = (static_cast<float>(new_r) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
+                    float orig_c = (static_cast<float>(new_c) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
+
+                    // Clamp to valid range
+                    orig_r = std::clamp(orig_r, 0.0f, static_cast<float>(rows - 1));
+                    orig_c = std::clamp(orig_c, 0.0f, static_cast<float>(cols - 1));
+
+                    // Bilinear interpolation indices
+                    int r0 = static_cast<int>(std::floor(orig_r));
+                    int c0 = static_cast<int>(std::floor(orig_c));
+                    int r1 = std::min(r0 + 1, rows - 1);
+                    int c1 = std::min(c0 + 1, cols - 1);
+
+                    // Check all 4 corners are valid - skip if any are invalid
+                    if (!is_valid_vertex(dst_points(r0, c0)) || !is_valid_vertex(dst_points(r0, c1)) ||
+                        !is_valid_vertex(dst_points(r1, c0)) || !is_valid_vertex(dst_points(r1, c1))) {
+                        continue;  // Leave as invalid marker
+                    }
+
+                    float t_r = orig_r - static_cast<float>(r0);
+                    float t_c = orig_c - static_cast<float>(c0);
+
+                    cv::Vec3f p00 = dst_points(r0, c0);
+                    cv::Vec3f p01 = dst_points(r0, c1);
+                    cv::Vec3f p10 = dst_points(r1, c0);
+                    cv::Vec3f p11 = dst_points(r1, c1);
+
+                    // Bilinear interpolation of world coordinates
+                    cv::Vec3f top = p00 * (1.0f - t_c) + p01 * t_c;
+                    cv::Vec3f bot = p10 * (1.0f - t_c) + p11 * t_c;
+                    resized_points(new_r, new_c) = top * (1.0f - t_r) + bot * t_r;
+                }
+            }
+
+            final_points = resized_points;
+
+            // Debug: Show bbox after resize
+            auto [final_min, final_max] = calc_bbox(final_points);
+            std::cout << "  Final bbox (after resize): [" << final_min << "] to [" << final_max << "]" << std::endl;
+        }
+
+        // Debug: Final output info
+        std::cout << "  Output grid: " << final_points.cols << "x" << final_points.rows << std::endl;
+
         // Prepare output surface and save
-        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(dst_points, src_surface->scale()));
+        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(final_points, src_surface->scale()));
         // Prepare naming
         std::string neighbor_prefix = std::string("neighbor_") + (cast_out ? "out_" : "in_");
         std::string uuid_local = neighbor_prefix + time_str();
@@ -858,18 +989,14 @@ int main(int argc, char *argv[])
         neighbor_meta["vc_gsfs_mode"] = mode;
         neighbor_meta["vc_gsfs_version"] = "dev";
 
-        out_surf->meta = new nlohmann::json(std::move(neighbor_meta));
+        out_surf->meta = std::make_unique<nlohmann::json>(std::move(neighbor_meta));
         out_surf->save(out_dir, uuid_local, true);
 
         // Done
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf, seg_dir, meta_params, corrections);
- 
-    if (resume_surf) {
-        delete resume_surf;
-    }
+    QuadSurface *surf = tracer(ds.get(), 1.0, &chunk_cache, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections);
 
     double area_cm2 = (*surf->meta)["area_cm2"].get<double>();
     if (area_cm2 < min_area_cm) {
@@ -881,32 +1008,27 @@ int main(int argc, char *argv[])
 
     std::cout << "saving " << seg_dir << std::endl;
     surf->save(seg_dir, uuid, true);
-
-    SurfaceMeta current;
+    surf->path = seg_dir;
 
     if (mode == "expansion" && !skip_overlap_check) {
-        current.path = seg_dir;
-        current.setSurface(surf);
-        current.bbox = surf->bbox();
-
         // Read existing overlapping data
-        std::set<std::string> current_overlapping = read_overlapping_json(current.path);
+        std::set<std::string> current_overlapping = read_overlapping_json(surf->path);
 
         // Add the source segment
-        current_overlapping.insert(src->name());
+        current_overlapping.insert(src->id);
 
         // Update source's overlapping data
         std::set<std::string> src_overlapping = read_overlapping_json(src->path);
-        src_overlapping.insert(current.name());
+        src_overlapping.insert(surf->id);
         write_overlapping_json(src->path, src_overlapping);
 
         // Check overlaps with existing surfaces
         for(auto &s : surfs_v)
-            if (overlap(current, *s, search_effort)) {
-                current_overlapping.insert(s->name());
+            if (overlap(*surf, *s, search_effort)) {
+                current_overlapping.insert(s->id);
 
                 std::set<std::string> s_overlapping = read_overlapping_json(s->path);
-                s_overlapping.insert(current.name());
+                s_overlapping.insert(surf->id);
                 write_overlapping_json(s->path, s_overlapping);
             }
 
@@ -918,7 +1040,7 @@ int main(int argc, char *argv[])
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
-                if (name == current.name())
+                if (name == surf->id)
                     continue;
 
                 std::filesystem::path meta_fn = entry.path() / "meta.json";
@@ -934,20 +1056,19 @@ int main(int argc, char *argv[])
                 if (meta.value("format","NONE") != "tifxyz")
                     continue;
 
-                SurfaceMeta other = SurfaceMeta(entry.path(), meta);
-                other.readOverlapping();
+                QuadSurface other = QuadSurface(entry.path(), meta);
 
-                if (overlap(current, other, search_effort)) {
-                    current_overlapping.insert(other.name());
+                if (overlap(*surf, other, search_effort)) {
+                    current_overlapping.insert(other.id);
 
                     std::set<std::string> other_overlapping = read_overlapping_json(other.path);
-                    other_overlapping.insert(current.name());
+                    other_overlapping.insert(surf->id);
                     write_overlapping_json(other.path, other_overlapping);
                 }
             }
 
         // Write final overlapping data for current
-        write_overlapping_json(current.path, current_overlapping);
+        write_overlapping_json(surf->path, current_overlapping);
     }
 
     delete surf;

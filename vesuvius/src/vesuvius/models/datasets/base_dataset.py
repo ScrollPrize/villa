@@ -13,21 +13,9 @@ import zarr
 from torch.utils.data import Dataset
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
-# Augmentations will be handled directly in this file
-from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
-from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar
-from vesuvius.models.augmentation.transforms.intensity.brightness import MultiplicativeBrightnessTransform
-from vesuvius.models.augmentation.transforms.intensity.contrast import ContrastTransform, BGContrast
-from vesuvius.models.augmentation.transforms.intensity.gamma import GammaTransform
-from vesuvius.models.augmentation.transforms.intensity.gaussian_noise import GaussianNoiseTransform
-from vesuvius.models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
-from vesuvius.models.augmentation.transforms.spatial.low_resolution import SimulateLowResolutionTransform
-from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
-from vesuvius.models.augmentation.transforms.spatial.spatial import SpatialTransform
+# Augmentation pipeline
+from vesuvius.models.augmentation.pipelines import create_training_transforms
 from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
-from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import BlankRectangleTransform, RicianNoiseTransform, SmearTransform
-from vesuvius.models.augmentation.transforms.intensity.illumination import InhomogeneousSliceIlluminationTransform
 
 from ..training.normalization import get_normalization
 from .intensity_properties import initialize_intensity_properties
@@ -149,6 +137,7 @@ class BaseDataset(Dataset):
 
         if self.slice_sampling_enabled:
             self._setup_plane_slicer()
+            self._setup_chunk_slicer()  # Also set up chunk slicer for fast 3D validation
         else:
             self._setup_chunk_slicer()
 
@@ -235,7 +224,14 @@ class BaseDataset(Dataset):
             if self.transforms is not None:
                 print("Validation transforms initialized")
 
-        if not self.skip_patch_validation:
+        # Check if patches will be inherited from another dataset (e.g., train -> val)
+        self.inherit_patches_externally = getattr(mgr, 'inherit_patches_externally', False)
+
+        if self.inherit_patches_externally:
+            # Skip all patch indexing - patches will be copied from another dataset
+            print("Patches will be inherited from training dataset")
+            self._setup_chunk_slicer()  # Still need slicer for extraction
+        elif not self.skip_patch_validation:
             self._get_valid_patches()
         else:
             print("Skipping patch validation as requested")
@@ -344,20 +340,32 @@ class BaseDataset(Dataset):
         self.plane_slicer = slicer
 
     def _setup_chunk_slicer(self) -> None:
-        if self.slice_sampling_enabled:
-            return
-
         target_names = list(self.target_volumes.keys())
         if not target_names:
             raise ValueError("Chunk slicing requires target volumes to be populated")
 
         patch_size = tuple(int(v) for v in self.patch_size)
+        # When in 2D slice mode, derive 3D patch size for validation
+        if len(patch_size) == 2 and self.slice_sampling_enabled:
+            cube_dim = min(patch_size)
+            patch_size = (cube_dim, cube_dim, cube_dim)
+            self.logger.info("Derived 3D validation patch size %s from 2D patch size", patch_size)
         stride_override = getattr(self.mgr, 'chunk_stride', None)
         if stride_override is not None:
             stride_override = tuple(int(v) for v in stride_override)
 
         channel_selector = self._resolve_label_channel_selector(target_names)
         ignore_map = self._resolve_target_ignore_labels(target_names)
+        valid_patch_value = self._resolve_valid_patch_value(target_names)
+
+        # Get unlabeled foreground config
+        unlabeled_fg_enabled = bool(getattr(self.mgr, 'unlabeled_foreground_enabled', False))
+        unlabeled_fg_threshold = float(getattr(self.mgr, 'unlabeled_foreground_threshold', 0.05))
+        unlabeled_fg_bbox_threshold = float(getattr(self.mgr, 'unlabeled_foreground_bbox_threshold', 0.15))
+        unlabeled_fg_volumes = getattr(self.mgr, 'unlabeled_foreground_volumes', None)
+        unlabeled_fg_volume_ids: Optional[Set[str]] = None
+        if unlabeled_fg_volumes is not None:
+            unlabeled_fg_volume_ids = set(unlabeled_fg_volumes)
 
         config = ChunkSliceConfig(
             patch_size=patch_size,
@@ -365,11 +373,19 @@ class BaseDataset(Dataset):
             min_labeled_ratio=float(self.min_labeled_ratio),
             min_bbox_percent=float(self.min_bbox_percent),
             allow_unlabeled=bool(self.allow_unlabeled_data),
-            downsample_level=int(getattr(self.mgr, 'downsample_level', 1)),
+            valid_patch_find_resolution=int(getattr(self.mgr, 'valid_patch_find_resolution', 1)),
             num_workers=int(getattr(self.mgr, 'num_workers', 8)),
             cache_enabled=bool(self.cache_enabled),
             cache_dir=self.cache_dir,
             label_channel_selector=channel_selector,
+            valid_patch_value=valid_patch_value,
+            bg_sampling_enabled=bool(getattr(self.mgr, 'bg_sampling_enabled', False)),
+            bg_to_fg_ratio=float(getattr(self.mgr, 'bg_to_fg_ratio', 0.5)),
+            # Unlabeled foreground detection for semi-supervised learning
+            unlabeled_fg_enabled=unlabeled_fg_enabled,
+            unlabeled_fg_threshold=unlabeled_fg_threshold,
+            unlabeled_fg_bbox_threshold=unlabeled_fg_bbox_threshold,
+            unlabeled_fg_volume_ids=unlabeled_fg_volume_ids,
         )
 
         slicer = ChunkSlicer(config=config, target_names=target_names)
@@ -410,6 +426,26 @@ class BaseDataset(Dataset):
                     if path_candidate:
                         cache_key_path = Path(path_candidate)
 
+            # Fall back to image path for cache key if no labels (for unlabeled datasets)
+            if cache_key_path is None:
+                if hasattr(image_array, 'path'):
+                    cache_key_path = Path(image_array.path)
+                elif hasattr(image_array, 'store') and hasattr(image_array.store, 'path'):
+                    cache_key_path = Path(image_array.store.path)
+
+            # Assign per-volume image source for unlabeled FG detection
+            image_source = None
+            if unlabeled_fg_enabled:
+                # If specific volumes are listed, only use those; otherwise use all volumes
+                should_use_volume = (
+                    unlabeled_fg_volume_ids is None or volume_name in unlabeled_fg_volume_ids
+                )
+                if should_use_volume:
+                    # Use the already-loaded image array directly
+                    # This works for self-supervised training where we don't have labels
+                    image_source = image_array
+                    self.logger.info("Using image array for unlabeled FG detection (volume=%s)", volume_name)
+
             slicer.register_volume(
                 ChunkVolume(
                     index=idx,
@@ -420,6 +456,7 @@ class BaseDataset(Dataset):
                     cache_key_path=cache_key_path,
                     label_ignore_value=label_ignore_value,
                     meshes=reference_info.get('meshes', {}),
+                    image_source=image_source,
                 )
             )
 
@@ -448,6 +485,48 @@ class BaseDataset(Dataset):
                         ignore_map[target_name] = value  # store first non-null alias per target
                         break
         return ignore_map
+
+    def _resolve_valid_patch_value(
+        self, target_names: Sequence[str]
+    ) -> Optional[Union[int, float]]:
+        """Resolve valid_patch_value from target config.
+
+        When set, only voxels matching this value count as labeled for patch validation
+        (instead of all non-zero values).
+        """
+        for target_name in target_names:
+            info = self.targets.get(target_name) or {}
+            value = info.get('valid_patch_value')
+            if value is not None:
+                return value
+        return None
+
+    def _derive_image_path_from_label(self, label_path: Path, target_name: str) -> Path:
+        """Derive image zarr path from label path.
+
+        Transforms: labels/sample_ink.zarr -> images/sample.zarr
+        Uses configured label_dirname and image_dirname for directory swap.
+        """
+        label_dirname = getattr(self.mgr, "label_dirname", "labels")
+        image_dirname = getattr(self.mgr, "image_dirname", "images")
+
+        # Swap label dir -> image dir
+        parts = list(label_path.parts)
+        try:
+            idx = parts.index(label_dirname)
+            parts[idx] = image_dirname
+        except ValueError:
+            pass  # No label dir found, keep as-is
+
+        # Remove target suffix from stem
+        stem = label_path.stem
+        suffix = f"_{target_name}"
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+
+        # Reconstruct path
+        new_path = Path(*parts[:-1]) / f"{stem}{label_path.suffix}"
+        return new_path
 
     @staticmethod
     def _normalize_channel_selector(
@@ -545,23 +624,27 @@ class BaseDataset(Dataset):
         if self.slice_sampling_enabled:
             if self.plane_slicer is None:
                 raise RuntimeError("Plane slicer not initialized despite slice_sampling_enabled=True")
-            patches, weights = self.plane_slicer.build_index(validate=not self.skip_patch_validation)
-            self._plane_patches = patches
+            if self.chunk_slicer is None:
+                raise RuntimeError("Chunk slicer not initialized despite slice_sampling_enabled=True")
+
+            # Use fast 3D validation via chunk_slicer - slices sampled on-the-fly during __getitem__
+            self._build_chunk_index(validate=not self.skip_patch_validation)
+
+            # Use 3D chunks directly - we'll sample 2D slices from them at training time
+            chunk_patches = self.chunk_slicer.patches
             self.valid_patches = [
                 {
                     "volume_index": p.volume_index,
                     "volume_name": p.volume_name,
-                    "plane": p.plane,
-                    "slice_index": p.slice_index,
                     "position": list(p.position),
                     "patch_size": list(p.patch_size),
                 }
-                for p in patches
+                for p in chunk_patches
             ]
-            self.patch_weights = weights
-            volume_count = len({p.volume_index for p in patches}) or len(self.target_volumes.get(next(iter(self.target_volumes)), []))
+            self.patch_weights = self.chunk_slicer.weights
+            volume_count = len({p.volume_index for p in chunk_patches}) or 1
             self.logger.info(
-                "Prepared %s plane patches across %s volume(s)",
+                "Using %s validated 3D chunks for 2D slice sampling across %s volume(s)",
                 len(self.valid_patches),
                 volume_count,
             )
@@ -569,8 +652,142 @@ class BaseDataset(Dataset):
 
         self._build_chunk_index(validate=not self.skip_patch_validation)
 
+    def _sample_plane_from_chunk(self, chunk_info: Dict) -> PlaneSlicePatch:
+        """Sample a random 2D plane patch from a validated 3D chunk.
+
+        Randomly selects a plane (z, y, x) and slice index within the chunk,
+        returning a PlaneSlicePatch that can be extracted by the plane_slicer.
+        """
+        import random
+
+        plane_config = self.plane_slicer.config
+        sample_planes = list(plane_config.sample_planes)
+
+        # Randomly pick a plane based on weights
+        plane_weights = [plane_config.plane_weights.get(p, 1.0) for p in sample_planes]
+        total_weight = sum(plane_weights)
+        if total_weight > 0:
+            plane_weights = [w / total_weight for w in plane_weights]
+            axis = random.choices(sample_planes, weights=plane_weights, k=1)[0]
+        else:
+            axis = random.choice(sample_planes)
+
+        z, y, x = chunk_info['position']
+        dz, dy, dx = chunk_info['patch_size']
+        patch_size = tuple(plane_config.plane_patch_sizes[axis])
+
+        # Pick a random slice index within the chunk
+        if axis == "z":
+            slice_idx = random.randint(z, z + dz - 1)
+            position = (y, x)
+        elif axis == "y":
+            slice_idx = random.randint(y, y + dy - 1)
+            position = (z, x)
+        else:  # x
+            slice_idx = random.randint(x, x + dx - 1)
+            position = (z, y)
+
+        return PlaneSlicePatch(
+            volume_index=chunk_info['volume_index'],
+            volume_name=chunk_info['volume_name'],
+            plane=axis,
+            slice_index=slice_idx,
+            position=position,
+            patch_size=patch_size,
+        )
+
+    def _generate_plane_patches_from_3d(self) -> Tuple[List[PlaneSlicePatch], List[float]]:
+        """Generate 2D plane patches from validated 3D chunk positions.
+
+        For each validated 3D chunk, generates 2D patches along the configured
+        sample planes (z, y, x) that slice through the valid 3D region.
+        """
+        if self.chunk_slicer is None or self.plane_slicer is None:
+            raise RuntimeError("Both chunk_slicer and plane_slicer must be initialized")
+
+        plane_config = self.plane_slicer.config
+        chunk_patches = self.chunk_slicer.patches
+
+        plane_patches: Dict[str, List[PlaneSlicePatch]] = {axis: [] for axis in plane_config.sample_planes}
+
+        for chunk in chunk_patches:
+            z, y, x = chunk.position
+            dz, dy, dx = chunk.patch_size
+
+            for axis in plane_config.sample_planes:
+                patch_size = tuple(plane_config.plane_patch_sizes[axis])
+
+                if axis == "z":
+                    # Sample z-slices through this 3D region
+                    for slice_idx in range(z, z + dz):
+                        plane_patches["z"].append(PlaneSlicePatch(
+                            volume_index=chunk.volume_index,
+                            volume_name=chunk.volume_name,
+                            plane="z",
+                            slice_index=slice_idx,
+                            position=(y, x),
+                            patch_size=patch_size,
+                        ))
+                elif axis == "y":
+                    # Sample y-slices through this 3D region
+                    for slice_idx in range(y, y + dy):
+                        plane_patches["y"].append(PlaneSlicePatch(
+                            volume_index=chunk.volume_index,
+                            volume_name=chunk.volume_name,
+                            plane="y",
+                            slice_index=slice_idx,
+                            position=(z, x),
+                            patch_size=patch_size,
+                        ))
+                elif axis == "x":
+                    # Sample x-slices through this 3D region
+                    for slice_idx in range(x, x + dx):
+                        plane_patches["x"].append(PlaneSlicePatch(
+                            volume_index=chunk.volume_index,
+                            volume_name=chunk.volume_name,
+                            plane="x",
+                            slice_index=slice_idx,
+                            position=(z, y),
+                            patch_size=patch_size,
+                        ))
+
+        # Flatten and compute weights
+        all_patches: List[PlaneSlicePatch] = []
+        axis_counts: Dict[str, int] = {}
+        for axis, patches in plane_patches.items():
+            if patches:
+                all_patches.extend(patches)
+                axis_counts[axis] = len(patches)
+
+        if not all_patches:
+            raise RuntimeError("No plane patches generated from validated 3D regions")
+
+        # Compute weights based on plane_weights config
+        weights: List[float] = []
+        for patch in all_patches:
+            axis_weight = float(plane_config.plane_weights.get(patch.plane, 1.0))
+            count = axis_counts.get(patch.plane, 0)
+            weight_per_patch = axis_weight / count if count > 0 and axis_weight > 0 else 0.0
+            weights.append(weight_per_patch)
+
+        return all_patches, weights
+
     def __len__(self):
         return len(self.valid_patches)
+
+    @property
+    def n_fg(self) -> int:
+        """Number of foreground patches (patches with labels)."""
+        if hasattr(self, 'chunk_slicer') and hasattr(self.chunk_slicer, 'n_fg'):
+            return self.chunk_slicer.n_fg
+        return len(self)
+
+    @property
+    def n_unlabeled_fg(self) -> int:
+        """Number of unlabeled foreground patches (has image data but no labels)."""
+        if hasattr(self, 'chunk_slicer') and hasattr(self.chunk_slicer, 'n_unlabeled_fg'):
+            return self.chunk_slicer.n_unlabeled_fg
+        return 0
 
     def _resolve_spatial_shape(self, source) -> Tuple[int, ...]:
         if hasattr(source, 'spatial_shape'):
@@ -726,204 +943,35 @@ class BaseDataset(Dataset):
         return data_dict
 
     def _create_training_transforms(self):
+        """
+        Create training augmentation transforms using the standard pipeline.
+        """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
         only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
-            
-        dimension = len(self.mgr.train_patch_size)
+        allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
 
-        if dimension == 2:
-            patch_h, patch_w = self.mgr.train_patch_size
-            patch_d = None  # Not used for 2D
-        elif dimension == 3:
-            patch_d, patch_h, patch_w = self.mgr.train_patch_size
-        else:
-            raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
-
-        transforms = []
-
-        if not no_spatial:
-            # Configure rotation based on patch aspect ratio
-            if dimension == 2:
-                if max(self.mgr.train_patch_size) / min(self.mgr.train_patch_size) > 1.5:
-                    rotation_for_DA = (-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi)
-                else:
-                    rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
-                mirror_axes = (0, 1)
-            else:  # 3D
-                rotation_for_DA = (-np.pi, np.pi)
-                mirror_axes = (0, 1, 2)
-
-            allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
-            # Add SpatialTransform for rotations, scaling, elastic deformations
-            transforms.append(
-                SpatialTransform(
-                    self.mgr.train_patch_size,
-                    patch_center_dist_from_border=0,
-                    random_crop=False,
-                    p_elastic_deform=0,
-                    p_rotation=0.5,
-                    rotation=rotation_for_DA,
-                    p_scaling=0.2,
-                    scaling=(0.7, 1.4),
-                    p_synchronize_scaling_across_axes=1,
-                    bg_style_seg_sampling=False,  # =, mode_seg='nearest'
-                    elastic_deform_magnitude=(5, 25),
-                    allowed_rotation_axes=allowed_rotation_axes
-                )
-            )
-
-            if mirror_axes is not None and len(mirror_axes) > 0:
-                transforms.append(MirrorTransform(allowed_axes=mirror_axes))
-
-        # Build shared intensity transforms once to keep 2D/3D lists aligned.
-        # Some transforms are conditional so we cache their ready-to-use wrappers.
-        blank_rectangle = None
-        if not only_spatial_and_intensity:
-            blank_rectangle = RandomTransform(
-                BlankRectangleTransform(
-                    rectangle_size=tuple(
-                        (max(1, size // 6), size // 3) for size in self.mgr.train_patch_size
-                    ),
-                    rectangle_value=np.mean,
-                    num_rectangles=(1, 5),
-                    force_square=False,
-                    p_per_sample=0.4,
-                    p_per_channel=0.5
-                ),
-                apply_probability=0.5
-            )
-
-        common_transforms = []
-        if not only_spatial_and_intensity:
-            common_transforms.append(RandomTransform(
-                GaussianNoiseTransform(
-                    noise_variance=(0, 0.15),
-                    p_per_channel=1,
-                    synchronize_channels=True
-                ), apply_probability=0.4
-            ))
-            common_transforms.append(RandomTransform(
-                GaussianBlurTransform(
-                    blur_sigma=(0.5, 1.5),
-                    synchronize_channels=False,
-                    synchronize_axes=False,
-                    p_per_channel=0.5,
-                    benchmark=False
-                ), apply_probability=0.4
-            ))
-
-        common_transforms.append(RandomTransform(
-            MultiplicativeBrightnessTransform(
-                multiplier_range=BGContrast((0.5, 1.5)),
-                synchronize_channels=False,
-                p_per_channel=1
-            ), apply_probability=0.3
-        ))
-        common_transforms.append(RandomTransform(
-            ContrastTransform(
-                contrast_range=BGContrast((0.5, 1.5)),
-                preserve_range=True,
-                synchronize_channels=False,
-                p_per_channel=1
-            ), apply_probability=0.3
-        ))
-
-        if not only_spatial_and_intensity:
-            common_transforms.append(RandomTransform(
-                SimulateLowResolutionTransform(
-                    scale=(0.25, 1),
-                    synchronize_channels=False,
-                    synchronize_axes=True,
-                    ignore_axes=None,
-                    allowed_channels=None,
-                    p_per_channel=0.5
-                ), apply_probability=0.4
-            ))
-
-        common_transforms.append(RandomTransform(
-            GammaTransform(
-                gamma=BGContrast((0.7, 1.5)),
-                p_invert_image=1,
-                synchronize_channels=False,
-                p_per_channel=1,
-                p_retain_stats=1
-            ), apply_probability=0.2
-        ))
-        common_transforms.append(RandomTransform(
-            GammaTransform(
-                gamma=BGContrast((0.7, 1.5)),
-                p_invert_image=0,
-                synchronize_channels=False,
-                p_per_channel=1,
-                p_retain_stats=1
-            ), apply_probability=0.4
-        ))
-
-        if dimension == 2:
-            if blank_rectangle is not None:
-                transforms.append(blank_rectangle)
-            transforms.extend(common_transforms)
-        else:
-            if not no_spatial and patch_d == patch_h == patch_w:
-                transforms.append(RandomTransform(
-                    TransposeAxesTransform(allowed_axes={0, 1, 2}),
-                    apply_probability=0.2
-                ))
-
-            if blank_rectangle is not None:
-                transforms.append(blank_rectangle)
-                transforms.append(RandomTransform(
-                    SmearTransform(
-                        shift=(5, 0),
-                        alpha=0.2,
-                        num_prev_slices=3,
-                        smear_axis=3
-                    ), apply_probability=0.3
-                ))
-
-            transforms.append(RandomTransform(
-                InhomogeneousSliceIlluminationTransform(
-                    num_defects=(2, 5),
-                    defect_width=(25, 50),
-                    mult_brightness_reduction_at_defect=(0.3, 1.5),
-                    base_p=(0.2, 0.4),
-                    base_red=(0.5, 0.9),
-                    p_per_sample=1.0,
-                    per_channel=True,
-                    p_per_channel=0.5
-                ), apply_probability=0.4
-            ))
-
-            transforms.extend(common_transforms)
-
-        if no_spatial:
-            print("Spatial transformations disabled (no_spatial=True)")
-        
-        if only_spatial_and_intensity:
-            print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
-
+        # Get skeleton targets and their ignore values
         skeleton_targets = self._skeleton_loss_targets()
+        skeleton_ignore_values = None
         if skeleton_targets:
-            from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
-            ignore_values = {}
+            skeleton_ignore_values = {}
             for target_name in skeleton_targets:
                 cfg = self.targets.get(target_name, {}) if isinstance(self.targets, dict) else {}
                 for alias in ("ignore_index", "ignore_label", "ignore_value"):
                     value = cfg.get(alias)
                     if value is not None:
-                        ignore_values[target_name] = value
+                        skeleton_ignore_values[target_name] = value
                         break
-            transforms.append(
-                MedialSurfaceTransform(
-                    do_tube=False,
-                    target_keys=skeleton_targets,
-                    ignore_values=ignore_values or None,
-                )
-            )
-            print(f"Added MedialSurfaceTransform to training pipeline for targets: {', '.join(skeleton_targets)}")
 
-        return ComposeTransforms(transforms)
-    
+        return create_training_transforms(
+            patch_size=self.mgr.train_patch_size,
+            no_spatial=no_spatial,
+            only_spatial_and_intensity=only_spatial_and_intensity,
+            allowed_rotation_axes=allowed_rotation_axes,
+            skeleton_targets=skeleton_targets,
+            skeleton_ignore_values=skeleton_ignore_values,
+        )
+
     def _create_validation_transforms(self):
         """
         Create validation transforms.
@@ -987,7 +1035,9 @@ class BaseDataset(Dataset):
             else:
                 raise IndexError(f"Index {index} out of range for dataset of length {len(self.valid_patches)}")
         if self.slice_sampling_enabled:
-            plane_patch = self._plane_patches[index]
+            # Sample a random 2D slice from the validated 3D chunk
+            chunk_info = self.valid_patches[index]
+            plane_patch = self._sample_plane_from_chunk(chunk_info)
             plane_result = self.plane_slicer.extract(plane_patch)
             data_dict = {
                 'image': torch.from_numpy(plane_result.image),

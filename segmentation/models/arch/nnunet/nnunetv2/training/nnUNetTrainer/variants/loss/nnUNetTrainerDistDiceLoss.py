@@ -415,12 +415,8 @@ class nnUNetTrainerDistDiceLoss(nnUNetTrainer):
             self.grad_scaler.update()
         else:
             l.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-
-        if self.local_rank == 0:
-            self.wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
-            self.wandb.log({"grad_norm": grad_norm})
 
         return {'loss': l.detach().cpu().numpy()}
 

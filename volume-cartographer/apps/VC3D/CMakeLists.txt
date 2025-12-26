@@ -8,6 +8,9 @@ set(srcs
     CWindow.cpp
     CWindowContextMenu.cpp
     CVolumeViewer.cpp
+    CVolumeViewerIntersections.cpp
+    CVolumeViewerRender.cpp
+    CVolumeViewerOverlay.cpp
     CVolumeViewerView.cpp
     VolumeViewerCmaps.cpp
     VolumeViewerCmaps.hpp
@@ -21,10 +24,6 @@ set(srcs
     elements/RangeSlider.hpp
     SettingsDialog.cpp
     CSurfaceCollection.cpp
-    OpChain.cpp
-    OpsList.cpp
-    OpsSettings.cpp
-    formsetsrc.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SeedingWidget.cpp
@@ -40,6 +39,8 @@ set(srcs
     segmentation/SegmentationEditManager.hpp
     segmentation/SegmentationBrushTool.cpp
     segmentation/SegmentationBrushTool.hpp
+    segmentation/ApprovalMaskBrushTool.cpp
+    segmentation/ApprovalMaskBrushTool.hpp
     segmentation/SegmentationLineTool.cpp
     segmentation/SegmentationLineTool.hpp
     segmentation/SegmentationPushPullTool.cpp
@@ -52,6 +53,8 @@ set(srcs
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
     overlays/PointsOverlayController.hpp
+    overlays/RawPointsOverlayController.cpp
+    overlays/RawPointsOverlayController.hpp
     overlays/BBoxOverlayController.cpp
     overlays/BBoxOverlayController.hpp
     overlays/PathsOverlayController.cpp

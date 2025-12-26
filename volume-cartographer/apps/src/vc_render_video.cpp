@@ -10,12 +10,14 @@
 #include "z5/multiarray/xtensor_access.hxx"
 #include "z5/attributes.hxx"
 
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <filesystem>
 #include <omp.h>
@@ -102,12 +104,12 @@ int main(int argc, char *argv[])
 
     cv::Size tgt_size = {3840, 2160};
 
-    ChunkCache chunk_cache(10e9);
+    ChunkCache<uint8_t> chunk_cache(10e9);
 
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 
     for(auto &path : seg_dirs) {
-        QuadSurface *surf = nullptr;
+        std::unique_ptr<QuadSurface> surf;
         try {
             surf = load_quad_from_tifxyz(path);
         }
@@ -137,8 +139,6 @@ int main(int argc, char *argv[])
 
         vid << col;
         cv::imwrite("col.tif", col);
-
-        delete surf;
     }
 
     return EXIT_SUCCESS;

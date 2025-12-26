@@ -1,7 +1,7 @@
 #include <iostream>
 #include <chrono>
 #include <fstream>
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/ximgproc.hpp>
 #include "vc/core/util/Thinning.hpp"
 

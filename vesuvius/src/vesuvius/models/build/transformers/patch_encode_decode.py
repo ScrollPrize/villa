@@ -52,8 +52,9 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        returns shape (B, embed_dim, px, py, pz) where (px, py, pz) is patch_size.
-        This output will need to be rearranged to whatever your transformer expects!
+        Returns a patch grid of shape (B, embed_dim, D, H, W) for 3D or
+        (B, embed_dim, H, W) for 2D, where (D, H, W) = input_shape / patch_size.
+        This output will need to be rearranged to whatever your transformer expects.
         """
         x = self.proj(x)
         return x
@@ -63,6 +64,8 @@ class PatchDecode(nn.Module):
     """
     Loosely inspired by SAM decoder
     https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/mask_decoder.py#L53
+
+    Supports both 2D and 3D inputs based on patch_size dimensionality.
     """
 
     def __init__(
@@ -75,8 +78,15 @@ class PatchDecode(nn.Module):
     ):
         """
         patch size must be 2^x, so 2, 4, 8, 16, 32, etc. Otherwise we die
+
+        Args:
+            patch_size: Tuple of (H, W) for 2D or (D, H, W) for 3D
         """
         super().__init__()
+
+        # Determine dimensionality from patch_size
+        self.ndim = len(patch_size)
+        conv_transpose_op = nn.ConvTranspose2d if self.ndim == 2 else nn.ConvTranspose3d
 
         def _round_to_8(inp):
             return int(max(8, np.round((inp + 1e-6) / 8) * 8))
@@ -93,16 +103,17 @@ class PatchDecode(nn.Module):
         for s in range(num_stages - 1):
             stages.append(
                 nn.Sequential(
-                    nn.ConvTranspose3d(channels[s], channels[s + 1], kernel_size=strides[s], stride=strides[s]),
+                    conv_transpose_op(channels[s], channels[s + 1], kernel_size=strides[s], stride=strides[s]),
                     norm(channels[s + 1]),
                     activation(),
                 )
             )
-        stages.append(nn.ConvTranspose3d(channels[-2], channels[-1], kernel_size=strides[-1], stride=strides[-1]))
+        stages.append(conv_transpose_op(channels[-2], channels[-1], kernel_size=strides[-1], stride=strides[-1]))
         self.decode = nn.Sequential(*stages)
 
     def forward(self, x):
         """
-        Expects input of shape (B, embed_dim, px, py, pz)! This will require you to reshape the output of your transformer!
+        Expects input of shape (B, embed_dim, D, H, W) for 3D or (B, embed_dim, H, W) for 2D.
+        This will require you to reshape the output of your transformer.
         """
         return self.decode(x)

@@ -1,33 +1,26 @@
 #include "vc/core/util/Slicing.hpp"
-
-#include <nlohmann/json.hpp>
+#include "vc/core/util/Compositing.hpp"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xarray.hpp)
-#include XTENSORINCLUDE(views, xaxis_slice_iterator.hpp)
 #include XTENSORINCLUDE(io, xio.hpp)
 #include XTENSORINCLUDE(generators, xbuilder.hpp)
 #include XTENSORINCLUDE(views, xview.hpp)
 
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/filesystem/dataset.hxx"
-#include "z5/common.hxx"
 #include "z5/multiarray/xtensor_access.hxx"
-#include "z5/attributes.hxx"
 
-#include <opencv2/highgui.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
-#include <opencv2/imgproc.hpp>
 #include <shared_mutex>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <random>
 
 
 template<typename T>
-static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chunkId)
+static xt::xarray<T> *readChunk(const z5::Dataset & ds, const z5::types::ShapeType& chunkId)
 {
     if (!ds.chunkExists(chunkId)) {
         return nullptr;
@@ -75,83 +68,9 @@ static xt::xarray<T> *readChunk(const z5::Dataset & ds, z5::types::ShapeType chu
 }
 
 
-int ChunkCache::groupIdx(const std::string &name)
-{
-    if (!_group_store.count(name))
-        _group_store[name] = _group_store.size()+1;
-    
-     return _group_store[name];
-}
-    
-void ChunkCache::put(const cv::Vec4i &idx, xt::xarray<uint8_t> *ar)
-{
-    if (_stored >= _size) {
-        using KP = std::pair<cv::Vec4i, uint64_t>;
-        std::vector<KP> gen_list(_gen_store.begin(), _gen_store.end());
-        std::sort(gen_list.begin(), gen_list.end(), [](KP &a, KP &b){ return a.second < b.second; });
-        for(auto it : gen_list) {
-            std::shared_ptr<xt::xarray<uint8_t>> ar = _store[it.first];
-            //TODO we could remove this with lower probability so we dont store infiniteyl empty blocks but also keep more of them as they are cheap
-            if (ar.get()) {
-                size_t size = ar.get()->storage().size(); // elements (uint8)
-                size *= sizeof(uint8_t);
-                ar.reset();
-                _stored -= size;
-            
-                _store.erase(it.first);
-                _gen_store.erase(it.first);
-            }
 
-            //we delete 10% of cache content to amortize sorting costs
-            if (_stored < 0.9*_size) {
-                break;
-            }
-        }
-    }
-
-    if (ar) {
-        if (_store.count(idx)) {
-            assert(_store[idx].get());
-            _stored -= _store[idx]->size() * sizeof(uint8_t);
-        }
-        _stored += ar->size() * sizeof(uint8_t);
-    }
-    _store[idx].reset(ar);
-    _generation++;
-    _gen_store[idx] = _generation;
-}
-
-void ChunkCache::put16(const cv::Vec4i &idx, xt::xarray<uint16_t> *ar)
-{
-    if (_stored >= _size) {
-        using KP = std::pair<cv::Vec4i, uint64_t>;
-        std::vector<KP> gen_list(_gen_store16.begin(), _gen_store16.end());
-        std::sort(gen_list.begin(), gen_list.end(), [](KP &a, KP &b){ return a.second < b.second; });
-        for(auto it : gen_list) {
-            std::shared_ptr<xt::xarray<uint16_t>> ar = _store16[it.first];
-            if (ar.get()) {
-                size_t size = ar.get()->storage().size() * sizeof(uint16_t);
-                ar.reset();
-                _stored -= size;
-                _store16.erase(it.first);
-                _gen_store16.erase(it.first);
-            }
-            if (_stored < 0.9*_size) break;
-        }
-    }
-    if (ar) {
-        if (_store16.count(idx)) {
-            assert(_store16[idx].get());
-            _stored -= _store16[idx]->size() * sizeof(uint16_t);
-        }
-        _stored += ar->size() * sizeof(uint16_t);
-    }
-    _store16[idx].reset(ar);
-    _generation++;
-    _gen_store16[idx] = _generation;
-}
-
-void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache* cache) {
+template<typename T>
+static void readArea3DImpl(xt::xtensor<T, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, z5::Dataset* ds, ChunkCache<T>* cache) {
     int group_idx = cache->groupIdx(ds->path());
     cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
     auto chunksize = ds->chunking().blockShape();
@@ -176,7 +95,7 @@ void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, con
     // Step 2 & 3: Combined parallel I/O and copy
     #pragma omp parallel for schedule(dynamic, 1)
     for (const auto& idx : chunks_to_process) {
-        std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
+        std::shared_ptr<xt::xarray<T>> chunk_ref;
         bool needs_read = false;
 
         {
@@ -189,7 +108,7 @@ void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, con
         }
 
         if (needs_read) {
-            auto* new_chunk = readChunk<uint8_t>(*ds, {(size_t)idx[1], (size_t)idx[2], (size_t)idx[3]});
+            auto* new_chunk = readChunk<T>(*ds, {(size_t)idx[1], (size_t)idx[2], (size_t)idx[3]});
             std::unique_lock<std::shared_mutex> lock(cache->mutex);
             if (!cache->has(idx)) {
                 cache->put(idx, new_chunk);
@@ -237,128 +156,17 @@ void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, con
     }
 }
 
-void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major>& out, const cv::Vec3i offset, z5::Dataset* ds, ChunkCache* cache) {
-    int group_idx = cache->groupIdx(ds->path());
-    cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
-    auto chunksize = ds->chunking().blockShape();
-    cv::Vec3i to = offset + size;
-
-    std::vector<cv::Vec4i> chunks_to_process;
-    cv::Vec3i start_chunk = {offset[0] / (int)chunksize[0], offset[1] / (int)chunksize[1], offset[2] / (int)chunksize[2]};
-    cv::Vec3i end_chunk   = {(to[0] - 1) / (int)chunksize[0], (to[1] - 1) / (int)chunksize[1], (to[2] - 1) / (int)chunksize[2]};
-
-    for (int cz = start_chunk[0]; cz <= end_chunk[0]; ++cz)
-        for (int cy = start_chunk[1]; cy <= end_chunk[1]; ++cy)
-            for (int cx = start_chunk[2]; cx <= end_chunk[2]; ++cx)
-                chunks_to_process.push_back({group_idx, cz, cy, cx});
-
-    std::shuffle(chunks_to_process.begin(), chunks_to_process.end(), std::mt19937(std::random_device()()));
-
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (const auto& idx : chunks_to_process) {
-        std::shared_ptr<xt::xarray<uint16_t>> chunk_ref;
-        bool needs_read = false;
-
-        {
-            std::shared_lock<std::shared_mutex> lock(cache->mutex);
-            if (cache->has16(idx)) chunk_ref = cache->get16(idx);
-            else needs_read = true;
-        }
-
-        if (needs_read) {
-            auto* new_chunk = readChunk<uint16_t>(*ds, {(size_t)idx[1], (size_t)idx[2], (size_t)idx[3]});
-            std::unique_lock<std::shared_mutex> lock(cache->mutex);
-            if (!cache->has16(idx)) cache->put16(idx, new_chunk);
-            else delete new_chunk;
-            chunk_ref = cache->get16(idx);
-        }
-
-        int cz = idx[1], cy = idx[2], cx = idx[3];
-        cv::Vec3i chunk_offset = {(int)chunksize[0] * cz, (int)chunksize[1] * cy, (int)chunksize[2] * cx};
-
-        cv::Vec3i copy_from_start = {
-            std::max(offset[0], chunk_offset[0]),
-            std::max(offset[1], chunk_offset[1]),
-            std::max(offset[2], chunk_offset[2])
-        };
-        cv::Vec3i copy_from_end = {
-            std::min(to[0], chunk_offset[0] + (int)chunksize[0]),
-            std::min(to[1], chunk_offset[1] + (int)chunksize[1]),
-            std::min(to[2], chunk_offset[2] + (int)chunksize[2])
-        };
-
-        if (chunk_ref) {
-            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z)
-                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y)
-                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
-                        int lz = z - chunk_offset[0];
-                        int ly = y - chunk_offset[1];
-                        int lx = x - chunk_offset[2];
-                        out(z - offset[0], y - offset[1], x - offset[2]) = (*chunk_ref)(lz, ly, lx);
-                    }
-        } else {
-            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z)
-                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y)
-                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x)
-                        out(z - offset[0], y - offset[1], x - offset[2]) = 0;
-        }
-    }
+void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, z5::Dataset* ds, ChunkCache<uint8_t>* cache) {
+    readArea3DImpl(out, offset, ds, cache);
 }
 
-ChunkCache::~ChunkCache()
-{
-    for(auto &it : _store)
-        it.second.reset();
-    for(auto &it : _store16)
-        it.second.reset();
+void readArea3D(xt::xtensor<uint16_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, z5::Dataset* ds, ChunkCache<uint16_t>* cache) {
+    readArea3DImpl(out, offset, ds, cache);
 }
 
-void ChunkCache::reset()
-{
-    _gen_store.clear();
-    _group_store.clear();
-    _store.clear();
-    _gen_store16.clear();
-    _store16.clear();
-
-    _generation = 0;
-    _stored = 0;
-}
-
-std::shared_ptr<xt::xarray<uint8_t>> ChunkCache::get(const cv::Vec4i &idx)
-{
-    auto res = _store.find(idx);
-    if (res == _store.end())
-        return nullptr;
-
-    _generation++;
-    _gen_store[idx] = _generation;
-    
-    return res->second;
-}
-
-bool ChunkCache::has(const cv::Vec4i &idx)
-{
-    return _store.count(idx);
-}
-
-std::shared_ptr<xt::xarray<uint16_t>> ChunkCache::get16(const cv::Vec4i &idx)
-{
-    auto res = _store16.find(idx);
-    if (res == _store16.end())
-        return nullptr;
-    _generation++;
-    _gen_store16[idx] = _generation;
-    return res->second;
-}
-
-bool ChunkCache::has16(const cv::Vec4i &idx)
-{
-    return _store16.count(idx);
-}
-
-void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache) {
-    out = cv::Mat_<uint8_t>(coords.size(), 0);
+template<typename T>
+static void readNearestNeighborImpl(cv::Mat_<T> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<T> *cache) {
+    out = cv::Mat_<T>(coords.size(), 0);
     int group_idx = cache->groupIdx(ds->path());
 
     const auto& blockShape = ds->chunking().blockShape();
@@ -382,8 +190,8 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     {
         // Thread-local variables
         cv::Vec4i last_idx = {-1,-1,-1,-1};
-        xt::xarray<uint8_t> *chunk = nullptr;
-        std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
+        xt::xarray<T> *chunk = nullptr;
+        std::shared_ptr<xt::xarray<T>> chunk_ref;
 
         #pragma omp for schedule(static, 1) collapse(2)
         for(size_t tile_y = 0; tile_y < static_cast<size_t>(h); tile_y += TILE_SIZE) {
@@ -416,7 +224,7 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
                             #pragma omp critical(cache_access)
                             {
                                 if (!cache->has(idx)) {
-                                    auto* new_chunk = readChunk<uint8_t>(*ds, {size_t(ix), size_t(iy), size_t(iz)});
+                                    auto* new_chunk = readChunk<T>(*ds, {size_t(ix), size_t(iy), size_t(iz)});
                                     cache->put(idx, new_chunk);
                                     chunk_ref = cache->get(idx);
                                 } else {
@@ -446,83 +254,26 @@ void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv
     }
 }
 
-static void readNearestNeighbor16(cv::Mat_<uint16_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache) {
-    out = cv::Mat_<uint16_t>(coords.size(), 0);
-    int group_idx = cache->groupIdx(ds->path());
-
-    const auto& blockShape = ds->chunking().blockShape();
-    const int chunk_size_x = static_cast<int>(blockShape[0]);
-    const int chunk_size_y = static_cast<int>(blockShape[1]);
-    const int chunk_size_z = static_cast<int>(blockShape[2]);
-
-    int w = coords.cols, h = coords.rows;
-    constexpr int TILE_SIZE = 32;
-
-    #pragma omp parallel
-    {
-        cv::Vec4i last_idx = {-1,-1,-1,-1};
-        xt::xarray<uint16_t> *chunk = nullptr;
-        std::shared_ptr<xt::xarray<uint16_t>> chunk_ref;
-
-        #pragma omp for schedule(static, 1) collapse(2)
-        for(size_t tile_y = 0; tile_y < static_cast<size_t>(h); tile_y += TILE_SIZE) {
-            for(size_t tile_x = 0; tile_x < static_cast<size_t>(w); tile_x += TILE_SIZE) {
-                size_t y_end = std::min(tile_y + TILE_SIZE, static_cast<size_t>(h));
-                size_t x_end = std::min(tile_x + TILE_SIZE, static_cast<size_t>(w));
-
-                for(size_t y = tile_y; y < y_end; y++) {
-                    if (y + 1 < y_end) {
-                        __builtin_prefetch(&coords(y+1, tile_x), 0, 1);
-                    }
-                    for(size_t x = tile_x; x < x_end; x++) {
-                        int ox = static_cast<int>(coords(y,x)[2] + 0.5f);
-                        int oy = static_cast<int>(coords(y,x)[1] + 0.5f);
-                        int oz = static_cast<int>(coords(y,x)[0] + 0.5f);
-                        if ((ox | oy | oz) < 0) continue;
-
-                        int ix = ox / chunk_size_x;
-                        int iy = oy / chunk_size_y;
-                        int iz = oz / chunk_size_z;
-                        cv::Vec4i idx = {group_idx, ix, iy, iz};
-
-                        if (idx != last_idx) {
-                            last_idx = idx;
-                            #pragma omp critical(cache_access)
-                            {
-                                if (!cache->has16(idx)) {
-                                    auto* new_chunk = readChunk<uint16_t>(*ds, {size_t(ix), size_t(iy), size_t(iz)});
-                                    cache->put16(idx, new_chunk);
-                                    chunk_ref = cache->get16(idx);
-                                } else {
-                                    chunk_ref = cache->get16(idx);
-                                }
-                            }
-                            chunk = chunk_ref.get();
-                        }
-                        if (!chunk) continue;
-
-                        int lx = ox - ix * chunk_size_x;
-                        int ly = oy - iy * chunk_size_y;
-                        int lz = oz - iz * chunk_size_z;
-                        if (lx < 0 || ly < 0 || lz < 0 ||
-                            lx >= chunk_size_x || ly >= chunk_size_y || lz >= chunk_size_z) {
-                            continue;
-                        }
-                        out(y,x) = chunk->operator()(lx,ly,lz);
-                    }
-                }
-            }
-        }
-    }
+void readNearestNeighbor(cv::Mat_<uint8_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache) {
+    readNearestNeighborImpl(out, ds, coords, cache);
 }
 
-void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
-                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache, bool nearest_neighbor) {
+static void readNearestNeighbor16(cv::Mat_<uint16_t> &out, const z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache) {
+    readNearestNeighborImpl(out, ds, coords, cache);
+}
+
+template<typename T>
+static void readInterpolated3DImpl(cv::Mat_<T> &out, z5::Dataset *ds,
+                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache<T> *cache, bool nearest_neighbor) {
     if (nearest_neighbor) {
-        return readNearestNeighbor(out,ds,coords,cache);
+        if constexpr (std::is_same_v<T, uint8_t>) {
+            return readNearestNeighbor(out,ds,coords,cache);
+        } else {
+            return readNearestNeighbor16(out,ds,coords,cache);
+        }
     }
-  
-    out = cv::Mat_<uint8_t>(coords.size(), 0);
+
+    out = cv::Mat_<T>(coords.size(), 0);
 
     if (!cache) {
         std::cout << "ERROR should use a shared chunk cache!" << std::endl;
@@ -547,11 +298,11 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
     int h = coords.rows;
 
     std::shared_mutex mutex;
-    std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint8_t>>,vec4i_hash> chunks;
+    std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<T>>,vec4i_hash> chunks;
 
     // Lambda for retrieving single values (unchanged)
     auto retrieve_single_value_cached = [&cw,&ch,&cd,&group_idx,&chunks,&sx,&sy,&sz](
-        int ox, int oy, int oz) -> uint8_t {
+        int ox, int oy, int oz) -> T {
 
             if (ox < 0 || oy < 0 || oz < 0 ||
                 ox >= sx || oy >= sy || oz >= sz) {
@@ -568,7 +319,7 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
                 return 0;
             }
 
-            xt::xarray<uint8_t> *chunk  = it->second.get();
+            xt::xarray<T> *chunk  = it->second.get();
 
             if (!chunk)
                 return 0;
@@ -585,9 +336,9 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
         #pragma omp parallel
         {
             cv::Vec4i last_idx = {-1,-1,-1,-1};
-            std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
-            xt::xarray<uint8_t> *chunk = nullptr;
-            std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint8_t>>,vec4i_hash> chunks_local;
+            std::shared_ptr<xt::xarray<T>> chunk_ref;
+            xt::xarray<T> *chunk = nullptr;
+            std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<T>>,vec4i_hash> chunks_local;
 
             #pragma omp for collapse(2)
             for(size_t y = 0;y<h;y++) {
@@ -655,12 +406,12 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
 
         }
 
-    std::vector<std::pair<cv::Vec4i,xt::xarray<uint8_t>*>> needs_io;
+    std::vector<std::pair<cv::Vec4i,xt::xarray<T>*>> needs_io;
 
     cache->mutex.lock();
     for(auto &it : chunks) {
-        xt::xarray<uint8_t> *chunk = nullptr;
-        std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
+        xt::xarray<T> *chunk = nullptr;
+        std::shared_ptr<xt::xarray<T>> chunk_ref;
 
         cv::Vec4i idx = it.first;
 
@@ -676,8 +427,8 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
     #pragma omp parallel for schedule(dynamic, 1)
     for(auto &it : needs_io) {
         cv::Vec4i idx = it.first;
-        std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
-        it.second = readChunk<uint8_t>(*ds, {size_t(idx[1]),size_t(idx[2]),size_t(idx[3])});
+        std::shared_ptr<xt::xarray<T>> chunk_ref;
+        it.second = readChunk<T>(*ds, {size_t(idx[1]),size_t(idx[2]),size_t(idx[3])});
     }
 
     cache->mutex.lock();
@@ -692,8 +443,8 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
     #pragma omp parallel
     {
         cv::Vec4i last_idx = {-1,-1,-1,-1};
-        std::shared_ptr<xt::xarray<uint8_t>> chunk_ref;
-        xt::xarray<uint8_t> *chunk = nullptr;
+        std::shared_ptr<xt::xarray<T>> chunk_ref;
+        xt::xarray<T> *chunk = nullptr;
 
         #pragma omp for collapse(2)
         for(size_t y = 0;y<h;y++) {
@@ -782,393 +533,728 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
 
                 float c = (1-fx)*c0 + fx*c1;
 
-                out(y,x) = c;
+                if constexpr (std::is_same_v<T, uint16_t>) {
+                    if (c < 0.f) c = 0.f;
+                    if (c > 65535.f) c = 65535.f;
+                    out(y,x) = static_cast<uint16_t>(c + 0.5f);
+                } else {
+                    out(y,x) = c;
+                }
             }
         }
     }
+}
+
+void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds,
+                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache, bool nearest_neighbor) {
+    readInterpolated3DImpl(out, ds, coords, cache, nearest_neighbor);
 }
 
 void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds,
-                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache, bool nearest_neighbor) {
-    if (nearest_neighbor) {
-        return readNearestNeighbor16(out,ds,coords,cache);
-    }
-    out = cv::Mat_<uint16_t>(coords.size(), 0);
+                               const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache, bool nearest_neighbor) {
+    readInterpolated3DImpl(out, ds, coords, cache, nearest_neighbor);
+}
 
-    if (!cache) {
-        std::cout << "ERROR should use a shared chunk cache!" << std::endl;
-        abort();
-    }
-    int group_idx = cache->groupIdx(ds->path());
 
-    auto cw = ds->chunking().blockShape()[0];
-    auto ch = ds->chunking().blockShape()[1];
-    auto cd = ds->chunking().blockShape()[2];
+// ============================================================================
+// FastCompositeCache implementation - lock-free chunk caching for composite
+// ============================================================================
+
+void FastCompositeCache::clear() {
+    _chunks.clear();
+    _ds = nullptr;
+    _cw = _ch = _cd = 0;
+    _sx = _sy = _sz = 0;
+    _chunksX = _chunksY = _chunksZ = 0;
+}
+
+void FastCompositeCache::setDataset(z5::Dataset* ds) {
+    if (_ds == ds) return;  // Already set to this dataset
+
+    clear();
+    _ds = ds;
+
+    if (!ds) return;
+
+    const auto& blockShape = ds->chunking().blockShape();
+    _cw = static_cast<int>(blockShape[0]);
+    _ch = static_cast<int>(blockShape[1]);
+    _cd = static_cast<int>(blockShape[2]);
 
     const auto& dsShape = ds->shape();
-    const int sx = static_cast<int>(dsShape[0]);
-    const int sy = static_cast<int>(dsShape[1]);
-    const int sz = static_cast<int>(dsShape[2]);
-    const int chunksX = (sx + static_cast<int>(cw) - 1) / static_cast<int>(cw);
-    const int chunksY = (sy + static_cast<int>(ch) - 1) / static_cast<int>(ch);
-    const int chunksZ = (sz + static_cast<int>(cd) - 1) / static_cast<int>(cd);
+    _sx = static_cast<int>(dsShape[0]);
+    _sy = static_cast<int>(dsShape[1]);
+    _sz = static_cast<int>(dsShape[2]);
 
-    int w = coords.cols, h = coords.rows;
+    _chunksX = (_sx + _cw - 1) / _cw;
+    _chunksY = (_sy + _ch - 1) / _ch;
+    _chunksZ = (_sz + _cd - 1) / _cd;
+}
 
-    std::shared_mutex mutex;
-    std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint16_t>>,vec4i_hash> chunks;
+const xt::xarray<uint8_t>* FastCompositeCache::getChunk(int ix, int iy, int iz) {
+    if (!_ds) return nullptr;
+    if (ix < 0 || ix >= _chunksX || iy < 0 || iy >= _chunksY || iz < 0 || iz >= _chunksZ)
+        return nullptr;
 
-    auto retrieve_single_value_cached = [&cw,&ch,&cd,&group_idx,&chunks,&sx,&sy,&sz](
-        int ox, int oy, int oz) -> uint16_t {
-            if (ox < 0 || oy < 0 || oz < 0 || ox >= sx || oy >= sy || oz >= sz) return 0;
-            int ix = int(ox)/cw, iy = int(oy)/ch, iz = int(oz)/cd;
-            cv::Vec4i idx = {group_idx,ix,iy,iz};
-            auto it = chunks.find(idx);
-            if (it == chunks.end()) return 0;
-            xt::xarray<uint16_t>* chunk  = it->second.get();
-            if (!chunk) return 0;
-            int lx = ox-ix*cw, ly = oy-iy*ch, lz = oz-iz*cd;
-            return chunk->operator()(lx,ly,lz);
-        };
+    uint64_t key = chunkKey(ix, iy, iz);
+    auto it = _chunks.find(key);
+    if (it != _chunks.end()) {
+        return it->second.get();
+    }
 
+    // Load chunk directly - no mutex needed
+    auto* chunk = readChunk<uint8_t>(*_ds, {static_cast<size_t>(ix), static_cast<size_t>(iy), static_cast<size_t>(iz)});
+    if (chunk) {
+        _chunks[key] = std::unique_ptr<xt::xarray<uint8_t>>(chunk);
+        return chunk;
+    }
+    return nullptr;
+}
+
+// ============================================================================
+// readCompositeFast - specialized fast path for nearest-neighbor compositing
+// ============================================================================
+
+// Helper to compute log2 for power-of-2 values (used for bit shift optimization)
+static inline int log2_pow2(int v) {
+    // For power-of-2 values, count trailing zeros gives log2
+    int r = 0;
+    while ((v >> r) > 1) r++;
+    return r;
+}
+
+void readCompositeFast(
+    cv::Mat_<uint8_t>& out,
+    z5::Dataset* ds,
+    const cv::Mat_<cv::Vec3f>& baseCoords,
+    const cv::Mat_<cv::Vec3f>& normals,
+    float zStep,
+    int zStart, int zEnd,
+    const CompositeParams& params,
+    FastCompositeCache& cache)
+{
+    cache.setDataset(ds);
+
+    const int h = baseCoords.rows;
+    const int w = baseCoords.cols;
+    const int numLayers = zEnd - zStart + 1;
+
+    const bool hasNormals = !normals.empty() && normals.size() == baseCoords.size();
+
+    const int cw = cache.chunkSizeX();
+    const int ch = cache.chunkSizeY();
+    const int cd = cache.chunkSizeZ();
+    const int sx = cache.datasetSizeX();
+    const int sy = cache.datasetSizeY();
+    const int sz = cache.datasetSizeZ();
+    const int chunksX = (sx + cw - 1) / cw;
+    const int chunksY = (sy + ch - 1) / ch;
+    const int chunksZ = (sz + cd - 1) / cd;
+
+    // Bit shift constants for power-of-2 chunk sizes (replaces expensive division)
+    const int cwShift = log2_pow2(cw);
+    const int chShift = log2_pow2(ch);
+    const int cdShift = log2_pow2(cd);
+    const int cwMask = cw - 1;  // For modulo: x % cw == x & cwMask when cw is power of 2
+    const int chMask = ch - 1;
+    const int cdMask = cd - 1;
+
+    // Phase 1: Collect all needed chunks using a bitmap (much faster than unordered_set)
+    // Use a flat array as a 3D bitmap - O(1) insert/lookup vs O(1) amortized with hash overhead
+    const size_t totalChunks = static_cast<size_t>(chunksX) * chunksY * chunksZ;
+    std::vector<uint8_t> chunkNeeded(totalChunks, 0);
+
+    // Track bounding box for efficient array allocation (use atomics for parallel updates)
+    std::atomic<int> minIx{chunksX}, maxIx{-1};
+    std::atomic<int> minIy{chunksY}, maxIy{-1};
+    std::atomic<int> minIz{chunksZ}, maxIz{-1};
+
+    // Pre-compute layer offsets (constant for all pixels)
+    std::vector<float> layerOffsets(numLayers);
+    for (int layer = 0; layer < numLayers; layer++) {
+        layerOffsets[layer] = (zStart + layer) * zStep;
+    }
+
+    // Parallel scan of all coordinates to find needed chunks
     #pragma omp parallel
     {
-        cv::Vec4i last_idx = {-1,-1,-1,-1};
-        std::shared_ptr<xt::xarray<uint16_t>> chunk_ref;
-        xt::xarray<uint16_t> *chunk = nullptr;
-        std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint16_t>>,vec4i_hash> chunks_local;
+        // Thread-local min/max to reduce atomic contention
+        int localMinIx = chunksX, localMaxIx = -1;
+        int localMinIy = chunksY, localMaxIy = -1;
+        int localMinIz = chunksZ, localMaxIz = -1;
 
-        #pragma omp for collapse(2)
-        for(size_t y = 0;y<h;y++) {
-            for(size_t x = 0;x<w;x++) {
-                float ox = coords(y,x)[2];
-                float oy = coords(y,x)[1];
-                float oz = coords(y,x)[0];
-                if (ox < 0 || oy < 0 || oz < 0) continue;
-                if (ox >= sx || oy >= sy || oz >= sz) continue;
-                int ix = int(ox)/cw, iy = int(oy)/ch, iz = int(oz)/cd;
-                cv::Vec4i idx = {group_idx,ix,iy,iz};
-                if (idx != last_idx) {
-                    last_idx = idx;
+        #pragma omp for schedule(dynamic, 16)
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                const cv::Vec3f& baseCoord = baseCoords(y, x);
+                const float base_ox = baseCoord[2];
+                const float base_oy = baseCoord[1];
+                const float base_oz = baseCoord[0];
+
+                if (base_oz < 0 || base_oy < 0 || base_ox < 0) continue;
+                if (base_ox >= sx || base_oy >= sy) continue;
+
+                float nx = 0, ny = 0, nz = 1;
+                if (hasNormals) {
+                    const cv::Vec3f& n = normals(y, x);
+                    if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+                        nx = n[0]; ny = n[1]; nz = n[2];
+                    }
+                }
+
+                for (int layer = 0; layer < numLayers; layer++) {
+                    const float layerOffset = layerOffsets[layer];
+                    const float ox = base_ox + nz * layerOffset;
+                    const float oy = base_oy + ny * layerOffset;
+                    const float oz = base_oz + nx * layerOffset;
+
+                    if (oz < 0 || oz >= sz || oy < 0 || oy >= sy || ox < 0 || ox >= sx) continue;
+
+                    int iox = static_cast<int>(ox + 0.5f);
+                    int ioy = static_cast<int>(oy + 0.5f);
+                    int ioz = static_cast<int>(oz + 0.5f);
+
+                    if (iox >= sx) iox = sx - 1;
+                    if (ioy >= sy) ioy = sy - 1;
+                    if (ioz >= sz) ioz = sz - 1;
+
+                    // Use bit shifts instead of division (chunk sizes are power of 2)
+                    const int ix = iox >> cwShift;
+                    const int iy = ioy >> chShift;
+                    const int iz = ioz >> cdShift;
+
                     if (ix >= 0 && ix < chunksX && iy >= 0 && iy < chunksY && iz >= 0 && iz < chunksZ) {
-                        chunks_local[idx] = nullptr;
+                        // Bitmap write is safe even with races - worst case we write 1 multiple times
+                        chunkNeeded[ix + iy * chunksX + iz * chunksX * chunksY] = 1;
+                        localMinIx = std::min(localMinIx, ix);
+                        localMaxIx = std::max(localMaxIx, ix);
+                        localMinIy = std::min(localMinIy, iy);
+                        localMaxIy = std::max(localMaxIy, iy);
+                        localMinIz = std::min(localMinIz, iz);
+                        localMaxIz = std::max(localMaxIz, iz);
                     }
-                }
-                int lx = ox-ix*cw, ly = oy-iy*ch, lz = oz-iz*cd;
-                if (lx+1 >= cw || ly+1 >= ch || lz+1 >= cd) {
-                    if (lx+1>=cw) { cv::Vec4i idx2 = idx; idx2[1]++; if (idx2[1] >= 0 && idx2[1] < chunksX) chunks_local[idx2] = nullptr; }
-                    if (ly+1>=ch) { cv::Vec4i idx2 = idx; idx2[2]++; if (idx2[2] >= 0 && idx2[2] < chunksY) chunks_local[idx2] = nullptr; }
-                    if (lz+1>=cd) { cv::Vec4i idx2 = idx; idx2[3]++; if (idx2[3] >= 0 && idx2[3] < chunksZ) chunks_local[idx2] = nullptr; }
                 }
             }
         }
-#pragma omp barrier
-#pragma omp critical
-        chunks.merge(chunks_local);
-    }
 
-    std::vector<std::pair<cv::Vec4i,xt::xarray<uint16_t>*>> needs_io;
-    cache->mutex.lock();
-    for(auto &it : chunks) {
-        std::shared_ptr<xt::xarray<uint16_t>> chunk_ref;
-        cv::Vec4i idx = it.first;
-        if (!cache->has16(idx)) {
-            needs_io.push_back({idx,nullptr});
-        } else {
-            chunk_ref = cache->get16(idx);
-            chunks[idx] = chunk_ref;
+        // Merge thread-local bounds into global atomics
+        #pragma omp critical
+        {
+            if (localMinIx < minIx.load()) minIx.store(localMinIx);
+            if (localMaxIx > maxIx.load()) maxIx.store(localMaxIx);
+            if (localMinIy < minIy.load()) minIy.store(localMinIy);
+            if (localMaxIy > maxIy.load()) maxIy.store(localMaxIy);
+            if (localMinIz < minIz.load()) minIz.store(localMinIz);
+            if (localMaxIz > maxIz.load()) maxIz.store(localMaxIz);
         }
     }
-    cache->mutex.unlock();
 
-    #pragma omp parallel for schedule(dynamic, 1)
-    for(auto &it : needs_io) {
-        cv::Vec4i idx = it.first;
-        it.second = readChunk<uint16_t>(*ds, {size_t(idx[1]),size_t(idx[2]),size_t(idx[3])});
-    }
-    cache->mutex.lock();
-    for(auto &it : needs_io) {
-        cv::Vec4i idx = it.first;
-        cache->put16(idx, it.second);
-        chunks[idx] = cache->get16(idx);
-    }
-    cache->mutex.unlock();
+    const int finalMinIx = minIx.load(), finalMaxIx = maxIx.load();
+    const int finalMinIy = minIy.load(), finalMaxIy = maxIy.load();
+    const int finalMinIz = minIz.load(), finalMaxIz = maxIz.load();
 
-    #pragma omp parallel
-    {
-        cv::Vec4i last_idx = {-1,-1,-1,-1};
-        xt::xarray<uint16_t> *chunk = nullptr;
-        #pragma omp for collapse(2)
-        for(size_t y = 0;y<h;y++) {
-            for(size_t x = 0;x<w;x++) {
-                float ox = coords(y,x)[2], oy = coords(y,x)[1], oz = coords(y,x)[0];
-                if (ox < 0 || oy < 0 || oz < 0) continue;
-                if (ox >= sx || oy >= sy || oz >= sz) continue;
-                int ix = int(ox)/cw, iy = int(oy)/ch, iz = int(oz)/cd;
-                cv::Vec4i idx = {group_idx,ix,iy,iz};
-                if (idx != last_idx) {
-                    last_idx = idx;
-                    if (ix < 0 || ix >= chunksX || iy < 0 || iy >= chunksY || iz < 0 || iz >= chunksZ) {
-                        chunk = nullptr;
-                    } else {
-                        chunk = chunks[idx].get();
-                    }
-                }
-                int lx = ox-ix*cw, ly = oy-iy*ch, lz = oz-iz*cd;
-                if (!chunk) continue;
-
-                float c000 = chunk->operator()(lx,ly,lz);
-                float c100, c010, c110, c001, c101, c011, c111;
-                if (lx+1 >= cw || ly+1 >= ch || lz+1 >= cd) {
-                    c100 = (lx+1>=cw) ? retrieve_single_value_cached(ox+1,oy,oz) : chunk->operator()(lx+1,ly,lz);
-                    c010 = (ly+1>=ch) ? retrieve_single_value_cached(ox,oy+1,oz) : chunk->operator()(lx,ly+1,lz);
-                    c001 = (lz+1>=cd) ? retrieve_single_value_cached(ox,oy,oz+1) : chunk->operator()(lx,ly,lz+1);
-                    c110 = retrieve_single_value_cached(ox+1,oy+1,oz);
-                    c101 = retrieve_single_value_cached(ox+1,oy,oz+1);
-                    c011 = retrieve_single_value_cached(ox,oy+1,oz+1);
-                    c111 = retrieve_single_value_cached(ox+1,oy+1,oz+1);
-                } else {
-                    c100 = chunk->operator()(lx+1,ly,lz);
-                    c010 = chunk->operator()(lx,ly+1,lz);
-                    c110 = chunk->operator()(lx+1,ly+1,lz);
-                    c001 = chunk->operator()(lx,ly,lz+1);
-                    c101 = chunk->operator()(lx+1,ly,lz+1);
-                    c011 = chunk->operator()(lx,ly+1,lz+1);
-                    c111 = chunk->operator()(lx+1,ly+1,lz+1);
-                }
-                float fx = ox-int(ox), fy = oy-int(oy), fz = oz-int(oz);
-                float c00 = (1-fz)*c000 + fz*c001;
-                float c01 = (1-fz)*c010 + fz*c011;
-                float c10 = (1-fz)*c100 + fz*c101;
-                float c11 = (1-fz)*c110 + fz*c111;
-                float c0 = (1-fy)*c00 + fy*c01;
-                float c1 = (1-fy)*c10 + fy*c11;
-                float c = (1-fx)*c0 + fx*c1;
-                if (c < 0.f) c = 0.f;
-                if (c > 65535.f) c = 65535.f;
-                out(y,x) = static_cast<uint16_t>(c + 0.5f);
-            }
-        }
-    }
-}
-
-//somehow opencvs functions are pretty slow
-static cv::Vec3f normed(const cv::Vec3f v)
-{
-    return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
-}
-
-static cv::Vec3f at_int(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f p)
-{
-    int x = p[0];
-    int y = p[1];
-    float fx = p[0]-x;
-    float fy = p[1]-y;
-    
-    cv::Vec3f p00 = points(y,x);
-    cv::Vec3f p01 = points(y,x+1);
-    cv::Vec3f p10 = points(y+1,x);
-    cv::Vec3f p11 = points(y+1,x+1);
-    
-    cv::Vec3f p0 = (1-fx)*p00 + fx*p01;
-    cv::Vec3f p1 = (1-fx)*p10 + fx*p11;
-    
-    return (1-fy)*p0 + fy*p1;
-}
-
-static cv::Vec2f vmin(const cv::Vec2f &a, const cv::Vec2f &b)
-{
-    return {std::min(a[0],b[0]),std::min(a[1],b[1])};
-}
-
-static cv::Vec2f vmax(const cv::Vec2f &a, const cv::Vec2f &b)
-{
-    return {std::max(a[0],b[0]),std::max(a[1],b[1])};
-}
-
-cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
-{
-    cv::Vec2f inb_loc = {loc[0], loc[1]};
-    //move inside from the grid border so w can access required locations
-    inb_loc = vmax(inb_loc, {1,1});
-    inb_loc = vmin(inb_loc, {points.cols-3,points.rows-3});
-    
-    if (!loc_valid_xy(points, inb_loc))
-        return {NAN,NAN,NAN};
-    
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(1,0)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(-1,0)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(0,1)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(0,-1)))
-        return {NAN,NAN,NAN};
-    
-    cv::Vec3f xv = normed(at_int(points,inb_loc+cv::Vec2f(1,0))-at_int(points,inb_loc-cv::Vec2f(1,0)));
-    cv::Vec3f yv = normed(at_int(points,inb_loc+cv::Vec2f(0,1))-at_int(points,inb_loc-cv::Vec2f(0,1)));
-    
-    cv::Vec3f n = yv.cross(xv);
-
-    if (std::isnan(n[0]))
-        return {NAN,NAN,NAN};
-    
-    return normed(n);
-}
-
-static float sdist(const cv::Vec3f &a, const cv::Vec3f &b)
-{
-    cv::Vec3f d = a-b;
-    return d.dot(d);
-}
-
-static void min_loc(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, bool z_search = true)
-{
-    cv::Rect boundary(1,1,points.cols-2,points.rows-2);
-    if (!boundary.contains(cv::Point(loc))) {
-        out = {-1,-1,-1};
-        loc = {-1,-1};
+    if (finalMaxIx < finalMinIx) {
+        // No valid chunks needed
+        out = cv::Mat_<uint8_t>(baseCoords.size(), 0);
         return;
     }
-    
-    bool changed = true;
-    cv::Vec3f val = at_int(points, loc);
-    out = val;
-    float best = sdist(val, tgt);
-    float res;
-    
-    std::vector<cv::Vec2f> search;
-    if (z_search)
-        search = {{0,-1},{0,1},{-1,0},{1,0}};
-    else
-        search = {{1,0},{-1,0}};
-    
-    float step = 1.0;
-    
-    
-    while (changed) {
-        changed = false;
-        
-        for(auto &off : search) {
-            cv::Vec2f cand = loc+off*step;
-            
-            if (!boundary.contains(cv::Point(cand))) {
-                out = {-1,-1,-1};
-                loc = {-1,-1};
-                return;
-            }
-            
-            
-            val = at_int(points, cand);
-            res = sdist(val,tgt);
-            if (res < best) {
-                changed = true;
-                best = res;
-                loc = cand;
-                out = val;
+
+    // Phase 2: Pre-load all needed chunks and build lookup array
+    const int arrSizeX = finalMaxIx - finalMinIx + 1;
+    const int arrSizeY = finalMaxIy - finalMinIy + 1;
+    const int arrSizeZ = finalMaxIz - finalMinIz + 1;
+    std::vector<const xt::xarray<uint8_t>*> chunkArray(arrSizeX * arrSizeY * arrSizeZ, nullptr);
+
+    // Iterate over bounding box and load chunks that are marked as needed
+    for (int iz = finalMinIz; iz <= finalMaxIz; iz++) {
+        for (int iy = finalMinIy; iy <= finalMaxIy; iy++) {
+            for (int ix = finalMinIx; ix <= finalMaxIx; ix++) {
+                if (chunkNeeded[ix + iy * chunksX + iz * chunksX * chunksY]) {
+                    const int arrIdx = (ix - finalMinIx) + (iy - finalMinIy) * arrSizeX + (iz - finalMinIz) * arrSizeX * arrSizeY;
+                    chunkArray[arrIdx] = cache.getChunk(ix, iy, iz);
+                }
             }
         }
-        
-        if (!changed && step > 0.125) {
-            step *= 0.5;
-            changed = true;
+    }
+
+    auto getChunk = [&](int ix, int iy, int iz) -> const xt::xarray<uint8_t>* {
+        if (ix < finalMinIx || ix > finalMaxIx || iy < finalMinIy || iy > finalMaxIy || iz < finalMinIz || iz > finalMaxIz)
+            return nullptr;
+        return chunkArray[(ix - finalMinIx) + (iy - finalMinIy) * arrSizeX + (iz - finalMinIz) * arrSizeX * arrSizeY];
+    };
+
+    // Phase 3: Contrast enhancement
+    // Identity LUT - no histogram enhancement (GLCAE removed)
+    std::array<uint8_t, 256> equalizeLUT;
+    for (int i = 0; i < 256; i++) equalizeLUT[i] = static_cast<uint8_t>(i);
+
+    // Phase 4: Initialize output
+    out = cv::Mat_<uint8_t>(baseCoords.size(), 0);
+
+    // Determine which compositing path to use
+    const bool isAlpha = (params.method == "alpha");
+    const bool isMin = (params.method == "min");
+    const bool isMax = (params.method == "max");
+    const bool isMean = (params.method == "mean");
+    const bool needsLayerStorage = methodRequiresLayerStorage(params.method);
+
+    // Pre-compute alpha normalization constants
+    const float alphaScale = 1.0f / (255.0f * (params.alphaMax - params.alphaMin));
+    const float alphaOffset = params.alphaMin / (params.alphaMax - params.alphaMin);
+
+    // Pre-compute incremental step for coordinate updates
+    const float firstLayerOffset = zStart * zStep;
+
+    // Pre-compute chunk stride for C-contiguous layout (common case)
+    // This avoids 3 multiplies per sample when layout is standard
+    const size_t chunkPlaneStride = static_cast<size_t>(cw) * ch;  // stride for z dimension
+    const size_t chunkRowStride = static_cast<size_t>(cw);         // stride for y dimension
+
+    // Phase 4: Process all layers for each pixel
+    #pragma omp parallel
+    {
+        // Thread-local layer stack for methods that need it
+        LayerStack stack;
+        if (needsLayerStorage) {
+            stack.values.resize(numLayers);
+        }
+
+        #pragma omp for collapse(2)
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                const cv::Vec3f& baseCoord = baseCoords(y, x);
+                const float base_ox = baseCoord[2];
+                const float base_oy = baseCoord[1];
+                const float base_oz = baseCoord[0];
+
+                if (base_oz < 0 || base_oy < 0 || base_ox < 0) continue;
+
+                // Get normal once per pixel
+                float nx = 0, ny = 0, nz = 1;
+                if (hasNormals) {
+                    const cv::Vec3f& n = normals(y, x);
+                    if (n[0] == n[0] && n[1] == n[1] && n[2] == n[2]) {
+                        nx = n[0];
+                        ny = n[1];
+                        nz = n[2];
+                    }
+                }
+
+                // Accumulators for simple methods
+                float acc = isMin ? 255.0f : 0.0f;
+                int validCount = 0;
+
+                // Reset layer stack
+                if (needsLayerStorage) {
+                    stack.validCount = 0;
+                }
+
+                // Pre-compute incremental coordinate deltas for this pixel's normal
+                const float dx = nz * zStep;
+                const float dy = ny * zStep;
+                const float dz = nx * zStep;
+
+                // Start at first layer position
+                float ox = base_ox + nz * firstLayerOffset;
+                float oy = base_oy + ny * firstLayerOffset;
+                float oz = base_oz + nx * firstLayerOffset;
+
+                // Chunk caching: track current chunk to avoid re-lookup
+                int cachedIx = -1, cachedIy = -1, cachedIz = -1;
+                const uint8_t* cachedData = nullptr;
+                size_t cachedStride0 = 0, cachedStride1 = 0, cachedStride2 = 0;
+
+                // Sample all layers
+                for (int layer = 0; layer < numLayers; layer++) {
+                    float value;
+                    bool validSample = false;
+
+                    // Bounds check
+                    if (oz >= 0 && oz < sz && oy >= 0 && oy < sy && ox >= 0 && ox < sx) {
+                            // Fast rounding with clamping to valid range
+                            int iox = static_cast<int>(ox + 0.5f);
+                            int ioy = static_cast<int>(oy + 0.5f);
+                            int ioz = static_cast<int>(oz + 0.5f);
+
+                            // Clamp to valid range (rounding can push to boundary)
+                            if (iox >= sx) iox = sx - 1;
+                            if (ioy >= sy) ioy = sy - 1;
+                            if (ioz >= sz) ioz = sz - 1;
+
+                            // Use bit shifts for chunk index
+                            const int ix = iox >> cwShift;
+                            const int iy = ioy >> chShift;
+                            const int iz = ioz >> cdShift;
+
+                            // Check if we need to switch chunks
+                            if (ix != cachedIx || iy != cachedIy || iz != cachedIz) {
+                                const xt::xarray<uint8_t>* chunk = getChunk(ix, iy, iz);
+                                if (chunk) {
+                                    cachedData = chunk->data();
+                                    const auto& strides = chunk->strides();
+                                    cachedStride0 = strides[0];
+                                    cachedStride1 = strides[1];
+                                    cachedStride2 = strides[2];
+                                    cachedIx = ix;
+                                    cachedIy = iy;
+                                    cachedIz = iz;
+
+                                    // Prefetch next likely chunk (along z direction)
+                                    if (iz + 1 <= finalMaxIz) {
+                                        const xt::xarray<uint8_t>* nextChunk = getChunk(ix, iy, iz + 1);
+                                        if (nextChunk) {
+                                            __builtin_prefetch(nextChunk->data(), 0, 1);
+                                        }
+                                    }
+                                } else {
+                                    cachedData = nullptr;
+                                }
+                            }
+
+                            if (cachedData) {
+                                // Use bit masking for local coordinates
+                                const int lx = iox & cwMask;
+                                const int ly = ioy & chMask;
+                                const int lz = ioz & cdMask;
+
+                                // Direct pointer arithmetic with actual strides
+                                const uint8_t rawValue = cachedData[lx * cachedStride0 + ly * cachedStride1 + lz * cachedStride2];
+
+                                // Apply LUT (ISO cutoff)
+                                value = static_cast<float>(equalizeLUT[rawValue < params.isoCutoff ? 0 : rawValue]);
+                                validSample = true;
+                            }
+                        }
+
+                        // Increment coordinates for next layer
+                        ox += dx; oy += dy; oz += dz;
+
+                    if (validSample) {
+                        if (needsLayerStorage) {
+                            stack.values[stack.validCount++] = value;
+                        } else if (isMax) {
+                            acc = value > acc ? value : acc;
+                            validCount++;
+                        } else if (isMin) {
+                            acc = value < acc ? value : acc;
+                            validCount++;
+                        } else {
+                            // mean
+                            acc += value;
+                            validCount++;
+                        }
+                    }
+                }
+
+                // Compute final value
+                float result = 0.0f;
+
+                if (needsLayerStorage) {
+                    result = compositeLayerStack(stack, params);
+                } else if (isMax || isMin) {
+                    result = acc;
+                } else if (isMean && validCount > 0) {
+                    result = acc / static_cast<float>(validCount);
+                }
+
+                // Apply directional lighting if enabled
+                if (params.lightingEnabled && hasNormals) {
+                    const cv::Vec3f& n = normals(y, x);
+                    float lightFactor = computeLightingFactor(n, params);
+                    result *= lightFactor;
+                }
+
+                out(y, x) = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, result)));
+            }
         }
     }
 }
 
-//this works surprisingly well, though some artifacts where original there was a lot of skew
-cv::Mat_<cv::Vec3f> smooth_vc_segmentation(const cv::Mat_<cv::Vec3f> &points)
+void readCompositeFastConstantNormal(
+    cv::Mat_<uint8_t>& out,
+    z5::Dataset* ds,
+    const cv::Mat_<cv::Vec3f>& baseCoords,
+    const cv::Vec3f& normal,
+    float zStep,
+    int zStart, int zEnd,
+    const CompositeParams& params,
+    FastCompositeCache& cache)
 {
-    cv::Mat_<cv::Vec3f> out = points.clone();
-    cv::Mat_<cv::Vec3f> blur(points.cols, points.rows);
-    cv::Mat_<cv::Vec2f> locs(points.size());
-    
-    cv::Mat trans = out.t();
-    
-    #pragma omp parallel for
-    for(int j=0;j<trans.rows;j++) 
-        cv::GaussianBlur(trans({0,j,trans.cols,1}), blur({0,j,trans.cols,1}), {255,1}, 0);
-    
-    blur = blur.t();
-    
-    #pragma omp parallel for
-    for(int j=1;j<points.rows;j++)
-        for(int i=1;i<points.cols-1;i++) {
-            cv::Vec2f loc = {i,j};
-            min_loc(points, loc, out(j,i), blur(j,i), false);
-        }
-        
-        return out;
-}
+    cache.setDataset(ds);
 
-void vc_segmentation_scales(cv::Mat_<cv::Vec3f> points, double &sx, double &sy)
-{
-    //so we get something somewhat meaningful by default
-    double sum_x = 0;
-    double sum_y = 0;
-    int count = 0;
-    //NOTE leave out bordes as these contain lots of artifacst if coming from smooth_segmentation() ... would need median or something ...
-    int jmin = points.size().height*0.1+1;
-    int jmax = points.size().height*0.9;
-    int imin = points.size().width*0.1+1;
-    int imax = points.size().width*0.9;
-    int step = 4;
-    if (points.size().height < 20) {
-        std::cout << "small array vc scales " << std::endl;
-        jmin = 1;
-        jmax = points.size().height;
-        imin = 1;
-        imax = points.size().width;
-        step = 1;
+    const int h = baseCoords.rows;
+    const int w = baseCoords.cols;
+    const int numLayers = zEnd - zStart + 1;
+
+    // Extract constant normal components once
+    const float nx = normal[0];
+    const float ny = normal[1];
+    const float nz = normal[2];
+
+    const int cw = cache.chunkSizeX();
+    const int ch = cache.chunkSizeY();
+    const int cd = cache.chunkSizeZ();
+    const int sx = cache.datasetSizeX();
+    const int sy = cache.datasetSizeY();
+    const int sz = cache.datasetSizeZ();
+    const int chunksX = (sx + cw - 1) / cw;
+    const int chunksY = (sy + ch - 1) / ch;
+    const int chunksZ = (sz + cd - 1) / cd;
+
+    // Bit shift constants for power-of-2 chunk sizes (replaces expensive division)
+    const int cwShift = log2_pow2(cw);
+    const int chShift = log2_pow2(ch);
+    const int cdShift = log2_pow2(cd);
+    const int cwMask = cw - 1;
+    const int chMask = ch - 1;
+    const int cdMask = cd - 1;
+
+    // Pre-compute layer offsets as 3D vectors (constant normal * layer offset)
+    // This is the key optimization for constant normals - we compute the delta once per layer
+    struct LayerDelta {
+        float dx, dy, dz;
+    };
+    std::vector<LayerDelta> layerDeltas(numLayers);
+    for (int layer = 0; layer < numLayers; layer++) {
+        const float offset = (zStart + layer) * zStep;
+        layerDeltas[layer] = {nz * offset, ny * offset, nx * offset};
     }
-#pragma omp parallel for
-    for(int j=jmin;j<jmax;j+=step) {
-        double _sum_x = 0;
-        double _sum_y = 0;
-        int _count = 0;
-        cv::Vec3f *row = points.ptr<cv::Vec3f>(j);
-        for(int i=imin;i<imax;i+=step) {
-            cv::Vec3f v = points(j,i)-points(j,i-1);
-            _sum_x += sqrt(v.dot(v));
-            v = points(j,i)-points(j-1,i);
-            _sum_y += sqrt(v.dot(v));
-            _count++;
+
+    // Phase 1: Collect all needed chunks using bitmap
+    const size_t totalChunks = static_cast<size_t>(chunksX) * chunksY * chunksZ;
+    std::vector<uint8_t> chunkNeeded(totalChunks, 0);
+
+    std::atomic<int> minIx{chunksX}, maxIx{-1};
+    std::atomic<int> minIy{chunksY}, maxIy{-1};
+    std::atomic<int> minIz{chunksZ}, maxIz{-1};
+
+    #pragma omp parallel
+    {
+        int localMinIx = chunksX, localMaxIx = -1;
+        int localMinIy = chunksY, localMaxIy = -1;
+        int localMinIz = chunksZ, localMaxIz = -1;
+
+        #pragma omp for schedule(dynamic, 16)
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                const cv::Vec3f& baseCoord = baseCoords(y, x);
+                const float base_ox = baseCoord[2];
+                const float base_oy = baseCoord[1];
+                const float base_oz = baseCoord[0];
+
+                if (base_oz < 0 || base_oy < 0 || base_ox < 0) continue;
+                if (base_ox >= sx || base_oy >= sy) continue;
+
+                for (int layer = 0; layer < numLayers; layer++) {
+                    const LayerDelta& delta = layerDeltas[layer];
+                    const float ox = base_ox + delta.dx;
+                    const float oy = base_oy + delta.dy;
+                    const float oz = base_oz + delta.dz;
+
+                    if (oz < 0 || oz >= sz || oy < 0 || oy >= sy || ox < 0 || ox >= sx) continue;
+
+                    int iox = static_cast<int>(ox + 0.5f);
+                    int ioy = static_cast<int>(oy + 0.5f);
+                    int ioz = static_cast<int>(oz + 0.5f);
+
+                    if (iox >= sx) iox = sx - 1;
+                    if (ioy >= sy) ioy = sy - 1;
+                    if (ioz >= sz) ioz = sz - 1;
+
+                    // Use bit shifts instead of division
+                    const int ix = iox >> cwShift;
+                    const int iy = ioy >> chShift;
+                    const int iz = ioz >> cdShift;
+
+                    if (ix >= 0 && ix < chunksX && iy >= 0 && iy < chunksY && iz >= 0 && iz < chunksZ) {
+                        chunkNeeded[ix + iy * chunksX + iz * chunksX * chunksY] = 1;
+                        localMinIx = std::min(localMinIx, ix);
+                        localMaxIx = std::max(localMaxIx, ix);
+                        localMinIy = std::min(localMinIy, iy);
+                        localMaxIy = std::max(localMaxIy, iy);
+                        localMinIz = std::min(localMinIz, iz);
+                        localMaxIz = std::max(localMaxIz, iz);
+                    }
+                }
+            }
         }
-#pragma omp critical
+
+        #pragma omp critical
         {
-            sum_x += _sum_x;
-            sum_y += _sum_y;
-            count += _count;
+            if (localMinIx < minIx.load()) minIx.store(localMinIx);
+            if (localMaxIx > maxIx.load()) maxIx.store(localMaxIx);
+            if (localMinIy < minIy.load()) minIy.store(localMinIy);
+            if (localMaxIy > maxIy.load()) maxIy.store(localMaxIy);
+            if (localMinIz < minIz.load()) minIz.store(localMinIz);
+            if (localMaxIz > maxIz.load()) maxIz.store(localMaxIz);
         }
     }
 
-    sx = count/sum_x;
-    sy = count/sum_y;
-}
+    const int finalMinIx = minIx.load(), finalMaxIx = maxIx.load();
+    const int finalMinIy = minIy.load(), finalMaxIy = maxIy.load();
+    const int finalMinIz = minIz.load(), finalMaxIz = maxIz.load();
 
-cv::Mat_<cv::Vec3f> vc_segmentation_calc_normals(const cv::Mat_<cv::Vec3f> &points) {
-    int n_step = 1;
-    cv::Mat_<cv::Vec3f> blur;
-    cv::GaussianBlur(points, blur, {21,21}, 0);
-    cv::Mat_<cv::Vec3f> normals(points.size());
-#pragma omp parallel for
-    for(int j=n_step;j<points.rows-n_step;j++)
-        for(int i=n_step;i<points.cols-n_step;i++) {
-            cv::Vec3f xv = normed(blur(j,i+n_step)-blur(j,i-n_step));
-            cv::Vec3f yv = normed(blur(j+n_step,i)-blur(j-n_step,i));
-            
-            cv::Vec3f n = yv.cross(xv);
-            n = n/sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
-            
-            normals(j,i) = n;
+    if (finalMaxIx < finalMinIx) {
+        out = cv::Mat_<uint8_t>(baseCoords.size(), 0);
+        return;
+    }
+
+    // Phase 2: Pre-load chunks and build lookup array
+    const int arrSizeX = finalMaxIx - finalMinIx + 1;
+    const int arrSizeY = finalMaxIy - finalMinIy + 1;
+    const int arrSizeZ = finalMaxIz - finalMinIz + 1;
+    std::vector<const xt::xarray<uint8_t>*> chunkArray(arrSizeX * arrSizeY * arrSizeZ, nullptr);
+
+    for (int iz = finalMinIz; iz <= finalMaxIz; iz++) {
+        for (int iy = finalMinIy; iy <= finalMaxIy; iy++) {
+            for (int ix = finalMinIx; ix <= finalMaxIx; ix++) {
+                if (chunkNeeded[ix + iy * chunksX + iz * chunksX * chunksY]) {
+                    const int arrIdx = (ix - finalMinIx) + (iy - finalMinIy) * arrSizeX + (iz - finalMinIz) * arrSizeX * arrSizeY;
+                    chunkArray[arrIdx] = cache.getChunk(ix, iy, iz);
+                }
+            }
         }
-        
-        cv::GaussianBlur(normals, normals, {21,21}, 0);
-        
-#pragma omp parallel for
-        for(int j=n_step;j<points.rows-n_step;j++)
-            for(int i=n_step;i<points.cols-n_step;i++)
-                normals(j,i) = normed(normals(j,i));
-    
-    return normals;
+    }
+
+    auto getChunk = [&](int ix, int iy, int iz) -> const xt::xarray<uint8_t>* {
+        if (ix < finalMinIx || ix > finalMaxIx || iy < finalMinIy || iy > finalMaxIy || iz < finalMinIz || iz > finalMaxIz)
+            return nullptr;
+        return chunkArray[(ix - finalMinIx) + (iy - finalMinIy) * arrSizeX + (iz - finalMinIz) * arrSizeX * arrSizeY];
+    };
+
+    // Phase 3: Identity LUT - no histogram enhancement (GLCAE removed)
+    std::array<uint8_t, 256> equalizeLUT;
+    for (int i = 0; i < 256; i++) equalizeLUT[i] = static_cast<uint8_t>(i);
+    // Phase 4: Composite rendering
+    out = cv::Mat_<uint8_t>(baseCoords.size(), 0);
+
+    const bool isMin = (params.method == "min");
+    const bool isMax = (params.method == "max");
+    const bool isMean = (params.method == "mean");
+    const bool needsLayerStorage = methodRequiresLayerStorage(params.method);
+
+    #pragma omp parallel
+    {
+        LayerStack stack;
+        if (needsLayerStorage) {
+            stack.values.resize(numLayers);
+        }
+
+        #pragma omp for collapse(2)
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                const cv::Vec3f& baseCoord = baseCoords(y, x);
+                const float base_ox = baseCoord[2];
+                const float base_oy = baseCoord[1];
+                const float base_oz = baseCoord[0];
+
+                if (base_oz < 0 || base_oy < 0 || base_ox < 0) continue;
+
+                float acc = isMin ? 255.0f : 0.0f;
+                int validCount = 0;
+
+                if (needsLayerStorage) {
+                    stack.validCount = 0;
+                }
+
+                // Chunk caching (only used for non-3DGLCAE path)
+                int cachedIx = -1, cachedIy = -1, cachedIz = -1;
+                const uint8_t* cachedData = nullptr;
+                size_t cachedStride0 = 0, cachedStride1 = 0, cachedStride2 = 0;
+
+                // Sample all layers
+                for (int layer = 0; layer < numLayers; layer++) {
+                    float value;
+                    bool validSample = false;
+
+                    const LayerDelta& delta = layerDeltas[layer];
+                    const float ox = base_ox + delta.dx;
+                    const float oy = base_oy + delta.dy;
+                    const float oz = base_oz + delta.dz;
+
+                    // Bounds check
+                    if (oz >= 0 && oz < sz && oy >= 0 && oy < sy && ox >= 0 && ox < sx) {
+                            // Fast rounding with clamping
+                            int iox = static_cast<int>(ox + 0.5f);
+                            int ioy = static_cast<int>(oy + 0.5f);
+                            int ioz = static_cast<int>(oz + 0.5f);
+
+                            if (iox >= sx) iox = sx - 1;
+                            if (ioy >= sy) ioy = sy - 1;
+                            if (ioz >= sz) ioz = sz - 1;
+
+                            const int ix = iox >> cwShift;
+                            const int iy = ioy >> chShift;
+                            const int iz = ioz >> cdShift;
+
+                            if (ix != cachedIx || iy != cachedIy || iz != cachedIz) {
+                                const xt::xarray<uint8_t>* chunk = getChunk(ix, iy, iz);
+                                if (chunk) {
+                                    cachedData = chunk->data();
+                                    const auto& strides = chunk->strides();
+                                    cachedStride0 = strides[0];
+                                    cachedStride1 = strides[1];
+                                    cachedStride2 = strides[2];
+                                    cachedIx = ix;
+                                    cachedIy = iy;
+                                    cachedIz = iz;
+
+                                    // Prefetch next chunk along z
+                                    if (iz + 1 <= finalMaxIz) {
+                                        const xt::xarray<uint8_t>* nextChunk = getChunk(ix, iy, iz + 1);
+                                        if (nextChunk) {
+                                            __builtin_prefetch(nextChunk->data(), 0, 1);
+                                        }
+                                    }
+                                } else {
+                                    cachedData = nullptr;
+                                }
+                            }
+
+                            if (cachedData) {
+                                const int lx = iox & cwMask;
+                                const int ly = ioy & chMask;
+                                const int lz = ioz & cdMask;
+
+                                const uint8_t rawValue = cachedData[lx * cachedStride0 + ly * cachedStride1 + lz * cachedStride2];
+                                value = static_cast<float>(equalizeLUT[rawValue]);
+                                validSample = true;
+                            }
+                        }
+
+                    if (validSample) {
+                        if (needsLayerStorage) {
+                            stack.values[stack.validCount++] = value;
+                        } else if (isMax) {
+                            acc = value > acc ? value : acc;
+                            validCount++;
+                        } else if (isMin) {
+                            acc = value < acc ? value : acc;
+                            validCount++;
+                        } else {
+                            acc += value;
+                            validCount++;
+                        }
+                    }
+                }
+
+                float result = 0.0f;
+                if (needsLayerStorage) {
+                    result = compositeLayerStack(stack, params);
+                } else if (isMax || isMin) {
+                    result = acc;
+                } else if (isMean && validCount > 0) {
+                    result = acc / static_cast<float>(validCount);
+                }
+
+                // Apply directional lighting if enabled (using constant normal)
+                if (params.lightingEnabled) {
+                    float lightFactor = computeLightingFactor(normal, params);
+                    result *= lightFactor;
+                }
+
+                out(y, x) = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, result)));
+            }
+        }
+    }
 }

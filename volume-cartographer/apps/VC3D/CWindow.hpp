@@ -12,6 +12,7 @@
 #include <vector>
 #include <deque>
 #include <optional>
+#include <chrono>
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
@@ -19,6 +20,7 @@
 #include <QShortcut>
 #include <QSet>
 #include <unordered_map>
+#include <map>
 
 #include "CPointCollectionWidget.hpp"
 #include "CSurfaceCollection.hpp"
@@ -27,6 +29,7 @@
 #include "segmentation/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
+#include "overlays/RawPointsOverlayController.hpp"
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
@@ -35,13 +38,11 @@
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/SegmentationGrowth.hpp"
-#include "OpChain.hpp"
-#include "OpsList.hpp"
-#include "OpsSettings.hpp"
 #include "SeedingWidget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <sys/inotify.h>
 #include <QSocketNotifier>
@@ -76,7 +77,6 @@ public:
 
 signals:
     void sendVolumeChanged(std::shared_ptr<Volume> vol, const std::string& volumeId);
-    void sendOpChainSelected(OpChain*);
     void sendSurfacesLoaded();
     void sendVolumeClosing(); // Signal to notify viewers before closing volume
 
@@ -85,7 +85,6 @@ public slots:
     void onLocChanged(void);
     void onManualPlaneChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
-    void onOpChainChanged(OpChain *chain);
     void onRenderSegment(const std::string& segmentId);
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
@@ -93,6 +92,7 @@ public slots:
     void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
+    void onABFFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
@@ -116,6 +116,7 @@ public:
 protected:
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     void CreateWidgets(void);
@@ -141,10 +142,11 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
-    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, Surface* source, bool addToHistory = false);
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory = false);
     bool centerFocusOnCursor();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
+    void updateSurfaceOverlayDropdown();
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -163,12 +165,15 @@ private slots:
     void configureViewerConnections(CVolumeViewer* viewer);
     CVolumeViewer* segmentationViewer() const;
     void clearSurfaceSelection();
-    void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface, OpChain* chain);
+    void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onAxisAlignedSliceMousePress(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onAxisAlignedSliceMouseMove(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onSegmentationGrowthStatusChanged(bool running);
     void processPendingInotifyEvents();
+    void onSliceStepSizeChanged(int newSize);
+    void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
+    void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -181,7 +186,7 @@ private:
 
     QComboBox* volSelect;
     QComboBox* cmbSegmentationDir;
-    QuadSurface *_surf;
+    std::weak_ptr<QuadSurface> _surf_weak;  // Non-owning reference to active surface
     std::string _surfID;
     
   
@@ -191,10 +196,8 @@ private:
     CPointCollectionWidget* _point_collection_widget;
 
     VCCollection* _point_collection;
-    
+
     SurfaceTreeWidget *treeWidgetSurfaces;
-    OpsList *wOpsList;
-    OpsSettings *wOpsSettings;
     QPushButton *btnReloadSurfaces;
     
     //TODO abstract these into separate QWidget class?
@@ -206,6 +209,7 @@ private:
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;
 
 
@@ -213,8 +217,8 @@ private:
     QMdiArea *mdiArea;
 
     bool can_change_volume_();
-    
-    ChunkCache *chunk_cache;
+
+    ChunkCache<uint8_t> *chunk_cache;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
@@ -223,11 +227,10 @@ private:
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
-    std::unordered_map<std::string, OpChain*> _opchains;
-
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
     std::unique_ptr<PointsOverlayController> _pointsOverlay;
+    std::unique_ptr<RawPointsOverlayController> _rawPointsOverlay;
     std::unique_ptr<PathsOverlayController> _pathsOverlay;
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
@@ -243,7 +246,7 @@ private:
     struct FocusHistoryEntry {
         cv::Vec3f position;
         cv::Vec3f normal;
-        Surface* source{nullptr};
+        std::string surfaceId;  // Store ID instead of raw pointer
     };
     std::deque<FocusHistoryEntry> _focusHistory;
     int _focusHistoryIndex{-1};
@@ -257,11 +260,22 @@ private:
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
     QShortcut* fAxisAlignedSlicesShortcut;
+    QShortcut* fZoomInShortcut;
+    QShortcut* fZoomOutShortcut;
+    QShortcut* fResetViewShortcut;
+
+    // Z offset shortcuts (Ctrl+,/. for normal direction)
+    QShortcut* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)
+    QShortcut* fWorldOffsetZNegShortcut;  // Ctrl+, (closer)
 
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
     void updateAxisAlignedSliceInteraction();
     float currentAxisAlignedRotationDegrees(const std::string& surfaceName) const;
     void setAxisAlignedRotationDegrees(const std::string& surfaceName, float degrees);
+    void scheduleAxisAlignedOrientationUpdate();
+    void flushAxisAlignedOrientationUpdate();
+    void processAxisAlignedOrientationUpdate();
+    void cancelAxisAlignedOrientationTimer();
     static float normalizeDegrees(float degrees);
 
     struct AxisAlignedSliceDragState {
@@ -272,6 +286,9 @@ private:
     std::unordered_map<const CVolumeViewer*, AxisAlignedSliceDragState> _axisAlignedSliceDrags;
     float _axisAlignedSegXZRotationDeg = 0.0f;
     float _axisAlignedSegYZRotationDeg = 0.0f;
+
+    QTimer* _axisAlignedRotationTimer{nullptr};
+    bool _axisAlignedOrientationDirty{false};
 
     int _inotifyFd;
     QSocketNotifier* _inotifyNotifier;
@@ -286,9 +303,17 @@ private:
     void processInotifySegmentRename(const std::string& dirName, const std::string& oldId, const std::string& newId);
     void processInotifySegmentUpdate(const std::string& dirName, const std::string& segmentName);
     void scheduleInotifyProcessing();
+    bool shouldSkipInotifyForSegment(const std::string& segmentId, const char* eventCategory);
+    void markSegmentRecentlyEdited(const std::string& segmentId);
+    void pruneExpiredRecentlyEdited();
 
     // Periodic timer for inotify events
     QTimer* _inotifyProcessTimer;
+
+    // Timer for debounced window state saving
+    QTimer* _windowStateSaveTimer{nullptr};
+    void scheduleWindowStateSave();
+    void saveWindowState();
 
     struct InotifyEvent {
         enum Type { Addition, Removal, Rename, Update };
@@ -304,7 +329,9 @@ private:
     // Set to track unique segments that need updating (to avoid duplicates)
     std::set<std::pair<std::string, std::string>> _pendingSegmentUpdates; // (dirName, segmentId)
     QElapsedTimer _lastInotifyProcessTime;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> _recentlyEditedSegments;
     static constexpr int INOTIFY_THROTTLE_MS = 100;
+    static constexpr int RECENT_EDIT_GRACE_SECONDS = 30;
 
     struct NeighborCopyJob {
         enum class Stage { None, FirstPass, SecondPass };
@@ -317,6 +344,7 @@ private:
         QString pass1JsonPath;
         QString pass2JsonPath;
         QString directoryPrefix;
+        QString resumeOptMode{QStringLiteral("local")};
         bool copyOut{true};
         QSet<QString> baselineEntries;
         std::unique_ptr<QTemporaryFile> pass1JsonFile;

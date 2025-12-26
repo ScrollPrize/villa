@@ -4,53 +4,70 @@
 #include "vc/core/util/Surface.hpp"
 
 
-
 CSurfaceCollection::~CSurfaceCollection()
 {
-    for (auto& pair : _surfs) {
-        if (pair.second.owns && pair.second.ptr) {
-            delete pair.second.ptr;
-        }
-    }
+    // Surfaces are automatically cleaned up by shared_ptr
 
     for (auto& pair : _pois) {
         delete pair.second;
     }
+}
 
-    for (auto& pair : _intersections) {
-        delete pair.second;
+void CSurfaceCollection::setSurface(const std::string &name, std::shared_ptr<Surface> surf, bool noSignalSend, bool isEditUpdate)
+{
+    auto it = _surfs.find(name);
+    if (it != _surfs.end() && it->second && it->second != surf) {
+        // Notify listeners BEFORE replacement so they can clear their references
+        emit sendSurfaceWillBeDeleted(name, it->second);
+    }
+
+    _surfs[name] = surf;
+
+    // Always emit signal when surface is deleted (nullptr) to prevent dangling pointers
+    // Only suppress signal for non-deletion updates
+    if (!noSignalSend || surf == nullptr) {
+        emit sendSurfaceChanged(name, surf, isEditUpdate);
     }
 }
 
-void CSurfaceCollection::setSurface(const std::string &name, Surface* surf, bool noSignalSend, bool takeOwnership)
+void CSurfaceCollection::emitSurfacesChanged()
 {
-    auto it = _surfs.find(name);
-    if (it != _surfs.end()) {
-        if (it->second.owns && it->second.ptr && it->second.ptr != surf) {
-            delete it->second.ptr;
-        }
-        it->second.ptr = surf;
-        it->second.owns = takeOwnership;
-    } else {
-        _surfs[name] = {surf, takeOwnership};
-    }
-    if (!noSignalSend) {
-        sendSurfaceChanged(name, surf);
-    }
+    // Emit a signal to notify listeners that surfaces have been modified in batch.
+    // Use empty name and nullptr to indicate batch update.
+    emit sendSurfaceChanged("", nullptr, false);
 }
 
 void CSurfaceCollection::setPOI(const std::string &name, POI *poi)
 {
     _pois[name] = poi;
-    sendPOIChanged(name, poi);
+    emit sendPOIChanged(name, poi);
 }
 
-Surface* CSurfaceCollection::surface(const std::string &name)
+std::shared_ptr<Surface> CSurfaceCollection::surface(const std::string &name)
 {
     auto it = _surfs.find(name);
     if (it == _surfs.end())
         return nullptr;
-    return it->second.ptr;
+    return it->second;
+}
+
+Surface* CSurfaceCollection::surfaceRaw(const std::string &name)
+{
+    auto it = _surfs.find(name);
+    if (it == _surfs.end())
+        return nullptr;
+    return it->second.get();
+}
+
+std::string CSurfaceCollection::findSurfaceId(Surface* surf)
+{
+    if (!surf) return {};
+    for (const auto& [name, s] : _surfs) {
+        if (s.get() == surf) {
+            return name;
+        }
+    }
+    return {};
 }
 
 POI *CSurfaceCollection::poi(const std::string &name)
@@ -60,28 +77,28 @@ POI *CSurfaceCollection::poi(const std::string &name)
     return _pois[name];
 }
 
-std::vector<Surface*> CSurfaceCollection::surfaces()
+std::vector<std::shared_ptr<Surface>> CSurfaceCollection::surfaces()
 {
-    std::vector<Surface*> surfaces;
-    surfaces.reserve(_surfs.size());
+    std::vector<std::shared_ptr<Surface>> result;
+    result.reserve(_surfs.size());
 
-    for(auto surface : _surfs) {
-        surfaces.push_back(surface.second.ptr);
-    } 
+    for(auto& surface : _surfs) {
+        result.push_back(surface.second);
+    }
 
-    return surfaces;
+    return result;
 }
 
 std::vector<POI*> CSurfaceCollection::pois()
 {
-    std::vector<POI*> pois;
-    pois.reserve(_pois.size());
+    std::vector<POI*> result;
+    result.reserve(_pois.size());
 
-    for(auto poi : _pois) {
-        pois.push_back(poi.second);  
-    } 
+    for(auto& poi : _pois) {
+        result.push_back(poi.second);
+    }
 
-    return pois;
+    return result;
 }
 
 std::vector<std::string> CSurfaceCollection::surfaceNames()
@@ -89,7 +106,7 @@ std::vector<std::string> CSurfaceCollection::surfaceNames()
     std::vector<std::string> keys;
     for(auto &it : _surfs)
         keys.push_back(it.first);
-    
+
     return keys;
 }
 
@@ -100,43 +117,4 @@ std::vector<std::string> CSurfaceCollection::poiNames()
         keys.push_back(it.first);
 
     return keys;
-}
-
-void CSurfaceCollection::setIntersection(const std::string &a, const std::string &b, Intersection *intersect)
-{
-    auto key = std::make_pair(a, b);
-    if (_intersections.count(key)) {
-        delete _intersections[key];  // Delete old before overwriting
-    }
-    _intersections[key] = intersect;
-    sendIntersectionChanged(a, b, intersect);
-}
-
-Intersection *CSurfaceCollection::intersection(const std::string &a, const std::string &b)
-{
-    if (_intersections.count({a,b}))
-        return _intersections[{a,b}];
-        
-    if (_intersections.count({b,a}))
-        return _intersections[{b,a}];
-    
-    return nullptr;
-}
-
-std::vector<std::pair<std::string,std::string>> CSurfaceCollection::intersections(const std::string &a)
-{
-    std::vector<std::pair<std::string,std::string>> res;
-
-    if (!a.size()) {
-        for(auto item : _intersections)
-            res.push_back(item.first);
-    }
-    else
-        for(auto item : _intersections) {
-            if (item.first.first == a)
-                res.push_back(item.first);
-            else if (item.first.second == a)
-                res.push_back(item.first);
-        }
-    return res;
 }

@@ -10,8 +10,8 @@ class TransposeAxesTransform(BasicTransform):
     A transformation class to permute specified spatial axes of an image and related data.
 
     Attributes:
-        allowed_axes (Set[int]): Set of spatial axes allowed for permutation (e.g., {1, 2} for y and z axes in an
-        image of shape (c, x, y, z)).
+        allowed_axes (Set[int]): Set of spatial axes allowed for permutation (e.g., {1, 2} for y and x axes in an
+        image of shape (C, Z, Y, X)). Spatial axes are indexed in (Z=0, Y=1, X=2) order.
     """
 
     def __init__(self, allowed_axes: Set[int], normal_keys: Optional[Set[str]] = None):

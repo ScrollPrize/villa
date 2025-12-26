@@ -77,4 +77,9 @@ private:
     bool _alphaOverrideActive{false};
     AlphaPushPullConfig _alphaConfig{};
     bool _undoCaptured{false};
+
+    // Cached state to avoid rebuilding samples every tick
+    int _cachedRow{-1};
+    int _cachedCol{-1};
+    bool _samplesValid{false};
 };

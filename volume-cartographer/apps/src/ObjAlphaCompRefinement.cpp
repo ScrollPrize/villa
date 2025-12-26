@@ -10,13 +10,16 @@
 #include "z5/multiarray/xtensor_access.hxx"
 #include "z5/attributes.hxx"
 
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/Surface.hpp"
 #include "vc/core/util/StreamOperators.hpp"
+#include "vc/core/util/Surface.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -142,7 +145,7 @@ bool istype(const std::string &line, const std::string &type)
 struct DSReader {
     z5::Dataset* ds;
     float scale;
-    ChunkCache* cache;
+    ChunkCache<uint8_t>* cache;
     std::mutex read_mutex;
 };
 
@@ -300,7 +303,7 @@ int process_tifxyz(const std::filesystem::path& src,
 {
     std::unique_ptr<QuadSurface> surf;
     try {
-        surf.reset(load_quad_from_tifxyz(src.string()));
+        surf = load_quad_from_tifxyz(src.string());
     } catch (const std::exception& e) {
         std::cerr << "failed to load tifxyz: " << e.what() << std::endl;
         return EXIT_FAILURE;
@@ -324,9 +327,7 @@ int process_tifxyz(const std::filesystem::path& src,
                 if (!loc_valid(original, cv::Vec2d(y, x))) {
                     continue;
                 }
-                const cv::Vec3f normal = grid_normal(original, cv::Vec3f(static_cast<float>(x),
-                                                                         static_cast<float>(y),
-                                                                         0.0f));
+                const cv::Vec3f normal = surf->gridNormal(y, x);
                 if (!normal_is_valid(normal)) {
                     continue;
                 }
@@ -353,7 +354,7 @@ int process_tifxyz(const std::filesystem::path& src,
     outSurf.id = uuid;
 
     if (surf->meta) {
-        outSurf.meta = new nlohmann::json(*surf->meta);
+        outSurf.meta = std::make_unique<nlohmann::json>(*surf->meta);
     }
 
     try {
@@ -416,7 +417,7 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group << " " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
     std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
-    ChunkCache chunk_cache(cfg.cache_bytes);
+    ChunkCache<uint8_t> chunk_cache(cfg.cache_bytes);
 
     DSReader reader = {ds.get(), cfg.reader_scale, &chunk_cache};
 

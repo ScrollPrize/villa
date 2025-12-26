@@ -1,22 +1,27 @@
 configure_file(src/Version.cpp.in Version.cpp)
 
 add_library(vc_core
-        src/DiskBasedObjectBaseClass.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
-        src/Metadata.cpp
         src/Segmentation.cpp
         src/Volume.cpp
         src/VolumePkg.cpp
         src/ChunkedTensor.cpp
         src/SurfacePatchIndex.cpp
+        src/PointIndex.cpp
         src/Logging.cpp
+        src/ChunkCache.cpp
         src/Slicing.cpp
-        src/Surface.cpp
+        src/Compositing.cpp
+        src/PlaneSurface.cpp
+        src/QuadSurface.cpp
         src/Render.cpp
+        src/Tiff.cpp
+        src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/ABFFlattening.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
@@ -25,13 +30,13 @@ target_link_libraries(vc_core
         opencv_core
         opencv_imgproc
         opencv_imgcodecs
-        opencv_highgui
         opencv_calib3d
         opencv_video
         nlohmann_json::nlohmann_json
         z5
         OpenMP::OpenMP_CXX
         tiff
+        OpenABF
         #${CURL_LIBRARIES}
         #${OPENSSL_LIBRARIES}
         #${ZLIB_LIBRARIES}

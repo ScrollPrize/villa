@@ -3,6 +3,7 @@
 #include <QString>
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <utility>
@@ -16,7 +17,7 @@
 
 class QuadSurface;
 class Volume;
-class ChunkCache;
+template <typename T> class ChunkCache;
 
 enum class SegmentationGrowthMethod {
     Tracer = 0,
@@ -152,10 +153,14 @@ struct SegmentationGrowthRequest {
 struct TracerGrowthContext {
     QuadSurface* resumeSurface{nullptr};
     class Volume* volume{nullptr};
-    class ChunkCache* cache{nullptr};
+    class ChunkCache<uint8_t>* cache{nullptr};
     QString cacheRoot;
     double voxelSize{1.0};
     QString normalGridPath;
+    // For corrections annotation saving
+    std::filesystem::path volpkgRoot;
+    std::vector<std::string> volumeIds;
+    std::string growthVolumeId;
 };
 
 struct TracerGrowthResult {

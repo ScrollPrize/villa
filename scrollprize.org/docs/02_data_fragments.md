@@ -64,47 +64,47 @@ For more technical details, see [EduceLab-Scrolls: Verifiable Recovery of Text f
 
 > ⚠️3D x-ray scan volumes of Fragments 5-6 are aligned, but Fragments 1-4 are NOT aligned.
 
-### Fragment 1 (PHerc. Paris 2 Fr 47)
+### PHerc. Paris 2 Fr 47 (Fragment 1)
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[200px]"><img src="/img/data/fr1.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 1 (PHerc. Paris. 2 Fr 47)</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[200px]"><img src="/img/data/fr1.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 2 Fr 47 (Fragment 1)</figcaption></div>
 </div>
 <p>Volume [20230205142449](https://dl.ash2txt.org/fragments/Frag1/PHercParis2Fr47.volpkg/volumes/20230205142449/): 3.24µm, 54keV, 7219 x 20MB .tif files. Total size: 145 GB</p>
 <p>Volume [20230213100222](https://dl.ash2txt.org/fragments/Frag1/PHercParis2Fr47.volpkg/volumes/20230213100222/): 3.24µm, 88keV, 7229 x 24MB .tif files. Total size: 171 GB</p>
 
-### Fragment 2 (PHerc. Paris 2 Fr 143)
+### PHerc. Paris 2 Fr 143 (Fragment 2)
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[200px]"><img src="/img/data/fr2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 2 (PHerc. Paris. 2 Fr 143)</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[200px]"><img src="/img/data/fr2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 2 Fr 143 (Fragment 2)</figcaption></div>
 </div>
 <p>Volume [20230216174557](https://dl.ash2txt.org/fragments/Frag2/PHercParis2Fr143.volpkg/volumes/20230216174557/): 3.24µm, 54keV, 14111 x 46MB .tif files. Total size: 645 GB</p>
 <p>Volume [20230226143835](https://dl.ash2txt.org/fragments/Frag2/PHercParis2Fr143.volpkg/volumes/20230226143835/): 3.24µm, 88keV, 14144 x 43MB .tif files. Total size: 599 GB</p>
 
 
-### Fragment 3 (PHerc. Paris 1 Fr 34)
+### PHerc. Paris 1 Fr 34 (Fragment 3)
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[220px]"><img src="/img/data/fr3.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 3 (PHerc. Paris. 1 Fr 34)</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[220px]"><img src="/img/data/fr3.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 1 Fr 34 (Fragment 3)</figcaption></div>
 </div>
 <p>Volume [20230212182547](https://dl.ash2txt.org/fragments/Frag3/PHercParis1Fr34.volpkg/volumes/20230212182547/): 3.24µm, 88keV, 6650 x 20MB .tif files. Total size: 134 GB</p>
 <p>Volume [20230215142309](https://dl.ash2txt.org/fragments/Frag3/PHercParis1Fr34.volpkg/volumes/20230215142309/): 3.24µm, 54keV, 6656 x 18MB .tif files. Total size: 121 GB</p>
 
-### Fragment 4 (PHerc. Paris 1 Fr 39)
+### PHerc. Paris 1 Fr 39 (Fragment 4)
 Originally held back for automated scoring in the [Kaggle](https://kaggle.com/competitions/vesuvius-challenge-ink-detection/) competition, this fragment has since been released.
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[170px]"><img src="/img/data/fr4.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 4 (PHerc. Paris. 1 Fr 39)</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[170px]"><img src="/img/data/fr4.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 1 Fr 39 (Fragment 4)</figcaption></div>
 </div>
 <p>Volume [20230215185642](https://dl.ash2txt.org/fragments/Frag4/PHercParis1Fr39.volpkg/volumes/20230215185642/): 3.24µm, 54keV, 9231 x 23MB .tif files. Total size: 211 GB</p>
 <p>Volume [20230222173037](https://dl.ash2txt.org/fragments/Frag4/PHercParis1Fr39.volpkg/volumes/20230222173037/): 3.24µm, 88keV, 9209 x 24MB .tif files. Total size: 216 GB</p>
 
-### Fragment 5 (PHerc. 1667 Cr 1 Fr 3)
+### PHerc. 1667 Cr 1 Fr 3 (Fragment 5)
 From the same original scroll as Scroll 4 (PHerc. 1667), which was partially opened in 1987 using the Oslo method. Find this fragment on [Chartes.it](https://www.chartes.it/index.php?r=document/view&id=1691).
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[300px]"><img src="/img/data/fr5-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 5 (PHerc. 1667 Cr 1 Fr 3)</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[300px]"><img src="/img/data/fr5-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 1667 Cr 1 Fr 3 (Fragment 5)</figcaption></div>
 </div>
 <p>Volume [20231121133215](https://dl.ash2txt.org/fragments/Frag5/PHerc1667Cr1Fr3.volpkg/volumes/20231121133215/): 3.24µm, 70keV, 7010 x 13MB .tif files. Total size: 87 GB</p>
 <p>Volume [20231130111236](https://dl.ash2txt.org/fragments/Frag5/PHerc1667Cr1Fr3.volpkg/volumes/20231130111236/): 7.91µm, 70keV, 3131 x 3MB .tif files. Total size: 8.5 GB</p>
 
-### Fragment 6 (PHerc. 51 Cr 4 Fr 8)
+### PHerc. 51 Cr 4 Fr 8 (Fragment 6)
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] mb-2 mr-2 max-w-[325px]"><img src="/img/data/fr6-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Fragment 6 (PHerc. 51 Cr 4 Fr 48)</figcaption></div>
+  <div className="w-[45%] mb-2 mr-2 max-w-[325px]"><img src="/img/data/fr6-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 51 Cr 4 Fr 8 (Fragment 6)</figcaption></div>
 </div>
 <p>Volume [20231121152933](https://dl.ash2txt.org/fragments/Frag6/PHerc51Cr4Fr8.volpkg/volumes/20231121152933/): 3.24µm, 53keV, 8855 x 29MB .tif files. Total size: 253 GB</p>
 <p>Volume [20231130112027](https://dl.ash2txt.org/fragments/Frag6/PHerc51Cr4Fr8.volpkg/volumes/20231130112027/): 7.91µm, 53keV, 3683 x 6MB .tif files. Total size: 21 GB</p>
@@ -123,7 +123,7 @@ From the same original scroll as Scroll 4 (PHerc. 1667), which was partially ope
 
 ## 2 · ESRF Fragments (BM18, Grenoble — May 2025)
 
-Between **6 May 2025 and 12 May 2025** we scanned three additional fragments on the brand‑new **BM18** 4th‑generation beamline at the European Synchrotron Radiation Facility.  Phase‑contrast helical CT, ultrafine 2.2 µm voxels, and generous sample‑to‑detector distances were explored to squeeze out every bit of ink contrast.
+Between **6 May 2025 and 12 May 2025** we scanned three additional fragments on the **BM18** beamline at the 4th‑generation European Synchrotron Radiation Facility (ESRF).  Phase‑contrast helical CT, ultrafine 2.2 µm voxels, and several sample‑to‑detector distances were explored.
 
 👉 **Draft info‑sheet**: <a href="https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing" target="_blank" rel="noopener">ESRF Fragment Data (May 2025)</a>
 
@@ -154,8 +154,11 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0009B-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 9B – infrared</figcaption></div>
 </div>
-- **4.320 µm, 116 keV (bin×2)** · OME‑Zarr
-- Multispectral stack (16 bands)  
+Data available [here](https://data.aws.ash2txt.org/samples/PHerc0009B/) and [here](https://dl.ash2txt.org/fragments/PHerc0009B/).
+- Volume [20250521125136](https://data.aws.ash2txt.org/samples/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/) , 8.64µm, 1.2m propagation distance, 116keV average incident energy. uint8 OME-Zarr archive. Total size: 72.4 GB
+- Volume [20250820154339](https://data.aws.ash2txt.org/samples/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/) , 2.40µm, 0.3m propagation distance, 77keV average incident energy. uint8 OME-Zarr archive. Total size: 1.7 TB
+- Multispectral stack (16 bands)
+- Unwrapped segments
 - Case + mesh STL
 
 > **Preliminary ink detection**  – Our TimesFormer ML models already pick up discrete strokes in the 2.2 µm volumes of 343P and 500P2.  For a sneak‑peek see the [blog post](https://scrollprize.substack.com/p/summer-haze-comes-with-ink).  Surface volumes & precise IR alignment are coming soon.

@@ -20,6 +20,7 @@ public:
     void setAxisAlignedEnabled(bool enabled);
     void setRotationSetter(std::function<void(const std::string&, float)> setter);
     void setAxisAlignedOverlayOpacity(float opacity);
+    void setRotationFinishedCallback(std::function<void()> callback);
     float axisAlignedOverlayOpacity() const { return _overlayOpacity; }
 
     bool isVolumePointNearRotationHandle(CVolumeViewer* viewer,
@@ -80,6 +81,7 @@ private:
     CSurfaceCollection* _surfaces{nullptr};
     bool _axisAlignedEnabled{false};
     std::function<void(const std::string&, float)> _rotationSetter;
+    std::function<void()> _rotationFinishedCallback;
     float _overlayOpacity{0.7f};
 
     mutable std::unordered_map<CVolumeViewer*, ViewerState> _viewerStates;

@@ -1,6 +1,9 @@
 #include "SegmentationEditManager.hpp"
 
+#include "ViewerManager.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -9,27 +12,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <nlohmann/json.hpp>
-
 namespace
 {
 bool isInvalidPoint(const cv::Vec3f& value)
 {
     return !std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) ||
            (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
-}
-
-void syncMaskChannel(QuadSurface* dst, QuadSurface* src)
-{
-    if (!dst || !src) {
-        return;
-    }
-    cv::Mat mask = src->channel("mask");
-    if (mask.empty()) {
-        dst->setChannel("mask", cv::Mat());
-    } else {
-        dst->setChannel("mask", mask);
-    }
 }
 
 void ensureSurfaceMetaObject(QuadSurface* surface)
@@ -40,10 +28,7 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (surface->meta && surface->meta->is_object()) {
         return;
     }
-    if (surface->meta) {
-        delete surface->meta;
-    }
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
 }
 
@@ -52,40 +37,32 @@ SegmentationEditManager::SegmentationEditManager(QObject* parent)
 {
 }
 
-bool SegmentationEditManager::beginSession(QuadSurface* baseSurface)
+bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurface)
 {
     if (!baseSurface) {
         return false;
     }
 
-    ensureSurfaceMetaObject(baseSurface);
+    ensureSurfaceMetaObject(baseSurface.get());
+
+    auto* basePoints = baseSurface->rawPointsPtr();
+    if (!basePoints || basePoints->empty()) {
+        return false;
+    }
 
     _baseSurface = baseSurface;
     _gridScale = baseSurface->scale();
     resetPointerSeed();
 
-    _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(baseSurface->rawPoints().clone());
-    auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
-    _previewSurface = std::make_unique<QuadSurface>(previewMatrix, baseSurface->scale());
-    if (_previewSurface->meta) {
-        delete _previewSurface->meta;
-        _previewSurface->meta = nullptr;
-    }
-    if (baseSurface->meta) {
-        _previewSurface->meta = new nlohmann::json(*baseSurface->meta);
-    }
-    _previewSurface->path = baseSurface->path;
-    _previewSurface->id = baseSurface->id;
-    syncMaskChannel(_previewSurface.get(), baseSurface);
-    _previewPoints = _previewSurface->rawPointsPtr();
+    _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(basePoints->clone());
+    _previewPoints = basePoints;
 
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
     rebuildPreviewFromOriginal();
-    _editedBounds.reset();
 
-    _dirty = false;
+    _hasPendingEdits = false;
     _pendingGrowthMarking = false;
     return true;
 }
@@ -95,14 +72,12 @@ void SegmentationEditManager::endSession()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _editedBounds.reset();
 
-    _previewSurface.reset();
     _previewPoints = nullptr;
     _originalPoints.reset();
-    _baseSurface = nullptr;
+    _baseSurface.reset();
     resetPointerSeed();
-    _dirty = false;
+    _hasPendingEdits = false;
     _pendingGrowthMarking = false;
 }
 
@@ -131,8 +106,17 @@ const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
     return kEmpty;
 }
 
+cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPointsMutable()
+{
+    static cv::Mat_<cv::Vec3f> kEmpty;
+    if (_previewPoints) {
+        return *_previewPoints;
+    }
+    return kEmpty;
+}
+
 bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                                               bool dirtyState,
+                                               bool markAsPendingEdit,
                                                std::optional<cv::Rect>* outDiffBounds)
 {
     if (outDiffBounds) {
@@ -182,8 +166,7 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
         points.copyTo(*_originalPoints);
     }
     _editedVertices.clear();
-    _dirty = dirtyState;
-    _editedBounds.reset();
+    _hasPendingEdits = markAsPendingEdit;
 
     if (outDiffBounds) {
         if (diffFound) {
@@ -205,18 +188,13 @@ void SegmentationEditManager::resetPreview()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _editedBounds.reset();
-    _dirty = false;
+    _hasPendingEdits = false;
 }
 
 void SegmentationEditManager::applyPreview()
 {
-    if (!_baseSurface || !_previewPoints) {
+    if (!_previewPoints) {
         return;
-    }
-
-    if (auto* basePoints = _baseSurface->rawPointsPtr()) {
-        _previewPoints->copyTo(*basePoints);
     }
 
     if (_originalPoints) {
@@ -226,8 +204,7 @@ void SegmentationEditManager::applyPreview()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _editedBounds.reset();
-    _dirty = false;
+    _hasPendingEdits = false;
 }
 
 void SegmentationEditManager::refreshFromBaseSurface()
@@ -245,15 +222,14 @@ void SegmentationEditManager::refreshFromBaseSurface()
         current.copyTo(*_originalPoints);
     }
 
-    if (!_previewSurface) {
-        auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
-        _previewSurface = std::make_unique<QuadSurface>(previewMatrix, _baseSurface->scale());
-        _previewPoints = _previewSurface->rawPointsPtr();
+    _previewPoints = _baseSurface->rawPointsPtr();
+    if (!_previewPoints) {
+        _hasPendingEdits = !_editedVertices.empty();
+        return;
     }
-    syncMaskChannel(_previewSurface.get(), _baseSurface);
 
     rebuildPreviewFromOriginal();
-    _dirty = !_editedVertices.empty();
+    _hasPendingEdits = !_editedVertices.empty();
 }
 
 bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexRect)
@@ -278,14 +254,16 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     baseRegion.copyTo(originalRegion);
 
     cv::Mat_<cv::Vec3f>* previewMatrix = _previewPoints;
-    if (!previewMatrix && _previewSurface) {
-        previewMatrix = _previewSurface->rawPointsPtr();
+    if (!previewMatrix && _baseSurface) {
+        previewMatrix = _baseSurface->rawPointsPtr();
         _previewPoints = previewMatrix;
     }
-    if (previewMatrix) {
-        cv::Mat previewRegion(*previewMatrix, clipped);
-        baseRegion.copyTo(previewRegion);
+    if (!previewMatrix) {
+        return false;
     }
+
+    cv::Mat previewRegion(*previewMatrix, clipped);
+    baseRegion.copyTo(previewRegion);
 
     auto containsKey = [&](const GridKey& key) {
         return key.row >= clipped.y && key.row < clipped.y + clipped.height &&
@@ -303,11 +281,7 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     }
 
     if (removedEdits) {
-        _editedBounds.reset();
-        for (const auto& entry : _editedVertices) {
-            expandEditedBounds(entry.first.row, entry.first.col);
-        }
-        _dirty = !_editedVertices.empty();
+        _hasPendingEdits = !_editedVertices.empty();
     }
 
     if (!_recentTouched.empty()) {
@@ -358,16 +332,12 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
         _pointerSeed = ptr;
         _pointerSeedValid = true;
     }
-    const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400);
+    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+    const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
     _pointerSeed = ptr;
     cv::Vec3f raw = _baseSurface->loc_raw(ptr);
 
-    const cv::Mat_<cv::Vec3f>* points = nullptr;
-    if (_previewPoints) {
-        points = _previewPoints;
-    } else if (_previewSurface) {
-        points = _previewSurface->rawPointsPtr();
-    }
+    const cv::Mat_<cv::Vec3f>* points = _previewPoints;
     if (!points) {
         points = _baseSurface->rawPointsPtr();
     }
@@ -592,12 +562,11 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
         _activeDrag.targetWorld = newWorldPositions.front();
     }
 
-    _dirty = true;
+    _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
         _pendingGrowthMarking = false;
     }
 
-    publishDirtyBoundsFromRecentTouched();
     return true;
 }
 
@@ -742,8 +711,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
     }
 
     _recentTouched.assign(regionVec.begin(), regionVec.end());
-    _dirty = true;
-    publishDirtyBoundsFromRecentTouched();
+    _hasPendingEdits = true;
     return true;
 }
 
@@ -770,6 +738,25 @@ void SegmentationEditManager::cancelActiveDrag()
 
     _recentTouched.clear();
     clearActiveDrag();
+}
+
+void SegmentationEditManager::refreshActiveDragBasePositions()
+{
+    if (!_activeDrag.active || !_previewPoints) {
+        return;
+    }
+
+    // Update each sample's baseWorld to current preview position
+    // This allows reusing samples across continuous push/pull ticks
+    for (auto& sample : _activeDrag.samples) {
+        sample.baseWorld = (*_previewPoints)(sample.row, sample.col);
+    }
+
+    // Also update the center baseWorld
+    if (!_activeDrag.samples.empty()) {
+        const auto& center = _activeDrag.center;
+        _activeDrag.baseWorld = (*_previewPoints)(center.row, center.col);
+    }
 }
 
 std::vector<SegmentationEditManager::VertexEdit> SegmentationEditManager::editedVertices() const
@@ -804,44 +791,6 @@ std::optional<cv::Rect> SegmentationEditManager::recentTouchedBounds() const
     return rect;
 }
 
-void SegmentationEditManager::publishDirtyBounds(const cv::Rect& vertexRect)
-{
-    if (!_previewSurface || vertexRect.width <= 0 || vertexRect.height <= 0) {
-        return;
-    }
-
-    ensureSurfaceMetaObject(_previewSurface.get());
-
-    auto& meta = *_previewSurface->meta;
-    int version = 0;
-    if (meta.contains("dirty_bounds_version") && meta["dirty_bounds_version"].is_number_integer()) {
-        version = meta["dirty_bounds_version"].get<int>();
-    }
-    if (version == std::numeric_limits<int>::max()) {
-        version = 0;
-    }
-    ++version;
-
-    meta["dirty_bounds_version"] = version;
-    nlohmann::json bounds = {
-        {"row_start", vertexRect.y},
-        {"row_end", vertexRect.y + vertexRect.height},
-        {"col_start", vertexRect.x},
-        {"col_end", vertexRect.x + vertexRect.width},
-        {"version", version}
-    };
-    meta["dirty_bounds"] = std::move(bounds);
-}
-
-void SegmentationEditManager::publishDirtyBoundsFromRecentTouched()
-{
-    auto bounds = recentTouchedBounds();
-    if (!bounds) {
-        return;
-    }
-    publishDirtyBounds(*bounds);
-}
-
 void SegmentationEditManager::markNextEditsAsGrowth()
 {
     _pendingGrowthMarking = true;
@@ -857,7 +806,7 @@ void SegmentationEditManager::bakePreviewToOriginal()
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
-    _dirty = false;
+    _hasPendingEdits = false;
 }
 
 bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int radius)
@@ -891,7 +840,7 @@ bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int
     }
 
     if (changed) {
-        _dirty = true;
+        _hasPendingEdits = true;
     }
 
     return changed;
@@ -951,7 +900,6 @@ bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, fl
 
     if (changed) {
         _recentTouched = std::move(touched);
-        publishDirtyBoundsFromRecentTouched();
     } else {
         _recentTouched.clear();
     }
@@ -979,14 +927,7 @@ void SegmentationEditManager::clearInvalidatedEdits()
         _recentTouched.clear();
     }
 
-    _dirty = !_editedVertices.empty();
-}
-
-std::optional<cv::Rect> SegmentationEditManager::takeEditedBounds()
-{
-    auto bounds = _editedBounds;
-    _editedBounds.reset();
-    return bounds;
+    _hasPendingEdits = !_editedVertices.empty();
 }
 
 bool SegmentationEditManager::isInvalidPoint(const cv::Vec3f& value)
@@ -1009,19 +950,6 @@ void SegmentationEditManager::rebuildPreviewFromOriginal()
         }
         (*_previewPoints)(key.row, key.col) = edit.currentWorld;
     }
-}
-
-void SegmentationEditManager::ensurePreviewAvailable()
-{
-    if (_previewPoints) {
-        return;
-    }
-    if (!_originalPoints) {
-        return;
-    }
-    auto* previewMatrix = new cv::Mat_<cv::Vec3f>(_originalPoints->clone());
-    _previewSurface = std::make_unique<QuadSurface>(previewMatrix, _gridScale);
-    _previewPoints = _previewSurface->rawPointsPtr();
 }
 
 bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& gridIndex)
@@ -1117,12 +1045,10 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
         _recentTouched.push_back(GridKey{sample.row, sample.col});
     }
 
-    _dirty = true;
+    _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
         _pendingGrowthMarking = false;
     }
-
-    publishDirtyBoundsFromRecentTouched();
 }
 
 void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f& newWorld)
@@ -1141,6 +1067,16 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
 
     GridKey key{row, col};
     const float delta = static_cast<float>(cv::norm(newWorld - original));
+
+    // Queue cell updates in SurfacePatchIndex for R-tree sync
+    if (_viewerManager && _baseSurface) {
+        if (auto* index = _viewerManager->surfacePatchIndex()) {
+            index->queueCellUpdateForVertex(_baseSurface, row, col);
+        }
+    }
+    _hasPendingEdits = true;
+
+    // But only track in _editedVertices if change is significant
     if (delta < 1e-4f) {
         _editedVertices.erase(key);
         return;
@@ -1155,28 +1091,6 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
             it->second.isGrowth = true;
         }
     }
-
-    expandEditedBounds(row, col);
-    _dirty = true;
-}
-
-void SegmentationEditManager::expandEditedBounds(int row, int col)
-{
-    cv::Rect rect(col, row, 1, 1);
-    if (!_editedBounds) {
-        _editedBounds = rect;
-        return;
-    }
-
-    auto& bounds = *_editedBounds;
-    const int left = std::min(bounds.x, rect.x);
-    const int top = std::min(bounds.y, rect.y);
-    const int right = std::max(bounds.x + bounds.width, rect.x + rect.width);
-    const int bottom = std::max(bounds.y + bounds.height, rect.y + rect.height);
-    bounds.x = left;
-    bounds.y = top;
-    bounds.width = right - left;
-    bounds.height = bottom - top;
 }
 
 void SegmentationEditManager::clearActiveDrag()

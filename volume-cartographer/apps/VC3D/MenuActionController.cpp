@@ -5,9 +5,6 @@
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "OpChain.hpp"
-#include "OpsList.hpp"
-#include "OpsSettings.hpp"
 #include "CVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
@@ -19,7 +16,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/JsonSafe.hpp"
+#include "vc/core/util/LoadJson.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -31,6 +28,8 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QMainWindow>
+#include <QMdiArea>
+#include <QMdiSubWindow>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -187,12 +186,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(qWindow->ui.dockWidgetVolumes->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetSegmentation->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDistanceTransform->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetOpList->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDrawing->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetOpSettings->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetComposite->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetPreprocessing->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetPostprocessing->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetView->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetOverlay->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetRenderSettings->toggleViewAction());
 
     if (qWindow->_point_collection_widget) {
         _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
@@ -248,13 +248,13 @@ void MenuActionController::ensureRecentActions()
 QStringList MenuActionController::loadRecentPaths() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    return settings.value("volpkg/recent").toStringList();
+    return settings.value(vc3d::settings::volpkg::RECENT).toStringList();
 }
 
 void MenuActionController::saveRecentPaths(const QStringList& paths)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue("volpkg/recent", paths);
+    settings.setValue(vc3d::settings::volpkg::RECENT, paths);
 }
 
 void MenuActionController::refreshRecentMenu()
@@ -371,7 +371,8 @@ void MenuActionController::showSettingsDialog()
     dialog->exec();
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    bool showDirHints = settings.value("viewer/show_direction_hints", true).toBool();
+    bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
+                                       vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
     if (_window->_viewerManager) {
         _window->_viewerManager->forEachViewer([showDirHints](CVolumeViewer* viewer) {
             if (viewer) {
@@ -413,50 +414,74 @@ void MenuActionController::showKeybindings()
         _window,
         QObject::tr("Keybindings for Volume Cartographer"),
         QObject::tr(
-            "Keyboard: \n"
-            "------------------- \n"
-            "FIXME FIXME FIXME \n"
-            "------------------- \n"
-            "Ctrl+O: Open Volume Package \n"
-            "Ctrl+S: Save Volume Package \n"
-            "A,D: Impact Range down/up \n"
-            "[, ]: Alternative Impact Range down/up \n"
-            "Q,E: Slice scan range down/up (mouse wheel scanning) \n"
-            "Arrow Left/Right: Slice down/up by 1 \n"
-            "1,2: Slice down/up by 1 \n"
-            "3,4: Slice down/up by 5 \n"
-            "5,6: Slice down/up by 10 \n"
-            "7,8: Slice down/up by 50 \n"
-            "9,0: Slice down/up by 100 \n"
-            "Ctrl+J: Toggle axis-aligned slice planes \n"
-            "Ctrl+T: Toggle direction hints (flip_x arrows) \n"
-            "T: Segmentation Tool \n"
-            "P: Pen Tool \n"
-            "Space: Toggle Curve Visibility \n"
-            "C: Alternate Toggle Curve Visibility \n"
-            "J: Highlight Next Curve that is selected for computation \n"
-            "K: Highlight Previous Curve that is selected for computation \n"
-            "F: Return to slice that the currently active tool was started on \n"
-            "L: Mark/unmark current slice as anchor (only in Segmentation Tool) \n"
-            "Y/Z/V: Evenly space Points on Curve (only in Segmentation Tool) \n"
-            "U: Rotate view counterclockwise \n"
-            "O: Rotate view clockwise \n"
-            "X/I: Reset view rotation back to zero \n"
+            "=== File Menu ===\n"
+            "Ctrl+O: Open Volume Package\n"
+            "Ctrl+I: Inpaint (Telea) & Rebuild Segment\n"
             "\n"
-            "Mouse: \n"
-            "------------------- \n"
-            "Mouse Wheel: Scroll up/down \n"
-            "Mouse Wheel + Alt: Scroll left/right \n"
-            "Mouse Wheel + Ctrl: Zoom in/out \n"
-            "Mouse Wheel + Shift: Next/previous slice \n"
-            "Mouse Wheel + W Key Hold: Change impact range \n"
-            "Mouse Wheel + R Key Hold: Follow Highlighted Curve \n"
-            "Mouse Wheel + S Key Hold: Rotate view \n"
-            "Mouse Left Click: Add Points to Curve in Pen Tool. Snap Closest Point to Cursor in Segmentation Tool. \n"
-            "Mouse Left Drag: Drag Point / Curve after Mouse Left Click \n"
-            "Mouse Right Drag: Pan slice image\n"
-            "Mouse Back/Forward Button: Follow Highlighted Curve \n"
-            "Highlighting Segment ID: Shift/(Alt as well as Ctrl) Modifier to jump to Segment start/end."));
+            "=== View Menu ===\n"
+            "Ctrl+J: Toggle axis-aligned slice planes\n"
+            "Ctrl+T: Toggle direction hints (flip_x arrows)\n"
+            "C: Toggle composite view\n"
+            "Ctrl+Shift+D: Toggle drawing mode\n"
+            "Space: Toggle volume overlay visibility\n"
+            "\n"
+            "=== Viewer Controls ===\n"
+            "Ctrl+Tab: Cycle between viewers\n"
+            "Shift+=: Zoom in (active viewer)\n"
+            "Shift+-: Zoom out (active viewer)\n"
+            "M: Reset view (fit surface and reset Z offset)\n"
+            "Ctrl+.: Z offset deeper (surface normal direction)\n"
+            "Ctrl+,: Z offset closer (surface normal direction)\n"
+            "Arrow Keys: Pan view\n"
+            "\n"
+            "=== Navigation ===\n"
+            "R: Center focus on cursor\n"
+            "F: Step backward in focus history\n"
+            "Ctrl+F: Step forward in focus history\n"
+            "\n"
+            "=== Segmentation Editing ===\n"
+            "Ctrl+Z: Undo last change (segmentation or approval mask)\n"
+            "Shift (hold): Activate invalidation brush\n"
+            "S (hold): Line draw mode\n"
+            "E: Apply pending brush changes\n"
+            "T: Create correction annotation\n"
+            "Escape: Cancel current drag/operation\n"
+            "\n"
+            "=== Approval Mask ===\n"
+            "B: Toggle approval painting (when mask is shown)\n"
+            "N: Toggle unapproval painting (when mask is shown)\n"
+            "Ctrl+B: Undo last approval mask stroke\n"
+            "\n"
+            "=== Segmentation Growth ===\n"
+            "Ctrl+G: Grow segmentation (all directions)\n"
+            "1: Grow left\n"
+            "2: Grow up\n"
+            "3: Grow down\n"
+            "4: Grow right\n"
+            "5: Grow all directions\n"
+            "6: Grow one step (all directions)\n"
+            "\n"
+            "=== Push/Pull ===\n"
+            "A (hold): Push (move inward)\n"
+            "D (hold): Pull (move outward)\n"
+            "Ctrl+A/D: Push/Pull with alpha override\n"
+            "Q: Decrease push/pull radius\n"
+            "E: Increase push/pull radius\n"
+            "\n"
+            "=== Point Collection ===\n"
+            "Delete: Remove selected point\n"
+            "\n"
+            "=== Mouse Controls ===\n"
+            "Left Click: Select/Add point or drag surface\n"
+            "Left Drag: Drag surface point or draw with active tool\n"
+            "Right Drag: Pan slice image\n"
+            "Middle Drag: Pan (if enabled)\n"
+            "Mouse Wheel: Zoom in/out (when editing: adjust tool radius)\n"
+            "Shift+Scroll Wheel: Pan through slices\n"
+            "\n"
+            "=== Slice Step Size ===\n"
+            "Shift+G: Decrease slice step size\n"
+            "Shift+H: Increase slice step size\n"));
 }
 
 void MenuActionController::exitApplication()
@@ -518,13 +543,13 @@ void MenuActionController::generateReviewReport()
     double grandTotalArea = 0.0;
 
     for (const auto& id : _window->fVpkg->getLoadedSurfaceIDs()) {
-        auto surfMeta = _window->fVpkg->getSurface(id);
-        if (!surfMeta || !surfMeta->surface() || !surfMeta->surface()->meta) {
+        auto surf = _window->fVpkg->getSurface(id);
+        if (!surf || !surf->meta) {
             continue;
         }
 
-        nlohmann::json* meta = surfMeta->surface()->meta;
-        const auto tags = vc::json_safe::tags_or_empty(meta);
+        nlohmann::json* meta = surf->meta.get();
+        const auto tags = vc::json::tags_or_empty(meta);
         const auto itReviewed = tags.find("reviewed");
         if (itReviewed == tags.end() || !itReviewed->is_object()) {
             continue;
@@ -533,23 +558,23 @@ void MenuActionController::generateReviewReport()
         const nlohmann::json& reviewed = *itReviewed;
 
         QString reviewDate = "Unknown";
-        const std::string reviewDateRaw = vc::json_safe::string_or(&reviewed, "date", std::string{});
+        const std::string reviewDateRaw = vc::json::string_or(&reviewed, "date", std::string{});
         if (!reviewDateRaw.empty()) {
             reviewDate = QString::fromStdString(reviewDateRaw).left(10);
         } else {
-            QFileInfo metaFile(QString::fromStdString(surfMeta->path.string()) + "/meta.json");
+            QFileInfo metaFile(QString::fromStdString(surf->path.string()) + "/meta.json");
             if (metaFile.exists()) {
                 reviewDate = metaFile.lastModified().toString("yyyy-MM-dd");
             }
         }
 
         QString username = "Unknown";
-        const std::string reviewerUser = vc::json_safe::string_or(&reviewed, "user", std::string{});
+        const std::string reviewerUser = vc::json::string_or(&reviewed, "user", std::string{});
         if (!reviewerUser.empty()) {
             username = QString::fromStdString(reviewerUser);
         }
 
-        const double area = vc::json_safe::number_or(meta, "area_cm2", 0.0);
+        const double area = vc::json::number_or(meta, "area_cm2", 0.0);
 
         dailyStats[reviewDate][username].totalArea += area;
         dailyStats[reviewDate][username].surfaceCount++;
@@ -646,8 +671,8 @@ void MenuActionController::surfaceFromSelection()
         return;
     }
 
-    auto surfMeta = _window->fVpkg->getSurface(_window->_surfID);
-    std::filesystem::path baseSegPath = surfMeta->path;
+    auto surf = _window->fVpkg->getSurface(_window->_surfID);
+    std::filesystem::path baseSegPath = surf->path;
     std::filesystem::path parentDir = baseSegPath.parent_path();
 
     int idx = 1;
@@ -720,13 +745,13 @@ void MenuActionController::runTeleaInpaint()
 
     for (QTreeWidgetItem* item : selectedItems) {
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-        auto surfMeta = _window->fVpkg ? _window->fVpkg->getSurface(id) : nullptr;
-        if (!surfMeta) {
+        auto surf = _window->fVpkg ? _window->fVpkg->getSurface(id) : nullptr;
+        if (!surf) {
             ++failCount;
             continue;
         }
 
-        const std::filesystem::path segDir = surfMeta->path;
+        const std::filesystem::path segDir = surf->path;
         const std::filesystem::path parentDir = segDir.parent_path();
         const std::filesystem::path metaJson = segDir / "meta.json";
 

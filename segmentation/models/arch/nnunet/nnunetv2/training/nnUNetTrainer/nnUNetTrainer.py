@@ -10,7 +10,6 @@ from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List, Optional
-from nnunetv2.training.nnUNetTrainer.variants.WandbWrapper import WandbWrapper
 
 import numpy as np
 import torch
@@ -244,10 +243,6 @@ class nnUNetTrainer(object):
         self._set_batch_size_and_oversample()
 
         self.was_initialized = False
-
-        # WandbWrapper initialization
-        self.wandb = WandbWrapper(use_wandb=yaml_config['wandb_enabled'], config=yaml_config)
-        self.wandb.init(local_rank=self.local_rank, config=yaml_config)
 
         self.print_to_log_file("\n#######################################################################\n"
                                "Please cite the following paper when using nnU-Net:\n"
@@ -1047,8 +1042,6 @@ class nnUNetTrainer(object):
 
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
-        if self.local_rank == 0:
-            self.wandb.finish()
 
     def on_train_epoch_start(self):
         self.network.train()
@@ -1088,12 +1081,8 @@ class nnUNetTrainer(object):
             self.grad_scaler.update()
         else:
             l.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-
-        if self.local_rank == 0:
-            self.wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
-            self.wandb.log({"grad_norm": grad_norm})
 
         return {'loss': l.detach().cpu().numpy()}
 
@@ -1213,27 +1202,6 @@ class nnUNetTrainer(object):
 
         mean_fg_dice = np.nanmean(global_dice_per_class)
 
-        # Improved WandB logging with clear per-class dice labels
-        # When using DDP, all processes should log validation metrics (not just rank 0)
-        # This ensures all ranks have the same logger state
-        
-        # WandB logging only happens on rank 0
-        if self.local_rank == 0:
-            dice_per_class_dict = {
-                f"dice/{label_name}": np.round(global_dice_per_class[label_idx - 1], 4)
-                for label_name, label_idx in self.dataset_json['labels'].items()
-                if label_idx != 0
-            }
-
-            log_dict = {
-                "epoch": self.current_epoch,
-                "val/loss": aggregated_loss,
-                "val/mean_fg_dice": mean_fg_dice,
-                **dice_per_class_dict
-            }
-
-            self.wandb.log(log_dict)
-        
         # ALL ranks must log validation metrics to keep logger state consistent across processes
         self.logger.log('val_losses', aggregated_loss, self.current_epoch)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
@@ -1258,39 +1226,17 @@ class nnUNetTrainer(object):
             2
         )
 
-        # Improved WandB logging (clean, structured)
-        if self.local_rank == 0:
-            log_dict = {
-                "epoch": self.current_epoch,
-                "train/loss": train_loss,
-                "val/loss": val_loss,
-                "val/avg_dice": dice_val_avg,
-                "epoch_time": epoch_time,
-                "learning_rate": self.optimizer.param_groups[0]['lr'],
-            }
-
-            # log per-class dice explicitly
-            for label_name, label_idx in self.dataset_json['labels'].items():
-                if label_idx == 0:
-                    continue
-                dice_idx = label_idx - 1
-                if 0 <= dice_idx < len(dice_scores):
-                    log_dict[f"dice/{label_name}"] = np.round(dice_scores[dice_idx], 4)
-
-            # EMA dice logging
-            current_ema_dice = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-            log_dict["val/ema_dice"] = current_ema_dice
-
-            if self._best_ema is None or current_ema_dice > self._best_ema:
-                self._best_ema = current_ema_dice
-                log_dict["val/best_ema_dice"] = current_ema_dice
+        # Save best checkpoint based on EMA dice
+        current_ema_dice = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        if self._best_ema is None or current_ema_dice > self._best_ema:
+            self._best_ema = current_ema_dice
+            if self.local_rank == 0:
                 self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
-
-            self.wandb.log(log_dict)
 
         self.print_to_log_file('train_loss', train_loss)
         self.print_to_log_file('val_loss', val_loss)
         self.print_to_log_file('Pseudo dice', [np.round(d, 4) for d in dice_scores])
+        self.print_to_log_file(f'EMA dice: {np.round(current_ema_dice, 4)} (best: {np.round(self._best_ema, 4)})')
         self.print_to_log_file(f"Epoch time: {epoch_time} s")
 
         if self.local_rank == 0:
@@ -1332,7 +1278,7 @@ class nnUNetTrainer(object):
             self.initialize()
 
         if isinstance(filename_or_checkpoint, str):
-            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device)
+            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
         # if state dict comes from nn.DataParallel but we use non-parallel model here then the state dict keys do not
         # match. Use heuristic to make it match
         new_state_dict = {}

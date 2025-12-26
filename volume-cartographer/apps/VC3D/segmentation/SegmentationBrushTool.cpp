@@ -12,6 +12,8 @@
 #include <cmath>
 #include <unordered_set>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 namespace
 {
 constexpr float kBrushSampleSpacing = 2.0f;
@@ -170,7 +172,6 @@ bool SegmentationBrushTool::applyPending(float dragRadiusSteps)
         return false;
     }
 
-    bool snapshotCaptured = _module.captureUndoSnapshot();
     bool anyChanged = false;
     for (const auto& key : targets) {
         if (_editManager->markInvalidRegion(key.row, key.col, brushRadius)) {
@@ -181,14 +182,14 @@ bool SegmentationBrushTool::applyPending(float dragRadiusSteps)
     clear();
 
     if (!anyChanged) {
-        if (snapshotCaptured) {
-            _module.discardLastUndoSnapshot();
-        }
         return false;
     }
 
+    // Capture delta for undo after edits have been tracked
+    (void)_module.captureUndoDelta();
+
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     _module.emitPendingChanges();

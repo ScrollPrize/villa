@@ -30,10 +30,7 @@ list(APPEND project_warnings
     -Wunused
     -Wunused-macros
     -Wvla
-    -Wno-missing-braces
-    -Wno-switch-enum
-    -Wno-sign-conversion
-    -Wno-unused-function
+    -Wunused-parameter
 )
 
 # Clang specific?
@@ -90,11 +87,19 @@ list(APPEND project_warnings
     -Wunreachable-code-return
     -Wused-but-marked-unused
     -Wvexing-parse
-    -Wno-c++1z-extensions
-    -Wno-c++98-compat
-    -Wno-unknown-attributes
-    -Wno-shorten-64-to-32
     -Weverything
+    # Disable broken/noisy warnings
+    -Wno-unsafe-buffer-usage
+    -Wno-unsafe-buffer-usage-in-libc-call
+    # Disable compatibility warnings (we're using C++23)
+    -Wno-c++98-compat
+    -Wno-c++98-compat-pedantic
+    -Wno-c++98-compat-local-type-template-args
+    -Wno-c++98-compat-unnamed-type-template-args
+    -Wno-c++98-compat-extra-semi
+    -Wno-pre-c++14-compat
+    -Wno-pre-c++17-compat
+    -Wno-pre-c++23-compat
 )
 endif()
 

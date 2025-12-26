@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QVector>
 #include <QWidget>
 
@@ -22,6 +23,7 @@ class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
 class QPushButton;
+class QSlider;
 class QSpinBox;
 class QToolButton;
 class CollapsibleSettingsGroup;
@@ -87,6 +89,24 @@ public:
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
+    // Approval mask getters
+    [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
+    [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
+    [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
+    [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
+    [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
+    [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
+    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
+
+    // Approval mask setters
+    void setShowApprovalMask(bool enabled);
+    void setEditApprovedMask(bool enabled);
+    void setEditUnapprovedMask(bool enabled);
+    void setApprovalBrushRadius(float radius);
+    void setApprovalBrushDepth(float depth);
+    void setApprovalMaskOpacity(int opacity);
+    void setApprovalBrushColor(const QColor& color);
+
 signals:
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
@@ -113,6 +133,14 @@ signals:
     void correctionsAnnotateToggled(bool enabled);
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
+    void showApprovalMaskChanged(bool enabled);
+    void editApprovedMaskChanged(bool enabled);
+    void editUnapprovedMaskChanged(bool enabled);
+    void approvalBrushRadiusChanged(float radius);
+    void approvalBrushDepthChanged(float depth);
+    void approvalMaskOpacityChanged(int opacity);
+    void approvalBrushColorChanged(QColor color);
+    void approvalStrokesUndoRequested();
 
 private:
     void buildUi();
@@ -254,4 +282,24 @@ private:
     int _correctionsZMin{0};
     int _correctionsZMax{0};
     bool _correctionsAnnotateChecked{false};
+
+    // Approval mask state and UI
+    // Cylinder brush model: radius defines circle in plane views, depth defines cylinder height
+    bool _showApprovalMask{false};
+    bool _editApprovedMask{false};    // Editing in approve mode (mutually exclusive with unapprove)
+    bool _editUnapprovedMask{false};  // Editing in unapprove mode (mutually exclusive with approve)
+    float _approvalBrushRadius{50.0f};     // Cylinder radius (circle in plane views, rect width in flattened)
+    float _approvalBrushDepth{15.0f};      // Cylinder depth (rect height in flattened view)
+    int _approvalMaskOpacity{50};          // Mask overlay opacity (0-100, default 50%)
+    QColor _approvalBrushColor{0, 255, 0}; // RGB color for approval painting (default pure green)
+    CollapsibleSettingsGroup* _groupApprovalMask{nullptr};
+    QCheckBox* _chkShowApprovalMask{nullptr};
+    QCheckBox* _chkEditApprovedMask{nullptr};
+    QCheckBox* _chkEditUnapprovedMask{nullptr};
+    QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
+    QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
+    QSlider* _sliderApprovalMaskOpacity{nullptr};
+    QLabel* _lblApprovalMaskOpacity{nullptr};
+    QPushButton* _btnApprovalColor{nullptr};
+    QPushButton* _btnUndoApprovalStroke{nullptr};
 };

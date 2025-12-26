@@ -12,9 +12,9 @@
 #include <vector>
 
 class CSurfaceCollection;
+class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
-class OpChain;
 class VolumePkg;
 class CVolumeViewer;
 class VCCollection;
@@ -25,6 +25,9 @@ class QPushButton;
 class QStandardItemModel;
 class QuadSurface;
 class DropdownChecklistButton;
+
+// Forward declare for QuadSurface pointer usage
+#include "vc/core/util/QuadSurface.hpp"
 
 class SurfacePanelController : public QObject
 {
@@ -51,6 +54,7 @@ public:
         QCheckBox* hideUnapproved{nullptr};
         QCheckBox* inspectOnly{nullptr};
         QCheckBox* currentOnly{nullptr};
+        QLineEdit* surfaceIdFilter{nullptr};
     };
 
     struct TagUiRefs {
@@ -72,7 +76,6 @@ public:
     SurfacePanelController(const UiRefs& ui,
                            CSurfaceCollection* surfaces,
                            ViewerManager* viewerManager,
-                           std::unordered_map<std::string, OpChain*>* opchains,
                            std::function<CVolumeViewer*()> segmentationViewerProvider,
                            std::function<void()> filtersUpdated,
                            QObject* parent = nullptr);
@@ -100,13 +103,13 @@ public:
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
     void addSingleSegmentation(const std::string& segId);
-    void removeSingleSegmentation(const std::string& segId);
+    void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
 
 signals:
     void surfacesLoaded();
     void surfaceSelectionCleared();
     void filtersApplied(int hiddenCount);
-    void surfaceActivated(const QString& id, QuadSurface* surface, OpChain* chain);
+    void surfaceActivated(const QString& id, QuadSurface* surface);
     void copySegmentPathRequested(const QString& segmentId);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
@@ -114,6 +117,7 @@ signals:
     void convertToObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
+    void abfFlattenRequested(const QString& segmentId);
     void awsUploadRequested(const QString& segmentId);
     void growSeedsRequested(const QString& segmentId, bool isExpand, bool isRandomSeed);
     void teleaInpaintRequested();
@@ -150,14 +154,12 @@ private:
                                bool enabledReviewed,
                                bool enabledRevisit,
                                bool enabledInspect);
-    OpChain* ensureOpChainFor(const std::string& id);
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
 
     UiRefs _ui;
     CSurfaceCollection* _surfaces{nullptr};
     ViewerManager* _viewerManager{nullptr};
-    std::unordered_map<std::string, OpChain*>* _opchains{nullptr};
     std::shared_ptr<VolumePkg> _volumePkg;
     std::function<CVolumeViewer*()> _segmentationViewerProvider;
     std::function<void()> _filtersUpdated;

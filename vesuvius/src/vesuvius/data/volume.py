@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import yaml
 import json
@@ -10,11 +11,6 @@ import tempfile
 from PIL import Image
 from io import BytesIO
 from pathlib import Path
-# Direct import to avoid circular reference issues
-# Import necessary functions directly to avoid circular imports
-import os
-import yaml
-import requests
 from vesuvius.install.accept_terms import get_installation_path
 import zarr
 
@@ -39,7 +35,13 @@ def is_aws_ec2_instance():
     return False
 
 
-import torch
+# Attempt to import torch. If unavailable, set to None; tensor conversion will
+# gracefully raise a helpful error later.  This prevents a hard failure when
+# users install vesuvius without the heavy ML stack.
+try:
+    import torch  # type: ignore
+except ImportError:
+    torch = None  # type: ignore
 import fsspec
 from .utils import get_max_value, open_zarr
 
@@ -327,12 +329,37 @@ class Volume:
                 storage_options={'anon': False} if self.path.startswith('s3://') else None,
                 verbose=self.verbose
             )
-            
-            # Get original dtype
-            if isinstance(self.data.dtype, type):
-                self.dtype = np.dtype(self.data.dtype)
+
+            # Get original dtype - handle both Array and Group cases
+            if isinstance(self.data, zarr.Array):
+                # Direct zarr array case
+                if isinstance(self.data.dtype, type):
+                    self.dtype = np.dtype(self.data.dtype)
+                else:
+                    self.dtype = self.data.dtype
+            elif isinstance(self.data, zarr.hierarchy.Group):
+                # Group case (e.g., OME-Zarr with multiscales)
+                # Find the first array in the group - typically '0' for highest resolution
+                first_key = None
+                for key in self.data.keys():
+                    if isinstance(self.data[key], zarr.Array):
+                        first_key = key
+                        break
+                if first_key is None:
+                    raise ValueError(f"No arrays found in zarr Group at {self.path}")
+                first_array = self.data[first_key]
+                if hasattr(first_array.dtype, 'numpy_dtype'):
+                    self.dtype = first_array.dtype.numpy_dtype
+                else:
+                    self.dtype = first_array.dtype
+                if self.verbose:
+                    print(f"Zarr Group detected, using array '{first_key}' with shape {first_array.shape}")
             else:
-                self.dtype = self.data.dtype
+                # Legacy list case or other iterable
+                if hasattr(self.data[0].dtype, 'numpy_dtype'):
+                    self.dtype = self.data[0].dtype.numpy_dtype
+                else:
+                    self.dtype = self.data[0].dtype
                 
             if self.verbose:
                 print(f"Successfully opened zarr store: {self.data}")
@@ -378,8 +405,16 @@ class Volume:
         print(f"Return Type: {self.return_as_type}")
         print(f"Return as Tensor: {self.return_as_tensor}")
         print(f"Number of Resolution Levels: {len(self.data)}")
-        for idx, store in enumerate(self.data):
-            print(f"  Level {idx} Shape: {store.shape}, Dtype: {store.dtype}")
+        if isinstance(self.data, zarr.Array):
+            print(f"  Level 0 Shape: {self.data.shape}, Dtype: {self.data.dtype}")
+        elif isinstance(self.data, zarr.hierarchy.Group):
+            for key in sorted(self.data.keys(), key=lambda x: int(x) if x.isdigit() else x):
+                arr = self.data[key]
+                if isinstance(arr, zarr.Array):
+                    print(f"  Level {key} Shape: {arr.shape}, Dtype: {arr.dtype}")
+        else:
+            for idx, store in enumerate(self.data):
+                print(f"  Level {idx} Shape: {store.shape}, Dtype: {store.dtype}")
         if self.inklabel is not None:
             print(f"Ink Label Shape: {self.inklabel.shape}")
         print("-------------------------")
@@ -892,17 +927,22 @@ class Volume:
             except Exception as e:
                 print(f"  Warning: Error during final type conversion to {self.return_as_type}: {e}. Skipping.")
 
-        # 4. Convert to Tensor (if requested)
+        # 4. Convert to Tensor (if requested).  Only possible if torch is available.
         if self.return_as_tensor:
+            # Torch is optional.  If import failed above, torch will be None.
+            if torch is None:  # type: ignore
+                raise ImportError(
+                    "PyTorch is required for return_as_tensor but is not installed. "
+                    "Please install with pip install vesuvius[models] or ensure torch is available."
+                )
             try:
                 # Ensure data is contiguous for PyTorch
                 data_slice = np.ascontiguousarray(data_slice)
-                data_slice = torch.from_numpy(data_slice)
-                if self.verbose: print(f"  Converted final NumPy array to torch.Tensor.")
+                data_slice = torch.from_numpy(data_slice)  # type: ignore
+                if self.verbose:
+                    print(f"  Converted final NumPy array to torch.Tensor.")
             except Exception as e:
                 print(f"  Error converting NumPy array to PyTorch Tensor: {e}")
-                # Decide how to handle - maybe return numpy array instead?
-                # For now, let the error propagate if conversion fails.
                 raise
 
         return data_slice

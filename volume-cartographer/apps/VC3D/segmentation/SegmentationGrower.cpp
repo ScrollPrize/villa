@@ -11,7 +11,9 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QtConcurrent/QtConcurrent>
 
@@ -19,8 +21,11 @@
 #include <QLoggingCategory>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <utility>
 #include <cstdint>
@@ -73,12 +78,9 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
         return;
     }
 
-    if (surface->meta) {
-        delete surface->meta;
-    }
-
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
+
 
 bool isInvalidPoint(const cv::Vec3f& value)
 {
@@ -89,7 +91,8 @@ bool isInvalidPoint(const cv::Vec3f& value)
 std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
                                                           const cv::Vec3f& worldPos,
                                                           cv::Vec3f& pointerSeed,
-                                                          bool& pointerSeedValid)
+                                                          bool& pointerSeedValid,
+                                                          SurfacePatchIndex* patchIndex = nullptr)
 {
     if (!surface) {
         return std::nullopt;
@@ -105,7 +108,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
         pointerSeedValid = true;
     }
 
-    surface->pointTo(pointerSeed, worldPos, std::numeric_limits<float>::max(), 400);
+    surface->pointTo(pointerSeed, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
     cv::Vec3f raw = surface->loc_raw(pointerSeed);
 
     const int rows = points->rows;
@@ -164,8 +167,48 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     return std::make_pair(approxRow, approxCol);
 }
 
-std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,
-                                                      const SegmentationCorrectionsPayload& corrections)
+std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* surface,
+                                                                 SurfacePatchIndex* patchIndex,
+                                                                 const cv::Vec3f& worldPos,
+                                                                 cv::Vec3f& pointerSeed,
+                                                                 bool& pointerSeedValid)
+{
+    if (!surface) {
+        return std::nullopt;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+
+    if (patchIndex) {
+        cv::Vec2f gridScale = surface->scale();
+        float scale = std::max(gridScale[0], gridScale[1]);
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            scale = 1.0f;
+        }
+        const float tolerance = std::max(8.0f, scale * 8.0f);
+        // Query without surface filter, then verify result matches our surface
+        if (auto hit = patchIndex->locate(worldPos, tolerance)) {
+            if (hit->surface.get() == surface) {
+                const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
+                                           0,
+                                           points->cols - 1);
+                const int row = std::clamp(static_cast<int>(std::round(hit->ptr[1])),
+                                           0,
+                                           points->rows - 1);
+                return std::make_pair(row, col);
+            }
+        }
+    }
+
+    return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid, patchIndex);
+}
+
+std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
+                                                      const SegmentationCorrectionsPayload& corrections,
+                                                      ViewerManager* viewerManager)
 {
     if (!surface || corrections.empty()) {
         return std::nullopt;
@@ -176,139 +219,338 @@ std::optional<cv::Rect> computeCorrectionsDirtyBounds(QuadSurface* surface,
         return std::nullopt;
     }
 
+    SurfacePatchIndex* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+
     cv::Vec3f pointerSeed{0.0f, 0.0f, 0.0f};
     bool pointerSeedValid = false;
 
     const int rows = points->rows;
     const int cols = points->cols;
 
-    int overallMinRow = rows;
-    int overallMaxRow = -1;
-    int overallMinCol = cols;
-    int overallMaxCol = -1;
+    constexpr int kPaddingCells = 12;
 
-    bool haveCollectionRect = false;
+    bool anyMapped = false;
     int unionRowStart = rows;
     int unionRowEnd = 0;
     int unionColStart = cols;
     int unionColEnd = 0;
-
-    constexpr float kCollectionRadiusPadding = 8.0f;
-    constexpr int kFallbackPadding = 16;
 
     for (const auto& collection : corrections.collections) {
         if (collection.points.empty()) {
             continue;
         }
 
-        std::vector<cv::Point2f> gridPoints;
-        gridPoints.reserve(collection.points.size());
+        int collectionMinRow = rows;
+        int collectionMaxRow = -1;
+        int collectionMinCol = cols;
+        int collectionMaxCol = -1;
 
         for (const auto& colPoint : collection.points) {
-            auto gridIndex = worldToGridIndexApprox(surface, colPoint.p, pointerSeed, pointerSeedValid);
+            auto gridIndex = locateGridIndexWithPatchIndex(surface,
+                                                           patchIndex,
+                                                           colPoint.p,
+                                                           pointerSeed,
+                                                           pointerSeedValid);
             if (!gridIndex) {
                 continue;
             }
             const auto [row, col] = *gridIndex;
-            overallMinRow = std::min(overallMinRow, row);
-            overallMaxRow = std::max(overallMaxRow, row);
-            overallMinCol = std::min(overallMinCol, col);
-            overallMaxCol = std::max(overallMaxCol, col);
-            gridPoints.emplace_back(static_cast<float>(col), static_cast<float>(row));
+            collectionMinRow = std::min(collectionMinRow, row);
+            collectionMaxRow = std::max(collectionMaxRow, row);
+            collectionMinCol = std::min(collectionMinCol, col);
+            collectionMaxCol = std::max(collectionMaxCol, col);
         }
 
-        if (gridPoints.empty()) {
+        if (collectionMinRow > collectionMaxRow || collectionMinCol > collectionMaxCol) {
             continue;
         }
 
-        cv::Point2f center(0.0f, 0.0f);
-        for (const auto& pt : gridPoints) {
-            center += pt;
-        }
-        center *= (1.0f / static_cast<float>(gridPoints.size()));
+        anyMapped = true;
+        const int rowStart = std::max(0, collectionMinRow - kPaddingCells);
+        const int rowEndExclusive = std::min(rows, collectionMaxRow + kPaddingCells + 1);
+        const int colStart = std::max(0, collectionMinCol - kPaddingCells);
+        const int colEndExclusive = std::min(cols, collectionMaxCol + kPaddingCells + 1);
 
-        float maxDist = 0.0f;
-        for (const auto& pt : gridPoints) {
-            const float dx = pt.x - center.x;
-            const float dy = pt.y - center.y;
-            maxDist = std::max(maxDist, std::sqrt(dx * dx + dy * dy));
-        }
-
-        const float paddedRadius = std::max(0.0f, maxDist) + kCollectionRadiusPadding;
-        const int rowStart = std::max(0, static_cast<int>(std::floor(center.y - paddedRadius)));
-        const int rowEndExclusive = std::min(rows, static_cast<int>(std::ceil(center.y + paddedRadius)));
-        const int colStart = std::max(0, static_cast<int>(std::floor(center.x - paddedRadius)));
-        const int colEndExclusive = std::min(cols, static_cast<int>(std::ceil(center.x + paddedRadius)));
-
-        if (rowStart < rowEndExclusive && colStart < colEndExclusive) {
-            haveCollectionRect = true;
-            unionRowStart = std::min(unionRowStart, rowStart);
-            unionRowEnd = std::max(unionRowEnd, rowEndExclusive);
-            unionColStart = std::min(unionColStart, colStart);
-            unionColEnd = std::max(unionColEnd, colEndExclusive);
-        }
+        unionRowStart = std::min(unionRowStart, rowStart);
+        unionRowEnd = std::max(unionRowEnd, rowEndExclusive);
+        unionColStart = std::min(unionColStart, colStart);
+        unionColEnd = std::max(unionColEnd, colEndExclusive);
     }
 
-    int finalRowStart = rows;
-    int finalRowEnd = 0;
-    int finalColStart = cols;
-    int finalColEnd = 0;
-
-    if (haveCollectionRect) {
-        finalRowStart = unionRowStart;
-        finalRowEnd = unionRowEnd;
-        finalColStart = unionColStart;
-        finalColEnd = unionColEnd;
-    } else if (overallMaxRow >= 0 && overallMaxCol >= 0) {
-        finalRowStart = std::max(0, overallMinRow - kFallbackPadding);
-        finalRowEnd = std::min(rows, overallMaxRow + kFallbackPadding + 1);
-        finalColStart = std::max(0, overallMinCol - kFallbackPadding);
-        finalColEnd = std::min(cols, overallMaxCol + kFallbackPadding + 1);
-    } else {
-        return std::nullopt;
+    if (!anyMapped) {
+        return cv::Rect(0, 0, cols, rows);
     }
 
-    const int width = std::max(0, finalColEnd - finalColStart);
-    const int height = std::max(0, finalRowEnd - finalRowStart);
+    const int width = std::max(0, unionColEnd - unionColStart);
+    const int height = std::max(0, unionRowEnd - unionRowStart);
     if (width == 0 || height == 0) {
-        return std::nullopt;
+        return cv::Rect(0, 0, cols, rows);
     }
 
-    return cv::Rect(finalColStart, finalRowStart, width, height);
+    return cv::Rect(unionColStart, unionRowStart, width, height);
 }
 
-void applyDirtyBoundsToSurface(QuadSurface* surface, const cv::Rect& vertexRect)
+// Compute 3D world-space bounding box from correction points (min 512^3, centered)
+// Returns the world-space box and the corresponding 2D grid region
+std::optional<CorrectionsBounds> computeCorrectionsBounds(
+    const SegmentationCorrectionsPayload& corrections,
+    QuadSurface* surface,
+    float minWorldSize = 512.0f)
 {
-    if (!surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
+    if (!surface || corrections.empty()) {
+        return std::nullopt;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+
+    // Find min/max of all correction point positions (3D world coords)
+    cv::Vec3f worldMin(std::numeric_limits<float>::max(),
+                       std::numeric_limits<float>::max(),
+                       std::numeric_limits<float>::max());
+    cv::Vec3f worldMax(std::numeric_limits<float>::lowest(),
+                       std::numeric_limits<float>::lowest(),
+                       std::numeric_limits<float>::lowest());
+
+    bool hasPoints = false;
+    for (const auto& collection : corrections.collections) {
+        for (const auto& colPoint : collection.points) {
+            hasPoints = true;
+            worldMin[0] = std::min(worldMin[0], colPoint.p[0]);
+            worldMin[1] = std::min(worldMin[1], colPoint.p[1]);
+            worldMin[2] = std::min(worldMin[2], colPoint.p[2]);
+            worldMax[0] = std::max(worldMax[0], colPoint.p[0]);
+            worldMax[1] = std::max(worldMax[1], colPoint.p[1]);
+            worldMax[2] = std::max(worldMax[2], colPoint.p[2]);
+        }
+    }
+
+    if (!hasPoints) {
+        return std::nullopt;
+    }
+
+    // Compute center and expand to at least minWorldSize in each dimension
+    cv::Vec3f center = (worldMin + worldMax) * 0.5f;
+    cv::Vec3f halfSize;
+    for (int i = 0; i < 3; ++i) {
+        float extent = worldMax[i] - worldMin[i];
+        halfSize[i] = std::max(extent * 0.5f, minWorldSize * 0.5f);
+    }
+
+    worldMin = center - halfSize;
+    worldMax = center + halfSize;
+
+    // Find all grid cells whose 3D positions fall within this world-space box
+    const int rows = points->rows;
+    const int cols = points->cols;
+
+    int gridRowMin = rows;
+    int gridRowMax = -1;
+    int gridColMin = cols;
+    int gridColMax = -1;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const cv::Vec3f& pt = (*points)(r, c);
+            if (isInvalidPoint(pt)) {
+                continue;
+            }
+
+            // Check if point is within the world-space bounding box
+            if (pt[0] >= worldMin[0] && pt[0] <= worldMax[0] &&
+                pt[1] >= worldMin[1] && pt[1] <= worldMax[1] &&
+                pt[2] >= worldMin[2] && pt[2] <= worldMax[2]) {
+                gridRowMin = std::min(gridRowMin, r);
+                gridRowMax = std::max(gridRowMax, r);
+                gridColMin = std::min(gridColMin, c);
+                gridColMax = std::max(gridColMax, c);
+            }
+        }
+    }
+
+    if (gridRowMin > gridRowMax || gridColMin > gridColMax) {
+        // No grid cells found within bounds, return full grid
+        return CorrectionsBounds{worldMin, worldMax, cv::Rect(0, 0, cols, rows)};
+    }
+
+    // Clip to surface grid bounds (already implicitly done by loop bounds)
+    int width = gridColMax - gridColMin + 1;
+    int height = gridRowMax - gridRowMin + 1;
+
+    CorrectionsBounds bounds;
+    bounds.worldMin = worldMin;
+    bounds.worldMax = worldMax;
+    bounds.gridRegion = cv::Rect(gridColMin, gridRowMin, width, height);
+
+    return bounds;
+}
+
+// Crop a QuadSurface to a 2D grid region
+std::unique_ptr<QuadSurface> cropSurfaceToGridRegion(
+    const QuadSurface* surface,
+    const cv::Rect& gridRegion)
+{
+    if (!surface) {
+        return nullptr;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return nullptr;
+    }
+
+    const int rows = points->rows;
+    const int cols = points->cols;
+
+    // Clamp region to valid bounds
+    int x0 = std::clamp(gridRegion.x, 0, cols - 1);
+    int y0 = std::clamp(gridRegion.y, 0, rows - 1);
+    int x1 = std::clamp(gridRegion.x + gridRegion.width, 1, cols);
+    int y1 = std::clamp(gridRegion.y + gridRegion.height, 1, rows);
+
+    if (x1 <= x0 || y1 <= y0) {
+        return nullptr;
+    }
+
+    // Extract ROI
+    cv::Mat_<cv::Vec3f> roi(*points, cv::Range(y0, y1), cv::Range(x0, x1));
+    cv::Mat_<cv::Vec3f> roiClone = roi.clone();
+
+    // Create new QuadSurface with the cropped data
+    auto cropped = std::make_unique<QuadSurface>(roiClone, surface->scale());
+
+    return cropped;
+}
+
+// Generate ISO 8601 timestamp string for folder naming
+std::string generateTimestampString()
+{
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&time, &tm);
+
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H-%M-%S", &tm);
+    return std::string(buffer);
+}
+
+// Save correction annotation data
+void saveCorrectionsAnnotation(
+    const std::filesystem::path& volpkgRoot,
+    const std::string& segmentId,
+    const QuadSurface* beforeCrop,
+    const QuadSurface* afterCrop,
+    const SegmentationCorrectionsPayload& corrections,
+    const std::vector<std::string>& volumeIds,
+    const std::string& growthVolumeId,
+    const CorrectionsBounds& bounds)
+{
+    if (!beforeCrop || !afterCrop || corrections.empty()) {
         return;
     }
 
-    ensureSurfaceMetaObject(surface);
-    nlohmann::json& meta = *surface->meta;
+    // Create timestamped folder
+    std::string timestamp = generateTimestampString();
+    std::filesystem::path correctionsDir = volpkgRoot / "corrections" / timestamp;
 
-    int version = 0;
-    if (meta.contains("dirty_bounds_version") && meta["dirty_bounds_version"].is_number_integer()) {
-        version = meta["dirty_bounds_version"].get<int>();
-    } else if (meta.contains("dirty_bounds")) {
-        const auto& boundsObj = meta["dirty_bounds"];
-        if (boundsObj.contains("version") && boundsObj["version"].is_number_integer()) {
-            version = boundsObj["version"].get<int>();
-        }
+    std::error_code ec;
+    std::filesystem::create_directories(correctionsDir, ec);
+    if (ec) {
+        qCWarning(lcSegGrowth) << "Failed to create corrections directory:" << ec.message().c_str();
+        return;
     }
-    if (version == std::numeric_limits<int>::max()) {
-        version = 0;
-    }
-    ++version;
 
-    meta["dirty_bounds_version"] = version;
-    nlohmann::json bounds = {
-        {"row_start", vertexRect.y},
-        {"row_end", vertexRect.y + vertexRect.height},
-        {"col_start", vertexRect.x},
-        {"col_end", vertexRect.x + vertexRect.width},
-        {"version", version}
+    // Save before tifxyz
+    std::filesystem::path beforePath = correctionsDir / "before";
+    try {
+        auto* mutableBefore = const_cast<QuadSurface*>(beforeCrop);
+        mutableBefore->save(beforePath.string(), "before", true);
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegGrowth) << "Failed to save before tifxyz:" << ex.what();
+    }
+
+    // Save after tifxyz
+    std::filesystem::path afterPath = correctionsDir / "after";
+    try {
+        auto* mutableAfter = const_cast<QuadSurface*>(afterCrop);
+        mutableAfter->save(afterPath.string(), "after", true);
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegGrowth) << "Failed to save after tifxyz:" << ex.what();
+    }
+
+    // Build corrections.json
+    nlohmann::json j;
+    j["timestamp"] = timestamp;
+    j["segment_id"] = segmentId;
+    j["volumes"] = volumeIds;
+    j["volume_used"] = growthVolumeId;
+    j["bbox"] = {
+        {"min", {bounds.worldMin[0], bounds.worldMin[1], bounds.worldMin[2]}},
+        {"max", {bounds.worldMax[0], bounds.worldMax[1], bounds.worldMax[2]}}
     };
-    meta["dirty_bounds"] = std::move(bounds);
+
+    // Build collections array with points sorted by creation_time
+    nlohmann::json collectionsJson = nlohmann::json::array();
+    for (const auto& collection : corrections.collections) {
+        nlohmann::json collJson;
+        collJson["id"] = collection.id;
+        collJson["name"] = collection.name;
+        collJson["color"] = {collection.color[0], collection.color[1], collection.color[2]};
+
+        // Sort points by creation_time to preserve placement order
+        std::vector<ColPoint> sortedPoints = collection.points;
+        std::sort(sortedPoints.begin(), sortedPoints.end(),
+                  [](const ColPoint& a, const ColPoint& b) {
+                      return a.creation_time < b.creation_time;
+                  });
+
+        nlohmann::json pointsJson = nlohmann::json::array();
+        for (const auto& pt : sortedPoints) {
+            nlohmann::json ptJson;
+            ptJson["id"] = pt.id;
+            ptJson["position"] = {pt.p[0], pt.p[1], pt.p[2]};
+            ptJson["creation_time"] = pt.creation_time;
+            pointsJson.push_back(ptJson);
+        }
+        collJson["points"] = pointsJson;
+
+        collectionsJson.push_back(collJson);
+    }
+    j["collections"] = collectionsJson;
+
+    // Write corrections.json
+    std::filesystem::path jsonPath = correctionsDir / "corrections.json";
+    try {
+        std::ofstream ofs(jsonPath);
+        if (ofs.is_open()) {
+            ofs << j.dump(2);
+            ofs.close();
+            qCInfo(lcSegGrowth) << "Saved corrections annotation to" << jsonPath.c_str();
+        } else {
+            qCWarning(lcSegGrowth) << "Failed to open corrections.json for writing";
+        }
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegGrowth) << "Failed to write corrections.json:" << ex.what();
+    }
+}
+
+void queueIndexUpdateForBounds(SurfacePatchIndex* index,
+                               const SurfacePatchIndex::SurfacePtr& surface,
+                               const cv::Rect& vertexRect)
+{
+    if (!index || !surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
+        return;
+    }
+
+    const int rowStart = vertexRect.y;
+    const int rowEnd = vertexRect.y + vertexRect.height;
+    const int colStart = vertexRect.x;
+    const int colEnd = vertexRect.x + vertexRect.width;
+
+    index->queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd);
 }
 
 void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
@@ -319,26 +561,24 @@ void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
         return;
     }
 
+    // getSurface now returns the QuadSurface directly, so we just need to refresh the panel
     const auto loadedIds = pkg->getLoadedSurfaceIDs();
     for (const auto& id : loadedIds) {
-        auto surfMeta = pkg->getSurface(id);
-        if (!surfMeta) {
+        auto loadedSurface = pkg->getSurface(id);
+        if (!loadedSurface) {
             continue;
         }
 
-        if (surfMeta->path == surface->path) {
-            if (!surfMeta->meta) {
-                surfMeta->meta = new nlohmann::json(nlohmann::json::object());
-            }
-
+        if (loadedSurface->path == surface->path) {
+            // Sync metadata if needed
             if (surface->meta) {
-                *surfMeta->meta = *surface->meta;
-            } else {
-                surfMeta->meta->clear();
+                if (!loadedSurface->meta) {
+                    loadedSurface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+                }
+                *loadedSurface->meta = *surface->meta;
+            } else if (loadedSurface->meta) {
+                loadedSurface->meta->clear();
             }
-
-            surfMeta->bbox = surface->bbox();
-            surfMeta->setSurface(surface);
 
             if (panel) {
                 panel->refreshSurfaceMetrics(id);
@@ -413,14 +653,14 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return false;
     }
 
-    auto* segmentationSurface = dynamic_cast<QuadSurface*>(_context.surfaces->surface("segmentation"));
+    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.surfaces->surface("segmentation"));
     if (!segmentationSurface) {
         qCInfo(lcSegGrowth) << "Rejecting growth because segmentation surface is missing";
         showStatus(tr("Segmentation surface is not available."), kStatusMedium);
         return false;
     }
 
-    ensureGenerationsChannel(segmentationSurface);
+    ensureGenerationsChannel(segmentationSurface.get());
 
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;
@@ -528,27 +768,36 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
     }
 
-    std::optional<cv::Rect> correctionDirtyBounds;
+    std::optional<cv::Rect> correctionAffectedBounds;
     if (usingCorrections) {
-        correctionDirtyBounds = computeCorrectionsDirtyBounds(segmentationSurface, corrections);
-        if (correctionDirtyBounds) {
-            const int rowEnd = correctionDirtyBounds->y + correctionDirtyBounds->height;
-            const int colEnd = correctionDirtyBounds->x + correctionDirtyBounds->width;
-            qCInfo(lcSegGrowth) << "Computed correction dirty bounds:"
-                                << "rows" << correctionDirtyBounds->y << "to" << rowEnd
-                                << "cols" << correctionDirtyBounds->x << "to" << colEnd;
+        correctionAffectedBounds = computeCorrectionsAffectedBounds(segmentationSurface.get(),
+                                                                    corrections,
+                                                                    _context.viewerManager);
+        if (correctionAffectedBounds) {
+            const int rowEnd = correctionAffectedBounds->y + correctionAffectedBounds->height;
+            const int colEnd = correctionAffectedBounds->x + correctionAffectedBounds->width;
+            qCInfo(lcSegGrowth) << "Computed correction affected bounds:"
+                                << "rows" << correctionAffectedBounds->y << "to" << rowEnd
+                                << "cols" << correctionAffectedBounds->x << "to" << colEnd;
         } else {
-            qCInfo(lcSegGrowth) << "Unable to compute correction dirty bounds; falling back to full surface rebuild.";
+            qCInfo(lcSegGrowth) << "Unable to compute correction affected bounds; falling back to full surface rebuild.";
         }
     }
 
     TracerGrowthContext ctx;
-    ctx.resumeSurface = segmentationSurface;
+    ctx.resumeSurface = segmentationSurface.get();
     ctx.volume = growthVolume.get();
     ctx.cache = _context.chunkCache;
     ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
+
+    // Populate fields for corrections annotation saving
+    if (volumeContext.package) {
+        ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
+        ctx.volumeIds = volumeContext.package->volumeIDs();
+    }
+    ctx.growthVolumeId = growthVolumeId;
 
     if (ctx.cacheRoot.isEmpty()) {
         const auto volumePath = growthVolume->path();
@@ -594,7 +843,22 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     pending.growthVoxelSize = growthVolume->voxelSize();
     pending.usingCorrections = usingCorrections;
     pending.inpaintOnly = inpaintOnly;
-    pending.correctionsDirtyBounds = correctionDirtyBounds;
+    pending.correctionsAffectedBounds = correctionAffectedBounds;
+
+    // Compute corrections bounds and snapshot "before" surface for annotation saving
+    if (usingCorrections) {
+        pending.corrections = corrections;
+        auto bounds = computeCorrectionsBounds(corrections, segmentationSurface.get());
+        if (bounds) {
+            pending.correctionsBounds = bounds;
+            pending.beforeCrop = cropSurfaceToGridRegion(segmentationSurface.get(), bounds->gridRegion);
+            if (pending.beforeCrop) {
+                qCInfo(lcSegGrowth) << "Captured before-crop for corrections annotation:"
+                                    << bounds->gridRegion.width << "x" << bounds->gridRegion.height;
+            }
+        }
+    }
+
     _activeRequest = std::move(pending);
 
     auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
@@ -626,6 +890,93 @@ void SegmentationGrower::handleFailure(const QString& message)
         showStatus(message, kStatusLong);
     }
     finalize(false);
+}
+
+// Compute bounding box of cells that changed between two point matrices
+// Returns bounds in the NEW surface's coordinate system
+static cv::Rect computeChangedBounds(const cv::Mat_<cv::Vec3f>& oldPts,
+                                     const cv::Mat_<cv::Vec3f>& newPts)
+{
+    // Handle size differences - the new surface may have padding around it
+    // The old content is centered in the new surface
+    const int padX = (newPts.cols - oldPts.cols) / 2;
+    const int padY = (newPts.rows - oldPts.rows) / 2;
+
+    int minRow = newPts.rows, maxRow = -1;
+    int minCol = newPts.cols, maxCol = -1;
+
+    // Compare the overlapping region (old surface embedded in new)
+    for (int oldRow = 0; oldRow < oldPts.rows; ++oldRow) {
+        const int newRow = oldRow + padY;
+        if (newRow < 0 || newRow >= newPts.rows) continue;
+
+        for (int oldCol = 0; oldCol < oldPts.cols; ++oldCol) {
+            const int newCol = oldCol + padX;
+            if (newCol < 0 || newCol >= newPts.cols) continue;
+
+            const auto& o = oldPts(oldRow, oldCol);
+            const auto& n = newPts(newRow, newCol);
+            if (o[0] != n[0] || o[1] != n[1] || o[2] != n[2]) {
+                minRow = std::min(minRow, newRow);
+                maxRow = std::max(maxRow, newRow);
+                minCol = std::min(minCol, newCol);
+                maxCol = std::max(maxCol, newCol);
+            }
+        }
+    }
+
+    // Check padding cells for valid (non-empty) content that was added
+    // Invalid points have x == -1
+    auto isValid = [](const cv::Vec3f& p) { return p[0] != -1.0f; };
+
+    // Check top/bottom padding rows
+    for (int row = 0; row < padY && row < newPts.rows; ++row) {
+        for (int col = 0; col < newPts.cols; ++col) {
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+    }
+    for (int row = newPts.rows - padY; row < newPts.rows; ++row) {
+        if (row < 0) continue;
+        for (int col = 0; col < newPts.cols; ++col) {
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+    }
+    // Check left/right padding cols
+    for (int row = 0; row < newPts.rows; ++row) {
+        for (int col = 0; col < padX && col < newPts.cols; ++col) {
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+        for (int col = newPts.cols - padX; col < newPts.cols; ++col) {
+            if (col < 0) continue;
+            if (isValid(newPts(row, col))) {
+                minRow = std::min(minRow, row);
+                maxRow = std::max(maxRow, row);
+                minCol = std::min(minCol, col);
+                maxCol = std::max(maxCol, col);
+            }
+        }
+    }
+
+    if (maxRow < 0) {
+        return cv::Rect();  // No changes
+    }
+
+    return cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
 }
 
 void SegmentationGrower::onFutureFinished()
@@ -669,9 +1020,9 @@ void SegmentationGrower::onFutureFinished()
     const double voxelSize = request.growthVoxelSize;
     cv::Mat generations = result.surface->channel("generations");
 
-    std::vector<QuadSurface*> surfacesToUpdate;
+    std::vector<SurfacePatchIndex::SurfacePtr> surfacesToUpdate;
     surfacesToUpdate.reserve(3);
-    auto appendUniqueSurface = [&](QuadSurface* surface) {
+    auto appendUniqueSurface = [&](const SurfacePatchIndex::SurfacePtr& surface) {
         if (!surface) {
             return;
         }
@@ -682,12 +1033,30 @@ void SegmentationGrower::onFutureFinished()
 
     appendUniqueSurface(request.segmentationSurface);
     if (_context.module && _context.module->hasActiveSession()) {
-        appendUniqueSurface(_context.module->activeBaseSurface());
+        appendUniqueSurface(_context.module->activeBaseSurfaceShared());
     }
 
-    QuadSurface* primarySurface = surfacesToUpdate.empty() ? nullptr : surfacesToUpdate.front();
+    QuadSurface* primarySurface = surfacesToUpdate.empty() ? nullptr : surfacesToUpdate.front().get();
     cv::Mat_<cv::Vec3f>* primaryPoints = primarySurface ? primarySurface->rawPointsPtr() : nullptr;
     cv::Mat_<cv::Vec3f>* resultPoints = result.surface->rawPointsPtr();
+
+    // Compute the changed region before swapping points (for efficient R-tree update)
+    // Only use region update when sizes match; otherwise grid coordinates shift
+    cv::Rect changedBounds;
+    bool sizeChanged = false;
+    if (primarySurface && primaryPoints && resultPoints) {
+        sizeChanged = (primaryPoints->size() != resultPoints->size());
+        if (!sizeChanged) {
+            changedBounds = computeChangedBounds(*primaryPoints, *resultPoints);
+            qCInfo(lcSegGrowth) << "Changed bounds:" << changedBounds.x << changedBounds.y
+                                << changedBounds.width << "x" << changedBounds.height
+                                << "(surface:" << resultPoints->cols << "x" << resultPoints->rows << ")";
+        } else {
+            qCInfo(lcSegGrowth) << "Surface size changed:" << primaryPoints->cols << "x" << primaryPoints->rows
+                                << "->" << resultPoints->cols << "x" << resultPoints->rows
+                                << "- using full update";
+        }
+    }
 
     if (primarySurface && primaryPoints && resultPoints) {
         std::swap(*primaryPoints, *resultPoints);
@@ -697,7 +1066,8 @@ void SegmentationGrower::onFutureFinished()
         primarySurface->invalidateCache();
     }
 
-    for (QuadSurface* targetSurface : surfacesToUpdate) {
+    for (const auto& targetSurfacePtr : surfacesToUpdate) {
+        QuadSurface* targetSurface = targetSurfacePtr.get();
         if (!targetSurface) {
             continue;
         }
@@ -729,12 +1099,14 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->setChannel("generations", generations);
         }
 
+        // Copy preserved approval mask from result surface
+        cv::Mat approval = result.surface->channel("approval", SURF_CHANNEL_NORESIZE);
+        if (!approval.empty()) {
+            targetSurface->setChannel("approval", approval);
+        }
+
         if (result.surface->meta) {
-            if (targetSurface->meta) {
-                delete targetSurface->meta;
-                targetSurface->meta = nullptr;
-            }
-            targetSurface->meta = new nlohmann::json(*result.surface->meta);
+            targetSurface->meta = std::make_unique<nlohmann::json>(*result.surface->meta);
         } else {
             ensureSurfaceMetaObject(targetSurface);
         }
@@ -749,8 +1121,14 @@ void SegmentationGrower::onFutureFinished()
         }
 
         updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
-        if (request.usingCorrections && request.correctionsDirtyBounds) {
-            applyDirtyBoundsToSurface(targetSurface, *request.correctionsDirtyBounds);
+
+        // Refresh intersection index for this surface so renderIntersections() has up-to-date data
+        if (_context.viewerManager) {
+            if (!changedBounds.empty()) {
+                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr, changedBounds);
+            } else {
+                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr);
+            }
         }
     }
 
@@ -760,7 +1138,12 @@ void SegmentationGrower::onFutureFinished()
         surfaceToPersist = _context.module->activeBaseSurface();
     }
     if (!surfaceToPersist) {
-        surfaceToPersist = request.segmentationSurface;
+        surfaceToPersist = request.segmentationSurface.get();
+    }
+
+    // Mask is no longer valid after growth/inpainting
+    if (surfaceToPersist) {
+        surfaceToPersist->invalidateMask();
     }
 
     if (!sessionActive) {
@@ -791,7 +1174,8 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (_context.surfaces) {
-        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, false);
+        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, true);
+        // Note: SurfacePatchIndex is automatically updated via handleSurfaceChanged signal
     }
 
     if (!resetDefaults.empty()) {
@@ -812,8 +1196,8 @@ void SegmentationGrower::onFutureFinished()
     if (sessionActive && _context.module) {
         _context.module->markNextHandlesFromGrowth();
         bool appliedIncremental = false;
-        if (request.correctionsDirtyBounds) {
-            appliedIncremental = _context.module->applySurfaceUpdateFromGrowth(*request.correctionsDirtyBounds);
+        if (request.correctionsAffectedBounds) {
+            appliedIncremental = _context.module->applySurfaceUpdateFromGrowth(*request.correctionsAffectedBounds);
         }
         if (!appliedIncremental) {
             qCInfo(lcSegGrowth) << "Refreshing active segmentation session after tracer growth";
@@ -822,14 +1206,21 @@ void SegmentationGrower::onFutureFinished()
     }
 
     QuadSurface* currentSegSurface = nullptr;
+    std::shared_ptr<Surface> currentSegSurfaceHolder;  // Keep surface alive during this scope
     if (_context.surfaces) {
-        currentSegSurface = dynamic_cast<QuadSurface*>(_context.surfaces->surface("segmentation"));
+        currentSegSurfaceHolder = _context.surfaces->surface("segmentation");
+        currentSegSurface = dynamic_cast<QuadSurface*>(currentSegSurfaceHolder.get());
     }
     if (!currentSegSurface) {
-        currentSegSurface = request.segmentationSurface;
+        currentSegSurface = request.segmentationSurface.get();
     }
 
-    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface;
+    // Update approval tool after surface replacement (handles case with no active editing session)
+    if (_context.module) {
+        _context.module->updateApprovalToolAfterGrowth(currentSegSurface);
+    }
+
+    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface.get();
     synchronizeSurfaceMeta(request.volumeContext.package, metaSurface, _surfacePanel);
 
     if (_surfacePanel) {
@@ -849,12 +1240,12 @@ void SegmentationGrower::onFutureFinished()
             }
         };
 
-        for (QuadSurface* surface : surfacesToUpdate) {
-            maybeAddId(surface);
+        for (const auto& surface : surfacesToUpdate) {
+            maybeAddId(surface.get());
         }
         maybeAddId(currentSegSurface);
         if (_context.module && _context.module->hasActiveSession()) {
-            maybeAddId(_context.module->activeBaseSurface());
+            maybeAddId(_context.module->activeBaseSurfaceShared().get());
         }
 
         for (const auto& id : idsToRefresh) {
@@ -867,6 +1258,34 @@ void SegmentationGrower::onFutureFinished()
     }
 
     refreshSegmentationViewers(_context.viewerManager);
+
+    // Save corrections annotation if we have a before-crop and bounds
+    if (request.usingCorrections && request.beforeCrop && request.correctionsBounds) {
+        // Crop the "after" surface using the same grid region
+        auto afterCrop = cropSurfaceToGridRegion(primarySurface ? primarySurface : request.segmentationSurface.get(),
+                                                  request.correctionsBounds->gridRegion);
+        if (afterCrop) {
+            // Get volpkg root from the package
+            std::filesystem::path volpkgRoot;
+            std::vector<std::string> volumeIds;
+            if (request.volumeContext.package) {
+                volpkgRoot = std::filesystem::path(request.volumeContext.package->getVolpkgDirectory());
+                volumeIds = request.volumeContext.package->volumeIDs();
+            }
+
+            if (!volpkgRoot.empty()) {
+                saveCorrectionsAnnotation(
+                    volpkgRoot,
+                    request.segmentationSurface ? request.segmentationSurface->id : "",
+                    request.beforeCrop.get(),
+                    afterCrop.get(),
+                    request.corrections,
+                    volumeIds,
+                    request.growthVolumeId,
+                    *request.correctionsBounds);
+            }
+        }
+    }
 
     if (request.usingCorrections && _context.module) {
         _context.module->clearPendingCorrections();
