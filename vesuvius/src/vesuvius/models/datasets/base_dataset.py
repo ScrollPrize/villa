@@ -137,6 +137,7 @@ class BaseDataset(Dataset):
 
         if self.slice_sampling_enabled:
             self._setup_plane_slicer()
+            self._setup_chunk_slicer()  # Also set up chunk slicer for fast 3D validation
         else:
             self._setup_chunk_slicer()
 
@@ -223,7 +224,14 @@ class BaseDataset(Dataset):
             if self.transforms is not None:
                 print("Validation transforms initialized")
 
-        if not self.skip_patch_validation:
+        # Check if patches will be inherited from another dataset (e.g., train -> val)
+        self.inherit_patches_externally = getattr(mgr, 'inherit_patches_externally', False)
+
+        if self.inherit_patches_externally:
+            # Skip all patch indexing - patches will be copied from another dataset
+            print("Patches will be inherited from training dataset")
+            self._setup_chunk_slicer()  # Still need slicer for extraction
+        elif not self.skip_patch_validation:
             self._get_valid_patches()
         else:
             print("Skipping patch validation as requested")
@@ -332,14 +340,16 @@ class BaseDataset(Dataset):
         self.plane_slicer = slicer
 
     def _setup_chunk_slicer(self) -> None:
-        if self.slice_sampling_enabled:
-            return
-
         target_names = list(self.target_volumes.keys())
         if not target_names:
             raise ValueError("Chunk slicing requires target volumes to be populated")
 
         patch_size = tuple(int(v) for v in self.patch_size)
+        # When in 2D slice mode, derive 3D patch size for validation
+        if len(patch_size) == 2 and self.slice_sampling_enabled:
+            cube_dim = min(patch_size)
+            patch_size = (cube_dim, cube_dim, cube_dim)
+            self.logger.info("Derived 3D validation patch size %s from 2D patch size", patch_size)
         stride_override = getattr(self.mgr, 'chunk_stride', None)
         if stride_override is not None:
             stride_override = tuple(int(v) for v in stride_override)
@@ -416,30 +426,25 @@ class BaseDataset(Dataset):
                     if path_candidate:
                         cache_key_path = Path(path_candidate)
 
+            # Fall back to image path for cache key if no labels (for unlabeled datasets)
+            if cache_key_path is None:
+                if hasattr(image_array, 'path'):
+                    cache_key_path = Path(image_array.path)
+                elif hasattr(image_array, 'store') and hasattr(image_array.store, 'path'):
+                    cache_key_path = Path(image_array.store.path)
+
             # Assign per-volume image source for unlabeled FG detection
             image_source = None
-            if (unlabeled_fg_enabled and unlabeled_fg_volume_ids
-                    and volume_name in unlabeled_fg_volume_ids and cache_key_path):
-                # Derive image path from label path
-                image_path = self._derive_image_path_from_label(cache_key_path, first_target)
-                if image_path.exists():
-                    try:
-                        import zarr
-                        image_source = zarr.open(str(image_path), mode='r')
-                        self.logger.info(
-                            "Opened image zarr for unlabeled FG (volume=%s): %s",
-                            volume_name, image_path
-                        )
-                    except Exception as e:
-                        self.logger.warning(
-                            "Failed to open derived image path %s for volume %s: %s",
-                            image_path, volume_name, e
-                        )
-                else:
-                    self.logger.warning(
-                        "Derived image path does not exist for volume %s: %s",
-                        volume_name, image_path
-                    )
+            if unlabeled_fg_enabled:
+                # If specific volumes are listed, only use those; otherwise use all volumes
+                should_use_volume = (
+                    unlabeled_fg_volume_ids is None or volume_name in unlabeled_fg_volume_ids
+                )
+                if should_use_volume:
+                    # Use the already-loaded image array directly
+                    # This works for self-supervised training where we don't have labels
+                    image_source = image_array
+                    self.logger.info("Using image array for unlabeled FG detection (volume=%s)", volume_name)
 
             slicer.register_volume(
                 ChunkVolume(
@@ -619,29 +624,153 @@ class BaseDataset(Dataset):
         if self.slice_sampling_enabled:
             if self.plane_slicer is None:
                 raise RuntimeError("Plane slicer not initialized despite slice_sampling_enabled=True")
-            patches, weights = self.plane_slicer.build_index(validate=not self.skip_patch_validation)
-            self._plane_patches = patches
+            if self.chunk_slicer is None:
+                raise RuntimeError("Chunk slicer not initialized despite slice_sampling_enabled=True")
+
+            # Use fast 3D validation via chunk_slicer - slices sampled on-the-fly during __getitem__
+            self._build_chunk_index(validate=not self.skip_patch_validation)
+
+            # Use 3D chunks directly - we'll sample 2D slices from them at training time
+            chunk_patches = self.chunk_slicer.patches
             self.valid_patches = [
                 {
                     "volume_index": p.volume_index,
                     "volume_name": p.volume_name,
-                    "plane": p.plane,
-                    "slice_index": p.slice_index,
                     "position": list(p.position),
                     "patch_size": list(p.patch_size),
                 }
-                for p in patches
+                for p in chunk_patches
             ]
-            self.patch_weights = weights
-            volume_count = len({p.volume_index for p in patches}) or len(self.target_volumes.get(next(iter(self.target_volumes)), []))
+            self.patch_weights = self.chunk_slicer.weights
+            volume_count = len({p.volume_index for p in chunk_patches}) or 1
             self.logger.info(
-                "Prepared %s plane patches across %s volume(s)",
+                "Using %s validated 3D chunks for 2D slice sampling across %s volume(s)",
                 len(self.valid_patches),
                 volume_count,
             )
             return
 
         self._build_chunk_index(validate=not self.skip_patch_validation)
+
+    def _sample_plane_from_chunk(self, chunk_info: Dict) -> PlaneSlicePatch:
+        """Sample a random 2D plane patch from a validated 3D chunk.
+
+        Randomly selects a plane (z, y, x) and slice index within the chunk,
+        returning a PlaneSlicePatch that can be extracted by the plane_slicer.
+        """
+        import random
+
+        plane_config = self.plane_slicer.config
+        sample_planes = list(plane_config.sample_planes)
+
+        # Randomly pick a plane based on weights
+        plane_weights = [plane_config.plane_weights.get(p, 1.0) for p in sample_planes]
+        total_weight = sum(plane_weights)
+        if total_weight > 0:
+            plane_weights = [w / total_weight for w in plane_weights]
+            axis = random.choices(sample_planes, weights=plane_weights, k=1)[0]
+        else:
+            axis = random.choice(sample_planes)
+
+        z, y, x = chunk_info['position']
+        dz, dy, dx = chunk_info['patch_size']
+        patch_size = tuple(plane_config.plane_patch_sizes[axis])
+
+        # Pick a random slice index within the chunk
+        if axis == "z":
+            slice_idx = random.randint(z, z + dz - 1)
+            position = (y, x)
+        elif axis == "y":
+            slice_idx = random.randint(y, y + dy - 1)
+            position = (z, x)
+        else:  # x
+            slice_idx = random.randint(x, x + dx - 1)
+            position = (z, y)
+
+        return PlaneSlicePatch(
+            volume_index=chunk_info['volume_index'],
+            volume_name=chunk_info['volume_name'],
+            plane=axis,
+            slice_index=slice_idx,
+            position=position,
+            patch_size=patch_size,
+        )
+
+    def _generate_plane_patches_from_3d(self) -> Tuple[List[PlaneSlicePatch], List[float]]:
+        """Generate 2D plane patches from validated 3D chunk positions.
+
+        For each validated 3D chunk, generates 2D patches along the configured
+        sample planes (z, y, x) that slice through the valid 3D region.
+        """
+        if self.chunk_slicer is None or self.plane_slicer is None:
+            raise RuntimeError("Both chunk_slicer and plane_slicer must be initialized")
+
+        plane_config = self.plane_slicer.config
+        chunk_patches = self.chunk_slicer.patches
+
+        plane_patches: Dict[str, List[PlaneSlicePatch]] = {axis: [] for axis in plane_config.sample_planes}
+
+        for chunk in chunk_patches:
+            z, y, x = chunk.position
+            dz, dy, dx = chunk.patch_size
+
+            for axis in plane_config.sample_planes:
+                patch_size = tuple(plane_config.plane_patch_sizes[axis])
+
+                if axis == "z":
+                    # Sample z-slices through this 3D region
+                    for slice_idx in range(z, z + dz):
+                        plane_patches["z"].append(PlaneSlicePatch(
+                            volume_index=chunk.volume_index,
+                            volume_name=chunk.volume_name,
+                            plane="z",
+                            slice_index=slice_idx,
+                            position=(y, x),
+                            patch_size=patch_size,
+                        ))
+                elif axis == "y":
+                    # Sample y-slices through this 3D region
+                    for slice_idx in range(y, y + dy):
+                        plane_patches["y"].append(PlaneSlicePatch(
+                            volume_index=chunk.volume_index,
+                            volume_name=chunk.volume_name,
+                            plane="y",
+                            slice_index=slice_idx,
+                            position=(z, x),
+                            patch_size=patch_size,
+                        ))
+                elif axis == "x":
+                    # Sample x-slices through this 3D region
+                    for slice_idx in range(x, x + dx):
+                        plane_patches["x"].append(PlaneSlicePatch(
+                            volume_index=chunk.volume_index,
+                            volume_name=chunk.volume_name,
+                            plane="x",
+                            slice_index=slice_idx,
+                            position=(z, y),
+                            patch_size=patch_size,
+                        ))
+
+        # Flatten and compute weights
+        all_patches: List[PlaneSlicePatch] = []
+        axis_counts: Dict[str, int] = {}
+        for axis, patches in plane_patches.items():
+            if patches:
+                all_patches.extend(patches)
+                axis_counts[axis] = len(patches)
+
+        if not all_patches:
+            raise RuntimeError("No plane patches generated from validated 3D regions")
+
+        # Compute weights based on plane_weights config
+        weights: List[float] = []
+        for patch in all_patches:
+            axis_weight = float(plane_config.plane_weights.get(patch.plane, 1.0))
+            count = axis_counts.get(patch.plane, 0)
+            weight_per_patch = axis_weight / count if count > 0 and axis_weight > 0 else 0.0
+            weights.append(weight_per_patch)
+
+        return all_patches, weights
 
     def __len__(self):
         return len(self.valid_patches)
@@ -652,6 +781,13 @@ class BaseDataset(Dataset):
         if hasattr(self, 'chunk_slicer') and hasattr(self.chunk_slicer, 'n_fg'):
             return self.chunk_slicer.n_fg
         return len(self)
+
+    @property
+    def n_unlabeled_fg(self) -> int:
+        """Number of unlabeled foreground patches (has image data but no labels)."""
+        if hasattr(self, 'chunk_slicer') and hasattr(self.chunk_slicer, 'n_unlabeled_fg'):
+            return self.chunk_slicer.n_unlabeled_fg
+        return 0
 
     def _resolve_spatial_shape(self, source) -> Tuple[int, ...]:
         if hasattr(source, 'spatial_shape'):
@@ -811,7 +947,6 @@ class BaseDataset(Dataset):
         Create training augmentation transforms using the standard pipeline.
         """
         no_spatial = getattr(self.mgr, 'no_spatial', False)
-        no_scaling = getattr(self.mgr, 'no_scaling', False)
         only_spatial_and_intensity = getattr(self.mgr, 'only_spatial_and_intensity', False)
         allowed_rotation_axes = getattr(self.mgr, 'allowed_rotation_axes', None)
 
@@ -831,7 +966,6 @@ class BaseDataset(Dataset):
         return create_training_transforms(
             patch_size=self.mgr.train_patch_size,
             no_spatial=no_spatial,
-            no_scaling=no_scaling,
             only_spatial_and_intensity=only_spatial_and_intensity,
             allowed_rotation_axes=allowed_rotation_axes,
             skeleton_targets=skeleton_targets,
@@ -901,7 +1035,9 @@ class BaseDataset(Dataset):
             else:
                 raise IndexError(f"Index {index} out of range for dataset of length {len(self.valid_patches)}")
         if self.slice_sampling_enabled:
-            plane_patch = self._plane_patches[index]
+            # Sample a random 2D slice from the validated 3D chunk
+            chunk_info = self.valid_patches[index]
+            plane_patch = self._sample_plane_from_chunk(chunk_info)
             plane_result = self.plane_slicer.extract(plane_patch)
             data_dict = {
                 'image': torch.from_numpy(plane_result.image),

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
+from tqdm import tqdm
 
 from vesuvius.utils.utils import pad_or_crop_2d, pad_or_crop_3d
 
@@ -151,21 +152,43 @@ class ChunkSlicer:
                 raise RuntimeError(
                     "Chunk slice validation requested but no labeled volumes are registered"
                 )
-            logger.info(
-                "ChunkSlicer: validation disabled because volumes lack labels; enumerating all positions"
-            )
-            validate = False
+            # Only disable validation if unlabeled_fg filtering is also disabled
+            # When unlabeled_fg_enabled, we still want to filter patches by image content
+            if not self.config.unlabeled_fg_enabled:
+                logger.info(
+                    "ChunkSlicer: validation disabled because volumes lack labels; enumerating all positions"
+                )
+                validate = False
+            else:
+                logger.info(
+                    "ChunkSlicer: no labeled volumes, but unlabeled_fg_enabled=True; filtering by image content"
+                )
 
         fg_patches: List[ChunkPatch] = []
         bg_patches: List[ChunkPatch] = []
         unlabeled_fg_patches: List[ChunkPatch] = []
 
         if validate:
-            labeled_volumes = [self._volumes[idx] for idx in self._labeled_indices]
+            # When no labeled volumes but unlabeled_fg is enabled, use all volumes
+            if not self._labeled_indices and self.config.unlabeled_fg_enabled:
+                labeled_volumes = list(self._volumes)
+                logger.info("Using all %d volumes for unlabeled FG filtering", len(labeled_volumes))
+            else:
+                labeled_volumes = [self._volumes[idx] for idx in self._labeled_indices]
             label_arrays = [vol.label_source for vol in labeled_volumes]
             label_names = [vol.name for vol in labeled_volumes]
 
-            cache_paths = [vol.cache_key_path for vol in labeled_volumes]
+            # Fall back to image path when no label path (for unlabeled datasets)
+            cache_paths = []
+            for vol in labeled_volumes:
+                if vol.cache_key_path is not None:
+                    cache_paths.append(vol.cache_key_path)
+                elif hasattr(vol.image, 'path'):
+                    cache_paths.append(Path(vol.image.path))
+                elif vol.image_source is not None and hasattr(vol.image_source, 'path'):
+                    cache_paths.append(Path(vol.image_source.path))
+                else:
+                    cache_paths.append(None)
 
             fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
             bg_positions: List[Tuple[int, Tuple[int, ...]]] = []
@@ -201,6 +224,9 @@ class ChunkSlicer:
                         valid_patch_value=self.config.valid_patch_value,
                         bg_sampling_enabled=self.config.bg_sampling_enabled,
                         bg_to_fg_ratio=self.config.bg_to_fg_ratio,
+                        unlabeled_fg_enabled=self.config.unlabeled_fg_enabled,
+                        unlabeled_fg_threshold=self.config.unlabeled_fg_threshold,
+                        unlabeled_fg_bbox_threshold=self.config.unlabeled_fg_bbox_threshold,
                     )
 
                 if cached is not None:
@@ -275,7 +301,7 @@ class ChunkSlicer:
                         labeled_volumes, label_arrays, label_names, ignore_values
                     )
 
-                    if cache_supported and (raw_fg_entries or raw_bg_entries):
+                    if cache_supported and (raw_fg_entries or raw_bg_entries or raw_unlabeled_fg_entries):
                         cache_list = [Path(p) for p in cache_paths]  # type: ignore[arg-type]
                         save_valid_patches(
                             valid_patches=[
@@ -312,6 +338,9 @@ class ChunkSlicer:
                                 }
                                 for entry in raw_unlabeled_fg_entries
                             ] if raw_unlabeled_fg_entries else None,
+                            unlabeled_fg_enabled=self.config.unlabeled_fg_enabled,
+                            unlabeled_fg_threshold=self.config.unlabeled_fg_threshold,
+                            unlabeled_fg_bbox_threshold=self.config.unlabeled_fg_bbox_threshold,
                         )
 
             # Create ChunkPatch objects from positions (when not loaded from cache)
@@ -430,13 +459,31 @@ class ChunkSlicer:
         # Check if all label sources can be used with find_valid_patches.
         # Valid sources are: zarr Arrays (have shape), zarr Groups (have keys method
         # for accessing resolution levels), or any array-like with shape attribute.
+        # For unlabeled FG detection, we can use image sources instead of labels.
         all_valid_for_vectorized = True
-        for arr in label_arrays:
-            has_shape = getattr(arr, "shape", None) is not None
-            has_keys = callable(getattr(arr, "keys", None))
-            if not (has_shape or has_keys):
-                all_valid_for_vectorized = False
-                break
+
+        # When doing unlabeled FG detection with no labels, check image sources instead
+        if self.config.unlabeled_fg_enabled and all(arr is None for arr in label_arrays):
+            # Check image sources for vectorized processing
+            for vol in labeled_volumes:
+                img_src = vol.image_source
+                if img_src is None:
+                    all_valid_for_vectorized = False
+                    break
+                # Check if we can get a raw array from the handle
+                raw = getattr(img_src, 'raw', lambda: img_src)()
+                has_shape = getattr(raw, "shape", None) is not None
+                has_keys = callable(getattr(raw, "keys", None))
+                if not (has_shape or has_keys):
+                    all_valid_for_vectorized = False
+                    break
+        else:
+            for arr in label_arrays:
+                has_shape = getattr(arr, "shape", None) is not None
+                has_keys = callable(getattr(arr, "keys", None))
+                if not (has_shape or has_keys):
+                    all_valid_for_vectorized = False
+                    break
 
         if not all_valid_for_vectorized:
             logger.info(
@@ -450,9 +497,17 @@ class ChunkSlicer:
             valid_patch_values = [self.config.valid_patch_value] * len(label_arrays)
 
         # Collect image arrays for unlabeled foreground detection if enabled
+        # Use raw() to get the underlying zarr group for resolution level access
         image_arrays = None
         if self.config.unlabeled_fg_enabled:
-            image_arrays = [vol.image_source for vol in labeled_volumes]
+            image_arrays = []
+            for vol in labeled_volumes:
+                img_src = vol.image_source
+                if img_src is not None:
+                    raw = getattr(img_src, 'raw', lambda: img_src)()
+                    image_arrays.append(raw)
+                else:
+                    image_arrays.append(None)
 
         result = find_valid_patches(
             label_arrays=label_arrays,
@@ -535,8 +590,13 @@ class ChunkSlicer:
             if label_array is None:
                 if should_collect_unlabeled_fg:
                     # Enumerate all positions and check image content only
-                    candidate_patches = self.enumerate(volume, stride=self.config.stride)
-                    for candidate in candidate_patches:
+                    candidate_patches = list(self.enumerate(volume, stride=self.config.stride))
+                    logger.info("Filtering %d candidate patches for volume %s", len(candidate_patches), volume.name)
+                    for candidate in tqdm(
+                        candidate_patches,
+                        desc=f"Filtering unlabeled patches ({volume.name})",
+                        leave=False,
+                    ):
                         position = tuple(int(v) for v in candidate.position)
                         patch_vol = int(np.prod(candidate.patch_size))
                         if self._check_image_has_data(volume.image_source, position, patch_vol):
@@ -648,16 +708,28 @@ class ChunkSlicer:
             image_nonzero = np.count_nonzero(image_patch)
             img_fraction = image_nonzero / patch_vol if patch_vol > 0 else 0
             if img_fraction < self.config.unlabeled_fg_threshold:
+                logger.debug(
+                    "_check_image_has_data: img_fraction %.4f < threshold %.4f at %s",
+                    img_fraction, self.config.unlabeled_fg_threshold, position
+                )
                 return False
             # Compute bbox coverage
             img_mask = image_patch != 0
             bbox = compute_bounding_box_3d(img_mask)
             if bbox is None:
+                logger.debug("_check_image_has_data: bbox is None at position %s", position)
                 return False
             bb_vol = bounding_box_volume(bbox)
             img_bbox_fraction = bb_vol / patch_vol if patch_vol > 0 else 0
-            return img_bbox_fraction >= self.config.unlabeled_fg_bbox_threshold
-        except Exception:
+            if img_bbox_fraction < self.config.unlabeled_fg_bbox_threshold:
+                logger.debug(
+                    "_check_image_has_data: bbox_fraction %.4f < threshold %.4f at %s",
+                    img_bbox_fraction, self.config.unlabeled_fg_bbox_threshold, position
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.warning("_check_image_has_data: exception at position %s: %s", position, e)
             return False
 
     def _extract_image_patch_for_validation(
@@ -669,7 +741,10 @@ class ChunkSlicer:
         pos = tuple(int(v) for v in position)
         patch_size = tuple(int(v) for v in self.config.patch_size)
         try:
-            if self._is_2d:
+            # Handle ArrayHandle types (e.g., ZarrArrayHandle) with read_window method
+            if hasattr(image_source, 'read_window'):
+                arr = image_source.read_window(pos, patch_size)
+            elif self._is_2d:
                 y, x = pos
                 ph, pw = patch_size[-2:]
                 arr = np.asarray(image_source[y:y + ph, x:x + pw])
@@ -677,9 +752,9 @@ class ChunkSlicer:
                 z, y, x = pos
                 pd, ph, pw = patch_size
                 arr = np.asarray(image_source[z:z + pd, y:y + ph, x:x + pw])
-            # Reduce to spatial only
-            if arr.ndim > len(patch_size):
-                arr = arr.reshape(arr.shape[-len(patch_size):])
+            # Reduce to spatial only (squeeze channel dims if present)
+            while arr.ndim > len(patch_size):
+                arr = arr[0] if arr.shape[0] == 1 else arr.reshape(arr.shape[-len(patch_size):])
             return arr
         except Exception:
             return None

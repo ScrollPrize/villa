@@ -140,7 +140,7 @@ class TrainEVAMAE(BaseTrainer):
         # Call model with return_mae_mask=True to get restoration mask
         outputs, restoration_mask = model(inputs, return_mae_mask=True)
         
-        # - Shape: (B, 1, W, H, D) at full resolution
+        # - Shape: (B, 1, D, H, W) at full resolution
         # - Values: True/1 for visible patches, False/0 for masked patches
         # loss computes on masked patches (where mask == 0)
         

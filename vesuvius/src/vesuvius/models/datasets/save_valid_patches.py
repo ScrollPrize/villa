@@ -13,7 +13,10 @@ def generate_cache_filename(train_data_paths: List,
                           valid_patch_find_resolution: int = 1,
                           valid_patch_value: Optional[float] = None,
                           bg_sampling_enabled: bool = False,
-                          bg_to_fg_ratio: float = 0.5) -> str:
+                          bg_to_fg_ratio: float = 0.5,
+                          unlabeled_fg_enabled: bool = False,
+                          unlabeled_fg_threshold: float = 0.05,
+                          unlabeled_fg_bbox_threshold: float = 0.15) -> str:
     """
     Generate a unique cache filename based on dataset configuration.
 
@@ -27,6 +30,9 @@ def generate_cache_filename(train_data_paths: List,
         valid_patch_value: Optional specific label value for patch validation
         bg_sampling_enabled: Whether BG-only patch sampling is enabled
         bg_to_fg_ratio: Ratio of BG samples to FG samples
+        unlabeled_fg_enabled: Whether unlabeled foreground detection is enabled
+        unlabeled_fg_threshold: Minimum fraction of non-zero image voxels for unlabeled FG
+        unlabeled_fg_bbox_threshold: Minimum bbox coverage for unlabeled FG
 
     Returns:
         Unique filename for the cache
@@ -46,6 +52,9 @@ def generate_cache_filename(train_data_paths: List,
         f"valid_patch_value:{valid_patch_value}"
         f"bg_sampling_enabled:{bg_sampling_enabled}"
         f"bg_to_fg_ratio:{bg_to_fg_ratio}"
+        f"unlabeled_fg_enabled:{unlabeled_fg_enabled}"
+        f"unlabeled_fg_threshold:{unlabeled_fg_threshold}"
+        f"unlabeled_fg_bbox_threshold:{unlabeled_fg_bbox_threshold}"
     )
 
     # Generate hash
@@ -65,7 +74,10 @@ def save_valid_patches(valid_patches: List[Dict],
                       bg_only_patches: Optional[List[Dict]] = None,
                       bg_sampling_enabled: bool = False,
                       bg_to_fg_ratio: float = 0.5,
-                      unlabeled_fg_patches: Optional[List[Dict]] = None) -> str:
+                      unlabeled_fg_patches: Optional[List[Dict]] = None,
+                      unlabeled_fg_enabled: bool = False,
+                      unlabeled_fg_threshold: float = 0.05,
+                      unlabeled_fg_bbox_threshold: float = 0.15) -> str:
     """
     Save valid patches to a JSON file with metadata.
 
@@ -83,6 +95,9 @@ def save_valid_patches(valid_patches: List[Dict],
         bg_sampling_enabled: Whether BG-only patch sampling is enabled
         bg_to_fg_ratio: Ratio of BG samples to FG samples
         unlabeled_fg_patches: Optional list of unlabeled foreground patches (for semi-supervised)
+        unlabeled_fg_enabled: Whether unlabeled foreground detection is enabled
+        unlabeled_fg_threshold: Minimum fraction of non-zero image voxels for unlabeled FG
+        unlabeled_fg_bbox_threshold: Minimum bbox coverage for unlabeled FG
 
     Returns:
         Path to the saved JSON file
@@ -100,7 +115,8 @@ def save_valid_patches(valid_patches: List[Dict],
     cache_filename = generate_cache_filename(
         train_data_paths, label_paths, patch_size,
         min_labeled_ratio, bbox_threshold, valid_patch_find_resolution, valid_patch_value,
-        bg_sampling_enabled, bg_to_fg_ratio
+        bg_sampling_enabled, bg_to_fg_ratio,
+        unlabeled_fg_enabled, unlabeled_fg_threshold, unlabeled_fg_bbox_threshold
     )
 
     cache_file_path = cache_dir / cache_filename
@@ -121,6 +137,9 @@ def save_valid_patches(valid_patches: List[Dict],
             "bg_to_fg_ratio": bg_to_fg_ratio,
             "num_bg_only_patches": len(bg_only_patches) if bg_only_patches else 0,
             "num_unlabeled_fg_patches": len(unlabeled_fg_patches) if unlabeled_fg_patches else 0,
+            "unlabeled_fg_enabled": unlabeled_fg_enabled,
+            "unlabeled_fg_threshold": unlabeled_fg_threshold,
+            "unlabeled_fg_bbox_threshold": unlabeled_fg_bbox_threshold,
         },
         "valid_patches": [],
         "bg_only_patches": [],
@@ -187,7 +206,10 @@ def load_cached_patches(train_data_paths: List,
                        cache_path: Optional[str] = None,
                        valid_patch_value: Optional[float] = None,
                        bg_sampling_enabled: bool = False,
-                       bg_to_fg_ratio: float = 0.5) -> Optional[Dict[str, List[Dict]]]:
+                       bg_to_fg_ratio: float = 0.5,
+                       unlabeled_fg_enabled: bool = False,
+                       unlabeled_fg_threshold: float = 0.05,
+                       unlabeled_fg_bbox_threshold: float = 0.15) -> Optional[Dict[str, List[Dict]]]:
     """
     Load cached valid patches if they exist and match current configuration.
 
@@ -202,9 +224,12 @@ def load_cached_patches(train_data_paths: List,
         valid_patch_value: Optional specific label value for patch validation
         bg_sampling_enabled: Whether BG-only patch sampling is enabled
         bg_to_fg_ratio: Ratio of BG samples to FG samples
+        unlabeled_fg_enabled: Whether unlabeled foreground detection is enabled
+        unlabeled_fg_threshold: Minimum fraction of non-zero image voxels for unlabeled FG
+        unlabeled_fg_bbox_threshold: Minimum bbox coverage for unlabeled FG
 
     Returns:
-        Dictionary with 'fg_patches' and 'bg_patches' lists if cache is valid, None otherwise
+        Dictionary with 'fg_patches', 'bg_patches', and 'unlabeled_fg_patches' lists if cache is valid, None otherwise
     """
     # Determine cache directory
     if cache_path is None:
@@ -216,7 +241,8 @@ def load_cached_patches(train_data_paths: List,
     cache_filename = generate_cache_filename(
         train_data_paths, label_paths, patch_size,
         min_labeled_ratio, bbox_threshold, valid_patch_find_resolution, valid_patch_value,
-        bg_sampling_enabled, bg_to_fg_ratio
+        bg_sampling_enabled, bg_to_fg_ratio,
+        unlabeled_fg_enabled, unlabeled_fg_threshold, unlabeled_fg_bbox_threshold
     )
 
     cache_file_path = cache_dir / cache_filename
@@ -243,7 +269,10 @@ def load_cached_patches(train_data_paths: List,
             valid_patch_find_resolution != metadata.get("valid_patch_find_resolution", 1) or
             valid_patch_value != metadata.get("valid_patch_value") or
             bg_sampling_enabled != metadata.get("bg_sampling_enabled", False) or
-            bg_to_fg_ratio != metadata.get("bg_to_fg_ratio", 0.5)
+            bg_to_fg_ratio != metadata.get("bg_to_fg_ratio", 0.5) or
+            unlabeled_fg_enabled != metadata.get("unlabeled_fg_enabled", False) or
+            unlabeled_fg_threshold != metadata.get("unlabeled_fg_threshold", 0.05) or
+            unlabeled_fg_bbox_threshold != metadata.get("unlabeled_fg_bbox_threshold", 0.15)
         ):
             print("Cache configuration mismatch - recomputing patches")
             return None
