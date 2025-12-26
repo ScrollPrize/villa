@@ -7,7 +7,7 @@ import fsspec
 import numcodecs
 import shutil
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import partial
 from vesuvius.data.utils import open_zarr
 from vesuvius.data.chunks_filter import load_chunks_json
@@ -498,7 +498,6 @@ def finalize_logits(
 
         future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunk_infos}
         
-        from concurrent.futures import as_completed
         for future in tqdm(
             as_completed(future_to_chunk),
             total=total_chunks,
@@ -540,6 +539,8 @@ def finalize_logits(
 
     # Build multiscale pyramid (levels 1..5) with 2x downsampling
     def build_multiscales(root_path: str, levels: int = 6):
+        if verbose:
+            print(f"Building multiscale pyramid (levels 1-{levels - 1})")
         try:
             # Open level 0 lazily
             lvl0 = open_zarr(os.path.join(root_path, '0'), mode='r', storage_options={'anon': False} if root_path.startswith('s3://') else None)
@@ -571,6 +572,9 @@ def finalize_logits(
                     xc = min(chunks_lvl0[2], tX)
                     chunks = (zc, yc, xc)
 
+                if verbose:
+                    print(f"Downsampling level {i}/{levels - 1}: shape {next_shape}, chunks {chunks}")
+
                 lvl_path = os.path.join(root_path, str(i))
                 ds_store = open_zarr(
                     path=lvl_path,
@@ -596,42 +600,76 @@ def finalize_logits(
                     Zp, Yp, Xp = next_shape
                     zc, yc, xc = chunks[0], chunks[1], chunks[2]
 
-                for oz in range(0, Zp, zc):
-                    for oy in range(0, Yp, yc):
-                        for ox in range(0, Xp, xc):
-                            oz1 = min(oz + zc, Zp)
-                            oy1 = min(oy + yc, Yp)
-                            ox1 = min(ox + xc, Xp)
+                prev_z, prev_y, prev_x = prev_shape[-3], prev_shape[-2], prev_shape[-1]
+                total_tiles = ((Zp + zc - 1) // zc) * ((Yp + yc - 1) // yc) * ((Xp + xc - 1) // xc)
+                downsample_workers = max(1, min(num_workers, total_tiles))
+                if verbose:
+                    print(f"Using {downsample_workers} workers for downsampling level {i}")
 
-                            # Corresponding prev indices
-                            pz0, py0, px0 = oz * 2, oy * 2, ox * 2
-                            pz1, py1, px1 = min(oz1 * 2, prev_shape[-3]), min(oy1 * 2, prev_shape[-2]), min(ox1 * 2, prev_shape[-1])
+                def iter_blocks():
+                    for oz in range(0, Zp, zc):
+                        for oy in range(0, Yp, yc):
+                            for ox in range(0, Xp, xc):
+                                yield oz, oy, ox
 
-                            if has_channel:
-                                prev_block = prev_store[(slice(None), slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
-                                # Pad to even along spatial dims
-                                pad_z = (0, (prev_block.shape[1] % 2))
-                                pad_y = (0, (prev_block.shape[2] % 2))
-                                pad_x = (0, (prev_block.shape[3] % 2))
-                                prev_block = np.pad(prev_block, ((0, 0), pad_z, pad_y, pad_x), mode='edge')
-                                # Reshape and average
-                                Cb, Zb, Yb, Xb = prev_block.shape
-                                block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
-                                if mode == "surface_frame" and Cb == 9:
-                                    tu_ds, tv_ds, n_ds = _orthonormalize_surface_frame(
-                                        block_ds[0:3], block_ds[3:6], block_ds[6:9]
-                                    )
-                                    block_ds = np.concatenate([tu_ds, tv_ds, n_ds], axis=0).astype(block_ds.dtype, copy=False)
-                                ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
-                            else:
-                                prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
-                                pad_z = (0, (prev_block.shape[0] % 2))
-                                pad_y = (0, (prev_block.shape[1] % 2))
-                                pad_x = (0, (prev_block.shape[2] % 2))
-                                prev_block = np.pad(prev_block, (pad_z, pad_y, pad_x), mode='edge')
-                                Zb, Yb, Xb = prev_block.shape
-                                block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
-                                ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+                def downsample_block(block_coords):
+                    oz, oy, ox = block_coords
+                    oz1 = min(oz + zc, Zp)
+                    oy1 = min(oy + yc, Yp)
+                    ox1 = min(ox + xc, Xp)
+
+                    # Corresponding prev indices
+                    pz0, py0, px0 = oz * 2, oy * 2, ox * 2
+                    pz1 = min(oz1 * 2, prev_z)
+                    py1 = min(oy1 * 2, prev_y)
+                    px1 = min(ox1 * 2, prev_x)
+
+                    if has_channel:
+                        prev_block = prev_store[(slice(None), slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
+                        # Pad to even along spatial dims
+                        pad_z = (0, (prev_block.shape[1] % 2))
+                        pad_y = (0, (prev_block.shape[2] % 2))
+                        pad_x = (0, (prev_block.shape[3] % 2))
+                        prev_block = np.pad(prev_block, ((0, 0), pad_z, pad_y, pad_x), mode='edge')
+                        # Reshape and average
+                        Cb, Zb, Yb, Xb = prev_block.shape
+                        block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
+                        if mode == "surface_frame" and Cb == 9:
+                            tu_ds, tv_ds, n_ds = _orthonormalize_surface_frame(
+                                block_ds[0:3], block_ds[3:6], block_ds[6:9]
+                            )
+                            block_ds = np.concatenate([tu_ds, tv_ds, n_ds], axis=0).astype(block_ds.dtype, copy=False)
+                        ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+                    else:
+                        prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
+                        pad_z = (0, (prev_block.shape[0] % 2))
+                        pad_y = (0, (prev_block.shape[1] % 2))
+                        pad_x = (0, (prev_block.shape[2] % 2))
+                        prev_block = np.pad(prev_block, (pad_z, pad_y, pad_x), mode='edge')
+                        Zb, Yb, Xb = prev_block.shape
+                        block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
+                        ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+
+                if downsample_workers == 1:
+                    for block_coords in tqdm(
+                        iter_blocks(),
+                        total=total_tiles,
+                        desc=f"Downsample level {i}",
+                        unit="blocks",
+                        disable=not verbose
+                    ):
+                        downsample_block(block_coords)
+                else:
+                    with ThreadPoolExecutor(max_workers=downsample_workers) as executor:
+                        futures = [executor.submit(downsample_block, block_coords) for block_coords in iter_blocks()]
+                        for future in tqdm(
+                            as_completed(futures),
+                            total=total_tiles,
+                            desc=f"Downsample level {i}",
+                            unit="blocks",
+                            disable=not verbose
+                        ):
+                            future.result()
 
                 datasets.append({'path': str(i)})
                 prev_path = lvl_path
