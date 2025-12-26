@@ -126,14 +126,15 @@ class SIGRegLoss(nn.Module):
             loss: scalar loss tensor
             loss_dict: dict with individual loss components for logging
         """
-        V_g, B, K = global_proj.shape
-        V = all_proj.shape[0]
+        V, B, K = all_proj.shape
+        V_g = global_proj.shape[0]
 
-        # Invariance loss: MSE between each view and mean of global projections
+        # Invariance loss: MSE between each view and mean of GLOBAL projections
+        # Reference paper: centers computed from global views only, all views match to it
         # centers: mean projection across global views (B, K)
         centers = global_proj.mean(dim=0)
 
-        # Each view should match the global center
+        # Each view should match the global view mean
         invariance_loss = (all_proj - centers.unsqueeze(0)).square().mean()
 
         # SIGReg loss: average over all views
@@ -143,8 +144,8 @@ class SIGRegLoss(nn.Module):
             sigreg_losses.append(T.mean())
         sigreg_loss = torch.stack(sigreg_losses).mean()
 
-        # Combined loss: sigreg * lambda + invariance * (1 - lambda)
-        # Following the original paper's formulation
+        # Combined loss: lambda * sigreg + (1 - lambda) * invariance
+        # Following the original paper's formulation exactly
         loss = self.lambd * sigreg_loss + (1 - self.lambd) * invariance_loss
 
         loss_dict = {

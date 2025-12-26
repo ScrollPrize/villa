@@ -75,6 +75,15 @@ class ConfigManager:
         for key, value in mean_teacher_config.items():
             setattr(self, key, value)
 
+        # Load LeJEPA config - flatten into attributes
+        # These parameters are used by TrainLeJEPA
+        lejepa_config = config.get("lejepa_config", {})
+        for key, value in lejepa_config.items():
+            # Handle 'lambda' specially since it's a Python reserved word
+            # and trainer expects 'lejepa_lambda' attribute name
+            attr_name = "lejepa_lambda" if key == "lambda" else key
+            setattr(self, attr_name, value)
+
         self._init_attributes()
 
         if self.auxiliary_tasks and self.targets:
