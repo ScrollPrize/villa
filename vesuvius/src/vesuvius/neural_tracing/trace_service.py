@@ -106,10 +106,10 @@ def process_request(request, inference, volume_scale):
         prev_v = xyz_to_scaled_zyx(prev_v_xyz)
         prev_diag = xyz_to_scaled_zyx(prev_diag_xyz)
 
-        heatmaps, min_corner_zyx = inference.get_heatmaps_at(center_zyx, prev_u, prev_v, prev_diag)
+        heatmaps, min_corner_zyxs = inference.get_heatmaps_at(center_zyx, prev_u, prev_v, prev_diag)
 
-        u_coordinates = [inference.get_blob_coordinates(heatmap[0, 0], min_corner_zyx) for heatmap in heatmaps]
-        v_coordinates = [inference.get_blob_coordinates(heatmap[1, 0], min_corner_zyx) for heatmap in heatmaps]
+        u_coordinates = [inference.get_blob_coordinates(heatmap[0, 0], min_corner_zyx) for heatmap, min_corner_zyx in zip(heatmaps, min_corner_zyxs)]
+        v_coordinates = [inference.get_blob_coordinates(heatmap[1, 0], min_corner_zyx) for heatmap, min_corner_zyx in zip(heatmaps, min_corner_zyxs)]
 
         response = {
             'center_xyz': center_xyz,
