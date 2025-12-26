@@ -211,6 +211,7 @@ version = {attr = "vesuvius._version.VERSION"}
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
+extra-build-dependencies = { "flash-attn" = ["torch"] }
 
 [tool.uv.sources]
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }

@@ -1639,6 +1639,15 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-attn"
+version = "2.8.3"
+source = { git = "https://github.com/Dao-AILab/flash-attention.git#58fe37fba6b07ac0aa6e88a94d68f8378c901028" }
+dependencies = [
+    { name = "einops" },
+    { name = "torch" },
+]
+
+[[package]]
 name = "flask"
 version = "3.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -7458,6 +7467,7 @@ all = [
     { name = "dynamic-network-architectures" },
     { name = "einops" },
     { name = "fft-conv-pytorch" },
+    { name = "flash-attn" },
     { name = "fvcore" },
     { name = "huggingface-hub" },
     { name = "libigl" },
@@ -7510,13 +7520,21 @@ gui = [
     { name = "pyqt6" },
 ]
 models = [
+    { name = "aiohttp" },
     { name = "batchgenerators" },
     { name = "batchgeneratorsv2" },
+    { name = "blosc2", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "blosc2", version = "3.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "dask", version = "2024.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "dask", version = "2025.9.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "dask-image" },
     { name = "dynamic-network-architectures" },
     { name = "einops" },
     { name = "fft-conv-pytorch" },
+    { name = "flash-attn" },
     { name = "fvcore" },
     { name = "huggingface-hub" },
+    { name = "lxml" },
     { name = "monai" },
     { name = "nnunetv2" },
     { name = "numba", version = "0.60.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -7583,6 +7601,7 @@ volume-only = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'all'", specifier = ">=3.12.15" },
+    { name = "aiohttp", marker = "extra == 'models'", specifier = ">=3.12.15" },
     { name = "alphashape", marker = "extra == 'all'", specifier = ">=1.3.1" },
     { name = "alphashape", marker = "extra == 'render'", specifier = ">=1.3.1" },
     { name = "batchgenerators", marker = "extra == 'all'", specifier = ">=0.25.1" },
@@ -7590,17 +7609,22 @@ requires-dist = [
     { name = "batchgeneratorsv2", marker = "extra == 'all'", directory = "../segmentation/models/batchgeneratorsv2" },
     { name = "batchgeneratorsv2", marker = "extra == 'models'", directory = "../segmentation/models/batchgeneratorsv2" },
     { name = "blosc2", marker = "extra == 'all'", specifier = ">=2.5.1" },
+    { name = "blosc2", marker = "extra == 'models'", specifier = ">=2.5.1" },
     { name = "build", marker = "extra == 'all'" },
     { name = "connected-components-3d", marker = "extra == 'all'", specifier = ">=3.24.0" },
     { name = "connected-components-3d", marker = "extra == 'render'", specifier = ">=3.24.0" },
     { name = "dask", marker = "extra == 'all'", specifier = ">=2024.8.0" },
+    { name = "dask", marker = "extra == 'models'", specifier = ">=2024.8.0" },
     { name = "dask-image", marker = "extra == 'all'", specifier = ">=2024.5.3" },
+    { name = "dask-image", marker = "extra == 'models'", specifier = ">=2024.5.3" },
     { name = "dynamic-network-architectures", marker = "extra == 'all'", specifier = ">=0.3.1" },
     { name = "dynamic-network-architectures", marker = "extra == 'models'", specifier = ">=0.3.1" },
     { name = "einops", marker = "extra == 'all'", specifier = ">=0.8.1" },
     { name = "einops", marker = "extra == 'models'", specifier = ">=0.8.1" },
     { name = "fft-conv-pytorch", marker = "extra == 'all'", specifier = ">=1.2.0" },
     { name = "fft-conv-pytorch", marker = "extra == 'models'", specifier = ">=1.2.0" },
+    { name = "flash-attn", marker = "extra == 'all'", git = "https://github.com/Dao-AILab/flash-attention.git" },
+    { name = "flash-attn", marker = "extra == 'models'", git = "https://github.com/Dao-AILab/flash-attention.git" },
     { name = "fsspec", specifier = ">=2025.9.0" },
     { name = "fsspec", marker = "extra == 'volume-only'", specifier = ">=2025.9.0" },
     { name = "fvcore", marker = "extra == 'all'", specifier = ">=0.1.5.post20221221" },
@@ -7612,6 +7636,7 @@ requires-dist = [
     { name = "libigl", marker = "extra == 'all'", specifier = ">=2.6.1" },
     { name = "libigl", marker = "extra == 'render'", specifier = ">=2.6.1" },
     { name = "lxml", marker = "extra == 'all'", specifier = ">=6.0.2" },
+    { name = "lxml", marker = "extra == 'models'", specifier = ">=6.0.2" },
     { name = "magic-class", marker = "extra == 'all'", specifier = ">=0.7.17" },
     { name = "magic-class", marker = "extra == 'gui'", specifier = ">=0.7.17" },
     { name = "magicgui", marker = "extra == 'all'", specifier = ">=0.10.1" },
