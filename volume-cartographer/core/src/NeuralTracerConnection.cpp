@@ -68,56 +68,67 @@ NeuralTracerConnection::~NeuralTracerConnection() {
     }
 }
 
-NeuralTracerConnection::NextUvs NeuralTracerConnection::get_next_points(
-    cv::Vec3f const &center,
-    std::optional<cv::Vec3f> const &prev_u,
-    std::optional<cv::Vec3f> const &prev_v,
-    std::optional<cv::Vec3f> const &prev_diag
+std::vector<NeuralTracerConnection::NextUvs> NeuralTracerConnection::get_next_points(
+    std::vector<cv::Vec3f> const &center,
+    std::vector<std::optional<cv::Vec3f>> const &prev_u,
+    std::vector<std::optional<cv::Vec3f>> const &prev_v,
+    std::vector<std::optional<cv::Vec3f>> const &prev_diag
 ) const {
     nlohmann::json req;
 
-    req["center_xyz"] = {center[0], center[1], center[2]};
+    nlohmann::json center_list = nlohmann::json::array();
+    for (const auto& c : center) {
+        center_list.push_back({c[0], c[1], c[2]});
+    }
+    req["center_xyz"] = center_list;
 
-    if (prev_u.has_value()) {
-        req["prev_u_xyz"] = {prev_u.value()[0], prev_u.value()[1], prev_u.value()[2]};
-    }
-    if (prev_v.has_value()) {
-        req["prev_v_xyz"] = {prev_v.value()[0], prev_v.value()[1], prev_v.value()[2]};
-    }
-    if (prev_diag.has_value()) {
-        req["prev_diag_xyz"] = {prev_diag.value()[0], prev_diag.value()[1], prev_diag.value()[2]};
-    }
+    auto convert_prev_coords = [](const std::vector<std::optional<cv::Vec3f>>& coords) {
+        nlohmann::json list = nlohmann::json::array();
+        for (const auto& p : coords) {
+            if (p.has_value()) {
+                list.push_back({p.value()[0], p.value()[1], p.value()[2]});
+            } else {
+                list.push_back(nullptr);
+            }
+        }
+        return list;
+    };
+    req["prev_u_xyz"] = convert_prev_coords(prev_u);
+    req["prev_v_xyz"] = convert_prev_coords(prev_v);
+    req["prev_diag_xyz"] = convert_prev_coords(prev_diag);
 
     nlohmann::json response = process_json_request(req, sock);
-
-    NextUvs result;
 
     auto get_float_or_nan = [](const nlohmann::json& j) {
         return j.is_null() ? std::numeric_limits<float>::quiet_NaN() : j.get<float>();
     };
 
-    if (response.contains("u_candidates")) {
-        for (auto const& u_candidate : response["u_candidates"]) {
-            if (u_candidate.is_array() && u_candidate.size() == 3) {
-                result.next_u_xyzs.emplace_back(
-                    get_float_or_nan(u_candidate[0]),
-                    get_float_or_nan(u_candidate[1]),
-                    get_float_or_nan(u_candidate[2])
-                );
-            }
+    auto process_candidates = [&](const nlohmann::json& batch) {
+        std::vector<cv::Vec3f> candidates;
+        assert(batch.is_array());
+        for (auto const& candidate : batch) {
+            assert(candidate.is_array() && candidate.size() == 3);
+            candidates.emplace_back(
+                get_float_or_nan(candidate[0]),
+                get_float_or_nan(candidate[1]),
+                get_float_or_nan(candidate[2])
+            );
         }
-    }
-    if (response.contains("v_candidates")) {
-        for (auto const& v_candidate : response["v_candidates"]) {
-            if (v_candidate.is_array() && v_candidate.size() == 3) {
-                result.next_v_xyzs.emplace_back(
-                    get_float_or_nan(v_candidate[0]),
-                    get_float_or_nan(v_candidate[1]),
-                    get_float_or_nan(v_candidate[2])
-                );
-            }
+        return candidates;
+    };
+
+    std::vector<NextUvs> results;
+    if (response.contains("u_candidates") && response.contains("v_candidates")) {
+        auto& u_batch = response["u_candidates"];
+        auto& v_batch = response["v_candidates"];
+        assert(u_batch.size() == v_batch.size());
+        for (size_t i = 0; i < u_batch.size(); ++i) {
+            results.emplace_back(
+                process_candidates(u_batch[i]),
+                process_candidates(v_batch[i])
+            );
         }
     }
 
-    return result;
+    return results;
 }

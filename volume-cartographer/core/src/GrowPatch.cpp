@@ -605,9 +605,9 @@ static bool call_neural_tracer_for_point(
     auto prev_v_xyz = best_ortho_pos.transform(get_point);
     auto prev_diag_xyz = best_diag_pos.transform(get_point);
 
-    auto next_uvs = neural_tracer->get_next_points(center_xyz, prev_u_xyz, prev_v_xyz, prev_diag_xyz);
+    auto next_uvs = neural_tracer->get_next_points({center_xyz}, {prev_u_xyz}, {prev_v_xyz}, {prev_diag_xyz});
 
-    const auto& candidates = next_uvs.next_u_xyzs;
+    const auto& candidates = next_uvs[0].next_u_xyzs;
     if (!candidates.empty() && cv::norm(candidates[0]) > 1e-6) {
         trace_params.dpoints(p) = {candidates[0][0], candidates[0][1], candidates[0][2]};
         trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -2029,7 +2029,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             generations(y0, x0) = 1;
             fringe.push_back({y0, x0});
 
-            auto next_points = neural_tracer->get_next_points(origin, std::nullopt, std::nullopt, std::nullopt);
+            auto next_points = neural_tracer->get_next_points({origin}, {std::nullopt}, {std::nullopt}, {std::nullopt})[0];
 
             if (next_points.next_u_xyzs.size() >= 4) {
                 std::cout << "Neural tracer returned " << next_points.next_u_xyzs.size() << " initial points." << std::endl;

@@ -21,11 +21,11 @@ public:
     NeuralTracerConnection(NeuralTracerConnection const &) = delete;
     NeuralTracerConnection &operator =(NeuralTracerConnection const &) = delete;
 
-    NextUvs get_next_points(
-        cv::Vec3f const &center,
-        std::optional<cv::Vec3f> const &prev_u,
-        std::optional<cv::Vec3f> const &prev_v,
-        std::optional<cv::Vec3f> const &prev_diag
+    std::vector<NextUvs> get_next_points(
+        std::vector<cv::Vec3f> const &center,
+        std::vector<std::optional<cv::Vec3f>> const &prev_u,
+        std::vector<std::optional<cv::Vec3f>> const &prev_v,
+        std::vector<std::optional<cv::Vec3f>> const &prev_diag
     ) const;
 
 private:

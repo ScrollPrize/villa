@@ -79,21 +79,25 @@ def process_request(request, inference, volume_scale):
         return {'error': 'Missing required field: center_xyz'}
     center_xyz = request['center_xyz']
 
-    prev_u_xyz = request.get('prev_u_xyz')
-    prev_v_xyz = request.get('prev_v_xyz')
-    prev_diag_xyz = request.get('prev_diag_xyz')
+    prev_u_xyz = request['prev_u_xyz']
+    prev_v_xyz = request['prev_v_xyz']
+    prev_diag_xyz = request['prev_diag_xyz']
 
     print(f'handling request with center_xyz = {center_xyz}, prev_u_xyz = {prev_u_xyz}, prev_v_xyz = {prev_v_xyz}, prev_diag_xyz = {prev_diag_xyz}')
 
-    def xyz_to_scaled_zyx(xyz):
-        if xyz is None:
-            return None
-        if not isinstance(xyz, list) or len(xyz) != 3:
-            raise ValueError(f'Coordinate must be a list of 3 numbers, got {xyz}')
-        return torch.tensor(xyz).flip(0) / (2 ** volume_scale)
+    def xyz_to_scaled_zyx(xyzs):
+        for xyz in xyzs:
+            if xyz is None:
+                continue
+            if not isinstance(xyz, list) or len(xyz) != 3:
+                raise ValueError(f'Coordinate must be a list of 3 numbers, got {xyz}')
+        return [
+            torch.tensor(xyz).flip(0) / (2 ** volume_scale) if xyz is not None else None
+            for xyz in xyzs
+        ]
 
-    def zyxs_to_scaled_xyzs(zyxs):
-        return (zyxs.flip(1) * (2 ** volume_scale)).tolist()
+    def zyxs_to_scaled_xyzs(zyxss):
+        return [(zyxs.flip(1) * (2 ** volume_scale)).tolist() for zyxs in zyxss]
 
     with torch.inference_mode():
 
@@ -104,8 +108,8 @@ def process_request(request, inference, volume_scale):
 
         heatmaps, min_corner_zyx = inference.get_heatmaps_at(center_zyx, prev_u, prev_v, prev_diag)
 
-        u_coordinates = inference.get_blob_coordinates(heatmaps[0, 0], min_corner_zyx)
-        v_coordinates = inference.get_blob_coordinates(heatmaps[1, 0], min_corner_zyx)
+        u_coordinates = [inference.get_blob_coordinates(heatmap[0, 0], min_corner_zyx) for heatmap in heatmaps]
+        v_coordinates = [inference.get_blob_coordinates(heatmap[1, 0], min_corner_zyx) for heatmap in heatmaps]
 
         response = {
             'center_xyz': center_xyz,

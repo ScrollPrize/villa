@@ -18,7 +18,6 @@ class Inference:
             mixed_precision=config['mixed_precision'],
         )
 
-
         self.model = self.accelerator.prepare(model)
         self.device = self.accelerator.device
         self.config = config
@@ -31,7 +30,6 @@ class Inference:
 
         self.model.eval()
 
-
         print(f"loading volume zarr {volume_zarr}...")
         ome_zarr = zarr.open_group(volume_zarr, mode='r')
         self.volume = ome_zarr[str(volume_scale)]
@@ -40,23 +38,41 @@ class Inference:
         print(f"volume shape: {self.volume.shape}, dtype: {self.volume.dtype}, voxel-size: {self.voxel_size_um * 2 ** volume_scale}um")
 
     def get_heatmaps_at(self, zyx, prev_u, prev_v, prev_diag):
+        if isinstance(zyx, torch.Tensor) and zyx.ndim == 1:
+            zyx = zyx[None]
+            prev_u = [prev_u]
+            prev_v = [prev_v]
+            prev_diag = [prev_diag]
+            not_originally_batched = True
+        else:
+            not_originally_batched = False
         crop_size = self.config['crop_size']
-        volume_crop, min_corner_zyx = get_crop_from_volume(self.volume, zyx, crop_size)
         use_localiser = bool(self.config.get('use_localiser', True))
-        if use_localiser:
-            localiser = build_localiser(zyx, min_corner_zyx, crop_size)
-        prev_u_heatmap = make_heatmaps([prev_u[None]], min_corner_zyx, crop_size) if prev_u is not None else torch.zeros([1, crop_size, crop_size, crop_size])
-        prev_v_heatmap = make_heatmaps([prev_v[None]], min_corner_zyx, crop_size) if prev_v is not None else torch.zeros([1, crop_size, crop_size, crop_size])
-        prev_diag_heatmap = make_heatmaps([prev_diag[None]], min_corner_zyx, crop_size) if prev_diag is not None else torch.zeros([1, crop_size, crop_size, crop_size])
+        zeros = torch.zeros([1, crop_size, crop_size, crop_size])
+        volume_crops = []
+        min_corner_zyxs = []
+        localisers = []
+        prev_u_heatmaps = []
+        prev_v_heatmaps = []
+        prev_diag_heatmaps = []
+        for idx in range(len(zyx)):
+            volume_crop, min_corner_zyx = get_crop_from_volume(self.volume, zyx[idx], crop_size)
+            volume_crops.append(volume_crop)
+            min_corner_zyxs.append(min_corner_zyx)
+            if use_localiser:
+                localisers.append(build_localiser(zyx[idx], min_corner_zyx, crop_size))
+            prev_u_heatmaps.append(make_heatmaps([prev_u[idx][None]], min_corner_zyx, crop_size) if prev_u[idx] is not None else zeros)
+            prev_v_heatmaps.append(make_heatmaps([prev_v[idx][None]], min_corner_zyx, crop_size) if prev_v[idx] is not None else zeros)
+            prev_diag_heatmaps.append(make_heatmaps([prev_diag[idx][None]], min_corner_zyx, crop_size) if prev_diag[idx] is not None else zeros)
         input_parts = [
-            volume_crop[None, None].to(self.device),
-            prev_u_heatmap[None].to(self.device),
-            prev_v_heatmap[None].to(self.device),
-            prev_diag_heatmap[None].to(self.device),
+            torch.stack(volume_crops)[:, None]
+        ] + ([torch.stack(localisers)[:, None]] if use_localiser else []) + [
+            torch.stack(prev_u_heatmaps),
+            torch.stack(prev_v_heatmaps),
+            torch.stack(prev_diag_heatmaps),
         ]
-        if use_localiser:
-            input_parts.insert(1, localiser[None, None].to(self.device))
-        inputs = torch.cat(input_parts, dim=1)
+        inputs = torch.cat(input_parts, dim=1).to(self.device)
+        min_corner_zyxs = torch.stack(min_corner_zyxs)
 
         def forward(model_inputs):
             outputs = self.model(model_inputs)
@@ -72,10 +88,14 @@ class Inference:
 
         with torch.no_grad():
             logits = run_with_tta(inputs)
-            logits = logits.squeeze(0).reshape(2, self.config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
+            logits = logits.reshape(len(zyx), 2, self.config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
             probs = torch.sigmoid(logits)
 
-        return probs, min_corner_zyx
+        if not_originally_batched:
+            probs = probs.squeeze(0)
+            min_corner_zyxs = min_corner_zyxs.squeeze(0)
+
+        return probs, min_corner_zyxs
 
     def get_blob_coordinates(self, heatmap, min_corner_zyx, threshold=0.5, min_size=8):
         # Find up to four blobs of sufficient size; return their centroids in descending order of blob size
