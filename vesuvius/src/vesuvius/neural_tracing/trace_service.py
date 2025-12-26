@@ -83,7 +83,7 @@ def process_request(request, inference, volume_scale):
     prev_v_xyz = request['prev_v_xyz']
     prev_diag_xyz = request['prev_diag_xyz']
 
-    print(f'handling request with center_xyz = {center_xyz}, prev_u_xyz = {prev_u_xyz}, prev_v_xyz = {prev_v_xyz}, prev_diag_xyz = {prev_diag_xyz}')
+    print(f'handling request with batch size = {len(center_xyz)}, center_xyz = {center_xyz}, prev_u_xyz = {prev_u_xyz}, prev_v_xyz = {prev_v_xyz}, prev_diag_xyz = {prev_diag_xyz}')
 
     def xyz_to_scaled_zyx(xyzs):
         for xyz in xyzs:

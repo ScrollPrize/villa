@@ -533,89 +533,107 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
 
 } // namespace
 
-static bool call_neural_tracer_for_point(
-    const cv::Vec2i& p,
+static std::vector<cv::Vec2i> call_neural_tracer_for_points(
+    const std::vector<cv::Vec2i>& points,
     TraceParameters& trace_params,
     NeuralTracerConnection* neural_tracer)
 {
-    if (!neural_tracer) return false;
+    if (!neural_tracer)
+        throw std::logic_error("Neural tracer connection is null");
 
     auto is_valid = [&](const cv::Vec2i& pt) {
         return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
     };
 
-    cv::Vec2i best_dir;
-    std::optional<cv::Vec2i> best_ortho_pos;
-    std::optional<cv::Vec2i> best_diag_pos;
-    int max_score = -1;
+    std::vector<cv::Vec3f> center_xyzs;
+    std::vector<std::optional<cv::Vec3f>> prev_u_xyzs, prev_v_xyzs, prev_diag_xyzs;
+    std::vector<cv::Vec2i> points_with_valid_dirs;
 
-    const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (auto const &p : points) {
 
-    for (const auto& dir : dirs) {
-        if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {  // check if center and prev_u (where u is dir-direction) are valid
+        cv::Vec2i best_dir;
+        std::optional<cv::Vec2i> best_ortho_pos;
+        std::optional<cv::Vec2i> best_diag_pos;
+        int max_score = -1;
+
+        const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+        for (const auto& dir : dirs) {
+            if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {  // check if center and prev_u (where u is dir-direction) are valid
+                continue;
+            }
+
+            const cv::Vec2i center_pos = p - dir;
+
+            const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
+
+            for (const auto& ortho_dir : ortho_dirs) {
+
+                auto current_ortho_pos = is_valid(center_pos - ortho_dir) ? std::optional{center_pos - ortho_dir} : std::nullopt;
+                cv::Vec2i diag_dir;  // vector from prev_diag to center
+                if (current_ortho_pos) {
+                    // if prev_u and prev_v both given, then prev_diag should be adjacent to the gap p (not to center)
+                    diag_dir = dir - ortho_dir;
+                } else {
+                    // if only prev_u not prev_v given, then prev_diag should be opposite to the gap p along ortho_dir
+                    diag_dir = dir + ortho_dir;
+                }
+                auto current_diag_pos = is_valid(center_pos - diag_dir) ? std::optional{center_pos - diag_dir} : std::nullopt;
+
+                int current_score =
+                    current_ortho_pos && current_diag_pos ? 3 :
+                    current_ortho_pos ? 2 :
+                    current_diag_pos ? 1 :
+                    0;  // only prev_u & center valid
+
+                if (current_score > max_score) {
+                    max_score = current_score;
+                    best_dir = dir;
+                    best_ortho_pos = current_ortho_pos;
+                    best_diag_pos = current_diag_pos;
+                }
+            }
+        }
+
+        if (max_score < 1) {
+            // we disallow score = -1 since this implies no neighbors found, and score = 0 since this is likely to create long, poorly-supported tendrils
+            std::cout << "warning: max_score = " << max_score << std::endl;
             continue;
         }
 
-        const cv::Vec2i center_pos = p - dir;
+        auto get_point = [&](const cv::Vec2i& pos) {
+            assert(is_valid(pos));
+            const auto& p_double_neighbor = trace_params.dpoints(pos);
+            return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
+        };
 
-        const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
+        center_xyzs.push_back(get_point(p - best_dir));
+        prev_u_xyzs.push_back(get_point(p - 2 * best_dir));
+        prev_v_xyzs.push_back(best_ortho_pos.transform(get_point));
+        prev_diag_xyzs.push_back(best_diag_pos.transform(get_point));
+        points_with_valid_dirs.push_back(p);
+    }
 
-        for (const auto& ortho_dir : ortho_dirs) {
+    if (points_with_valid_dirs.empty()) {
+        return {};
+    }
 
-            auto current_ortho_pos = is_valid(center_pos - ortho_dir) ? std::optional{center_pos - ortho_dir} : std::nullopt;
-            cv::Vec2i diag_dir;  // vector from prev_diag to center
-            if (current_ortho_pos) {
-                // if prev_u and prev_v both given, then prev_diag should be adjacent to the gap p (not to center)
-                diag_dir = dir - ortho_dir;
-            } else {
-                // if only prev_u not prev_v given, then prev_diag should be opposite to the gap p along ortho_dir
-                diag_dir = dir + ortho_dir;
-            }
-            auto current_diag_pos = is_valid(center_pos - diag_dir) ? std::optional{center_pos - diag_dir} : std::nullopt;
+    auto next_uvs = neural_tracer->get_next_points(center_xyzs, prev_u_xyzs, prev_v_xyzs, prev_diag_xyzs);
 
-            int current_score =
-                current_ortho_pos && current_diag_pos ? 3 :
-                current_ortho_pos ? 2 :
-                current_diag_pos ? 1 :
-                0;  // only prev_u & center valid
-
-            if (current_score > max_score) {
-                max_score = current_score;
-                best_dir = dir;
-                best_ortho_pos = current_ortho_pos;
-                best_diag_pos = current_diag_pos;
-            }
+    std::vector<cv::Vec2i> successful_points;
+    for (int point_idx = 0; point_idx < points_with_valid_dirs.size(); point_idx++) {
+        auto const p = points_with_valid_dirs[point_idx];
+        const auto& candidates = next_uvs[point_idx].next_u_xyzs;
+        if (!candidates.empty() && cv::norm(candidates[0]) > 1e-6) {
+            trace_params.dpoints(p) = {candidates[0][0], candidates[0][1], candidates[0][2]};
+            trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+            successful_points.push_back(p);
+        } else {
+            std::cout << "warning: no valid next point found at " << p << std::endl;
         }
     }
 
-    if (max_score < 1) {
-        // we disallow score = -1 since this implies no neighbors found, and score = 0 since this is likely to create long, poorly-supported tendrils
-        std::cout << "warning: max_score = " << max_score << std::endl;
-        return false;
-    }
-
-    auto get_point = [&](const cv::Vec2i& pos) {
-        assert(is_valid(pos));
-        const auto& p_double_neighbor = trace_params.dpoints(pos);
-        return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
-    };
-
-    auto center_xyz = get_point(p - best_dir);
-    auto prev_u_xyz = get_point(p - 2 * best_dir);
-    auto prev_v_xyz = best_ortho_pos.transform(get_point);
-    auto prev_diag_xyz = best_diag_pos.transform(get_point);
-
-    auto next_uvs = neural_tracer->get_next_points({center_xyz}, {prev_u_xyz}, {prev_v_xyz}, {prev_diag_xyz});
-
-    const auto& candidates = next_uvs[0].next_u_xyzs;
-    if (!candidates.empty() && cv::norm(candidates[0]) > 1e-6) {
-        trace_params.dpoints(p) = {candidates[0][0], candidates[0][1], candidates[0][2]};
-        trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-        return true;
-    } else {
-        std::cout << "warning: no valid next point found at " << p << std::endl;
-        return false;
-    }
+    return successful_points;
 }
 
 // global CUDA to allow use to set to false globally
@@ -1558,7 +1576,7 @@ struct thresholdedDistance
 QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
-    int pre_neural_gens = 0;
+    int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {
         std::string socket_path = params["neural_socket"];
         if (!socket_path.empty()) {
@@ -1571,6 +1589,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             }
         }
         pre_neural_gens = params.value("pre_neural_generations", 0);
+        neural_batch_size = params.value("neural_batch_size", 1);
     }
     if (!neural_tracer) {
         std::cout << "Neural tracer not active" << std::endl;
@@ -2382,67 +2401,104 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         // considering two points that are too close to each other...
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
-        // ...then start iterating over candidates in parallel using the above to yield points
-// #pragma omp parallel
-        {
-            CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
-//             int idx = rand() % cands.size();
+        if (neural_tracer && generation > pre_neural_gens) {
+
             while (true) {
-                int r = 1;
-                double phys_fail_th = 0.1;
-                cv::Vec2i p = cands_threadcol.next();
-                if (p[0] == -1)
-                    break;
 
-                if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
-                    continue;
+                // FIXME: when cands are few (e.g. ~4x batch size), we should not try to process them in parallel
 
-                // p is now a 2D point we consider adding to the patch; find the best 3D point to map it to
-
-                // Iterate all adjacent points that are in the patch, and find their 3D locations
-                int ref_count = 0;
-                cv::Vec3d avg = {0,0,0};
-                std::vector<cv::Vec2i> srcs;
-                for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,trace_params.dpoints.rows-1);oy++)
-                    for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,trace_params.dpoints.cols-1);ox++)
-                        if (trace_params.state(oy,ox) & STATE_LOC_VALID) {
-                            ref_count++;
-                            avg += trace_params.dpoints(oy,ox);
-                            srcs.push_back({oy,ox});
-                        }
-
-                // Of those adjacent points, find the one that itself has most adjacent in-patch points
-                cv::Vec2i best_l = srcs[0];
-                int best_ref_l = -1;
-                int rec_ref_sum = 0;
-                for(cv::Vec2i l : srcs) {
-                    int ref_l = 0;
-                    for(int oy=std::max(l[0]-r,0);oy<=std::min(l[0]+r,trace_params.dpoints.rows-1);oy++)
-                        for(int ox=std::max(l[1]-r,0);ox<=std::min(l[1]+r,trace_params.dpoints.cols-1);ox++)
-                            if (trace_params.state(oy,ox) & STATE_LOC_VALID)
-                                ref_l++;
-
-                    rec_ref_sum += ref_l;
-
-                    if (ref_l > best_ref_l) {
-                        best_l = l;
-                        best_ref_l = ref_l;
+                bool no_more_candidates = false;
+                std::vector<cv::Vec2i> batch_cands;
+                batch_cands.reserve(neural_batch_size);
+                // FIXME: we only use parallel to 'borrow' OmpPointCol logic for not processing nearby points together
+                #pragma omp parallel for
+                for (int idx_in_batch = 0; idx_in_batch < neural_batch_size; ++idx_in_batch) {
+                    cv::Vec2i const p = cands_threadcol.next();
+                    if (p[0] == -1) {
+                        no_more_candidates = true;
+                        continue;
                     }
+                    if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
+                        continue;
+                    // TODO: also skip if its neighbors are outside the z-range (c.f. ceres case checking avg)
+                    #pragma omp critical
+                        batch_cands.push_back(p);
                 }
 
-                avg /= ref_count;
+                auto const points_placed = call_neural_tracer_for_points(batch_cands, trace_params, neural_tracer.get());
 
-                // FIXME: for the neural case, only need avg for the z-bounds check, and don't need best_l / best_ref_l at all
+                for (cv::Vec2i const &p : points_placed) {
+                    generations(p) = generation;
+                    if (!used_area.contains(cv::Point(p[1],p[0]))) {
+                        used_area = used_area | cv::Rect(p[1],p[0],1,1);
+                    }
+                    fringe.push_back(p);
+                    succ_gen_ps.push_back(p);
+                }
+                succ += points_placed.size();
+                succ_gen += points_placed.size();
 
-                //"fast" skip based on avg z value out of limits
-                if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
-                    continue;
+                if (no_more_candidates)
+                    break;
 
-                bool point_was_placed = false;
-                if (neural_tracer && generation > pre_neural_gens) {
-                    point_was_placed = call_neural_tracer_for_point(p, trace_params, neural_tracer.get());
-                } else {
-                    // Standard Ceres optimization path
+            }  // end loop over batches
+
+        } else {
+
+            // ...then start iterating over candidates in parallel using the above to yield points
+            #pragma omp parallel
+            {
+                CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
+                //             int idx = rand() % cands.size();
+                while (true) {
+                    int r = 1;
+                    double phys_fail_th = 0.1;
+                    cv::Vec2i p = cands_threadcol.next();
+                    if (p[0] == -1)
+                        break;
+
+                    if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
+                        continue;
+
+                    // p is now a 2D point we consider adding to the patch; find the best 3D point to map it to
+
+                    // Iterate all adjacent points that are in the patch, and find their 3D locations
+                    int ref_count = 0;
+                    cv::Vec3d avg = {0,0,0};
+                    std::vector<cv::Vec2i> srcs;
+                    for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,trace_params.dpoints.rows-1);oy++)
+                        for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,trace_params.dpoints.cols-1);ox++)
+                            if (trace_params.state(oy,ox) & STATE_LOC_VALID) {
+                                ref_count++;
+                                avg += trace_params.dpoints(oy,ox);
+                                srcs.push_back({oy,ox});
+                            }
+
+                    // Of those adjacent points, find the one that itself has most adjacent in-patch points
+                    cv::Vec2i best_l = srcs[0];
+                    int best_ref_l = -1;
+                    int rec_ref_sum = 0;
+                    for(cv::Vec2i l : srcs) {
+                        int ref_l = 0;
+                        for(int oy=std::max(l[0]-r,0);oy<=std::min(l[0]+r,trace_params.dpoints.rows-1);oy++)
+                            for(int ox=std::max(l[1]-r,0);ox<=std::min(l[1]+r,trace_params.dpoints.cols-1);ox++)
+                                if (trace_params.state(oy,ox) & STATE_LOC_VALID)
+                                    ref_l++;
+
+                        rec_ref_sum += ref_l;
+
+                        if (ref_l > best_ref_l) {
+                            best_l = l;
+                            best_ref_l = ref_l;
+                        }
+                    }
+
+                    avg /= ref_count;
+
+                    //"fast" skip based on avg z value out of limits
+                    if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
+                        continue;
+
                     cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                     trace_params.dpoints(p) = init;
 
@@ -2463,14 +2519,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     local_optimization(1, p, trace_params, trace_data, loss_settings, true);
                     // if (local_opt_r > 1)
                         // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
-                    
-                    point_was_placed = true;
-                }
 
-                if (point_was_placed) {
                     generations(p) = generation;
 
-#pragma omp critical
+                    #pragma omp critical
                     {
                         succ++;
                         succ_gen++;
@@ -2481,8 +2533,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                         fringe.push_back(p);
                         succ_gen_ps.push_back(p);
                     }
-                }
-            }  // end parallel iteration over cands
+                }  // end parallel iteration over cands
+            }
         }
 
         if (neural_tracer && generation > pre_neural_gens) {
