@@ -1736,9 +1736,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         }
         pre_neural_gens = params.value("pre_neural_generations", 0);
         neural_batch_size = params.value("neural_batch_size", 1);
-    }
-    if (!neural_tracer) {
-        std::cout << "Neural tracer not active" << std::endl;
+        if (!neural_tracer) {
+            std::cout << "Neural tracer not active" << std::endl;
+        }
     }
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
