@@ -322,9 +322,9 @@ def train(config_path):
                 else:
                     sample_zyxs_in_subcrop = centroid[:, None, :]
 
-                sample_zyxs_in_subcrop = sample_zyxs_in_subcrop.round().long().clamp(
+                sample_zyxs_in_subcrop = sample_zyxs_in_subcrop.clamp(
                     torch.tensor([0, 0, 0], device=device),
-                    torch.tensor(shape, device=device) - 1
+                    torch.tensor(shape, device=device) - 1.
                 )
 
                 # TODO: not correct in num_samples>1 case, and unclear what to do in num_samples=1 case
@@ -409,7 +409,7 @@ def train(config_path):
                     step_targets_filtered = torch.zeros_like(step_targets)
                     step_targets_filtered[where_multistep_targets_available, step_directions[multistep_targets_available]] = step_targets.detach()[where_multistep_targets_available, step_directions[multistep_targets_available]]
                     first_step_crop_min = outer_crop_center - config['crop_size'] // 2
-                    offset = min_corner_new_subcrop_in_outer - first_step_crop_min
+                    offset = (min_corner_new_subcrop_in_outer - first_step_crop_min).round().int()
                     step_target_in_first_crop = transform_to_first_crop_space(step_targets_filtered, offset, config['crop_size'])
                     step_pred_in_first_crop = transform_to_first_crop_space(step_pred_filtered, offset, config['crop_size'])
                     all_step_targets_vis.append(step_target_in_first_crop)

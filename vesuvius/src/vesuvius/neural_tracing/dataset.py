@@ -424,9 +424,27 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         return heatmaps
 
     @classmethod
+    def _make_heatmaps_with_grad(cls, all_zyxs, min_corner_zyx, crop_size, sigma):
+
+        if len(all_zyxs) != 1 or all_zyxs[0].shape[0] != 1:
+            raise NotImplementedError  # for now we only support the special case of one heatmap in this differentiable version!
+        zyx = all_zyxs[0]
+
+        coords = min_corner_zyx + torch.stack(torch.meshgrid(
+            *[torch.arange(crop_size, device=zyx.device)] * 3,
+            indexing='ij'
+        ), dim=-1)
+        heatmap = torch.exp(-((coords - zyx) ** 2).sum(dim=-1) / (2 * sigma ** 2))
+
+        return heatmap.unsqueeze(0)
+
+    @classmethod
     def make_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size, apply_gaussian=True, sigma: float = 2.0):
         if not apply_gaussian:
             return cls._scatter_heatmaps(all_zyxs, min_corner_zyx, crop_size)
+
+        if any([zyxs.requires_grad for zyxs in all_zyxs]) or min_corner_zyx.requires_grad:
+            return cls._make_heatmaps_with_grad(all_zyxs, min_corner_zyx, crop_size, sigma)
 
         crop_size_int = int(crop_size)
         device = all_zyxs[0].device
