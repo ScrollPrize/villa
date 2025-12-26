@@ -186,7 +186,28 @@ class ZarrAdapter(DataSourceAdapter):
         if resolution is None:
             resolution = 0 if _is_ome_zarr(path) else None
         zarr_path = _get_zarr_path(path, resolution_level=resolution)
-        return zarr.open(zarr_path, mode="r")
+        result = zarr.open(zarr_path, mode="r")
+
+        # If we got a Group instead of an Array, try to find the array inside
+        if isinstance(result, zarr.hierarchy.Group):
+            # Check for common array names or numbered levels
+            for key in ["0", "data", "arr_0", ""]:
+                if key in result:
+                    candidate = result[key]
+                    if hasattr(candidate, "shape"):
+                        self.logger.debug(
+                            "Opened zarr Group at %s, using nested array '%s'", path, key
+                        )
+                        return candidate
+            # If no named array found, check if the group itself has array data
+            # (some zarr stores have the array at the root)
+            if hasattr(result, "shape"):
+                return result
+            raise ValueError(
+                f"Zarr at {path} is a Group without a recognizable array. "
+                f"Available keys: {list(result.keys())}"
+            )
+        return result
 
     def _extract_spatial_shape(
         self, shape: Sequence[int], path: Optional[Path] = None

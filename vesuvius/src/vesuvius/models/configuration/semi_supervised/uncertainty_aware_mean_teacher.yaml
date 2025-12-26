@@ -1,0 +1,61 @@
+# Uncertainty-Aware Mean Teacher Semi-Supervised Training Configuration
+#
+# This config enables semi-supervised learning where:
+# - Labeled patches: Used for supervised loss (dice + cross-entropy)
+# - Unlabeled foreground patches: Used for consistency loss with uncertainty weighting
+#
+# Unlabeled foreground patches are regions where:
+# - Labels are effectively unlabeled (zero OR ignore value)
+# - Image volume has non-zero data (actual data exists)
+
+
+
+tr_config:
+  patch_size: [128, 128, 128]
+  trainer: "uncertainty_aware_mean_teacher"
+
+dataset_config:
+  valid_patch_find_resolution: 2
+  valid_patch_value: 1
+  min_labeled_ratio: 0.01
+  min_bbox_percent: 0.15
+  normalization_scheme: "zscore"
+  skip_patch_validation: false
+  ome_zarr_resolution: 0
+
+  # Background sampling (optional, can be disabled for semi-supervised)
+  bg_sampling_enabled: false
+  bg_to_fg_ratio: 0.0
+
+  # Unlabeled foreground detection for semi-supervised learning
+  # These patches have image data but no labels - used for consistency loss
+  unlabeled_foreground_enabled: true
+  unlabeled_foreground_threshold: 0.15      # Min fraction of non-zero image voxels
+  unlabeled_foreground_bbox_threshold: 0.15  # Min bbox coverage for image data
+  # List of volume IDs to scan for unlabeled foreground regions (opt-in)
+  # Image paths are auto-derived from label paths: labels/sample_ink.zarr -> images/sample.zarr
+  unlabeled_foreground_volumes:
+    - "s5_rewindowed"
+    - "Scroll1_8um_uint8"
+
+  targets:
+    ink:
+      ignore_label: 2
+      activation: "none"
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0
+          dice_label_smoothing: 0.001
+          ce_kwargs:
+            label_smoothing: 0.001
+
+
+
+# Mean Teacher hyperparameters
+mean_teacher_config:
+  consistency_rampup: 200.0               # Epochs for consistency ramp-up
+  uncertainty_T: 6                        # Number of stochastic forward passes (must be even)
+  uncertainty_weight: 0.1
+  uncertainty_threshold_end: 0.65
+
+

@@ -58,7 +58,15 @@ def minmax_scale_to_8bit(arr_np, clip_quantile: float = 0.005):
     if max_val > min_val:
         arr_np = (arr_np - min_val) / (max_val - min_val) * 255
     else:
-        arr_np = np.zeros_like(arr_np, dtype=np.float32)
+        # Uniform value - scale assuming label range [0, max(2, value)]
+        # This ensures: 0→0 (black), 1→127 (gray), 2→255 (white)
+        uniform_val = float(min_val)
+        assumed_max = max(2.0, uniform_val)
+        if assumed_max > 0:
+            scaled = (uniform_val / assumed_max) * 255
+        else:
+            scaled = 0.0
+        arr_np = np.full_like(arr_np, scaled, dtype=np.float32)
     return np.clip(arr_np, 0, 255).astype(np.uint8)
 
 
@@ -210,7 +218,11 @@ def save_debug(
     train_outputs_dict: dict = None,    # Optional train sample outputs
     skeleton_dict: dict = None,         # Optional skeleton data for visualization
     train_skeleton_dict: dict = None,   # Optional train skeleton data
-    apply_activation: bool = True       # Whether to apply activation functions
+    apply_activation: bool = True,      # Whether to apply activation functions
+    # Unlabeled sample visualization for semi-supervised training
+    unlabeled_input: torch.Tensor = None,       # Optional unlabeled sample input
+    unlabeled_pseudo_dict: dict = None,         # Teacher predictions (pseudo-labels)
+    unlabeled_outputs_dict: dict = None         # Student predictions on unlabeled data
 ):
     """
     Save debug visualization as GIF (3D) or PNG (2D).
@@ -308,8 +320,55 @@ def save_debug(
 
             if apply_activation:
                 arr_np = _apply_activation(arr_np, activation, is_surface=is_surface_frame)
-            
+
             train_preds_np[t_name] = arr_np
+
+    # Process unlabeled data if provided (for semi-supervised training visualization)
+    unlabeled_inp_np = None
+    unlabeled_pseudo_np = {}
+    unlabeled_preds_np = {}
+
+    if unlabeled_input is not None and unlabeled_pseudo_dict is not None and unlabeled_outputs_dict is not None:
+        # Convert BFloat16 to Float32 before numpy conversion
+        if unlabeled_input.dtype == torch.bfloat16:
+            unlabeled_input = unlabeled_input.float()
+        unlabeled_inp_np = unlabeled_input.cpu().numpy()[0]
+        if unlabeled_inp_np.shape[0] == 1:
+            unlabeled_inp_np = unlabeled_inp_np[0]
+
+        # Process pseudo-labels (teacher predictions)
+        for t_name, p_tensor in unlabeled_pseudo_dict.items():
+            if p_tensor.dtype == torch.bfloat16:
+                p_tensor = p_tensor.float()
+            arr_np = p_tensor.cpu().numpy()
+            if arr_np.ndim > (3 if is_2d else 4):
+                arr_np = arr_np[0]
+
+            task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
+            activation = task_cfg.get("activation", None)
+            is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
+
+            if apply_activation:
+                arr_np = _apply_activation(arr_np, activation, is_surface=is_surface_frame)
+
+            unlabeled_pseudo_np[t_name] = arr_np
+
+        # Process student predictions on unlabeled data
+        for t_name, p_tensor in unlabeled_outputs_dict.items():
+            if p_tensor.dtype == torch.bfloat16:
+                p_tensor = p_tensor.float()
+            arr_np = p_tensor.cpu().numpy()
+            if arr_np.ndim > (3 if is_2d else 4):
+                arr_np = arr_np[0]
+
+            task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
+            activation = task_cfg.get("activation", None)
+            is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
+
+            if apply_activation:
+                arr_np = _apply_activation(arr_np, activation, is_surface=is_surface_frame)
+
+            unlabeled_preds_np[t_name] = arr_np
 
     # Create visualization
     # Get actual prediction tasks (not skeleton data)
@@ -374,9 +433,28 @@ def save_debug(
                     pred = train_preds_np[t_name]
                     pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
                     train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
-            
+
             rows.append(np.hstack(train_imgs))
-        
+
+        # Unlabeled row if available (for semi-supervised training)
+        if unlabeled_inp_np is not None:
+            unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_inp_np), "Unlabeled")]
+
+            # Show pseudo-labels (teacher predictions)
+            for t_name in sorted(unlabeled_pseudo_np.keys()):
+                pseudo = unlabeled_pseudo_np[t_name]
+                pseudo_slice = pseudo[0] if pseudo.ndim == 3 and pseudo.shape[0] == 1 else pseudo
+                unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pseudo_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pseudo {t_name}"))
+
+            # Show student predictions on unlabeled data
+            for t_name in pred_task_names:
+                if t_name in unlabeled_preds_np:
+                    pred = unlabeled_preds_np[t_name]
+                    pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
+                    unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+
+            rows.append(np.hstack(unlabeled_imgs))
+
         # Stack rows and save
         rows = _pad_rows_to_uniform_width(rows)
         final_img = np.vstack(rows)
@@ -456,9 +534,41 @@ def save_debug(
                         else:
                             pred_slice = pred[z_idx, :, :]
                         train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
-                
+
                 rows.append(np.hstack(train_imgs))
-            
+
+            # Unlabeled row if available (for semi-supervised training)
+            if unlabeled_inp_np is not None:
+                unlabeled_slice = unlabeled_inp_np[z_idx] if unlabeled_inp_np.ndim == 3 else unlabeled_inp_np[:, z_idx, :, :]
+                unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_slice), "Unlabeled")]
+
+                # Show pseudo-labels (teacher predictions)
+                for t_name in sorted(unlabeled_pseudo_np.keys()):
+                    pseudo = unlabeled_pseudo_np[t_name]
+                    if pseudo.ndim == 4:
+                        if pseudo.shape[0] == 1:
+                            pseudo_slice = pseudo[0, z_idx, :, :]
+                        else:
+                            pseudo_slice = pseudo[:, z_idx, :, :]
+                    else:
+                        pseudo_slice = pseudo[z_idx, :, :]
+                    unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pseudo_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pseudo {t_name}"))
+
+                # Show student predictions on unlabeled data
+                for t_name in pred_task_names:
+                    if t_name in unlabeled_preds_np:
+                        pred = unlabeled_preds_np[t_name]
+                        if pred.ndim == 4:
+                            if pred.shape[0] == 1:
+                                pred_slice = pred[0, z_idx, :, :]
+                            else:
+                                pred_slice = pred[:, z_idx, :, :]
+                        else:
+                            pred_slice = pred[z_idx, :, :]
+                        unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+
+                rows.append(np.hstack(unlabeled_imgs))
+
             # Stack rows for this frame
             rows = _pad_rows_to_uniform_width(rows)
             frame = np.vstack(rows)

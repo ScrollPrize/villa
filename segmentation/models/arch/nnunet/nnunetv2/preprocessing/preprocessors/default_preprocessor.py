@@ -14,7 +14,7 @@
 import multiprocessing
 import shutil
 from time import sleep
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 
 import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import *
@@ -24,6 +24,7 @@ import nnunetv2
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_raw
 from nnunetv2.preprocessing.cropping.cropping import crop_to_nonzero
 from nnunetv2.preprocessing.resampling.default_resampling import compute_new_shape
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2, BLOSC2_AVAILABLE
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
@@ -99,7 +100,7 @@ class DefaultPreprocessor(object):
             # when using the ignore label we want to sample only from annotated regions. Therefore we also need to
             # collect samples uniformly from all classes (incl background)
             if label_manager.has_ignore_label:
-                collect_for_this.append(label_manager.all_labels)
+                collect_for_this.append([-1] + label_manager.all_labels)
 
             # no need to filter background in regions because it is already filtered in handle_labels
             # print(all_labels, regions)
@@ -144,37 +145,125 @@ class DefaultPreprocessor(object):
                       plans_manager: PlansManager, configuration_manager: ConfigurationManager,
                       dataset_json: Union[dict, str]):
         data, seg, properties = self.run_case(image_files, seg_file, plans_manager, configuration_manager, dataset_json)
-        # print('dtypes', data.dtype, seg.dtype)
-        np.savez_compressed(output_filename_truncated + '.npz', data=data, seg=seg)
-        write_pickle(properties, output_filename_truncated + '.pkl')
+        data = data.astype(np.float32, copy=False)
+        seg = seg.astype(np.int16, copy=False)
+
+        block_size_data, chunk_size_data = nnUNetDatasetBlosc2.comp_blosc2_params(
+            data.shape,
+            tuple(configuration_manager.patch_size),
+            data.itemsize)
+        block_size_seg, chunk_size_seg = nnUNetDatasetBlosc2.comp_blosc2_params(
+            seg.shape,
+            tuple(configuration_manager.patch_size),
+            seg.itemsize)
+
+        nnUNetDatasetBlosc2.save_case(data, seg, properties, output_filename_truncated,
+                                      chunks=chunk_size_data, blocks=block_size_data,
+                                      chunks_seg=chunk_size_seg, blocks_seg=block_size_seg)
 
     @staticmethod
-    def _sample_foreground_locations(seg: np.ndarray, classes_or_regions: Union[List[int], List[Tuple[int, ...]]],
-                                     seed: int = 1234, verbose: bool = False):
-        num_samples = 10000
-        min_percent_coverage = 0.01  # at least 1% of the class voxels need to be selected, otherwise it may be too
-        # sparse
+    def _sample_foreground_locations(
+            seg: np.ndarray,
+            classes_or_regions: Union[List[int], List[Tuple[int, ...]]],
+            seed: int = 1234,
+            verbose: bool = False,
+            min_num_samples: int = 10000,
+            min_percent_coverage: float = 0.01
+    ):
         rndst = np.random.RandomState(seed)
         class_locs = {}
+
+        # Normalize requested labels and compute the set of all labels we might need
+        normalized = []
+        requested_labels = set()
         for c in classes_or_regions:
-            k = c if not isinstance(c, list) else tuple(c)
             if isinstance(c, (tuple, list)):
-                mask = seg == c[0]
-                for cc in c[1:]:
-                    mask = mask | (seg == cc)
-                all_locs = np.argwhere(mask)
+                labs = tuple(int(x) for x in c)
+                normalized.append(labs)
+                requested_labels.update(labs)
             else:
-                all_locs = np.argwhere(seg == c)
-            if len(all_locs) == 0:
+                lab = int(c)
+                normalized.append(lab)
+                requested_labels.add(lab)
+
+        # Create mask for all requested labels (this includes 0 if requested)
+        requested_labels_arr = np.fromiter(requested_labels, dtype=np.int32)
+        valid_mask = np.isin(seg, requested_labels_arr)
+
+        coords = np.argwhere(valid_mask)
+        seg_sel = seg[valid_mask]
+        del valid_mask
+
+        n = seg_sel.size
+        if n == 0:
+            for c in classes_or_regions:
+                k = tuple(c) if isinstance(c, (tuple, list)) else int(c)
+                class_locs[k] = []
+            return class_locs
+
+        # sort once, then compute label blocks
+        order = np.argsort(seg_sel, kind="stable")
+        lab_sorted = seg_sel[order]
+        coords_sorted = coords[order]
+
+        change = np.flatnonzero(lab_sorted[1:] != lab_sorted[:-1]) + 1
+        starts = np.r_[0, change]
+        ends = np.r_[change, n]
+        labels_present = lab_sorted[starts]
+
+        label_to_range = {int(l): (int(s), int(e)) for l, s, e in zip(labels_present, starts, ends)}
+        present_labels = set(label_to_range.keys())
+
+        for c in classes_or_regions:
+            is_region = isinstance(c, (tuple, list))
+            labs = tuple(int(x) for x in c) if is_region else (int(c),)
+            k = labs if is_region else labs[0]
+
+            # Skip if none of the labels are present
+            if not any(lab in present_labels for lab in labs):
                 class_locs[k] = []
                 continue
-            target_num_samples = min(num_samples, len(all_locs))
-            target_num_samples = max(target_num_samples, int(np.ceil(len(all_locs) * min_percent_coverage)))
 
-            selected = all_locs[rndst.choice(len(all_locs), target_num_samples, replace=False)]
+            # Collect ranges for present labels in this class/region
+            ranges = []
+            counts = []
+            for lab in labs:
+                r = label_to_range.get(lab)
+                if r is None:
+                    continue
+                s, e = r
+                cnt = e - s
+                if cnt > 0:
+                    ranges.append((s, e))
+                    counts.append(cnt)
+
+            if len(counts) == 0:
+                class_locs[k] = []
+                continue
+
+            total = int(np.sum(counts))
+            target_num_samples = min(min_num_samples, total)
+            target_num_samples = max(target_num_samples, int(np.ceil(total * min_percent_coverage)))
+
+            # Sample uniformly without replacement from the union of ranges
+            offsets = rndst.choice(total, target_num_samples, replace=False)
+
+            # Map offsets -> (range index, in-range offset) using cumulative counts
+            cum = np.cumsum(counts)
+            which = np.searchsorted(cum, offsets, side="right")
+            prev = np.concatenate(([0], cum[:-1]))
+            in_range = offsets - prev[which]
+
+            # Convert to indices in coords_sorted
+            starts_for_pick = np.fromiter((ranges[i][0] for i in which), dtype=np.int64, count=which.size)
+            picked_idx = starts_for_pick + in_range.astype(np.int64)
+
+            selected = coords_sorted[picked_idx]
             class_locs[k] = selected
+
             if verbose:
                 print(c, target_num_samples)
+
         return class_locs
 
     def _normalize(self, data: np.ndarray, seg: np.ndarray, configuration_manager: ConfigurationManager,

@@ -48,7 +48,9 @@ class Decoder(nn.Module):
         self.deep_supervision = deep_supervision
         # If num_classes is None, operate in features-only mode (no seg heads)
         self.return_features_only = num_classes is None
-        self.encoder = encoder
+        # Store encoder reference without registering as submodule to avoid
+        # duplicate state_dict keys when decoder is used with separate_decoders=True
+        object.__setattr__(self, '_encoder_ref', encoder)
         self.num_classes = num_classes if num_classes is not None else 0
         n_stages_encoder = len(encoder.output_channels)
         if isinstance(n_conv_per_stage, int):
@@ -140,6 +142,11 @@ class Decoder(nn.Module):
         self.transpconvs = nn.ModuleList(transpconvs)
         # In features-only mode there are no segmentation layers
         self.seg_layers = nn.ModuleList(seg_layers) if not self.return_features_only else nn.ModuleList()
+
+    @property
+    def encoder(self):
+        """Access the encoder reference (not a submodule to avoid duplicate state_dict keys)."""
+        return self._encoder_ref
 
     def forward(self, skips):
         """

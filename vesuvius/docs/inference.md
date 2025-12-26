@@ -76,12 +76,10 @@ vesuvius.blend_logits /tmp/logits /tmp/merged_logits.zarr \
 |----------|-------------|
 | `parent_dir` | Folder containing the per-part logits and coordinates Zarr stores.
 | `output_path` | Destination Zarr for the merged logits.
-| `--weights_path` | Optional path for the temporary weight accumulator.
 | `--sigma_scale` | Controls Gaussian falloff (`patch_size / sigma_scale`, default `8.0`).
 | `--chunk_size` | Spatial chunk size (`Z,Y,X`) for the merged Zarr. Leave unset to auto-pick.
 | `--num_workers` | Number of worker processes. Defaults to `CPU_COUNT - 1`.
 | `--compression_level` | Zarr compression level (0–9, default `1`).
-| `--keep_weights` | Preserve the weight accumulator instead of deleting it after blending.
 | `--quiet` | Suppress verbose logging.
 
 The merged logits retain the same class/channel dimension as the individual parts.

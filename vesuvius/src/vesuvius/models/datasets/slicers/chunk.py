@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
+from tqdm import tqdm
 
 from vesuvius.utils.utils import pad_or_crop_2d, pad_or_crop_3d
 
@@ -33,11 +34,19 @@ class ChunkSliceConfig:
     min_labeled_ratio: float
     min_bbox_percent: float
     allow_unlabeled: bool
-    downsample_level: int
+    valid_patch_find_resolution: int
     num_workers: int
     cache_enabled: bool
     cache_dir: Optional[Path]
     label_channel_selector: Optional[Union[int, Tuple[int, ...]]] = None
+    valid_patch_value: Optional[Union[int, float]] = None
+    bg_sampling_enabled: bool = False
+    bg_to_fg_ratio: float = 0.5
+    # Unlabeled foreground detection for semi-supervised learning
+    unlabeled_fg_enabled: bool = False
+    unlabeled_fg_threshold: float = 0.05  # Min fraction of non-zero image voxels
+    unlabeled_fg_bbox_threshold: float = 0.15  # Min bbox coverage for image data
+    unlabeled_fg_volume_ids: Optional[Set[str]] = None  # Volume IDs to scan for unlabeled FG
 
 
 @dataclass
@@ -52,6 +61,8 @@ class ChunkVolume:
     cache_key_path: Optional[Path]
     label_ignore_value: Optional[Union[int, float]] = None
     meshes: Mapping[str, MeshHandle] = field(default_factory=dict)
+    # Image source for unlabeled foreground validation (zarr array/group)
+    image_source: Optional[object] = None
 
 
 @dataclass
@@ -63,6 +74,8 @@ class ChunkPatch:
     position: Tuple[int, ...]
     patch_size: Tuple[int, ...]
     weight: Optional[float] = None
+    is_bg_only: bool = False
+    is_unlabeled_fg: bool = False  # Unlabeled but has image data (for semi-supervised)
 
 
 @dataclass
@@ -139,34 +152,65 @@ class ChunkSlicer:
                 raise RuntimeError(
                     "Chunk slice validation requested but no labeled volumes are registered"
                 )
-            logger.info(
-                "ChunkSlicer: validation disabled because volumes lack labels; enumerating all positions"
-            )
-            validate = False
+            # Only disable validation if unlabeled_fg filtering is also disabled
+            # When unlabeled_fg_enabled, we still want to filter patches by image content
+            if not self.config.unlabeled_fg_enabled:
+                logger.info(
+                    "ChunkSlicer: validation disabled because volumes lack labels; enumerating all positions"
+                )
+                validate = False
+            else:
+                logger.info(
+                    "ChunkSlicer: no labeled volumes, but unlabeled_fg_enabled=True; filtering by image content"
+                )
 
-        patches: List[ChunkPatch] = []
-
-        raw_valid_entries: Optional[List[Dict[str, object]]] = None
+        fg_patches: List[ChunkPatch] = []
+        bg_patches: List[ChunkPatch] = []
+        unlabeled_fg_patches: List[ChunkPatch] = []
 
         if validate:
-            labeled_volumes = [self._volumes[idx] for idx in self._labeled_indices]
+            # When no labeled volumes but unlabeled_fg is enabled, use all volumes
+            if not self._labeled_indices and self.config.unlabeled_fg_enabled:
+                labeled_volumes = list(self._volumes)
+                logger.info("Using all %d volumes for unlabeled FG filtering", len(labeled_volumes))
+            else:
+                labeled_volumes = [self._volumes[idx] for idx in self._labeled_indices]
             label_arrays = [vol.label_source for vol in labeled_volumes]
             label_names = [vol.name for vol in labeled_volumes]
 
-            cache_paths = [vol.cache_key_path for vol in labeled_volumes]
-            raw_valid_entries: Optional[List[Dict[str, object]]] = None
+            # Fall back to image path when no label path (for unlabeled datasets)
+            cache_paths = []
+            for vol in labeled_volumes:
+                if vol.cache_key_path is not None:
+                    cache_paths.append(vol.cache_key_path)
+                elif hasattr(vol.image, 'path'):
+                    cache_paths.append(Path(vol.image.path))
+                elif vol.image_source is not None and hasattr(vol.image_source, 'path'):
+                    cache_paths.append(Path(vol.image_source.path))
+                else:
+                    cache_paths.append(None)
 
-            labeled_positions: List[Tuple[int, Tuple[int, ...]]] = []
-            raw_valid_entries = []
+            fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+            bg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+            unlabeled_fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+            raw_fg_entries: List[Dict[str, object]] = []
+            raw_bg_entries: List[Dict[str, object]] = []
 
             if self.config.num_workers <= 0:
-                labeled_positions, raw_valid_entries = self._compute_valid_positions_sequential(
+                (
+                    fg_positions,
+                    bg_positions,
+                    raw_fg_entries,
+                    raw_bg_entries,
+                    unlabeled_fg_positions,
+                    raw_unlabeled_fg_entries,
+                ) = self._compute_valid_positions_sequential(
                     labeled_volumes
                 )
             else:
                 cache_supported = self.config.cache_enabled and all(cache_paths)
 
-                cached: Optional[List[Dict[str, object]]] = None
+                cached = None
                 if cache_supported:
                     cache_list = [Path(p) for p in cache_paths]  # type: ignore[arg-type]
                     cached = load_cached_patches(
@@ -175,34 +219,89 @@ class ChunkSlicer:
                         patch_size=tuple(self.config.patch_size),
                         min_labeled_ratio=self.config.min_labeled_ratio,
                         bbox_threshold=self.config.min_bbox_percent,
-                        downsample_level=self.config.downsample_level,
+                        valid_patch_find_resolution=self.config.valid_patch_find_resolution,
                         cache_path=str(self.config.cache_dir) if self.config.cache_dir else None,
+                        valid_patch_value=self.config.valid_patch_value,
+                        bg_sampling_enabled=self.config.bg_sampling_enabled,
+                        bg_to_fg_ratio=self.config.bg_to_fg_ratio,
+                        unlabeled_fg_enabled=self.config.unlabeled_fg_enabled,
+                        unlabeled_fg_threshold=self.config.unlabeled_fg_threshold,
+                        unlabeled_fg_bbox_threshold=self.config.unlabeled_fg_bbox_threshold,
                     )
 
                 if cached is not None:
-                    logger.info("ChunkSlicer: loaded %s patches from cache", len(cached))
-                    for entry in cached:
+                    # Load FG patches from cache
+                    logger.info("ChunkSlicer: loaded %s FG patches from cache", len(cached.get('fg_patches', [])))
+                    for entry in cached.get('fg_patches', []):
                         labeled_idx = int(entry['volume_index'])
                         if labeled_idx >= len(labeled_volumes):
                             raise RuntimeError(
                                 f"Cached patch references volume index {labeled_idx} which is unavailable"
                             )
                         position = tuple(int(v) for v in entry['position'])
-                        patches.append(
+                        fg_patches.append(
                             ChunkPatch(
                                 volume_index=labeled_volumes[labeled_idx].index,
                                 volume_name=labeled_volumes[labeled_idx].name,
                                 position=position,
                                 patch_size=tuple(self.config.patch_size),
-                                )
+                                is_bg_only=False,
+                            )
                         )
+
+                    # Load BG patches from cache
+                    if cached.get('bg_patches'):
+                        logger.info("ChunkSlicer: loaded %s BG patches from cache", len(cached['bg_patches']))
+                        for entry in cached['bg_patches']:
+                            labeled_idx = int(entry['volume_index'])
+                            if labeled_idx >= len(labeled_volumes):
+                                continue  # Skip invalid BG patch references
+                            position = tuple(int(v) for v in entry['position'])
+                            bg_patches.append(
+                                ChunkPatch(
+                                    volume_index=labeled_volumes[labeled_idx].index,
+                                    volume_name=labeled_volumes[labeled_idx].name,
+                                    position=position,
+                                    patch_size=tuple(self.config.patch_size),
+                                    is_bg_only=True,
+                                )
+                            )
+
+                    # Load unlabeled FG patches from cache (for semi-supervised)
+                    if cached.get('unlabeled_fg_patches'):
+                        logger.info(
+                            "ChunkSlicer: loaded %s unlabeled FG patches from cache",
+                            len(cached['unlabeled_fg_patches']),
+                        )
+                        for entry in cached['unlabeled_fg_patches']:
+                            labeled_idx = int(entry['volume_index'])
+                            if labeled_idx >= len(labeled_volumes):
+                                continue  # Skip invalid patch references
+                            position = tuple(int(v) for v in entry['position'])
+                            unlabeled_fg_patches.append(
+                                ChunkPatch(
+                                    volume_index=labeled_volumes[labeled_idx].index,
+                                    volume_name=labeled_volumes[labeled_idx].name,
+                                    position=position,
+                                    patch_size=tuple(self.config.patch_size),
+                                    is_bg_only=False,
+                                    is_unlabeled_fg=True,
+                                )
+                            )
                 else:
                     ignore_values = [vol.label_ignore_value for vol in labeled_volumes]
-                    labeled_positions, raw_valid_entries = self._compute_valid_positions(
+                    (
+                        fg_positions,
+                        bg_positions,
+                        raw_fg_entries,
+                        raw_bg_entries,
+                        unlabeled_fg_positions,
+                        raw_unlabeled_fg_entries,
+                    ) = self._compute_valid_positions(
                         labeled_volumes, label_arrays, label_names, ignore_values
                     )
 
-                    if cache_supported and raw_valid_entries:
+                    if cache_supported and (raw_fg_entries or raw_bg_entries or raw_unlabeled_fg_entries):
                         cache_list = [Path(p) for p in cache_paths]  # type: ignore[arg-type]
                         save_valid_patches(
                             valid_patches=[
@@ -211,39 +310,127 @@ class ChunkSlicer:
                                     "volume_name": str(entry['volume_name']),
                                     "start_pos": list(entry['start_pos']),
                                 }
-                                for entry in raw_valid_entries
+                                for entry in raw_fg_entries
                             ],
                             train_data_paths=cache_list,
                             label_paths=cache_list,
                             patch_size=tuple(self.config.patch_size),
                             min_labeled_ratio=self.config.min_labeled_ratio,
                             bbox_threshold=self.config.min_bbox_percent,
-                            downsample_level=self.config.downsample_level,
+                            valid_patch_find_resolution=self.config.valid_patch_find_resolution,
                             cache_path=str(self.config.cache_dir) if self.config.cache_dir else None,
+                            valid_patch_value=self.config.valid_patch_value,
+                            bg_only_patches=[
+                                {
+                                    "volume_idx": int(entry['volume_idx']),
+                                    "volume_name": str(entry['volume_name']),
+                                    "start_pos": list(entry['start_pos']),
+                                }
+                                for entry in raw_bg_entries
+                            ] if raw_bg_entries else None,
+                            bg_sampling_enabled=self.config.bg_sampling_enabled,
+                            bg_to_fg_ratio=self.config.bg_to_fg_ratio,
+                            unlabeled_fg_patches=[
+                                {
+                                    "volume_idx": int(entry['volume_idx']),
+                                    "volume_name": str(entry['volume_name']),
+                                    "start_pos": list(entry['start_pos']),
+                                }
+                                for entry in raw_unlabeled_fg_entries
+                            ] if raw_unlabeled_fg_entries else None,
+                            unlabeled_fg_enabled=self.config.unlabeled_fg_enabled,
+                            unlabeled_fg_threshold=self.config.unlabeled_fg_threshold,
+                            unlabeled_fg_bbox_threshold=self.config.unlabeled_fg_bbox_threshold,
                         )
 
-            for labeled_idx, position in labeled_positions:
+            # Create ChunkPatch objects from positions (when not loaded from cache)
+            for labeled_idx, position in fg_positions:
                 volume = labeled_volumes[labeled_idx]
-                patches.append(
+                fg_patches.append(
                     ChunkPatch(
                         volume_index=volume.index,
                         volume_name=volume.name,
                         position=position,
                         patch_size=tuple(self.config.patch_size),
+                        is_bg_only=False,
                     )
                 )
 
-        if not validate or any(v.label_source is None for v in self._volumes):
+            for labeled_idx, position in bg_positions:
+                volume = labeled_volumes[labeled_idx]
+                bg_patches.append(
+                    ChunkPatch(
+                        volume_index=volume.index,
+                        volume_name=volume.name,
+                        position=position,
+                        patch_size=tuple(self.config.patch_size),
+                        is_bg_only=True,
+                    )
+                )
+
+            # Create ChunkPatch objects for unlabeled foreground patches
+            for labeled_idx, position in unlabeled_fg_positions:
+                volume = labeled_volumes[labeled_idx]
+                unlabeled_fg_patches.append(
+                    ChunkPatch(
+                        volume_index=volume.index,
+                        volume_name=volume.name,
+                        position=position,
+                        patch_size=tuple(self.config.patch_size),
+                        is_bg_only=False,
+                        is_unlabeled_fg=True,
+                    )
+                )
+
+        # Add unvalidated patches for volumes without labels (unless unlabeled_fg_enabled,
+        # in which case the filtered patches are already in unlabeled_fg_patches)
+        if not validate or (any(v.label_source is None for v in self._volumes) and not self.config.unlabeled_fg_enabled):
             for volume in self._volumes:
                 if not validate or volume.label_source is None:
-                    patches.extend(self.enumerate(volume, stride=self.config.stride))
+                    fg_patches.extend(self.enumerate(volume, stride=self.config.stride))
 
-        if not patches:
+        # Combine FG, BG, and unlabeled FG patches
+        # Order: fg_patches, unlabeled_fg_patches, bg_patches
+        all_patches = fg_patches + unlabeled_fg_patches + bg_patches
+        self._n_fg = len(fg_patches)  # Store labeled FG count for train/val split
+        self._n_unlabeled_fg = len(unlabeled_fg_patches)  # Store unlabeled FG count
+
+        if not all_patches:
             raise RuntimeError("Chunk slicing produced zero patches across all volumes")
 
-        self._patches = patches
-        self._weights = None
-        return patches, self._weights
+        # Compute sampling weights if BG sampling is enabled
+        weights: Optional[List[float]] = None
+        if self.config.bg_sampling_enabled and bg_patches:
+            weights = self._compute_sampling_weights(len(fg_patches), len(bg_patches))
+            logger.info(
+                "ChunkSlicer: computed sampling weights for %d FG and %d BG patches (ratio=%.2f)",
+                len(fg_patches), len(bg_patches), self.config.bg_to_fg_ratio
+            )
+
+        if unlabeled_fg_patches:
+            logger.info(
+                "ChunkSlicer: found %d unlabeled foreground patches for semi-supervised training",
+                len(unlabeled_fg_patches),
+            )
+
+        self._patches = all_patches
+        self._weights = weights
+        return all_patches, weights
+
+    def _compute_sampling_weights(self, n_fg: int, n_bg: int) -> List[float]:
+        """Compute sampling weights so BG patches are sampled at bg_to_fg_ratio.
+
+        If bg_to_fg_ratio=0.5 and we have 1000 FG patches, we want ~500 BG samples per epoch.
+        Weight for each BG patch = target_bg_samples / n_bg = (n_fg * ratio) / n_bg
+        """
+        if n_bg == 0:
+            return [1.0] * n_fg
+
+        target_bg_samples = n_fg * self.config.bg_to_fg_ratio
+        bg_weight = target_bg_samples / n_bg if n_bg > 0 else 0.0
+
+        # FG patches have weight 1.0, BG patches have computed weight
+        return [1.0] * n_fg + [bg_weight] * n_bg
 
     def _compute_valid_positions(
         self,
@@ -251,57 +438,180 @@ class ChunkSlicer:
         label_arrays: Sequence[object],
         label_names: Sequence[str],
         ignore_values: Sequence[Optional[Union[int, float]]],
-    ) -> Tuple[List[Tuple[int, Tuple[int, ...]]], List[Dict[str, object]]]:
-        """Run find_valid_patches and map results to labeled volume indices."""
+    ) -> Tuple[
+        List[Tuple[int, Tuple[int, ...]]],
+        List[Tuple[int, Tuple[int, ...]]],
+        List[Dict[str, object]],
+        List[Dict[str, object]],
+        List[Tuple[int, Tuple[int, ...]]],
+        List[Dict[str, object]],
+    ]:
+        """Run find_valid_patches and map results to labeled volume indices.
+
+        Returns:
+            fg_positions, bg_positions, fg_entries, bg_entries, unlabeled_fg_positions, unlabeled_fg_entries
+        """
 
         channel_selectors = None
         if self._label_channel_selector is not None:
             channel_selectors = [self._label_channel_selector] * len(label_arrays)
 
-        all_have_shape = True
-        for arr in label_arrays:
-            if getattr(arr, "shape", None) is None:
-                all_have_shape = False
-                break
+        # Check if all label sources can be used with find_valid_patches.
+        # Valid sources are: zarr Arrays (have shape), zarr Groups (have keys method
+        # for accessing resolution levels), or any array-like with shape attribute.
+        # For unlabeled FG detection, we can use image sources instead of labels.
+        all_valid_for_vectorized = True
 
-        if not all_have_shape:
+        # When doing unlabeled FG detection with no labels, check image sources instead
+        if self.config.unlabeled_fg_enabled and all(arr is None for arr in label_arrays):
+            # Check image sources for vectorized processing
+            for vol in labeled_volumes:
+                img_src = vol.image_source
+                if img_src is None:
+                    all_valid_for_vectorized = False
+                    break
+                # Check if we can get a raw array from the handle
+                raw = getattr(img_src, 'raw', lambda: img_src)()
+                has_shape = getattr(raw, "shape", None) is not None
+                has_keys = callable(getattr(raw, "keys", None))
+                if not (has_shape or has_keys):
+                    all_valid_for_vectorized = False
+                    break
+        else:
+            for arr in label_arrays:
+                has_shape = getattr(arr, "shape", None) is not None
+                has_keys = callable(getattr(arr, "keys", None))
+                if not (has_shape or has_keys):
+                    all_valid_for_vectorized = False
+                    break
+
+        if not all_valid_for_vectorized:
             logger.info(
                 "ChunkSlicer: falling back to sequential patch validation because some label sources "
-                "lack array-style shape attributes"
+                "lack array-style shape attributes or zarr group keys"
             )
             return self._compute_valid_positions_sequential(labeled_volumes)
 
-        valid = find_valid_patches(
+        valid_patch_values = None
+        if self.config.valid_patch_value is not None:
+            valid_patch_values = [self.config.valid_patch_value] * len(label_arrays)
+
+        # Collect image arrays for unlabeled foreground detection if enabled
+        # Use raw() to get the underlying zarr group for resolution level access
+        image_arrays = None
+        if self.config.unlabeled_fg_enabled:
+            image_arrays = []
+            for vol in labeled_volumes:
+                img_src = vol.image_source
+                if img_src is not None:
+                    raw = getattr(img_src, 'raw', lambda: img_src)()
+                    image_arrays.append(raw)
+                else:
+                    image_arrays.append(None)
+
+        result = find_valid_patches(
             label_arrays=label_arrays,
             label_names=label_names,
             patch_size=tuple(self.config.patch_size),
             bbox_threshold=self.config.min_bbox_percent,
             label_threshold=self.config.min_labeled_ratio,
             num_workers=self.config.num_workers,
-            downsample_level=self.config.downsample_level,
+            valid_patch_find_resolution=self.config.valid_patch_find_resolution,
             channel_selectors=channel_selectors,
             ignore_labels=ignore_values,
+            valid_patch_values=valid_patch_values,
+            collect_bg_only=self.config.bg_sampling_enabled,
+            # Unlabeled foreground detection params
+            image_arrays=image_arrays,
+            collect_unlabeled_fg=self.config.unlabeled_fg_enabled,
+            unlabeled_fg_threshold=self.config.unlabeled_fg_threshold,
+            unlabeled_fg_bbox_threshold=self.config.unlabeled_fg_bbox_threshold,
         )
 
-        positions: List[Tuple[int, Tuple[int, ...]]] = []
-        for entry in valid:
+        fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+        bg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+        unlabeled_fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+
+        for entry in result['fg_patches']:
             labeled_idx = int(entry['volume_idx'])
             start_pos = tuple(int(v) for v in entry['start_pos'])
-            positions.append((labeled_idx, start_pos))
-        return positions, valid
+            fg_positions.append((labeled_idx, start_pos))
+
+        for entry in result['bg_patches']:
+            labeled_idx = int(entry['volume_idx'])
+            start_pos = tuple(int(v) for v in entry['start_pos'])
+            bg_positions.append((labeled_idx, start_pos))
+
+        for entry in result.get('unlabeled_fg_patches', []):
+            labeled_idx = int(entry['volume_idx'])
+            start_pos = tuple(int(v) for v in entry['start_pos'])
+            unlabeled_fg_positions.append((labeled_idx, start_pos))
+
+        return (
+            fg_positions,
+            bg_positions,
+            result['fg_patches'],
+            result['bg_patches'],
+            unlabeled_fg_positions,
+            result.get('unlabeled_fg_patches', []),
+        )
 
     def _compute_valid_positions_sequential(
         self, labeled_volumes: Sequence[ChunkVolume]
-    ) -> Tuple[List[Tuple[int, Tuple[int, ...]]], List[Dict[str, object]]]:
-        positions: List[Tuple[int, Tuple[int, ...]]] = []
-        entries: List[Dict[str, object]] = []
+    ) -> Tuple[
+        List[Tuple[int, Tuple[int, ...]]],
+        List[Tuple[int, Tuple[int, ...]]],
+        List[Dict[str, object]],
+        List[Dict[str, object]],
+        List[Tuple[int, Tuple[int, ...]]],
+        List[Dict[str, object]],
+    ]:
+        """Sequential fallback for patch validation.
+
+        Returns:
+            fg_positions, bg_positions, fg_entries, bg_entries, unlabeled_fg_positions, unlabeled_fg_entries
+        """
+        fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+        bg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+        fg_entries: List[Dict[str, object]] = []
+        bg_entries: List[Dict[str, object]] = []
+        unlabeled_fg_positions: List[Tuple[int, Tuple[int, ...]]] = []
+        unlabeled_fg_entries: List[Dict[str, object]] = []
 
         for labeled_idx, volume in enumerate(labeled_volumes):
             label_array = volume.label_source
+
+            # Unlabeled FG collection requires image source
+            should_collect_unlabeled_fg = (
+                self.config.unlabeled_fg_enabled and volume.image_source is not None
+            )
+
+            # Handle volumes with NO labels (e.g., self-supervised training)
             if label_array is None:
+                if should_collect_unlabeled_fg:
+                    # Enumerate all positions and check image content only
+                    candidate_patches = list(self.enumerate(volume, stride=self.config.stride))
+                    logger.info("Filtering %d candidate patches for volume %s", len(candidate_patches), volume.name)
+                    for candidate in tqdm(
+                        candidate_patches,
+                        desc=f"Filtering unlabeled patches ({volume.name})",
+                        leave=False,
+                    ):
+                        position = tuple(int(v) for v in candidate.position)
+                        patch_vol = int(np.prod(candidate.patch_size))
+                        if self._check_image_has_data(volume.image_source, position, patch_vol):
+                            unlabeled_fg_positions.append((labeled_idx, position))
+                            unlabeled_fg_entries.append({
+                                'volume_idx': labeled_idx,
+                                'volume_name': volume.name,
+                                'start_pos': list(position),
+                            })
                 continue
 
             ignore_value = volume.label_ignore_value
+            # BG collection only valid when ignore_value is set
+            should_collect_bg = self.config.bg_sampling_enabled and ignore_value is not None
+
             candidate_patches = self.enumerate(volume, stride=self.config.stride)
             for candidate in candidate_patches:
                 mask_patch = self._extract_label_patch(label_array, candidate.position)
@@ -315,37 +625,139 @@ class ChunkSlicer:
                     spatial_ndim=len(candidate.patch_size),
                     channel_selector=self._label_channel_selector,
                 )
-                mask = np.abs(mask) > 0
+                if self.config.valid_patch_value is not None:
+                    mask = (mask == self.config.valid_patch_value)
+                else:
+                    mask = np.abs(mask) > 0
+
+                position = tuple(int(v) for v in candidate.position)
+                patch_vol = mask.size
+
+                # Check if this patch is effectively unlabeled
+                labeled_ratio = np.count_nonzero(mask) / patch_vol if patch_vol > 0 else 0
+                is_effectively_unlabeled = labeled_ratio < self.config.min_labeled_ratio
+
                 if not mask.any():
+                    # No foreground - this is a BG-only patch or unlabeled FG candidate
+                    if should_collect_bg:
+                        bg_positions.append((labeled_idx, position))
+                        bg_entries.append({
+                            'volume_idx': labeled_idx,
+                            'volume_name': volume.name,
+                            'start_pos': list(position),
+                        })
+                    # Also check for unlabeled FG
+                    if should_collect_unlabeled_fg:
+                        if self._check_image_has_data(volume.image_source, position, patch_vol):
+                            unlabeled_fg_positions.append((labeled_idx, position))
+                            unlabeled_fg_entries.append({
+                                'volume_idx': labeled_idx,
+                                'volume_name': volume.name,
+                                'start_pos': list(position),
+                            })
                     continue
 
                 bbox = compute_bounding_box_3d(mask)
                 if bbox is None:
+                    if is_effectively_unlabeled and should_collect_unlabeled_fg:
+                        if self._check_image_has_data(volume.image_source, position, patch_vol):
+                            unlabeled_fg_positions.append((labeled_idx, position))
+                            unlabeled_fg_entries.append({
+                                'volume_idx': labeled_idx,
+                                'volume_name': volume.name,
+                                'start_pos': list(position),
+                            })
                     continue
 
                 bb_vol = bounding_box_volume(bbox)
-                patch_vol = mask.size
                 if patch_vol == 0:
                     continue
 
-                if (bb_vol / patch_vol) < self.config.min_bbox_percent:
-                    continue
+                bbox_ratio = bb_vol / patch_vol
+                passes_bbox = bbox_ratio >= self.config.min_bbox_percent
+                passes_label = labeled_ratio >= self.config.min_labeled_ratio
 
-                labeled_ratio = np.count_nonzero(mask) / patch_vol
-                if labeled_ratio < self.config.min_labeled_ratio:
-                    continue
-
-                position = tuple(int(v) for v in candidate.position)
-                positions.append((labeled_idx, position))
-                entries.append(
-                    {
+                if passes_bbox and passes_label:
+                    # Valid labeled patch
+                    fg_positions.append((labeled_idx, position))
+                    fg_entries.append({
                         'volume_idx': labeled_idx,
                         'volume_name': volume.name,
                         'start_pos': list(position),
-                    }
-                )
+                    })
+                elif should_collect_unlabeled_fg:
+                    # Failed label validation - check if it's an unlabeled FG patch
+                    if self._check_image_has_data(volume.image_source, position, patch_vol):
+                        unlabeled_fg_positions.append((labeled_idx, position))
+                        unlabeled_fg_entries.append({
+                            'volume_idx': labeled_idx,
+                            'volume_name': volume.name,
+                            'start_pos': list(position),
+                        })
 
-        return positions, entries
+        return fg_positions, bg_positions, fg_entries, bg_entries, unlabeled_fg_positions, unlabeled_fg_entries
+
+    def _check_image_has_data(
+        self, image_source: object, position: Tuple[int, ...], patch_vol: int
+    ) -> bool:
+        """Check if an image patch has sufficient non-zero data for unlabeled FG."""
+        try:
+            image_patch = self._extract_image_patch_for_validation(image_source, position)
+            if image_patch is None:
+                return False
+            image_nonzero = np.count_nonzero(image_patch)
+            img_fraction = image_nonzero / patch_vol if patch_vol > 0 else 0
+            if img_fraction < self.config.unlabeled_fg_threshold:
+                logger.debug(
+                    "_check_image_has_data: img_fraction %.4f < threshold %.4f at %s",
+                    img_fraction, self.config.unlabeled_fg_threshold, position
+                )
+                return False
+            # Compute bbox coverage
+            img_mask = image_patch != 0
+            bbox = compute_bounding_box_3d(img_mask)
+            if bbox is None:
+                logger.debug("_check_image_has_data: bbox is None at position %s", position)
+                return False
+            bb_vol = bounding_box_volume(bbox)
+            img_bbox_fraction = bb_vol / patch_vol if patch_vol > 0 else 0
+            if img_bbox_fraction < self.config.unlabeled_fg_bbox_threshold:
+                logger.debug(
+                    "_check_image_has_data: bbox_fraction %.4f < threshold %.4f at %s",
+                    img_bbox_fraction, self.config.unlabeled_fg_bbox_threshold, position
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.warning("_check_image_has_data: exception at position %s: %s", position, e)
+            return False
+
+    def _extract_image_patch_for_validation(
+        self, image_source: object, position: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """Extract image patch for unlabeled FG validation."""
+        if image_source is None:
+            return None
+        pos = tuple(int(v) for v in position)
+        patch_size = tuple(int(v) for v in self.config.patch_size)
+        try:
+            # Handle ArrayHandle types (e.g., ZarrArrayHandle) with read_window method
+            if hasattr(image_source, 'read_window'):
+                arr = image_source.read_window(pos, patch_size)
+            elif self._is_2d:
+                y, x = pos
+                ph, pw = patch_size[-2:]
+                arr = np.asarray(image_source[y:y + ph, x:x + pw])
+            else:
+                z, y, x = pos
+                pd, ph, pw = patch_size
+                arr = np.asarray(image_source[z:z + pd, y:y + ph, x:x + pw])
+            # Reduce to spatial only (squeeze channel dims if present)
+            while arr.ndim > len(patch_size):
+                arr = arr[0] if arr.shape[0] == 1 else arr.reshape(arr.shape[-len(patch_size):])
+            return arr
+        except Exception:
+            return None
 
     @property
     def patches(self) -> List[ChunkPatch]:
@@ -356,6 +768,16 @@ class ChunkSlicer:
         if self._weights is None:
             return None
         return list(self._weights)
+
+    @property
+    def n_fg(self) -> int:
+        """Number of foreground patches (patches with labels)."""
+        return getattr(self, '_n_fg', len(self._patches))
+
+    @property
+    def n_unlabeled_fg(self) -> int:
+        """Number of unlabeled foreground patches (has image data but no labels)."""
+        return getattr(self, '_n_unlabeled_fg', 0)
 
     # Enumeration -----------------------------------------------------------------------------------
 
@@ -450,9 +872,9 @@ class ChunkSlicer:
             'global_end': [
                 int(start + size) for start, size in zip(patch.position, patch.patch_size)
             ],
-            'source_path': str(getattr(volume.image, 'path', None)) if hasattr(volume.image, 'path') else None,
+            'source_path': str(getattr(volume.image, 'path', '')) if hasattr(volume.image, 'path') else '',
             'label_source_paths': {
-                name: str(getattr(handle, 'path', None)) if hasattr(handle, 'path') else None
+                name: str(getattr(handle, 'path', '')) if hasattr(handle, 'path') else ''
                 for name, handle in volume.labels.items()
             },
         }

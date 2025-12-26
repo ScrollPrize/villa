@@ -7,9 +7,10 @@ import fsspec
 import numcodecs
 import shutil
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import partial
 from vesuvius.data.utils import open_zarr
+from vesuvius.data.chunks_filter import load_chunks_json
 from math import ceil
 from scipy.ndimage import zoom
 import json
@@ -213,11 +214,13 @@ def finalize_logits(
     delete_intermediates: bool = False,  # If True, will delete the input logits after processing
     chunk_size: tuple = None,  # Optional custom chunk size for output
     num_workers: int = None,  # Number of worker processes to use
-    verbose: bool = True
+    verbose: bool = True,
+    input_zarr_path: str = None,  # Path to original input zarr for chunks.json detection
+    chunks_filter_mode: str = 'auto',  # 'auto', 'disabled'
 ):
     """
     Process merged logits and apply softmax/argmax to produce final outputs.
-    
+
     Args:
         input_path: Path to the merged logits Zarr store
         output_path: Path for the finalized output Zarr store
@@ -227,6 +230,8 @@ def finalize_logits(
         chunk_size: Optional custom chunk size for output (Z,Y,X)
         num_workers: Number of worker processes to use for parallel processing
         verbose: Print progress messages
+        input_zarr_path: Path to original input zarr for chunks.json detection.
+        chunks_filter_mode: 'auto' (use chunks.json if present) or 'disabled'.
     """
     numcodecs.blosc.use_threads = False
     
@@ -363,26 +368,112 @@ def finalize_logits(
         overwrite=True
     )
     
-    def get_chunk_indices(spatial_shape, spatial_chunks):
+    def get_chunk_indices(spatial_shape, spatial_chunks, valid_chunk_indices=None, zarr_chunk_size=None):
         # For each dimension, calculate how many chunks we need
-        
+
         # Generate all combinations of chunk indices
         from itertools import product
         chunk_counts = [int(np.ceil(s / c)) for s, c in zip(spatial_shape, spatial_chunks)]
         chunk_indices = list(product(*[range(count) for count in chunk_counts]))
-        
+
+        # Build set of valid regions if chunks.json filtering is enabled
+        valid_regions = None
+        if valid_chunk_indices is not None and zarr_chunk_size is not None:
+            valid_regions = set()
+            for chunk_idx in valid_chunk_indices:
+                ci_z, ci_y, ci_x = chunk_idx
+                valid_regions.add((ci_z, ci_y, ci_x))
+
         # list of dicts with indices for each chunk
         # Each dict will have 'indices' key with the chunk indices
-        # we pass these to the worker functions 
+        # we pass these to the worker functions
         chunks_info = []
         for idx in chunk_indices:
+            # If filtering by chunks.json, check if this chunk overlaps with any valid region
+            if valid_regions is not None:
+                cZ, cY, cX = zarr_chunk_size
+                sZ, sY, sX = spatial_chunks
+
+                # Calculate voxel range for this processing chunk
+                z_start = idx[0] * sZ
+                z_end = min((idx[0] + 1) * sZ, spatial_shape[0])
+                y_start = idx[1] * sY
+                y_end = min((idx[1] + 1) * sY, spatial_shape[1])
+                x_start = idx[2] * sX
+                x_end = min((idx[2] + 1) * sX, spatial_shape[2])
+
+                # Find which zarr chunks this processing chunk overlaps with
+                ci_z_start = z_start // cZ
+                ci_z_end = (z_end - 1) // cZ + 1
+                ci_y_start = y_start // cY
+                ci_y_end = (y_end - 1) // cY + 1
+                ci_x_start = x_start // cX
+                ci_x_end = (x_end - 1) // cX + 1
+
+                # Check if any overlapping zarr chunk is in the valid set
+                overlaps_valid = False
+                for ci_z in range(ci_z_start, ci_z_end):
+                    for ci_y in range(ci_y_start, ci_y_end):
+                        for ci_x in range(ci_x_start, ci_x_end):
+                            if (ci_z, ci_y, ci_x) in valid_regions:
+                                overlaps_valid = True
+                                break
+                        if overlaps_valid:
+                            break
+                    if overlaps_valid:
+                        break
+
+                if not overlaps_valid:
+                    continue  # Skip this chunk
+
             chunks_info.append({'indices': idx})
-        
+
         return chunks_info
-    
-    chunk_infos = get_chunk_indices(spatial_shape, spatial_chunks)
+
+    # --- Load chunk indices for filtering ---
+    # First try to get touched_chunk_indices from blending step (saved in attrs)
+    # This is more accurate than chunks.json because it accounts for patch overlap
+    valid_chunk_indices = None
+    zarr_chunk_size = None
+    if chunks_filter_mode != 'disabled':
+        # Check if blending saved touched_chunk_indices
+        if hasattr(input_store, 'attrs'):
+            touched_indices = input_store.attrs.get('touched_chunk_indices')
+            output_chunk_size = input_store.attrs.get('output_chunk_size')
+            if touched_indices is not None and output_chunk_size is not None:
+                valid_chunk_indices = touched_indices
+                zarr_chunk_size = tuple(output_chunk_size)
+                if verbose:
+                    print(f"\nLoaded {len(touched_indices)} touched chunks from blending metadata")
+                    print(f"  Output chunk size: {zarr_chunk_size}")
+
+        # Fallback to chunks.json if no blending metadata
+        if valid_chunk_indices is None:
+            if input_zarr_path is None and hasattr(input_store, 'attrs'):
+                input_zarr_path = input_store.attrs.get('input_zarr_path')
+                if input_zarr_path is None:
+                    inference_args = input_store.attrs.get('inference_args', {})
+                    input_zarr_path = inference_args.get('input_dir')
+
+            if input_zarr_path:
+                chunks_json = load_chunks_json(input_zarr_path)
+                if chunks_json:
+                    level0_chunks = chunks_json.get('chunks_by_level', {}).get('0', [])
+                    if level0_chunks:
+                        valid_chunk_indices = level0_chunks
+                        zarr_chunk_size = tuple(chunks_json.get('chunk_size', [128, 128, 128]))
+                        if verbose:
+                            print(f"\nLoaded chunks.json with {len(level0_chunks)} valid chunks (fallback)")
+                            print(f"  Zarr chunk size: {zarr_chunk_size}")
+
+    chunk_infos = get_chunk_indices(spatial_shape, spatial_chunks, valid_chunk_indices, zarr_chunk_size)
     total_chunks = len(chunk_infos)
-    print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
+
+    if valid_chunk_indices is not None:
+        full_chunks = get_chunk_indices(spatial_shape, spatial_chunks)
+        print(f"Filtered to {total_chunks} chunks (from {len(full_chunks)} total) based on chunk metadata")
+    else:
+        print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
     
     # main processing function with partial application of common arguments
     # This allows us to pass only the chunk_info to the worker function
@@ -407,7 +498,6 @@ def finalize_logits(
 
         future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunk_infos}
         
-        from concurrent.futures import as_completed
         for future in tqdm(
             as_completed(future_to_chunk),
             total=total_chunks,
@@ -449,6 +539,8 @@ def finalize_logits(
 
     # Build multiscale pyramid (levels 1..5) with 2x downsampling
     def build_multiscales(root_path: str, levels: int = 6):
+        if verbose:
+            print(f"Building multiscale pyramid (levels 1-{levels - 1})")
         try:
             # Open level 0 lazily
             lvl0 = open_zarr(os.path.join(root_path, '0'), mode='r', storage_options={'anon': False} if root_path.startswith('s3://') else None)
@@ -480,6 +572,9 @@ def finalize_logits(
                     xc = min(chunks_lvl0[2], tX)
                     chunks = (zc, yc, xc)
 
+                if verbose:
+                    print(f"Downsampling level {i}/{levels - 1}: shape {next_shape}, chunks {chunks}")
+
                 lvl_path = os.path.join(root_path, str(i))
                 ds_store = open_zarr(
                     path=lvl_path,
@@ -505,42 +600,76 @@ def finalize_logits(
                     Zp, Yp, Xp = next_shape
                     zc, yc, xc = chunks[0], chunks[1], chunks[2]
 
-                for oz in range(0, Zp, zc):
-                    for oy in range(0, Yp, yc):
-                        for ox in range(0, Xp, xc):
-                            oz1 = min(oz + zc, Zp)
-                            oy1 = min(oy + yc, Yp)
-                            ox1 = min(ox + xc, Xp)
+                prev_z, prev_y, prev_x = prev_shape[-3], prev_shape[-2], prev_shape[-1]
+                total_tiles = ((Zp + zc - 1) // zc) * ((Yp + yc - 1) // yc) * ((Xp + xc - 1) // xc)
+                downsample_workers = max(1, min(num_workers, total_tiles))
+                if verbose:
+                    print(f"Using {downsample_workers} workers for downsampling level {i}")
 
-                            # Corresponding prev indices
-                            pz0, py0, px0 = oz * 2, oy * 2, ox * 2
-                            pz1, py1, px1 = min(oz1 * 2, prev_shape[-3]), min(oy1 * 2, prev_shape[-2]), min(ox1 * 2, prev_shape[-1])
+                def iter_blocks():
+                    for oz in range(0, Zp, zc):
+                        for oy in range(0, Yp, yc):
+                            for ox in range(0, Xp, xc):
+                                yield oz, oy, ox
 
-                            if has_channel:
-                                prev_block = prev_store[(slice(None), slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
-                                # Pad to even along spatial dims
-                                pad_z = (0, (prev_block.shape[1] % 2))
-                                pad_y = (0, (prev_block.shape[2] % 2))
-                                pad_x = (0, (prev_block.shape[3] % 2))
-                                prev_block = np.pad(prev_block, ((0, 0), pad_z, pad_y, pad_x), mode='edge')
-                                # Reshape and average
-                                Cb, Zb, Yb, Xb = prev_block.shape
-                                block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
-                                if mode == "surface_frame" and Cb == 9:
-                                    tu_ds, tv_ds, n_ds = _orthonormalize_surface_frame(
-                                        block_ds[0:3], block_ds[3:6], block_ds[6:9]
-                                    )
-                                    block_ds = np.concatenate([tu_ds, tv_ds, n_ds], axis=0).astype(block_ds.dtype, copy=False)
-                                ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
-                            else:
-                                prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
-                                pad_z = (0, (prev_block.shape[0] % 2))
-                                pad_y = (0, (prev_block.shape[1] % 2))
-                                pad_x = (0, (prev_block.shape[2] % 2))
-                                prev_block = np.pad(prev_block, (pad_z, pad_y, pad_x), mode='edge')
-                                Zb, Yb, Xb = prev_block.shape
-                                block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
-                                ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+                def downsample_block(block_coords):
+                    oz, oy, ox = block_coords
+                    oz1 = min(oz + zc, Zp)
+                    oy1 = min(oy + yc, Yp)
+                    ox1 = min(ox + xc, Xp)
+
+                    # Corresponding prev indices
+                    pz0, py0, px0 = oz * 2, oy * 2, ox * 2
+                    pz1 = min(oz1 * 2, prev_z)
+                    py1 = min(oy1 * 2, prev_y)
+                    px1 = min(ox1 * 2, prev_x)
+
+                    if has_channel:
+                        prev_block = prev_store[(slice(None), slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
+                        # Pad to even along spatial dims
+                        pad_z = (0, (prev_block.shape[1] % 2))
+                        pad_y = (0, (prev_block.shape[2] % 2))
+                        pad_x = (0, (prev_block.shape[3] % 2))
+                        prev_block = np.pad(prev_block, ((0, 0), pad_z, pad_y, pad_x), mode='edge')
+                        # Reshape and average
+                        Cb, Zb, Yb, Xb = prev_block.shape
+                        block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
+                        if mode == "surface_frame" and Cb == 9:
+                            tu_ds, tv_ds, n_ds = _orthonormalize_surface_frame(
+                                block_ds[0:3], block_ds[3:6], block_ds[6:9]
+                            )
+                            block_ds = np.concatenate([tu_ds, tv_ds, n_ds], axis=0).astype(block_ds.dtype, copy=False)
+                        ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+                    else:
+                        prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
+                        pad_z = (0, (prev_block.shape[0] % 2))
+                        pad_y = (0, (prev_block.shape[1] % 2))
+                        pad_x = (0, (prev_block.shape[2] % 2))
+                        prev_block = np.pad(prev_block, (pad_z, pad_y, pad_x), mode='edge')
+                        Zb, Yb, Xb = prev_block.shape
+                        block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
+                        ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
+
+                if downsample_workers == 1:
+                    for block_coords in tqdm(
+                        iter_blocks(),
+                        total=total_tiles,
+                        desc=f"Downsample level {i}",
+                        unit="blocks",
+                        disable=not verbose
+                    ):
+                        downsample_block(block_coords)
+                else:
+                    with ThreadPoolExecutor(max_workers=downsample_workers) as executor:
+                        futures = [executor.submit(downsample_block, block_coords) for block_coords in iter_blocks()]
+                        for future in tqdm(
+                            as_completed(futures),
+                            total=total_tiles,
+                            desc=f"Downsample level {i}",
+                            unit="blocks",
+                            disable=not verbose
+                        ):
+                            future.result()
 
                 datasets.append({'path': str(i)})
                 prev_path = lvl_path
@@ -643,7 +772,12 @@ def main():
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')
-    
+    parser.add_argument('--input-zarr', type=str, default=None,
+                      help='Path to original input zarr for chunks.json detection (auto-detected from logits metadata if not provided)')
+    parser.add_argument('--chunks-filter-mode', type=str, default='auto',
+                      choices=['auto', 'disabled'],
+                      help='Chunk filtering: auto (use chunks.json if present), disabled (process full volume)')
+
     args = parser.parse_args()
 
     if args.mode == 'surface_frame' and args.threshold:
@@ -666,7 +800,9 @@ def main():
             delete_intermediates=args.delete_intermediates,
             chunk_size=chunks,
             num_workers=args.num_workers,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            input_zarr_path=args.input_zarr,
+            chunks_filter_mode=args.chunks_filter_mode,
         )
         return 0
     except Exception as e:

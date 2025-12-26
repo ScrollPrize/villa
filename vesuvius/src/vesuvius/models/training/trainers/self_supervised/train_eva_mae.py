@@ -49,8 +49,6 @@ class TrainEVAMAE(BaseTrainer):
         self.weight_decay = 5e-2
         self.warmup_duration_whole_net = 50  # lin increase whole network
         self.vit_patch_size = (8, 8, 8)
-        self.decoder_depth = 2  # Number of Eva decoder layers for MAE
-        self.decoder_num_heads = 12  # Number of heads in decoder
         
         if mgr is not None:
             self.mask_ratio = getattr(mgr, 'mask_ratio', self.mask_ratio)
@@ -79,8 +77,6 @@ class TrainEVAMAE(BaseTrainer):
             mgr.model_config['drop_path_rate'] = self.drop_path_rate
             mgr.model_config['attn_drop_rate'] = self.attention_drop_rate
             mgr.model_config['patch_embed_size'] = self.vit_patch_size
-            mgr.model_config['decoder_depth'] = self.decoder_depth
-            mgr.model_config['decoder_num_heads'] = self.decoder_num_heads
         
         super().__init__(mgr, verbose)
         
@@ -144,7 +140,7 @@ class TrainEVAMAE(BaseTrainer):
         # Call model with return_mae_mask=True to get restoration mask
         outputs, restoration_mask = model(inputs, return_mae_mask=True)
         
-        # - Shape: (B, 1, W, H, D) at full resolution
+        # - Shape: (B, 1, D, H, W) at full resolution
         # - Values: True/1 for visible patches, False/0 for masked patches
         # loss computes on masked patches (where mask == 0)
         

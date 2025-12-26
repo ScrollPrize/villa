@@ -1,0 +1,40 @@
+# Fine-tune from LeJEPA pretrained checkpoint
+# Use with: python -m vesuvius.models.training.trainers.self_supervised.train_finetune_lejepa
+
+# Task definition - customize for your downstream task
+
+
+tr_config:
+  patch_size: [128, 128, 128]  # Can differ from pretrain patch size
+  initial_lr: 1e-4  # Lower LR for fine-tuning
+  weight_decay: 0.01
+  max_epoch: 100
+  optimizer: "adamw"
+
+# Model config - encoder settings MUST match pretrained checkpoint
+model_config:
+  architecture_type: "primus_m"
+  primus_variant: "M"  # Must match pretrained (S, B, M, or L)
+  patch_embed_size: [8, 8, 8]  # Must match pretrained
+  drop_path_rate: 0.1
+  proj_drop_rate: 0.0
+  attn_drop_rate: 0.0
+
+# Fine-tuning options
+finetune_config:
+  pretrained_lejepa_checkpoint: null  # Set via CLI: --pretrained_lejepa_checkpoint /path/to/checkpoint.pt
+  freeze_encoder_epochs: 0  # Optional: freeze encoder for N epochs
+  encoder_lr_mult: 1.0  # Optional: LR multiplier for encoder (e.g., 0.1 for 10x lower)
+  finetune_warmup_epochs: 0  # Optional: warmup epochs
+  load_decoder_from_pretrain: false  # LeJEPA has no decoder, keep false
+
+dataset_config:
+  skip_patch_validation: true
+  normalization_scheme: "zscore"
+  targets:
+    surface:
+      activation: "none"
+      ignore_label: 2
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0

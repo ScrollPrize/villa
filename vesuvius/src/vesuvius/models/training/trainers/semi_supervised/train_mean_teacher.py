@@ -43,6 +43,11 @@ class TrainMeanTeacher(BaseTrainer):
         self.unlabeled_indices = None
 
         mgr.enable_deep_supervision = False
+
+        # Disable scaling augmentation - it requires padding which causes issues
+        # with consistency loss (padded regions get different noise, creating fake disagreement)
+        mgr.no_scaling = True
+
         # One-time validation debug flag
         self._val_debug_done = False
 
@@ -64,6 +69,19 @@ class TrainMeanTeacher(BaseTrainer):
     def _get_current_consistency_weight(self, epoch_like):
         # Consistency ramp-up from https://arxiv.org/abs/1610.02242
         return self.consistency_weight * ramps.sigmoid_rampup(epoch_like, self.consistency_rampup)
+
+    def _get_noise_bounds(self, inputs):
+        """Compute noise clamp bounds relative to input statistics.
+
+        The original hardcoded ±0.2 clamp assumes z-score normalized data (std~1).
+        This method adapts the bounds to the actual input scale, so the noise
+        remains proportionally meaningful regardless of normalization scheme.
+        """
+        input_std = inputs.std()
+        # Clamp noise to roughly 2x noise_scale * std
+        # For z-score data with std~1, this gives ~0.2 matching original behavior
+        bound = 2.0 * self.noise_scale * max(input_std.item(), 0.1)
+        return bound
 
     # --- Dataloaders (two-stream) --- #
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
@@ -254,8 +272,9 @@ class TrainMeanTeacher(BaseTrainer):
             if autocast_ctx is None:
                 autocast_ctx = nullcontext()
 
+            noise_bound = self._get_noise_bounds(unlabeled_inputs)
             with torch.no_grad():
-                noise = torch.clamp(torch.randn_like(unlabeled_inputs) * self.noise_scale, -0.2, 0.2)
+                noise = torch.clamp(torch.randn_like(unlabeled_inputs) * self.noise_scale, -noise_bound, noise_bound)
                 teacher_inputs = unlabeled_inputs + noise
                 with autocast_ctx:
                     teacher_outputs = self.ema_model(teacher_inputs)

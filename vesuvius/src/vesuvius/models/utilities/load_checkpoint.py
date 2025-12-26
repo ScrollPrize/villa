@@ -1,3 +1,4 @@
+import re
 import torch
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
 
         if hasattr(mgr, 'targets') and 'targets' in checkpoint['model_config']:
             mgr.targets = checkpoint['model_config']['targets']
-            print(f"Updated targets from checkpoint: {mgr.targets}")
+            print("Loaded targets from checkpoint (may be overridden by config)")
 
     if isinstance(checkpoint, dict) and 'normalization_scheme' in checkpoint:
         print(f"Found normalization scheme in checkpoint: {checkpoint['normalization_scheme']}")
@@ -79,6 +80,21 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
             mgr.model_config = checkpoint['model_config']
         except Exception:
             pass
+
+    # --- Infer separate_decoders from checkpoint keys if not accurately saved ---
+    # Old checkpoints may have saved separate_decoders: False even when separate decoders were used
+    # Detect the actual architecture from state dict keys
+    if isinstance(checkpoint, dict) and 'model_config' in checkpoint:
+        raw_state = checkpoint.get('model') or checkpoint.get('state_dict') or {}
+        has_task_decoders = any(k.startswith('task_decoders.') and '.decoder.' in k for k in raw_state.keys())
+        has_shared_decoder = any(k.startswith('shared_decoder.') for k in raw_state.keys())
+
+        saved_sep_dec = checkpoint['model_config'].get('separate_decoders', False)
+        inferred_sep_dec = has_task_decoders and not has_shared_decoder
+
+        if inferred_sep_dec and not saved_sep_dec:
+            print(f"Detected separate decoders from checkpoint keys (overriding saved separate_decoders=False)")
+            checkpoint['model_config']['separate_decoders'] = True
 
     # Prefer rebuilding the model from checkpoint config to ensure an exact architectural match
     # unless the user explicitly requested weights-only load and wants to keep current model.
@@ -143,6 +159,46 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
     # Optionally filter to matching keys/shapes when loading weights only
     target_state = model.state_dict()
     allow_partial = bool(load_weights_only)
+
+    # Handle backward compatibility for encoder reference in task decoders.
+    # Old models stored encoder as a submodule in each task decoder, creating duplicate
+    # state_dict keys like task_decoders.<task>.encoder.* alongside shared_encoder.*.
+    # New models don't have these duplicate keys.
+    task_decoder_encoder_pattern = re.compile(r'^task_decoders\.([^.]+)\.encoder\.(.+)$')
+
+    # Check if model expects task_decoders.<task>.encoder.* keys but checkpoint doesn't have them
+    # (loading new checkpoint into old model) - populate from shared_encoder.*
+    model_expects_decoder_encoder = any(task_decoder_encoder_pattern.match(k) for k in target_state.keys())
+    ckpt_has_decoder_encoder = any(task_decoder_encoder_pattern.match(k) for k in model_state.keys())
+
+    if model_expects_decoder_encoder and not ckpt_has_decoder_encoder:
+        # Old model expects task_decoders.<task>.encoder.* but new checkpoint doesn't have them
+        # Copy from shared_encoder.* to task_decoders.<task>.encoder.*
+        task_names = set()
+        for k in target_state.keys():
+            m = task_decoder_encoder_pattern.match(k)
+            if m:
+                task_names.add(m.group(1))
+
+        added_keys = []
+        for task_name in task_names:
+            for k, v in list(model_state.items()):
+                if k.startswith('shared_encoder.'):
+                    new_key = f'task_decoders.{task_name}.encoder.{k[len("shared_encoder."):]}'
+                    if new_key in target_state and target_state[new_key].shape == v.shape:
+                        model_state[new_key] = v
+                        added_keys.append(new_key)
+        if added_keys:
+            print(f"Populated {len(added_keys)} task_decoders.<task>.encoder.* keys from shared_encoder.* for backward compatibility")
+
+    elif ckpt_has_decoder_encoder and not model_expects_decoder_encoder:
+        # Old checkpoint has task_decoders.<task>.encoder.* but new model doesn't need them
+        # Filter out these duplicate keys to avoid unexpected key warnings
+        removed_keys = [k for k in model_state.keys() if task_decoder_encoder_pattern.match(k)]
+        if removed_keys:
+            model_state = {k: v for k, v in model_state.items() if not task_decoder_encoder_pattern.match(k)}
+            print(f"Filtered out {len(removed_keys)} duplicate task_decoders.<task>.encoder.* keys from old checkpoint")
+
     if allow_partial:
         model_state = {k: v for k, v in model_state.items()
                        if k in target_state and target_state[k].shape == v.shape}

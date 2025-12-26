@@ -43,7 +43,7 @@ def _make_mgr(data_path, *, allow_unlabeled=False, patch_size=None):
         skip_intensity_sampling=True,
         data_path=data_path,
         num_workers=0,
-        downsample_level=1,
+        valid_patch_find_resolution=1,
         train_batch_size=2,
     )
 

@@ -1033,17 +1033,18 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             'batch_dice': loss_config.get('batch_dice', False),
             'smooth': loss_config.get('smooth', 1e-5),
             'do_bg': loss_config.get('do_bg', False),
-            'ddp': loss_config.get('ddp', False)
+            'ddp': loss_config.get('ddp', False),
+            'label_smoothing': loss_config.get('dice_label_smoothing', 0.0)
         }
-        
+
         # Allow override with soft_dice_kwargs if provided
         if 'soft_dice_kwargs' in loss_config:
             soft_dice_kwargs.update(loss_config['soft_dice_kwargs'])
-        
+
         ce_kwargs = loss_config.get('ce_kwargs', {})
         weight_ce = loss_config.get('weight_ce', 1)
         weight_dice = loss_config.get('weight_dice', 1)
-        
+
         base_loss = DC_and_CE_loss(
             soft_dice_kwargs=soft_dice_kwargs,
             ce_kwargs=ce_kwargs,
