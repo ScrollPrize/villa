@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from timm.layers import DropPath, GluMlp, Mlp, SwiGLU, maybe_add_mask, use_fused_attn
+from timm.layers import DropPath, GluMlp, Mlp, SwiGLU
 from timm.layers.pos_embed_sincos import build_fourier_pos_embed, freq_bands, pixel_freq_bands
 from torch.nn import LayerNorm
 
@@ -205,7 +205,6 @@ class PoPEAttention(nn.Module):
         attn_dim = head_dim * self.num_heads
         self.scale = head_dim ** -0.5
         self.num_prefix_tokens = num_prefix_tokens
-        self.fused_attn = use_fused_attn()
         self.qkv_bias_separate = qkv_bias_separate
 
         if qkv_fused:
@@ -232,6 +231,13 @@ class PoPEAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.phase_bias = nn.Parameter(torch.zeros(self.num_heads, self.head_dim))
+        try:
+            from flash_attn import flash_attn_func
+        except ImportError as exc:
+            raise ImportError(
+                "flash_attn is required for PoPEAttention. Install it via the models extra."
+            ) from exc
+        self.flash_attn_func = flash_attn_func
 
     def _apply_pope(self, q: torch.Tensor, k: torch.Tensor, rope: torch.Tensor):
         npt = self.num_prefix_tokens
@@ -307,20 +313,25 @@ class PoPEAttention(nn.Module):
             q = q.type_as(v)
             k = k.type_as(v)
 
-        if self.fused_attn:
-            q = q * math.sqrt(2.0)
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = maybe_add_mask(attn, attn_mask)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
+        if attn_mask is not None:
+            raise ValueError("PoPEAttention with flash_attn does not support attn_mask.")
+        if not q.is_cuda:
+            raise RuntimeError("PoPEAttention with flash_attn requires CUDA tensors.")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("PoPEAttention with flash_attn requires fp16 or bf16 tensors.")
+
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        x = self.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            softmax_scale=self.scale * math.sqrt(2.0),
+            causal=False,
+        )
+        x = x.transpose(1, 2)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.norm(x)

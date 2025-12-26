@@ -53,7 +53,7 @@ class Primus(AbstractDynamicNetworkArchitectures):
         num_register_tokens: int = 0,
         use_rot_pos_emb: bool = True,
         use_abs_pos_embed: bool = True,
-        pos_emb_type: str = "pope",
+        pos_emb_type: str = "rope",
         mlp_ratio=4 * 2 / 3,
         drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining

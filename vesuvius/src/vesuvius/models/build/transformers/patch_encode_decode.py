@@ -52,8 +52,9 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        returns shape (B, embed_dim, px, py, pz) where (px, py, pz) is patch_size.
-        This output will need to be rearranged to whatever your transformer expects!
+        Returns a patch grid of shape (B, embed_dim, D, H, W) for 3D or
+        (B, embed_dim, H, W) for 2D, where (D, H, W) = input_shape / patch_size.
+        This output will need to be rearranged to whatever your transformer expects.
         """
         x = self.proj(x)
         return x
@@ -112,6 +113,7 @@ class PatchDecode(nn.Module):
 
     def forward(self, x):
         """
-        Expects input of shape (B, embed_dim, px, py, pz)! This will require you to reshape the output of your transformer!
+        Expects input of shape (B, embed_dim, D, H, W) for 3D or (B, embed_dim, H, W) for 2D.
+        This will require you to reshape the output of your transformer.
         """
         return self.decode(x)

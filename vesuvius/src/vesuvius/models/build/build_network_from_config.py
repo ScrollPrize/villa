@@ -474,7 +474,7 @@ class NetworkFromConfig(nn.Module):
             "num_register_tokens": model_config.get("num_register_tokens", 0),
             "use_rot_pos_emb": model_config.get("use_rot_pos_emb", True),
             "use_abs_pos_embed": model_config.get("use_abs_pos_embed", True),
-            "pos_emb_type": model_config.get("pos_emb_type", "pope"),
+            "pos_emb_type": model_config.get("pos_emb_type", "rope"),
             "mlp_ratio": model_config.get("mlp_ratio", 4 * 2 / 3),
             "init_values": model_config.get("init_values", 0.1 if config_name != "S" else 0.1),
             "scale_attn_inner": model_config.get("scale_attn_inner", True),
