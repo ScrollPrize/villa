@@ -45,7 +45,7 @@ def test_chunk_slicer_attaches_mesh_payloads():
         min_labeled_ratio=0.0,
         min_bbox_percent=0.0,
         allow_unlabeled=True,
-        downsample_level=1,
+        valid_patch_find_resolution=1,
         num_workers=0,
         cache_enabled=False,
         cache_dir=None,

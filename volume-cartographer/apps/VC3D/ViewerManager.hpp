@@ -7,9 +7,10 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include <opencv2/core.hpp>
 
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
@@ -19,11 +20,12 @@ class CSurfaceCollection;
 class VCCollection;
 class SegmentationOverlayController;
 class PointsOverlayController;
+class RawPointsOverlayController;
 class PathsOverlayController;
 class BBoxOverlayController;
 class VectorOverlayController;
 class VolumeOverlayController;
-class ChunkCache;
+template <typename T> class ChunkCache;
 class SegmentationModule;
 class Volume;
 class Surface;
@@ -36,7 +38,7 @@ class ViewerManager : public QObject
 public:
     ViewerManager(CSurfaceCollection* surfaces,
                   VCCollection* points,
-                  ChunkCache* cache,
+                  ChunkCache<uint8_t>* cache,
                   QObject* parent = nullptr);
 
     CVolumeViewer* createViewer(const std::string& surfaceName,
@@ -46,9 +48,12 @@ public:
     const std::vector<CVolumeViewer*>& viewers() const { return _viewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
+    SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
     void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);
+    void setRawPointsOverlay(RawPointsOverlayController* overlay);
+    RawPointsOverlayController* rawPointsOverlay() const { return _rawPointsOverlay; }
     void setPathsOverlay(PathsOverlayController* overlay);
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
@@ -77,9 +82,10 @@ public:
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 
-    void setSurfacePatchSamplingStride(int stride);
+    void setSurfacePatchSamplingStride(int stride, bool userInitiated = true);
     int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
     void primeSurfacePatchIndicesAsync();
+    void resetStrideUserOverride() { _surfacePatchStrideUserSet = false; }
 
     bool resetDefaultFor(CVolumeViewer* viewer) const;
     void setResetDefaultFor(CVolumeViewer* viewer, bool value);
@@ -87,28 +93,39 @@ public:
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
 
+    void setSliceStepSize(int size);
+    int sliceStepSize() const { return _sliceStepSize; }
+
     void forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
+    void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
+    void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
+    void waitForPendingIndexRebuild();
 
 signals:
     void viewerCreated(CVolumeViewer* viewer);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
+    void samplingStrideChanged(int stride);
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
-    void handleSurfaceChanged(std::string name, Surface* surf);
+    void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
+    void handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
+    bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
+
     CSurfaceCollection* _surfaces;
     VCCollection* _points;
-    ChunkCache* _chunkCache;
+    ChunkCache<uint8_t>* _chunkCache;
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
+    RawPointsOverlayController* _rawPointsOverlay{nullptr};
     PathsOverlayController* _pathsOverlay{nullptr};
     BBoxOverlayController* _bboxOverlay{nullptr};
     VectorOverlayController* _vectorOverlay{nullptr};
@@ -127,14 +144,19 @@ private:
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
+    int _sliceStepSize{1};
     int _surfacePatchSamplingStride{1};
+    bool _surfacePatchStrideUserSet{false};
+    int _targetRefinedStride{0};  // 0 = no refinement pending
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
-    bool _surfacePatchIndexDirty{true};
-    std::unordered_map<const QuadSurface*, int> _surfaceDirtyBoundsVersions;
-    std::unordered_set<QuadSurface*> _indexedSurfaces;
-    std::vector<QuadSurface*> _pendingSurfacePatchIndexSurfaces;
+    bool _surfacePatchIndexNeedsRebuild{true};
+    // Use string IDs for surface tracking to avoid dangling pointers in async operations
+    std::unordered_set<std::string> _indexedSurfaceIds;
+    std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
+    std::vector<std::string> _surfacesQueuedDuringRebuildIds;
+    std::vector<std::string> _surfacesQueuedForRemovalDuringRebuildIds;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
 
     void rebuildSurfacePatchIndexIfNeeded();

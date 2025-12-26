@@ -60,7 +60,7 @@ class Chunked3d {
 public:
     using CHUNKT = xt::xtensor<T,3,xt::layout_type::column_major>;
 
-    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache *cache) : _compute_f(compute_f), _ds(ds), _cache(cache)
+    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache<T> *cache) : _compute_f(compute_f), _ds(ds), _cache(cache)
     {
         _border = compute_f.BORDER;
     };
@@ -69,12 +69,12 @@ public:
         if (!_persistent)
             remove_all(_cache_dir);
     };
-    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache *cache, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache)
+    Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache<T> *cache, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache)
     {
         _border = compute_f.BORDER;
         
         if (_ds)
-            _shape = {_ds->shape()[0],_ds->shape()[1],_ds->shape()[2]};
+            _shape = {static_cast<int>(_ds->shape()[0]), static_cast<int>(_ds->shape()[1]), static_cast<int>(_ds->shape()[2])};
         
         if (cache_root.empty())
             return;
@@ -258,9 +258,9 @@ public:
         close(fd);
         
         cv::Vec3i offset =
-        {id[0]*s-_border,
-            id[1]*s-_border,
-            id[2]*s-_border};
+        {static_cast<int>(id[0]*s-_border),
+            static_cast<int>(id[1]*s-_border),
+            static_cast<int>(id[2]*s-_border)};
 
         CHUNKT small = xt::empty<T>({s,s,s});
         CHUNKT large;
@@ -305,9 +305,9 @@ public:
         CHUNKT small = xt::empty<T>({s,s,s});
 
         cv::Vec3i offset =
-        {id[0]*s-_border,
-            id[1]*s-_border,
-            id[2]*s-_border};
+        {static_cast<int>(id[0]*s-_border),
+            static_cast<int>(id[1]*s-_border),
+            static_cast<int>(id[2]*s-_border)};
             
         CHUNKT large;
         if (_ds) {
@@ -428,7 +428,7 @@ public:
 
     std::unordered_map<cv::Vec3i,T*,vec3i_hash> _chunks;
     z5::Dataset *_ds;
-    ChunkCache *_cache;
+    ChunkCache<T> *_cache;
     size_t _border;
     C &_compute_f;
     std::shared_mutex _mutex;
@@ -654,7 +654,7 @@ private:
 
 struct Chunked3dFloatFromUint8
 {
-    Chunked3dFloatFromUint8(std::unique_ptr<z5::Dataset> &&ds, float scale, ChunkCache *cache, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dFloatFromUint8(std::unique_ptr<z5::Dataset> &&ds, float scale, ChunkCache<uint8_t> *cache, std::string const &cache_root, std::string const &unique_id) :
         _passthrough{unique_id},
         _x(_passthrough, ds.get(), cache, cache_root),
         _scale(scale),  // multiplying by this maps indices of the 'canonical' volume to indices of our dataset
@@ -666,9 +666,9 @@ struct Chunked3dFloatFromUint8
     {
         // p has zyx ordering!
         p *= _scale;
-        cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
+        cv::Vec3i i{static_cast<int>(lround(p[0])), static_cast<int>(lround(p[1])), static_cast<int>(lround(p[2]))};
         uint8_t x = _x.safe_at(i);
-        return float{x} / 255.f;
+        return static_cast<float>(x) / 255.f;
     }
 
     float operator()(double z, double y, double x)
@@ -684,7 +684,7 @@ struct Chunked3dFloatFromUint8
 
 struct Chunked3dVec3fFromUint8
 {
-    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<z5::Dataset>> &&dss, float scale, ChunkCache *cache, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<z5::Dataset>> &&dss, float scale, ChunkCache<uint8_t> *cache, std::string const &cache_root, std::string const &unique_id) :
         _passthrough_x{unique_id + "_x"},
         _passthrough_y{unique_id + "_y"},
         _passthrough_z{unique_id + "_z"},
@@ -700,11 +700,11 @@ struct Chunked3dVec3fFromUint8
     {
         // Both p and returned vector have zyx ordering!
         p *= _scale;
-        cv::Vec3i i{lround(p[0]), lround(p[1]), lround(p[2])};
+        cv::Vec3i i{static_cast<int>(lround(p[0])), static_cast<int>(lround(p[1])), static_cast<int>(lround(p[2]))};
         uint8_t x = _x.safe_at(i);
         uint8_t y = _y.safe_at(i);
         uint8_t z = _z.safe_at(i);
-        return (cv::Vec3f{z, y, x} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
+        return (cv::Vec3f{static_cast<float>(z), static_cast<float>(y), static_cast<float>(x)} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
     }
 
     cv::Vec3f operator()(double z, double y, double x)

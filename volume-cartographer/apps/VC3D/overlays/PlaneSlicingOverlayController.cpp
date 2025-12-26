@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "vc/core/util/PlaneSurface.hpp"
+
 namespace
 {
 constexpr const char* kOverlayGroup = "plane_slicing_guides";
@@ -53,6 +55,11 @@ void PlaneSlicingOverlayController::setAxisAlignedEnabled(bool enabled)
 void PlaneSlicingOverlayController::setRotationSetter(std::function<void(const std::string&, float)> setter)
 {
     _rotationSetter = std::move(setter);
+}
+
+void PlaneSlicingOverlayController::setRotationFinishedCallback(std::function<void()> callback)
+{
+    _rotationFinishedCallback = std::move(callback);
 }
 
 void PlaneSlicingOverlayController::setAxisAlignedOverlayOpacity(float opacity)
@@ -174,7 +181,8 @@ void PlaneSlicingOverlayController::collectPrimitives(CVolumeViewer* viewer,
     };
 
     for (const auto& def : planeDefs) {
-        auto* plane = dynamic_cast<PlaneSurface*>(_surfaces->surface(def.name));
+        auto planeHolder = _surfaces->surface(def.name);  // Keep surface alive during this iteration
+        auto* plane = dynamic_cast<PlaneSurface*>(planeHolder.get());
         if (!plane) {
             continue;
         }
@@ -347,7 +355,8 @@ void PlaneSlicingOverlayController::handleMouseMove(CVolumeViewer* viewer,
         float candidate = normalizeDegrees(angle - visual.baseAngleDegrees);
 
         float currentAngle = 0.0f;
-        if (auto* planeSurface = dynamic_cast<PlaneSurface*>(_surfaces->surface(_activeDrag.planeName))) {
+        auto planeSurfaceHolder = _surfaces->surface(_activeDrag.planeName);  // Keep surface alive
+        if (auto* planeSurface = dynamic_cast<PlaneSurface*>(planeSurfaceHolder.get())) {
             cv::Vec3f currentNormal = planeSurface->normal({}, {});
             cv::Vec3f currentDir3D = currentNormal.cross(cv::Vec3f(0.0f, 0.0f, 1.0f));
             if (cv::norm(currentDir3D) > 1e-5f) {
@@ -394,9 +403,13 @@ void PlaneSlicingOverlayController::handleMouseRelease(CVolumeViewer* viewer,
     }
 
     if (button == Qt::LeftButton && _activeDrag.viewer == viewer) {
+        const bool hadActiveDrag = !_activeDrag.planeName.empty();
         _activeDrag.viewer = nullptr;
         _activeDrag.planeName.clear();
         viewer->fGraphicsView->setCursor(Qt::ArrowCursor);
+        if (hadActiveDrag && _rotationFinishedCallback) {
+            _rotationFinishedCallback();
+        }
     }
 }
 

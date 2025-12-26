@@ -158,9 +158,15 @@ class DatasetOrchestrator(BaseDataset):
             for target in targets:
                 label_handle = volume.labels.get(target)
                 label_path = volume.metadata.label_paths.get(target)
+                # Use .raw() for label_source when available - this returns a zarr
+                # Group (for OME-ZARR) or Array that supports direct slicing and can
+                # be used with find_valid_patches for fast vectorized patch validation.
+                # The handle is still used for 'label' to provide read_window for extraction.
                 label_source = None
-                if label_handle is not None and hasattr(label_handle, "raw"):
-                    label_source = label_handle.raw()
+                if label_handle is not None:
+                    raw_obj = getattr(label_handle, "raw", None)
+                    if callable(raw_obj):
+                        label_source = raw_obj()
 
                 entry = {
                     "volume_id": volume_id,
@@ -173,8 +179,8 @@ class DatasetOrchestrator(BaseDataset):
                 }
                 self.target_volumes[target].append(entry)
 
-                if label_handle is not None and getattr(label_handle, "raw", None) is not None and label_path is not None:
-                    self.zarr_arrays.append(label_handle.raw())
+                if label_source is not None and label_path is not None:
+                    self.zarr_arrays.append(label_source)
                     self.zarr_names.append(f"{volume_id}_{target}")
                     self.data_paths.append(str(label_path))
 
@@ -359,7 +365,13 @@ class DatasetOrchestrator(BaseDataset):
     # Additional dataset helpers ------------------------------------------------------------------
 
     def get_labeled_unlabeled_patch_indices(self):
-        """Mirror ImageDataset helper for semi-supervised workflows."""
+        """Classify patches for semi-supervised workflows.
+
+        Returns:
+            labeled_indices: Indices of patches with valid labels (for supervised loss)
+            unlabeled_indices: Indices of patches that are unlabeled foreground or
+                from unlabeled volumes (for consistency loss in semi-supervised training)
+        """
 
         labeled_indices: List[int] = []
         unlabeled_indices: List[int] = []
@@ -367,6 +379,22 @@ class DatasetOrchestrator(BaseDataset):
         if not self.valid_patches:
             return labeled_indices, unlabeled_indices
 
+        # Prefer patch-level classification via ChunkSlicer if available
+        if hasattr(self, 'chunk_slicer') and self.chunk_slicer is not None:
+            patches = self.chunk_slicer.patches
+            for idx, patch in enumerate(patches):
+                if hasattr(patch, 'is_unlabeled_fg') and patch.is_unlabeled_fg:
+                    # Unlabeled foreground: has image data but no labels
+                    unlabeled_indices.append(idx)
+                elif hasattr(patch, 'is_bg_only') and patch.is_bg_only:
+                    # BG-only patches are excluded from both lists
+                    pass
+                else:
+                    # Labeled foreground patches
+                    labeled_indices.append(idx)
+            return labeled_indices, unlabeled_indices
+
+        # Fallback: volume-level classification
         first_target = next(iter(self.target_volumes))
 
         for idx, patch_info in enumerate(self.valid_patches):

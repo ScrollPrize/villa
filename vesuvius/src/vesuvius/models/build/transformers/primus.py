@@ -53,6 +53,7 @@ class Primus(AbstractDynamicNetworkArchitectures):
         num_register_tokens: int = 0,
         use_rot_pos_emb: bool = True,
         use_abs_pos_embed: bool = True,
+        pos_emb_type: str = "pope",
         mlp_ratio=4 * 2 / 3,
         drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
@@ -70,8 +71,9 @@ class Primus(AbstractDynamicNetworkArchitectures):
         consists of simple patch_embedding, a EVA ViT encoder with a few adatptations and a simple patch decoder.
         """
         assert input_shape is not None
-        assert len(input_shape) == 3, "Currently on ly 3d is supported"
+        assert len(input_shape) in (2, 3), "Only 2D and 3D inputs are supported"
         assert all([j % i == 0 for i, j in zip(patch_embed_size, input_shape)])
+        self.ndim = len(input_shape)
 
         super().__init__()
         self.key_to_encoder = "eva"
@@ -93,6 +95,7 @@ class Primus(AbstractDynamicNetworkArchitectures):
             num_reg_tokens=num_register_tokens,
             use_rot_pos_emb=use_rot_pos_emb,
             use_abs_pos_emb=use_abs_pos_embed,
+            pos_emb_type=pos_emb_type,
             mlp_ratio=mlp_ratio,
             drop_path_rate=drop_path_rate,
             patch_drop_rate=patch_drop_rate,
@@ -103,9 +106,8 @@ class Primus(AbstractDynamicNetworkArchitectures):
             init_values=init_values,
             scale_attn_inner=scale_attn_inner,
         )
-        # self.mask_token =
-        self.mask_token: torch.Tensor
-        self.register_buffer("mask_token", torch.zeros(1, 1, embed_dim))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.normal_(self.mask_token, std=1e-6)
 
         if num_register_tokens > 0:
             self.register_tokens = (
@@ -125,42 +127,38 @@ class Primus(AbstractDynamicNetworkArchitectures):
         """
         if keep_indices is None:
             return x, None
+
         B, num_kept, C = x.shape
         device = x.device
 
-        # Create mask tokens for missing patches
-        num_masked = num_patches - num_kept
-        mask_tokens = self.mask_token.repeat(B, num_masked, 1)
-
-        # Prepare an empty tensor for the restored sequence
-        restored = torch.zeros(B, num_patches, C, device=device)
+        # Initialize with mask tokens expanded to full sequence
+        restored = self.mask_token.expand(B, num_patches, -1).clone()
         restored_mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
 
-        # Assign the kept patches and mask tokens in the correct positions
-        for i in range(B):
-            kept_pos = keep_indices[i]
-            # masked_pos_prior = torch.tensor([j for j in range(num_patches) if j not in kept_pos], device=device)
-            # replacement of list comprehension
-            # kept_pos_tensor = torch.tensor(kept_pos, device=device)  # Ensure kept_pos is a tensor
-            all_indices = torch.arange(num_patches, device=device)  # Create tensor of all indices
-            mask = torch.ones(num_patches, device=device, dtype=torch.bool)  # Start with all True
-            mask[kept_pos] = False  # Set kept positions to False
-            masked_pos = all_indices[mask]  # Extract indices not in kept_pos
 
-            restored[i, kept_pos] = x[i]
-            restored[i, masked_pos] = mask_tokens[i, : len(masked_pos)]
-            restored_mask[i, kept_pos] = True
+        # keep_indices shape: (B, num_kept)
+        batch_indices = torch.arange(B, device=device)[:, None].expand(-1, num_kept)
+
+        # Assign kept patches to their positions
+        restored[batch_indices, keep_indices] = x
+        restored_mask[batch_indices, keep_indices] = True
 
         return (restored, restored_mask)
 
     def forward(self, x, ret_mask=False):
-        FW, FH, FD = x.shape[2:]  # Full W , ...
+        full_spatial = x.shape[2:]  # Full spatial dimensions (H, W) or (D, H, W)
         x = self.down_projection(x)
-        # last output of the encoder is the input to EVA
-        B, C, W, H, D = x.shape
-        num_patches = W * H * D
 
-        x = rearrange(x, "b c w h d -> b (w h d) c")
+        # Handle both 2D and 3D inputs
+        B, C = x.shape[:2]
+        spatial_shape = x.shape[2:]  # (H, W) or (D, H, W)
+        num_patches = int(torch.tensor(spatial_shape).prod().item())
+
+        if self.ndim == 2:
+            x = rearrange(x, "b c h w -> b (h w) c")
+        else:
+            x = rearrange(x, "b c d h w -> b (d h w) c")
+
         if self.register_tokens is not None:
             x = torch.cat(
                 (
@@ -173,19 +171,36 @@ class Primus(AbstractDynamicNetworkArchitectures):
 
         if self.register_tokens is not None:
             x = x[:, self.register_tokens.shape[1] :]  # Removes the register tokens
+
         # In-fill in-active patches with empty tokens
         restored_x, restoration_mask = self.restore_full_sequence(x, keep_indices, num_patches)
-        x = rearrange(restored_x, "b (w h d) c -> b c w h d", h=H, w=W, d=D)
-        if restoration_mask is not None:
-            mask = rearrange(restoration_mask, "b (w h d) -> b w h d", h=H, w=W, d=D)
-            full_mask = (
-                mask.repeat_interleave(FW // W, dim=1)
-                .repeat_interleave(FH // H, dim=2)
-                .repeat_interleave(FD // D, dim=3)
-            )
-            full_mask = full_mask[:, None, ...]  # Add channel dimension  # [B, 1, W, H, D]
+
+        # Rearrange back to spatial format
+        if self.ndim == 2:
+            H, W = spatial_shape
+            x = rearrange(restored_x, "b (h w) c -> b c h w", h=H, w=W)
+            if restoration_mask is not None:
+                mask = rearrange(restoration_mask, "b (h w) -> b h w", h=H, w=W)
+                full_mask = (
+                    mask.repeat_interleave(full_spatial[0] // H, dim=1)
+                    .repeat_interleave(full_spatial[1] // W, dim=2)
+                )
+                full_mask = full_mask[:, None, ...]  # Add channel dimension [B, 1, H, W]
+            else:
+                full_mask = None
         else:
-            full_mask = None
+            D, H, W = spatial_shape
+            x = rearrange(restored_x, "b (d h w) c -> b c d h w", d=D, h=H, w=W)
+            if restoration_mask is not None:
+                mask = rearrange(restoration_mask, "b (d h w) -> b d h w", d=D, h=H, w=W)
+                full_mask = (
+                    mask.repeat_interleave(full_spatial[0] // D, dim=1)
+                    .repeat_interleave(full_spatial[1] // H, dim=2)
+                    .repeat_interleave(full_spatial[2] // W, dim=3)
+                )
+                full_mask = full_mask[:, None, ...]  # Add channel dimension [B, 1, D, H, W]
+            else:
+                full_mask = None
 
         dec_out = self.up_projection(x)
         if ret_mask:
@@ -415,3 +430,23 @@ if __name__ == "__main__":
 
     test_submodules_loadable(model)
     time.sleep(5)
+
+    # 2D tests
+    print("\n" + "="*50)
+    print("2D TESTS")
+    print("="*50)
+
+    print("\nPrimus S (2D)")
+    x_2d = torch.rand([1, 1, 96, 96], device="cuda", dtype=torch.float32)
+    model_2d = PrimusS(1, 2, (8, 8), (96, 96)).cuda()
+    out = model_2d(x_2d)
+    print(f"Input shape: {x_2d.shape}, Output shape: {out.shape}")
+    print(f"Parameter count: {parameter_count(model_2d)[''] / 1e6:.2f}M")
+    test_submodules_loadable(model_2d)
+
+    print("\nPrimus B (2D)")
+    model_2d = PrimusB(1, 2, (8, 8), (96, 96)).cuda()
+    out = model_2d(x_2d)
+    print(f"Input shape: {x_2d.shape}, Output shape: {out.shape}")
+    print(f"Parameter count: {parameter_count(model_2d)[''] / 1e6:.2f}M")
+    test_submodules_loadable(model_2d)

@@ -1,21 +1,61 @@
 #include "vc/core/types/Segmentation.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
+static const std::filesystem::path METADATA_FILE = "meta.json";
+
 Segmentation::Segmentation(std::filesystem::path path)
-    : DiskBasedObjectBaseClass(std::move(path))
+    : path_(std::move(path))
 {
-    if (metadata_.get<std::string>("type") != "seg") {
-        throw std::runtime_error("File not of type: seg");
-    }
+    loadMetadata();
 }
 
 Segmentation::Segmentation(std::filesystem::path path, std::string uuid, std::string name)
-    : DiskBasedObjectBaseClass(
-          std::move(path), std::move(uuid), std::move(name))
+    : path_(std::move(path))
 {
-    metadata_.set("type", "seg");
-    metadata_.set("volume", std::string{});
-    metadata_.save();
+    metadata_["uuid"] = uuid;
+    metadata_["name"] = name;
+    metadata_["type"] = "seg";
+    metadata_["volume"] = std::string{};
+    saveMetadata();
+}
+
+void Segmentation::loadMetadata()
+{
+    auto metaPath = path_ / METADATA_FILE;
+    metadata_ = vc::json::load_json_file(metaPath);
+    vc::json::require_type(metadata_, "type", "seg", metaPath.string());
+    vc::json::require_fields(metadata_, {"uuid"}, metaPath.string());
+}
+
+std::string Segmentation::id() const
+{
+    return metadata_["uuid"].get<std::string>();
+}
+
+std::string Segmentation::name() const
+{
+    return metadata_["name"].get<std::string>();
+}
+
+void Segmentation::setName(const std::string& n)
+{
+    metadata_["name"] = n;
+}
+
+void Segmentation::saveMetadata()
+{
+    auto metaPath = path_ / METADATA_FILE;
+    std::ofstream jsonFile(metaPath.string(), std::ofstream::out);
+    jsonFile << metadata_ << '\n';
+    if (jsonFile.fail()) {
+        throw std::runtime_error("could not write json file '" + metaPath.string() + "'");
+    }
+}
+
+bool Segmentation::checkDir(std::filesystem::path path)
+{
+    return std::filesystem::is_directory(path) && std::filesystem::exists(path / METADATA_FILE);
 }
 
 std::shared_ptr<Segmentation> Segmentation::New(const std::filesystem::path& path)
@@ -35,11 +75,11 @@ bool Segmentation::isSurfaceLoaded() const
 
 bool Segmentation::canLoadSurface() const
 {
-    return metadata_.hasKey("format") &&
-           metadata_.get<std::string>("format") == "tifxyz";
+    return metadata_.contains("format") &&
+           metadata_["format"].get<std::string>() == "tifxyz";
 }
 
-std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()
+std::shared_ptr<QuadSurface> Segmentation::loadSurface()
 {
     if (surface_) {
         return surface_;
@@ -50,9 +90,13 @@ std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()
     }
 
     try {
-        surface_ = std::make_shared<SurfaceMeta>(path_);
-        surface_->surface();
-        surface_->readOverlapping();
+        // Load the surface directly (no SurfaceMeta wrapper)
+        surface_ = load_quad_from_tifxyz(path_.string());
+
+        // Load overlapping info and cache mask timestamp
+        surface_->readOverlappingJson();
+        surface_->refreshMaskTimestamp();
+
         return surface_;
     } catch (const std::exception& e) {
         Logger()->error("Failed to load surface for {}: {}", id(), e.what());
@@ -61,7 +105,7 @@ std::shared_ptr<SurfaceMeta> Segmentation::loadSurface()
     }
 }
 
-std::shared_ptr<SurfaceMeta> Segmentation::getSurface() const
+std::shared_ptr<QuadSurface> Segmentation::getSurface() const
 {
     return surface_;
 }

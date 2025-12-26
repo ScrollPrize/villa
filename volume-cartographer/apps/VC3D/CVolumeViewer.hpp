@@ -1,6 +1,12 @@
 #pragma once
 
-#include <QtWidgets>
+#include <QWidget>
+#include <QPointF>
+#include <QRectF>
+#include <QColor>
+#include <QString>
+#include <QList>
+#include <QImage>
 
 #include <memory>
 #include <set>
@@ -15,8 +21,14 @@
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/ChunkCache.hpp"
+#include "vc/core/util/Slicing.hpp"
 
-class QImage;
+class QGraphicsScene;
+class QGraphicsItem;
+class QGraphicsPixmapItem;
+class QLabel;
+class QTimer;
 class ViewerManager;
 
 
@@ -28,14 +40,15 @@ public:
     CVolumeViewer(CSurfaceCollection *col, ViewerManager* manager, QWidget* parent = 0);
     ~CVolumeViewer(void);
 
-    void setCache(ChunkCache *cache);
+    void setCache(ChunkCache<uint8_t> *cache);
     void setPointCollection(VCCollection* point_collection);
     void setSurface(const std::string &name);
     void renderVisible(bool force = false);
     void renderIntersections();
     cv::Mat render_area(const cv::Rect &roi);
     cv::Mat_<uint8_t> render_composite(const cv::Rect &roi);
-    cv::Mat_<uint8_t> renderCompositeForSurface(QuadSurface* surface, cv::Size outputSize);
+    cv::Mat_<uint8_t> render_composite_plane(const cv::Rect &roi, const cv::Mat_<cv::Vec3f> &coords, const cv::Vec3f &planeNormal);
+    cv::Mat_<uint8_t> renderCompositeForSurface(std::shared_ptr<QuadSurface> surface, cv::Size outputSize);
     void invalidateVis();
     void invalidateIntersect(const std::string &name = "");
     
@@ -53,10 +66,35 @@ public:
     void setCompositeAlphaThreshold(int value);
     void setCompositeMaterial(int value);
     void setCompositeReverseDirection(bool reverse);
+    void setCompositeBLExtinction(float value);
+    void setCompositeBLEmission(float value);
+    void setCompositeBLAmbient(float value);
+    void setLightingEnabled(bool enabled);
+    void setLightAzimuth(float degrees);
+    void setLightElevation(float degrees);
+    void setLightDiffuse(float value);
+    void setLightAmbient(float value);
+    void setUseVolumeGradients(bool enabled);
+    void setIsoCutoff(int value);
     void setResetViewOnSurfaceChange(bool reset);
+
+    // Plane composite view methods (for XY/XZ/YZ plane viewers)
+    void setPlaneCompositeEnabled(bool enabled);
+    void setPlaneCompositeLayers(int front, int behind);
+    bool isPlaneCompositeEnabled() const { return _plane_composite_enabled; }
+    int planeCompositeLayersFront() const { return _plane_composite_layers_front; }
+    int planeCompositeLayersBehind() const { return _plane_composite_layers_behind; }
+
+    // Postprocessing settings
+    void setPostStretchValues(bool enabled);
+    bool postStretchValues() const { return _postStretchValues; }
+    void setPostRemoveSmallComponents(bool enabled);
+    bool postRemoveSmallComponents() const { return _postRemoveSmallComponents; }
+    void setPostMinComponentSize(int size);
+    int postMinComponentSize() const { return _postMinComponentSize; }
     bool isCompositeEnabled() const { return _composite_enabled; }
     std::shared_ptr<Volume> currentVolume() const { return volume; }
-    ChunkCache* chunkCachePtr() const { return cache; }
+    ChunkCache<uint8_t>* chunkCachePtr() const { return cache; }
     int datasetScaleIndex() const { return _ds_sd_idx; }
     float datasetScaleFactor() const { return _ds_scale; }
     VCCollection* pointCollection() const { return _point_collection; }
@@ -69,6 +107,13 @@ public:
     // Direction hints toggle
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
+
+    // Surface-relative offset controls (normal direction only)
+    void adjustSurfaceOffset(float dn);
+    void resetSurfaceOffsets();
+    float normalOffset() const { return _z_off; }
+
+    void updateStatusLabel();
 
     void setSegmentationEditActive(bool active);
 
@@ -85,6 +130,10 @@ public:
     // Transform scene coordinates to volume coordinates
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
     QPointF volumePointToScene(const cv::Vec3f& vol_point) { return volumeToScene(vol_point); }
+    // Get the last known scene position (for coordinate lookups)
+    QPointF lastScenePosition() const { return _lastScenePos; }
+    // Get the dataset scale factor for scene→surface coordinate conversion
+    float dsScale() const { return _ds_scale; }
     Surface* currentSurface() const;
 
     // BBox drawing mode for segmentation view
@@ -125,6 +174,37 @@ public:
     float volumeWindowLow() const { return _baseWindowLow; }
     float volumeWindowHigh() const { return _baseWindowHigh; }
 
+    struct ActiveSegmentationHandle {
+        QuadSurface* surface{nullptr};
+        std::string slotName;
+        QColor accentColor;
+        bool viewerIsSegmentationView{false};
+
+        bool valid() const { return surface != nullptr; }
+        explicit operator bool() const { return valid(); }
+        void reset()
+        {
+            surface = nullptr;
+            slotName.clear();
+            accentColor = QColor();
+            viewerIsSegmentationView = false;
+        }
+    };
+
+    const ActiveSegmentationHandle& activeSegmentationHandle() const;
+
+    void setBaseColormap(const std::string& colormapId);
+    const std::string& baseColormap() const { return _baseColormapId; }
+    void setStretchValues(bool enabled);
+    bool stretchValues() const { return _stretchValues; }
+
+    void setSurfaceOverlayEnabled(bool enabled);
+    bool surfaceOverlayEnabled() const { return _surfaceOverlayEnabled; }
+    void setSurfaceOverlay(const std::string& surfaceName);
+    const std::string& surfaceOverlay() const { return _surfaceOverlayName; }
+    void setSurfaceOverlapThreshold(float threshold);
+    float surfaceOverlapThreshold() const { return _surfaceOverlapThreshold; }
+
     struct OverlayColormapEntry {
         QString label;
         std::string id;
@@ -139,12 +219,12 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
-    void onSurfaceChanged(std::string name, Surface *surf);
+    void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
     void onPOIChanged(std::string name, POI *poi);
-    void onIntersectionChanged(std::string a, std::string b, Intersection *intersection);
     void onScrolled();
     void onResized();
     void onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers);
+    void adjustZoomByFactor(float factor);  // Adjust zoom by multiplicative factor (e.g., 1.15 for +15%)
     void onCursorMove(QPointF);
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onPointSelected(uint64_t pointId);
@@ -154,6 +234,7 @@ public slots:
     void onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onVolumeClosing(); // Clear surface pointers when volume is closing
+    void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf); // Clear references before surface deletion
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onDrawingModeActive(bool active, float brushSize = 3.0f, bool isSquare = false);
 
@@ -183,14 +264,14 @@ protected:
     bool fSkipImageFormatConv;
 
     QGraphicsPixmapItem* fBaseImageItem;
-    
+
     std::shared_ptr<Volume> volume = nullptr;
-    Surface *_surf = nullptr;
+    std::weak_ptr<Surface> _surf_weak;  // Non-owning reference to current surface
     cv::Vec3f _ptr = cv::Vec3f(0,0,0);
     cv::Vec2f _vis_center = {0,0};
     std::string _surf_name;
     
-    ChunkCache *cache = nullptr;
+    ChunkCache<uint8_t> *cache = nullptr;
     QRect curr_img_area = {0,0,1000,1000};
     float _scale = 0.5;
     float _scene_scale = 1.0;
@@ -201,9 +282,10 @@ protected:
 
     QLabel *_lbl = nullptr;
 
-    float _z_off = 0.0;
-    
-    // Composite view settings
+    float _z_off = 0.0;  // Offset along surface normal (perpendicular to surface)
+    QPointF _lastScenePos;  // Last known scene position for grid coordinate lookups
+
+    // Composite view settings (for segmentation/QuadSurface)
     bool _composite_enabled = false;
     int _composite_layers = 7;
     int _composite_layers_front = 8;
@@ -214,6 +296,23 @@ protected:
     int _composite_alpha_threshold = 9950;
     int _composite_material = 230;
     bool _composite_reverse_direction = false;
+    float _composite_bl_extinction = 1.5f;
+    float _composite_bl_emission = 1.5f;
+    float _composite_bl_ambient = 0.1f;
+    bool _lighting_enabled = false;
+    float _light_azimuth = 45.0f;
+    float _light_elevation = 45.0f;
+    float _light_diffuse = 0.7f;
+    float _light_ambient = 0.3f;
+    bool _use_volume_gradients = false;
+    int _iso_cutoff = 0;
+
+    // Plane composite view settings (for XY/XZ/YZ plane viewers)
+    // These share the same composite method/parameters as segmentation,
+    // but have separate layer counts and enable flag
+    bool _plane_composite_enabled = false;
+    int _plane_composite_layers_front = 4;
+    int _plane_composite_layers_behind = 4;
     
     QGraphicsItem *_center_marker = nullptr;
     QGraphicsItem *_cursor = nullptr;
@@ -221,8 +320,13 @@ protected:
     std::vector<QGraphicsItem*> slice_vis_items; 
 
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
+    std::unordered_map<std::string, SurfacePatchIndex::SurfacePtr> _cachedIntersectSurfaces;
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
-    Intersection *_ignore_intersect_change = nullptr;
+    std::unordered_map<std::string, std::vector<IntersectionLine>> _cachedIntersectionLines;
+    float _cachedIntersectionScale = 0.0f;  // Scale used when caching intersection lines
+    // Reusable buffers to avoid per-frame allocations
+    std::vector<SurfacePatchIndex::TriangleCandidate> _triangleCandidates;
+    std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<size_t>> _trianglesBySurface;
     bool _autoRefocusOnOffscreenIntersections = true;
     bool _hasLastPlaneOrigin = false;
     cv::Vec3f _lastPlaneOrigin = {0.0f, 0.0f, 0.0f};
@@ -235,6 +339,10 @@ protected:
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::unordered_set<std::string> _highlightedSurfaceIds;
+
+    // Persistent color assignments for intersection rendering (up to 500 surfaces)
+    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
+    size_t _nextColorIndex{0};
     
     // Point interaction state
     uint64_t _highlighted_point_id = 0;
@@ -280,4 +388,38 @@ protected:
     QImage _overlayImage;
 
     int _surfacePatchSamplingStride{1};
+
+    void markActiveSegmentationDirty();
+    mutable ActiveSegmentationHandle _activeSegHandle;
+    mutable bool _activeSegHandleDirty{true};
+
+
+    std::string _baseColormapId;
+    bool _stretchValues{false};
+    bool _surfaceOverlayEnabled{false};
+    std::string _surfaceOverlayName;
+    float _surfaceOverlapThreshold{5.0f};
+
+    // Postprocessing settings
+    bool _postStretchValues{false};
+    bool _postRemoveSmallComponents{false};
+    int _postMinComponentSize{50};
+
+    // Fast composite rendering cache - no mutex, specialized for composite
+    FastCompositeCache _fastCompositeCache;
+
+    // Cached normals for composite rendering - invalidated on surface/ptr change
+    cv::Mat_<cv::Vec3f> _cachedNormals;
+    cv::Mat_<cv::Vec3f> _cachedBaseCoords;
+    cv::Mat_<cv::Vec3f> _coordsWorkBuffer;  // Reusable buffer for z_off-adjusted coords
+    cv::Size _cachedNormalsSize;
+    float _cachedNormalsScale{0.0f};
+    cv::Vec3f _cachedNormalsPtr{0, 0, 0};
+    float _cachedNormalsZOff{0.0f};
+    std::weak_ptr<Surface> _cachedNormalsSurf;
+
+    // Cached volume gradients for PBR lighting - separate surface tracking
+    cv::Mat_<cv::Vec3f> _cachedNativeVolumeGradients;
+    std::weak_ptr<Surface> _cachedGradientsSurf;
+
 };  // class CVolumeViewer

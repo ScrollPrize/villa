@@ -2,20 +2,19 @@
 
 #include <set>
 #include <utility>
-#include <sys/inotify.h>
-#include <unistd.h>
-#include <poll.h>
-#include <cerrno>
 #include <cstring>
 
 #include "vc/core/util/DateTime.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
 constexpr auto CONFIG = "config.json";
 
 VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileLocation}
 {
-    config_ = Metadata(fileLocation / ::CONFIG);
+    auto configPath = fileLocation / ::CONFIG;
+    config_ = vc::json::load_json_file(configPath);
+    vc::json::require_fields(config_, {"name", "version"}, configPath.string());
 
     std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders","backups"};
 
@@ -48,7 +47,7 @@ std::shared_ptr<VolumePkg> VolumePkg::New(const std::filesystem::path& fileLocat
 
 std::string VolumePkg::name() const
 {
-    auto name = config_.get<std::string>("name");
+    auto name = config_["name"].get<std::string>();
     if (name != "NULL") {
         return name;
     }
@@ -56,7 +55,7 @@ std::string VolumePkg::name() const
     return "UnnamedVolume";
 }
 
-int VolumePkg::version() const { return config_.get<int>("version"); }
+int VolumePkg::version() const { return config_["version"].get<int>(); }
 
 bool VolumePkg::hasVolumes() const { return !volumes_.empty(); }
 
@@ -146,21 +145,39 @@ void VolumePkg::loadSegmentationsFromDirectory(const std::string& dirName)
     }
 
     // Load segmentations from the specified directory
+    int loadedCount = 0;
+    int skippedCount = 0;
+    int failedCount = 0;
     for (const auto& entry : std::filesystem::directory_iterator(segDir)) {
         std::filesystem::path dirpath = std::filesystem::canonical(entry);
         if (std::filesystem::is_directory(dirpath)) {
+            // Skip hidden directories and .tmp folders
+            const auto dirName_ = dirpath.filename().string();
+            if (dirName_.empty() || dirName_[0] == '.' || dirName_ == ".tmp") {
+                skippedCount++;
+                continue;
+            }
             try {
                 auto s = Segmentation::New(dirpath);
-                segmentations_.emplace(s->id(), s);
-                // Track which directory this segmentation came from
-                segmentationDirectories_[s->id()] = dirName;
+                auto result = segmentations_.emplace(s->id(), s);
+                if (result.second) {
+                    // Track which directory this segmentation came from
+                    segmentationDirectories_[s->id()] = dirName;
+                    loadedCount++;
+                } else {
+                    Logger()->warn("Duplicate segment ID '{}' - already loaded from different path, skipping: {}",
+                                   s->id(), dirpath.string());
+                    skippedCount++;
+                }
             }
             catch (const std::exception &exc) {
-                std::cout << "WARNING: some exception occured, skipping segment dir: " << dirpath << std::endl;
-                std::cerr << exc.what();
+                Logger()->warn("Failed to load segment dir: {} - {}", dirpath.string(), exc.what());
+                failedCount++;
             }
         }
     }
+    Logger()->info("Loaded {} segments from '{}' (skipped={}, failed={})",
+                   loadedCount, dirName, skippedCount, failedCount);
 }
 
 void VolumePkg::setSegmentationDirectory(const std::string& dirName)
@@ -230,6 +247,11 @@ void VolumePkg::refreshSegmentations()
     for (const auto& entry : std::filesystem::directory_iterator(segDir)) {
         std::filesystem::path dirpath = std::filesystem::canonical(entry);
         if (std::filesystem::is_directory(dirpath)) {
+            // Skip hidden directories and .tmp folders
+            const auto dirName = dirpath.filename().string();
+            if (dirName.empty() || dirName[0] == '.' || dirName == ".tmp") {
+                continue;
+            }
             diskPaths.insert(dirpath);
         }
     }
@@ -297,7 +319,7 @@ bool VolumePkg::isSurfaceLoaded(const std::string& id) const
     return segIt->second->isSurfaceLoaded();
 }
 
-std::shared_ptr<SurfaceMeta> VolumePkg::loadSurface(const std::string& id)
+std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
 {
     auto segIt = segmentations_.find(id);
     if (segIt == segmentations_.end()) {
@@ -307,7 +329,7 @@ std::shared_ptr<SurfaceMeta> VolumePkg::loadSurface(const std::string& id)
     return segIt->second->loadSurface();
 }
 
-std::shared_ptr<SurfaceMeta> VolumePkg::getSurface(const std::string& id)
+std::shared_ptr<QuadSurface> VolumePkg::getSurface(const std::string& id)
 {
     auto segIt = segmentations_.find(id);
     if (segIt == segmentations_.end()) {

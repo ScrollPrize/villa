@@ -1,4 +1,3 @@
-#include <cstddef>
 #include <cstdint>
 
 #include <opencv2/core.hpp>

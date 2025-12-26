@@ -1,8 +1,10 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
@@ -26,6 +28,8 @@
 #include <limits>
 #include <memory>
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 #include <cmath>
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
@@ -101,6 +105,7 @@ public:
     struct CorrectionCollection {
         std::vector<cv::Vec3f> tgts_;
         std::vector<cv::Vec2f> grid_locs_;
+        std::optional<cv::Vec2f> anchor2d_;  // If set, use this as the 2D grid anchor instead of searching from first point
     };
 
     PointCorrection() = default;
@@ -110,9 +115,12 @@ public:
 
         for (const auto& pair : collections) {
             const auto& collection = pair.second;
-            if (collection.points.empty()) continue;
+            // Allow collections with anchor2d set even if they have no points (drag-and-drop case)
+            if (collection.points.empty() && !collection.anchor2d.has_value()) continue;
 
             CorrectionCollection new_collection;
+            new_collection.anchor2d_ = collection.anchor2d;
+
             std::vector<ColPoint> sorted_points;
             sorted_points.reserve(collection.points.size());
             for (const auto& point_pair : collection.points) {
@@ -139,24 +147,51 @@ public:
         }
 
         QuadSurface tmp(points, {1.0f, 1.0f});
-        
+
         for (auto& collection : collections_) {
-            cv::Vec3f ptr = tmp.pointer();
+            if (collection.anchor2d_.has_value()) {
+                // Use the provided 2D anchor directly - this is the drag-and-drop case
+                cv::Vec2f anchor = collection.anchor2d_.value();
+                std::cout << "using provided anchor2d: " << anchor << std::endl;
 
-            // Initialize anchor point (lowest ID)
-            float d = tmp.pointTo(ptr, collection.tgts_[0], 1.0f);
-            cv::Vec3f loc_3d = tmp.loc_raw(ptr);
-            std::cout << "base diff: " << d << loc_3d << std::endl;
-            cv::Vec2f loc(loc_3d[0], loc_3d[1]);
-            collection.grid_locs_.push_back({loc[0], loc[1]});
+                // Convert 2D grid location to pointer coordinates
+                // pointer coords are relative to center: ptr = grid_loc - center
+                // With scale {1,1}, center is {cols/2, rows/2, 0}
+                cv::Vec3f ptr = {
+                    anchor[0] - points.cols / 2.0f,
+                    anchor[1] - points.rows / 2.0f,
+                    0.0f
+                };
 
-            // Initialize other points
-            for (size_t i = 1; i < collection.tgts_.size(); ++i) {
-                d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
-                loc_3d = tmp.loc_raw(ptr);
-                std::cout << "point diff: " << d << loc_3d << std::endl;
-                loc = {loc_3d[0], loc_3d[1]};
+                // Search for all correction points from the anchor position
+                for (size_t i = 0; i < collection.tgts_.size(); ++i) {
+                    float d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
+                    cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+                    std::cout << "point diff: " << d << loc_3d << std::endl;
+                    cv::Vec2f loc = {loc_3d[0], loc_3d[1]};
+                    collection.grid_locs_.push_back(loc);
+                }
+            } else {
+                // Original behavior: use first point as anchor
+                if (collection.tgts_.empty()) continue;
+
+                cv::Vec3f ptr = tmp.pointer();
+
+                // Initialize anchor point (lowest ID)
+                float d = tmp.pointTo(ptr, collection.tgts_[0], 1.0f);
+                cv::Vec3f loc_3d = tmp.loc_raw(ptr);
+                std::cout << "base diff: " << d << loc_3d << std::endl;
+                cv::Vec2f loc(loc_3d[0], loc_3d[1]);
                 collection.grid_locs_.push_back({loc[0], loc[1]});
+
+                // Initialize other points
+                for (size_t i = 1; i < collection.tgts_.size(); ++i) {
+                    d = tmp.pointTo(ptr, collection.tgts_[i], 100.0f, 0);
+                    loc_3d = tmp.loc_raw(ptr);
+                    std::cout << "point diff: " << d << loc_3d << std::endl;
+                    loc = {loc_3d[0], loc_3d[1]};
+                    collection.grid_locs_.push_back({loc[0], loc[1]});
+                }
             }
         }
     }
@@ -378,7 +413,7 @@ struct LossSettings {
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
-        w[LossType::SDIR] = 0.00f; // conservative default; tune 0.01–0.10 maybe
+        w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
     }
 
@@ -417,6 +452,9 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+    // Anti-flipback constraint settings
+    float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
+    float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
 };
 
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
@@ -1173,6 +1211,87 @@ static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t>
     return set;
 };
 
+// Compute local surface normal from neighboring 3D points using cross product of tangent vectors.
+// Returns normalized normal vector, or zero vector if insufficient neighbors.
+// If surface_normals is provided and has valid neighbors, orients the result to be consistent.
+static cv::Vec3d compute_surface_normal_at(
+    const cv::Vec2i& p,
+    const cv::Mat_<cv::Vec3d>& dpoints,
+    const cv::Mat_<uchar>& state,
+    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr)
+{
+    auto is_valid = [&](const cv::Vec2i& pt) {
+        return pt[0] >= 0 && pt[0] < dpoints.rows &&
+               pt[1] >= 0 && pt[1] < dpoints.cols &&
+               (state(pt) & STATE_LOC_VALID);
+    };
+
+    // Try to get horizontal and vertical tangents
+    cv::Vec3d tangent_h(0,0,0), tangent_v(0,0,0);
+    bool has_h = false, has_v = false;
+
+    // Horizontal tangent
+    cv::Vec2i left = {p[0], p[1] - 1};
+    cv::Vec2i right = {p[0], p[1] + 1};
+    if (is_valid(left) && is_valid(right)) {
+        tangent_h = dpoints(right) - dpoints(left);
+        has_h = true;
+    }
+
+    // Vertical tangent
+    cv::Vec2i up = {p[0] - 1, p[1]};
+    cv::Vec2i down = {p[0] + 1, p[1]};
+    if (is_valid(up) && is_valid(down)) {
+        tangent_v = dpoints(down) - dpoints(up);
+        has_v = true;
+    }
+
+    if (!has_h || !has_v) {
+        return cv::Vec3d(0,0,0);
+    }
+
+    cv::Vec3d normal = tangent_h.cross(tangent_v);
+    double len = cv::norm(normal);
+    if (len < 1e-9) {
+        return cv::Vec3d(0,0,0);
+    }
+    normal /= len;
+
+    // Orient consistently with neighbors if surface_normals provided
+    if (surface_normals) {
+        static const cv::Vec2i neighbor_offsets[] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+        for (const auto& off : neighbor_offsets) {
+            cv::Vec2i neighbor = p + off;
+            if (is_valid(neighbor)) {
+                cv::Vec3d neighbor_normal = (*surface_normals)(neighbor);
+                if (cv::norm(neighbor_normal) > 0.5) {
+                    // Flip if pointing opposite to neighbor
+                    if (normal.dot(neighbor_normal) < 0) {
+                        normal = -normal;
+                    }
+                    break;  // Use first valid neighbor for orientation
+                }
+            }
+        }
+    }
+
+    return normal;
+}
+
+// Compute and store oriented surface normal for a point
+// Uses existing neighbor normals for consistent orientation
+static void update_surface_normal(
+    const cv::Vec2i& p,
+    const cv::Mat_<cv::Vec3d>& dpoints,
+    const cv::Mat_<uchar>& state,
+    cv::Mat_<cv::Vec3d>& surface_normals)
+{
+    cv::Vec3d normal = compute_surface_normal_at(p, dpoints, state, &surface_normals);
+    if (cv::norm(normal) > 0.5) {
+        surface_normals(p) = normal;
+    }
+}
+
 static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_status, const cv::Vec2i &p,
     TraceParameters &params, TraceData& trace_data,
     const LossSettings &settings)
@@ -1390,9 +1509,19 @@ struct LocalOptimizationConfig {
     bool use_dense_qr = false;
 };
 
+// Configuration for anti-flipback constraint
+// This prevents the surface from flipping back through itself during optimization
+struct AntiFlipbackConfig {
+    const cv::Mat_<cv::Vec3d>* anchors = nullptr;        // Positions before optimization
+    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr; // Consistently oriented surface normals
+    double threshold = 5.0;   // Allow up to this much inward movement (voxels) before penalty kicks in
+    double weight = 1.0;       // Weight of the anti-flipback loss when activated
+};
+
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false,
-    const LocalOptimizationConfig* solver_config = nullptr)
+    const LocalOptimizationConfig* solver_config = nullptr,
+    const AntiFlipbackConfig* flipback_config = nullptr)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
     // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
@@ -1412,6 +1541,27 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
                 add_missing_losses(problem, loss_status, op, params, trace_data, settings);
             }
         }
+
+    // Add anti-flipback loss if configured
+    // This penalizes points that move too far in the inward (negative normal) direction
+    if (flipback_config && flipback_config->anchors && flipback_config->surface_normals) {
+        for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
+            for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
+                cv::Vec2i op = {oy, ox};
+                if (cv::norm(p-op) <= radius && (params.state(op) & STATE_LOC_VALID)) {
+                    cv::Vec3d anchor = (*flipback_config->anchors)(op);
+                    cv::Vec3d normal = (*flipback_config->surface_normals)(op);
+                    // Only add loss if we have valid anchor and normal
+                    if (cv::norm(normal) > 0.5 && anchor[0] >= 0) {
+                        problem.AddResidualBlock(
+                            AntiFlipbackLoss::Create(anchor, normal, flipback_config->threshold, flipback_config->weight),
+                            nullptr,
+                            &params.dpoints(op)[0]);
+                    }
+                }
+            }
+    }
+
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++) {
             cv::Vec2i op = {oy, ox};
@@ -1467,10 +1617,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-
-
-
-
 template <typename E>
 static E _max_d_ign(const E &a, const E &b)
 {
@@ -1573,7 +1719,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
+QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
@@ -1617,7 +1763,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
 
         if (!ref_path.empty()) {
             try {
-                reference_surface.reset(load_quad_from_tifxyz(ref_path));
+                reference_surface = load_quad_from_tifxyz(ref_path);
                 trace_data.reference_raycast.surface = reference_surface.get();
                 std::cout << "Loaded reference surface from " << ref_path << std::endl;
             } catch (const std::exception& e) {
@@ -1672,8 +1818,36 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     TraceParameters trace_params;
     int snapshot_interval = params.value("snapshot-interval", 0);
     int stop_gen = params.value("generations", 100);
-    float step = params.value("step_size", 20.0f);
+
+    // Load normal grid first if provided, so we can use its spiral-step
+    std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
+    if (params.contains("normal_grid_path")) {
+        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
+    }
+
+    // Determine step size with priority: explicit param > normal_grid > resume_surf > default
+    float step;
+    if (params.contains("step_size")) {
+        step = params.value("step_size", 20.0f);
+    } else if (ngv) {
+        // Use normal grid's spiral-step as authoritative (handles legacy surfaces with wrong scale)
+        step = ngv->metadata()["spiral-step"].get<float>();
+    } else if (resume_surf) {
+        step = 1.0f / resume_surf->scale()[0];
+    } else {
+        step = 20.0f;
+    }
     trace_params.unit = step*scale;
+
+    // Validate step matches normal grid if explicit step_size was provided
+    if (ngv && params.contains("step_size")) {
+        float ngv_step = ngv->metadata()["spiral-step"].get<float>();
+        if (std::abs(ngv_step - step) > 1e-6) {
+            throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
+        }
+    }
+    trace_data.ngv = ngv.get();
+
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
               << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
@@ -1685,16 +1859,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
+    loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
+    loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
+    std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
+              << " weight=" << loss_settings.flipback_weight
+              << (loss_settings.flipback_weight == 0 ? " (DISABLED)" : "") << std::endl;
     ALifeTime f_timer("empty space tracing\n");
-    // DSReader reader = {ds,scale,cache};
-    std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
-    if (params.contains("normal_grid_path")) {
-        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
-        if (ngv->metadata()["spiral-step"] != step) {
-            throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
-        }
-    }
-    trace_data.ngv = ngv.get();
 
 
 
@@ -1763,12 +1933,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     trace_params.dpoints = cv::Mat_<cv::Vec3d>(size,cv::Vec3f(-1,-1,-1));
     trace_params.state = cv::Mat_<uint8_t>(size,0);
     cv::Mat_<uint16_t> generations(size, (uint16_t)0);
+    cv::Mat_<cv::Vec3d> surface_normals(size, cv::Vec3d(0,0,0));  // Consistently oriented surface normals
     cv::Mat_<uint8_t> phys_fail(size,0);
     // cv::Mat_<float> init_dist(size,0);
     cv::Mat_<uint16_t> loss_status(cv::Size(w,h),0);
     cv::Rect used_area;
     int generation = 1;
+
     int succ = 0;  // number of quads successfully added to the patch (each of size approx. step**2)
+
+    int resume_pad_y = 0;
+    int resume_pad_x = 0;
 
     auto create_surface_from_state = [&, &f_timer = *timer]() {
         cv::Rect used_area_safe = used_area;
@@ -1839,12 +2014,104 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         const double voxel_size_d = static_cast<double>(voxelsize);
         const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
 
-        surf->meta = new nlohmann::json(meta_params);
+        surf->meta = std::make_unique<nlohmann::json>(meta_params);
         (*surf->meta)["area_vx2"] = area_est_vx2;
         (*surf->meta)["area_cm2"] = area_est_cm2;
         (*surf->meta)["max_gen"] = generation;
         (*surf->meta)["seed"] = {origin[0], origin[1], origin[2]};
         (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
+        if (resume_surf && !resume_surf->id.empty()) {
+            (*surf->meta)["seed_surface_id"] = resume_surf->id;
+        }
+
+        // Preserve approval and mask channels from resume surface with correct offset
+        // Note: These channels are stored at raw points resolution, not scaled size
+        if (resume_surf) {
+            const int offset_row = resume_pad_y - used_area_safe.y;
+            const int offset_col = resume_pad_x - used_area_safe.x;
+
+            // Get raw points size (channels are stored at this resolution)
+            const cv::Mat_<cv::Vec3f>* new_points = surf->rawPointsPtr();
+            if (!new_points || new_points->empty()) {
+                return surf;
+            }
+            const cv::Size raw_size = new_points->size();
+
+            // Preserve approval channel (3-channel BGR image)
+            cv::Mat old_approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
+            if (!old_approval.empty()) {
+                // Create new approval mask matching old format at raw points resolution
+                cv::Mat new_approval;
+                if (old_approval.channels() == 3) {
+                    new_approval = cv::Mat_<cv::Vec3b>(raw_size, cv::Vec3b(0, 0, 0));
+                    for (int r = 0; r < old_approval.rows; ++r) {
+                        for (int c = 0; c < old_approval.cols; ++c) {
+                            int new_r = r + offset_row;
+                            int new_c = c + offset_col;
+                            if (new_r >= 0 && new_r < new_approval.rows &&
+                                new_c >= 0 && new_c < new_approval.cols) {
+                                new_approval.at<cv::Vec3b>(new_r, new_c) = old_approval.at<cv::Vec3b>(r, c);
+                            }
+                        }
+                    }
+                } else {
+                    // Single channel fallback
+                    new_approval = cv::Mat_<uint8_t>(raw_size, static_cast<uint8_t>(0));
+                    for (int r = 0; r < old_approval.rows; ++r) {
+                        for (int c = 0; c < old_approval.cols; ++c) {
+                            int new_r = r + offset_row;
+                            int new_c = c + offset_col;
+                            if (new_r >= 0 && new_r < new_approval.rows &&
+                                new_c >= 0 && new_c < new_approval.cols) {
+                                new_approval.at<uint8_t>(new_r, new_c) = old_approval.at<uint8_t>(r, c);
+                            }
+                        }
+                    }
+                }
+                surf->setChannel("approval", new_approval);
+                std::cout << "Preserved approval mask (" << old_approval.channels() << " channels, "
+                          << old_approval.cols << "x" << old_approval.rows << " -> "
+                          << new_approval.cols << "x" << new_approval.rows
+                          << ") with offset (" << offset_row << ", " << offset_col << ")" << std::endl;
+            }
+
+            // Preserve mask channel (single channel uint8)
+            // Layer 0 of mask.tif is the validity mask - it can mask out points that have
+            // valid coordinates but shouldn't be used (human corrections).
+            // Strategy:
+            // 1. Generate fresh validity mask from new surface points (255 if valid, 0 if -1,-1,-1)
+            // 2. Overlay old mask values at correct offset (preserving human edits)
+            cv::Mat old_mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+            if (!old_mask.empty()) {
+                // Start with validity mask based on actual point data
+                cv::Mat_<uint8_t> new_mask(raw_size, static_cast<uint8_t>(0));
+                for (int r = 0; r < new_points->rows; ++r) {
+                    for (int c = 0; c < new_points->cols; ++c) {
+                        const cv::Vec3f& p = (*new_points)(r, c);
+                        if (p[0] != -1.0f) {
+                            new_mask(r, c) = 255;  // Valid point
+                        }
+                    }
+                }
+
+                // Now overlay the old mask values (preserving human edits that masked out valid points)
+                for (int r = 0; r < old_mask.rows; ++r) {
+                    for (int c = 0; c < old_mask.cols; ++c) {
+                        int new_r = r + offset_row;
+                        int new_c = c + offset_col;
+                        if (new_r >= 0 && new_r < new_mask.rows &&
+                            new_c >= 0 && new_c < new_mask.cols) {
+                            // Preserve the old mask value (including human edits that set 0 on valid points)
+                            new_mask(new_r, new_c) = old_mask.at<uint8_t>(r, c);
+                        }
+                    }
+                }
+                surf->setChannel("mask", new_mask);
+                std::cout << "Preserved mask (" << old_mask.cols << "x" << old_mask.rows << " -> "
+                          << new_mask.cols << "x" << new_mask.rows
+                          << ") with offset (" << offset_row << ", " << offset_col << ")" << std::endl;
+            }
+        }
 
         return surf;
     };
@@ -1858,15 +2125,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     int last_succ = 0;
     int start_gen = 0;
 
-    int resume_pad_y = 0;
-    int resume_pad_x = 0;
-
     std::cout << "lets go! " << std::endl;
 
     if (resume_surf) {
         std::cout << "resuime! " << std::endl;
         float resume_step = 1.0 / resume_surf->scale()[0];
-        if (std::abs(resume_step - step) > 1e-6) {
+        // Only validate step match if not using normal_grid (which is authoritative for legacy surfaces)
+        if (!ngv && std::abs(resume_step - step) > 1e-6) {
             throw std::runtime_error("Step size parameter mismatch between new trace and resume surface.");
         }
 
@@ -1914,19 +2179,31 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             cv::Mat mask = resume_surf->channel("mask");
             if (!mask.empty()) {
                 std::vector<std::vector<cv::Point2f>> all_hulls;
+                // For single-point collections (e.g., drag-and-drop), store center and radius
+                std::vector<std::pair<cv::Point2f, float>> single_point_regions;
+
                 for (const auto& collection : trace_data.point_correction.collections()) {
                     if (collection.grid_locs_.empty()) continue;
 
-                    std::vector<cv::Point2f> points_for_hull;
-                    points_for_hull.reserve(collection.grid_locs_.size());
-                    for (const auto& loc : collection.grid_locs_) {
-                        points_for_hull.emplace_back(loc[0], loc[1]);
-                    }
-                    
-                    std::vector<cv::Point2f> hull_points;
-                    cv::convexHull(points_for_hull, hull_points);
-                    if (!hull_points.empty()) {
-                        all_hulls.push_back(hull_points);
+                    if (collection.grid_locs_.size() == 1) {
+                        // Single point - use a radius-based region instead of convex hull
+                        // This handles the drag-and-drop case where only one correction point is set
+                        cv::Point2f center(collection.grid_locs_[0][0], collection.grid_locs_[0][1]);
+                        float radius = 8.0f;  // Default radius for single-point corrections
+                        single_point_regions.emplace_back(center, radius);
+                        std::cout << "single-point correction region at " << center << " with radius " << radius << std::endl;
+                    } else {
+                        std::vector<cv::Point2f> points_for_hull;
+                        points_for_hull.reserve(collection.grid_locs_.size());
+                        for (const auto& loc : collection.grid_locs_) {
+                            points_for_hull.emplace_back(loc[0], loc[1]);
+                        }
+
+                        std::vector<cv::Point2f> hull_points;
+                        cv::convexHull(points_for_hull, hull_points);
+                        if (!hull_points.empty()) {
+                            all_hulls.push_back(hull_points);
+                        }
                     }
                 }
 
@@ -1937,12 +2214,27 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                             int target_x = resume_pad_x + i;
                             cv::Point2f p(target_x, target_y);
                             bool keep = false;
+
+                            // Check convex hull regions
                             for (const auto& hull : all_hulls) {
                                 if (cv::pointPolygonTest(hull, p, false) >= 0) {
                                     keep = true;
                                     break;
                                 }
                             }
+
+                            // Check single-point circular regions
+                            if (!keep) {
+                                for (const auto& [center, radius] : single_point_regions) {
+                                    float dx = p.x - center.x;
+                                    float dy = p.y - center.y;
+                                    if (dx * dx + dy * dy <= radius * radius) {
+                                        keep = true;
+                                        break;
+                                    }
+                                }
+                            }
+
                             if (!keep) {
                                 trace_params.state(target_y, target_x) = 0;
                                 trace_params.dpoints(target_y, target_x) = cv::Vec3d(-1,-1,-1);
@@ -2037,6 +2329,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         std::cout << "Resuming from generation " << generation << " with " << fringe.size() << " points. Initial loss count: " << loss_count << std::endl;
 
     } else {
+        // Initialize seed normals with consistent orientation (vx cross vy = +Z direction)
+        cv::Vec3d seed_normal = cv::Vec3d(vx).cross(cv::Vec3d(vy));
+        seed_normal /= cv::norm(seed_normal);
+
         if (neural_tracer && pre_neural_gens == 0) {
             std::cout << "Initializing with neural tracer..." << std::endl;
 
@@ -2047,6 +2343,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             trace_params.state(y0, x0) = STATE_LOC_VALID | STATE_COORD_VALID;
             generations(y0, x0) = 1;
             fringe.push_back({y0, x0});
+            surface_normals(y0, x0) = seed_normal;
 
             auto next_points = neural_tracer->get_next_points({origin}, {std::nullopt}, {std::nullopt}, {std::nullopt})[0];
 
@@ -2083,6 +2380,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     trace_params.dpoints(grid_pos[i]) = tracer_points[i];
                     trace_params.state(grid_pos[i]) = STATE_LOC_VALID | STATE_COORD_VALID;
                     generations(grid_pos[i]) = 1;
+                    surface_normals(grid_pos[i]) = seed_normal;
                     fringe.push_back(grid_pos[i]);
                 }
 
@@ -2100,6 +2398,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                 trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
                 trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
                 generations(y0,x0) = 1; generations(y0,x0+1) = 1; generations(y0+1,x0) = 1; generations(y0+1,x0+1) = 1;
+                surface_normals(y0,x0) = seed_normal;
+                surface_normals(y0,x0+1) = seed_normal;
+                surface_normals(y0+1,x0) = seed_normal;
+                surface_normals(y0+1,x0+1) = seed_normal;
                 fringe.push_back({y0,x0}); fringe.push_back({y0+1,x0}); fringe.push_back({y0,x0+1}); fringe.push_back({y0+1,x0+1});
             }
         } else {
@@ -2120,6 +2422,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             generations(y0,x0+1) = 1;
             generations(y0+1,x0) = 1;
             generations(y0+1,x0+1) = 1;
+
+            surface_normals(y0,x0) = seed_normal;
+            surface_normals(y0,x0+1) = seed_normal;
+            surface_normals(y0+1,x0) = seed_normal;
+            surface_normals(y0+1,x0+1) = seed_normal;
 
             fringe.push_back({y0,x0});
             fringe.push_back({y0+1,x0});
@@ -2402,7 +2709,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
         if (neural_tracer && generation > pre_neural_gens) {
-
             while (true) {
 
                 // FIXME: when cands are few (e.g. ~4x batch size), we should not try to process them in parallel
@@ -2444,6 +2750,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             }  // end loop over batches
 
         } else {
+
+            // Snapshot positions before per-point optimization for flip detection
+            cv::Mat_<cv::Vec3d> positions_before_perpoint = trace_params.dpoints.clone();
+
+            // Configure anti-flipback constraint for per-point optimization
+            // Note: new points won't have surface normals yet, but the loss function handles this
+            AntiFlipbackConfig perpoint_flipback_config;
+            perpoint_flipback_config.anchors = &positions_before_perpoint;
+            perpoint_flipback_config.surface_normals = &surface_normals;
+            perpoint_flipback_config.threshold = loss_settings.flipback_threshold;
+            perpoint_flipback_config.weight = loss_settings.flipback_weight;
 
             // ...then start iterating over candidates in parallel using the above to yield points
             #pragma omp parallel
@@ -2516,9 +2833,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     ceres::Solver::Summary summary;
                     ceres::Solve(options, &problem, &summary);
 
-                    local_optimization(1, p, trace_params, trace_data, loss_settings, true);
-                    // if (local_opt_r > 1)
-                        // local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true);
+                    local_optimization(1, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
+                    if (local_opt_r > 1)
+                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
 
                     generations(p) = generation;
 
@@ -2537,6 +2854,22 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             }
         }
 
+        // Update surface normals for all newly added points and their neighbors
+        // This must be done after parallel section completes
+        for (const auto& p : succ_gen_ps) {
+            update_surface_normal(p, trace_params.dpoints, trace_params.state, surface_normals);
+            // Also update neighbors since their geometry may have changed
+            static const cv::Vec2i neighbor_offsets[] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+            for (const auto& off : neighbor_offsets) {
+                cv::Vec2i neighbor = p + off;
+                if (neighbor[0] >= 0 && neighbor[0] < trace_params.dpoints.rows &&
+                    neighbor[1] >= 0 && neighbor[1] < trace_params.dpoints.cols &&
+                    (trace_params.state(neighbor) & STATE_LOC_VALID)) {
+                    update_surface_normal(neighbor, trace_params.dpoints, trace_params.state, surface_normals);
+                }
+            }
+        }
+
         if (neural_tracer && generation > pre_neural_gens) {
             // Skip optimizations
         } else if (!global_opt) {
@@ -2550,6 +2883,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
             int done = 0;
 
             if (!opt_local.empty()) {
+                // Snapshot positions before optimization for flip detection
+                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
+
+                // Configure anti-flipback constraint
+                AntiFlipbackConfig flipback_config;
+                flipback_config.anchors = &positions_before_opt;
+                flipback_config.surface_normals = &surface_normals;
+                flipback_config.threshold = loss_settings.flipback_threshold;
+                flipback_config.weight = loss_settings.flipback_weight;
+
                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
 
 #pragma omp parallel
@@ -2560,7 +2903,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(8, p, trace_params, trace_data, loss_settings, true);
+                    local_optimization(8, p, trace_params, trace_data, loss_settings, true, false, nullptr, &flipback_config);
+
 #pragma omp atomic
                     done++;
                 }
@@ -2569,7 +2913,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
             if (generation % 8 == 0) {
-                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
+                // Snapshot positions before global optimization
+                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
+
+                // Configure anti-flipback constraint
+                AntiFlipbackConfig flipback_config;
+                flipback_config.anchors = &positions_before_opt;
+                flipback_config.surface_normals = &surface_normals;
+                flipback_config.threshold = loss_settings.flipback_threshold;
+                flipback_config.weight = loss_settings.flipback_weight;
+
+                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true, nullptr, &flipback_config);
             }
         }
 
@@ -2617,6 +2971,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache *cache, cv::Vec3f o
     delete timer;
 
     QuadSurface* surf = create_surface_from_state();
+
     const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
     const double voxel_size_d = static_cast<double>(voxelsize);
     const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;

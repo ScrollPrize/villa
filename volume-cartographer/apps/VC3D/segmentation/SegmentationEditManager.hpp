@@ -12,6 +12,7 @@
 #include <opencv2/core.hpp>
 
 class QuadSurface;
+class ViewerManager;
 
 class SegmentationEditManager : public QObject
 {
@@ -74,12 +75,15 @@ public:
 
     explicit SegmentationEditManager(QObject* parent = nullptr);
 
-    bool beginSession(QuadSurface* baseSurface);
+    void setViewerManager(ViewerManager* manager) { _viewerManager = manager; }
+    [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
+
+    bool beginSession(std::shared_ptr<QuadSurface> baseSurface);
     void endSession();
 
     [[nodiscard]] bool hasSession() const { return static_cast<bool>(_baseSurface); }
-    [[nodiscard]] QuadSurface* baseSurface() const { return _baseSurface; }
-    [[nodiscard]] QuadSurface* previewSurface() const { return _previewSurface.get(); }
+    [[nodiscard]] std::shared_ptr<QuadSurface> baseSurface() const { return _baseSurface; }
+    [[nodiscard]] std::shared_ptr<QuadSurface> previewSurface() const { return _baseSurface; }
 
     // Synchronize a rectangular region with the latest base-surface data without rebuilding the session.
     bool applyExternalSurfaceUpdate(const cv::Rect& vertexRect);
@@ -90,10 +94,11 @@ public:
     [[nodiscard]] float radius() const { return _radiusSteps; }
     [[nodiscard]] float sigma() const { return _sigmaSteps; }
 
-    [[nodiscard]] bool hasPendingChanges() const { return _dirty; }
+    [[nodiscard]] bool hasPendingChanges() const { return _hasPendingEdits; }
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const;
+    [[nodiscard]] cv::Mat_<cv::Vec3f>& previewPointsMutable();
     bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                          bool dirtyState,
+                          bool markAsPendingEdit,
                           std::optional<cv::Rect>* outDiffBounds = nullptr);
 
     void resetPreview();
@@ -112,49 +117,44 @@ public:
     bool smoothRecentTouched(float strength = 0.35f, int iterations = 1);
     void commitActiveDrag();
     void cancelActiveDrag();
+    void refreshActiveDragBasePositions();
 
     [[nodiscard]] const ActiveDrag& activeDrag() const { return _activeDrag; }
     [[nodiscard]] const std::vector<GridKey>& recentTouched() const { return _recentTouched; }
     [[nodiscard]] std::optional<cv::Rect> recentTouchedBounds() const;
     [[nodiscard]] std::vector<VertexEdit> editedVertices() const;
 
-    void publishDirtyBounds(const cv::Rect& vertexRect);
     void markNextEditsAsGrowth();
 
     void bakePreviewToOriginal();
     bool invalidateRegion(int centerRow, int centerCol, int radius);
     bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
-    std::optional<cv::Rect> takeEditedBounds();
 
 private:
     static bool isInvalidPoint(const cv::Vec3f& value);
     void rebuildPreviewFromOriginal();
-    void ensurePreviewAvailable();
     bool buildActiveSamples(const std::pair<int, int>& gridIndex);
     void applyGaussianToSamples(const cv::Vec3f& delta);
     void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld);
     void clearActiveDrag();
     float stepNormalization() const;
     void resetPointerSeed();
-    void expandEditedBounds(int row, int col);
-    void publishDirtyBoundsFromRecentTouched();
 
-    QuadSurface* _baseSurface{nullptr};
+    std::shared_ptr<QuadSurface> _baseSurface;
+    ViewerManager* _viewerManager{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
     cv::Mat_<cv::Vec3f>* _previewPoints{nullptr};
-    std::unique_ptr<QuadSurface> _previewSurface;
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};
-    bool _dirty{false};
+    bool _hasPendingEdits{false};
     bool _pendingGrowthMarking{false};
 
     std::unordered_map<GridKey, VertexEdit, GridKeyHash> _editedVertices;
     std::vector<GridKey> _recentTouched;
     ActiveDrag _activeDrag;
     cv::Vec2f _gridScale{1.0f, 1.0f};
-    std::optional<cv::Rect> _editedBounds;
 
     mutable bool _pointerSeedValid{false};
     mutable cv::Vec3f _pointerSeed{0.0f, 0.0f, 0.0f};

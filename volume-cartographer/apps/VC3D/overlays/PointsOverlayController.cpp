@@ -1,14 +1,18 @@
 #include "PointsOverlayController.hpp"
 
 #include "../CVolumeViewer.hpp"
+#include "../ViewerManager.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 
 #include <QtGlobal>
 
 #include <algorithm>
 #include <cmath>
+
+#include "vc/core/util/QuadSurface.hpp"
 
 namespace
 {
@@ -137,7 +141,8 @@ void PointsOverlayController::collectPrimitives(CVolumeViewer* viewer, OverlayBu
         filter.clipToSurface = false;
         filter.requireSceneVisibility = true;
         filter.computeScenePoints = true;
-        filter.volumePredicate = [planeSurface, quadSurface, &entries](const cv::Vec3f&, size_t index) {
+        auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+        filter.volumePredicate = [planeSurface, quadSurface, patchIndex, &entries](const cv::Vec3f&, size_t index) {
             auto& entry = entries[index];
             float opacity = 1.0f;
             if (planeSurface) {
@@ -149,7 +154,7 @@ void PointsOverlayController::collectPrimitives(CVolumeViewer* viewer, OverlayBu
                 }
             } else if (quadSurface) {
                 auto ptr = quadSurface->pointer();
-                float dist = quadSurface->pointTo(ptr, entry.world, 10.0, 100);
+                float dist = quadSurface->pointTo(ptr, entry.world, 10.0, 100, patchIndex);
                 if (dist >= kFadeThreshold) {
                     opacity = 0.0f;
                 } else if (dist >= 0.0f) {
@@ -210,7 +215,7 @@ void PointsOverlayController::connectCollectionSignals()
 
     disconnectCollectionSignals();
 
-    _collectionConnections[0] = connect(_collection, &VCCollection::collectionAdded,
+    _collectionConnections[0] = connect(_collection, &VCCollection::collectionsAdded,
                                         this, &PointsOverlayController::handleCollectionMutated);
     _collectionConnections[1] = connect(_collection, &VCCollection::collectionRemoved,
                                         this, &PointsOverlayController::handleCollectionMutated);

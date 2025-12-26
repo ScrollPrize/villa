@@ -1,7 +1,6 @@
 #pragma once
 
 #include <filesystem>
-#include <istream>
 #include <optional>
 #include <utility>
 #include <vector>

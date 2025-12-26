@@ -3,13 +3,18 @@
 #include "../CVolumeViewer.hpp"
 #include "../CSurfaceCollection.hpp"
 #include "../VCSettings.hpp"
+#include "../ViewerManager.hpp"
 
 #include "vc/core/util/Surface.hpp"
 
 #include <QSettings>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cmath>
+
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 namespace
 {
@@ -125,9 +130,14 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         builder.addCircle(center, radius, true, style);
     };
 
-    auto* segSurface = dynamic_cast<QuadSurface*>(viewer->surfName() == "segmentation"
-                                                      ? currentSurface
-                                                      : (_surfaces ? dynamic_cast<QuadSurface*>(_surfaces->surface("segmentation")) : nullptr));
+    QuadSurface* segSurface = nullptr;
+    std::shared_ptr<Surface> segSurfaceHolder;  // Keep surface alive during this scope
+    if (viewer->surfName() == "segmentation") {
+        segSurface = dynamic_cast<QuadSurface*>(currentSurface);
+    } else if (_surfaces) {
+        segSurfaceHolder = _surfaces->surface("segmentation");
+        segSurface = dynamic_cast<QuadSurface*>(segSurfaceHolder.get());
+    }
 
     auto fetchFocusScene = [&](QPointF& anchor) {
         if (!segSurface || !_surfaces) {
@@ -135,7 +145,8 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         }
         if (auto* poi = _surfaces->poi("focus")) {
             auto ptr = segSurface->pointer();
-            float dist = segSurface->pointTo(ptr, poi->p, 4.0, 100);
+            auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+            float dist = segSurface->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
             if (dist >= 0 && dist < 20.0f / scale) {
                 cv::Vec3f sp = segSurface->loc(ptr) * scale;
                 anchor = QPointF(sp[0], sp[1]);
@@ -163,17 +174,19 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         auto ptr = quad->pointer();
         if (_surfaces) {
             if (auto* poi = _surfaces->poi("focus")) {
-                quad->pointTo(ptr, poi->p, 4.0, 100);
+                auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+                quad->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
             }
         }
 
         cv::Vec3f centerParam = quad->loc(ptr) * scale;
         addMarker(QPointF(centerParam[0], centerParam[1]), kCenterColor, kStepCenterRadius);
 
+        using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool useSegStep = settings.value("viewer/use_seg_step_for_hints", true).toBool();
-        int numPoints = std::max(0, std::min(100, settings.value("viewer/direction_step_points", 5).toInt()));
-        float stepVal = settings.value("viewer/direction_step", 10.0f).toFloat();
+        bool useSegStep = settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toBool();
+        int numPoints = std::max(0, std::min(100, settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt()));
+        float stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
         if (useSegStep && quad->meta) {
             try {
                 if (quad->meta->contains("vc_grow_seg_from_segments_params")) {
@@ -187,7 +200,7 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
             }
         }
         if (stepVal <= 0.0f) {
-            stepVal = settings.value("viewer/direction_step", 10.0f).toFloat();
+            stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
         }
 
         for (int n = 1; n <= numPoints; ++n) {
@@ -216,7 +229,8 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         }
 
         auto segPtr = segSurface->pointer();
-        segSurface->pointTo(segPtr, targetWP, 4.0, 100);
+        auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+        segSurface->pointTo(segPtr, targetWP, 4.0, 100, patchIndex);
 
         cv::Vec3f p0 = segSurface->coord(segPtr, {0, 0, 0});
         if (p0[0] == -1.0f) {
@@ -249,10 +263,11 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         addLabel(redTip + QPointF(8.0, -8.0), QStringLiteral("false"), kArrowFalseColor);
         addLabel(greenTip + QPointF(8.0, -8.0), QStringLiteral("true"), kArrowTrueColor);
 
+        using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool useSegStep = settings.value("viewer/use_seg_step_for_hints", true).toBool();
-        int numPoints = std::max(0, std::min(100, settings.value("viewer/direction_step_points", 5).toInt()));
-        float stepVal = settings.value("viewer/direction_step", 10.0f).toFloat();
+        bool useSegStep = settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toBool();
+        int numPoints = std::max(0, std::min(100, settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt()));
+        float stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
         if (useSegStep && segSurface->meta) {
             try {
                 if (segSurface->meta->contains("vc_grow_seg_from_segments_params")) {
@@ -266,7 +281,7 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
             }
         }
         if (stepVal <= 0.0f) {
-            stepVal = settings.value("viewer/direction_step", 10.0f).toFloat();
+            stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
         }
 
         addMarker(anchor, kCenterColor, kStepCenterRadius);

@@ -19,7 +19,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/core/util/JsonSafe.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -53,10 +53,7 @@ void ensureMetaObject(QuadSurface* surface)
     if (surface->meta && surface->meta->is_object()) {
         return;
     }
-    if (surface->meta) {
-        delete surface->meta;
-    }
-    surface->meta = new nlohmann::json(nlohmann::json::object());
+    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
 
 bool ensureGenerationsChannel(QuadSurface* surface)
@@ -79,6 +76,56 @@ bool ensureGenerationsChannel(QuadSurface* surface)
     return true;
 }
 
+void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
+{
+    if (!oldSurface || !newSurface) {
+        return;
+    }
+
+    // Load old approval mask without auto-resize
+    cv::Mat old_approval = oldSurface->channel("approval", SURF_CHANNEL_NORESIZE);
+    if (old_approval.empty()) {
+        return;  // No approval mask to preserve
+    }
+
+    // Get new surface dimensions
+    const cv::Mat_<cv::Vec3f>* new_points = newSurface->rawPointsPtr();
+    if (!new_points || new_points->empty()) {
+        return;
+    }
+
+    cv::Size new_size = new_points->size();
+
+    // Create new approval mask with same type as old mask
+    // Approval masks can be 1-channel (legacy) or 3-channel (RGB)
+    cv::Mat new_approval;
+    if (old_approval.channels() == 3) {
+        new_approval = cv::Mat(new_size, CV_8UC3, cv::Scalar(0, 0, 0));
+    } else {
+        new_approval = cv::Mat(new_size, CV_8UC1, cv::Scalar(0));
+    }
+
+    // Copy old approval values to same grid positions
+    // Grid expansion preserves old point indices, so old[r,c] == new[r,c]
+    int copy_rows = std::min(old_approval.rows, new_approval.rows);
+    int copy_cols = std::min(old_approval.cols, new_approval.cols);
+
+    if (copy_rows > 0 && copy_cols > 0) {
+        cv::Rect src_roi(0, 0, copy_cols, copy_rows);
+        cv::Rect dst_roi(0, 0, copy_cols, copy_rows);
+        old_approval(src_roi).copyTo(new_approval(dst_roi));
+
+        qCInfo(lcSegGrowth) << "Preserved approval mask from"
+                            << old_approval.cols << "x" << old_approval.rows
+                            << "to" << new_approval.cols << "x" << new_approval.rows
+                            << "(channels:" << old_approval.channels() << ")";
+    }
+
+    // Set preserved approval mask on new surface
+    newSurface->setChannel("approval", new_approval);
+}
+
+
 QString directionToString(SegmentationGrowthDirection direction)
 {
     switch (direction) {
@@ -97,7 +144,7 @@ QString directionToString(SegmentationGrowthDirection direction)
 }
 
 bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
-                          ChunkCache* cache,
+                          ChunkCache<uint8_t>* cache,
                           const QString& cacheRoot,
                           std::vector<DirectionField>& out,
                           QString& error)
@@ -205,9 +252,8 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     }
     cv::normalize(normal, normal);
 
-    cv::Vec3f volumeCenter(static_cast<float>(volume->sliceWidth()) * 0.5f,
-                           static_cast<float>(volume->sliceHeight()) * 0.5f,
-                           static_cast<float>(volume->numSlices()) * 0.5f);
+    auto [w, h, d] = volume->shape();
+    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
     cv::Vec3f toCenter = volumeCenter - p;
     toCenter[2] = 0.0f;
 
@@ -457,6 +503,9 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       std::filesystem::path(),
                                       nlohmann::json{},
                                       correctionCollection);
+
+        // Note: approval and mask channels are preserved inside the tracer
+
         result.surface = surface;
         result.statusMessage = QStringLiteral("Tracer growth completed");
     } catch (const std::exception& ex) {
@@ -475,8 +524,8 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
-    const double previousAreaVx2 = vc::json_safe::number_or(surface->meta, "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json_safe::number_or(surface->meta, "area_cm2", -1.0);
+    const double previousAreaVx2 = vc::json::number_or(surface->meta.get(), "area_vx2", -1.0);
+    const double previousAreaCm2 = vc::json::number_or(surface->meta.get(), "area_cm2", -1.0);
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {

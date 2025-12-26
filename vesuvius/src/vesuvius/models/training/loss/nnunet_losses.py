@@ -144,14 +144,17 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
     Memory efficient implementation of soft dice loss.
     Based on nnUNetv2 implementation.
     """
-    def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False, 
-                 do_bg: bool = True, smooth: float = 1., ddp: bool = True):
+    def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False,
+                 do_bg: bool = True, smooth: float = 1., ddp: bool = True,
+                 label_smoothing: float = 0.0, ignore_label: int = None):
         super(MemoryEfficientSoftDiceLoss, self).__init__()
         self.do_bg = do_bg
         self.batch_dice = batch_dice
         self.apply_nonlin = apply_nonlin
         self.smooth = smooth
         self.ddp = ddp
+        self.label_smoothing = label_smoothing
+        self.ignore_label = ignore_label
 
     def forward(self, x, y, loss_mask=None):
         if self.apply_nonlin is not None:
@@ -164,12 +167,31 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
             if x.ndim != y.ndim:
                 y = y.view((y.shape[0], 1, *y.shape[1:]))
 
+            # Handle ignore_label: create internal mask and combine with provided loss_mask
+            if self.ignore_label is not None:
+                ignore_mask = (y == self.ignore_label)
+                if loss_mask is None:
+                    loss_mask = ~ignore_mask
+                else:
+                    loss_mask = loss_mask & ~ignore_mask
+
             if x.shape == y.shape:
                 # if this is the case then gt is probably already a one hot encoding
                 y_onehot = y
             else:
-                y_onehot = torch.zeros(x.shape, device=x.device, dtype=torch.bool)
-                y_onehot.scatter_(1, y.long(), 1)
+                num_classes = x.shape[1]
+                # Clamp y to valid indices to prevent CUDA scatter_ crash
+                # This is safe because ignored pixels are masked out anyway
+                y_safe = torch.clamp(y.long(), min=0, max=num_classes - 1)
+
+                if self.label_smoothing > 0:
+                    # Soft one-hot encoding with label smoothing
+                    y_onehot = torch.full(x.shape, self.label_smoothing / (num_classes - 1),
+                                          device=x.device, dtype=x.dtype)
+                    y_onehot.scatter_(1, y_safe, 1.0 - self.label_smoothing)
+                else:
+                    y_onehot = torch.zeros(x.shape, device=x.device, dtype=torch.bool)
+                    y_onehot.scatter_(1, y_safe, 1)
 
             if not self.do_bg:
                 y_onehot = y_onehot[:, 1:]
@@ -207,19 +229,56 @@ class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
     """
     Cross entropy loss that supports ignore_index and is more robust.
     Based on nnUNetv2 implementation.
+
+    When label_smoothing > 0 and ignore_index is set, we handle this manually
+    because PyTorch's CrossEntropyLoss can have issues with this combination.
     """
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if target.ndim == input.ndim:
             assert target.shape[1] == 1
             target = target[:, 0]
-        return super().forward(input, target.long())
+
+        target = target.long()
+
+        # When using ignore_index, we need to handle manually
+        # because PyTorch CE can crash if target values >= num_classes even with ignore_index set
+        if self.ignore_index is not None and self.ignore_index >= 0:
+            num_classes = input.shape[1]
+            # Create mask of valid (non-ignored) pixels
+            valid_mask = target != self.ignore_index
+            # Replace ignore_index values with 0 to prevent CUDA crash
+            # These will be masked out of the loss anyway
+            target_safe = torch.where(valid_mask, target, torch.zeros_like(target))
+            # Also clamp to valid range in case of other out-of-range values
+            target_safe = torch.clamp(target_safe, min=0, max=num_classes - 1)
+
+            # Compute loss with no reduction
+            original_reduction = self.reduction
+            self.reduction = 'none'
+            loss = super().forward(input, target_safe)
+            self.reduction = original_reduction
+
+            # Apply mask and reduce
+            loss = loss * valid_mask.float()
+            if original_reduction == 'mean':
+                num_valid = valid_mask.sum()
+                if num_valid > 0:
+                    return loss.sum() / num_valid
+                else:
+                    return loss.sum() * 0  # Return 0 with grad
+            elif original_reduction == 'sum':
+                return loss.sum()
+            else:
+                return loss
+
+        return super().forward(input, target)
 
 
 class DC_and_CE_loss(nn.Module):
     """
     Combined Dice and Cross Entropy loss as used in nnUNetv2.
     """
-    def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, 
+    def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1,
                  ignore_label=None, dice_class=MemoryEfficientSoftDiceLoss):
         super(DC_and_CE_loss, self).__init__()
         if ignore_label is not None:
@@ -230,7 +289,8 @@ class DC_and_CE_loss(nn.Module):
         self.ignore_label = ignore_label
 
         self.ce = RobustCrossEntropyLoss(**ce_kwargs)
-        self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+        # Pass ignore_label to dice loss so it handles masking internally
+        self.dc = dice_class(apply_nonlin=softmax_helper_dim1, ignore_label=ignore_label, **soft_dice_kwargs)
 
     def forward(self, net_output: torch.Tensor, target: torch.Tensor):
         """
@@ -238,16 +298,14 @@ class DC_and_CE_loss(nn.Module):
         """
         if self.ignore_label is not None:
             assert target.shape[1] == 1, 'ignore label is not implemented for one hot encoded target variables'
-            mask = target != self.ignore_label
-            # remove ignore label from target, replace with one of the known labels
-            target_dice = torch.where(mask, target, 0)
-            num_fg = mask.sum()
+            num_fg = (target != self.ignore_label).sum()
         else:
-            target_dice = target
-            mask = None
+            num_fg = None
 
-        dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \
-            if self.weight_dice != 0 else 0
+        # Dice loss handles ignore_label internally via clamping + masking
+        dc_loss = self.dc(net_output, target) if self.weight_dice != 0 else 0
+
+        # CE loss uses ignore_index natively
         ce_loss = self.ce(net_output, target[:, 0]) \
             if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
 

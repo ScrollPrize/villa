@@ -4,16 +4,12 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <unordered_map>
 
 #include <filesystem>
-#include "vc/core/types/Metadata.hpp"
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkgVersion.hpp"
 
 class VolumePkg
 {
@@ -43,10 +39,10 @@ public:
     void refreshSegmentations();
 
 
-    // Surface management
+    // Surface management - returns QuadSurface directly (no SurfaceMeta wrapper)
     [[nodiscard]] bool isSurfaceLoaded(const std::string& id) const;
-    std::shared_ptr<SurfaceMeta> loadSurface(const std::string& id);
-    std::shared_ptr<SurfaceMeta> getSurface(const std::string& id);
+    std::shared_ptr<QuadSurface> loadSurface(const std::string& id);
+    std::shared_ptr<QuadSurface> getSurface(const std::string& id);
     bool unloadSurface(const std::string& id);
     [[nodiscard]] std::vector<std::string> getLoadedSurfaceIDs() const;
     void unloadAllSurfaces();
@@ -56,7 +52,7 @@ public:
     bool reloadSingleSegmentation(const std::string& id);
 
 private:
-    Metadata config_;
+    nlohmann::json config_;
     std::filesystem::path rootDir_;
     std::map<std::string, std::shared_ptr<Volume>> volumes_;
     std::map<std::string, std::shared_ptr<Segmentation>> segmentations_;

@@ -43,18 +43,16 @@ else()
 endif()
 
 # ---- Qt (apps / utils) -------------------------------------------------------
-if ((VC_BUILD_APPS OR VC_BUILD_UTILS) AND VC_BUILD_GUI)
-    find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network)
-    set(CMAKE_AUTOMOC ON)
-    set(CMAKE_AUTORCC ON)
-    set(CMAKE_AUTOUIC ON)
+find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
 
-    # Guard old qt cmake helper on distros with Qt < 6.3
-    if(NOT DEFINED qt_generate_deploy_app_script)
-        message(WARNING "WARNING qt_generate_deploy_app_script MISSING!")
-        function(qt_generate_deploy_app_script)
-        endfunction()
-    endif()
+# Guard old qt cmake helper on distros with Qt < 6.3
+if(NOT DEFINED qt_generate_deploy_app_script)
+    message(WARNING "WARNING qt_generate_deploy_app_script MISSING!")
+    function(qt_generate_deploy_app_script)
+    endfunction()
 endif()
 
 # ---- CUDA sparse toggle ------------------------------------------------------
@@ -92,6 +90,8 @@ else()
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
+    # Add openmp_stub to the export set so install(EXPORT) works
+    install(TARGETS openmp_stub EXPORT "${targets_export_name}")
 endif()
 
 # ---- xtensor/xsimd toggle used by your code ---------------------------------
@@ -117,9 +117,7 @@ else()
 endif()
 
 # ---- Boost (apps/utils only) -------------------------------------------------
-if (VC_BUILD_APPS OR VC_BUILD_UTILS)
-    find_package(Boost 1.58 REQUIRED COMPONENTS program_options)
-endif()
+find_package(Boost 1.58 REQUIRED COMPONENTS program_options)
 
 # ---- PaStiX ------------------------------------------------------------------
 if (VC_WITH_PASTIX)

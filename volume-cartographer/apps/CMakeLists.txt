@@ -1,16 +1,14 @@
 ############
 # GUI Apps #
 ############
-if(VC_BUILD_GUI)
 add_subdirectory(VC3D)
-endif()
 
 #################
 # CMD Line Apps #
 #################
 
 add_executable(vc_render_video src/vc_render_video.cpp)
-target_link_libraries(vc_render_video z5 opencv_core vc_core)
+target_link_libraries(vc_render_video z5 opencv_core vc_core opencv_videoio)
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
 target_link_libraries(vc_render_tifxyz vc_core Boost::program_options tiff)
@@ -35,6 +33,9 @@ target_link_libraries(vc_obj2tifxyz vc_core)
 
 add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
+
+add_executable(vc_flatten src/vc_flatten.cpp)
+target_link_libraries(vc_flatten vc_core Boost::program_options)
 
 add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
 target_link_libraries(vc_tifxyz_inp_mask vc_core)
@@ -70,9 +71,8 @@ set(vc_diffuse_winding_sources
 add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources})
 target_include_directories(vc_diffuse_winding PRIVATE diffusion)
 target_link_libraries(vc_diffuse_winding
-    PRIVATE
         z5
-        opencv_highgui
+        opencv_videoio
         opencv_ximgproc
         vc_core
         vc_ui
@@ -137,7 +137,7 @@ target_link_libraries(vc_telea_inpaint
 )
 
 add_executable(vc_thinning src/vc_thinning.cpp)
-target_link_libraries(vc_thinning vc_core opencv_highgui opencv_ximgproc)
+target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
@@ -155,6 +155,7 @@ install(
         vc_tifxyz2obj
         vc_obj2tifxyz
         vc_obj2tifxyz_legacy
+        vc_flatten
         vc_tifxyz2rgb
         vc_rgb2tifxyz
         vc_tifxyz_winding

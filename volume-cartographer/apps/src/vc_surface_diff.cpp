@@ -1,13 +1,11 @@
 #include <nlohmann/json.hpp>
 
-#include <opencv2/highgui.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 
-#include <unordered_map>
 #include <filesystem>
 #include <chrono>
 #include <iostream>
@@ -62,7 +60,7 @@ QuadSurface* load_surface(const std::filesystem::path& path) {
     std::string format = meta.value("format", "unknown");
 
     if (format == "tifxyz") {
-        return load_quad_from_tifxyz(path.string());
+        return load_quad_from_tifxyz(path.string()).release();
     } else {
         throw std::runtime_error("Unknown surface format: " + format);
     }
@@ -150,7 +148,7 @@ int main(int argc, char *argv[])
                   << " scale: [" << surf_b->scale()[0] << ", " << surf_b->scale()[1] << "]" << std::endl;
 
         // Perform the operation
-        QuadSurface* result = nullptr;
+        std::unique_ptr<QuadSurface> result;
         std::cout << "Performing " << operation << " operation with tolerance=" << tolerance << std::endl;
 
         {
@@ -174,7 +172,7 @@ int main(int argc, char *argv[])
 
         // Prepare metadata
         if (!result->meta) {
-            result->meta = new json();
+            result->meta = std::make_unique<json>();
         }
 
         // Generate output path - append operation and timestamp to the base name
@@ -200,20 +198,10 @@ int main(int argc, char *argv[])
         std::cout << "Result saved to: " << output_path << std::endl;
 
         // Print statistics
-        cv::Mat_<cv::Vec3f> result_points = result->rawPoints();
-        int valid_count = 0;
-        for (int j = 0; j < result_points.rows; j++) {
-            for (int i = 0; i < result_points.cols; i++) {
-                if (result_points(j, i)[0] != -1) {
-                    ++valid_count;
-                }
-            }
-        }
-
-        std::cout << "Result surface contains " << valid_count << " valid points" << std::endl;
+        std::cout << "Result surface contains " << result->countValidPoints() << " valid points" << std::endl;
 
         if (result->meta) {
-            const double area_vx2 = vc::surface::computeSurfaceAreaVox2(result_points);
+            const double area_vx2 = vc::surface::computeSurfaceAreaVox2(result->rawPoints());
             (*result->meta)["area_vx2"] = area_vx2;
 
             if (params.contains("voxelsize")) {
@@ -228,11 +216,6 @@ int main(int argc, char *argv[])
 
         // Update metadata with final statistics
         result->save_meta();
-
-        // Cleanup
-        delete surf_a;
-        delete surf_b;
-        delete result;
 
         std::cout << "Operation completed successfully!" << std::endl;
 

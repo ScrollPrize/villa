@@ -1,15 +1,26 @@
 tr_config:
   patch_size: [128,128,128]
+  enable_deep_supervision: false
 
+model_config:
+  architecture_type: "primus_m"
+  patch_embed_size: [8, 8, 8]
 
 dataset_config:
-  min_labeled_ratio: 0 
-  min_bbox_percent: 0 
+  valid_patch_find_resolution: 2
+  valid_patch_value: 1
+  min_labeled_ratio: 0.01
+  min_bbox_percent: 0.15
   normalization_scheme: "zscore"
-  skip_patch_validation: true
+  skip_patch_validation: false
+  ome_zarr_resolution: 0
+  bg_sampling_enabled: true
+  bg_to_fg_ratio: 0.10
+
   targets:
-    surface:
+    ink:
       activation: "none"
+      ignore_label: 2
       losses:
         - name: "nnUNet_DC_and_CE_loss"
           weight: 1.0

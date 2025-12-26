@@ -3,6 +3,8 @@ import torch
 from torch import autocast
 from typing import Tuple, Union, List, Optional
 import warnings
+import os
+import matplotlib.pyplot as plt
 
 from nnunetv2.training.loss.compound_losses import DC_SkelREC_and_CE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
@@ -432,10 +434,6 @@ class nnUNetTrainerSkeletonRecall(nnUNetTrainer):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        if self.local_rank == 0:
-            self.wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
-            self.wandb.log({"grad_norm": grad_norm})
-
         return {'loss': l.detach().cpu().numpy()}
     
 
@@ -742,3 +740,131 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainerSkeletonRecall):
         if deep_supervision_scales is not None:
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
         return ComposeTransforms(transforms)
+
+    def on_validation_epoch_start(self):
+        super().on_validation_epoch_start()
+        self._log_val_image = True
+
+    def validation_step(self, batch: dict) -> dict:
+        data = batch['data']
+        target = batch['target']
+        skel = batch['skel']
+
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [i.to(self.device, non_blocking=True) for i in target]
+            skel = [i.to(self.device, non_blocking=True) for i in skel]
+        else:
+            target = target.to(self.device, non_blocking=True)
+            skel = skel.to(self.device, non_blocking=True)
+
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data)
+            l = self.loss(output, target, skel)
+
+        # Log image on first batch of validation
+        if self._log_val_image and self.local_rank == 0:
+            self._log_val_image = False
+            self._save_val_prediction_image(data, target, output)
+
+        del data
+
+        # we only need the output with the highest output resolution (if DS enabled)
+        if self.enable_deep_supervision:
+            output = output[0]
+            target = target[0]
+
+        # the following is needed for online evaluation. Fake dice (green line)
+        axes = [0] + list(range(2, output.ndim))
+
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+        else:
+            # no need for softmax
+            output_seg = output.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
+            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+            del output_seg
+
+        if self.label_manager.has_ignore_label:
+            if not self.label_manager.has_regions:
+                mask = (target != self.label_manager.ignore_label).float()
+                target[target == self.label_manager.ignore_label] = 0
+            else:
+                if target.dtype == torch.bool:
+                    mask = ~target[:, -1:]
+                else:
+                    mask = 1 - target[:, -1:]
+                target = target[:, :-1]
+        else:
+            mask = None
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+
+    def _save_val_prediction_image(self, data, target, output):
+        """Save GT and prediction comparison image for the first validation batch."""
+        try:
+            # Handle deep supervision - get highest resolution
+            if self.enable_deep_supervision:
+                output_vis = output[0]
+                target_vis = target[0]
+            else:
+                output_vis = output
+                target_vis = target
+
+            # Get prediction (argmax for segmentation)
+            if self.label_manager.has_regions:
+                pred = (torch.sigmoid(output_vis) > 0.5).float()
+            else:
+                pred = output_vis.argmax(1)
+
+            # Get first sample, first channel for data, and middle slice
+            data_np = data[0, 0].detach().cpu().numpy()
+            target_np = target_vis[0, 0].detach().cpu().numpy()
+            pred_np = pred[0].detach().cpu().numpy()
+
+            # Get middle slice (assuming 3D data with shape [D, H, W])
+            if data_np.ndim == 3:
+                mid_slice = data_np.shape[0] // 2
+                data_slice = data_np[mid_slice]
+                target_slice = target_np[mid_slice]
+                pred_slice = pred_np[mid_slice]
+            else:
+                # 2D case
+                data_slice = data_np
+                target_slice = target_np
+                pred_slice = pred_np
+
+            # Create figure
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+            axes[0].imshow(data_slice, cmap='gray')
+            axes[0].set_title('Input')
+            axes[0].axis('off')
+
+            axes[1].imshow(target_slice, cmap='tab10', vmin=0)
+            axes[1].set_title('Ground Truth')
+            axes[1].axis('off')
+
+            axes[2].imshow(pred_slice, cmap='tab10', vmin=0)
+            axes[2].set_title('Prediction')
+            axes[2].axis('off')
+
+            plt.tight_layout()
+
+            # Save to output folder
+            save_path = os.path.join(self.output_folder, f'val_pred_epoch_{self.current_epoch}.png')
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        except Exception as e:
+            self.print_to_log_file(f"Failed to save validation image: {e}")

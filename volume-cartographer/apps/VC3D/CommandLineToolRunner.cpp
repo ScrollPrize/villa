@@ -7,6 +7,11 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QTextStream>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMessageBox>
+#include <QClipboard>
+#include <QApplication>
 
 
 
@@ -194,6 +199,13 @@ void CommandLineToolRunner::setOmpThreads(int threads)
     _ompThreads = threads;
 }
 
+void CommandLineToolRunner::setFlattenOptions(bool flatten, int iterations, int downsample)
+{
+    _flatten = flatten;
+    _flattenIters = iterations;
+    _flattenDownsample = downsample;
+}
+
 void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
 {
     _optNormalizeUV = normalizeUV;
@@ -229,7 +241,12 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    _consoleOutput->clear();
+    if (_preserveConsoleOutput) {
+        _consoleOutput->appendOutput(tr("\n========== Next Pass ==========\n\n"));
+        _preserveConsoleOutput = false;
+    } else {
+        _consoleOutput->clear();
+    }
 
     QString toolCmd = toolName(tool);
     QFileInfo toolInfo(toolCmd);
@@ -434,6 +451,11 @@ void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
     _autoShowConsole = autoShow;
 }
 
+void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
+{
+    _preserveConsoleOutput = preserve;
+}
+
 void CommandLineToolRunner::setParallelProcesses(int count)
 {
     _parallelProcesses = count;
@@ -596,6 +618,11 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             }
             if (_includeTifs) {
                 args << "--include-tifs";
+            }
+            if (_flatten) {
+                args << "--flatten";
+                args << "--flatten-iterations" << QString::number(_flattenIters);
+                args << "--flatten-downsample" << QString::number(_flattenDownsample);
             }
             break;
 

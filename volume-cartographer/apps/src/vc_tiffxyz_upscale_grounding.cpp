@@ -1,12 +1,14 @@
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
 
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <omp.h>
 
 
@@ -81,7 +83,7 @@ float find_loc_wind_slow(cv::Vec2f &loc, float tgt_wind, const cv::Mat_<cv::Vec3
         cv::Vec2f cand = loc;
         
         if (r)
-            cand = {rand_r(&sr) % points.cols, rand_r(&sr) % points.rows};
+            cand = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(rand_r(&sr) % points.rows)};
         
         if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
             continue;
@@ -134,37 +136,27 @@ cv::Mat_<cv::Vec3f> points_hr_grounding(cv::Mat_<float> wind_lr, const cv::Mat_<
     
     for(int n=0;n<points_hr_src.size();n++) {
         int succ = 0;
-        for(int j=0;j<points_lr.rows-1;j++)
-            for(int i=0;i<points_lr.cols-1;i++) {
-                if (points_lr(j,i)[0] == -1)
-                    continue;
-                if (points_lr(j,i+1)[0] == -1)
-                    continue;
-                if (points_lr(j+1,i)[0] == -1)
-                    continue;
-                if (points_lr(j+1,i+1)[0] == -1)
-                    continue;
-                
+        for (auto [j, i, q00, q01, q10, q11] : ValidQuadRange<const cv::Vec3f>(&points_lr)) {
                 cv::Vec2f l00, l01, l10, l11;
-                
+
                 float hr_th = 20.0;
                 float res;
                 cv::Vec3f out_;
 
-                res = find_loc_wind_slow(l00, wind_lr(j,i), points_hr_src[n], wind_hr_src[n], points_lr(j,i), hr_th*hr_th);
+                res = find_loc_wind_slow(l00, wind_lr(j,i), points_hr_src[n], wind_hr_src[n], q00, hr_th*hr_th);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l00[1],l00[0]}))
                     continue;
 
                 l01 = l00;
-                res = min_loc_plain(points_hr_src[n], l01, out_, points_lr(j,i+1), 1.0, 0.01);
+                res = min_loc_plain(points_hr_src[n], l01, out_, q01, 1.0, 0.01);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l01[1],l01[0]}))
                     continue;
                 l10 = l00;
-                res = min_loc_plain(points_hr_src[n], l10, out_, points_lr(j+1,i), 1.0, 0.01);
+                res = min_loc_plain(points_hr_src[n], l10, out_, q10, 1.0, 0.01);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l10[1],l10[0]}))
                     continue;
                 l11 = l00;
-                res = min_loc_plain(points_hr_src[n], l11, out_, points_lr(j+1,i+1), 1.0, 0.01);
+                res = min_loc_plain(points_hr_src[n], l11, out_, q11, 1.0, 0.01);
                 if (res < 0 || res > hr_th*hr_th || !loc_valid(points_hr_src[n], {l11[1],l11[0]}))
                     continue;
                 
@@ -272,39 +264,39 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
     
-    std::vector<QuadSurface*> surfs;
+    std::vector<std::unique_ptr<QuadSurface>> surfs;
     std::vector<cv::Mat_<cv::Vec3f>> surf_points;
     std::vector<cv::Mat_<float>> winds;
 
-    QuadSurface *surf_lr = load_quad_from_tifxyz(argv[1]);
+    auto surf_lr = load_quad_from_tifxyz(argv[1]);
     cv::Mat_<cv::Vec3f> points_lr = surf_lr->rawPoints();
     cv::Mat_<float> wind_lr = cv::imread(argv[2], cv::IMREAD_UNCHANGED);
-    
+
     if (points_lr.size() != wind_lr.size())
         throw std::runtime_error("tiffxyz-lr data must have same size as winding-lr");
 
     int scale_factor = atoi(argv[3]);
-    
+
     for(int j=0;j<wind_lr.rows;j++)
         for(int i=0;i<wind_lr.cols;i++)
             if (points_lr(j,i)[0] == -1)
                 wind_lr(j,i) = NAN;
-    
+
     for(int n=0;n<(argc-4)/2;n++) {
-        QuadSurface *surf = load_quad_from_tifxyz(argv[n*2+4]);
-        
+        auto surf = load_quad_from_tifxyz(argv[n*2+4]);
+
         std::cout << "surf " << argv[n*2+4] << std::endl;
-        
+
         cv::Mat_<float> wind = cv::imread(argv[n*2+5], cv::IMREAD_UNCHANGED);
-                    
+
         cv::Mat_<cv::Vec3f> points = surf->rawPoints();
-        
+
         for(int j=0;j<wind.rows;j++)
             for(int i=0;i<wind.cols;i++)
                 if (points(j,i)[0] == -1)
                     wind(j,i) = NAN;
-        
-        surfs.push_back(surf);
+
+        surfs.push_back(std::move(surf));
         winds.push_back(wind);
         surf_points.push_back(points);
     }
@@ -355,7 +347,7 @@ int main(int argc, char *argv[])
         cv::Mat_<cv::Vec3f> points_hr = points_hr_grounding(wind_lr, points_lr, winds, surf_points, scale_factor);
         QuadSurface *surf_hr = new QuadSurface(points_hr, surfs[0]->_scale);
         std::filesystem::path tgt_dir = "./";
-        surf_hr->meta = new nlohmann::json;
+        surf_hr->meta = std::make_unique<nlohmann::json>();
         (*surf_hr->meta)["vc_tiffxyz_upscale_grounding_scale_factor"] = scale_factor;
         std::string name_prefix = "grounding_hr_";
         std::string uuid = name_prefix + time_str();

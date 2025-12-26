@@ -3,111 +3,86 @@
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(containers, xarray.hpp)
 #include <opencv2/core.hpp>
+#include <string>
 
-#include <vc/core/util/HashFunctions.hpp>
+#include <vc/core/util/ChunkCache.hpp>
+#include <vc/core/util/Compositing.hpp>
 
-#include <shared_mutex>
-#include <z5/dataset.hxx>
-
-//TODO generation overrun
-//TODO groupkey overrun
-class ChunkCache
-{
-public:
-    ChunkCache(size_t size) : _size(size) {};
-    ~ChunkCache();
-    
-    //get key for a subvolume - should be uniqueley identified between all groups and volumes that use this cache.
-    //for example by using path + group name
-    int groupIdx(const std::string &name);
-    
-    //key should be unique for chunk and contain groupkey (groupkey sets highest 16bits of uint64_t)
-    void put(const cv::Vec4i &key, xt::xarray<uint8_t> *ar);
-    std::shared_ptr<xt::xarray<uint8_t>> get(const cv::Vec4i &key);
-    void reset();
-    bool has(const cv::Vec4i &idx);
-
-    // 16-bit lane
-    void put16(const cv::Vec4i &key, xt::xarray<uint16_t> *ar);
-    std::shared_ptr<xt::xarray<uint16_t>> get16(const cv::Vec4i &key);
-    bool has16(const cv::Vec4i &idx);
-
-    std::shared_mutex mutex;
-private:
-    uint64_t _generation = 0;
-    size_t _size = 0;
-    size_t _stored = 0;
-    std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint8_t>>,vec4i_hash> _store;
-    //store generation number
-    std::unordered_map<cv::Vec4i,uint64_t,vec4i_hash> _gen_store;
-    // 16-bit storage and generations
-    std::unordered_map<cv::Vec4i,std::shared_ptr<xt::xarray<uint16_t>>,vec4i_hash> _store16;
-    std::unordered_map<cv::Vec4i,uint64_t,vec4i_hash> _gen_store16;
-    //store group keys
-    std::unordered_map<std::string,int> _group_store;
-
-    std::shared_mutex _mutex;
-};
+// Forward declaration
+namespace z5 { class Dataset; }
 
 //NOTE depending on request this might load a lot (the whole array) into RAM
 // void readInterpolated3D(xt::xarray<uint8_t> &out, z5::Dataset *ds, const xt::xarray<float> &coords, ChunkCache *cache = nullptr);
-void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache = nullptr, bool nearest_neighbor=false);
-void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache *cache = nullptr, bool nearest_neighbor=false);
-template <typename T>
-void readArea3D(xt::xtensor<T,3,xt::layout_type::column_major> &out, const cv::Vec3i offset, z5::Dataset *ds, ChunkCache *cache) { throw std::runtime_error("missing implementation"); }
-void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i offset, z5::Dataset *ds, ChunkCache *cache);
-void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major> &out, const cv::Vec3i offset, z5::Dataset *ds, ChunkCache *cache);
-cv::Mat_<cv::Vec3f> smooth_vc_segmentation(const cv::Mat_<cv::Vec3f> &points);
-cv::Mat_<cv::Vec3f> vc_segmentation_calc_normals(const cv::Mat_<cv::Vec3f> &points);
-void vc_segmentation_scales(cv::Mat_<cv::Vec3f> points, double &sx, double &sy);
-cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc);
+void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache = nullptr, bool nearest_neighbor=false);
+void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache = nullptr, bool nearest_neighbor=false);
+//template <typename T>
+//void readArea3D(xt::xtensor<T,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, z5::Dataset *ds, ChunkCache<T> *cache) { throw std::runtime_error("missing implementation"); }
+void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, z5::Dataset *ds, ChunkCache<uint8_t> *cache);
+void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, z5::Dataset *ds, ChunkCache<uint16_t> *cache);
 
-template <typename E>
-E at_int(const cv::Mat_<E> &points, cv::Vec2f p)
-{
-    int x = p[0];
-    int y = p[1];
-    float fx = p[0]-x;
-    float fy = p[1]-y;
-    
-    E p00 = points(y,x);
-    E p01 = points(y,x+1);
-    E p10 = points(y+1,x);
-    E p11 = points(y+1,x+1);
-    
-    E p0 = (1-fx)*p00 + fx*p01;
-    E p1 = (1-fx)*p10 + fx*p11;
-    
-    return (1-fy)*p0 + fy*p1;
-}
+// Fast composite rendering cache - holds chunks needed for composite rendering
+// without mutex overhead. Designed for single-threaded composite rendering.
+class FastCompositeCache {
+public:
+    FastCompositeCache() = default;
+    ~FastCompositeCache() = default;
 
-template<typename T, int C>
-//l is [y, x]!
-bool loc_valid(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
-{
-    if (l[0] == -1)
-        return false;
-    
-    cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
-    cv::Vec2i li = {floor(l[0]),floor(l[1])};
-    
-    if (!bounds.contains(cv::Point(li)))
-        return false;
-    
-    if (m(li[0],li[1])[0] == -1)
-        return false;
-    if (m(li[0]+1,li[1])[0] == -1)
-        return false;
-    if (m(li[0],li[1]+1)[0] == -1)
-        return false;
-    if (m(li[0]+1,li[1]+1)[0] == -1)
-        return false;
-    return true;
-}
+    // Clear the cache
+    void clear();
 
-template<typename T, int C>
-//l is [x, y]!
-bool loc_valid_xy(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
-{
-    return loc_valid(m, {l[1],l[0]});
-}
+    // Set the dataset this cache is for
+    void setDataset(z5::Dataset* ds);
+
+    // Get a chunk, loading it if necessary. Returns nullptr if out of bounds.
+    // No mutex - assumes single-threaded access during composite rendering.
+    const xt::xarray<uint8_t>* getChunk(int ix, int iy, int iz);
+
+    // Get chunk dimensions
+    int chunkSizeX() const { return _cw; }
+    int chunkSizeY() const { return _ch; }
+    int chunkSizeZ() const { return _cd; }
+
+    // Get dataset dimensions
+    int datasetSizeX() const { return _sx; }
+    int datasetSizeY() const { return _sy; }
+    int datasetSizeZ() const { return _sz; }
+
+private:
+    z5::Dataset* _ds = nullptr;
+    int _cw = 0, _ch = 0, _cd = 0;  // Chunk dimensions
+    int _sx = 0, _sy = 0, _sz = 0;  // Dataset dimensions
+    int _chunksX = 0, _chunksY = 0, _chunksZ = 0;  // Number of chunks
+
+    // Simple map for chunk storage - no shared_ptr overhead
+    std::unordered_map<uint64_t, std::unique_ptr<xt::xarray<uint8_t>>> _chunks;
+
+    uint64_t chunkKey(int ix, int iy, int iz) const {
+        return (uint64_t(ix) << 40) | (uint64_t(iy) << 20) | uint64_t(iz);
+    }
+};
+
+// Fast composite rendering - nearest neighbor only, no mutex, inline caching
+// Returns directly into output matrix
+void readCompositeFast(
+    cv::Mat_<uint8_t>& out,
+    z5::Dataset* ds,
+    const cv::Mat_<cv::Vec3f>& baseCoords,
+    const cv::Mat_<cv::Vec3f>& normals,
+    float zStep,
+    int zStart, int zEnd,
+    const CompositeParams& params,
+    FastCompositeCache& cache
+);
+
+// Fast composite rendering with constant normal (optimized for plane surfaces)
+// Avoids per-pixel normal lookup and uses pre-computed layer offsets
+void readCompositeFastConstantNormal(
+    cv::Mat_<uint8_t>& out,
+    z5::Dataset* ds,
+    const cv::Mat_<cv::Vec3f>& baseCoords,
+    const cv::Vec3f& normal,  // Single constant normal for all pixels
+    float zStep,
+    int zStart, int zEnd,
+    const CompositeParams& params,
+    FastCompositeCache& cache
+);

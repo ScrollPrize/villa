@@ -136,6 +136,24 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     adv->addRow("Rotate (deg):", spRotate_);
     adv->addRow("Flip:", cmbFlip_);
 
+    // ABF++ flattening options
+    chkFlatten_ = new QCheckBox("Enable ABF++ flattening", this);
+    chkFlatten_->setToolTip("Apply ABF++ mesh flattening before rendering to reduce texture distortion");
+    spFlattenIters_ = new QSpinBox(this);
+    spFlattenIters_->setRange(1, 100);
+    spFlattenIters_->setValue(10);
+    spFlattenIters_->setEnabled(false);
+    spFlattenDownsample_ = new QSpinBox(this);
+    spFlattenDownsample_->setRange(1, 8);
+    spFlattenDownsample_->setValue(1);
+    spFlattenDownsample_->setEnabled(false);
+    spFlattenDownsample_->setToolTip("Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality");
+    connect(chkFlatten_, &QCheckBox::toggled, spFlattenIters_, &QSpinBox::setEnabled);
+    connect(chkFlatten_, &QCheckBox::toggled, spFlattenDownsample_, &QSpinBox::setEnabled);
+    adv->addRow("Flatten:", chkFlatten_);
+    adv->addRow("Flatten iterations:", spFlattenIters_);
+    adv->addRow("Flatten downsample:", spFlattenDownsample_);
+
     // Buttons
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     auto btnReset = btns->addButton("Reset to Defaults", QDialogButtonBox::ResetRole);
@@ -194,6 +212,9 @@ double RenderParamsDialog::scaleSegmentation() const { return spScaleSeg_->value
 double RenderParamsDialog::rotateDegrees() const { return spRotate_->value(); }
 int RenderParamsDialog::flipAxis() const { return cmbFlip_->currentData().toInt(); }
 bool RenderParamsDialog::includeTifs() const { return chkIncludeTifs_->isChecked(); }
+bool RenderParamsDialog::flatten() const { return chkFlatten_->isChecked(); }
+int RenderParamsDialog::flattenIterations() const { return spFlattenIters_->value(); }
+int RenderParamsDialog::flattenDownsample() const { return spFlattenDownsample_->value(); }
 
 // ---- RenderParamsDialog: defaults + session helpers ----
 bool RenderParamsDialog::s_haveSession = false;
@@ -207,6 +228,9 @@ double RenderParamsDialog::s_scaleSeg = 1.0;
 double RenderParamsDialog::s_rotateDeg = 0.0;
 int  RenderParamsDialog::s_flipAxis = -1;
 int  RenderParamsDialog::s_ompThreads = -1;
+bool RenderParamsDialog::s_flatten = false;
+int  RenderParamsDialog::s_flattenIters = 10;
+int  RenderParamsDialog::s_flattenDownsample = 1;
 
 void RenderParamsDialog::applyCodeDefaults() {
     chkIncludeTifs_->setChecked(false);
@@ -222,6 +246,9 @@ void RenderParamsDialog::applyCodeDefaults() {
     int idx = cmbFlip_->findData(-1);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     edtThreads_->setText("");
+    chkFlatten_->setChecked(false);
+    spFlattenIters_->setValue(10);
+    spFlattenDownsample_->setValue(1);
 }
 
 void RenderParamsDialog::applySavedDefaults() {
@@ -241,6 +268,9 @@ void RenderParamsDialog::applySavedDefaults() {
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     const int th = s.value("omp_threads", -1).toInt();
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
+    chkFlatten_->setChecked(s.value("flatten", chkFlatten_->isChecked()).toBool());
+    spFlattenIters_->setValue(s.value("flatten_iterations", spFlattenIters_->value()).toInt());
+    spFlattenDownsample_->setValue(s.value("flatten_downsample", spFlattenDownsample_->value()).toInt());
     s.endGroup();
 }
 
@@ -257,6 +287,9 @@ void RenderParamsDialog::applySessionDefaults() {
     int idx = cmbFlip_->findData(s_flipAxis);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
+    chkFlatten_->setChecked(s_flatten);
+    spFlattenIters_->setValue(s_flattenIters);
+    spFlattenDownsample_->setValue(s_flattenDownsample);
 }
 
 void RenderParamsDialog::saveDefaults() const {
@@ -272,6 +305,9 @@ void RenderParamsDialog::saveDefaults() const {
     s.setValue("rotate_deg", spRotate_->value());
     s.setValue("flip_axis", cmbFlip_->currentData().toInt());
     s.setValue("omp_threads", ompThreads());
+    s.setValue("flatten", chkFlatten_->isChecked());
+    s.setValue("flatten_iterations", spFlattenIters_->value());
+    s.setValue("flatten_downsample", spFlattenDownsample_->value());
     s.endGroup();
 }
 
@@ -287,6 +323,9 @@ void RenderParamsDialog::updateSessionFromUI() {
     s_rotateDeg = spRotate_->value();
     s_flipAxis = cmbFlip_->currentData().toInt();
     s_ompThreads = ompThreads();
+    s_flatten = chkFlatten_->isChecked();
+    s_flattenIters = spFlattenIters_->value();
+    s_flattenDownsample = spFlattenDownsample_->value();
 }
 
 // ================= TraceParamsDialog =================
@@ -1017,7 +1056,7 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
 
     spResumeStep_ = new QSpinBox(this);
     spResumeStep_->setRange(1, 512);
-    spResumeStep_->setValue(16);
+    spResumeStep_->setValue(20);
     spResumeStep_->setToolTip(tr("Stride applied when selecting cells for resume-local optimization during pass 2."));
     pass2Form->addRow(tr("Local step:"), spResumeStep_);
 
@@ -1097,7 +1136,7 @@ QString NeighborCopyDialog::outputPath() const
 
 int NeighborCopyDialog::resumeLocalOptStep() const
 {
-    return spResumeStep_ ? spResumeStep_->value() : 16;
+    return spResumeStep_ ? spResumeStep_->value() : 20;
 }
 
 int NeighborCopyDialog::resumeLocalOptRadius() const
@@ -1113,4 +1152,160 @@ int NeighborCopyDialog::resumeLocalMaxIters() const
 bool NeighborCopyDialog::resumeLocalDenseQr() const
 {
     return chkResumeDenseQr_ ? chkResumeDenseQr_->isChecked() : false;
+}
+
+// ================= ExportChunksDialog =================
+ExportChunksDialog::ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("Export Width Chunks"));
+    auto main = new QVBoxLayout(this);
+
+    // Info label about the surface
+    const int realWidth = scale > 0 ? static_cast<int>(surfaceWidth / scale) : surfaceWidth;
+    auto infoLabel = new QLabel(tr("Surface width: %1 px (real)").arg(realWidth), this);
+    main->addWidget(infoLabel);
+
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    // Load defaults from settings
+    using namespace vc3d::settings;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int defaultChunkWidth = settings.value(export_::CHUNK_WIDTH_PX, export_::CHUNK_WIDTH_PX_DEFAULT).toInt();
+    const int defaultOverlap = settings.value(export_::CHUNK_OVERLAP_PX, export_::CHUNK_OVERLAP_PX_DEFAULT).toInt();
+    const bool defaultOverwrite = settings.value(export_::OVERWRITE, export_::OVERWRITE_DEFAULT).toBool();
+
+    spChunkWidth_ = new QSpinBox(this);
+    spChunkWidth_->setRange(100, 1000000);
+    spChunkWidth_->setSingleStep(1000);
+    spChunkWidth_->setValue(defaultChunkWidth);
+    spChunkWidth_->setSuffix(tr(" px"));
+    spChunkWidth_->setToolTip(tr("Width of each exported chunk in real (output) pixels"));
+    form->addRow(tr("Chunk width:"), spChunkWidth_);
+
+    spOverlap_ = new QSpinBox(this);
+    spOverlap_->setRange(0, 100000);
+    spOverlap_->setSingleStep(500);
+    spOverlap_->setValue(defaultOverlap);
+    spOverlap_->setSuffix(tr(" px"));
+    spOverlap_->setToolTip(tr("Overlap per side in real pixels.\n"
+                              "Each chunk extends this far into adjacent chunks.\n"
+                              "First chunk has no left overlap, last has no right overlap."));
+    form->addRow(tr("Overlap (per side):"), spOverlap_);
+
+    chkOverwrite_ = new QCheckBox(tr("Overwrite existing exports"), this);
+    chkOverwrite_->setChecked(defaultOverwrite);
+    form->addRow(chkOverwrite_);
+
+    // Preview info that updates when values change
+    auto previewLabel = new QLabel(this);
+    auto updatePreview = [this, previewLabel, realWidth, scale]() {
+        const int chunkW = spChunkWidth_->value();
+        const int overlap = spOverlap_->value();
+        // Step is chunk width (so overlap extends beyond)
+        const int step = chunkW;
+        int nChunks = 0;
+        if (step > 0 && realWidth > 0) {
+            // Each chunk covers [i*step - overlap, i*step + chunkW + overlap]
+            // But first starts at 0 and last ends at realWidth
+            nChunks = (realWidth + step - 1) / step;
+        }
+        previewLabel->setText(tr("Estimated chunks: %1").arg(nChunks));
+    };
+    connect(spChunkWidth_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
+    connect(spOverlap_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
+    updatePreview();
+    main->addWidget(previewLabel);
+
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(buttons, &QDialogButtonBox::accepted, this, [this, &settings]() {
+        // Save settings for next time
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+        s.setValue("export/chunk_width_px", spChunkWidth_->value());
+        s.setValue("export/chunk_overlap_px", spOverlap_->value());
+        s.setValue("export/overwrite", chkOverwrite_->isChecked());
+        accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(buttons);
+}
+
+int ExportChunksDialog::chunkWidth() const
+{
+    return spChunkWidth_ ? spChunkWidth_->value() : 40000;
+}
+
+int ExportChunksDialog::overlapPerSide() const
+{
+    return spOverlap_ ? spOverlap_->value() : 0;
+}
+
+bool ExportChunksDialog::overwrite() const
+{
+    return chkOverwrite_ ? chkOverwrite_->isChecked() : true;
+}
+
+// ================= ABFFlattenDialog =================
+bool ABFFlattenDialog::s_haveSession = false;
+int ABFFlattenDialog::s_iterations = 10;
+int ABFFlattenDialog::s_downsample = 1;
+
+ABFFlattenDialog::ABFFlattenDialog(QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("ABF++ Flatten"));
+    auto main = new QVBoxLayout(this);
+
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    spIterations_ = new QSpinBox(this);
+    spIterations_->setRange(1, 100);
+    spIterations_->setValue(10);
+    spIterations_->setToolTip(tr("Maximum number of ABF++ optimization iterations"));
+    form->addRow(tr("Iterations:"), spIterations_);
+
+    spDownsample_ = new QSpinBox(this);
+    spDownsample_->setRange(1, 8);
+    spDownsample_->setValue(1);
+    spDownsample_->setToolTip(tr("Downsample factor for faster computation (1=full, 2=half, 4=quarter).\n"
+                                  "Higher values are faster but may reduce quality."));
+    form->addRow(tr("Downsample factor:"), spDownsample_);
+
+    // Buttons
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(btns);
+
+    // Apply session defaults
+    applySessionDefaults();
+
+    // Save session on accept
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
+}
+
+void ABFFlattenDialog::applySessionDefaults()
+{
+    if (!s_haveSession) return;
+    spIterations_->setValue(s_iterations);
+    spDownsample_->setValue(s_downsample);
+}
+
+void ABFFlattenDialog::updateSessionFromUI()
+{
+    s_haveSession = true;
+    s_iterations = spIterations_->value();
+    s_downsample = spDownsample_->value();
+}
+
+int ABFFlattenDialog::iterations() const
+{
+    return spIterations_ ? spIterations_->value() : 10;
+}
+
+int ABFFlattenDialog::downsampleFactor() const
+{
+    return spDownsample_ ? spDownsample_->value() : 1;
 }

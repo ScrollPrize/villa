@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
-include(FetchContent)
 
 set(VC_VERSION 3.0.2)
 
@@ -20,13 +19,24 @@ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 option(VC_USE_OPENMP "Enable OpenMP support" ON)
 option(VC_USE_VALGRIND "Enable Valgrind support" off)
 
-set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fPIC -Wno-narrowing -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
+set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fPIC -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
 include_directories(core/include)
 
 if(NOT CMAKE_BUILD_TYPE)
     message(STATUS "Setting build type to 'Release' as none was specified.")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+# Set LTO type and linker based on compiler
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set(VC_LTO_FLAGS "-flto=thin")
+    set(VC_LINKER_FLAGS "-fuse-ld=lld")
+    message(STATUS "Using Clang: thin LTO with lld linker")
+else()
+    set(VC_LTO_FLAGS "-flto=auto")
+    set(VC_LINKER_FLAGS "")
+    message(STATUS "Using ${CMAKE_CXX_COMPILER_ID}: auto LTO with default linker")
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -36,17 +46,17 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O1")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
 elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3  -flto=auto")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=auto ")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 ${VC_LTO_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
 elseif(CMAKE_BUILD_TYPE STREQUAL "ReleaseUnsafe")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3   -flto=auto")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=auto -fuse-ld=lld")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 ${VC_LTO_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
 elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -flto=auto")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=auto")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 ${VC_LTO_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
 elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os  -flto=auto")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=auto")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os ${VC_LTO_FLAGS}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
 endif()
 
 
@@ -136,10 +146,6 @@ endif()
 # Use modern C++ for everything and generate compile_commands database.
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 
-# Choose what to build
-option(VC_BUILD_APPS     "Compile VC core programs"    on)
-option(VC_BUILD_GUI      "Compile GUI programs"        on)
-option(VC_BUILD_UTILS    "Compile VC utility programs" on)
 
 # Choose what to install
 option(VC_INSTALL_APPS      "Install VC core programs"    on)
@@ -155,15 +161,6 @@ option(VC_WITH_PASTIX "Build with PaStiX support" OFF)
 # Look for external dependencies.
 include(VCFindDependencies)
 
-# Weird bug on macOS where system includes aren't included with the right flag
-if (APPLE)
-    set(CMAKE_INCLUDE_SYSTEM_FLAG_CXX "-isystem ")
-endif()
-
-if (VC_BUILD_TESTS)
-    enable_testing()
-endif()
-
 option(VC_DEVELOPER_WARNINGS "For developers: Enable extensive compiler warnings" OFF)
 mark_as_advanced(VC_DEVELOPER_WARNINGS)
 if(VC_DEVELOPER_WARNINGS)
@@ -171,13 +168,11 @@ if(VC_DEVELOPER_WARNINGS)
 endif()
 
 add_subdirectory(misc)
+add_subdirectory(libs/OpenABF)
 add_subdirectory(core)
-
-
-if (VC_BUILD_APPS)
-    add_subdirectory(apps)
-endif()
+add_subdirectory(apps)
 
 include(VCPackageConfig)
 include(VCInstall)
 include(Packing)
+

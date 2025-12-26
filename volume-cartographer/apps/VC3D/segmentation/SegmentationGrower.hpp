@@ -4,13 +4,22 @@
 
 #include <QFutureWatcher>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+// Bounding box info for corrections annotation saving
+struct CorrectionsBounds {
+    cv::Vec3f worldMin{0.0f, 0.0f, 0.0f};
+    cv::Vec3f worldMax{0.0f, 0.0f, 0.0f};
+    cv::Rect gridRegion;  // 2D crop region on surface grid
+};
 
 class SegmentationModule;
 class SegmentationWidget;
@@ -19,7 +28,7 @@ class ViewerManager;
 class SurfacePanelController;
 class VolumePkg;
 class Volume;
-class ChunkCache;
+template <typename T> class ChunkCache;
 class QuadSurface;
 class CVolumeViewer;
 
@@ -34,7 +43,7 @@ public:
         SegmentationWidget* widget{nullptr};
         CSurfaceCollection* surfaces{nullptr};
         ViewerManager* viewerManager{nullptr};
-        ChunkCache* chunkCache{nullptr};
+        ChunkCache<uint8_t>* chunkCache{nullptr};
     };
 
     struct UiCallbacks
@@ -74,11 +83,15 @@ private:
         VolumeContext volumeContext;
         std::shared_ptr<Volume> growthVolume;
         std::string growthVolumeId;
-        QuadSurface* segmentationSurface{nullptr};
+        std::shared_ptr<QuadSurface> segmentationSurface;
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
         bool inpaintOnly{false};
-        std::optional<cv::Rect> correctionsDirtyBounds;
+        std::optional<cv::Rect> correctionsAffectedBounds;
+        // For corrections annotation saving
+        std::optional<CorrectionsBounds> correctionsBounds;
+        std::unique_ptr<QuadSurface> beforeCrop;
+        SegmentationCorrectionsPayload corrections;
     };
 
     void finalize(bool ok);
@@ -87,7 +100,7 @@ private:
 
     Context _context;
     UiCallbacks _callbacks;
-    SurfacePanelController* _surfacePanel{nullptr};
+    QPointer<SurfacePanelController> _surfacePanel;
     bool _running{false};
     std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
     std::optional<ActiveRequest> _activeRequest;

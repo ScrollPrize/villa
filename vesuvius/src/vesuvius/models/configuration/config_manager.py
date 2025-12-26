@@ -68,8 +68,24 @@ class ConfigManager:
         self.infer_num_dataloader_workers = infer_config.get("num_dataloader_workers", None)
 
         self.auxiliary_tasks = config.get("auxiliary_tasks", {})
+
+        # Load mean teacher / semi-supervised trainer config
+        # These parameters are used by TrainMeanTeacher and TrainUncertaintyAwareMeanTeacher
+        mean_teacher_config = config.get("mean_teacher_config", {})
+        for key, value in mean_teacher_config.items():
+            setattr(self, key, value)
+
+        # Load LeJEPA config - flatten into attributes
+        # These parameters are used by TrainLeJEPA
+        lejepa_config = config.get("lejepa_config", {})
+        for key, value in lejepa_config.items():
+            # Handle 'lambda' specially since it's a Python reserved word
+            # and trainer expects 'lejepa_lambda' attribute name
+            attr_name = "lejepa_lambda" if key == "lambda" else key
+            setattr(self, attr_name, value)
+
         self._init_attributes()
-    
+
         if self.auxiliary_tasks and self.targets:
             self._apply_auxiliary_tasks()
 
@@ -132,6 +148,31 @@ class ConfigManager:
         self.skip_bounding_box = bool(self.dataset_config.get("skip_bounding_box", True))
         self.cache_valid_patches = bool(self.dataset_config.get("cache_valid_patches", True))
 
+        # BG-only patch sampling configuration
+        self.bg_sampling_enabled = bool(self.dataset_config.get("bg_sampling_enabled", False))
+        self.bg_to_fg_ratio = float(self.dataset_config.get("bg_to_fg_ratio", 0.5))
+
+        # Validate BG sampling requirements: must have ignore_label configured
+        if self.bg_sampling_enabled:
+            has_ignore_label = any(
+                target_info.get("ignore_label") is not None or
+                target_info.get("ignore_index") is not None or
+                target_info.get("ignore_value") is not None
+                for target_info in self.targets.values()
+            )
+            if not has_ignore_label:
+                raise ValueError(
+                    "bg_sampling_enabled requires at least one target with ignore_label configured. "
+                    "Without ignore_label, unlabeled areas default to 0 making BG detection unreliable."
+                )
+
+        # Unlabeled foreground detection for semi-supervised learning
+        self.unlabeled_foreground_enabled = bool(self.dataset_config.get("unlabeled_foreground_enabled", False))
+        self.unlabeled_foreground_threshold = float(self.dataset_config.get("unlabeled_foreground_threshold", 0.05))
+        self.unlabeled_foreground_bbox_threshold = float(self.dataset_config.get("unlabeled_foreground_bbox_threshold", 0.15))
+        # List of volume IDs to scan for unlabeled foreground (opt-in)
+        self.unlabeled_foreground_volumes = self.dataset_config.get("unlabeled_foreground_volumes", None)
+
         rotation_axes_cfg = self.dataset_config.get("rotation_axes", None)
         axis_name_to_index = {
             'z': 0,
@@ -187,7 +228,7 @@ class ConfigManager:
             self.dataset_config['rotation_axes'] = [index_to_axis_name[idx] for idx in normalized_axes]
 
         # Chunk-slicing worker configuration
-        self.downsample_level = int(self.dataset_config.get("downsample_level", 1))
+        self.valid_patch_find_resolution = int(self.dataset_config.get("valid_patch_find_resolution", 1))
         self.num_workers = int(self.dataset_config.get("num_workers", 8))
 
         # Worker configuration for image→Zarr pipeline

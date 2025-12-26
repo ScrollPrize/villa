@@ -10,11 +10,13 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/program_options.hpp>
 
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -24,14 +26,15 @@ namespace po = boost::program_options;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+
 class SegmentRenderer {
     std::shared_ptr<VolumePkg> vpkg_;
     std::shared_ptr<Volume> volume_;
-    ChunkCache* cache_;
+    ChunkCache<uint8_t>* cache_;
 
     struct SurfaceInfo {
         std::string id;
-        QuadSurface* surface;
+        std::shared_ptr<QuadSurface> surface;
         int color_index;
     };
 
@@ -45,21 +48,6 @@ class SegmentRenderer {
 
         cv::applyColorMap(gray, colored, cv::COLORMAP_HSV);
         return colored.at<cv::Vec3b>(0, 0);
-    }
-
-    float estimateCellSize(const std::vector<QuadSurface*>& surfaces) {
-        if (surfaces.empty()) return 100.0f;
-
-        float avg_dimension = 0;
-        int count = 0;
-        for (auto* surf : surfaces) {
-            Rect3D bbox = surf->bbox();
-            avg_dimension += (bbox.high[0] - bbox.low[0]);
-            avg_dimension += (bbox.high[1] - bbox.low[1]);
-            avg_dimension += (bbox.high[2] - bbox.low[2]);
-            count += 3;
-        }
-        return (count > 0) ? (avg_dimension / count) * 2.0f : 100.0f;
     }
 
     cv::Mat generateLegend(const fs::path& output_path) {
@@ -139,9 +127,9 @@ public:
         }
         volume_ = vpkg_->volume(volume_id);
         std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
-        std::cout << "Volume dimensions: " << volume_->sliceWidth() << "x"
-                  << volume_->sliceHeight() << "x" << volume_->numSlices() << std::endl;
-        cache_ = new ChunkCache(1ULL * 1024ULL * 1024ULL * 1024ULL);
+        auto [w, h, d] = volume_->shape();
+        std::cout << "Volume dimensions: " << w << "x" << h << "x" << d << std::endl;
+        cache_ = new ChunkCache<uint8_t>(1ULL * 1024ULL * 1024ULL * 1024ULL);
     }
 
     ~SegmentRenderer() {
@@ -166,12 +154,10 @@ private:
         segment_color_map_.clear();
 
         // Load target segment
-        auto target_meta = vpkg_->loadSurface(target_segment_id);
-        if (!target_meta) {
+        auto target_surf = vpkg_->loadSurface(target_segment_id);
+        if (!target_surf) {
             throw std::runtime_error("Failed to load target segment: " + target_segment_id);
         }
-
-        QuadSurface* target_surf = target_meta->surface();
 
         cv::Mat_<cv::Vec3f> raw_points = target_surf->rawPoints();
         cv::Vec2f stored_scale = target_surf->scale();
@@ -196,7 +182,7 @@ private:
         target_surf->gen(&coords, nullptr, gen_size, center, gen_scale, offset);
 
         // Load surface IDs based on source with sorted color assignment
-        std::vector<SurfaceInfo> surfaces = loadSurfaces(target_segment_id, target_meta,
+        std::vector<SurfaceInfo> surfaces = loadSurfaces(target_segment_id, target_surf,
                                                          source, filter);
 
         std::cout << "Loaded " << surfaces.size() << " surfaces" << std::endl;
@@ -221,21 +207,15 @@ private:
             return output;
         }
 
-        // Build spatial index
-        std::vector<QuadSurface*> surface_ptrs;
+        // Build spatial index using SurfacePatchIndex
+        SurfacePatchIndex patchIndex;
+        std::vector<SurfacePatchIndex::SurfacePtr> surface_ptrs;
         for (const auto& info : surfaces) {
             surface_ptrs.push_back(info.surface);
         }
+        patchIndex.rebuild(surface_ptrs);
 
-        float cell_size = estimateCellSize(surface_ptrs);
-        MultiSurfaceIndex spatial_index(cell_size);
-
-        for (size_t i = 0; i < surfaces.size(); i++) {
-            spatial_index.addPatch(i, surfaces[i].surface);
-        }
-
-        std::cout << "Spatial index built with " << spatial_index.getCellCount()
-                  << " cells, cell size: " << cell_size << std::endl;
+        std::cout << "SurfacePatchIndex built for " << surfaces.size() << " surfaces" << std::endl;
 
         // Process with optional stride for performance
         if (stride <= 0) {
@@ -284,20 +264,19 @@ private:
 
                 valid_count++;
 
-                // Get candidate surfaces from spatial index
-                std::vector<int> candidates = spatial_index.getCandidatePatches(point, tolerance);
-
+                // Direct lookup using SurfacePatchIndex
                 bool found_match = false;
                 int matched_idx = -1;
 
-                // Check each candidate
-                for (int surf_idx : candidates) {
-                    bool contained = surfaces[surf_idx].surface->containsPoint(point, tolerance);
-
-                    if (contained) {
-                        matched_idx = surf_idx;
-                        found_match = true;
-                        break;
+                auto result = patchIndex.locate(point, tolerance);
+                if (result.has_value()) {
+                    // Find matching surface index
+                    for (size_t idx = 0; idx < surfaces.size(); idx++) {
+                        if (surfaces[idx].surface == result->surface) {
+                            matched_idx = static_cast<int>(idx);
+                            found_match = true;
+                            break;
+                        }
                     }
                 }
 
@@ -332,12 +311,12 @@ private:
     }
 
     std::vector<SurfaceInfo> loadSurfaces(const std::string& target_id,
-                                          std::shared_ptr<SurfaceMeta> target_meta,
+                                          std::shared_ptr<QuadSurface> target_surf,
                                           const std::string& source,
                                           const std::string& filter) {
 
         std::vector<SurfaceInfo> surfaces;
-        std::vector<std::string> surface_ids = getSurfaceIds(target_id, target_meta, source);
+        std::vector<std::string> surface_ids = getSurfaceIds(target_id, target_surf, source);
 
         // Apply filter if provided
         if (!filter.empty()) {
@@ -353,15 +332,15 @@ private:
 
         // Handle sequence source specially
         if (source == "sequence") {
-            return loadSequenceSurfaces(target_id, target_meta, surface_ids);
+            return loadSequenceSurfaces(target_id, target_surf, surface_ids);
         }
 
         // Load all surfaces with color indices based on sorted order
         int color_idx = 0;
         for (const auto& surf_id : surface_ids) {
-            auto surf_meta = vpkg_->loadSurface(surf_id);
-            if (surf_meta) {
-                surfaces.push_back({surf_id, surf_meta->surface(), color_idx});
+            auto surf = vpkg_->loadSurface(surf_id);
+            if (surf) {
+                surfaces.push_back({surf_id, surf, color_idx});
                 segment_color_map_[surf_id] = color_idx;
                 std::cout << "  " << surf_id << " -> color index " << color_idx << std::endl;
                 color_idx++;
@@ -374,7 +353,7 @@ private:
     }
 
     std::vector<SurfaceInfo> loadSequenceSurfaces(const std::string& target_id,
-                                                  std::shared_ptr<SurfaceMeta> target_meta,
+                                                  std::shared_ptr<QuadSurface> target_surf,
                                                   const std::vector<std::string>& sorted_sequence) {
         std::vector<SurfaceInfo> surfaces;
 
@@ -388,12 +367,12 @@ private:
         bool found_target = false;
 
         // Need to get original unsorted sequence for loading order
-        std::vector<std::string> original_sequence = getSurfaceIds(target_id, target_meta, "sequence");
+        std::vector<std::string> original_sequence = getSurfaceIds(target_id, target_surf, "sequence");
 
         for (const auto& seq_id : original_sequence) {
-            auto surf_meta = vpkg_->loadSurface(seq_id);
-            if (surf_meta && segment_color_map_.find(seq_id) != segment_color_map_.end()) {
-                surfaces.push_back({seq_id, surf_meta->surface(), segment_color_map_[seq_id]});
+            auto surf = vpkg_->loadSurface(seq_id);
+            if (surf && segment_color_map_.find(seq_id) != segment_color_map_.end()) {
+                surfaces.push_back({seq_id, surf, segment_color_map_[seq_id]});
             }
 
             if (seq_id == target_id) {
@@ -408,25 +387,22 @@ private:
             if (segment_color_map_.find(target_id) == segment_color_map_.end()) {
                 segment_color_map_[target_id] = segment_color_map_.size();
             }
-            surfaces.push_back({target_id, target_meta->surface(), segment_color_map_[target_id]});
+            surfaces.push_back({target_id, target_surf, segment_color_map_[target_id]});
         }
 
         return surfaces;
     }
 
     std::vector<std::string> getSurfaceIds(const std::string& target_id,
-                                           std::shared_ptr<SurfaceMeta> target_meta,
+                                           std::shared_ptr<QuadSurface> target_surf,
                                            const std::string& source) {
         std::vector<std::string> ids;
 
         if (source == "overlapping") {
-            target_meta->readOverlapping();
-            if (!target_meta->overlapping_str.empty()) {
-                ids.assign(target_meta->overlapping_str.begin(),
-                          target_meta->overlapping_str.end());
-            }
+            auto overlapping_ids = target_surf->overlappingIds();
+            ids.assign(overlapping_ids.begin(), overlapping_ids.end());
         } else if (source == "contributing" || source == "approved_patches" || source == "sequence") {
-            fs::path meta_path = target_meta->path / "meta.json";
+            fs::path meta_path = target_surf->path / "meta.json";
             if (fs::exists(meta_path)) {
                 std::ifstream meta_file(meta_path);
                 json meta_json;

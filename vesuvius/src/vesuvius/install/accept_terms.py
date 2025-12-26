@@ -52,9 +52,7 @@ def display_terms_and_conditions(accept_terms):
     terms = """
     ## LICENSE
 
-    The PHerc. 172 (Scroll 5) dataset Â© 2024 by Scroll Prize and the Bodleian Library is licensed under CC BY-NC 4.0: https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt.
-
-    All other Vesuvius Challenge datasets are bound by the following terms:
+    All Vesuvius Challenge datasets are released under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt), except Scrolls 1–4 and Fragments 1–6, which are bound by the following terms:
 
     By registering for downloads from the EduceLab-Scrolls Dataset and Vesuvius Challenge Discord Server, I agree to license the data from Vesuvius Challenge* under the following licensing terms:
     - I agree that all points below apply to both the EduceLab-Scrolls Dataset downloaded from our webserver, as well as any data (e.g. text, pictures, code) downloaded from the Vesuvius Challenge Discord Server.

@@ -7,6 +7,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
@@ -26,6 +27,7 @@
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSpinBox>
 #include <QToolButton>
 #include <QVariant>
@@ -518,6 +520,107 @@ void SegmentationWidget::buildUi()
 
     layout->addWidget(_groupEditing);
 
+    // Approval Mask Group
+    _groupApprovalMask = new CollapsibleSettingsGroup(tr("Approval Mask"), this);
+    auto* approvalLayout = _groupApprovalMask->contentLayout();
+    auto* approvalParent = _groupApprovalMask->contentWidget();
+
+    // Show approval mask checkbox
+    _chkShowApprovalMask = new QCheckBox(tr("Show Approval Mask"), approvalParent);
+    _chkShowApprovalMask->setToolTip(tr("Display the approval mask overlay on the surface."));
+    approvalLayout->addWidget(_chkShowApprovalMask);
+
+    // Edit checkboxes row - mutually exclusive approve/unapprove modes
+    auto* editRow = new QHBoxLayout();
+    editRow->setSpacing(8);
+
+    _chkEditApprovedMask = new QCheckBox(tr("Edit Approved (B)"), approvalParent);
+    _chkEditApprovedMask->setToolTip(tr("Paint regions as approved. Saves to disk when toggled off."));
+    _chkEditApprovedMask->setEnabled(false);  // Only enabled when show is checked
+
+    _chkEditUnapprovedMask = new QCheckBox(tr("Edit Unapproved (N)"), approvalParent);
+    _chkEditUnapprovedMask->setToolTip(tr("Paint regions as unapproved. Saves to disk when toggled off."));
+    _chkEditUnapprovedMask->setEnabled(false);  // Only enabled when show is checked
+
+    editRow->addWidget(_chkEditApprovedMask);
+    editRow->addWidget(_chkEditUnapprovedMask);
+    editRow->addStretch(1);
+    approvalLayout->addLayout(editRow);
+
+    // Cylinder brush controls: radius and depth
+    // Radius = circle in plane views, width of rectangle in flattened view
+    // Depth = height of rectangle in flattened view, cylinder thickness for plane painting
+    auto* approvalBrushRow = new QHBoxLayout();
+    approvalBrushRow->setSpacing(8);
+
+    auto* brushRadiusLabel = new QLabel(tr("Radius:"), approvalParent);
+    _spinApprovalBrushRadius = new QDoubleSpinBox(approvalParent);
+    _spinApprovalBrushRadius->setDecimals(0);
+    _spinApprovalBrushRadius->setRange(1.0, 1000.0);
+    _spinApprovalBrushRadius->setSingleStep(10.0);
+    _spinApprovalBrushRadius->setValue(_approvalBrushRadius);
+    _spinApprovalBrushRadius->setToolTip(tr("Cylinder radius: circle size in plane views, rectangle width in flattened view (native voxels)."));
+    approvalBrushRow->addWidget(brushRadiusLabel);
+    approvalBrushRow->addWidget(_spinApprovalBrushRadius);
+
+    auto* brushDepthLabel = new QLabel(tr("Depth:"), approvalParent);
+    _spinApprovalBrushDepth = new QDoubleSpinBox(approvalParent);
+    _spinApprovalBrushDepth->setDecimals(0);
+    _spinApprovalBrushDepth->setRange(1.0, 500.0);
+    _spinApprovalBrushDepth->setSingleStep(5.0);
+    _spinApprovalBrushDepth->setValue(_approvalBrushDepth);
+    _spinApprovalBrushDepth->setToolTip(tr("Cylinder depth: rectangle height in flattened view, painting thickness from plane views (native voxels)."));
+    approvalBrushRow->addWidget(brushDepthLabel);
+    approvalBrushRow->addWidget(_spinApprovalBrushDepth);
+    approvalBrushRow->addStretch(1);
+    approvalLayout->addLayout(approvalBrushRow);
+
+    // Opacity slider row
+    auto* opacityRow = new QHBoxLayout();
+    opacityRow->setSpacing(8);
+
+    auto* opacityLabel = new QLabel(tr("Opacity:"), approvalParent);
+    _sliderApprovalMaskOpacity = new QSlider(Qt::Horizontal, approvalParent);
+    _sliderApprovalMaskOpacity->setRange(0, 100);
+    _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    _sliderApprovalMaskOpacity->setToolTip(tr("Mask overlay transparency (0 = transparent, 100 = opaque)."));
+
+    _lblApprovalMaskOpacity = new QLabel(QString::number(_approvalMaskOpacity) + QStringLiteral("%"), approvalParent);
+    _lblApprovalMaskOpacity->setMinimumWidth(35);
+
+    opacityRow->addWidget(opacityLabel);
+    opacityRow->addWidget(_sliderApprovalMaskOpacity, 1);
+    opacityRow->addWidget(_lblApprovalMaskOpacity);
+    approvalLayout->addLayout(opacityRow);
+
+    // Color picker row
+    auto* colorRow = new QHBoxLayout();
+    colorRow->setSpacing(8);
+
+    auto* colorLabel = new QLabel(tr("Brush Color:"), approvalParent);
+    _btnApprovalColor = new QPushButton(approvalParent);
+    _btnApprovalColor->setFixedSize(60, 24);
+    _btnApprovalColor->setToolTip(tr("Click to choose the color for approval mask painting."));
+    // Set initial color preview
+    _btnApprovalColor->setStyleSheet(
+        QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
+
+    colorRow->addWidget(colorLabel);
+    colorRow->addWidget(_btnApprovalColor);
+    colorRow->addStretch(1);
+    approvalLayout->addLayout(colorRow);
+
+    // Undo button
+    auto* buttonRow = new QHBoxLayout();
+    buttonRow->setSpacing(8);
+    _btnUndoApprovalStroke = new QPushButton(tr("Undo (Ctrl+B)"), approvalParent);
+    _btnUndoApprovalStroke->setToolTip(tr("Undo the last approval mask brush stroke."));
+    buttonRow->addWidget(_btnUndoApprovalStroke);
+    buttonRow->addStretch(1);
+    approvalLayout->addLayout(buttonRow);
+
+    layout->addWidget(_groupApprovalMask);
+
     _groupDirectionField = new CollapsibleSettingsGroup(tr("Direction Fields"), this);
 
     auto* directionParent = _groupDirectionField->contentWidget();
@@ -668,6 +771,49 @@ void SegmentationWidget::buildUi()
     connect(_chkShowHoverMarker, &QCheckBox::toggled, this, [this](bool enabled) {
         setShowHoverMarker(enabled);
     });
+
+    // Approval mask signal connections
+    connect(_chkShowApprovalMask, &QCheckBox::toggled, this, [this](bool enabled) {
+        setShowApprovalMask(enabled);
+        // If show is being unchecked and edit modes are active, turn them off
+        if (!enabled) {
+            if (_editApprovedMask) {
+                setEditApprovedMask(false);
+            }
+            if (_editUnapprovedMask) {
+                setEditUnapprovedMask(false);
+            }
+        }
+    });
+
+    connect(_chkEditApprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
+        setEditApprovedMask(enabled);
+    });
+
+    connect(_chkEditUnapprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
+        setEditUnapprovedMask(enabled);
+    });
+
+    connect(_spinApprovalBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setApprovalBrushRadius(static_cast<float>(value));
+    });
+
+    connect(_spinApprovalBrushDepth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setApprovalBrushDepth(static_cast<float>(value));
+    });
+
+    connect(_sliderApprovalMaskOpacity, &QSlider::valueChanged, this, [this](int value) {
+        setApprovalMaskOpacity(value);
+    });
+
+    connect(_btnApprovalColor, &QPushButton::clicked, this, [this]() {
+        QColor newColor = QColorDialog::getColor(_approvalBrushColor, this, tr("Choose Approval Mask Color"));
+        if (newColor.isValid()) {
+            setApprovalBrushColor(newColor);
+        }
+    });
+
+    connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
@@ -1140,34 +1286,60 @@ void SegmentationWidget::syncUiState()
         _lblNormalGrid->setAccessibleDescription(message);
     }
 
+    // Approval mask checkboxes
+    if (_chkShowApprovalMask) {
+        const QSignalBlocker blocker(_chkShowApprovalMask);
+        _chkShowApprovalMask->setChecked(_showApprovalMask);
+    }
+    if (_chkEditApprovedMask) {
+        const QSignalBlocker blocker(_chkEditApprovedMask);
+        _chkEditApprovedMask->setChecked(_editApprovedMask);
+        // Edit checkboxes only enabled when show is checked
+        _chkEditApprovedMask->setEnabled(_showApprovalMask);
+    }
+    if (_chkEditUnapprovedMask) {
+        const QSignalBlocker blocker(_chkEditUnapprovedMask);
+        _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
+        // Edit checkboxes only enabled when show is checked
+        _chkEditUnapprovedMask->setEnabled(_showApprovalMask);
+    }
+    if (_sliderApprovalMaskOpacity) {
+        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
+        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    }
+    if (_lblApprovalMaskOpacity) {
+        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
+
     updateGrowthUiState();
 }
 
 void SegmentationWidget::restoreSettings()
 {
+    using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(settingsGroup());
 
     _restoringSettings = true;
 
-    if (settings.contains(QStringLiteral("drag_radius_steps"))) {
-        _dragRadiusSteps = settings.value(QStringLiteral("drag_radius_steps"), _dragRadiusSteps).toFloat();
+    if (settings.contains(segmentation::DRAG_RADIUS_STEPS)) {
+        _dragRadiusSteps = settings.value(segmentation::DRAG_RADIUS_STEPS, _dragRadiusSteps).toFloat();
     } else {
-        _dragRadiusSteps = settings.value(QStringLiteral("radius_steps"), _dragRadiusSteps).toFloat();
+        _dragRadiusSteps = settings.value(segmentation::RADIUS_STEPS, _dragRadiusSteps).toFloat();
     }
 
-    if (settings.contains(QStringLiteral("drag_sigma_steps"))) {
-        _dragSigmaSteps = settings.value(QStringLiteral("drag_sigma_steps"), _dragSigmaSteps).toFloat();
+    if (settings.contains(segmentation::DRAG_SIGMA_STEPS)) {
+        _dragSigmaSteps = settings.value(segmentation::DRAG_SIGMA_STEPS, _dragSigmaSteps).toFloat();
     } else {
-        _dragSigmaSteps = settings.value(QStringLiteral("sigma_steps"), _dragSigmaSteps).toFloat();
+        _dragSigmaSteps = settings.value(segmentation::SIGMA_STEPS, _dragSigmaSteps).toFloat();
     }
 
-    _lineRadiusSteps = settings.value(QStringLiteral("line_radius_steps"), _dragRadiusSteps).toFloat();
-    _lineSigmaSteps = settings.value(QStringLiteral("line_sigma_steps"), _dragSigmaSteps).toFloat();
+    _lineRadiusSteps = settings.value(segmentation::LINE_RADIUS_STEPS, _dragRadiusSteps).toFloat();
+    _lineSigmaSteps = settings.value(segmentation::LINE_SIGMA_STEPS, _dragSigmaSteps).toFloat();
 
-    _pushPullRadiusSteps = settings.value(QStringLiteral("push_pull_radius_steps"), _dragRadiusSteps).toFloat();
-    _pushPullSigmaSteps = settings.value(QStringLiteral("push_pull_sigma_steps"), _dragSigmaSteps).toFloat();
-    _showHoverMarker = settings.value(QStringLiteral("show_hover_marker"), _showHoverMarker).toBool();
+    _pushPullRadiusSteps = settings.value(segmentation::PUSH_PULL_RADIUS_STEPS, _dragRadiusSteps).toFloat();
+    _pushPullSigmaSteps = settings.value(segmentation::PUSH_PULL_SIGMA_STEPS, _dragSigmaSteps).toFloat();
+    _showHoverMarker = settings.value(segmentation::SHOW_HOVER_MARKER, _showHoverMarker).toBool();
 
     _dragRadiusSteps = std::clamp(_dragRadiusSteps, 0.25f, 128.0f);
     _dragSigmaSteps = std::clamp(_dragSigmaSteps, 0.05f, 64.0f);
@@ -1176,27 +1348,27 @@ void SegmentationWidget::restoreSettings()
     _pushPullRadiusSteps = std::clamp(_pushPullRadiusSteps, 0.25f, 128.0f);
     _pushPullSigmaSteps = std::clamp(_pushPullSigmaSteps, 0.05f, 64.0f);
 
-    _pushPullStep = settings.value(QStringLiteral("push_pull_step"), _pushPullStep).toFloat();
+    _pushPullStep = settings.value(segmentation::PUSH_PULL_STEP, _pushPullStep).toFloat();
     _pushPullStep = std::clamp(_pushPullStep, 0.05f, 10.0f);
 
     AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
-    storedAlpha.start = settings.value(QStringLiteral("push_pull_alpha_start"), storedAlpha.start).toFloat();
-    storedAlpha.stop = settings.value(QStringLiteral("push_pull_alpha_stop"), storedAlpha.stop).toFloat();
-    storedAlpha.step = settings.value(QStringLiteral("push_pull_alpha_step"), storedAlpha.step).toFloat();
-    storedAlpha.low = settings.value(QStringLiteral("push_pull_alpha_low"), storedAlpha.low).toFloat();
-    storedAlpha.high = settings.value(QStringLiteral("push_pull_alpha_high"), storedAlpha.high).toFloat();
-    storedAlpha.borderOffset = settings.value(QStringLiteral("push_pull_alpha_border"), storedAlpha.borderOffset).toFloat();
-    storedAlpha.blurRadius = settings.value(QStringLiteral("push_pull_alpha_radius"), storedAlpha.blurRadius).toInt();
-    storedAlpha.perVertexLimit = settings.value(QStringLiteral("push_pull_alpha_limit"), storedAlpha.perVertexLimit).toFloat();
-    storedAlpha.perVertex = settings.value(QStringLiteral("push_pull_alpha_per_vertex"), storedAlpha.perVertex).toBool();
+    storedAlpha.start = settings.value(segmentation::PUSH_PULL_ALPHA_START, storedAlpha.start).toFloat();
+    storedAlpha.stop = settings.value(segmentation::PUSH_PULL_ALPHA_STOP, storedAlpha.stop).toFloat();
+    storedAlpha.step = settings.value(segmentation::PUSH_PULL_ALPHA_STEP, storedAlpha.step).toFloat();
+    storedAlpha.low = settings.value(segmentation::PUSH_PULL_ALPHA_LOW, storedAlpha.low).toFloat();
+    storedAlpha.high = settings.value(segmentation::PUSH_PULL_ALPHA_HIGH, storedAlpha.high).toFloat();
+    storedAlpha.borderOffset = settings.value(segmentation::PUSH_PULL_ALPHA_BORDER, storedAlpha.borderOffset).toFloat();
+    storedAlpha.blurRadius = settings.value(segmentation::PUSH_PULL_ALPHA_RADIUS, storedAlpha.blurRadius).toInt();
+    storedAlpha.perVertexLimit = settings.value(segmentation::PUSH_PULL_ALPHA_LIMIT, storedAlpha.perVertexLimit).toFloat();
+    storedAlpha.perVertex = settings.value(segmentation::PUSH_PULL_ALPHA_PER_VERTEX, storedAlpha.perVertex).toBool();
     applyAlphaPushPullConfig(storedAlpha, false, false);
-    _smoothStrength = settings.value(QStringLiteral("smooth_strength"), _smoothStrength).toFloat();
-    _smoothIterations = settings.value(QStringLiteral("smooth_iterations"), _smoothIterations).toInt();
+    _smoothStrength = settings.value(segmentation::SMOOTH_STRENGTH, _smoothStrength).toFloat();
+    _smoothIterations = settings.value(segmentation::SMOOTH_ITERATIONS, _smoothIterations).toInt();
     _smoothStrength = std::clamp(_smoothStrength, 0.0f, 1.0f);
     _smoothIterations = std::clamp(_smoothIterations, 1, 25);
     _growthMethod = segmentationGrowthMethodFromInt(
-        settings.value(QStringLiteral("growth_method"), static_cast<int>(_growthMethod)).toInt());
-    int storedGrowthSteps = settings.value(QStringLiteral("growth_steps"), _growthSteps).toInt();
+        settings.value(segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod)).toInt());
+    int storedGrowthSteps = settings.value(segmentation::GROWTH_STEPS, _growthSteps).toInt();
     storedGrowthSteps = std::clamp(storedGrowthSteps, 0, 1024);
     _tracerGrowthSteps = settings
                              .value(QStringLiteral("growth_steps_tracer"),
@@ -1205,9 +1377,9 @@ void SegmentationWidget::restoreSettings()
     _tracerGrowthSteps = std::clamp(_tracerGrowthSteps, 1, 1024);
     applyGrowthSteps(storedGrowthSteps, false, false);
     _growthDirectionMask = normalizeGrowthDirectionMask(
-        settings.value(QStringLiteral("growth_direction_mask"), kGrowDirAllMask).toInt());
+        settings.value(segmentation::GROWTH_DIRECTION_MASK, kGrowDirAllMask).toInt());
 
-    QVariantList serialized = settings.value(QStringLiteral("direction_fields"), QVariantList{}).toList();
+    QVariantList serialized = settings.value(segmentation::DIRECTION_FIELDS, QVariantList{}).toList();
     _directionFields.clear();
     for (const QVariant& entry : serialized) {
         const QVariantMap map = entry.toMap();
@@ -1222,22 +1394,37 @@ void SegmentationWidget::restoreSettings()
         }
     }
 
-    _correctionsEnabled = settings.value(QStringLiteral("corrections_enabled"), false).toBool();
-    _correctionsZRangeEnabled = settings.value(QStringLiteral("corrections_z_range_enabled"), false).toBool();
-    _correctionsZMin = settings.value(QStringLiteral("corrections_z_min"), 0).toInt();
-   _correctionsZMax = settings.value(QStringLiteral("corrections_z_max"), _correctionsZMin).toInt();
+    _correctionsEnabled = settings.value(segmentation::CORRECTIONS_ENABLED, segmentation::CORRECTIONS_ENABLED_DEFAULT).toBool();
+    _correctionsZRangeEnabled = settings.value(segmentation::CORRECTIONS_Z_RANGE_ENABLED, segmentation::CORRECTIONS_Z_RANGE_ENABLED_DEFAULT).toBool();
+    _correctionsZMin = settings.value(segmentation::CORRECTIONS_Z_MIN, segmentation::CORRECTIONS_Z_MIN_DEFAULT).toInt();
+   _correctionsZMax = settings.value(segmentation::CORRECTIONS_Z_MAX, _correctionsZMin).toInt();
     if (_correctionsZMax < _correctionsZMin) {
         _correctionsZMax = _correctionsZMin;
     }
 
-    _customParamsText = settings.value(QStringLiteral("custom_params_text"), QString()).toString();
+    _customParamsText = settings.value(segmentation::CUSTOM_PARAMS_TEXT, QString()).toString();
     validateCustomParamsText();
 
-    const bool editingExpanded = settings.value(QStringLiteral("group_editing_expanded"), true).toBool();
-    const bool dragExpanded = settings.value(QStringLiteral("group_drag_expanded"), true).toBool();
-    const bool lineExpanded = settings.value(QStringLiteral("group_line_expanded"), true).toBool();
-    const bool pushPullExpanded = settings.value(QStringLiteral("group_push_pull_expanded"), true).toBool();
-    const bool directionExpanded = settings.value(QStringLiteral("group_direction_field_expanded"), true).toBool();
+    _approvalBrushRadius = settings.value(segmentation::APPROVAL_BRUSH_RADIUS, _approvalBrushRadius).toFloat();
+    _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
+    _approvalBrushDepth = settings.value(segmentation::APPROVAL_BRUSH_DEPTH, _approvalBrushDepth).toFloat();
+    _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
+    // Don't restore approval mask show/edit states - user must explicitly enable each session
+
+    _approvalMaskOpacity = settings.value(segmentation::APPROVAL_MASK_OPACITY, _approvalMaskOpacity).toInt();
+    _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
+    const QString colorName = settings.value(segmentation::APPROVAL_BRUSH_COLOR, _approvalBrushColor.name()).toString();
+    if (QColor::isValidColorName(colorName)) {
+        _approvalBrushColor = QColor::fromString(colorName);
+    }
+    _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
+    // Don't restore edit states - user must explicitly enable editing each session
+
+    const bool editingExpanded = settings.value(segmentation::GROUP_EDITING_EXPANDED, segmentation::GROUP_EDITING_EXPANDED_DEFAULT).toBool();
+    const bool dragExpanded = settings.value(segmentation::GROUP_DRAG_EXPANDED, segmentation::GROUP_DRAG_EXPANDED_DEFAULT).toBool();
+    const bool lineExpanded = settings.value(segmentation::GROUP_LINE_EXPANDED, segmentation::GROUP_LINE_EXPANDED_DEFAULT).toBool();
+    const bool pushPullExpanded = settings.value(segmentation::GROUP_PUSH_PULL_EXPANDED, segmentation::GROUP_PUSH_PULL_EXPANDED_DEFAULT).toBool();
+    const bool directionExpanded = settings.value(segmentation::GROUP_DIRECTION_FIELD_EXPANDED, segmentation::GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT).toBool();
 
     if (_groupEditing) {
         _groupEditing->setExpanded(editingExpanded);
@@ -1307,6 +1494,145 @@ void SegmentationWidget::setShowHoverMarker(bool enabled)
     if (_chkShowHoverMarker) {
         const QSignalBlocker blocker(_chkShowHoverMarker);
         _chkShowHoverMarker->setChecked(_showHoverMarker);
+    }
+}
+
+void SegmentationWidget::setShowApprovalMask(bool enabled)
+{
+    if (_showApprovalMask == enabled) {
+        return;
+    }
+    _showApprovalMask = enabled;
+    qInfo() << "SegmentationWidget: Show approval mask changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("show_approval_mask"), _showApprovalMask);
+        qInfo() << "  Emitting showApprovalMaskChanged signal";
+        emit showApprovalMaskChanged(_showApprovalMask);
+    }
+    if (_chkShowApprovalMask) {
+        const QSignalBlocker blocker(_chkShowApprovalMask);
+        _chkShowApprovalMask->setChecked(_showApprovalMask);
+    }
+    syncUiState();
+}
+
+void SegmentationWidget::setEditApprovedMask(bool enabled)
+{
+    if (_editApprovedMask == enabled) {
+        return;
+    }
+    _editApprovedMask = enabled;
+    qInfo() << "SegmentationWidget: Edit approved mask changed to:" << enabled;
+
+    // Mutual exclusion: if enabling approved, disable unapproved
+    if (enabled && _editUnapprovedMask) {
+        setEditUnapprovedMask(false);
+    }
+
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("edit_approved_mask"), _editApprovedMask);
+        qInfo() << "  Emitting editApprovedMaskChanged signal";
+        emit editApprovedMaskChanged(_editApprovedMask);
+    }
+    if (_chkEditApprovedMask) {
+        const QSignalBlocker blocker(_chkEditApprovedMask);
+        _chkEditApprovedMask->setChecked(_editApprovedMask);
+    }
+    syncUiState();
+}
+
+void SegmentationWidget::setEditUnapprovedMask(bool enabled)
+{
+    if (_editUnapprovedMask == enabled) {
+        return;
+    }
+    _editUnapprovedMask = enabled;
+    qInfo() << "SegmentationWidget: Edit unapproved mask changed to:" << enabled;
+
+    // Mutual exclusion: if enabling unapproved, disable approved
+    if (enabled && _editApprovedMask) {
+        setEditApprovedMask(false);
+    }
+
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("edit_unapproved_mask"), _editUnapprovedMask);
+        qInfo() << "  Emitting editUnapprovedMaskChanged signal";
+        emit editUnapprovedMaskChanged(_editUnapprovedMask);
+    }
+    if (_chkEditUnapprovedMask) {
+        const QSignalBlocker blocker(_chkEditUnapprovedMask);
+        _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
+    }
+    syncUiState();
+}
+
+void SegmentationWidget::setApprovalBrushRadius(float radius)
+{
+    const float sanitized = std::clamp(radius, 1.0f, 1000.0f);
+    if (std::abs(_approvalBrushRadius - sanitized) < 1e-4f) {
+        return;
+    }
+    _approvalBrushRadius = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_radius"), _approvalBrushRadius);
+        emit approvalBrushRadiusChanged(_approvalBrushRadius);
+    }
+    if (_spinApprovalBrushRadius) {
+        const QSignalBlocker blocker(_spinApprovalBrushRadius);
+        _spinApprovalBrushRadius->setValue(static_cast<double>(_approvalBrushRadius));
+    }
+}
+
+void SegmentationWidget::setApprovalBrushDepth(float depth)
+{
+    const float sanitized = std::clamp(depth, 1.0f, 500.0f);
+    if (std::abs(_approvalBrushDepth - sanitized) < 1e-4f) {
+        return;
+    }
+    _approvalBrushDepth = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_depth"), _approvalBrushDepth);
+        emit approvalBrushDepthChanged(_approvalBrushDepth);
+    }
+    if (_spinApprovalBrushDepth) {
+        const QSignalBlocker blocker(_spinApprovalBrushDepth);
+        _spinApprovalBrushDepth->setValue(static_cast<double>(_approvalBrushDepth));
+    }
+}
+
+void SegmentationWidget::setApprovalMaskOpacity(int opacity)
+{
+    const int sanitized = std::clamp(opacity, 0, 100);
+    if (_approvalMaskOpacity == sanitized) {
+        return;
+    }
+    _approvalMaskOpacity = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity);
+        emit approvalMaskOpacityChanged(_approvalMaskOpacity);
+    }
+    if (_sliderApprovalMaskOpacity) {
+        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
+        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    }
+    if (_lblApprovalMaskOpacity) {
+        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
+}
+
+void SegmentationWidget::setApprovalBrushColor(const QColor& color)
+{
+    if (!color.isValid() || _approvalBrushColor == color) {
+        return;
+    }
+    _approvalBrushColor = color;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_color"), _approvalBrushColor.name());
+        emit approvalBrushColorChanged(_approvalBrushColor);
+    }
+    if (_btnApprovalColor) {
+        _btnApprovalColor->setStyleSheet(
+            QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
 }
 

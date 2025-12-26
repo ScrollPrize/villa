@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <iostream>
@@ -310,14 +311,20 @@ private:
 struct Flatboi {
   std::string input_obj;
   int max_iter = 50;
-
+  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
   Eigen::MatrixXd V;          // #V x 3
   Eigen::MatrixXi F;          // #F x 3
   Eigen::MatrixXd TC;         // #TC x 2
   Eigen::MatrixXi FTC;        // #F x 3
   bool have_per_corner_uv = false;
 
-  Flatboi(const std::string& obj_path, int max_iter_) : input_obj(obj_path), max_iter(max_iter_) {
+  // Backwards-compatible constructor: defaults to Symmetric Dirichlet
+  Flatboi(const std::string& obj_path, int max_iter_)
+    : Flatboi(obj_path, max_iter_, igl::MappingEnergyType::SYMMETRIC_DIRICHLET) {}
+
+  // New constructor where the caller can select the SLIM energy type
+  Flatboi(const std::string& obj_path, int max_iter_, igl::MappingEnergyType energy_)
+    : input_obj(obj_path), max_iter(max_iter_), energy(energy_) {
     read_mesh();
   }
 
@@ -463,7 +470,7 @@ struct Flatboi {
     igl::SLIMData data;
     igl::slim_precompute(
       V, F, uv, data,
-      igl::MappingEnergyType::SYMMETRIC_DIRICHLET,
+      energy,          // <- selected at construction time
       bnd, bnd_uv,
       /*soft_penalty=*/0.0
     );
@@ -855,21 +862,49 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 // main
 // ------------------------------
 int main(int argc, char** argv) {
-  if(argc != 3) {
-    std::cerr << "Usage: " << argv[0] << " <mesh.obj> <iters>\n";
+  if (argc < 3 || argc > 4) {
+    std::cerr << "Usage: " << argv[0] << " <mesh.obj> <iters> [energy]\n"
+              << "  energy (optional): symmetric_dirichlet (default) or conformal\n";
     return 1;
   }
+
   const std::string obj_path = argv[1];
   const int iters = std::atoi(argv[2]);
-  if(iters <= 0) { std::cerr << "iters must be > 0\n"; return 1; }
-  if(!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
-  if(fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
+  if (iters <= 0) { std::cerr << "iters must be > 0\n"; return 1; }
+  if (!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
+  if (fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
+
+  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
+  std::string energy_label = "symmetric_dirichlet";
+
+  if (argc == 4) {
+    std::string e = argv[3];
+    std::string e_lower = e;
+    std::transform(
+      e_lower.begin(), e_lower.end(), e_lower.begin(),
+      [](unsigned char c){ return static_cast<char>(std::tolower(c)); }
+    );
+
+    if (e_lower == "symmetric_dirichlet" || e_lower == "symmetric-dirichlet" || e_lower == "sd") {
+      energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
+      energy_label = "symmetric_dirichlet";
+    } else if (e_lower == "conformal" || e_lower == "conf") {
+      energy = igl::MappingEnergyType::CONFORMAL;
+      energy_label = "conformal";
+    } else {
+      std::cerr << "Unknown energy type '" << e
+                << "'. Supported: symmetric_dirichlet, conformal\n";
+      return 1;
+    }
+  }
+
+  std::cout << "Using SLIM energy: " << energy_label << "\n";
 
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
   
   try {
-    Flatboi fb(obj_path, iters);
+    Flatboi fb(obj_path, iters, energy);
 
     WBLogger wblog(obj_path, iters); // optional; becomes no-op if unavailable
 

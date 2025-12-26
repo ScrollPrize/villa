@@ -1,6 +1,7 @@
 #include "SegmentationPushPullTool.hpp"
 
 #include "SegmentationModule.hpp"
+#include "ViewerManager.hpp"
 #include "CVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
@@ -24,11 +25,16 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
 Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
 
 namespace
 {
-constexpr int kPushPullIntervalMs = 30;
+constexpr int kPushPullIntervalMs = 16;       // ~60fps for smooth feedback
+constexpr int kPushPullIntervalMsFast = 16;   // Non-alpha mode: faster feedback
+constexpr int kPushPullIntervalMsSlow = 100;  // Alpha mode: more time for computation
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -83,7 +89,8 @@ std::optional<cv::Vec3f> averageNormals(const std::vector<cv::Vec3f>& normals)
 
 std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
                                                         const cv::Vec3f& basePtr,
-                                                        const SegmentationEditManager::ActiveDrag& drag)
+                                                        const SegmentationEditManager::ActiveDrag& drag,
+                                                        SurfacePatchIndex* patchIndex = nullptr)
 {
     if (!surface || !drag.active) {
         return std::nullopt;
@@ -95,7 +102,7 @@ std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
     // Try the center first, then nearby samples in order of proximity.
     const auto collectNormalAt = [&](const cv::Vec3f& worldPoint) {
         cv::Vec3f ptrCandidate = basePtr;
-        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200);
+        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200, patchIndex);
         const cv::Vec3f candidateNormal = surface->normal(ptrCandidate);
         if (isValidNormal(candidateNormal)) {
             normals.push_back(candidateNormal);
@@ -325,13 +332,14 @@ std::optional<cv::Vec3f> fitPlaneNormal(const SegmentationEditManager::ActiveDra
 std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
                                              const cv::Vec3f& centerPtr,
                                              const cv::Vec3f& centerWorld,
-                                             const SegmentationEditManager::ActiveDrag& drag)
+                                             const SegmentationEditManager::ActiveDrag& drag,
+                                             SurfacePatchIndex* patchIndex = nullptr)
 {
     if (!surface || !drag.active) {
         return std::nullopt;
     }
 
-    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag);
+    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag, patchIndex);
     const auto rowVec = axisVectorFromSamples(AxisDirection::Row, drag);
     const auto colVec = axisVectorFromSamples(AxisDirection::Column, drag);
 
@@ -466,17 +474,24 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     _state.active = true;
     _state.direction = direction;
     _undoCaptured = false;
+
+    // Reset cached position for new operation
+    _cachedRow = -1;
+    _cachedCol = -1;
+    _samplesValid = false;
+
     _module.useFalloff(SegmentationModule::FalloffTool::PushPull);
 
-    if (_timer && !_timer->isActive()) {
-        _timer->start();
+    // Set adaptive timer interval based on alpha mode
+    if (_timer) {
+        const int interval = _activeAlphaEnabled ? kPushPullIntervalMsSlow : kPushPullIntervalMsFast;
+        _timer->setInterval(interval);
+        if (!_timer->isActive()) {
+            _timer->start();
+        }
     }
 
-    if (!applyStepInternal()) {
-        stopAll();
-        return false;
-    }
-
+    // Let the timer handle the first step asynchronously to avoid blocking the UI
     return true;
 }
 
@@ -493,17 +508,54 @@ void SegmentationPushPullTool::stop(int direction)
 
 void SegmentationPushPullTool::stopAll()
 {
+    const bool wasActive = _state.active;
     _state.active = false;
     _state.direction = 0;
     if (_timer && _timer->isActive()) {
         _timer->stop();
     }
-    _undoCaptured = false;
     _alphaOverrideActive = false;
     _activeAlphaEnabled = false;
+
+    // Clear cached position
+    _cachedRow = -1;
+    _cachedCol = -1;
+    _samplesValid = false;
+
     if (_module._activeFalloff == SegmentationModule::FalloffTool::PushPull) {
         _module.useFalloff(SegmentationModule::FalloffTool::Drag);
     }
+
+    // Finalize the edits and trigger final surface update
+    if (wasActive && _editManager && _editManager->hasSession() && _surfaces) {
+        // Capture delta for undo before applyPreview() clears edited vertices
+        _module.captureUndoDelta();
+
+        // Auto-approve edited regions before applyPreview() clears them
+        if (_overlay && _overlay->hasApprovalMaskData()) {
+            const auto editedVerts = _editManager->editedVertices();
+            if (!editedVerts.empty()) {
+                std::vector<std::pair<int, int>> gridPositions;
+                gridPositions.reserve(editedVerts.size());
+                for (const auto& edit : editedVerts) {
+                    gridPositions.emplace_back(edit.row, edit.col);
+                }
+                constexpr uint8_t kApproved = 255;
+                constexpr float kRadius = 1.0f;
+                constexpr bool kIsAutoApproval = true;
+                const QColor brushColor = _module.approvalBrushColor();
+                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
+                _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+                qCInfo(lcSegPushPull) << "Auto-approved" << gridPositions.size() << "push/pull edited vertices";
+            }
+        }
+
+        _editManager->applyPreview();
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        _module.emitPendingChanges();
+    }
+
+    _undoCaptured = false;
 }
 
 bool SegmentationPushPullTool::applyStep()
@@ -533,74 +585,59 @@ bool SegmentationPushPullTool::applyStepInternal()
         qCWarning(lcSegPushPull) << reason << "(row" << row << ", col" << col << ")";
     };
 
-    bool snapshotCapturedThisStep = false;
-    if (!_undoCaptured) {
-        snapshotCapturedThisStep = _module.captureUndoSnapshot();
-        if (snapshotCapturedThisStep) {
-            _undoCaptured = true;
-        }
-    }
+    // Check if we can reuse existing samples (position unchanged and samples still valid)
+    const bool positionChanged = (row != _cachedRow || col != _cachedCol);
+    const bool needRebuild = positionChanged || !_samplesValid || !_editManager->activeDrag().active;
 
-    if (!_editManager->beginActiveDrag({row, col})) {
-        if (snapshotCapturedThisStep) {
-            _module.discardLastUndoSnapshot();
-            _undoCaptured = false;
+    if (needRebuild) {
+        if (!_editManager->beginActiveDrag({row, col})) {
+            logFailure("Push/pull aborted: beginActiveDrag failed");
+            return false;
         }
-        logFailure("Push/pull aborted: beginActiveDrag failed");
-        return false;
+        _cachedRow = row;
+        _cachedCol = col;
+        _samplesValid = true;
     }
 
     auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
     if (!centerWorldOpt) {
         _editManager->cancelActiveDrag();
-        if (snapshotCapturedThisStep) {
-            _module.discardLastUndoSnapshot();
-            _undoCaptured = false;
-        }
+        _samplesValid = false;
         logFailure("Push/pull aborted: vertex world position unavailable");
         return false;
     }
     const cv::Vec3f centerWorld = *centerWorldOpt;
 
-    QuadSurface* baseSurface = _editManager->baseSurface();
+    auto baseSurface = _editManager->baseSurface();
     if (!baseSurface) {
         _editManager->cancelActiveDrag();
+        _samplesValid = false;
         logFailure("Push/pull aborted: base surface missing");
         return false;
     }
 
-    cv::Vec3f ptr = baseSurface->pointer();
-    baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400);
-    cv::Vec3f normal = baseSurface->normal(ptr);
-    if (std::isnan(normal[0]) || std::isnan(normal[1]) || std::isnan(normal[2])) {
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag())) {
+    auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
+
+    // Get normal directly from grid position (avoids expensive pointTo lookup)
+    cv::Vec3f normal = baseSurface->gridNormal(row, col);
+    if (!isValidNormal(normal)) {
+        // Fallback to robust normal computation if direct lookup fails
+        cv::Vec3f ptr = baseSurface->pointer();
+        baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
-            logFailure("Push/pull aborted: surface normal lookup returned NaN and fallback failed");
+            _samplesValid = false;
+            logFailure("Push/pull aborted: surface normal lookup failed");
             return false;
         }
-    }
-
-    if (!isValidNormal(normal)) {
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface, ptr, centerWorld, _editManager->activeDrag())) {
-            normal = *fallbackNormal;
-        } else {
-            _editManager->cancelActiveDrag();
-            logFailure("Push/pull aborted: surface normal invalid and fallback failed");
-            return false;
-        }
-    }
-
-    if (!isValidNormal(normal)) {
-        _editManager->cancelActiveDrag();
-        logFailure("Push/pull aborted: surface normal remained invalid after fallback");
-        return false;
     }
 
     const float norm = cv::norm(normal);
     if (norm <= 1e-4f) {
         _editManager->cancelActiveDrag();
+        _samplesValid = false;
         logFailure("Push/pull aborted: surface normal magnitude too small");
         return false;
     }
@@ -624,16 +661,17 @@ bool SegmentationPushPullTool::applyStepInternal()
 
             for (const auto& sample : activeSamples) {
                 const cv::Vec3f& baseWorld = sample.baseWorld;
-                cv::Vec3f sampleNormal = normal;
-                cv::Vec3f samplePtr = baseSurface->pointer();
-                baseSurface->pointTo(samplePtr, baseWorld, std::numeric_limits<float>::max(), 400);
-                cv::Vec3f candidateNormal = baseSurface->normal(samplePtr);
-                if (std::isfinite(candidateNormal[0]) &&
-                    std::isfinite(candidateNormal[1]) &&
-                    std::isfinite(candidateNormal[2])) {
-                    const float candidateNorm = cv::norm(candidateNormal);
-                    if (candidateNorm > 1e-4f) {
-                        sampleNormal = candidateNormal / candidateNorm;
+
+                // Get normal directly from grid position (fast, no pointTo needed)
+                cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
+                if (!isValidNormal(sampleNormal)) {
+                    sampleNormal = normal;  // Fallback to center normal
+                } else {
+                    const float sampleNorm = cv::norm(sampleNormal);
+                    if (sampleNorm > 1e-4f) {
+                        sampleNormal /= sampleNorm;
+                    } else {
+                        sampleNormal = normal;
                     }
                 }
 
@@ -641,7 +679,7 @@ bool SegmentationPushPullTool::applyStepInternal()
                 auto sampleTarget = computeAlphaTarget(baseWorld,
                                  sampleNormal,
                                  _state.direction,
-                                 baseSurface,
+                                 baseSurface.get(),
                                  hover.viewer,
                                  &sampleUnavailable);
                 if (sampleUnavailable) {
@@ -687,30 +725,21 @@ bool SegmentationPushPullTool::applyStepInternal()
 
             if (alphaUnavailable) {
                 _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    _module.discardLastUndoSnapshot();
-                    _undoCaptured = false;
-                }
+                _samplesValid = false;
                 logFailure("Push/pull aborted: alpha push/pull unavailable for per-vertex samples");
                 return false;
             }
 
             if (!anyMovement) {
                 _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    _module.discardLastUndoSnapshot();
-                    _undoCaptured = false;
-                }
+                _samplesValid = false;
                 logFailure("Push/pull aborted: alpha push/pull produced no movement for per-vertex samples");
                 return false;
             }
 
             if (!_editManager->updateActiveDragTargets(perVertexTargets)) {
                 _editManager->cancelActiveDrag();
-                if (snapshotCapturedThisStep) {
-                    _module.discardLastUndoSnapshot();
-                    _undoCaptured = false;
-                }
+                _samplesValid = false;
                 logFailure("Push/pull aborted: failed to update per-vertex drag targets");
                 return false;
             }
@@ -723,7 +752,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         auto alphaTarget = computeAlphaTarget(centerWorld,
                           normal,
                           _state.direction,
-                          baseSurface,
+                          baseSurface.get(),
                           hover.viewer,
                           &alphaUnavailable);
         if (alphaTarget) {
@@ -731,10 +760,7 @@ bool SegmentationPushPullTool::applyStepInternal()
             usedAlphaPushPull = true;
         } else if (!alphaUnavailable) {
             _editManager->cancelActiveDrag();
-            if (snapshotCapturedThisStep) {
-                _module.discardLastUndoSnapshot();
-                _undoCaptured = false;
-            }
+            _samplesValid = false;
             logFailure("Push/pull aborted: alpha push/pull target unavailable");
             return false;
         }
@@ -744,6 +770,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         const float stepWorld = _module.gridStepWorld() * _stepMultiplier;
         if (stepWorld <= 0.0f) {
             _editManager->cancelActiveDrag();
+            _samplesValid = false;
             logFailure("Push/pull aborted: computed step size non-positive");
             return false;
         }
@@ -753,24 +780,25 @@ bool SegmentationPushPullTool::applyStepInternal()
     if (!usedAlphaPushPullPerVertex) {
         if (!_editManager->updateActiveDrag(targetWorld)) {
             _editManager->cancelActiveDrag();
-            if (snapshotCapturedThisStep) {
-                _module.discardLastUndoSnapshot();
-                _undoCaptured = false;
-            }
+            _samplesValid = false;
             logFailure("Push/pull aborted: failed to update drag target");
             return false;
         }
     }
 
-    _editManager->commitActiveDrag();
-    _editManager->applyPreview();
+    // Update sample base positions for next tick (allows reusing samples)
+    // Skip commitActiveDrag() and applyPreview() during continuous operation
+    // - they clear samples, causing expensive rebuilds every tick
+    // Final cleanup happens in stopAll()
+    _editManager->refreshActiveDragBasePositions();
 
+    // Trigger visual refresh
     if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, false);
+        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     _module.refreshOverlay();
-    _module.emitPendingChanges();
+    // Note: emitPendingChanges() removed here for performance - called in stopAll() instead
     _module.markAutosaveNeeded();
     return true;
 }
@@ -837,7 +865,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
         scale = 1.0f;
     }
 
-    ChunkCache* cache = viewer->chunkCachePtr();
+    ChunkCache<uint8_t>* cache = viewer->chunkCachePtr();
 
     AlphaPushPullConfig cfg = sanitizeConfig(_alphaConfig);
 

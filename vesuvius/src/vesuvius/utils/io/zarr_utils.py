@@ -4,31 +4,39 @@ import json
 
 def _is_ome_zarr(zarr_path):
     """
-    Check if a zarr directory is in OME-Zarr format.
-    
-    OME-Zarr directories contain:
-    - .zattrs file with multiscales metadata
-    - Numbered subdirectories (0, 1, 2, etc.) for resolution levels
+    Check if a zarr directory has multi-resolution pyramid structure.
+
+    Detects:
+    - Standard OME-Zarr with .zattrs multiscales metadata
+    - Pyramid zarrs with numbered subdirectories (0, 1, 2, etc.) even without .zattrs
     """
     zarr_path = Path(zarr_path)
-    
-    # Check for .zattrs file
-    zattrs_path = zarr_path / '.zattrs'
-    if not zattrs_path.exists():
-        return False
-    
-    # Check for numbered subdirectories
+
+    # Check for numbered subdirectories (0, 1, etc.)
     has_level_0 = (zarr_path / '0').exists()
-    
-    # Optionally, verify .zattrs contains multiscales metadata
-    try:
-        with open(zattrs_path, 'r') as f:
-            attrs = json.load(f)
-            has_multiscales = 'multiscales' in attrs
-    except:
-        has_multiscales = False
-    
-    return has_level_0 and has_multiscales
+    if not has_level_0:
+        return False
+
+    # If level 0 exists, check if it contains array data (not just another group)
+    level_0_path = zarr_path / '0'
+    has_zarray = (level_0_path / '.zarray').exists()
+    if not has_zarray:
+        return False
+
+    # At this point we have numbered directories with array data - treat as multi-resolution
+    # Optionally verify .zattrs contains multiscales metadata (but not required)
+    zattrs_path = zarr_path / '.zattrs'
+    if zattrs_path.exists():
+        try:
+            with open(zattrs_path, 'r') as f:
+                attrs = json.load(f)
+                if 'multiscales' in attrs:
+                    return True
+        except Exception:
+            pass
+
+    # Even without .zattrs, if we have level 0 with array data, treat as multi-resolution
+    return True
 
 def _get_zarr_path(zarr_dir, resolution_level=None):
     """
