@@ -474,6 +474,7 @@ class NetworkFromConfig(nn.Module):
             "num_register_tokens": model_config.get("num_register_tokens", 0),
             "use_rot_pos_emb": model_config.get("use_rot_pos_emb", True),
             "use_abs_pos_embed": model_config.get("use_abs_pos_embed", True),
+            "pos_emb_type": model_config.get("pos_emb_type", "pope"),
             "mlp_ratio": model_config.get("mlp_ratio", 4 * 2 / 3),
             "init_values": model_config.get("init_values", 0.1 if config_name != "S" else 0.1),
             "scale_attn_inner": model_config.get("scale_attn_inner", True),
@@ -531,8 +532,10 @@ class NetworkFromConfig(nn.Module):
             )
             for target_name in tasks_using_shared:
                 out_ch = self.targets[target_name]["out_channels"]
-                # Primus is 3D
-                self.task_heads[target_name] = nn.Conv3d(decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+                head_conv = nn.Conv2d if self.shared_encoder.ndim == 2 else nn.Conv3d
+                self.task_heads[target_name] = head_conv(
+                    decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True
+                )
                 activation_str = self.targets[target_name].get("activation", "none")
                 self.task_activations[target_name] = get_activation_module(activation_str)
                 print(f"Primus task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
