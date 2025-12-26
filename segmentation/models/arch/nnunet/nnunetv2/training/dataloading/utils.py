@@ -72,9 +72,14 @@ def unpack_dataset(folder: str, unpack_segmentation: bool = True, overwrite_exis
 
 def get_case_identifiers(folder: str) -> List[str]:
     """
-    finds all npz files in the given folder and reconstructs the training case names from them
+    finds all npz or b2nd files in the given folder and reconstructs the training case names from them
     """
-    case_identifiers = [i[:-4] for i in os.listdir(folder) if i.endswith("npz") and (i.find("segFromPrevStage") == -1)]
+    files = os.listdir(folder)
+    # Check for blosc2 format first (.b2nd)
+    case_identifiers = [i[:-5] for i in files if i.endswith(".b2nd") and not i.endswith("_seg.b2nd")]
+    if len(case_identifiers) == 0:
+        # Fall back to npz format
+        case_identifiers = [i[:-4] for i in files if i.endswith("npz") and (i.find("segFromPrevStage") == -1)]
     return case_identifiers
 
 
