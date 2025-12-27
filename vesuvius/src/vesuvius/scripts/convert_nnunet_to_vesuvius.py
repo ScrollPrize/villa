@@ -159,7 +159,7 @@ def build_model_config(plans: dict, dataset_json: dict, task_name: str = "segmen
         "targets": {
             task_name: {
                 "out_channels": out_channels,
-                "activation": "softmax"  # nnUNet uses softmax for multi-class
+                "activation": None
             }
         },
         "separate_decoders": True,
