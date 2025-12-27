@@ -22,8 +22,26 @@ def softmax_mse_loss(input_logits, target_logits):
     input_softmax = F.softmax(input_logits, dim=1)
     target_softmax = F.softmax(target_logits, dim=1)
     mse_loss = (input_softmax - target_softmax) ** 2
-    
+
     return mse_loss
+
+
+def prob_mse_loss(student_logits, target_probs):
+    """MSE loss between student softmax and target probabilities.
+
+    Use this when the target is already softmax probabilities (e.g., from
+    ensemble aggregation) rather than raw logits.
+
+    Args:
+        student_logits: Raw logits from student model [B, C, ...]
+        target_probs: Softmax probabilities from teacher [B, C, ...]
+
+    Returns:
+        Element-wise squared differences [B, C, ...]
+    """
+    assert student_logits.size() == target_probs.size()
+    student_softmax = F.softmax(student_logits, dim=1)
+    return (student_softmax - target_probs) ** 2
 
 
 class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
@@ -390,20 +408,15 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         all_preds = []
 
         with torch.no_grad():
-            # 1. Ensemble model passes
+            # 1. Ensemble model passes (no noise - these are frozen pre-trained models)
             for i, ensemble_model in enumerate(self.ensemble_models[:ensemble_passes]):
-                noise = torch.clamp(
-                    torch.randn_like(unlabeled_inputs) * self.noise_scale,
-                    -noise_bound, noise_bound
-                )
-                ensemble_inputs = unlabeled_inputs + noise
                 with autocast_ctx:
-                    ensemble_outputs = ensemble_model(ensemble_inputs)
+                    ensemble_outputs = ensemble_model(unlabeled_inputs)
                     first_task = self._get_first_task_key(ensemble_outputs)
                     ensemble_pred = F.softmax(ensemble_outputs[first_task], dim=1)
                     all_preds.append(ensemble_pred)
 
-            # 2. EMA teacher passes (fills remaining T - num_ensemble passes)
+            # 2. EMA teacher passes with noise (fills remaining T - num_ensemble passes)
             for i in range(ema_passes):
                 noise = torch.clamp(
                     torch.randn_like(unlabeled_inputs) * self.noise_scale,
@@ -476,29 +489,23 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             from contextlib import nullcontext
             autocast_ctx = nullcontext()
         
+        # Compute uncertainty and get ensemble-aggregated predictions as pseudo-labels
+        # mean_pred combines predictions from:
+        # - Frozen pre-trained ensemble models (clean inputs, authoritative)
+        # - EMA teacher (noised inputs for diversity)
         uncertainty, mean_pred = self._compute_uncertainty(unlabeled_inputs, autocast_ctx)
-        
-        noise_bound = self._get_noise_bounds(unlabeled_inputs)
-        with torch.no_grad():
-            noise = torch.clamp(
-                torch.randn_like(unlabeled_inputs) * self.noise_scale,
-                -noise_bound, noise_bound
-            )
-            teacher_inputs = unlabeled_inputs + noise
-            with autocast_ctx:
-                teacher_outputs = self.ema_model(teacher_inputs)
-        
+
         first_task = list(outputs.keys())[0]
         if first_task == '_inputs':
             first_task = list(outputs.keys())[1] if len(outputs.keys()) > 1 else None
             if first_task is None:
                 raise ValueError("No task outputs found besides _inputs")
-        
+
         student_unlabeled = outputs[first_task][unlabeled_mask]
-        teacher_unlabeled = teacher_outputs[first_task]
-        
-        # Compute consistency loss (element-wise)
-        consistency_dist = softmax_mse_loss(student_unlabeled, teacher_unlabeled)
+
+        # Compute consistency loss using ensemble-aggregated predictions as target
+        # mean_pred is already softmax probabilities, so use prob_mse_loss
+        consistency_dist = prob_mse_loss(student_unlabeled, mean_pred)
         
         # Apply uncertainty-based weighting
         # Use sigmoid ramp-up for threshold
