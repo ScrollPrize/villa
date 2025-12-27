@@ -136,5 +136,13 @@ def strip_state(state):
                     changed = True
         return key
 
-    return {strip_prefixes(k): v for k, v in state.items()}
+    new_state = {}
+    for k, v in state.items():
+        new_key = strip_prefixes(k)
+        # Skip duplicate encoder keys nested inside decoder (from old checkpoints).
+        # These were created when Decoder registered encoder as a submodule.
+        if '.encoder.' in new_key and new_key.split('.encoder.')[0].endswith('decoder'):
+            continue
+        new_state[new_key] = v
+    return new_state
 
