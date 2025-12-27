@@ -1,0 +1,5 @@
+# Extended training config
+# Use this with --yaml_config when resuming training for additional epochs
+# Example: nnunet_training Dataset001 3d_fullres 0 --c --yaml_config extended_training.yaml
+
+num_epochs: 500  # Adjust as needed
