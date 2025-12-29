@@ -14,6 +14,7 @@ def safe_crop_with_padding(tensor, min_corner, crop_size):
     """
     crop_size_int = int(crop_size)
     min_corner = torch.broadcast_to(min_corner, (tensor.shape[0], 3))
+    min_corner = torch.round(min_corner)
     max_corner = min_corner + crop_size_int
 
     # Get tensor spatial shape (last 3 dims before any trailing dimensions)
