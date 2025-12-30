@@ -230,8 +230,10 @@ def train(config_path):
 
     # Create datasets
     train_patches, val_patches = load_datasets(config)
-    train_dataset = HeatmapDatasetSlotted(config, train_patches)
-    val_dataset = HeatmapDatasetSlotted(config, val_patches)
+    multistep_count = int(config.get('multistep_count', 1))
+    bidirectional = False  # Slots don't use directional conditioning
+    train_dataset = HeatmapDatasetSlotted(config, train_patches, multistep_count, bidirectional)
+    val_dataset = HeatmapDatasetSlotted(config, val_patches, multistep_count, bidirectional)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=config['batch_size'], num_workers=config.get('num_workers', 4)
     )
