@@ -281,7 +281,21 @@ def train(config_path):
     if 'load_ckpt' in config:
         print(f'Loading checkpoint {config["load_ckpt"]}')
         ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
-        model.load_state_dict(ckpt['model'])
+        state_dict = ckpt['model']
+        # Handle compiled model state dict (strip _orig_mod. prefix if needed)
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            # Check if current model is compiled
+            model_keys = set(model.state_dict().keys())
+            if not any(k.startswith('_orig_mod.') for k in model_keys):
+                # Strip prefix from checkpoint
+                state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+                print('Stripped _orig_mod. prefix from checkpoint state dict')
+        # Filter out duplicate shared_decoder.encoder keys (old architecture had encoder copy in decoder)
+        filtered_keys = [k for k in state_dict.keys() if 'shared_decoder.encoder.' in k]
+        if filtered_keys:
+            state_dict = {k: v for k, v in state_dict.items() if 'shared_decoder.encoder.' not in k}
+            print(f'Filtered out {len(filtered_keys)} duplicate shared_decoder.encoder keys')
+        model.load_state_dict(state_dict)
         optimizer.load_state_dict(ckpt['optimizer'])
 
     # Prepare with accelerator
