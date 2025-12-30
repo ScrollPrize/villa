@@ -2423,7 +2423,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
-    //just continue on resume no additional global opt	
+    //just continue on resume no additional global opt
     if (!resume_surf) {
         if (!neural_tracer) {
             local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
@@ -2686,31 +2686,26 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         int succ_gen = 0;
         std::vector<cv::Vec2i> succ_gen_ps;
 
-        // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
-        // considering two points that are too close to each other...
-        OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
-
         if (neural_tracer && generation > pre_neural_gens) {
+            std::unordered_set<cv::Vec2i> cands_processed;  // subset of cands we've already passed to the neural tracer in this gen
             while (true) {
 
-                // FIXME: when cands are few (e.g. ~4x batch size), we should not try to process them in parallel
+                float const min_pair_distance = 4.f;  // points closer than this in uv-space aren't processed together
 
-                bool no_more_candidates = false;
                 std::vector<cv::Vec2i> batch_cands;
                 batch_cands.reserve(neural_batch_size);
-                // FIXME: we only use parallel to 'borrow' OmpPointCol logic for not processing nearby points together
-                #pragma omp parallel for
-                for (int idx_in_batch = 0; idx_in_batch < neural_batch_size; ++idx_in_batch) {
-                    cv::Vec2i const p = cands_threadcol.next();
-                    if (p[0] == -1) {
-                        no_more_candidates = true;
-                        continue;
-                    }
+                for (auto const& p : cands) {
                     if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
                         continue;
+                    if (cands_processed.contains(p))
+                        continue;
+                    if (min_dist(p, batch_cands) < min_pair_distance)
+                        continue;
                     // TODO: also skip if its neighbors are outside the z-range (c.f. ceres case checking avg)
-                    #pragma omp critical
-                        batch_cands.push_back(p);
+                    batch_cands.push_back(p);
+                    cands_processed.insert(p);
+                    if (batch_cands.size() == neural_batch_size)
+                        break;
                 }
 
                 auto const points_placed = call_neural_tracer_for_points(batch_cands, trace_params, neural_tracer.get());
@@ -2726,7 +2721,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 succ += points_placed.size();
                 succ_gen += points_placed.size();
 
-                if (no_more_candidates)
+                if (cands_processed.size() == cands.size())
                     break;
 
             }  // end loop over batches
@@ -2743,6 +2738,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             perpoint_flipback_config.surface_normals = &surface_normals;
             perpoint_flipback_config.threshold = loss_settings.flipback_threshold;
             perpoint_flipback_config.weight = loss_settings.flipback_weight;
+
+            // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
+            // considering two points that are too close to each other...
+            OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
             // ...then start iterating over candidates in parallel using the above to yield points
             #pragma omp parallel
