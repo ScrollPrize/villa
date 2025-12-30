@@ -53,7 +53,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._multistep_count = multistep_count
         self._bidirectional = bidirectional
         self._heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
-        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'],config['augmentation']['allow_mirroring'], config['augmentation']['only_spatial_and_intensity'])
+        aug_config = config.get('augmentation', {})
+        self._augmentations = augmentation.get_training_augmentations(
+            config['crop_size'],
+            aug_config.get('allow_transposes', True),
+            aug_config.get('allow_mirroring', True),
+            aug_config.get('only_spatial_and_intensity', False)
+        )
         self._perturb_prob = config['point_perturbation']['perturb_probability']
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
         self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels
@@ -1006,8 +1012,13 @@ def load_datasets(config, shard_idx=None, total_shards=None):
         patches = [patch.retarget(2 ** (volume_scale - patches_wrt_volume_scale)) for patch in patches]
 
         num_val_per_volume = config.get('num_val_segments_per_volume', 1)
-        train_patches.extend(patches[num_val_per_volume:])
-        val_patches.extend(patches[:num_val_per_volume])
+        min_segments_for_val = config.get('min_segments_for_val', 5)
+        if len(patches) < min_segments_for_val:
+            # Not enough segments - use all for training, none for validation
+            train_patches.extend(patches)
+        else:
+            train_patches.extend(patches[num_val_per_volume:])
+            val_patches.extend(patches[:num_val_per_volume])
         
     print(f'loaded {len(train_patches)} train patches and {len(val_patches)} val patches')
 
