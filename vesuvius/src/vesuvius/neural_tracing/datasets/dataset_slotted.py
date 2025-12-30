@@ -215,7 +215,7 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         seg_mask,
         normals,
         normals_mask,
-        center_heatmaps,
+        center_heatmap,
     ):
         """Build batch dict for slotted dataset."""
         valid_mask = self._slotted_valid_mask
