@@ -76,7 +76,8 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         v_pos_valid = torch.ones(step_count, dtype=torch.bool)
         v_neg_valid = torch.ones(step_count, dtype=torch.bool)
 
-        # Collect all slot data: (ij, zyx, valid) for each slot
+        # Collect cardinal slot data first: (ij, zyx, valid) for slots 0-3
+        # Slot mapping: 0=u_neg, 1=u_pos, 2=v_neg, 3=v_pos
         slot_data = []  # list of (ij, zyx_unperturbed, valid)
 
         def _append_slot_data(ijs, zyxs, valids):
@@ -88,65 +89,96 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         _append_slot_data(v_neg_shifted_ijs, v_neg_shifted_zyxs, v_neg_valid)
         _append_slot_data(v_pos_shifted_ijs, v_pos_shifted_zyxs, v_pos_valid)
 
-        # Handle diagonal slots
-        diag_in_ij = diag_out_ij = None
-        diag_in_zyx = diag_out_zyx = None
+        # Compute masking for cardinal slots first (needed for diagonal selection)
+        cardinal_valid_mask = torch.stack([s[2] for s in slot_data])
+        if not cardinal_valid_mask.any():
+            return None
+
+        known_prob = float(self._config.get("masked_condition_known_prob", 0.5))
+        cardinal_known_mask = (torch.rand_like(cardinal_valid_mask, dtype=torch.float32) < known_prob) & cardinal_valid_mask
+        cardinal_unknown_mask = cardinal_valid_mask & ~cardinal_known_mask
+
+        # Ensure at least one cardinal is unknown
+        if not cardinal_unknown_mask.any():
+            valid_indices = torch.nonzero(cardinal_valid_mask, as_tuple=False).flatten()
+            chosen = valid_indices[torch.randint(len(valid_indices), size=[])]
+            cardinal_known_mask[chosen] = False
+            cardinal_unknown_mask[chosen] = True
+
+        # Handle diagonal slots - select based on which cardinals are unknown (geometric heuristic)
+        # This matches inference: diagonal should be OPPOSITE to the gap direction
         if self._config.get("masked_include_diag", True):
             diag_prob = float(self._config.get("masked_diag_prob", 0.5))
-            # Opposite diagonal pairs: (diag_in, diag_out)
-            diag_pairs = [
-                # (u_neg, v_neg) <-> (u_pos, v_pos)
-                (
-                    (torch.stack([u_neg_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]]), u_neg_valid[0] & v_neg_valid[0]),
-                    (torch.stack([u_pos_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]]), u_pos_valid[0] & v_pos_valid[0]),
-                ),
-                # (u_neg, v_pos) <-> (u_pos, v_neg)
-                (
-                    (torch.stack([u_neg_shifted_ijs[0, 0], v_pos_shifted_ijs[0, 1]]), u_neg_valid[0] & v_pos_valid[0]),
-                    (torch.stack([u_pos_shifted_ijs[0, 0], v_neg_shifted_ijs[0, 1]]), u_pos_valid[0] & v_neg_valid[0]),
-                ),
-            ]
-            valid_pairs = [(d_in, d_out) for (d_in, d_out) in diag_pairs if d_in[1] and d_out[1]]
-
+            diag_in_ij = diag_out_ij = None
+            diag_in_zyx = diag_out_zyx = None
             diag_in_valid = torch.tensor(False)
             diag_out_valid = torch.tensor(False)
 
-            if valid_pairs and torch.rand([]) < diag_prob:
-                (diag_in_ij, _), (diag_out_ij, _) = random.choice(valid_pairs)
-                if torch.rand([]) < 0.5:
-                    diag_in_ij, diag_out_ij = diag_out_ij, diag_in_ij
-                diag_in_zyx = get_zyx_from_patch(diag_in_ij, patch)
-                diag_out_zyx = get_zyx_from_patch(diag_out_ij, patch)
-                diag_in_valid = torch.tensor(True)
-                diag_out_valid = torch.tensor(True)
+            if torch.rand([]) < diag_prob:
+                # Pick primary unknown direction (random from unknown cardinals)
+                unknown_indices = torch.nonzero(cardinal_unknown_mask, as_tuple=False).flatten()
+                primary_target = unknown_indices[torch.randint(len(unknown_indices), size=[])].item()
+
+                # Select diagonal OPPOSITE to primary target direction
+                # Slot mapping: 0=u_neg(i-1), 1=u_pos(i+1), 2=v_neg(j-1), 3=v_pos(j+1)
+                if primary_target == 0:  # predicting above (u_neg) → diagonal from below (u_pos side)
+                    diag_i = u_pos_shifted_ijs[0, 0]
+                    diag_j_options = [(v_neg_shifted_ijs[0, 1], v_neg_valid[0]), (v_pos_shifted_ijs[0, 1], v_pos_valid[0])]
+                    opposite_diag_i = u_neg_shifted_ijs[0, 0]
+                elif primary_target == 1:  # predicting below (u_pos) → diagonal from above (u_neg side)
+                    diag_i = u_neg_shifted_ijs[0, 0]
+                    diag_j_options = [(v_neg_shifted_ijs[0, 1], v_neg_valid[0]), (v_pos_shifted_ijs[0, 1], v_pos_valid[0])]
+                    opposite_diag_i = u_pos_shifted_ijs[0, 0]
+                elif primary_target == 2:  # predicting left (v_neg) → diagonal from right (v_pos side)
+                    diag_j = v_pos_shifted_ijs[0, 1]
+                    diag_i_options = [(u_neg_shifted_ijs[0, 0], u_neg_valid[0]), (u_pos_shifted_ijs[0, 0], u_pos_valid[0])]
+                    opposite_diag_j = v_neg_shifted_ijs[0, 1]
+                else:  # primary_target == 3: predicting right (v_pos) → diagonal from left (v_neg side)
+                    diag_j = v_neg_shifted_ijs[0, 1]
+                    diag_i_options = [(u_neg_shifted_ijs[0, 0], u_neg_valid[0]), (u_pos_shifted_ijs[0, 0], u_pos_valid[0])]
+                    opposite_diag_j = v_pos_shifted_ijs[0, 1]
+
+                # Build diag_in and diag_out positions
+                if primary_target in [0, 1]:  # u-direction target, fixed i for diagonal
+                    # Shuffle j options and pick first valid
+                    random.shuffle(diag_j_options)
+                    for diag_j, j_valid in diag_j_options:
+                        if j_valid:
+                            diag_in_ij = torch.stack([diag_i, diag_j])
+                            diag_out_ij = torch.stack([opposite_diag_i, diag_j])
+                            diag_in_zyx = get_zyx_from_patch(diag_in_ij, patch)
+                            diag_out_zyx = get_zyx_from_patch(diag_out_ij, patch)
+                            diag_in_valid = torch.tensor(True)
+                            diag_out_valid = torch.tensor(True)
+                            break
+                else:  # v-direction target, fixed j for diagonal
+                    # Shuffle i options and pick first valid
+                    random.shuffle(diag_i_options)
+                    for diag_i, i_valid in diag_i_options:
+                        if i_valid:
+                            diag_in_ij = torch.stack([diag_i, diag_j])
+                            diag_out_ij = torch.stack([diag_i, opposite_diag_j])
+                            diag_in_zyx = get_zyx_from_patch(diag_in_ij, patch)
+                            diag_out_zyx = get_zyx_from_patch(diag_out_ij, patch)
+                            diag_in_valid = torch.tensor(True)
+                            diag_out_valid = torch.tensor(True)
+                            break
 
             slot_data.append((diag_in_ij, diag_in_zyx, diag_in_valid))
             slot_data.append((diag_out_ij, diag_out_zyx, diag_out_valid))
 
-        valid_mask = torch.stack([s[2] for s in slot_data]) if slot_data else torch.tensor([], dtype=torch.bool)
-        if valid_mask.numel() == 0 or not valid_mask.any():
-            return None
-
-        known_prob = float(self._config.get("masked_condition_known_prob", 0.5))
-        known_mask = (torch.rand_like(valid_mask, dtype=torch.float32) < known_prob) & valid_mask
-        unknown_mask = valid_mask & ~known_mask
-
-        # Force diagonal slots: diag_in (slot -2) is always known, diag_out (slot -1) is always unknown
+        # Build full masks including diagonal slots
+        valid_mask = torch.stack([s[2] for s in slot_data])
         if self._config.get("masked_include_diag", True):
-            diag_in_idx = len(slot_data) - 2
-            diag_out_idx = len(slot_data) - 1
-            if valid_mask[diag_in_idx]:
-                known_mask[diag_in_idx] = True
-                unknown_mask[diag_in_idx] = False
-            if valid_mask[diag_out_idx]:
-                known_mask[diag_out_idx] = False
-                unknown_mask[diag_out_idx] = True
-
-        if not unknown_mask.any():
-            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
-            chosen = valid_indices[torch.randint(len(valid_indices), size=[])]
-            known_mask[chosen] = False
-            unknown_mask[chosen] = True
+            # Extend cardinal masks with diagonal masks
+            # diag_in is always known, diag_out is always unknown
+            diag_in_valid = valid_mask[-2]
+            diag_out_valid = valid_mask[-1]
+            known_mask = torch.cat([cardinal_known_mask, torch.tensor([diag_in_valid.item(), False])])
+            unknown_mask = torch.cat([cardinal_unknown_mask, torch.tensor([False, diag_out_valid.item()])])
+        else:
+            known_mask = cardinal_known_mask
+            unknown_mask = cardinal_unknown_mask
 
         # Apply perturbation to known slots for input heatmaps
         should_perturb = torch.rand([]) < self._perturb_prob
