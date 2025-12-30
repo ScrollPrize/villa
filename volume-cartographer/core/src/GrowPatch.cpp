@@ -1737,6 +1737,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
+    bool neural_top_candidates_only = false;
     if (params.contains("neural_socket")) {
         std::string socket_path = params["neural_socket"];
         if (!socket_path.empty()) {
@@ -1750,6 +1751,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         }
         pre_neural_gens = params.value("pre_neural_generations", 0);
         neural_batch_size = params.value("neural_batch_size", 1);
+        neural_top_candidates_only = params.value("neural_top_candidates_only", false);
         if (!neural_tracer) {
             std::cout << "Neural tracer not active" << std::endl;
         }
@@ -2723,26 +2725,64 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
         if (neural_tracer && generation > pre_neural_gens) {
-            while (true) {
 
-                // FIXME: when cands are few (e.g. ~4x batch size), we should not try to process them in parallel
+            while (true) {
 
                 bool no_more_candidates = false;
                 std::vector<cv::Vec2i> batch_cands;
                 batch_cands.reserve(neural_batch_size);
-                // FIXME: we only use parallel to 'borrow' OmpPointCol logic for not processing nearby points together
-                #pragma omp parallel for
-                for (int idx_in_batch = 0; idx_in_batch < neural_batch_size; ++idx_in_batch) {
-                    cv::Vec2i const p = cands_threadcol.next();
-                    if (p[0] == -1) {
-                        no_more_candidates = true;
-                        continue;
+                if (neural_top_candidates_only) {
+
+                    // In this mode each gen processes only one batch of points; these are the
+                    // highest-scored (and thus best-supported) subset; afterwards we move to
+                    // the next gen and thus recalculate the fringe and candidates, which may
+                    // result in new higher-scored points than in the previous gen
+
+                    std::vector<std::pair<cv::Vec2i, int>> cands_and_scores;
+                    cands_and_scores.reserve(cands.size());
+                    for (const auto& cand : cands) {
+                        int score = compute_neural_tracer_point_info(cand, trace_params).max_score;
+                        cands_and_scores.emplace_back(cand, score);
                     }
-                    if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
-                        continue;
-                    // TODO: also skip if its neighbors are outside the z-range (c.f. ceres case checking avg)
-                    #pragma omp critical
-                        batch_cands.push_back(p);
+
+                    // Take points that are high scored (i.e. strong connectivity) and sufficiently separated in uv space
+                    float const min_pair_distance = 4.f;  // TODO: what's the best value for this?
+                    std::sort(
+                        cands_and_scores.begin(),
+                        cands_and_scores.end(),
+                        [] (const auto& a, const auto& b) { return a.second > b.second; }  // i.e. sort by descending score
+                    );
+                    for (auto const& [cand, score] : cands_and_scores) {
+                        if (batch_cands.size() == neural_batch_size) {
+                            trace_params.state(cand) &= ~STATE_PROCESSING;
+                            continue;
+                        }
+                        if (min_dist(cand, batch_cands) < min_pair_distance) {
+                            trace_params.state(cand) &= ~STATE_PROCESSING;
+                            continue;
+                        }
+                        std::cout << "selected point with score " << score << std::endl;
+                        batch_cands.push_back(cand);
+                    }
+
+                    no_more_candidates = true;  // ...so we move to the next gen immediately
+
+                } else {
+                    // FIXME: we only use parallel to 'borrow' OmpPointCol logic for not processing nearby points together
+                    // FIXME: should we assert that omp_num_threads is greater than batch size?
+                    #pragma omp parallel for
+                    for (int idx_in_batch = 0; idx_in_batch < neural_batch_size; ++idx_in_batch) {
+                        cv::Vec2i const p = cands_threadcol.next();
+                        if (p[0] == -1) {
+                            no_more_candidates = true;
+                            continue;
+                        }
+                        if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
+                            continue;
+                        // TODO: also skip if its neighbors are outside the z-range (c.f. ceres case checking avg)
+                        #pragma omp critical
+                            batch_cands.push_back(p);
+                    }
                 }
 
                 auto const points_placed = call_neural_tracer_for_points(batch_cands, trace_params, neural_tracer.get());
@@ -2763,7 +2803,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
             }  // end loop over batches
 
-        } else {
+        } else {  // i.e. we're not doing neural tracing
 
             // Snapshot positions before per-point optimization for flip detection
             cv::Mat_<cv::Vec3d> positions_before_perpoint = trace_params.dpoints.clone();
