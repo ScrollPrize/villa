@@ -600,17 +600,14 @@ def train(config_path):
                 val_srf_overlap_loss = None
                 if use_srf_overlap and val_outputs is not None:
                     val_srf_overlap_mask = val_batch.get('srf_overlap_mask')
-                    val_srf_overlap_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
-                    if val_srf_overlap_mask is not None and val_srf_overlap_valid.any():
+                    if val_srf_overlap_mask is not None:
                         from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
                         val_srf_overlap_mask = val_srf_overlap_mask.unsqueeze(1)
                         # Get model's srf_overlap prediction
                         val_pred_srf_overlap = require_head(val_outputs, 'srf_overlap')
                         if isinstance(val_pred_srf_overlap, (list, tuple)):
                             val_pred_srf_overlap = val_pred_srf_overlap[0]
-                        val_srf_overlap_loss_raw = compute_surf_overlap_loss(val_pred_srf_overlap, val_srf_overlap_mask)
-                        valid_batch_mask = val_srf_overlap_valid.to(val_srf_overlap_loss_raw.device).float()
-                        val_srf_overlap_loss = (val_srf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
+                        val_srf_overlap_loss = compute_surf_overlap_loss(val_pred_srf_overlap, val_srf_overlap_mask)
                         total_val_loss = total_val_loss + srf_overlap_loss_weight * val_srf_overlap_loss
                         # Store for visualization
                         val_srf_overlap_for_vis = val_srf_overlap_mask
