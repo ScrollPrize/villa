@@ -6,6 +6,7 @@ opposite-axis spans consistent.
 """
 
 import torch
+import torch.nn.functional as F
 
 
 def differentiable_centroid(heatmap, threshold=0.5, temperature=10.0):
@@ -303,9 +304,10 @@ def compute_uv_equidist_loss_slots(
         gt_edge_distances = _compute_edge_distances(gt_u_neg, gt_u_pos, gt_v_neg, gt_v_pos)
         gt_axis_distances = _compute_axis_distances(gt_u_neg, gt_u_pos, gt_v_neg, gt_v_pos)
 
-        # L1 loss between predicted and GT distances
-        edge_loss = torch.abs(pred_edge_distances - gt_edge_distances).mean()
-        axis_loss = torch.abs(pred_axis_distances - gt_axis_distances).mean()
+        # Huber loss - robust to outliers from poor centroid extraction
+        # beta=10.0: quadratic for errors < 10 voxels, linear for larger errors
+        edge_loss = F.smooth_l1_loss(pred_edge_distances, gt_edge_distances, beta=10.0)
+        axis_loss = F.smooth_l1_loss(pred_axis_distances, gt_axis_distances, beta=10.0)
         losses.append(edge_loss + axis_loss)
 
     # Return mean over valid samples only
