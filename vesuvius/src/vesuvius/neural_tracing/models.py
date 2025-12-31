@@ -12,8 +12,7 @@ class SlotConditionedHead(nn.Module):
     Task head with slot-specific FiLM modulation for neural tracing.
 
     Takes shared decoder features and applies per-slot FiLM modulation before
-    projecting to each slot's output. This helps the model distinguish between
-    slots (u_neg, u_pos, v_neg, v_pos, etc.) early in training.
+    projecting to each slot's output. Each slot has its own projection head.
 
     Used as a task_head, receiving features from the shared_decoder.
     """
@@ -21,6 +20,7 @@ class SlotConditionedHead(nn.Module):
     def __init__(self, feature_dim, num_slots, embed_dim=64, conv_op=nn.Conv3d):
         super().__init__()
         self.num_slots = num_slots
+        self.feature_dim = feature_dim
 
         # Learnable slot embeddings
         self.slot_embed = nn.Embedding(num_slots, embed_dim)
@@ -32,8 +32,11 @@ class SlotConditionedHead(nn.Module):
             nn.Linear(embed_dim, feature_dim * 2)
         )
 
-        # Shared 1x1 conv for output projection
-        self.slot_head = conv_op(feature_dim, 1, kernel_size=1, bias=True)
+        # Per-slot 1x1 conv heads (instead of shared)
+        self.slot_heads = nn.ModuleList([
+            conv_op(feature_dim, 1, kernel_size=1, bias=True)
+            for _ in range(num_slots)
+        ])
 
         # Initialize FiLM to near-identity (scale=0, shift=0)
         nn.init.zeros_(self.film_proj[-1].weight)
@@ -41,17 +44,23 @@ class SlotConditionedHead(nn.Module):
 
     def forward(self, shared_features):
         # shared_features: [B, feat_dim, Z, Y, X]
+
+        # Compute all FiLM parameters at once (batched)
+        all_film_params = self.film_proj(self.slot_embed.weight)  # [num_slots, feat_dim*2]
+        scales, shifts = all_film_params.chunk(2, dim=1)  # [num_slots, feat_dim] each
+
+        # Reshape for broadcasting: [num_slots, feat_dim, 1, 1, 1]
+        scales = scales.view(self.num_slots, self.feature_dim, 1, 1, 1)
+        shifts = shifts.view(self.num_slots, self.feature_dim, 1, 1, 1)
+
+        # Apply FiLM and per-slot heads
         outputs = []
-        for slot_idx in range(self.num_slots):
-            emb = self.slot_embed.weight[slot_idx]
-            film_params = self.film_proj(emb)
-            scale, shift = film_params.chunk(2)
-
+        for i in range(self.num_slots):
             # FiLM: feature * (1 + scale) + shift
-            modulated = shared_features * (1 + scale.view(1, -1, 1, 1, 1)) + shift.view(1, -1, 1, 1, 1)
-            outputs.append(self.slot_head(modulated))
+            modulated = shared_features * (1 + scales[i]) + shifts[i]
+            outputs.append(self.slot_heads[i](modulated))
 
-        return torch.cat(outputs, dim=1)
+        return torch.cat(outputs, dim=1)  # [B, num_slots, Z, Y, X]
 
 
 def _config_dict_to_mgr(config_dict):
