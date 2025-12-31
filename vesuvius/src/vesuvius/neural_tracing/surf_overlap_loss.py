@@ -13,6 +13,8 @@ to the GT mask using BCE + Dice loss.
 import torch
 import torch.nn.functional as F
 
+from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
+
 
 def _point_in_triangle_3d(points, v0, v1, v2, thickness):
     """
@@ -119,9 +121,26 @@ def render_surf_overlap_mask(u_neg_zyx, u_pos_zyx, v_neg_zyx, v_pos_zyx,
     return (in_tri1 | in_tri2).float()
 
 
+# Module-level loss instance (created lazily)
+_srf_overlap_loss_fn = None
+
+
+def _get_srf_overlap_loss_fn():
+    """Get or create the surface overlap loss function."""
+    global _srf_overlap_loss_fn
+    if _srf_overlap_loss_fn is None:
+        _srf_overlap_loss_fn = DC_and_BCE_loss(
+            bce_kwargs={},
+            soft_dice_kwargs={'batch_dice': False, 'ddp': False},
+            weight_ce=1.0,
+            weight_dice=1.0
+        )
+    return _srf_overlap_loss_fn
+
+
 def compute_surf_overlap_loss(pred_surf_overlap, target_surf_overlap_mask, mask=None):
     """
-    Compute surface overlap loss using BCE + Dice (same as heatmap loss).
+    Compute surface overlap loss using BCE + Dice.
 
     Args:
         pred_surf_overlap: Predicted surface overlap logits [B, 1, Z, Y, X]
@@ -129,38 +148,16 @@ def compute_surf_overlap_loss(pred_surf_overlap, target_surf_overlap_mask, mask=
         mask: Optional validity mask [B, 1, Z, Y, X]
 
     Returns:
-        Per-batch loss tensor [B]
+        Scalar loss tensor
     """
     # Ensure target has channel dim
     if target_surf_overlap_mask.ndim == 4:
         target_surf_overlap_mask = target_surf_overlap_mask.unsqueeze(1)
 
-    if mask is None:
-        mask = torch.ones_like(target_surf_overlap_mask)
-    if mask.ndim == 4:
+    if mask is not None and mask.ndim == 4:
         mask = mask.unsqueeze(1)
-    mask = mask.to(dtype=pred_surf_overlap.dtype)
 
     target_binary = (target_surf_overlap_mask > 0.5).float()
 
-    # BCE loss
-    bce = F.binary_cross_entropy_with_logits(pred_surf_overlap, target_binary, reduction='none')
-    bce = (bce * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4)).clamp_min(1)
-
-    # Dice loss
-    pred_probs = torch.sigmoid(pred_surf_overlap)
-    dice_losses = []
-    for i in range(pred_surf_overlap.shape[0]):
-        batch_mask = mask[i:i+1]
-        pred_masked = pred_probs[i:i+1] * batch_mask
-        target_masked = target_binary[i:i+1] * batch_mask
-
-        intersection = (pred_masked * target_masked).sum()
-        pred_sum = (pred_masked * pred_masked).sum()
-        target_sum = (target_masked * target_masked).sum()
-
-        dice = 1.0 - (2.0 * intersection + 1e-5) / (pred_sum + target_sum + 1e-5)
-        dice_losses.append(dice)
-
-    dice = torch.stack(dice_losses)
-    return bce + dice
+    loss_fn = _get_srf_overlap_loss_fn()
+    return loss_fn(pred_surf_overlap, target_binary, loss_mask=mask)

@@ -38,9 +38,9 @@ class SlotConditionedHead(nn.Module):
             for _ in range(num_slots)
         ])
 
-        # Initialize FiLM to near-identity (scale=0, shift=0)
-        nn.init.zeros_(self.film_proj[-1].weight)
-        nn.init.zeros_(self.film_proj[-1].bias)
+        # Initialize FiLM with small random values to break symmetry
+        nn.init.normal_(self.film_proj[-1].weight, std=0.02)
+        nn.init.normal_(self.film_proj[-1].bias, std=0.02)
 
     def forward(self, shared_features):
         # shared_features: [B, feat_dim, Z, Y, X]
@@ -99,6 +99,17 @@ def _config_dict_to_mgr(config_dict):
             'out_channels': 1,
             'activation': 'none',
         }
+
+    # Direction field only mode - replaces default uv_heatmaps output
+    if config_dict.get('direction_field_only', False):
+        targets = {
+            'direction_field': {
+                'out_channels': 6,  # U (3) + V (3) displacement vectors
+                'activation': 'none',
+            }
+        }
+        # Direction field doesn't use conditioning channels
+        conditioning_channels = 0
 
     mgr = SimpleNamespace()
     mgr.model_config = model_config

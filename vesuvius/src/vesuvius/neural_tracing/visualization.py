@@ -152,10 +152,11 @@ def make_canvas(
         targets = rearrange(targets, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
         target_pred = rearrange(target_pred, 'b (uv s) z y x -> b uv s z y x', uv=2).amax(dim=2)
 
-    # For slotted, show all conditioning channels; otherwise limit to 3
+    # For slotted, show heatmap conditioning channels (first half, not slot ID channels)
     is_slotted = config.get('dataset_variant') == 'slotted'
     if is_slotted:
-        num_cond_channels = inputs.shape[1] - cond_channel_start  # all conditioning channels
+        total_cond_channels = inputs.shape[1] - cond_channel_start
+        num_cond_channels = total_cond_channels // 2  # Only heatmaps, skip slot ID channels
     else:
         num_cond_channels = min(3, inputs.shape[1] - cond_channel_start)
 

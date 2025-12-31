@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.dataset import load_datasets
 from vesuvius.neural_tracing.datasets.dataset_slotted import HeatmapDatasetSlotted
-from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, DC_and_BCE_loss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
@@ -49,6 +49,14 @@ def make_loss_fn(config):
     """Create loss function based on config. Returns per-example losses."""
     binary = config.get('binary', False)
 
+    # Create loss function once (not per call)
+    dc_bce_loss_fn = DC_and_BCE_loss(
+        bce_kwargs={},
+        soft_dice_kwargs={'batch_dice': False, 'ddp': False},
+        weight_ce=1.0,
+        weight_dice=1.0
+    ) if binary else None
+
     def loss_fn(target_pred, targets, mask):
         if binary:
             if mask is None:
@@ -56,28 +64,15 @@ def make_loss_fn(config):
             mask = mask.to(dtype=target_pred.dtype)
             targets_binary = (targets > 0.5).to(target_pred.dtype)
 
-            # BCE loss with proper masking (mask applied after loss computation)
-            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred, targets_binary)
-            bce = (bce * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4)).clamp_min(1)
-
-            # Dice loss: apply sigmoid first, then mask, then compute dice
-            # This avoids the sigmoid(0)=0.5 problem when multiplying logits by mask
-            pred_probs = torch.sigmoid(target_pred)
-            dice_losses = []
-            for i in range(target_pred.shape[0]):
-                batch_mask = mask[i:i+1]
-                pred_masked = pred_probs[i:i+1] * batch_mask
-                target_masked = targets_binary[i:i+1] * batch_mask
-
-                intersection = (pred_masked * target_masked).sum()
-                pred_sum = (pred_masked * pred_masked).sum()
-                target_sum = (target_masked * target_masked).sum()
-
-                dice = 1.0 - (2.0 * intersection + 1e-5) / (pred_sum + target_sum + 1e-5)
-                dice_losses.append(dice)
-
-            dice = torch.stack(dice_losses)
-            return bce + dice
+            # Use DC_and_BCE_loss per sample to get per-batch losses
+            losses = torch.stack([
+                dc_bce_loss_fn(
+                    target_pred[i:i+1],
+                    targets_binary[i:i+1],
+                    loss_mask=mask[i:i+1]
+                ) for i in range(target_pred.shape[0])
+            ])
+            return losses
         else:
             if mask is None:
                 mask = torch.ones_like(targets)
@@ -213,7 +208,8 @@ def train(config_path):
     else:
         conditioning_slots = cardinal_slots
         out_slots = cardinal_slots
-    config.setdefault('conditioning_channels', conditioning_slots)
+    # Double conditioning channels: heatmaps + slot identity channels
+    config.setdefault('conditioning_channels', conditioning_slots * 2)
     config.setdefault('out_channels', out_slots)
 
     # Multistep settings
@@ -479,18 +475,14 @@ def train(config_path):
             srf_overlap_loss = None
             if use_srf_overlap and outputs is not None:
                 srf_overlap_mask = batch.get('srf_overlap_mask')
-                srf_overlap_valid = batch.get('srf_overlap_valid', torch.tensor(False))
-                if srf_overlap_mask is not None and srf_overlap_valid.any():
+                if srf_overlap_mask is not None:
                     from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
                     srf_overlap_mask = srf_overlap_mask.unsqueeze(1)  # [B, 1, Z, Y, X]
                     # Get model's srf_overlap prediction
                     pred_srf_overlap = require_head(outputs, 'srf_overlap')
                     if isinstance(pred_srf_overlap, (list, tuple)):
                         pred_srf_overlap = pred_srf_overlap[0]
-                    srf_overlap_loss_raw = compute_surf_overlap_loss(pred_srf_overlap, srf_overlap_mask)
-                    # Only average over valid batches
-                    valid_batch_mask = srf_overlap_valid.to(srf_overlap_loss_raw.device).float()
-                    srf_overlap_loss = (srf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
+                    srf_overlap_loss = compute_surf_overlap_loss(pred_srf_overlap, srf_overlap_mask)
                     # Apply loss only after warmup iteration
                     if iteration >= srf_overlap_loss_start_iter:
                         total_loss = total_loss + srf_overlap_loss_weight * srf_overlap_loss

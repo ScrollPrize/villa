@@ -280,7 +280,16 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         uv_heatmaps_in_all = torch.cat(input_slot_heatmaps, dim=0)
         uv_heatmaps_in_all = uv_heatmaps_in_all * input_known_mask[:, None, None, None].to(dtype=uv_heatmaps_in_all.dtype)
 
-        condition_channels = uv_heatmaps_in_all.shape[0]
+        # Add slot identity channels: constant values per slot to differentiate them
+        num_input_slots = len(input_slot_heatmaps)
+        slot_ids = torch.linspace(0, 1, num_input_slots, dtype=uv_heatmaps_in_all.dtype, device=uv_heatmaps_in_all.device)
+        # Shape: [num_slots, Z, Y, X] - each channel is a constant value
+        Z, Y, X = uv_heatmaps_in_all.shape[1:]
+        slot_id_channels = slot_ids.view(-1, 1, 1, 1).expand(num_input_slots, Z, Y, X)
+        # Concatenate heatmaps + slot IDs
+        uv_heatmaps_in_all = torch.cat([uv_heatmaps_in_all, slot_id_channels], dim=0)
+
+        condition_channels = uv_heatmaps_in_all.shape[0]  # Now doubled (heatmaps + slot IDs)
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
 
         # Store both masks for hybrid supervision in _build_batch_dict
