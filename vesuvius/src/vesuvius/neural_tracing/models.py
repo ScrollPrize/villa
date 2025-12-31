@@ -1,9 +1,57 @@
 import torch
+import torch.nn as nn
 from types import SimpleNamespace
 from pathlib import Path
 
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.neural_tracing.youssef_mae import Vesuvius3dViTModel
+
+
+class SlotConditionedHead(nn.Module):
+    """
+    Task head with slot-specific FiLM modulation for neural tracing.
+
+    Takes shared decoder features and applies per-slot FiLM modulation before
+    projecting to each slot's output. This helps the model distinguish between
+    slots (u_neg, u_pos, v_neg, v_pos, etc.) early in training.
+
+    Used as a task_head, receiving features from the shared_decoder.
+    """
+
+    def __init__(self, feature_dim, num_slots, embed_dim=64, conv_op=nn.Conv3d):
+        super().__init__()
+        self.num_slots = num_slots
+
+        # Learnable slot embeddings
+        self.slot_embed = nn.Embedding(num_slots, embed_dim)
+
+        # Project embedding to scale/shift for FiLM
+        self.film_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, feature_dim * 2)
+        )
+
+        # Shared 1x1 conv for output projection
+        self.slot_head = conv_op(feature_dim, 1, kernel_size=1, bias=True)
+
+        # Initialize FiLM to near-identity (scale=0, shift=0)
+        nn.init.zeros_(self.film_proj[-1].weight)
+        nn.init.zeros_(self.film_proj[-1].bias)
+
+    def forward(self, shared_features):
+        # shared_features: [B, feat_dim, Z, Y, X]
+        outputs = []
+        for slot_idx in range(self.num_slots):
+            emb = self.slot_embed.weight[slot_idx]
+            film_params = self.film_proj(emb)
+            scale, shift = film_params.chunk(2)
+
+            # FiLM: feature * (1 + scale) + shift
+            modulated = shared_features * (1 + scale.view(1, -1, 1, 1, 1)) + shift.view(1, -1, 1, 1, 1)
+            outputs.append(self.slot_head(modulated))
+
+        return torch.cat(outputs, dim=1)
 
 
 def _config_dict_to_mgr(config_dict):
@@ -74,7 +122,25 @@ def make_model(config):
     default_out_channels = int(config.get('out_channels', config['step_count'] * 2))
 
     if config['model_type'] == 'unet':
-        return build_network_from_config_dict(config)
+        model = build_network_from_config_dict(config)
+
+        # If slot conditioning enabled, replace uv_heatmaps head with SlotConditionedHead
+        if config.get('slot_conditioning', False):
+            num_slots = int(config.get('out_channels', 5))
+            embed_dim = int(config.get('slot_embed_dim', 64))
+            feature_dim = model.shared_encoder.output_channels[0]
+            conv_op = model.shared_encoder.conv_op
+
+            # Replace the simple 1x1 conv head with SlotConditionedHead
+            model.task_heads['uv_heatmaps'] = SlotConditionedHead(
+                feature_dim, num_slots, embed_dim, conv_op
+            )
+            # Remove from task_decoders if it exists (we want to use shared_decoder + our head)
+            if 'uv_heatmaps' in model.task_decoders:
+                del model.task_decoders['uv_heatmaps']
+            print(f"Using SlotConditionedHead for uv_heatmaps: {num_slots} slots, embed_dim={embed_dim}, feature_dim={feature_dim}")
+
+        return model
     elif config['model_type'] == 'vit':
         return Vesuvius3dViTModel(
             mae_ckpt_path=config['model_config'].get('mae_ckpt_path', None),
