@@ -54,7 +54,7 @@ def make_loss_fn(config):
             if mask is None:
                 mask = torch.ones_like(targets)
             mask = mask.to(dtype=target_pred.dtype)
-            targets_binary = (targets > 0.5).float()
+            targets_binary = (targets > 0.5).to(target_pred.dtype)
 
             # BCE loss with proper masking (mask applied after loss computation)
             bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred, targets_binary)
@@ -243,6 +243,9 @@ def train(config_path):
     equidist_loss_weight = config.setdefault('equidist_loss_weight', 0.1)
     equidist_threshold = config.setdefault('equidist_threshold', 0.5)
     equidist_temperature = config.setdefault('equidist_temperature', 10.0)
+    step_size = config['step_size']
+    equidist_loss_start_iter = config.setdefault('equidist_loss_start_iter', 0)
+    srf_overlap_loss_start_iter = config.setdefault('srf_overlap_loss_start_iter', 0)
 
     # Set random seeds
     random.seed(config['seed'])
@@ -488,7 +491,9 @@ def train(config_path):
                     # Only average over valid batches
                     valid_batch_mask = srf_overlap_valid.to(srf_overlap_loss_raw.device).float()
                     srf_overlap_loss = (srf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
-                    total_loss = total_loss + srf_overlap_loss_weight * srf_overlap_loss
+                    # Apply loss only after warmup iteration
+                    if iteration >= srf_overlap_loss_start_iter:
+                        total_loss = total_loss + srf_overlap_loss_weight * srf_overlap_loss
                     # Store for visualization
                     srf_overlap_for_vis = srf_overlap_mask
                     srf_overlap_pred_for_vis = pred_srf_overlap
@@ -496,13 +501,15 @@ def train(config_path):
             # Equidistance loss - enforces uniform spacing of cardinal predictions
             equidist_loss = None
             if use_equidist and outputs is not None and not multistep_enabled:
-                srf_overlap_valid = batch.get('srf_overlap_valid', torch.tensor(False))
+                cardinal_valid = batch.get('cardinal_valid', None)
+                if cardinal_valid is None:
+                    cardinal_valid = batch.get('srf_overlap_valid', torch.tensor(False))
                 cardinal_positions = batch.get('cardinal_positions')
-                if srf_overlap_valid.any() and cardinal_positions is not None:
+                if cardinal_valid.any() and cardinal_positions is not None:
                     from vesuvius.neural_tracing.uv_equidist_loss import compute_uv_equidist_loss_slots
 
                     # Get predictions for cardinal slots (0-3): u_neg, u_pos, v_neg, v_pos
-                    pred_cardinals = torch.sigmoid(target_pred[:, :4])  # [B, 4, Z, Y, X]
+                    pred_cardinals = torch.sigmoid(target_pred_for_vis[:, :4])  # [B, 4, Z, Y, X]
 
                     # Derive cardinal unknown mask from uv_heatmaps_out_mask
                     # Shape: [B, Z, Y, X, C] - mask is uniform across spatial dims
@@ -512,12 +519,14 @@ def train(config_path):
                         pred_cardinals,
                         cardinal_positions,
                         cardinal_unknown_mask,
-                        valid_mask=srf_overlap_valid,  # Filter per-sample validity
+                        valid_mask=cardinal_valid,  # Filter per-sample validity
                         threshold=equidist_threshold,
                         temperature=equidist_temperature,
                     )
                     equidist_loss = equidist_loss_raw
-                    total_loss = total_loss + equidist_loss_weight * equidist_loss
+                    # Apply loss only after warmup iteration
+                    if iteration >= equidist_loss_start_iter:
+                        total_loss = total_loss + equidist_loss_weight * equidist_loss
 
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
@@ -618,13 +627,15 @@ def train(config_path):
                 # Validation equidistance loss
                 val_equidist_loss = None
                 if use_equidist and val_outputs is not None and not multistep_enabled:
-                    val_srf_overlap_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
+                    val_cardinal_valid = val_batch.get('cardinal_valid', None)
+                    if val_cardinal_valid is None:
+                        val_cardinal_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
                     val_cardinal_positions = val_batch.get('cardinal_positions')
-                    if val_srf_overlap_valid.any() and val_cardinal_positions is not None:
+                    if val_cardinal_valid.any() and val_cardinal_positions is not None:
                         from vesuvius.neural_tracing.uv_equidist_loss import compute_uv_equidist_loss_slots
 
                         # Get predictions for cardinal slots (0-3)
-                        val_pred_cardinals = torch.sigmoid(val_target_pred[:, :4])
+                        val_pred_cardinals = torch.sigmoid(val_target_pred_for_vis[:, :4])
 
                         # Derive cardinal unknown mask from uv_heatmaps_out_mask
                         val_cardinal_unknown_mask = (val_batch['uv_heatmaps_out_mask'][:, 0, 0, 0, :4] > 0)  # [B, 4]
@@ -633,7 +644,7 @@ def train(config_path):
                             val_pred_cardinals,
                             val_cardinal_positions,
                             val_cardinal_unknown_mask,
-                            valid_mask=val_srf_overlap_valid,  # Filter per-sample validity
+                            valid_mask=val_cardinal_valid,  # Filter per-sample validity
                             threshold=equidist_threshold,
                             temperature=equidist_temperature,
                         )
