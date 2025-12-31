@@ -245,7 +245,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         quad_main_component = self._get_current_patch_center_component_mask(current_patch, center_ij, min_corner_zyx, crop_size)
 
         all_patch_points = []
-        crop_min = min_corner_zyx.to(dtype=current_patch.zyxs.dtype, device=current_patch.zyxs.device)
+        crop_min = min_corner_zyx.to(dtype=current_patch.zyxs.dtype, device=current_patch.zyxs.device, non_blocking=True)
         crop_max = crop_min + torch.as_tensor(crop_size, dtype=crop_min.dtype, device=crop_min.device)
 
         volume_key = id(current_patch.volume)
@@ -380,14 +380,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             coords = torch.arange(kernel_size) - radius
             z_off, y_off, x_off = torch.meshgrid(coords, coords, coords, indexing='ij')
             cls._kernel_offsets_cache[sigma] = torch.stack([z_off, y_off, x_off], dim=-1).view(-1, 3)
-        return cls._kernel_offsets_cache[sigma].to(device=device)
+        return cls._kernel_offsets_cache[sigma].to(device=device, non_blocking=True)
 
     @classmethod
     def _get_kernel_values(cls, device, dtype, sigma):
         key = (device, dtype, float(sigma))
         if key not in cls._kernel_value_cache:
             kernel, _ = _get_gaussian_kernel(sigma)
-            cls._kernel_value_cache[key] = kernel.to(device=device, dtype=dtype).reshape(-1)
+            cls._kernel_value_cache[key] = kernel.to(device=device, dtype=dtype, non_blocking=True).reshape(-1)
         return cls._kernel_value_cache[key]
 
     @classmethod
@@ -396,10 +396,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         coords_accum = []
         channel_accum = []
         channel_range = cls._get_channel_range(channel_count, device)
-        min_corner = min_corner_zyx.to(device=device, dtype=dtype)
+        min_corner = min_corner_zyx.to(device=device, dtype=dtype, non_blocking=True)
 
         for zyxs in all_zyxs:
-            coords = (zyxs.to(device=device, dtype=dtype) - min_corner + 0.5).to(torch.int64)
+            coords = (zyxs.to(device=device, dtype=dtype, non_blocking=True) - min_corner + 0.5).to(torch.int64)
             valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_int).all(dim=1)
             if not torch.any(valid_mask):
                 continue
@@ -587,9 +587,22 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         else:
             maybe_center_heatmap = {}
 
+        # Generate surf_overlap mask if enabled
+        surf_overlap_mask = None
+        if self._config.get('use_surf_overlap_loss', False):
+            from vesuvius.neural_tracing.surf_overlap_loss import render_surf_overlap_mask
+            surf_overlap_thickness = self._config.get('surf_overlap_thickness', 2.0)
+            # Use first step coordinates for surf_overlap (step 0)
+            surf_overlap_mask = render_surf_overlap_mask(
+                u_neg_shifted_zyxs[0], u_pos_shifted_zyxs[0],
+                v_neg_shifted_zyxs[0], v_pos_shifted_zyxs[0],
+                min_corner_zyx, crop_size, thickness=surf_overlap_thickness
+            )
+
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
+            'surf_overlap_mask': surf_overlap_mask,
             **maybe_center_heatmap,
         }
 
@@ -608,6 +621,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         normals,
         normals_mask,
         center_heatmap,
+        surf_overlap_mask=None,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -622,6 +636,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
         if self._config.get("aux_normals", False) and normals is not None:
             batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
+        if self._config.get("use_surf_overlap_loss", False) and surf_overlap_mask is not None:
+            batch_dict.update({'surf_overlap_mask': surf_overlap_mask})
 
         return batch_dict
 
@@ -751,7 +767,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
                     quad_corners = info["quad_corners_flat"][quad_in_crop]
                     points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners).reshape(-1, 3)
-                    surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device)).round().long()
+                    surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device, non_blocking=True)).round().long()
                     in_bounds = ((surface_pts_crop >= 0) & (surface_pts_crop < crop_size)).all(dim=1)
                     surface_pts_crop = surface_pts_crop[in_bounds]
                     if surface_pts_crop.numel() > 0:
@@ -773,7 +789,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                             label = labeled[anchor_voxel[0].item(), anchor_voxel[1].item(), anchor_voxel[2].item()]
                             if label != 0:
                                 surface_mask_np = (labeled == label)[None].astype(np.float32)
-                                surface_mask = torch.from_numpy(surface_mask_np).to(surface_mask.device)
+                                surface_mask = torch.from_numpy(surface_mask_np).to(surface_mask.device, non_blocking=True)
                     if self._config.get("aux_normals", False):
                         vertex_normals = self._vertex_normals[id(patch)]
                         filtered_quad_normals = torch.stack([
@@ -839,6 +855,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
             heatmap_num_in_channels = heatmap_result['condition_channels']
             maybe_center_heatmap = heatmap_result['center_heatmap'] if 'center_heatmap' in heatmap_result else None
+            surf_overlap_mask = heatmap_result.get('surf_overlap_mask', None)
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -852,7 +869,14 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
             #  ok since it's 'just more augmentation' that won't be applied during tracing
             uv_channels = uv_heatmaps_both.shape[0]
-            regression_target = torch.cat([uv_heatmaps_both] + ([maybe_center_heatmap] if maybe_center_heatmap is not None else []), dim=0)
+            has_center_heatmap = maybe_center_heatmap is not None
+            has_surf_overlap_mask = surf_overlap_mask is not None
+            regression_parts = [uv_heatmaps_both]
+            if has_center_heatmap:
+                regression_parts.append(maybe_center_heatmap)
+            if has_surf_overlap_mask:
+                regression_parts.append(surf_overlap_mask.unsqueeze(0))
+            regression_target = torch.cat(regression_parts, dim=0)
             seg_for_aug = seg[None] if seg is not None else None
             while True:
                 augmented = self._augmentations(
@@ -869,7 +893,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
-            maybe_center_heatmap = regression_aug[..., uv_channels] if uv_channels < regression_aug.shape[-1] else None
+            channel_idx = uv_channels
+            if has_center_heatmap:
+                maybe_center_heatmap = regression_aug[..., channel_idx]
+                channel_idx += 1
+            else:
+                maybe_center_heatmap = None
+            if has_surf_overlap_mask:
+                surf_overlap_mask = regression_aug[..., channel_idx]
+                # Re-binarize after augmentation (interpolation may have created non-binary values)
+                surf_overlap_mask = (surf_overlap_mask > 0.5).float()
             if seg is not None:
                 seg_aug = augmented.get('segmentation', None)
                 if seg_aug is None:
@@ -928,6 +961,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 normals=normals,
                 normals_mask=normals_mask,
                 center_heatmap=maybe_center_heatmap,
+                surf_overlap_mask=surf_overlap_mask if has_surf_overlap_mask else None,
             )
 
             yield batch_dict

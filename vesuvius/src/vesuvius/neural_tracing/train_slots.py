@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.dataset import load_datasets
 from vesuvius.neural_tracing.datasets.dataset_slotted import HeatmapDatasetSlotted
-from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
+from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
@@ -51,17 +51,37 @@ def make_loss_fn(config):
 
     def loss_fn(target_pred, targets, mask):
         if binary:
-            targets_binary = (targets > 0.5).long()
-            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred, targets_binary.float()).mean(dim=(1, 2, 3, 4))
-            dice_loss_fn = MemoryEfficientSoftDiceLoss(apply_nonlin=torch.sigmoid, batch_dice=False, ddp=False)
-            dice = torch.stack([
-                dice_loss_fn(target_pred[i:i+1], targets_binary[i:i+1]) for i in range(target_pred.shape[0])
-            ])
+            if mask is None:
+                mask = torch.ones_like(targets)
+            mask = mask.to(dtype=target_pred.dtype)
+            targets_binary = (targets > 0.5).float()
+
+            # BCE loss with proper masking (mask applied after loss computation)
+            bce = torch.nn.BCEWithLogitsLoss(reduction='none')(target_pred, targets_binary)
+            bce = (bce * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4)).clamp_min(1)
+
+            # Dice loss: apply sigmoid first, then mask, then compute dice
+            # This avoids the sigmoid(0)=0.5 problem when multiplying logits by mask
+            pred_probs = torch.sigmoid(target_pred)
+            dice_losses = []
+            for i in range(target_pred.shape[0]):
+                batch_mask = mask[i:i+1]
+                pred_masked = pred_probs[i:i+1] * batch_mask
+                target_masked = targets_binary[i:i+1] * batch_mask
+
+                intersection = (pred_masked * target_masked).sum()
+                pred_sum = (pred_masked * pred_masked).sum()
+                target_sum = (target_masked * target_masked).sum()
+
+                dice = 1.0 - (2.0 * intersection + 1e-5) / (pred_sum + target_sum + 1e-5)
+                dice_losses.append(dice)
+
+            dice = torch.stack(dice_losses)
             return bce + dice
         else:
             if mask is None:
                 mask = torch.ones_like(targets)
-            per_batch = ((target_pred - targets) ** 2 * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4))
+            per_batch = ((target_pred - targets) ** 2 * mask).sum(dim=(1, 2, 3, 4)) / mask.sum(dim=(1, 2, 3, 4)).clamp_min(1e-6)
             return per_batch
 
     return loss_fn
@@ -95,7 +115,10 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
         channel_idx += 1
 
     slot_channels = targets.shape[1]
-    uv_cond = inputs[:, channel_idx : channel_idx + slot_channels]
+    cond_channels = inputs.shape[1] - channel_idx
+    if cond_channels <= 0:
+        raise ValueError("slot multistep expected at least one conditioning channel")
+    uv_cond = inputs[:, channel_idx : channel_idx + cond_channels]
 
     # Channels with non-zero mask are the ones we should eventually supervise
     remaining_slots = (mask.flatten(2).sum(dim=2) > 0)
@@ -144,7 +167,19 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
         # Accumulate predictions for visualisation and update conditioning for next step
         preds_for_vis = torch.where(step_selector_cf, step_pred, preds_for_vis)
         pred_heatmaps = torch.sigmoid(step_pred.detach())
-        current_cond = torch.where(step_selector_cf, pred_heatmaps, current_cond)
+        if slot_channels == cond_channels:
+            cond_selector = step_selector
+            pred_for_cond = pred_heatmaps
+        elif slot_channels == cond_channels + 1:
+            cond_selector = step_selector[:, :cond_channels]
+            pred_for_cond = pred_heatmaps[:, :cond_channels]
+        else:
+            raise ValueError(
+                f"slot multistep expected conditioning channels to match outputs (or outputs=cond+1), "
+                f"got cond={cond_channels}, out={slot_channels}"
+            )
+        cond_selector_cf = cond_selector[:, :, None, None, None]
+        current_cond = torch.where(cond_selector_cf, pred_for_cond, current_cond)
 
     if not step_losses:
         raise ValueError("slot multistep did not select any slots to supervise")
@@ -170,11 +205,11 @@ def train(config_path):
 
     # Calculate channel counts based on step_count
     # Input: 4 cardinal + diag_in (5 conditioning slots)
-    # Output: 4 cardinal + diag_in + diag_out (6 output slots)
+    # Output: 4 cardinal + diag_out (5 output slots) - diag_in is never predicted
     cardinal_slots = 4 * config['step_count']
     if config['masked_include_diag']:
         conditioning_slots = cardinal_slots + 1  # diag_in only
-        out_slots = cardinal_slots + 2  # diag_in + diag_out
+        out_slots = cardinal_slots + 1  # diag_out only (diag_in is conditioning, not output)
     else:
         conditioning_slots = cardinal_slots
         out_slots = cardinal_slots
@@ -200,8 +235,10 @@ def train(config_path):
     ds_enabled = config.setdefault('enable_deep_supervision', False)
     use_seg = config.setdefault('aux_segmentation', False)
     use_normals = config.setdefault('aux_normals', False)
+    use_surf_overlap = config.setdefault('use_surf_overlap_loss', False)
     seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
     normals_loss_weight = config.setdefault('normals_loss_weight', 1.0)
+    surf_overlap_loss_weight = config.setdefault('surf_overlap_loss_weight', 1.0)
 
     # Set random seeds
     random.seed(config['seed'])
@@ -216,6 +253,7 @@ def train(config_path):
         'uv': {'weights': None, 'loss_fn': None},
         'seg': {'weights': None, 'loss_fn': None},
         'normals': {'weights': None, 'loss_fn': None},
+        'surf_overlap': {'weights': None, 'loss_fn': None},
     }
 
     # Setup accelerator
@@ -228,6 +266,16 @@ def train(config_path):
     if 'wandb_project' in config and accelerator.is_main_process:
         wandb.init(project=config['wandb_project'], entity=config.get('wandb_entity', None), config=config)
 
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    def make_generator(offset=0):
+        gen = torch.Generator()
+        gen.manual_seed(config['seed'] + accelerator.process_index * 1000 + offset)
+        return gen
+
     # Create datasets
     train_patches, val_patches = load_datasets(config)
     multistep_count = int(config.get('multistep_count', 1))
@@ -235,10 +283,18 @@ def train(config_path):
     train_dataset = HeatmapDatasetSlotted(config, train_patches, multistep_count, bidirectional)
     val_dataset = HeatmapDatasetSlotted(config, val_patches, multistep_count, bidirectional)
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=config['batch_size'], num_workers=config.get('num_workers', 4)
+        train_dataset,
+        batch_size=config['batch_size'],
+        num_workers=config.get('num_workers', 4),
+        worker_init_fn=seed_worker,
+        generator=make_generator(0),
     )
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=config['batch_size'] * 2, num_workers=1
+        val_dataset,
+        batch_size=config['batch_size'] * 2,
+        num_workers=1,
+        worker_init_fn=seed_worker,
+        generator=make_generator(1),
     )
 
     # Create model
@@ -296,7 +352,13 @@ def train(config_path):
             state_dict = {k: v for k, v in state_dict.items() if 'shared_decoder.encoder.' not in k}
             print(f'Filtered out {len(filtered_keys)} duplicate shared_decoder.encoder keys')
         model.load_state_dict(state_dict)
-        optimizer.load_state_dict(ckpt['optimizer'])
+        # Only load optimizer state if optimizer type matches (avoid SGD/Adam mismatch)
+        ckpt_optim_type = type(ckpt['optimizer']['param_groups'][0].get('betas', None))
+        curr_optim_type = type(optimizer.param_groups[0].get('betas', None))
+        if ckpt_optim_type == curr_optim_type:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        else:
+            print(f'Skipping optimizer state load (optimizer type changed)')
 
     # Prepare with accelerator
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
@@ -365,6 +427,7 @@ def train(config_path):
         wandb_log = {}
         seg_loss = normals_loss = None
         seg_for_vis = seg_pred_for_vis = normals_for_vis = normals_pred_for_vis = None
+        surf_overlap_for_vis = surf_overlap_pred_for_vis = None
 
         with accelerator.accumulate(model):
             if multistep_enabled:
@@ -405,6 +468,27 @@ def train(config_path):
                     total_loss = total_loss + normals_loss_weight * normals_loss
                     normals_for_vis = normals
 
+            # Surface overlap loss - model directly predicts surface overlap segmentation
+            surf_overlap_loss = None
+            if use_surf_overlap and outputs is not None:
+                surf_overlap_mask = batch.get('surf_overlap_mask')
+                surf_overlap_valid = batch.get('surf_overlap_valid', torch.tensor(False))
+                if surf_overlap_mask is not None and surf_overlap_valid.any():
+                    from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
+                    surf_overlap_mask = surf_overlap_mask.unsqueeze(1)  # [B, 1, Z, Y, X]
+                    # Get model's surf_overlap prediction
+                    pred_surf_overlap = require_head(outputs, 'surf_overlap')
+                    if isinstance(pred_surf_overlap, (list, tuple)):
+                        pred_surf_overlap = pred_surf_overlap[0]
+                    surf_overlap_loss_raw = compute_surf_overlap_loss(pred_surf_overlap, surf_overlap_mask)
+                    # Only average over valid batches
+                    valid_batch_mask = surf_overlap_valid.to(surf_overlap_loss_raw.device).float()
+                    surf_overlap_loss = (surf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
+                    total_loss = total_loss + surf_overlap_loss_weight * surf_overlap_loss
+                    # Store for visualization
+                    surf_overlap_for_vis = surf_overlap_mask
+                    surf_overlap_pred_for_vis = pred_surf_overlap
+
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
             accelerator.backward(total_loss)
@@ -415,11 +499,13 @@ def train(config_path):
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
-        wandb_log['heatmap_loss'] = heatmap_loss.detach().item()
+        wandb_log['first_step_heatmap_loss'] = heatmap_loss.detach().item()
         if use_seg and seg_loss is not None:
-            wandb_log['seg_loss'] = seg_loss.detach().item()
+            wandb_log['seg_loss'] = (seg_loss_weight * seg_loss).detach().item()
         if use_normals and normals_loss is not None:
-            wandb_log['normals_loss'] = normals_loss.detach().item()
+            wandb_log['normals_loss'] = (normals_loss_weight * normals_loss).detach().item()
+        if use_surf_overlap and surf_overlap_loss is not None:
+            wandb_log['surf_overlap_loss'] = (surf_overlap_loss_weight * surf_overlap_loss).detach().item()
         progress_bar.set_postfix({'loss': wandb_log['loss']})
         progress_bar.update(1)
 
@@ -437,6 +523,7 @@ def train(config_path):
 
                 val_seg_loss = val_normals_loss = None
                 val_seg_for_vis = val_seg_pred_for_vis = val_normals_for_vis = val_normals_pred_for_vis = None
+                val_surf_overlap_for_vis = val_surf_overlap_pred_for_vis = None
 
                 if multistep_enabled:
                     val_heatmap_loss, val_target_pred_for_vis = compute_slot_multistep_loss(
@@ -476,12 +563,34 @@ def train(config_path):
                         total_val_loss = total_val_loss + normals_loss_weight * val_normals_loss
                         val_normals_for_vis = val_normals
 
+                # Validation surface overlap loss - model directly predicts surface overlap segmentation
+                val_surf_overlap_loss = None
+                if use_surf_overlap and val_outputs is not None:
+                    val_surf_overlap_mask = val_batch.get('surf_overlap_mask')
+                    val_surf_overlap_valid = val_batch.get('surf_overlap_valid', torch.tensor(False))
+                    if val_surf_overlap_mask is not None and val_surf_overlap_valid.any():
+                        from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
+                        val_surf_overlap_mask = val_surf_overlap_mask.unsqueeze(1)
+                        # Get model's surf_overlap prediction
+                        val_pred_surf_overlap = require_head(val_outputs, 'surf_overlap')
+                        if isinstance(val_pred_surf_overlap, (list, tuple)):
+                            val_pred_surf_overlap = val_pred_surf_overlap[0]
+                        val_surf_overlap_loss_raw = compute_surf_overlap_loss(val_pred_surf_overlap, val_surf_overlap_mask)
+                        valid_batch_mask = val_surf_overlap_valid.to(val_surf_overlap_loss_raw.device).float()
+                        val_surf_overlap_loss = (val_surf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
+                        total_val_loss = total_val_loss + surf_overlap_loss_weight * val_surf_overlap_loss
+                        # Store for visualization
+                        val_surf_overlap_for_vis = val_surf_overlap_mask
+                        val_surf_overlap_pred_for_vis = val_pred_surf_overlap
+
                 wandb_log['val_loss'] = total_val_loss.item()
-                wandb_log['val_heatmap_loss'] = val_heatmap_loss.item()
+                wandb_log['val_first_step_heatmap_loss'] = val_heatmap_loss.item()
                 if use_seg and val_seg_loss is not None:
-                    wandb_log['val_seg_loss'] = val_seg_loss.item()
+                    wandb_log['val_seg_loss'] = (seg_loss_weight * val_seg_loss).item()
                 if use_normals and val_normals_loss is not None:
-                    wandb_log['val_normals_loss'] = val_normals_loss.item()
+                    wandb_log['val_normals_loss'] = (normals_loss_weight * val_normals_loss).item()
+                if use_surf_overlap and val_surf_overlap_loss is not None:
+                    wandb_log['val_surf_overlap_loss'] = (surf_overlap_loss_weight * val_surf_overlap_loss).item()
 
                 # Create and save visualization
                 cond_start = 2 if config.get('use_localiser', False) else 1
@@ -491,13 +600,17 @@ def train(config_path):
                 make_canvas(inputs, targets, target_pred_for_vis, config,
                            seg=seg_for_vis, seg_pred=seg_pred_for_vis,
                            normals=normals_for_vis, normals_pred=normals_pred_for_vis, normals_mask=None,
+                           surf_overlap=surf_overlap_for_vis, surf_overlap_pred=surf_overlap_pred_for_vis,
                            cond_channel_start=cond_start,
-                           save_path=train_img_path)
+                           save_path=train_img_path,
+                           unknown_mask=mask)
                 make_canvas(val_inputs, val_targets, val_target_pred_for_vis, config,
                            seg=val_seg_for_vis, seg_pred=val_seg_pred_for_vis,
                            normals=val_normals_for_vis, normals_pred=val_normals_pred_for_vis, normals_mask=None,
+                           surf_overlap=val_surf_overlap_for_vis, surf_overlap_pred=val_surf_overlap_pred_for_vis,
                            cond_channel_start=cond_start,
-                           save_path=val_img_path)
+                           save_path=val_img_path,
+                           unknown_mask=val_mask)
 
                 if wandb.run is not None:
                     wandb_log['train_image'] = wandb.Image(train_img_path)
