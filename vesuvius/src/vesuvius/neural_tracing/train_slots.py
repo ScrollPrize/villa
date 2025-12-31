@@ -505,13 +505,14 @@ def train(config_path):
                     pred_cardinals = torch.sigmoid(target_pred[:, :4])  # [B, 4, Z, Y, X]
 
                     # Derive cardinal unknown mask from uv_heatmaps_out_mask
-                    # Shape: [B, Z, Y, X, C] - check any voxel (they're uniform across spatial dims)
+                    # Shape: [B, Z, Y, X, C] - mask is uniform across spatial dims
                     cardinal_unknown_mask = (batch['uv_heatmaps_out_mask'][:, 0, 0, 0, :4] > 0)  # [B, 4]
 
                     equidist_loss_raw, _ = compute_uv_equidist_loss_slots(
                         pred_cardinals,
                         cardinal_positions,
                         cardinal_unknown_mask,
+                        valid_mask=srf_overlap_valid,  # Filter per-sample validity
                         threshold=equidist_threshold,
                         temperature=equidist_temperature,
                     )
@@ -632,6 +633,7 @@ def train(config_path):
                             val_pred_cardinals,
                             val_cardinal_positions,
                             val_cardinal_unknown_mask,
+                            valid_mask=val_srf_overlap_valid,  # Filter per-sample validity
                             threshold=equidist_threshold,
                             temperature=equidist_temperature,
                         )

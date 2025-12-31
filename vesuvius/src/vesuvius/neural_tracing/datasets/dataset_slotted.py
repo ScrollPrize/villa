@@ -360,13 +360,13 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             # Use the stored srf_overlap mask and validity from _build_final_heatmaps
             srf_overlap_mask = self._slotted_srf_overlap_mask
             srf_overlap_valid = self._slotted_srf_overlap_valid
+            # Always include cardinal_positions and srf_overlap_valid for consistent
+            # batch collation (avoids crash when batch has mixed validity samples)
+            batch_dict.update({
+                'srf_overlap_valid': torch.tensor(srf_overlap_valid),
+                'cardinal_positions': self._slotted_cardinal_positions,  # [4, 3] GT positions
+            })
             if srf_overlap_mask is not None:
-                batch_dict.update({
-                    'srf_overlap_mask': srf_overlap_mask,
-                    'srf_overlap_valid': torch.tensor(srf_overlap_valid),
-                    'cardinal_positions': self._slotted_cardinal_positions,  # [4, 3] GT positions
-                })
-            else:
-                batch_dict.update({'srf_overlap_valid': torch.tensor(False)})
+                batch_dict['srf_overlap_mask'] = srf_overlap_mask
 
         return batch_dict
