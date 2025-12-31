@@ -495,7 +495,7 @@ def train(config_path):
 
             # Equidistance loss - enforces uniform spacing of cardinal predictions
             equidist_loss = None
-            if use_equidist and outputs is not None and not use_multistep:
+            if use_equidist and outputs is not None and not multistep_enabled:
                 srf_overlap_valid = batch.get('srf_overlap_valid', torch.tensor(False))
                 cardinal_positions = batch.get('cardinal_positions')
                 if srf_overlap_valid.any() and cardinal_positions is not None:
@@ -616,7 +616,7 @@ def train(config_path):
 
                 # Validation equidistance loss
                 val_equidist_loss = None
-                if use_equidist and val_outputs is not None and not use_multistep:
+                if use_equidist and val_outputs is not None and not multistep_enabled:
                     val_srf_overlap_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
                     val_cardinal_positions = val_batch.get('cardinal_positions')
                     if val_srf_overlap_valid.any() and val_cardinal_positions is not None:
