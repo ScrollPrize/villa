@@ -587,22 +587,22 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         else:
             maybe_center_heatmap = {}
 
-        # Generate surf_overlap mask if enabled
-        surf_overlap_mask = None
-        if self._config.get('use_surf_overlap_loss', False):
+        # Generate srf_overlap mask if enabled
+        srf_overlap_mask = None
+        if self._config.get('aux_srf_overlap', False):
             from vesuvius.neural_tracing.surf_overlap_loss import render_surf_overlap_mask
-            surf_overlap_thickness = self._config.get('surf_overlap_thickness', 2.0)
-            # Use first step coordinates for surf_overlap (step 0)
-            surf_overlap_mask = render_surf_overlap_mask(
+            srf_overlap_thickness = self._config.get('srf_overlap_thickness', 2.0)
+            # Use first step coordinates for srf_overlap (step 0)
+            srf_overlap_mask = render_surf_overlap_mask(
                 u_neg_shifted_zyxs[0], u_pos_shifted_zyxs[0],
                 v_neg_shifted_zyxs[0], v_pos_shifted_zyxs[0],
-                min_corner_zyx, crop_size, thickness=surf_overlap_thickness
+                min_corner_zyx, crop_size, thickness=srf_overlap_thickness
             )
 
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
-            'surf_overlap_mask': surf_overlap_mask,
+            'srf_overlap_mask': srf_overlap_mask,
             **maybe_center_heatmap,
         }
 
@@ -621,7 +621,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         normals,
         normals_mask,
         center_heatmap,
-        surf_overlap_mask=None,
+        srf_overlap_mask=None,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -636,8 +636,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
         if self._config.get("aux_normals", False) and normals is not None:
             batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
-        if self._config.get("use_surf_overlap_loss", False) and surf_overlap_mask is not None:
-            batch_dict.update({'surf_overlap_mask': surf_overlap_mask})
+        if self._config.get("aux_srf_overlap", False) and srf_overlap_mask is not None:
+            batch_dict.update({'srf_overlap_mask': srf_overlap_mask})
 
         return batch_dict
 
@@ -855,7 +855,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
             heatmap_num_in_channels = heatmap_result['condition_channels']
             maybe_center_heatmap = heatmap_result['center_heatmap'] if 'center_heatmap' in heatmap_result else None
-            surf_overlap_mask = heatmap_result.get('surf_overlap_mask', None)
+            srf_overlap_mask = heatmap_result.get('srf_overlap_mask', None)
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -870,12 +870,12 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             #  ok since it's 'just more augmentation' that won't be applied during tracing
             uv_channels = uv_heatmaps_both.shape[0]
             has_center_heatmap = maybe_center_heatmap is not None
-            has_surf_overlap_mask = surf_overlap_mask is not None
+            has_srf_overlap_mask = srf_overlap_mask is not None
             regression_parts = [uv_heatmaps_both]
             if has_center_heatmap:
                 regression_parts.append(maybe_center_heatmap)
-            if has_surf_overlap_mask:
-                regression_parts.append(surf_overlap_mask.unsqueeze(0))
+            if has_srf_overlap_mask:
+                regression_parts.append(srf_overlap_mask.unsqueeze(0))
             regression_target = torch.cat(regression_parts, dim=0)
             seg_for_aug = seg[None] if seg is not None else None
             while True:
@@ -899,10 +899,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 channel_idx += 1
             else:
                 maybe_center_heatmap = None
-            if has_surf_overlap_mask:
-                surf_overlap_mask = regression_aug[..., channel_idx]
+            if has_srf_overlap_mask:
+                srf_overlap_mask = regression_aug[..., channel_idx]
                 # Re-binarize after augmentation (interpolation may have created non-binary values)
-                surf_overlap_mask = (surf_overlap_mask > 0.5).float()
+                srf_overlap_mask = (srf_overlap_mask > 0.5).float()
             if seg is not None:
                 seg_aug = augmented.get('segmentation', None)
                 if seg_aug is None:
@@ -961,7 +961,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 normals=normals,
                 normals_mask=normals_mask,
                 center_heatmap=maybe_center_heatmap,
-                surf_overlap_mask=surf_overlap_mask if has_surf_overlap_mask else None,
+                srf_overlap_mask=srf_overlap_mask if has_srf_overlap_mask else None,
             )
 
             yield batch_dict

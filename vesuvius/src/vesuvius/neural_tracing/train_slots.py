@@ -235,10 +235,14 @@ def train(config_path):
     ds_enabled = config.setdefault('enable_deep_supervision', False)
     use_seg = config.setdefault('aux_segmentation', False)
     use_normals = config.setdefault('aux_normals', False)
-    use_surf_overlap = config.setdefault('use_surf_overlap_loss', False)
+    use_srf_overlap = config.setdefault('aux_srf_overlap', False)
+    use_equidist = config.setdefault('use_equidist_loss', False)
     seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
     normals_loss_weight = config.setdefault('normals_loss_weight', 1.0)
-    surf_overlap_loss_weight = config.setdefault('surf_overlap_loss_weight', 1.0)
+    srf_overlap_loss_weight = config.setdefault('srf_overlap_loss_weight', 1.0)
+    equidist_loss_weight = config.setdefault('equidist_loss_weight', 0.1)
+    equidist_threshold = config.setdefault('equidist_threshold', 0.5)
+    equidist_temperature = config.setdefault('equidist_temperature', 10.0)
 
     # Set random seeds
     random.seed(config['seed'])
@@ -253,7 +257,7 @@ def train(config_path):
         'uv': {'weights': None, 'loss_fn': None},
         'seg': {'weights': None, 'loss_fn': None},
         'normals': {'weights': None, 'loss_fn': None},
-        'surf_overlap': {'weights': None, 'loss_fn': None},
+        'srf_overlap': {'weights': None, 'loss_fn': None},
     }
 
     # Setup accelerator
@@ -427,7 +431,7 @@ def train(config_path):
         wandb_log = {}
         seg_loss = normals_loss = None
         seg_for_vis = seg_pred_for_vis = normals_for_vis = normals_pred_for_vis = None
-        surf_overlap_for_vis = surf_overlap_pred_for_vis = None
+        srf_overlap_for_vis = srf_overlap_pred_for_vis = None
 
         with accelerator.accumulate(model):
             if multistep_enabled:
@@ -469,25 +473,50 @@ def train(config_path):
                     normals_for_vis = normals
 
             # Surface overlap loss - model directly predicts surface overlap segmentation
-            surf_overlap_loss = None
-            if use_surf_overlap and outputs is not None:
-                surf_overlap_mask = batch.get('surf_overlap_mask')
-                surf_overlap_valid = batch.get('surf_overlap_valid', torch.tensor(False))
-                if surf_overlap_mask is not None and surf_overlap_valid.any():
+            srf_overlap_loss = None
+            if use_srf_overlap and outputs is not None:
+                srf_overlap_mask = batch.get('srf_overlap_mask')
+                srf_overlap_valid = batch.get('srf_overlap_valid', torch.tensor(False))
+                if srf_overlap_mask is not None and srf_overlap_valid.any():
                     from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
-                    surf_overlap_mask = surf_overlap_mask.unsqueeze(1)  # [B, 1, Z, Y, X]
-                    # Get model's surf_overlap prediction
-                    pred_surf_overlap = require_head(outputs, 'surf_overlap')
-                    if isinstance(pred_surf_overlap, (list, tuple)):
-                        pred_surf_overlap = pred_surf_overlap[0]
-                    surf_overlap_loss_raw = compute_surf_overlap_loss(pred_surf_overlap, surf_overlap_mask)
+                    srf_overlap_mask = srf_overlap_mask.unsqueeze(1)  # [B, 1, Z, Y, X]
+                    # Get model's srf_overlap prediction
+                    pred_srf_overlap = require_head(outputs, 'srf_overlap')
+                    if isinstance(pred_srf_overlap, (list, tuple)):
+                        pred_srf_overlap = pred_srf_overlap[0]
+                    srf_overlap_loss_raw = compute_surf_overlap_loss(pred_srf_overlap, srf_overlap_mask)
                     # Only average over valid batches
-                    valid_batch_mask = surf_overlap_valid.to(surf_overlap_loss_raw.device).float()
-                    surf_overlap_loss = (surf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
-                    total_loss = total_loss + surf_overlap_loss_weight * surf_overlap_loss
+                    valid_batch_mask = srf_overlap_valid.to(srf_overlap_loss_raw.device).float()
+                    srf_overlap_loss = (srf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
+                    total_loss = total_loss + srf_overlap_loss_weight * srf_overlap_loss
                     # Store for visualization
-                    surf_overlap_for_vis = surf_overlap_mask
-                    surf_overlap_pred_for_vis = pred_surf_overlap
+                    srf_overlap_for_vis = srf_overlap_mask
+                    srf_overlap_pred_for_vis = pred_srf_overlap
+
+            # Equidistance loss - enforces uniform spacing of cardinal predictions
+            equidist_loss = None
+            if use_equidist and outputs is not None and not use_multistep:
+                srf_overlap_valid = batch.get('srf_overlap_valid', torch.tensor(False))
+                cardinal_positions = batch.get('cardinal_positions')
+                if srf_overlap_valid.any() and cardinal_positions is not None:
+                    from vesuvius.neural_tracing.uv_equidist_loss import compute_uv_equidist_loss_slots
+
+                    # Get predictions for cardinal slots (0-3): u_neg, u_pos, v_neg, v_pos
+                    pred_cardinals = torch.sigmoid(target_pred[:, :4])  # [B, 4, Z, Y, X]
+
+                    # Derive cardinal unknown mask from uv_heatmaps_out_mask
+                    # Shape: [B, Z, Y, X, C] - check any voxel (they're uniform across spatial dims)
+                    cardinal_unknown_mask = (batch['uv_heatmaps_out_mask'][:, 0, 0, 0, :4] > 0)  # [B, 4]
+
+                    equidist_loss_raw, _ = compute_uv_equidist_loss_slots(
+                        pred_cardinals,
+                        cardinal_positions,
+                        cardinal_unknown_mask,
+                        threshold=equidist_threshold,
+                        temperature=equidist_temperature,
+                    )
+                    equidist_loss = equidist_loss_raw
+                    total_loss = total_loss + equidist_loss_weight * equidist_loss
 
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
@@ -504,8 +533,10 @@ def train(config_path):
             wandb_log['seg_loss'] = (seg_loss_weight * seg_loss).detach().item()
         if use_normals and normals_loss is not None:
             wandb_log['normals_loss'] = (normals_loss_weight * normals_loss).detach().item()
-        if use_surf_overlap and surf_overlap_loss is not None:
-            wandb_log['surf_overlap_loss'] = (surf_overlap_loss_weight * surf_overlap_loss).detach().item()
+        if use_srf_overlap and srf_overlap_loss is not None:
+            wandb_log['srf_overlap_loss'] = (srf_overlap_loss_weight * srf_overlap_loss).detach().item()
+        if use_equidist and equidist_loss is not None:
+            wandb_log['equidist_loss'] = (equidist_loss_weight * equidist_loss).detach().item()
         progress_bar.set_postfix({'loss': wandb_log['loss']})
         progress_bar.update(1)
 
@@ -523,7 +554,7 @@ def train(config_path):
 
                 val_seg_loss = val_normals_loss = None
                 val_seg_for_vis = val_seg_pred_for_vis = val_normals_for_vis = val_normals_pred_for_vis = None
-                val_surf_overlap_for_vis = val_surf_overlap_pred_for_vis = None
+                val_srf_overlap_for_vis = val_srf_overlap_pred_for_vis = None
 
                 if multistep_enabled:
                     val_heatmap_loss, val_target_pred_for_vis = compute_slot_multistep_loss(
@@ -564,24 +595,48 @@ def train(config_path):
                         val_normals_for_vis = val_normals
 
                 # Validation surface overlap loss - model directly predicts surface overlap segmentation
-                val_surf_overlap_loss = None
-                if use_surf_overlap and val_outputs is not None:
-                    val_surf_overlap_mask = val_batch.get('surf_overlap_mask')
-                    val_surf_overlap_valid = val_batch.get('surf_overlap_valid', torch.tensor(False))
-                    if val_surf_overlap_mask is not None and val_surf_overlap_valid.any():
+                val_srf_overlap_loss = None
+                if use_srf_overlap and val_outputs is not None:
+                    val_srf_overlap_mask = val_batch.get('srf_overlap_mask')
+                    val_srf_overlap_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
+                    if val_srf_overlap_mask is not None and val_srf_overlap_valid.any():
                         from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
-                        val_surf_overlap_mask = val_surf_overlap_mask.unsqueeze(1)
-                        # Get model's surf_overlap prediction
-                        val_pred_surf_overlap = require_head(val_outputs, 'surf_overlap')
-                        if isinstance(val_pred_surf_overlap, (list, tuple)):
-                            val_pred_surf_overlap = val_pred_surf_overlap[0]
-                        val_surf_overlap_loss_raw = compute_surf_overlap_loss(val_pred_surf_overlap, val_surf_overlap_mask)
-                        valid_batch_mask = val_surf_overlap_valid.to(val_surf_overlap_loss_raw.device).float()
-                        val_surf_overlap_loss = (val_surf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
-                        total_val_loss = total_val_loss + surf_overlap_loss_weight * val_surf_overlap_loss
+                        val_srf_overlap_mask = val_srf_overlap_mask.unsqueeze(1)
+                        # Get model's srf_overlap prediction
+                        val_pred_srf_overlap = require_head(val_outputs, 'srf_overlap')
+                        if isinstance(val_pred_srf_overlap, (list, tuple)):
+                            val_pred_srf_overlap = val_pred_srf_overlap[0]
+                        val_srf_overlap_loss_raw = compute_surf_overlap_loss(val_pred_srf_overlap, val_srf_overlap_mask)
+                        valid_batch_mask = val_srf_overlap_valid.to(val_srf_overlap_loss_raw.device).float()
+                        val_srf_overlap_loss = (val_srf_overlap_loss_raw * valid_batch_mask).sum() / valid_batch_mask.sum().clamp(min=1)
+                        total_val_loss = total_val_loss + srf_overlap_loss_weight * val_srf_overlap_loss
                         # Store for visualization
-                        val_surf_overlap_for_vis = val_surf_overlap_mask
-                        val_surf_overlap_pred_for_vis = val_pred_surf_overlap
+                        val_srf_overlap_for_vis = val_srf_overlap_mask
+                        val_srf_overlap_pred_for_vis = val_pred_srf_overlap
+
+                # Validation equidistance loss
+                val_equidist_loss = None
+                if use_equidist and val_outputs is not None and not use_multistep:
+                    val_srf_overlap_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
+                    val_cardinal_positions = val_batch.get('cardinal_positions')
+                    if val_srf_overlap_valid.any() and val_cardinal_positions is not None:
+                        from vesuvius.neural_tracing.uv_equidist_loss import compute_uv_equidist_loss_slots
+
+                        # Get predictions for cardinal slots (0-3)
+                        val_pred_cardinals = torch.sigmoid(val_target_pred[:, :4])
+
+                        # Derive cardinal unknown mask from uv_heatmaps_out_mask
+                        val_cardinal_unknown_mask = (val_batch['uv_heatmaps_out_mask'][:, 0, 0, 0, :4] > 0)  # [B, 4]
+
+                        val_equidist_loss_raw, _ = compute_uv_equidist_loss_slots(
+                            val_pred_cardinals,
+                            val_cardinal_positions,
+                            val_cardinal_unknown_mask,
+                            threshold=equidist_threshold,
+                            temperature=equidist_temperature,
+                        )
+                        val_equidist_loss = val_equidist_loss_raw
+                        total_val_loss = total_val_loss + equidist_loss_weight * val_equidist_loss
 
                 wandb_log['val_loss'] = total_val_loss.item()
                 wandb_log['val_first_step_heatmap_loss'] = val_heatmap_loss.item()
@@ -589,8 +644,10 @@ def train(config_path):
                     wandb_log['val_seg_loss'] = (seg_loss_weight * val_seg_loss).item()
                 if use_normals and val_normals_loss is not None:
                     wandb_log['val_normals_loss'] = (normals_loss_weight * val_normals_loss).item()
-                if use_surf_overlap and val_surf_overlap_loss is not None:
-                    wandb_log['val_surf_overlap_loss'] = (surf_overlap_loss_weight * val_surf_overlap_loss).item()
+                if use_srf_overlap and val_srf_overlap_loss is not None:
+                    wandb_log['val_srf_overlap_loss'] = (srf_overlap_loss_weight * val_srf_overlap_loss).item()
+                if use_equidist and val_equidist_loss is not None:
+                    wandb_log['val_equidist_loss'] = (equidist_loss_weight * val_equidist_loss).item()
 
                 # Create and save visualization
                 cond_start = 2 if config.get('use_localiser', False) else 1
@@ -600,14 +657,14 @@ def train(config_path):
                 make_canvas(inputs, targets, target_pred_for_vis, config,
                            seg=seg_for_vis, seg_pred=seg_pred_for_vis,
                            normals=normals_for_vis, normals_pred=normals_pred_for_vis, normals_mask=None,
-                           surf_overlap=surf_overlap_for_vis, surf_overlap_pred=surf_overlap_pred_for_vis,
+                           srf_overlap=srf_overlap_for_vis, srf_overlap_pred=srf_overlap_pred_for_vis,
                            cond_channel_start=cond_start,
                            save_path=train_img_path,
                            unknown_mask=mask)
                 make_canvas(val_inputs, val_targets, val_target_pred_for_vis, config,
                            seg=val_seg_for_vis, seg_pred=val_seg_pred_for_vis,
                            normals=val_normals_for_vis, normals_pred=val_normals_pred_for_vis, normals_mask=None,
-                           surf_overlap=val_surf_overlap_for_vis, surf_overlap_pred=val_surf_overlap_pred_for_vis,
+                           srf_overlap=val_srf_overlap_for_vis, srf_overlap_pred=val_srf_overlap_pred_for_vis,
                            cond_channel_start=cond_start,
                            save_path=val_img_path,
                            unknown_mask=val_mask)

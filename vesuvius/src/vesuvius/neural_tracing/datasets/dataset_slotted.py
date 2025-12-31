@@ -288,24 +288,24 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         self._slotted_unknown_mask = unknown_mask
         self._slotted_known_mask = known_mask & valid_mask  # known AND valid
 
-        # Generate surf_overlap mask if enabled - only valid when all 4 cardinal slots are valid
-        surf_overlap_mask = None
-        surf_overlap_valid = False
-        if self._config.get('use_surf_overlap_loss', False):
+        # Generate srf_overlap mask if enabled - only valid when all 4 cardinal slots are valid
+        srf_overlap_mask = None
+        srf_overlap_valid = False
+        if self._config.get('aux_srf_overlap', False):
             cardinal_all_valid = valid_mask[:4].all()  # slots 0-3 are cardinals
             if cardinal_all_valid:
                 from vesuvius.neural_tracing.surf_overlap_loss import render_surf_overlap_mask
-                surf_overlap_thickness = self._config.get('surf_overlap_thickness', 2.0)
+                srf_overlap_thickness = self._config.get('srf_overlap_thickness', 2.0)
                 # Use slot positions: 0=u_neg, 1=u_pos, 2=v_neg, 3=v_pos
-                surf_overlap_mask = render_surf_overlap_mask(
+                srf_overlap_mask = render_surf_overlap_mask(
                     slot_zyxs_for_output[0], slot_zyxs_for_output[1],
                     slot_zyxs_for_output[2], slot_zyxs_for_output[3],
-                    min_corner_zyx, crop_size, thickness=surf_overlap_thickness
+                    min_corner_zyx, crop_size, thickness=srf_overlap_thickness
                 )
-                surf_overlap_valid = True
-        self._slotted_surf_overlap_mask = surf_overlap_mask
-        self._slotted_surf_overlap_valid = surf_overlap_valid
-        # Store cardinal GT positions (in local crop coordinates) for surf_overlap loss
+                srf_overlap_valid = True
+        self._slotted_srf_overlap_mask = srf_overlap_mask
+        self._slotted_srf_overlap_valid = srf_overlap_valid
+        # Store cardinal GT positions (in local crop coordinates) for srf_overlap loss
         self._slotted_cardinal_positions = torch.stack([
             slot_zyxs_for_output[0] - min_corner_zyx,  # u_neg
             slot_zyxs_for_output[1] - min_corner_zyx,  # u_pos
@@ -316,7 +316,7 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
-            'surf_overlap_mask': surf_overlap_mask,
+            'srf_overlap_mask': srf_overlap_mask,
         }
 
     def _build_batch_dict(
@@ -330,7 +330,7 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         normals,
         normals_mask,
         center_heatmap,
-        surf_overlap_mask=None,
+        srf_overlap_mask=None,
     ):
         """Build batch dict for slotted dataset."""
         # Only supervise unknown slots (known slots are conditioning inputs only)
@@ -356,17 +356,17 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
         if self._config.get("aux_normals", False) and normals is not None:
             batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
-        if self._config.get("use_surf_overlap_loss", False):
-            # Use the stored surf_overlap mask and validity from _build_final_heatmaps
-            surf_overlap_mask = self._slotted_surf_overlap_mask
-            surf_overlap_valid = self._slotted_surf_overlap_valid
-            if surf_overlap_mask is not None:
+        if self._config.get("aux_srf_overlap", False):
+            # Use the stored srf_overlap mask and validity from _build_final_heatmaps
+            srf_overlap_mask = self._slotted_srf_overlap_mask
+            srf_overlap_valid = self._slotted_srf_overlap_valid
+            if srf_overlap_mask is not None:
                 batch_dict.update({
-                    'surf_overlap_mask': surf_overlap_mask,
-                    'surf_overlap_valid': torch.tensor(surf_overlap_valid),
+                    'srf_overlap_mask': srf_overlap_mask,
+                    'srf_overlap_valid': torch.tensor(srf_overlap_valid),
                     'cardinal_positions': self._slotted_cardinal_positions,  # [4, 3] GT positions
                 })
             else:
-                batch_dict.update({'surf_overlap_valid': torch.tensor(False)})
+                batch_dict.update({'srf_overlap_valid': torch.tensor(False)})
 
         return batch_dict

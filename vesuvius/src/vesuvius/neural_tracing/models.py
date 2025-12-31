@@ -36,9 +36,9 @@ def _config_dict_to_mgr(config_dict):
             'out_channels': 3,
             'activation': 'none',
         }
-    if config_dict.get('use_surf_overlap_loss', False) and 'surf_overlap' not in targets:
+    if config_dict.get('aux_srf_overlap', False) and 'srf_overlap' not in targets:
         targets = dict(targets)
-        targets['surf_overlap'] = {
+        targets['srf_overlap'] = {
             'out_channels': 1,
             'activation': 'none',
         }

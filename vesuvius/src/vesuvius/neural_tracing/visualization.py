@@ -5,7 +5,53 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+import numpy as np
 from torchvision.transforms.v2.functional._color import _hsv_to_rgb
+
+
+def render_text_to_tensor(text, height, width, color, device, font_size=10):
+    """Render text to a tensor image.
+
+    Args:
+        text: String to render
+        height: Height of output image
+        width: Width of output image
+        color: RGB color tuple (0-1 range)
+        device: Torch device
+        font_size: Font size in points
+
+    Returns:
+        Tensor of shape [height, width, 3]
+    """
+    dpi = 100
+    fig_width = width / dpi
+    fig_height = height / dpi
+
+    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
+    fig.patch.set_facecolor('black')
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_facecolor('black')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+
+    # Render text in the slot's color
+    ax.text(0.05, 0.5, text, fontsize=font_size, color=color,
+            verticalalignment='center', fontweight='bold',
+            fontfamily='monospace')
+
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+
+    # Get the image as numpy array
+    buf = canvas.buffer_rgba()
+    img = np.asarray(buf)[:, :, :3]  # Drop alpha
+    plt.close(fig)
+
+    # Convert to tensor and normalize to 0-1
+    tensor = torch.from_numpy(img).float() / 255.0
+    return tensor.to(device)
 
 
 def print_training_config(config, accelerator):
@@ -45,8 +91,11 @@ def make_canvas(
     normals=None,
     normals_pred=None,
     normals_mask=None,
+    srf_overlap=None,
+    srf_overlap_pred=None,
     cond_channel_start=2,
     save_path=None,
+    unknown_mask=None,
 ):
     """
     Create visualization canvas for training/validation images.
@@ -63,6 +112,7 @@ def make_canvas(
         normals_mask: Optional normals mask
         cond_channel_start: Starting channel index for conditioning visualization
         save_path: Optional path to save the canvas image
+        unknown_mask: Optional mask [B, C, Z, Y, X] indicating which slots were unknown (1) vs known (0)
 
     Returns:
         Grid tensor ready for saving with plt.imsave
@@ -89,6 +139,12 @@ def make_canvas(
         normals_pred = normals_pred[:sample_count]
     if normals_mask is not None:
         normals_mask = normals_mask[:sample_count]
+    if unknown_mask is not None:
+        unknown_mask = unknown_mask[:sample_count]
+    if srf_overlap is not None:
+        srf_overlap = srf_overlap[:sample_count]
+    if srf_overlap_pred is not None:
+        srf_overlap_pred = srf_overlap_pred[:sample_count]
 
     # For non-slotted multistep, collapse step dimension for visualization
     # Slotted variant uses fixed slots, not (uv, steps) organization
@@ -105,9 +161,9 @@ def make_canvas(
 
     # Create colors for visualization
     if is_slotted:
-        # Fixed semantic colors for slotted: conditioning (5) + output (6) channels
-        # Conditioning: u_neg, u_pos, v_neg, v_pos, diag_in (shown in gray/white - known inputs)
-        # Output: u_neg, u_pos, v_neg, v_pos, diag_in, diag_out (colored - predictions)
+        # Fixed semantic colors for slotted: conditioning (5) + output (5) channels
+        # Conditioning: u_neg, u_pos, v_neg, v_pos, diag_in (shown in white - known inputs)
+        # Output: u_neg, u_pos, v_neg, v_pos, diag_out (colored - predictions)
         cond_colors = torch.tensor([
             [1.0, 1.0, 1.0],  # u_neg - white
             [1.0, 1.0, 1.0],  # u_pos - white
@@ -120,7 +176,6 @@ def make_canvas(
             [1.0, 0.6, 0.2],  # u_pos - orange
             [0.3, 0.5, 1.0],  # v_neg - blue
             [0.3, 0.9, 0.9],  # v_pos - cyan
-            [0.3, 0.9, 0.4],  # diag_in - green
             [0.9, 0.3, 0.9],  # diag_out - magenta
         ], device=inputs.device)
         colours_by_step = torch.cat([cond_colors[:num_cond_channels], out_colors[:targets.shape[1]]], dim=0)
@@ -173,11 +228,54 @@ def make_canvas(
             slices.append(overlay_crosshair(blended))
         return torch.cat(slices, dim=1)
 
+    def projection_single_slot(x, slot_idx, color):
+        """Project a single slot channel with its assigned color."""
+        single = x[:, slot_idx:slot_idx+1]  # [B, 1, D, H, W]
+        coloured = single[..., None] * color[None, None, None, None, None, :]
+        return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
+
+    # Build views list
     views = [
         torch.cat([inputs_slice(dim) for dim in range(3)], dim=1),
         projections(F.sigmoid(target_pred)),
         projections(targets),
     ]
+
+    # For slotted variant, add per-slot rows for easier comparison
+    if is_slotted:
+        slot_names = ['u_neg', 'u_pos', 'v_neg', 'v_pos', 'diag_out']
+        num_slots = min(targets.shape[1], len(slot_names))
+
+        for slot_idx in range(num_slots):
+            color = out_colors[slot_idx]
+            color_tuple = tuple(color.cpu().tolist())
+
+            # Create per-slot projections
+            pred_slot = projection_single_slot(F.sigmoid(target_pred), slot_idx, color)
+            gt_slot = projection_single_slot(targets, slot_idx, color)
+
+            # Determine if this slot was known or predicted (use first sample)
+            slot_label = slot_names[slot_idx]
+            if unknown_mask is not None:
+                # mask=1 means unknown (predicted), mask=0 means known (conditioned)
+                is_unknown = unknown_mask[0, slot_idx].any().item()
+                slot_label = f"{slot_label} [pred]" if is_unknown else f"{slot_label} [known]"
+
+            # Render slot label and overlay onto pred_slot
+            _, h, w, _ = pred_slot.shape
+            label_width = min(200, w)  # Wide enough for "diag_out [known]"
+            label_height = min(30, h // 2)
+            label_img = render_text_to_tensor(
+                slot_label, label_height, label_width,
+                color_tuple, inputs.device, font_size=7
+            )
+
+            # Overlay label on pred_slot (top-left of first orthogonal view)
+            pred_slot_labeled = pred_slot.clone()
+            pred_slot_labeled[:, :label_height, :label_width, :] = label_img.unsqueeze(0)
+
+            views.append(pred_slot_labeled)
+            views.append(gt_slot)
 
     if seg is not None:
         views.append(seg_overlay((seg != 0).float(), torch.tensor([0.0, 1.0, 0.0], device=inputs.device)))
@@ -195,6 +293,17 @@ def make_canvas(
             if isinstance(n_pred, (list, tuple)):
                 n_pred = n_pred[0]
             views.append(normals_vis(n_pred))
+
+    if srf_overlap is not None:
+        # Yellow for GT srf_overlap
+        views.append(seg_overlay((srf_overlap != 0).float(), torch.tensor([1.0, 0.8, 0.0], device=inputs.device)))
+        if srf_overlap_pred is not None:
+            s_pred = srf_overlap_pred
+            if isinstance(s_pred, (list, tuple)):
+                s_pred = s_pred[0]
+            srf_overlap_pred_mask = torch.sigmoid(s_pred)
+            # Orange for predicted srf_overlap
+            views.append(seg_overlay(srf_overlap_pred_mask, torch.tensor([1.0, 0.5, 0.0], device=inputs.device), alpha=0.45))
 
     canvas = torch.stack(views, dim=-1)
     sample_canvases = rearrange(canvas.clip(0, 1), 'b y x rgb v -> b y (v x) rgb').cpu()
