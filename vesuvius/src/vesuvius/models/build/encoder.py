@@ -45,6 +45,8 @@ class Encoder(nn.Module,):
                  stem_channels: int = None,
                  squeeze_excitation: bool = False,
                  squeeze_excitation_reduction_ratio: float = 1. / 16,
+                 squeeze_excitation_type: str = "channel",
+                 squeeze_excitation_add_maxpool: bool = False,
                  stochastic_depth_p: float = 0.0,
                  return_skips: bool = False,
                  bottleneck_block = BasicBlockD,
@@ -113,7 +115,9 @@ class Encoder(nn.Module,):
                     bottleneck_channels=bottleneck_channels[s],
                     stochastic_depth_p=stochastic_depth_p,
                     squeeze_excitation=squeeze_excitation,
-                    squeeze_excitation_reduction_ratio=squeeze_excitation_reduction_ratio
+                    squeeze_excitation_reduction_ratio=squeeze_excitation_reduction_ratio,
+                    squeeze_excitation_type=squeeze_excitation_type,
+                    squeeze_excitation_add_maxpool=squeeze_excitation_add_maxpool
                 )
 
                 if pool_op is not None:
