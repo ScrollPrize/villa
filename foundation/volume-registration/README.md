@@ -41,6 +41,7 @@ Typically one finds a transform by following these steps (details below):
 
 First one roughly positions the moving volume using the following commands:
 
+- Step sizes can be customized via `--small-rotate-deg`, `--large-rotate-deg`, `--small-translate-voxels`, and `--large-translate-voxels`.
 - `Alt + a` - Rotate +X (`+ Shift` for bigger step)
 - `Alt + q` - Rotate -X (`+ Shift` for bigger step)
 - `Alt + s` - Rotate +Y (`+ Shift` for bigger step)
@@ -68,6 +69,7 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 
 #### Refining landmark points
 
+- Point perturb step can be customized via `--point-perturb-voxels`.
 - `Alt + x` - Delete nearest landmark point
 - `Alt + [` - Navigate to previous fixed point
 - `Alt + ]` - Navigate to next fixed point
