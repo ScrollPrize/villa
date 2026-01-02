@@ -96,6 +96,7 @@ def get_volume_dimensions(
 
     metadata = None
     metadata_path = None
+    metadata_error: Optional[Exception] = None
 
     if is_remote:
         # Remote path
@@ -108,9 +109,7 @@ def get_volume_dimensions(
             requests.RequestException,
             json.JSONDecodeError,
         ) as e:
-            raise RuntimeError(
-                f"Could not fetch/parse metadata from {metadata_url}: {e}"
-            )
+            metadata_error = e
         metadata_path = metadata_url
     else:
         # Local path
@@ -120,39 +119,54 @@ def get_volume_dimensions(
                 with metadata_path.open("r") as f:
                     metadata = json.load(f)
             except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"Could not parse metadata from {metadata_path}: {e}"
-                )
+                metadata_error = e
 
-    if metadata is not None:
-        metadata_voxel_size_mm = (
-            metadata.get("scan")
-            .get("tomo")
-            .get("acquisition")
-            .get("detector")
-            .get("samplePixelSize")
+    if metadata_error is not None and provided_voxel_size is None:
+        raise RuntimeError(
+            f"Could not fetch/parse metadata from {metadata_path}: {metadata_error}"
         )
-        metadata_voxel_size_um = metadata_voxel_size_mm * 1000
-        if provided_voxel_size is not None:
-            assert (
-                metadata_voxel_size_um == provided_voxel_size
-            ), "Voxel size from metadata.json and provided voxel size do not match"
-        return Dimensions(
-            voxels_x=voxels_x,
-            voxels_y=voxels_y,
-            voxels_z=voxels_z,
-            voxel_size_um=metadata_voxel_size_um,
-        )
+
+    metadata_voxel_size_um = None
+    if isinstance(metadata, dict):
+        scan = metadata.get("scan") or {}
+        tomo = scan.get("tomo") or {}
+        acquisition = tomo.get("acquisition") or {}
+        detector = acquisition.get("detector") or {}
+        metadata_voxel_size_mm = detector.get("samplePixelSize")
+        if metadata_voxel_size_mm is not None:
+            try:
+                metadata_voxel_size_um = float(metadata_voxel_size_mm) * 1000
+            except (TypeError, ValueError):
+                metadata_voxel_size_um = None
+
+    if metadata_voxel_size_um is not None:
+        if provided_voxel_size is not None and not np.isclose(
+            metadata_voxel_size_um, provided_voxel_size
+        ):
+            raise ValueError(
+                "Voxel size from metadata.json and provided voxel size do not match: "
+                f"{metadata_voxel_size_um} != {provided_voxel_size} (microns)"
+            )
+        voxel_size_um = metadata_voxel_size_um
     else:
-        assert (
-            provided_voxel_size is not None
-        ), f"No metadata.json found at {metadata_path} and no voxel size provided directly"
-        return Dimensions(
-            voxels_x=voxels_x,
-            voxels_y=voxels_y,
-            voxels_z=voxels_z,
-            voxel_size_um=provided_voxel_size,
-        )
+        if provided_voxel_size is None:
+            if metadata is not None:
+                raise ValueError(
+                    f"metadata.json found at {metadata_path} but voxel size was not found at "
+                    "'scan.tomo.acquisition.detector.samplePixelSize'. "
+                    "Provide voxel size directly with --fixed-voxel-size/--moving-voxel-size."
+                )
+            raise ValueError(
+                f"No metadata.json found at {metadata_path} and no voxel size provided directly"
+            )
+        voxel_size_um = provided_voxel_size
+
+    return Dimensions(
+        voxels_x=voxels_x,
+        voxels_y=voxels_y,
+        voxels_z=voxels_z,
+        voxel_size_um=voxel_size_um,
+    )
 
 
 def affine_matrix_to_sitk_transform(matrix: np.ndarray) -> sitk.AffineTransform:
