@@ -145,9 +145,9 @@ Finding the first letters inside one of these scrolls is a major step forward.
 
 Additionally, finding the title of any scroll is a huge and exciting discovery that helps scholars contextualize the rest of the work!
 
-**First Letters: $60,000 to the first team that uncovers 10 letters within a single 4cm^2 area of any of Scrolls 2-4.**
+**First Letters: $60,000 to the first team that uncovers 10 letters within a single 4cm^2 area of any of Scrolls 2-3.**
 
-**First Title: $60,000 to the first team to discover the title in any of Scrolls 1-4.**
+**First Title: $60,000 to the first team to discover the title in any of Scrolls 1-3.**
 
 <div className="mb-4">
   <img src="/img/data/title_example.webp" className="w-[50%]"/>
