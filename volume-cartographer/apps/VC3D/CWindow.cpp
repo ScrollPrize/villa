@@ -682,6 +682,25 @@ CWindow::CWindow() :
         }
     });
 
+    // Toggle surface normals visualization (Ctrl+N)
+    fSurfaceNormalsShortcut = new QShortcut(QKeySequence("Ctrl+N"), this);
+    fSurfaceNormalsShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fSurfaceNormalsShortcut, &QShortcut::activated, [this]() {
+        using namespace vc3d::settings;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        bool current = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
+        bool next = !current;
+        settings.setValue(viewer::SHOW_SURFACE_NORMALS, next ? "1" : "0");
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([next](CVolumeViewer* viewer) {
+                if (viewer) {
+                    viewer->setShowSurfaceNormals(next);
+                }
+            });
+        }
+        statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
+    });
+
     fAxisAlignedSlicesShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
     fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
     connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
@@ -1250,6 +1269,14 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::cropBoundsRequested,
             this, [this](const QString& segmentId) {
                 onCropSurfaceToValidRegion(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::flipURequested,
+            this, [this](const QString& segmentId) {
+                onFlipSurface(segmentId.toStdString(), true);
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::flipVRequested,
+            this, [this](const QString& segmentId) {
+                onFlipSurface(segmentId.toStdString(), false);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
