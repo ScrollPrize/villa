@@ -386,6 +386,49 @@ private:
     mutable std::unique_ptr<CachedChunked3dInterpolator<uint8_t, passTroughComputor>> interp_;
 };
 
+struct NeuralTracerCost {
+    explicit NeuralTracerCost(NeuralTracerConnection& connection, double w)
+        : _connection{connection}, _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const center, const T* const prev_u, const T* const prev_v, const T* const prev_diag, const T* const gap_u, T* residual) const {
+
+        // Call the neural tracer with center and prev_* xyzs; measure how the output xyz differs from gap xyz
+        // FIXME: these should not be detached! should differentiate through the model and coordinate-from-heatmaps
+        cv::Vec3f center_vec_detached(unjet(center[0]), unjet(center[1]), unjet(center[2]));
+        cv::Vec3f prev_u_vec_detached(unjet(prev_u[0]), unjet(prev_u[1]), unjet(prev_u[2]));
+        cv::Vec3f prev_v_vec_detached(unjet(prev_v[0]), unjet(prev_v[1]), unjet(prev_v[2]));
+        cv::Vec3f prev_diag_vec_detached(unjet(prev_diag[0]), unjet(prev_diag[1]), unjet(prev_diag[2]));
+        auto const next_points = _connection.get_next_points({center_vec_detached}, {{prev_u_vec_detached}}, {{prev_v_vec_detached}}, {{prev_diag_vec_detached}}).front();
+        auto const pred_gap_u = next_points.next_u_xyzs[0];
+        T displacement[] = {T(pred_gap_u[0]) - gap_u[0], T(pred_gap_u[1]) - gap_u[1], T(pred_gap_u[2]) - gap_u[2]};
+        residual[0] = T(_w) * displacement[0];
+        residual[1] = T(_w) * displacement[1];
+        residual[2] = T(_w) * displacement[2];
+        return true;
+    }
+
+    static ceres::CostFunction* Create(bool has_prev_v, bool has_prev_diag, NeuralTracerConnection &connection, double w = 1.0)
+    {
+        assert(has_prev_v || has_prev_diag);
+        if (has_prev_v && has_prev_diag) {
+            return new ceres::AutoDiffCostFunction<NeuralTracerCost, 3, 3, 3, 3, 3, 3>(
+                new NeuralTracerCost(connection, w));
+        }
+        throw std::logic_error("NeuralTracerCost::Create: currently requires both prev_v and prev_diag");
+        // TODO!
+        /* else if (has_prev_v) {
+        } else {
+        } */
+    }
+
+    static double unjet(const double& v) { return v; }
+    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
+
+    NeuralTracerConnection& _connection;
+    double _w;
+};
+
 struct TraceParameters {
     cv::Mat_<uint8_t> state;
     cv::Mat_<cv::Vec3d> dpoints;
@@ -400,6 +443,7 @@ enum LossType {
     NORMAL,
     SDIR,
     CORRECTION,
+    NEURAL_TRACER,
     COUNT
 };
 
@@ -415,6 +459,7 @@ struct LossSettings {
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
+        w[LossType::NEURAL_TRACER] = 1.0f;
     }
 
     void applyJsonWeights(const nlohmann::json& params) {
@@ -437,6 +482,7 @@ struct LossSettings {
         set_weight("direction_weight", LossType::DIRECTION);
         set_weight("sdir_weight", LossType::SDIR);
         set_weight("correction_weight", LossType::CORRECTION);
+        set_weight("neural_tracer_weight", LossType::NEURAL_TRACER);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -1631,6 +1677,100 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
+
+static float local_optimization_neural(int radius, const cv::Vec2i &p0, TraceParameters &params,
+    TraceData& trace_data, LossSettings &settings, NeuralTracerConnection &neural_tracer, bool quiet = false,
+    bool parallel = false, const LocalOptimizationConfig* solver_config = nullptr)
+{
+    // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
+    // the neural tracer is happy with all pairs of neighbors
+
+    ceres::Problem problem;
+
+    auto const gen_neural_loss = [&] (const cv::Vec2i &p) {
+
+        // p is a 'gap' point as far as the neural tracer is concerned. For this p, we ask the tracer to predict it
+        // using whatever is the best combination of valid neighbors
+        // TODO: consider instead whether it'd be better to treat p as the center and predict horizontally and vertically
+        //  from it (which can be done jointly in one call)
+
+        if (!coord_valid(params.state(p)))
+            return;
+        if (params.dpoints(p)[0] == -1)
+            throw std::runtime_error("invalid loc passed as valid!");
+
+        auto const point_info = compute_neural_tracer_point_info(p, params);
+        if (point_info.max_score > 0) {
+            auto const center = p - point_info.best_dir;
+            auto const prev_u = p - 2 * point_info.best_dir;
+            auto const prev_v = *point_info.best_ortho_pos;
+            auto const prev_diag = *point_info.best_diag_pos;
+            if (point_info.best_ortho_pos && point_info.best_diag_pos)
+                problem.AddResidualBlock(
+                    NeuralTracerCost::Create(true, true, neural_tracer, settings(LossType::NEURAL_TRACER, p)),
+                    nullptr,
+                    params.dpoints(center).val,
+                    params.dpoints(prev_u).val,
+                    params.dpoints(prev_v).val,
+                    params.dpoints(prev_diag).val,
+                    params.dpoints(p).val
+                );
+            // TODO!
+            /*
+            else if (point_info.best_ortho_pos)
+                problem.AddResidualBlock(NeuralTracerLoss::Create(true, false, settings(LossType::NEURAL_TRACER, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
+            else if (point_info.best_diag_pos)
+                problem.AddResidualBlock(NeuralTracerLoss::Create(false, true, settings(LossType::NEURAL_TRACER, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
+            else {
+                // this case should never be hit, since a score of >0 implies either prev_v or prev_diag is available
+                throw std::logic_error("invalid neural tracer point info");
+            }
+            */
+        }
+    };
+
+    int r_outer = radius + 3;
+
+    for (int py = std::max(p0[0] - radius, 0); py <= std::min(p0[0] + radius, params.dpoints.rows - 1); py++) {
+        for (int px = std::max(p0[1] - radius, 0); px <= std::min(p0[1] + radius, params.dpoints.cols - 1); px++) {
+            cv::Vec2i p(py, px);
+            if (cv::norm(p - p0) <= radius) {
+                gen_neural_loss(p);  // predict p from neighbors
+                gen_reference_ray_loss(problem, p, params, trace_data);  // reference wrap
+            }
+        }
+    }
+
+    for (int py = std::max(p0[0] - r_outer, 0); py <= std::min(p0[0] + r_outer, params.dpoints.rows - 1); py++) {
+        for (int px = std::max(p0[1] - r_outer, 0); px <= std::min(p0[1] + r_outer, params.dpoints.cols - 1); px++) {
+            cv::Vec2i p(py, px);
+            if (cv::norm(p - p0) > radius && problem.HasParameterBlock(&params.dpoints(p)[0]))
+                problem.SetParameterBlockConstant(params.dpoints(p).val);
+        }
+    }
+
+    std::cout << problem.NumParameterBlocks() << " parameter blocks, " << problem.NumResidualBlocks() << " residual blocks" << std::endl;
+    problem.Evaluate({}, nullptr, nullptr, nullptr, nullptr);
+
+    ceres::Solver::Options options;
+    if (solver_config && solver_config->use_dense_qr) {
+        options.linear_solver_type = ceres::DENSE_QR;
+    } else {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    }
+    options.minimizer_progress_to_stdout = true;  // TODO: disable
+    options.max_num_iterations = solver_config ? solver_config->max_iterations : 1000;
+    options.num_threads = 1;  // TODO: allow parallelism in NeuralTracerConnection somehow
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    if (!quiet)
+        std::cout << "local solve radius " << radius << " " << summary.BriefReport() << std::endl;
+
+    return sqrt(summary.final_cost / summary.num_residual_blocks);
+}
+
 template <typename E>
 static E _max_d_ign(const E &a, const E &b)
 {
@@ -1737,6 +1877,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
+    bool neural_reoptimization = false;
     if (params.contains("neural_socket")) {
         std::string socket_path = params["neural_socket"];
         if (!socket_path.empty()) {
@@ -1750,6 +1891,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         }
         pre_neural_gens = params.value("pre_neural_generations", 0);
         neural_batch_size = params.value("neural_batch_size", 1);
+        neural_reoptimization = params.value("neural_reoptimization", false);
         if (!neural_tracer) {
             std::cout << "Neural tracer not active" << std::endl;
         }
@@ -2852,7 +2994,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         }
 
         if (neural_tracer && generation > pre_neural_gens) {
-            // Skip optimizations
+            if (neural_reoptimization) {
+                if (generation % 4 == 0) {  // TODO: 8???
+                    local_optimization_neural(stop_gen + 10, {y0, x0}, trace_params, trace_data, loss_settings, *neural_tracer, false, true, nullptr);
+                }
+            } else {
+                // Skip optimizations
+            }
         } else if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
             // of the newly added points
