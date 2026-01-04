@@ -724,11 +724,6 @@ const team = {
       title: "Annotation Specialist",
       href: "https://www.linkedin.com/in/sarah-morejohn-1140b049/",
     },
-    {
-      name: "Techjays",
-      title: "Annotation Services",
-      href: "https://www.techjays.com/",
-    },
   ],
   educe: [
     {
@@ -812,6 +807,11 @@ const team = {
       name: "Sergei Pnev",
       title: "Annotation Specialist",
       href: "www.linkedin.com/in/sergey-pnev",
+    },
+    {
+      name: "Techjays",
+      title: "Annotation Services",
+      href: "https://www.techjays.com/",
     },
     {
       name: "Daniel Havíř",
@@ -954,10 +954,6 @@ const partners = [
   {
     icon: "/img/landing/kaggle.svg",
     href: "https://www.kaggle.com/",
-  },
-  {
-    icon: "/img/landing/panua.svg",
-    href: "https://panua.ch/",
   },
 ];
 
