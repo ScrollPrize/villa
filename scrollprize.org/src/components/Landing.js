@@ -940,10 +940,6 @@ const partners = [
     href: "https://www.institutdefrance.fr/en/home/",
   },
   {
-    icon: "/img/landing/diamond.svg",
-    href: "https://www.diamond.ac.uk/",
-  },
-  {
     icon: "/img/landing/biblioteca.svg",
     href: "https://www.bnnonline.it/",
   },
