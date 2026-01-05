@@ -50,70 +50,6 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ***
 
-## Unwrapping at Scale Prize
-
-We’re awarding **$200,000** (single winner) for delivering **automated virtual unwrapping at production scale on two different scrolls**.
-
-**Scope (two-scroll generalization).** Your pipeline must pass all requirements on **two distinct scrolls** from our official datasets. **At least one must be Scroll 1 _or_ Scroll 5.** The second can be **a different** scroll from the set.
-
-Ink detection is **not required**; the focus is high-quality segmentation, continuity, and flattening suitable for later reading.
-
-We accept submissions for this prize until 11:59pm Pacific, December 31st, 2025!
-
-<div className="mb-4">
-  <img src="/img/landing/scroll.webp" className="w-[50%]"/>
-  <figcaption className="mt-[-6px]">A carbonized scroll.</figcaption>
-</div>
-
-<details class="submission-details">
-<summary>Submission criteria and requirements</summary>
-
-### What to deliver (for each of the two scrolls)
-1. **Segmented sheet manifold(s).** A continuous 3D mesh (or meshes) of the papyrus sheet(s) suitable for flattening. If the submission includes multiple meshes, the minimum size of each mesh should be larger than a full papyrus sheet wrap in the scroll volume.
-2. **Flattened 2D sheets.** UV maps / atlases covering the **accepted area** you claim as correct.
-3. **Accepted-area mask.** Binary mask(s) over the flattened sheets indicating regions you assert are error-free.
-4. **Video record (if humans involved).** A screen-capture timelapse or periodic snapshots covering all interactive steps.
-5. **Reproducible pipeline.** Container with a one-click script that regenerates meshes, maps, masks, and sheets from organizer-supplied volumes.
-
-### Pass/fail gates (must be met on **both** scrolls)
-- **Coverage: ≥ 70% (per scroll)** of the (to be estimated) total scroll surface after exclusions of areas masked as errors in the binary masks.
-- **Sheet-switch rate: ≤ 0.5% per scroll** over the audited area.
-    - *Definition:* It's the rate of triangles or quads in the delivered meshes that are marked as error-free in the binary masks but actually contain errors.
-- **Human effort cap: ≤ 72 human-hours per scroll** (i.e., **≤ 144 hours total** across the two).
-    - *Counts:* any human touch specific to processing the evaluation scrolls (seed placement, parameter tweaks, manual stitching/edits, quality control passes, mask painting, bookkeeping).
-    - *Doesn’t count:* general R&D prior to evaluation, model training on public data, writing docs, idle waiting while jobs run.
-- **Reproducibility:** Organizers must be able to re-run your container end-to-end and reproduce deliverables and metrics.
-
-> **No compute cap.** We do not limit hardware or cloud cost.
-
-### Data & generalization
-- Two distinct scrolls from our official set. **At least one must be Scroll 1 or Scroll 5.** The second can be a **different** scroll.  
-- You may use public volumes/fragments for development. For prize evaluation, organizers provide the exact evaluation volumes for the two scrolls.  
-
-### Submission package
-- **GitHub repository** with code, container (e.g. Docker, conda, etc.), and run scripts.  
-- **Deliverables:** 3D meshes, flattened sheets (TIFF/PNG), UV maps, accepted-area masks.  
-- **Logs:** timing CSVs per scroll; screen-capture or snapshots; CLI logs; environment/hardware info; container image digest.  
-- **Method note:** 2–6 pages describing pipeline, assumptions, and known failure modes.  
-- **Licensing:** if you win, you agree to open-source the method under the CC BY-NC 4.0 License.
-
-### Winner determination & tie-breakers
-- **Single winner:** the **first team** to pass all gates on **both** scrolls during organizer verification receives **$200,000**.  
-- If two teams pass within **96 hours**, tie-breakers:  
-  1) Lower **sheet-switch rate** across the two;
-  2) Higher **coverage** across the two scrolls;    
-  3) Fewer **total human-hours** (sum over both);  
-  4) Earlier submission timestamp.
-
-### Deadline
-- **11:59pm Pacific, December 31st, 2025**
-
-</details>
-
-[Submission Form](https://forms.gle/MqP3XQGX7o2ZFfZW6)
-
-***
-
 ## 3D Surface Detection Challenge (hosted on Kaggle)
 
 We are holding a $200,000 prize pool competition for detection of the recto papyrus surfaces in the 3D CT scans.
@@ -145,9 +81,9 @@ Finding the first letters inside one of these scrolls is a major step forward.
 
 Additionally, finding the title of any scroll is a huge and exciting discovery that helps scholars contextualize the rest of the work!
 
-**First Letters: $60,000 to the first team that uncovers 10 letters within a single 4cm^2 area of any of Scrolls 2-4.**
+**First Letters: $60,000 to the first team that uncovers 10 letters within a single 4cm^2 area of any of Scrolls 2-3.**
 
-**First Title: $60,000 to the first team to discover the title in any of Scrolls 1-4.**
+**First Title: $60,000 to the first team to discover the title in any of Scrolls 1-3.**
 
 <div className="mb-4">
   <img src="/img/data/title_example.webp" className="w-[50%]"/>
@@ -203,7 +139,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, December 31st, 2025!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, January 30th, 2026!
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -222,7 +158,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Designed for modular integration
 </details>
 
-[Submission Form](https://forms.gle/mLUnkaWvaeuMYdgX6)
+[Submission Form](https://forms.gle/GwoS6tcehQE2t6fH9)
 
 ***
 
