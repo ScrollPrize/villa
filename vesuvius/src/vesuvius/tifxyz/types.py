@@ -943,6 +943,8 @@ class Tifxyz:
 
     def smooth_rows_catmull_rom(
         self,
+        *,
+        stored_resolution: Optional[bool] = None,
     ) -> List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]]:
         """Extract valid points per row and apply 1D Catmull-Rom smoothing.
 
@@ -952,21 +954,28 @@ class Tifxyz:
 
         The smoothing uses Catmull-Rom weights at t=0.5 as a 4-tap filter:
         [-1/16, 9/16, 9/16, -1/16], which provides local smoothing while
-        preserving the general shape of the curve.
+        preserving the general shape of the curve. Edge points are handled
+        by linearly extrapolating phantom control points beyond boundaries.
+
+        Parameters
+        ----------
+        stored_resolution : bool, optional
+            If True, use internal stored resolution (fast, no interpolation).
+            If False, use full resolution (interpolated).
+            If None (default), uses current self.resolution setting.
 
         Returns
         -------
         List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]]
             List of (x, y, z) tuples, one per row. Each tuple contains
             1D arrays of smoothed coordinates for valid points in that row.
-            Rows with < 4 valid points return empty arrays.
+            Rows with < 2 valid points return empty arrays.
 
         Notes
         -----
-        - Uses stored resolution data regardless of current resolution mode
         - Invalid points (z <= 0 or not finite) are skipped entirely
         - The number of output points per row equals the number of valid
-          input points in that row (or 0 if < 4 valid points)
+          input points in that row (or 0 if < 2 valid points)
 
         Examples
         --------
@@ -975,19 +984,36 @@ class Tifxyz:
         >>> for row_idx, (x, y, z) in enumerate(smoothed_rows):
         ...     if len(x) > 0:
         ...         print(f"Row {row_idx}: {len(x)} smoothed points")
+        >>>
+        >>> # Force full resolution
+        >>> smoothed_full = surface.smooth_rows_catmull_rom(stored_resolution=False)
         """
         from .upsampling import catmull_rom_smooth_1d
 
-        h, w = self._x.shape
-        valid = self._valid_mask
+        # Resolve resolution: explicit param > instance attribute
+        if stored_resolution is None:
+            use_stored = self.resolution == "stored"
+        else:
+            use_stored = stored_resolution
+
+        if use_stored:
+            x_data = self._x
+            y_data = self._y
+            z_data = self._z
+            valid = self._valid_mask
+        else:
+            # Get full resolution coordinates via interpolation
+            x_data, y_data, z_data, valid = self[:, :]
+
+        h, w = x_data.shape
         results: List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = []
 
         for row in range(h):
             # Get column indices of valid points in this row
             valid_cols = np.where(valid[row])[0]
 
-            if len(valid_cols) < 4:
-                # Not enough points for Catmull-Rom
+            if len(valid_cols) < 2:
+                # Not enough points for extrapolation
                 results.append((
                     np.array([], dtype=np.float32),
                     np.array([], dtype=np.float32),
@@ -996,9 +1022,9 @@ class Tifxyz:
                 continue
 
             # Extract coordinates for valid points
-            x_valid = self._x[row, valid_cols]
-            y_valid = self._y[row, valid_cols]
-            z_valid = self._z[row, valid_cols]
+            x_valid = x_data[row, valid_cols]
+            y_valid = y_data[row, valid_cols]
+            z_valid = z_data[row, valid_cols]
 
             # Apply 1D Catmull-Rom smoothing
             x_smooth, y_smooth, z_smooth = catmull_rom_smooth_1d(x_valid, y_valid, z_valid)

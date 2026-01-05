@@ -13,31 +13,27 @@ from scipy import ndimage
 
 @njit(fastmath=True)
 def _catmull_rom_smooth_1d_kernel(
-    x: NDArray[np.float64],
-    y: NDArray[np.float64],
-    z: NDArray[np.float64],
+    ext_x: NDArray[np.float64],
+    ext_y: NDArray[np.float64],
+    ext_z: NDArray[np.float64],
     out_x: NDArray[np.float64],
     out_y: NDArray[np.float64],
     out_z: NDArray[np.float64],
     n: int,
 ) -> None:
-    """Apply 1D Catmull-Rom smoothing kernel to coordinate sequence.
+    """Apply 1D Catmull-Rom smoothing kernel to extended coordinate sequence.
 
     Uses CR weights at t=0.5: [-1/16, 9/16, 9/16, -1/16]
-    Boundary indices are clamped to valid range.
+    Expects extended arrays with phantom points already filled.
     """
     w0, w1, w2, w3 = -0.0625, 0.5625, 0.5625, -0.0625
 
     for i in range(n):
-        # Boundary-clamped indices for 4-point stencil
-        i0 = max(0, i - 1)
-        i1 = i
-        i2 = min(n - 1, i + 1)
-        i3 = min(n - 1, i + 2)
-
-        out_x[i] = w0 * x[i0] + w1 * x[i1] + w2 * x[i2] + w3 * x[i3]
-        out_y[i] = w0 * y[i0] + w1 * y[i1] + w2 * y[i2] + w3 * y[i3]
-        out_z[i] = w0 * z[i0] + w1 * z[i1] + w2 * z[i2] + w3 * z[i3]
+        # Extended array has 1 phantom point at start, so offset by 0
+        # ext[i] = P_{i-1}, ext[i+1] = P_i, ext[i+2] = P_{i+1}, ext[i+3] = P_{i+2}
+        out_x[i] = w0 * ext_x[i] + w1 * ext_x[i + 1] + w2 * ext_x[i + 2] + w3 * ext_x[i + 3]
+        out_y[i] = w0 * ext_y[i] + w1 * ext_y[i + 1] + w2 * ext_y[i + 2] + w3 * ext_y[i + 3]
+        out_z[i] = w0 * ext_z[i] + w1 * ext_z[i + 1] + w2 * ext_z[i + 2] + w3 * ext_z[i + 3]
 
 
 def catmull_rom_smooth_1d(
@@ -51,6 +47,9 @@ def catmull_rom_smooth_1d(
     [-1/16, 9/16, 9/16, -1/16]. This provides local smoothing while
     preserving the general shape of the curve.
 
+    Edge points are handled by linearly extrapolating phantom control points
+    beyond the boundaries, ensuring proper smoothing all the way to the edges.
+
     Parameters
     ----------
     x, y, z : NDArray[np.float32]
@@ -60,29 +59,49 @@ def catmull_rom_smooth_1d(
     -------
     Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]
         Smoothed (x, y, z) coordinate arrays.
-        Returns empty arrays if input has < 4 points.
+        Returns empty arrays if input has < 2 points (need 2 for extrapolation).
     """
     n = len(x)
-    if n < 4:
+    if n < 2:
         return (
             np.array([], dtype=np.float32),
             np.array([], dtype=np.float32),
             np.array([], dtype=np.float32),
         )
 
+    # Create extended arrays with phantom points:
+    # ext[0] = phantom before start
+    # ext[1..n] = original points
+    # ext[n+1], ext[n+2] = phantoms after end
+    ext_x = np.empty(n + 3, dtype=np.float64)
+    ext_y = np.empty(n + 3, dtype=np.float64)
+    ext_z = np.empty(n + 3, dtype=np.float64)
+
+    # Copy original points (offset by 1)
+    ext_x[1 : n + 1] = x.astype(np.float64)
+    ext_y[1 : n + 1] = y.astype(np.float64)
+    ext_z[1 : n + 1] = z.astype(np.float64)
+
+    # Linear extrapolation for phantom points
+    # Before: P_{-1} = 2*P_0 - P_1
+    ext_x[0] = 2.0 * ext_x[1] - ext_x[2]
+    ext_y[0] = 2.0 * ext_y[1] - ext_y[2]
+    ext_z[0] = 2.0 * ext_z[1] - ext_z[2]
+
+    # After: P_n = 2*P_{n-1} - P_{n-2}, P_{n+1} = 2*P_n - P_{n-1}
+    ext_x[n + 1] = 2.0 * ext_x[n] - ext_x[n - 1]
+    ext_y[n + 1] = 2.0 * ext_y[n] - ext_y[n - 1]
+    ext_z[n + 1] = 2.0 * ext_z[n] - ext_z[n - 1]
+
+    ext_x[n + 2] = 2.0 * ext_x[n + 1] - ext_x[n]
+    ext_y[n + 2] = 2.0 * ext_y[n + 1] - ext_y[n]
+    ext_z[n + 2] = 2.0 * ext_z[n + 1] - ext_z[n]
+
     out_x = np.empty(n, dtype=np.float64)
     out_y = np.empty(n, dtype=np.float64)
     out_z = np.empty(n, dtype=np.float64)
 
-    _catmull_rom_smooth_1d_kernel(
-        x.astype(np.float64),
-        y.astype(np.float64),
-        z.astype(np.float64),
-        out_x,
-        out_y,
-        out_z,
-        n,
-    )
+    _catmull_rom_smooth_1d_kernel(ext_x, ext_y, ext_z, out_x, out_y, out_z, n)
 
     return (
         out_x.astype(np.float32),
