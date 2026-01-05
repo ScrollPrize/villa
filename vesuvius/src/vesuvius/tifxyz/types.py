@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    import zarr
+    import torch
 
 import numpy as np
 from numpy.typing import NDArray
+
+InterpolationMethod = Literal["linear", "bspline", "catmull_rom"]
 
 
 @dataclass
@@ -42,12 +48,17 @@ class Tifxyz:
     uuid: str = ""
     _scale: Tuple[float, float] = (1.0, 1.0)
     bbox: Optional[Tuple[float, float, float, float, float, float]] = None
-    format: str = "tifxyz"
-    surface_type: str = "seg"
     area: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
     _mask: Optional[NDArray[np.bool_]] = None
     path: Optional[Path] = None
+    interp_method: InterpolationMethod = "catmull_rom"
+    resolution: Literal["stored", "full"] = "stored"
+    volume: Optional["zarr.Array"] = field(default=None, repr=False)
+    # Cache fields for quad properties
+    _valid_quad_mask_cache: Optional[NDArray[np.bool_]] = field(default=None, repr=False)
+    _quad_centers_cache: Optional[NDArray[np.float32]] = field(default=None, repr=False)
+    _normals_cache: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate shapes and ensure arrays are float32."""
@@ -66,11 +77,19 @@ class Tifxyz:
         # Set default uuid from path if not provided
         if not self.uuid and self.path:
             object.__setattr__(self, "uuid", self.path.name)
+        # Validate resolution
+        if self.resolution not in ("stored", "full"):
+            raise ValueError(
+                f"resolution must be 'stored' or 'full', got {self.resolution!r}"
+            )
 
     def __getitem__(
         self, key
     ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.bool_]]:
         """Get coordinates at the specified location.
+
+        In 'stored' mode (default), returns direct array access without interpolation.
+        In 'full' mode, returns interpolated coordinates at full resolution.
 
         Parameters
         ----------
@@ -85,10 +104,18 @@ class Tifxyz:
         Examples
         --------
         >>> surface = read_tifxyz("/path/to/segment")
-        >>> surface.shape  # (84300, 87460)
-        >>> x, y, z, valid = surface[2000, 4000]  # single point
-        >>> x, y, z, valid = surface[1000:1100, 2000:2100]  # tile
+        >>> x, y, z, valid = surface[100, 200]  # single point
+        >>> x, y, z, valid = surface[100:200, 200:300]  # tile
         """
+        # Stored mode: direct array access, no interpolation
+        if self.resolution == "stored":
+            x = self._x[key]
+            y = self._y[key]
+            z = self._z[key]
+            valid = self._valid_mask[key]
+            return x, y, z, valid
+
+        # Full mode: interpolate to full resolution
         from .upsampling import interpolate_at_points
 
         # Parse the key into row and column slices
@@ -119,7 +146,7 @@ class Tifxyz:
             self._x, self._y, self._z, self._valid_mask,
             source_grid_y, source_grid_x,
             scale=(1.0, 1.0),  # Already in internal coords
-            order=1,
+            method=self.interp_method,
         )
 
     def _key_to_slice(self, key, size: int) -> slice:
@@ -140,30 +167,72 @@ class Tifxyz:
         col: int,
         height: int,
         width: int,
+        *,
+        method: Optional[InterpolationMethod] = None,
     ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.bool_]]:
-        """Get a tile at full resolution (lazy interpolation).
+        """Get a tile at current resolution.
+
+        In 'stored' mode (default), returns direct array slice without interpolation.
+        In 'full' mode, returns interpolated coordinates at full resolution.
 
         Parameters
         ----------
         row : int
-            Starting row in full resolution coordinates.
+            Starting row in current resolution coordinates.
         col : int
-            Starting column in full resolution coordinates.
+            Starting column in current resolution coordinates.
         height : int
             Tile height.
         width : int
             Tile width.
+        method : str, optional
+            Interpolation method override (only used in 'full' mode).
+            If None, uses self.interp_method.
+            Options: "catmull_rom", "linear", "cubic", "bspline".
 
         Returns
         -------
         Tuple[NDArray, NDArray, NDArray, NDArray]
             (x, y, z, valid) for the tile.
         """
-        return self[row:row + height, col:col + width]
+        # Stored mode: direct slice access
+        if self.resolution == "stored":
+            return (
+                self._x[row:row+height, col:col+width],
+                self._y[row:row+height, col:col+width],
+                self._z[row:row+height, col:col+width],
+                self._valid_mask[row:row+height, col:col+width],
+            )
+
+        # Full mode: interpolate
+        from .upsampling import interpolate_at_points
+
+        use_method = method if method is not None else self.interp_method
+
+        row_indices = np.arange(row, row + height)
+        col_indices = np.arange(col, col + width)
+        col_grid, row_grid = np.meshgrid(col_indices, row_indices)
+
+        source_grid_y = row_grid.astype(np.float32) * self._scale[0]
+        source_grid_x = col_grid.astype(np.float32) * self._scale[1]
+
+        return interpolate_at_points(
+            self._x, self._y, self._z, self._valid_mask,
+            source_grid_y, source_grid_x,
+            scale=(1.0, 1.0),
+            method=use_method,
+        )
 
     @property
     def shape(self) -> Tuple[int, int]:
-        """Return the full resolution grid shape (height, width)."""
+        """Return grid shape at current resolution.
+
+        In 'stored' mode (default), returns the internal stored dimensions.
+        In 'full' mode, returns the full resolution dimensions.
+        """
+        if self.resolution == "stored":
+            return self._x.shape  # type: ignore[return-value]
+        # Full resolution
         h, w = self._x.shape
         scale_y, scale_x = self._scale
         if scale_y == 0 or scale_x == 0:
@@ -206,7 +275,7 @@ class Tifxyz:
 
         This method computes normals over the entire surface at the internal
         stored resolution, which is efficient for whole-surface operations
-        like analyzing normal direction or orientation.
+        like analyzing normal direction or orientation. Results are cached.
 
         For tile-based access at full resolution, use get_normals() instead.
 
@@ -216,6 +285,9 @@ class Tifxyz:
             (nx, ny, nz) - normalized normal components at stored resolution.
             Invalid points and boundary points have NaN normals.
         """
+        if self._normals_cache is not None:
+            return self._normals_cache
+
         x, y, z = self._x, self._y, self._z
         valid = self._valid_mask
 
@@ -270,7 +342,9 @@ class Tifxyz:
         ny[1:-1, 1:-1] = n_y.astype(np.float32)
         nz[1:-1, 1:-1] = n_z.astype(np.float32)
 
-        return nx, ny, nz
+        result = (nx, ny, nz)
+        object.__setattr__(self, "_normals_cache", result)
+        return result
 
     def get_normals(
         self,
@@ -279,20 +353,21 @@ class Tifxyz:
         col_start: int,
         col_end: int,
     ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
-        """Compute surface normals for a tile at full resolution.
+        """Compute surface normals for a tile at current resolution.
 
-        Normals are computed lazily - only the requested region is calculated.
+        In 'stored' mode (default), slices from cached compute_normals().
+        In 'full' mode, computes normals at full resolution via interpolation.
 
         Parameters
         ----------
         row_start : int
-            Starting row in full resolution coordinates.
+            Starting row in current resolution coordinates.
         row_end : int
-            Ending row (exclusive) in full resolution coordinates.
+            Ending row (exclusive) in current resolution coordinates.
         col_start : int
-            Starting column in full resolution coordinates.
+            Starting column in current resolution coordinates.
         col_end : int
-            Ending column (exclusive) in full resolution coordinates.
+            Ending column (exclusive) in current resolution coordinates.
 
         Returns
         -------
@@ -300,6 +375,16 @@ class Tifxyz:
             (nx, ny, nz) - normalized normal components, shape (row_end - row_start, col_end - col_start).
             Invalid points and boundary points have NaN normals.
         """
+        # Stored mode: slice from cached normals
+        if self.resolution == "stored":
+            nx, ny, nz = self.compute_normals()
+            return (
+                nx[row_start:row_end, col_start:col_end],
+                ny[row_start:row_end, col_start:col_end],
+                nz[row_start:row_end, col_start:col_end],
+            )
+
+        # Full mode: compute at full resolution
         height = row_end - row_start
         width = col_end - col_start
 
@@ -483,27 +568,29 @@ class Tifxyz:
 
     def flip_normals(
         self,
-        normals: Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]],
+        normals: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = None,
     ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
         """Flip the direction of all normals (negate all components).
 
         Parameters
         ----------
-        normals : Tuple[NDArray, NDArray, NDArray]
-            (nx, ny, nz) normal components.
+        normals : Tuple[NDArray, NDArray, NDArray], optional
+            (nx, ny, nz) normal components. If None, computes normals first.
 
         Returns
         -------
         Tuple[NDArray, NDArray, NDArray]
             Flipped (-nx, -ny, -nz) normal components.
         """
+        if normals is None:
+            normals = self.compute_normals()
         nx, ny, nz = normals
         return (-nx, -ny, -nz)
 
     def orient_normals(
         self,
-        normals: Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]],
         direction: str = 'outward',
+        normals: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = None,
     ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
         """Orient all normals to point in a specified direction.
 
@@ -513,10 +600,10 @@ class Tifxyz:
 
         Parameters
         ----------
-        normals : Tuple[NDArray, NDArray, NDArray]
-            (nx, ny, nz) normal components.
         direction : str
             'inward' (toward centroid) or 'outward' (away from centroid).
+        normals : Tuple[NDArray, NDArray, NDArray], optional
+            (nx, ny, nz) normal components. If None, computes normals first.
 
         Returns
         -------
@@ -526,6 +613,8 @@ class Tifxyz:
         if direction not in ('inward', 'outward'):
             raise ValueError(f"direction must be 'inward' or 'outward', got {direction!r}")
 
+        if normals is None:
+            normals = self.compute_normals()
         nx, ny, nz = normals
         nx = nx.copy()
         ny = ny.copy()
@@ -563,28 +652,357 @@ class Tifxyz:
 
         return nx, ny, nz
 
-    def get_normals_pointing_outward(
-        self,
-    ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
-        """Compute normals and orient all to point outward (away from centroid).
+    def get_zyxs(
+        self, *, stored_resolution: Optional[bool] = None, as_tensor: bool = False
+    ) -> Union[NDArray[np.float32], "torch.Tensor"]:
+        """Get coordinates stacked as a (H, W, 3) array in z, y, x order.
+
+        Returns coordinates stacked into a single array. Invalid points have
+        value -1.
+
+        This is useful for neural network training where coordinates are
+        needed as a single tensor.
+
+        Parameters
+        ----------
+        stored_resolution : bool, optional
+            If True, return at internal stored resolution (faster, no interpolation).
+            If False, return at full resolution (interpolated).
+            If None (default), uses self.resolution setting.
+        as_tensor : bool
+            If True, return as a torch.Tensor instead of numpy array.
+            Requires torch to be installed.
 
         Returns
         -------
-        Tuple[NDArray, NDArray, NDArray]
-            (nx, ny, nz) - normalized normals all pointing away from centroid.
-        """
-        normals = self.compute_normals()
-        return self.orient_normals(normals, direction='outward')
+        NDArray[np.float32] or torch.Tensor
+            Array of shape (H, W, 3) where the last axis is (z, y, x).
 
-    def get_normals_pointing_inward(
-        self,
-    ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
-        """Compute normals and orient all to point inward (toward centroid).
+        Examples
+        --------
+        >>> surface = read_tifxyz("/path/to/segment")
+        >>> zyxs = surface.get_zyxs()  # Uses current resolution setting
+        >>> zyxs_stored = surface.get_zyxs(stored_resolution=True)  # Force stored
+        >>> zyxs_tensor = surface.get_zyxs(as_tensor=True)  # torch.Tensor
+        """
+        # Resolve resolution: explicit param > instance attribute
+        if stored_resolution is None:
+            use_stored = self.resolution == "stored"
+        else:
+            use_stored = stored_resolution
+
+        if use_stored:
+            result = np.stack([self._z, self._y, self._x], axis=-1)
+        else:
+            # Get full resolution coordinates via interpolation
+            # Temporarily switch to full resolution for this operation
+            old_resolution = self.resolution
+            object.__setattr__(self, "resolution", "full")
+            x, y, z, valid = self[:, :]
+            object.__setattr__(self, "resolution", old_resolution)
+            # Mark invalid points with -1
+            x = np.where(valid, x, -1.0)
+            y = np.where(valid, y, -1.0)
+            z = np.where(valid, z, -1.0)
+            result = np.stack([z, y, x], axis=-1)
+
+        if as_tensor:
+            try:
+                import torch
+            except ImportError:
+                raise ImportError(
+                    "torch is required for as_tensor=True. "
+                    "Install with: pip install vesuvius[models]"
+                )
+            return torch.from_numpy(result)
+
+        return result
+
+    def get_scale_tuple(self) -> Tuple[float, float]:
+        """Get the scale as a (scale_y, scale_x) tuple.
 
         Returns
         -------
-        Tuple[NDArray, NDArray, NDArray]
-            (nx, ny, nz) - normalized normals all pointing toward centroid.
+        Tuple[float, float]
+            Scale factors (scale_y, scale_x).
         """
-        normals = self.compute_normals()
-        return self.orient_normals(normals, direction='inward')
+        return self._scale
+
+    def use_stored_resolution(self) -> "Tifxyz":
+        """Set resolution to 'stored' and return self for chaining.
+
+        In stored mode, shape, indexing, get_tile, and get_normals all
+        operate at the internal stored resolution without interpolation.
+
+        Returns
+        -------
+        Tifxyz
+            Self, for method chaining.
+
+        Examples
+        --------
+        >>> surface.use_stored_resolution()
+        >>> print(surface.shape)  # Stored resolution dimensions
+        >>> x, y, z, valid = surface[0:100, 0:100]  # Direct array access
+        """
+        object.__setattr__(self, "resolution", "stored")
+        return self
+
+    def use_full_resolution(self) -> "Tifxyz":
+        """Set resolution to 'full' and return self for chaining.
+
+        In full mode, shape, indexing, get_tile, and get_normals all
+        operate at full resolution with interpolation.
+
+        Returns
+        -------
+        Tifxyz
+            Self, for method chaining.
+
+        Examples
+        --------
+        >>> surface.use_full_resolution()
+        >>> print(surface.shape)  # Full resolution dimensions
+        >>> x, y, z, valid = surface[0:100, 0:100]  # Interpolated access
+        """
+        object.__setattr__(self, "resolution", "full")
+        return self
+
+    @property
+    def valid_quad_mask(self) -> NDArray[np.bool_]:
+        """Boolean mask where [i,j] is True if all 4 corners of quad at (i,j) are valid.
+
+        A quad at position (i,j) consists of vertices at:
+        (i,j), (i+1,j), (i,j+1), (i+1,j+1)
+
+        Returns
+        -------
+        NDArray[np.bool_]
+            Mask of shape (H-1, W-1) at stored resolution.
+        """
+        if self._valid_quad_mask_cache is None:
+            valid = self._valid_mask
+            object.__setattr__(
+                self,
+                "_valid_quad_mask_cache",
+                valid[:-1, :-1] & valid[1:, :-1] & valid[:-1, 1:] & valid[1:, 1:],
+            )
+        return self._valid_quad_mask_cache
+
+    @property
+    def valid_quad_indices(self) -> NDArray[np.int64]:
+        """Indices of valid quads as (N, 2) array.
+
+        Returns
+        -------
+        NDArray[np.int64]
+            Array of shape (N, 2) where each row is (row, col) of a valid quad.
+        """
+        return np.stack(np.where(self.valid_quad_mask), axis=-1)
+
+    @property
+    def valid_vertex_mask(self) -> NDArray[np.bool_]:
+        """Boolean mask for valid vertices (alias for _valid_mask).
+
+        Returns
+        -------
+        NDArray[np.bool_]
+            Mask of shape (H, W) at stored resolution.
+        """
+        return self._valid_mask
+
+    @property
+    def quad_area(self) -> float:
+        """Surface area computed from valid quad count.
+
+        Returns the number of valid quads divided by the scale factors,
+        giving area in full-resolution units.
+
+        Returns
+        -------
+        float
+            Surface area in full-resolution coordinate units.
+        """
+        scale_y, scale_x = self._scale
+        return float(self.valid_quad_mask.sum() / (scale_y * scale_x))
+
+    @property
+    def quad_centers(self) -> NDArray[np.float32]:
+        """Centers of quads at stored resolution.
+
+        Returns
+        -------
+        NDArray[np.float32]
+            Array of shape (H-1, W-1, 3) with (z, y, x) centers.
+            Invalid quads have value -1.
+        """
+        if self._quad_centers_cache is None:
+            zyxs = self.get_zyxs(stored_resolution=True)
+            centers = 0.5 * (zyxs[1:, 1:] + zyxs[:-1, :-1])
+            mask = self.valid_quad_mask[..., np.newaxis]
+            object.__setattr__(
+                self,
+                "_quad_centers_cache",
+                np.where(mask, centers, -1.0).astype(np.float32),
+            )
+        return self._quad_centers_cache
+
+    def retarget(self, factor: float) -> "Tifxyz":
+        """Return new Tifxyz with coordinates scaled by factor.
+
+        Used to adapt coordinates to a downsampled or upsampled volume.
+
+        Parameters
+        ----------
+        factor : float
+            Scale factor. Values >1 mean target volume is downsampled
+            (coordinates become smaller). Values <1 mean upsampled.
+
+        Returns
+        -------
+        Tifxyz
+            New instance with scaled coordinates and updated bbox.
+            If volume is an OME-zarr group, selects appropriate level.
+        """
+        valid = self._valid_mask
+        new_x = np.where(valid, self._x / factor, -1.0).astype(np.float32)
+        new_y = np.where(valid, self._y / factor, -1.0).astype(np.float32)
+        new_z = np.where(valid, self._z / factor, -1.0).astype(np.float32)
+
+        # Compute new bbox from scaled coordinates
+        new_bbox = None
+        if valid.any():
+            new_bbox = (
+                float(new_x[valid].min()),
+                float(new_y[valid].min()),
+                float(new_z[valid].min()),
+                float(new_x[valid].max()),
+                float(new_y[valid].max()),
+                float(new_z[valid].max()),
+            )
+
+        # Handle OME-zarr: select appropriate resolution level
+        new_volume = self._get_volume_level(factor) if self.volume is not None else None
+
+        return Tifxyz(
+            _x=new_x,
+            _y=new_y,
+            _z=new_z,
+            uuid=self.uuid,
+            _scale=(self._scale[0] * factor, self._scale[1] * factor),
+            bbox=new_bbox,
+            area=None,  # Computed lazily via quad_area
+            extra=dict(self.extra),
+            _mask=valid.copy(),
+            path=self.path,
+            interp_method=self.interp_method,
+            resolution=self.resolution,
+            volume=new_volume,
+        )
+
+    def _get_volume_level(self, factor: float) -> Optional["zarr.Array"]:
+        """Get the appropriate OME-zarr resolution level for the given factor.
+
+        For OME-zarr groups with multiple resolution levels (0, 1, 2, ...),
+        selects the level closest to the requested downsampling factor.
+
+        Parameters
+        ----------
+        factor : float
+            The downsampling factor.
+
+        Returns
+        -------
+        zarr.Array or None
+            The appropriate resolution level array.
+        """
+        import zarr
+
+        vol = self.volume
+        if vol is None:
+            return None
+
+        # If it's a zarr Group (OME-zarr), find the right level
+        if isinstance(vol, zarr.Group):
+            # OME-zarr levels are typically named "0", "1", "2", etc.
+            # Level 0 is full resolution, higher levels are downsampled by 2x each
+            level = int(np.log2(factor)) if factor >= 1 else 0
+            level = max(0, level)
+
+            # Find available levels
+            available = sorted([k for k in vol.keys() if k.isdigit()], key=int)
+            if not available:
+                return vol  # Not an OME-zarr, return as-is
+
+            # Clamp to available range
+            level = min(level, int(available[-1]))
+            return vol[str(level)]
+
+        # Already an array, return as-is
+        return vol
+
+    def smooth_rows_catmull_rom(
+        self,
+    ) -> List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]]:
+        """Extract valid points per row and apply 1D Catmull-Rom smoothing.
+
+        For each row, collects valid points in column order (skipping invalid
+        points where z <= 0 or not finite), then applies 1D Catmull-Rom
+        smoothing to the (x, y, z) coordinates independently.
+
+        The smoothing uses Catmull-Rom weights at t=0.5 as a 4-tap filter:
+        [-1/16, 9/16, 9/16, -1/16], which provides local smoothing while
+        preserving the general shape of the curve.
+
+        Returns
+        -------
+        List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]]
+            List of (x, y, z) tuples, one per row. Each tuple contains
+            1D arrays of smoothed coordinates for valid points in that row.
+            Rows with < 4 valid points return empty arrays.
+
+        Notes
+        -----
+        - Uses stored resolution data regardless of current resolution mode
+        - Invalid points (z <= 0 or not finite) are skipped entirely
+        - The number of output points per row equals the number of valid
+          input points in that row (or 0 if < 4 valid points)
+
+        Examples
+        --------
+        >>> surface = read_tifxyz("/path/to/segment")
+        >>> smoothed_rows = surface.smooth_rows_catmull_rom()
+        >>> for row_idx, (x, y, z) in enumerate(smoothed_rows):
+        ...     if len(x) > 0:
+        ...         print(f"Row {row_idx}: {len(x)} smoothed points")
+        """
+        from .upsampling import catmull_rom_smooth_1d
+
+        h, w = self._x.shape
+        valid = self._valid_mask
+        results: List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = []
+
+        for row in range(h):
+            # Get column indices of valid points in this row
+            valid_cols = np.where(valid[row])[0]
+
+            if len(valid_cols) < 4:
+                # Not enough points for Catmull-Rom
+                results.append((
+                    np.array([], dtype=np.float32),
+                    np.array([], dtype=np.float32),
+                    np.array([], dtype=np.float32),
+                ))
+                continue
+
+            # Extract coordinates for valid points
+            x_valid = self._x[row, valid_cols]
+            y_valid = self._y[row, valid_cols]
+            z_valid = self._z[row, valid_cols]
+
+            # Apply 1D Catmull-Rom smoothing
+            x_smooth, y_smooth, z_smooth = catmull_rom_smooth_1d(x_valid, y_valid, z_valid)
+
+            results.append((x_smooth, y_smooth, z_smooth))
+
+        return results

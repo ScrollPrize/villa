@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import tifffile
@@ -15,12 +16,173 @@ from .types import Tifxyz
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class TifxyzInfo:
+    """Lightweight metadata for a tifxyz segment without loading coordinates.
+
+    Use this for filtering/listing segments before deciding which to fully load.
+    """
+
+    path: Path
+    scale: Tuple[float, float]
+    bbox: Optional[Tuple[float, float, float, float, float, float]]
+    uuid: str
+
+    @property
+    def z_min(self) -> Optional[float]:
+        """Return minimum z coordinate from bbox, or None if no bbox."""
+        return self.bbox[2] if self.bbox else None
+
+    @property
+    def z_max(self) -> Optional[float]:
+        """Return maximum z coordinate from bbox, or None if no bbox."""
+        return self.bbox[5] if self.bbox else None
+
+    def load(self, **kwargs) -> Tifxyz:
+        """Load the full Tifxyz object for this segment.
+
+        Parameters
+        ----------
+        **kwargs
+            Passed to read_tifxyz (e.g., load_mask, validate).
+
+        Returns
+        -------
+        Tifxyz
+            The fully loaded surface.
+        """
+        return read_tifxyz(self.path, **kwargs)
+
+
+def list_tifxyz(
+    folder: Union[str, Path],
+    *,
+    z_range: Optional[Tuple[float, float]] = None,
+    recursive: bool = True,
+) -> List[TifxyzInfo]:
+    """Discover all tifxyz segments in a folder.
+
+    Scans for directories containing the required tifxyz files (x.tif, y.tif,
+    z.tif, meta.json) and returns lightweight metadata for each, without
+    loading the full coordinate arrays.
+
+    Parameters
+    ----------
+    folder : Union[str, Path]
+        Path to folder containing tifxyz segment directories.
+    z_range : Optional[Tuple[float, float]]
+        If provided, filter to only segments whose bbox overlaps this z range.
+        Format: (z_min, z_max).
+    recursive : bool
+        If True (default), search recursively. If False, only search immediate
+        subdirectories.
+
+    Returns
+    -------
+    List[TifxyzInfo]
+        List of TifxyzInfo objects for discovered segments, sorted by path.
+
+    Examples
+    --------
+    >>> from vesuvius.tifxyz import list_tifxyz
+    >>> segments = list_tifxyz("/path/to/segments", z_range=(1000, 2000))
+    >>> for seg in segments:
+    ...     print(f"{seg.uuid}: z=[{seg.z_min}, {seg.z_max}]")
+    ...     surface = seg.load()  # Load full data when needed
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    results = []
+
+    # Find all meta.json files (indicates a tifxyz directory)
+    pattern = "**/meta.json" if recursive else "*/meta.json"
+    for meta_path in folder.glob(pattern):
+        segment_dir = meta_path.parent
+
+        # Check if required files exist
+        required = ["x.tif", "y.tif", "z.tif"]
+        if not all((segment_dir / f).exists() for f in required):
+            continue
+
+        try:
+            reader = TifxyzReader(segment_dir)
+            meta = reader.read_metadata()
+
+            info = TifxyzInfo(
+                path=segment_dir,
+                scale=meta["scale"],
+                bbox=meta["bbox"],
+                uuid=meta["uuid"],
+            )
+
+            # Filter by z_range if specified
+            if z_range is not None and info.bbox is not None:
+                bbox_z_min, bbox_z_max = info.z_min, info.z_max
+                range_z_min, range_z_max = z_range
+                # Skip if bbox doesn't overlap z_range
+                if bbox_z_min > range_z_max or bbox_z_max < range_z_min:
+                    continue
+
+            results.append(info)
+
+        except Exception as e:
+            logger.warning(f"Error reading metadata from {segment_dir}: {e}")
+            continue
+
+    # Sort by path for consistent ordering
+    results.sort(key=lambda x: x.path)
+    return results
+
+
+def load_folder(
+    folder: Union[str, Path],
+    *,
+    z_range: Optional[Tuple[float, float]] = None,
+    recursive: bool = True,
+    **load_kwargs,
+) -> Iterator[Tifxyz]:
+    """Load all tifxyz segments in a folder.
+
+    Convenience function that combines list_tifxyz with loading.
+
+    Parameters
+    ----------
+    folder : Union[str, Path]
+        Path to folder containing tifxyz segment directories.
+    z_range : Optional[Tuple[float, float]]
+        If provided, filter to only segments whose bbox overlaps this z range.
+    recursive : bool
+        If True (default), search recursively.
+    **load_kwargs
+        Passed to read_tifxyz (e.g., load_mask, validate).
+
+    Yields
+    ------
+    Tifxyz
+        Loaded surface for each discovered segment.
+
+    Examples
+    --------
+    >>> from vesuvius.tifxyz import load_folder
+    >>> for surface in load_folder("/path/to/segments", z_range=(1000, 2000)):
+    ...     print(f"{surface.uuid}: {surface.shape}")
+    """
+    for info in list_tifxyz(folder, z_range=z_range, recursive=recursive):
+        try:
+            yield info.load(**load_kwargs)
+        except Exception as e:
+            logger.warning(f"Error loading {info.path}: {e}")
+            continue
+
+
 def read_tifxyz(
     path: Union[str, Path],
     *,
     load_mask: bool = True,
     validate: bool = True,
-    full_resolution: bool = False,
+    volume_path: Optional[Union[str, Path]] = None,
 ) -> Tifxyz:
     """Read a tifxyz directory into a Tifxyz object.
 
@@ -32,15 +194,15 @@ def read_tifxyz(
         If True, load mask.tif if present. Default True.
     validate : bool
         If True, validate the loaded data. Default True.
-    full_resolution : bool
-        If True, upsample to full resolution (effective_scale=1.0) so that
-        array indices correspond directly to voxel coordinates. Default False.
-        Use surface.to_full_resolution() to convert later if needed.
+    volume_path : Union[str, Path], optional
+        Path to an OME-zarr volume to associate with the surface.
+        If provided, opens the zarr and attaches it to tifxyz.volume.
 
     Returns
     -------
     Tifxyz
-        The loaded surface data.
+        The loaded surface data. Access coordinates via indexing (e.g., surface[row, col])
+        which provides interpolated access at full resolution.
 
     Raises
     ------
@@ -50,12 +212,14 @@ def read_tifxyz(
         If validation fails (shape mismatch, invalid data).
     """
     reader = TifxyzReader(path)
-    surface = reader.read(load_mask=load_mask, validate=validate)
+    tifxyz = reader.read(load_mask=load_mask, validate=validate)
 
-    if full_resolution and not surface.is_full_resolution:
-        surface = surface.to_full_resolution()
+    if volume_path is not None:
+        import zarr
 
-    return surface
+        tifxyz.volume = zarr.open(volume_path, mode="r")
+
+    return tifxyz
 
 
 class TifxyzReader:
@@ -138,15 +302,13 @@ class TifxyzReader:
             )
 
         # Extract known fields and put rest in extra
-        known_keys = {"uuid", "scale", "bbox", "format", "type", "area"}
+        known_keys = {"uuid", "scale", "bbox", "area"}
         extra = {k: v for k, v in meta_dict.items() if k not in known_keys}
 
         return {
             "uuid": meta_dict.get("uuid", self.path.name),
             "scale": scale,
             "bbox": bbox,
-            "format": meta_dict.get("format", "tifxyz"),
-            "surface_type": meta_dict.get("type", "seg"),
             "area": meta_dict.get("area"),
             "extra": extra,
         }
@@ -239,11 +401,11 @@ class TifxyzReader:
         if load_mask:
             mask = self.read_mask()
             if mask is not None and mask.shape != x.shape:
-                # Mask might be at different resolution - resize if needed
-                logger.warning(
-                    f"Mask shape {mask.shape} differs from coordinate shape {x.shape}. "
-                    "Mask will be derived from z > 0."
-                )
+                # Mask might be at different resolution - derive from z > 0 instead
+                # logger.warning(
+                #     f"Mask shape {mask.shape} differs from coordinate shape {x.shape}. "
+                #     "Mask will be derived from z > 0."
+                # )
                 mask = None
 
         # If no mask, derive from z > 0
@@ -263,8 +425,6 @@ class TifxyzReader:
             uuid=meta["uuid"],
             _scale=meta["scale"],
             bbox=meta["bbox"],
-            format=meta["format"],
-            surface_type=meta["surface_type"],
             area=meta["area"],
             extra=meta["extra"],
             _mask=mask,
