@@ -470,6 +470,100 @@ def interpolate_at_points(
     return x_interp, y_interp, z_interp, valid
 
 
+def _fit_gp_1d(
+    t_train: NDArray[np.float32],
+    y_train: NDArray[np.float32],
+    t_pred: NDArray[np.float32],
+    training_iters: int = 50,
+) -> NDArray[np.float32]:
+    """Fit a 1D Gaussian Process and predict at new locations.
+
+    Uses GPyTorch with an RBF kernel for smooth extrapolation.
+
+    Parameters
+    ----------
+    t_train : NDArray[np.float32]
+        1D array of input locations (e.g., column or row indices).
+    y_train : NDArray[np.float32]
+        1D array of coordinate values at input locations.
+    t_pred : NDArray[np.float32]
+        1D array of locations to predict at.
+    training_iters : int
+        Number of optimization iterations (default 50).
+
+    Returns
+    -------
+    NDArray[np.float32]
+        Predicted values at t_pred locations.
+
+    Raises
+    ------
+    ImportError
+        If torch or gpytorch are not installed.
+    """
+    try:
+        import torch
+        import gpytorch
+    except ImportError:
+        raise ImportError(
+            "gpytorch is required for extrapolation. "
+            "Install with: pip install gpytorch"
+        )
+
+    # Convert to torch tensors
+    train_x = torch.from_numpy(t_train.astype(np.float64)).float()
+    train_y = torch.from_numpy(y_train.astype(np.float64)).float()
+    test_x = torch.from_numpy(t_pred.astype(np.float64)).float()
+
+    # Normalize inputs for numerical stability
+    x_mean = train_x.mean()
+    x_std = train_x.std() + 1e-6
+    train_x_norm = (train_x - x_mean) / x_std
+    test_x_norm = (test_x - x_mean) / x_std
+
+    # Define GP model
+    class GP1D(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super().__init__(train_x, train_y, likelihood)
+            self.mean_module = gpytorch.means.ConstantMean()
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.RBFKernel()
+            )
+
+        def forward(self, x):
+            mean_x = self.mean_module(x)
+            covar_x = self.covar_module(x)
+            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    # Initialize likelihood and model
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    model = GP1D(train_x_norm, train_y, likelihood)
+
+    # Training mode
+    model.train()
+    likelihood.train()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+    for _ in range(training_iters):
+        optimizer.zero_grad()
+        output = model(train_x_norm)
+        loss = -mll(output, train_y)
+        loss.backward()
+        optimizer.step()
+
+    # Prediction mode
+    model.eval()
+    likelihood.eval()
+
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        pred = likelihood(model(test_x_norm))
+        pred_mean = pred.mean.numpy()
+
+    return pred_mean.astype(np.float32)
+
+
 def compute_grid_bounds(
     x: NDArray[np.float32],
     y: NDArray[np.float32],

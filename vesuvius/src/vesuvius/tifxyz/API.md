@@ -113,7 +113,6 @@ coords = surface.use_full_resolution().get_zyxs()
 |--------|----------------------|-----------|
 | `shape` | Internal array dimensions | Computed full dimensions |
 | `surface[i, j]` | Direct array access | Interpolated coordinates |
-| `get_tile()` | Direct array slice | Interpolated tile |
 | `get_normals()` | Slice from cached normals | Compute at full resolution |
 | `get_zyxs()` | No interpolation | Interpolated |
 
@@ -134,9 +133,6 @@ x, y, z, valid = surface[row, col]
 
 # Tile/region
 x, y, z, valid = surface[100:200, 200:300]
-
-# Using get_tile method
-x, y, z, valid = surface.get_tile(row=100, col=200, height=100, width=100)
 
 # For interpolated access, switch to full resolution
 surface.use_full_resolution()
@@ -173,9 +169,6 @@ The surface uses Catmull-Rom interpolation by default, which provides smooth cur
 ```python
 # Change default interpolation method
 surface.interp_method = "linear"  # faster but less smooth
-
-# Override per-call with get_tile
-x, y, z, valid = surface.get_tile(1000, 2000, 100, 100, method="bspline")
 ```
 
 Available methods:
@@ -264,6 +257,107 @@ nx, ny, nz = surface.flip_normals()
 # Or pass pre-computed normals
 nx, ny, nz = surface.flip_normals(normals=(nx, ny, nz))
 ```
+
+---
+
+## Row Smoothing
+
+### smooth_rows_catmull_rom
+
+Apply 1D Catmull-Rom smoothing to each row independently. Returns array in same format as `get_zyxs()`.
+
+For each row, collects valid points in column order (skipping invalid points), then applies 1D Catmull-Rom smoothing to the (x, y, z) coordinates independently.
+
+```python
+# Basic usage (uses current resolution mode)
+smoothed = surface.smooth_rows_catmull_rom()
+smoothed.shape  # (H, W, 3) - same as get_zyxs()
+
+# Force stored resolution (fast, no interpolation)
+smoothed = surface.smooth_rows_catmull_rom(stored_resolution=True)
+
+# Force full resolution (interpolated)
+smoothed = surface.smooth_rows_catmull_rom(stored_resolution=False)
+
+# Invalid points still have value -1
+valid = (smoothed != -1).all(axis=-1)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stored_resolution` | `bool` or `None` | `None` | `True`: force stored resolution. `False`: force full resolution. `None`: use current `resolution` setting. |
+
+**Returns:**
+
+`NDArray[np.float32]` - Shape `(H, W, 3)` with smoothed coordinates in `[z, y, x]` order, same format as `get_zyxs()`. Invalid points have value -1. Rows with < 2 valid points are left unchanged.
+
+**Notes:**
+- Uses Catmull-Rom weights at t=0.5: `[-1/16, 9/16, 9/16, -1/16]`
+- Edge points are handled by linearly extrapolating phantom control points beyond boundaries
+- Invalid points (z ≤ 0 or not finite) are skipped during smoothing
+- Valid points are replaced with their smoothed values
+
+---
+
+## Extrapolation
+
+### extrapolate
+
+Extend surface coordinates beyond the current boundary using Gaussian Process regression. Returns array in same format as `get_zyxs()`.
+
+For each row (left/right) or column (up/down), fits independent GPs for x, y, z coordinates using valid points, then predicts coordinates at new grid positions beyond the edge.
+
+```python
+# Extrapolate 20 grid points to the right (returns only extension)
+ext = surface.extrapolate("right", steps=20)
+ext.shape  # (num_rows, 20, 3)
+
+# Extrapolate downward with combined output
+combined = surface.extrapolate("down", steps=10, return_combined=True)
+combined.shape  # (original_rows + 10, num_cols, 3)
+
+# Use only last 50 points near edge for local extrapolation
+ext = surface.extrapolate("left", steps=15, use_last_n=50)
+
+# Adjust GP training iterations
+ext = surface.extrapolate("up", steps=10, training_iters=100)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `direction` | `str` | required | Direction to extrapolate: `"left"`, `"right"`, `"up"`, or `"down"` |
+| `steps` | `int` | `10` | Number of grid points to extrapolate |
+| `min_points` | `int` | `4` | Minimum valid points required to fit GP. Slices with fewer points return -1 sentinel values. |
+| `training_iters` | `int` | `50` | Number of GP optimization iterations |
+| `use_last_n` | `int` or `None` | `None` | If specified, only use the last N valid points closest to the edge for GP fitting |
+| `return_combined` | `bool` | `False` | If True, return original data concatenated with extrapolated region |
+
+**Direction semantics:**
+- `"left"`: Extrapolate toward column 0, iterating over rows
+- `"right"`: Extrapolate toward last column, iterating over rows
+- `"up"`: Extrapolate toward row 0, iterating over columns
+- `"down"`: Extrapolate toward last row, iterating over columns
+
+**Returns:**
+
+`NDArray[np.float32]` - Shape `(H, W, 3)` with coordinates in `[z, y, x]` order, same format as `get_zyxs()`.
+
+| `return_combined` | Shape (left/right) | Shape (up/down) |
+|-------------------|-------------------|-----------------|
+| `False` (default) | `(num_rows, steps, 3)` | `(steps, num_cols, 3)` |
+| `True` | `(num_rows, original_cols + steps, 3)` | `(original_rows + steps, num_cols, 3)` |
+
+Invalid slices (insufficient valid points) have `-1.0` sentinel values.
+
+**Notes:**
+- Requires GPyTorch: `pip install gpytorch`
+- Uses RBF (squared exponential) kernel for smooth extrapolation
+- Fits independent GPs for x, y, z coordinates
+- Always operates at stored resolution
 
 ---
 

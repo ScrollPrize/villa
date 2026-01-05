@@ -161,68 +161,6 @@ class Tifxyz:
         else:
             raise TypeError(f"Invalid index type: {type(key)}")
 
-    def get_tile(
-        self,
-        row: int,
-        col: int,
-        height: int,
-        width: int,
-        *,
-        method: Optional[InterpolationMethod] = None,
-    ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.bool_]]:
-        """Get a tile at current resolution.
-
-        In 'stored' mode (default), returns direct array slice without interpolation.
-        In 'full' mode, returns interpolated coordinates at full resolution.
-
-        Parameters
-        ----------
-        row : int
-            Starting row in current resolution coordinates.
-        col : int
-            Starting column in current resolution coordinates.
-        height : int
-            Tile height.
-        width : int
-            Tile width.
-        method : str, optional
-            Interpolation method override (only used in 'full' mode).
-            If None, uses self.interp_method.
-            Options: "catmull_rom", "linear", "cubic", "bspline".
-
-        Returns
-        -------
-        Tuple[NDArray, NDArray, NDArray, NDArray]
-            (x, y, z, valid) for the tile.
-        """
-        # Stored mode: direct slice access
-        if self.resolution == "stored":
-            return (
-                self._x[row:row+height, col:col+width],
-                self._y[row:row+height, col:col+width],
-                self._z[row:row+height, col:col+width],
-                self._valid_mask[row:row+height, col:col+width],
-            )
-
-        # Full mode: interpolate
-        from .upsampling import interpolate_at_points
-
-        use_method = method if method is not None else self.interp_method
-
-        row_indices = np.arange(row, row + height)
-        col_indices = np.arange(col, col + width)
-        col_grid, row_grid = np.meshgrid(col_indices, row_indices)
-
-        source_grid_y = row_grid.astype(np.float32) * self._scale[0]
-        source_grid_x = col_grid.astype(np.float32) * self._scale[1]
-
-        return interpolate_at_points(
-            self._x, self._y, self._z, self._valid_mask,
-            source_grid_y, source_grid_x,
-            scale=(1.0, 1.0),
-            method=use_method,
-        )
-
     @property
     def shape(self) -> Tuple[int, int]:
         """Return grid shape at current resolution.
@@ -731,7 +669,7 @@ class Tifxyz:
     def use_stored_resolution(self) -> "Tifxyz":
         """Set resolution to 'stored' and return self for chaining.
 
-        In stored mode, shape, indexing, get_tile, and get_normals all
+        In stored mode, shape, indexing, and get_normals all
         operate at the internal stored resolution without interpolation.
 
         Returns
@@ -751,7 +689,7 @@ class Tifxyz:
     def use_full_resolution(self) -> "Tifxyz":
         """Set resolution to 'full' and return self for chaining.
 
-        In full mode, shape, indexing, get_tile, and get_normals all
+        In full mode, shape, indexing, and get_normals all
         operate at full resolution with interpolation.
 
         Returns
@@ -945,8 +883,8 @@ class Tifxyz:
         self,
         *,
         stored_resolution: Optional[bool] = None,
-    ) -> List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]]:
-        """Extract valid points per row and apply 1D Catmull-Rom smoothing.
+    ) -> NDArray[np.float32]:
+        """Apply 1D Catmull-Rom smoothing to each row independently.
 
         For each row, collects valid points in column order (skipping invalid
         points where z <= 0 or not finite), then applies 1D Catmull-Rom
@@ -966,24 +904,22 @@ class Tifxyz:
 
         Returns
         -------
-        List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]]
-            List of (x, y, z) tuples, one per row. Each tuple contains
-            1D arrays of smoothed coordinates for valid points in that row.
-            Rows with < 2 valid points return empty arrays.
+        NDArray[np.float32]
+            Array of shape (H, W, 3) with smoothed coordinates in [z, y, x] order,
+            same format as get_zyxs(). Invalid points have value -1.
+            Rows with < 2 valid points are left unchanged (still -1 for invalid).
 
         Notes
         -----
-        - Invalid points (z <= 0 or not finite) are skipped entirely
-        - The number of output points per row equals the number of valid
-          input points in that row (or 0 if < 2 valid points)
+        - Invalid points (z <= 0 or not finite) are skipped during smoothing
+        - Valid points are replaced with their smoothed values in-place
+        - Output format matches get_zyxs() for consistency
 
         Examples
         --------
         >>> surface = read_tifxyz("/path/to/segment")
-        >>> smoothed_rows = surface.smooth_rows_catmull_rom()
-        >>> for row_idx, (x, y, z) in enumerate(smoothed_rows):
-        ...     if len(x) > 0:
-        ...         print(f"Row {row_idx}: {len(x)} smoothed points")
+        >>> smoothed = surface.smooth_rows_catmull_rom()
+        >>> smoothed.shape  # (H, W, 3)
         >>>
         >>> # Force full resolution
         >>> smoothed_full = surface.smooth_rows_catmull_rom(stored_resolution=False)
@@ -997,28 +933,25 @@ class Tifxyz:
             use_stored = stored_resolution
 
         if use_stored:
-            x_data = self._x
-            y_data = self._y
-            z_data = self._z
+            x_data = self._x.copy()
+            y_data = self._y.copy()
+            z_data = self._z.copy()
             valid = self._valid_mask
         else:
             # Get full resolution coordinates via interpolation
             x_data, y_data, z_data, valid = self[:, :]
+            x_data = x_data.copy()
+            y_data = y_data.copy()
+            z_data = z_data.copy()
 
         h, w = x_data.shape
-        results: List[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = []
 
         for row in range(h):
             # Get column indices of valid points in this row
             valid_cols = np.where(valid[row])[0]
 
             if len(valid_cols) < 2:
-                # Not enough points for extrapolation
-                results.append((
-                    np.array([], dtype=np.float32),
-                    np.array([], dtype=np.float32),
-                    np.array([], dtype=np.float32),
-                ))
+                # Not enough points for smoothing, leave as-is
                 continue
 
             # Extract coordinates for valid points
@@ -1029,6 +962,188 @@ class Tifxyz:
             # Apply 1D Catmull-Rom smoothing
             x_smooth, y_smooth, z_smooth = catmull_rom_smooth_1d(x_valid, y_valid, z_valid)
 
-            results.append((x_smooth, y_smooth, z_smooth))
+            # Write smoothed values back to the valid positions
+            if len(x_smooth) > 0:
+                x_data[row, valid_cols] = x_smooth
+                y_data[row, valid_cols] = y_smooth
+                z_data[row, valid_cols] = z_smooth
 
-        return results
+        # Stack as (H, W, 3) in [z, y, x] order like get_zyxs()
+        return np.stack([z_data, y_data, x_data], axis=-1)
+
+    def extrapolate(
+        self,
+        direction: Literal["left", "right", "up", "down"],
+        steps: int = 10,
+        *,
+        min_points: int = 4,
+        training_iters: int = 50,
+        use_last_n: Optional[int] = None,
+        return_combined: bool = False,
+    ) -> NDArray[np.float32]:
+        """Extrapolate surface coordinates beyond the current boundary using GP regression.
+
+        Uses Gaussian Process regression to extend the surface beyond its current
+        boundaries. For each row (left/right) or column (up/down), fits independent
+        GPs for x, y, z coordinates using valid points, then predicts coordinates
+        at new grid positions beyond the edge.
+
+        Parameters
+        ----------
+        direction : {"left", "right", "up", "down"}
+            Direction to extrapolate:
+            - "left": toward column 0, iterating over rows
+            - "right": toward last column, iterating over rows
+            - "up": toward row 0, iterating over columns
+            - "down": toward last row, iterating over columns
+        steps : int
+            Number of grid points to extrapolate (default 10).
+        min_points : int
+            Minimum valid points required to fit GP (default 4).
+            Slices with fewer points return -1 sentinel values.
+        training_iters : int
+            Number of optimization iterations for GP hyperparameters (default 50).
+        use_last_n : int, optional
+            If specified, only use the last N valid points closest to the edge
+            for GP fitting. Useful for long rows where local behavior matters most.
+        return_combined : bool
+            If True, return original data concatenated with extrapolated region.
+            If False (default), return only the extrapolated region.
+
+        Returns
+        -------
+        NDArray[np.float32]
+            Array of shape (H, W, 3) with coordinates in [z, y, x] order,
+            same format as get_zyxs().
+
+            If return_combined=False:
+                Shape: (num_rows, steps, 3) for left/right, (steps, num_cols, 3) for up/down.
+
+            If return_combined=True:
+                Shape: (num_rows, original_cols + steps, 3) for left/right,
+                       (original_rows + steps, num_cols, 3) for up/down.
+
+            Invalid slices have -1.0 sentinel values.
+
+        Raises
+        ------
+        ImportError
+            If gpytorch or torch are not installed.
+        ValueError
+            If direction is not one of the valid options.
+
+        Examples
+        --------
+        >>> surface = read_tifxyz("/path/to/segment")
+        >>> # Extrapolate 20 grid points to the right
+        >>> ext = surface.extrapolate("right", steps=20)
+        >>> ext.shape  # (surface.shape[0], 20, 3)
+        >>>
+        >>> # Get combined original + extrapolated
+        >>> combined = surface.extrapolate("down", steps=10, return_combined=True)
+        """
+        from .upsampling import _fit_gp_1d
+
+        if direction not in ("left", "right", "up", "down"):
+            raise ValueError(
+                f"direction must be 'left', 'right', 'up', or 'down', got {direction!r}"
+            )
+
+        h, w = self._x.shape
+        valid = self._valid_mask
+
+        # Determine which axis to iterate over
+        is_horizontal = direction in ("left", "right")
+
+        if is_horizontal:
+            num_slices = h
+            out_shape = (h, steps)
+        else:
+            num_slices = w
+            out_shape = (steps, w)
+
+        # Initialize output arrays with sentinel values
+        x_out = np.full(out_shape, -1.0, dtype=np.float32)
+        y_out = np.full(out_shape, -1.0, dtype=np.float32)
+        z_out = np.full(out_shape, -1.0, dtype=np.float32)
+
+        for slice_idx in range(num_slices):
+            # Extract the 1D slice
+            if is_horizontal:
+                # Row slice: data[row, :]
+                valid_mask_1d = valid[slice_idx, :]
+                x_1d = self._x[slice_idx, :]
+                y_1d = self._y[slice_idx, :]
+                z_1d = self._z[slice_idx, :]
+            else:
+                # Column slice: data[:, col]
+                valid_mask_1d = valid[:, slice_idx]
+                x_1d = self._x[:, slice_idx]
+                y_1d = self._y[:, slice_idx]
+                z_1d = self._z[:, slice_idx]
+
+            # Get valid indices
+            valid_indices = np.where(valid_mask_1d)[0]
+
+            if len(valid_indices) < min_points:
+                continue  # Output already initialized to -1
+
+            # Optionally limit to last N points near the edge
+            if use_last_n is not None and len(valid_indices) > use_last_n:
+                if direction in ("right", "down"):
+                    valid_indices = valid_indices[-use_last_n:]
+                else:  # left, up
+                    valid_indices = valid_indices[:use_last_n]
+
+            # Determine extrapolation target points (past the grid boundary)
+            if direction == "right":
+                t_pred = np.arange(w, w + steps, dtype=np.float32)
+            elif direction == "left":
+                t_pred = np.arange(-steps, 0, dtype=np.float32)
+            elif direction == "down":
+                t_pred = np.arange(h, h + steps, dtype=np.float32)
+            else:  # up
+                t_pred = np.arange(-steps, 0, dtype=np.float32)
+
+            # Training data
+            t_train = valid_indices.astype(np.float32)
+            x_train = x_1d[valid_indices]
+            y_train = y_1d[valid_indices]
+            z_train = z_1d[valid_indices]
+
+            # Fit separate GPs for x, y, z
+            x_pred = _fit_gp_1d(t_train, x_train, t_pred, training_iters)
+            y_pred = _fit_gp_1d(t_train, y_train, t_pred, training_iters)
+            z_pred = _fit_gp_1d(t_train, z_train, t_pred, training_iters)
+
+            # Store results
+            if is_horizontal:
+                x_out[slice_idx, :] = x_pred
+                y_out[slice_idx, :] = y_pred
+                z_out[slice_idx, :] = z_pred
+            else:
+                x_out[:, slice_idx] = x_pred
+                y_out[:, slice_idx] = y_pred
+                z_out[:, slice_idx] = z_pred
+
+        # Optionally combine with original data
+        if return_combined:
+            if direction == "right":
+                x_out = np.concatenate([self._x, x_out], axis=1)
+                y_out = np.concatenate([self._y, y_out], axis=1)
+                z_out = np.concatenate([self._z, z_out], axis=1)
+            elif direction == "left":
+                x_out = np.concatenate([x_out, self._x], axis=1)
+                y_out = np.concatenate([y_out, self._y], axis=1)
+                z_out = np.concatenate([z_out, self._z], axis=1)
+            elif direction == "down":
+                x_out = np.concatenate([self._x, x_out], axis=0)
+                y_out = np.concatenate([self._y, y_out], axis=0)
+                z_out = np.concatenate([self._z, z_out], axis=0)
+            else:  # up
+                x_out = np.concatenate([x_out, self._x], axis=0)
+                y_out = np.concatenate([y_out, self._y], axis=0)
+                z_out = np.concatenate([z_out, self._z], axis=0)
+
+        # Stack as (H, W, 3) in [z, y, x] order like get_zyxs()
+        return np.stack([z_out, y_out, x_out], axis=-1)
