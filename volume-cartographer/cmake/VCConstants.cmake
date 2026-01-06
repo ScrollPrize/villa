@@ -20,6 +20,14 @@ set(namespace "${PROJECT_NAME}::")
 # Get Git hash
 include(GetGitRevisionDescription)
 get_git_head_revision(GIT_REFSPEC GIT_SHA1)
+if(NOT GIT_SHA1)
+    execute_process(
+        COMMAND git -C "${CMAKE_SOURCE_DIR}" rev-parse HEAD
+        OUTPUT_VARIABLE GIT_SHA1
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(GIT_SHA1)
     string(SUBSTRING ${GIT_SHA1} 0 7 GIT_SHA1_SHORT)
 else()

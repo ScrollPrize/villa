@@ -83,6 +83,7 @@
 #include "segmentation/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
+#include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -486,6 +487,12 @@ CWindow::CWindow() :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
+    const QString baseTitle = windowTitle();
+    const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
+    if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
+        && repoShortHash.compare("Untracked", Qt::CaseInsensitive) != 0) {
+        setWindowTitle(QString("%1 %2").arg(baseTitle, repoShortHash));
+    }
     // setAttribute(Qt::WA_DeleteOnClose);
 
     chunk_cache = new ChunkCache<uint8_t>(CHUNK_CACHE_SIZE_GB*1024ULL*1024ULL*1024ULL);

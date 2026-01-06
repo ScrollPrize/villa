@@ -6,6 +6,7 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <opencv2/core.hpp>
+#include <iostream>
 #include <thread>
 
 
@@ -28,6 +29,7 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+    std::cout << "VC3D commit: " << ProjectInfo::RepositoryHash() << std::endl;
 
     QCommandLineParser parser;
     parser.setApplicationDescription("VC3D - Volume Cartographer 3D Viewer");
