@@ -11,7 +11,8 @@ from tqdm import tqdm
 from einops import rearrange
 from functools import lru_cache
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, Any
 
 import vesuvius.neural_tracing.augmentation as augmentation
 
@@ -23,6 +24,9 @@ class Patch:
     zyxs: torch.Tensor
     scale: torch.Tensor
     volume: zarr.Array
+    tifxyz_path: Optional[str] = None
+
+    _tifxyz_cache: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
@@ -33,12 +37,22 @@ class Patch:
         self.area = self.valid_quad_mask.sum() * (1 / self.scale).prod()
         self.quad_centers = torch.where(self.valid_quad_mask[..., None], 0.5 * (self.zyxs[1:, 1:] + self.zyxs[:-1, :-1]), torch.tensor(-1.))
 
+    def get_tifxyz(self):
+        """Lazily load and cache the Tifxyz object for high-res access."""
+        if self._tifxyz_cache is None:
+            if self.tifxyz_path is None:
+                raise ValueError("No tifxyz_path set for this Patch")
+            from vesuvius.tifxyz import read_tifxyz
+            self._tifxyz_cache = read_tifxyz(self.tifxyz_path)
+        return self._tifxyz_cache
+
     def retarget(self, factor):
         # Retarget the patch to a volume downsampled by the given factor
         return Patch(
             torch.where((self.zyxs == -1).all(dim=-1, keepdim=True), -1, self.zyxs / factor),
             self.scale * factor,
-            self.volume
+            self.volume,
+            self.tifxyz_path
         )
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
@@ -606,6 +620,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             **maybe_center_heatmap,
         }
 
+    def _should_flip_uv_directions(self):
+        """Whether to randomly flip positive/negative directions as augmentation."""
+        return bool(self._config.get("flip_uv_directions", True))
+
     def _should_swap_uv_axes(self):
         """Whether to apply UV axis swap augmentation. Override in subclasses."""
         return True
@@ -698,12 +716,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 continue
 
             # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
-            if torch.rand([]) < 0.5:
-                u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
-                u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
-            if torch.rand([]) < 0.5:
-                v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
-                v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
+            if self._should_flip_uv_directions():
+                if torch.rand([]) < 0.5:
+                    u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
+                    u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
+                if torch.rand([]) < 0.5:
+                    v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
+                    v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
 
             # Decide conditioning directions early so we know which points to perturb
             cond_result = self._decide_conditioning(
@@ -1086,7 +1105,7 @@ def load_tifxyz_patches(segments_path, z_range, volume):
                 cv2.imread( f'{segment_path}/{coord}.tif', flags=cv2.IMREAD_UNCHANGED)
                 for coord in 'zyx'
             ], axis=-1))
-            all_patches.append(Patch(zyxs, scale, volume))
+            all_patches.append(Patch(zyxs, scale, volume, tifxyz_path=segment_path))
         except Exception as e:
             print(f'error loading {segment_path}: {e}')
             continue
