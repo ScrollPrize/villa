@@ -368,7 +368,7 @@ void SegmentationWidget::buildUi()
     auto* pushPullLabel = new QLabel(tr("Step"), pushParent);
     _spinPushPullStep = new QDoubleSpinBox(pushParent);
     _spinPushPullStep->setDecimals(2);
-    _spinPushPullStep->setRange(0.05, 10.0);
+    _spinPushPullStep->setRange(0.05, 40.0);
     _spinPushPullStep->setSingleStep(0.05);
     pushGrid->addWidget(pushPullLabel, 1, 0);
     pushGrid->addWidget(_spinPushPullStep, 1, 1);
@@ -1349,7 +1349,7 @@ void SegmentationWidget::restoreSettings()
     _pushPullSigmaSteps = std::clamp(_pushPullSigmaSteps, 0.05f, 64.0f);
 
     _pushPullStep = settings.value(segmentation::PUSH_PULL_STEP, _pushPullStep).toFloat();
-    _pushPullStep = std::clamp(_pushPullStep, 0.05f, 10.0f);
+    _pushPullStep = std::clamp(_pushPullStep, 0.05f, 40.0f);
 
     AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
     storedAlpha.start = settings.value(segmentation::PUSH_PULL_ALPHA_START, storedAlpha.start).toFloat();
@@ -1736,7 +1736,7 @@ void SegmentationWidget::setPushPullSigma(float value)
 
 void SegmentationWidget::setPushPullStep(float value)
 {
-    const float clamped = std::clamp(value, 0.05f, 10.0f);
+    const float clamped = std::clamp(value, 0.05f, 40.0f);
     if (std::fabs(clamped - _pushPullStep) < 1e-4f) {
         return;
     }

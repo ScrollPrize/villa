@@ -153,7 +153,7 @@ void SegmentationModule::useFalloff(FalloffTool tool)
 
 void SegmentationModule::setPushPullStepMultiplier(float multiplier)
 {
-    const float sanitized = std::clamp(multiplier, 0.05f, 10.0f);
+    const float sanitized = std::clamp(multiplier, 0.05f, 40.0f);
     if (_pushPullTool && std::fabs(sanitized - _pushPullTool->stepMultiplier()) < kFloatEpsilon) {
         if (_widget && std::fabs(_widget->pushPullStep() - sanitized) >= kFloatEpsilon) {
             _widget->setPushPullStep(sanitized);

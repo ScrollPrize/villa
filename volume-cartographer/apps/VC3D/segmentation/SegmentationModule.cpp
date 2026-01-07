@@ -115,7 +115,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _lineSigmaSteps = _widget->lineSigma();
         _pushPullRadiusSteps = _widget->pushPullRadius();
         _pushPullSigmaSteps = _widget->pushPullSigma();
-        initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 10.0f);
+        initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 40.0f);
         _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
