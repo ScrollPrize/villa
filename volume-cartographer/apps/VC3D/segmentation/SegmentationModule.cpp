@@ -5,7 +5,6 @@
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
-#include "SegmentationBrushTool.hpp"
 #include "SegmentationLineTool.hpp"
 #include "SegmentationPushPullTool.hpp"
 #include "ApprovalMaskBrushTool.hpp"
@@ -130,7 +129,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         }
     }
 
-    _brushTool = std::make_unique<SegmentationBrushTool>(*this, _editManager, _widget, _surfaces);
     _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _surfaces, _smoothStrength, _smoothIterations);
     _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _surfaces);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
@@ -313,8 +311,6 @@ void SegmentationModule::bindWidgetSignals()
             _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
             this, &SegmentationModule::undoApprovalStroke);
-
-    _widget->setEraseBrushActive(false);
 }
 
 void SegmentationModule::bindViewerSignals(CVolumeViewer* viewer)
@@ -382,7 +378,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (!enabled) {
         stopAllPushPull();
         setCorrectionsAnnotateMode(false, false);
-        deactivateInvalidationBrush();
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
@@ -539,7 +534,6 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
         }
 
         // Deactivate regular editing tools
-        deactivateInvalidationBrush();
         clearLineDragStroke();
         stopAllPushPull();
     } else if (!isEditingApprovalMask()) {
@@ -602,7 +596,6 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
         }
 
         // Deactivate regular editing tools
-        deactivateInvalidationBrush();
         clearLineDragStroke();
         stopAllPushPull();
     } else if (!isEditingApprovalMask()) {
@@ -691,7 +684,6 @@ void SegmentationModule::applyEdits()
         return;
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
-    clearInvalidationBrush();
 
     // Capture delta for undo before applyPreview() clears edited vertices
     if (hadPendingChanges) {
@@ -737,7 +729,6 @@ void SegmentationModule::resetEdits()
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
     cancelDrag();
-    clearInvalidationBrush();
     clearLineDragStroke();
     _editManager->resetPreview();
     if (_surfaces) {
@@ -790,7 +781,6 @@ void SegmentationModule::setGrowthInProgress(bool running)
     }
     if (running) {
         setCorrectionsAnnotateMode(false, false);
-        deactivateInvalidationBrush();
         clearLineDragStroke();
         _lineDrawKeyActive = false;
     }
@@ -922,23 +912,10 @@ void SegmentationModule::refreshOverlay()
 
     std::vector<cv::Vec3f> maskPoints;
     std::size_t maskReserve = 0;
-    const bool brushHasOverlay = _brushTool &&
-                                 (!_brushTool->overlayPoints().empty() ||
-                                  !_brushTool->currentStrokePoints().empty());
-    if (_brushTool) {
-        maskReserve += _brushTool->overlayPoints().size();
-        maskReserve += _brushTool->currentStrokePoints().size();
-    }
     if (_lineTool) {
         maskReserve += _lineTool->overlayPoints().size();
     }
     maskPoints.reserve(maskReserve);
-    if (_brushTool) {
-        const auto& overlayPts = _brushTool->overlayPoints();
-        maskPoints.insert(maskPoints.end(), overlayPts.begin(), overlayPts.end());
-        const auto& strokePts = _brushTool->currentStrokePoints();
-        maskPoints.insert(maskPoints.end(), strokePts.begin(), strokePts.end());
-    }
     if (_lineTool) {
         const auto& linePts = _lineTool->overlayPoints();
         maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
@@ -946,23 +923,19 @@ void SegmentationModule::refreshOverlay()
 
     const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
-    const bool brushActive = _brushTool && _brushTool->brushActive();
-    const bool brushStrokeActive = _brushTool && _brushTool->strokeActive();
     const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
 
     state.maskPoints = std::move(maskPoints);
     state.maskVisible = !state.maskPoints.empty();
     state.hasLineStroke = hasLineStroke;
     state.lineStrokeActive = lineStrokeActive;
-    state.brushActive = brushActive;
-    state.brushStrokeActive = brushStrokeActive;
+    state.brushActive = false;
+    state.brushStrokeActive = false;
     state.pushPullActive = pushPullActive;
 
     FalloffTool overlayTool = _activeFalloff;
     if (hasLineStroke) {
         overlayTool = FalloffTool::Line;
-    } else if (brushHasOverlay || brushStrokeActive || brushActive) {
-        overlayTool = FalloffTool::Drag;
     } else if (pushPullActive) {
         overlayTool = FalloffTool::PushPull;
     }
@@ -990,7 +963,6 @@ void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userIniti
     const bool wasActive = _corrections->annotateMode();
     const bool isActive = _corrections->setAnnotateMode(enabled, userInitiated, _editingEnabled);
     if (isActive && !wasActive) {
-        deactivateInvalidationBrush();
     }
 }
 
@@ -1136,8 +1108,7 @@ void SegmentationModule::onCorrectionsCreateRequested()
     if (created != 0) {
         const bool nowActive = _corrections->setAnnotateMode(true, false, _editingEnabled);
         if (nowActive && !wasActive) {
-            deactivateInvalidationBrush();
-        }
+            }
     }
 }
 
@@ -1202,11 +1173,6 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
         return;
     }
 
-    // Ensure any pending invalidation brush strokes are committed before growth.
-    if (_brushTool) {
-        _brushTool->applyPending(_dragRadiusSteps);
-    }
-
     if (!inpaintOnly) {
         _growthMethod = method;
         if (method == SegmentationGrowthMethod::Corrections) {
@@ -1217,51 +1183,6 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
     }
     markNextEditsFromGrowth();
     emit growSurfaceRequested(method, direction, sanitizedSteps, inpaintOnly);
-}
-
-void SegmentationModule::setInvalidationBrushActive(bool active)
-{
-    if (!_brushTool) {
-        return;
-    }
-
-    const bool canUseBrush = _editingEnabled && !_growthInProgress &&
-                             !(_corrections && _corrections->annotateMode()) &&
-                             _editManager && _editManager->hasSession();
-    const bool shouldEnable = active && canUseBrush;
-
-    if (!shouldEnable) {
-        if (_brushTool->brushActive()) {
-            _brushTool->setActive(false);
-        }
-        // Only discard pending strokes when brush use is no longer possible.
-        if (!canUseBrush) {
-            _brushTool->clear();
-        }
-        return;
-    }
-
-    if (!_brushTool->brushActive()) {
-        _brushTool->setActive(true);
-    }
-}
-
-void SegmentationModule::clearInvalidationBrush()
-{
-    if (_brushTool) {
-        _brushTool->clear();
-    }
-}
-
-void SegmentationModule::deactivateInvalidationBrush()
-{
-    if (!_brushTool) {
-        return;
-    }
-    if (_brushTool->brushActive()) {
-        _brushTool->setActive(false);
-    }
-    _brushTool->clear();
 }
 
 void SegmentationModule::clearLineDragStroke()

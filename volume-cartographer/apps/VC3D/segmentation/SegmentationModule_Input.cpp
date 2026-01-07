@@ -79,36 +79,16 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
-    if (event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
-        setInvalidationBrushActive(true);
-        event->accept();
-        return true;
-    }
-
     if (event->key() == Qt::Key_S && !event->isAutoRepeat()) {
         if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
             _lineDrawKeyActive = true;
             stopAllPushPull();
-            const bool brushActive = _brushTool && _brushTool->brushActive();
-            if (brushActive) {
-                deactivateInvalidationBrush();
-            }
             clearLineDragStroke();
             cancelDrag();
             event->accept();
             return true;
         }
         _lineDrawKeyActive = false;
-    }
-
-    if (event->key() == Qt::Key_E && !event->isAutoRepeat()) {
-        const Qt::KeyboardModifiers mods = event->modifiers();
-        if (mods == Qt::NoModifier || mods == Qt::ShiftModifier) {
-            if (_brushTool && _brushTool->applyPending(_dragRadiusSteps)) {
-                event->accept();
-                return true;
-            }
-        }
     }
 
     if (!event->isAutoRepeat() && event->key() == Qt::Key_G &&
@@ -242,12 +222,6 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         return false;
     }
 
-    if (event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
-        setInvalidationBrushActive(false);
-        event->accept();
-        return true;
-    }
-
     if (event->key() == Qt::Key_S && !event->isAutoRepeat()) {
         _lineDrawKeyActive = false;
         if (_lineTool && _lineTool->strokeActive()) {
@@ -323,20 +297,18 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
             updateCorrectionsWidget();
             return;
         }
-        // Start correction drag - find the grid position where user clicked
-        if (_editManager) {
+        // Shift+click+drag: start correction drag with anchor2d
+        // Click without Shift: add correction point directly (old behavior)
+        if (modifiers.testFlag(Qt::ShiftModifier) && _editManager) {
             auto gridIndex = _editManager->worldToGridIndex(worldPos);
             if (gridIndex) {
                 beginCorrectionDrag(gridIndex->first, gridIndex->second, viewer, worldPos);
-            } else {
-                // Fallback to old behavior if we can't find grid position
-                handleCorrectionPointAdded(worldPos);
-                updateCorrectionsWidget();
+                return;
             }
-        } else {
-            handleCorrectionPointAdded(worldPos);
-            updateCorrectionsWidget();
         }
+        // Default: add correction point at clicked position
+        handleCorrectionPointAdded(worldPos);
+        updateCorrectionsWidget();
         return;
     }
 
@@ -352,26 +324,13 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         return;
     }
 
-    const bool brushActive = _brushTool && _brushTool->brushActive();
-
     if (_lineDrawKeyActive) {
         stopAllPushPull();
-        if (brushActive) {
-            deactivateInvalidationBrush();
-        }
         if (_drag.active) {
             cancelDrag();
         }
         if (_lineTool) {
             _lineTool->startStroke(worldPos);
-        }
-        return;
-    }
-
-    if (brushActive) {
-        stopAllPushPull();
-        if (_brushTool) {
-            _brushTool->startStroke(worldPos);
         }
         return;
     }
@@ -478,20 +437,6 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
         return;
     }
 
-    const bool paintStrokeActive = _brushTool && _brushTool->strokeActive();
-    if (paintStrokeActive) {
-        if (buttons.testFlag(Qt::LeftButton)) {
-            if (_brushTool) {
-                _brushTool->extendStroke(worldPos, false);
-            }
-        } else {
-            if (_brushTool) {
-                _brushTool->finishStroke();
-            }
-        }
-        return;
-    }
-
     if (_drag.active) {
         updateDrag(worldPos);
         return;
@@ -549,15 +494,6 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
         if (_lineTool) {
             _lineTool->extendStroke(worldPos, true);
             _lineTool->finishStroke(_lineDrawKeyActive);
-        }
-        return;
-    }
-
-    const bool paintStrokeActive = _brushTool && _brushTool->strokeActive();
-    if (paintStrokeActive && button == Qt::LeftButton) {
-        if (_brushTool) {
-            _brushTool->extendStroke(worldPos, true);
-            _brushTool->finishStroke();
         }
         return;
     }

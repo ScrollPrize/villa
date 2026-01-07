@@ -68,7 +68,6 @@ public:
     void setSmoothingIterations(int value);
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
-    void setEraseBrushActive(bool active);
     void setShowHoverMarker(bool enabled);
 
     void setNormalGridAvailable(bool available);
@@ -175,7 +174,6 @@ private:
     bool _editingEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
-    bool _eraseBrushActive{false};
     float _dragRadiusSteps{5.75f};
     float _dragSigmaSteps{2.0f};
     float _lineRadiusSteps{5.75f};
@@ -268,7 +266,6 @@ private:
     QPushButton* _btnApply{nullptr};
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};
-    QCheckBox* _chkEraseBrush{nullptr};
     QCheckBox* _chkShowHoverMarker{nullptr};
 
     QGroupBox* _groupCustomParams{nullptr};

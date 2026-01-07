@@ -224,15 +224,6 @@ void SegmentationWidget::buildUi()
     editingRow->addWidget(_lblStatus, 1);
     layout->addLayout(editingRow);
 
-    auto* brushRow = new QHBoxLayout();
-    brushRow->addSpacing(4);
-    _chkEraseBrush = new QCheckBox(tr("Invalidation brush (Shift)"), this);
-    _chkEraseBrush->setToolTip(tr("Hold Shift to temporarily switch to the invalidate brush while editing."));
-    _chkEraseBrush->setEnabled(false);
-    brushRow->addWidget(_chkEraseBrush);
-    brushRow->addStretch(1);
-    layout->addLayout(brushRow);
-
     _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
 
@@ -1097,12 +1088,6 @@ void SegmentationWidget::syncUiState()
         }
     }
 
-    if (_chkEraseBrush) {
-        const QSignalBlocker blocker(_chkEraseBrush);
-        _chkEraseBrush->setChecked(_eraseBrushActive);
-        _chkEraseBrush->setEnabled(_editingEnabled);
-    }
-
     if (_chkShowHoverMarker) {
         const QSignalBlocker blocker(_chkShowHoverMarker);
         _chkShowHoverMarker->setChecked(_showHoverMarker);
@@ -1461,24 +1446,11 @@ void SegmentationWidget::updateEditingState(bool enabled, bool notifyListeners)
     }
 
     _editingEnabled = enabled;
-    if (!_editingEnabled && _eraseBrushActive) {
-        _eraseBrushActive = false;
-    }
     syncUiState();
 
     if (notifyListeners) {
         emit editingModeChanged(_editingEnabled);
     }
-}
-
-void SegmentationWidget::setEraseBrushActive(bool active)
-{
-    const bool sanitized = _editingEnabled && active;
-    if (_eraseBrushActive == sanitized) {
-        return;
-    }
-    _eraseBrushActive = sanitized;
-    syncUiState();
 }
 
 void SegmentationWidget::setShowHoverMarker(bool enabled)
