@@ -93,6 +93,9 @@ def _gradmag_period_loss(
     cosine_periods: float,
     unet_mag_img: torch.Tensor | None,
     torch_device: torch.device,
+    *,
+    w_img: int,
+    h_img: int,
     mask_sample: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
@@ -120,7 +123,7 @@ def _gradmag_period_loss(
     )  # (1,1,hr,wr)
 
     # Per-sample distance along the horizontal index direction of the sampling grid.
-    _, h_img, w_img, _ = grid.shape
+    # Use the *source image* size for pixel scaling (matches original implementation).
     dist_x_hr = _grid_segment_length_x(grid, w_img=w_img, h_img=h_img)
 
     # If a sample-space mask is provided with matching spatial size, apply it
