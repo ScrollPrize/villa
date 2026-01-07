@@ -191,6 +191,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(qWindow->ui.dockWidgetPreprocessing->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetPostprocessing->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetView->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetNormalVis->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetOverlay->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetRenderSettings->toggleViewAction());
 
@@ -420,6 +421,7 @@ void MenuActionController::showKeybindings()
             "\n"
             "=== View Menu ===\n"
             "Ctrl+J: Toggle axis-aligned slice planes\n"
+            "Ctrl+N: Toggle surface normals visualization\n"
             "Ctrl+T: Toggle direction hints (flip_x arrows)\n"
             "C: Toggle composite view\n"
             "Ctrl+Shift+D: Toggle drawing mode\n"
