@@ -526,18 +526,22 @@ def fit_cosine_grid(
     }
 
     stage3_modifiers: dict[str, float] = {
-        "grad_mag": 1.0,
+        # Stage 2: refine coarse grid with full regularization; keep data/grad_data
+        # disabled to match previous behavior (global, no Gaussian mask).
+        "data": 0.0,
+        "grad_data": 0.0,
+        "grad_mag": 0.0,
         "quad_tri": 0.0,
-        "step": 1.0,
+        "step": 0.1,
         "mod_smooth": 0.0,
-        "angle_sym": 1.0,
-        "dir_unet": 10.0,
+        "angle_sym": 0.1,
+        "dir_unet": 0.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
         # "smooth_x": 10.0,
         # "smooth_y": 0.0,
-        "line_smooth_y": 0.1,
+        "line_smooth_y": 0.0,
         # other terms default to 1.0 (enabled).
     }
 
@@ -615,6 +619,26 @@ def fit_cosine_grid(
                 & (gy <= 1.0)
             ).float()
             valid = valid.unsqueeze(1)  # (1,1,H,W)
+
+            # Coarse validity mask in image space (per coarse vertex).
+            coords_c = model.base_grid + model.offset  # (1,2,gh,gw)
+            u_c = coords_c[:, 0:1]
+            v_c = coords_c[:, 1:2]
+            x_c, y_c = model._apply_global_transform(u_c, v_c)
+            valid_coarse = (
+                (x_c >= -1.0)
+                & (x_c <= 1.0)
+                & (y_c >= -1.0)
+                & (y_c <= 1.0)
+            ).float()  # (1,1,gh,gw)
+
+            # Stage 3: shrink the fixed (valid) region a bit so the boundary can adjust.
+            if stage == 3:
+                valid_coarse_erode_iters = 4
+                for _ in range(valid_coarse_erode_iters):
+                    inv = 1.0 - valid_coarse
+                    inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
+                    valid_coarse = 1.0 - inv
 
             valid_erode_iters = 0
             for _ in range(valid_erode_iters):
@@ -813,6 +837,9 @@ def fit_cosine_grid(
             terms["_mask_full"] = weight_full.detach()
             terms["_mask_valid"] = valid.detach()
 
+        if stage == 3:
+            terms["_valid_coarse"] = valid_coarse.detach()
+
         return total_loss, terms
 
     def _optimize_stage(
@@ -839,6 +866,32 @@ def fit_cosine_grid(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
+            if stage == 3:
+                # Stage 3: update only outside the validity mask.
+                # We mask gradients for per-vertex / per-cell parameters.
+                valid_coarse = terms.get("_valid_coarse", None)
+                if valid_coarse is not None:
+                    with torch.no_grad():
+                        m_out = (1.0 - valid_coarse).to(device=model.offset.device, dtype=model.offset.dtype)
+                        if model.offset.grad is not None:
+                            model.offset.grad.mul_(m_out.expand_as(model.offset.grad))
+                        if model.line_offset.grad is not None:
+                            model.line_offset.grad.mul_(m_out.expand_as(model.line_offset.grad))
+                        if model.amp_coarse.grad is not None or model.bias_coarse.grad is not None:
+                            gh_m = int(model.amp_coarse.shape[2])
+                            gw_m = int(model.amp_coarse.shape[3])
+                            m_out_mod = F.interpolate(
+                                m_out,
+                                size=(gh_m, gw_m),
+                                mode="bilinear",
+                                align_corners=True,
+                            )
+                            if model.amp_coarse.grad is not None:
+                                model.amp_coarse.grad.mul_(m_out_mod.expand_as(model.amp_coarse.grad))
+                            if model.bias_coarse.grad is not None:
+                                model.bias_coarse.grad.mul_(m_out_mod.expand_as(model.bias_coarse.grad))
+
             optimizer.step()
 
             if stage == 1:
@@ -948,9 +1001,6 @@ def fit_cosine_grid(
     if total_stage3 > 0:
         opt3 = torch.optim.Adam(
             [
-                model.theta,
-                model.log_s,
-                model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
                 model.offset,
