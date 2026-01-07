@@ -115,7 +115,10 @@ def _config_dict_to_mgr(config_dict):
     mgr.model_config = model_config
     mgr.train_patch_size = tuple([config_dict['crop_size']] * 3)
     mgr.train_batch_size = int(config_dict.get('batch_size', 1))
-    mgr.in_channels = 1 + conditioning_channels + (1 if use_localiser else 0)  # volume + optional localiser + conditioning
+    if 'in_channels' in config_dict:
+        mgr.in_channels = int(config_dict['in_channels'])
+    else:
+        mgr.in_channels = 1 + conditioning_channels + (1 if use_localiser else 0)  # volume + optional localiser + conditioning
     mgr.model_name = config_dict.get('model_name', 'neural_tracing')
     mgr.autoconfigure = True  # explicit per request
     mgr.spacing = model_config.get('spacing', [1, 1, 1])
