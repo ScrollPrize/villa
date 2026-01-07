@@ -47,30 +47,28 @@ def prepare_batch(batch):
 
 
 def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_target, plane_mask, save_path):
-    """Create and save visualization of predictions."""
+    """Create and save GIF visualization cycling through z-slices."""
     import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
 
     b = 0
+    D = inputs.shape[2]  # depth
 
-    # Find z-slice with most conditioning for visualization (so we can see it)
-    cond_3d = inputs[b, 1].cpu().numpy()  # conditioning channel [D, H, W]
-    cond_per_z = cond_3d.sum(axis=(1, 2))  # sum over H, W -> per-z
-    z = int(np.argmax(cond_per_z))
+    # Precompute 3D arrays
+    vol_3d = inputs[b, 0].cpu().numpy()
+    cond_3d = inputs[b, 1].cpu().numpy()
+    seg_3d = seg_target[b].cpu().numpy()
+    dt_gt_3d = dt_target[b, 0].cpu().numpy()
+    mask_3d = plane_mask[b].cpu().numpy()
+    seg_pred_3d = torch.argmax(seg_pred[b], dim=0).cpu().numpy()
+    dt_pred_3d = dt_pred[b, 0].cpu().numpy()
 
-    vol = inputs[b, 0, z].cpu().numpy()
-    cond = inputs[b, 1, z].cpu().numpy()
-    seg_gt = seg_target[b, z].cpu().numpy()
-    dt_gt = dt_target[b, 0, z].cpu().numpy()
-    skel_gt = skel_target[b, z].cpu().numpy()
-    mask_slice = plane_mask[b, z].cpu().numpy()  # 1=known (conditioned), 0=unknown
+    # Global min/max for consistent DT colormap
+    dt_vmin = min(dt_gt_3d.min(), dt_pred_3d.min())
+    dt_vmax = max(dt_gt_3d.max(), dt_pred_3d.max())
 
-    # For seg pred, take argmax of 2-channel output
-    seg_p = torch.argmax(seg_pred[b, :, z], dim=0).cpu().numpy()
-    dt_p = dt_pred[b, 0, z].cpu().numpy()
-
+    # Setup figure
     fig = plt.figure(figsize=(16, 8))
-
-    # Create grid: 2 rows x 4 cols, but axes[0,1] will be 3D
     axes = [[None for _ in range(4)] for _ in range(2)]
     axes[0][0] = fig.add_subplot(2, 4, 1)
     axes[0][1] = fig.add_subplot(2, 4, 2, projection='3d')
@@ -81,27 +79,16 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
     axes[1][2] = fig.add_subplot(2, 4, 7)
     axes[1][3] = fig.add_subplot(2, 4, 8)
 
-    axes[0][0].imshow(vol, cmap='gray')
-    axes[0][0].set_title(f'Volume (z={z})')
-    axes[0][0].axis('off')
-
-    # 3D scatter of GT segmentation: green=known, red=unknown
-    seg_3d = seg_target[b].cpu().numpy()
-    mask_3d = plane_mask[b].cpu().numpy()
-    gt_coords = np.argwhere(seg_3d > 0.5)  # [N, 3] of (z, y, x)
-
+    # 3D scatter plot (static) - GT segmentation: green=known, red=unknown
+    gt_coords = np.argwhere(seg_3d > 0.5)
     if len(gt_coords) > 0:
-        # Subsample for speed if too many points
         max_pts = 2000
         if len(gt_coords) > max_pts:
             idx = np.random.choice(len(gt_coords), max_pts, replace=False)
             gt_coords = gt_coords[idx]
-
-        # Split into known/unknown based on plane_mask
         known_mask = mask_3d[gt_coords[:, 0], gt_coords[:, 1], gt_coords[:, 2]] > 0.5
         known_pts = gt_coords[known_mask]
         unknown_pts = gt_coords[~known_mask]
-
         ax3d = axes[0][1]
         if len(known_pts) > 0:
             ax3d.scatter(known_pts[:, 2], known_pts[:, 1], known_pts[:, 0],
@@ -114,56 +101,93 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
         ax3d.set_zlabel('Z')
         ax3d.legend(loc='upper right', markerscale=4)
     axes[0][1].set_title('GT: known(green) / unknown(red)')
-    vol_norm = (vol - vol.min()) / (vol.max() - vol.min() + 1e-8)
 
-    axes[0][2].imshow(seg_gt, cmap='gray')
+    # Create image objects for animation
+    z0 = D // 2
+    vol_slice = vol_3d[z0]
+    vol_norm = (vol_slice - vol_slice.min()) / (vol_slice.max() - vol_slice.min() + 1e-8)
+
+    im_vol = axes[0][0].imshow(vol_slice, cmap='gray')
+    axes[0][0].set_title(f'Volume (z={z0})')
+    axes[0][0].axis('off')
+
+    im_seg = axes[0][2].imshow(seg_3d[z0], cmap='gray')
     axes[0][2].set_title('Seg GT')
     axes[0][2].axis('off')
 
-    # Show plane mask overlay on volume slice
     mask_overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
-    mask_overlay[mask_slice > 0.5, 1] = mask_overlay[mask_slice > 0.5, 1] * 0.5 + 0.5  # green tint
-    # Overlay conditioning points in yellow
-    cond_pts = cond > 0.5
-    mask_overlay[cond_pts, 0] = 1.0
-    mask_overlay[cond_pts, 1] = 1.0
-    mask_overlay[cond_pts, 2] = 0.0
-    axes[0][3].imshow(mask_overlay)
+    im_mask = axes[0][3].imshow(mask_overlay)
     axes[0][3].set_title('Mask (green) + Cond (yellow)')
     axes[0][3].axis('off')
 
-    # Overlay segmentation prediction on volume
-    # Red = prediction in unknown region, blue = prediction in known region
     overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
-    pred_mask = seg_p > 0.5
-    unknown_pred = pred_mask & (mask_slice < 0.5)
-    known_pred = pred_mask & (mask_slice > 0.5)
-    overlay[unknown_pred, 0] = overlay[unknown_pred, 0] * 0.5 + 0.5  # red for unknown predictions
-    overlay[unknown_pred, 1] = overlay[unknown_pred, 1] * 0.5
-    overlay[unknown_pred, 2] = overlay[unknown_pred, 2] * 0.5
-    overlay[known_pred, 2] = overlay[known_pred, 2] * 0.5 + 0.5  # blue for known region predictions
-
-    axes[1][0].imshow(overlay)
+    im_pred = axes[1][0].imshow(overlay)
     axes[1][0].set_title('Pred (red=unknown, blue=known)')
     axes[1][0].axis('off')
 
-    vmin = min(dt_gt.min(), dt_p.min())
-    vmax = max(dt_gt.max(), dt_p.max())
-
-    axes[1][1].imshow(dt_gt, cmap='RdBu', vmin=vmin, vmax=vmax)
+    im_dt_gt = axes[1][1].imshow(dt_gt_3d[z0], cmap='RdBu', vmin=dt_vmin, vmax=dt_vmax)
     axes[1][1].set_title('DT GT')
     axes[1][1].axis('off')
 
-    axes[1][2].imshow(dt_p, cmap='RdBu', vmin=vmin, vmax=vmax)
+    im_dt_p = axes[1][2].imshow(dt_pred_3d[z0], cmap='RdBu', vmin=dt_vmin, vmax=dt_vmax)
     axes[1][2].set_title('DT Pred')
     axes[1][2].axis('off')
 
-    axes[1][3].imshow(seg_p, cmap='gray')
+    im_seg_p = axes[1][3].imshow(seg_pred_3d[z0], cmap='gray')
     axes[1][3].set_title('Seg Pred')
     axes[1][3].axis('off')
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+
+    def update(z):
+        vol_slice = vol_3d[z]
+        vol_norm = (vol_slice - vol_slice.min()) / (vol_slice.max() - vol_slice.min() + 1e-8)
+        mask_slice = mask_3d[z]
+        cond_slice = cond_3d[z]
+        seg_p_slice = seg_pred_3d[z]
+
+        # Volume
+        im_vol.set_data(vol_slice)
+        axes[0][0].set_title(f'Volume (z={z})')
+
+        # Seg GT
+        im_seg.set_data(seg_3d[z])
+
+        # Mask + Cond overlay
+        mask_overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
+        mask_overlay[mask_slice > 0.5, 1] = mask_overlay[mask_slice > 0.5, 1] * 0.5 + 0.5
+        cond_pts = cond_slice > 0.5
+        mask_overlay[cond_pts, 0] = 1.0
+        mask_overlay[cond_pts, 1] = 1.0
+        mask_overlay[cond_pts, 2] = 0.0
+        im_mask.set_data(mask_overlay)
+
+        # Pred overlay
+        overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
+        pred_mask = seg_p_slice > 0.5
+        unknown_pred = pred_mask & (mask_slice < 0.5)
+        known_pred = pred_mask & (mask_slice > 0.5)
+        overlay[unknown_pred, 0] = overlay[unknown_pred, 0] * 0.5 + 0.5
+        overlay[unknown_pred, 1] = overlay[unknown_pred, 1] * 0.5
+        overlay[unknown_pred, 2] = overlay[unknown_pred, 2] * 0.5
+        overlay[known_pred, 2] = overlay[known_pred, 2] * 0.5 + 0.5
+        im_pred.set_data(overlay)
+
+        # DT
+        im_dt_gt.set_data(dt_gt_3d[z])
+        im_dt_p.set_data(dt_pred_3d[z])
+
+        # Seg pred
+        im_seg_p.set_data(seg_p_slice)
+
+        return [im_vol, im_seg, im_mask, im_pred, im_dt_gt, im_dt_p, im_seg_p]
+
+    # Sample every few slices for speed
+    z_step = max(1, D // 32)
+    z_frames = list(range(0, D, z_step))
+
+    anim = FuncAnimation(fig, update, frames=z_frames, interval=150, blit=True)
+    anim.save(save_path, writer='pillow', fps=6)
     plt.close(fig)
 
 
@@ -472,10 +496,9 @@ def train(config_path):
                 wandb_log['val_seg_loss'] = val_seg_loss.item()
                 wandb_log['val_dt_loss'] = val_dt_loss.item()
 
-                # Create visualization
-                log_image_ext = config.get('log_image_ext', 'jpg')
-                train_img_path = f'{out_dir}/{iteration:06}_train.{log_image_ext}'
-                val_img_path = f'{out_dir}/{iteration:06}_val.{log_image_ext}'
+                # Create visualization (saved as GIF)
+                train_img_path = f'{out_dir}/{iteration:06}_train.gif'
+                val_img_path = f'{out_dir}/{iteration:06}_val.gif'
 
                 # plane_mask: 1=known/conditioned, 0=unknown (inverse of loss_mask)
                 train_plane_mask = 1.0 - loss_mask
@@ -490,8 +513,8 @@ def train(config_path):
                 )
 
                 if wandb.run is not None:
-                    wandb_log['train_image'] = wandb.Image(train_img_path)
-                    wandb_log['val_image'] = wandb.Image(val_img_path)
+                    wandb_log['train_image'] = wandb.Video(train_img_path, fps=6, format='gif')
+                    wandb_log['val_image'] = wandb.Video(val_img_path, fps=6, format='gif')
 
                 model.train()
 

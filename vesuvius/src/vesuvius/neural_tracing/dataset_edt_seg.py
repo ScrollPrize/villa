@@ -266,8 +266,8 @@ class EdtSegDataset(Dataset):
         plane_mask = sample_plane_mask(
             gt_segmentation,
             target_range=(
-                self.config.get('plane_split_ratio_min', 0.1),
-                self.config.get('plane_split_ratio_max', 0.4),
+                self.config.get('plane_split_ratio_min', 0.05),
+                self.config.get('plane_split_ratio_max', 0.30),
             ),
             max_attempts=10,
         )
