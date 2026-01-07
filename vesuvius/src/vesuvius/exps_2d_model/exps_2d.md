@@ -16,3 +16,8 @@ Date:   Wed Nov 26 12:44:39 2025 +0100
 [hendrik@staticsheep exps_2d]$ python fit_cosine_grid.py --image inf_sample1.tif --output-prefix res/res --downscale 4 --lambda-smooth 10 --device cuda --snapshot 1000 --lr 0.01 --steps 10000 --lambda-mono 100
 31a05dbb7c076ff8db3c559f3ed883d2d28feff3
 -> pretty good!
+
+# 2026-01-07
+- starting point refactor, tokens:
+PATH=/home/hendrik/.local/bin::$PATH; total=0; for f in fit*.py; do [[ -e "$f" ]] && total=$((total + $(token-count -m gpt-5 --file "$f"))); done; echo "$total"
+35364
