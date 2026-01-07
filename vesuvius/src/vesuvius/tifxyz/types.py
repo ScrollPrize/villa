@@ -59,6 +59,7 @@ class Tifxyz:
     _valid_quad_mask_cache: Optional[NDArray[np.bool_]] = field(default=None, repr=False)
     _quad_centers_cache: Optional[NDArray[np.float32]] = field(default=None, repr=False)
     _normals_cache: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = field(default=None, repr=False)
+    _patches_cache: Optional[List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate shapes and ensure arrays are float32."""
@@ -171,6 +172,19 @@ class Tifxyz:
         if self.resolution == "stored":
             return self._x.shape  # type: ignore[return-value]
         # Full resolution
+        h, w = self._x.shape
+        scale_y, scale_x = self._scale
+        if scale_y == 0 or scale_x == 0:
+            return (h, w)
+        return (int(h / scale_y), int(w / scale_x))
+
+    @property
+    def full_resolution_shape(self) -> Tuple[int, int]:
+        """Return grid shape at full resolution.
+
+        Unlike `shape` which depends on the current resolution mode,
+        this always returns the full resolution dimensions.
+        """
         h, w = self._x.shape
         scale_y, scale_x = self._scale
         if scale_y == 0 or scale_x == 0:
@@ -971,179 +985,111 @@ class Tifxyz:
         # Stack as (H, W, 3) in [z, y, x] order like get_zyxs()
         return np.stack([z_data, y_data, x_data], axis=-1)
 
-    def extrapolate(
+    def get_patches_3d(
         self,
-        direction: Literal["left", "right", "up", "down"],
-        steps: int = 10,
+        target_size: Tuple[int, int, int],
         *,
-        min_points: int = 4,
-        training_iters: int = 50,
-        use_last_n: Optional[int] = None,
-        return_combined: bool = False,
-    ) -> NDArray[np.float32]:
-        """Extrapolate surface coordinates beyond the current boundary using GP regression.
+        overlap_fraction: float = 0.25,
+        coarse_multiplier: float = 2.0,
+        num_calibration_samples: int = 200,
+        min_new_coverage: float = 0.5,
+        verbose: bool = False,
+        force_recompute: bool = False,
+    ) -> List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]:
+        """Find hierarchical patches that cover the target 3D volume size.
 
-        Uses Gaussian Process regression to extend the surface beyond its current
-        boundaries. For each row (left/right) or column (up/down), fits independent
-        GPs for x, y, z coordinates using valid points, then predicts coordinates
-        at new grid positions beyond the edge.
+        Uses multipass hierarchical tiling to find 2D patches that, when
+        sampled with 3D context, will cover the specified volume size.
+        Results are cached in memory and persisted to JSON in the tifxyz folder.
 
         Parameters
         ----------
-        direction : {"left", "right", "up", "down"}
-            Direction to extrapolate:
-            - "left": toward column 0, iterating over rows
-            - "right": toward last column, iterating over rows
-            - "up": toward row 0, iterating over columns
-            - "down": toward last row, iterating over columns
-        steps : int
-            Number of grid points to extrapolate (default 10).
-        min_points : int
-            Minimum valid points required to fit GP (default 4).
-            Slices with fewer points return -1 sentinel values.
-        training_iters : int
-            Number of optimization iterations for GP hyperparameters (default 50).
-        use_last_n : int, optional
-            If specified, only use the last N valid points closest to the edge
-            for GP fitting. Useful for long rows where local behavior matters most.
-        return_combined : bool
-            If True, return original data concatenated with extrapolated region.
-            If False (default), return only the extrapolated region.
+        target_size : Tuple[int, int, int]
+            Target 3D volume size (depth, height, width) in voxels.
+        overlap_fraction : float
+            Fraction of overlap between adjacent tiles (0.0-1.0, default 0.25).
+        coarse_multiplier : float
+            Multiplier for coarse tile size (default 2.0).
+        num_calibration_samples : int
+            Number of samples for global calibration (default 200).
+        min_new_coverage : float
+            For multipass: min fraction of new pixels required (default 0.5).
+        verbose : bool
+            Print progress information (default False).
+        force_recompute : bool
+            If True, recompute even if cached (default False).
 
         Returns
         -------
-        NDArray[np.float32]
-            Array of shape (H, W, 3) with coordinates in [z, y, x] order,
-            same format as get_zyxs().
-
-            If return_combined=False:
-                Shape: (num_rows, steps, 3) for left/right, (steps, num_cols, 3) for up/down.
-
-            If return_combined=True:
-                Shape: (num_rows, original_cols + steps, 3) for left/right,
-                       (original_rows + steps, num_cols, 3) for up/down.
-
-            Invalid slices have -1.0 sentinel values.
-
-        Raises
-        ------
-        ImportError
-            If gpytorch or torch are not installed.
-        ValueError
-            If direction is not one of the valid options.
-
-        Examples
-        --------
-        >>> surface = read_tifxyz("/path/to/segment")
-        >>> # Extrapolate 20 grid points to the right
-        >>> ext = surface.extrapolate("right", steps=20)
-        >>> ext.shape  # (surface.shape[0], 20, 3)
-        >>>
-        >>> # Get combined original + extrapolated
-        >>> combined = surface.extrapolate("down", steps=10, return_combined=True)
+        List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]
+            List of (bbox_2d, bbox_3d) tuples where:
+            - bbox_2d: (r_min, r_max, c_min, c_max) in 2D grid coordinates
+            - bbox_3d: (z_min, z_max, y_min, y_max, x_min, x_max) in 3D volume coordinates
         """
-        from .upsampling import _fit_gp_1d
+        import json
 
-        if direction not in ("left", "right", "up", "down"):
-            raise ValueError(
-                f"direction must be 'left', 'right', 'up', or 'down', got {direction!r}"
-            )
+        cache_key = f"{target_size[0]},{target_size[1]},{target_size[2]},{self._scale[0]},{self._scale[1]}"
 
-        h, w = self._x.shape
-        valid = self._valid_mask
+        # Check in-memory cache first
+        if self._patches_cache is not None and not force_recompute:
+            return self._patches_cache
 
-        # Determine which axis to iterate over
-        is_horizontal = direction in ("left", "right")
+        # Try to load from disk cache
+        cache_file = self.path / "patches_cache.json" if self.path else None
+        if cache_file and cache_file.exists() and not force_recompute:
+            try:
+                with open(cache_file, "r") as f:
+                    disk_cache = json.load(f)
+                if cache_key in disk_cache:
+                    # Convert lists back to tuples
+                    patches = [
+                        (tuple(bbox_2d), tuple(bbox_3d))
+                        for bbox_2d, bbox_3d in disk_cache[cache_key]
+                    ]
+                    object.__setattr__(self, "_patches_cache", patches)
+                    if verbose:
+                        print(f"Loaded {len(patches)} patches from {cache_file}")
+                    return patches
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass  # Cache file corrupted or wrong format, recompute
 
-        if is_horizontal:
-            num_slices = h
-            out_shape = (h, steps)
-        else:
-            num_slices = w
-            out_shape = (steps, w)
+        # Compute patches
+        from .hierarchical_tiling import multipass_hierarchical_tiling
 
-        # Initialize output arrays with sentinel values
-        x_out = np.full(out_shape, -1.0, dtype=np.float32)
-        y_out = np.full(out_shape, -1.0, dtype=np.float32)
-        z_out = np.full(out_shape, -1.0, dtype=np.float32)
+        patches = multipass_hierarchical_tiling(
+            self,
+            target_size=target_size,
+            num_calibration_samples=num_calibration_samples,
+            coarse_multiplier=coarse_multiplier,
+            overlap_fraction=overlap_fraction,
+            min_new_coverage=min_new_coverage,
+            verbose=verbose,
+        )
 
-        for slice_idx in range(num_slices):
-            # Extract the 1D slice
-            if is_horizontal:
-                # Row slice: data[row, :]
-                valid_mask_1d = valid[slice_idx, :]
-                x_1d = self._x[slice_idx, :]
-                y_1d = self._y[slice_idx, :]
-                z_1d = self._z[slice_idx, :]
-            else:
-                # Column slice: data[:, col]
-                valid_mask_1d = valid[:, slice_idx]
-                x_1d = self._x[:, slice_idx]
-                y_1d = self._y[:, slice_idx]
-                z_1d = self._z[:, slice_idx]
+        # Cache in memory
+        object.__setattr__(self, "_patches_cache", patches)
 
-            # Get valid indices
-            valid_indices = np.where(valid_mask_1d)[0]
+        # Persist to disk
+        if cache_file:
+            # Load existing cache or create new
+            disk_cache = {}
+            if cache_file.exists():
+                try:
+                    with open(cache_file, "r") as f:
+                        disk_cache = json.load(f)
+                except (json.JSONDecodeError, TypeError):
+                    disk_cache = {}
 
-            if len(valid_indices) < min_points:
-                continue  # Output already initialized to -1
+            # Convert tuples to lists for JSON serialization
+            disk_cache[cache_key] = [
+                [list(bbox_2d), list(bbox_3d)]
+                for bbox_2d, bbox_3d in patches
+            ]
 
-            # Optionally limit to last N points near the edge
-            if use_last_n is not None and len(valid_indices) > use_last_n:
-                if direction in ("right", "down"):
-                    valid_indices = valid_indices[-use_last_n:]
-                else:  # left, up
-                    valid_indices = valid_indices[:use_last_n]
+            with open(cache_file, "w") as f:
+                json.dump(disk_cache, f, indent=2)
 
-            # Determine extrapolation target points (past the grid boundary)
-            if direction == "right":
-                t_pred = np.arange(w, w + steps, dtype=np.float32)
-            elif direction == "left":
-                t_pred = np.arange(-steps, 0, dtype=np.float32)
-            elif direction == "down":
-                t_pred = np.arange(h, h + steps, dtype=np.float32)
-            else:  # up
-                t_pred = np.arange(-steps, 0, dtype=np.float32)
+            if verbose:
+                print(f"Saved {len(patches)} patches to {cache_file}")
 
-            # Training data
-            t_train = valid_indices.astype(np.float32)
-            x_train = x_1d[valid_indices]
-            y_train = y_1d[valid_indices]
-            z_train = z_1d[valid_indices]
-
-            # Fit separate GPs for x, y, z
-            x_pred = _fit_gp_1d(t_train, x_train, t_pred, training_iters)
-            y_pred = _fit_gp_1d(t_train, y_train, t_pred, training_iters)
-            z_pred = _fit_gp_1d(t_train, z_train, t_pred, training_iters)
-
-            # Store results
-            if is_horizontal:
-                x_out[slice_idx, :] = x_pred
-                y_out[slice_idx, :] = y_pred
-                z_out[slice_idx, :] = z_pred
-            else:
-                x_out[:, slice_idx] = x_pred
-                y_out[:, slice_idx] = y_pred
-                z_out[:, slice_idx] = z_pred
-
-        # Optionally combine with original data
-        if return_combined:
-            if direction == "right":
-                x_out = np.concatenate([self._x, x_out], axis=1)
-                y_out = np.concatenate([self._y, y_out], axis=1)
-                z_out = np.concatenate([self._z, z_out], axis=1)
-            elif direction == "left":
-                x_out = np.concatenate([x_out, self._x], axis=1)
-                y_out = np.concatenate([y_out, self._y], axis=1)
-                z_out = np.concatenate([z_out, self._z], axis=1)
-            elif direction == "down":
-                x_out = np.concatenate([self._x, x_out], axis=0)
-                y_out = np.concatenate([self._y, y_out], axis=0)
-                z_out = np.concatenate([self._z, z_out], axis=0)
-            else:  # up
-                x_out = np.concatenate([x_out, self._x], axis=0)
-                y_out = np.concatenate([y_out, self._y], axis=0)
-                z_out = np.concatenate([z_out, self._z], axis=0)
-
-        # Stack as (H, W, 3) in [z, y, x] order like get_zyxs()
-        return np.stack([z_out, y_out, x_out], axis=-1)
+        return patches
