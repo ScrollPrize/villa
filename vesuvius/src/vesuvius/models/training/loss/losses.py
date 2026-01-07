@@ -412,51 +412,76 @@ from torch import nn
 
 class SignedDistanceLoss(nn.Module):
     """
-    Band-limited Smooth-L1 loss for signed-distance regression, with optional
-    Eikonal term enforcing ‖∇d_pred‖ ≈ 1 near the surface.
+    Smooth-L1 loss for signed-distance regression, with optional band-limiting,
+    Eikonal term enforcing ‖∇d_pred‖ ≈ 1, and Laplacian smoothness regularization.
 
     Parameters
     ----------
-    rho            Width of the surface band in *voxels* (|d_gt| < rho)          (default: 4)
-    beta           Huber transition point (see torch.nn.SmoothL1Loss)            (default: 1)
-    eikonal        If True, add λ * (‖∇d_pred‖ − 1)^2 in the same band           (default: False)
-    eikonal_weight λ – weight of the Eikonal term relative to data term          (default: 0.01)
-    reduction      "mean" (default) | "sum" | "none"
-    ignore_index   Sentinel value in target to be ignored                        (default: None)
+    rho              Width of the surface band in *voxels* (|d_gt| < rho).       (default: None = no band)
+                     If None, loss is computed on all voxels.
+    beta             Huber transition point (see torch.nn.SmoothL1Loss)          (default: 1)
+    eikonal          If True, add λ_e * (‖∇d_pred‖ − 1)^2                         (default: False)
+    eikonal_weight   λ_e – weight of the Eikonal term relative to data term      (default: 0.01)
+    laplacian        If True, add λ_l * (∇²d_pred)^2 for curvature smoothness    (default: False)
+    laplacian_weight λ_l – weight of the Laplacian term relative to data term    (default: 0.01)
+    reduction        "mean" (default) | "sum" | "none"
+    ignore_index     Sentinel value in target to be ignored                      (default: None)
     """
     def __init__(
         self,
-        rho: float = 4.0,
+        rho: float | None = None,
         beta: float = 1.0,
         eikonal: bool = False,
         eikonal_weight: float = 0.01,
+        laplacian: bool = False,
+        laplacian_weight: float = 0.01,
         reduction: str = "mean",
         ignore_index: float | int | None = None,
     ):
         super().__init__()
         if reduction not in ("mean", "sum", "none"):
             raise ValueError("reduction must be 'mean', 'sum', or 'none'")
-        self.rho = float(rho)
+        self.rho = float(rho) if rho is not None else None
         self.beta = float(beta)
         self.eikonal = bool(eikonal)
         self.eik_w = float(eikonal_weight)
+        self.laplacian = bool(laplacian)
+        self.lap_w = float(laplacian_weight)
         self.reduction = reduction
         self.ignore_index = ignore_index
 
     @staticmethod
     def _gradient_3d(t: torch.Tensor) -> torch.Tensor:
-        """Finite-difference ∇t (same shape as `t`, zero-padded borders)."""
-        dz = F.pad(t[:, :, 2:] - t[:, :, :-2],  (0, 0, 0, 0, 1, 1))
-        dy = F.pad(t[:, :, :, 2:] - t[:, :, :, :-2], (0, 0, 1, 1, 0, 0))
-        dx = F.pad(t[:, :, :, :, 2:] - t[:, :, :, :, :-2], (1, 1, 0, 0, 0, 0))
-        return torch.stack((dz, dy, dx), dim=1) * 0.5   # shape (B,3,D,H,W)
+        """Finite-difference ∇t. For input (B,C,D,H,W) returns (B,3,C,D,H,W)."""
+        # Replicate-pad by 1 on each side to handle borders correctly for SDFs
+        t_pad = F.pad(t, (1,1,1,1,1,1), mode='replicate')
+        # Central differences: f'(x) ≈ (f(x+1) - f(x-1)) / 2
+        dz = (t_pad[:, :, 2:, 1:-1, 1:-1] - t_pad[:, :, :-2, 1:-1, 1:-1]) * 0.5
+        dy = (t_pad[:, :, 1:-1, 2:, 1:-1] - t_pad[:, :, 1:-1, :-2, 1:-1]) * 0.5
+        dx = (t_pad[:, :, 1:-1, 1:-1, 2:] - t_pad[:, :, 1:-1, 1:-1, :-2]) * 0.5
+        return torch.stack((dz, dy, dx), dim=1)  # shape (B,3,C,D,H,W)
+
+    @staticmethod
+    def _laplacian_3d(t: torch.Tensor) -> torch.Tensor:
+        """Finite-difference Laplacian ∇²t (same shape as `t`, replicate-padded borders)."""
+        # Replicate-pad by 1 on each side to handle borders correctly for SDFs
+        t_pad = F.pad(t, (1,1,1,1,1,1), mode='replicate')
+        # Second derivatives using central differences: f''(x) ≈ f(x+1) - 2f(x) + f(x-1)
+        # After padding, original voxel [i] is at [i+1], so we compute on the interior
+        d2z = t_pad[:, :, 2:, 1:-1, 1:-1] - 2*t_pad[:, :, 1:-1, 1:-1, 1:-1] + t_pad[:, :, :-2, 1:-1, 1:-1]
+        d2y = t_pad[:, :, 1:-1, 2:, 1:-1] - 2*t_pad[:, :, 1:-1, 1:-1, 1:-1] + t_pad[:, :, 1:-1, :-2, 1:-1]
+        d2x = t_pad[:, :, 1:-1, 1:-1, 2:] - 2*t_pad[:, :, 1:-1, 1:-1, 1:-1] + t_pad[:, :, 1:-1, 1:-1, :-2]
+        return d2z + d2y + d2x  # scalar Laplacian, shape (B,C,D,H,W)
 
     def forward(self, d_pred: torch.Tensor, d_gt: torch.Tensor) -> torch.Tensor:
         if d_pred.shape != d_gt.shape:
             raise ValueError(f"Shape mismatch {d_pred.shape} vs {d_gt.shape}")
 
         # ── build validity mask ───────────────────────────────────────────────
-        band_mask = (d_gt.abs() < self.rho)
+        if self.rho is not None:
+            band_mask = (d_gt.abs() < self.rho)
+        else:
+            band_mask = torch.ones_like(d_gt, dtype=torch.bool)
         if self.ignore_index is not None:
             band_mask &= d_gt.ne(self.ignore_index)
 
@@ -477,11 +502,18 @@ class SignedDistanceLoss(nn.Module):
 
         # ── optional Eikonal regulariser ─────────────────────────────────────
         if self.eikonal:
-            grad = self._gradient_3d(d_pred)           # (B,3,D,H,W)
-            grad_norm = grad.norm(dim=1)               # (B,D,H,W)
+            grad = self._gradient_3d(d_pred)           # (B,3,C,D,H,W)
+            grad_norm = grad.norm(dim=1)               # (B,C,D,H,W)
             eik = (grad_norm - 1.0) ** 2
             eik_data = eik[band_mask]
             data_term = data_term + self.eik_w * eik_data
+
+        # ── optional Laplacian smoothness regulariser ─────────────────────────
+        if self.laplacian:
+            lap = self._laplacian_3d(d_pred)           # (B,C,D,H,W)
+            lap_sq = lap ** 2
+            lap_data = lap_sq[band_mask]
+            data_term = data_term + self.lap_w * lap_data
 
         # ── reduction ────────────────────────────────────────────────────────
         if self.reduction == "sum":
@@ -989,14 +1021,16 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
         base_loss = ChannelSelectLoss(inner, channels)
 
     elif name == 'SignedDistanceLoss':
-        # rho, beta, eikonal, eikonal_weight, reduction are read from the YAML / json
+        # rho, beta, eikonal, eikonal_weight, laplacian, laplacian_weight, reduction are read from the YAML / json
         base_loss = SignedDistanceLoss(
-            rho             = loss_config.get('rho', 4.0),
-            beta            = loss_config.get('beta', 1.0),
-            eikonal         = loss_config.get('eikonal', True),
-            eikonal_weight  = loss_config.get('eikonal_weight', 0.01),
-            reduction       = loss_config.get('reduction', 'mean'),
-            ignore_index    = ignore_index,
+            rho              = loss_config.get('rho', None),
+            beta             = loss_config.get('beta', 1.0),
+            eikonal          = loss_config.get('eikonal', True),
+            eikonal_weight   = loss_config.get('eikonal_weight', 0.01),
+            laplacian        = loss_config.get('laplacian', False),
+            laplacian_weight = loss_config.get('laplacian_weight', 0.01),
+            reduction        = loss_config.get('reduction', 'mean'),
+            ignore_index     = ignore_index,
         )
         
     elif name == 'PlanarityLoss':
