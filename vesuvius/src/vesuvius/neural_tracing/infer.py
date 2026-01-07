@@ -123,13 +123,13 @@ class Inference:
                 - Missing keys or None values are treated as unknown (zero input)
 
         Returns:
-            probs: Probabilities for all 6 output slots, shape [6, crop_size, crop_size, crop_size]
-                   or [batch, 6, crop_size, crop_size, crop_size]
+            probs: Probabilities for all 5 output slots, shape [5, crop_size, crop_size, crop_size]
+                   or [batch, 5, crop_size, crop_size, crop_size]
             min_corner_zyxs: Minimum corner of crop in volume coordinates
 
         Slot output order:
             0: u_neg (above), 1: u_pos (below), 2: v_neg (left), 3: v_pos (right),
-            4: diag_in, 5: diag_out
+            4: diag_out
         """
         if isinstance(zyx, torch.Tensor) and zyx.ndim == 1:
             zyx = zyx[None]
@@ -145,7 +145,7 @@ class Inference:
 
         # Number of conditioning slots (excluding diag_out which is always unknown)
         num_cond_slots = 4 * step_count + (1 if include_diag else 0)  # 5 with diag for step_count=1
-        num_out_slots = 4 * step_count + (2 if include_diag else 0)  # 6 with diag for step_count=1
+        num_out_slots = 4 * step_count + (1 if include_diag else 0)  # 5 with diag for step_count=1 (diag_out only, diag_in is conditioning)
 
         zeros = torch.zeros([1, crop_size, crop_size, crop_size])
 
