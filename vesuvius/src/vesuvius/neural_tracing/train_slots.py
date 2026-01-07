@@ -82,12 +82,16 @@ def make_loss_fn(config):
     return loss_fn
 
 
-def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
+def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn, known_out_mask=None):
     """
     Multistep training for masked-slot conditioning.
 
     At each step, supervise a subset of still-masked slots, then feed those predictions
     back into the conditioning channels for the next forward pass.
+
+    Args:
+        known_out_mask: Optional [B, C] bool tensor indicating which output channels are
+            known (conditioning inputs). Used for reconstruction loss on first step.
 
     Returns:
         tuple: (total_loss, predictions_for_visualization)
@@ -157,22 +161,38 @@ def compute_slot_multistep_loss(model, inputs, targets, mask, config, loss_fn):
             raise ValueError(f"slot multistep expected {slot_channels} channels, got {step_pred.shape[1]}")
 
         step_loss = loss_fn(step_pred, targets, step_mask).mean()
+
+        # Add known reconstruction loss on FIRST step only
+        use_known_recon = config.get("use_known_recon", False)
+        if step_idx == 0 and use_known_recon and known_out_mask is not None:
+            known_recon_weight = float(config.get("known_recon_weight", 0.25))
+            known_mask_cf = known_out_mask[:, :, None, None, None].float()
+            known_mask_full = known_mask_cf.expand_as(targets)
+            known_loss = loss_fn(step_pred, targets, known_mask_full).mean()
+            step_loss = step_loss + known_recon_weight * known_loss
+
         step_losses.append(step_loss)
 
         # Accumulate predictions for visualisation and update conditioning for next step
         preds_for_vis = torch.where(step_selector_cf, step_pred, preds_for_vis)
         pred_heatmaps = torch.sigmoid(step_pred.detach())
-        if slot_channels == cond_channels:
-            cond_selector = step_selector
-            pred_for_cond = pred_heatmaps
-        elif slot_channels == cond_channels + 1:
-            cond_selector = step_selector[:, :cond_channels]
-            pred_for_cond = pred_heatmaps[:, :cond_channels]
-        else:
-            raise ValueError(
-                f"slot multistep expected conditioning channels to match outputs (or outputs=cond+1), "
-                f"got cond={cond_channels}, out={slot_channels}"
-            )
+
+        # Only update cardinal slots (0 to num_cardinals-1), never update diag_in
+        # Output layout: [cardinals..., diag_out], Conditioning layout: [cardinals..., diag_in]
+        # diag_out and diag_in are different spatial locations - don't mix them
+        include_diag = config.get('masked_include_diag', True)
+        num_cardinals = slot_channels - 1 if include_diag else slot_channels
+
+        # Select only cardinal predictions to feed back
+        cond_selector = step_selector[:, :num_cardinals]
+        pred_for_cond = pred_heatmaps[:, :num_cardinals]
+
+        # Pad to match cond_channels if needed (leaving diag_in unchanged)
+        if cond_channels > num_cardinals:
+            pad_size = cond_channels - num_cardinals
+            cond_selector = F.pad(cond_selector, (0, pad_size), value=False)
+            pred_for_cond = torch.cat([pred_for_cond, current_cond[:, num_cardinals:]], dim=1)
+
         cond_selector_cf = cond_selector[:, :, None, None, None]
         current_cond = torch.where(cond_selector_cf, pred_for_cond, current_cond)
 
@@ -197,6 +217,8 @@ def train(config_path):
     config.setdefault('use_localiser', True)
     config.setdefault('masked_include_diag', True)
     config.setdefault('step_count', 1)
+    config.setdefault('slotted_allow_spatial_transforms', False)
+    config.setdefault('flip_uv_directions', False)
 
     # Calculate channel counts based on step_count
     # Input: 4 cardinal + diag_in (5 conditioning slots)
@@ -208,8 +230,8 @@ def train(config_path):
     else:
         conditioning_slots = cardinal_slots
         out_slots = cardinal_slots
-    # Double conditioning channels: heatmaps + slot identity channels
-    config.setdefault('conditioning_channels', conditioning_slots * 2)
+    # Conditioning channels = number of slots (direction encoding applied in dataset)
+    config.setdefault('conditioning_channels', conditioning_slots)
     config.setdefault('out_channels', out_slots)
 
     # Multistep settings
@@ -232,16 +254,12 @@ def train(config_path):
     use_seg = config.setdefault('aux_segmentation', False)
     use_normals = config.setdefault('aux_normals', False)
     use_srf_overlap = config.setdefault('aux_srf_overlap', False)
-    use_equidist = config.setdefault('use_equidist_loss', False)
     seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
     normals_loss_weight = config.setdefault('normals_loss_weight', 1.0)
     srf_overlap_loss_weight = config.setdefault('srf_overlap_loss_weight', 1.0)
-    equidist_loss_weight = config.setdefault('equidist_loss_weight', 0.1)
-    equidist_threshold = config.setdefault('equidist_threshold', 0.5)
-    equidist_temperature = config.setdefault('equidist_temperature', 10.0)
     step_size = config['step_size']
-    equidist_loss_start_iter = config.setdefault('equidist_loss_start_iter', 0)
     srf_overlap_loss_start_iter = config.setdefault('srf_overlap_loss_start_iter', 0)
+
 
     # Set random seeds
     random.seed(config['seed'])
@@ -434,8 +452,9 @@ def train(config_path):
 
         with accelerator.accumulate(model):
             if multistep_enabled:
+                known_out_mask = batch.get('known_out_mask')
                 heatmap_loss, target_pred_for_vis = compute_slot_multistep_loss(
-                    model, inputs, targets, mask, config, loss_fn
+                    model, inputs, targets, mask, config, loss_fn, known_out_mask=known_out_mask
                 )
                 outputs = None  # Multistep doesn't return full outputs for aux losses yet
             else:
@@ -490,36 +509,6 @@ def train(config_path):
                     srf_overlap_for_vis = srf_overlap_mask
                     srf_overlap_pred_for_vis = pred_srf_overlap
 
-            # Equidistance loss - enforces uniform spacing of cardinal predictions
-            equidist_loss = None
-            if use_equidist and outputs is not None and not multistep_enabled:
-                cardinal_valid = batch.get('cardinal_valid', None)
-                if cardinal_valid is None:
-                    cardinal_valid = batch.get('srf_overlap_valid', torch.tensor(False))
-                cardinal_positions = batch.get('cardinal_positions')
-                if cardinal_valid.any() and cardinal_positions is not None:
-                    from vesuvius.neural_tracing.uv_equidist_loss import compute_uv_equidist_loss_slots
-
-                    # Get predictions for cardinal slots (0-3): u_neg, u_pos, v_neg, v_pos
-                    pred_cardinals = torch.sigmoid(target_pred_for_vis[:, :4])  # [B, 4, Z, Y, X]
-
-                    # Derive cardinal unknown mask from uv_heatmaps_out_mask
-                    # Shape: [B, Z, Y, X, C] - mask is uniform across spatial dims
-                    cardinal_unknown_mask = (batch['uv_heatmaps_out_mask'][:, 0, 0, 0, :4] > 0)  # [B, 4]
-
-                    equidist_loss_raw, _ = compute_uv_equidist_loss_slots(
-                        pred_cardinals,
-                        cardinal_positions,
-                        cardinal_unknown_mask,
-                        valid_mask=cardinal_valid,  # Filter per-sample validity
-                        threshold=equidist_threshold,
-                        temperature=equidist_temperature,
-                    )
-                    equidist_loss = equidist_loss_raw
-                    # Apply loss only after warmup iteration
-                    if iteration >= equidist_loss_start_iter:
-                        total_loss = total_loss + equidist_loss_weight * equidist_loss
-
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
             accelerator.backward(total_loss)
@@ -537,9 +526,15 @@ def train(config_path):
             wandb_log['normals_loss'] = (normals_loss_weight * normals_loss).detach().item()
         if use_srf_overlap and srf_overlap_loss is not None:
             wandb_log['srf_overlap_loss'] = (srf_overlap_loss_weight * srf_overlap_loss).detach().item()
-        if use_equidist and equidist_loss is not None:
-            wandb_log['equidist_loss'] = (equidist_loss_weight * equidist_loss).detach().item()
-        progress_bar.set_postfix({'loss': wandb_log['loss']})
+        # Build tqdm postfix with all active losses
+        postfix = {'total': f"{wandb_log['loss']:.3f}", 'hm': f"{wandb_log['first_step_heatmap_loss']:.3f}"}
+        if use_seg and seg_loss is not None:
+            postfix['seg'] = f"{wandb_log['seg_loss']:.3f}"
+        if use_normals and normals_loss is not None:
+            postfix['norm'] = f"{wandb_log['normals_loss']:.3f}"
+        if use_srf_overlap and srf_overlap_loss is not None:
+            postfix['srf'] = f"{wandb_log['srf_overlap_loss']:.3f}"
+        progress_bar.set_postfix(postfix)
         progress_bar.update(1)
 
         # Validation and logging
@@ -559,8 +554,9 @@ def train(config_path):
                 val_srf_overlap_for_vis = val_srf_overlap_pred_for_vis = None
 
                 if multistep_enabled:
+                    val_known_out_mask = val_batch.get('known_out_mask')
                     val_heatmap_loss, val_target_pred_for_vis = compute_slot_multistep_loss(
-                        model, val_inputs, val_targets, val_mask, config, loss_fn
+                        model, val_inputs, val_targets, val_mask, config, loss_fn, known_out_mask=val_known_out_mask
                     )
                     val_outputs = None
                 else:
@@ -613,33 +609,6 @@ def train(config_path):
                         val_srf_overlap_for_vis = val_srf_overlap_mask
                         val_srf_overlap_pred_for_vis = val_pred_srf_overlap
 
-                # Validation equidistance loss
-                val_equidist_loss = None
-                if use_equidist and val_outputs is not None and not multistep_enabled:
-                    val_cardinal_valid = val_batch.get('cardinal_valid', None)
-                    if val_cardinal_valid is None:
-                        val_cardinal_valid = val_batch.get('srf_overlap_valid', torch.tensor(False))
-                    val_cardinal_positions = val_batch.get('cardinal_positions')
-                    if val_cardinal_valid.any() and val_cardinal_positions is not None:
-                        from vesuvius.neural_tracing.uv_equidist_loss import compute_uv_equidist_loss_slots
-
-                        # Get predictions for cardinal slots (0-3)
-                        val_pred_cardinals = torch.sigmoid(val_target_pred_for_vis[:, :4])
-
-                        # Derive cardinal unknown mask from uv_heatmaps_out_mask
-                        val_cardinal_unknown_mask = (val_batch['uv_heatmaps_out_mask'][:, 0, 0, 0, :4] > 0)  # [B, 4]
-
-                        val_equidist_loss_raw, _ = compute_uv_equidist_loss_slots(
-                            val_pred_cardinals,
-                            val_cardinal_positions,
-                            val_cardinal_unknown_mask,
-                            valid_mask=val_cardinal_valid,  # Filter per-sample validity
-                            threshold=equidist_threshold,
-                            temperature=equidist_temperature,
-                        )
-                        val_equidist_loss = val_equidist_loss_raw
-                        total_val_loss = total_val_loss + equidist_loss_weight * val_equidist_loss
-
                 wandb_log['val_loss'] = total_val_loss.item()
                 wandb_log['val_first_step_heatmap_loss'] = val_heatmap_loss.item()
                 if use_seg and val_seg_loss is not None:
@@ -648,28 +617,28 @@ def train(config_path):
                     wandb_log['val_normals_loss'] = (normals_loss_weight * val_normals_loss).item()
                 if use_srf_overlap and val_srf_overlap_loss is not None:
                     wandb_log['val_srf_overlap_loss'] = (srf_overlap_loss_weight * val_srf_overlap_loss).item()
-                if use_equidist and val_equidist_loss is not None:
-                    wandb_log['val_equidist_loss'] = (equidist_loss_weight * val_equidist_loss).item()
 
                 # Create and save visualization
                 cond_start = 2 if config.get('use_localiser', False) else 1
                 log_image_ext = config.get('log_image_ext', 'jpg')
                 train_img_path = f'{out_dir}/{iteration:06}_train.{log_image_ext}'
                 val_img_path = f'{out_dir}/{iteration:06}_val.{log_image_ext}'
+                train_unknown_mask = batch.get('uv_heatmaps_unknown_mask', mask)
+                val_unknown_mask = val_batch.get('uv_heatmaps_unknown_mask', val_mask)
                 make_canvas(inputs, targets, target_pred_for_vis, config,
                            seg=seg_for_vis, seg_pred=seg_pred_for_vis,
                            normals=normals_for_vis, normals_pred=normals_pred_for_vis, normals_mask=None,
                            srf_overlap=srf_overlap_for_vis, srf_overlap_pred=srf_overlap_pred_for_vis,
                            cond_channel_start=cond_start,
                            save_path=train_img_path,
-                           unknown_mask=mask)
+                           unknown_mask=train_unknown_mask)
                 make_canvas(val_inputs, val_targets, val_target_pred_for_vis, config,
                            seg=val_seg_for_vis, seg_pred=val_seg_pred_for_vis,
                            normals=val_normals_for_vis, normals_pred=val_normals_pred_for_vis, normals_mask=None,
                            srf_overlap=val_srf_overlap_for_vis, srf_overlap_pred=val_srf_overlap_pred_for_vis,
                            cond_channel_start=cond_start,
                            save_path=val_img_path,
-                           unknown_mask=val_mask)
+                           unknown_mask=val_unknown_mask)
 
                 if wandb.run is not None:
                     wandb_log['train_image'] = wandb.Image(train_img_path)

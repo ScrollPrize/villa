@@ -93,6 +93,8 @@ def make_canvas(
     normals_mask=None,
     srf_overlap=None,
     srf_overlap_pred=None,
+    grid_heatmap=None,
+    grid_heatmap_pred=None,
     cond_channel_start=2,
     save_path=None,
     unknown_mask=None,
@@ -112,7 +114,7 @@ def make_canvas(
         normals_mask: Optional normals mask
         cond_channel_start: Starting channel index for conditioning visualization
         save_path: Optional path to save the canvas image
-        unknown_mask: Optional mask [B, C, Z, Y, X] indicating which slots were unknown (1) vs known (0)
+        unknown_mask: Optional mask [B, C] or [B, C, Z, Y, X] indicating which slots were unknown (1) vs known (0)
 
     Returns:
         Grid tensor ready for saving with plt.imsave
@@ -145,6 +147,10 @@ def make_canvas(
         srf_overlap = srf_overlap[:sample_count]
     if srf_overlap_pred is not None:
         srf_overlap_pred = srf_overlap_pred[:sample_count]
+    if grid_heatmap is not None:
+        grid_heatmap = grid_heatmap[:sample_count]
+    if grid_heatmap_pred is not None:
+        grid_heatmap_pred = grid_heatmap_pred[:sample_count]
 
     # For non-slotted multistep, collapse step dimension for visualization
     # Slotted variant uses fixed slots, not (uv, steps) organization
@@ -156,7 +162,16 @@ def make_canvas(
     is_slotted = config.get('dataset_variant') == 'slotted'
     if is_slotted:
         total_cond_channels = inputs.shape[1] - cond_channel_start
-        num_cond_channels = total_cond_channels // 2  # Only heatmaps, skip slot ID channels
+        step_count = int(config.get('step_count', 1))
+        include_diag = bool(config.get('masked_include_diag', True))
+        expected_cond_channels = 4 * step_count + (1 if include_diag else 0)
+
+        # Some variants may append slot-ID channels after the heatmaps (doubling cond channels).
+        # Prefer showing only the heatmaps when that pattern is detected; otherwise show all cond channels.
+        if total_cond_channels == expected_cond_channels * 2:
+            num_cond_channels = expected_cond_channels
+        else:
+            num_cond_channels = total_cond_channels
     else:
         num_cond_channels = min(3, inputs.shape[1] - cond_channel_start)
 
@@ -229,9 +244,11 @@ def make_canvas(
             slices.append(overlay_crosshair(blended))
         return torch.cat(slices, dim=1)
 
-    def projection_single_slot(x, slot_idx, color):
+    def projection_single_slot(x, slot_idx, color, threshold=0.5):
         """Project a single slot channel with its assigned color."""
         single = x[:, slot_idx:slot_idx+1]  # [B, 1, D, H, W]
+        # Apply threshold - values below threshold become 0
+        single = torch.where(single >= threshold, single, torch.zeros_like(single))
         coloured = single[..., None] * color[None, None, None, None, None, :]
         return torch.cat([overlay_crosshair(coloured.amax(dim=(1, dim + 2))) for dim in range(3)], dim=1)
 
@@ -251,29 +268,57 @@ def make_canvas(
             color = out_colors[slot_idx]
             color_tuple = tuple(color.cpu().tolist())
 
-            # Create per-slot projections
-            pred_slot = projection_single_slot(F.sigmoid(target_pred), slot_idx, color)
-            gt_slot = projection_single_slot(targets, slot_idx, color)
-
-            # Determine if this slot was known or predicted (use first sample)
-            slot_label = slot_names[slot_idx]
+            # Determine if this slot was known/predicted per sample.
+            slot_label_base = slot_names[slot_idx]
             if unknown_mask is not None:
-                # mask=1 means unknown (predicted), mask=0 means known (conditioned)
-                is_unknown = unknown_mask[0, slot_idx].any().item()
-                slot_label = f"{slot_label} [pred]" if is_unknown else f"{slot_label} [known]"
+                mask_slot = unknown_mask[:, slot_idx]
+                mask_val = mask_slot.float()
+                if mask_val.ndim > 1:
+                    mask_val = mask_val.flatten(1).amax(dim=1)
+                is_unknown = mask_val > 0.5
+            else:
+                is_unknown = None
+
+            # Determine threshold - use lower threshold (0.2) for diag_out when predicted
+            is_diag_out = (slot_idx == 4)  # diag_out is slot index 4
+            # For diag_out: use 0.2 if any sample has it as unknown, else 0.5
+            # For other slots: always 0.5
+            if is_diag_out and is_unknown is not None and is_unknown.any():
+                slot_threshold = 0.2
+            else:
+                slot_threshold = 0.5
+
+            # Create per-slot projections
+            pred_slot = projection_single_slot(F.sigmoid(target_pred), slot_idx, color, threshold=slot_threshold)
+            gt_slot = projection_single_slot(targets, slot_idx, color, threshold=slot_threshold)
 
             # Render slot label and overlay onto pred_slot
             _, h, w, _ = pred_slot.shape
             label_width = min(200, w)  # Wide enough for "diag_out [known]"
             label_height = min(30, h // 2)
-            label_img = render_text_to_tensor(
-                slot_label, label_height, label_width,
-                color_tuple, inputs.device, font_size=7
-            )
+            if is_unknown is None:
+                label_imgs = render_text_to_tensor(
+                    slot_label_base, label_height, label_width,
+                    color_tuple, inputs.device, font_size=7
+                )[None].expand(pred_slot.shape[0], -1, -1, -1)
+            else:
+                other_tag = "skip" if slot_label_base == "diag_out" else "known"
+                label_pred = render_text_to_tensor(
+                    f"{slot_label_base} [pred]", label_height, label_width,
+                    color_tuple, inputs.device, font_size=7
+                )
+                label_other = render_text_to_tensor(
+                    f"{slot_label_base} [{other_tag}]", label_height, label_width,
+                    color_tuple, inputs.device, font_size=7
+                )
+                label_imgs = torch.stack(
+                    [label_pred if bool(is_unknown[b].item()) else label_other for b in range(pred_slot.shape[0])],
+                    dim=0
+                )
 
             # Overlay label on pred_slot (top-left of first orthogonal view)
             pred_slot_labeled = pred_slot.clone()
-            pred_slot_labeled[:, :label_height, :label_width, :] = label_img.unsqueeze(0)
+            pred_slot_labeled[:, :label_height, :label_width, :] = label_imgs
 
             views.append(pred_slot_labeled)
             views.append(gt_slot)
@@ -305,6 +350,17 @@ def make_canvas(
             srf_overlap_pred_mask = torch.sigmoid(s_pred)
             # Orange for predicted srf_overlap
             views.append(seg_overlay(srf_overlap_pred_mask, torch.tensor([1.0, 0.5, 0.0], device=inputs.device), alpha=0.45))
+
+    if grid_heatmap is not None:
+        # Cyan for GT grid_heatmap
+        views.append(seg_overlay((grid_heatmap != 0).float(), torch.tensor([0.0, 1.0, 1.0], device=inputs.device)))
+        if grid_heatmap_pred is not None:
+            g_pred = grid_heatmap_pred
+            if isinstance(g_pred, (list, tuple)):
+                g_pred = g_pred[0]
+            grid_heatmap_pred_mask = torch.sigmoid(g_pred)
+            # Magenta for predicted grid_heatmap
+            views.append(seg_overlay(grid_heatmap_pred_mask, torch.tensor([1.0, 0.0, 1.0], device=inputs.device), alpha=0.45))
 
     canvas = torch.stack(views, dim=-1)
     sample_canvases = rearrange(canvas.clip(0, 1), 'b y x rgb v -> b y (v x) rgb').cpu()

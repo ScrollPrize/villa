@@ -17,8 +17,8 @@ SLOT_U_NEG = 0  # above (i-1, j)
 SLOT_U_POS = 1  # below (i+1, j)
 SLOT_V_NEG = 2  # left (i, j-1)
 SLOT_V_POS = 3  # right (i, j+1)
-SLOT_DIAG_IN = 4  # diagonal input
-SLOT_DIAG_OUT = 5  # diagonal output
+SLOT_DIAG_IN = 4  # diagonal input (index in conditioning tensor)
+SLOT_DIAG_OUT = 4  # diagonal output (index in output tensor; same index, different tensor)
 
 
 @click.command()

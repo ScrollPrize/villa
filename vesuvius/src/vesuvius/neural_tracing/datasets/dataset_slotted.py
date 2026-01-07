@@ -16,6 +16,8 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
 
     def __init__(self, config, patches_for_split, multistep_count, bidirectional):
         config = dict(config)
+        config.setdefault("slotted_allow_spatial_transforms", False)
+        config.setdefault("flip_uv_directions", False)
         aug_config = dict(config.get("augmentation", {}) or {})
         if not config.get("slotted_allow_spatial_transforms", True):
             # Slot channels encode direction; spatial flips/transposes would require channel remapping.
@@ -161,9 +163,8 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             diag_out_valid = torch.tensor(False)
 
             if torch.rand([]) < diag_prob:
-                # Pick primary unknown direction (random from unknown cardinals)
-                unknown_indices = torch.nonzero(cardinal_unknown_mask, as_tuple=False).flatten()
-                primary_target = unknown_indices[torch.randint(len(unknown_indices), size=[])].item()
+                # Use the true gap direction to choose the diagonal (aligns with inference).
+                primary_target = target_idx
 
                 # Select diagonal OPPOSITE to primary target direction
                 # Slot mapping: 0=u_neg(i-1), 1=u_pos(i+1), 2=v_neg(j-1), 3=v_pos(j+1)
@@ -217,11 +218,11 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         valid_mask = torch.stack([s[2] for s in slot_data])
         if self._config.get("masked_include_diag", True):
             # Extend cardinal masks with diagonal masks
-            # diag_in randomly known (like perpendiculars), diag_out always unknown
+            # diag_in is known when diagonal is included; diag_out supervised only if diag_in is known
             diag_in_valid = valid_mask[-2]
             diag_out_valid = valid_mask[-1]
-            # diag_in: randomly known (maskable to prevent over-reliance), never in output
-            diag_in_known = diag_in_valid.item() and not force_zero_known and torch.rand([]).item() < perp_known_prob
+            # diag_in: known when diagonal is present (unless force_zero_known), never in output
+            diag_in_known = diag_in_valid.item() and not force_zero_known
             # known_mask has 6 entries (matches slot_data), unknown_mask has 5 (matches output channels)
             known_mask = torch.cat([cardinal_known_mask, torch.tensor([diag_in_known, False])])
             unknown_mask = torch.cat([cardinal_unknown_mask, torch.tensor([diag_out_valid.item()])])
@@ -229,42 +230,45 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             known_mask = cardinal_known_mask
             unknown_mask = cardinal_unknown_mask
 
+        # Create output-aligned known mask for reconstruction loss
+        # Output has 5 channels: cardinals[0:4] + diag_out; diag_out is never known
+        if self._config.get("masked_include_diag", True):
+            known_out_mask = torch.cat([known_mask[:4], torch.tensor([False])])
+        else:
+            known_out_mask = known_mask[:4].clone()
+
         # Apply perturbation to known slots for input heatmaps
         should_perturb = (torch.rand([]) < self._perturb_prob).item()
-        slot_zyxs_for_input = []  # perturbed positions for known slots
-        slot_zyxs_for_output = []  # unperturbed positions for all slots
-
-        for idx, (ij, zyx_unperturbed, valid) in enumerate(slot_data):
-            # Output always uses unperturbed
-            if zyx_unperturbed is not None:
-                slot_zyxs_for_output.append(zyx_unperturbed)
-            else:
-                # Invalid slot - use zeros
-                slot_zyxs_for_output.append(torch.zeros(3))
-
-            # Input: perturb if known and should_perturb
-            if known_mask[idx] and should_perturb and ij is not None:
-                perturbed_zyx = self._get_perturbed_zyx_from_patch(
-                    ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=False
-                )
-                slot_zyxs_for_input.append(perturbed_zyx)
-            elif zyx_unperturbed is not None:
-                slot_zyxs_for_input.append(zyx_unperturbed)
-            else:
-                slot_zyxs_for_input.append(torch.zeros(3))
-
-        # Build heatmaps
+        # Build heatmaps directly. For invalid/unselected slots, emit empty heatmaps (not a dummy point).
+        # Keep unperturbed slot positions for aux losses / logging.
+        zeros = torch.zeros((1, crop_size, crop_size, crop_size), dtype=torch.float32)
+        nan_zyx = torch.full((3,), float("nan"), dtype=torch.float32)
         slot_heatmaps_out = []
-        for zyx in slot_zyxs_for_output:
-            slot_heatmaps_out.append(self.make_heatmaps([zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma))
-
         slot_heatmaps_in = []
-        for zyx in slot_zyxs_for_input:
-            slot_heatmaps_in.append(self.make_heatmaps([zyx[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma))
+        slot_zyxs_for_output = []
+        for idx, (ij, zyx_unperturbed, valid) in enumerate(slot_data):
+            is_valid = bool(valid.item()) if isinstance(valid, torch.Tensor) else bool(valid)
+            if is_valid and zyx_unperturbed is not None:
+                slot_zyxs_for_output.append(zyx_unperturbed)
+                slot_heatmaps_out.append(self.make_heatmaps([zyx_unperturbed[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma))
+            else:
+                slot_zyxs_for_output.append(nan_zyx)
+                slot_heatmaps_out.append(zeros)
+
+            if known_mask[idx] and is_valid and ij is not None and zyx_unperturbed is not None:
+                zyx_for_input = zyx_unperturbed
+                if should_perturb:
+                    zyx_for_input = self._get_perturbed_zyx_from_patch(
+                        ij, patch, center_ij, min_corner_zyx, crop_size, is_center_point=False
+                    )
+                slot_heatmaps_in.append(self.make_heatmaps([zyx_for_input[None]], min_corner_zyx, crop_size, sigma=heatmap_sigma))
+            else:
+                slot_heatmaps_in.append(zeros)
 
         # Output channels exclude diag_in (index 4) - it's only conditioning, never predicted
         if self._config.get("masked_include_diag", True):
-            output_slot_heatmaps = slot_heatmaps_out[:4] + [slot_heatmaps_out[5]]  # cardinals + diag_out
+            # slot_data layout: cardinals (4*step_count), diag_in, diag_out
+            output_slot_heatmaps = slot_heatmaps_out[:4] + [slot_heatmaps_out[-1]]  # cardinals + diag_out
         else:
             output_slot_heatmaps = slot_heatmaps_out
         uv_heatmaps_out_all = torch.cat(output_slot_heatmaps, dim=0)
@@ -272,34 +276,26 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         # Input channels exclude diag_out (last slot) since it's never conditioned
         if self._config.get("masked_include_diag", True):
             input_slot_heatmaps = slot_heatmaps_in[:-1]  # exclude diag_out
-            input_known_mask = known_mask[:-1]
         else:
             input_slot_heatmaps = slot_heatmaps_in
-            input_known_mask = known_mask
 
         uv_heatmaps_in_all = torch.cat(input_slot_heatmaps, dim=0)
-        uv_heatmaps_in_all = uv_heatmaps_in_all * input_known_mask[:, None, None, None].to(dtype=uv_heatmaps_in_all.dtype)
 
-        # Add slot identity channels: constant values per slot to differentiate them
-        num_input_slots = len(input_slot_heatmaps)
-        slot_ids = torch.linspace(0, 1, num_input_slots, dtype=uv_heatmaps_in_all.dtype, device=uv_heatmaps_in_all.device)
-        # Shape: [num_slots, Z, Y, X] - each channel is a constant value
-        Z, Y, X = uv_heatmaps_in_all.shape[1:]
-        slot_id_channels = slot_ids.view(-1, 1, 1, 1).expand(num_input_slots, Z, Y, X)
-        # Concatenate heatmaps + slot IDs
-        uv_heatmaps_in_all = torch.cat([uv_heatmaps_in_all, slot_id_channels], dim=0)
-
-        condition_channels = uv_heatmaps_in_all.shape[0]  # Now doubled (heatmaps + slot IDs)
+        condition_channels = uv_heatmaps_in_all.shape[0]
         uv_heatmaps_both = torch.cat([uv_heatmaps_in_all, uv_heatmaps_out_all], dim=0)
 
         # Store both masks for hybrid supervision in _build_batch_dict
         # Unknown slots get full weight, known slots get reduced weight (stabilizing anchor)
         self._slotted_unknown_mask = unknown_mask
         self._slotted_known_mask = known_mask & valid_mask  # known AND valid
+        if self._config.get("masked_include_diag", True):
+            out_valid_mask = torch.cat([valid_mask[:4], valid_mask[-1:]])
+        else:
+            out_valid_mask = valid_mask[:4]
+        self._slotted_known_out_mask = known_out_mask & out_valid_mask  # output-aligned known mask
 
-        # Track cardinal validity for aux losses
+        # Track cardinal validity for srf_overlap aux loss
         cardinal_all_valid = bool(valid_mask[:4].all())  # slots 0-3 are cardinals
-        self._slotted_cardinal_valid = cardinal_all_valid
 
         # Generate srf_overlap mask if enabled - only valid when all 4 cardinal slots are valid
         srf_overlap_mask = None
@@ -317,18 +313,20 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
                 srf_overlap_valid = True
         self._slotted_srf_overlap_mask = srf_overlap_mask
         self._slotted_srf_overlap_valid = srf_overlap_valid
-        # Store cardinal GT positions (in local crop coordinates) for aux losses
-        self._slotted_cardinal_positions = torch.stack([
-            slot_zyxs_for_output[0] - min_corner_zyx,  # u_neg
-            slot_zyxs_for_output[1] - min_corner_zyx,  # u_pos
-            slot_zyxs_for_output[2] - min_corner_zyx,  # v_neg
-            slot_zyxs_for_output[3] - min_corner_zyx,  # v_pos
-        ])  # [4, 3]
+
+        center_zyx = get_zyx_from_patch(center_ij, patch)
+        center_heatmap = self.make_heatmaps(
+            [center_zyx[None]],
+            min_corner_zyx,
+            crop_size,
+            sigma=heatmap_sigma,
+        )
 
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
             'srf_overlap_mask': srf_overlap_mask,
+            'center_heatmap': center_heatmap,
         }
 
     def _build_batch_dict(
@@ -345,10 +343,17 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
         srf_overlap_mask=None,
     ):
         """Build batch dict for slotted dataset."""
-        # Only supervise unknown slots (known slots are conditioning inputs only)
-        # This avoids conflict with perturbation: conditioning uses perturbed positions,
-        # but targets use unperturbed - we don't want to supervise that mismatch
-        loss_mask = self._slotted_unknown_mask.float()
+        # Build loss weight mask: unknown=1.0, known=known_recon_weight, neither=0.0
+        # Known recon acts as denoising when perturbation is applied to known slots
+        use_known_recon = self._config.get("use_known_recon", False)
+        known_recon_weight = float(self._config.get("known_recon_weight", 0.25))
+
+        unknown_mask = self._slotted_unknown_mask.float()
+        if use_known_recon:
+            known_out_mask = self._slotted_known_out_mask.float()
+            loss_mask = unknown_mask + known_out_mask * known_recon_weight
+        else:
+            loss_mask = unknown_mask
 
         # Expand to match output shape for loss masking
         loss_mask_expanded = loss_mask.to(
@@ -362,7 +367,14 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             'uv_heatmaps_in': uv_heatmaps_in,
             'uv_heatmaps_out': uv_heatmaps_out,
             'uv_heatmaps_out_mask': uv_heatmaps_out_mask,
+            'uv_heatmaps_unknown_mask': self._slotted_unknown_mask,
         }
+        if center_heatmap is not None:
+            batch_dict['center_heatmap'] = center_heatmap
+
+        # Add known_out_mask for multistep training (needs separate mask for first-step recon)
+        if use_known_recon:
+            batch_dict['known_out_mask'] = self._slotted_known_out_mask
 
         if self._config.get("aux_segmentation", False) and seg is not None:
             batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
@@ -375,10 +387,5 @@ class HeatmapDatasetSlotted(HeatmapDatasetV2):
             batch_dict.update({'srf_overlap_valid': torch.tensor(srf_overlap_valid)})
             if srf_overlap_mask is not None:
                 batch_dict['srf_overlap_mask'] = srf_overlap_mask
-        if self._config.get("use_equidist_loss", False):
-            batch_dict.update({
-                'cardinal_positions': self._slotted_cardinal_positions,  # [4, 3] GT positions
-                'cardinal_valid': torch.tensor(self._slotted_cardinal_valid),
-            })
 
         return batch_dict
