@@ -25,6 +25,7 @@ class CosineGridModel(nn.Module):
         cosine_periods: float,
         grid_step: int = 2,
         samples_per_period: float = 1.0,
+        offset_scales: int = 5,
     ) -> None:
         super().__init__()
         self.height = int(height)
@@ -32,6 +33,7 @@ class CosineGridModel(nn.Module):
         self.grid_step = int(grid_step)
         self.cosine_periods = float(cosine_periods)
         self.samples_per_period = float(samples_per_period)
+        self.offset_scales = int(offset_scales)
 
         # Coarse resolution in sample-space.
         # Vertical: based on grid_step relative to evaluation height.
@@ -52,10 +54,25 @@ class CosineGridModel(nn.Module):
         base = torch.cat([u, v], dim=1)
         self.register_buffer("base_grid", base)
 
-        # Learnable per-point offset in sample space (same coarse resolution).
-        # Initialized to zero for stage 1; optimized jointly with global params
-        # during stage 2.
-        self.offset = nn.Parameter(torch.zeros_like(self.base_grid))
+
+        # Learnable per-point offset in sample space as a multi-scale pyramid.
+        #
+        # Lowest scale is absolute; each higher scale is a delta added to a bilinear
+        # upsampling of the previous scale.
+        gh0 = int(self.base_grid.shape[2])
+        gw0 = int(self.base_grid.shape[3])
+        n_scales = max(1, int(self.offset_scales))
+        shapes: list[tuple[int, int]] = []
+        for i in range(n_scales):
+            k = n_scales - 1 - i
+            gh_i = max(2, (gh0 - 1) // (2 ** k) + 1)
+            gw_i = max(2, (gw0 - 1) // (2 ** k) + 1)
+            shapes.append((gh_i, gw_i))
+        shapes[-1] = (gh0, gw0)
+        self._offset_shapes = shapes
+        self.offset_ms = nn.ParameterList(
+            [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i)) for (gh_i, gw_i) in shapes]
+        )
 
         # Line offsets for horizontal connectivity.
         #
@@ -106,6 +123,17 @@ class CosineGridModel(nn.Module):
         self.log_s = nn.Parameter(torch.zeros(1) + math.log(3.0))
         self.phase = nn.Parameter(torch.zeros(1))
 
+    def offset_coarse(self) -> torch.Tensor:
+        off = self.offset_ms[0]
+        for d in self.offset_ms[1:]:
+            off = F.interpolate(
+                off,
+                size=(int(d.shape[2]), int(d.shape[3])),
+                mode="bilinear",
+                align_corners=True,
+            ) + d
+        return off
+
     def _apply_global_transform(
         self,
         u: torch.Tensor,
@@ -154,7 +182,7 @@ class CosineGridModel(nn.Module):
             grid: (1, H, W, 2) in [-1,1]^2, suitable for grid_sample.
         """
         # Upsample deformed (u,v) grid (canonical + offset) to full resolution.
-        uv_coarse = self.base_grid + self.offset
+        uv_coarse = self.base_grid + self.offset_coarse()
         uv = F.interpolate(
             uv_coarse,
             size=(self.height, self.width),
@@ -271,7 +299,7 @@ class CosineGridModel(nn.Module):
 
         # Build mapped coarse coords once. Direction computations are done on this
         # low-res grid (matching line_offset connectivity semantics), then upsampled.
-        coords_c = self.base_grid + self.offset  # (1,2,gh,gw)
+        coords_c = self.base_grid + self.offset_coarse()  # (1,2,gh,gw)
         u_c = coords_c[:, 0:1]
         v_c = coords_c[:, 1:2]
         x_c, y_c = self._apply_global_transform(u_c, v_c)  # (1,1,gh,gw)

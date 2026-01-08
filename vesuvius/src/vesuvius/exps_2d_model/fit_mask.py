@@ -61,7 +61,7 @@ def _coarse_geom_mask(
         mask_cosine_coarse:(1,1,gh,gw) cosine-domain mask only
     """
     with torch.no_grad():
-        coords = model.base_grid + model.offset  # (1,2,gh,gw)
+        coords = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
         u = coords[:, 0:1]
         v = coords[:, 1:2]
 

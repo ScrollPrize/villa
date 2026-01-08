@@ -36,7 +36,7 @@ def _smoothness_reg(
         - smooth_x: 1/10 of its in-band weight
         - smooth_y: 1/10  of its in-band weight
     """
-    off = model.offset  # (1,2,gh,gw)  2 = (u_offset, v_offset)
+    off = model.offset_coarse()  # (1,2,gh,gw)  2 = (u_offset, v_offset)
     _, _, gh, gw = off.shape
 
     # Horizontal smoothness using line-offset connectivity.
@@ -224,7 +224,7 @@ def _step_reg(mask: torch.Tensor | None = None, *, model, w_img: int, h_img: int
     do not contribute while edges with one in-image endpoint still receive
     a non-zero weight.
     """
-    coords = model.base_grid + model.offset  # (1,2,gh,gw)
+    coords = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
     u = coords[:, 0:1]
     v = coords[:, 1:2]
 
@@ -291,8 +291,8 @@ def _step_reg(mask: torch.Tensor | None = None, *, model, w_img: int, h_img: int
         else:
             loss_h = (shortfall_h * shortfall_h).mean()
 
-    # Vertical: encourage each distance to be close to avg distance.
-    target_v = avg_v_det
+    # Vertical: enforce a fixed step size in pixel space.
+    target_v = dist_v.new_full((), 4.0)
     diff_v = dist_v - target_v
     if mask is not None:
         wsum_v = m_v.sum()
@@ -328,7 +328,7 @@ def _angle_symmetry_reg(mask: torch.Tensor | None = None, *, model, w_img: int, 
     least one in-image vertex still contribute, while locations whose
     participating edges are fully outside the image receive zero weight.
     """
-    coords = model.base_grid + model.offset  # (1,2,gh,gw)
+    coords = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
     u = coords[:, 0:1]
     v = coords[:, 1:2]
 
@@ -392,7 +392,7 @@ def _y_straight_reg(mask: torch.Tensor | None = None, *, model, w_img: int, h_im
     If a coarse-grid mask is provided, we weight each second-difference term by the
     average of the three involved vertex weights.
     """
-    coords = model.base_grid + model.offset  # (1,2,gh,gw)
+    coords = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
     u = coords[:, 0:1]
     v = coords[:, 1:2]
 
