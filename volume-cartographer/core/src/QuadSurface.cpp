@@ -16,6 +16,8 @@
 #include <cmath>
 #include <limits>
 #include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <vector>
 #include <fstream>
@@ -536,6 +538,55 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
     return sqrt(best);
 }
 
+namespace {
+static inline uint64_t mix64(uint64_t x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static inline uint32_t float_bits(float v)
+{
+    uint32_t out = 0;
+    std::memcpy(&out, &v, sizeof(out));
+    return out;
+}
+
+class LocalRng {
+public:
+    explicit LocalRng(uint64_t seed)
+        : state_(seed ? seed : 0x9e3779b97f4a7c15ULL) {}
+
+    uint32_t next_u32()
+    {
+        state_ = state_ * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<uint32_t>(state_ >> 32);
+    }
+
+    int uniform_int(int lo, int hi)
+    {
+        const uint32_t span = static_cast<uint32_t>(hi - lo + 1);
+        return lo + static_cast<int>(next_u32() % span);
+    }
+
+private:
+    uint64_t state_;
+};
+
+static inline uint64_t seed_from_target(const cv::Vec3f& tgt, int rows, int cols, int max_iters, float scale)
+{
+    uint64_t seed = mix64(static_cast<uint64_t>(rows) << 32 | static_cast<uint64_t>(cols));
+    seed = mix64(seed ^ static_cast<uint64_t>(max_iters));
+    seed = mix64(seed ^ static_cast<uint64_t>(float_bits(tgt[0])));
+    seed = mix64(seed ^ (static_cast<uint64_t>(float_bits(tgt[1])) << 1));
+    seed = mix64(seed ^ (static_cast<uint64_t>(float_bits(tgt[2])) << 2));
+    seed = mix64(seed ^ static_cast<uint64_t>(float_bits(scale)));
+    return seed;
+}
+} // namespace
+
 
 //search the surface point that is closest to th tgt coord
 template <typename E>
@@ -550,6 +601,10 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
 
     assert(points.cols > 3);
     assert(points.rows > 3);
+
+    LocalRng rng(seed_from_target(tgt, points.rows, points.cols, max_iters, scale));
+    const int col_max = points.cols - 3;
+    const int row_max = points.rows - 3;
 
     float dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1);
 
@@ -566,7 +621,8 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
     int r_full = 0;
     for(int r=0;r<10*max_iters && r_full < max_iters;r++) {
         //FIXME skipn invalid init locs!
-        loc = {static_cast<float>(1 + (rand() % (points.cols-3))), static_cast<float>(1 + (rand() % (points.rows-3)))};
+        loc = {static_cast<float>(rng.uniform_int(1, col_max)),
+               static_cast<float>(rng.uniform_int(1, row_max))};
 
         if (points(loc[1],loc[0])[0] == -1)
             continue;
@@ -622,6 +678,10 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     float min_dist = dist;
     if (min_dist < 0)
         min_dist = 10*(_points->cols/_scale[0]+_points->rows/_scale[1]);
+
+    LocalRng rng(seed_from_target(tgt, _points->rows, _points->cols, max_iters, std::max(_scale[0], _scale[1])));
+    const int col_max = _points->cols - 3;
+    const int row_max = _points->rows - 3;
 
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
@@ -694,12 +754,14 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     int r_full = 0;
     int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
-        loc = {static_cast<float>(1 + (rand() % (_points->cols-3))), static_cast<float>(1 + (rand() % (_points->rows-3)))};
+        loc = {static_cast<float>(rng.uniform_int(1, col_max)),
+               static_cast<float>(rng.uniform_int(1, row_max))};
 
         if ((*_points)(loc[1],loc[0])[0] == -1) {
             skip_count++;
             if (skip_count > max_iters / 10) {
-                cv::Vec2f dir = { (float)(rand() % 3 - 1), (float)(rand() % 3 - 1) };
+                cv::Vec2f dir = { static_cast<float>(rng.uniform_int(-1, 1)),
+                                  static_cast<float>(rng.uniform_int(-1, 1)) };
                 if (dir[0] == 0 && dir[1] == 0) dir = {1, 0};
 
                 cv::Vec2f current_pos = loc;

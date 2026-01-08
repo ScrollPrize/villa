@@ -16,6 +16,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 
 #include "vc/core/util/LifeTime.hpp"
@@ -36,7 +37,10 @@
 int static dbg_counter = 0;
 // Default values for thresholds Will be configurable through JSON
 static float local_cost_inl_th = 0.2;
-static float same_surface_th = 2.0;
+static float assoc_surface_th = 2.0f;        // Threshold for surface association
+static float duplicate_surface_th = 2.0f;    // Threshold for duplicate rejection
+static float remap_attach_surface_th = 2.0f; // Threshold for remap attachment
+static int point_to_max_iters = 10;          // Max iterations for pointTo searches
 static float straight_weight = 0.7f;       // Weight for 2D straight line constraints
 static float straight_weight_3D = 4.0f;    // Weight for 3D straight line constraints
 static float sliding_w_scale = 1.0f;       // Scale factor for sliding window
@@ -942,6 +946,7 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
 static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Mat_<uint16_t> &generations, cv::Rect used_area,
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r,
     const std::unordered_map<QuadSurface*, std::set<QuadSurface*>>& overlapping_map,
+    SurfacePatchIndex* surface_patch_index = nullptr,
     bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
     bool pin_approved = true, float approved_weight_hr = 4.0f, bool prefer_approved_in_hr = true,
@@ -1220,10 +1225,10 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     for (auto& s : surfs) {
                         auto ptr = s->pointer();
                         const bool is_locally_approved = approved_neighborhood.contains(s);
-                        const float thr = same_surface_th * (is_locally_approved ? approved_attach_relax : 1.0f);
+                        const float thr = remap_attach_surface_th * (is_locally_approved ? approved_attach_relax : 1.0f);
                         // use relaxed thr also inside pointTo
                         auto _t0 = std::chrono::steady_clock::now();
-                        float res = s->pointTo(ptr, points_out(j, i), thr, 10);
+                        float res = s->pointTo(ptr, points_out(j, i), thr, point_to_max_iters, surface_patch_index);
                         double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                         #pragma omp atomic
                         pointTo_total_ms += _elapsed;
@@ -1245,9 +1250,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         cv::Vec3f best_loc_raw;
                         for (auto s : approved_neighborhood) {
                             auto ptr = s->pointer();
-                            float thr = same_surface_th * approved_attach_relax;
+                            float thr = remap_attach_surface_th * approved_attach_relax;
                             auto _t0 = std::chrono::steady_clock::now();
-                            float res = s->pointTo(ptr, points_out(j, i), thr, 10); //
+                            float res = s->pointTo(ptr, points_out(j, i), thr, point_to_max_iters, surface_patch_index); //
                             double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                             #pragma omp atomic
                             pointTo_total_ms += _elapsed;
@@ -1257,7 +1262,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                                 best_loc_raw = s->loc_raw(ptr);
                             }
                         }
-                        if (best_s && best_res <= same_surface_th * hr_attach_relax_factor) {
+                        if (best_s && best_res <= remap_attach_surface_th * hr_attach_relax_factor) {
                             mutex.lock();
                             data_out.surfs({j,i}).insert(best_s);
                             data_out.loc(best_s, {j,i}) = {best_loc_raw[1], best_loc_raw[0]};
@@ -1320,11 +1325,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
                         auto ptr = test_surf->pointer();
                         auto _t0 = std::chrono::steady_clock::now();
-                        float _res = test_surf->pointTo(ptr, points_out(j, i), same_surface_th, 10);
+                        float _res = test_surf->pointTo(ptr, points_out(j, i), remap_attach_surface_th, point_to_max_iters, surface_patch_index);
                         double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                         #pragma omp atomic
                         pointTo_total_ms += _elapsed;
-                        if (_res > same_surface_th)
+                        if (_res > remap_attach_surface_th)
                             continue;
 
                         int count = 0;
@@ -1435,7 +1440,14 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     int max_width = params.value("max_width", 80000);
 
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
-    same_surface_th = params.value("same_surface_th", 2.0f);
+    assoc_surface_th = params.value("same_surface_th", 2.0f);
+    duplicate_surface_th = params.value("duplicate_surface_th", assoc_surface_th);
+    remap_attach_surface_th = params.value("remap_attach_surface_th", assoc_surface_th);
+    point_to_max_iters = params.value("point_to_max_iters", 10);
+    int point_to_seed_max_iters = params.value("point_to_seed_max_iters", 1000);
+    bool use_surface_patch_index = params.value("use_surface_patch_index", false);
+    int surface_patch_stride = params.value("surface_patch_stride", 1);
+    float surface_patch_bbox_pad = params.value("surface_patch_bbox_pad", 0.0f);
     straight_weight = params.value("straight_weight", 0.7f);            // Weight for 2D straight line constraints
     straight_weight_3D = params.value("straight_weight_3D", 4.0f);      // Weight for 3D straight line constraints
     sliding_w_scale = params.value("sliding_w_scale", 1.0f);            // Scale factor for sliding window
@@ -1482,7 +1494,14 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     }
 
     std::cout << "  local_cost_inl_th: " << local_cost_inl_th << std::endl;
-    std::cout << "  same_surface_th: " << same_surface_th << std::endl;
+    std::cout << "  assoc_surface_th: " << assoc_surface_th << std::endl;
+    std::cout << "  duplicate_surface_th: " << duplicate_surface_th << std::endl;
+    std::cout << "  remap_attach_surface_th: " << remap_attach_surface_th << std::endl;
+    std::cout << "  point_to_max_iters: " << point_to_max_iters << std::endl;
+    std::cout << "  point_to_seed_max_iters: " << point_to_seed_max_iters << std::endl;
+    std::cout << "  use_surface_patch_index: " << use_surface_patch_index << std::endl;
+    std::cout << "  surface_patch_stride: " << surface_patch_stride << std::endl;
+    std::cout << "  surface_patch_bbox_pad: " << surface_patch_bbox_pad << std::endl;
     std::cout << "  straight_weight: " << straight_weight << std::endl;
     std::cout << "  straight_weight_3D: " << straight_weight_3D << std::endl;
     std::cout << "  straight_min_count: " << straight_min_count << std::endl;
@@ -1525,6 +1544,19 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         for(const auto& name : sm->overlappingIds())
             if (surfs.contains(name))
                 overlapping_map[sm].insert(surfs[name]);
+
+    SurfacePatchIndex patch_index;
+    SurfacePatchIndex* patch_index_ptr = nullptr;
+    if (use_surface_patch_index) {
+        std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
+        patch_surfaces.reserve(surfs.size());
+        for (const auto& it : surfs)
+            patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(it.second, [](QuadSurface*) {}));
+        patch_index.setSamplingStride(surface_patch_stride);
+        patch_index.rebuild(patch_surfaces, surface_patch_bbox_pad);
+        patch_index_ptr = &patch_index;
+        std::cout << "SurfacePatchIndex built for " << patch_surfaces.size() << " surfaces" << std::endl;
+    }
 
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
     std::cout << "seed " << seed << " name " << seed->id << " seed overlapping: "
@@ -1625,10 +1657,10 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         for(auto s : overlapping_map[seed]) {
             auto ptr = s->pointer();
             auto _t0 = std::chrono::steady_clock::now();
-            float _res = s->pointTo(ptr, coord, same_surface_th);
+            float _res = s->pointTo(ptr, coord, assoc_surface_th, point_to_seed_max_iters, patch_index_ptr);
             double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
             pointTo_total_ms += _elapsed;
-            if (_res <= same_surface_th) {
+            if (_res <= assoc_surface_th) {
                 cv::Vec3f loc = s->loc_raw(ptr);
                 data.surfs(p).insert(s);
                 data.loc(s, p) = {loc[1], loc[0]};
@@ -1801,6 +1833,12 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
                 int straight_count_init = 0;
                 int count_init = surftrack_add_local(ref_surf, p, data_th, problem, state, points, step, src_step, LOSS_ZLOC, &straight_count_init);
+                if (count_init == 0) {
+                    state(p) = 0;
+                    generations(p) = 0;
+                    data_th.erase(ref_surf, p);
+                    continue;
+                }
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
                 float cost_init = sqrt(summary.final_cost/count_init);
@@ -1866,11 +1904,11 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     auto ptr = test_surf->pointer();
                     //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
                     auto _t0 = std::chrono::steady_clock::now();
-                    float _res = test_surf->pointTo(ptr, coord, same_surface_th, 10);
+                    float _res = test_surf->pointTo(ptr, coord, assoc_surface_th, point_to_max_iters, patch_index_ptr);
                     double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                     #pragma omp atomic
                     pointTo_total_ms += _elapsed;
-                    if (_res <= same_surface_th) {
+                    if (_res <= assoc_surface_th) {
                         int count = 0;
                         int straight_count = 0;
                         state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -1916,9 +1954,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 } else if (used_area.width >=4 && used_area.height >= 4) {
                     cv::Vec2f tmp_loc_;
                     cv::Rect used_th = used_area;
-                    float dist = pointTo(tmp_loc_, points(used_th), best_coord, same_surface_th, 1000, 1.0/(step*src_step));
+                    float dist = pointTo(tmp_loc_, points(used_th), best_coord, duplicate_surface_th, 1000, 1.0/(step*src_step));
                     tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
-                    if (dist <= same_surface_th) {
+                    if (dist <= duplicate_surface_th) {
                         int state_sum = state(tmp_loc_[1],tmp_loc_[0]) + state(tmp_loc_[1]+1,tmp_loc_[0]) + state(tmp_loc_[1],tmp_loc_[0]+1) + state(tmp_loc_[1]+1,tmp_loc_[0]+1);
                         best_inliers = -1;
                         best_ref_seed = false;
@@ -1955,11 +1993,11 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
                     auto ptr = test_surf->pointer();
                     auto _t0 = std::chrono::steady_clock::now();
-                    float _res = test_surf->pointTo(ptr, best_coord, same_surface_th, 10);
+                    float _res = test_surf->pointTo(ptr, best_coord, assoc_surface_th, point_to_max_iters, patch_index_ptr);
                     double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                     #pragma omp atomic
                     pointTo_total_ms += _elapsed;
-                    if (_res <= same_surface_th) {
+                    if (_res <= assoc_surface_th) {
                         cv::Vec3f loc = test_surf->loc_raw(ptr);
                         cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
                         if (coord[0] == -1) {
@@ -1986,11 +2024,11 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 for(auto test_surf : test_surfs) {
                     auto ptr = test_surf->pointer();
                     auto _t0 = std::chrono::steady_clock::now();
-                    float res = test_surf->pointTo(ptr, best_coord, same_surface_th, 10);
+                    float res = test_surf->pointTo(ptr, best_coord, assoc_surface_th, point_to_max_iters, patch_index_ptr);
                     double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                     #pragma omp atomic
                     pointTo_total_ms += _elapsed;
-                    if (res <= same_surface_th) {
+                    if (res <= assoc_surface_th) {
                         cv::Vec3f loc = test_surf->loc_raw(ptr);
                         cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
                         if (coord[0] == -1) {
@@ -2180,7 +2218,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
             cv::Rect active = active_bounds & used_area;
             optimize_surface_mapping(opt_data, opt_state, opt_points, opt_generations, active, static_bounds, step, src_step,
-                                     {y0,x0}, closing_r, overlapping_map, /*keep_inpainted=*/true, tgt_dir,
+                                     {y0,x0}, closing_r, overlapping_map, patch_index_ptr,
+                                     /*keep_inpainted=*/true, tgt_dir,
                                      /*pin_approved=*/pin_approved_points,
                                      /*approved_weight_hr=*/approved_weight_hr,
                                      /*prefer_approved_in_hr=*/prefer_approved_in_hr,
