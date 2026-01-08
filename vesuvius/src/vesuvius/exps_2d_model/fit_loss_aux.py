@@ -16,7 +16,7 @@ def _quad_triangle_reg(mask: torch.Tensor | None = None) -> torch.Tensor:
     (all four corners 0) do not contribute, while quads with at least one
     in-image corner still receive a non-zero weight.
     """
-    coords = model.base_grid + model.offset  # (1,2,gh,gw)
+    coords = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
     u = coords[:, 0:1]
     v = coords[:, 1:2]
 

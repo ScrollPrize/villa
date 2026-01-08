@@ -117,7 +117,7 @@ def _draw_grid_vis(
             bg_color[y0:y1, x0:x1, :] = img_resized
 
         # Coarse coordinates in sample space (u,v).
-        coords = model.base_grid + model.offset  # (1,2,gh,gw)
+        coords = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
         u = coords[:, 0:1]
         v = coords[:, 1:2]
 

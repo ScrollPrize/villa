@@ -625,7 +625,7 @@ def fit_cosine_grid(
             valid = valid.unsqueeze(1)  # (1,1,H,W)
 
             # Coarse validity mask in image space (per coarse vertex).
-            coords_c = model.base_grid + model.offset  # (1,2,gh,gw)
+            coords_c = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
             u_c = coords_c[:, 0:1]
             v_c = coords_c[:, 1:2]
             x_c, y_c = model._apply_global_transform(u_c, v_c)
@@ -881,15 +881,23 @@ def fit_cosine_grid(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
+
             if stage == 3:
                 # Stage 3: update only outside the validity mask.
                 # We mask gradients for per-vertex / per-cell parameters.
                 valid_coarse = terms.get("_valid_coarse", None)
                 if valid_coarse is not None:
                     with torch.no_grad():
-                        m_out = (1.0 - valid_coarse).to(device=model.offset.device, dtype=model.offset.dtype)
-                        if model.offset.grad is not None:
-                            model.offset.grad.mul_(m_out.expand_as(model.offset.grad))
+                        m_out = (1.0 - valid_coarse).to(device=model.offset_ms[0].device, dtype=model.offset_ms[0].dtype)
+                        for p in model.offset_ms:
+                            if p.grad is not None:
+                                m_p = F.interpolate(
+                                    m_out,
+                                    size=(int(p.shape[2]), int(p.shape[3])),
+                                    mode="bilinear",
+                                    align_corners=True,
+                                )
+                                p.grad.mul_(m_p.expand_as(p.grad))
                         if model.line_offset.grad is not None:
                             model.line_offset.grad.mul_(m_out.expand_as(model.line_offset.grad))
                         if model.amp_coarse.grad is not None or model.bias_coarse.grad is not None:
@@ -989,6 +997,7 @@ def fit_cosine_grid(
     if total_stage2 > 0:
         # In stage 2, continue optimizing the global x-scale, rotation and phase
         # together with the coarse grid offsets and modulation fields (no data terms).
+
         opt2 = torch.optim.Adam(
             [
                 # model.theta,
@@ -996,7 +1005,7 @@ def fit_cosine_grid(
                 # model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
-                model.offset,
+                *list(model.offset_ms),
                 model.line_offset,
             ],
             lr=lr,
@@ -1017,7 +1026,7 @@ def fit_cosine_grid(
             [
                 model.amp_coarse,
                 model.bias_coarse,
-                model.offset,
+                *list(model.offset_ms),
                 model.line_offset,
             ],
             lr=0.1*lr,
@@ -1041,7 +1050,7 @@ def fit_cosine_grid(
                 model.phase,
                 model.amp_coarse,
                 model.bias_coarse,
-                model.offset,
+                *list(model.offset_ms),
                 model.line_offset,
             ],
             lr=0.1*lr,
