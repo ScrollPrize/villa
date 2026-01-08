@@ -168,7 +168,8 @@ int main(int argc, char *argv[])
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
             ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
             ("inpaint", "perform automatic inpainting on all detected holes.")
-            ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)");
+            ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
+            ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)");
 
         po::variables_map vm;
         try {
@@ -238,6 +239,10 @@ int main(int argc, char *argv[])
                 std::cerr << "ERROR: --resume-opt must be one of 'skip', 'local', or 'global'" << std::endl;
                 return EXIT_FAILURE;
             }
+        }
+
+        if (vm.count("resume-generations")) {
+            params["resume_generations"] = vm["resume-generations"].as<int>();
         }
     }
 
