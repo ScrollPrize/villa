@@ -379,49 +379,49 @@ def _angle_symmetry_reg(mask: torch.Tensor | None = None, *, model, w_img: int, 
     base_unweighted = cos_theta * cos_theta  # (1,1,2,gh-1,gw-1)
 
     if mask is None:
-	return base_unweighted.mean()
+        return base_unweighted.mean()
 
 def _y_straight_reg(mask: torch.Tensor | None = None, *, model, w_img: int, h_img: int) -> torch.Tensor:
-	"""
-	Straightness regularizer along coarse y: penalize changes in the y-step vector.
+    """
+    Straightness regularizer along coarse y: penalize changes in the y-step vector.
 
-	This is a second-difference penalty on the mapped (x_pix,y_pix) field:
-	- build per-row step vectors v_j = p_{j+1} - p_j,
-	- penalize ||v_{j+1} - v_j||^2.
+    This is a second-difference penalty on the mapped (x_pix,y_pix) field:
+    - build per-row step vectors v_j = p_{j+1} - p_j,
+    - penalize ||v_{j+1} - v_j||^2.
 
-	If a coarse-grid mask is provided, we weight each second-difference term by the
-	average of the three involved vertex weights.
-	"""
-	coords = model.base_grid + model.offset  # (1,2,gh,gw)
-	u = coords[:, 0:1]
-	v = coords[:, 1:2]
+    If a coarse-grid mask is provided, we weight each second-difference term by the
+    average of the three involved vertex weights.
+    """
+    coords = model.base_grid + model.offset  # (1,2,gh,gw)
+    u = coords[:, 0:1]
+    v = coords[:, 1:2]
 
-	x_norm, y_norm = model._apply_global_transform(u, v)
-	x_pix = (x_norm + 1.0) * 0.5 * float(max(1, w_img - 1))
-	y_pix = (y_norm + 1.0) * 0.5 * float(max(1, h_img - 1))
+    x_norm, y_norm = model._apply_global_transform(u, v)
+    x_pix = (x_norm + 1.0) * 0.5 * float(max(1, w_img - 1))
+    y_pix = (y_norm + 1.0) * 0.5 * float(max(1, h_img - 1))
 
-	_, _, gh, gw = x_pix.shape
-	if gh < 3:
-		return torch.zeros((), device=coords.device, dtype=coords.dtype)
+    _, _, gh, gw = x_pix.shape
+    if gh < 3:
+        return torch.zeros((), device=coords.device, dtype=coords.dtype)
 
-	# v_j: step from row j to j+1.
-	dx_v = x_pix[:, :, 1:, :] - x_pix[:, :, :-1, :]
-	dy_v = y_pix[:, :, 1:, :] - y_pix[:, :, :-1, :]
-	# second difference of step vectors.
-	d2x = dx_v[:, :, 1:, :] - dx_v[:, :, :-1, :]
-	d2y = dy_v[:, :, 1:, :] - dy_v[:, :, :-1, :]
-	base = d2x * d2x + d2y * d2y  # (1,1,gh-2,gw)
+    # v_j: step from row j to j+1.
+    dx_v = x_pix[:, :, 1:, :] - x_pix[:, :, :-1, :]
+    dy_v = y_pix[:, :, 1:, :] - y_pix[:, :, :-1, :]
+    # second difference of step vectors.
+    d2x = dx_v[:, :, 1:, :] - dx_v[:, :, :-1, :]
+    d2y = dy_v[:, :, 1:, :] - dy_v[:, :, :-1, :]
+    base = d2x * d2x + d2y * d2y  # (1,1,gh-2,gw)
 
-	if mask is None:
-		return base.mean()
+    if mask is None:
+        return base.mean()
 
-	m = mask.to(device=coords.device, dtype=coords.dtype)
-	# Each term involves rows j, j+1, j+2 -> average their per-vertex weights.
-	w = (m[:, :, :-2, :] + m[:, :, 1:-1, :] + m[:, :, 2:, :]) / 3.0  # (1,1,gh-2,gw)
-	wsum = w.sum()
-	if wsum > 0:
-		return (base * w).sum() / wsum
-	return base.mean()
+    m = mask.to(device=coords.device, dtype=coords.dtype)
+    # Each term involves rows j, j+1, j+2 -> average their per-vertex weights.
+    w = (m[:, :, :-2, :] + m[:, :, 1:-1, :] + m[:, :, 2:, :]) / 3.0  # (1,1,gh-2,gw)
+    wsum = w.sum()
+    if wsum > 0:
+        return (base * w).sum() / wsum
+    return base.mean()
 
     # Build per-location weights from coarse mask: combine horizontal and
     # vertical edge masks so that locations involving out-of-image points
