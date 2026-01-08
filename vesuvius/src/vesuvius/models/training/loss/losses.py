@@ -426,6 +426,9 @@ class SignedDistanceLoss(nn.Module):
     laplacian_weight λ_l – weight of the Laplacian term relative to data term    (default: 0.01)
     reduction        "mean" (default) | "sum" | "none"
     ignore_index     Sentinel value in target to be ignored                      (default: None)
+    surface_sigma    Additive surface weighting: w = 1 + exp(-|d|²/2σ²).         (default: None)
+                     Surface (d=0) gets 2x weight, decays to 1x far away.
+                     If None, all voxels weighted equally (w=1).
     """
     def __init__(
         self,
@@ -437,6 +440,7 @@ class SignedDistanceLoss(nn.Module):
         laplacian_weight: float = 0.01,
         reduction: str = "mean",
         ignore_index: float | int | None = None,
+        surface_sigma: float | None = None,
     ):
         super().__init__()
         if reduction not in ("mean", "sum", "none"):
@@ -449,6 +453,7 @@ class SignedDistanceLoss(nn.Module):
         self.lap_w = float(laplacian_weight)
         self.reduction = reduction
         self.ignore_index = ignore_index
+        self.surface_sigma = float(surface_sigma) if surface_sigma is not None else None
 
     @staticmethod
     def _gradient_3d(t: torch.Tensor) -> torch.Tensor:
@@ -515,6 +520,17 @@ class SignedDistanceLoss(nn.Module):
             lap_data = lap_sq[band_mask]
             data_term = data_term + self.lap_w * lap_data
 
+        # ── optional surface-focused Gaussian weighting ─────────────────────
+        # ADDITIVE weighting: w = 1 + exp(-|d_gt|² / 2σ²)
+        # - Surface (d=0): weight = 2  (2x emphasis)
+        # - Far from surface: weight ≈ 1  (normal, NOT zero)
+        # This prevents the model from collapsing to predicting 0 everywhere.
+        if self.surface_sigma is not None:
+            d_gt_masked = d_gt[band_mask]
+            gaussian = torch.exp(-d_gt_masked.abs().pow(2) / (2 * self.surface_sigma ** 2))
+            weights = 1.0 + gaussian  # additive: base weight 1, surface boost up to +1
+            data_term = data_term * weights
+
         # ── reduction ────────────────────────────────────────────────────────
         if self.reduction == "sum":
             return data_term.sum()
@@ -522,7 +538,7 @@ class SignedDistanceLoss(nn.Module):
             out = torch.zeros_like(d_pred)
             out[band_mask] = data_term
             return out
-        # "mean"  – average only over valid voxels
+        # "mean"
         return data_term.mean()
 
 # ======================================================================
