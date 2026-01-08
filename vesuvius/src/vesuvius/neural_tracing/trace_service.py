@@ -16,9 +16,13 @@ from vesuvius.neural_tracing.infer import Inference
 @click.option('--volume_zarr', type=click.Path(exists=True), required=True, help='Path to ome-zarr folder')
 @click.option('--volume_scale', type=int, required=True, help='OME scale to use')
 @click.option('--socket_path', type=click.Path(), required=True, help='Path to Unix domain socket')
-def serve(checkpoint_path, volume_zarr, volume_scale, socket_path):
+@click.option('--no-cache', is_flag=True, help='Disable crop cache')
+def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, no_cache):
 
     model, config = load_checkpoint(checkpoint_path)
+
+    if no_cache:
+        config['use_crop_cache'] = False
 
     random.seed(config['seed'])
     np.random.seed(config['seed'])
@@ -74,7 +78,6 @@ def handle_connection(conn, request_fn):
 
 def process_request(request, inference, volume_scale):
     """Process a single inference request and return results."""
-
     if 'center_xyz' not in request:
         return {'error': 'Missing required field: center_xyz'}
     center_xyz = request['center_xyz']
@@ -82,8 +85,6 @@ def process_request(request, inference, volume_scale):
     prev_u_xyz = request['prev_u_xyz']
     prev_v_xyz = request['prev_v_xyz']
     prev_diag_xyz = request['prev_diag_xyz']
-
-    print(f'handling request with batch size = {len(center_xyz)}, center_xyz = {center_xyz}, prev_u_xyz = {prev_u_xyz}, prev_v_xyz = {prev_v_xyz}, prev_diag_xyz = {prev_diag_xyz}')
 
     def xyz_to_scaled_zyx(xyzs):
         for xyz in xyzs:
@@ -100,7 +101,6 @@ def process_request(request, inference, volume_scale):
         return [(zyxs.flip(1) * (2 ** volume_scale)).tolist() for zyxs in zyxss]
 
     with torch.inference_mode():
-
         center_zyx = xyz_to_scaled_zyx(center_xyz)
         prev_u = xyz_to_scaled_zyx(prev_u_xyz)
         prev_v = xyz_to_scaled_zyx(prev_v_xyz)
@@ -116,8 +116,6 @@ def process_request(request, inference, volume_scale):
             'u_candidates': zyxs_to_scaled_xyzs(u_coordinates),
             'v_candidates': zyxs_to_scaled_xyzs(v_coordinates),
         }
-
-    print(f'response: {response}')
 
     return response
 
