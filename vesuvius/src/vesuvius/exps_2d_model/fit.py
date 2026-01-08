@@ -10,7 +10,7 @@ from fit_model import CosineGridModel
 from fit_vis import _save_snapshot, _to_uint8
 from fit_loss_data import _directional_alignment_loss, _gradient_data_loss
 from fit_loss_gradmag import _gradmag_period_loss
-from fit_loss_geom import _smoothness_reg, _line_offset_smooth_reg, _mod_smooth_reg, _step_reg, _angle_symmetry_reg
+from fit_loss_geom import _smoothness_reg, _line_offset_smooth_reg, _mod_smooth_reg, _step_reg, _angle_symmetry_reg, _y_straight_reg
 
 def fit_cosine_grid(
     image_path: str,
@@ -489,6 +489,7 @@ def fit_cosine_grid(
         "angle_sym": lambda_angle_sym,
         "dir_unet": lambda_dir_unet,
         "line_smooth_y": lambda_line_smooth_y,
+        "y_straight": 1.0,
     }
 
     # Per-stage modifiers. Keys omitted imply modifier 1.0.
@@ -502,6 +503,7 @@ def fit_cosine_grid(
         "mod_smooth": 0.0,
         "quad_tri": 0.0,
         "angle_sym": 0.0,
+        "y_straight": 0.0,
         # grad_mag and dir_unet default to 1.0 (enabled).
     }
 
@@ -522,6 +524,7 @@ def fit_cosine_grid(
         # "smooth_x": 10.0,
         # "smooth_y": 0.0,
         "line_smooth_y": 0.1,
+        "y_straight": 0.0,
         # other terms default to 1.0 (enabled).
     }
 
@@ -532,16 +535,17 @@ def fit_cosine_grid(
         "grad_data": 0.0,
         "grad_mag": 0.0,
         "quad_tri": 0.0,
-        "step": 0.1,
+        "step": 0.0,
         "mod_smooth": 0.0,
-        "angle_sym": 0.1,
+        "angle_sym": 0.0,
         "dir_unet": 0.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
-        # "smooth_x": 10.0,
-        # "smooth_y": 0.0,
+        "smooth_x": 0.0,
+        "smooth_y": 0.0,
         "line_smooth_y": 0.0,
+        "y_straight": 1.0,
         # other terms default to 1.0 (enabled).
     }
 
@@ -833,6 +837,16 @@ def fit_cosine_grid(
             angle_reg = torch.zeros((), device=device, dtype=dtype)
         terms["angle_sym"] = angle_reg
 
+
+        # Straightness along y: encourage consistent outward projection.
+        w_yst = _need_term("y_straight", stage_modifiers)
+        if w_yst != 0.0:
+            y_straight = _y_straight_reg(None, model=model, w_img=w_img, h_img=h_img)
+            total_loss = total_loss + w_yst * y_straight
+        else:
+            y_straight = torch.zeros((), device=device, dtype=dtype)
+        terms["y_straight"] = y_straight
+
         if dbg:
             terms["_mask_full"] = weight_full.detach()
             terms["_mask_valid"] = valid.detach()
@@ -1006,7 +1020,7 @@ def fit_cosine_grid(
                 model.offset,
                 model.line_offset,
             ],
-            lr=lr,
+            lr=0.1*lr,
         )
         _optimize_stage(
             stage=3,
