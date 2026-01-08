@@ -2561,6 +2561,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 if (hierarchy[i][3] != -1) { // It's a hole
                     cv::Rect roi = cv::boundingRect(contours[i]);
 
+                    // Skip contours that touch the image boundary - these are border artifacts, not real holes
+                    if (roi.x == 0 || roi.y == 0 ||
+                        (roi.x + roi.width) >= hole_mask.cols ||
+                        (roi.y + roi.height) >= hole_mask.rows) {
+                        continue;
+                    }
+
                     int margin = 4;
                     roi.x = std::max(0, roi.x - margin);
                     roi.y = std::max(0, roi.y - margin);
@@ -2663,6 +2670,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             }
 
             // cv::imwrite("vis_inp_rect.tif", vis);
+
+            // Skip growth when in inpaint-only mode
+            fringe.resize(0);
         }
     }
 
