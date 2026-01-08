@@ -521,10 +521,10 @@ def fit_cosine_grid(
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
-        # "smooth_x": 10.0,
-        # "smooth_y": 0.0,
+        "smooth_x": 0.0,
+        "smooth_y": 0.0,
         "line_smooth_y": 0.1,
-        "y_straight": 0.0,
+        "y_straight": 1.0,
         # other terms default to 1.0 (enabled).
     }
 
@@ -533,18 +533,18 @@ def fit_cosine_grid(
         # disabled to match previous behavior (global, no Gaussian mask).
         "data": 0.0,
         "grad_data": 0.0,
-        "grad_mag": 0.0,
+        "grad_mag": 1.0,
         "quad_tri": 0.0,
-        "step": 0.0,
+        "step": 1.0,
         "mod_smooth": 0.0,
-        "angle_sym": 0.0,
-        "dir_unet": 0.0,
+        "angle_sym": 1.0,
+        "dir_unet": 10.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
         # "dir_unet": 10.0,
         "smooth_x": 0.0,
         "smooth_y": 0.0,
-        "line_smooth_y": 0.0,
+        "line_smooth_y": 0.1,
         "y_straight": 1.0,
         # other terms default to 1.0 (enabled).
     }
@@ -637,12 +637,12 @@ def fit_cosine_grid(
             ).float()  # (1,1,gh,gw)
 
             # Stage 3: shrink the fixed (valid) region a bit so the boundary can adjust.
-            if stage == 3:
-                valid_coarse_erode_iters = 4
-                for _ in range(valid_coarse_erode_iters):
-                    inv = 1.0 - valid_coarse
-                    inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
-                    valid_coarse = 1.0 - inv
+            # if stage == 3:
+            valid_coarse_erode_iters = 4
+            for _ in range(valid_coarse_erode_iters):
+                inv = 1.0 - valid_coarse
+                inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
+                valid_coarse = 1.0 - inv
 
             valid_erode_iters = 0
             for _ in range(valid_erode_iters):
@@ -650,22 +650,22 @@ def fit_cosine_grid(
                 inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
                 valid = 1.0 - inv
 
-            if stage in (1, 2):
-                # Stages 1 and 2: use only in-bounds validity; ignore Gaussian mask.
-                weight_full = valid
-            else:
-                gauss = fit_mask._gaussian_mask(stage=stage, stage_progress=stage_progress)
-                if gauss is None:
-                    w_sample = torch.ones_like(valid)
-                else:
-                    w_sample = F.grid_sample(
-                        gauss,
-                        grid_ng,
-                        mode="bilinear",
-                        padding_mode="zeros",
-                        align_corners=True,
-                    )
-                weight_full = valid * w_sample
+            # if stage in (1, 2):
+            #     # Stages 1 and 2: use only in-bounds validity; ignore Gaussian mask.
+            weight_full = valid
+            # else:
+            # gauss = fit_mask._gaussian_mask(stage=stage, stage_progress=stage_progress)
+            # if gauss is None:
+            #     w_sample = torch.ones_like(valid)
+            # else:
+            #     w_sample = F.grid_sample(
+            #         gauss,
+            #         grid_ng,
+            #         mode="bilinear",
+            #         padding_mode="zeros",
+            #         align_corners=True,
+            #     )
+            # weight_full = valid * w_sample
 
             # Apply cosine-domain band mask in sample space so that only selected
             # periods/rows contribute to the loss, with vertical extent possibly
@@ -851,8 +851,8 @@ def fit_cosine_grid(
             terms["_mask_full"] = weight_full.detach()
             terms["_mask_valid"] = valid.detach()
 
-        if stage == 3:
-            terms["_valid_coarse"] = valid_coarse.detach()
+        # if stage == 3:
+        terms["_valid_coarse"] = valid_coarse.detach()
 
         return total_loss, terms
 
@@ -882,37 +882,37 @@ def fit_cosine_grid(
             loss.backward()
 
 
-            if stage == 3:
-                # Stage 3: update only outside the validity mask.
-                # We mask gradients for per-vertex / per-cell parameters.
-                valid_coarse = terms.get("_valid_coarse", None)
-                if valid_coarse is not None:
-                    with torch.no_grad():
-                        m_out = (1.0 - valid_coarse).to(device=model.offset_ms[0].device, dtype=model.offset_ms[0].dtype)
-                        for p in model.offset_ms:
-                            if p.grad is not None:
-                                m_p = F.interpolate(
-                                    m_out,
-                                    size=(int(p.shape[2]), int(p.shape[3])),
-                                    mode="bilinear",
-                                    align_corners=True,
-                                )
-                                p.grad.mul_(m_p.expand_as(p.grad))
-                        if model.line_offset.grad is not None:
-                            model.line_offset.grad.mul_(m_out.expand_as(model.line_offset.grad))
-                        if model.amp_coarse.grad is not None or model.bias_coarse.grad is not None:
-                            gh_m = int(model.amp_coarse.shape[2])
-                            gw_m = int(model.amp_coarse.shape[3])
-                            m_out_mod = F.interpolate(
-                                m_out,
-                                size=(gh_m, gw_m),
-                                mode="bilinear",
-                                align_corners=True,
-                            )
-                            if model.amp_coarse.grad is not None:
-                                model.amp_coarse.grad.mul_(m_out_mod.expand_as(model.amp_coarse.grad))
-                            if model.bias_coarse.grad is not None:
-                                model.bias_coarse.grad.mul_(m_out_mod.expand_as(model.bias_coarse.grad))
+            # if stage == 3:
+            #     # Stage 3: update only outside the validity mask.
+            #     # We mask gradients for per-vertex / per-cell parameters.
+            #     valid_coarse = terms.get("_valid_coarse", None)
+            #     if valid_coarse is not None:
+            #         with torch.no_grad():
+            #             m_out = (1.0 - valid_coarse).to(device=model.offset_ms[0].device, dtype=model.offset_ms[0].dtype)
+            #             for p in model.offset_ms:
+            #                 if p.grad is not None:
+            #                     m_p = F.interpolate(
+            #                         m_out,
+            #                         size=(int(p.shape[2]), int(p.shape[3])),
+            #                         mode="bilinear",
+            #                         align_corners=True,
+            #                     )
+            #                     p.grad.mul_(m_p.expand_as(p.grad))
+            #             if model.line_offset.grad is not None:
+            #                 model.line_offset.grad.mul_(m_out.expand_as(model.line_offset.grad))
+            #             if model.amp_coarse.grad is not None or model.bias_coarse.grad is not None:
+            #                 gh_m = int(model.amp_coarse.shape[2])
+            #                 gw_m = int(model.amp_coarse.shape[3])
+            #                 m_out_mod = F.interpolate(
+            #                     m_out,
+            #                     size=(gh_m, gw_m),
+            #                     mode="bilinear",
+            #                     align_corners=True,
+            #                 )
+            #                 if model.amp_coarse.grad is not None:
+            #                     model.amp_coarse.grad.mul_(m_out_mod.expand_as(model.amp_coarse.grad))
+            #                 if model.bias_coarse.grad is not None:
+            #                     model.bias_coarse.grad.mul_(m_out_mod.expand_as(model.bias_coarse.grad))
 
             optimizer.step()
 
@@ -1008,7 +1008,7 @@ def fit_cosine_grid(
                 *list(model.offset_ms),
                 model.line_offset,
             ],
-            lr=lr,
+            lr=0.1*lr,
         )
         _optimize_stage(
             stage=2,

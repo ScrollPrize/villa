@@ -20,8 +20,8 @@ def _gaussian_mask(stage: int, stage_progress: float) -> torch.Tensor | None:
     """
     # Stages 1 and 2 use global optimization without a Gaussian mask.
     # When use_image_mask is False we disable the Gaussian entirely.
-    if (not use_image_mask) or stage < 3:
-        return None
+    # if (not use_image_mask) or stage < 3:
+        # return None
 
     # Stage 3: grow sigma from sigma_min to sigma_max over the first 90% of
     # the stage, then disable the Gaussian mask (equivalent to full-image
