@@ -11,7 +11,6 @@ from tqdm import tqdm
 from vesuvius.neural_tracing.dataset_edt_seg import EdtSegDataset
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from vesuvius.models.training.loss.losses import SignedDistanceLoss
-from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
@@ -46,7 +45,7 @@ def prepare_batch(batch):
     return inputs, seg_target, dt_target, skel_target, loss_mask
 
 
-def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_target, plane_mask, save_path):
+def make_visualization(inputs, dt_target, seg_pred, dt_pred, skel_target, plane_mask, save_path):
     """Create and save GIF visualization cycling through z-slices."""
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
@@ -57,7 +56,7 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
     # Precompute 3D arrays
     vol_3d = inputs[b, 0].cpu().numpy()
     cond_3d = inputs[b, 1].cpu().numpy()
-    seg_3d = seg_target[b].cpu().numpy()
+    skel_3d = skel_target[b].cpu().numpy()
     dt_gt_3d = dt_target[b, 0].cpu().numpy()
     mask_3d = plane_mask[b].cpu().numpy()
     seg_pred_3d = torch.argmax(seg_pred[b], dim=0).cpu().numpy()
@@ -79,16 +78,16 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
     axes[1][2] = fig.add_subplot(2, 4, 7)
     axes[1][3] = fig.add_subplot(2, 4, 8)
 
-    # 3D scatter plot (static) - GT segmentation: green=known, red=unknown
-    gt_coords = np.argwhere(seg_3d > 0.5)
-    if len(gt_coords) > 0:
+    # 3D scatter plot (static) - GT skeleton: green=known, red=unknown
+    skel_coords = np.argwhere(skel_3d > 0.5)
+    if len(skel_coords) > 0:
         max_pts = 2000
-        if len(gt_coords) > max_pts:
-            idx = np.random.choice(len(gt_coords), max_pts, replace=False)
-            gt_coords = gt_coords[idx]
-        known_mask = mask_3d[gt_coords[:, 0], gt_coords[:, 1], gt_coords[:, 2]] > 0.5
-        known_pts = gt_coords[known_mask]
-        unknown_pts = gt_coords[~known_mask]
+        if len(skel_coords) > max_pts:
+            idx = np.random.choice(len(skel_coords), max_pts, replace=False)
+            skel_coords = skel_coords[idx]
+        known_mask = mask_3d[skel_coords[:, 0], skel_coords[:, 1], skel_coords[:, 2]] > 0.5
+        known_pts = skel_coords[known_mask]
+        unknown_pts = skel_coords[~known_mask]
         ax3d = axes[0][1]
         if len(known_pts) > 0:
             ax3d.scatter(known_pts[:, 2], known_pts[:, 1], known_pts[:, 0],
@@ -100,7 +99,7 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
         ax3d.set_ylabel('Y')
         ax3d.set_zlabel('Z')
         ax3d.legend(loc='upper right', markerscale=4)
-    axes[0][1].set_title('GT: known(green) / unknown(red)')
+    axes[0][1].set_title('Skel GT: known(green) / unknown(red)')
 
     # Create image objects for animation
     z0 = D // 2
@@ -111,8 +110,8 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
     axes[0][0].set_title(f'Volume (z={z0})')
     axes[0][0].axis('off')
 
-    im_seg = axes[0][2].imshow(seg_3d[z0], cmap='gray')
-    axes[0][2].set_title('Seg GT')
+    im_skel = axes[0][2].imshow(skel_3d[z0], cmap='gray')
+    axes[0][2].set_title('Skel GT')
     axes[0][2].axis('off')
 
     mask_overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
@@ -150,8 +149,8 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
         im_vol.set_data(vol_slice)
         axes[0][0].set_title(f'Volume (z={z})')
 
-        # Seg GT
-        im_seg.set_data(seg_3d[z])
+        # Skel GT
+        im_skel.set_data(skel_3d[z])
 
         # Mask + Cond overlay
         mask_overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
@@ -180,7 +179,7 @@ def make_visualization(inputs, seg_target, dt_target, seg_pred, dt_pred, skel_ta
         # Seg pred
         im_seg_p.set_data(seg_p_slice)
 
-        return [im_vol, im_seg, im_mask, im_pred, im_dt_gt, im_dt_p, im_seg_p]
+        return [im_vol, im_skel, im_mask, im_pred, im_dt_gt, im_dt_p, im_seg_p]
 
     # Sample every few slices for speed
     z_step = max(1, D // 32)
@@ -201,7 +200,7 @@ def train(config_path):
 
     # Defaults
     config.setdefault('in_channels', 2)
-    config.setdefault('out_channels', 3)  # 2 seg + 1 dt
+    config.setdefault('out_channels', 1)  # dt only
     config.setdefault('step_count', 1)  # Required by make_model
     config.setdefault('num_iterations', 250000)
     config.setdefault('log_frequency', 100)
@@ -209,7 +208,6 @@ def train(config_path):
     config.setdefault('grad_clip', 5)
     config.setdefault('learning_rate', 0.01)
     config.setdefault('weight_decay', 3e-5)
-    config.setdefault('dt_loss_weight', 1.0)
     config.setdefault('batch_size', 4)
     config.setdefault('num_workers', 4)
     config.setdefault('seed', 0)
@@ -235,14 +233,7 @@ def train(config_path):
             config=config
         )
 
-    seg_loss_fn = DC_SkelREC_and_CE_loss(
-        soft_dice_kwargs={'batch_dice': False, 'do_bg': False, 'smooth': 1e-5, 'ddp': False},
-        soft_skelrec_kwargs={'batch_dice': False, 'do_bg': False, 'smooth': 1e-5, 'ddp': False},
-        ce_kwargs={},
-        weight_ce=1.0,
-        weight_dice=1.0,
-        weight_srec=1.0,
-    )
+    skel_threshold = config.get('skel_threshold', 0.5)  # Only used for visualization
 
     dt_loss_fn = SignedDistanceLoss(
         beta=config.get('sdt_beta', 1.0),
@@ -250,11 +241,11 @@ def train(config_path):
         eikonal_weight=config.get('sdt_eikonal_weight', 0.01),
         laplacian=config.get('sdt_laplacian', True),
         laplacian_weight=config.get('sdt_laplacian_weight', 0.01),
+        surface_sigma=config.get('sdt_surface_sigma', None),  # Gaussian weight centered at d=0
         reduction='mean',
     )
 
     ds_cache = {
-        'seg': {'weights': None, 'loss_fn': None},
         'dt': {'weights': None, 'loss_fn': None},
     }
 
@@ -370,7 +361,7 @@ def train(config_path):
     start_iteration = 0
     if 'load_ckpt' in config:
         print(f'Loading checkpoint {config["load_ckpt"]}')
-        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
+        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=True)
         state_dict = ckpt['model']
         # Handle compiled model state dict
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
@@ -386,19 +377,17 @@ def train(config_path):
     )
 
     if accelerator.is_main_process:
-        accelerator.print("\n=== EDT Segmentation Configuration ===")
+        accelerator.print("\n=== DT-Only Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
-        accelerator.print(f"Output channels: {config['out_channels']} (2 seg + 1 dt)")
+        accelerator.print(f"Output channels: {config['out_channels']} (dt only)")
         accelerator.print(f"Optimizer: SGD (lr={config['learning_rate']}, momentum={config.get('momentum', 0.99)})")
         accelerator.print(f"Scheduler: PolyLR (exponent={config.get('poly_exponent', 0.9)})")
-        accelerator.print(f"DT loss weight: {config['dt_loss_weight']}")
         accelerator.print(f"Train samples: {num_train}, Val samples: {num_val}")
-        accelerator.print("======================================\n")
+        accelerator.print("=======================================\n")
 
     val_iterator = iter(val_dataloader)
     train_iterator = iter(train_dataloader)
     grad_clip = config['grad_clip']
-    dt_loss_weight = config['dt_loss_weight']
 
     progress_bar = tqdm(
         total=config['num_iterations'],
@@ -421,26 +410,14 @@ def train(config_path):
         with accelerator.accumulate(model):
             # Forward pass
             output = model(inputs)
-            seg_pred = output['seg']   # [B, 2, D, H, W] or list for DS
-            dt_pred = output['dt']     # [B, 1, D, H, W] or list for DS
-
-            # Segmentation loss with skeleton recall (masked to unknown region only)
-            # DC_SkelREC_and_CE_loss expects target as [B, 1, D, H, W] with class indices
-            seg_target_long = seg_target.long().unsqueeze(1)
-            skel_target_shaped = skel_target.unsqueeze(1)  # [B, 1, D, H, W]
-            loss_mask_shaped = loss_mask.unsqueeze(1)  # [B, 1, D, H, W]
-            seg_loss, seg_pred_for_vis = compute_loss_with_ds(
-                seg_pred, seg_target_long, seg_loss_fn, 'seg', resize_mode='nearest',
-                skel=skel_target_shaped, loss_mask=loss_mask_shaped
-            )
+            dt_pred = output['dt']  # [B, 1, D, H, W] or list for DS
 
             # Distance transform loss (NO masking - compute everywhere)
             dt_loss, dt_pred_for_vis = compute_loss_with_ds(
                 dt_pred, dt_target, dt_loss_fn, 'dt', resize_mode='trilinear'
             )
 
-            # Combined loss
-            total_loss = seg_loss + dt_loss_weight * dt_loss
+            total_loss = dt_loss
 
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
@@ -453,13 +430,11 @@ def train(config_path):
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
-        wandb_log['seg_loss'] = seg_loss.detach().item()
         wandb_log['dt_loss'] = dt_loss.detach().item()
         wandb_log['lr'] = optimizer.param_groups[0]['lr']
 
         progress_bar.set_postfix({
             'loss': f"{wandb_log['loss']:.4f}",
-            'seg': f"{wandb_log['seg_loss']:.4f}",
             'dt': f"{wandb_log['dt_loss']:.4f}",
         })
         progress_bar.update(1)
@@ -477,23 +452,17 @@ def train(config_path):
                 val_inputs, val_seg_target, val_dt_target, val_skel_target, val_loss_mask = prepare_batch(val_batch)
 
                 val_output = model(val_inputs)
-                val_seg_pred = val_output['seg']
                 val_dt_pred = val_output['dt']
 
-                val_seg_target_long = val_seg_target.long().unsqueeze(1)
-                val_skel_target_shaped = val_skel_target.unsqueeze(1)  # [B, 1, D, H, W]
-                val_loss_mask_shaped = val_loss_mask.unsqueeze(1)  # [B, 1, D, H, W]
-                val_seg_loss, val_seg_pred_for_vis = compute_loss_with_ds(
-                    val_seg_pred, val_seg_target_long, seg_loss_fn, 'seg', resize_mode='nearest',
-                    skel=val_skel_target_shaped, loss_mask=val_loss_mask_shaped
-                )
                 val_dt_loss, val_dt_pred_for_vis = compute_loss_with_ds(
                     val_dt_pred, val_dt_target, dt_loss_fn, 'dt', resize_mode='trilinear'
                 )
-                val_total_loss = val_seg_loss + dt_loss_weight * val_dt_loss
 
-                wandb_log['val_loss'] = val_total_loss.item()
-                wandb_log['val_seg_loss'] = val_seg_loss.item()
+                # Derive seg from thresholded DT for visualization
+                val_seg_from_dt = (val_dt_pred_for_vis.abs() < skel_threshold).float()
+                val_seg_for_skel = torch.cat([1 - val_seg_from_dt, val_seg_from_dt], dim=1)
+
+                wandb_log['val_loss'] = val_dt_loss.item()
                 wandb_log['val_dt_loss'] = val_dt_loss.item()
 
                 # Create visualization (saved as GIF)
@@ -503,12 +472,18 @@ def train(config_path):
                 # plane_mask: 1=known/conditioned, 0=unknown (inverse of loss_mask)
                 train_plane_mask = 1.0 - loss_mask
                 val_plane_mask = 1.0 - val_loss_mask
+
+                # Derive seg from thresholded DT for visualization
+                train_seg_from_dt = (dt_pred_for_vis.abs() < skel_threshold).float()
+                train_seg_for_vis = torch.cat([1 - train_seg_from_dt, train_seg_from_dt], dim=1)
+                val_seg_for_vis = val_seg_for_skel  # Already computed above
+
                 make_visualization(
-                    inputs, seg_target, dt_target, seg_pred_for_vis, dt_pred_for_vis, skel_target,
+                    inputs, dt_target, train_seg_for_vis, dt_pred_for_vis, skel_target,
                     train_plane_mask, train_img_path
                 )
                 make_visualization(
-                    val_inputs, val_seg_target, val_dt_target, val_seg_pred_for_vis, val_dt_pred_for_vis, val_skel_target,
+                    val_inputs, val_dt_target, val_seg_for_vis, val_dt_pred_for_vis, val_skel_target,
                     val_plane_mask, val_img_path
                 )
 
