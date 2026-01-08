@@ -11,8 +11,7 @@ from tqdm import tqdm
 from einops import rearrange
 from functools import lru_cache
 import torch.nn.functional as F
-from dataclasses import dataclass, field
-from typing import Optional, Any
+from dataclasses import dataclass
 
 import vesuvius.neural_tracing.augmentation as augmentation
 
@@ -24,9 +23,6 @@ class Patch:
     zyxs: torch.Tensor
     scale: torch.Tensor
     volume: zarr.Array
-    tifxyz_path: Optional[str] = None
-
-    _tifxyz_cache: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
@@ -37,22 +33,12 @@ class Patch:
         self.area = self.valid_quad_mask.sum() * (1 / self.scale).prod()
         self.quad_centers = torch.where(self.valid_quad_mask[..., None], 0.5 * (self.zyxs[1:, 1:] + self.zyxs[:-1, :-1]), torch.tensor(-1.))
 
-    def get_tifxyz(self):
-        """Lazily load and cache the Tifxyz object for high-res access."""
-        if self._tifxyz_cache is None:
-            if self.tifxyz_path is None:
-                raise ValueError("No tifxyz_path set for this Patch")
-            from vesuvius.tifxyz import read_tifxyz
-            self._tifxyz_cache = read_tifxyz(self.tifxyz_path)
-        return self._tifxyz_cache
-
     def retarget(self, factor):
         # Retarget the patch to a volume downsampled by the given factor
         return Patch(
             torch.where((self.zyxs == -1).all(dim=-1, keepdim=True), -1, self.zyxs / factor),
             self.scale * factor,
-            self.volume,
-            self.tifxyz_path
+            self.volume
         )
 
 class HeatmapDatasetV2(torch.utils.data.IterableDataset):
@@ -67,13 +53,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._multistep_count = multistep_count
         self._bidirectional = bidirectional
         self._heatmap_sigma = float(config.get('heatmap_sigma', 2.0))
-        aug_config = config.get('augmentation', {})
-        self._augmentations = augmentation.get_training_augmentations(
-            config['crop_size'],
-            aug_config.get('allow_transposes', True),
-            aug_config.get('allow_mirroring', True),
-            aug_config.get('only_spatial_and_intensity', False)
-        )
+        self._augmentations = augmentation.get_training_augmentations(config['crop_size'], config['augmentation']['allow_transposes'],config['augmentation']['allow_mirroring'], config['augmentation']['only_spatial_and_intensity'])
         self._perturb_prob = config['point_perturbation']['perturb_probability']
         self._uv_max_perturbation = config['point_perturbation']['uv_max_perturbation']  # measured in voxels
         self._w_max_perturbation = config['point_perturbation']['w_max_perturbation']  # measured in voxels
@@ -888,14 +868,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             #  the center-point, since the heatmaps do, but not follow rotations/scales; however in practice maybe
             #  ok since it's 'just more augmentation' that won't be applied during tracing
             uv_channels = uv_heatmaps_both.shape[0]
-            has_center_heatmap = maybe_center_heatmap is not None
-            has_srf_overlap_mask = srf_overlap_mask is not None
-            regression_parts = [uv_heatmaps_both]
-            if has_center_heatmap:
-                regression_parts.append(maybe_center_heatmap)
-            if has_srf_overlap_mask:
-                regression_parts.append(srf_overlap_mask.unsqueeze(0))
-            regression_target = torch.cat(regression_parts, dim=0)
+            regression_target = torch.cat([uv_heatmaps_both] + ([maybe_center_heatmap] if maybe_center_heatmap is not None else []), dim=0)
             seg_for_aug = seg[None] if seg is not None else None
             while True:
                 augmented = self._augmentations(
@@ -912,16 +885,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
-            channel_idx = uv_channels
-            if has_center_heatmap:
-                maybe_center_heatmap = regression_aug[..., channel_idx]
-                channel_idx += 1
-            else:
-                maybe_center_heatmap = None
-            if has_srf_overlap_mask:
-                srf_overlap_mask = regression_aug[..., channel_idx]
-                # Re-binarize after augmentation (interpolation may have created non-binary values)
-                srf_overlap_mask = (srf_overlap_mask > 0.5).float()
+            maybe_center_heatmap = regression_aug[..., uv_channels] if uv_channels < regression_aug.shape[-1] else None
             if seg is not None:
                 seg_aug = augmented.get('segmentation', None)
                 if seg_aug is None:
@@ -980,7 +944,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 normals=normals,
                 normals_mask=normals_mask,
                 center_heatmap=maybe_center_heatmap,
-                srf_overlap_mask=srf_overlap_mask if has_srf_overlap_mask else None,
             )
 
             yield batch_dict
@@ -1105,7 +1068,7 @@ def load_tifxyz_patches(segments_path, z_range, volume):
                 cv2.imread( f'{segment_path}/{coord}.tif', flags=cv2.IMREAD_UNCHANGED)
                 for coord in 'zyx'
             ], axis=-1))
-            all_patches.append(Patch(zyxs, scale, volume, tifxyz_path=segment_path))
+            all_patches.append(Patch(zyxs, scale, volume))
         except Exception as e:
             print(f'error loading {segment_path}: {e}')
             continue

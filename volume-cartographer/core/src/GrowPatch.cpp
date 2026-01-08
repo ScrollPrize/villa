@@ -1887,6 +1887,12 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
+
+        // If resume_generations is specified, override stop_gen to grow that many more from current
+        if (params.contains("resume_generations")) {
+            stop_gen = start_gen + params["resume_generations"].get<int>();
+        }
+
         int gen_diff = std::max(0, stop_gen - start_gen);
         w = resume_generations.cols + 2 * gen_diff + 50;
         h = resume_generations.rows + 2 * gen_diff + 50;
@@ -2441,9 +2447,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
     ceres::Solver::Summary big_summary;
-    //just continue on resume no additional global opt	
+    //just continue on resume no additional global opt
     if (!resume_surf) {
-        if (!neural_tracer) {
+        if (!neural_tracer || pre_neural_gens > 0) {
             local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
         }
     }
@@ -2872,6 +2878,18 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
         if (neural_tracer && generation > pre_neural_gens) {
             // Skip optimizations
+        } else if (neural_tracer && generation == pre_neural_gens) {
+            // Run global optimization on the last pre-neural generation before handing off to neural tracer
+            std::cout << "Running global optimization before neural tracer handoff..." << std::endl;
+            cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
+
+            AntiFlipbackConfig flipback_config;
+            flipback_config.anchors = &positions_before_opt;
+            flipback_config.surface_normals = &surface_normals;
+            flipback_config.threshold = loss_settings.flipback_threshold;
+            flipback_config.weight = loss_settings.flipback_weight;
+
+            local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true, nullptr, &flipback_config);
         } else if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
             // of the newly added points
