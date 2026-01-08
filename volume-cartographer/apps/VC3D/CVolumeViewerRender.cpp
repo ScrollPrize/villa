@@ -1,4 +1,5 @@
 #include "CVolumeViewer.hpp"
+#include "ViewerManager.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 
 #include "VolumeViewerCmaps.hpp"
@@ -652,42 +653,25 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
         }
     }
 
-    // Surface overlap detection
+    // Surface overlap detection using SurfacePatchIndex
     if (_surfaceOverlayEnabled && !_surfaceOverlayName.empty() && _surf_col && !baseColor.empty()) {
         auto overlaySurf = _surf_col->surface(_surfaceOverlayName);
-        if (overlaySurf && overlaySurf != surf) {
-            cv::Mat_<cv::Vec3f> overlayCoords;
-
-            // Generate coordinates for overlay surface using the same ROI parameters
-            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-                overlaySurf->gen(&overlayCoords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale,
-                               {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
-            } else {
-                cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
-                auto overlayPtr = overlaySurf->pointer();
-                cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
-                overlaySurf->move(overlayPtr, diff / _scale);
-                overlaySurf->gen(&overlayCoords, nullptr, roi.size(), overlayPtr, _scale,
-                               {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
-            }
-
-            // Compute distances and create overlap mask
-            if (!overlayCoords.empty() && overlayCoords.size() == coords.size()) {
+        auto overlayQuad = std::dynamic_pointer_cast<QuadSurface>(overlaySurf);
+        if (overlayQuad && overlaySurf != surf && _viewerManager) {
+            auto* patchIndex = _viewerManager->surfacePatchIndex();
+            if (patchIndex) {
                 cv::Mat_<uint8_t> overlapMask(baseColor.size(), uint8_t(0));
 
+                // For each base surface point, query distance to overlay surface
                 #pragma omp parallel for collapse(2)
                 for (int y = 0; y < coords.rows; ++y) {
                     for (int x = 0; x < coords.cols; ++x) {
                         const cv::Vec3f& basePos = coords(y, x);
-                        const cv::Vec3f& overlayPos = overlayCoords(y, x);
-
-                        // Check if both positions are valid (not -1)
-                        if (basePos[0] >= 0 && overlayPos[0] >= 0) {
-                            // Compute Euclidean distance
-                            cv::Vec3f diff = basePos - overlayPos;
-                            float distance = std::sqrt(diff.dot(diff));
-
-                            if (distance < _surfaceOverlapThreshold) {
+                        // Check if position is valid (not -1)
+                        if (basePos[0] >= 0) {
+                            // Use SurfacePatchIndex to find nearest point on overlay surface
+                            auto result = patchIndex->locate(basePos, _surfaceOverlapThreshold, overlayQuad);
+                            if (result && result->distance < _surfaceOverlapThreshold) {
                                 overlapMask(y, x) = 255;
                             }
                         }
