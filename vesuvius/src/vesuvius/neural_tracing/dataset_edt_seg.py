@@ -11,7 +11,7 @@ from typing import Tuple
 from dataclasses import dataclass
 from vesuvius.tifxyz import Tifxyz
 
-from vesuvius.neural_tracing import augmentation
+from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 
 import os                                                                                                               
@@ -134,9 +134,18 @@ class EdtSegDataset(Dataset):
         self.config = config
         self.apply_augmentation = apply_augmentation
 
-        self.crop_size = int(config.get('crop_size', 128))
-        target_size = (self.crop_size, self.crop_size, self.crop_size)
-        self._heatmap_axis = torch.arange(self.crop_size, dtype=torch.float32)
+        # Parse crop_size - can be int (cubic) or list of 3 ints [D, H, W]
+        crop_size_cfg = config.get('crop_size', 128)
+        if isinstance(crop_size_cfg, (list, tuple)):
+            if len(crop_size_cfg) != 3:
+                raise ValueError(f"crop_size must be an int or a list of 3 ints, got {crop_size_cfg}")
+            self.crop_size = tuple(int(x) for x in crop_size_cfg)
+        else:
+            size = int(crop_size_cfg)
+            self.crop_size = (size, size, size)
+
+        target_size = self.crop_size
+        self._heatmap_axes = [torch.arange(s, dtype=torch.float32) for s in self.crop_size]
 
         config.setdefault('use_sdf', True)
         config.setdefault('dilation_radius', 1)  # voxels
@@ -144,11 +153,11 @@ class EdtSegDataset(Dataset):
         # Setup augmentations
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
-            self._augmentations = augmentation.get_training_augmentations(
-                self.crop_size,
-                aug_config.get('allow_transposes', True),
-                aug_config.get('allow_mirroring', True),
-                aug_config.get('only_spatial_and_intensity', False)
+            self._augmentations = create_training_transforms(
+                patch_size=self.crop_size,
+                no_spatial=False,
+                no_scaling=False,
+                only_spatial_and_intensity=aug_config.get('only_spatial_and_intensity', False),
             )
         else:
             self._augmentations = None
@@ -205,13 +214,13 @@ class EdtSegDataset(Dataset):
         if isinstance(volume, zarr.Group):
             volume = volume[str(patch.scale)]
 
-        crop_size = self.crop_size
-        target_shape = (crop_size, crop_size, crop_size)
+        crop_size = self.crop_size  # tuple (D, H, W)
+        target_shape = crop_size
 
         # world_bbox is centered on surface centroid and extends to target size
         z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
         min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
-        max_corner = min_corner + crop_size
+        max_corner = min_corner + np.array(crop_size)
 
         vol_crop = np.zeros(target_shape, dtype=volume.dtype)
         vol_shape = volume.shape

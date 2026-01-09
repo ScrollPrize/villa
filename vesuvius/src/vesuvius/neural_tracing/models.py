@@ -113,7 +113,12 @@ def _config_dict_to_mgr(config_dict):
 
     mgr = SimpleNamespace()
     mgr.model_config = model_config
-    mgr.train_patch_size = tuple([config_dict['crop_size']] * 3)
+    # Handle crop_size as int (cubic) or list [D, H, W]
+    crop_size = config_dict['crop_size']
+    if isinstance(crop_size, (list, tuple)):
+        mgr.train_patch_size = tuple(crop_size)
+    else:
+        mgr.train_patch_size = (crop_size, crop_size, crop_size)
     mgr.train_batch_size = int(config_dict.get('batch_size', 1))
     if 'in_channels' in config_dict:
         mgr.in_channels = int(config_dict['in_channels'])

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from cachetools import LRUCache
 
 from vesuvius.neural_tracing.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
+from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.models.run.tta import infer_with_tta
 
 
@@ -36,11 +37,13 @@ class CropCache:
         max_memory_bytes: int = 4 * 1024**3,
         num_workers: int = 4,
         prefetch_queue_size: int = 64,
+        normalize: bool = True,
     ):
         self.volume = volume
         self.crop_size = crop_size
         self.supercrop_size = crop_size * 2  # Cache 2x larger crops for spatial reuse
         self.num_workers = num_workers
+        self.normalize = normalize
 
         # Estimate max items based on memory budget
         # Each supercrop is supercrop_size^3 * 4 bytes (float32) + min_corner (3 * 8 bytes)
@@ -122,7 +125,7 @@ class CropCache:
                 supercrop_size = key[3]
 
                 # Fetch the supercrop (I/O releases GIL)
-                crop, min_corner = get_crop_from_volume(self.volume, supercrop_center, supercrop_size)
+                crop, min_corner = get_crop_from_volume(self.volume, supercrop_center, supercrop_size, normalize=self.normalize)
 
                 # Store in cache
                 with self._cache_lock:
@@ -165,7 +168,7 @@ class CropCache:
         # Cache miss - fetch supercrop synchronously
         self._stats['misses'] += 1
         supercrop_center = self._key_to_center(key)
-        supercrop, supercrop_min_corner = get_crop_from_volume(self.volume, supercrop_center, self.supercrop_size)
+        supercrop, supercrop_min_corner = get_crop_from_volume(self.volume, supercrop_center, self.supercrop_size, normalize=self.normalize)
 
         with self._cache_lock:
             self._cache[key] = (supercrop, supercrop_min_corner)
@@ -286,7 +289,7 @@ class Inference:
         else:
             self._base_localiser = None
 
-    def get_heatmaps_at(self, zyx, prev_u, prev_v, prev_diag):
+    def get_heatmaps_at(self, zyx, prev_u, prev_v, prev_diag, return_debug: bool = False):
         if isinstance(zyx, torch.Tensor) and zyx.ndim == 1:
             zyx = zyx[None]
             prev_u = [prev_u]
@@ -314,6 +317,13 @@ class Inference:
         CH_V = 3 if use_localiser else 2
         CH_DIAG = 4 if use_localiser else 3
 
+        # For debug output (only first sample if batched)
+        debug_volume_crop = None
+        debug_localiser = None
+        debug_prev_u_hm = None
+        debug_prev_v_hm = None
+        debug_prev_diag_hm = None
+
         min_corner_zyxs = []
         for idx in range(len(zyx)):
             if self.crop_cache is not None:
@@ -334,6 +344,14 @@ class Inference:
             inputs_cpu[idx, CH_U] = prev_u_hm[0]
             inputs_cpu[idx, CH_V] = prev_v_hm[0]
             inputs_cpu[idx, CH_DIAG] = prev_diag_hm[0]
+
+            # Capture debug data from first sample only
+            if return_debug and idx == 0:
+                debug_volume_crop = volume_crop.clone()
+                debug_localiser = localiser.clone() if use_localiser else None
+                debug_prev_u_hm = prev_u_hm[0].clone()
+                debug_prev_v_hm = prev_v_hm[0].clone()
+                debug_prev_diag_hm = prev_diag_hm[0].clone()
 
         inputs = inputs_cpu.to(self.device, non_blocking=True)
         min_corner_zyxs = torch.stack(min_corner_zyxs)
@@ -358,6 +376,17 @@ class Inference:
         if not_originally_batched:
             probs = probs.squeeze(0)
             min_corner_zyxs = min_corner_zyxs.squeeze(0)
+
+        if return_debug:
+            debug_data = {
+                'volume_crop': debug_volume_crop,
+                'localiser': debug_localiser,
+                'prev_u_hm': debug_prev_u_hm,
+                'prev_v_hm': debug_prev_v_hm,
+                'prev_diag_hm': debug_prev_diag_hm,
+                'model_input': inputs_cpu[0].clone(),  # First sample's full input
+            }
+            return probs, min_corner_zyxs, debug_data
 
         return probs, min_corner_zyxs
 
@@ -390,3 +419,208 @@ class Inference:
             centroid_zyxs = np.empty((0, 3), dtype=np.float32)
 
         return torch.from_numpy(centroid_zyxs)
+
+
+class EdtInference:
+    """Inference wrapper for EDT-trained distance transform models."""
+
+    def __init__(self, model, config, volume_zarr, volume_scale):
+
+        dynamo_plugin = TorchDynamoPlugin(
+            backend="inductor",
+            mode="default",
+            fullgraph=False,
+            dynamic=False,
+            use_regional_compilation=False
+        )
+
+        self.accelerator = accelerate.Accelerator(
+            mixed_precision=config['mixed_precision'],
+            dynamo_plugin=dynamo_plugin
+        )
+
+        self.model = self.accelerator.prepare(model)
+        self.device = self.accelerator.device
+        self.config = config
+
+        self.model.eval()
+
+        print(f"loading volume zarr {volume_zarr}...")
+        ome_zarr = zarr.open_group(volume_zarr, mode='r')
+        self.volume = ome_zarr[str(volume_scale)]
+        with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
+            self.voxel_size_um = json.load(meta_fp)['voxelsize']
+        print(f"volume shape: {self.volume.shape}, dtype: {self.volume.dtype}, voxel-size: {self.voxel_size_um * 2 ** volume_scale}um")
+
+        # cache for prefetching (normalize=False to allow z-score normalization)
+        self.use_crop_cache = config.get('use_crop_cache', True)
+        if self.use_crop_cache:
+            cache_gb = config.get('crop_cache_gb', 4)
+            num_workers = config.get('prefetch_workers', 4)
+            self.crop_cache = CropCache(
+                volume=self.volume,
+                crop_size=config['crop_size'],
+                max_memory_bytes=int(cache_gb * 1024**3),
+                num_workers=num_workers,
+                normalize=False,
+            )
+        else:
+            self.crop_cache = None
+
+    def get_distance_transform_at(
+        self,
+        center_zyx: torch.Tensor,
+        conditioning_mask: torch.Tensor,
+        return_debug: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run EDT inference at a given center point.
+
+        Args:
+            center_zyx: Center coordinates in volume space (scaled), shape [3]
+            conditioning_mask: Binary/float mask indicating known surface regions,
+                             shape [D, H, W], must match crop_size from config
+            return_debug: If True, return a third element with debug data dict
+
+        Returns:
+            distance_transform: [D, H, W] float32 distance transform output
+            min_corner_zyx: [3] coordinates of crop origin in volume space
+            debug_data: (only if return_debug=True) dict with intermediate tensors
+        """
+        crop_size = self.config['crop_size']
+
+        # Validate conditioning mask shape
+        expected_shape = (crop_size, crop_size, crop_size)
+        if conditioning_mask.shape != expected_shape:
+            raise ValueError(f"conditioning_mask shape {conditioning_mask.shape} != expected {expected_shape}")
+
+        # Get volume crop (raw, without [-1,1] normalization)
+        if self.crop_cache is not None:
+            volume_crop_raw, min_corner_zyx = self.crop_cache.get(center_zyx)
+        else:
+            volume_crop_raw, min_corner_zyx = get_crop_from_volume(self.volume, center_zyx, crop_size, normalize=False)
+
+        # Apply z-score normalization to match training
+        volume_crop_zscore = torch.from_numpy(normalize_zscore(volume_crop_raw.numpy()))
+
+        # Build 2-channel input: [volume, conditioning]
+        inputs = torch.stack([volume_crop_zscore, conditioning_mask], dim=0)
+        inputs = inputs.unsqueeze(0).to(self.device)  # [1, 2, D, H, W]
+
+        with torch.no_grad(), torch.autocast('cuda'):
+            outputs = self.model(inputs)
+            dt = outputs['dt']  # [B, 1, D, H, W]
+            if isinstance(dt, (list, tuple)):
+                dt = dt[0]  # Handle deep supervision
+
+        dt_cpu = dt[0, 0].cpu()
+
+        if return_debug:
+            debug_data = {
+                'volume_crop_raw': volume_crop_raw,
+                'volume_crop_zscore': volume_crop_zscore,
+                'model_input': inputs[0].cpu(),  # [2, D, H, W]
+            }
+            return dt_cpu, min_corner_zyx, debug_data
+
+        return dt_cpu, min_corner_zyx
+
+    def get_distance_transform_batch(
+        self,
+        centers_zyx: List[torch.Tensor],
+        conditioning_masks: List[torch.Tensor],
+    ) -> List[Tuple[torch.Tensor, torch.Tensor, bool, str]]:
+        """
+        Run batched EDT inference for multiple samples.
+
+        Args:
+            centers_zyx: List of center coordinates in volume space (scaled), each shape [3]
+            conditioning_masks: List of conditioning masks, each shape [D, H, W] or None if failed
+
+        Returns:
+            List of tuples: (distance_transform, min_corner_zyx, success, error_message)
+            - distance_transform: [D, H, W] float32 (empty if failed)
+            - min_corner_zyx: [3] coordinates of crop origin
+            - success: bool indicating if this sample succeeded
+            - error_message: string describing failure (empty if success)
+        """
+        crop_size = self.config['crop_size']
+        batch_size = len(centers_zyx)
+
+        # Initialize results with failures
+        results: List[Tuple[torch.Tensor, torch.Tensor, bool, str]] = [
+            (torch.empty(0), torch.zeros(3), False, "Not processed")
+            for _ in range(batch_size)
+        ]
+
+        # Track which samples are valid
+        valid_indices = []
+
+        # Pre-validate samples
+        expected_shape = (crop_size, crop_size, crop_size)
+        for i, (center_zyx, mask) in enumerate(zip(centers_zyx, conditioning_masks)):
+            if mask is None:
+                results[i] = (torch.empty(0), torch.zeros(3), False, "Conditioning mask is None")
+                continue
+
+            if mask.shape != expected_shape:
+                results[i] = (torch.empty(0), torch.zeros(3), False,
+                             f"Mask shape {mask.shape} != expected {expected_shape}")
+                continue
+
+            valid_indices.append(i)
+
+        if not valid_indices:
+            return results
+
+        # Gather volume crops and build batched input
+        volume_crops = []
+        min_corner_zyxs = []
+        valid_masks = []
+
+        for i in valid_indices:
+            center_zyx = centers_zyx[i]
+            mask = conditioning_masks[i]
+
+            # Get volume crop (raw, without [-1,1] normalization)
+            if self.crop_cache is not None:
+                volume_crop_raw, min_corner_zyx = self.crop_cache.get(center_zyx)
+            else:
+                volume_crop_raw, min_corner_zyx = get_crop_from_volume(
+                    self.volume, center_zyx, crop_size, normalize=False
+                )
+
+            # Apply z-score normalization
+            volume_crop_zscore = torch.from_numpy(normalize_zscore(volume_crop_raw.numpy()))
+
+            volume_crops.append(volume_crop_zscore)
+            min_corner_zyxs.append(min_corner_zyx)
+            valid_masks.append(mask)
+
+        # Stack into batch tensors
+        # inputs shape: [N_valid, 2, D, H, W]
+        inputs = torch.stack([
+            torch.stack([vol, mask], dim=0)
+            for vol, mask in zip(volume_crops, valid_masks)
+        ], dim=0).to(self.device)
+
+        print(f"[EDT_BATCH_INFER] Input tensor shape: {inputs.shape}", flush=True)
+
+        # Run batched inference
+        with torch.no_grad(), torch.autocast('cuda'):
+            outputs = self.model(inputs)
+            dt_batch = outputs['dt']  # [N_valid, 1, D, H, W]
+            if isinstance(dt_batch, (list, tuple)):
+                dt_batch = dt_batch[0]  # Handle deep supervision
+
+        print(f"[EDT_BATCH_INFER] Output tensor shape: {dt_batch.shape}", flush=True)
+
+        # Unpack results back to original indices
+        dt_batch_cpu = dt_batch[:, 0].cpu()  # [N_valid, D, H, W]
+
+        for batch_idx, orig_idx in enumerate(valid_indices):
+            dt = dt_batch_cpu[batch_idx]
+            min_corner = min_corner_zyxs[batch_idx]
+            results[orig_idx] = (dt, min_corner, True, "")
+
+        return results
