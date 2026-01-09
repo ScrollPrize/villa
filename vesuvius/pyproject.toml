@@ -6,10 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "vesuvius"
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.10,<3.13"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -31,6 +30,7 @@ dependencies = [
     "numcodecs>=0.12.1",
     "zarr>=2,<3",
     "s3fs>=2025.9.0",
+    "cachetools>=6.2.4",
 ]
 
 [project.optional-dependencies]
@@ -48,8 +48,7 @@ volume-only = [
 ]
 # Machine-learning & training stack
 models = [
-    "torch>=2.6",
-    "flash-attn @ git+https://github.com/Dao-AILab/flash-attention.git",
+    "torch>=2.6,<2.9",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
     "monai>=1.5.1",
@@ -78,6 +77,7 @@ models = [
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
     "lxml>=6.0.2",
+    "cucim-cu13>=25.12",
 ]
 # Rendering and geometry utilities
 render = [
@@ -112,8 +112,7 @@ tests = ["pytest>=8.4.2"]
 # Convenience alias to install everything
 all = [
     # Machine-learning & training stack
-    "torch>=2.6",
-    "flash-attn @ git+https://github.com/Dao-AILab/flash-attention.git",
+    "torch>=2.6,<2.9",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
     "monai>=1.5.1",
@@ -211,8 +210,12 @@ version = {attr = "vesuvius._version.VERSION"}
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
-extra-build-dependencies = { "flash-attn" = ["torch"] }
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
 
 [tool.uv.sources]
+cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }

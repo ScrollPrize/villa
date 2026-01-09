@@ -63,6 +63,7 @@ class SegmentationGrower;
 class WindowRangeWidget;
 class QLabel;
 class QTemporaryFile;
+class QStandardItemModel;
 
 class CWindow : public QMainWindow
 {
@@ -147,6 +148,9 @@ private:
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void updateSurfaceOverlayDropdown();
+    void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
+    QColor getOverlayColor(size_t index) const;
+    cv::Vec3b getOverlayColorBGR(size_t index) const;
 
 private slots:
     void onSegmentationDirChanged(int index);
@@ -226,6 +230,11 @@ private:
     bool _useAxisAlignedSlices{false};
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
+
+    // Surface overlay multi-select state
+    std::map<std::string, size_t> _surfaceOverlayColorAssignments;
+    size_t _nextSurfaceOverlayColorIndex{0};
+    QStandardItemModel* _surfaceOverlayModel{nullptr};
 
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;

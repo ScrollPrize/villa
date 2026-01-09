@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
@@ -514,10 +515,15 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     std::vector<std::string> surfaceIds;
     quadSurfaces.reserve(allSurfaces.size());
     surfaceIds.reserve(allSurfaces.size());
+    // Track seen surfaces to avoid duplicates (e.g., "segmentation" alias)
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
     for (const auto& surface : allSurfaces) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surface)) {
-            quadSurfaces.push_back(quad);
-            surfaceIds.push_back(surface->id);
+            // Skip if we've already seen this surface (shared_ptr hash uses underlying pointer)
+            if (seenSurfaces.insert(quad).second) {
+                quadSurfaces.push_back(quad);
+                surfaceIds.push_back(surface->id);
+            }
         }
     }
     _pendingSurfacePatchIndexSurfaceIds = surfaceIds;
@@ -584,10 +590,14 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
 
     std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
     std::vector<std::string> surfaceIds;
+    // Track seen surfaces to avoid duplicates (e.g., "segmentation" alias)
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
     for (const auto& surf : _surfaces->surfaces()) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-            surfaces.push_back(quad);
-            surfaceIds.push_back(surf->id);
+            if (seenSurfaces.insert(quad).second) {
+                surfaces.push_back(quad);
+                surfaceIds.push_back(surf->id);
+            }
         }
     }
 

@@ -6,7 +6,7 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
-from vesuvius.models.utilities.utils import maybe_convert_scalar_to_list, get_matching_pool_op, DropPath, SqueezeExcite
+from vesuvius.models.utilities.utils import maybe_convert_scalar_to_list, get_matching_pool_op, DropPath, SqueezeExcite, create_attention_module
 from .simple_conv_blocks import ConvDropoutNormReLU
 from .activations import SwiGLUBlock, GLUBlock
 import numpy as np
@@ -29,6 +29,8 @@ class BasicBlockD(nn.Module):
                  stochastic_depth_p: float = 0.0,
                  squeeze_excitation: bool = False,
                  squeeze_excitation_reduction_ratio: float = 1. / 16,
+                 squeeze_excitation_type: str = "channel",
+                 squeeze_excitation_add_maxpool: bool = False,
                  # todo wideresnet?
                  ):
         """
@@ -87,11 +89,17 @@ class BasicBlockD(nn.Module):
         if self.apply_stochastic_depth:
             self.drop_path = DropPath(drop_prob=stochastic_depth_p)
 
-        # Squeeze Excitation
+        # Squeeze Excitation / Attention
         self.apply_se = squeeze_excitation
         if self.apply_se:
-            self.squeeze_excitation = SqueezeExcite(self.output_channels, conv_op,
-                                                    rd_ratio=squeeze_excitation_reduction_ratio, rd_divisor=8)
+            self.squeeze_excitation = create_attention_module(
+                attention_type=squeeze_excitation_type,
+                channels=self.output_channels,
+                conv_op=conv_op,
+                rd_ratio=squeeze_excitation_reduction_ratio,
+                rd_divisor=8,
+                add_maxpool=squeeze_excitation_add_maxpool
+            )
 
         has_stride = (isinstance(stride, int) and stride != 1) or any([i != 1 for i in stride])
         requires_projection = (input_channels != output_channels)
@@ -156,7 +164,9 @@ class BottleneckD(nn.Module):
                  nonlin_kwargs: dict = None,
                  stochastic_depth_p: float = 0.0,
                  squeeze_excitation: bool = False,
-                 squeeze_excitation_reduction_ratio: float = 1. / 16
+                 squeeze_excitation_reduction_ratio: float = 1. / 16,
+                 squeeze_excitation_type: str = "channel",
+                 squeeze_excitation_add_maxpool: bool = False,
                  ):
         """
         This implementation follows ResNet-D:
@@ -219,11 +229,17 @@ class BottleneckD(nn.Module):
         if self.apply_stochastic_depth:
             self.drop_path = DropPath(drop_prob=stochastic_depth_p)
 
-        # Squeeze Excitation
+        # Squeeze Excitation / Attention
         self.apply_se = squeeze_excitation
         if self.apply_se:
-            self.squeeze_excitation = SqueezeExcite(self.output_channels, conv_op,
-                                                    rd_ratio=squeeze_excitation_reduction_ratio, rd_divisor=8)
+            self.squeeze_excitation = create_attention_module(
+                attention_type=squeeze_excitation_type,
+                channels=self.output_channels,
+                conv_op=conv_op,
+                rd_ratio=squeeze_excitation_reduction_ratio,
+                rd_divisor=8,
+                add_maxpool=squeeze_excitation_add_maxpool
+            )
 
         has_stride = (isinstance(stride, int) and stride != 1) or any([i != 1 for i in stride])
         requires_projection = (input_channels != output_channels)
@@ -292,7 +308,9 @@ class StackedResidualBlocks(nn.Module):
                  bottleneck_channels: Union[int, List[int], Tuple[int, ...]] = None,
                  stochastic_depth_p: float = 0.0,
                  squeeze_excitation: bool = False,
-                 squeeze_excitation_reduction_ratio: float = 1. / 16
+                 squeeze_excitation_reduction_ratio: float = 1. / 16,
+                 squeeze_excitation_type: str = "channel",
+                 squeeze_excitation_add_maxpool: bool = False,
                  ):
         """
         Stack multiple instances of block.
@@ -334,20 +352,24 @@ class StackedResidualBlocks(nn.Module):
             blocks = nn.Sequential(
                 block(conv_op, input_channels, output_channels[0], kernel_size, initial_stride, conv_bias,
                       norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, stochastic_depth_p,
-                      squeeze_excitation, squeeze_excitation_reduction_ratio),
+                      squeeze_excitation, squeeze_excitation_reduction_ratio, squeeze_excitation_type,
+                      squeeze_excitation_add_maxpool),
                 *[block(conv_op, output_channels[n - 1], output_channels[n], kernel_size, 1, conv_bias, norm_op,
                         norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, stochastic_depth_p,
-                        squeeze_excitation, squeeze_excitation_reduction_ratio) for n in range(1, n_blocks)]
+                        squeeze_excitation, squeeze_excitation_reduction_ratio, squeeze_excitation_type,
+                        squeeze_excitation_add_maxpool) for n in range(1, n_blocks)]
             )
         else:
             blocks = nn.Sequential(
                 block(conv_op, input_channels, bottleneck_channels[0], output_channels[0], kernel_size,
                       initial_stride, conv_bias, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
-                      nonlin, nonlin_kwargs, stochastic_depth_p, squeeze_excitation, squeeze_excitation_reduction_ratio),
+                      nonlin, nonlin_kwargs, stochastic_depth_p, squeeze_excitation, squeeze_excitation_reduction_ratio,
+                      squeeze_excitation_type, squeeze_excitation_add_maxpool),
                 *[block(conv_op, output_channels[n - 1], bottleneck_channels[n], output_channels[n], kernel_size,
                         1, conv_bias, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
                         nonlin, nonlin_kwargs, stochastic_depth_p, squeeze_excitation,
-                        squeeze_excitation_reduction_ratio) for n in range(1, n_blocks)]
+                        squeeze_excitation_reduction_ratio, squeeze_excitation_type,
+                        squeeze_excitation_add_maxpool) for n in range(1, n_blocks)]
             )
         self.blocks = blocks
         self.initial_stride = maybe_convert_scalar_to_list(conv_op, initial_stride)

@@ -16,9 +16,14 @@ from vesuvius.neural_tracing.infer import Inference
 @click.option('--volume_zarr', type=click.Path(exists=True), required=True, help='Path to ome-zarr folder')
 @click.option('--volume_scale', type=int, required=True, help='OME scale to use')
 @click.option('--socket_path', type=click.Path(), required=True, help='Path to Unix domain socket')
-def serve(checkpoint_path, volume_zarr, volume_scale, socket_path):
+@click.option('--no-cache', is_flag=True, help='Disable crop cache')
+
+def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, no_cache):
 
     model, config = load_checkpoint(checkpoint_path)
+
+    if no_cache:
+        config['use_crop_cache'] = False
 
     random.seed(config['seed'])
     np.random.seed(config['seed'])

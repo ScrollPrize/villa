@@ -8,8 +8,17 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 from vesuvius.neural_tracing.models import make_model, load_checkpoint
-from vesuvius.neural_tracing.infer import Inference
+from vesuvius.neural_tracing.infer import Inference, is_slots_model
 from vesuvius.neural_tracing.tifxyz import save_tifxyz, get_area
+
+
+# Slot constants for slots-based tracing
+SLOT_U_NEG = 0  # above (i-1, j)
+SLOT_U_POS = 1  # below (i+1, j)
+SLOT_V_NEG = 2  # left (i, j-1)
+SLOT_V_POS = 3  # right (i, j+1)
+SLOT_DIAG_IN = 4  # diagonal input (index in conditioning tensor)
+SLOT_DIAG_OUT = 4  # diagonal output (index in output tensor; same index, different tensor)
 
 
 @click.command()
@@ -457,6 +466,306 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
 
         return patch, gens
 
+    def get_known_slots_for_gap(center_ij, gap_ij, patch, in_patch_fn):
+        """
+        Map grid neighbors to known slot dictionary for slots-based inference.
+
+        Slot mapping (fixed cardinal):
+            0: u_neg (above, i-1,j)
+            1: u_pos (below, i+1,j)
+            2: v_neg (left, i,j-1)
+            3: v_pos (right, i,j+1)
+            4: diag_in (diagonal opposite to gap)
+        """
+        known_slots = {}
+        diag_in_ij = None
+        i, j = center_ij
+        gap_i, gap_j = gap_ij
+
+        # Check each cardinal neighbor of center (excluding gap)
+        # above (i-1, j) -> slot 0 (u_neg)
+        if in_patch_fn((i - 1, j)) and not (gap_i == i - 1 and gap_j == j):
+            known_slots[SLOT_U_NEG] = torch.from_numpy(patch[i - 1, j].astype(np.float32))
+
+        # below (i+1, j) -> slot 1 (u_pos)
+        if in_patch_fn((i + 1, j)) and not (gap_i == i + 1 and gap_j == j):
+            known_slots[SLOT_U_POS] = torch.from_numpy(patch[i + 1, j].astype(np.float32))
+
+        # left (i, j-1) -> slot 2 (v_neg)
+        if in_patch_fn((i, j - 1)) and not (gap_i == i and gap_j == j - 1):
+            known_slots[SLOT_V_NEG] = torch.from_numpy(patch[i, j - 1].astype(np.float32))
+
+        # right (i, j+1) -> slot 3 (v_pos)
+        if in_patch_fn((i, j + 1)) and not (gap_i == i and gap_j == j + 1):
+            known_slots[SLOT_V_POS] = torch.from_numpy(patch[i, j + 1].astype(np.float32))
+
+        # Diagonal (slot 4) - pick a valid diagonal opposite to gap
+        # If gap is above/below, look for diagonals in the opposite u direction
+        # If gap is left/right, look for diagonals in the opposite v direction
+        diag_found = False
+        if gap_i != i:  # gap is above or below
+            diag_u = i + (i - gap_i)  # opposite direction from gap
+            for diag_j in [j - 1, j + 1]:
+                if in_patch_fn((diag_u, diag_j)):
+                    known_slots[SLOT_DIAG_IN] = torch.from_numpy(patch[diag_u, diag_j].astype(np.float32))
+                    diag_in_ij = (diag_u, diag_j)
+                    diag_found = True
+                    break
+        if not diag_found and gap_j != j:  # gap is left or right
+            diag_v = j + (j - gap_j)  # opposite direction from gap
+            for diag_i in [i - 1, i + 1]:
+                if in_patch_fn((diag_i, diag_v)):
+                    known_slots[SLOT_DIAG_IN] = torch.from_numpy(patch[diag_i, diag_v].astype(np.float32))
+                    diag_in_ij = (diag_i, diag_v)
+                    break
+
+        return known_slots, diag_in_ij
+
+    def get_output_slot_for_gap(center_ij, gap_ij):
+        """Determine which output slot corresponds to the gap direction."""
+        i, j = center_ij
+        gap_i, gap_j = gap_ij
+
+        if gap_i < i:  # gap is above
+            return SLOT_U_NEG
+        elif gap_i > i:  # gap is below
+            return SLOT_U_POS
+        elif gap_j < j:  # gap is left
+            return SLOT_V_NEG
+        else:  # gap is right
+            return SLOT_V_POS
+
+    def get_diag_out_ij(center_ij, gap_ij, diag_in_ij):
+        """Infer diag_out grid location from the selected diag_in and gap direction."""
+        if diag_in_ij is None:
+            return None
+        i, j = center_ij
+        gap_i, gap_j = gap_ij
+        diag_in_i, diag_in_j = diag_in_ij
+        if gap_i != i:  # gap is above or below
+            return (gap_i, diag_in_j)
+        if gap_j != j:  # gap is left or right
+            return (diag_in_i, gap_j)
+        return None
+
+    def trace_patch_v5_slots(start_zyx, max_size):
+        """
+        Trace a patch using slots-based model with fixed cardinal slot mapping.
+
+        Slot layout:
+            0: u_neg (above, i-1,j)
+            1: u_pos (below, i+1,j)
+            2: v_neg (left, i,j-1)
+            3: v_pos (right, i,j+1)
+            4: diag_in (diagonal input conditioning)
+            5: diag_out (diagonal output, always predicted)
+        """
+        patch = np.full([max_size, max_size, 3], -1.)
+        start_ij = np.array([max_size // 2, max_size // 2])
+        patch[*start_ij] = start_zyx
+
+        gens = np.zeros([max_size, max_size], dtype=np.int32)
+        gens[*start_ij] = 1
+
+        include_diag = bool(config.get('masked_include_diag', True))
+
+        def in_patch(ij):
+            i, j = ij
+            return 0 <= i < max_size and 0 <= j < max_size and not (patch[i, j] == -1).all()
+
+        def in_bounds(ij):
+            i, j = ij
+            return 0 <= i < max_size and 0 <= j < max_size
+
+        # Bootstrap the first quad using slots-based inference
+        # Step 1: No conditioning, get combined heatmap to find first neighbor
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at_slots(start_zyx, known_slots={})
+        # Combine cardinal slots (0-3) to find strongest neighbor
+        combined = heatmaps[:4].amax(dim=0)
+        coordinates = inference.get_blob_coordinates(combined, min_corner_zyx)
+        if len(coordinates) == 0 or coordinates[0].isnan().any():
+            print('no blobs found while bootstrapping (vertex #1)')
+            return patch, gens
+
+        # Choose first neighbor based on minimum z-displacement (orients the patch)
+        best_idx = torch.argmin((coordinates - start_zyx)[:, 0].abs())
+        first_neighbor_zyx = coordinates[best_idx]
+
+        # Determine which slot the first neighbor fills based on relative position
+        delta = first_neighbor_zyx - start_zyx
+        if delta[1].abs() > delta[2].abs():  # more y displacement than x
+            if delta[1] > 0:
+                first_slot = SLOT_U_POS  # below
+                first_neighbor_ij = (start_ij[0] + 1, start_ij[1])
+            else:
+                first_slot = SLOT_U_NEG  # above
+                first_neighbor_ij = (start_ij[0] - 1, start_ij[1])
+        else:  # more x displacement than y
+            if delta[2] > 0:
+                first_slot = SLOT_V_POS  # right
+                first_neighbor_ij = (start_ij[0], start_ij[1] + 1)
+            else:
+                first_slot = SLOT_V_NEG  # left
+                first_neighbor_ij = (start_ij[0], start_ij[1] - 1)
+
+        patch[*first_neighbor_ij] = first_neighbor_zyx.numpy()
+        gens[*first_neighbor_ij] = 2
+
+        # Step 2: Use first neighbor as conditioning to find second neighbor
+        known_slots = {first_slot: first_neighbor_zyx}
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at_slots(start_zyx, known_slots=known_slots)
+
+        # Find a neighbor in a perpendicular direction
+        if first_slot in [SLOT_U_NEG, SLOT_U_POS]:  # first was vertical, look horizontal
+            target_slots = [SLOT_V_NEG, SLOT_V_POS]
+            target_ijs = [(start_ij[0], start_ij[1] - 1), (start_ij[0], start_ij[1] + 1)]
+        else:  # first was horizontal, look vertical
+            target_slots = [SLOT_U_NEG, SLOT_U_POS]
+            target_ijs = [(start_ij[0] - 1, start_ij[1]), (start_ij[0] + 1, start_ij[1])]
+
+        # Try each perpendicular direction
+        second_found = False
+        for target_slot, target_ij in zip(target_slots, target_ijs):
+            coordinates = inference.get_blob_coordinates(heatmaps[target_slot], min_corner_zyx)
+            if len(coordinates) > 0 and not coordinates[0].isnan().any():
+                patch[*target_ij] = coordinates[0].numpy()
+                gens[*target_ij] = 3
+                second_slot = target_slot
+                second_neighbor_zyx = coordinates[0]
+                second_neighbor_ij = target_ij
+                second_found = True
+                break
+
+        if not second_found:
+            print('no blobs found while bootstrapping (vertex #2)')
+            return patch, gens
+
+        # Step 3: Find the fourth corner (diagonal from start)
+        known_slots = {first_slot: first_neighbor_zyx, second_slot: second_neighbor_zyx}
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at_slots(start_zyx, known_slots=known_slots)
+
+        # The fourth corner is diagonal from start
+        diag_ij = (first_neighbor_ij[0] + (second_neighbor_ij[0] - start_ij[0]),
+                   first_neighbor_ij[1] + (second_neighbor_ij[1] - start_ij[1]))
+
+        # Predict from first_neighbor with second_neighbor as diag conditioning
+        first_known_slots, _ = get_known_slots_for_gap(first_neighbor_ij, diag_ij, patch, in_patch)
+        heatmaps, min_corner_zyx = inference.get_heatmaps_at_slots(
+            torch.from_numpy(patch[*first_neighbor_ij].astype(np.float32)),
+            known_slots=first_known_slots
+        )
+        target_slot = get_output_slot_for_gap(first_neighbor_ij, diag_ij)
+        coordinates = inference.get_blob_coordinates(heatmaps[target_slot], min_corner_zyx)
+        if len(coordinates) == 0 or coordinates[0].isnan().any():
+            print('no blobs found while bootstrapping (vertex #3, diagonal)')
+            return patch, gens
+        patch[*diag_ij] = coordinates[0].numpy()
+        gens[*diag_ij] = 4
+
+        num_vertices = 4
+        print(f'bootstrapped: vertex count = {num_vertices}')
+
+        def maybe_add_point_slots(gap_i, gap_j):
+            nonlocal num_vertices
+
+            gap_ij = (gap_i, gap_j)
+            assert not in_patch(gap_ij)
+
+            # Find best center with most known slots
+            max_score = -1
+            best_center_ij = None
+            best_known_slots = None
+            best_diag_in_ij = None
+
+            # Check all 4 potential centers (adjacent to gap)
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                center_ij = (gap_i + di, gap_j + dj)
+                if not in_patch(center_ij):
+                    continue
+
+                known_slots, diag_in_ij = get_known_slots_for_gap(center_ij, gap_ij, patch, in_patch)
+                score = len(known_slots)
+
+                if score > max_score:
+                    max_score = score
+                    best_center_ij = center_ij
+                    best_known_slots = known_slots
+                    best_diag_in_ij = diag_in_ij
+
+            if best_center_ij is None:
+                print(f'warning: no valid center found for gap {gap_ij}')
+                return
+
+            center_zyx = torch.from_numpy(patch[*best_center_ij].astype(np.float32))
+
+            # Query model with slots-based conditioning
+            heatmaps, min_corner_zyx = inference.get_heatmaps_at_slots(center_zyx, known_slots=best_known_slots)
+
+            # Get output from appropriate slot based on gap direction
+            target_slot = get_output_slot_for_gap(best_center_ij, gap_ij)
+            coordinates = inference.get_blob_coordinates(heatmaps[target_slot], min_corner_zyx)
+
+            if len(coordinates) == 0 or coordinates[0].isnan().any():
+                print(f'warning: no point found for gap {gap_ij}')
+                return
+
+            patch[gap_i, gap_j] = coordinates[0].numpy()
+            num_vertices += 1
+            gens[gap_i, gap_j] = num_vertices
+
+            if include_diag and best_diag_in_ij is not None and heatmaps.shape[0] > SLOT_DIAG_OUT:
+                diag_out_ij = get_diag_out_ij(best_center_ij, gap_ij, best_diag_in_ij)
+                if diag_out_ij is not None and in_bounds(diag_out_ij) and not in_patch(diag_out_ij):
+                    diag_coords = inference.get_blob_coordinates(heatmaps[SLOT_DIAG_OUT], min_corner_zyx)
+                    if len(diag_coords) > 0 and not diag_coords[0].isnan().any():
+                        patch[diag_out_ij[0], diag_out_ij[1]] = diag_coords[0].numpy()
+                        num_vertices += 1
+                        gens[diag_out_ij[0], diag_out_ij[1]] = num_vertices
+
+        # Main expansion loop - same radial growth as v5
+        for radius in range(1, max_size // 2 - 1):
+
+            # right edge (and bottom-right diagonal)
+            j = start_ij[1] + radius + 1
+            for i in range(start_ij[0] - radius + 1, start_ij[0] + radius + 2):
+                if 0 <= i < max_size and 0 <= j < max_size and not in_patch((i, j)):
+                    maybe_add_point_slots(i, j)
+
+            # bottom edge (and bottom-left diagonal)
+            i = start_ij[0] + radius + 1
+            for j in range(start_ij[1] + radius, start_ij[1] - radius - 1, -1):
+                if 0 <= i < max_size and 0 <= j < max_size and not in_patch((i, j)):
+                    maybe_add_point_slots(i, j)
+
+            # left edge (and top-left diagonal)
+            j = start_ij[1] - radius
+            for i in range(start_ij[0] + radius, start_ij[0] - radius - 1, -1):
+                if 0 <= i < max_size and 0 <= j < max_size and not in_patch((i, j)):
+                    maybe_add_point_slots(i, j)
+
+            # top edge (and top-right diagonal)
+            i = start_ij[0] - radius
+            for j in range(start_ij[1] - radius + 1, start_ij[1] + radius + 2):
+                if 0 <= i < max_size and 0 <= j < max_size and not in_patch((i, j)):
+                    maybe_add_point_slots(i, j)
+
+            _, area_cm2 = get_area(patch, step_size, inference.voxel_size_um)
+            print(f'radius = {radius}, vertex count = {num_vertices}, area = {area_cm2:.2f}cm2')
+
+            if save_partial and num_vertices > 0 and num_vertices % 1000 == 0:
+                partial_uuid = f'{base_uuid}_r{radius:03}'
+                save_tifxyz(
+                    (np.where((patch == -1).all(-1, keepdims=True), -1, patch * 2 ** volume_scale)),
+                    f'{out_path}',
+                    partial_uuid,
+                    step_size,
+                    inference.voxel_size_um,
+                    'neural-tracer',
+                    {'seed': start_xyz}
+                )
+
+        return patch, gens
+
     def save_point_collection(filename, zyxs):
         with open(filename, 'wt') as fp:
             json.dump({
@@ -491,7 +800,11 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
 
         else:  # freeform 2D growth
 
-            patch_zyxs, gens = trace_patch_v5(start_zyx, max_size=max_size)
+            if is_slots_model(config):
+                print('Using slots-based tracing (trace_patch_v5_slots)')
+                patch_zyxs, gens = trace_patch_v5_slots(start_zyx, max_size=max_size)
+            else:
+                patch_zyxs, gens = trace_patch_v5(start_zyx, max_size=max_size)
 
         print(f'saving with uuid {base_uuid}')
         save_tifxyz(

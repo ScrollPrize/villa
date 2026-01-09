@@ -48,6 +48,16 @@ public:
     [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
+    [[nodiscard]] int extrapolationPointCount() const { return _extrapolationPointCount; }
+    [[nodiscard]] ExtrapolationType extrapolationType() const { return _extrapolationType; }
+    [[nodiscard]] int sdtMaxSteps() const { return _sdtMaxSteps; }
+    [[nodiscard]] float sdtStepSize() const { return _sdtStepSize; }
+    [[nodiscard]] float sdtConvergence() const { return _sdtConvergence; }
+    [[nodiscard]] int sdtChunkSize() const { return _sdtChunkSize; }
+    [[nodiscard]] int skeletonConnectivity() const { return _skeletonConnectivity; }
+    [[nodiscard]] int skeletonSliceOrientation() const { return _skeletonSliceOrientation; }
+    [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
+    [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
     [[nodiscard]] QString customParamsText() const { return _customParamsText; }
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
@@ -197,6 +207,20 @@ private:
     int _growthSteps{5};
     int _tracerGrowthSteps{5};
     int _growthDirectionMask{0};
+    int _extrapolationPointCount{7};
+    ExtrapolationType _extrapolationType{ExtrapolationType::Linear};
+
+    // SDT/Newton refinement parameters for Linear+Fit
+    int _sdtMaxSteps{5};
+    float _sdtStepSize{0.8f};
+    float _sdtConvergence{0.5f};
+    int _sdtChunkSize{128};
+
+    // Skeleton path parameters
+    int _skeletonConnectivity{26};  // 6, 18, or 26
+    int _skeletonSliceOrientation{0};  // 0=X, 1=Y for up/down growth
+    int _skeletonChunkSize{128};
+    int _skeletonSearchRadius{5};  // 1-100 pixels
 
     QString _directionFieldPath;
     SegmentationDirectionFieldOrientation _directionFieldOrientation{SegmentationDirectionFieldOrientation::Normal};
@@ -210,6 +234,21 @@ private:
     QLabel* _lblStatus{nullptr};
     QGroupBox* _groupGrowth{nullptr};
     QSpinBox* _spinGrowthSteps{nullptr};
+    QComboBox* _comboGrowthMethod{nullptr};
+    QWidget* _extrapolationOptionsPanel{nullptr};
+    QLabel* _lblExtrapolationPoints{nullptr};
+    QSpinBox* _spinExtrapolationPoints{nullptr};
+    QComboBox* _comboExtrapolationType{nullptr};
+    QWidget* _sdtParamsContainer{nullptr};
+    QSpinBox* _spinSDTMaxSteps{nullptr};
+    QDoubleSpinBox* _spinSDTStepSize{nullptr};
+    QDoubleSpinBox* _spinSDTConvergence{nullptr};
+    QSpinBox* _spinSDTChunkSize{nullptr};
+    QWidget* _skeletonParamsContainer{nullptr};
+    QComboBox* _comboSkeletonConnectivity{nullptr};
+    QComboBox* _comboSkeletonSliceOrientation{nullptr};
+    QSpinBox* _spinSkeletonChunkSize{nullptr};
+    QSpinBox* _spinSkeletonSearchRadius{nullptr};
     QPushButton* _btnGrow{nullptr};
     QPushButton* _btnInpaint{nullptr};
     QCheckBox* _chkGrowthDirUp{nullptr};

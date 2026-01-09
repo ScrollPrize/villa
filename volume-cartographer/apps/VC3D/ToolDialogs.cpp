@@ -1050,6 +1050,62 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     edtOutput_->setText(defaultOutputPath);
     form->addRow(tr("Output path:"), outPick);
 
+    // First pass parameters (collapsible, collapsed by default)
+    auto pass1Group = new QGroupBox(tr("First pass parameters (advanced)"), this);
+    pass1Group->setCheckable(true);
+    pass1Group->setChecked(false);
+    auto pass1Form = new QFormLayout(pass1Group);
+    pass1Form->setSpacing(6);
+
+    spMaxDistance_ = new QSpinBox(this);
+    spMaxDistance_->setRange(1, 500);
+    spMaxDistance_->setValue(50);
+    spMaxDistance_->setToolTip(tr("Maximum distance to search for neighbors."));
+    pass1Form->addRow(tr("Max distance:"), spMaxDistance_);
+
+    spMinClearance_ = new QSpinBox(this);
+    spMinClearance_->setRange(1, 100);
+    spMinClearance_->setValue(4);
+    spMinClearance_->setToolTip(tr("Minimum clearance between neighbors."));
+    pass1Form->addRow(tr("Min clearance:"), spMinClearance_);
+
+    chkNeighborFill_ = new QCheckBox(this);
+    chkNeighborFill_->setChecked(true);
+    chkNeighborFill_->setToolTip(tr("Fill gaps with interpolation."));
+    pass1Form->addRow(tr("Fill gaps:"), chkNeighborFill_);
+
+    spInterpWindow_ = new QSpinBox(this);
+    spInterpWindow_->setRange(1, 50);
+    spInterpWindow_->setValue(5);
+    spInterpWindow_->setToolTip(tr("Window size for interpolation."));
+    pass1Form->addRow(tr("Interp window:"), spInterpWindow_);
+
+    spGenerations_ = new QSpinBox(this);
+    spGenerations_->setRange(1, 10);
+    spGenerations_->setValue(2);
+    spGenerations_->setToolTip(tr("Number of generations to expand."));
+    pass1Form->addRow(tr("Generations:"), spGenerations_);
+
+    spSpikeWindow_ = new QSpinBox(this);
+    spSpikeWindow_->setRange(1, 20);
+    spSpikeWindow_->setValue(2);
+    spSpikeWindow_->setToolTip(tr("Window size for spike detection/removal."));
+    pass1Form->addRow(tr("Spike window:"), spSpikeWindow_);
+
+    // Hide contents when collapsed
+    auto setPass1Visible = [this](bool visible) {
+        spMaxDistance_->setVisible(visible);
+        spMinClearance_->setVisible(visible);
+        chkNeighborFill_->setVisible(visible);
+        spInterpWindow_->setVisible(visible);
+        spGenerations_->setVisible(visible);
+        spSpikeWindow_->setVisible(visible);
+    };
+    connect(pass1Group, &QGroupBox::toggled, setPass1Visible);
+    setPass1Visible(false);  // Initially collapsed
+
+    main->addWidget(pass1Group);
+
     auto pass2Group = new QGroupBox(tr("Second pass resume optimization"), this);
     auto pass2Form = new QFormLayout(pass2Group);
     pass2Form->setSpacing(6);
@@ -1152,6 +1208,36 @@ int NeighborCopyDialog::resumeLocalMaxIters() const
 bool NeighborCopyDialog::resumeLocalDenseQr() const
 {
     return chkResumeDenseQr_ ? chkResumeDenseQr_->isChecked() : false;
+}
+
+int NeighborCopyDialog::neighborMaxDistance() const
+{
+    return spMaxDistance_ ? spMaxDistance_->value() : 50;
+}
+
+int NeighborCopyDialog::neighborMinClearance() const
+{
+    return spMinClearance_ ? spMinClearance_->value() : 4;
+}
+
+bool NeighborCopyDialog::neighborFill() const
+{
+    return chkNeighborFill_ ? chkNeighborFill_->isChecked() : true;
+}
+
+int NeighborCopyDialog::neighborInterpWindow() const
+{
+    return spInterpWindow_ ? spInterpWindow_->value() : 5;
+}
+
+int NeighborCopyDialog::generations() const
+{
+    return spGenerations_ ? spGenerations_->value() : 2;
+}
+
+int NeighborCopyDialog::neighborSpikeWindow() const
+{
+    return spSpikeWindow_ ? spSpikeWindow_->value() : 2;
 }
 
 // ================= ExportChunksDialog =================

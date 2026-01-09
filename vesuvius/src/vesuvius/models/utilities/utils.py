@@ -460,6 +460,126 @@ class SqueezeExcite(nn.Module):
         return x * self.gate(x_se)
 
 
+class SpatialSE(nn.Module):
+    """Spatial Squeeze-and-Excitation layer.
+
+    Re-implementation of spatial SE from:
+        Roy et al., Concurrent Spatial and Channel Squeeze & Excitation
+        in Fully Convolutional Networks, MICCAI 2018
+
+    Learns which channels are important at each spatial location via
+    a 1x1 conv projection across all channels.
+    """
+    def __init__(
+            self,
+            channels,
+            conv_op,
+            gate_layer=nn.Sigmoid):
+        super(SpatialSE, self).__init__()
+        # 1x1 conv: project all channels to 1 channel (spatial attention map)
+        self.conv = conv_op(channels, 1, kernel_size=1, bias=True)
+        self.gate = gate_layer()
+
+    def forward(self, x):
+        # Spatial squeeze: (B, C, D, H, W) -> (B, 1, D, H, W)
+        squeeze = self.conv(x)
+        # Spatial excitation
+        return x * self.gate(squeeze)
+
+
+class ChannelSpatialSE(nn.Module):
+    """Concurrent Spatial and Channel SE (scSE) attention.
+
+    Re-implementation of concurrent spatial and channel squeeze & excitation:
+        Roy et al., Concurrent Spatial and Channel Squeeze & Excitation
+        in Fully Convolutional Networks, MICCAI 2018
+
+    Applies both channel SE and spatial SE in parallel and combines via addition.
+    """
+    def __init__(
+            self,
+            channels,
+            conv_op,
+            rd_ratio=1./16,
+            rd_channels=None,
+            rd_divisor=8,
+            add_maxpool=False,
+            act_layer=nn.ReLU,
+            norm_layer=None,
+            gate_layer=nn.Sigmoid):
+        super(ChannelSpatialSE, self).__init__()
+
+        # Channel SE (cSE)
+        self.cSE = SqueezeExcite(
+            channels, conv_op, rd_ratio, rd_channels, rd_divisor,
+            add_maxpool, act_layer, norm_layer, gate_layer
+        )
+
+        # Spatial SE (sSE)
+        self.sSE = SpatialSE(channels, conv_op, gate_layer)
+
+    def forward(self, x):
+        # Combine via addition (as per Roy et al.)
+        return self.cSE(x) + self.sSE(x)
+
+
+def create_attention_module(
+        attention_type: str,
+        channels: int,
+        conv_op,
+        rd_ratio: float = 1./16,
+        rd_channels: int = None,
+        rd_divisor: int = 8,
+        add_maxpool: bool = False,
+        act_layer=nn.ReLU,
+        norm_layer=None,
+        gate_layer=nn.Sigmoid):
+    """Factory function to create attention modules.
+
+    Based on Roy et al., Concurrent Spatial and Channel Squeeze & Excitation
+    in Fully Convolutional Networks, MICCAI 2018.
+
+    Parameters
+    ----------
+    attention_type : str
+        One of: "channel" (cSE), "spatial" (sSE), "scse" (both combined)
+    channels : int
+        Number of input channels
+    conv_op : nn.Module
+        Convolution operation (nn.Conv1d, nn.Conv2d, nn.Conv3d)
+    rd_ratio : float
+        Reduction ratio for channel attention (default 1/16)
+    rd_channels : int, optional
+        Override reduction channels directly
+    rd_divisor : int
+        Divisor for making channels divisible (default 8)
+    add_maxpool : bool
+        Use max pooling in addition to avg pooling for channel SE (default False)
+
+    Returns
+    -------
+    nn.Module
+        The attention module
+    """
+    attention_type = attention_type.lower()
+
+    if attention_type == "channel":
+        return SqueezeExcite(
+            channels, conv_op, rd_ratio, rd_channels, rd_divisor,
+            add_maxpool, act_layer, norm_layer, gate_layer
+        )
+    elif attention_type == "spatial":
+        return SpatialSE(channels, conv_op, gate_layer)
+    elif attention_type == "scse":
+        return ChannelSpatialSE(
+            channels, conv_op, rd_ratio, rd_channels, rd_divisor,
+            add_maxpool, act_layer, norm_layer, gate_layer
+        )
+    else:
+        raise ValueError(f"Unknown attention type: {attention_type}. "
+                        f"Must be one of: channel, spatial, scse")
+
+
 def determine_dimensionality(patch_size, pool_type='avg', verbose=False):
     """
     Centralized function to determine dimensionality and set appropriate operations

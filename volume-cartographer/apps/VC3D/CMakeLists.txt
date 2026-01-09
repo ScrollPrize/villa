@@ -33,6 +33,8 @@ set(srcs
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp
     segmentation/SegmentationGrowth.cpp
+    segmentation/ExtrapolationGrowth.cpp
+    segmentation/ExtrapolationGrowth.hpp
     segmentation/SegmentationGrower.cpp
     segmentation/SegmentationGrower.hpp
     segmentation/SegmentationEditManager.cpp
@@ -101,6 +103,9 @@ add_executable(VC3D ${srcs} resources.qrc)
 target_include_directories(VC3D
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/libs/edt
+        ${CMAKE_SOURCE_DIR}/libs/cc3d
+        ${CMAKE_SOURCE_DIR}/libs/djikstra3d
 )
 
 target_link_libraries(VC3D
@@ -110,6 +115,7 @@ target_link_libraries(VC3D
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    opencv_ximgproc
 )
 
 if (${VC_INSTALL_APPS})

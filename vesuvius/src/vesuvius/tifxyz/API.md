@@ -5,7 +5,7 @@ Python module for reading and writing tifxyz surface files from volume-cartograp
 ## Installation
 
 ```python
-from vesuvius.tifxyz import Tifxyz, read_tifxyz, write_tifxyz
+from vesuvius.tifxyz import Tifxyz, read_tifxyz, write_tifxyz, list_tifxyz, load_folder
 ```
 
 ## File Format
@@ -21,54 +21,29 @@ segment_name/
 └── mask.tif     # Optional validity mask
 ```
 
-## Scale and Resolution
-
-Surfaces are stored at reduced resolution to save space. The `scale` parameter indicates what fraction of full resolution the grid represents:
-
-- **scale = 0.05** means the grid is at 5% of full resolution (20x downsampled)
-- **scale = 1.0** means the grid is at full resolution (no downsampling)
-
-Key relationships:
-- `nominal_size = stored_size / scale` (e.g., 4215 / 0.05 = 84,300)
-- `zoom_factor = 1 / scale` (e.g., 1 / 0.05 = 20x to reach full res)
-
 ## Quick Start
 
 ```python
 from vesuvius.tifxyz import read_tifxyz, write_tifxyz
 
-# Read a surface
+# Read a surface (defaults to stored resolution)
 surface = read_tifxyz("/path/to/segment")
 
-# Two ways to access coordinates:
-print(surface.shape)         # (4215, 4373) - stored resolution
-print(surface.nominal_size)  # (84300, 87460) - full resolution
+# Get dimensions at current resolution
+print(surface.shape)  # e.g., (4215, 4373) - stored resolution
 
-# 1. Direct array access (stored resolution)
-x = surface.x[100, 200]      # Fast, no interpolation
-y = surface.y[100, 200]
-z = surface.z[100, 200]
+# Access coordinates (direct array access at stored resolution)
+x, y, z, valid = surface[100, 200]           # Single point
+x, y, z, valid = surface[100:200, 200:300]   # 100x100 tile
 
-# 2. Lazy full-resolution access (interpolated on-demand)
-x, y, z, valid = surface[2000, 4000]           # Single point
-x, y, z, valid = surface[1000:1100, 2000:2100] # 100x100 tile
-x, y, z, valid = surface.get_tile(1000, 2000, 100, 100)  # Same as above
+# Switch to full resolution for interpolated access
+surface.use_full_resolution()
+print(surface.shape)  # e.g., (84300, 87460) - full resolution
+x, y, z, valid = surface[2000:2100, 4000:4100]  # Interpolated
 
 # Write a surface
 write_tifxyz("/path/to/output", surface, overwrite=True)
 ```
-
-## Lazy vs Materialized Access
-
-The key design principle: **full-resolution data is computed lazily, never stored**.
-
-| Access Method | Resolution | Memory | Speed |
-|--------------|------------|--------|-------|
-| `surface.x[i,j]` | Stored (e.g., 4215×4373) | ~220 MB | Instant |
-| `surface[i,j]` | Full (e.g., 84300×87460) | Per-tile only | ~0.1ms/point |
-| `surface.get_tile(...)` | Full | Per-tile only | ~10ms/1000×1000 |
-
-This means you can work with 88 GB of full-resolution data using only 220 MB of memory.
 
 ---
 
@@ -80,149 +55,126 @@ Main class representing a tifxyz surface.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `x` | `ndarray[float32]` | X coordinates, shape (H, W) |
-| `y` | `ndarray[float32]` | Y coordinates, shape (H, W) |
-| `z` | `ndarray[float32]` | Z coordinates, shape (H, W) |
 | `uuid` | `str` | Unique identifier |
-| `scale` | `tuple[float, float]` | Grid scale (scale_y, scale_x) |
 | `bbox` | `tuple` or `None` | Bounding box (x_min, y_min, z_min, x_max, y_max, z_max) |
-| `mask` | `ndarray[bool]` or `None` | Validity mask |
 | `path` | `Path` or `None` | Source path if loaded from disk |
+| `area` | `float` or `None` | Surface area if computed |
+| `extra` | `dict` | Additional metadata fields |
+| `volume` | `zarr.Array` or `None` | Associated volume (set via `volume_path` or manually) |
+| `resolution` | `"stored"` or `"full"` | Current resolution mode (default: "stored") |
+| `interp_method` | `str` | Interpolation method (default: "catmull_rom") |
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `shape` | `tuple[int, int]` | Stored grid dimensions (height, width) |
-| `nominal_size` | `tuple[int, int]` | Full resolution dimensions = shape / scale |
-| `is_full_resolution` | `bool` | True if scale ~= 1.0 |
-| `valid_mask` | `ndarray[bool]` | Validity mask (z > 0 and finite) |
+| `shape` | `tuple[int, int]` | Grid dimensions at current resolution |
+| `valid_quad_mask` | `NDArray[bool]` | Mask of valid quads at stored resolution (H-1, W-1) |
+| `valid_quad_indices` | `NDArray[int64]` | Indices of valid quads as (N, 2) array |
+| `valid_vertex_mask` | `NDArray[bool]` | Mask of valid vertices at stored resolution |
+| `quad_area` | `float` | Surface area computed from valid quad count |
+| `quad_centers` | `NDArray[float32]` | Centers of quads at stored resolution (H-1, W-1, 3) |
 
-### Constructor
+---
+
+## Resolution Mode
+
+Surfaces can operate in two resolution modes:
+
+- **`"stored"`** (default): Direct array access without interpolation. Fast and memory-efficient.
+- **`"full"`**: Interpolated access at full resolution. Slower but provides sub-pixel accuracy.
+
+### Switching Modes
 
 ```python
-surface = Tifxyz(
-    x=x_array,           # Required: X coordinates
-    y=y_array,           # Required: Y coordinates
-    z=z_array,           # Required: Z coordinates
-    uuid="my-surface",   # Optional: identifier
-    scale=(20.0, 20.0),  # Optional: grid scale
-)
+surface = read_tifxyz("/path/to/segment")
+
+# Default: stored resolution
+print(surface.resolution)  # "stored"
+print(surface.shape)       # e.g., (4215, 4373) - stored dimensions
+
+# Switch to full resolution
+surface.use_full_resolution()
+print(surface.shape)       # e.g., (84300, 87460) - full dimensions
+
+# Switch back to stored
+surface.use_stored_resolution()
+
+# Or set directly
+surface.resolution = "full"
+
+# Chaining is supported
+coords = surface.use_full_resolution().get_zyxs()
 ```
+
+### Behavior by Mode
+
+| Method | Stored Mode (default) | Full Mode |
+|--------|----------------------|-----------|
+| `shape` | Internal array dimensions | Computed full dimensions |
+| `surface[i, j]` | Direct array access | Interpolated coordinates |
+| `get_normals()` | Slice from cached normals | Compute at full resolution |
+| `get_zyxs()` | No interpolation | Interpolated |
+
+Methods that always use stored resolution (regardless of mode):
+- `compute_normals()` - whole-surface cached computation
+- `valid_quad_mask`, `quad_centers` - mesh operations
+- `compute_centroid()` - internal computation
 
 ---
 
 ## Coordinate Access
 
-### Lazy Full-Resolution Access (Recommended)
-
-Access coordinates at full resolution using indexing. Data is interpolated on-demand.
+Access coordinates at any position using indexing. Behavior depends on resolution mode.
 
 ```python
-# Single point at full resolution
+# Single point (at current resolution)
 x, y, z, valid = surface[row, col]
 
-# Tile at full resolution
-x, y, z, valid = surface[1000:1100, 2000:2100]
+# Tile/region
+x, y, z, valid = surface[100:200, 200:300]
 
-# Using get_tile method
-x, y, z, valid = surface.get_tile(row=1000, col=2000, height=100, width=100)
+# For interpolated access, switch to full resolution
+surface.use_full_resolution()
+x, y, z, valid = surface[1000:1100, 2000:2100]  # Now interpolated
 ```
 
-### Direct Array Access (Stored Resolution)
+All access methods return a tuple of four arrays:
+- `x`, `y`, `z`: Coordinate arrays (float32)
+- `valid`: Boolean mask indicating valid points
 
-Access the stored arrays directly for maximum performance.
+### get_zyxs
+
+Get coordinates stacked as a single array (useful for neural networks).
 
 ```python
-# Single point at stored resolution
-x, y, z = surface.x[row, col], surface.y[row, col], surface.z[row, col]
+# Get stacked coordinates (uses current resolution mode)
+zyxs = surface.get_zyxs()  # shape: (H, W, 3), order: z, y, x
 
-# Check validity first
-if surface.valid_mask[row, col]:
-    x, y, z = surface.x[row, col], surface.y[row, col], surface.z[row, col]
+# Force specific resolution (overrides current mode)
+zyxs = surface.get_zyxs(stored_resolution=True)   # Always stored
+zyxs = surface.get_zyxs(stored_resolution=False)  # Always full/interpolated
 
-# All valid points
-valid = surface.valid_mask
-x_valid = surface.x[valid]
-y_valid = surface.y[valid]
-z_valid = surface.z[valid]
+# Invalid points have value -1
+valid = (zyxs != -1).all(axis=-1)
+
+# Get as torch tensor directly
+zyxs_tensor = surface.get_zyxs(as_tensor=True)
 ```
 
-### get_point_at_grid
+### Interpolation Methods
 
-Get 3D coordinates at a stored grid location.
+The surface uses Catmull-Rom interpolation by default, which provides smooth curves that pass through control points. You can change the method:
 
 ```python
-x, y, z = surface.get_point_at_grid(grid_y, grid_x)
-# Returns (-1, -1, -1) if invalid or out of bounds
+# Change default interpolation method
+surface.interp_method = "linear"  # faster but less smooth
 ```
 
----
-
-## Coordinate Conversion
-
-### grid_to_nominal
-
-Convert stored grid indices to nominal (voxel) coordinates.
-
-```python
-nominal_y, nominal_x = surface.grid_to_nominal(grid_y, grid_x)
-# nominal = grid * scale
-```
-
-### nominal_to_grid
-
-Convert nominal coordinates to stored grid indices.
-
-```python
-grid_y, grid_x = surface.nominal_to_grid(nominal_y, nominal_x)
-# grid = nominal / scale
-```
-
-### get_nominal_extent
-
-Get the nominal coordinate extent of the grid.
-
-```python
-min_y, max_y, min_x, max_x = surface.get_nominal_extent()
-```
-
----
-
-## Materialized Upsampling
-
-For cases where you need the full array in memory (not recommended for large surfaces).
-
-### upsample
-
-Upsample surface to a specific target scale.
-
-```python
-# Upsample to 50% of full resolution (10x zoom from 5%)
-half_res = surface.upsample(target_scale=0.5, order=1)
-print(half_res.shape)  # 10x larger than original
-```
-
-### to_full_resolution
-
-Materialize the entire full-resolution surface. **Warning: May use tens of GB of memory.**
-
-```python
-# Creates ~88 GB array for a typical surface
-full_res = surface.to_full_resolution()
-```
-
-### get_points_at_nominal
-
-Interpolate 3D points at arbitrary nominal coordinates.
-
-```python
-x, y, z, valid = surface.get_points_at_nominal(
-    nominal_y=np.array([100, 200, 300]),
-    nominal_x=np.array([150, 250, 350]),
-    order=1  # 0=nearest, 1=bilinear, 3=bicubic
-)
-```
+Available methods:
+- `"catmull_rom"` (default): Smooth spline that passes through control points. Best quality.
+- `"linear"`: Bilinear interpolation. Fast (via OpenCV).
+- `"bspline"`: B-spline interpolation (via scipy). Smooth but approximating.
 
 ---
 
@@ -230,24 +182,23 @@ x, y, z, valid = surface.get_points_at_nominal(
 
 ### get_normals
 
-Compute surface normals lazily for a tile at full resolution.
+Compute surface normals for a tile. In stored mode, slices from cached normals. In full mode, computes at full resolution.
 
 ```python
-# Get normals for a 100x100 tile at full resolution
-nx, ny, nz = surface.get_normals(row_start=1000, row_end=1100, col_start=2000, col_end=2100)
+# Get normals for a tile (at current resolution)
+nx, ny, nz = surface.get_normals(row_start=100, row_end=200, col_start=200, col_end=300)
 # Returns NaN for invalid/boundary points
 # Shape: (100, 100) each
 ```
 
 ### compute_normals
 
-Compute surface normals for the entire surface at stored resolution.
-Used for whole-surface operations like analyzing normal direction.
+Compute surface normals for the entire surface (at internal resolution). Results are cached.
 
 ```python
 nx, ny, nz = surface.compute_normals()
 # Returns NaN for invalid/boundary points
-# Shape matches stored resolution, not full resolution
+# Subsequent calls return cached result
 ```
 
 ### compute_centroid
@@ -282,36 +233,129 @@ print(analysis)
 ### orient_normals
 
 Orient all normals to point in a specified direction (flips individual normals as needed).
+Computes normals automatically if not provided.
 
 ```python
-nx, ny, nz = surface.compute_normals()
-
-# Make all normals point outward
-nx, ny, nz = surface.orient_normals((nx, ny, nz), direction='outward')
+# Make all normals point outward (default)
+nx, ny, nz = surface.orient_normals('outward')
 
 # Make all normals point inward
-nx, ny, nz = surface.orient_normals((nx, ny, nz), direction='inward')
+nx, ny, nz = surface.orient_normals('inward')
+
+# Or pass pre-computed normals
+nx, ny, nz = surface.orient_normals('outward', normals=(nx, ny, nz))
 ```
 
 ### flip_normals
 
-Flip all normals (negate all components).
+Flip all normals (negate all components). Computes normals automatically if not provided.
 
 ```python
-nx, ny, nz = surface.flip_normals((nx, ny, nz))
+nx, ny, nz = surface.flip_normals()
 # Equivalent to: -nx, -ny, -nz
+
+# Or pass pre-computed normals
+nx, ny, nz = surface.flip_normals(normals=(nx, ny, nz))
 ```
 
-### get_normals_pointing_outward / get_normals_pointing_inward
+---
 
-Convenience methods to compute and orient normals in one call.
+## Row Smoothing
+
+### smooth_rows_catmull_rom
+
+Apply 1D Catmull-Rom smoothing to each row independently. Returns array in same format as `get_zyxs()`.
+
+For each row, collects valid points in column order (skipping invalid points), then applies 1D Catmull-Rom smoothing to the (x, y, z) coordinates independently.
 
 ```python
-# All normals pointing away from centroid
-nx, ny, nz = surface.get_normals_pointing_outward()
+# Basic usage (uses current resolution mode)
+smoothed = surface.smooth_rows_catmull_rom()
+smoothed.shape  # (H, W, 3) - same as get_zyxs()
 
-# All normals pointing toward centroid
-nx, ny, nz = surface.get_normals_pointing_inward()
+# Force stored resolution (fast, no interpolation)
+smoothed = surface.smooth_rows_catmull_rom(stored_resolution=True)
+
+# Force full resolution (interpolated)
+smoothed = surface.smooth_rows_catmull_rom(stored_resolution=False)
+
+# Invalid points still have value -1
+valid = (smoothed != -1).all(axis=-1)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stored_resolution` | `bool` or `None` | `None` | `True`: force stored resolution. `False`: force full resolution. `None`: use current `resolution` setting. |
+
+**Returns:**
+
+`NDArray[np.float32]` - Shape `(H, W, 3)` with smoothed coordinates in `[z, y, x]` order, same format as `get_zyxs()`. Invalid points have value -1. Rows with < 2 valid points are left unchanged.
+
+**Notes:**
+- Uses Catmull-Rom weights at t=0.5: `[-1/16, 9/16, 9/16, -1/16]`
+- Edge points are handled by linearly extrapolating phantom control points beyond boundaries
+- Invalid points (z ≤ 0 or not finite) are skipped during smoothing
+- Valid points are replaced with their smoothed values
+
+---
+
+## Volume Association
+
+Associate a surface with a zarr volume for coordinate-based sampling workflows.
+
+### Setting the Volume
+
+```python
+# Option 1: Set volume at load time
+surface = read_tifxyz("/path/to/segment", volume_path="/path/to/volume.zarr")
+
+# Option 2: Set volume after loading
+import zarr
+surface.volume = zarr.open("/path/to/volume.zarr", mode="r")
+```
+
+### retarget
+
+Rescale coordinates for a downsampled or upsampled volume. Returns a new Tifxyz instance.
+
+```python
+# Original surface at full resolution
+surface = read_tifxyz("/path/to/segment", volume_path="/path/to/volume.zarr")
+
+# Create surface for 2x downsampled volume
+# Coordinates are divided by 2, volume is set to level "1" if OME-zarr
+surface_2x = surface.retarget(2.0)
+
+# Create surface for 4x downsampled volume
+surface_4x = surface.retarget(4.0)
+
+# For upsampled volume (factor < 1)
+surface_half = surface.retarget(0.5)  # Coordinates multiplied by 2
+```
+
+When the volume is an OME-zarr group with multiple resolution levels (named "0", "1", "2", etc.), `retarget()` automatically selects the appropriate level based on the factor.
+
+### Quad Properties
+
+Properties for mesh-based operations at stored resolution:
+
+```python
+# Boolean mask of valid quads (all 4 corners valid)
+mask = surface.valid_quad_mask  # shape: (H-1, W-1)
+
+# Indices of valid quads
+indices = surface.valid_quad_indices  # shape: (N, 2)
+
+# Boolean mask of valid vertices
+vertex_mask = surface.valid_vertex_mask  # shape: (H, W)
+
+# Surface area from valid quad count
+area = surface.quad_area
+
+# Centers of each quad
+centers = surface.quad_centers  # shape: (H-1, W-1, 3), invalid quads have -1
 ```
 
 ---
@@ -325,11 +369,12 @@ surface = read_tifxyz(
     path,                   # Path to tifxyz directory
     load_mask=True,         # Load mask.tif if present
     validate=True,          # Validate data after loading
-    full_resolution=False,  # If True, upsample to full resolution on load
+    volume_path=None,       # Optional path to OME-zarr volume
 )
 
-# Load at full resolution directly
-full_res = read_tifxyz("/path/to/segment", full_resolution=True)
+# Example with volume association
+surface = read_tifxyz("/path/to/segment", volume_path="/path/to/volume.zarr")
+print(surface.volume)  # zarr.Group or zarr.Array
 ```
 
 ### write_tifxyz
@@ -370,22 +415,82 @@ data = reader.read_extra_channel('generations')
 
 ---
 
+## Discovery
+
+Functions for finding and filtering tifxyz segments in a folder.
+
+### list_tifxyz
+
+Discover all tifxyz segments in a folder without loading coordinates. Returns lightweight `TifxyzInfo` objects for filtering before loading.
+
+```python
+from vesuvius.tifxyz import list_tifxyz
+
+# Find all segments in a folder
+segments = list_tifxyz("/path/to/segments")
+
+# Filter by z-range (only segments whose bbox overlaps this range)
+segments = list_tifxyz("/path/to/segments", z_range=(1000, 2000))
+
+# Non-recursive (only immediate subdirectories)
+segments = list_tifxyz("/path/to/segments", recursive=False)
+
+# Work with results
+for seg in segments:
+    print(f"{seg.uuid}: z=[{seg.z_min}, {seg.z_max}]")
+    surface = seg.load()  # Load full data when needed
+```
+
+### load_folder
+
+Load all tifxyz segments in a folder.
+
+```python
+from vesuvius.tifxyz import load_folder
+
+# Load all segments
+for surface in load_folder("/path/to/segments", z_range=(1000, 2000)):
+    print(f"{surface.uuid}: {surface.shape}")
+```
+
+### TifxyzInfo
+
+Lightweight metadata container returned by `list_tifxyz`.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `path` | `Path` | Path to the tifxyz directory |
+| `scale` | `tuple[float, float]` | Scale factors (scale_y, scale_x) |
+| `bbox` | `tuple` or `None` | Bounding box (x_min, y_min, z_min, x_max, y_max, z_max) |
+| `uuid` | `str` | Unique identifier |
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `z_min` | `float` or `None` | Minimum z from bbox |
+| `z_max` | `float` or `None` | Maximum z from bbox |
+
+| Method | Description |
+|--------|-------------|
+| `load(**kwargs)` | Load full `Tifxyz` object (kwargs passed to `read_tifxyz`) |
+
+---
+
 ## Invalid Points
 
 Invalid points (holes in the surface) are indicated by:
 - `z <= 0`
 - Coordinates set to `(-1, -1, -1)`
-- `valid_mask[y, x] == False`
+- The `valid` array returned from coordinate access is `False`
 
 ```python
-# Check single point
-if surface.valid_mask[row, col]:
-    # Point is valid
+# Access returns validity as 4th element
+x, y, z, valid = surface[1000:1100, 2000:2100]
 
-# Count valid points
-num_valid = surface.valid_mask.sum()
+# Use valid mask to filter
+x_valid = x[valid]
+y_valid = y[valid]
+z_valid = z[valid]
 
-# Get all valid coordinates
-valid = surface.valid_mask
-points = np.stack([surface.x[valid], surface.y[valid], surface.z[valid]], axis=1)
+# Get all valid coordinates as point cloud
+points = np.stack([x[valid], y[valid], z[valid]], axis=1)
 ```

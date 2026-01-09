@@ -1,5 +1,6 @@
 #include "SegmentationGrower.hpp"
 
+#include "ExtrapolationGrowth.hpp"
 #include "SegmentationModule.hpp"
 #include "SegmentationWidget.hpp"
 
@@ -661,6 +662,265 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
 
     ensureGenerationsChannel(segmentationSurface.get());
+
+    // Handle Extrapolation method separately - it doesn't need volume data
+    if (method == SegmentationGrowthMethod::Extrapolation) {
+        const int sanitizedSteps = std::max(1, steps);
+        const SegmentationGrowthDirection effectiveDirection = direction;
+
+        // Get extrapolation parameters from widget
+        int pointCount = _context.widget->extrapolationPointCount();
+        ExtrapolationType extrapType = _context.widget->extrapolationType();
+
+        // Check for JSON custom params overrides
+        if (_context.widget->customParamsValid()) {
+            if (auto customParams = _context.widget->customParamsJson()) {
+                if (customParams->contains("extrapolation_point_count") &&
+                    (*customParams)["extrapolation_point_count"].is_number()) {
+                    pointCount = (*customParams)["extrapolation_point_count"].get<int>();
+                    pointCount = std::clamp(pointCount, 3, 20);
+                }
+                if (customParams->contains("extrapolation_type") &&
+                    (*customParams)["extrapolation_type"].is_string()) {
+                    const std::string typeStr = (*customParams)["extrapolation_type"].get<std::string>();
+                    if (typeStr == "quadratic") {
+                        extrapType = ExtrapolationType::Quadratic;
+                    } else {
+                        extrapType = ExtrapolationType::Linear;
+                    }
+                }
+            }
+        }
+
+        showStatus(tr("Running extrapolation-based surface growth..."), kStatusMedium);
+
+        // Set up SDT context for LinearFit mode or custom params override
+        SDTContext sdtContext;
+        SDTContext* sdtContextPtr = nullptr;
+        std::shared_ptr<Volume> sdtVolume;
+
+        // For LinearFit, automatically use the dropdown-selected volume for SDT refinement
+        if (extrapType == ExtrapolationType::LinearFit && volumeContext.package) {
+            std::string sdtVolumeId = volumeContext.requestedVolumeId;
+            if (sdtVolumeId.empty()) {
+                sdtVolumeId = volumeContext.activeVolumeId;
+            }
+            if (!sdtVolumeId.empty()) {
+                try {
+                    sdtVolume = volumeContext.package->volume(sdtVolumeId);
+                    if (sdtVolume) {
+                        sdtContext.binaryDataset = sdtVolume->zarrDataset(0);
+                        sdtContext.cache = _context.chunkCache;
+                        sdtContextPtr = &sdtContext;
+                        qCInfo(lcSegGrowth) << "Linear+Fit: SDT refinement using volume"
+                                            << QString::fromStdString(sdtVolumeId);
+                    }
+                } catch (const std::exception& e) {
+                    qCWarning(lcSegGrowth) << "Failed to set up SDT for Linear+Fit:" << e.what();
+                }
+            }
+        }
+
+        // Apply SDT params from widget UI as defaults (applied to sdtContext regardless of source)
+        sdtContext.params.maxSteps = _context.widget->sdtMaxSteps();
+        sdtContext.params.stepSize = _context.widget->sdtStepSize();
+        sdtContext.params.convergenceThreshold = _context.widget->sdtConvergence();
+        sdtContext.params.chunkSize = _context.widget->sdtChunkSize();
+
+        // Check custom params for SDT settings overrides (or explicit volume for other modes)
+        if (_context.widget->customParamsValid()) {
+            if (auto customParams = _context.widget->customParamsJson()) {
+                // Allow custom params to override/specify SDT volume for any mode
+                if (!sdtContextPtr && customParams->contains("sdt_volume_id") &&
+                    (*customParams)["sdt_volume_id"].is_string()) {
+                    const std::string sdtVolumeId = (*customParams)["sdt_volume_id"].get<std::string>();
+                    if (!sdtVolumeId.empty() && volumeContext.package) {
+                        try {
+                            sdtVolume = volumeContext.package->volume(sdtVolumeId);
+                            if (sdtVolume) {
+                                sdtContext.binaryDataset = sdtVolume->zarrDataset(0);
+                                sdtContext.cache = _context.chunkCache;
+                                sdtContextPtr = &sdtContext;
+                                qCInfo(lcSegGrowth) << "SDT refinement enabled with volume"
+                                                    << QString::fromStdString(sdtVolumeId);
+                            }
+                        } catch (const std::exception& e) {
+                            qCWarning(lcSegGrowth) << "Failed to load SDT volume:" << e.what();
+                        }
+                    }
+                }
+
+                // Apply Newton refinement param overrides from JSON if SDT is enabled
+                // (JSON overrides widget UI values for advanced users)
+                if (sdtContextPtr) {
+                    if (customParams->contains("sdt_max_steps") &&
+                        (*customParams)["sdt_max_steps"].is_number()) {
+                        sdtContext.params.maxSteps = std::clamp(
+                            (*customParams)["sdt_max_steps"].get<int>(), 1, 10);
+                    }
+                    if (customParams->contains("sdt_step_size") &&
+                        (*customParams)["sdt_step_size"].is_number()) {
+                        sdtContext.params.stepSize = std::clamp(
+                            (*customParams)["sdt_step_size"].get<float>(), 0.1f, 2.0f);
+                    }
+                    if (customParams->contains("sdt_convergence") &&
+                        (*customParams)["sdt_convergence"].is_number()) {
+                        sdtContext.params.convergenceThreshold = std::clamp(
+                            (*customParams)["sdt_convergence"].get<float>(), 0.1f, 2.0f);
+                    }
+                    if (customParams->contains("sdt_chunk_size") &&
+                        (*customParams)["sdt_chunk_size"].is_number()) {
+                        sdtContext.params.chunkSize = std::clamp(
+                            (*customParams)["sdt_chunk_size"].get<int>(), 32, 256);
+                    }
+                }
+            }
+        }
+
+        // Set up SkeletonPath context when using SkeletonPath extrapolation
+        SkeletonPathContext skeletonContext;
+        SkeletonPathContext* skeletonContextPtr = nullptr;
+        std::shared_ptr<Volume> skeletonVolume;
+
+        if (extrapType == ExtrapolationType::SkeletonPath && volumeContext.package) {
+            std::string skeletonVolumeId = volumeContext.requestedVolumeId;
+            if (skeletonVolumeId.empty()) {
+                skeletonVolumeId = volumeContext.activeVolumeId;
+            }
+            if (!skeletonVolumeId.empty()) {
+                try {
+                    skeletonVolume = volumeContext.package->volume(skeletonVolumeId);
+                    if (skeletonVolume) {
+                        skeletonContext.binaryDataset = skeletonVolume->zarrDataset(0);
+                        skeletonContext.cache = _context.chunkCache;
+                        skeletonContextPtr = &skeletonContext;
+                        qCInfo(lcSegGrowth) << "Skeleton Path: using volume"
+                                            << QString::fromStdString(skeletonVolumeId);
+                    }
+                } catch (const std::exception& e) {
+                    qCWarning(lcSegGrowth) << "Failed to set up Skeleton Path volume:" << e.what();
+                }
+            }
+
+            // Apply skeleton params from widget UI
+            int connectivity = _context.widget->skeletonConnectivity();
+            if (connectivity == 6) {
+                skeletonContext.params.connectivity = DijkstraConnectivity::Conn6;
+            } else if (connectivity == 18) {
+                skeletonContext.params.connectivity = DijkstraConnectivity::Conn18;
+            } else {
+                skeletonContext.params.connectivity = DijkstraConnectivity::Conn26;
+            }
+
+            int sliceOrientation = _context.widget->skeletonSliceOrientation();
+            skeletonContext.params.sliceOrientation = sliceOrientation == 0
+                ? SkeletonSliceOrientation::X
+                : SkeletonSliceOrientation::Y;
+            skeletonContext.params.chunkSize = _context.widget->skeletonChunkSize();
+            skeletonContext.params.searchRadius = _context.widget->skeletonSearchRadius();
+        }
+
+        qCInfo(lcSegGrowth) << "Segmentation extrapolation requested"
+                            << segmentationGrowthDirectionToString(effectiveDirection)
+                            << "steps" << sanitizedSteps
+                            << "pointCount" << pointCount
+                            << "type" << extrapolationTypeToString(extrapType)
+                            << "sdtRefinement" << (sdtContextPtr != nullptr)
+                            << "skeletonPath" << (skeletonContextPtr != nullptr);
+
+        _running = true;
+        _context.module->setGrowthInProgress(true);
+
+        // Run extrapolation (synchronous since it's fast)
+        auto result = runExtrapolationGrowth(
+            segmentationSurface.get(),
+            effectiveDirection,
+            sanitizedSteps,
+            pointCount,
+            extrapType,
+            sdtContextPtr,
+            skeletonContextPtr);
+
+        if (!result.error.isEmpty()) {
+            handleFailure(result.error);
+            return false;
+        }
+
+        if (!result.surface) {
+            handleFailure(tr("Extrapolation produced no result surface."));
+            return false;
+        }
+
+        // Get the active volume for voxel size (for metadata update)
+        double voxelSize = 1.0;
+        if (volumeContext.activeVolume) {
+            voxelSize = volumeContext.activeVolume->voxelSize();
+        }
+
+        // Swap points into the existing surface
+        cv::Mat_<cv::Vec3f>* newPoints = result.surface->rawPointsPtr();
+        cv::Mat_<cv::Vec3f>* oldPoints = segmentationSurface->rawPointsPtr();
+        if (newPoints && oldPoints) {
+            *oldPoints = newPoints->clone();
+        }
+
+        // Copy channels from result to existing surface
+        cv::Mat newGen = result.surface->channel("generations");
+        if (!newGen.empty()) {
+            segmentationSurface->setChannel("generations", newGen);
+        }
+
+        cv::Mat newApproval = result.surface->channel("approval", SURF_CHANNEL_NORESIZE);
+        if (!newApproval.empty()) {
+            segmentationSurface->setChannel("approval", newApproval);
+        }
+
+        // Copy metadata
+        if (result.surface->meta && result.surface->meta->is_object()) {
+            ensureSurfaceMetaObject(segmentationSurface.get());
+            *segmentationSurface->meta = *result.surface->meta;
+        }
+
+        // Update metadata
+        updateSegmentationSurfaceMetadata(segmentationSurface.get(), voxelSize);
+
+        // Clean up
+        delete result.surface;
+
+        // Invalidate caches and refresh
+        segmentationSurface->invalidateCache();
+
+        // Update the surface patch index (used for intersection rendering)
+        // Must be done before setSurface to ensure index is current when viewers refresh
+        if (_context.viewerManager) {
+            _context.viewerManager->refreshSurfacePatchIndex(segmentationSurface);
+        }
+
+        // Re-set the surface in the collection to trigger proper viewer refresh
+        // (same pattern used by Tracer growth)
+        if (_context.surfaces) {
+            _context.surfaces->setSurface("segmentation", segmentationSurface, false, true);
+        }
+        refreshSegmentationViewers(_context.viewerManager);
+        if (_context.module && _context.module->hasActiveSession()) {
+            QuadSurface* baseSurface = _context.module->activeBaseSurface();
+            if (baseSurface) {
+                _context.module->refreshSessionFromSurface(baseSurface);
+            }
+        }
+
+        if (_surfacePanel) {
+            _surfacePanel->refreshSurfaceMetrics("segmentation");
+        }
+
+        showStatus(result.statusMessage.isEmpty()
+                       ? tr("Extrapolation growth completed.")
+                       : result.statusMessage,
+                   kStatusMedium);
+
+        finalize(true);
+        return true;
+    }
 
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;

@@ -99,6 +99,31 @@ def create_training_transforms(
     else:
         raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
 
+    # For 3D anisotropic patches, determine valid rotation and transpose axes
+    # Rot90: picks 2 axes from allowed_axes to form a rotation plane
+    # We can only rotate in a plane if both dimensions in that plane are equal
+    # Transpose: can only swap axes with equal dimensions
+    if dimension == 3:
+        dims_3d = [patch_d, patch_h, patch_w]
+        # Valid rotation planes: can rotate in plane (i,j) if dims[i] == dims[j]
+        # Collect all axes that are part of at least one valid rotation plane
+        rot90_allowed_axes = set()
+        if patch_h == patch_w:  # can rotate in H-W plane (axes 1, 2)
+            rot90_allowed_axes.update([1, 2])
+        if patch_d == patch_w:  # can rotate in D-W plane (axes 0, 2)
+            rot90_allowed_axes.update([0, 2])
+        if patch_d == patch_h:  # can rotate in D-H plane (axes 0, 1)
+            rot90_allowed_axes.update([0, 1])
+
+        # Valid transpose axes: pairs of axes with equal dimensions
+        transpose_allowed_axes = set()
+        if patch_d == patch_h:
+            transpose_allowed_axes.update([0, 1])
+        if patch_d == patch_w:
+            transpose_allowed_axes.update([0, 2])
+        if patch_h == patch_w:
+            transpose_allowed_axes.update([1, 2])
+
     # Local transform scale parameters (derived from patch size)
     min_patch_dim = min(patch_size)
     _local_transform_scale = (min_patch_dim / 6, min_patch_dim / 2)
@@ -143,13 +168,13 @@ def create_training_transforms(
             )
         )
 
-        # Rot90 for 3D, Mirror for 2D
-        if dimension == 3:
+        # Rot90 for 3D (only if there are valid rotation axes), Mirror for 2D
+        if dimension == 3 and rot90_allowed_axes:
             transforms.append(RandomTransform(
                 Rot90Transform(
                     num_axis_combinations=1,
                     num_rot_per_combination=(1, 2, 3),
-                    allowed_axes={0, 1, 2},
+                    allowed_axes=rot90_allowed_axes,
                 ),
                 apply_probability=0.5
             ))
@@ -354,9 +379,10 @@ def create_training_transforms(
         transforms.extend(common_transforms)
     else:
         # 3D-specific transforms
-        if not no_spatial and patch_d == patch_h == patch_w:
+        # Transpose only between axes with equal dimensions (need at least 2 axes)
+        if not no_spatial and len(transpose_allowed_axes) >= 2:
             transforms.append(RandomTransform(
-                TransposeAxesTransform(allowed_axes={0, 1, 2}),
+                TransposeAxesTransform(allowed_axes=transpose_allowed_axes),
                 apply_probability=0.2
             ))
 
