@@ -295,8 +295,18 @@ class Inference:
         # cache base localiser (only depends on crop_size)
         if bool(config.get('use_localiser', True)):
             crop_size = config['crop_size']
+            # Normalize crop_size to tuple of 3 ints [D, H, W]
+            if isinstance(crop_size, (list, tuple)):
+                crop_size_dhw = tuple(crop_size)
+            else:
+                crop_size_dhw = (crop_size, crop_size, crop_size)
             base_localiser = torch.linalg.norm(
-                torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2,
+                torch.stack(torch.meshgrid(
+                    torch.arange(crop_size_dhw[0]),
+                    torch.arange(crop_size_dhw[1]),
+                    torch.arange(crop_size_dhw[2]),
+                    indexing='ij'
+                ), dim=-1).to(torch.float32) - torch.tensor(crop_size_dhw).float() / 2,
                 dim=-1
             )
             self._base_localiser = base_localiser / base_localiser.amax() * 2 - 1
@@ -313,14 +323,19 @@ class Inference:
         else:
             not_originally_batched = False
         crop_size = self.config['crop_size']
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
         use_localiser = bool(self.config.get('use_localiser', True))
-        zeros = torch.zeros([1, crop_size, crop_size, crop_size])
+        zeros = torch.zeros([1, *crop_size_dhw])
 
         # pre-allocate input tensor (i tested w/o pin memory and it was slower)
         batch_size = len(zyx)
         num_channels = 5 if use_localiser else 4  # volume, [localiser], u, v, diag
         inputs_cpu = torch.empty(
-            (batch_size, num_channels, crop_size, crop_size, crop_size),
+            (batch_size, num_channels, *crop_size_dhw),
             dtype=torch.float32,
             pin_memory=True,
         )
@@ -384,7 +399,7 @@ class Inference:
 
         with torch.no_grad(), torch.autocast('cuda'):
             logits = run_with_tta(inputs)
-            logits = logits.reshape(len(zyx), 2, self.config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
+            logits = logits.reshape(len(zyx), 2, self.config['step_count'], *crop_size_dhw)  # u/v, step, z, y, x
             probs = torch.sigmoid(logits)
 
         if not_originally_batched:

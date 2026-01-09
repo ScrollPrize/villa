@@ -385,7 +385,18 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         return cls._kernel_value_cache[key]
 
     @classmethod
-    def _collect_coords(cls, all_zyxs, min_corner_zyx, crop_size_int, device, dtype):
+    def _collect_coords(cls, all_zyxs, min_corner_zyx, crop_size, device, dtype):
+        """Collect valid coordinates within the crop bounds.
+
+        Args:
+            crop_size: int for cubic, or tuple/list of 3 ints [D, H, W] for anisotropic
+        """
+        # Normalize crop_size to tensor
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_tensor = torch.tensor(crop_size, device=device, dtype=torch.int64)
+        else:
+            crop_size_tensor = torch.tensor([crop_size, crop_size, crop_size], device=device, dtype=torch.int64)
+
         channel_count = all_zyxs[0].shape[0]
         coords_accum = []
         channel_accum = []
@@ -394,7 +405,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
         for zyxs in all_zyxs:
             coords = (zyxs.to(device=device, dtype=dtype, non_blocking=True) - min_corner + 0.5).to(torch.int64)
-            valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_int).all(dim=1)
+            valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_tensor).all(dim=1)
             if not torch.any(valid_mask):
                 continue
             coords_accum.append(coords[valid_mask])
@@ -1111,13 +1122,18 @@ def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
     Args:
         volume: The source volume array
         center_zyx: Center coordinates for the crop
-        crop_size: Size of the crop (int for cubic, or will be converted to int)
+        crop_size: Size of the crop (int for cubic, or tuple/list for anisotropic [D, H, W])
         normalize: If True, normalize intensity to [-1, 1] range. If False, return
                    raw float32 values (useful when caller handles normalization).
     """
-    crop_size_int = int(crop_size)
-    crop_min = (center_zyx - crop_size_int // 2).int()
-    crop_max = crop_min + crop_size_int
+    # Normalize crop_size to tensor of 3 ints [D, H, W]
+    if isinstance(crop_size, (list, tuple)):
+        crop_size_tensor = torch.tensor(crop_size)
+    else:
+        crop_size_tensor = torch.tensor([crop_size, crop_size, crop_size])
+
+    crop_min = (center_zyx - crop_size_tensor // 2).int()
+    crop_max = crop_min + crop_size_tensor
 
     vol_shape = torch.tensor(volume.shape)
 
@@ -1148,12 +1164,12 @@ def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
         if volume_crop.numel() == 0:
             volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
 
-    # Compute padding so final shape is exactly crop_size_int in each dimension.
+    # Compute padding so final shape is exactly crop_size in each dimension.
     pad_before = torch.clamp(actual_min - crop_min, min=0)
-    pad_before = torch.minimum(pad_before, torch.tensor(crop_size_int).repeat(3))
+    pad_before = torch.minimum(pad_before, crop_size_tensor)
 
     current_shape = torch.tensor(volume_crop.shape)
-    pad_after = crop_size_int - current_shape - pad_before
+    pad_after = crop_size_tensor - current_shape - pad_before
     pad_after = torch.clamp(pad_after, min=0)
 
     if torch.any(pad_before > 0) or torch.any(pad_after > 0):
@@ -1165,8 +1181,9 @@ def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
         volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
 
     # Ensure any edge cases still return the desired shape.
-    if volume_crop.shape != (crop_size_int, crop_size_int, crop_size_int):
-        volume_crop = volume_crop[:crop_size_int, :crop_size_int, :crop_size_int]
+    expected_shape = tuple(crop_size_tensor.tolist())
+    if volume_crop.shape != expected_shape:
+        volume_crop = volume_crop[:expected_shape[0], :expected_shape[1], :expected_shape[2]]
 
     # min_corner reflects the coordinate of voxel [0,0,0] after padding/truncation
     min_corner = actual_min - pad_before
@@ -1174,7 +1191,20 @@ def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
 
 
 def build_localiser(center_zyx, min_corner_zyx, crop_size):
-    localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
+    # Normalize crop_size to tuple of 3 ints [D, H, W]
+    if isinstance(crop_size, (list, tuple)):
+        crop_size_dhw = tuple(crop_size)
+    else:
+        crop_size_dhw = (crop_size, crop_size, crop_size)
+    localiser = torch.linalg.norm(
+        torch.stack(torch.meshgrid(
+            torch.arange(crop_size_dhw[0]),
+            torch.arange(crop_size_dhw[1]),
+            torch.arange(crop_size_dhw[2]),
+            indexing='ij'
+        ), dim=-1).to(torch.float32) - torch.tensor(crop_size_dhw).float() / 2,
+        dim=-1
+    )
     localiser = localiser / localiser.amax() * 2 - 1
     mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
     return localiser
