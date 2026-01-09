@@ -19,13 +19,15 @@ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 option(VC_USE_OPENMP "Enable OpenMP support" ON)
 option(VC_USE_VALGRIND "Enable Valgrind support" off)
 
-set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fPIC -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fPIC -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
 include_directories(core/include)
 
 if(NOT CMAKE_BUILD_TYPE)
     message(STATUS "Setting build type to 'Release' as none was specified.")
-    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+    set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Choose the type of build." FORCE)
 endif()
 
 # Set LTO type and linker based on compiler
@@ -40,8 +42,8 @@ else()
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ggdb -O0 -g3 -gdwarf-5 -funwind-tables -fasynchronous-unwind-tables")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}  -g3 -gdwarf-5 -rdynamic -fPIE")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
 elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O1")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
@@ -140,7 +142,17 @@ endif()
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER ccache)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
+endif()
+
+option(VC_BUILD_JSON "Build in-source JSON library" OFF)
+option(VC_BUILD_Z5   "Build (vendor) z5 header-only library" OFF)
+
+option(VC_WITH_CUDA_SPARSE "use cudss" ON)
+if (VC_WITH_CUDA_SPARSE)
+    add_definitions(-DVC_USE_CUDA_SPARSE=1)
 endif()
 
 # Use modern C++ for everything and generate compile_commands database.

@@ -130,12 +130,4 @@ if (${VC_INSTALL_APPS})
             DESTINATION ${CMAKE_INSTALL_BINDIR}
             COMPONENT Programs
     )
-
-
-    qt_generate_deploy_app_script(
-        TARGET VC3D
-        OUTPUT_SCRIPT vc_gui_deploy_script
-        NO_UNSUPPORTED_PLATFORM_ERROR
-    )
-    install(SCRIPT ${vc_gui_deploy_script} COMPONENT Programs)
 endif()

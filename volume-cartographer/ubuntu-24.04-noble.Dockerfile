@@ -12,7 +12,7 @@ RUN apt -y install --no-install-recommends \
     build-essential git cmake ninja-build pkg-config \
     qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
     libopencv-dev libopencv-contrib-dev \
-    libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev \
+    libxsimd-dev libblosc2-dev libblosc-dev liblz4-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev \
     file curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils \
  && rm -rf /var/lib/apt/lists/*
 
@@ -120,6 +120,7 @@ RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
 RUN mkdir -p /src/build
 WORKDIR /src/build
 RUN cmake -DVC_WITH_CUDA_SPARSE=off \
+          -DVC_BUILD_Z5=ON \
           -DCPACK_DEBIAN_PACKAGE_SHLIBDEPS=ON \
           -DCPACK_DEBIAN_PACKAGE_DEPENDS="" \
           -GNinja /src \
