@@ -134,11 +134,11 @@ def build_mask_from_points(points_zyx, center_zyx, crop_size, dilation_radius):
     Args:
         points_zyx: List of torch.Tensor or np.ndarray, each shape [3] in ZYX model coords
         center_zyx: torch.Tensor or np.ndarray, shape [3] in ZYX model coords
-        crop_size: int, size of the output cube
+        crop_size: int or list/tuple of 3 ints, size of the output volume (Z, Y, X)
         dilation_radius: float, radius to dilate points by (in model voxels)
 
     Returns:
-        torch.Tensor: Binary mask of shape (crop_size, crop_size, crop_size)
+        torch.Tensor: Binary mask of shape crop_size
     """
     def to_numpy(t):
         if isinstance(t, torch.Tensor):
@@ -148,12 +148,18 @@ def build_mask_from_points(points_zyx, center_zyx, crop_size, dilation_radius):
     center_np = to_numpy(center_zyx)
     points_np = [to_numpy(p) for p in points_zyx]
 
-    min_corner_zyx = center_np - crop_size // 2
-    mask = np.zeros((crop_size, crop_size, crop_size), dtype=np.float32)
+    # Handle both scalar and list crop_size
+    if isinstance(crop_size, (list, tuple)):
+        crop_size_zyx = np.array(crop_size)
+    else:
+        crop_size_zyx = np.array([crop_size, crop_size, crop_size])
+
+    min_corner_zyx = center_np - crop_size_zyx // 2
+    mask = np.zeros(tuple(crop_size_zyx), dtype=np.float32)
 
     for p in points_np:
         local = np.round(p - min_corner_zyx).astype(int)
-        if (local >= 0).all() and (local < crop_size).all():
+        if (local >= 0).all() and (local < crop_size_zyx).all():
             mask[local[0], local[1], local[2]] = 1.0
 
     # Dilate to match training - compute distance from non-mask points
@@ -243,6 +249,7 @@ def handle_connection(conn, request_fn):
 
 def process_edt_batch_request(request, edt_inference, volume_scale, output_dir):
     """Process a batched EDT inference request."""
+    global _debug_written
     import time
     t0 = time.time()
 
@@ -283,6 +290,7 @@ def process_edt_batch_request(request, edt_inference, volume_scale, output_dir):
                 mask = build_mask_from_points(points_zyx, center_zyx, crop_size, dilation_radius)
                 conditioning_masks.append(mask)
             except Exception as e:
+                print(f"[EDT_BATCH] Mask building failed: {e}", flush=True)
                 conditioning_masks.append(None)
 
     elif 'conditioning_mask_paths' in request:
@@ -299,6 +307,7 @@ def process_edt_batch_request(request, edt_inference, volume_scale, output_dir):
                 mask = torch.from_numpy((dist <= dilation_radius).astype(np.float32))
                 conditioning_masks.append(mask)
             except Exception as e:
+                print(f"[EDT_BATCH] Mask loading failed for {path}: {e}", flush=True)
                 conditioning_masks.append(None)
     else:
         return {'error': 'edt_batch requires conditioning_points_xyz_batch or conditioning_mask_paths'}
@@ -312,6 +321,40 @@ def process_edt_batch_request(request, edt_inference, volume_scale, output_dir):
 
     t2 = time.time()
     print(f"[EDT_BATCH] Inference took {t2-t1:.3f}s for {batch_size} samples", flush=True)
+
+    # Debug output for first sample of first batch
+    if not _debug_written and batch_results:
+        dt_first, min_corner_first, success, error_msg = batch_results[0]
+        if success:
+            # Re-run single inference with debug to get intermediate tensors
+            _, _, debug_data = edt_inference.get_distance_transform_at(
+                centers_zyx[0], conditioning_masks[0], return_debug=True
+            )
+            write_debug_data("edt",
+                conditioning_mask=conditioning_masks[0],
+                distance_transform=dt_first,
+                metadata={
+                    "center_xyz": centers_xyz[0],
+                    "crop_size": crop_size,
+                    "min_corner_zyx": min_corner_first.tolist(),
+                    "volume_scale": volume_scale,
+                },
+                **debug_data
+            )
+        else:
+            # Write whatever we have on failure for debugging
+            mask_to_save = conditioning_masks[0] if conditioning_masks[0] is not None else None
+            write_debug_data("edt_failed",
+                metadata={
+                    "center_xyz": centers_xyz[0],
+                    "crop_size": crop_size if isinstance(crop_size, list) else [crop_size, crop_size, crop_size],
+                    "volume_scale": volume_scale,
+                    "error": error_msg,
+                    "mask_shape": list(mask_to_save.shape) if mask_to_save is not None else None,
+                },
+                **({"conditioning_mask": mask_to_save} if mask_to_save is not None else {}),
+            )
+        _debug_written = True
 
     # Build response
     response = {'batch_results': [], 'scale_factor': scale, 'crop_size': crop_size}
@@ -374,67 +417,28 @@ def process_request(request, inference, edt_inference, volume_scale, model_type,
 
     with torch.inference_mode():
         if request_type == 'edt':
-            if edt_inference is None:
-                return {'error': 'EDT model not loaded. Load an EDT checkpoint to use request_type=edt'}
-
-            center_zyx = xyz_to_scaled_zyx([center_xyz])[0]
-
-            # Support both conditioning_points_xyz and conditioning_mask_path
+            # Convert single request to batch format and route through batch handler
+            batch_request = {
+                'request_type': 'edt_batch',
+                'center_xyz_batch': [request['center_xyz']],
+            }
             if 'conditioning_points_xyz' in request:
-                points_xyz = request['conditioning_points_xyz']
-
-                # Convert each point: XYZ full-res -> ZYX model-res
-                points_zyx = [
-                    torch.tensor([p[2], p[1], p[0]]) / (2 ** volume_scale)
-                    for p in points_xyz
-                ]
-
-                conditioning_mask = build_mask_from_points(
-                    points_zyx, center_zyx,
-                    edt_inference.config['crop_size'],
-                    edt_inference.config.get('dilation_radius', 1.0)
-                )
+                batch_request['conditioning_points_xyz_batch'] = [request['conditioning_points_xyz']]
             elif 'conditioning_mask_path' in request:
-                print(f"[DEBUG] Request has conditioning_mask_path: '{request['conditioning_mask_path']}'", flush=True)
-                mask = load_zarr_array(request['conditioning_mask_path'])
-                # Apply dilation to match training (same as build_mask_from_points)
-                dilation_radius = edt_inference.config.get('dilation_radius', 1.0)
-                dist = edt.edt(1 - mask.numpy(), parallel=1)
-                conditioning_mask = torch.from_numpy((dist <= dilation_radius).astype(np.float32))
-            else:
-                return {'error': 'EDT request requires conditioning_points_xyz or conditioning_mask_path'}
+                batch_request['conditioning_mask_paths'] = [request['conditioning_mask_path']]
 
-            if not _debug_written:
-                dt, min_corner_zyx, debug_data = edt_inference.get_distance_transform_at(
-                    center_zyx, conditioning_mask, return_debug=True
-                )
-                write_debug_data("edt",
-                    conditioning_mask=conditioning_mask,
-                    distance_transform=dt,
-                    metadata={
-                        "center_xyz": center_xyz,
-                        "crop_size": edt_inference.config['crop_size'],
-                        "min_corner_zyx": min_corner_zyx.tolist(),
-                        "volume_scale": volume_scale,
-                    },
-                    **debug_data
-                )
-                _debug_written = True
-            else:
-                dt, min_corner_zyx = edt_inference.get_distance_transform_at(
-                    center_zyx, conditioning_mask
-                )
+            batch_response = process_edt_batch_request(batch_request, edt_inference, volume_scale, output_dir)
 
-            if 'distance_transform' in output_types:
-                min_corner_xyz = (min_corner_zyx.flip(0) * (2 ** volume_scale)).tolist()
-                dt_path = save_array(dt.numpy(), output_dir, 'dt')
-                response['distance_transform'] = {
-                    'path': dt_path,
-                    'shape': list(dt.shape),
-                    'min_corner_xyz': min_corner_xyz,
-                    'scale_factor': 2 ** volume_scale,
-                    'crop_size': edt_inference.config['crop_size']
-                }
+            # Convert batch response back to single format
+            if 'error' in batch_response:
+                return batch_response
+            result = batch_response['batch_results'][0]
+            if 'error' in result:
+                return result
+            return {
+                'center_xyz': request['center_xyz'],
+                'distance_transform': result['distance_transform']
+            }
         else:
             if inference is None:
                 return {'error': 'UV model not loaded. Load a UV checkpoint to use request_type=uv'}

@@ -180,8 +180,16 @@ NeuralTracerConnection::EdtResult NeuralTracerConnection::get_distance_transform
     // Parse scale_factor (default to 1.0 for backward compatibility)
     result.scale_factor = dt_response.value("scale_factor", 1.0f);
 
-    // Parse crop_size (default to 192 for backward compatibility)
-    result.crop_size = dt_response.value("crop_size", 192);
+    // Parse crop_size (supports both int and array for backward compatibility)
+    if (dt_response.contains("crop_size")) {
+        auto& cs = dt_response["crop_size"];
+        if (cs.is_array()) {
+            result.crop_size = {cs[0].get<int>(), cs[1].get<int>(), cs[2].get<int>()};
+        } else {
+            int val = cs.get<int>();
+            result.crop_size = {val, val, val};
+        }
+    }
 
     // Read the 3D TIFF file
     std::string zarr_path = dt_response["path"].get<std::string>();
@@ -238,8 +246,16 @@ NeuralTracerConnection::EdtResult NeuralTracerConnection::get_sdt_from_points(
     // Parse scale_factor
     result.scale_factor = dt_response.value("scale_factor", 1.0f);
 
-    // Parse crop_size (default to 192 for backward compatibility)
-    result.crop_size = dt_response.value("crop_size", 192);
+    // Parse crop_size (supports both int and array for backward compatibility)
+    if (dt_response.contains("crop_size")) {
+        auto& cs = dt_response["crop_size"];
+        if (cs.is_array()) {
+            result.crop_size = {cs[0].get<int>(), cs[1].get<int>(), cs[2].get<int>()};
+        } else {
+            int val = cs.get<int>();
+            result.crop_size = {val, val, val};
+        }
+    }
 
     // Read the 3D TIFF file
     std::string zarr_path = dt_response["path"].get<std::string>();
@@ -320,7 +336,15 @@ NeuralTracerConnection::BatchEdtResult NeuralTracerConnection::get_sdt_from_poin
         auto& shape = dt_data["shape"];
         result.shape = {shape[0].get<int>(), shape[1].get<int>(), shape[2].get<int>()};
         result.scale_factor = dt_data.value("scale_factor", 1.0f);
-        result.crop_size = dt_data.value("crop_size", 192);
+        if (dt_data.contains("crop_size")) {
+            auto& cs = dt_data["crop_size"];
+            if (cs.is_array()) {
+                result.crop_size = {cs[0].get<int>(), cs[1].get<int>(), cs[2].get<int>()};
+            } else {
+                int val = cs.get<int>();
+                result.crop_size = {val, val, val};
+            }
+        }
 
         // Read zarr volume
         std::string zarr_path = dt_data["path"].get<std::string>();
@@ -397,7 +421,15 @@ NeuralTracerConnection::BatchEdtResult NeuralTracerConnection::get_distance_tran
         auto& shape = dt_data["shape"];
         result.shape = {shape[0].get<int>(), shape[1].get<int>(), shape[2].get<int>()};
         result.scale_factor = dt_data.value("scale_factor", 1.0f);
-        result.crop_size = dt_data.value("crop_size", 192);
+        if (dt_data.contains("crop_size")) {
+            auto& cs = dt_data["crop_size"];
+            if (cs.is_array()) {
+                result.crop_size = {cs[0].get<int>(), cs[1].get<int>(), cs[2].get<int>()};
+            } else {
+                int val = cs.get<int>();
+                result.crop_size = {val, val, val};
+            }
+        }
 
         // Read zarr volume
         std::string zarr_path = dt_data["path"].get<std::string>();

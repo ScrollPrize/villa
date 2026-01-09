@@ -25,7 +25,7 @@ public:
         cv::Vec3f min_corner_xyz;
         std::array<int, 3> shape;  // (depth, height, width)
         float scale_factor = 1.0f;  // 2^volume_scale for coordinate conversion
-        int crop_size = 192;  // Model crop size in model-space voxels
+        std::array<int, 3> crop_size = {192, 192, 192};  // Model crop size in model-space voxels (Z, Y, X)
     };
 
     struct BatchEdtResult

@@ -504,8 +504,11 @@ class EdtInference:
         crop_size = self.config['crop_size']
 
         # Validate conditioning mask shape
-        expected_shape = (crop_size, crop_size, crop_size)
-        if conditioning_mask.shape != expected_shape:
+        if isinstance(crop_size, (list, tuple)):
+            expected_shape = tuple(crop_size)
+        else:
+            expected_shape = (crop_size, crop_size, crop_size)
+        if tuple(conditioning_mask.shape) != expected_shape:
             raise ValueError(f"conditioning_mask shape {conditioning_mask.shape} != expected {expected_shape}")
 
         # Get volume crop (raw, without [-1,1] normalization)
@@ -571,7 +574,10 @@ class EdtInference:
         valid_indices = []
 
         # Pre-validate samples
-        expected_shape = (crop_size, crop_size, crop_size)
+        if isinstance(crop_size, (list, tuple)):
+            expected_shape = tuple(crop_size)
+        else:
+            expected_shape = (crop_size, crop_size, crop_size)
         for i, (center_zyx, mask) in enumerate(zip(centers_zyx, conditioning_masks)):
             if mask is None:
                 results[i] = (torch.empty(0), torch.zeros(3), False, "Conditioning mask is None")
