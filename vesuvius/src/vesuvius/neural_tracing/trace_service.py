@@ -72,7 +72,6 @@ def save_array(arr: np.ndarray, output_dir: Path, prefix: str) -> str:
 def load_zarr_array(path: str) -> torch.Tensor:
     """Load array from zarr file."""
     import zarr
-    import os
 
     print(f"[DEBUG] load_zarr_array called with path: '{path}'", flush=True)
 
