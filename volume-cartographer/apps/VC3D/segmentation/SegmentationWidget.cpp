@@ -227,6 +227,150 @@ void SegmentationWidget::buildUi()
     _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
 
+    // Method selection row
+    auto* methodRow = new QHBoxLayout();
+    auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
+    _comboGrowthMethod = new QComboBox(_groupGrowth);
+    _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
+    _comboGrowthMethod->addItem(tr("Extrapolation"), static_cast<int>(SegmentationGrowthMethod::Extrapolation));
+    _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
+                                      "- Tracer: Neural-guided growth using volume data\n"
+                                      "- Extrapolation: Simple polynomial extrapolation from boundary points"));
+    methodRow->addWidget(methodLabel);
+    methodRow->addWidget(_comboGrowthMethod);
+    methodRow->addStretch(1);
+    growthLayout->addLayout(methodRow);
+
+    // Extrapolation options panel (shown only when Extrapolation method is selected)
+    _extrapolationOptionsPanel = new QWidget(_groupGrowth);
+    auto* extrapLayout = new QHBoxLayout(_extrapolationOptionsPanel);
+    extrapLayout->setContentsMargins(0, 0, 0, 0);
+    _lblExtrapolationPoints = new QLabel(tr("Fit points:"), _extrapolationOptionsPanel);
+    _spinExtrapolationPoints = new QSpinBox(_extrapolationOptionsPanel);
+    _spinExtrapolationPoints->setRange(3, 20);
+    _spinExtrapolationPoints->setValue(7);
+    _spinExtrapolationPoints->setToolTip(tr("Number of boundary points to use for polynomial fitting."));
+    auto* typeLabel = new QLabel(tr("Type:"), _extrapolationOptionsPanel);
+    _comboExtrapolationType = new QComboBox(_extrapolationOptionsPanel);
+    _comboExtrapolationType->addItem(tr("Linear"), static_cast<int>(ExtrapolationType::Linear));
+    _comboExtrapolationType->addItem(tr("Quadratic"), static_cast<int>(ExtrapolationType::Quadratic));
+    _comboExtrapolationType->addItem(tr("Linear+Fit"), static_cast<int>(ExtrapolationType::LinearFit));
+    _comboExtrapolationType->addItem(tr("Skeleton Path"), static_cast<int>(ExtrapolationType::SkeletonPath));
+    _comboExtrapolationType->setToolTip(tr("Extrapolation method:\n"
+                                           "- Linear: Fit a straight line (faster, simpler)\n"
+                                           "- Quadratic: Fit a parabola (better for curved surfaces)\n"
+                                           "- Linear+Fit: Linear extrapolation + Newton refinement to fit selected volume\n"
+                                           "- Skeleton Path: Use 2D skeleton analysis + 3D Dijkstra path following"));
+    extrapLayout->addWidget(_lblExtrapolationPoints);
+    extrapLayout->addWidget(_spinExtrapolationPoints);
+    extrapLayout->addSpacing(12);
+    extrapLayout->addWidget(typeLabel);
+    extrapLayout->addWidget(_comboExtrapolationType);
+    extrapLayout->addStretch(1);
+    growthLayout->addWidget(_extrapolationOptionsPanel);
+    _extrapolationOptionsPanel->setVisible(false);
+
+    // SDT/Newton refinement params (shown only when Linear+Fit is selected)
+    _sdtParamsContainer = new QWidget(_groupGrowth);
+    auto* sdtLayout = new QHBoxLayout(_sdtParamsContainer);
+    sdtLayout->setContentsMargins(0, 0, 0, 0);
+
+    auto* maxStepsLabel = new QLabel(tr("Newton steps:"), _sdtParamsContainer);
+    _spinSDTMaxSteps = new QSpinBox(_sdtParamsContainer);
+    _spinSDTMaxSteps->setRange(1, 10);
+    _spinSDTMaxSteps->setValue(5);
+    _spinSDTMaxSteps->setToolTip(tr("Maximum Newton iterations for surface refinement (1-10)."));
+
+    auto* stepSizeLabel = new QLabel(tr("Step size:"), _sdtParamsContainer);
+    _spinSDTStepSize = new QDoubleSpinBox(_sdtParamsContainer);
+    _spinSDTStepSize->setRange(0.1, 2.0);
+    _spinSDTStepSize->setSingleStep(0.1);
+    _spinSDTStepSize->setValue(0.8);
+    _spinSDTStepSize->setToolTip(tr("Newton step size multiplier (0.1-2.0). Smaller values are more stable."));
+
+    auto* convergenceLabel = new QLabel(tr("Convergence:"), _sdtParamsContainer);
+    _spinSDTConvergence = new QDoubleSpinBox(_sdtParamsContainer);
+    _spinSDTConvergence->setRange(0.1, 2.0);
+    _spinSDTConvergence->setSingleStep(0.1);
+    _spinSDTConvergence->setValue(0.5);
+    _spinSDTConvergence->setToolTip(tr("Stop refinement when distance < this threshold in voxels (0.1-2.0)."));
+
+    auto* chunkSizeLabel = new QLabel(tr("Chunk:"), _sdtParamsContainer);
+    _spinSDTChunkSize = new QSpinBox(_sdtParamsContainer);
+    _spinSDTChunkSize->setRange(32, 256);
+    _spinSDTChunkSize->setSingleStep(32);
+    _spinSDTChunkSize->setValue(128);
+    _spinSDTChunkSize->setToolTip(tr("Size of SDT chunks in voxels (32-256). Larger = faster but more memory."));
+
+    sdtLayout->addWidget(maxStepsLabel);
+    sdtLayout->addWidget(_spinSDTMaxSteps);
+    sdtLayout->addSpacing(8);
+    sdtLayout->addWidget(stepSizeLabel);
+    sdtLayout->addWidget(_spinSDTStepSize);
+    sdtLayout->addSpacing(8);
+    sdtLayout->addWidget(convergenceLabel);
+    sdtLayout->addWidget(_spinSDTConvergence);
+    sdtLayout->addSpacing(8);
+    sdtLayout->addWidget(chunkSizeLabel);
+    sdtLayout->addWidget(_spinSDTChunkSize);
+    sdtLayout->addStretch(1);
+    growthLayout->addWidget(_sdtParamsContainer);
+    _sdtParamsContainer->setVisible(false);
+
+    // Skeleton path params (shown only when Skeleton Path is selected)
+    _skeletonParamsContainer = new QWidget(_groupGrowth);
+    auto* skeletonLayout = new QHBoxLayout(_skeletonParamsContainer);
+    skeletonLayout->setContentsMargins(0, 0, 0, 0);
+
+    auto* connectivityLabel = new QLabel(tr("Connectivity:"), _skeletonParamsContainer);
+    _comboSkeletonConnectivity = new QComboBox(_skeletonParamsContainer);
+    _comboSkeletonConnectivity->addItem(tr("6"), 6);
+    _comboSkeletonConnectivity->addItem(tr("18"), 18);
+    _comboSkeletonConnectivity->addItem(tr("26"), 26);
+    _comboSkeletonConnectivity->setCurrentIndex(2);  // Default to 26
+    _comboSkeletonConnectivity->setToolTip(tr("3D neighborhood connectivity for Dijkstra pathfinding:\n"
+                                              "- 6: Face neighbors only\n"
+                                              "- 18: Face + edge neighbors\n"
+                                              "- 26: Face + edge + corner neighbors"));
+
+    auto* sliceOrientLabel = new QLabel(tr("Up/Down slice:"), _skeletonParamsContainer);
+    _comboSkeletonSliceOrientation = new QComboBox(_skeletonParamsContainer);
+    _comboSkeletonSliceOrientation->addItem(tr("YZ (X-slice)"), 0);
+    _comboSkeletonSliceOrientation->addItem(tr("XZ (Y-slice)"), 1);
+    _comboSkeletonSliceOrientation->setToolTip(tr("For Up/Down growth, which plane to use for 2D skeleton analysis:\n"
+                                                   "- YZ (X-slice): Extract slice perpendicular to X axis\n"
+                                                   "- XZ (Y-slice): Extract slice perpendicular to Y axis\n"
+                                                   "(Left/Right growth always uses XY Z-slices)"));
+
+    auto* skeletonChunkLabel = new QLabel(tr("Chunk:"), _skeletonParamsContainer);
+    _spinSkeletonChunkSize = new QSpinBox(_skeletonParamsContainer);
+    _spinSkeletonChunkSize->setRange(32, 256);
+    _spinSkeletonChunkSize->setSingleStep(32);
+    _spinSkeletonChunkSize->setValue(128);
+    _spinSkeletonChunkSize->setToolTip(tr("Size of chunks for binary volume loading (32-256). Larger = faster but more memory."));
+
+    auto* searchRadiusLabel = new QLabel(tr("Search:"), _skeletonParamsContainer);
+    _spinSkeletonSearchRadius = new QSpinBox(_skeletonParamsContainer);
+    _spinSkeletonSearchRadius->setRange(1, 100);
+    _spinSkeletonSearchRadius->setSingleStep(1);
+    _spinSkeletonSearchRadius->setValue(5);
+    _spinSkeletonSearchRadius->setToolTip(tr("When starting point is on background, search this many pixels for nearest component (1-100)."));
+
+    skeletonLayout->addWidget(connectivityLabel);
+    skeletonLayout->addWidget(_comboSkeletonConnectivity);
+    skeletonLayout->addSpacing(12);
+    skeletonLayout->addWidget(sliceOrientLabel);
+    skeletonLayout->addWidget(_comboSkeletonSliceOrientation);
+    skeletonLayout->addSpacing(12);
+    skeletonLayout->addWidget(skeletonChunkLabel);
+    skeletonLayout->addWidget(_spinSkeletonChunkSize);
+    skeletonLayout->addSpacing(12);
+    skeletonLayout->addWidget(searchRadiusLabel);
+    skeletonLayout->addWidget(_spinSkeletonSearchRadius);
+    skeletonLayout->addStretch(1);
+    growthLayout->addWidget(_skeletonParamsContainer);
+    _skeletonParamsContainer->setVisible(false);
+
     auto* dirRow = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
@@ -822,6 +966,82 @@ void SegmentationWidget::buildUi()
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this](int value) { applyGrowthSteps(value, true, true); });
 
+    connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int index) {
+                const auto method = static_cast<SegmentationGrowthMethod>(
+                    _comboGrowthMethod->itemData(index).toInt());
+                setGrowthMethod(method);
+            });
+
+    connect(_spinExtrapolationPoints, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int value) {
+                _extrapolationPointCount = std::clamp(value, 3, 20);
+                writeSetting(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount);
+            });
+
+    connect(_comboExtrapolationType, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int index) {
+                _extrapolationType = extrapolationTypeFromInt(
+                    _comboExtrapolationType->itemData(index).toInt());
+                writeSetting(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType));
+                // Show SDT params only when Extrapolation method AND Linear+Fit type
+                if (_sdtParamsContainer) {
+                    _sdtParamsContainer->setVisible(
+                        _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+                        _extrapolationType == ExtrapolationType::LinearFit);
+                }
+                // Show skeleton params only when Extrapolation method AND SkeletonPath type
+                if (_skeletonParamsContainer) {
+                    _skeletonParamsContainer->setVisible(
+                        _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+                        _extrapolationType == ExtrapolationType::SkeletonPath);
+                }
+                // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
+                bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
+                if (_lblExtrapolationPoints) {
+                    _lblExtrapolationPoints->setVisible(showFitPoints);
+                }
+                if (_spinExtrapolationPoints) {
+                    _spinExtrapolationPoints->setVisible(showFitPoints);
+                }
+            });
+
+    // SDT/Newton refinement parameter connections
+    connect(_spinSDTMaxSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _sdtMaxSteps = std::clamp(value, 1, 10);
+        writeSetting(QStringLiteral("sdt_max_steps"), _sdtMaxSteps);
+    });
+    connect(_spinSDTStepSize, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        _sdtStepSize = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
+        writeSetting(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize));
+    });
+    connect(_spinSDTConvergence, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        _sdtConvergence = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
+        writeSetting(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence));
+    });
+    connect(_spinSDTChunkSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _sdtChunkSize = std::clamp(value, 32, 256);
+        writeSetting(QStringLiteral("sdt_chunk_size"), _sdtChunkSize);
+    });
+
+    // Skeleton path parameter connections
+    connect(_comboSkeletonConnectivity, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _skeletonConnectivity = _comboSkeletonConnectivity->itemData(index).toInt();
+        writeSetting(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity);
+    });
+    connect(_comboSkeletonSliceOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _skeletonSliceOrientation = _comboSkeletonSliceOrientation->itemData(index).toInt();
+        writeSetting(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation);
+    });
+    connect(_spinSkeletonChunkSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _skeletonChunkSize = std::clamp(value, 32, 256);
+        writeSetting(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize);
+    });
+    connect(_spinSkeletonSearchRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _skeletonSearchRadius = std::clamp(value, 1, 100);
+        writeSetting(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius);
+    });
+
     const auto triggerConfiguredGrowth = [this]() {
         const auto allowed = allowedGrowthDirections();
         auto direction = SegmentationGrowthDirection::All;
@@ -1190,6 +1410,91 @@ void SegmentationWidget::syncUiState()
         _spinGrowthSteps->setValue(_growthSteps);
     }
 
+    if (_comboGrowthMethod) {
+        const QSignalBlocker blocker(_comboGrowthMethod);
+        int idx = _comboGrowthMethod->findData(static_cast<int>(_growthMethod));
+        if (idx >= 0) {
+            _comboGrowthMethod->setCurrentIndex(idx);
+        }
+    }
+
+    if (_extrapolationOptionsPanel) {
+        _extrapolationOptionsPanel->setVisible(_growthMethod == SegmentationGrowthMethod::Extrapolation);
+    }
+
+    if (_spinExtrapolationPoints) {
+        const QSignalBlocker blocker(_spinExtrapolationPoints);
+        _spinExtrapolationPoints->setValue(_extrapolationPointCount);
+    }
+
+    if (_comboExtrapolationType) {
+        const QSignalBlocker blocker(_comboExtrapolationType);
+        int idx = _comboExtrapolationType->findData(static_cast<int>(_extrapolationType));
+        if (idx >= 0) {
+            _comboExtrapolationType->setCurrentIndex(idx);
+        }
+    }
+
+    // SDT params container visibility: only show when Extrapolation method AND Linear+Fit type
+    if (_sdtParamsContainer) {
+        _sdtParamsContainer->setVisible(
+            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+            _extrapolationType == ExtrapolationType::LinearFit);
+    }
+    if (_spinSDTMaxSteps) {
+        const QSignalBlocker blocker(_spinSDTMaxSteps);
+        _spinSDTMaxSteps->setValue(_sdtMaxSteps);
+    }
+    if (_spinSDTStepSize) {
+        const QSignalBlocker blocker(_spinSDTStepSize);
+        _spinSDTStepSize->setValue(static_cast<double>(_sdtStepSize));
+    }
+    if (_spinSDTConvergence) {
+        const QSignalBlocker blocker(_spinSDTConvergence);
+        _spinSDTConvergence->setValue(static_cast<double>(_sdtConvergence));
+    }
+    if (_spinSDTChunkSize) {
+        const QSignalBlocker blocker(_spinSDTChunkSize);
+        _spinSDTChunkSize->setValue(_sdtChunkSize);
+    }
+
+    // Skeleton params container visibility: only show when Extrapolation method AND SkeletonPath type
+    if (_skeletonParamsContainer) {
+        _skeletonParamsContainer->setVisible(
+            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+            _extrapolationType == ExtrapolationType::SkeletonPath);
+    }
+    if (_comboSkeletonConnectivity) {
+        const QSignalBlocker blocker(_comboSkeletonConnectivity);
+        int idx = _comboSkeletonConnectivity->findData(_skeletonConnectivity);
+        if (idx >= 0) {
+            _comboSkeletonConnectivity->setCurrentIndex(idx);
+        }
+    }
+    if (_comboSkeletonSliceOrientation) {
+        const QSignalBlocker blocker(_comboSkeletonSliceOrientation);
+        int idx = _comboSkeletonSliceOrientation->findData(_skeletonSliceOrientation);
+        if (idx >= 0) {
+            _comboSkeletonSliceOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_spinSkeletonChunkSize) {
+        const QSignalBlocker blocker(_spinSkeletonChunkSize);
+        _spinSkeletonChunkSize->setValue(_skeletonChunkSize);
+    }
+    if (_spinSkeletonSearchRadius) {
+        const QSignalBlocker blocker(_spinSkeletonSearchRadius);
+        _spinSkeletonSearchRadius->setValue(_skeletonSearchRadius);
+    }
+    // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
+    bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
+    if (_lblExtrapolationPoints) {
+        _lblExtrapolationPoints->setVisible(showFitPoints);
+    }
+    if (_spinExtrapolationPoints) {
+        _spinExtrapolationPoints->setVisible(showFitPoints);
+    }
+
     applyGrowthDirectionMaskToUi();
     refreshDirectionFieldList();
 
@@ -1353,6 +1658,26 @@ void SegmentationWidget::restoreSettings()
     _smoothIterations = std::clamp(_smoothIterations, 1, 25);
     _growthMethod = segmentationGrowthMethodFromInt(
         settings.value(segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod)).toInt());
+    _extrapolationPointCount = settings.value(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount).toInt();
+    _extrapolationPointCount = std::clamp(_extrapolationPointCount, 3, 20);
+    _extrapolationType = extrapolationTypeFromInt(
+        settings.value(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType)).toInt());
+
+    // Restore SDT/Newton refinement parameters
+    _sdtMaxSteps = std::clamp(settings.value(QStringLiteral("sdt_max_steps"), _sdtMaxSteps).toInt(), 1, 10);
+    _sdtStepSize = std::clamp(settings.value(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize)).toFloat(), 0.1f, 2.0f);
+    _sdtConvergence = std::clamp(settings.value(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence)).toFloat(), 0.1f, 2.0f);
+    _sdtChunkSize = std::clamp(settings.value(QStringLiteral("sdt_chunk_size"), _sdtChunkSize).toInt(), 32, 256);
+
+    // Restore skeleton path parameters
+    int storedConnectivity = settings.value(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity).toInt();
+    if (storedConnectivity == 6 || storedConnectivity == 18 || storedConnectivity == 26) {
+        _skeletonConnectivity = storedConnectivity;
+    }
+    _skeletonSliceOrientation = std::clamp(settings.value(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation).toInt(), 0, 1);
+    _skeletonChunkSize = std::clamp(settings.value(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize).toInt(), 32, 256);
+    _skeletonSearchRadius = std::clamp(settings.value(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius).toInt(), 1, 100);
+
     int storedGrowthSteps = settings.value(segmentation::GROWTH_STEPS, _growthSteps).toInt();
     storedGrowthSteps = std::clamp(storedGrowthSteps, 0, 1024);
     _tracerGrowthSteps = settings
