@@ -1,0 +1,107 @@
+{
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/edt_only_v8",
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "neural-tracing",
+    "load_ckpt":"/mnt/raid_nvme/datasets/results/neural_tracer/edt_only_v8/ckpt_004000.pth",
+    "seed": 0,
+    "batch_size": 4,
+    "num_workers": 10,
+
+    "datasets": [
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0009b.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0009b"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0139.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0139"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_rewindowed.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0172"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0175A.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0175A"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0332.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0332"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0800.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0800"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0814.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0814"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0846A.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0846A"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1451.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1451"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1667.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1667"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/volpkgs/PHercParis4.volpkg/volumes/Scroll1_8um_uint8.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHercParis4"
+        }
+    ],
+
+    "crop_size": [384,96,96],
+    "use_sdf": true,
+    "sdt_surface_sigma": 3.0,
+    "dilation_radius": 1.0,
+    "val_fraction": 0.01,
+
+    "plane_split_ratio_min": 0.25,
+    "plane_split_ratio_max": 0.5,
+
+    "num_iterations": 250000,
+    "log_frequency": 500,
+    "ckpt_frequency": 2000,
+
+    "learning_rate": 0.01,
+    "weight_decay": 3e-5,
+    "momentum": 0.99,
+    "nesterov": true,
+    "poly_exponent": 0.9,
+    "grad_clip": 12,
+
+    "mixed_precision": "bf16",
+    "compile_model": true,
+
+    "in_channels": 2,
+    "model_type": "unet",
+    "targets": {
+        "dt": {"out_channels": 1, "activation": "none"}
+    },
+    "use_skel": false,
+    "model_config": {
+        "autoconfigure":true
+    },
+
+    "augmentation": {
+        "enabled": true,
+        "allow_transposes": true,
+        "allow_mirroring": true,
+        "intensity": true
+    }
+}
