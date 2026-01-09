@@ -1115,13 +1115,13 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     QJsonObject pass1Params;
     pass1Params["normal_grid_path"] = normalGridPath;
     pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
-    pass1Params["neighbor_max_distance"] = 50;
+    pass1Params["neighbor_max_distance"] = dlg.neighborMaxDistance();
     pass1Params["mode"] = QStringLiteral("gen_neighbor");
-    pass1Params["neighbor_min_clearance"] = 4;
-    pass1Params["neighbor_fill"] = true;
-    pass1Params["neighbor_interp_window"] = 5;
-    pass1Params["generations"] = 2;
-    pass1Params["neighbor_spike_window"] = 2;
+    pass1Params["neighbor_min_clearance"] = dlg.neighborMinClearance();
+    pass1Params["neighbor_fill"] = dlg.neighborFill();
+    pass1Params["neighbor_interp_window"] = dlg.neighborInterpWindow();
+    pass1Params["generations"] = dlg.generations();
+    pass1Params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
 
     auto pass1JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass1_XXXXXX.json"));
     if (!pass1JsonFile->open()) {

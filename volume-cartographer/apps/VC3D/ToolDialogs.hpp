@@ -293,6 +293,14 @@ public:
     int resumeLocalMaxIters() const;
     bool resumeLocalDenseQr() const;
 
+    // First pass parameters
+    int neighborMaxDistance() const;
+    int neighborMinClearance() const;
+    bool neighborFill() const;
+    int neighborInterpWindow() const;
+    int generations() const;
+    int neighborSpikeWindow() const;
+
 private:
     void populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
                                const QString& defaultVolumeId);
@@ -304,6 +312,14 @@ private:
     QSpinBox* spResumeRadius_{nullptr};
     QSpinBox* spResumeMaxIters_{nullptr};
     QCheckBox* chkResumeDenseQr_{nullptr};
+
+    // First pass parameter widgets
+    QSpinBox* spMaxDistance_{nullptr};
+    QSpinBox* spMinClearance_{nullptr};
+    QCheckBox* chkNeighborFill_{nullptr};
+    QSpinBox* spInterpWindow_{nullptr};
+    QSpinBox* spGenerations_{nullptr};
+    QSpinBox* spSpikeWindow_{nullptr};
 };
 
 class ExportChunksDialog : public QDialog {
