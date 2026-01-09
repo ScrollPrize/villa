@@ -420,11 +420,15 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     @classmethod
     def _scatter_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size):
-        crop_size_int = int(crop_size)
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
         dtype = all_zyxs[0].dtype
         device = all_zyxs[0].device
-        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
-        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size, device, dtype)
+        heatmaps = torch.zeros((channel_count, *crop_size_dhw), device=device, dtype=dtype)
 
         if coords is None:
             return heatmaps
@@ -441,8 +445,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             raise NotImplementedError  # for now we only support the special case of one heatmap in this differentiable version!
         zyx = all_zyxs[0]
 
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
+
         coords = min_corner_zyx + torch.stack(torch.meshgrid(
-            *[torch.arange(crop_size, device=zyx.device)] * 3,
+            torch.arange(crop_size_dhw[0], device=zyx.device),
+            torch.arange(crop_size_dhw[1], device=zyx.device),
+            torch.arange(crop_size_dhw[2], device=zyx.device),
             indexing='ij'
         ), dim=-1)
         heatmap = torch.exp(-((coords - zyx) ** 2).sum(dim=-1) / (2 * sigma ** 2))
@@ -457,10 +469,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         if any([zyxs.requires_grad for zyxs in all_zyxs]) or min_corner_zyx.requires_grad:
             return cls._make_heatmaps_with_grad(all_zyxs, min_corner_zyx, crop_size, sigma)
 
-        crop_size_int = int(crop_size)
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
+        crop_size_tensor = torch.tensor(crop_size_dhw)
+
         device = all_zyxs[0].device
-        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, torch.float32)
-        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=torch.float32)
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size, device, torch.float32)
+        heatmaps = torch.zeros((channel_count, *crop_size_dhw), device=device, dtype=torch.float32)
 
         if coords is None:
             return heatmaps
@@ -469,7 +487,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         kernel_values = cls._get_kernel_values(device, torch.float32, sigma)
 
         expanded_coords = coords[:, None, :] + kernel_offsets[None, :, :]
-        in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_int).all(dim=-1)
+        crop_size_bounds = crop_size_tensor.to(device=device)
+        in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_bounds).all(dim=-1)
 
         if torch.any(in_bounds):
             valid_positions = expanded_coords[in_bounds]
