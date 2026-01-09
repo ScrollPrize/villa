@@ -32,15 +32,8 @@
 #include <iomanip>
 #include <cmath>
 #include <omp.h>  // ensure omp_get_max_threads() is declared
-#include <set>
-#include <filesystem>
-#include <thread>
-#include <sstream>
 
 #include "vc/tracer/Tracer.hpp"
-#include "vc/core/util/Zarr.hpp"
-
-namespace fs = std::filesystem;
 #include "vc/ui/VCCollection.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
 
@@ -85,15 +78,6 @@ std::mt19937& thread_rng()
 {
     thread_rng().seed(seed);
 }
-
-// Thread-local cache for values from neural tracer responses
-// Avoids mutating const SdtConfig& parameter
-struct SdtCache {
-    int crop_size = 192;
-    float scale_factor = 4.0f;
-    int call_count = 0;
-};
-thread_local SdtCache sdt_cache;
 
 cv::Vec3d random_perturbation(double max_abs_offset = 0.05) {
     std::uniform_real_distribution<double> dist(-max_abs_offset, max_abs_offset);
@@ -255,10 +239,6 @@ struct TraceData {
     } reference_raycast;
 
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
-
-    // SDT neural tracer data - set per-batch when using SDT losses in traditional loop
-    const SdtFieldData* sdt_field = nullptr;  // Current SDT prediction, nullptr when not in use
-    cv::Vec3f sdt_fiber_hint_xyz = {1, 0, 0}; // Local fiber direction hint in XYZ order
 };
 
 class ReferenceClearanceCost {
@@ -420,9 +400,6 @@ enum LossType {
     NORMAL,
     SDIR,
     CORRECTION,
-    SDT_SURFACE,   // SDT=0 surface constraint from neural tracer
-    SDT_FIBER,     // SDT gradient fiber alignment from neural tracer
-    SDT_NORMAL,    // SDT gradient normal alignment from neural tracer
     COUNT
 };
 
@@ -438,10 +415,6 @@ struct LossSettings {
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
-        // SDT losses disabled by default (only active when neural tracer SDT is used)
-        w[LossType::SDT_SURFACE] = 0.0f;
-        w[LossType::SDT_FIBER] = 0.0f;
-        w[LossType::SDT_NORMAL] = 0.0f;
     }
 
     void applyJsonWeights(const nlohmann::json& params) {
@@ -464,10 +437,6 @@ struct LossSettings {
         set_weight("direction_weight", LossType::DIRECTION);
         set_weight("sdir_weight", LossType::SDIR);
         set_weight("correction_weight", LossType::CORRECTION);
-        // SDT neural tracer losses
-        set_weight("sdt_surface_weight", LossType::SDT_SURFACE);
-        set_weight("sdt_fiber_weight", LossType::SDT_FIBER);
-        set_weight("sdt_normal_weight", LossType::SDT_NORMAL);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -602,6 +571,66 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
 
 } // namespace
 
+struct NeuralTracerPointInfo {
+    cv::Vec2i best_dir;
+    std::optional<cv::Vec2i> best_ortho_pos;
+    std::optional<cv::Vec2i> best_diag_pos;
+    int max_score;
+};
+
+static NeuralTracerPointInfo compute_neural_tracer_point_info(
+    const cv::Vec2i& p,
+    TraceParameters& trace_params)
+{
+    auto is_valid = [&](const cv::Vec2i& pt) {
+        return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
+    };
+
+    NeuralTracerPointInfo result;
+    result.max_score = -1;
+
+    const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+    for (const auto& dir : dirs) {
+        if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {  // check if center and prev_u (where u is dir-direction) are valid
+            continue;
+        }
+
+        const cv::Vec2i center_pos = p - dir;
+
+        const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
+
+        for (const auto& ortho_dir : ortho_dirs) {
+
+            auto current_ortho_pos = is_valid(center_pos - ortho_dir) ? std::optional{center_pos - ortho_dir} : std::nullopt;
+            cv::Vec2i diag_dir;  // vector from prev_diag to center
+            if (current_ortho_pos) {
+                // if prev_u and prev_v both given, then prev_diag should be adjacent to the gap p (not to center)
+                diag_dir = dir - ortho_dir;
+            } else {
+                // if only prev_u not prev_v given, then prev_diag should be opposite to the gap p along ortho_dir
+                diag_dir = dir + ortho_dir;
+            }
+            auto current_diag_pos = is_valid(center_pos - diag_dir) ? std::optional{center_pos - diag_dir} : std::nullopt;
+
+            int current_score =
+                current_ortho_pos && current_diag_pos ? 3 :
+                current_ortho_pos ? 2 :
+                current_diag_pos ? 1 :
+                0;  // only prev_u & center valid
+
+            if (current_score > result.max_score) {
+                result.max_score = current_score;
+                result.best_dir = dir;
+                result.best_ortho_pos = current_ortho_pos;
+                result.best_diag_pos = current_diag_pos;
+            }
+        }
+    }
+
+    return result;
+}
+
 static std::vector<cv::Vec2i> call_neural_tracer_for_points(
     const std::vector<cv::Vec2i>& points,
     TraceParameters& trace_params,
@@ -610,76 +639,30 @@ static std::vector<cv::Vec2i> call_neural_tracer_for_points(
     if (!neural_tracer)
         throw std::logic_error("Neural tracer connection is null");
 
-    auto is_valid = [&](const cv::Vec2i& pt) {
-        return point_in_bounds(trace_params.state, pt) && (trace_params.state(pt) & STATE_LOC_VALID);
-    };
-
     std::vector<cv::Vec3f> center_xyzs;
     std::vector<std::optional<cv::Vec3f>> prev_u_xyzs, prev_v_xyzs, prev_diag_xyzs;
     std::vector<cv::Vec2i> points_with_valid_dirs;
 
     for (auto const &p : points) {
 
-        cv::Vec2i best_dir;
-        std::optional<cv::Vec2i> best_ortho_pos;
-        std::optional<cv::Vec2i> best_diag_pos;
-        int max_score = -1;
+        auto const point_info = compute_neural_tracer_point_info(p, trace_params);
 
-        const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-
-        for (const auto& dir : dirs) {
-            if (!is_valid(p - dir) || !is_valid(p - 2 * dir)) {  // check if center and prev_u (where u is dir-direction) are valid
-                continue;
-            }
-
-            const cv::Vec2i center_pos = p - dir;
-
-            const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
-
-            for (const auto& ortho_dir : ortho_dirs) {
-
-                auto current_ortho_pos = is_valid(center_pos - ortho_dir) ? std::optional{center_pos - ortho_dir} : std::nullopt;
-                cv::Vec2i diag_dir;  // vector from prev_diag to center
-                if (current_ortho_pos) {
-                    // if prev_u and prev_v both given, then prev_diag should be adjacent to the gap p (not to center)
-                    diag_dir = dir - ortho_dir;
-                } else {
-                    // if only prev_u not prev_v given, then prev_diag should be opposite to the gap p along ortho_dir
-                    diag_dir = dir + ortho_dir;
-                }
-                auto current_diag_pos = is_valid(center_pos - diag_dir) ? std::optional{center_pos - diag_dir} : std::nullopt;
-
-                int current_score =
-                    current_ortho_pos && current_diag_pos ? 3 :
-                    current_ortho_pos ? 2 :
-                    current_diag_pos ? 1 :
-                    0;  // only prev_u & center valid
-
-                if (current_score > max_score) {
-                    max_score = current_score;
-                    best_dir = dir;
-                    best_ortho_pos = current_ortho_pos;
-                    best_diag_pos = current_diag_pos;
-                }
-            }
-        }
-
-        if (max_score < 1) {
+        if (point_info.max_score < 1) {
             // we disallow score = -1 since this implies no neighbors found, and score = 0 since this is likely to create long, poorly-supported tendrils
-            std::cout << "warning: max_score = " << max_score << std::endl;
+            std::cout << "warning: max_score = " << point_info.max_score << std::endl;
             continue;
         }
 
         auto get_point = [&](const cv::Vec2i& pos) {
-            assert(is_valid(pos));
+            assert(point_in_bounds(trace_params.state, pos) && (trace_params.state(pos) & STATE_LOC_VALID));
             const auto& p_double_neighbor = trace_params.dpoints(pos);
             return cv::Vec3f(p_double_neighbor[0], p_double_neighbor[1], p_double_neighbor[2]);
         };
 
-        center_xyzs.push_back(get_point(p - best_dir));
-        prev_u_xyzs.push_back(get_point(p - 2 * best_dir));
-        prev_v_xyzs.push_back(best_ortho_pos.transform(get_point));
-        prev_diag_xyzs.push_back(best_diag_pos.transform(get_point));
+        center_xyzs.push_back(get_point(p - point_info.best_dir));
+        prev_u_xyzs.push_back(get_point(p - 2 * point_info.best_dir));
+        prev_v_xyzs.push_back(point_info.best_ortho_pos.transform(get_point));
+        prev_diag_xyzs.push_back(point_info.best_diag_pos.transform(get_point));
         points_with_valid_dirs.push_back(p);
     }
 
@@ -703,453 +686,6 @@ static std::vector<cv::Vec2i> call_neural_tracer_for_points(
     }
 
     return successful_points;
-}
-
-// ============================================================================
-// SDT (Signed Distance Transform) Neural Tracing Support
-// ============================================================================
-
-struct SdtConfig {
-    int conditioning_radius = 6;         // grid cells (fallback, prefer crop-bounds method)
-    float step_size_model = 10.0f;       // model-space voxels
-    int newton_iterations = 2;
-    int min_conditioning_points = 10;
-    float convergence_tolerance = 0.1f;  // model-space voxels
-
-    // Smart conditioning parameters
-    float conditioning_ratio = 0.30f;    // Target fraction of crop for conditioning
-    int cleanup_interval = 25;           // Clean temp files every N calls
-
-    // Ceres optimization mode (alternative to Newton projection)
-    bool use_ceres_mode = false;         // false = Newton projection, true = Ceres optimization
-    float ceres_surface_weight = 1.0f;   // Weight for SDT surface constraint
-    float ceres_normal_weight = 2.0f;    // Weight for normal alignment constraint
-    float ceres_forward_weight = 1.0f;   // Weight for forward direction constraint
-    float ceres_min_forward_dist = 0.5f; // Minimum forward distance (fraction of step size)
-    int ceres_max_iterations = 50;       // Max Ceres solver iterations
-
-    // Computed at runtime after receiving scale_factor from Python
-    float step_size_fullres(float scale_factor) const {
-        return step_size_model * scale_factor;
-    }
-};
-
-// Gather conditioning points behind the growth direction (negative dot product with u_dir)
-static std::vector<cv::Vec3f> gather_directional_conditioning(
-    const cv::Mat_<cv::Vec3d>& dpoints,
-    const cv::Mat_<uint8_t>& state,
-    const cv::Vec2i& center_grid,
-    const cv::Vec3f& center_xyz,
-    const cv::Vec3f& u_dir,  // normalized growth direction
-    int radius
-) {
-    std::vector<cv::Vec3f> points;
-
-    for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            cv::Vec2i p = center_grid + cv::Vec2i(dy, dx);
-            if (!point_in_bounds(state, p) || !(state(p) & STATE_LOC_VALID))
-                continue;
-
-            cv::Vec3f pt_xyz = cv::Vec3f(dpoints(p));
-            cv::Vec3f offset = pt_xyz - center_xyz;
-
-            // Only include points "behind" the growth direction
-            // (negative or zero dot product = on or behind the frontier plane)
-            if (offset.dot(u_dir) <= 0) {
-                points.push_back(pt_xyz);
-            }
-        }
-    }
-    return points;
-}
-
-// Gather all valid points behind the plane that fall within crop bounds
-static std::vector<cv::Vec3f> gather_conditioning_in_crop(
-    const cv::Mat_<cv::Vec3d>& dpoints,
-    const cv::Mat_<uint8_t>& state,
-    const cv::Vec3f& shifted_center,
-    const cv::Vec3f& u_dir,
-    float scale_factor,
-    int crop_size,
-    int padding = 2  // Small padding to avoid border truncation
-) {
-    std::vector<cv::Vec3f> points;
-
-    // Crop half-size in full-res voxels
-    float half_crop_fullres = (crop_size / 2.0f) * scale_factor;
-
-    // Iterate all grid points
-    for (int r = 0; r < dpoints.rows; ++r) {
-        for (int c = 0; c < dpoints.cols; ++c) {
-            if (!(state(r, c) & STATE_LOC_VALID)) continue;
-
-            cv::Vec3f pt_xyz = cv::Vec3f(dpoints(r, c));
-            cv::Vec3f offset = pt_xyz - shifted_center;
-
-            // Must be behind the plane (conditioning side)
-            if (offset.dot(u_dir) > 0) continue;
-
-            // Must be within crop bounds (with padding)
-            float bound = half_crop_fullres - padding * scale_factor;
-            if (std::abs(offset[0]) > bound ||
-                std::abs(offset[1]) > bound ||
-                std::abs(offset[2]) > bound) continue;
-
-            points.push_back(pt_xyz);
-        }
-    }
-    return points;
-}
-
-// Bilinear interpolation helper
-static cv::Vec3d bilinear_interp(
-    const cv::Vec3d& p00, const cv::Vec3d& p01,
-    const cv::Vec3d& p10, const cv::Vec3d& p11,
-    float fx, float fy
-) {
-    cv::Vec3d p0 = p00 * (1-fx) + p01 * fx;
-    cv::Vec3d p1 = p10 * (1-fx) + p11 * fx;
-    return p0 * (1-fy) + p1 * fy;
-}
-
-// Densify surface points via bilinear interpolation on grid cells
-// Grid points are 20 full-res voxels apart. The model operates at scale_factor
-// (e.g., 4 = 4x downsampled). In model space, grid points are 20/scale_factor voxels apart.
-// To fill every model voxel, we need 20/scale_factor points per axis.
-static std::vector<cv::Vec3f> densify_points_on_grid(
-    const cv::Mat_<cv::Vec3d>& dpoints,
-    const cv::Mat_<uint8_t>& state,
-    float scale_factor
-) {
-    // Build set of valid grid cells (all 4 corners must be valid)
-    std::set<std::pair<int,int>> cells_to_densify;
-    for (int r = 0; r < dpoints.rows - 1; ++r) {
-        for (int c = 0; c < dpoints.cols - 1; ++c) {
-            if ((state(r, c) & STATE_LOC_VALID) &&
-                (state(r, c+1) & STATE_LOC_VALID) &&
-                (state(r+1, c) & STATE_LOC_VALID) &&
-                (state(r+1, c+1) & STATE_LOC_VALID)) {
-                cells_to_densify.insert({r, c});
-            }
-        }
-    }
-
-    std::vector<cv::Vec3f> dense;
-
-    // Grid points are 20 full-res voxels apart
-    // In model space: 20/scale_factor model-voxels apart
-    // To fill each model voxel: step = scale_factor/20
-    // e.g., scale_factor=4 -> step=0.2 -> 5 points/axis -> 25 points/cell
-    float step = scale_factor / 20.0f;
-
-    for (const auto& [r, c] : cells_to_densify) {
-        cv::Vec3d p00 = dpoints(r, c);
-        cv::Vec3d p01 = dpoints(r, c+1);
-        cv::Vec3d p10 = dpoints(r+1, c);
-        cv::Vec3d p11 = dpoints(r+1, c+1);
-
-        for (float fy = 0; fy < 1.0f; fy += step) {
-            for (float fx = 0; fx < 1.0f; fx += step) {
-                cv::Vec3d pt = bilinear_interp(p00, p01, p10, p11, fx, fy);
-                dense.push_back(cv::Vec3f(pt));
-            }
-        }
-    }
-    return dense;
-}
-
-// Get per-thread temp directory for mask files
-static std::string get_thread_temp_dir() {
-    std::ostringstream oss;
-    oss << "/tmp/neural_tracer_data/" << std::this_thread::get_id();
-    return oss.str();
-}
-
-// Clean up zarr files in thread's temp directory
-static void cleanup_thread_temp_files() {
-    std::string dir = get_thread_temp_dir();
-    if (fs::exists(dir)) {
-        for (auto& entry : fs::directory_iterator(dir)) {
-            if (entry.path().extension() == ".zarr") {
-                fs::remove_all(entry.path());
-            }
-        }
-    }
-}
-
-// Trilinear interpolation of SDT at world position
-static float sample_sdt_trilinear(
-    const xt::xarray<float>& sdt,
-    const cv::Vec3f& world_pos_xyz,      // full-res XYZ
-    const cv::Vec3f& min_corner_xyz,     // full-res XYZ
-    float scale_factor                    // 2^volume_scale
-) {
-    // Convert to model-space local coordinates
-    cv::Vec3f local_fullres = world_pos_xyz - min_corner_xyz;
-    cv::Vec3f local_model = local_fullres / scale_factor;
-
-    // XYZ → ZYX for array indexing
-    float x = local_model[0];
-    float y = local_model[1];
-    float z = local_model[2];
-
-    // Bounds check (array is ZYX: shape[0]=D, shape[1]=H, shape[2]=W)
-    int D = sdt.shape(0), H = sdt.shape(1), W = sdt.shape(2);
-    if (x < 0 || x >= W-1 || y < 0 || y >= H-1 || z < 0 || z >= D-1)
-        return std::numeric_limits<float>::quiet_NaN();
-
-    // Integer and fractional parts
-    int x0 = (int)x, y0 = (int)y, z0 = (int)z;
-    int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-    float xf = x - x0, yf = y - y0, zf = z - z0;
-
-    // Trilinear interpolation (array is ZYX)
-    float c000 = sdt(z0, y0, x0), c001 = sdt(z0, y0, x1);
-    float c010 = sdt(z0, y1, x0), c011 = sdt(z0, y1, x1);
-    float c100 = sdt(z1, y0, x0), c101 = sdt(z1, y0, x1);
-    float c110 = sdt(z1, y1, x0), c111 = sdt(z1, y1, x1);
-
-    float c00 = c000 * (1-xf) + c001 * xf;
-    float c01 = c010 * (1-xf) + c011 * xf;
-    float c10 = c100 * (1-xf) + c101 * xf;
-    float c11 = c110 * (1-xf) + c111 * xf;
-
-    float c0 = c00 * (1-yf) + c01 * yf;
-    float c1 = c10 * (1-yf) + c11 * yf;
-
-    return c0 * (1-zf) + c1 * zf;
-}
-
-// Compute SDT gradient via central differences (returns gradient in full-res XYZ space)
-static cv::Vec3f compute_sdt_gradient(
-    const xt::xarray<float>& sdt,
-    const cv::Vec3f& world_pos_xyz,
-    const cv::Vec3f& min_corner_xyz,
-    float scale_factor
-) {
-    // Step size in full-res coordinates (1 model voxel = scale_factor full-res)
-    const float h = scale_factor;
-
-    float dx = sample_sdt_trilinear(sdt, world_pos_xyz + cv::Vec3f(h,0,0), min_corner_xyz, scale_factor)
-             - sample_sdt_trilinear(sdt, world_pos_xyz - cv::Vec3f(h,0,0), min_corner_xyz, scale_factor);
-    float dy = sample_sdt_trilinear(sdt, world_pos_xyz + cv::Vec3f(0,h,0), min_corner_xyz, scale_factor)
-             - sample_sdt_trilinear(sdt, world_pos_xyz - cv::Vec3f(0,h,0), min_corner_xyz, scale_factor);
-    float dz = sample_sdt_trilinear(sdt, world_pos_xyz + cv::Vec3f(0,0,h), min_corner_xyz, scale_factor)
-             - sample_sdt_trilinear(sdt, world_pos_xyz - cv::Vec3f(0,0,h), min_corner_xyz, scale_factor);
-
-    // Guard against NaN/inf from out-of-bounds samples
-    if (std::isnan(dx) || std::isnan(dy) || std::isnan(dz) ||
-        std::isinf(dx) || std::isinf(dy) || std::isinf(dz)) {
-        return cv::Vec3f(0, 0, 0);  // Return zero gradient (caught by grad_norm_sq check)
-    }
-
-    return cv::Vec3f(dx, dy, dz) / (2 * h);
-}
-
-// Newton projection to SDT=0 surface
-static cv::Vec3f project_to_surface(
-    const xt::xarray<float>& sdt,
-    const cv::Vec3f& initial_pos_xyz,
-    const cv::Vec3f& min_corner_xyz,
-    float scale_factor,
-    int max_iterations = 2,
-    float tolerance = 0.1f  // in model-space voxels
-) {
-    cv::Vec3f pos = initial_pos_xyz;
-    const float tol_fullres = tolerance * scale_factor;
-
-    for (int i = 0; i < max_iterations; ++i) {
-        float sdt_val = sample_sdt_trilinear(sdt, pos, min_corner_xyz, scale_factor);
-        if (std::isnan(sdt_val) || std::isinf(sdt_val)) break;  // out of bounds or invalid
-
-        // SDT value is in model-space voxels
-        if (std::abs(sdt_val * scale_factor) < tol_fullres) break;
-
-        cv::Vec3f grad = compute_sdt_gradient(sdt, pos, min_corner_xyz, scale_factor);
-        float grad_norm_sq = grad.dot(grad);
-        if (grad_norm_sq < 1e-12f) break;  // flat region or NaN guard triggered
-
-        // Defensive NaN check on gradient norm
-        if (std::isnan(grad_norm_sq)) break;
-
-        // Newton step: pos -= sdt * grad / |grad|^2
-        // grad is dsdt_model/dpos_fullres, sdt_val is in model voxels
-        // Result: model_voxels / (model_voxels/fullres_voxels) = fullres_voxels
-        pos = pos - (sdt_val / grad_norm_sq) * grad;
-    }
-    return pos;
-}
-
-// Returns best growth direction or {0,0} if no valid direction found
-static cv::Vec2i find_best_traced_neighbor_direction(
-    const cv::Vec2i& p,
-    const cv::Mat_<uint8_t>& state,
-    const cv::Mat_<cv::Vec3d>& dpoints
-) {
-    const cv::Vec2i dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-
-    auto is_valid = [&](const cv::Vec2i& pos) {
-        return point_in_bounds(state, pos) && (state(pos) & STATE_LOC_VALID);
-    };
-
-    int max_score = -1;
-    cv::Vec2i best_dir(0, 0);
-
-    for (const auto& dir : dirs) {
-        // Need center (p-dir) and prev_u (p-2*dir) to be valid
-        if (!is_valid(p - dir) || !is_valid(p - 2 * dir))
-            continue;
-
-        cv::Vec2i center_pos = p - dir;
-        const cv::Vec2i ortho_dirs[] = {{-dir[1], dir[0]}, {dir[1], -dir[0]}};
-
-        for (const auto& ortho_dir : ortho_dirs) {
-            bool has_ortho = is_valid(center_pos - ortho_dir);
-
-            cv::Vec2i diag_dir = has_ortho ? (dir - ortho_dir) : (dir + ortho_dir);
-            bool has_diag = is_valid(center_pos - diag_dir);
-
-            // Score: 3 (both ortho+diag), 2 (ortho only), 1 (diag only), 0 (neither)
-            int score = (has_ortho && has_diag) ? 3 :
-                        has_ortho ? 2 :
-                        has_diag ? 1 : 0;
-
-            if (score > max_score) {
-                max_score = score;
-                best_dir = dir;
-            }
-        }
-    }
-
-    // Require at least score 1 (some neighbor context)
-    return (max_score >= 1) ? best_dir : cv::Vec2i(0, 0);
-}
-
-// Result of SDT query for a single point - owns the data
-struct SinglePointSdtResult {
-    NeuralTracerConnection::EdtResult edt_result;  // Owns the xt::xarray data
-    cv::Vec3f u_dir;                               // Growth direction (fiber hint)
-    cv::Vec3f center_xyz;                          // Center position
-    float normal_sign;                             // Orientation sign
-
-    // Build SdtFieldData pointing into edt_result (valid while this struct exists)
-    SdtFieldData build_field_data() const {
-        SdtFieldData field;
-        field.sdt_data = edt_result.distance_transform.data();
-        field.sdt_shape[0] = edt_result.shape[0];
-        field.sdt_shape[1] = edt_result.shape[1];
-        field.sdt_shape[2] = edt_result.shape[2];
-        field.min_corner_xyz = edt_result.min_corner_xyz;
-        field.scale_factor = edt_result.scale_factor;
-        field.forward_dir = u_dir;
-        field.center_xyz = center_xyz;
-        field.normal_sign = normal_sign;
-        return field;
-    }
-};
-
-// Query SDT for a single candidate point - returns nullopt if query fails or point is unsuitable
-// This is used by the traditional loop when SDT losses are enabled
-static std::optional<SinglePointSdtResult> query_sdt_for_point(
-    const cv::Vec2i& p,
-    TraceParameters& trace_params,
-    NeuralTracerConnection* neural_tracer,
-    float scale_factor,
-    int crop_size,
-    float conditioning_ratio,
-    int min_conditioning_points
-) {
-    if (!neural_tracer) return std::nullopt;
-
-    // Find growth direction
-    cv::Vec2i best_dir = find_best_traced_neighbor_direction(
-        p, trace_params.state, trace_params.dpoints);
-    if (best_dir == cv::Vec2i(0, 0)) return std::nullopt;
-
-    cv::Vec2i center_grid = p - best_dir;
-    cv::Vec2i prev_u_grid = p - 2 * best_dir;
-
-    // Check bounds
-    if (center_grid[0] < 0 || center_grid[0] >= trace_params.dpoints.rows ||
-        center_grid[1] < 0 || center_grid[1] >= trace_params.dpoints.cols ||
-        prev_u_grid[0] < 0 || prev_u_grid[0] >= trace_params.dpoints.rows ||
-        prev_u_grid[1] < 0 || prev_u_grid[1] >= trace_params.dpoints.cols)
-        return std::nullopt;
-
-    if (!(trace_params.state(center_grid) & STATE_LOC_VALID) ||
-        !(trace_params.state(prev_u_grid) & STATE_LOC_VALID))
-        return std::nullopt;
-
-    cv::Vec3f center_xyz = cv::Vec3f(trace_params.dpoints(center_grid));
-    cv::Vec3f prev_u_xyz = cv::Vec3f(trace_params.dpoints(prev_u_grid));
-
-    // Compute normalized U direction
-    cv::Vec3f u_vec = center_xyz - prev_u_xyz;
-    float u_len = cv::norm(u_vec);
-    if (u_len < 1e-6f) return std::nullopt;
-    cv::Vec3f u_dir = u_vec / u_len;
-
-    // Calculate shifted center for target conditioning ratio
-    float shift_voxels = crop_size * (0.5f - conditioning_ratio) * scale_factor;
-    cv::Vec3f shifted_center = center_xyz + shift_voxels * u_dir;
-
-    // Gather conditioning points
-    auto cond_points = gather_conditioning_in_crop(
-        trace_params.dpoints, trace_params.state,
-        shifted_center, u_dir, scale_factor, crop_size
-    );
-    if ((int)cond_points.size() < min_conditioning_points) return std::nullopt;
-
-    // Densify the conditioning points
-    auto dense_points = densify_points_on_grid(
-        trace_params.dpoints, trace_params.state, scale_factor
-    );
-
-    // Filter dense points: behind plane and within crop bounds
-    float half_crop_fullres = (crop_size / 2.0f) * scale_factor;
-    std::vector<cv::Vec3f> filtered_points;
-    for (const auto& pt : dense_points) {
-        cv::Vec3f offset = pt - shifted_center;
-        if (offset.dot(u_dir) > 0) continue;
-        if (std::abs(offset[0]) > half_crop_fullres ||
-            std::abs(offset[1]) > half_crop_fullres ||
-            std::abs(offset[2]) > half_crop_fullres) continue;
-        filtered_points.push_back(pt);
-    }
-
-    // Query SDT (single-element batch)
-    std::vector<cv::Vec3f> centers = {shifted_center};
-    std::vector<std::vector<cv::Vec3f>> points_batch = {filtered_points};
-
-    try {
-        auto batch_result = neural_tracer->get_sdt_from_points_batch(centers, points_batch);
-        if (batch_result.errors.empty() || !batch_result.errors[0].empty()) {
-            return std::nullopt;
-        }
-
-        SinglePointSdtResult result;
-        result.edt_result = std::move(batch_result.results[0]);
-        result.u_dir = u_dir;
-        result.center_xyz = center_xyz;
-
-        // Compute normal sign - build temporary field data for gradient computation
-        SdtFieldData temp_field = result.build_field_data();
-        cv::Vec3f grad = temp_field.gradient(center_xyz);
-        float grad_len = cv::norm(grad);
-        if (grad_len < 1e-6f) {
-            result.normal_sign = 1.0f;
-        } else {
-            float dot = u_dir.dot(grad / grad_len);
-            result.normal_sign = (dot >= 0) ? 1.0f : -1.0f;
-        }
-
-        return result;
-
-    } catch (const std::exception& e) {
-        std::cerr << "SDT query failed for point: " << e.what() << std::endl;
-        return std::nullopt;
-    }
 }
 
 // global CUDA to allow use to set to false globally
@@ -1526,119 +1062,6 @@ int gen_direction_loss(ceres::Problem &problem,
     return count;
 }
 
-// ============================================================================
-// SDT Loss Generation Functions
-// These apply SDT-derived constraints using the templated direction losses
-// ============================================================================
-
-// Generate SDT surface loss - penalizes points that deviate from SDT=0
-static int gen_sdt_surface_loss(ceres::Problem& problem,
-    const cv::Vec2i& p,
-    cv::Mat_<uint8_t>& state,
-    cv::Mat_<cv::Vec3d>& loc,
-    const TraceData& trace_data,
-    const LossSettings& settings)
-{
-    if (!trace_data.sdt_field) return 0;
-    if (!loc_valid(state(p))) return 0;
-
-    float weight = settings(LossType::SDT_SURFACE, p);
-    if (weight <= 0.0f) return 0;
-
-    problem.AddResidualBlock(
-        SdtSurfaceLoss::Create(*trace_data.sdt_field, weight),
-        nullptr, &loc(p)[0]);
-    return 1;
-}
-
-// Generate SDT fiber direction loss - aligns patch U/V direction with SDT-derived tangent
-static int gen_sdt_fiber_loss(ceres::Problem& problem,
-    const cv::Vec2i& p,
-    int off_dist,
-    cv::Mat_<uint8_t>& state,
-    cv::Mat_<cv::Vec3d>& loc,
-    TraceData& trace_data,
-    const LossSettings& settings)
-{
-    if (!trace_data.sdt_field) return 0;
-    if (!loc_valid(state(p))) return 0;
-
-    cv::Vec2i const p_off_horz{p[0], p[1] + off_dist};
-    if (!loc_valid(state(p_off_horz))) return 0;
-
-    float weight = settings(LossType::SDT_FIBER, p);
-    if (weight <= 0.0f) return 0;
-
-    // Create fiber adapter with current hint
-    SdtFiberFieldAdapter adapter(trace_data.sdt_field, trace_data.sdt_fiber_hint_xyz);
-
-    // Use templated FiberDirectionLoss with SDT adapter (no per-voxel weights)
-    problem.AddResidualBlock(
-        FiberDirectionLossT<SdtFiberFieldAdapter, Chunked3dFloatFromUint8>::Create(adapter, nullptr, weight),
-        nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
-    return 1;
-}
-
-// Generate SDT normal direction loss - aligns surface normal with SDT gradient
-static int gen_sdt_normal_loss(ceres::Problem& problem,
-    const cv::Vec2i& p,
-    cv::Mat_<uint8_t>& state,
-    cv::Mat_<cv::Vec3d>& loc,
-    const TraceData& trace_data,
-    const LossSettings& settings)
-{
-    if (!trace_data.sdt_field) return 0;
-    if (!loc_valid(state(p))) return 0;
-
-    cv::Vec2i const p_off_horz{p[0], p[1] + 1};
-    cv::Vec2i const p_off_vert{p[0] + 1, p[1]};
-    if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert))) return 0;
-
-    float weight = settings(LossType::SDT_NORMAL, p);
-    if (weight <= 0.0f) return 0;
-
-    // Create normal adapter
-    SdtNormalFieldAdapter adapter(trace_data.sdt_field);
-
-    // Use templated NormalDirectionLoss with SDT adapter (no per-voxel weights)
-    problem.AddResidualBlock(
-        NormalDirectionLossT<SdtNormalFieldAdapter, Chunked3dFloatFromUint8>::Create(adapter, nullptr, weight),
-        nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
-    return 1;
-}
-
-// Conditional versions for add_missing_losses
-static int conditional_sdt_surface_loss(int bit, const cv::Vec2i& p, cv::Mat_<uint16_t>& loss_status,
-    ceres::Problem& problem, cv::Mat_<uint8_t>& state, cv::Mat_<cv::Vec3d>& loc,
-    const TraceData& trace_data, const LossSettings& settings)
-{
-    int set = 0;
-    if (!loss_mask(bit, p, {0,0}, loss_status))
-        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_sdt_surface_loss(problem, p, state, loc, trace_data, settings));
-    return set;
-}
-
-static int conditional_sdt_fiber_loss(int bit, const cv::Vec2i& p, int off_dist, cv::Mat_<uint16_t>& loss_status,
-    ceres::Problem& problem, cv::Mat_<uint8_t>& state, cv::Mat_<cv::Vec3d>& loc,
-    TraceData& trace_data, const LossSettings& settings)
-{
-    int set = 0;
-    cv::Vec2i const off{0, off_dist};
-    if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_sdt_fiber_loss(problem, p, off_dist, state, loc, trace_data, settings));
-    return set;
-}
-
-static int conditional_sdt_normal_loss(int bit, const cv::Vec2i& p, cv::Mat_<uint16_t>& loss_status,
-    ceres::Problem& problem, cv::Mat_<uint8_t>& state, cv::Mat_<cv::Vec3d>& loc,
-    const TraceData& trace_data, const LossSettings& settings)
-{
-    int set = 0;
-    if (!loss_mask(bit, p, {0,0}, loss_status))
-        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_sdt_normal_loss(problem, p, state, loc, trace_data, settings));
-    return set;
-}
-
 //create all valid losses for this point
 // Forward declarations
 static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceData& trace_data, const LossSettings &settings);
@@ -1947,14 +1370,6 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data, settings);
 
     count += gen_reference_ray_loss(problem, p, params, trace_data);
-
-    // SDT-based losses (only active when sdt_field is set via neural tracer)
-    if (trace_data.sdt_field) {
-        count += conditional_sdt_surface_loss(12, p, loss_status, problem, params.state, params.dpoints, trace_data, settings);
-        count += conditional_sdt_fiber_loss(13, p, 1, loss_status, problem, params.state, params.dpoints, trace_data, settings);
-        count += conditional_sdt_fiber_loss(13, p, -1, loss_status, problem, params.state, params.dpoints, trace_data, settings);
-        count += conditional_sdt_normal_loss(14, p, loss_status, problem, params.state, params.dpoints, trace_data, settings);
-    }
 
     return count;
 }
@@ -2339,35 +1754,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             std::cout << "Neural tracer not active" << std::endl;
         }
     }
-
-    // SDT model configuration
-    std::string neural_model_type = params.value("neural_model_type", "uv");
-    SdtConfig sdt_cfg;
-    if (neural_tracer && neural_model_type == "sdt") {
-        sdt_cfg.conditioning_radius = params.value("sdt_conditioning_radius", 6);
-        sdt_cfg.step_size_model = params.value("sdt_step_size_model", 10.0f);
-        sdt_cfg.newton_iterations = params.value("sdt_newton_iterations", 2);
-        sdt_cfg.min_conditioning_points = params.value("sdt_min_conditioning_points", 10);
-        sdt_cfg.convergence_tolerance = params.value("sdt_convergence_tolerance", 0.1f);
-        // Smart conditioning configuration
-        sdt_cfg.conditioning_ratio = params.value("sdt_conditioning_ratio", 0.30f);
-        sdt_cfg.cleanup_interval = params.value("sdt_cleanup_interval", 25);
-        // Ceres mode configuration
-        sdt_cfg.use_ceres_mode = params.value("sdt_use_ceres_mode", false);
-        sdt_cfg.ceres_surface_weight = params.value("sdt_ceres_surface_weight", 1.0f);
-        sdt_cfg.ceres_normal_weight = params.value("sdt_ceres_normal_weight", 2.0f);
-        sdt_cfg.ceres_forward_weight = params.value("sdt_ceres_forward_weight", 1.0f);
-        sdt_cfg.ceres_min_forward_dist = params.value("sdt_ceres_min_forward_dist", 0.5f);
-        sdt_cfg.ceres_max_iterations = params.value("sdt_ceres_max_iterations", 50);
-        std::cout << "SDT model enabled (radius=" << sdt_cfg.conditioning_radius
-                  << ", step=" << sdt_cfg.step_size_model
-                  << ", newton_iter=" << sdt_cfg.newton_iterations
-                  << ", min_points=" << sdt_cfg.min_conditioning_points
-                  << ", conditioning_ratio=" << sdt_cfg.conditioning_ratio
-                  << ", ceres_mode=" << (sdt_cfg.use_ceres_mode ? "true" : "false") << ")" << std::endl;
-    } else if (neural_tracer) {
-        std::cout << "UV model enabled" << std::endl;
-    }
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
@@ -2515,12 +1901,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
-
-        // If resume_generations is specified, override stop_gen to grow that many more from current
-        if (params.contains("resume_generations")) {
-            stop_gen = start_gen + params["resume_generations"].get<int>();
-        }
-
         int gen_diff = std::max(0, stop_gen - start_gen);
         w = resume_generations.cols + 2 * gen_diff + 50;
         h = resume_generations.rows + 2 * gen_diff + 50;
@@ -2970,105 +2350,73 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         if (neural_tracer && pre_neural_gens == 0) {
             std::cout << "Initializing with neural tracer..." << std::endl;
 
-            // TODO: change this to work like the python trace_patch_v5
-            throw std::runtime_error("Neural tracer in VC3D does not support growing from scratch yet");
+            // Bootstrap the first quad with the neural tracer -- we already have the
+            // top-left point; we construct top-right, bottom-left and bottom-right
 
             trace_params.dpoints(y0, x0) = origin;
-            trace_params.state(y0, x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-            generations(y0, x0) = 1;
-            fringe.push_back({y0, x0});
-            surface_normals(y0, x0) = seed_normal;
 
-            auto next_points = neural_tracer->get_next_points({origin}, {std::nullopt}, {std::nullopt}, {std::nullopt})[0];
-
-            if (next_points.next_u_xyzs.size() >= 4) {
-                std::cout << "Neural tracer returned " << next_points.next_u_xyzs.size() << " initial points." << std::endl;
-                
-                std::vector<cv::Vec3f> points = next_points.next_u_xyzs;
-                if (points.size() > 4) points.resize(4);
-
-                float max_dist_sq = -1.0f;
-                int idx1 = -1, idx2 = -1;
-                for (int i = 0; i < 4; ++i) {
-                    for (int j = i + 1; j < 4; ++j) {
-                        float d_sq = cv::norm(points[i] - points[j], cv::NORM_L2SQR);
-                        if (d_sq > max_dist_sq) {
-                            max_dist_sq = d_sq;
-                            idx1 = i;
-                            idx2 = j;
-                        }
-                    }
-                }
-
-                std::vector<int> remaining_indices;
-                for (int i = 0; i < 4; ++i) {
-                    if (i != idx1 && i != idx2) remaining_indices.push_back(i);
-                }
-                int idx3 = remaining_indices[0];
-                int idx4 = remaining_indices[1];
-
-                cv::Vec2i grid_pos[] = {{y0, x0 + 1}, {y0, x0 - 1}, {y0 - 1, x0}, {y0 + 1, x0}};
-                cv::Vec3f tracer_points[] = {points[idx1], points[idx2], points[idx3], points[idx4]};
-
-                for (int i = 0; i < 4; ++i) {
-                    trace_params.dpoints(grid_pos[i]) = tracer_points[i];
-                    trace_params.state(grid_pos[i]) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    generations(grid_pos[i]) = 1;
-                    surface_normals(grid_pos[i]) = seed_normal;
-                    fringe.push_back(grid_pos[i]);
-                }
-
-                used_area = cv::Rect(x0 - 1, y0 - 1, 3, 3);
-                local_optimization(3, {y0,x0}, trace_params, trace_data, loss_settings, true);
-            } else {
-                std::cout << "Neural tracer initialization failed (not enough points), falling back to default." << std::endl;
-                used_area = cv::Rect(x0,y0,2,2);
-                trace_params.dpoints(y0,x0) = origin;
-                trace_params.dpoints(y0,x0+1) = origin+vx*0.1;
-                trace_params.dpoints(y0+1,x0) = origin+vy*0.1;
-                trace_params.dpoints(y0+1,x0+1) = origin+vx*0.1 + vy*0.1;
-                trace_params.state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-                trace_params.state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-                trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
-                trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
-                generations(y0,x0) = 1; generations(y0,x0+1) = 1; generations(y0+1,x0) = 1; generations(y0+1,x0+1) = 1;
-                surface_normals(y0,x0) = seed_normal;
-                surface_normals(y0,x0+1) = seed_normal;
-                surface_normals(y0+1,x0) = seed_normal;
-                surface_normals(y0+1,x0+1) = seed_normal;
-                fringe.push_back({y0,x0}); fringe.push_back({y0+1,x0}); fringe.push_back({y0,x0+1}); fringe.push_back({y0+1,x0+1});
+            // Get hopefully-4 adjacent points; take the one with min or max z-displacement depending on required direction
+            auto coordinates = neural_tracer->get_next_points({origin}, {{}}, {{}}, {{}})[0].next_u_xyzs;
+            if (coordinates.empty() || cv::norm(coordinates[0]) < 1e-6) {
+                std::cout << "no blobs found while bootstrapping (vertex #1, top-right)" << std::endl;
+                throw std::runtime_error("Neural tracer bootstrap failed at vertex #1");
             }
+            // use minimum delta-z; this choice orients the patch
+            auto min_delta_z_it = std::min_element(coordinates.begin(), coordinates.end(), [&origin](const cv::Vec3f& a, const cv::Vec3f& b) {
+                return std::abs(a[2] - origin[2]) < std::abs(b[2] - origin[2]);
+            });
+            trace_params.dpoints(y0, x0 + 1) = *min_delta_z_it;
+
+            // Conditioned on center and right, predict below & above (choosing one arbitrarily)
+            cv::Vec3f prev_v = trace_params.dpoints(y0, x0 + 1);
+            coordinates = neural_tracer->get_next_points({origin}, {{}}, {prev_v}, {{}})[0].next_u_xyzs;
+            if (coordinates.empty() || cv::norm(coordinates[0]) < 1e-6) {
+                std::cout << "no blobs found while bootstrapping (vertex #2, bottom-left)" << std::endl;
+                throw std::runtime_error("Neural tracer bootstrap failed at vertex #2");
+            }
+            trace_params.dpoints(y0 + 1, x0) = coordinates[0];
+
+            // Conditioned on center (top-right of the quad!) and left and below-left, predict below
+            cv::Vec3f center_xyz = trace_params.dpoints(y0, x0 + 1);
+            prev_v = trace_params.dpoints(y0, x0);
+            cv::Vec3f prev_diag = trace_params.dpoints(y0 + 1, x0);
+            coordinates = neural_tracer->get_next_points({center_xyz}, {{}}, {prev_v}, {prev_diag})[0].next_u_xyzs;
+            if (coordinates.empty() || cv::norm(coordinates[0]) < 1e-6) {
+                std::cout << "no blobs found while bootstrapping (vertex #3, bottom-right)" << std::endl;
+                throw std::runtime_error("Neural tracer bootstrap failed at vertex #3");
+            }
+            trace_params.dpoints(y0 + 1, x0 + 1) = coordinates[0];
+
         } else {
             // Initialise the trace at the center of the available area, as a tiny single-quad patch at the seed point
-            used_area = cv::Rect(x0,y0,2,2);
             //these are locations in the local volume!
             trace_params.dpoints(y0,x0) = origin;
             trace_params.dpoints(y0,x0+1) = origin+vx*0.1;
             trace_params.dpoints(y0+1,x0) = origin+vy*0.1;
             trace_params.dpoints(y0+1,x0+1) = origin+vx*0.1 + vy*0.1;
-
-            trace_params.state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-            trace_params.state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-            trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
-            trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
-
-            generations(y0,x0) = 1;
-            generations(y0,x0+1) = 1;
-            generations(y0+1,x0) = 1;
-            generations(y0+1,x0+1) = 1;
-
-            surface_normals(y0,x0) = seed_normal;
-            surface_normals(y0,x0+1) = seed_normal;
-            surface_normals(y0+1,x0) = seed_normal;
-            surface_normals(y0+1,x0+1) = seed_normal;
-
-            fringe.push_back({y0,x0});
-            fringe.push_back({y0+1,x0});
-            fringe.push_back({y0,x0+1});
-            fringe.push_back({y0+1,x0+1});
-
-            std::cout << "init loss count " << loss_count << std::endl;
         }
+
+        used_area = cv::Rect(x0,y0,2,2);
+
+        trace_params.state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+        trace_params.state(y0+1,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+        trace_params.state(y0,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+        trace_params.state(y0+1,x0+1) = STATE_LOC_VALID | STATE_COORD_VALID;
+
+        generations(y0,x0) = 1;
+        generations(y0,x0+1) = 1;
+        generations(y0+1,x0) = 1;
+        generations(y0+1,x0+1) = 1;
+
+        surface_normals(y0,x0) = seed_normal;
+        surface_normals(y0,x0+1) = seed_normal;
+        surface_normals(y0+1,x0) = seed_normal;
+        surface_normals(y0+1,x0+1) = seed_normal;
+
+        fringe.push_back({y0,x0});
+        fringe.push_back({y0+1,x0});
+        fringe.push_back({y0,x0+1});
+        fringe.push_back({y0+1,x0+1});
     }
 
     int succ_start = succ;
@@ -3077,7 +2425,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     ceres::Solver::Summary big_summary;
     //just continue on resume no additional global opt
     if (!resume_surf) {
-        if (!neural_tracer || pre_neural_gens > 0) {
+        if (!neural_tracer) {
             local_optimization(8, {y0,x0}, trace_params, trace_data, loss_settings, true);
         }
     }
@@ -3189,13 +2537,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 if (hierarchy[i][3] != -1) { // It's a hole
                     cv::Rect roi = cv::boundingRect(contours[i]);
 
-                    // Skip contours that touch the image boundary - these are border artifacts, not real holes
-                    if (roi.x == 0 || roi.y == 0 ||
-                        (roi.x + roi.width) >= hole_mask.cols ||
-                        (roi.y + roi.height) >= hole_mask.rows) {
-                        continue;
-                    }
-
                     int margin = 4;
                     roi.x = std::max(0, roi.x - margin);
                     roi.y = std::max(0, roi.y - margin);
@@ -3298,9 +2639,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             }
 
             // cv::imwrite("vis_inp_rect.tif", vis);
-
-            // Skip growth when in inpaint-only mode
-            fringe.resize(0);
         }
     }
 
@@ -3332,15 +2670,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         // new 2D points we might add to the patch (and later find the corresponding 3D point for)
         for(const auto& p : fringe)
         {
-            for(const auto& n : neighs) {
-                cv::Vec2i pn = p + n;
-                if (bounds.contains(cv::Point(pn[1], pn[0]))
-                    && (trace_params.state(pn) & STATE_PROCESSING) == 0
-                    && (trace_params.state(pn) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(pn) |= STATE_PROCESSING;
-                    cands.push_back(pn);
+            for(const auto& n : neighs)
+                if (bounds.contains(cv::Point(p+n))
+                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
+                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
+                    trace_params.state(p+n) |= STATE_PROCESSING;
+                    cands.push_back(p+n);
                 }
-            }
         }
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);
@@ -3350,36 +2686,29 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         int succ_gen = 0;
         std::vector<cv::Vec2i> succ_gen_ps;
 
-        // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
-        // considering two points that are too close to each other...
-        OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
-
-        // Neural tracer UV model takeover path - only for non-SDT models
-        // SDT model always uses the traditional loop with SDT losses integrated
-        if (neural_tracer && generation > pre_neural_gens && neural_model_type != "sdt") {
+        if (neural_tracer && generation > pre_neural_gens) {
+            std::unordered_set<cv::Vec2i> cands_processed;  // subset of cands we've already passed to the neural tracer in this gen
             while (true) {
 
-                // FIXME: when cands are few (e.g. ~4x batch size), we should not try to process them in parallel
+                float const min_pair_distance = 4.f;  // points closer than this in uv-space aren't processed together
 
-                bool no_more_candidates = false;
                 std::vector<cv::Vec2i> batch_cands;
                 batch_cands.reserve(neural_batch_size);
-                // FIXME: we only use parallel to 'borrow' OmpPointCol logic for not processing nearby points together
-                #pragma omp parallel for
-                for (int idx_in_batch = 0; idx_in_batch < neural_batch_size; ++idx_in_batch) {
-                    cv::Vec2i const p = cands_threadcol.next();
-                    if (p[0] == -1) {
-                        no_more_candidates = true;
-                        continue;
-                    }
+                for (auto const& p : cands) {
                     if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
                         continue;
+                    if (cands_processed.contains(p))
+                        continue;
+                    if (min_dist(p, batch_cands) < min_pair_distance)
+                        continue;
                     // TODO: also skip if its neighbors are outside the z-range (c.f. ceres case checking avg)
-                    #pragma omp critical
-                        batch_cands.push_back(p);
+                    batch_cands.push_back(p);
+                    cands_processed.insert(p);
+                    if (batch_cands.size() == neural_batch_size)
+                        break;
                 }
 
-                std::vector<cv::Vec2i> points_placed = call_neural_tracer_for_points(batch_cands, trace_params, neural_tracer.get());
+                auto const points_placed = call_neural_tracer_for_points(batch_cands, trace_params, neural_tracer.get());
 
                 for (cv::Vec2i const &p : points_placed) {
                     generations(p) = generation;
@@ -3392,7 +2721,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 succ += points_placed.size();
                 succ_gen += points_placed.size();
 
-                if (no_more_candidates)
+                if (cands_processed.size() == cands.size())
                     break;
 
             }  // end loop over batches
@@ -3410,111 +2739,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             perpoint_flipback_config.threshold = loss_settings.flipback_threshold;
             perpoint_flipback_config.weight = loss_settings.flipback_weight;
 
-            // Check if SDT losses are enabled in the traditional loop
-            // This allows using SDT as additional constraints without taking over point placement
-            bool use_sdt_in_traditional = neural_tracer && neural_model_type == "sdt" &&
-                (loss_settings[LossType::SDT_SURFACE] > 0 ||
-                 loss_settings[LossType::SDT_FIBER] > 0 ||
-                 loss_settings[LossType::SDT_NORMAL] > 0);
-
-            if (use_sdt_in_traditional) {
-                // Sequential loop with SDT queries - SDT queries are not thread-safe
-                // Process each candidate individually with optional SDT losses
-                CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor);
-
-                while (true) {
-                    int r = 1;
-                    cv::Vec2i p = cands_threadcol.next();
-                    if (p[0] == -1) break;
-
-                    if (trace_params.state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
-                        continue;
-
-                    // Find best neighbor (same as parallel loop)
-                    int ref_count = 0;
-                    cv::Vec3d avg = {0,0,0};
-                    std::vector<cv::Vec2i> srcs;
-                    for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,trace_params.dpoints.rows-1);oy++)
-                        for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,trace_params.dpoints.cols-1);ox++)
-                            if (trace_params.state(oy,ox) & STATE_LOC_VALID) {
-                                ref_count++;
-                                avg += trace_params.dpoints(oy,ox);
-                                srcs.push_back({oy,ox});
-                            }
-
-                    if (ref_count == 0 || srcs.empty()) continue;
-
-                    cv::Vec2i best_l = srcs[0];
-                    int best_ref_l = -1;
-                    for(cv::Vec2i l : srcs) {
-                        int ref_l = 0;
-                        for(int oy=std::max(l[0]-r,0);oy<=std::min(l[0]+r,trace_params.dpoints.rows-1);oy++)
-                            for(int ox=std::max(l[1]-r,0);ox<=std::min(l[1]+r,trace_params.dpoints.cols-1);ox++)
-                                if (trace_params.state(oy,ox) & STATE_LOC_VALID)
-                                    ref_l++;
-                        if (ref_l > best_ref_l) {
-                            best_l = l;
-                            best_ref_l = ref_l;
-                        }
-                    }
-
-                    avg /= ref_count;
-                    if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
-                        continue;
-
-                    // Query SDT for this point
-                    auto sdt_query_result = query_sdt_for_point(
-                        p, trace_params, neural_tracer.get(),
-                        sdt_cache.scale_factor, sdt_cache.crop_size,
-                        sdt_cfg.conditioning_ratio, sdt_cfg.min_conditioning_points);
-
-                    // Set up trace_data with SDT field if query succeeded
-                    SdtFieldData sdt_field;
-                    if (sdt_query_result) {
-                        sdt_field = sdt_query_result->build_field_data();
-                        trace_data.sdt_field = &sdt_field;
-                        trace_data.sdt_fiber_hint_xyz = sdt_query_result->u_dir;
-                    }
-
-                    // Initialize point position
-                    cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
-                    trace_params.dpoints(p) = init;
-
-                    // Create and solve Ceres problem
-                    ceres::Problem problem;
-                    trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
-
-                    std::vector<double*> parameter_blocks;
-                    problem.GetParameterBlocks(&parameter_blocks);
-                    for (auto& block : parameter_blocks) {
-                        problem.SetParameterBlockConstant(block);
-                    }
-                    problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
-
-                    ceres::Solver::Summary summary;
-                    ceres::Solve(options, &problem, &summary);
-
-                    // Run local optimization (SDT losses will be included via add_missing_losses)
-                    local_optimization(1, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
-                    if (local_opt_r > 1)
-                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
-
-                    // Clear SDT field
-                    trace_data.sdt_field = nullptr;
-
-                    generations(p) = generation;
-                    succ++;
-                    succ_gen++;
-                    if (!used_area.contains(cv::Point(p[1],p[0]))) {
-                        used_area = used_area | cv::Rect(p[1],p[0],1,1);
-                    }
-                    fringe.push_back(p);
-                    succ_gen_ps.push_back(p);
-                }  // end sequential SDT loop
-
-            } else {
-                // Original parallel loop without SDT
+            // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
+            // considering two points that are too close to each other...
+            OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
 
             // ...then start iterating over candidates in parallel using the above to yield points
             #pragma omp parallel
@@ -3606,7 +2833,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     }
                 }  // end parallel iteration over cands
             }
-            }  // end else (parallel loop without SDT)
         }
 
         // Update surface normals for all newly added points and their neighbors
@@ -3627,18 +2853,6 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
         if (neural_tracer && generation > pre_neural_gens) {
             // Skip optimizations
-        } else if (neural_tracer && generation == pre_neural_gens) {
-            // Run global optimization on the last pre-neural generation before handing off to neural tracer
-            std::cout << "Running global optimization before neural tracer handoff..." << std::endl;
-            cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
-
-            AntiFlipbackConfig flipback_config;
-            flipback_config.anchors = &positions_before_opt;
-            flipback_config.surface_normals = &surface_normals;
-            flipback_config.threshold = loss_settings.flipback_threshold;
-            flipback_config.weight = loss_settings.flipback_weight;
-
-            local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true, nullptr, &flipback_config);
         } else if (!global_opt) {
             // For late generations, instead of re-solving the global problem, solve many local-ish problems, around each
             // of the newly added points
