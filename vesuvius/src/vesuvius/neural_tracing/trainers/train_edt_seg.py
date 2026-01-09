@@ -8,8 +8,8 @@ import accelerate
 import numpy as np
 from tqdm import tqdm
 
-from vesuvius.neural_tracing.dataset_edt_seg import EdtSegDataset
-from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
+from vesuvius.neural_tracing.datasets.dataset_edt_seg import EdtSegDataset
+from vesuvius.neural_tracing.loss.deep_supervision import _resize_for_ds, _compute_ds_weights
 from vesuvius.models.training.loss.losses import SignedDistanceLoss
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper
 from vesuvius.models.training.optimizers import create_optimizer
