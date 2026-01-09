@@ -11,7 +11,6 @@ to the GT mask using BCE + Dice loss.
 """
 
 import torch
-import torch.nn.functional as F
 
 from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 
