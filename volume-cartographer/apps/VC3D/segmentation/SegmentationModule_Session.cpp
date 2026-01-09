@@ -19,8 +19,6 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
     stopAllPushPull();
     clearUndoStack();
-    clearInvalidationBrush();
-    setInvalidationBrushActive(false);
     resetHoverLookupDetail();
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
@@ -66,9 +64,7 @@ void SegmentationModule::endEditingSession()
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
-    clearInvalidationBrush();
     clearLineDragStroke();
-    setInvalidationBrushActive(false);
     _lineDrawKeyActive = false;
     resetHoverLookupDetail();
     _hoverPointer.valid = false;
@@ -253,7 +249,6 @@ bool SegmentationModule::restoreUndoSnapshot()
             }
         }
 
-        clearInvalidationBrush();
         refreshOverlay();
         emitPendingChanges();
         markAutosaveNeeded();

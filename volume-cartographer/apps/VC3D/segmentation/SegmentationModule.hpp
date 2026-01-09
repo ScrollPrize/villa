@@ -45,7 +45,6 @@ class VCCollection;
 class ViewerManager;
 class QKeyEvent;
 class QTimer;
-class SegmentationBrushTool;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
@@ -157,7 +156,6 @@ signals:
     void approvalMaskSaved(const std::string& segmentId);
 
 private:
-    friend class SegmentationBrushTool;
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
@@ -242,9 +240,6 @@ private:
                                     SegmentationGrowthDirection direction,
                                     int steps,
                                     bool inpaintOnly);
-    void setInvalidationBrushActive(bool active);
-    void clearInvalidationBrush();
-    void deactivateInvalidationBrush();
     void clearLineDragStroke();
 
     void handleMousePress(CVolumeViewer* viewer,
@@ -335,7 +330,6 @@ private:
     bool _lineDrawKeyActive{false};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 
-    std::unique_ptr<SegmentationBrushTool> _brushTool;
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;

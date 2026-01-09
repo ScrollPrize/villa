@@ -395,7 +395,7 @@ void SegmentationPushPullTool::setDependencies(SegmentationEditManager* editMana
 
 void SegmentationPushPullTool::setStepMultiplier(float multiplier)
 {
-    _stepMultiplier = std::clamp(multiplier, 0.05f, 10.0f);
+    _stepMultiplier = std::clamp(multiplier, 0.05f, 40.0f);
 }
 
 AlphaPushPullConfig SegmentationPushPullTool::sanitizeConfig(const AlphaPushPullConfig& config)

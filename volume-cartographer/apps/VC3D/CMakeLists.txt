@@ -37,8 +37,6 @@ set(srcs
     segmentation/SegmentationGrower.hpp
     segmentation/SegmentationEditManager.cpp
     segmentation/SegmentationEditManager.hpp
-    segmentation/SegmentationBrushTool.cpp
-    segmentation/SegmentationBrushTool.hpp
     segmentation/ApprovalMaskBrushTool.cpp
     segmentation/ApprovalMaskBrushTool.hpp
     segmentation/SegmentationLineTool.cpp
@@ -122,7 +120,7 @@ if (${VC_INSTALL_APPS})
     )
 
     install(
-            PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/vc_sync.py ${CMAKE_SOURCE_DIR}/scripts/flatboi.py
+            PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/vc_sync.py
             DESTINATION ${CMAKE_INSTALL_BINDIR}
             COMPONENT Programs
     )

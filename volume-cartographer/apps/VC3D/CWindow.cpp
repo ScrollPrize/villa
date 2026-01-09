@@ -44,9 +44,6 @@
 #include <QDebug>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QStandardItemModel>
-#include <QStandardItem>
-#include <QListView>
 #include <nlohmann/json.hpp>
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
@@ -86,6 +83,7 @@
 #include "segmentation/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
+#include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -489,6 +487,12 @@ CWindow::CWindow() :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
+    const QString baseTitle = windowTitle();
+    const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
+    if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
+        && repoShortHash.compare("Untracked", Qt::CaseInsensitive) != 0) {
+        setWindowTitle(QString("%1 %2").arg(baseTitle, repoShortHash));
+    }
     // setAttribute(Qt::WA_DeleteOnClose);
 
     chunk_cache = new ChunkCache<uint8_t>(CHUNK_CACHE_SIZE_GB*1024ULL*1024ULL*1024ULL);
@@ -1560,7 +1564,13 @@ void CWindow::CreateWidgets(void)
         ui.spinOverlapThreshold->setEnabled(checked);
     });
 
-    // Note: surfaceOverlaySelect model's dataChanged signal is connected in updateSurfaceOverlayDropdown()
+    connect(ui.surfaceOverlaySelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
+        if (index < 0 || !_viewerManager) return;
+        const QString surfaceName = ui.surfaceOverlaySelect->currentData().toString();
+        _viewerManager->forEachViewer([&surfaceName](CVolumeViewer* viewer) {
+            viewer->setSurfaceOverlay(surfaceName.toStdString());
+        });
+    });
 
     connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
         if (!_viewerManager) return;
@@ -2954,16 +2964,6 @@ void CWindow::onSegmentationDirChanged(int index)
         }
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(false);
-        }
-
-        // Update surface overlay dropdown to filter by new directory
-        updateSurfaceOverlayDropdown();
-
-        // Clear any existing overlay selections since surfaces changed
-        if (_viewerManager) {
-            _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-                viewer->setSurfaceOverlays({});
-            });
         }
 
         // Update the status bar to show the change
