@@ -28,20 +28,29 @@ class CropCache:
     - LRU eviction policy with memory budget
     - FIFO prefetch queue
     - Thread-safe via cachetools.LRUCache
+
+    Supports both isotropic (cubic) and anisotropic crop sizes.
     """
 
     def __init__(
         self,
         volume,
-        crop_size: int,
+        crop_size,  # int or tuple/list of 3 ints [D, H, W]
         max_memory_bytes: int = 4 * 1024**3,
         num_workers: int = 4,
         prefetch_queue_size: int = 64,
         normalize: bool = True,
     ):
         self.volume = volume
-        self.crop_size = crop_size
-        self.supercrop_size = crop_size * 2  # Cache 2x larger crops for spatial reuse
+
+        # Normalize crop_size to numpy array [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            self.crop_size = np.array(crop_size)
+        else:
+            self.crop_size = np.array([crop_size, crop_size, crop_size])
+
+        # Supercrop is cubic with size = 2 * max dimension (for spatial reuse)
+        self.supercrop_size = int(np.max(self.crop_size) * 2)
         self.num_workers = num_workers
         self.normalize = normalize
 
@@ -71,9 +80,10 @@ class CropCache:
     def _compute_supercrop_key(self, center_zyx: torch.Tensor) -> tuple:
         """
         Compute the cache key for the supercrop that contains this center.
-        Supercrops are aligned to a grid with spacing = crop_size.
+        Supercrops are aligned to a grid with spacing = max(crop_size).
         """
-        grid_spacing = self.crop_size
+        # Use max dimension for grid spacing (supercrops are cubic)
+        grid_spacing = int(np.max(self.crop_size))
         grid_idx = (center_zyx / grid_spacing).int()
         supercrop_center = (grid_idx.float() + 0.5) * grid_spacing
         supercrop_min = (supercrop_center - self.supercrop_size // 2).int()
@@ -91,18 +101,22 @@ class CropCache:
         center_zyx: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extract the requested crop_size region from a cached super-crop."""
-        crop_min = (center_zyx - self.crop_size // 2).int()
+        # crop_size is [D, H, W] numpy array
+        crop_size_tensor = torch.from_numpy(self.crop_size)
+        crop_min = (center_zyx - crop_size_tensor // 2).int()
         offset = crop_min - supercrop_min_corner.int()
 
         z0, y0, x0 = int(offset[0]), int(offset[1]), int(offset[2])
 
         # Safety clamp (should rarely trigger if grid alignment is correct)
-        supercrop_dim = supercrop.shape[0]
-        z0 = max(0, min(z0, supercrop_dim - self.crop_size))
-        y0 = max(0, min(y0, supercrop_dim - self.crop_size))
-        x0 = max(0, min(x0, supercrop_dim - self.crop_size))
+        # supercrop is cubic, crop_size may be anisotropic
+        supercrop_dims = supercrop.shape
+        d, h, w = int(self.crop_size[0]), int(self.crop_size[1]), int(self.crop_size[2])
+        z0 = max(0, min(z0, supercrop_dims[0] - d))
+        y0 = max(0, min(y0, supercrop_dims[1] - h))
+        x0 = max(0, min(x0, supercrop_dims[2] - w))
 
-        crop = supercrop[z0:z0 + self.crop_size, y0:y0 + self.crop_size, x0:x0 + self.crop_size]
+        crop = supercrop[z0:z0 + d, y0:y0 + h, x0:x0 + w]
         actual_min_corner = supercrop_min_corner + torch.tensor([z0, y0, x0])
         return crop, actual_min_corner
 

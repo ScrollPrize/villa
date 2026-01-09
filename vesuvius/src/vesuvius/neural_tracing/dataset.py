@@ -1101,12 +1101,19 @@ def filter_patches_by_roi(patches, approved_cubes):
     return filtered_patches
 
 
-def get_crop_from_volume(volume, center_zyx, crop_size):
+def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
     """Crop volume around center point, padding with zeros if needed.
 
     Guarantees the returned crop is exactly `crop_size` on each axis, even if the
     requested center lies far outside the volume (previously this could yield
     huge tensors and blow up concatenation in inference).
+
+    Args:
+        volume: The source volume array
+        center_zyx: Center coordinates for the crop
+        crop_size: Size of the crop (int for cubic, or will be converted to int)
+        normalize: If True, normalize intensity to [-1, 1] range. If False, return
+                   raw float32 values (useful when caller handles normalization).
     """
     crop_size_int = int(crop_size)
     crop_min = (center_zyx - crop_size_int // 2).int()
@@ -1126,16 +1133,20 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         actual_min[2]:actual_max[2]
     ]).to(torch.float32)
 
-    if volume_crop.numel() > 0:
-        # TODO: should instead always use standardised uint8 volumes!
-        if volume.dtype == np.uint8:
-            volume_crop = volume_crop / 255.
+    if normalize:
+        if volume_crop.numel() > 0:
+            # TODO: should instead always use standardised uint8 volumes!
+            if volume.dtype == np.uint8:
+                volume_crop = volume_crop / 255.
+            else:
+                max_val = volume_crop.amax()
+                volume_crop = volume_crop / max_val if max_val > 0 else volume_crop
         else:
-            max_val = volume_crop.amax()
-            volume_crop = volume_crop / max_val if max_val > 0 else volume_crop
+            volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
+        volume_crop = volume_crop * 2 - 1
     else:
-        volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
-    volume_crop = volume_crop * 2 - 1
+        if volume_crop.numel() == 0:
+            volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
 
     # Compute padding so final shape is exactly crop_size_int in each dimension.
     pad_before = torch.clamp(actual_min - crop_min, min=0)
