@@ -654,7 +654,8 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     }
 
     // Surface overlap detection using SurfacePatchIndex (multi-surface with colors)
-    if (_surfaceOverlayEnabled && !_surfaceOverlays.empty() && _surf_col && !baseColor.empty()) {
+    // Only process in segmentation viewer - plane views don't need surface overlays
+    if (_surf_name == "segmentation" && _surfaceOverlayEnabled && !_surfaceOverlays.empty() && _surf_col && !baseColor.empty()) {
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
         if (patchIndex) {
             // Use subsampling for many surfaces (conservative 2x stride)
@@ -701,21 +702,16 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
                 }
 
                 // Bounding box culling: skip surfaces that can't intersect viewport
-                // Compute surface 3D bounds from sparse sampling of points
-                const auto& pts = overlayQuad->rawPoints();
-                cv::Vec3f surfMin(std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-                cv::Vec3f surfMax(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
-                for (int py = 0; py < pts.rows; py += std::max(1, pts.rows / 10)) {
-                    for (int px = 0; px < pts.cols; px += std::max(1, pts.cols / 10)) {
-                        const cv::Vec3f& p = pts(py, px);
-                        if (p[0] >= 0) {
-                            for (int i = 0; i < 3; ++i) {
-                                surfMin[i] = std::min(surfMin[i], p[i]);
-                                surfMax[i] = std::max(surfMax[i], p[i]);
-                            }
-                        }
-                    }
+                // Use cached bbox - O(1) for surfaces loaded from disk
+                const Rect3D surfBBox = overlayQuad->bbox();
+                const cv::Vec3f& surfMin = surfBBox.low;
+                const cv::Vec3f& surfMax = surfBBox.high;
+
+                // Skip if bbox is invalid (uninitialized surface)
+                if (surfMin[0] < 0) {
+                    continue;
                 }
+
                 bool canIntersect = true;
                 for (int i = 0; i < 3; ++i) {
                     if (surfMin[i] > viewMax[i] || surfMax[i] < viewMin[i]) {
