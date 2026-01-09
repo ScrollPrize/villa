@@ -48,6 +48,7 @@
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
 #include <QPen>
+#include <QListView>
 #include <QFont>
 #include <QPainter>
 #include <chrono>
@@ -1562,14 +1563,6 @@ void CWindow::CreateWidgets(void)
         });
         ui.surfaceOverlaySelect->setEnabled(checked);
         ui.spinOverlapThreshold->setEnabled(checked);
-    });
-
-    connect(ui.surfaceOverlaySelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
-        if (index < 0 || !_viewerManager) return;
-        const QString surfaceName = ui.surfaceOverlaySelect->currentData().toString();
-        _viewerManager->forEachViewer([&surfaceName](CVolumeViewer* viewer) {
-            viewer->setSurfaceOverlay(surfaceName.toStdString());
-        });
     });
 
     connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
