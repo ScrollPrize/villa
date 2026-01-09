@@ -1777,7 +1777,7 @@ void QuadSurface::refreshMaskTimestamp()
 }
 
 // Surface overlap/containment tests
-bool overlap(QuadSurface& a, QuadSurface& b, int max_iters)
+bool overlap(QuadSurface& a, QuadSurface& b, int max_iters, SurfacePatchIndex* surfaceIndex)
 {
     if (!intersect(a.bbox(), b.bbox()))
         return false;
@@ -1790,7 +1790,8 @@ bool overlap(QuadSurface& a, QuadSurface& b, int max_iters)
             continue;
 
         cv::Vec3f ptr = b.pointer();
-        if (b.pointTo(ptr, loc, 2.0, max_iters) <= 2.0) {
+        // Pass surfaceIndex to pointTo() for R-tree acceleration
+        if (b.pointTo(ptr, loc, 2.0, max_iters, surfaceIndex) <= 2.0) {
             return true;
         }
     }
