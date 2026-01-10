@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from typing import Callable
 
+from .common import voxelize_surface_grid
+
 
 # Registry of extrapolation methods
 _EXTRAPOLATION_METHODS: dict[str, Callable] = {}
@@ -234,6 +236,187 @@ def _extrapolate_rbf_clamped(
     return zyx_extrapolated
 
 
+@register_method('linear_rowcol')
+def _extrapolate_linear_rowcol(
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    uv_query: np.ndarray,
+    **kwargs,
+) -> np.ndarray:
+    """
+    Linear extrapolation fitting a line per-row or per-column.
+
+    Detects extrapolation direction, then:
+    - Horizontal: fit linear model per-row (z,y,x as function of col)
+    - Vertical: fit linear model per-col (z,y,x as function of row)
+
+    More robust than linear_edge since it uses all points in each row/col.
+
+    Args:
+        uv_cond: (N, 2) flattened UV coordinates of conditioning points
+        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
+        uv_query: (M, 2) flattened UV coordinates to extrapolate to
+
+    Returns:
+        (M, 3) extrapolated ZYX coordinates
+    """
+    # Detect extrapolation direction
+    cond_center = uv_cond.mean(axis=0)
+    query_center = uv_query.mean(axis=0)
+    delta_row = query_center[0] - cond_center[0]
+    delta_col = query_center[1] - cond_center[1]
+
+    is_horizontal = abs(delta_col) > abs(delta_row)
+
+    # Get unique rows and cols
+    rows_unique = np.unique(uv_cond[:, 0])
+    cols_unique = np.unique(uv_cond[:, 1])
+
+    # Build lookup structures
+    row_to_idx = {r: i for i, r in enumerate(rows_unique)}
+    col_to_idx = {c: i for i, c in enumerate(cols_unique)}
+
+    zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+
+    if is_horizontal:
+        # Fit linear model per row: zyx = a * col + b
+        # Store coefficients for each row
+        row_coeffs = {}  # row -> (slope, intercept) for each of z,y,x
+
+        for row in rows_unique:
+            # Get all points in this row
+            mask = uv_cond[:, 0] == row
+            cols_in_row = uv_cond[mask, 1]
+            zyx_in_row = zyx_cond[mask]
+
+            if len(cols_in_row) >= 2:
+                # Fit linear: [col, 1] @ [a, b].T = zyx
+                A = np.column_stack([cols_in_row, np.ones(len(cols_in_row))])
+                coeffs, *_ = np.linalg.lstsq(A, zyx_in_row, rcond=None)
+                row_coeffs[row] = coeffs  # (2, 3): [slope; intercept] for z,y,x
+            else:
+                # Single point: use constant extrapolation
+                row_coeffs[row] = np.array([[0, 0, 0], zyx_in_row[0]])
+
+        # Extrapolate query points
+        for i, (query_row, query_col) in enumerate(uv_query):
+            # Find closest row
+            closest_row_idx = np.argmin(np.abs(rows_unique - query_row))
+            closest_row = rows_unique[closest_row_idx]
+
+            coeffs = row_coeffs[closest_row]
+            # zyx = slope * col + intercept
+            zyx_extrapolated[i] = coeffs[0] * query_col + coeffs[1]
+
+    else:
+        # Fit linear model per column: zyx = a * row + b
+        col_coeffs = {}
+
+        for col in cols_unique:
+            # Get all points in this column
+            mask = uv_cond[:, 1] == col
+            rows_in_col = uv_cond[mask, 0]
+            zyx_in_col = zyx_cond[mask]
+
+            if len(rows_in_col) >= 2:
+                A = np.column_stack([rows_in_col, np.ones(len(rows_in_col))])
+                coeffs, *_ = np.linalg.lstsq(A, zyx_in_col, rcond=None)
+                col_coeffs[col] = coeffs
+            else:
+                col_coeffs[col] = np.array([[0, 0, 0], zyx_in_col[0]])
+
+        # Extrapolate query points
+        for i, (query_row, query_col) in enumerate(uv_query):
+            # Find closest column
+            closest_col_idx = np.argmin(np.abs(cols_unique - query_col))
+            closest_col = cols_unique[closest_col_idx]
+
+            coeffs = col_coeffs[closest_col]
+            zyx_extrapolated[i] = coeffs[0] * query_row + coeffs[1]
+
+    return zyx_extrapolated
+
+
+@register_method('polynomial')
+def _extrapolate_polynomial(
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    uv_query: np.ndarray,
+    degree: int = 2,
+    **kwargs,
+) -> np.ndarray:
+    """
+    Polynomial surface extrapolation using 2D polynomial fitting.
+
+    Fits a polynomial f(u,v) = Σ c_ij * u^i * v^j for each output dimension.
+
+    Args:
+        uv_cond: (N, 2) flattened UV coordinates of conditioning points
+        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
+        uv_query: (M, 2) flattened UV coordinates to extrapolate to
+        degree: polynomial degree (2=quadratic, 3=cubic)
+
+    Returns:
+        (M, 3) extrapolated ZYX coordinates
+    """
+    from numpy.polynomial.polynomial import polyvander2d
+
+    u_cond, v_cond = uv_cond[:, 0], uv_cond[:, 1]
+    u_query, v_query = uv_query[:, 0], uv_query[:, 1]
+
+    # Build Vandermonde matrix for conditioning points
+    # For degree=2: columns are [1, u, v, u², uv, v², ...]
+    vander_cond = polyvander2d(u_cond, v_cond, [degree, degree])
+
+    # Fit coefficients for each output dimension (z, y, x) using least squares
+    coeffs, *_ = np.linalg.lstsq(vander_cond, zyx_cond, rcond=None)
+
+    # Evaluate at query points
+    vander_query = polyvander2d(u_query, v_query, [degree, degree])
+    zyx_extrapolated = vander_query @ coeffs
+
+    return zyx_extrapolated
+
+
+@register_method('bspline')
+def _extrapolate_bspline(
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    uv_query: np.ndarray,
+    degree: int = 3,
+    smoothing: float = 0,
+    **kwargs,
+) -> np.ndarray:
+    """
+    B-spline surface extrapolation using scipy's bivariate spline fitting.
+
+    Args:
+        uv_cond: (N, 2) flattened UV coordinates of conditioning points
+        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
+        uv_query: (M, 2) flattened UV coordinates to extrapolate to
+        degree: spline degree (1=linear, 3=cubic)
+        smoothing: smoothing factor (0=interpolate exactly, higher=smoother)
+
+    Returns:
+        (M, 3) extrapolated ZYX coordinates
+    """
+    from scipy.interpolate import bisplrep, bisplev
+
+    u_cond, v_cond = uv_cond[:, 0], uv_cond[:, 1]
+    u_query, v_query = uv_query[:, 0], uv_query[:, 1]
+
+    zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+
+    for dim in range(3):  # z, y, x
+        # Fit spline to scattered data
+        tck = bisplrep(u_cond, v_cond, zyx_cond[:, dim],
+                       kx=degree, ky=degree, s=smoothing)
+        # Evaluate at query points
+        zyx_extrapolated[:, dim] = bisplev(u_query, v_query, tck, grid=False)
+
+    return zyx_extrapolated
+
+
 def compute_extrapolation(
     uv_cond: np.ndarray,
     zyx_cond: np.ndarray,
@@ -260,7 +443,8 @@ def compute_extrapolation(
     Returns:
         dict with:
             - extrap_coords_local: (N, 3) local coords of extrapolated points
-            - gt_displacement: (N, 3) displacement vectors (ground truth - extrapolated)
+            - gt_coords_local: (N, 3) local coords of ground truth points
+            - gt_displacement: (N, 3) displacement vectors (deprecated, use gt_coords_local)
             - extrap_surface: (D, H, W) voxelized extrapolated surface
 
     Raises:
@@ -332,26 +516,34 @@ def compute_extrapolation(
         x_extrap_local[in_bounds]
     ], axis=-1)  # (N, 3)
 
+    # Ground truth coords in local (crop) coordinates
+    z_gt_local = z_gt - min_corner[0]
+    y_gt_local = y_gt - min_corner[1]
+    x_gt_local = x_gt - min_corner[2]
+
+    gt_coords_local = np.stack([
+        z_gt_local[in_bounds],
+        y_gt_local[in_bounds],
+        x_gt_local[in_bounds]
+    ], axis=-1)  # (N, 3)
+
+    # Displacement = ground truth - extrapolated (kept for backward compatibility)
     gt_displacement = np.stack([
         dz[in_bounds],
         dy[in_bounds],
         dx[in_bounds]
     ], axis=-1)  # (N, 3)
 
-    # Voxelize extrapolated surface
-    z_vox = np.round(z_extrap_local).astype(np.int64)
-    y_vox = np.round(y_extrap_local).astype(np.int64)
-    x_vox = np.round(x_extrap_local).astype(np.int64)
-
-    z_vox_valid = np.clip(z_vox[in_bounds], 0, crop_size[0] - 1)
-    y_vox_valid = np.clip(y_vox[in_bounds], 0, crop_size[1] - 1)
-    x_vox_valid = np.clip(x_vox[in_bounds], 0, crop_size[2] - 1)
-
-    extrap_surface = np.zeros(crop_size, dtype=np.float32)
-    extrap_surface[z_vox_valid, y_vox_valid, x_vox_valid] = 1.0
+    # Voxelize extrapolated surface with line interpolation
+    # Reshape local coords back to original UV grid shape for line drawing
+    zyx_extrap_local = np.stack([z_extrap_local, y_extrap_local, x_extrap_local], axis=-1)
+    uv_mask_shape = uv_mask.shape[:2]  # (R', C')
+    zyx_grid_local = zyx_extrap_local.reshape(uv_mask_shape + (3,))
+    extrap_surface = voxelize_surface_grid(zyx_grid_local, crop_size)
 
     return {
         'extrap_coords_local': extrap_coords_local,
-        'gt_displacement': gt_displacement,
+        'gt_coords_local': gt_coords_local,  # Ground truth coords for post-augmentation displacement
+        'gt_displacement': gt_displacement,  # Pre-computed displacement (deprecated, for backward compat)
         'extrap_surface': extrap_surface,
     }

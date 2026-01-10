@@ -1,17 +1,158 @@
 import torch
 import numpy as np
+from numba import njit
 from dataclasses import dataclass
 from vesuvius.tifxyz import Tifxyz
 import zarr
-from typing import Tuple
+from typing import Any, Dict, List, Tuple
+
+
+@njit
+def _draw_line_3d(volume: np.ndarray, z0: int, y0: int, x0: int, z1: int, y1: int, x1: int) -> None:
+    """Draw a 3D line using Bresenham's algorithm. Modifies volume in-place."""
+    dz = abs(z1 - z0)
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+
+    sz = 1 if z0 < z1 else -1
+    sy = 1 if y0 < y1 else -1
+    sx = 1 if x0 < x1 else -1
+
+    # Determine the dominant axis
+    if dx >= dy and dx >= dz:
+        # X is dominant
+        err_y = 2 * dy - dx
+        err_z = 2 * dz - dx
+        while x0 != x1:
+            if 0 <= z0 < volume.shape[0] and 0 <= y0 < volume.shape[1] and 0 <= x0 < volume.shape[2]:
+                volume[z0, y0, x0] = 1.0
+            if err_y > 0:
+                y0 += sy
+                err_y -= 2 * dx
+            if err_z > 0:
+                z0 += sz
+                err_z -= 2 * dx
+            err_y += 2 * dy
+            err_z += 2 * dz
+            x0 += sx
+    elif dy >= dx and dy >= dz:
+        # Y is dominant
+        err_x = 2 * dx - dy
+        err_z = 2 * dz - dy
+        while y0 != y1:
+            if 0 <= z0 < volume.shape[0] and 0 <= y0 < volume.shape[1] and 0 <= x0 < volume.shape[2]:
+                volume[z0, y0, x0] = 1.0
+            if err_x > 0:
+                x0 += sx
+                err_x -= 2 * dy
+            if err_z > 0:
+                z0 += sz
+                err_z -= 2 * dy
+            err_x += 2 * dx
+            err_z += 2 * dz
+            y0 += sy
+    else:
+        # Z is dominant
+        err_x = 2 * dx - dz
+        err_y = 2 * dy - dz
+        while z0 != z1:
+            if 0 <= z0 < volume.shape[0] and 0 <= y0 < volume.shape[1] and 0 <= x0 < volume.shape[2]:
+                volume[z0, y0, x0] = 1.0
+            if err_x > 0:
+                x0 += sx
+                err_x -= 2 * dz
+            if err_y > 0:
+                y0 += sy
+                err_y -= 2 * dz
+            err_x += 2 * dx
+            err_y += 2 * dy
+            z0 += sz
+
+    # Set the final point
+    if 0 <= z1 < volume.shape[0] and 0 <= y1 < volume.shape[1] and 0 <= x1 < volume.shape[2]:
+        volume[z1, y1, x1] = 1.0
+
+
+@njit
+def voxelize_surface_grid(
+    zyx_grid: np.ndarray,
+    crop_size: tuple,
+) -> np.ndarray:
+    """
+    Voxelize a 2D grid of 3D points by drawing lines between adjacent points.
+
+    Args:
+        zyx_grid: (H, W, 3) array of ZYX coordinates in local crop space
+        crop_size: (D, H, W) shape of output volume
+
+    Returns:
+        (D, H, W) binary volume with lines connecting adjacent grid points
+    """
+    volume = np.zeros(crop_size, dtype=np.float32)
+    n_rows, n_cols = zyx_grid.shape[0], zyx_grid.shape[1]
+
+    # Draw horizontal lines (between adjacent columns)
+    for r in range(n_rows):
+        for c in range(n_cols - 1):
+            z0 = int(round(zyx_grid[r, c, 0]))
+            y0 = int(round(zyx_grid[r, c, 1]))
+            x0 = int(round(zyx_grid[r, c, 2]))
+            z1 = int(round(zyx_grid[r, c + 1, 0]))
+            y1 = int(round(zyx_grid[r, c + 1, 1]))
+            x1 = int(round(zyx_grid[r, c + 1, 2]))
+            _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
+
+    # Draw vertical lines (between adjacent rows)
+    for r in range(n_rows - 1):
+        for c in range(n_cols):
+            z0 = int(round(zyx_grid[r, c, 0]))
+            y0 = int(round(zyx_grid[r, c, 1]))
+            x0 = int(round(zyx_grid[r, c, 2]))
+            z1 = int(round(zyx_grid[r + 1, c, 0]))
+            y1 = int(round(zyx_grid[r + 1, c, 1]))
+            x1 = int(round(zyx_grid[r + 1, c, 2]))
+            _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
+
+    return volume
 
 @dataclass
 class Patch:
+    """A single patch from the hierarchical tiling method."""
     seg: Tifxyz                           # Reference to the segment
     volume: zarr.Array                    # zarr volume
     scale: float                          # volume_scale from config
     grid_bbox: Tuple[int, int, int, int]  # (row_min, row_max, col_min, col_max) in the tifxyz grid
     world_bbox: Tuple[float, ...]         # (z_min, z_max, y_min, y_max, x_min, x_max) in world coordinates (volume coordinates)
+
+
+@dataclass
+class ChunkPatch:
+    """A world-space chunk containing one or more surface wraps.
+
+    This is the output of the world-chunk tiling method. Each chunk can contain
+    multiple wraps from potentially multiple segments.
+    """
+    chunk_id: Tuple[int, int, int]         # (cz, cy, cx) index in chunk grid
+    volume: Any                            # zarr.Array or zarr.Group
+    scale: int                             # volume_scale from config
+    world_bbox: Tuple[float, ...]          # (z_min, z_max, y_min, y_max, x_min, x_max)
+    wraps: List[Dict]                      # [{"segment": Tifxyz, "bbox_2d": tuple, "wrap_id": int, "segment_idx": int}, ...]
+    segments: List[Tifxyz]                 # All segments (for lookup by segment_idx)
+
+    @property
+    def wrap_count(self) -> int:
+        """Number of wraps in this chunk."""
+        return len(self.wraps)
+
+    @property
+    def has_multiple_wraps(self) -> bool:
+        """Whether this chunk has more than one wrap."""
+        return len(self.wraps) > 1
+
+    @property
+    def segment_ids(self) -> List[str]:
+        """List of unique segment UUIDs in this chunk."""
+        return list(set(w["segment"].uuid for w in self.wraps))
 
 
 

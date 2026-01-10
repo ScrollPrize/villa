@@ -7,7 +7,8 @@ from torch.utils.data import Dataset
 import json
 import tifffile
 from pathlib import Path
-from vesuvius.neural_tracing.datasets.common import Patch, compute_heatmap_targets
+from vesuvius.neural_tracing.datasets.common import ChunkPatch, compute_heatmap_targets, voxelize_surface_grid
+from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
@@ -40,7 +41,6 @@ class EdtSegDataset(Dataset):
         target_size = self.crop_size
         self._heatmap_axes = [torch.arange(s, dtype=torch.float32) for s in self.crop_size]
 
-        config.setdefault('use_sdf', True)
         config.setdefault('use_sdt', False)
         config.setdefault('dilation_radius', 1)  # voxels
         config.setdefault('cond_percent', 0.5)
@@ -51,8 +51,17 @@ class EdtSegDataset(Dataset):
         config.setdefault('heatmap_step_size', 10)
         config.setdefault('heatmap_step_count', 5)
         config.setdefault('heatmap_sigma', 2.0)
+
+        config.setdefault('overlap_fraction', 0.0)
+        config.setdefault('min_span_ratio', 1.0)
+        config.setdefault('edge_touch_frac', 0.1)
+        config.setdefault('edge_touch_min_count', 10)
+        config.setdefault('edge_touch_pad', 0)
+        config.setdefault('min_points_per_wrap', 100)
+        config.setdefault('bbox_pad_2d', 0)
+        config.setdefault('require_all_valid_in_bbox', True)
+        config.setdefault('skip_chunk_if_any_invalid', False)
         
-        # Setup augmentations
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
             self._augmentations = create_training_transforms(
@@ -73,24 +82,58 @@ class EdtSegDataset(Dataset):
             segments_path = dataset['segments_path']
             dataset_segments = list(tifxyz.load_folder(segments_path))
 
-            for seg in dataset_segments:
-                # retarget segment to match the volume resolution level
-                retarget_factor = 2 ** volume_scale
+            # retarget to the proper scale
+            retarget_factor = 2 ** volume_scale
+            scaled_segments = []
+            for i, seg in enumerate(dataset_segments):
+                if i == 0:
+                    print(f"  [DEBUG PRE-RETARGET] seg._scale={seg._scale}, shape={seg._z.shape}")
+                    print(f"  [DEBUG PRE-RETARGET] z range: {seg._z[seg._valid_mask].min():.2f} to {seg._z[seg._valid_mask].max():.2f}")
                 seg_scaled = seg.retarget(retarget_factor)
+                if i == 0:
+                    print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
+                    print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
                 seg_scaled.volume = volume
-                seg_patches = seg_scaled.get_patches_3d(
-                    target_size,
-                    force_recompute=config.get('force_recompute_patches', False),
-                )
+                scaled_segments.append(seg_scaled)
 
-                for grid_bbox, world_bbox in seg_patches:
-                    patches.append(Patch(
-                        seg=seg_scaled,
-                        volume=volume,
-                        scale=volume_scale,
-                        grid_bbox=grid_bbox,
-                        world_bbox=world_bbox,
-                    ))
+            cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
+            chunk_results = find_world_chunk_patches(
+                segments=scaled_segments,
+                target_size=target_size,
+                overlap_fraction=config.get('overlap_fraction', 0.0),
+                min_span_ratio=config.get('min_span_ratio', 1.0),
+                edge_touch_frac=config.get('edge_touch_frac', 0.1),
+                edge_touch_min_count=config.get('edge_touch_min_count', 10),
+                edge_touch_pad=config.get('edge_touch_pad', 0),
+                min_points_per_wrap=config.get('min_points_per_wrap', 100),
+                bbox_pad_2d=config.get('bbox_pad_2d', 0),
+                require_all_valid_in_bbox=config.get('require_all_valid_in_bbox', True),
+                skip_chunk_if_any_invalid=config.get('skip_chunk_if_any_invalid', False),
+                cache_dir=cache_dir,
+                force_recompute=config.get('force_recompute_patches', False),
+                verbose=True,
+                chunk_pad=config.get('chunk_pad', 0.0),
+            )
+
+            for chunk in chunk_results:
+                wraps_in_chunk = []
+                for w in chunk["wraps"]:
+                    seg_idx = w["segment_idx"]
+                    wraps_in_chunk.append({
+                        "segment": scaled_segments[seg_idx],
+                        "bbox_2d": tuple(w["bbox_2d"]),
+                        "wrap_id": w["wrap_id"],
+                        "segment_idx": seg_idx,
+                    })
+
+                patches.append(ChunkPatch(
+                    chunk_id=tuple(chunk["chunk_id"]),
+                    volume=volume,
+                    scale=volume_scale,
+                    world_bbox=tuple(chunk["bbox_3d"]),
+                    wraps=wraps_in_chunk,
+                    segments=scaled_segments,
+                ))
 
         self.patches = patches
 
@@ -98,14 +141,27 @@ class EdtSegDataset(Dataset):
         return len(self.patches)
 
     def __getitem__(self, idx):
-        
-        patch = self.patches[idx]
-        patch.seg.use_full_resolution() # scale/interpolate to "full" resolution
-                                        # slicing is lazy, we only access the part we need at this res
 
-        r_min, r_max, c_min, c_max = patch.grid_bbox
+        patch = self.patches[idx]
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
+
+        # Select one wrap randomly for conditioning/masked split
+        wrap = random.choice(patch.wraps)
+        seg = wrap["segment"]
+        r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+        # Clamp bbox to segment bounds (bbox is inclusive in stored resolution)
+        seg_h, seg_w = seg._valid_mask.shape
+        r_min = max(0, r_min)
+        r_max = min(seg_h - 1, r_max)
+        c_min = max(0, c_min)
+        c_max = min(seg_w - 1, c_max)
+        if r_max < r_min or c_max < c_min:
+            return self[np.random.randint(len(self))]
+
+        seg.use_full_resolution()  # scale/interpolate to "full" resolution
+                                   # slicing is lazy, we only access the part we need at this res
 
         # world_bbox is centered on surface centroid and extends to target size
         fallback_min_corner = None
@@ -113,11 +169,24 @@ class EdtSegDataset(Dataset):
             z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
             fallback_min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
 
-        scale_y, scale_x = patch.seg._scale
-        r_min_full = int(r_min / scale_y)
-        r_max_full = int(r_max / scale_y)
-        c_min_full = int(c_min / scale_x)
-        c_max_full = int(c_max / scale_x)
+        def _to_full_bounds(min_idx, max_idx, scale, full_size):
+            # Convert inclusive stored bounds -> half-open full-res bounds.
+            if scale <= 0:
+                return 0, full_size
+            min_full = int(np.floor(min_idx / scale))
+            max_full = int(np.floor(max_idx / scale)) + 1
+            if min_full < 0:
+                min_full = 0
+            if max_full > full_size:
+                max_full = full_size
+            if max_full <= min_full:
+                max_full = min(full_size, min_full + 1)
+            return min_full, max_full
+
+        full_h, full_w = seg.full_resolution_shape
+        scale_y, scale_x = seg._scale
+        r_min_full, r_max_full = _to_full_bounds(r_min, r_max, scale_y, full_h)
+        c_min_full, c_max_full = _to_full_bounds(c_min, c_max, scale_x, full_w)
 
         conditioning_percent = self.config['cond_percent']
         r_split = r_min_full + round((r_max_full - r_min_full) * conditioning_percent)
@@ -127,17 +196,17 @@ class EdtSegDataset(Dataset):
 
         if cond_direction == "left":
             # the left half of the patch is conditioning, mask the right half
-            x_cond, y_cond, z_cond, valid_cond = patch.seg[r_min_full:r_max_full, c_min_full:c_split]
-            x_mask, y_mask, z_mask, valid_mask = patch.seg[r_min_full:r_max_full, c_split:c_max_full]
-            
+            x_cond, y_cond, z_cond, valid_cond = seg[r_min_full:r_max_full, c_min_full:c_split]
+            x_mask, y_mask, z_mask, valid_mask = seg[r_min_full:r_max_full, c_split:c_max_full]
+
             rows = np.arange(r_min_full, r_max_full)
             uv_cond = np.stack(np.meshgrid(rows, np.arange(c_min_full, c_split), indexing='ij'), axis=-1)
             uv_mask = np.stack(np.meshgrid(rows, np.arange(c_split, c_max_full), indexing='ij'), axis=-1)
-                               
+
         elif cond_direction == "right":
             # the right half of the patch is conditioning, mask the left half
-            x_cond, y_cond, z_cond, valid_cond = patch.seg[r_min_full:r_max_full, c_split:c_max_full]
-            x_mask, y_mask, z_mask, valid_mask = patch.seg[r_min_full:r_max_full, c_min_full:c_split]
+            x_cond, y_cond, z_cond, valid_cond = seg[r_min_full:r_max_full, c_split:c_max_full]
+            x_mask, y_mask, z_mask, valid_mask = seg[r_min_full:r_max_full, c_min_full:c_split]
 
             rows = np.arange(r_min_full, r_max_full)
             uv_cond = np.stack(np.meshgrid(rows, np.arange(c_split, c_max_full), indexing='ij'), axis=-1)
@@ -145,8 +214,8 @@ class EdtSegDataset(Dataset):
 
         elif cond_direction == "up":
             # the top half of the patch is conditioning, mask the bottom half
-            x_cond, y_cond, z_cond, valid_cond = patch.seg[r_min_full:r_split, c_min_full:c_max_full]
-            x_mask, y_mask, z_mask, valid_mask = patch.seg[r_split:r_max_full, c_min_full:c_max_full]
+            x_cond, y_cond, z_cond, valid_cond = seg[r_min_full:r_split, c_min_full:c_max_full]
+            x_mask, y_mask, z_mask, valid_mask = seg[r_split:r_max_full, c_min_full:c_max_full]
 
             cols = np.arange(c_min_full, c_max_full)
             uv_cond = np.stack(np.meshgrid(np.arange(r_min_full, r_split), cols, indexing='ij'), axis=-1)
@@ -154,8 +223,8 @@ class EdtSegDataset(Dataset):
 
         elif cond_direction == "down":
             # the bottom half of the patch is conditioning, mask the top half
-            x_cond, y_cond, z_cond, valid_cond = patch.seg[r_split:r_max_full, c_min_full:c_max_full]
-            x_mask, y_mask, z_mask, valid_mask = patch.seg[r_min_full:r_split, c_min_full:c_max_full]
+            x_cond, y_cond, z_cond, valid_cond = seg[r_split:r_max_full, c_min_full:c_max_full]
+            x_mask, y_mask, z_mask, valid_mask = seg[r_min_full:r_split, c_min_full:c_max_full]
 
             cols = np.arange(c_min_full, c_max_full)
             uv_cond = np.stack(np.meshgrid(np.arange(r_split, r_max_full), cols, indexing='ij'), axis=-1)
@@ -168,7 +237,7 @@ class EdtSegDataset(Dataset):
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
 
-        # Center the crop on the combined conditioning+masked surface coords.
+        # center the crop on the combined conditioning+masked surface coords.
         combined_zyxs = np.concatenate(
             [cond_zyxs.reshape(-1, 3), masked_zyxs.reshape(-1, 3)],
             axis=0,
@@ -187,6 +256,17 @@ class EdtSegDataset(Dataset):
                 center_zyx = combined_zyxs[finite_mask].mean(axis=0)
                 min_corner = np.round(center_zyx - np.array(crop_size) / 2.0).astype(np.int64)
 
+                # clamp min_corner to ensure all surface data fits within crop
+                # (discrete sampling can cause surface span < crop_size, but centering
+                # may still push edge points outside the crop bounds)
+                finite_points = combined_zyxs[finite_mask]
+                surface_min = finite_points.min(axis=0)
+                surface_max = finite_points.max(axis=0)
+                # Shift min_corner down if surface_min would be outside crop
+                min_corner = np.minimum(min_corner, np.floor(surface_min).astype(np.int64))
+                # shift min_corner up if surface_max would be outside crop
+                min_corner = np.maximum(min_corner, np.ceil(surface_max).astype(np.int64) - np.array(crop_size) + 1)
+
         max_corner = min_corner + np.array(crop_size)
 
         # if we're extrapolating, compute it with the extrapolation module
@@ -204,7 +284,7 @@ class EdtSegDataset(Dataset):
                 return self[np.random.randint(len(self))]
             extrap_surface = extrap_result['extrap_surface']
             extrap_coords_local = extrap_result['extrap_coords_local']
-            gt_displacement = extrap_result['gt_displacement']
+            gt_coords_local = extrap_result['gt_coords_local']
 
         volume = patch.volume
         if isinstance(volume, zarr.Group):
@@ -230,52 +310,26 @@ class EdtSegDataset(Dataset):
 
         vol_crop = normalize_zscore(vol_crop)
 
-        masked_segmentation = np.zeros(target_shape, dtype=np.float32)
-        cond_segmentation = np.zeros(target_shape, dtype=np.float32)
-
-        # convert cond and masked coords to crop-local coords
-        cond_zyxs_local = (cond_zyxs - min_corner).astype(np.int64)
-        masked_zyxs_local = (masked_zyxs - min_corner).astype(np.int64)
+        # convert cond and masked coords to crop-local coords (float for line interpolation)
+        cond_zyxs_local_float = (cond_zyxs - min_corner).astype(np.float64)
+        masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float64)
 
         crop_shape = target_shape
 
-        cond_in_bounds = (
-            (cond_zyxs_local[..., 0] >= 0) & (cond_zyxs_local[..., 0] < crop_shape[0]) &
-            (cond_zyxs_local[..., 1] >= 0) & (cond_zyxs_local[..., 1] < crop_shape[1]) &
-            (cond_zyxs_local[..., 2] >= 0) & (cond_zyxs_local[..., 2] < crop_shape[2])
-        )
-        cond_zyxs_local = cond_zyxs_local[cond_in_bounds]
-
-        masked_in_bounds = (
-            (masked_zyxs_local[..., 0] >= 0) & (masked_zyxs_local[..., 0] < crop_shape[0]) &
-            (masked_zyxs_local[..., 1] >= 0) & (masked_zyxs_local[..., 1] < crop_shape[1]) &
-            (masked_zyxs_local[..., 2] >= 0) & (masked_zyxs_local[..., 2] < crop_shape[2])
-        )
-
-        masked_zyxs_local = masked_zyxs_local[masked_in_bounds]
-        cond_segmentation[cond_zyxs_local[:, 0], cond_zyxs_local[:, 1], cond_zyxs_local[:, 2]] = 1
-        masked_segmentation[masked_zyxs_local[:, 0], masked_zyxs_local[:, 1], masked_zyxs_local[:, 2]] = 1
+        # voxelize with line interpolation between adjacent grid points
+        cond_segmentation = voxelize_surface_grid(cond_zyxs_local_float, crop_shape)
+        masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
 
         if self.config['use_sdt']:
-            # Combine cond + masked into full segmentation
-            full_segmentation = np.zeros(target_shape, dtype=np.float32)
-            all_zyxs_local = np.concatenate([cond_zyxs_local, masked_zyxs_local], axis=0)
-
-            # Filter to in-bounds
-            in_bounds = (
-                (all_zyxs_local[..., 0] >= 0) & (all_zyxs_local[..., 0] < crop_shape[0]) &
-                (all_zyxs_local[..., 1] >= 0) & (all_zyxs_local[..., 1] < crop_shape[1]) &
-                (all_zyxs_local[..., 2] >= 0) & (all_zyxs_local[..., 2] < crop_shape[2])
-            )
-            all_zyxs_local = all_zyxs_local[in_bounds]
-            full_segmentation[all_zyxs_local[:, 0], all_zyxs_local[:, 1], all_zyxs_local[:, 2]] = 1
+            # combine cond + masked into full segmentation (already voxelized with line interpolation)
+            full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
 
             dilation_radius = self.config.get('dilation_radius', 1.0)
             distance_from_surface = edt.edt(1 - full_segmentation, parallel=1)
             seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
             sdt = edt.sdf(seg_dilated, parallel=1).astype(np.float32)
 
-        # Generate heatmap targets for expected positions in masked region
+        # generate heatmap targets for expected positions in masked region
         use_heatmap = self.config['use_heatmap_targets']
         if use_heatmap:
             effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
@@ -284,7 +338,7 @@ class EdtSegDataset(Dataset):
                 r_split=r_split, c_split=c_split,
                 r_min_full=r_min_full, r_max_full=r_max_full,
                 c_min_full=c_min_full, c_max_full=c_max_full,
-                patch_seg=patch.seg,
+                patch_seg=seg,
                 min_corner=min_corner,
                 crop_size=crop_size,
                 step_size=effective_step,
@@ -303,7 +357,8 @@ class EdtSegDataset(Dataset):
         if use_extrapolation:
             extrap_surf = torch.from_numpy(extrap_surface).to(torch.float32)
             extrap_coords = torch.from_numpy(extrap_coords_local).to(torch.float32)
-            gt_disp = torch.from_numpy(gt_displacement).to(torch.float32)
+            gt_coords = torch.from_numpy(gt_coords_local).to(torch.float32)
+            n_points = len(extrap_coords)
 
         use_sdt = self.config['use_sdt']
         if use_sdt:
@@ -330,9 +385,9 @@ class EdtSegDataset(Dataset):
             if dist_list:
                 aug_kwargs['dist_map'] = torch.stack(dist_list, dim=0)
             if use_extrapolation:
-                aug_kwargs['keypoints'] = extrap_coords
-                aug_kwargs['gt_displacement'] = gt_disp
-                aug_kwargs['vector_keys'] = ['gt_displacement']
+                # stack both coordinate sets together - they get the same keypoint transform
+                # we will split them after augmentation and compute displacement from the difference
+                aug_kwargs['keypoints'] = torch.cat([extrap_coords, gt_coords], dim=0)
             if use_heatmap:
                 aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
                 aug_kwargs['regression_keys'] = ['heatmap_target']
@@ -354,10 +409,19 @@ class EdtSegDataset(Dataset):
                         sdt_tensor = augmented['dist_map'][i]
 
             if use_extrapolation:
-                extrap_coords = augmented['keypoints']
-                gt_disp = augmented['gt_displacement']
+                all_coords = augmented['keypoints']
+                extrap_coords = all_coords[:n_points]
+                gt_coords = all_coords[n_points:]
+                # compute displacement AFTER augmentation 
+                # both coordinate sets received the same spatial transform, so their
+                # difference (displacement) is now in the post-augmentation coordinate system
+                gt_disp = gt_coords - extrap_coords
             if use_heatmap:
                 heatmap_tensor = augmented['heatmap_target'].squeeze(0)
+        else:
+            # No augmentation - compute displacement directly from coordinates
+            if use_extrapolation:
+                gt_disp = gt_coords - extrap_coords
 
         result = {
             "vol": vol_crop,                 # raw volume crop
@@ -379,11 +443,14 @@ class EdtSegDataset(Dataset):
         # Validate all tensors are non-empty and contain no NaN/Inf
         for key, tensor in result.items():
             if tensor.numel() == 0:
-                raise ValueError(f"Empty tensor for '{key}' at index {idx}")
+                print(f"WARNING: Empty tensor for '{key}' at index {idx}, resampling...")
+                return self[np.random.randint(len(self))]
             if torch.isnan(tensor).any():
-                raise ValueError(f"NaN values in '{key}' at index {idx}")
+                print(f"WARNING: NaN values in '{key}' at index {idx}, resampling...")
+                return self[np.random.randint(len(self))]
             if torch.isinf(tensor).any():
-                raise ValueError(f"Inf values in '{key}' at index {idx}")
+                print(f"WARNING: Inf values in '{key}' at index {idx}, resampling...")
+                return self[np.random.randint(len(self))]
 
         return result
     
