@@ -2,7 +2,10 @@
     "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v1",
     "seed": 0,
     "batch_size": 6,
-    "num_workers": 14,
+    "num_workers": 8,
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "neural-tracing",
+
 
     "datasets": [
         {
@@ -38,11 +41,16 @@
     ],
 
     "crop_size": 128,
-    "force_recompute_patches": true,
+    "force_recompute_patches": false,
     "val_fraction": 0.01,
     "use_extrapolation": true,
     "extrapolation_method": "linear_edge",
     "cond_percent": 0.5,
+
+    "use_heatmap_targets": false,
+    "heatmap_step_size": 10,
+    "heatmap_step_count": 5,
+    "heatmap_sigma": 2.0,
 
     "lambda_smooth": 0.1,
 

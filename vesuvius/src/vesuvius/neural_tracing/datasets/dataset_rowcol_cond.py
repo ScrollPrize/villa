@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 import json
 import tifffile
 from pathlib import Path
-from vesuvius.neural_tracing.datasets.common import Patch
+from vesuvius.neural_tracing.datasets.common import Patch, compute_heatmap_targets
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
@@ -47,8 +47,11 @@ class EdtSegDataset(Dataset):
         config.setdefault('use_extrapolation', True)
         config.setdefault('extrapolation_method', 'linear_edge')
         config.setdefault('force_recompute_patches', False)
+        config.setdefault('use_heatmap_targets', False)
+        config.setdefault('heatmap_step_size', 10)
+        config.setdefault('heatmap_step_count', 5)
+        config.setdefault('heatmap_sigma', 2.0)
         
-
         # Setup augmentations
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -272,6 +275,26 @@ class EdtSegDataset(Dataset):
             seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
             sdt = edt.sdf(seg_dilated, parallel=1).astype(np.float32)
 
+        # Generate heatmap targets for expected positions in masked region
+        use_heatmap = self.config['use_heatmap_targets']
+        if use_heatmap:
+            effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
+            heatmap_tensor = compute_heatmap_targets(
+                cond_direction=cond_direction,
+                r_split=r_split, c_split=c_split,
+                r_min_full=r_min_full, r_max_full=r_max_full,
+                c_min_full=c_min_full, c_max_full=c_max_full,
+                patch_seg=patch.seg,
+                min_corner=min_corner,
+                crop_size=crop_size,
+                step_size=effective_step,
+                step_count=self.config['heatmap_step_count'],
+                sigma=self.config['heatmap_sigma'],
+                axis_1d=self._heatmap_axes[0],
+            )
+            if heatmap_tensor is None:
+                return self[np.random.randint(len(self))]
+
         vol_crop = torch.from_numpy(vol_crop).to(torch.float32)
         masked_seg = torch.from_numpy(masked_segmentation).to(torch.float32)
         cond_seg = torch.from_numpy(cond_segmentation).to(torch.float32)
@@ -310,6 +333,9 @@ class EdtSegDataset(Dataset):
                 aug_kwargs['keypoints'] = extrap_coords
                 aug_kwargs['gt_displacement'] = gt_disp
                 aug_kwargs['vector_keys'] = ['gt_displacement']
+            if use_heatmap:
+                aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
+                aug_kwargs['regression_keys'] = ['heatmap_target']
 
             augmented = self._augmentations(**aug_kwargs)
 
@@ -330,6 +356,8 @@ class EdtSegDataset(Dataset):
             if use_extrapolation:
                 extrap_coords = augmented['keypoints']
                 gt_disp = augmented['gt_displacement']
+            if use_heatmap:
+                heatmap_tensor = augmented['heatmap_target'].squeeze(0)
 
         result = {
             "vol": vol_crop,                 # raw volume crop
@@ -345,6 +373,9 @@ class EdtSegDataset(Dataset):
         if use_sdt:
             result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation
 
+        if use_heatmap:
+            result["heatmap_target"] = heatmap_tensor  # (D, H, W) gaussian heatmap at expected positions
+
         # Validate all tensors are non-empty and contain no NaN/Inf
         for key, tensor in result.items():
             if tensor.numel() == 0:
@@ -359,7 +390,7 @@ class EdtSegDataset(Dataset):
 
 
 if __name__ == "__main__":
-    config_path = "/home/sean/Documents/villa/vesuvius/src/vesuvius/neural_tracing/configs/config_edt_seg.json"
+    config_path = "/home/sean/Documents/villa/vesuvius/src/vesuvius/neural_tracing/configs/config_rowcol_cond.json"
     with open(config_path, 'r') as f:
         config = json.load(f)
 
@@ -374,7 +405,7 @@ if __name__ == "__main__":
         sample = train_ds[i]
 
         # Save 3D volumes as tif
-        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'sdt']:
+        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'sdt', 'heatmap_target']:
             if key in sample:
                 subdir = out_dir / key
                 subdir.mkdir(exist_ok=True)

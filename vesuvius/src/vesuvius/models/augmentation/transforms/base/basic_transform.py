@@ -66,19 +66,19 @@ class BasicTransform(abc.ABC):
         return data_dict
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
-        pass
+        return img
 
     def _apply_to_regr_target(self, regression_target, **params) -> torch.Tensor:
-        pass
+        return regression_target
 
     def _apply_to_segmentation(self, segmentation: torch.Tensor, **params) -> torch.Tensor:
-        pass
+        return segmentation
 
     def _apply_to_dist_map(self, dist_map: torch.Tensor, **params) -> torch.Tensor:
-        pass
+        return dist_map
 
     def _apply_to_geols_labels(self, geols_labels: torch.Tensor, **params) -> torch.Tensor:
-        pass
+        return geols_labels
 
     def _apply_to_keypoints(self, keypoints, **params):
         """Default: pass keypoints through unchanged."""

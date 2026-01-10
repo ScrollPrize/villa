@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.loss.displacement_losses import surface_sampled_loss, smoothness_loss
+from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.models import make_model
@@ -64,10 +65,14 @@ def collate_with_padding(batch):
     if 'sdt' in batch[0]:
         result['sdt'] = torch.stack([b['sdt'] for b in batch])
 
+    # Optional heatmap target
+    if 'heatmap_target' in batch[0]:
+        result['heatmap_target'] = torch.stack([b['heatmap_target'] for b in batch])
+
     return result
 
 
-def prepare_batch(batch, use_sdt=False):
+def prepare_batch(batch, use_sdt=False, use_heatmap=False):
     """Prepare batch tensors for training."""
     vol = batch['vol'].unsqueeze(1)                    # [B, 1, D, H, W]
     cond = batch['cond'].unsqueeze(1)                  # [B, 1, D, H, W]
@@ -80,12 +85,15 @@ def prepare_batch(batch, use_sdt=False):
     valid_mask = batch['valid_mask']             # [B, N]
 
     sdt_target = batch['sdt'].unsqueeze(1) if use_sdt and 'sdt' in batch else None  # [B, 1, D, H, W]
+    heatmap_target = batch['heatmap_target'].unsqueeze(1) if use_heatmap and 'heatmap_target' in batch else None  # [B, 1, D, H, W]
 
-    return inputs, extrap_coords, gt_displacement, valid_mask, sdt_target
+    return inputs, extrap_coords, gt_displacement, valid_mask, sdt_target, heatmap_target
 
 
 def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_mask,
-                       sdt_pred=None, sdt_target=None, save_path=None):
+                       sdt_pred=None, sdt_target=None,
+                       heatmap_pred=None, heatmap_target=None,
+                       save_path=None):
     """Create and save GIF visualization cycling through z-slices."""
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
@@ -102,8 +110,12 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     disp_3d = disp_pred[b].cpu().numpy()  # [3, D, H, W]
     disp_mag_3d = np.linalg.norm(disp_3d, axis=0)  # [D, H, W]
 
-    # Setup figure
-    n_cols = 4 if sdt_pred is None else 5
+    # Setup figure - add columns for heatmap if present
+    n_cols = 4
+    if sdt_pred is not None:
+        n_cols += 1
+    if heatmap_pred is not None:
+        n_cols += 1
     fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 8))
 
     z0 = D // 2
@@ -152,19 +164,45 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     axes[1, 3].set_title('Cond(G) + Extrap(R)')
     axes[1, 3].axis('off')
 
+    # Track current column for optional visualizations
+    col_idx = 4
+
     # Optional SDT
+    im_sdt_pred = im_sdt_gt = None
+    sdt_pred_3d = sdt_gt_3d = None
+    sdt_col = None
     if sdt_pred is not None:
+        sdt_col = col_idx
         sdt_pred_3d = sdt_pred[b, 0].cpu().numpy()
         sdt_gt_3d = sdt_target[b, 0].cpu().numpy() if sdt_target is not None else np.zeros_like(sdt_pred_3d)
         sdt_vmax = max(np.abs(sdt_pred_3d).max(), np.abs(sdt_gt_3d).max())
 
-        im_sdt_pred = axes[0, 4].imshow(sdt_pred_3d[z0], cmap='RdBu', vmin=-sdt_vmax, vmax=sdt_vmax)
-        axes[0, 4].set_title('SDT Pred')
-        axes[0, 4].axis('off')
+        im_sdt_pred = axes[0, sdt_col].imshow(sdt_pred_3d[z0], cmap='RdBu', vmin=-sdt_vmax, vmax=sdt_vmax)
+        axes[0, sdt_col].set_title('SDT Pred')
+        axes[0, sdt_col].axis('off')
 
-        im_sdt_gt = axes[1, 4].imshow(sdt_gt_3d[z0], cmap='RdBu', vmin=-sdt_vmax, vmax=sdt_vmax)
-        axes[1, 4].set_title('SDT GT')
-        axes[1, 4].axis('off')
+        im_sdt_gt = axes[1, sdt_col].imshow(sdt_gt_3d[z0], cmap='RdBu', vmin=-sdt_vmax, vmax=sdt_vmax)
+        axes[1, sdt_col].set_title('SDT GT')
+        axes[1, sdt_col].axis('off')
+        col_idx += 1
+
+    # Optional Heatmap
+    im_hm_pred = im_hm_gt = None
+    hm_pred_3d = hm_gt_3d = None
+    hm_col = None
+    if heatmap_pred is not None:
+        hm_col = col_idx
+        hm_pred_3d = torch.sigmoid(heatmap_pred[b, 0]).cpu().numpy()
+        hm_gt_3d = heatmap_target[b, 0].cpu().numpy() if heatmap_target is not None else np.zeros_like(hm_pred_3d)
+
+        im_hm_pred = axes[0, hm_col].imshow(hm_pred_3d[z0], cmap='hot', vmin=0, vmax=1)
+        axes[0, hm_col].set_title('Heatmap Pred')
+        axes[0, hm_col].axis('off')
+
+        im_hm_gt = axes[1, hm_col].imshow(hm_gt_3d[z0], cmap='hot', vmin=0, vmax=1)
+        axes[1, hm_col].set_title('Heatmap GT')
+        axes[1, hm_col].axis('off')
+        col_idx += 1
 
     plt.tight_layout()
 
@@ -194,6 +232,11 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
             im_sdt_pred.set_data(sdt_pred_3d[z])
             im_sdt_gt.set_data(sdt_gt_3d[z])
             result.extend([im_sdt_pred, im_sdt_gt])
+
+        if heatmap_pred is not None:
+            im_hm_pred.set_data(hm_pred_3d[z])
+            im_hm_gt.set_data(hm_gt_3d[z])
+            result.extend([im_hm_pred, im_hm_gt])
 
         return result
 
@@ -228,6 +271,8 @@ def train(config_path):
     config.setdefault('lambda_smooth', 0.1)
     config.setdefault('use_sdt', False)
     config.setdefault('lambda_sdt', 1.0)
+    config.setdefault('use_heatmap_targets', False)
+    config.setdefault('lambda_heatmap', 1.0)
 
     # Build targets dict based on config
     targets = {
@@ -236,6 +281,9 @@ def train(config_path):
     use_sdt = config.get('use_sdt', False)
     if use_sdt:
         targets['sdt'] = {'out_channels': 1, 'activation': 'none'}
+    use_heatmap = config.get('use_heatmap_targets', False)
+    if use_heatmap:
+        targets['heatmap'] = {'out_channels': 1, 'activation': 'none'}
     config['targets'] = targets
 
     out_dir = config['out_dir']
@@ -274,6 +322,17 @@ def train(config_path):
 
     lambda_smooth = config['lambda_smooth']
     lambda_sdt = config.get('lambda_sdt', 1.0)
+    lambda_heatmap = config.get('lambda_heatmap', 1.0)
+
+    # Setup heatmap loss if enabled (BCE + Dice)
+    heatmap_loss_fn = None
+    if use_heatmap:
+        heatmap_loss_fn = DC_and_BCE_loss(
+            bce_kwargs={},
+            soft_dice_kwargs={'batch_dice': False, 'ddp': False},
+            weight_ce=1.0,
+            weight_dice=1.0
+        )
 
     def make_generator(offset=0):
         gen = torch.Generator()
@@ -362,10 +421,17 @@ def train(config_path):
     if accelerator.is_main_process:
         accelerator.print("\n=== Displacement Field Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
-        accelerator.print(f"Output: displacement (3ch)" + (" + SDT (1ch)" if use_sdt else ""))
+        output_str = "Output: displacement (3ch)"
+        if use_sdt:
+            output_str += " + SDT (1ch)"
+        if use_heatmap:
+            output_str += " + heatmap (1ch)"
+        accelerator.print(output_str)
         accelerator.print(f"Lambda smooth: {lambda_smooth}")
         if use_sdt:
             accelerator.print(f"Lambda SDT: {lambda_sdt}")
+        if use_heatmap:
+            accelerator.print(f"Lambda heatmap: {lambda_heatmap}")
         accelerator.print(f"Optimizer: SGD (lr={config['learning_rate']}, momentum={config.get('momentum', 0.99)})")
         accelerator.print(f"Scheduler: PolyLR (exponent={config.get('poly_exponent', 0.9)})")
         accelerator.print(f"Train samples: {num_train}, Val samples: {num_val}")
@@ -389,7 +455,7 @@ def train(config_path):
             train_iterator = iter(train_dataloader)
             batch = next(train_iterator)
 
-        inputs, extrap_coords, gt_displacement, valid_mask, sdt_target = prepare_batch(batch, use_sdt)
+        inputs, extrap_coords, gt_displacement, valid_mask, sdt_target, heatmap_target = prepare_batch(batch, use_sdt, use_heatmap)
 
         wandb_log = {}
 
@@ -413,6 +479,15 @@ def train(config_path):
                 total_loss = total_loss + lambda_sdt * sdt_loss
                 wandb_log['sdt_loss'] = sdt_loss.detach().item()
 
+            # Optional heatmap loss (BCE + Dice)
+            heatmap_pred = None
+            if use_heatmap:
+                heatmap_pred = output['heatmap']  # [B, 1, D, H, W]
+                heatmap_target_binary = (heatmap_target > 0.5).float()
+                heatmap_loss = heatmap_loss_fn(heatmap_pred, heatmap_target_binary)
+                total_loss = total_loss + lambda_heatmap * heatmap_loss
+                wandb_log['heatmap_loss'] = heatmap_loss.detach().item()
+
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
 
@@ -433,6 +508,8 @@ def train(config_path):
         }
         if use_sdt:
             postfix['sdt'] = f"{wandb_log['sdt_loss']:.4f}"
+        if use_heatmap:
+            postfix['hm'] = f"{wandb_log['heatmap_loss']:.4f}"
         progress_bar.set_postfix(postfix)
         progress_bar.update(1)
 
@@ -446,7 +523,7 @@ def train(config_path):
                     val_iterator = iter(val_dataloader)
                     val_batch = next(val_iterator)
 
-                val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_sdt_target = prepare_batch(val_batch, use_sdt)
+                val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_sdt_target, val_heatmap_target = prepare_batch(val_batch, use_sdt, use_heatmap)
 
                 val_output = model(val_inputs)
                 val_disp_pred = val_output['displacement']
@@ -465,6 +542,14 @@ def train(config_path):
                     val_total_loss = val_total_loss + lambda_sdt * val_sdt_loss
                     wandb_log['val_sdt_loss'] = val_sdt_loss.item()
 
+                val_heatmap_pred = None
+                if use_heatmap:
+                    val_heatmap_pred = val_output['heatmap']
+                    val_heatmap_target_binary = (val_heatmap_target > 0.5).float()
+                    val_heatmap_loss = heatmap_loss_fn(val_heatmap_pred, val_heatmap_target_binary)
+                    val_total_loss = val_total_loss + lambda_heatmap * val_heatmap_loss
+                    wandb_log['val_heatmap_loss'] = val_heatmap_loss.item()
+
                 wandb_log['val_loss'] = val_total_loss.item()
 
                 # Create visualization
@@ -472,13 +557,18 @@ def train(config_path):
                 val_img_path = f'{out_dir}/{iteration:06}_val.gif'
 
                 train_sdt_pred = output.get('sdt') if use_sdt else None
+                train_heatmap_pred = heatmap_pred if use_heatmap else None
                 make_visualization(
                     inputs, disp_pred, extrap_coords, gt_displacement, valid_mask,
-                    sdt_pred=train_sdt_pred, sdt_target=sdt_target, save_path=train_img_path
+                    sdt_pred=train_sdt_pred, sdt_target=sdt_target,
+                    heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
+                    save_path=train_img_path
                 )
                 make_visualization(
                     val_inputs, val_disp_pred, val_extrap_coords, val_gt_displacement, val_valid_mask,
-                    sdt_pred=val_sdt_pred, sdt_target=val_sdt_target, save_path=val_img_path
+                    sdt_pred=val_sdt_pred, sdt_target=val_sdt_target,
+                    heatmap_pred=val_heatmap_pred, heatmap_target=val_heatmap_target,
+                    save_path=val_img_path
                 )
 
                 if wandb.run is not None:
