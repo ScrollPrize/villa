@@ -64,7 +64,22 @@ class TransposeAxesTransform(BasicTransform):
         raise NotImplementedError
 
     def _apply_to_keypoints(self, keypoints, **params):
-        raise NotImplementedError
+        """Permute keypoint coordinate components according to axis transpose."""
+        if keypoints is None:
+            return None
+        axis_order = params['axis_order']
+        # axis_order is for tensors with channel dim, extract spatial permutation
+        spatial_perm = [ax - 1 for ax in axis_order[1:]]
+        return keypoints[:, spatial_perm].contiguous()
+
+    def _apply_to_vectors(self, vectors, **params):
+        """Permute vector components according to axis transpose."""
+        if vectors is None:
+            return None
+        axis_order = params['axis_order']
+        # axis_order is for tensors with channel dim, extract spatial permutation
+        spatial_perm = [ax - 1 for ax in axis_order[1:]]
+        return vectors[:, spatial_perm].contiguous()
 
     def apply(self, data_dict: dict, **params) -> dict:
         """
@@ -109,6 +124,16 @@ class TransposeAxesTransform(BasicTransform):
                 permuted = normals[channel_perm]
                 permuted = permuted.permute(axis_order_list).contiguous()
                 data_dict[key] = permuted
+
+        # Handle keypoints
+        if data_dict.get('keypoints') is not None:
+            data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
+
+        # Handle vector_keys
+        vector_keys = set(data_dict.get('vector_keys', []) or [])
+        for key in vector_keys:
+            if data_dict.get(key) is not None:
+                data_dict[key] = self._apply_to_vectors(data_dict[key], **params)
 
         return data_dict
 

@@ -328,7 +328,14 @@ class SpatialTransform(BasicTransform):
         return self._apply_to_image(regression_target, **params)
 
     def _apply_to_keypoints(self, keypoints, **params):
-        raise NotImplementedError
+        # TODO: Implement proper keypoint transformation for affine/elastic
+        # For now, pass through unchanged (Rot90/Transpose/Mirror handle discrete transforms)
+        return keypoints
+
+    def _apply_to_vectors(self, vectors, **params):
+        # TODO: Implement proper vector transformation for affine/elastic
+        # For now, pass through unchanged (Rot90/Transpose/Mirror handle discrete transforms)
+        return vectors
 
     def _apply_to_bbox(self, bbox, **params):
         raise NotImplementedError

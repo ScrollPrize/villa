@@ -40,17 +40,19 @@ class BasicTransform(abc.ABC):
             if data_dict.get('geols_labels') is not None:
                 data_dict['geols_labels'] = self._apply_to_dist_map(data_dict['geols_labels'], **params)
 
-            if data_dict.get('keypoints') is not None:
-                data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
-
-            if data_dict.get('bbox') is not None:
-                data_dict['bbox'] = self._apply_to_bbox(data_dict['bbox'], **params)
+            # Note: keypoints, bbox, and vector_keys are NOT handled here.
+            # Transforms that support them (Rot90, Transpose, Mirror) handle them
+            # in their own apply() override.
 
             # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
             # Skip 'ignore_masks' as it shouldn't be transformed
             regression_keys = set(data_dict.get('regression_keys', []) or [])
+            vector_keys = set(data_dict.get('vector_keys', []) or [])
             known_keys = {'image', 'regression_target', 'segmentation', 'dist_map',
-                          'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled', 'regression_keys'}
+                          'geols_labels', 'keypoints', 'bbox', 'ignore_masks', 'is_unlabeled',
+                          'regression_keys', 'vector_keys', 'crop_shape'}
+            # Also skip vector_keys since they're handled by specific transforms
+            known_keys.update(vector_keys)
 
             for key in list(data_dict.keys()):
                 if key in known_keys or data_dict.get(key) is None:
@@ -79,10 +81,17 @@ class BasicTransform(abc.ABC):
         pass
 
     def _apply_to_keypoints(self, keypoints, **params):
-        pass
+        """Default: pass keypoints through unchanged."""
+        return keypoints
 
     def _apply_to_bbox(self, bbox, **params):
-        pass
+        """Default: pass bbox through unchanged."""
+        return bbox
+
+    def _apply_to_vectors(self, vectors, **params):
+        """Apply directional transformation to (N, 3) vectors (rotation/flip only, no translation).
+        Default: pass vectors through unchanged."""
+        return vectors
 
     def get_parameters(self, **data_dict) -> dict:
         return {}
