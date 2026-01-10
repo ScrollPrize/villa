@@ -56,8 +56,8 @@ Our goal is to read the entire library.
 
 We need help in automating the virtual unwrapping of entire scrolls:
 
-<Admonition type="tip" icon="📜" title="Unwrapping at Scale">
-* Prizes: \$200,000 [Unwrapping at Scale Prize](prizes#unwrapping-at-scale-prize)
+<Admonition type="tip" icon="📜" title="3D Surface Detection Challenge (hosted on Kaggle)">
+* Prizes: \$200,000 [3D Surface Detection](prizes#3d-surface-detection-challenge-hosted-on-kaggle)
 * Starting point: [Data](data), [Tutorials](tutorial)
 </Admonition>
 

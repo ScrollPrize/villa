@@ -145,6 +145,7 @@ int main(int argc, char *argv[])
     json params;
     VCCollection corrections;
     bool skip_overlap_check = false;
+    std::string segment_name;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -168,7 +169,9 @@ int main(int argc, char *argv[])
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
             ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
             ("inpaint", "perform automatic inpainting on all detected holes.")
-            ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)");
+            ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
+            ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
+            ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)");
 
         po::variables_map vm;
         try {
@@ -238,6 +241,14 @@ int main(int argc, char *argv[])
                 std::cerr << "ERROR: --resume-opt must be one of 'skip', 'local', or 'global'" << std::endl;
                 return EXIT_FAILURE;
             }
+        }
+
+        if (vm.count("resume-generations")) {
+            params["resume_generations"] = vm["resume-generations"].as<int>();
+        }
+
+        if (vm.count("segment-name")) {
+            segment_name = vm["segment-name"].as<std::string>();
         }
     }
 
@@ -501,8 +512,17 @@ int main(int argc, char *argv[])
     if (mode == "expansion")
         meta_params["seed_overlap"] = count_overlap;
 
-    std::string uuid = name_prefix + time_str();
-    std::filesystem::path seg_dir = tgt_dir / uuid;
+    std::string uuid;
+    std::filesystem::path seg_dir;
+    if (!segment_name.empty()) {
+        // Use target-dir directly with custom segment name
+        uuid = segment_name;
+        seg_dir = tgt_dir;
+    } else {
+        // Default: create timestamped subfolder
+        uuid = name_prefix + time_str();
+        seg_dir = tgt_dir / uuid;
+    }
 
     //
     // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals

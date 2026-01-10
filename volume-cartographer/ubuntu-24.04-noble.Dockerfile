@@ -60,15 +60,7 @@ ENV MAMBA_ROOT_PREFIX=/opt/micromamba
 SHELL ["/bin/bash", "-lc"]
 RUN micromamba create -y -n py310 -c conda-forge python=3.10 pip
 RUN micromamba run -n py310 python -m pip install --upgrade pip
-RUN micromamba run -n py310 pip install --no-cache-dir numpy==1.26.4 pillow tqdm wandb
-
-# Open3D needs GL/GLib bits even for headless usage.
-# These packages are not available on arm64 so skip for now
-# TODO: install from source?
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-        apt -y install libgl1 libglib2.0-0 libx11-6 libxext6 libxrender1 libsm6 libegl1; \
-        micromamba run -n py310 pip install --no-cache-dir libigl==2.5.1 open3d==0.18.0; \
-    fi
+RUN micromamba run -n py310 pip install --no-cache-dir numpy==1.26.4 tqdm wandb
 
 # Make this Python visible to subsequent steps
 ENV PATH="/opt/micromamba/envs/py310/bin:${PATH}"

@@ -36,8 +36,10 @@ def train(config_path):
     ds_enabled = config.setdefault('enable_deep_supervision', False)
     use_seg = config.setdefault('aux_segmentation', False)
     use_normals = config.setdefault('aux_normals', False)
+    use_srf_overlap = config.setdefault('aux_srf_overlap', False)
     seg_loss_weight = config.setdefault('seg_loss_weight', 1.0)
     normals_loss_weight = config.setdefault('normals_loss_weight', 1.0)
+    srf_overlap_loss_weight = config.setdefault('srf_overlap_loss_weight', 1.0)
     random.seed(config['seed'])
     np.random.seed(config['seed'])
     torch.manual_seed(config['seed'])
@@ -48,6 +50,7 @@ def train(config_path):
         'uv': {'weights': None, 'loss_fn': None},
         'seg': {'weights': None, 'loss_fn': None},
         'normals': {'weights': None, 'loss_fn': None},
+        'srf_overlap': {'weights': None, 'loss_fn': None},
     }
 
     accelerator = accelerate.Accelerator(
@@ -78,7 +81,7 @@ def train(config_path):
         val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'] * 2, num_workers=1, pin_memory=True)
         def to_gpu(dataloader):  # we don't use accelerator.prepare since we handle sharding ourselves
             for batch in dataloader:
-                yield {k: v.to(accelerator.device) for k, v in batch.items()}
+                yield {k: v.to(accelerator.device, non_blocking=True) for k, v in batch.items()}
         return to_gpu(train_dataloader), to_gpu(val_dataloader)
 
     train_dataloader, val_dataloader = make_dataloaders()
@@ -125,7 +128,13 @@ def train(config_path):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
         model.load_state_dict(strip_state(ckpt['model']))
-        optimizer.load_state_dict(ckpt['optimizer'])
+        # Only load optimizer state if optimizer type matches (avoid SGD/Adam mismatch)
+        ckpt_optim_type = type(ckpt['optimizer']['param_groups'][0].get('betas', None))
+        curr_optim_type = type(optimizer.param_groups[0].get('betas', None))
+        if ckpt_optim_type == curr_optim_type:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        else:
+            print(f'Skipping optimizer state load (optimizer type changed)')
         lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
         first_iteration = ckpt['step']
         # Note we don't load the config saved with the ckpt!
@@ -262,6 +271,18 @@ def train(config_path):
             first_step_loss = first_step_loss + normals_loss_weight * normals_loss
         else:
             normals_loss = normals = normals_pred_for_vis = None
+        if use_srf_overlap and batch.get('srf_overlap_mask') is not None:
+            from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
+            srf_overlap_mask_raw = batch['srf_overlap_mask']
+            # Crop srf_overlap mask to match the subcrop
+            srf_overlap_mask_cropped = safe_crop_with_padding(srf_overlap_mask_raw.unsqueeze(-1), first_min_corner_in_outer, config['crop_size']).squeeze(-1)
+            srf_overlap_mask_cropped = srf_overlap_mask_cropped.unsqueeze(1)  # [B, 1, Z, Y, X]
+            # Use the heatmap predictions to compute srf_overlap loss
+            target_pred_for_srf_overlap = target_pred[0] if isinstance(target_pred, (list, tuple)) else target_pred
+            srf_overlap_loss = compute_surf_overlap_loss(target_pred_for_srf_overlap, srf_overlap_mask_cropped, mask).mean()
+            first_step_loss = first_step_loss + srf_overlap_loss_weight * srf_overlap_loss
+        else:
+            srf_overlap_loss = None
 
         # Direction to extend (assumes exactly one of prev_u/prev_v is set)
         step_directions = batch['uv_heatmaps_in'].amax(dim=[1, 2, 3])[:, :2].argmax(dim=-1)
@@ -353,7 +374,7 @@ def train(config_path):
             multistep_targets_available = batch['uv_heatmaps_out'][:, ..., 1::multistep_count].amax(dim=(1, 2, 3, 4)) > 0
         else:
             multistep_targets_available = torch.zeros(batch['uv_heatmaps_out'].shape[0], dtype=bool, device=multistep_available_device)
-        multistep_targets_available = multistep_targets_available.to(multistep_available_device)
+        multistep_targets_available = multistep_targets_available.to(multistep_available_device, non_blocking=True)
         mask = mask * multistep_targets_available[:, None, None, None, None]
 
         for sample_idx in range(sample_count):
@@ -373,7 +394,7 @@ def train(config_path):
                 prev_heatmap = torch.cat([
                     make_heatmaps([prev_center_in_outer_crop[iib:iib+1]], min_corner_new_subcrop_in_outer[iib], config['crop_size'])
                     for iib in range(min_corner_new_subcrop_in_outer.shape[0])
-                ], dim=0).to(prev_center_in_outer_crop.device)
+                ], dim=0).to(prev_center_in_outer_crop.device, non_blocking=True)
                 prev_uv = torch.zeros([prev_heatmap.shape[0], 2, *prev_heatmap.shape[1:]], device=prev_heatmap.device, dtype=prev_heatmap.dtype)
                 prev_uv[torch.arange(prev_heatmap.shape[0]), step_directions] = prev_heatmap
 
@@ -484,7 +505,7 @@ def train(config_path):
         target_pred_all_steps = rearrange(torch.stack(all_step_preds_vis, dim=2), 'b uv s z y x -> b (uv s) z y x')
 
         return (
-            total_loss, first_step_heatmap_loss, later_step_loss, seg_loss, normals_loss,
+            total_loss, first_step_heatmap_loss, later_step_loss, seg_loss, normals_loss, srf_overlap_loss,
             first_step_inputs, target_all_steps, target_pred_all_steps,
             seg, seg_pred_for_vis, normals, normals_pred_for_vis
         )
@@ -538,7 +559,7 @@ def train(config_path):
         with accelerator.accumulate(model):
 
             (
-                total_loss, first_step_heatmap_loss, later_step_loss, seg_loss, normals_loss,
+                total_loss, first_step_heatmap_loss, later_step_loss, seg_loss, normals_loss, srf_overlap_loss,
                 inputs_for_vis, targets_for_vis, target_pred_for_vis,
                 seg_for_vis, seg_pred_for_vis, normals_for_vis, normals_pred_for_vis
             ) = compute_loss_and_pred(batch)
@@ -560,6 +581,8 @@ def train(config_path):
             wandb_log['seg_loss'] = seg_loss.detach().item()
         if use_normals:
             wandb_log['normals_loss'] = normals_loss.detach().item()
+        if use_srf_overlap and srf_overlap_loss is not None:
+            wandb_log['srf_overlap_loss'] = srf_overlap_loss.detach().item()
         progress_bar.set_postfix({'loss': wandb_log['loss']})
         progress_bar.update(1)
 
@@ -570,7 +593,7 @@ def train(config_path):
                 val_batch = next(val_iterator)
 
                 (
-                    total_val_loss, val_first_step_heatmap_loss, val_later_step_loss, val_seg_loss, val_normals_loss,
+                    total_val_loss, val_first_step_heatmap_loss, val_later_step_loss, val_seg_loss, val_normals_loss, val_srf_overlap_loss,
                     val_inputs_for_vis, val_targets_for_vis, val_target_pred_for_vis,
                     val_seg_for_vis, val_seg_pred_for_vis, val_normals_for_vis, val_normals_pred_for_vis
                 ) = compute_loss_and_pred(val_batch)
@@ -583,6 +606,8 @@ def train(config_path):
                     wandb_log['val_seg_loss'] = val_seg_loss.item()
                 if use_normals:
                     wandb_log['val_normals_loss'] = val_normals_loss.item()
+                if use_srf_overlap and val_srf_overlap_loss is not None:
+                    wandb_log['val_srf_overlap_loss'] = val_srf_overlap_loss.item()
 
                 log_image_ext = config.get('log_image_ext', 'jpg')
                 make_canvas(inputs_for_vis, targets_for_vis, target_pred_for_vis, config,

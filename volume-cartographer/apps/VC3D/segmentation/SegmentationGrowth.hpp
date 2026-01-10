@@ -22,6 +22,7 @@ template <typename T> class ChunkCache;
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
+    Extrapolation = 2,
 };
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
@@ -31,6 +32,8 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Tracer");
     case SegmentationGrowthMethod::Corrections:
         return QStringLiteral("Corrections");
+    case SegmentationGrowthMethod::Extrapolation:
+        return QStringLiteral("Extrapolation");
     }
     return QStringLiteral("Unknown");
 }
@@ -39,6 +42,9 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
 {
     if (value == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
         return SegmentationGrowthMethod::Corrections;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::Extrapolation)) {
+        return SegmentationGrowthMethod::Extrapolation;
     }
     return SegmentationGrowthMethod::Tracer;
 }
@@ -115,6 +121,42 @@ inline SegmentationDirectionFieldOrientation segmentationDirectionFieldOrientati
     }
 }
 
+enum class ExtrapolationType {
+    Linear = 0,
+    Quadratic = 1,
+    LinearFit = 2,  // Linear extrapolation + SDT Newton refinement
+    SkeletonPath = 3,  // 2D skeleton analysis + 3D Dijkstra path following
+};
+
+inline QString extrapolationTypeToString(ExtrapolationType type)
+{
+    switch (type) {
+    case ExtrapolationType::Linear:
+        return QStringLiteral("Linear");
+    case ExtrapolationType::Quadratic:
+        return QStringLiteral("Quadratic");
+    case ExtrapolationType::LinearFit:
+        return QStringLiteral("Linear+Fit");
+    case ExtrapolationType::SkeletonPath:
+        return QStringLiteral("Skeleton Path");
+    }
+    return QStringLiteral("Linear");
+}
+
+inline ExtrapolationType extrapolationTypeFromInt(int value)
+{
+    if (value == static_cast<int>(ExtrapolationType::Quadratic)) {
+        return ExtrapolationType::Quadratic;
+    }
+    if (value == static_cast<int>(ExtrapolationType::LinearFit)) {
+        return ExtrapolationType::LinearFit;
+    }
+    if (value == static_cast<int>(ExtrapolationType::SkeletonPath)) {
+        return ExtrapolationType::SkeletonPath;
+    }
+    return ExtrapolationType::Linear;
+}
+
 struct SegmentationDirectionFieldConfig {
     QString path;
     SegmentationDirectionFieldOrientation orientation{SegmentationDirectionFieldOrientation::Normal};
@@ -148,6 +190,9 @@ struct SegmentationGrowthRequest {
     std::vector<SegmentationDirectionFieldConfig> directionFields;
     std::optional<nlohmann::json> customParams;
     bool inpaintOnly{false};
+    // Extrapolation parameters
+    int extrapolationPointCount{7};
+    ExtrapolationType extrapolationType{ExtrapolationType::Linear};
 };
 
 struct TracerGrowthContext {

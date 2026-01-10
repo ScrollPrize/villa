@@ -746,11 +746,15 @@ def write_current_transform(_):
         save_current_transform(state, args.output_transform, args.fixed)
 
 
-def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
-    SMALL_ROTATE = 1
-    LARGE_ROTATE = 90
-    SMALL_TRANSLATE = 10
-    LARGE_TRANSLATE = 1000
+def add_actions_and_keybinds(
+    viewer: neuroglancer.Viewer,
+    *,
+    small_rotate_deg: float = 1.0,
+    large_rotate_deg: float = 90.0,
+    small_translate_voxels: float = 10.0,
+    large_translate_voxels: float = 1000.0,
+    point_perturb_voxels: float = 1.0,
+) -> None:
 
     viewer.actions.add("toggle-color", toggle_color)
     viewer.actions.add("write-transform", write_current_transform)
@@ -760,39 +764,63 @@ def add_actions_and_keybinds(viewer: neuroglancer.Viewer) -> None:
     viewer.actions.add("delete-nearest-point", delete_nearest_point)
     viewer.actions.add("previous-fixed-point", navigate_to_previous_fixed_point)
     viewer.actions.add("next-fixed-point", navigate_to_next_fixed_point)
-    viewer.actions.add("rot-x-plus-small", _make_rotator("x", SMALL_ROTATE))
-    viewer.actions.add("rot-x-minus-small", _make_rotator("x", -SMALL_ROTATE))
-    viewer.actions.add("rot-y-plus-small", _make_rotator("y", SMALL_ROTATE))
-    viewer.actions.add("rot-y-minus-small", _make_rotator("y", -SMALL_ROTATE))
-    viewer.actions.add("rot-z-plus-small", _make_rotator("z", SMALL_ROTATE))
-    viewer.actions.add("rot-z-minus-small", _make_rotator("z", -SMALL_ROTATE))
-    viewer.actions.add("rot-x-plus-large", _make_rotator("x", LARGE_ROTATE))
-    viewer.actions.add("rot-x-minus-large", _make_rotator("x", -LARGE_ROTATE))
-    viewer.actions.add("rot-y-plus-large", _make_rotator("y", LARGE_ROTATE))
-    viewer.actions.add("rot-y-minus-large", _make_rotator("y", -LARGE_ROTATE))
-    viewer.actions.add("rot-z-plus-large", _make_rotator("z", LARGE_ROTATE))
-    viewer.actions.add("rot-z-minus-large", _make_rotator("z", -LARGE_ROTATE))
+    viewer.actions.add("rot-x-plus-small", _make_rotator("x", small_rotate_deg))
+    viewer.actions.add("rot-x-minus-small", _make_rotator("x", -small_rotate_deg))
+    viewer.actions.add("rot-y-plus-small", _make_rotator("y", small_rotate_deg))
+    viewer.actions.add("rot-y-minus-small", _make_rotator("y", -small_rotate_deg))
+    viewer.actions.add("rot-z-plus-small", _make_rotator("z", small_rotate_deg))
+    viewer.actions.add("rot-z-minus-small", _make_rotator("z", -small_rotate_deg))
+    viewer.actions.add("rot-x-plus-large", _make_rotator("x", large_rotate_deg))
+    viewer.actions.add("rot-x-minus-large", _make_rotator("x", -large_rotate_deg))
+    viewer.actions.add("rot-y-plus-large", _make_rotator("y", large_rotate_deg))
+    viewer.actions.add("rot-y-minus-large", _make_rotator("y", -large_rotate_deg))
+    viewer.actions.add("rot-z-plus-large", _make_rotator("z", large_rotate_deg))
+    viewer.actions.add("rot-z-minus-large", _make_rotator("z", -large_rotate_deg))
     viewer.actions.add("flip-x", _make_flipper("x"))
     viewer.actions.add("flip-y", _make_flipper("y"))
     viewer.actions.add("flip-z", _make_flipper("z"))
-    viewer.actions.add("trans-x-plus-small", _make_translator("x", SMALL_TRANSLATE))
-    viewer.actions.add("trans-x-minus-small", _make_translator("x", -SMALL_TRANSLATE))
-    viewer.actions.add("trans-y-plus-small", _make_translator("y", SMALL_TRANSLATE))
-    viewer.actions.add("trans-y-minus-small", _make_translator("y", -SMALL_TRANSLATE))
-    viewer.actions.add("trans-z-plus-small", _make_translator("z", SMALL_TRANSLATE))
-    viewer.actions.add("trans-z-minus-small", _make_translator("z", -SMALL_TRANSLATE))
-    viewer.actions.add("trans-x-plus-large", _make_translator("x", LARGE_TRANSLATE))
-    viewer.actions.add("trans-x-minus-large", _make_translator("x", -LARGE_TRANSLATE))
-    viewer.actions.add("trans-y-plus-large", _make_translator("y", LARGE_TRANSLATE))
-    viewer.actions.add("trans-y-minus-large", _make_translator("y", -LARGE_TRANSLATE))
-    viewer.actions.add("trans-z-plus-large", _make_translator("z", LARGE_TRANSLATE))
-    viewer.actions.add("trans-z-minus-large", _make_translator("z", -LARGE_TRANSLATE))
-    viewer.actions.add("perturb-fixed-point-x-plus", _make_point_perturber("x", 1))
-    viewer.actions.add("perturb-fixed-point-x-minus", _make_point_perturber("x", -1))
-    viewer.actions.add("perturb-fixed-point-y-plus", _make_point_perturber("y", 1))
-    viewer.actions.add("perturb-fixed-point-y-minus", _make_point_perturber("y", -1))
-    viewer.actions.add("perturb-fixed-point-z-plus", _make_point_perturber("z", 1))
-    viewer.actions.add("perturb-fixed-point-z-minus", _make_point_perturber("z", -1))
+    viewer.actions.add("trans-x-plus-small", _make_translator("x", small_translate_voxels))
+    viewer.actions.add(
+        "trans-x-minus-small", _make_translator("x", -small_translate_voxels)
+    )
+    viewer.actions.add("trans-y-plus-small", _make_translator("y", small_translate_voxels))
+    viewer.actions.add(
+        "trans-y-minus-small", _make_translator("y", -small_translate_voxels)
+    )
+    viewer.actions.add("trans-z-plus-small", _make_translator("z", small_translate_voxels))
+    viewer.actions.add(
+        "trans-z-minus-small", _make_translator("z", -small_translate_voxels)
+    )
+    viewer.actions.add("trans-x-plus-large", _make_translator("x", large_translate_voxels))
+    viewer.actions.add(
+        "trans-x-minus-large", _make_translator("x", -large_translate_voxels)
+    )
+    viewer.actions.add("trans-y-plus-large", _make_translator("y", large_translate_voxels))
+    viewer.actions.add(
+        "trans-y-minus-large", _make_translator("y", -large_translate_voxels)
+    )
+    viewer.actions.add("trans-z-plus-large", _make_translator("z", large_translate_voxels))
+    viewer.actions.add(
+        "trans-z-minus-large", _make_translator("z", -large_translate_voxels)
+    )
+    viewer.actions.add(
+        "perturb-fixed-point-x-plus", _make_point_perturber("x", point_perturb_voxels)
+    )
+    viewer.actions.add(
+        "perturb-fixed-point-x-minus", _make_point_perturber("x", -point_perturb_voxels)
+    )
+    viewer.actions.add(
+        "perturb-fixed-point-y-plus", _make_point_perturber("y", point_perturb_voxels)
+    )
+    viewer.actions.add(
+        "perturb-fixed-point-y-minus", _make_point_perturber("y", -point_perturb_voxels)
+    )
+    viewer.actions.add(
+        "perturb-fixed-point-z-plus", _make_point_perturber("z", point_perturb_voxels)
+    )
+    viewer.actions.add(
+        "perturb-fixed-point-z-minus", _make_point_perturber("z", -point_perturb_voxels)
+    )
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
@@ -876,6 +904,36 @@ if __name__ == "__main__":
         help="Voxel size of moving volume in microns (if not provided, will try to read from metadata.json)",
     )
     parser.add_argument(
+        "--small-rotate-deg",
+        type=float,
+        default=1.0,
+        help="Rotation step in degrees for Alt+<rotation key> (default: 1.0)",
+    )
+    parser.add_argument(
+        "--large-rotate-deg",
+        type=float,
+        default=90.0,
+        help="Rotation step in degrees for Alt+Shift+<rotation key> (default: 90.0)",
+    )
+    parser.add_argument(
+        "--small-translate-voxels",
+        type=float,
+        default=10.0,
+        help="Translation step in voxels for Alt+<translation key> (default: 10.0)",
+    )
+    parser.add_argument(
+        "--large-translate-voxels",
+        type=float,
+        default=1000.0,
+        help="Translation step in voxels for Alt+Shift+<translation key> (default: 1000.0)",
+    )
+    parser.add_argument(
+        "--point-perturb-voxels",
+        type=float,
+        default=1.0,
+        help="Fixed-point perturb step in voxels for Shift+<j/u/k/i/l/o> (default: 1.0)",
+    )
+    parser.add_argument(
         "--output-transform",
         type=str,
         help="Path to write the transform to (if not provided, print to stdout)",
@@ -912,7 +970,14 @@ if __name__ == "__main__":
 
     viewer = neuroglancer.Viewer()
 
-    add_actions_and_keybinds(viewer)
+    add_actions_and_keybinds(
+        viewer,
+        small_rotate_deg=args.small_rotate_deg,
+        large_rotate_deg=args.large_rotate_deg,
+        small_translate_voxels=args.small_translate_voxels,
+        large_translate_voxels=args.large_translate_voxels,
+        point_perturb_voxels=args.point_perturb_voxels,
+    )
 
     init_volume_layers(viewer, args.fixed, args.moving, scale_factor)
 

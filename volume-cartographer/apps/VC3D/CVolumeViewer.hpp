@@ -8,6 +8,7 @@
 #include <QList>
 #include <QImage>
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -200,8 +201,8 @@ public:
 
     void setSurfaceOverlayEnabled(bool enabled);
     bool surfaceOverlayEnabled() const { return _surfaceOverlayEnabled; }
-    void setSurfaceOverlay(const std::string& surfaceName);
-    const std::string& surfaceOverlay() const { return _surfaceOverlayName; }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays);
+    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const { return _surfaceOverlays; }
     void setSurfaceOverlapThreshold(float threshold);
     float surfaceOverlapThreshold() const { return _surfaceOverlapThreshold; }
 
@@ -397,7 +398,7 @@ protected:
     std::string _baseColormapId;
     bool _stretchValues{false};
     bool _surfaceOverlayEnabled{false};
-    std::string _surfaceOverlayName;
+    std::map<std::string, cv::Vec3b> _surfaceOverlays;  // name -> BGR color
     float _surfaceOverlapThreshold{5.0f};
 
     // Postprocessing settings

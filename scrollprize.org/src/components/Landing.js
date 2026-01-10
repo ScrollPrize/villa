@@ -724,11 +724,6 @@ const team = {
       title: "Annotation Specialist",
       href: "https://www.linkedin.com/in/sarah-morejohn-1140b049/",
     },
-    {
-      name: "Techjays",
-      title: "Annotation Services",
-      href: "https://www.techjays.com/",
-    },
   ],
   educe: [
     {
@@ -812,6 +807,11 @@ const team = {
       name: "Sergei Pnev",
       title: "Annotation Specialist",
       href: "www.linkedin.com/in/sergey-pnev",
+    },
+    {
+      name: "Techjays",
+      title: "Annotation Services",
+      href: "https://www.techjays.com/",
     },
     {
       name: "Daniel Havíř",
@@ -940,10 +940,6 @@ const partners = [
     href: "https://www.institutdefrance.fr/en/home/",
   },
   {
-    icon: "/img/landing/diamond.svg",
-    href: "https://www.diamond.ac.uk/",
-  },
-  {
     icon: "/img/landing/biblioteca.svg",
     href: "https://www.bnnonline.it/",
   },
@@ -954,10 +950,6 @@ const partners = [
   {
     icon: "/img/landing/kaggle.svg",
     href: "https://www.kaggle.com/",
-  },
-  {
-    icon: "/img/landing/panua.svg",
-    href: "https://panua.ch/",
   },
 ];
 

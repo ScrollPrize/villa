@@ -239,7 +239,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         quad_main_component = self._get_current_patch_center_component_mask(current_patch, center_ij, min_corner_zyx, crop_size)
 
         all_patch_points = []
-        crop_min = min_corner_zyx.to(dtype=current_patch.zyxs.dtype, device=current_patch.zyxs.device)
+        crop_min = min_corner_zyx.to(dtype=current_patch.zyxs.dtype, device=current_patch.zyxs.device, non_blocking=True)
         crop_max = crop_min + torch.as_tensor(crop_size, dtype=crop_min.dtype, device=crop_min.device)
 
         volume_key = id(current_patch.volume)
@@ -374,27 +374,38 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             coords = torch.arange(kernel_size) - radius
             z_off, y_off, x_off = torch.meshgrid(coords, coords, coords, indexing='ij')
             cls._kernel_offsets_cache[sigma] = torch.stack([z_off, y_off, x_off], dim=-1).view(-1, 3)
-        return cls._kernel_offsets_cache[sigma].to(device=device)
+        return cls._kernel_offsets_cache[sigma].to(device=device, non_blocking=True)
 
     @classmethod
     def _get_kernel_values(cls, device, dtype, sigma):
         key = (device, dtype, float(sigma))
         if key not in cls._kernel_value_cache:
             kernel, _ = _get_gaussian_kernel(sigma)
-            cls._kernel_value_cache[key] = kernel.to(device=device, dtype=dtype).reshape(-1)
+            cls._kernel_value_cache[key] = kernel.to(device=device, dtype=dtype, non_blocking=True).reshape(-1)
         return cls._kernel_value_cache[key]
 
     @classmethod
-    def _collect_coords(cls, all_zyxs, min_corner_zyx, crop_size_int, device, dtype):
+    def _collect_coords(cls, all_zyxs, min_corner_zyx, crop_size, device, dtype):
+        """Collect valid coordinates within the crop bounds.
+
+        Args:
+            crop_size: int for cubic, or tuple/list of 3 ints [D, H, W] for anisotropic
+        """
+        # Normalize crop_size to tensor
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_tensor = torch.tensor(crop_size, device=device, dtype=torch.int64)
+        else:
+            crop_size_tensor = torch.tensor([crop_size, crop_size, crop_size], device=device, dtype=torch.int64)
+
         channel_count = all_zyxs[0].shape[0]
         coords_accum = []
         channel_accum = []
         channel_range = cls._get_channel_range(channel_count, device)
-        min_corner = min_corner_zyx.to(device=device, dtype=dtype)
+        min_corner = min_corner_zyx.to(device=device, dtype=dtype, non_blocking=True)
 
         for zyxs in all_zyxs:
-            coords = (zyxs.to(device=device, dtype=dtype) - min_corner + 0.5).to(torch.int64)
-            valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_int).all(dim=1)
+            coords = (zyxs.to(device=device, dtype=dtype, non_blocking=True) - min_corner + 0.5).to(torch.int64)
+            valid_mask = (coords >= 0).all(dim=1) & (coords < crop_size_tensor).all(dim=1)
             if not torch.any(valid_mask):
                 continue
             coords_accum.append(coords[valid_mask])
@@ -409,11 +420,15 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     @classmethod
     def _scatter_heatmaps(cls, all_zyxs, min_corner_zyx, crop_size):
-        crop_size_int = int(crop_size)
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
         dtype = all_zyxs[0].dtype
         device = all_zyxs[0].device
-        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, dtype)
-        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=dtype)
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size, device, dtype)
+        heatmaps = torch.zeros((channel_count, *crop_size_dhw), device=device, dtype=dtype)
 
         if coords is None:
             return heatmaps
@@ -430,8 +445,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             raise NotImplementedError  # for now we only support the special case of one heatmap in this differentiable version!
         zyx = all_zyxs[0]
 
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
+
         coords = min_corner_zyx + torch.stack(torch.meshgrid(
-            *[torch.arange(crop_size, device=zyx.device)] * 3,
+            torch.arange(crop_size_dhw[0], device=zyx.device),
+            torch.arange(crop_size_dhw[1], device=zyx.device),
+            torch.arange(crop_size_dhw[2], device=zyx.device),
             indexing='ij'
         ), dim=-1)
         heatmap = torch.exp(-((coords - zyx) ** 2).sum(dim=-1) / (2 * sigma ** 2))
@@ -446,10 +469,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         if any([zyxs.requires_grad for zyxs in all_zyxs]) or min_corner_zyx.requires_grad:
             return cls._make_heatmaps_with_grad(all_zyxs, min_corner_zyx, crop_size, sigma)
 
-        crop_size_int = int(crop_size)
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
+        crop_size_tensor = torch.tensor(crop_size_dhw)
+
         device = all_zyxs[0].device
-        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size_int, device, torch.float32)
-        heatmaps = torch.zeros((channel_count, crop_size_int, crop_size_int, crop_size_int), device=device, dtype=torch.float32)
+        channel_count, coords, channels = cls._collect_coords(all_zyxs, min_corner_zyx, crop_size, device, torch.float32)
+        heatmaps = torch.zeros((channel_count, *crop_size_dhw), device=device, dtype=torch.float32)
 
         if coords is None:
             return heatmaps
@@ -458,7 +487,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         kernel_values = cls._get_kernel_values(device, torch.float32, sigma)
 
         expanded_coords = coords[:, None, :] + kernel_offsets[None, :, :]
-        in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_int).all(dim=-1)
+        crop_size_bounds = crop_size_tensor.to(device=device)
+        in_bounds = (expanded_coords >= 0).all(dim=-1) & (expanded_coords < crop_size_bounds).all(dim=-1)
 
         if torch.any(in_bounds):
             valid_positions = expanded_coords[in_bounds]
@@ -581,11 +611,28 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         else:
             maybe_center_heatmap = {}
 
+        # Generate srf_overlap mask if enabled
+        srf_overlap_mask = None
+        if self._config.get('aux_srf_overlap', False):
+            from vesuvius.neural_tracing.surf_overlap_loss import render_surf_overlap_mask
+            srf_overlap_thickness = self._config.get('srf_overlap_thickness', 2.0)
+            # Use first step coordinates for srf_overlap (step 0)
+            srf_overlap_mask = render_surf_overlap_mask(
+                u_neg_shifted_zyxs[0], u_pos_shifted_zyxs[0],
+                v_neg_shifted_zyxs[0], v_pos_shifted_zyxs[0],
+                min_corner_zyx, crop_size, thickness=srf_overlap_thickness
+            )
+
         return {
             'uv_heatmaps_both': uv_heatmaps_both,
             'condition_channels': condition_channels,
+            'srf_overlap_mask': srf_overlap_mask,
             **maybe_center_heatmap,
         }
+
+    def _should_flip_uv_directions(self):
+        """Whether to randomly flip positive/negative directions as augmentation."""
+        return bool(self._config.get("flip_uv_directions", True))
 
     def _should_swap_uv_axes(self):
         """Whether to apply UV axis swap augmentation. Override in subclasses."""
@@ -602,6 +649,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         normals,
         normals_mask,
         center_heatmap,
+        srf_overlap_mask=None,
     ):
         """Build the batch dictionary. Override in subclasses to add masking."""
         batch_dict = {
@@ -616,6 +664,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             batch_dict.update({'seg': seg, 'seg_mask': seg_mask})
         if self._config.get("aux_normals", False) and normals is not None:
             batch_dict.update({'normals': normals, 'normals_mask': normals_mask})
+        if self._config.get("aux_srf_overlap", False) and srf_overlap_mask is not None:
+            batch_dict.update({'srf_overlap_mask': srf_overlap_mask})
 
         return batch_dict
 
@@ -676,12 +726,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 continue
 
             # Randomly flip positive and negative directions, as a form of augmentation since they're arbitrary
-            if torch.rand([]) < 0.5:
-                u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
-                u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
-            if torch.rand([]) < 0.5:
-                v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
-                v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
+            if self._should_flip_uv_directions():
+                if torch.rand([]) < 0.5:
+                    u_pos_shifted_ijs, u_neg_shifted_ijs = u_neg_shifted_ijs, u_pos_shifted_ijs
+                    u_pos_valid, u_neg_valid = u_neg_valid, u_pos_valid
+                if torch.rand([]) < 0.5:
+                    v_pos_shifted_ijs, v_neg_shifted_ijs = v_neg_shifted_ijs, v_pos_shifted_ijs
+                    v_pos_valid, v_neg_valid = v_neg_valid, v_pos_valid
 
             # Decide conditioning directions early so we know which points to perturb
             cond_result = self._decide_conditioning(
@@ -745,7 +796,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
                     quad_corners = info["quad_corners_flat"][quad_in_crop]
                     points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners).reshape(-1, 3)
-                    surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device)).round().long()
+                    surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device, non_blocking=True)).round().long()
                     in_bounds = ((surface_pts_crop >= 0) & (surface_pts_crop < crop_size)).all(dim=1)
                     surface_pts_crop = surface_pts_crop[in_bounds]
                     if surface_pts_crop.numel() > 0:
@@ -767,7 +818,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                             label = labeled[anchor_voxel[0].item(), anchor_voxel[1].item(), anchor_voxel[2].item()]
                             if label != 0:
                                 surface_mask_np = (labeled == label)[None].astype(np.float32)
-                                surface_mask = torch.from_numpy(surface_mask_np).to(surface_mask.device)
+                                surface_mask = torch.from_numpy(surface_mask_np).to(surface_mask.device, non_blocking=True)
                     if self._config.get("aux_normals", False):
                         vertex_normals = self._vertex_normals[id(patch)]
                         filtered_quad_normals = torch.stack([
@@ -833,6 +884,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_heatmaps_both = heatmap_result['uv_heatmaps_both']
             heatmap_num_in_channels = heatmap_result['condition_channels']
             maybe_center_heatmap = heatmap_result['center_heatmap'] if 'center_heatmap' in heatmap_result else None
+            srf_overlap_mask = heatmap_result.get('srf_overlap_mask', None)
 
             # Build localiser volume
             localiser = build_localiser(center_zyx, min_corner_zyx, crop_size)
@@ -1006,8 +1058,13 @@ def load_datasets(config, shard_idx=None, total_shards=None):
         patches = [patch.retarget(2 ** (volume_scale - patches_wrt_volume_scale)) for patch in patches]
 
         num_val_per_volume = config.get('num_val_segments_per_volume', 1)
-        train_patches.extend(patches[num_val_per_volume:])
-        val_patches.extend(patches[:num_val_per_volume])
+        min_segments_for_val = config.get('min_segments_for_val', 5)
+        if len(patches) < min_segments_for_val:
+            # Not enough segments - use all for training, none for validation
+            train_patches.extend(patches)
+        else:
+            train_patches.extend(patches[num_val_per_volume:])
+            val_patches.extend(patches[:num_val_per_volume])
         
     print(f'loaded {len(train_patches)} train patches and {len(val_patches)} val patches')
 
@@ -1074,16 +1131,28 @@ def filter_patches_by_roi(patches, approved_cubes):
     return filtered_patches
 
 
-def get_crop_from_volume(volume, center_zyx, crop_size):
+def get_crop_from_volume(volume, center_zyx, crop_size, normalize=True):
     """Crop volume around center point, padding with zeros if needed.
 
     Guarantees the returned crop is exactly `crop_size` on each axis, even if the
     requested center lies far outside the volume (previously this could yield
     huge tensors and blow up concatenation in inference).
+
+    Args:
+        volume: The source volume array
+        center_zyx: Center coordinates for the crop
+        crop_size: Size of the crop (int for cubic, or tuple/list for anisotropic [D, H, W])
+        normalize: If True, normalize intensity to [-1, 1] range. If False, return
+                   raw float32 values (useful when caller handles normalization).
     """
-    crop_size_int = int(crop_size)
-    crop_min = (center_zyx - crop_size_int // 2).int()
-    crop_max = crop_min + crop_size_int
+    # Normalize crop_size to tensor of 3 ints [D, H, W]
+    if isinstance(crop_size, (list, tuple)):
+        crop_size_tensor = torch.tensor(crop_size)
+    else:
+        crop_size_tensor = torch.tensor([crop_size, crop_size, crop_size])
+
+    crop_min = (center_zyx - crop_size_tensor // 2).int()
+    crop_max = crop_min + crop_size_tensor
 
     vol_shape = torch.tensor(volume.shape)
 
@@ -1099,23 +1168,27 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         actual_min[2]:actual_max[2]
     ]).to(torch.float32)
 
-    if volume_crop.numel() > 0:
-        # TODO: should instead always use standardised uint8 volumes!
-        if volume.dtype == np.uint8:
-            volume_crop = volume_crop / 255.
+    if normalize:
+        if volume_crop.numel() > 0:
+            # TODO: should instead always use standardised uint8 volumes!
+            if volume.dtype == np.uint8:
+                volume_crop = volume_crop / 255.
+            else:
+                max_val = volume_crop.amax()
+                volume_crop = volume_crop / max_val if max_val > 0 else volume_crop
         else:
-            max_val = volume_crop.amax()
-            volume_crop = volume_crop / max_val if max_val > 0 else volume_crop
+            volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
+        volume_crop = volume_crop * 2 - 1
     else:
-        volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
-    volume_crop = volume_crop * 2 - 1
+        if volume_crop.numel() == 0:
+            volume_crop = torch.zeros((0, 0, 0), dtype=torch.float32)
 
-    # Compute padding so final shape is exactly crop_size_int in each dimension.
+    # Compute padding so final shape is exactly crop_size in each dimension.
     pad_before = torch.clamp(actual_min - crop_min, min=0)
-    pad_before = torch.minimum(pad_before, torch.tensor(crop_size_int).repeat(3))
+    pad_before = torch.minimum(pad_before, crop_size_tensor)
 
     current_shape = torch.tensor(volume_crop.shape)
-    pad_after = crop_size_int - current_shape - pad_before
+    pad_after = crop_size_tensor - current_shape - pad_before
     pad_after = torch.clamp(pad_after, min=0)
 
     if torch.any(pad_before > 0) or torch.any(pad_after > 0):
@@ -1127,8 +1200,9 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
         volume_crop = F.pad(volume_crop, paddings, mode='constant', value=0)
 
     # Ensure any edge cases still return the desired shape.
-    if volume_crop.shape != (crop_size_int, crop_size_int, crop_size_int):
-        volume_crop = volume_crop[:crop_size_int, :crop_size_int, :crop_size_int]
+    expected_shape = tuple(crop_size_tensor.tolist())
+    if volume_crop.shape != expected_shape:
+        volume_crop = volume_crop[:expected_shape[0], :expected_shape[1], :expected_shape[2]]
 
     # min_corner reflects the coordinate of voxel [0,0,0] after padding/truncation
     min_corner = actual_min - pad_before
@@ -1136,7 +1210,20 @@ def get_crop_from_volume(volume, center_zyx, crop_size):
 
 
 def build_localiser(center_zyx, min_corner_zyx, crop_size):
-    localiser = torch.linalg.norm(torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2, dim=-1)
+    # Normalize crop_size to tuple of 3 ints [D, H, W]
+    if isinstance(crop_size, (list, tuple)):
+        crop_size_dhw = tuple(crop_size)
+    else:
+        crop_size_dhw = (crop_size, crop_size, crop_size)
+    localiser = torch.linalg.norm(
+        torch.stack(torch.meshgrid(
+            torch.arange(crop_size_dhw[0]),
+            torch.arange(crop_size_dhw[1]),
+            torch.arange(crop_size_dhw[2]),
+            indexing='ij'
+        ), dim=-1).to(torch.float32) - torch.tensor(crop_size_dhw).float() / 2,
+        dim=-1
+    )
     localiser = localiser / localiser.amax() * 2 - 1
     mark_context_point(localiser, center_zyx - min_corner_zyx, value=0.)
     return localiser

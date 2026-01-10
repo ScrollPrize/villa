@@ -104,6 +104,8 @@ echo ""
 count=0
 processed=0
 failed=0
+skipped=0
+skipped_holes=0
 
 while IFS= read -r -d '' dir; do
     if [ -f "$dir/x.tif" ] && [ -f "$dir/y.tif" ] && [ -f "$dir/z.tif" ]; then
@@ -115,31 +117,88 @@ while IFS= read -r -d '' dir; do
         else
             target_dir="${dir}_inpaint"
         fi
+
+        # Skip if output already exists
+        if [ -f "$target_dir/x.tif" ] && [ -f "$target_dir/y.tif" ] && [ -f "$target_dir/z.tif" ]; then
+            echo "[$count] Skipping (output exists): $dir"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
         mkdir -p "$target_dir"
+
+        # Get segment name from target directory basename
+        segment_name=$(basename "$target_dir")
 
         echo "[$count] Inpainting: $dir"
         echo "    Target dir: $target_dir"
+        echo "    Segment name: $segment_name"
 
-        if "$VC_GSFS" \
+        # Run with output monitoring to detect too many holes relative to points
+        status_file=$(mktemp)
+        echo "OK" > "$status_file"
+        num_points=0
+
+        # Start the process and monitor output (disable pipefail for this section)
+        set +o pipefail
+        "$VC_GSFS" \
             --volume "$VOLUME_PATH" \
             --target-dir "$target_dir" \
             --params "$TMP_PARAMS" \
             --resume "$dir" \
             --inpaint \
-            "${EXTRA_ARGS[@]}"; then
+            --segment-name "$segment_name" \
+            "${EXTRA_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+            echo "$line"
+            # Parse: "Resuming from generation X with Y points."
+            if [[ "$line" =~ "with "([0-9]+)" points" ]]; then
+                echo "${BASH_REMATCH[1]}" > "${status_file}.points"
+            fi
+            # Parse: "performing inpaint on Z potential holes"
+            if [[ "$line" =~ "performing inpaint on "([0-9]+)" potential holes" ]]; then
+                num_holes="${BASH_REMATCH[1]}"
+                if [ -f "${status_file}.points" ]; then
+                    num_points=$(cat "${status_file}.points")
+                    threshold=$((num_points / 2))
+                    if [ "$num_holes" -ge "$threshold" ]; then
+                        echo "    ⚠ Too many holes ($num_holes) relative to points ($num_points), skipping..."
+                        pkill -f "vc_grow_seg_from_seed.*--target-dir $target_dir" 2>/dev/null || true
+                        echo "KILLED" > "$status_file"
+                        break
+                    fi
+                fi
+            fi
+        done
+        set -o pipefail
+
+        final_status=$(cat "$status_file")
+        rm -f "$status_file" "${status_file}.points"
+
+        if [ "$final_status" = "KILLED" ]; then
+            skipped_holes=$((skipped_holes + 1))
+            # Clean up partial output
+            rm -rf "$target_dir"
+            echo "    ⚠ Skipped (too many holes)"
+        elif [ -f "$target_dir/x.tif" ] && [ -f "$target_dir/y.tif" ] && [ -f "$target_dir/z.tif" ]; then
             processed=$((processed + 1))
-            echo "    ✓ Success"
+            # Move original to inpaint_completed folder
+            completed_dir="$INPUT_FOLDER/inpaint_completed"
+            mkdir -p "$completed_dir"
+            mv "$dir" "$completed_dir/"
+            echo "    ✓ Success (moved original to inpaint_completed)"
         else
             failed=$((failed + 1))
             echo "    ✗ Failed"
         fi
         echo ""
     fi
-done < <(find "$INPUT_FOLDER" -mindepth 1 -maxdepth 1 -type d -print0)
+done < <(find "$INPUT_FOLDER" -mindepth 1 -maxdepth 1 -type d ! -name '*_inpaint' ! -name 'inpaint_completed' -print0)
 
 echo "======================================"
 echo "vc_grow_seg_from_seed inpaint batch complete"
 echo "Total candidates: $count"
+echo "Skipped (already done): $skipped"
+echo "Skipped (too many holes): $skipped_holes"
 echo "Succeeded: $processed"
 echo "Failed: $failed"
 echo "======================================"

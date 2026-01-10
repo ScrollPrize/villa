@@ -168,9 +168,7 @@ class TifxyzWriter:
         """
         # Build metadata dict in C++ format
         meta_dict = {
-            "type": surface.surface_type,
             "uuid": surface.uuid,
-            "format": surface.format,
             # C++ format: scale is [x_scale, y_scale]
             # Our internal format is (scale_y, scale_x)
             "scale": [surface._scale[1], surface._scale[0]],

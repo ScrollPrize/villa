@@ -9,37 +9,32 @@ The tifxyz format stores 3D surface point clouds in a directory structure::
         meta.json  - Metadata (scale, bbox, uuid, etc.)
         mask.tif   - Optional validity mask
 
-Data is typically stored at 20x downsampling (scale=[20.0, 20.0]).
-The scale indicates how many voxels each grid point represents.
-
 Example
 -------
->>> from vesuvius.tifxyz import Tifxyz, read_tifxyz, write_tifxyz
+>>> from vesuvius.tifxyz import read_tifxyz, write_tifxyz
 >>>
 >>> # Read a tifxyz surface
 >>> surface = read_tifxyz("/path/to/segment")
 >>>
->>> # Get stored grid coordinates
->>> print(f"Grid shape: {surface.shape}")  # e.g., (500, 500)
->>> print(f"Scale: {surface.scale}")  # (20.0, 20.0)
+>>> # Get full resolution dimensions
+>>> print(f"Shape: {surface.shape}")  # e.g., (84300, 87460)
 >>>
->>> # Upsample to full resolution
->>> full_res = surface.upsample(target_scale=1.0)
->>> print(f"Full resolution shape: {full_res.shape}")  # (10000, 10000)
->>>
->>> # Query points at specific nominal locations
->>> x, y, z, valid = surface.get_points_at_nominal(
-...     nominal_y=np.array([100, 200, 300]),
-...     nominal_x=np.array([150, 250, 350])
-... )
+>>> # Access coordinates at any position (interpolated)
+>>> x, y, z, valid = surface[2000, 4000]           # Single point
+>>> x, y, z, valid = surface[1000:1100, 2000:2100] # 100x100 tile
 >>>
 >>> # Write a surface
 >>> write_tifxyz("/path/to/output", surface, overwrite=True)
 """
 
-from .reader import TifxyzReader, read_tifxyz
+from .reader import TifxyzInfo, TifxyzReader, list_tifxyz, load_folder, read_tifxyz
 from .types import Tifxyz
-from .upsampling import compute_grid_bounds, interpolate_at_points, upsample_coordinates
+from .upsampling import (
+    catmull_rom_smooth_1d,
+    compute_grid_bounds,
+    interpolate_at_points,
+    upsample_coordinates,
+)
 from .writer import TifxyzWriter, write_tifxyz
 
 __all__ = [
@@ -48,6 +43,10 @@ __all__ = [
     # Reader
     "read_tifxyz",
     "TifxyzReader",
+    # Discovery
+    "list_tifxyz",
+    "load_folder",
+    "TifxyzInfo",
     # Writer
     "write_tifxyz",
     "TifxyzWriter",
@@ -55,4 +54,5 @@ __all__ = [
     "upsample_coordinates",
     "interpolate_at_points",
     "compute_grid_bounds",
+    "catmull_rom_smooth_1d",
 ]
