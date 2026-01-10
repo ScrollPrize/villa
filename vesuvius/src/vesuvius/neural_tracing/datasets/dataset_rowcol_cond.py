@@ -163,12 +163,6 @@ class EdtSegDataset(Dataset):
         seg.use_full_resolution()  # scale/interpolate to "full" resolution
                                    # slicing is lazy, we only access the part we need at this res
 
-        # world_bbox is centered on surface centroid and extends to target size
-        fallback_min_corner = None
-        if patch.world_bbox is not None:
-            z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
-            fallback_min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
-
         def _to_full_bounds(min_idx, max_idx, scale, full_size):
             # Convert inclusive stored bounds -> half-open full-res bounds.
             if scale <= 0:
@@ -237,36 +231,9 @@ class EdtSegDataset(Dataset):
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
 
-        # center the crop on the combined conditioning+masked surface coords.
-        combined_zyxs = np.concatenate(
-            [cond_zyxs.reshape(-1, 3), masked_zyxs.reshape(-1, 3)],
-            axis=0,
-        )
-        if combined_zyxs.size == 0:
-            if fallback_min_corner is None:
-                return self[np.random.randint(len(self))]
-            min_corner = fallback_min_corner
-        else:
-            finite_mask = np.isfinite(combined_zyxs).all(axis=1)
-            if not finite_mask.any():
-                if fallback_min_corner is None:
-                    return self[np.random.randint(len(self))]
-                min_corner = fallback_min_corner
-            else:
-                center_zyx = combined_zyxs[finite_mask].mean(axis=0)
-                min_corner = np.round(center_zyx - np.array(crop_size) / 2.0).astype(np.int64)
-
-                # clamp min_corner to ensure all surface data fits within crop
-                # (discrete sampling can cause surface span < crop_size, but centering
-                # may still push edge points outside the crop bounds)
-                finite_points = combined_zyxs[finite_mask]
-                surface_min = finite_points.min(axis=0)
-                surface_max = finite_points.max(axis=0)
-                # Shift min_corner down if surface_min would be outside crop
-                min_corner = np.minimum(min_corner, np.floor(surface_min).astype(np.int64))
-                # shift min_corner up if surface_max would be outside crop
-                min_corner = np.maximum(min_corner, np.ceil(surface_max).astype(np.int64) - np.array(crop_size) + 1)
-
+        # Use world_bbox directly as crop position
+        z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
+        min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
         max_corner = min_corner + np.array(crop_size)
 
         # if we're extrapolating, compute it with the extrapolation module
