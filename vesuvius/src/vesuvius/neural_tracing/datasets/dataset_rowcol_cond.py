@@ -63,6 +63,7 @@ class EdtSegDataset(Dataset):
         config.setdefault('require_all_valid_in_bbox', True)
         config.setdefault('skip_chunk_if_any_invalid', False)
         config.setdefault('min_cond_span', 0.3)
+        config.setdefault('inner_bbox_fraction', 0.7)
 
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -111,6 +112,7 @@ class EdtSegDataset(Dataset):
                 bbox_pad_2d=config.get('bbox_pad_2d', 0),
                 require_all_valid_in_bbox=config.get('require_all_valid_in_bbox', True),
                 skip_chunk_if_any_invalid=config.get('skip_chunk_if_any_invalid', False),
+                inner_bbox_fraction=config.get('inner_bbox_fraction', 0.7),
                 cache_dir=cache_dir,
                 force_recompute=config.get('force_recompute_patches', False),
                 verbose=True,
@@ -202,10 +204,25 @@ class EdtSegDataset(Dataset):
 
         # Now split into cond and mask on the upsampled grid
         conditioning_percent = self.config['cond_percent']
-        r_split_up = round(h_up * conditioning_percent)
-        c_split_up = round(w_up * conditioning_percent)
+        if h_up < 2 and w_up < 2:
+            return self[np.random.randint(len(self))]
 
-        cond_direction = random.choice(["left", "right", "up", "down"])
+        valid_directions = []
+        if w_up >= 2:
+            valid_directions.extend(["left", "right"])
+        if h_up >= 2:
+            valid_directions.extend(["up", "down"])
+        if not valid_directions:
+            return self[np.random.randint(len(self))]
+
+        r_split_up = int(round(h_up * conditioning_percent))
+        c_split_up = int(round(w_up * conditioning_percent))
+        if h_up >= 2:
+            r_split_up = min(max(r_split_up, 1), h_up - 1)
+        if w_up >= 2:
+            c_split_up = min(max(c_split_up, 1), w_up - 1)
+
+        cond_direction = random.choice(valid_directions)
 
         if cond_direction == "left":
             x_cond, y_cond, z_cond = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
@@ -223,6 +240,8 @@ class EdtSegDataset(Dataset):
         # Generate UV coordinates in shared coordinate system
         cond_h, cond_w = x_cond.shape
         mask_h, mask_w = x_mask.shape
+        if cond_h == 0 or cond_w == 0 or mask_h == 0 or mask_w == 0:
+            return self[np.random.randint(len(self))]
 
         # Determine offsets based on split direction
         if cond_direction == "left":
@@ -481,7 +500,7 @@ if __name__ == "__main__":
     out_dir = Path("/tmp/edt_seg_debug")
     out_dir.mkdir(exist_ok=True)
 
-    num_samples = min(10, len(train_ds))
+    num_samples = min(100, len(train_ds))
     for i in range(num_samples):
         sample = train_ds[i]
 

@@ -685,6 +685,53 @@ def passes_span_check_axis_aligned(
     return True
 
 
+def passes_inner_bbox_check(
+    points_zyx: np.ndarray,
+    chunk_bbox: Tuple[float, ...],
+    inner_bbox_fraction: float,
+) -> bool:
+    """
+    Check if the wrap center lies within the inner fraction of the chunk bbox.
+
+    Parameters
+    ----------
+    points_zyx : np.ndarray
+        Array of shape (N, 3) with [z, y, x] coordinates
+    chunk_bbox : Tuple[float, ...]
+        (z_min, z_max, y_min, y_max, x_min, x_max)
+    inner_bbox_fraction : float
+        Fraction of chunk size to keep (0 to 1). 1.0 means no filtering.
+
+    Returns
+    -------
+    bool
+        True if wrap center (Y/X only) is inside inner bbox
+    """
+    if len(points_zyx) == 0:
+        return False
+    if inner_bbox_fraction >= 1.0:
+        return True
+    if inner_bbox_fraction <= 0.0:
+        return False
+
+    _, _, y_min, y_max, x_min, x_max = chunk_bbox
+    margin_frac = (1.0 - inner_bbox_fraction) / 2.0
+    y_margin = (y_max - y_min) * margin_frac
+    x_margin = (x_max - x_min) * margin_frac
+
+    inner_y_min = y_min + y_margin
+    inner_y_max = y_max - y_margin
+    inner_x_min = x_min + x_margin
+    inner_x_max = x_max - x_margin
+
+    center = points_zyx.mean(axis=0)
+
+    return (
+        center[1] >= inner_y_min and center[1] <= inner_y_max and
+        center[2] >= inner_x_min and center[2] <= inner_x_max
+    )
+
+
 def find_world_chunk_patches(
     segments: List[Tifxyz],
     target_size: Tuple[int, int, int],
@@ -697,6 +744,7 @@ def find_world_chunk_patches(
     bbox_pad_2d: int = 0,
     require_all_valid_in_bbox: bool = True,
     skip_chunk_if_any_invalid: bool = False,
+    inner_bbox_fraction: float = 0.7,
     use_pca_for_span: bool = False,
     cache_dir: Optional[Path] = None,
     force_recompute: bool = False,
@@ -735,6 +783,9 @@ def find_world_chunk_patches(
     skip_chunk_if_any_invalid : bool
         If True, reject entire chunk if ANY segment has invalid cells;
         If False (default), only skip that segment's wraps
+    inner_bbox_fraction : float
+        Fraction of chunk size to keep when filtering wraps by center (Y/X only).
+        1.0 disables this filter.
     use_pca_for_span : bool
         If True, use PCA for span check (not implemented, use False)
     cache_dir : Optional[Path]
@@ -782,6 +833,7 @@ def find_world_chunk_patches(
         "bbox_pad_2d": bbox_pad_2d,
         "require_all_valid_in_bbox": require_all_valid_in_bbox,
         "skip_chunk_if_any_invalid": skip_chunk_if_any_invalid,
+        "inner_bbox_fraction": inner_bbox_fraction,
         "chunk_pad": chunk_pad,
         "segment_scales": [list(seg._scale) for seg in segments],
         "segment_uuids": [seg.uuid for seg in segments],
@@ -841,6 +893,7 @@ def find_world_chunk_patches(
         "wraps_rejected_size": 0,
         "wraps_rejected_validity": 0,
         "wraps_rejected_span": 0,
+        "wraps_rejected_inner_bbox": 0,
         "wraps_accepted": 0,
     }
 
@@ -913,6 +966,14 @@ def find_world_chunk_patches(
                     stats["wraps_rejected_span"] += 1
                     continue
 
+                if not passes_inner_bbox_check(
+                    wrap["points_zyx"],
+                    chunk_bbox,
+                    inner_bbox_fraction,
+                ):
+                    stats["wraps_rejected_inner_bbox"] += 1
+                    continue
+
                 # Wrap is valid
                 stats["wraps_accepted"] += 1
                 segment_ids.add(seg.uuid)
@@ -946,6 +1007,7 @@ def find_world_chunk_patches(
         print(f"  Chunks rejected (no valid wraps): {stats['chunks_no_valid_wraps']}")
         print(f"  Chunks accepted: {stats['chunks_accepted']}")
         print(f"  Wraps rejected (span check): {stats['wraps_rejected_span']}")
+        print(f"  Wraps rejected (inner bbox): {stats['wraps_rejected_inner_bbox']}")
         print(f"  Wraps accepted: {stats['wraps_accepted']}")
 
     # Save to cache

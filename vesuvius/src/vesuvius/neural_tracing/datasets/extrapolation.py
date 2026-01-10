@@ -459,6 +459,8 @@ def compute_extrapolation(
     zyx_cond_flat = zyx_cond.reshape(-1, 3)
     uv_mask_flat = uv_mask.reshape(-1, 2)
     zyx_mask_flat = zyx_mask.reshape(-1, 3)
+    if uv_cond_flat.size == 0 or uv_mask_flat.size == 0:
+        return None
 
     # Run extrapolation method
     extrapolate_fn = _EXTRAPOLATION_METHODS[method]
