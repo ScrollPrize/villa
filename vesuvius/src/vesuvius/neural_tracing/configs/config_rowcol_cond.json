@@ -1,0 +1,85 @@
+{
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v1",
+    "seed": 0,
+    "batch_size": 6,
+    "num_workers": 14,
+
+    "datasets": [
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0139.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0139"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_rewindowed.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0172"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0332.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0332"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1451.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1451"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1667.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1667"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/volpkgs/PHercParis4.volpkg/volumes/Scroll1_8um_uint8.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHercParis4"
+        }
+    ],
+
+    "crop_size": 128,
+    "force_recompute_patches": true,
+    "val_fraction": 0.01,
+    "use_extrapolation": true,
+    "extrapolation_method": "linear_edge",
+    "cond_percent": 0.5,
+
+    "lambda_smooth": 0.1,
+
+    "use_sdt": true,
+    "lambda_sdt": 1.0,
+    "sdt_surface_sigma": 3.0,
+    "sdt_eikonal": true,
+    "sdt_eikonal_weight": 0.01,
+    "sdt_laplacian": true,
+    "sdt_laplacian_weight": 0.01,
+    "dilation_radius": 1.0,
+
+    "num_iterations": 250000,
+    "log_frequency": 500,
+    "ckpt_frequency": 2000,
+
+    "learning_rate": 0.01,
+    "weight_decay": 3e-5,
+    "momentum": 0.99,
+    "nesterov": true,
+    "poly_exponent": 0.9,
+    "grad_clip": 12,
+
+    "mixed_precision": "bf16",
+    "compile_model": true,
+
+    "in_channels": 3,
+    "model_type": "unet",
+
+    "model_config": {
+        "autoconfigure": true
+    },
+
+    "augmentation": {
+        "enabled": true,
+        "allow_transposes": true,
+        "allow_mirroring": true,
+        "intensity": true
+    }
+}

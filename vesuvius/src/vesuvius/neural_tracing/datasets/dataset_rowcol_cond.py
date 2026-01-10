@@ -45,7 +45,8 @@ class EdtSegDataset(Dataset):
         config.setdefault('dilation_radius', 1)  # voxels
         config.setdefault('cond_percent', 0.5)
         config.setdefault('use_extrapolation', True)
-        config.setdefault('extrapolation_method', 'rbf_clamped')
+        config.setdefault('extrapolation_method', 'linear_edge')
+        config.setdefault('force_recompute_patches', False)
         
 
         # Setup augmentations
@@ -74,7 +75,10 @@ class EdtSegDataset(Dataset):
                 retarget_factor = 2 ** volume_scale
                 seg_scaled = seg.retarget(retarget_factor)
                 seg_scaled.volume = volume
-                seg_patches = seg_scaled.get_patches_3d(target_size)
+                seg_patches = seg_scaled.get_patches_3d(
+                    target_size,
+                    force_recompute=config.get('force_recompute_patches', False),
+                )
 
                 for grid_bbox, world_bbox in seg_patches:
                     patches.append(Patch(
