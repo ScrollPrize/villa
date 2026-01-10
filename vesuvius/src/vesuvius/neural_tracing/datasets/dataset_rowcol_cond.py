@@ -13,6 +13,7 @@ from vesuvius.models.augmentation.pipelines.training_transforms import create_tr
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
 from vesuvius.neural_tracing.datasets.extrapolation import compute_extrapolation
+import cv2
 
 import os                                                                                                               
 os.environ['OMP_NUM_THREADS'] = '1' # this is set to 1 because by default the edt package uses omp to threads the edt call 
@@ -61,7 +62,8 @@ class EdtSegDataset(Dataset):
         config.setdefault('bbox_pad_2d', 0)
         config.setdefault('require_all_valid_in_bbox', True)
         config.setdefault('skip_chunk_if_any_invalid', False)
-        
+        config.setdefault('min_cond_span', 0.3)
+
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
             self._augmentations = create_training_transforms(
@@ -160,73 +162,97 @@ class EdtSegDataset(Dataset):
         if r_max < r_min or c_max < c_min:
             return self[np.random.randint(len(self))]
 
-        seg.use_full_resolution()  # scale/interpolate to "full" resolution
-                                   # slicing is lazy, we only access the part we need at this res
-
-        def _to_full_bounds(min_idx, max_idx, scale, full_size):
-            # Convert inclusive stored bounds -> half-open full-res bounds.
-            if scale <= 0:
-                return 0, full_size
-            min_full = int(np.floor(min_idx / scale))
-            max_full = int(np.floor(max_idx / scale)) + 1
-            if min_full < 0:
-                min_full = 0
-            if max_full > full_size:
-                max_full = full_size
-            if max_full <= min_full:
-                max_full = min(full_size, min_full + 1)
-            return min_full, max_full
-
-        full_h, full_w = seg.full_resolution_shape
+        # Use stored resolution and upsample - this ensures coords stay within world_bbox
+        seg.use_stored_resolution()
         scale_y, scale_x = seg._scale
-        r_min_full, r_max_full = _to_full_bounds(r_min, r_max, scale_y, full_h)
-        c_min_full, c_max_full = _to_full_bounds(c_min, c_max, scale_x, full_w)
 
+        # Slice FULL region at stored resolution first
+        x_full_s, y_full_s, z_full_s, valid_full_s = seg[r_min:r_max+1, c_min:c_max+1]
+
+        # Check validity before upsampling
+        if not valid_full_s.all():
+            return self[np.random.randint(len(self))]
+
+        # Upsample the full region using bilinear interpolation
+        h_s, w_s = x_full_s.shape
+        h_up = int(round(h_s / scale_y))
+        w_up = int(round(w_s / scale_x))
+        x_full = cv2.resize(x_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
+        y_full = cv2.resize(y_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
+        z_full = cv2.resize(z_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
+
+        # Crop to only points within world_bbox
+        z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
+        in_bounds = (
+            (z_full >= z_min) & (z_full < z_max) &
+            (y_full >= y_min) & (y_full < y_max) &
+            (x_full >= x_min) & (x_full < x_max)
+        )
+        # Find bounding box of valid region
+        valid_rows = np.any(in_bounds, axis=1)
+        valid_cols = np.any(in_bounds, axis=0)
+        if not valid_rows.any() or not valid_cols.any():
+            return self[np.random.randint(len(self))]
+        r0, r1 = np.where(valid_rows)[0][[0, -1]]
+        c0, c1 = np.where(valid_cols)[0][[0, -1]]
+        x_full = x_full[r0:r1+1, c0:c1+1]
+        y_full = y_full[r0:r1+1, c0:c1+1]
+        z_full = z_full[r0:r1+1, c0:c1+1]
+        h_up, w_up = x_full.shape  # update dimensions after crop
+
+        # Now split into cond and mask on the upsampled grid
         conditioning_percent = self.config['cond_percent']
-        r_split = r_min_full + round((r_max_full - r_min_full) * conditioning_percent)
-        c_split = c_min_full + round((c_max_full - c_min_full) * conditioning_percent)
+        r_split_up = round(h_up * conditioning_percent)
+        c_split_up = round(w_up * conditioning_percent)
 
         cond_direction = random.choice(["left", "right", "up", "down"])
 
         if cond_direction == "left":
-            # the left half of the patch is conditioning, mask the right half
-            x_cond, y_cond, z_cond, valid_cond = seg[r_min_full:r_max_full, c_min_full:c_split]
-            x_mask, y_mask, z_mask, valid_mask = seg[r_min_full:r_max_full, c_split:c_max_full]
-
-            rows = np.arange(r_min_full, r_max_full)
-            uv_cond = np.stack(np.meshgrid(rows, np.arange(c_min_full, c_split), indexing='ij'), axis=-1)
-            uv_mask = np.stack(np.meshgrid(rows, np.arange(c_split, c_max_full), indexing='ij'), axis=-1)
-
+            x_cond, y_cond, z_cond = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
+            x_mask, y_mask, z_mask = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
         elif cond_direction == "right":
-            # the right half of the patch is conditioning, mask the left half
-            x_cond, y_cond, z_cond, valid_cond = seg[r_min_full:r_max_full, c_split:c_max_full]
-            x_mask, y_mask, z_mask, valid_mask = seg[r_min_full:r_max_full, c_min_full:c_split]
-
-            rows = np.arange(r_min_full, r_max_full)
-            uv_cond = np.stack(np.meshgrid(rows, np.arange(c_split, c_max_full), indexing='ij'), axis=-1)
-            uv_mask = np.stack(np.meshgrid(rows, np.arange(c_min_full, c_split), indexing='ij'), axis=-1)
-
+            x_cond, y_cond, z_cond = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
+            x_mask, y_mask, z_mask = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
         elif cond_direction == "up":
-            # the top half of the patch is conditioning, mask the bottom half
-            x_cond, y_cond, z_cond, valid_cond = seg[r_min_full:r_split, c_min_full:c_max_full]
-            x_mask, y_mask, z_mask, valid_mask = seg[r_split:r_max_full, c_min_full:c_max_full]
-
-            cols = np.arange(c_min_full, c_max_full)
-            uv_cond = np.stack(np.meshgrid(np.arange(r_min_full, r_split), cols, indexing='ij'), axis=-1)
-            uv_mask = np.stack(np.meshgrid(np.arange(r_split, r_max_full), cols, indexing='ij'), axis=-1)
-
+            x_cond, y_cond, z_cond = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
+            x_mask, y_mask, z_mask = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
         elif cond_direction == "down":
-            # the bottom half of the patch is conditioning, mask the top half
-            x_cond, y_cond, z_cond, valid_cond = seg[r_split:r_max_full, c_min_full:c_max_full]
-            x_mask, y_mask, z_mask, valid_mask = seg[r_min_full:r_split, c_min_full:c_max_full]
+            x_cond, y_cond, z_cond = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
+            x_mask, y_mask, z_mask = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
 
-            cols = np.arange(c_min_full, c_max_full)
-            uv_cond = np.stack(np.meshgrid(np.arange(r_split, r_max_full), cols, indexing='ij'), axis=-1)
-            uv_mask = np.stack(np.meshgrid(np.arange(r_min_full, r_split), cols, indexing='ij'), axis=-1)
+        # Generate UV coordinates in shared coordinate system
+        cond_h, cond_w = x_cond.shape
+        mask_h, mask_w = x_mask.shape
 
-        # if either half contains invalid points, grab a different sample
-        if not valid_cond.all() or not valid_mask.all():
-            return self[np.random.randint(len(self))]
+        # Determine offsets based on split direction
+        if cond_direction == "left":
+            # cond is left, mask is right
+            cond_row_off, cond_col_off = 0, 0
+            mask_row_off, mask_col_off = 0, cond_w
+        elif cond_direction == "right":
+            # mask is left, cond is right
+            cond_row_off, cond_col_off = 0, mask_w
+            mask_row_off, mask_col_off = 0, 0
+        elif cond_direction == "up":
+            # cond is top, mask is bottom
+            cond_row_off, cond_col_off = 0, 0
+            mask_row_off, mask_col_off = cond_h, 0
+        elif cond_direction == "down":
+            # mask is top, cond is bottom
+            cond_row_off, cond_col_off = mask_h, 0
+            mask_row_off, mask_col_off = 0, 0
+
+        uv_cond = np.stack(np.meshgrid(
+            np.arange(cond_h) + cond_row_off,
+            np.arange(cond_w) + cond_col_off,
+            indexing='ij'
+        ), axis=-1)
+
+        uv_mask = np.stack(np.meshgrid(
+            np.arange(mask_h) + mask_row_off,
+            np.arange(mask_w) + mask_col_off,
+            indexing='ij'
+        ), axis=-1)
 
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
@@ -287,6 +313,23 @@ class EdtSegDataset(Dataset):
         cond_segmentation = voxelize_surface_grid(cond_zyxs_local_float, crop_shape)
         masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
 
+        # Validate conditioning has sufficient spatial extent (not just a tiny corner)
+        cond_nz = np.nonzero(cond_segmentation)
+        if len(cond_nz[0]) == 0:
+            return self[np.random.randint(len(self))]
+
+        min_span = self.config.get('min_cond_span', 0.3)
+        spans = [(cond_nz[i].max() - cond_nz[i].min() + 1) / crop_shape[i] for i in range(3)]
+
+        # For left/right splits, need good span in Z (dim 0) and Y (dim 1)
+        # For up/down splits, need good span in Z (dim 0) and X (dim 2)
+        if cond_direction in ["left", "right"]:
+            if spans[0] < min_span or spans[1] < min_span:
+                return self[np.random.randint(len(self))]
+        else:  # up/down
+            if spans[0] < min_span or spans[2] < min_span:
+                return self[np.random.randint(len(self))]
+
         if self.config['use_sdt']:
             # combine cond + masked into full segmentation (already voxelized with line interpolation)
             full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
@@ -300,11 +343,14 @@ class EdtSegDataset(Dataset):
         use_heatmap = self.config['use_heatmap_targets']
         if use_heatmap:
             effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
+            # Compute split in stored resolution for heatmap
+            r_split_s = r_min + round((r_max - r_min + 1) * conditioning_percent)
+            c_split_s = c_min + round((c_max - c_min + 1) * conditioning_percent)
             heatmap_tensor = compute_heatmap_targets(
                 cond_direction=cond_direction,
-                r_split=r_split, c_split=c_split,
-                r_min_full=r_min_full, r_max_full=r_max_full,
-                c_min_full=c_min_full, c_max_full=c_max_full,
+                r_split=r_split_s, c_split=c_split_s,
+                r_min_full=r_min, r_max_full=r_max + 1,
+                c_min_full=c_min, c_max_full=c_max + 1,
                 patch_seg=seg,
                 min_corner=min_corner,
                 crop_size=crop_size,
@@ -322,6 +368,7 @@ class EdtSegDataset(Dataset):
 
         use_extrapolation = self.config['use_extrapolation']
         if use_extrapolation:
+           
             extrap_surf = torch.from_numpy(extrap_surface).to(torch.float32)
             extrap_coords = torch.from_numpy(extrap_coords_local).to(torch.float32)
             gt_coords = torch.from_numpy(gt_coords_local).to(torch.float32)
