@@ -337,18 +337,6 @@ class EdtSegDataset(Dataset):
         if len(cond_nz[0]) == 0:
             return self[np.random.randint(len(self))]
 
-        min_span = self.config.get('min_cond_span', 0.3)
-        spans = [(cond_nz[i].max() - cond_nz[i].min() + 1) / crop_shape[i] for i in range(3)]
-
-        # For left/right splits, need good span in Z (dim 0) and Y (dim 1)
-        # For up/down splits, need good span in Z (dim 0) and X (dim 2)
-        if cond_direction in ["left", "right"]:
-            if spans[0] < min_span or spans[1] < min_span:
-                return self[np.random.randint(len(self))]
-        else:  # up/down
-            if spans[0] < min_span or spans[2] < min_span:
-                return self[np.random.randint(len(self))]
-
         if self.config['use_sdt']:
             # combine cond + masked into full segmentation (already voxelized with line interpolation)
             full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
