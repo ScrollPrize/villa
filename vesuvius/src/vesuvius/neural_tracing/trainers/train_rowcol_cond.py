@@ -403,7 +403,7 @@ def train(config_path):
     start_iteration = 0
     if 'load_ckpt' in config:
         print(f'Loading checkpoint {config["load_ckpt"]}')
-        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=True)
+        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
         state_dict = ckpt['model']
         # Handle compiled model state dict
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
@@ -412,7 +412,17 @@ def train(config_path):
                 state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
                 print('Stripped _orig_mod. prefix from checkpoint state dict')
         model.load_state_dict(state_dict)
-        start_iteration = ckpt.get('step', 0)
+
+        if not config.get('load_weights_only', False):
+            start_iteration = ckpt.get('step', 0)
+            # Load optimizer state if optimizer type matches (SGD vs Adam check via betas)
+            ckpt_optim_type = type(ckpt['optimizer']['param_groups'][0].get('betas', None))
+            curr_optim_type = type(optimizer.param_groups[0].get('betas', None))
+            if ckpt_optim_type == curr_optim_type:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                print('Loaded optimizer state (momentum preserved)')
+            else:
+                print('Skipping optimizer state load (optimizer type changed)')
 
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
