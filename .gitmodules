@@ -1,0 +1,24 @@
+[submodule "volume-cartographer/thirdparty/c-blosc2"]
+	path = volume-cartographer/thirdparty/c-blosc2
+	url = https://github.com/SuperOptimizer/c-blosc2
+[submodule "volume-cartographer/thirdparty/z5"]
+	path = volume-cartographer/thirdparty/z5
+	url = https://github.com/SuperOptimizer/z5
+[submodule "volume-cartographer/thirdparty/xtensor"]
+	path = volume-cartographer/thirdparty/xtensor
+	url = https://github.com/SuperOptimizer/xtensor
+[submodule "volume-cartographer/thirdparty/xsimd"]
+	path = volume-cartographer/thirdparty/xsimd
+	url = https://github.com/SuperOptimizer/xsimd
+[submodule "volume-cartographer/thirdparty/xtl"]
+	path = volume-cartographer/thirdparty/xtl
+	url = https://github.com/SuperOptimizer/xtl
+[submodule "volume-cartographer/thirdparty/opencv"]
+	path = volume-cartographer/thirdparty/opencv
+	url = https://github.com/SuperOptimizer/opencv
+[submodule "volume-cartographer/thirdparty/opencv_contrib"]
+	path = volume-cartographer/thirdparty/opencv_contrib
+	url = https://github.com/SuperOptimizer/opencv_contrib
+[submodule "volume-cartographer/thirdparty/json"]
+	path = volume-cartographer/thirdparty/json
+	url = https://github.com/SuperOptimizer/json

@@ -102,6 +102,7 @@ target_link_libraries(vc_ced2d
     opencv_imgproc
     Boost::program_options
     OpenMP::OpenMP_CXX
+    nlohmann_json::nlohmann_json
 )
 
 # Apply affine + scale to OBJ or TIFXYZ
@@ -141,6 +142,12 @@ target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
+
+add_executable(test_h264_zarr src/test_h264_zarr.cpp)
+target_link_libraries(test_h264_zarr z5 nlohmann_json::nlohmann_json blosc2_static)
+
+add_executable(test_blosc2_h264 src/test_blosc2_h264.cpp)
+target_link_libraries(test_blosc2_h264 blosc2_static)
 
 # Install targets
 if(VC_INSTALL_APPS)

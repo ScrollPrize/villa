@@ -19,7 +19,7 @@ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 option(VC_USE_OPENMP "Enable OpenMP support" ON)
 option(VC_USE_VALGRIND "Enable Valgrind support" off)
 
-set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fPIC -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
+set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fPIC  -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
 include_directories(core/include)
 
@@ -140,11 +140,18 @@ endif()
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
 endif()
 
 # Use modern C++ for everything and generate compile_commands database.
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)
+
+# Force C++23 standard (required for std::optional::transform and other features)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 
 # Choose what to install
