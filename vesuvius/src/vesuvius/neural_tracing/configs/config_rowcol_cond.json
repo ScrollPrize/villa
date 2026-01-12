@@ -1,10 +1,10 @@
 {
-    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v1",
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v6",
     "seed": 0,
     "batch_size": 6,
-    "num_workers": 8,
-    "wandb_entity": "vesuvius-challenge",
-    "wandb_project": "neural-tracing",
+    "num_workers": 12,
+
+    "load_weights_only": false,
 
 
     "datasets": [
@@ -40,21 +40,31 @@
         }
     ],
 
+    "verbose": false,
+
     "crop_size": 128,
+    "chunk_pad": 20.0,
     "force_recompute_patches": false,
-    "val_fraction": 0.01,
+    "val_fraction": 0.05,
     "use_extrapolation": true,
     "extrapolation_method": "linear_edge",
-    "cond_percent": 0.5,
+    "cond_percent": 0.70,
+    "extrap_degrade_prob": 0.5,
+    "extrap_degrade_curvature_range": [0.01, 0.1],
+    "extrap_degrade_gradient_range": [0.1, 0.3],
+
+    "use_other_wrap_cond": true,
+    "other_wrap_prob": 1.0,
 
     "use_heatmap_targets": false,
     "heatmap_step_size": 10,
     "heatmap_step_count": 5,
     "heatmap_sigma": 2.0,
 
-    "lambda_smooth": 0.1,
+    "lambda_smooth": 0.0000001,
+    "displacement_loss_type": "vector_l2",
 
-    "use_sdt": true,
+    "use_sdt": false,
     "lambda_sdt": 1.0,
     "sdt_surface_sigma": 3.0,
     "sdt_eikonal": true,
@@ -64,24 +74,25 @@
     "dilation_radius": 1.0,
 
     "num_iterations": 250000,
-    "log_frequency": 500,
-    "ckpt_frequency": 2000,
+    "log_frequency": 350,
+    "ckpt_frequency": 1000,
 
-    "learning_rate": 0.01,
-    "weight_decay": 3e-5,
-    "momentum": 0.99,
-    "nesterov": true,
-    "poly_exponent": 0.9,
-    "grad_clip": 12,
+    "learning_rate": 0.001,
+    "weight_decay": 1e-4,
+    "warmup_steps": 5000,
+    "grad_clip": 5,
 
     "mixed_precision": "bf16",
     "compile_model": true,
 
-    "in_channels": 3,
+    "in_channels": 4,
     "model_type": "unet",
 
     "model_config": {
-        "autoconfigure": true
+        "autoconfigure": true,
+        "squeeze_excitation": true,
+        "squeeze_excitation_type": "scse",
+        "basic_decoder_block": "BasicBlockD"
     },
 
     "augmentation": {

@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 
 
-def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask):
+def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
+                         loss_type='vector_l2', beta=5.0):
     """
     Sample predicted displacement field at extrapolated surface coords.
 
@@ -17,9 +18,14 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask)
         extrap_coords: (B, N, 3) surface point coords in [0, shape) range (z, y, x)
         gt_displacement: (B, N, 3) ground truth displacement (dz, dy, dx)
         valid_mask: (B, N) binary mask for valid (non-padded) points
+        loss_type: Loss formulation:
+            - 'vector_l2': Squared Euclidean distance (default)
+            - 'vector_huber': Huber loss on Euclidean distance
+            - 'component_huber': Independent Huber loss per component (legacy)
+        beta: Huber transition point for huber losses (default 5.0 voxels)
 
     Returns:
-        MSE loss between sampled predictions and ground truth
+        Loss between sampled predictions and ground truth
     """
     B, C, D, H, W = pred_field.shape
 
@@ -36,9 +42,23 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask)
     sampled = F.grid_sample(pred_field, grid, mode='bilinear', align_corners=True)
     sampled = sampled.view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
 
-    # Masked MSE loss
-    diff = (sampled - gt_displacement) ** 2  # (B, N, 3)
-    diff = diff.sum(dim=-1)  # (B, N) - squared L2 per point
+    # Compute loss based on loss_type
+    error = sampled - gt_displacement  # (B, N, 3)
+
+    if loss_type == 'vector_l2':
+        # Squared Euclidean distance
+        diff = (error ** 2).sum(dim=-1)  # (B, N)
+    elif loss_type == 'vector_huber':
+        # Huber loss on Euclidean distance
+        dist = (error ** 2).sum(dim=-1).sqrt()  # (B, N)
+        diff = F.smooth_l1_loss(dist, torch.zeros_like(dist), beta=beta, reduction='none')
+    elif loss_type == 'component_huber':
+        # Legacy: per-component Huber, then sum
+        diff = F.smooth_l1_loss(sampled, gt_displacement, beta=beta, reduction='none')  # (B, N, 3)
+        diff = diff.sum(dim=-1)  # (B, N)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
     masked_diff = diff * valid_mask
     loss = masked_diff.sum() / valid_mask.sum().clamp(min=1)
 

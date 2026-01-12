@@ -338,4 +338,3 @@ def compute_heatmap_targets(
 
     coords_tensor = torch.from_numpy(all_coords).float()
     return make_gaussian_heatmap(coords_tensor, crop_size[0], sigma=sigma, axis_1d=axis_1d)
-

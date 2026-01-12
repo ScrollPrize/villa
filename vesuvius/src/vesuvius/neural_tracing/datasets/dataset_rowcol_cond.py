@@ -15,9 +15,78 @@ import random
 from vesuvius.neural_tracing.datasets.extrapolation import compute_extrapolation
 import cv2
 
-import os                                                                                                               
-os.environ['OMP_NUM_THREADS'] = '1' # this is set to 1 because by default the edt package uses omp to threads the edt call 
+import os
+os.environ['OMP_NUM_THREADS'] = '1' # this is set to 1 because by default the edt package uses omp to threads the edt call
                                     # which is problematic if you use multiple dataloader workers (thread contention smokes cpu)
+
+
+def degrade_extrapolation(extrap_coords, cond_direction, config):
+    """
+    Randomly degrade extrapolated coordinates to create harder training data.
+
+    Applies either curvature bias (quadratic error) or gradient perturbation (linear tilt)
+    with probability extrap_degrade_prob. The error magnitude grows with distance from
+    the conditioning edge.
+
+    Args:
+        extrap_coords: (N, 3) extrapolated z,y,x coordinates in local crop space
+        cond_direction: "left", "right", "up", or "down" - where conditioning region is
+        config: dataset config dict
+
+    Returns:
+        degraded_coords: (N, 3) degraded coordinates (or original if no degradation applied)
+    """
+    prob = config.get('extrap_degrade_prob', 0.0)
+    if prob <= 0.0 or random.random() > prob:
+        return extrap_coords
+
+    # Compute distance from conditioning edge based on split direction
+    # extrap_coords is (N, 3) in z,y,x order
+    if cond_direction in ("left", "right"):
+        # Split is along x axis (column), use x coordinate (index 2)
+        x_coords = extrap_coords[:, 2]
+        if cond_direction == "left":
+            # Conditioning is on left, extrapolation extends right
+            # Distance increases with x
+            distance = x_coords - x_coords.min()
+        else:
+            # Conditioning is on right, extrapolation extends left
+            # Distance increases as x decreases
+            distance = x_coords.max() - x_coords
+    else:
+        # Split is along y axis (row), use y coordinate (index 1)
+        y_coords = extrap_coords[:, 1]
+        if cond_direction == "up":
+            # Conditioning is on top, extrapolation extends down
+            # Distance increases with y
+            distance = y_coords - y_coords.min()
+        else:
+            # Conditioning is on bottom, extrapolation extends up
+            # Distance increases as y decreases
+            distance = y_coords.max() - y_coords
+
+    # Avoid division by zero if all points at same position
+    if distance.max() < 1e-6:
+        return extrap_coords
+
+    # Choose degradation type randomly
+    if random.random() < 0.5:
+        # Curvature bias: error = k * distance^2
+        k_range = config.get('extrap_degrade_curvature_range', [0.001, 0.01])
+        k = random.uniform(k_range[0], k_range[1])
+        # Random direction for the curvature (in z,y,x space)
+        direction = np.random.randn(3)
+        direction = direction / (np.linalg.norm(direction) + 1e-8)
+        error = k * (distance ** 2)[:, None] * direction
+    else:
+        # Gradient perturbation: smooth tilt that grows linearly with distance
+        mag_range = config.get('extrap_degrade_gradient_range', [0.05, 0.2])
+        magnitude = random.uniform(mag_range[0], mag_range[1])
+        # Random tilt direction
+        tilt = np.random.randn(3) * magnitude
+        error = distance[:, None] * tilt
+
+    return extrap_coords + error
 
 
 class EdtSegDataset(Dataset):
@@ -29,7 +98,6 @@ class EdtSegDataset(Dataset):
         self.config = config
         self.apply_augmentation = apply_augmentation
 
-        # Parse crop_size - can be int (cubic) or list of 3 ints [D, H, W]
         crop_size_cfg = config.get('crop_size', 128)
         if isinstance(crop_size_cfg, (list, tuple)):
             if len(crop_size_cfg) != 3:
@@ -52,6 +120,10 @@ class EdtSegDataset(Dataset):
         config.setdefault('heatmap_step_size', 10)
         config.setdefault('heatmap_step_count', 5)
         config.setdefault('heatmap_sigma', 2.0)
+
+        # other wrap conditioning: provide other wraps from same segment as context
+        config.setdefault('use_other_wrap_cond', False)
+        config.setdefault('other_wrap_prob', 0.5)  # probability of including other wraps when available
 
         config.setdefault('overlap_fraction', 0.0)
         config.setdefault('min_span_ratio', 1.0)
@@ -90,12 +162,14 @@ class EdtSegDataset(Dataset):
             scaled_segments = []
             for i, seg in enumerate(dataset_segments):
                 if i == 0:
-                    print(f"  [DEBUG PRE-RETARGET] seg._scale={seg._scale}, shape={seg._z.shape}")
-                    print(f"  [DEBUG PRE-RETARGET] z range: {seg._z[seg._valid_mask].min():.2f} to {seg._z[seg._valid_mask].max():.2f}")
+                    if config['verbose']:
+                        print(f"  [DEBUG PRE-RETARGET] seg._scale={seg._scale}, shape={seg._z.shape}")
+                        print(f"  [DEBUG PRE-RETARGET] z range: {seg._z[seg._valid_mask].min():.2f} to {seg._z[seg._valid_mask].max():.2f}")
                 seg_scaled = seg.retarget(retarget_factor)
                 if i == 0:
-                    print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
-                    print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
+                    if config['verbose']:
+                        print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
+                        print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
                 seg_scaled.volume = volume
                 scaled_segments.append(seg_scaled)
 
@@ -150,12 +224,12 @@ class EdtSegDataset(Dataset):
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
-        # Select one wrap randomly for conditioning/masked split
+        # select one wrap randomly for conditioning/masked split
         wrap = random.choice(patch.wraps)
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
-        # Clamp bbox to segment bounds (bbox is inclusive in stored resolution)
+        # clamp bbox to segment bounds (bbox is inclusive in stored resolution)
         seg_h, seg_w = seg._valid_mask.shape
         r_min = max(0, r_min)
         r_max = min(seg_h - 1, r_max)
@@ -164,18 +238,16 @@ class EdtSegDataset(Dataset):
         if r_max < r_min or c_max < c_min:
             return self[np.random.randint(len(self))]
 
-        # Use stored resolution and upsample - this ensures coords stay within world_bbox
         seg.use_stored_resolution()
         scale_y, scale_x = seg._scale
-
-        # Slice FULL region at stored resolution first
         x_full_s, y_full_s, z_full_s, valid_full_s = seg[r_min:r_max+1, c_min:c_max+1]
 
-        # Check validity before upsampling
+        # if any sample contains an invalid point, just grab a new one
         if not valid_full_s.all():
             return self[np.random.randint(len(self))]
 
-        # Upsample the full region using bilinear interpolation
+        # upsampling here instead of in the tifxyz module because of the annoyances with 
+        # handling coords in dif scales
         h_s, w_s = x_full_s.shape
         h_up = int(round(h_s / scale_y))
         w_up = int(round(w_s / scale_x))
@@ -183,14 +255,13 @@ class EdtSegDataset(Dataset):
         y_full = cv2.resize(y_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
         z_full = cv2.resize(z_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
 
-        # Crop to only points within world_bbox
         z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
         in_bounds = (
             (z_full >= z_min) & (z_full < z_max) &
             (y_full >= y_min) & (y_full < y_max) &
             (x_full >= x_min) & (x_full < x_max)
         )
-        # Find bounding box of valid region
+
         valid_rows = np.any(in_bounds, axis=1)
         valid_cols = np.any(in_bounds, axis=0)
         if not valid_rows.any() or not valid_cols.any():
@@ -202,7 +273,7 @@ class EdtSegDataset(Dataset):
         z_full = z_full[r0:r1+1, c0:c1+1]
         h_up, w_up = x_full.shape  # update dimensions after crop
 
-        # Now split into cond and mask on the upsampled grid
+        # split into cond and mask on the upsampled grid
         conditioning_percent = self.config['cond_percent']
         if h_up < 2 and w_up < 2:
             return self[np.random.randint(len(self))]
@@ -225,41 +296,34 @@ class EdtSegDataset(Dataset):
         cond_direction = random.choice(valid_directions)
 
         if cond_direction == "left":
+            # conditioning is left, mask the right
             x_cond, y_cond, z_cond = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
             x_mask, y_mask, z_mask = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
+            cond_row_off, cond_col_off = 0, 0
+            mask_row_off, mask_col_off = 0, c_split_up
         elif cond_direction == "right":
+            # conditioning is right, mask the left
             x_cond, y_cond, z_cond = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
             x_mask, y_mask, z_mask = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
+            cond_row_off, cond_col_off = 0, c_split_up
+            mask_row_off, mask_col_off = 0, 0
         elif cond_direction == "up":
+            # conditioning is up, mask the bottom
             x_cond, y_cond, z_cond = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
             x_mask, y_mask, z_mask = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
+            cond_row_off, cond_col_off = 0, 0
+            mask_row_off, mask_col_off = r_split_up, 0
         elif cond_direction == "down":
+            # conditioning is down, mask the top
             x_cond, y_cond, z_cond = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
             x_mask, y_mask, z_mask = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
+            cond_row_off, cond_col_off = r_split_up, 0
+            mask_row_off, mask_col_off = 0, 0
 
-        # Generate UV coordinates in shared coordinate system
         cond_h, cond_w = x_cond.shape
         mask_h, mask_w = x_mask.shape
         if cond_h == 0 or cond_w == 0 or mask_h == 0 or mask_w == 0:
             return self[np.random.randint(len(self))]
-
-        # Determine offsets based on split direction
-        if cond_direction == "left":
-            # cond is left, mask is right
-            cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = 0, cond_w
-        elif cond_direction == "right":
-            # mask is left, cond is right
-            cond_row_off, cond_col_off = 0, mask_w
-            mask_row_off, mask_col_off = 0, 0
-        elif cond_direction == "up":
-            # cond is top, mask is bottom
-            cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = cond_h, 0
-        elif cond_direction == "down":
-            # mask is top, cond is bottom
-            cond_row_off, cond_col_off = mask_h, 0
-            mask_row_off, mask_col_off = 0, 0
 
         uv_cond = np.stack(np.meshgrid(
             np.arange(cond_h) + cond_row_off,
@@ -276,7 +340,7 @@ class EdtSegDataset(Dataset):
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
 
-        # Use world_bbox directly as crop position
+        # use world_bbox directly as crop position, this is the crop returned by find_patches
         z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
         min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
         max_corner = min_corner + np.array(crop_size)
@@ -297,6 +361,12 @@ class EdtSegDataset(Dataset):
             extrap_surface = extrap_result['extrap_surface']
             extrap_coords_local = extrap_result['extrap_coords_local']
             gt_coords_local = extrap_result['gt_coords_local']
+
+            # optionally degrade extrapolation to create harder training data
+            # as the extrapolation is sometimes frustratingly good
+            extrap_coords_local = degrade_extrapolation(
+                extrap_coords_local, cond_direction, self.config
+            )
 
         volume = patch.volume
         if isinstance(volume, zarr.Group):
@@ -332,7 +402,7 @@ class EdtSegDataset(Dataset):
         cond_segmentation = voxelize_surface_grid(cond_zyxs_local_float, crop_shape)
         masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
 
-        # Validate conditioning has sufficient spatial extent (not just a tiny corner)
+        # make sure we actually have some conditioning
         cond_nz = np.nonzero(cond_segmentation)
         if len(cond_nz[0]) == 0:
             return self[np.random.randint(len(self))]
@@ -350,7 +420,6 @@ class EdtSegDataset(Dataset):
         use_heatmap = self.config['use_heatmap_targets']
         if use_heatmap:
             effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
-            # Compute split in stored resolution for heatmap
             r_split_s = r_min + round((r_max - r_min + 1) * conditioning_percent)
             c_split_s = c_min + round((c_max - c_min + 1) * conditioning_percent)
             heatmap_tensor = compute_heatmap_targets(
@@ -369,9 +438,71 @@ class EdtSegDataset(Dataset):
             if heatmap_tensor is None:
                 return self[np.random.randint(len(self))]
 
+        # other wrap conditioning: find and voxelize other wraps from the same segment
+        use_other_wrap_cond = self.config['use_other_wrap_cond']
+        other_wraps_vox = np.zeros(crop_shape, dtype=np.float32)
+        if use_other_wrap_cond:
+            primary_segment_idx = wrap["segment_idx"]
+            other_wraps_list = [w for w in patch.wraps
+                                if w["segment_idx"] == primary_segment_idx and w is not wrap]
+
+            # if another wrap exists, get it with some probablity
+            if other_wraps_list and random.random() < self.config['other_wrap_prob']:
+                z_min_w, z_max_w, y_min_w, y_max_w, x_min_w, x_max_w = patch.world_bbox
+
+                for other_wrap in other_wraps_list:
+                    other_seg = other_wrap["segment"]
+                    or_min, or_max, oc_min, oc_max = other_wrap["bbox_2d"]
+
+                    other_seg_h, other_seg_w = other_seg._valid_mask.shape
+                    or_min = max(0, or_min)
+                    or_max = min(other_seg_h - 1, or_max)
+                    oc_min = max(0, oc_min)
+                    oc_max = min(other_seg_w - 1, oc_max)
+                    if or_max < or_min or oc_max < oc_min:
+                        continue
+
+                    other_seg.use_stored_resolution()
+                    o_scale_y, o_scale_x = other_seg._scale
+
+                    ox_s, oy_s, oz_s, ovalid_s = other_seg[or_min:or_max+1, oc_min:oc_max+1]
+                    if not ovalid_s.all():
+                        continue
+
+                    oh_s, ow_s = ox_s.shape
+                    oh_up = int(round(oh_s / o_scale_y))
+                    ow_up = int(round(ow_s / o_scale_x))
+                    ox_full = cv2.resize(ox_s, (ow_up, oh_up), interpolation=cv2.INTER_LINEAR)
+                    oy_full = cv2.resize(oy_s, (ow_up, oh_up), interpolation=cv2.INTER_LINEAR)
+                    oz_full = cv2.resize(oz_s, (ow_up, oh_up), interpolation=cv2.INTER_LINEAR)
+
+                    in_bounds = (
+                        (oz_full >= z_min_w) & (oz_full < z_max_w) &
+                        (oy_full >= y_min_w) & (oy_full < y_max_w) &
+                        (ox_full >= x_min_w) & (ox_full < x_max_w)
+                    )
+                    if not in_bounds.any():
+                        continue
+                    valid_rows = np.any(in_bounds, axis=1)
+                    valid_cols = np.any(in_bounds, axis=0)
+                    if not valid_rows.any() or not valid_cols.any():
+                        continue
+                    r0, r1 = np.where(valid_rows)[0][[0, -1]]
+                    c0, c1 = np.where(valid_cols)[0][[0, -1]]
+                    ox_full = ox_full[r0:r1+1, c0:c1+1]
+                    oy_full = oy_full[r0:r1+1, c0:c1+1]
+                    oz_full = oz_full[r0:r1+1, c0:c1+1]
+
+                    other_zyxs = np.stack([oz_full, oy_full, ox_full], axis=-1)
+                    other_zyxs_local = (other_zyxs - min_corner).astype(np.float64)
+
+                    other_vox = voxelize_surface_grid(other_zyxs_local, crop_shape)
+                    other_wraps_vox = np.maximum(other_wraps_vox, other_vox)
+
         vol_crop = torch.from_numpy(vol_crop).to(torch.float32)
         masked_seg = torch.from_numpy(masked_segmentation).to(torch.float32)
         cond_seg = torch.from_numpy(cond_segmentation).to(torch.float32)
+        other_wraps_tensor = torch.from_numpy(other_wraps_vox).to(torch.float32)
 
         use_extrapolation = self.config['use_extrapolation']
         if use_extrapolation:
@@ -386,8 +517,8 @@ class EdtSegDataset(Dataset):
             sdt_tensor = torch.from_numpy(sdt).to(torch.float32)
 
         if self._augmentations is not None:
-            seg_list = [masked_seg, cond_seg]
-            seg_keys = ['masked_seg', 'cond_seg']
+            seg_list = [masked_seg, cond_seg, other_wraps_tensor]
+            seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
             if use_extrapolation:
                 seg_list.append(extrap_surf)
                 seg_keys.append('extrap_surf')
@@ -421,6 +552,8 @@ class EdtSegDataset(Dataset):
                     masked_seg = augmented['segmentation'][i]
                 elif key == 'cond_seg':
                     cond_seg = augmented['segmentation'][i]
+                elif key == 'other_wraps':
+                    other_wraps_tensor = augmented['segmentation'][i]
                 elif key == 'extrap_surf':
                     extrap_surf = augmented['segmentation'][i]
 
@@ -449,6 +582,9 @@ class EdtSegDataset(Dataset):
             "cond": cond_seg,                # conditioning segmentation
             "masked_seg": masked_seg,        # masked (target) segmentation
         }
+
+        if use_other_wrap_cond:
+            result["other_wraps"] = other_wraps_tensor  # other wraps from same segment as context
 
         if use_extrapolation:
             result["extrap_surface"] = extrap_surf     # extrapolated surface voxelization
@@ -488,12 +624,26 @@ if __name__ == "__main__":
     out_dir = Path("/tmp/edt_seg_debug")
     out_dir.mkdir(exist_ok=True)
 
+    # Debug: check wrap distribution per chunk
+    from collections import Counter
+    wraps_per_chunk = []
+    same_seg_wraps_per_chunk = []
+    for patch in train_ds.patches[:2500]:
+        wraps_per_chunk.append(len(patch.wraps))
+        seg_idx_counts = Counter(w["segment_idx"] for w in patch.wraps)
+        max_same_seg = max(seg_idx_counts.values()) if seg_idx_counts else 0
+        same_seg_wraps_per_chunk.append(max_same_seg)
+
+    print(f"Wraps per chunk: min={min(wraps_per_chunk)}, max={max(wraps_per_chunk)}, avg={sum(wraps_per_chunk)/len(wraps_per_chunk):.1f}")
+    print(f"Max same-segment wraps per chunk: min={min(same_seg_wraps_per_chunk)}, max={max(same_seg_wraps_per_chunk)}")
+    print(f"Chunks with >1 same-segment wrap: {sum(1 for x in same_seg_wraps_per_chunk if x > 1)}/{len(same_seg_wraps_per_chunk)}")
+
     num_samples = min(100, len(train_ds))
     for i in range(num_samples):
         sample = train_ds[i]
 
         # Save 3D volumes as tif
-        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'sdt', 'heatmap_target']:
+        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'other_wraps', 'sdt', 'heatmap_target']:
             if key in sample:
                 subdir = out_dir / key
                 subdir.mkdir(exist_ok=True)

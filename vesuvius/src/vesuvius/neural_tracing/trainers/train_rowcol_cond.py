@@ -15,11 +15,12 @@ import numpy as np
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
-from vesuvius.neural_tracing.loss.displacement_losses import surface_sampled_loss, smoothness_loss
+from vesuvius.neural_tracing.loss.displacement_losses import surface_sampled_loss
 from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.models import make_model
+from accelerate.utils import TorchDynamoPlugin
 
 import multiprocessing
 multiprocessing.set_start_method('spawn', force=True)
@@ -69,6 +70,10 @@ def collate_with_padding(batch):
     if 'heatmap_target' in batch[0]:
         result['heatmap_target'] = torch.stack([b['heatmap_target'] for b in batch])
 
+    # Optional other_wraps
+    if 'other_wraps' in batch[0]:
+        result['other_wraps'] = torch.stack([b['other_wraps'] for b in batch])
+
     return result
 
 
@@ -78,7 +83,12 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False):
     cond = batch['cond'].unsqueeze(1)                  # [B, 1, D, H, W]
     extrap_surf = batch['extrap_surface'].unsqueeze(1) # [B, 1, D, H, W]
 
-    inputs = torch.cat([vol, cond, extrap_surf], dim=1)  # [B, 3, D, H, W]
+    input_list = [vol, cond, extrap_surf]
+    if 'other_wraps' in batch:
+        other_wraps = batch['other_wraps'].unsqueeze(1)  # [B, 1, D, H, W]
+        input_list.append(other_wraps)
+
+    inputs = torch.cat(input_list, dim=1)  # [B, 3 or 4, D, H, W]
 
     extrap_coords = batch['extrap_coords']       # [B, N, 3]
     gt_displacement = batch['gt_displacement']   # [B, N, 3]
@@ -94,9 +104,8 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
                        sdt_pred=None, sdt_target=None,
                        heatmap_pred=None, heatmap_target=None,
                        save_path=None):
-    """Create and save GIF visualization cycling through z-slices."""
+    """Create and save PNG visualization of middle z-slice."""
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
 
     b = 0
     D = inputs.shape[2]  # depth
@@ -105,6 +114,7 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     vol_3d = inputs[b, 0].cpu().numpy()
     cond_3d = inputs[b, 1].cpu().numpy()
     extrap_surf_3d = inputs[b, 2].cpu().numpy()
+    other_wraps_3d = inputs[b, 3].cpu().numpy() if inputs.shape[1] > 3 else None
 
     # Displacement magnitude
     disp_3d = disp_pred[b].cpu().numpy()  # [3, D, H, W]
@@ -154,14 +164,18 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     axes[1, 2].set_title('dx (pred)')
     axes[1, 2].axis('off')
 
-    # Overlay: cond + extrap
+    # Overlay: cond + extrap + other_wraps
     overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
     cond_pts = cond_3d[z0] > 0.5
     extrap_pts = extrap_surf_3d[z0] > 0.5
     overlay[cond_pts, 1] = 1.0  # green for conditioning
     overlay[extrap_pts, 0] = 1.0  # red for extrapolated
+    if other_wraps_3d is not None:
+        other_pts = other_wraps_3d[z0] > 0.5
+        overlay[other_pts, 2] = 1.0  # blue for other wraps
     im_overlay = axes[1, 3].imshow(overlay)
-    axes[1, 3].set_title('Cond(G) + Extrap(R)')
+    title = 'Cond(G) + Extrap(R)' + (' + Other(B)' if other_wraps_3d is not None else '')
+    axes[1, 3].set_title(title)
     axes[1, 3].axis('off')
 
     # Track current column for optional visualizations
@@ -206,45 +220,8 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
 
     plt.tight_layout()
 
-    def update(z):
-        vol_slice = vol_3d[z]
-        vol_norm = (vol_slice - vol_slice.min()) / (vol_slice.max() - vol_slice.min() + 1e-8)
-
-        im_vol.set_data(vol_slice)
-        axes[0, 0].set_title(f'Volume (z={z})')
-        im_cond.set_data(cond_3d[z])
-        im_extrap.set_data(extrap_surf_3d[z])
-        im_disp_mag.set_data(disp_mag_3d[z])
-        im_dz.set_data(disp_3d[0, z])
-        im_dy.set_data(disp_3d[1, z])
-        im_dx.set_data(disp_3d[2, z])
-
-        overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
-        cond_pts = cond_3d[z] > 0.5
-        extrap_pts = extrap_surf_3d[z] > 0.5
-        overlay[cond_pts, 1] = 1.0
-        overlay[extrap_pts, 0] = 1.0
-        im_overlay.set_data(overlay)
-
-        result = [im_vol, im_cond, im_extrap, im_disp_mag, im_dz, im_dy, im_dx, im_overlay]
-
-        if sdt_pred is not None:
-            im_sdt_pred.set_data(sdt_pred_3d[z])
-            im_sdt_gt.set_data(sdt_gt_3d[z])
-            result.extend([im_sdt_pred, im_sdt_gt])
-
-        if heatmap_pred is not None:
-            im_hm_pred.set_data(hm_pred_3d[z])
-            im_hm_gt.set_data(hm_gt_3d[z])
-            result.extend([im_hm_pred, im_hm_gt])
-
-        return result
-
-    z_step = max(1, D // 32)
-    z_frames = list(range(0, D, z_step))
-
-    anim = FuncAnimation(fig, update, frames=z_frames, interval=150, blit=True)
-    anim.save(save_path, writer='pillow', fps=6)
+    if save_path is not None:
+        plt.savefig(save_path, dpi=100, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -268,11 +245,11 @@ def train(config_path):
     config.setdefault('batch_size', 4)
     config.setdefault('num_workers', 4)
     config.setdefault('seed', 0)
-    config.setdefault('lambda_smooth', 0.1)
     config.setdefault('use_sdt', False)
     config.setdefault('lambda_sdt', 1.0)
     config.setdefault('use_heatmap_targets', False)
     config.setdefault('lambda_heatmap', 1.0)
+    config.setdefault('displacement_loss_type', 'vector_l2')
 
     # Build targets dict based on config
     targets = {
@@ -294,9 +271,19 @@ def train(config_path):
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
 
+    dynamo_plugin = TorchDynamoPlugin(
+            backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
+            mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
+            fullgraph=False,
+            dynamic=False,
+            use_regional_compilation=False
+        )
+    
+
     accelerator = accelerate.Accelerator(
         mixed_precision=config.get('mixed_precision', 'no'),
         gradient_accumulation_steps=config.get('grad_acc_steps', 1),
+        dynamo_plugin=dynamo_plugin
     )
 
     if 'wandb_project' in config and accelerator.is_main_process:
@@ -320,9 +307,9 @@ def train(config_path):
             reduction='mean',
         )
 
-    lambda_smooth = config['lambda_smooth']
     lambda_sdt = config.get('lambda_sdt', 1.0)
     lambda_heatmap = config.get('lambda_heatmap', 1.0)
+    disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
 
     # Setup heatmap loss if enabled (BCE + Dice)
     heatmap_loss_fn = None
@@ -363,8 +350,6 @@ def train(config_path):
         worker_init_fn=seed_worker,
         generator=make_generator(0),
         drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=2,
         collate_fn=collate_with_padding,
     )
     val_dataloader = torch.utils.data.DataLoader(
@@ -385,19 +370,17 @@ def train(config_path):
             accelerator.print("Model compiled with torch.compile")
 
     optimizer = create_optimizer({
-        'name': 'sgd',
-        'learning_rate': config['learning_rate'],
-        'momentum': config.get('momentum', 0.99),
-        'nesterov': config.get('nesterov', True),
-        'weight_decay': config['weight_decay'],
+        'name': 'adamw',
+        'learning_rate': config.get('learning_rate', 1e-3),
+        'weight_decay': config.get('weight_decay', 1e-4),
     }, model)
 
     lr_scheduler = get_scheduler(
-        scheduler_type='poly',
+        scheduler_type='diffusers_cosine_warmup',
         optimizer=optimizer,
-        initial_lr=config['learning_rate'],
+        initial_lr=config.get('learning_rate', 1e-3),
         max_steps=config['num_iterations'],
-        exponent=config.get('poly_exponent', 0.9),
+        warmup_steps=config.get('warmup_steps', 5000),
     )
 
     start_iteration = 0
@@ -431,22 +414,24 @@ def train(config_path):
     if accelerator.is_main_process:
         accelerator.print("\n=== Displacement Field Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
+        accelerator.print(f"Displacement loss: {disp_loss_type}")
         output_str = "Output: displacement (3ch)"
         if use_sdt:
             output_str += " + SDT (1ch)"
         if use_heatmap:
             output_str += " + heatmap (1ch)"
         accelerator.print(output_str)
-        accelerator.print(f"Lambda smooth: {lambda_smooth}")
         if use_sdt:
             accelerator.print(f"Lambda SDT: {lambda_sdt}")
         if use_heatmap:
             accelerator.print(f"Lambda heatmap: {lambda_heatmap}")
-        accelerator.print(f"Optimizer: SGD (lr={config['learning_rate']}, momentum={config.get('momentum', 0.99)})")
-        accelerator.print(f"Scheduler: PolyLR (exponent={config.get('poly_exponent', 0.9)})")
+        accelerator.print(f"Optimizer: AdamW (lr={config.get('learning_rate', 1e-3)})")
+        accelerator.print(f"Scheduler: diffusers_cosine_warmup (warmup={config.get('warmup_steps', 5000)})")
         accelerator.print(f"Train samples: {num_train}, Val samples: {num_val}")
         accelerator.print("=================================================\n")
 
+    if config['verbose']:
+            print("creating iterators...")
     val_iterator = iter(val_dataloader)
     train_iterator = iter(train_dataloader)
     grad_clip = config['grad_clip']
@@ -458,12 +443,16 @@ def train(config_path):
     )
 
     for iteration in range(start_iteration, config['num_iterations']):
-
+        if config['verbose']:
+            print(f"starting iteration {iteration}")
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_dataloader)
             batch = next(train_iterator)
+
+        if config['verbose']:
+            print(f"got batch, keys: {batch.keys()}")
 
         inputs, extrap_coords, gt_displacement, valid_mask, sdt_target, heatmap_target = prepare_batch(batch, use_sdt, use_heatmap)
 
@@ -474,13 +463,12 @@ def train(config_path):
             output = model(inputs)
             disp_pred = output['displacement']  # [B, 3, D, H, W]
 
-            # Displacement losses
-            surf_loss = surface_sampled_loss(disp_pred, extrap_coords, gt_displacement, valid_mask)
-            smooth_loss = smoothness_loss(disp_pred)
-            total_loss = surf_loss + lambda_smooth * smooth_loss
+            # Displacement loss
+            surf_loss = surface_sampled_loss(disp_pred, extrap_coords, gt_displacement, valid_mask,
+                                             loss_type=disp_loss_type)
+            total_loss = surf_loss
 
             wandb_log['surf_loss'] = surf_loss.detach().item()
-            wandb_log['smooth_loss'] = smooth_loss.detach().item()
 
             # Optional SDT loss
             if use_sdt:
@@ -514,7 +502,6 @@ def train(config_path):
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
             'surf': f"{wandb_log['surf_loss']:.4f}",
-            'smooth': f"{wandb_log['smooth_loss']:.4f}",
         }
         if use_sdt:
             postfix['sdt'] = f"{wandb_log['sdt_loss']:.4f}"
@@ -538,12 +525,11 @@ def train(config_path):
                 val_output = model(val_inputs)
                 val_disp_pred = val_output['displacement']
 
-                val_surf_loss = surface_sampled_loss(val_disp_pred, val_extrap_coords, val_gt_displacement, val_valid_mask)
-                val_smooth_loss = smoothness_loss(val_disp_pred)
-                val_total_loss = val_surf_loss + lambda_smooth * val_smooth_loss
+                val_surf_loss = surface_sampled_loss(val_disp_pred, val_extrap_coords, val_gt_displacement, val_valid_mask,
+                                                     loss_type=disp_loss_type)
+                val_total_loss = val_surf_loss
 
                 wandb_log['val_surf_loss'] = val_surf_loss.item()
-                wandb_log['val_smooth_loss'] = val_smooth_loss.item()
 
                 val_sdt_pred = None
                 if use_sdt:
@@ -563,8 +549,8 @@ def train(config_path):
                 wandb_log['val_loss'] = val_total_loss.item()
 
                 # Create visualization
-                train_img_path = f'{out_dir}/{iteration:06}_train.gif'
-                val_img_path = f'{out_dir}/{iteration:06}_val.gif'
+                train_img_path = f'{out_dir}/{iteration:06}_train.png'
+                val_img_path = f'{out_dir}/{iteration:06}_val.png'
 
                 train_sdt_pred = output.get('sdt') if use_sdt else None
                 train_heatmap_pred = heatmap_pred if use_heatmap else None
@@ -582,8 +568,8 @@ def train(config_path):
                 )
 
                 if wandb.run is not None:
-                    wandb_log['train_image'] = wandb.Video(train_img_path, fps=6, format='gif')
-                    wandb_log['val_image'] = wandb.Video(val_img_path, fps=6, format='gif')
+                    wandb_log['train_image'] = wandb.Image(train_img_path)
+                    wandb_log['val_image'] = wandb.Image(val_img_path)
 
                 model.train()
 
