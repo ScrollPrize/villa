@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: "RF-DETR"
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - family-names: Robinson
+    given-names: Isaac
+    email: isaac@roboflow.com
+    affiliation: Roboflow
+  - family-names: Robicheaux
+    given-names: Peter
+    email: peter@roboflow.com
+    affiliation: Roboflow
+  - family-names: Popov
+    given-names: Matvei
+    email: matvei@roboflow.com
+    affiliation: Roboflow
+repository-code: 'https://github.com/roboflow/rf-detr'
+abstract: 'A state-of-the-art, real-time object detection model developed by Roboflow.'
+date-released: 2025-03-20
+keywords:
+  - object detection
+  - computer vision
+  - rf-detr
+  - detr
+license: "Apache-2.0"

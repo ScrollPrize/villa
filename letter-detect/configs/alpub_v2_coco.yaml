@@ -1,0 +1,32 @@
+dataset:
+  name: alpub_v2
+  images_root: dataset/ALPUB_v2/images
+  train_json: data/alpub_v2_coco/annotations/train.json
+  val_json: data/alpub_v2_coco/annotations/val.json
+  test_json: data/alpub_v2_coco/annotations/test.json
+  num_classes: 24
+  class_names:
+    - Alpha
+    - Beta
+    - Chi
+    - Delta
+    - Epsilon
+    - Eta
+    - Gamma
+    - Iota
+    - Kappa
+    - Lambda
+    - LunateSigma
+    - Mu
+    - Nu
+    - Omega
+    - Omicron
+    - Phi
+    - Pi
+    - Psi
+    - Rho
+    - Tau
+    - Theta
+    - Upsilon
+    - Xi
+    - Zeta

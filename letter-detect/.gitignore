@@ -1,0 +1,24 @@
+# Data and outputs
+/data/
+/dataset/
+/runs/
+/outputs/
+/wandb/
+
+# Weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.tflite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env/
+
+# OS
+.DS_Store

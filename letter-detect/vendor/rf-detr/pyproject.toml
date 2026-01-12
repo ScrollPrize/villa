@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rfdetr"
+version = "1.3.0"
+description = "RF-DETR"
+readme = "README.md"
+authors = [
+    {name = "Roboflow, Inc", email = "peter@roboflow.com"}
+]
+license = {text = "Apache License 2.0"}
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Operating System :: MacOS"
+]
+keywords = ["machine-learning", "deep-learning", "vision", "ML", "DL", "AI", "DETR", "RF-DETR", "Roboflow"]
+
+dependencies = [
+    "cython",
+    "pycocotools",
+    "torch>=1.13.0",
+    "torchvision>=0.14.0",
+    "fairscale",
+    "scipy",
+    "timm",
+    "tqdm",
+    "numpy",
+    "accelerate",
+    "transformers",
+    "peft",
+    "ninja",
+    "einops",
+    "pandas",
+    "pylabel",
+    "polygraphy",
+    "open_clip_torch",
+    "rf100vl",
+    "pydantic",
+    "supervision",
+    "matplotlib",
+    "roboflow"
+]
+
+[project.optional-dependencies]
+onnxexport = [
+    "onnx",
+    "onnxsim",
+    "onnx_graphsurgeon",
+    "onnxruntime"
+]
+metrics = [
+    "tensorboard>=2.13.0",
+    "wandb"
+]
+docs = [
+    "mkdocs-material[imaging]>=9.5.5",
+    "mkdocstrings>=0.25.2,<0.30.0",
+    "mkdocstrings-python>=1.10.9",
+    "mike>=2.0.0",
+    "mkdocs-jupyter>=0.24.3",
+    "mkdocs-git-committers-plugin-2>=2.4.1; python_version >= '3.8' and python_version < '4'",
+    "mkdocs-git-revision-date-localized-plugin>=1.2.4"
+]
+build = [
+    "twine>=5.1.1",
+    "wheel>=0.40",
+    "build>=0.10"
+]
+
+[project.urls]
+Homepage = "https://github.com/roboflow/rf-detr"
+
+[project.scripts]
+rfdetr = "rfdetr.cli.main:trainer"
+
+[tool.setuptools.packages.find]
+include = ["rfdetr*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+rfdetr = ["py.typed", "models/backbone/dinov2_configs/*.json"]
