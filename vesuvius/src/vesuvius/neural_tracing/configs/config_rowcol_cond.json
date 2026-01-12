@@ -3,7 +3,8 @@
     "seed": 0,
     "batch_size": 6,
     "num_workers": 12,
-
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "neural-tracing",
     "load_weights_only": false,
 
 
@@ -64,6 +65,9 @@
     "lambda_smooth": 0.0000001,
     "displacement_loss_type": "vector_l2",
 
+    "use_dilation": true,
+    "dilation_radius": 0.75,
+
     "use_sdt": false,
     "lambda_sdt": 1.0,
     "sdt_surface_sigma": 3.0,
@@ -71,7 +75,6 @@
     "sdt_eikonal_weight": 0.01,
     "sdt_laplacian": true,
     "sdt_laplacian_weight": 0.01,
-    "dilation_radius": 1.0,
 
     "num_iterations": 250000,
     "log_frequency": 350,

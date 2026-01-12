@@ -407,13 +407,32 @@ class EdtSegDataset(Dataset):
         if len(cond_nz[0]) == 0:
             return self[np.random.randint(len(self))]
 
+        # add thickness to segmentation masks via dilation
+        use_dilation = self.config.get('use_dilation', False)
+        if use_dilation:
+            dilation_radius = self.config.get('dilation_radius', 1.0)
+
+            dist_from_cond = edt.edt(1 - cond_segmentation, parallel=1)
+            cond_segmentation = (dist_from_cond <= dilation_radius).astype(np.float32)
+
+            dist_from_masked = edt.edt(1 - masked_segmentation, parallel=1)
+            masked_segmentation = (dist_from_masked <= dilation_radius).astype(np.float32)
+
+            if self.config['use_extrapolation']:
+                dist_from_extrap = edt.edt(1 - extrap_surface, parallel=1)
+                extrap_surface = (dist_from_extrap <= dilation_radius).astype(np.float32)
+
         if self.config['use_sdt']:
-            # combine cond + masked into full segmentation (already voxelized with line interpolation)
+            # combine cond + masked into full segmentation
             full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
 
-            dilation_radius = self.config.get('dilation_radius', 1.0)
-            distance_from_surface = edt.edt(1 - full_segmentation, parallel=1)
-            seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
+            # if already dilated, just compute SDT directly; otherwise dilate first
+            if use_dilation:
+                seg_dilated = full_segmentation
+            else:
+                dilation_radius = self.config.get('dilation_radius', 1.0)
+                distance_from_surface = edt.edt(1 - full_segmentation, parallel=1)
+                seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
             sdt = edt.sdf(seg_dilated, parallel=1).astype(np.float32)
 
         # generate heatmap targets for expected positions in masked region
@@ -638,7 +657,7 @@ if __name__ == "__main__":
     print(f"Max same-segment wraps per chunk: min={min(same_seg_wraps_per_chunk)}, max={max(same_seg_wraps_per_chunk)}")
     print(f"Chunks with >1 same-segment wrap: {sum(1 for x in same_seg_wraps_per_chunk if x > 1)}/{len(same_seg_wraps_per_chunk)}")
 
-    num_samples = min(100, len(train_ds))
+    num_samples = min(25, len(train_ds))
     for i in range(num_samples):
         sample = train_ds[i]
 
