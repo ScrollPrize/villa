@@ -407,20 +407,12 @@ class EdtSegDataset(Dataset):
         if len(cond_nz[0]) == 0:
             return self[np.random.randint(len(self))]
 
-        # add thickness to segmentation masks via dilation
+        # add thickness to conditioning segmentation via dilation
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
             dilation_radius = self.config.get('dilation_radius', 1.0)
-
             dist_from_cond = edt.edt(1 - cond_segmentation, parallel=1)
             cond_segmentation = (dist_from_cond <= dilation_radius).astype(np.float32)
-
-            dist_from_masked = edt.edt(1 - masked_segmentation, parallel=1)
-            masked_segmentation = (dist_from_masked <= dilation_radius).astype(np.float32)
-
-            if self.config['use_extrapolation']:
-                dist_from_extrap = edt.edt(1 - extrap_surface, parallel=1)
-                extrap_surface = (dist_from_extrap <= dilation_radius).astype(np.float32)
 
         if self.config['use_sdt']:
             # combine cond + masked into full segmentation
