@@ -59,6 +59,7 @@ class Inputs:
     batch_size: int = 256  # Batch size for inference
     prefetch_factor: int = 8  # Prefetch factor for DataLoader
     output_path: str = ""  # Full output path (S3 URI or local path) for prediction result
+    pixel_resolution_um: Optional[float] = None  # Real-world pixel resolution in micrometers (µm), None to omit
 
 def parse_env() -> Inputs:
     try:
@@ -92,6 +93,10 @@ def parse_env() -> Inputs:
         prefetch_factor = int(os.getenv("PREFETCH_FACTOR", "8"))
         output_path = os.getenv("OUTPUT_PATH", "").strip()
 
+        # Optional pixel resolution - only parse if provided
+        pixel_resolution_str = os.getenv("PIXEL_RESOLUTION_UM", "").strip()
+        pixel_resolution_um = float(pixel_resolution_str) if pixel_resolution_str else None
+
         # Validate inference parameters
         if tile_size <= 0:
             raise ValueError(f"TILE_SIZE must be positive, got {tile_size}")
@@ -103,6 +108,8 @@ def parse_env() -> Inputs:
             raise ValueError(f"PREFETCH_FACTOR must be positive, got {prefetch_factor}")
         if stride > tile_size:
             logger.warning(f"STRIDE ({stride}) > TILE_SIZE ({tile_size}) may create gaps in coverage")
+        if pixel_resolution_um is not None and pixel_resolution_um <= 0:
+            raise ValueError(f"PIXEL_RESOLUTION_UM must be positive, got {pixel_resolution_um}")
 
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce"):
@@ -153,6 +160,7 @@ def parse_env() -> Inputs:
             batch_size=batch_size,
             prefetch_factor=prefetch_factor,
             output_path=output_path,
+            pixel_resolution_um=pixel_resolution_um,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -725,7 +733,7 @@ def run_reduce_step(inputs: Inputs) -> None:
     # Write to local tiled TIFF first (this is when the lazy reduction actually happens)
     local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
     start_reduce_time = time.time()
-    write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size)
+    write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size, inputs.pixel_resolution_um)
     logger.info(f"Reduce and TIFF write completed in {time.time() - start_reduce_time:.2f} seconds")
 
     # Handle S3 upload or local save

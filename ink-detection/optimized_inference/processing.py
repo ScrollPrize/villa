@@ -397,7 +397,7 @@ def reduce_partitions(
 
 # ----------------------------- TIFF Writing ------------------------------
 
-def write_tiled_tiff(tile_iterator, shape: Tuple[int, int], output_path: str, tile_size: int = 1024) -> None:
+def write_tiled_tiff(tile_iterator, shape: Tuple[int, int], output_path: str, tile_size: int = 1024, pixel_resolution_um: Optional[float] = None) -> None:
     """
     Write tiles from iterator to a tiled TIFF file.
 
@@ -406,24 +406,38 @@ def write_tiled_tiff(tile_iterator, shape: Tuple[int, int], output_path: str, ti
         shape: Output shape (H, W)
         output_path: Path to output TIFF file
         tile_size: Size of tiles (default 1024)
+        pixel_resolution_um: Real-world pixel resolution in micrometers (None to omit resolution metadata)
     """
     try:
         H, W = shape
-        logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}) and tile size {tile_size}x{tile_size}")
+
+        # Build tiff.imwrite kwargs
+        tiff_kwargs = {
+            'shape': (H, W),
+            'dtype': np.uint8,
+            'compression': 'deflate',
+            'tile': (tile_size, tile_size),
+            'metadata': {'software': 'optimized_inference'}
+        }
+
+        # Add resolution metadata if provided
+        if pixel_resolution_um is not None:
+            # Convert µm/pixel to DPI (dots per inch)
+            # 1 inch = 25400 µm, so DPI = 25400 / (µm per pixel)
+            dpi = 25400.0 / pixel_resolution_um
+            tiff_kwargs['resolution'] = (dpi, dpi)
+            tiff_kwargs['resolutionunit'] = 'INCH'
+            logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}), tile size {tile_size}x{tile_size}, "
+                       f"and resolution {pixel_resolution_um:.3f} µm/pixel ({dpi:.2f} DPI)")
+        else:
+            logger.info(f"Writing tiled TIFF to {output_path} with shape ({H}, {W}), tile size {tile_size}x{tile_size} "
+                       f"(no resolution metadata)")
 
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
         # Write with tiling and compression using iterator
-        tiff.imwrite(
-            output_path,
-            tile_iterator,
-            shape=(H, W),
-            dtype=np.uint8,
-            compression='deflate',
-            tile=(tile_size, tile_size),
-            metadata={'software': 'optimized_inference'}
-        )
+        tiff.imwrite(output_path, tile_iterator, **tiff_kwargs)
 
         file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
         logger.info(f"Wrote tiled TIFF: {output_path} ({file_size_mb:.2f} MB)")
