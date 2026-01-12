@@ -20,6 +20,7 @@ from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds
 from vesuvius.neural_tracing.models import make_model, strip_state, resolve_checkpoint_path
 from vesuvius.neural_tracing.cropping import safe_crop_with_padding, transform_to_first_crop_space
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
+from vesuvius.neural_tracing.heatmap_utils import expected_heatmap_centroid
 from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
 
 
@@ -322,19 +323,11 @@ def train(config_path):
                 #  over near-blob (voronoi?) regions
 
                 temperature = 1.0  # setting this too high will collapse centroid to the center of the crop
-                prob_map = torch.sigmoid(step_pred_for_dir / temperature)
-                prob_normalized = prob_map / (prob_map.sum(dim=(1, 2, 3), keepdim=True) + 1.e-8)
+                centroid = expected_heatmap_centroid(step_pred_for_dir, temperature=temperature, apply_sigmoid=True)
 
                 batch_size = step_pred_for_dir.shape[0]
                 shape = step_pred_for_dir.shape[1:]
                 device = step_pred_for_dir.device
-
-                z_coords = torch.arange(shape[0], device=device, dtype=torch.float32)
-                y_coords = torch.arange(shape[1], device=device, dtype=torch.float32)
-                x_coords = torch.arange(shape[2], device=device, dtype=torch.float32)
-                zyx_grid = torch.stack(torch.meshgrid(z_coords, y_coords, x_coords, indexing='ij'), dim=-1)
-
-                centroid = (prob_normalized.unsqueeze(-1) * zyx_grid).sum(dim=(1, 2, 3))
 
                 if num_samples > 1:
                     noise_sigma = 1.5

@@ -7,6 +7,7 @@ import zarr
 import cupy as cp
 from cucim.skimage.measure import label as cucim_label, regionprops_table
 import torch
+import torch.nn.functional as F
 import accelerate
 from accelerate.utils import TorchDynamoPlugin
 import numpy as np
@@ -353,17 +354,82 @@ class Inference:
         debug_prev_v_hm = None
         debug_prev_diag_hm = None
 
+        def get_volume_crop(center_zyx: torch.Tensor):
+            if center_zyx.requires_grad:
+                crop_size_tensor = torch.tensor(crop_size_dhw, dtype=center_zyx.dtype, device=center_zyx.device)
+                min_corner_float = center_zyx - crop_size_tensor / 2
+                base_min_corner = torch.floor(min_corner_float) - 1
+                base_min_corner_int = base_min_corner.to(dtype=torch.int64)
+                base_crop_size = torch.tensor([s + 2 for s in crop_size_dhw], dtype=torch.int64)
+                base_center = base_min_corner_int + base_crop_size // 2
+                base_crop, base_min_corner_zyx = get_crop_from_volume(
+                    self.volume,
+                    base_center,
+                    tuple(base_crop_size.tolist()),
+                )
+                base_crop = base_crop.to(device=center_zyx.device, dtype=torch.float32, non_blocking=True)
+                base_min_corner_zyx = base_min_corner_zyx.to(device=center_zyx.device, dtype=center_zyx.dtype)
+                offset = min_corner_float - base_min_corner_zyx
+
+                z_coords = torch.arange(crop_size_dhw[0], device=center_zyx.device, dtype=center_zyx.dtype) + offset[0]
+                y_coords = torch.arange(crop_size_dhw[1], device=center_zyx.device, dtype=center_zyx.dtype) + offset[1]
+                x_coords = torch.arange(crop_size_dhw[2], device=center_zyx.device, dtype=center_zyx.dtype) + offset[2]
+                zz, yy, xx = torch.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
+
+                denom = torch.tensor(
+                    [base_crop.shape[0] - 1, base_crop.shape[1] - 1, base_crop.shape[2] - 1],
+                    device=center_zyx.device,
+                    dtype=center_zyx.dtype,
+                )
+                denom = torch.clamp(denom, min=1)
+                grid_z = zz / denom[0] * 2 - 1
+                grid_y = yy / denom[1] * 2 - 1
+                grid_x = xx / denom[2] * 2 - 1
+                grid = torch.stack((grid_x, grid_y, grid_z), dim=-1)[None]
+
+                sampled = F.grid_sample(
+                    base_crop[None, None],
+                    grid,
+                    mode='bilinear',
+                    padding_mode='border',
+                    align_corners=True,
+                )
+                return sampled[0, 0], min_corner_float
+
+            if self.crop_cache is not None:
+                volume_crop, min_corner_zyx = self.crop_cache.get(center_zyx)
+            else:
+                volume_crop, min_corner_zyx = get_crop_from_volume(self.volume, center_zyx, crop_size)
+            return volume_crop, min_corner_zyx.to(dtype=center_zyx.dtype)
+
+        def build_differentiable_localiser(center_zyx: torch.Tensor, min_corner_zyx: torch.Tensor) -> torch.Tensor:
+            device = center_zyx.device
+            dtype = center_zyx.dtype
+            z_coords = torch.arange(crop_size_dhw[0], device=device, dtype=dtype)
+            y_coords = torch.arange(crop_size_dhw[1], device=device, dtype=dtype)
+            x_coords = torch.arange(crop_size_dhw[2], device=device, dtype=dtype)
+            zz, yy, xx = torch.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
+            grid = torch.stack((zz, yy, xx), dim=-1)
+            center = center_zyx - min_corner_zyx
+            dist = torch.linalg.norm(grid - center, dim=-1)
+            max_dist = torch.linalg.norm(
+                torch.tensor(crop_size_dhw, device=device, dtype=dtype) / 2
+            )
+            return dist / max_dist * 2 - 1
+
         min_corner_zyxs = []
         for idx in range(len(zyx)):
-            if self.crop_cache is not None:
-                volume_crop, min_corner_zyx = self.crop_cache.get(zyx[idx])
-            else:
-                volume_crop, min_corner_zyx = get_crop_from_volume(self.volume, zyx[idx], crop_size)
+            volume_crop, min_corner_zyx = get_volume_crop(zyx[idx])
             min_corner_zyxs.append(min_corner_zyx)
             inputs_cpu[idx, CH_VOLUME] = volume_crop
 
             if use_localiser:
-                localiser = self._base_localiser.clone()
+                if zyx[idx].requires_grad:
+                    localiser = build_differentiable_localiser(zyx[idx], min_corner_zyx)
+                    # FIXME: we should also have a derivative through mark_context_point, but that rasterises a single-pixel cross
+                    #  which it doesn't really make sense to construct differentiably unless we also see 'soft' version during training
+                else:
+                    localiser = self._base_localiser.clone()
                 mark_context_point(localiser, zyx[idx] - min_corner_zyx, value=0.)
                 inputs_cpu[idx, CH_LOCALISER] = localiser
 
@@ -397,7 +463,7 @@ class Inference:
                 return infer_with_tta(forward, model_inputs, self.tta_type, batched=self.tta_batched)
             return forward(model_inputs)
 
-        with torch.no_grad(), torch.autocast('cuda'):
+        with torch.autocast('cuda'):
             logits = run_with_tta(inputs)
             logits = logits.reshape(len(zyx), 2, self.config['step_count'], *crop_size_dhw)  # u/v, step, z, y, x
             probs = torch.sigmoid(logits)
@@ -428,7 +494,7 @@ class Inference:
 
         # area + centroid
         props = regionprops_table(labels_gpu, properties=['label', 'area', 'centroid'])
-        areas = props['area'].get() 
+        areas = props['area'].get()
 
         # find largest component and extract centroid
         if len(areas) > 0:

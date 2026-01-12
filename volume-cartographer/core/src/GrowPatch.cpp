@@ -386,34 +386,200 @@ private:
     mutable std::unique_ptr<CachedChunked3dInterpolator<uint8_t, passTroughComputor>> interp_;
 };
 
-struct NeuralTracerCost {
-    explicit NeuralTracerCost(NeuralTracerConnection& connection, double w)
-        : _connection{connection}, _w(w) {}
+struct NeuralTracerResidual final {
+    explicit NeuralTracerResidual(NeuralTracerConnection& connection, double w)
+        : connection_(connection), w_(w) {}
 
-    template <typename T>
-    bool operator()(const T* const center, const T* const prev_u, const T* const prev_v, const T* const prev_diag, const T* const gap_u, T* residual) const {
+    bool operator()(const double* center,
+                    const double* prev_u,
+                    const double* prev_v,
+                    const double* prev_diag,
+                    const double* gap_u,
+                    double* residuals) const {
+        cv::Vec3f center_vec(center[0], center[1], center[2]);
+        cv::Vec3f prev_u_vec(prev_u[0], prev_u[1], prev_u[2]);
+        cv::Vec3f prev_v_vec(prev_v[0], prev_v[1], prev_v[2]);
+        cv::Vec3f prev_diag_vec(prev_diag[0], prev_diag[1], prev_diag[2]);
 
-        // Call the neural tracer with center and prev_* xyzs; measure how the output xyz differs from gap xyz
-        // FIXME: these should not be detached! should differentiate through the model and coordinate-from-heatmaps
-        cv::Vec3f center_vec_detached(unjet(center[0]), unjet(center[1]), unjet(center[2]));
-        cv::Vec3f prev_u_vec_detached(unjet(prev_u[0]), unjet(prev_u[1]), unjet(prev_u[2]));
-        cv::Vec3f prev_v_vec_detached(unjet(prev_v[0]), unjet(prev_v[1]), unjet(prev_v[2]));
-        cv::Vec3f prev_diag_vec_detached(unjet(prev_diag[0]), unjet(prev_diag[1]), unjet(prev_diag[2]));
-        auto const next_points = _connection.get_next_points({center_vec_detached}, {{prev_u_vec_detached}}, {{prev_v_vec_detached}}, {{prev_diag_vec_detached}}).front();
+        auto const next_points = connection_.get_next_points(
+            {center_vec}, {{prev_u_vec}}, {{prev_v_vec}}, {{prev_diag_vec}}
+        ).front();
+        if (next_points.next_u_xyzs.empty()) {
+            std::cout << "warning: no next points found" << std::endl;
+            return false;
+        }
         auto const pred_gap_u = next_points.next_u_xyzs[0];
-        T displacement[] = {T(pred_gap_u[0]) - gap_u[0], T(pred_gap_u[1]) - gap_u[1], T(pred_gap_u[2]) - gap_u[2]};
-        residual[0] = T(_w) * displacement[0];
-        residual[1] = T(_w) * displacement[1];
-        residual[2] = T(_w) * displacement[2];
+
+        residuals[0] = w_ * (static_cast<double>(pred_gap_u[0]) - gap_u[0]);
+        residuals[1] = w_ * (static_cast<double>(pred_gap_u[1]) - gap_u[1]);
+        residuals[2] = w_ * (static_cast<double>(pred_gap_u[2]) - gap_u[2]);
         return true;
     }
 
-    static ceres::CostFunction* Create(bool has_prev_v, bool has_prev_diag, NeuralTracerConnection &connection, double w = 1.0)
+    NeuralTracerConnection& connection_;
+    double w_;
+};
+
+struct NeuralTracerCost final : ceres::SizedCostFunction<3, 3, 3, 3, 3, 3> {
+    explicit NeuralTracerCost(NeuralTracerConnection& connection, double w)
+        : _connection{connection}, _w(w) {}
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override {
+
+        const double* center = parameters[0];
+        const double* prev_u = parameters[1];
+        const double* prev_v = parameters[2];
+        const double* prev_diag = parameters[3];
+        const double* gap_u = parameters[4];
+
+        // Call the neural tracer with center and prev_* xyzs; measure how the output xyz differs from gap xyz.
+        cv::Vec3f center_vec(center[0], center[1], center[2]);
+        cv::Vec3f prev_u_vec(prev_u[0], prev_u[1], prev_u[2]);
+        cv::Vec3f prev_v_vec(prev_v[0], prev_v[1], prev_v[2]);
+        cv::Vec3f prev_diag_vec(prev_diag[0], prev_diag[1], prev_diag[2]);
+        if (jacobians == nullptr) {
+
+            auto const next_points = _connection.get_next_points(
+                {center_vec}, {{prev_u_vec}}, {{prev_v_vec}}, {{prev_diag_vec}}
+            ).front();
+            if (next_points.next_u_xyzs.empty()) {
+                std::cout << "warning: no next points found" << std::endl;
+                return false;
+            }
+            auto const pred_gap_u = next_points.next_u_xyzs[0];
+
+            residuals[0] = _w * (static_cast<double>(pred_gap_u[0]) - gap_u[0]);
+            residuals[1] = _w * (static_cast<double>(pred_gap_u[1]) - gap_u[1]);
+            residuals[2] = _w * (static_cast<double>(pred_gap_u[2]) - gap_u[2]);
+            return true;
+
+        } else {
+
+            auto const next_points_and_jac = _connection.get_next_points_with_jacobian(
+                {center_vec}, {{prev_u_vec}}, {{prev_v_vec}}, {{prev_diag_vec}}
+            ).front();
+            if (next_points_and_jac.next_u_xyzs.empty()) {
+                std::cout << "warning: no next points found" << std::endl;
+                return false;
+            }
+            auto const pred_gap_u = next_points_and_jac.next_u_xyzs[0];
+
+            residuals[0] = _w * (static_cast<double>(pred_gap_u[0]) - gap_u[0]);
+            residuals[1] = _w * (static_cast<double>(pred_gap_u[1]) - gap_u[1]);
+            residuals[2] = _w * (static_cast<double>(pred_gap_u[2]) - gap_u[2]);
+
+            const auto fill_from_mat = [&](double* jac, const std::optional<cv::Matx33f>& mat_opt) {
+                if (!jac) {
+                    return;
+                }
+                if (!mat_opt) {
+                    throw std::logic_error("fill_from_mat called with null jacobian");
+                }
+                const auto& mat = *mat_opt;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        jac[r * 3 + c] = _w * static_cast<double>(mat(r, c));
+                    }
+                }
+            };
+
+            fill_from_mat(jacobians[0], next_points_and_jac.u_jac_wrt_center[0]);
+            fill_from_mat(jacobians[1], next_points_and_jac.u_jac_wrt_prev_u[0]);
+            fill_from_mat(jacobians[2], next_points_and_jac.u_jac_wrt_prev_v[0]);
+            fill_from_mat(jacobians[3], next_points_and_jac.u_jac_wrt_prev_diag[0]);
+
+            if (jacobians[4]) {
+                std::fill(jacobians[4], jacobians[4] + 9, 0.0);
+                jacobians[4][0] = -_w;
+                jacobians[4][4] = -_w;
+                jacobians[4][8] = -_w;
+            }
+
+            if (false) {  // check grad by finite differences
+                const auto compute_residuals = [&](const double* c,
+                                                   const double* pu,
+                                                   const double* pv,
+                                                   const double* pd,
+                                                   const double* gu,
+                                                   double* out) {
+                    cv::Vec3f c_vec(c[0], c[1], c[2]);
+                    cv::Vec3f pu_vec(pu[0], pu[1], pu[2]);
+                    cv::Vec3f pv_vec(pv[0], pv[1], pv[2]);
+                    cv::Vec3f pd_vec(pd[0], pd[1], pd[2]);
+                    auto const next_points = _connection.get_next_points(
+                        {c_vec}, {{pu_vec}}, {{pv_vec}}, {{pd_vec}}
+                    ).front();
+                    auto const pred_gap_u = next_points.next_u_xyzs[0];
+                    out[0] = _w * (static_cast<double>(pred_gap_u[0]) - gu[0]);
+                    out[1] = _w * (static_cast<double>(pred_gap_u[1]) - gu[1]);
+                    out[2] = _w * (static_cast<double>(pred_gap_u[2]) - gu[2]);
+                };
+
+                constexpr double h = 0.1;
+                auto fd_block = [&](const double* base_c,
+                                    const double* base_pu,
+                                    const double* base_pv,
+                                    const double* base_pd,
+                                    const double* base_gu,
+                                    int block_idx,
+                                    double* fd_out) {
+                    double c[3] = {base_c[0], base_c[1], base_c[2]};
+                    double pu[3] = {base_pu[0], base_pu[1], base_pu[2]};
+                    double pv[3] = {base_pv[0], base_pv[1], base_pv[2]};
+                    double pd[3] = {base_pd[0], base_pd[1], base_pd[2]};
+                    double gu[3] = {base_gu[0], base_gu[1], base_gu[2]};
+
+                    double* targets[5] = {c, pu, pv, pd, gu};
+                    for (int dim = 0; dim < 3; ++dim) {
+                        double r_plus[3] = {0.0, 0.0, 0.0};
+                        double r_minus[3] = {0.0, 0.0, 0.0};
+                        targets[block_idx][dim] += h;
+                        compute_residuals(c, pu, pv, pd, gu, r_plus);
+                        targets[block_idx][dim] -= 2.0 * h;
+                        compute_residuals(c, pu, pv, pd, gu, r_minus);
+                        targets[block_idx][dim] += h;
+                        for (int r = 0; r < 3; ++r) {
+                            fd_out[r * 3 + dim] = (r_plus[r] - r_minus[r]) / (2.0 * h);
+                        }
+                    }
+                };
+
+                auto compare_block = [&](int idx, const char* name, const double* analytic) {
+                    if (!analytic) {
+                        return;
+                    }
+                    double fd_jac[9] = {};
+                    fd_block(center, prev_u, prev_v, prev_diag, gap_u, idx, fd_jac);
+                    double max_abs_diff = 0.0;
+                    for (int i = 0; i < 9; ++i) {
+                        max_abs_diff = std::max(max_abs_diff, std::abs(analytic[i] - fd_jac[i]));
+                    }
+                    std::cerr << "NeuralTracerCost FD check " << name
+                              << " max|diff|=" << max_abs_diff
+                              << " h=" << h << "\n";
+                };
+
+                compare_block(0, "center", jacobians[0]);
+                compare_block(1, "prev_u", jacobians[1]);
+                compare_block(2, "prev_v", jacobians[2]);
+                compare_block(3, "prev_diag", jacobians[3]);
+                compare_block(4, "gap_u", jacobians[4]);
+            }
+            return true;
+        }
+    }
+
+    static ceres::CostFunction* Create(bool has_prev_v, bool has_prev_diag, NeuralTracerConnection &connection, double w = 1.0, bool use_numeric_diff = false)
     {
         assert(has_prev_v || has_prev_diag);
         if (has_prev_v && has_prev_diag) {
-            return new ceres::AutoDiffCostFunction<NeuralTracerCost, 3, 3, 3, 3, 3, 3>(
-                new NeuralTracerCost(connection, w));
+            if (use_numeric_diff) {
+                return new ceres::NumericDiffCostFunction<NeuralTracerResidual, ceres::CENTRAL, 3, 3, 3, 3, 3, 3>(
+                    new NeuralTracerResidual(connection, w)
+                );
+            } else {
+                return new NeuralTracerCost(connection, w);
+            }
         }
         throw std::logic_error("NeuralTracerCost::Create: currently requires both prev_v and prev_diag");
         // TODO!
@@ -421,9 +587,6 @@ struct NeuralTracerCost {
         } else {
         } */
     }
-
-    static double unjet(const double& v) { return v; }
-    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
 
     NeuralTracerConnection& _connection;
     double _w;
@@ -1680,7 +1843,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
 static float local_optimization_neural(int radius, const cv::Vec2i &p0, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, NeuralTracerConnection &neural_tracer, bool quiet = false,
-    bool parallel = false, const LocalOptimizationConfig* solver_config = nullptr)
+    bool parallel = false, const LocalOptimizationConfig* solver_config = nullptr, bool use_numeric_diff = false)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
     // the neural tracer is happy with all pairs of neighbors
@@ -1707,7 +1870,7 @@ static float local_optimization_neural(int radius, const cv::Vec2i &p0, TracePar
             auto const prev_diag = *point_info.best_diag_pos;
             if (point_info.best_ortho_pos && point_info.best_diag_pos)
                 problem.AddResidualBlock(
-                    NeuralTracerCost::Create(true, true, neural_tracer, settings(LossType::NEURAL_TRACER, p)),
+                    NeuralTracerCost::Create(true, true, neural_tracer, settings(LossType::NEURAL_TRACER, p), use_numeric_diff),
                     nullptr,
                     params.dpoints(center).val,
                     params.dpoints(prev_u).val,
@@ -1878,6 +2041,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     bool neural_reoptimization = false;
+    bool neural_numeric_diff = false;
     if (params.contains("neural_socket")) {
         std::string socket_path = params["neural_socket"];
         if (!socket_path.empty()) {
@@ -1892,6 +2056,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         pre_neural_gens = params.value("pre_neural_generations", 0);
         neural_batch_size = params.value("neural_batch_size", 1);
         neural_reoptimization = params.value("neural_reoptimization", false);
+        neural_numeric_diff = params.value("neural_reopt_numeric_diff", false);
         if (!neural_tracer) {
             std::cout << "Neural tracer not active" << std::endl;
         }
@@ -2996,7 +3161,18 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         if (neural_tracer && generation > pre_neural_gens) {
             if (neural_reoptimization) {
                 if (generation % 4 == 0) {  // TODO: 8???
-                    local_optimization_neural(stop_gen + 10, {y0, x0}, trace_params, trace_data, loss_settings, *neural_tracer, false, true, nullptr);
+                    local_optimization_neural(
+                        stop_gen + 10,
+                        {y0, x0},
+                        trace_params,
+                        trace_data,
+                        loss_settings,
+                        *neural_tracer,
+                        false,
+                        true,
+                        nullptr,
+                        neural_numeric_diff
+                    );
                 }
             } else {
                 // Skip optimizations
