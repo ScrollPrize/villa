@@ -28,6 +28,8 @@
 #include <fstream>
 #include <iostream>
 #include <shared_mutex>
+#include <mutex>
+#include <memory>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -51,12 +53,18 @@ static float sliding_w_scale = 1.0f;       // Scale factor for sliding window
 static float z_loc_loss_w = 0.1f;          // Weight for Z location loss constraints
 static float dist_loss_2d_w = 1.0f;        // Weight for 2D distance constraints
 static float dist_loss_3d_w = 2.0f;        // Weight for 3D distance constraints
+static float dist_loss_xy_w = 1.0f;        // Weight for XY distance constraints (same-row)
+static float normal_loss_w = 1.0f;         // Weight for normal grid alignment loss
+static float snap_loss_w = 0.1f;           // Weight for normal grid snapping loss
 static float straight_min_count = 1.0f;    // Minimum number of straight constraints
 static int inlier_base_threshold = 20;     // Starting threshold for inliers
 static int heading_window = 9;             // Window (cols/rows) to estimate heading
 static int heading_min_segments = 3;       // Minimum segments required to apply heading loss
 static float heading_loss_w = 0.5f;        // Weight for heading loss (XY plane)
 static bool seed_pointto_from_neighbors = false; // Seed pointTo from neighbor locs (disabled by default)
+static int normal_grid_z_min = -1;
+static int normal_grid_z_max = std::numeric_limits<int>::max();
+static std::unique_ptr<vc::core::util::NormalGridVolume> normal_grid_volume;
 
 // ---- Deterministic helpers --------------------------------------------------
 static inline uint64_t mix64(uint64_t x) {
@@ -523,6 +531,68 @@ public:
     cv::Vec2i seed_loc;
 };
 
+static int add_normal_grid_loss(ceres::Problem &problem,
+                                const cv::Vec2i &p,
+                                const cv::Mat_<uint8_t> &state,
+                                cv::Mat_<cv::Vec3d> &points,
+                                int flags = 0)
+{
+    if (!normal_grid_volume)
+        return 0;
+    if (normal_loss_w <= 0.0f && snap_loss_w <= 0.0f)
+        return 0;
+
+    cv::Vec2i p_br = p + cv::Vec2i(1,1);
+    if (!point_in_bounds(state, p) || !point_in_bounds(state, p_br))
+        return 0;
+
+    auto valid_state = [&](const cv::Vec2i& pt) {
+        return (state(pt) & (STATE_COORD_VALID | STATE_LOC_VALID)) != 0;
+    };
+    if (!valid_state(p) || !valid_state({p[0], p[1] + 1}) ||
+        !valid_state({p[0] + 1, p[1]}) || !valid_state(p_br)) {
+        return 0;
+    }
+
+    cv::Vec2i p_tr = {p[0], p[1] + 1};
+    cv::Vec2i p_bl = {p[0] + 1, p[1]};
+
+    double* pA = &points(p)[0];
+    double* pB1 = &points(p_tr)[0];
+    double* pB2 = &points(p_bl)[0];
+    double* pC = &points(p_br)[0];
+
+    int count = 0;
+    for (int i = 0; i < 3; ++i) {
+        const bool direction_aware = false;
+        problem.AddResidualBlock(
+            NormalConstraintPlane::Create(*normal_grid_volume, i, normal_loss_w, snap_loss_w,
+                                          direction_aware, normal_grid_z_min, normal_grid_z_max),
+            nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(
+            NormalConstraintPlane::Create(*normal_grid_volume, i, normal_loss_w, snap_loss_w,
+                                          direction_aware, normal_grid_z_min, normal_grid_z_max),
+            nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(
+            NormalConstraintPlane::Create(*normal_grid_volume, i, normal_loss_w, snap_loss_w,
+                                          direction_aware, normal_grid_z_min, normal_grid_z_max),
+            nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(
+            NormalConstraintPlane::Create(*normal_grid_volume, i, normal_loss_w, snap_loss_w,
+                                          direction_aware, normal_grid_z_min, normal_grid_z_max),
+            nullptr, pB2, pA, pC, pB1);
+        count += 4;
+    }
+
+    if ((flags & OPTIMIZE_ALL) == 0) {
+        problem.SetParameterBlockConstant(&points(p_tr)[0]);
+        problem.SetParameterBlockConstant(&points(p_bl)[0]);
+        problem.SetParameterBlockConstant(&points(p_br)[0]);
+    }
+
+    return count;
+}
+
 static bool seed_ptr_from_neighbors(QuadSurface* surf,
                                     SurfTrackerData& data,
                                     const cv::Mat_<uint8_t>& state,
@@ -684,6 +754,29 @@ static int add_surftrack_distloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2
     return 1;
 }
 
+// XY-plane distance loss for same-row adjacent points
+// Complements z_loc_loss: ensures XY displacement is maintained along rows
+static int add_surftrack_distloss_XY(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, const cv::Vec2i &off,
+    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, int flags = 0)
+{
+    if (!point_in_bounds(state, p) || !point_in_bounds(state, p + off))
+        return 0;
+    if ((state(p) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if ((state(p+off) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+
+    if (!problem.HasParameterBlock(&points(p)[0]))
+        return 0;
+    if (!problem.HasParameterBlock(&points(p+off)[0]))
+        return 0;
+
+    problem.AddResidualBlock(DistLossXY::Create(unit*cv::norm(off), dist_loss_xy_w),
+                             nullptr, &points(p)[0], &points(p+off)[0]);
+
+    return 1;
+}
+
 static int cond_surftrack_distloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, const cv::Vec2i &off,
     SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, int flags = 0)
 {
@@ -841,6 +934,12 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
         count += add_surftrack_distloss_3D(points, p, {-1,1}, problem, state, step*src_step, flags);
         count += add_surftrack_distloss_3D(points, p, {-1,-1}, problem, state, step*src_step, flags);
 
+        // XY distance for same-row neighbors (complements z_loc_loss)
+        if (dist_loss_xy_w > 0.0f) {
+            count += add_surftrack_distloss_XY(points, p, {0,1}, problem, state, step*src_step, flags);
+            count += add_surftrack_distloss_XY(points, p, {0,-1}, problem, state, step*src_step, flags);
+        }
+
         //horizontal
         count_straight += add_surftrack_straightloss_3D(p, {0,-2},{0,-1},{0,0}, points, problem, state);
         count_straight += add_surftrack_straightloss_3D(p, {0,-1},{0,0},{0,1}, points, problem, state);
@@ -872,6 +971,13 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
         count_straight += add_surftrack_straightloss(sm, p, {-2,0},{-1,0},{0,0}, data, problem, state);
         count_straight += add_surftrack_straightloss(sm, p, {-1,0},{0,0},{1,0}, data, problem, state);
         count_straight += add_surftrack_straightloss(sm, p, {0,0},{1,0},{2,0}, data, problem, state);
+    }
+
+    if (normal_grid_volume && (normal_loss_w > 0.0f || snap_loss_w > 0.0f)) {
+        count += add_normal_grid_loss(problem, p, state, points, flags);
+        count += add_normal_grid_loss(problem, p + cv::Vec2i(-1, -1), state, points, flags);
+        count += add_normal_grid_loss(problem, p + cv::Vec2i(0, -1), state, points, flags);
+        count += add_normal_grid_loss(problem, p + cv::Vec2i(-1, 0), state, points, flags);
     }
 
     if (heading_loss_w > 0.0f && heading_window > 0) {
@@ -917,6 +1023,12 @@ static int surftrack_add_global(QuadSurface *sm, const cv::Vec2i& p, SurfTracker
         count += cond_surftrack_distloss_3D(3, sm, points, p, {-1,1}, data, problem, state, step, flags);
         count += cond_surftrack_distloss_3D(3, sm, points, p, {-1,-1}, data, problem, state, step, flags);
 
+        // XY distance for same-row neighbors (complements z_loc_loss)
+        if (dist_loss_xy_w > 0.0f) {
+            count += add_surftrack_distloss_XY(points, p, {0,1}, problem, state, step, flags);
+            count += add_surftrack_distloss_XY(points, p, {0,-1}, problem, state, step, flags);
+        }
+
         //horizontal
         count += cond_surftrack_straightloss_3D(4, sm, p, {0,-2},{0,-1},{0,0}, points, data, problem, state, flags);
         count += cond_surftrack_straightloss_3D(4, sm, p, {0,-1},{0,0},{0,1}, points, data, problem, state, flags);
@@ -937,6 +1049,9 @@ static int surftrack_add_global(QuadSurface *sm, const cv::Vec2i& p, SurfTracker
         count += cond_surftrack_straightloss_3D(7, sm, p, {-1,1},{0,0},{1,-1}, points, data, problem, state, flags);
         count += cond_surftrack_straightloss_3D(7, sm, p, {0,0},{1,-1},{2,-2}, points, data, problem, state, flags);
     }
+
+    if (normal_grid_volume && (normal_loss_w > 0.0f || snap_loss_w > 0.0f))
+        count += add_normal_grid_loss(problem, p, state, points, flags);
 
     //losses on surface
     if (flags & LOSS_ON_SURF)
@@ -1164,6 +1279,80 @@ static cv::Mat_<cv::Vec3f> surftrack_genpoints_hr(
     return points_hr;
 }
 
+static void thin_plate_inpaint(cv::Mat_<cv::Vec3d> &points,
+                               const cv::Mat_<uint8_t> &state,
+                               const cv::Mat_<uint8_t> &inpaint_mask,
+                               const cv::Rect &used_area,
+                               int warmup_iters,
+                               int thin_plate_iters)
+{
+    if (used_area.width <= 0 || used_area.height <= 0)
+        return;
+
+    constexpr uint8_t STATE_VALID = STATE_LOC_VALID | STATE_COORD_VALID;
+
+    const int y0 = used_area.y;
+    const int y1 = used_area.br().y;
+    const int x0 = used_area.x;
+    const int x1 = used_area.br().x;
+    const int max_y = state.rows - 1;
+    const int max_x = state.cols - 1;
+
+    auto clamp_i = [](int v, int lo, int hi) {
+        return std::max(lo, std::min(v, hi));
+    };
+
+    auto sample = [&](int yy, int xx, const cv::Vec3d &fallback) -> cv::Vec3d {
+        yy = clamp_i(yy, 0, max_y);
+        xx = clamp_i(xx, 0, max_x);
+        if ((state(yy, xx) & STATE_VALID) == 0)
+            return fallback;
+        return points(yy, xx);
+    };
+
+    // Warmup: diffuse boundary values into holes to seed the biharmonic solve.
+    for (int iter = 0; iter < warmup_iters; ++iter) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                if (inpaint_mask(y, x)) {
+                    const cv::Vec3d center = points(y, x);
+                    const cv::Vec3d sum =
+                        sample(y - 1, x, center) +
+                        sample(y + 1, x, center) +
+                        sample(y, x - 1, center) +
+                        sample(y, x + 1, center);
+                    points(y, x) = sum * 0.25;
+                }
+    }
+
+    // Thin-plate (bi-Laplacian) smoothing using a 13-point stencil.
+    for (int iter = 0; iter < thin_plate_iters; ++iter) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                if (inpaint_mask(y, x)) {
+                    const cv::Vec3d center = points(y, x);
+                    const cv::Vec3d up = sample(y - 1, x, center);
+                    const cv::Vec3d down = sample(y + 1, x, center);
+                    const cv::Vec3d left = sample(y, x - 1, center);
+                    const cv::Vec3d right = sample(y, x + 1, center);
+
+                    const cv::Vec3d diag =
+                        sample(y - 1, x - 1, center) +
+                        sample(y - 1, x + 1, center) +
+                        sample(y + 1, x - 1, center) +
+                        sample(y + 1, x + 1, center);
+
+                    const cv::Vec3d far =
+                        sample(y - 2, x, center) +
+                        sample(y + 2, x, center) +
+                        sample(y, x - 2, center) +
+                        sample(y, x + 2, center);
+
+                    points(y, x) = (8.0 * (up + down + left + right) - 2.0 * diag - far) / 20.0;
+                }
+    }
+}
+
 
 
 
@@ -1212,18 +1401,18 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         options.linear_solver_type = ceres::SPARSE_SCHUR;
         options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
 
-        // Enable mixed precision for SPARSE_SCHUR
-        if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-            options.use_mixed_precision_solves = true;
-        }
-    } else {
-        std::cerr << "Warning: CUDA_SPARSE requested but Ceres was not built with CUDA sparse support. Falling back to default solver." << std::endl;
-    }
+    //     // Enable mixed precision for SPARSE_SCHUR
+    //     if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
+    //         options.use_mixed_precision_solves = true;
+    //     }
+    // } else {
+    //     std::cerr << "Warning: CUDA_SPARSE requested but Ceres was not built with CUDA sparse support. Falling back to default solver." << std::endl;
+     }
 #endif
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 100;
     options.num_threads = omp_get_max_threads();
-    options.use_nonmonotonic_steps = true;
+    options.use_nonmonotonic_steps = false;
 
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
@@ -1240,7 +1429,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     uint8_t STATE_VALID = STATE_LOC_VALID | STATE_COORD_VALID;
 
     int res_count = 0;
-    //slowly inpaint physics only points
+    cv::Mat_<uint8_t> inpaint_mask(state.size(), static_cast<uint8_t>(0));
+    int inpainted_count = 0;
+    // Build inpaint mask by closing valid regions and marking newly included cells.
     for(int r=0;r<closing_r+2;r++) {
         cv::Mat_<uint8_t> masked;
         bitwise_and(state, STATE_VALID, masked);
@@ -1250,19 +1441,27 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
         for(int j=used_area.y;j<used_area.br().y;j++)
             for(int i=used_area.x;i<used_area.br().x;i++)
-                if ((masked(j,i) & STATE_VALID) && (~new_state(j,i) & STATE_VALID)) {
+                if ((masked(j,i) & STATE_VALID) && ((new_state(j,i) & STATE_VALID) == 0)) {
                     new_state(j, i) = STATE_COORD_VALID;
-                    points_new(j,i) = {-3,-2,-4};
-                    //TODO add local area solve
-                    double err = local_solve(sm, {j,i}, data_new, new_state, points_new, step, src_step, LOSS_3D_INDIRECT | SURF_LOSS);
-                    if (points_new(j,i)[0] == -3) {
-                        //FIXME actually check for solver failure?
-                        new_state(j, i) = 0;
-                        points_new(j,i) = {-1,-1,-1};
-                    }
-                    else
-                        res_count += surftrack_add_global(sm, {j,i}, data_new, problem_inpaint, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | OPTIMIZE_ALL);
+                    if (points_new(j, i)[0] == -1)
+                        points_new(j, i) = {0,0,0};
+                    inpaint_mask(j, i) = 255;
+                    inpainted_count++;
                 }
+    }
+
+    if (inpainted_count > 0) {
+        const int warmup_iters = std::max(10, closing_r);
+        const int thin_plate_iters = std::max(50, closing_r * 10);
+        std::cout << "optimizer: thin-plate inpaint " << inpainted_count
+                  << " cells (warmup " << warmup_iters
+                  << ", iters " << thin_plate_iters << ")" << std::endl;
+        thin_plate_inpaint(points_new, new_state, inpaint_mask, used_area, warmup_iters, thin_plate_iters);
+
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++)
+                if (inpaint_mask(j, i))
+                    res_count += surftrack_add_global(sm, {j,i}, data_new, problem_inpaint, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | OPTIMIZE_ALL);
     }
 
     for(int j=used_area.y;j<used_area.br().y;j++)
@@ -1286,7 +1485,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
-            if (new_state(j,i) & STATE_LOC_VALID) {
+            if (new_state(j,i) & STATE_VALID) {
                 data_inp.surfs({j,i}).insert(sm_inp);
                 data_inp.loc(sm_inp, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
             }
@@ -1331,8 +1530,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
             }
 
     options.max_num_iterations = 1000;
-    options.use_nonmonotonic_steps = true;
-    options.use_inner_iterations = true;
+    options.use_nonmonotonic_steps = false;
+    options.use_inner_iterations = false;
     ceres::Solve(options, &problem, &summary);
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
@@ -1571,6 +1770,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     float step = params.value("step", 10);
     const int step_int = surftrack_round_step(step);
     int max_width = params.value("max_width", 80000);
+    std::string normal_grid_path;
 
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
     assoc_surface_th = params.value("same_surface_th", 2.0f);
@@ -1603,6 +1803,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     z_loc_loss_w = params.value("z_loc_loss_w", 0.1f);                  // Weight for Z location loss constraints
     dist_loss_2d_w = params.value("dist_loss_2d_w", 1.0f);              // Weight for 2D distance constraints
     dist_loss_3d_w = params.value("dist_loss_3d_w", 2.0f);              // Weight for 3D distance constraints
+    dist_loss_xy_w = params.value("dist_loss_xy_w", 1.0f);              // Weight for XY distance constraints (same-row)
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
     heading_window = params.value("heading_window", 9);
@@ -1614,6 +1815,23 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     if (heading_min_segments > heading_window)
         heading_min_segments = heading_window;
     heading_loss_w = params.value("heading_loss_w", 0.5f);
+    normal_loss_w = params.value("normal_weight", 1.0f);
+    snap_loss_w = params.value("snap_weight", 0.1f);
+    normal_grid_z_min = params.value("normal_grid_z_min", params.value("z_min", -1));
+    normal_grid_z_max = params.value("normal_grid_z_max",
+                                     params.value("z_max", std::numeric_limits<int>::max()));
+    if (normal_grid_z_min > normal_grid_z_max)
+        std::swap(normal_grid_z_min, normal_grid_z_max);
+    normal_grid_volume.reset();
+    if (params.contains("normal_grid_path")) {
+        try {
+            normal_grid_path = params["normal_grid_path"].get<std::string>();
+            normal_grid_volume = std::make_unique<vc::core::util::NormalGridVolume>(normal_grid_path);
+        } catch (const std::exception& ex) {
+            std::cerr << "WARNING: failed to load normal_grid_path: " << ex.what() << std::endl;
+            normal_grid_volume.reset();
+        }
+    }
     uint64_t deterministic_seed = uint64_t(params.value("deterministic_seed", 5489));
     double deterministic_jitter_px = params.value("deterministic_jitter_px", 0.15);
     std::string candidate_ordering = params.value("candidate_ordering", "row_col");
@@ -1624,6 +1842,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     int hole_requeue_interval = params.value("hole_requeue_interval", 100);
     int hole_seal_radius = params.value("hole_seal_radius", 2);
     int hole_max_retries = params.value("hole_max_retries", 3);
+    int hole_edge_prune_min_neighbors = params.value("hole_edge_prune_min_neighbors", 0);
+    int force_retry_min_neighbors = params.value("force_retry_min_neighbors", 3);
+    int force_retry_max = params.value("force_retry_max", 3);
+    int disconnect_prune_interval = params.value("disconnect_prune_interval", 0);
+    int disconnect_window_width = params.value("disconnect_window_width", 0);
+    int disconnect_window_stride = params.value("disconnect_window_stride", 0);
+    int disconnect_erode_radius = params.value("disconnect_erode_radius", 0);
     if (hole_requeue_interval < 1)
         hole_requeue_interval = 0;
     if (hole_seal_radius < 0)
@@ -1632,6 +1857,22 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         hole_max_retries = 0;
     if (hole_max_retries > 255)
         hole_max_retries = 255;
+    if (hole_edge_prune_min_neighbors < 0)
+        hole_edge_prune_min_neighbors = 0;
+    if (force_retry_min_neighbors < 1)
+        force_retry_min_neighbors = 0;
+    if (force_retry_max < 1)
+        force_retry_max = 0;
+    if (force_retry_max > 255)
+        force_retry_max = 255;
+    if (disconnect_prune_interval < 1)
+        disconnect_prune_interval = 0;
+    if (disconnect_window_width < 0)
+        disconnect_window_width = 0;
+    if (disconnect_window_stride < 0)
+        disconnect_window_stride = 0;
+    if (disconnect_erode_radius < 0)
+        disconnect_erode_radius = 0;
     bool use_spread_out_ordering = false;
     if (candidate_ordering == "legacy") {
         use_spread_out_ordering = true;
@@ -1677,6 +1918,14 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             enforce_z_range = false;
         }
     }
+    if (params.contains("z_range") && !params.contains("normal_grid_z_min") &&
+        !params.contains("normal_grid_z_max") && !params.contains("z_min") &&
+        !params.contains("z_max")) {
+        normal_grid_z_min = static_cast<int>(std::lround(z_min));
+        normal_grid_z_max = static_cast<int>(std::lround(z_max));
+        if (normal_grid_z_min > normal_grid_z_max)
+            std::swap(normal_grid_z_min, normal_grid_z_max);
+    }
 
     std::cout << "  local_cost_inl_th: " << local_cost_inl_th << std::endl;
     std::cout << "  assoc_surface_th: " << assoc_surface_th << std::endl;
@@ -1696,6 +1945,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
+    std::cout << "  dist_loss_xy_w: " << dist_loss_xy_w << std::endl;
+    std::cout << "  normal_weight: " << normal_loss_w << std::endl;
+    std::cout << "  snap_weight: " << snap_loss_w << std::endl;
     std::cout << "  heading_window: " << heading_window << std::endl;
     std::cout << "  heading_min_segments: " << heading_min_segments << std::endl;
     std::cout << "  heading_loss_w: " << heading_loss_w << std::endl;
@@ -1706,11 +1958,20 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::cout << "  hole_requeue_interval: " << hole_requeue_interval << std::endl;
     std::cout << "  hole_seal_radius: " << hole_seal_radius << std::endl;
     std::cout << "  hole_max_retries: " << hole_max_retries << std::endl;
+    std::cout << "  hole_edge_prune_min_neighbors: " << hole_edge_prune_min_neighbors << std::endl;
+    std::cout << "  force_retry_min_neighbors: " << force_retry_min_neighbors << std::endl;
+    std::cout << "  force_retry_max: " << force_retry_max << std::endl;
     std::cout << "  max_local_surfs: " << max_local_surfs << std::endl;
     std::cout << "  seed_pointto_from_neighbors: " << (seed_pointto_from_neighbors ? 1 : 0) << std::endl;
     std::cout << "  pointto_interp: " << (pointto_catmull ? "catmull-rom" : "bilinear") << std::endl;
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
+    if (normal_grid_volume) {
+        std::cout << "  normal_grid_path: " << normal_grid_path << std::endl;
+        if (normal_grid_z_min != -1 || normal_grid_z_max != std::numeric_limits<int>::max())
+            std::cout << "  normal_grid_z_range: [" << normal_grid_z_min << ", "
+                      << normal_grid_z_max << "]" << std::endl;
+    }
 
     std::cout << "total surface count: " << surfs_v.size() << std::endl;
 
@@ -1765,6 +2026,17 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
     //1k ~ 1cm, scaled by sliding_w_scale parameter
     int sliding_w = static_cast<int>(1000/src_step/step*2 * sliding_w_scale);
+    if (disconnect_prune_interval > 0) {
+        if (disconnect_window_width < 1)
+            disconnect_window_width = std::max(1, sliding_w);
+        if (disconnect_window_stride < 1)
+            disconnect_window_stride = disconnect_window_width;
+        std::cout << "  disconnect_prune_interval: " << disconnect_prune_interval << std::endl;
+        std::cout << "  disconnect_window_width: " << disconnect_window_width << std::endl;
+        std::cout << "  disconnect_window_stride: " << disconnect_window_stride << std::endl;
+        if (disconnect_erode_radius > 0)
+            std::cout << "  disconnect_erode_radius: " << disconnect_erode_radius << std::endl;
+    }
     int w = 2000/src_step/step*2+10+2*closing_r;
     int h = 15000/src_step/step*2+10+2*closing_r;
     cv::Size size = {w,h};
@@ -1787,6 +2059,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     cv::Mat_<uint16_t> inliers_sum_dbg(size,0);
     cv::Mat_<cv::Vec3d> points(size,{-1,-1,-1});
     cv::Mat_<uint8_t> hole_retry_count(size, static_cast<uint8_t>(0));
+    cv::Mat_<uint8_t> force_retry_count(size, static_cast<uint8_t>(0));
+    cv::Mat_<uint8_t> force_retry_mark(size, static_cast<uint8_t>(0));
+    std::vector<cv::Vec2i> force_retry;
 
     cv::Rect used_area(x0,y0,2,2);
     cv::Rect used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
@@ -1911,6 +2186,21 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             }
         fringe.clear();
 
+        if (!force_retry.empty()) {
+            for (const auto& p : force_retry) {
+                force_retry_mark(p) = 0;
+                if (state(p) & STATE_LOC_VALID)
+                    continue;
+                if (state(p) & STATE_PROCESSING)
+                    continue;
+                if (!save_bounds_inv.contains(cv::Point(p)))
+                    continue;
+                state(p) |= STATE_PROCESSING;
+                cands.insert(p);
+            }
+            force_retry.clear();
+        }
+
         if (generation % 100 == 0) {
             std::cout << "go with cands " << cands.size() << " inl_th " << curr_best_inl_th << std::endl;
         }
@@ -1921,6 +2211,33 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         std::shared_mutex mutex;
         int best_inliers_gen = 0;
         const int r = 1;
+
+        auto valid_neighbor_count = [&](const cv::Vec2i& p) {
+            int count = 0;
+            for (const auto& n : neighs) {
+                cv::Vec2i pn = p + n;
+                if (point_in_bounds(state, pn) && (state(pn) & STATE_LOC_VALID))
+                    count++;
+            }
+            return count;
+        };
+
+        auto queue_force_retry = [&](const cv::Vec2i& p, int neighbor_count) {
+            if (force_retry_max == 0 || force_retry_min_neighbors == 0)
+                return;
+            if (neighbor_count < force_retry_min_neighbors)
+                return;
+            if (!save_bounds_inv.contains(cv::Point(p)))
+                return;
+            std::lock_guard<std::shared_mutex> lock(mutex);
+            if (force_retry_mark(p))
+                return;
+            if (force_retry_count(p) >= force_retry_max)
+                return;
+            force_retry_mark(p) = 1;
+            force_retry_count(p) = static_cast<uint8_t>(force_retry_count(p) + 1);
+            force_retry.push_back(p);
+        };
 
         auto process_candidate = [&](const cv::Vec2i& p) {
 
@@ -2160,6 +2477,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
                 points(p) = best_coord;
                 hole_retry_count(p) = 0;
+                force_retry_count(p) = 0;
+                force_retry_mark(p) = 0;
                 inliers_sum_dbg(p) = best_inliers;
                 generations(p) = static_cast<uint16_t>(std::min<int>(std::numeric_limits<uint16_t>::max(), generation + 1));
                 if (approved_sm.contains(best_surf)) {
@@ -2269,11 +2588,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 state(p) = 0;
                 points(p) = {-1,-1,-1};
                 generations(p) = 0;
+                queue_force_retry(p, valid_neighbor_count(p));
             }
             else {
                 state(p) = 0;
                 points(p) = {-1,-1,-1};
                 generations(p) = 0;
+                queue_force_retry(p, valid_neighbor_count(p));
 #pragma omp critical
                 best_inliers_gen = std::max(best_inliers_gen, best_inliers);
             }
@@ -2326,6 +2647,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             points.setTo(cv::Vec3d(-1,-1,-1));
             generations.setTo(0);
             hole_retry_count.setTo(0);
+            force_retry_count.setTo(0);
+            force_retry_mark.setTo(0);
+            force_retry.clear();
             cv::Rect new_used_area = used_area;
             for(int j=used_area.y;j<=used_area.br().y+1;j++)
                 for(int i=used_area.x;i<=used_area.br().x+1;i++)
@@ -2389,7 +2713,61 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 // Use original invalid mask to keep true hole geometry.
                 cv::bitwise_and(invalid_orig, outside_inv, holes);
 
+                int edge_pruned = 0;
                 if (cv::countNonZero(holes) > 0) {
+                    if (hole_edge_prune_min_neighbors > 0) {
+                        cv::Mat holes_dilated;
+                        cv::dilate(holes, holes_dilated, cv::getStructuringElement(cv::MORPH_RECT, {3,3}));
+                        cv::Mat hole_adj_valid;
+                        cv::bitwise_and(holes_dilated, valid_mask, hole_adj_valid);
+
+                        std::vector<cv::Vec2i> prune_points;
+                        prune_points.reserve(cv::countNonZero(hole_adj_valid));
+                        for (int y = 0; y < hole_adj_valid.rows; ++y) {
+                            const uint8_t* row = hole_adj_valid.ptr<uint8_t>(y);
+                            for (int x = 0; x < hole_adj_valid.cols; ++x) {
+                                if (!row[x])
+                                    continue;
+                                cv::Vec2i p = {y, x};
+                                if ((state(p) & STATE_LOC_VALID) == 0)
+                                    continue;
+                                int neighbor_count = 0;
+                                for (const auto& n : neighs) {
+                                    cv::Vec2i pn = p + n;
+                                    if (point_in_bounds(state, pn) && (state(pn) & STATE_LOC_VALID))
+                                        neighbor_count++;
+                                }
+                                if (neighbor_count < hole_edge_prune_min_neighbors)
+                                    prune_points.push_back(p);
+                            }
+                        }
+
+                        if (!prune_points.empty()) {
+                            auto clear_point = [&](const cv::Vec2i& p) {
+                                if (state(p) & STATE_LOC_VALID) {
+                                    auto &surfs_here = data.surfs(p);
+                                    for (auto s : surfs_here)
+                                        data.erase(s, p);
+                                    surfs_here.clear();
+                                }
+                                state(p) = 0;
+                                points(p) = {-1,-1,-1};
+                                generations(p) = 0;
+                                inliers_sum_dbg(p) = 0;
+                                hole_retry_count(p) = 0;
+                                force_retry_count(p) = 0;
+                                force_retry_mark(p) = 0;
+                            };
+
+                            for (const auto& p : prune_points) {
+                                clear_point(p);
+                                valid_mask.at<uint8_t>(p[0], p[1]) = 0;
+                                holes.at<uint8_t>(p[0], p[1]) = 255;
+                            }
+                            edge_pruned = static_cast<int>(prune_points.size());
+                        }
+                    }
+
                     cv::Mat eligible_holes(hole_roi.height, hole_roi.width, CV_8U, cv::Scalar(0));
                     int eligible = 0;
                     for (int y = 0; y < hole_roi.height; ++y) {
@@ -2428,6 +2806,155 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                             std::cout << "hole-seal: requeued " << requeued
                                       << " boundary points (" << eligible << " hole pixels)" << std::endl;
                     }
+                }
+                if (edge_pruned > 0) {
+                    for(int i=0;i<omp_get_max_threads();i++) {
+                        data_ths[i] = data;
+                        added_points_threads[i].clear();
+                    }
+                    for (const auto& p : force_retry)
+                        force_retry_mark(p) = 0;
+                    force_retry.clear();
+                    init_area_scan();
+                    std::cout << "hole-edge-prune: removed " << edge_pruned << " points" << std::endl;
+                }
+            }
+        }
+
+        if (disconnect_prune_interval > 0 &&
+            disconnect_window_width > 0 &&
+            generation > 0 &&
+            (generation % disconnect_prune_interval) == 0) {
+            int used_x0 = std::max(0, used_area.x);
+            int used_x1 = std::min(state.cols, used_area.br().x);
+            int available_w = used_x1 - used_x0;
+            int win_w = std::min(disconnect_window_width, available_w);
+            int stride = disconnect_window_stride;
+            if (stride < 1)
+                stride = win_w;
+
+            if (available_w > 0 && win_w > 0) {
+                std::set<cv::Vec2i, Vec2iLess> requeue;
+                int removed_total = 0;
+                int windows_pruned = 0;
+
+                std::array<cv::Vec2i, 8> neigh8 = {{
+                    {1,0},{0,1},{-1,0},{0,-1},
+                    {1,1},{1,-1},{-1,1},{-1,-1}
+                }};
+                cv::Mat disconnect_kernel;
+                if (disconnect_erode_radius > 0) {
+                    disconnect_kernel = cv::getStructuringElement(
+                        cv::MORPH_RECT,
+                        cv::Size(disconnect_erode_radius * 2 + 1, disconnect_erode_radius * 2 + 1));
+                }
+
+                auto clear_point = [&](const cv::Vec2i& p) {
+                    if (state(p) & STATE_LOC_VALID) {
+                        auto &surfs_here = data.surfs(p);
+                        for (auto s : surfs_here)
+                            data.erase(s, p);
+                        surfs_here.clear();
+                    }
+                    state(p) = 0;
+                    points(p) = {-1,-1,-1};
+                    generations(p) = 0;
+                    inliers_sum_dbg(p) = 0;
+                    hole_retry_count(p) = 0;
+                    force_retry_count(p) = 0;
+                    force_retry_mark(p) = 0;
+                };
+
+                auto process_window = [&](int x_start) {
+                    cv::Mat mask(state.rows, win_w, CV_8U, cv::Scalar(0));
+                    for (int y = 0; y < state.rows; ++y) {
+                        uint8_t* row = mask.ptr<uint8_t>(y);
+                        for (int x = 0; x < win_w; ++x) {
+                            if (state(y, x_start + x) & STATE_LOC_VALID)
+                                row[x] = 255;
+                        }
+                    }
+
+                    cv::Mat mask_cc;
+                    if (disconnect_erode_radius > 0)
+                        cv::erode(mask, mask_cc, disconnect_kernel);
+                    else
+                        mask_cc = mask;
+
+                    cv::Mat labels;
+                    int nlabels = cv::connectedComponents(mask_cc, labels, 8, CV_32S);
+                    if (nlabels <= 2)
+                        return;
+
+                    std::vector<int> counts(nlabels, 0);
+                    for (int y = 0; y < labels.rows; ++y) {
+                        const int* row = labels.ptr<int>(y);
+                        for (int x = 0; x < labels.cols; ++x) {
+                            int label = row[x];
+                            if (label > 0)
+                                counts[label]++;
+                        }
+                    }
+
+                    int keep_label = 1;
+                    for (int label = 2; label < nlabels; ++label)
+                        if (counts[label] > counts[keep_label])
+                            keep_label = label;
+
+                    cv::Mat keep_mask = (labels == keep_label);
+                    if (disconnect_erode_radius > 0)
+                        cv::dilate(keep_mask, keep_mask, disconnect_kernel);
+
+                    bool any_removed = false;
+                    for (int y = 0; y < labels.rows; ++y) {
+                        const uint8_t* keep_row = keep_mask.ptr<uint8_t>(y);
+                        for (int x = 0; x < labels.cols; ++x) {
+                            if (!mask.at<uint8_t>(y, x))
+                                continue;
+                            if (keep_row[x])
+                                continue;
+                            cv::Vec2i p = {y, x_start + x};
+                            if ((state(p) & STATE_LOC_VALID) == 0)
+                                continue;
+                            clear_point(p);
+                            removed_total++;
+                            any_removed = true;
+                            for (const auto& n : neigh8) {
+                                cv::Vec2i pn = p + n;
+                                if (!point_in_bounds(state, pn))
+                                    continue;
+                                if (state(pn) & STATE_LOC_VALID)
+                                    requeue.insert(pn);
+                            }
+                        }
+                    }
+                    if (any_removed)
+                        windows_pruned++;
+                };
+
+                int last_start = -1;
+                for (int x = used_x0; x + win_w <= used_x1; x += stride) {
+                    process_window(x);
+                    last_start = x;
+                }
+                int final_start = used_x1 - win_w;
+                if (final_start >= used_x0 && final_start != last_start)
+                    process_window(final_start);
+
+                if (removed_total > 0) {
+                    for (const auto& p : requeue)
+                        fringe.insert(p);
+                    for(int i=0;i<omp_get_max_threads();i++) {
+                        data_ths[i] = data;
+                        added_points_threads[i].clear();
+                    }
+                    for (const auto& p : force_retry)
+                        force_retry_mark(p) = 0;
+                    force_retry.clear();
+                    init_area_scan();
+                    std::cout << "disconnect-prune: removed " << removed_total
+                              << " points across " << windows_pruned
+                              << " windows; requeued " << requeue.size() << std::endl;
                 }
             }
         }
@@ -2517,14 +3044,17 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 opt_state(active).copyTo(state(active));
                 opt_generations(active).copyTo(generations(active));
                 for (int j = active.y; j < active.br().y; ++j)
-                    for (int i = active.x; i < active.br().x; ++i)
-                        if (state(j, i) & STATE_LOC_VALID)
-                            hole_retry_count(j, i) = 0;
+                    for (int i = active.x; i < active.br().x; ++i) {
+                        hole_retry_count(j, i) = 0;
+                        force_retry_count(j, i) = 0;
+                        force_retry_mark(j, i) = 0;
+                    }
 
                 for(int i=0;i<omp_get_max_threads();i++) {
                     data_ths[i] = data;
                     added_points_threads[i].resize(0);
                 }
+                force_retry.clear();
                 // After remap, geometry/states may have changed -> recompute area mask/accumulator
                 init_area_scan();
             }
@@ -2579,6 +3109,14 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             cv::Mat_<uint8_t> old_hole_retry_count = hole_retry_count;
             hole_retry_count = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
             old_hole_retry_count.copyTo(hole_retry_count(cv::Rect(0,0,old_hole_retry_count.cols,h)));
+
+            cv::Mat_<uint8_t> old_force_retry_count = force_retry_count;
+            force_retry_count = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
+            old_force_retry_count.copyTo(force_retry_count(cv::Rect(0,0,old_force_retry_count.cols,h)));
+
+            cv::Mat_<uint8_t> old_force_retry_mark = force_retry_mark;
+            force_retry_mark = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
+            old_force_retry_mark.copyTo(force_retry_mark(cv::Rect(0,0,old_force_retry_mark.cols,h)));
 
             int overlap = 5;
             active_bounds = {w-sliding_w-2*closing_r-10-overlap,closing_r+5,sliding_w+2*closing_r+10+overlap,h-closing_r-10};
