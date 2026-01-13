@@ -317,13 +317,15 @@ def create_scale_bar_tiles(
     """
     # Calculate scale bar dimensions in pixels
     scale_bar_width_px = int(scale_bar_length_um / pixel_resolution_um)
-    bar_thickness = 25  # pixels - main bar thickness
-    tick_height = 75  # pixels - tick mark height (5x taller)
+    line_thickness = 4  # pixels - uniform thickness for all lines (bar and ticks)
+    tick_height_major = 60  # pixels - height for major ticks (0 and end), symmetric around bar
+    tick_height_medium = 40  # pixels - height for medium ticks (middle)
+    tick_height_minor = 25  # pixels - height for minor ticks (others)
     text_height = 25  # pixels for font
 
     # Font settings
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.8
+    font_scale = 0.7
     font_thickness = 2
 
     # Calculate tick mark interval (1mm for mm scale, 100um for um scale)
@@ -372,7 +374,7 @@ def create_scale_bar_tiles(
 
     # Calculate total box dimensions
     box_width = scale_bar_width_px + 2 * padding
-    box_height = tick_height + bar_thickness + text_height + 3 * padding  # top tick, bar, text, spacing
+    box_height = tick_height_major + text_height + 3 * padding  # major tick (symmetric), text, spacing
 
     # Check if scale bar would exceed image width - if so, scale it down
     max_allowed_width = image_w - 2 * padding
@@ -445,29 +447,39 @@ def create_scale_bar_tiles(
                   (bg_box_x + bg_box_w, bg_box_y + bg_box_h),
                   255, -1)
 
-    # Draw main horizontal white bar
+    # Draw main horizontal white bar (centered vertically in the major tick area)
     bar_x = bg_box_x
-    bar_y = bg_box_y + tick_height
-    cv2.rectangle(scale_bar_canvas,
-                  (bar_x, bar_y),
-                  (bar_x + scale_bar_width_px, bar_y + bar_thickness),
-                  255, -1)
+    bar_y = bg_box_y + tick_height_major // 2  # Center the bar in the middle of major tick area
+    cv2.line(scale_bar_canvas,
+             (bar_x, bar_y),
+             (bar_x + scale_bar_width_px, bar_y),
+             255, line_thickness, cv2.LINE_AA)
 
-    # Draw tick marks at regular intervals
-    tick_width = 3  # pixels
+    # Draw tick marks at regular intervals with different heights
     num_intervals = int(scale_bar_length_um / tick_interval_um)
 
     for i in range(num_intervals + 1):
         tick_x = bar_x + int((i * tick_interval_um / scale_bar_length_um) * scale_bar_width_px)
 
-        # Draw vertical tick mark
-        cv2.rectangle(scale_bar_canvas,
-                      (tick_x - tick_width // 2, bar_y - tick_height),
-                      (tick_x + tick_width // 2, bar_y + bar_thickness),
-                      255, -1)
+        # Determine tick height based on position
+        if i == 0 or i == num_intervals:
+            # Major ticks at start and end
+            half_tick_height = tick_height_major // 2
+        elif i == num_intervals // 2:
+            # Medium tick at middle
+            half_tick_height = tick_height_medium // 2
+        else:
+            # Minor ticks everywhere else
+            half_tick_height = tick_height_minor // 2
 
-    # Draw text labels below bar for all ticks
-    label_y = bar_y + bar_thickness + text_height
+        # Draw vertical tick mark symmetrically around the bar
+        cv2.line(scale_bar_canvas,
+                 (tick_x, bar_y - half_tick_height),
+                 (tick_x, bar_y + half_tick_height),
+                 255, line_thickness, cv2.LINE_AA)
+
+    # Draw text labels below the bar
+    label_y = bar_y + tick_height_major // 2 + text_height
 
     for tick_x_offset, label, alignment in labels_with_positions:
         tick_x_abs = bar_x + tick_x_offset
