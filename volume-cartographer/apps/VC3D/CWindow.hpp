@@ -8,6 +8,7 @@
 #include <QCheckBox>
 #include <QFutureWatcher>
 #include <QPointF>
+#include <QElapsedTimer>
 #include <memory>
 #include <vector>
 #include <deque>
