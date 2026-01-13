@@ -10,6 +10,7 @@
 #include <opencv2/core/types.hpp>
 
 #include <ceres/ceres.h>
+#include <omp.h>
 
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -132,6 +133,38 @@ struct PlyWriter {
 
         std::error_code ec;
         fs::remove(tmp_edges_path, ec);
+    }
+
+    // Helpers for manual streaming/merge (avoid making internals public).
+    void append_vertex_lines_from_file(const fs::path& vtx_file, size_t vtx_count_to_add) {
+        std::ifstream in(vtx_file, std::ios::in);
+        if (!in) {
+            throw std::runtime_error("Failed to open temp vertex file for merge: " + vtx_file.string());
+        }
+        out << in.rdbuf();
+        vertex_count += vtx_count_to_add;
+        next_vertex_idx += static_cast<uint32_t>(vtx_count_to_add);
+    }
+
+    void append_edge_lines_from_file_with_offset(const fs::path& edg_file, size_t vtx_offset, size_t edg_count_to_add) {
+        std::ifstream in(edg_file, std::ios::in);
+        if (!in) {
+            throw std::runtime_error("Failed to open temp edge file for merge: " + edg_file.string());
+        }
+        std::string line;
+        size_t got = 0;
+        while (got < edg_count_to_add && std::getline(in, line)) {
+            size_t a = 0, b = 0;
+            if (sscanf(line.c_str(), "%zu %zu", &a, &b) != 2) {
+                throw std::runtime_error("Invalid edge line in temp edge file: " + edg_file.string());
+            }
+            edges_out << (a + vtx_offset) << " " << (b + vtx_offset) << "\n";
+            ++got;
+        }
+        if (got != edg_count_to_add) {
+            throw std::runtime_error("Truncated temp edge file for merge: " + edg_file.string());
+        }
+        edge_count += edg_count_to_add;
     }
 
 private:
@@ -396,8 +429,9 @@ static bool fit_normal_ceres(const std::vector<cv::Point3f>& dirs_unit, cv::Poin
         n);
 
     ceres::Solver::Options opts;
-    opts.linear_solver_type = ceres::DENSE_QR;
-    opts.max_num_iterations = 50;
+    // opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    opts.linear_solver_type = ceres::SPARSE_SCHUR;
+    opts.max_num_iterations = 1000;
     opts.minimizer_progress_to_stdout = false;
 
     ceres::Solver::Summary summary;
@@ -485,8 +519,31 @@ static void run_fit_normals(
                   std::numeric_limits<int>::max() / 4),
     });
 
-    PlyWriter ply(out_ply);
-    ply.begin_ascii_streaming();
+    // We parallelize fitting across sample points.
+    // To avoid locking output, each thread writes raw vertices/edges to its own temp files.
+    // We keep per-thread counts while writing, then merge into the requested PLY without parsing PLY.
+    const int nthreads = std::max(1, omp_get_max_threads());
+    struct ThreadOut {
+        fs::path vtx_path;
+        fs::path edg_path;
+        std::ofstream vtx;
+        std::ofstream edg;
+        size_t vtx_count = 0;
+        size_t edg_count = 0;
+    };
+    std::vector<ThreadOut> t_out(static_cast<size_t>(nthreads));
+    for (int t = 0; t < nthreads; ++t) {
+        t_out[t].vtx_path = out_ply;
+        t_out[t].vtx_path += ".normals.vtx.part" + std::to_string(t);
+        t_out[t].edg_path = out_ply;
+        t_out[t].edg_path += ".normals.edg.part" + std::to_string(t);
+        t_out[t].vtx.open(t_out[t].vtx_path, std::ios::out | std::ios::trunc);
+        t_out[t].edg.open(t_out[t].edg_path, std::ios::out | std::ios::trunc);
+        if (!t_out[t].vtx || !t_out[t].edg) {
+            throw std::runtime_error("Failed to open temp normal output files for thread " + std::to_string(t));
+        }
+    }
+
     const cv::Vec3b color_bgr(0, 255, 255); // yellow
 
     struct PlaneCfg {
@@ -516,9 +573,26 @@ static void run_fit_normals(
     const auto t0 = std::chrono::steady_clock::now();
     auto t_last = t0;
 
+    auto report_progress = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - t0).count();
+        const double rate = (elapsed > 1e-9) ? (static_cast<double>(processed) / elapsed) : 0.0;
+        const double rem = static_cast<double>(std::max<int64_t>(0, total_samples - processed));
+        const double eta = (rate > 1e-9) ? (rem / rate) : 0.0;
+        std::cerr << "fit-normals: " << processed << "/" << total_samples
+                  << " (written " << written << ")"
+                  << " | elapsed " << elapsed << "s"
+                  << " | rate " << rate << " samples/s"
+                  << " | ETA " << eta << "s\n";
+    };
+
+    #pragma omp parallel for collapse(3) schedule(dynamic,1)
     for (int z = sz0; z < crop.max[2]; z += step) {
         for (int y = sy0; y < crop.max[1]; y += step) {
             for (int x = sx0; x < crop.max[0]; x += step) {
+                const int tid = omp_get_thread_num();
+                ThreadOut& tout = t_out[static_cast<size_t>(tid)];
+
                 const cv::Point3f sample(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                 const float sample_arr[3] = {sample.x, sample.y, sample.z};
 
@@ -580,34 +654,83 @@ static void run_fit_normals(
                 }
 
                 cv::Point3f n;
-                if (!fit_normal_ceres(dirs_unit, n)) {
-                    ++processed;
-                } else {
+                const bool ok = fit_normal_ceres(dirs_unit, n);
+                if (ok) {
                     const cv::Point3f a = sample;
                     const cv::Point3f b = sample + normal_vis_scale * n;
-                    ply.write_segment_streaming(a, b, color_bgr);
-                    ++processed;
-                    ++written;
+                    const int r = static_cast<int>(color_bgr[2]);
+                    const int g = static_cast<int>(color_bgr[1]);
+                    const int bc = static_cast<int>(color_bgr[0]);
+
+                    const size_t idx0 = tout.vtx_count;
+                    const size_t idx1 = tout.vtx_count + 1;
+                    tout.vtx << a.x << " " << a.y << " " << a.z << " " << r << " " << g << " " << bc << "\n";
+                    tout.vtx << b.x << " " << b.y << " " << b.z << " " << r << " " << g << " " << bc << "\n";
+                    tout.edg << idx0 << " " << idx1 << "\n";
+                    tout.vtx_count += 2;
+                    tout.edg_count += 1;
                 }
 
+                #pragma omp atomic
+                processed += 1;
+                if (ok) {
+                    #pragma omp atomic
+                    written += 1;
+                }
+
+                // Only one thread reports.
                 const auto now = std::chrono::steady_clock::now();
-                if (now - t_last >= std::chrono::seconds(2)) {
-                    const double elapsed = std::chrono::duration<double>(now - t0).count();
-                    const double rate = (elapsed > 1e-9) ? (static_cast<double>(processed) / elapsed) : 0.0;
-                    const double rem = static_cast<double>(std::max<int64_t>(0, total_samples - processed));
-                    const double eta = (rate > 1e-9) ? (rem / rate) : 0.0;
-                    std::cerr << "fit-normals: " << processed << "/" << total_samples
-                              << " (written " << written << ")"
-                              << " | elapsed " << elapsed << "s"
-                              << " | rate " << rate << " samples/s"
-                              << " | ETA " << eta << "s\n";
-                    t_last = now;
+                if (tid == 0 && now - t_last >= std::chrono::seconds(2)) {
+                    #pragma omp critical
+                    {
+                        const auto now2 = std::chrono::steady_clock::now();
+                        if (now2 - t_last >= std::chrono::seconds(2)) {
+                            report_progress();
+                            t_last = now2;
+                        }
+                    }
                 }
             }
         }
     }
 
-    ply.end_streaming();
+    // Close per-thread temp files before merge.
+    for (auto& to : t_out) {
+        to.vtx.close();
+        to.edg.close();
+    }
+
+    // Merge into a single PLY (streaming).
+    size_t total_v = 0;
+    size_t total_e = 0;
+    for (const auto& to : t_out) {
+        total_v += to.vtx_count;
+        total_e += to.edg_count;
+    }
+
+    PlyWriter merged(out_ply);
+    merged.begin_ascii_streaming();
+
+    // Write vertices by concatenating temp vertex files.
+    for (const auto& to : t_out) {
+        merged.append_vertex_lines_from_file(to.vtx_path, to.vtx_count);
+    }
+
+    // Write edges with per-thread vertex offset.
+    size_t vtx_offset = 0;
+    for (const auto& to : t_out) {
+        merged.append_edge_lines_from_file_with_offset(to.edg_path, vtx_offset, to.edg_count);
+        vtx_offset += to.vtx_count;
+    }
+
+    merged.end_streaming();
+
+    // Cleanup temp files.
+    for (const auto& to : t_out) {
+        std::error_code ec;
+        fs::remove(to.vtx_path, ec);
+        fs::remove(to.edg_path, ec);
+    }
 }
 
 } // namespace
