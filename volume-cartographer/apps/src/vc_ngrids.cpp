@@ -24,7 +24,7 @@ static void print_usage() {
         << "  -h, --help              Print this help message\n"
         << "  -i, --input PATH        Input NormalGridVolume directory (required)\n"
         << "  -c, --crop x0 y0 z0 x1 y1 z1   Crop bounding box in voxel coords (half-open)\n"
-        << "      --vis-obj PATH      Write visualization as OBJ (vertices + polyline edges)\n\n"
+        << "      --vis-ply PATH      Write visualization as PLY with vertex colors\n\n"
         << "Notes:\n"
         << "  - Input is the directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
         << "  - Crop is optional; if omitted the full extent from metadata/available grids is used.\n";
@@ -49,42 +49,79 @@ static CropBox3i crop_from_args(const std::vector<int>& v) {
     return c;
 }
 
-struct ObjWriter {
-    explicit ObjWriter(const fs::path& path) : out(path) {
+struct PlyWriter {
+    struct Vtx {
+        float x, y, z;
+        uint8_t r, g, b;
+    };
+
+    explicit PlyWriter(const fs::path& path) : path(path) {}
+
+    void write_polyline(const std::vector<cv::Point3f>& pts, const cv::Vec3b& color) {
+        if (pts.size() < 2) return;
+
+        const size_t base = vertices.size();
+        vertices.reserve(vertices.size() + pts.size());
+        edges.reserve(edges.size() + (pts.size() - 1));
+
+        for (const auto& p : pts) {
+            vertices.push_back(Vtx{
+                p.x,
+                p.y,
+                p.z,
+                color[2], // OpenCV Vec3b is BGR; PLY expects RGB
+                color[1],
+                color[0],
+            });
+        }
+
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            edges.emplace_back(static_cast<uint32_t>(base + i), static_cast<uint32_t>(base + i + 1));
+        }
+    }
+
+    void flush_ascii() const {
+        std::ofstream out(path);
         if (!out) {
             throw std::runtime_error("Failed to open output file for writing: " + path.string());
         }
-        out << "# vc_ngrids visualization\n";
+
+        out << "ply\n";
+        out << "format ascii 1.0\n";
+        out << "comment vc_ngrids visualization\n";
+        out << "element vertex " << vertices.size() << "\n";
+        out << "property float x\n";
+        out << "property float y\n";
+        out << "property float z\n";
+        out << "property uchar red\n";
+        out << "property uchar green\n";
+        out << "property uchar blue\n";
+        out << "element edge " << edges.size() << "\n";
+        out << "property int vertex1\n";
+        out << "property int vertex2\n";
+        out << "end_header\n";
+
+        for (const auto& v : vertices) {
+            out << v.x << " " << v.y << " " << v.z << " "
+                << static_cast<int>(v.r) << " " << static_cast<int>(v.g) << " " << static_cast<int>(v.b) << "\n";
+        }
+        for (const auto& e : edges) {
+            out << e.first << " " << e.second << "\n";
+        }
     }
 
-    void write_polyline(const std::vector<cv::Point3f>& pts) {
-        if (pts.size() < 2) return;
-
-        std::vector<size_t> idx;
-        idx.reserve(pts.size());
-
-        for (const auto& p : pts) {
-            out << "v " << p.x << " " << p.y << " " << p.z << "\n";
-            idx.push_back(++vtx_count);
-        }
-
-        out << "l";
-        for (const auto i : idx) {
-            out << " " << i;
-        }
-        out << "\n";
-    }
-
-    std::ofstream out;
-    size_t vtx_count = 0;
+    fs::path path;
+    std::vector<Vtx> vertices;
+    std::vector<std::pair<uint32_t, uint32_t>> edges;
 };
 
-static void add_gridstore_paths_as_obj_polylines(
-    ObjWriter& obj,
+static void add_gridstore_paths_as_ply_polylines(
+    PlyWriter& ply,
     const vc::core::util::GridStore& grid,
     int plane_idx,
     int slice_idx,
-    const CropBox3i& crop) {
+    const CropBox3i& crop,
+    const cv::Vec3b& color_bgr) {
     const auto paths = grid.get_all();
     for (const auto& path_ptr : paths) {
         if (!path_ptr || path_ptr->size() < 2) continue;
@@ -93,22 +130,15 @@ static void add_gridstore_paths_as_obj_polylines(
         pts.reserve(path_ptr->size());
 
         for (const auto& p2 : *path_ptr) {
-            // GridStore coordinates are 2D pixel coords within the slice image.
-            // We map them back into a 3D voxel coordinate depending on plane.
-            // Dataset axis convention in vc_gen_normalgrids is assumed: (z,y,x).
             cv::Point3f p3;
             if (plane_idx == 0) {
-                // xy: fixed z
                 p3 = cv::Point3f(static_cast<float>(p2.x), static_cast<float>(p2.y), static_cast<float>(slice_idx));
             } else if (plane_idx == 1) {
-                // xz: fixed y
                 p3 = cv::Point3f(static_cast<float>(p2.x), static_cast<float>(slice_idx), static_cast<float>(p2.y));
             } else {
-                // yz: fixed x
                 p3 = cv::Point3f(static_cast<float>(slice_idx), static_cast<float>(p2.x), static_cast<float>(p2.y));
             }
 
-            // Optional crop filtering (in 3D).
             if (p3.x < crop.min.x || p3.y < crop.min.y || p3.z < crop.min.z) continue;
             if (p3.x >= crop.max.x) continue;
             if (p3.y >= crop.max.y) continue;
@@ -118,7 +148,7 @@ static void add_gridstore_paths_as_obj_polylines(
         }
 
         if (pts.size() >= 2) {
-            obj.write_polyline(pts);
+            ply.write_polyline(pts, color_bgr);
         }
     }
 }
@@ -141,11 +171,10 @@ static int align_down(int v, int step) {
     return -(((-v + step - 1) / step) * step);
 }
 
-static void run_vis_obj(const fs::path& input_dir, const fs::path& out_obj, const std::optional<CropBox3i>& crop_opt) {
+static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, const std::optional<CropBox3i>& crop_opt) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
-    // If no crop provided, use a permissive default. (We still only iterate slices that exist.)
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Point3i(0, 0, 0),
         cv::Point3i(std::numeric_limits<int>::max() / 4,
@@ -153,18 +182,18 @@ static void run_vis_obj(const fs::path& input_dir, const fs::path& out_obj, cons
                     std::numeric_limits<int>::max() / 4),
     });
 
-    ObjWriter obj(out_obj);
+    PlyWriter ply(out_ply);
 
     struct PlaneCfg {
         int plane_idx;
         const char* dir;
-        // which crop axis is the slice axis: 0=x,1=y,2=z
         int slice_axis;
+        cv::Vec3b color_bgr;
     };
     const PlaneCfg planes[3] = {
-        {0, "xy", 2},
-        {1, "xz", 1},
-        {2, "yz", 0},
+        {0, "xy", 2, cv::Vec3b(0, 0, 255)},   // red
+        {1, "xz", 1, cv::Vec3b(0, 255, 0)},   // green
+        {2, "yz", 0, cv::Vec3b(255, 0, 0)},   // blue
     };
 
     for (const auto& pc : planes) {
@@ -176,9 +205,11 @@ static void run_vis_obj(const fs::path& input_dir, const fs::path& out_obj, cons
         for (int slice = slice_start; slice < crop_max; slice += std::max(1, sparse_volume)) {
             auto grid = try_load_grid(input_dir, pc.dir, slice);
             if (!grid) continue;
-            add_gridstore_paths_as_obj_polylines(obj, *grid, pc.plane_idx, slice, crop);
+            add_gridstore_paths_as_ply_polylines(ply, *grid, pc.plane_idx, slice, crop, pc.color_bgr);
         }
     }
+
+    ply.flush_ascii();
 }
 
 } // namespace
@@ -189,7 +220,7 @@ int main(int argc, char** argv) {
         ("help,h", "Print help")
         ("input,i", po::value<std::string>()->required(), "Input NormalGridVolume directory")
         ("crop,c", po::value<std::vector<int>>()->multitoken(), "Crop x0 y0 z0 x1 y1 z1")
-        ("vis-obj", po::value<std::string>(), "Write visualization OBJ file");
+        ("vis-ply", po::value<std::string>(), "Write visualization PLY file (with colors)");
 
     po::variables_map vm;
     try {
@@ -220,12 +251,12 @@ int main(int argc, char** argv) {
         crop = crop_from_args(vm["crop"].as<std::vector<int>>());
     }
 
-    if (vm.count("vis-obj")) {
-        run_vis_obj(input_dir, fs::path(vm["vis-obj"].as<std::string>()), crop);
+    if (vm.count("vis-ply")) {
+        run_vis_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
         return 0;
     }
 
-    std::cerr << "Error: no output specified. Use --vis-obj.\n\n";
+    std::cerr << "Error: no output specified. Use --vis-ply.\n\n";
     print_usage();
     return 1;
 }
