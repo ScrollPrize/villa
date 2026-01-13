@@ -114,7 +114,7 @@ target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 
 # Read / visualize NormalGridVolume
 add_executable(vc_ngrids src/vc_ngrids.cpp)
-target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres)
+target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
 
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
