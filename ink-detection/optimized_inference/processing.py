@@ -317,24 +317,62 @@ def create_scale_bar_tiles(
     """
     # Calculate scale bar dimensions in pixels
     scale_bar_width_px = int(scale_bar_length_um / pixel_resolution_um)
-    bar_height = 10  # pixels
-    text_height = 20  # pixels for font
+    bar_thickness = 25  # pixels - main bar thickness
+    tick_height = 75  # pixels - tick mark height (5x taller)
+    text_height = 25  # pixels for font
 
-    # Format scale bar label
-    if scale_bar_length_um >= 1000:
-        label = f"{scale_bar_length_um/1000:.0f}mm"
-    else:
-        label = f"{scale_bar_length_um:.0f}um"
-
-    # Calculate text dimensions
+    # Font settings
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
+    font_scale = 0.8
     font_thickness = 2
-    (text_width, text_baseline), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+
+    # Calculate tick mark interval (1mm for mm scale, 100um for um scale)
+    if scale_bar_length_um >= 1000:
+        tick_interval_um = 1000  # 1mm
+        unit = "mm"
+    else:
+        tick_interval_um = 100  # 100um
+        unit = "um"
+
+    # Generate labels for each tick mark
+    num_intervals = int(scale_bar_length_um / tick_interval_um)
+    labels_with_positions = []
+
+    for i in range(num_intervals + 1):
+        # Position of this tick
+        tick_x = int((i * tick_interval_um / scale_bar_length_um) * scale_bar_width_px)
+
+        # Generate label
+        if i == 0:
+            label = "0"
+        elif i == num_intervals:
+            # Last tick - show value with unit
+            value = scale_bar_length_um / (1000.0 if unit == "mm" else 1.0)
+            if value == int(value):
+                label = f"{int(value)}{unit}"
+            else:
+                label = f"{value:.1f}{unit}"
+        else:
+            # Middle ticks - just show the number
+            value = i * tick_interval_um / (1000.0 if unit == "mm" else 1.0)
+            if value == int(value):
+                label = f"{int(value)}"
+            else:
+                label = f"{value:.1f}"
+
+        # Determine alignment
+        if i == 0:
+            alignment = "left"
+        elif i == num_intervals:
+            alignment = "right"
+        else:
+            alignment = "center"
+
+        labels_with_positions.append((tick_x, label, alignment))
 
     # Calculate total box dimensions
-    box_width = max(scale_bar_width_px, text_width) + 2 * padding
-    box_height = bar_height + text_height + 3 * padding  # top, middle, bottom spacing
+    box_width = scale_bar_width_px + 2 * padding
+    box_height = tick_height + bar_thickness + text_height + 3 * padding  # top tick, bar, text, spacing
 
     # Check if scale bar would exceed image width - if so, scale it down
     max_allowed_width = image_w - 2 * padding
@@ -344,14 +382,34 @@ def create_scale_bar_tiles(
         scale_bar_length_um = scale_bar_length_um * scale_factor
         scale_bar_width_px = int(scale_bar_length_um / pixel_resolution_um)
 
-        # Recalculate label and dimensions
+        # Recalculate labels and tick interval
         if scale_bar_length_um >= 1000:
-            label = f"{scale_bar_length_um/1000:.1f}mm"
+            tick_interval_um = 1000  # 1mm
+            unit = "mm"
         else:
-            label = f"{scale_bar_length_um:.0f}um"
-        (text_width, text_baseline), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
-        box_width = max(scale_bar_width_px, text_width) + 2 * padding
+            tick_interval_um = 100  # 100um
+            unit = "um"
 
+        # Regenerate labels for each tick mark
+        num_intervals = int(scale_bar_length_um / tick_interval_um)
+        labels_with_positions = []
+
+        for i in range(num_intervals + 1):
+            tick_x = int((i * tick_interval_um / scale_bar_length_um) * scale_bar_width_px)
+
+            if i == 0:
+                label = "0"
+            elif i == num_intervals:
+                value = scale_bar_length_um / (1000.0 if unit == "mm" else 1.0)
+                label = f"{int(value)}{unit}" if value == int(value) else f"{value:.1f}{unit}"
+            else:
+                value = i * tick_interval_um / (1000.0 if unit == "mm" else 1.0)
+                label = f"{int(value)}" if value == int(value) else f"{value:.1f}"
+
+            alignment = "left" if i == 0 else ("right" if i == num_intervals else "center")
+            labels_with_positions.append((tick_x, label, alignment))
+
+        box_width = scale_bar_width_px + 2 * padding
         logger.warning(f"Scale bar too wide for image, scaled down to {scale_bar_length_um:.0f}um")
 
     # Calculate how many horizontal tiles we need
@@ -371,31 +429,61 @@ def create_scale_bar_tiles(
     box_y = padding
 
     # Draw black background box on scale bar canvas
+    bg_box_x = box_x
+    bg_box_y = box_y
+    bg_box_w = scale_bar_width_px
+    bg_box_h = box_height - 2 * padding
+
     cv2.rectangle(scale_bar_canvas,
-                  (box_x, box_y),
-                  (box_x + box_width - 2 * padding, box_y + box_height - 2 * padding),
+                  (bg_box_x, bg_box_y),
+                  (bg_box_x + bg_box_w, bg_box_y + bg_box_h),
                   0, -1)
 
     # Mark the same region in mask canvas
     cv2.rectangle(mask_canvas,
-                  (box_x, box_y),
-                  (box_x + box_width - 2 * padding, box_y + box_height - 2 * padding),
+                  (bg_box_x, bg_box_y),
+                  (bg_box_x + bg_box_w, bg_box_y + bg_box_h),
                   255, -1)
 
-    # Draw white scale bar (centered horizontally in box)
-    bar_x = box_x + (box_width - 2 * padding - scale_bar_width_px) // 2
-    bar_y = box_y + padding
+    # Draw main horizontal white bar
+    bar_x = bg_box_x
+    bar_y = bg_box_y + tick_height
     cv2.rectangle(scale_bar_canvas,
                   (bar_x, bar_y),
-                  (bar_x + scale_bar_width_px, bar_y + bar_height),
+                  (bar_x + scale_bar_width_px, bar_y + bar_thickness),
                   255, -1)
 
-    # Draw white text below bar (centered)
-    text_x = box_x + (box_width - 2 * padding - text_width) // 2
-    text_y = bar_y + bar_height + text_height + padding // 2
-    cv2.putText(scale_bar_canvas, label,
-                (text_x, text_y),
-                font, font_scale, 255, font_thickness, cv2.LINE_AA)
+    # Draw tick marks at regular intervals
+    tick_width = 3  # pixels
+    num_intervals = int(scale_bar_length_um / tick_interval_um)
+
+    for i in range(num_intervals + 1):
+        tick_x = bar_x + int((i * tick_interval_um / scale_bar_length_um) * scale_bar_width_px)
+
+        # Draw vertical tick mark
+        cv2.rectangle(scale_bar_canvas,
+                      (tick_x - tick_width // 2, bar_y - tick_height),
+                      (tick_x + tick_width // 2, bar_y + bar_thickness),
+                      255, -1)
+
+    # Draw text labels below bar for all ticks
+    label_y = bar_y + bar_thickness + text_height
+
+    for tick_x_offset, label, alignment in labels_with_positions:
+        tick_x_abs = bar_x + tick_x_offset
+        (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
+
+        # Calculate x position based on alignment
+        if alignment == "left":
+            text_x = tick_x_abs
+        elif alignment == "center":
+            text_x = tick_x_abs - text_w // 2
+        else:  # right
+            text_x = tick_x_abs - text_w
+
+        cv2.putText(scale_bar_canvas, label,
+                    (text_x, label_y),
+                    font, font_scale, 255, font_thickness, cv2.LINE_AA)
 
     # Split both canvases into tiles
     scale_bar_tiles = []
