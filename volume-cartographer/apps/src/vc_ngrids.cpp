@@ -15,6 +15,14 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
+#include "z5/factory.hxx"
+#include "z5/dataset.hxx"
+#include "z5/multiarray/xtensor_access.hxx"
+#include "z5/filesystem/handle.hxx"
+
+#include "vc/core/util/xtensor_include.hpp"
+#include XTENSORINCLUDE(containers, xadapt.hpp)
+
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
@@ -31,6 +39,7 @@ static void print_usage() {
         << "      --vis-ply PATH      Write visualization as PLY with vertex colors\n"
         << "      --fit-normals       Estimate local 3D normals from segments (within crop)\n"
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
+        << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n\n"
         << "Notes:\n"
         << "  - Input is the directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
         << "  - Crop is optional; if omitted the full extent from metadata/available grids is used.\n";
@@ -40,6 +49,15 @@ struct CropBox3i {
     cv::Vec3i min; // inclusive
     cv::Vec3i max; // exclusive
 };
+
+static inline uint8_t encode_dir_component(float v) {
+    // Match direction-field encoding used by Chunked3dVec3fFromUint8:
+    // decode: (u8 - 128) / 127 -> [-1, 1]
+    if (!std::isfinite(v)) return 128;
+    v = std::max(-1.0f, std::min(1.0f, v));
+    const int q = static_cast<int>(std::lround(v * 127.0f + 128.0f));
+    return static_cast<uint8_t>(std::max(0, std::min(255, q)));
+}
 
 static CropBox3i crop_from_args(const std::vector<int>& v) {
     // v = {x0,y0,z0,x1,y1,z1}
@@ -507,6 +525,7 @@ static void run_fit_normals(
     const fs::path& input_dir,
     const fs::path& out_ply,
     const std::optional<CropBox3i>& crop_opt,
+    const std::optional<fs::path>& out_zarr_opt,
     int step = 64,
     float radius = 96.f) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
@@ -568,6 +587,18 @@ static void run_fit_normals(
     const int ny = (crop.max[1] - sy0 + step - 1) / step;
     const int nz = (crop.max[2] - sz0 + step - 1) / step;
     const int64_t total_samples = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) * static_cast<int64_t>(nz);
+
+    // Optional output: store fitted normals on the sample lattice.
+    // Encoding matches direction-field zarrs: 3 uint8 volumes x,y,z, decoded as (v-128)/127.
+    std::vector<uint8_t> enc_x;
+    std::vector<uint8_t> enc_y;
+    std::vector<uint8_t> enc_z;
+    if (out_zarr_opt.has_value()) {
+        const size_t n = static_cast<size_t>(std::max<int64_t>(0, total_samples));
+        enc_x.assign(n, 128);
+        enc_y.assign(n, 128);
+        enc_z.assign(n, 128);
+    }
     int64_t processed = 0;
     int64_t written = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -669,6 +700,16 @@ static void run_fit_normals(
                     tout.edg << idx0 << " " << idx1 << "\n";
                     tout.vtx_count += 2;
                     tout.edg_count += 1;
+
+                    if (out_zarr_opt.has_value()) {
+                        const int ix = (x - sx0) / step;
+                        const int iy = (y - sy0) / step;
+                        const int iz = (z - sz0) / step;
+                        const size_t lin = (static_cast<size_t>(iz) * static_cast<size_t>(ny) + static_cast<size_t>(iy)) * static_cast<size_t>(nx) + static_cast<size_t>(ix);
+                        enc_x[lin] = encode_dir_component(n.x);
+                        enc_y[lin] = encode_dir_component(n.y);
+                        enc_z[lin] = encode_dir_component(n.z);
+                    }
                 }
 
                 #pragma omp atomic
@@ -731,6 +772,57 @@ static void run_fit_normals(
         fs::remove(to.vtx_path, ec);
         fs::remove(to.edg_path, ec);
     }
+
+    if (out_zarr_opt.has_value()) {
+        const fs::path out_zarr = *out_zarr_opt;
+
+        // Create datasets with Zarr metadata using '/' as dimension_separator.
+        // NOTE: direction-field readers in vc_grow_seg_from_seed expect:
+        //   <root>/{x,y,z}/0/.zarray
+        // and will read the delimiter from that .zarray.
+        z5::filesystem::handle::File outFile(out_zarr);
+        z5::createFile(outFile, true);
+
+        // Ensure groups exist so z5 can infer the zarr format when creating datasets.
+        z5::createGroup(outFile, "x");
+        z5::createGroup(outFile, "y");
+        z5::createGroup(outFile, "z");
+
+        const std::vector<size_t> shape = {static_cast<size_t>(nz), static_cast<size_t>(ny), static_cast<size_t>(nx)}; // ZYX
+        const std::vector<size_t> chunks = {std::min<size_t>(64, shape[0]), std::min<size_t>(64, shape[1]), std::min<size_t>(64, shape[2])};
+        nlohmann::json compOpts = {{"cname", "zstd"}, {"clevel", 1}, {"shuffle", 0}};
+
+        z5::filesystem::handle::Group gx(outFile, "x");
+        z5::filesystem::handle::Group gy(outFile, "y");
+        z5::filesystem::handle::Group gz(outFile, "z");
+
+        auto dsx = z5::createDataset(gx, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+        auto dsy = z5::createDataset(gy, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+        auto dsz = z5::createDataset(gz, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+
+        auto ax = xt::adapt(enc_x, shape);
+        auto ay = xt::adapt(enc_y, shape);
+        auto az = xt::adapt(enc_z, shape);
+        z5::types::ShapeType off = {0, 0, 0};
+        z5::multiarray::writeSubarray<uint8_t>(dsx, ax, off.begin());
+        z5::multiarray::writeSubarray<uint8_t>(dsy, ay, off.begin());
+        z5::multiarray::writeSubarray<uint8_t>(dsz, az, off.begin());
+
+        // Minimal attrs on root.
+        nlohmann::json attrs;
+        attrs["source"] = "vc_ngrids";
+        attrs["note_axes_order"] = "ZYX";
+        attrs["encoding"] = "uint8_dir";
+        attrs["decode"] = "(v-128)/127";
+        attrs["sample_step"] = step;
+        attrs["radius"] = radius;
+        attrs["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
+        attrs["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
+        attrs["grid_origin_xyz"] = {sx0, sy0, sz0};
+        attrs["grid_shape_zyx"] = {shape[0], shape[1], shape[2]};
+        z5::filesystem::handle::Group root(outFile, "");
+        z5::filesystem::writeAttributes(root, attrs);
+    }
 }
 
 } // namespace
@@ -743,7 +835,8 @@ int main(int argc, char** argv) {
         ("crop,c", po::value<std::vector<int>>()->multitoken(), "Crop x0 y0 z0 x1 y1 z1")
         ("vis-ply", po::value<std::string>(), "Write visualization PLY file (with colors)")
         ("fit-normals", "Estimate local 3D normals from segments (requires --vis-normals)")
-        ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments");
+        ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments")
+        ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)");
 
     po::variables_map vm;
     try {
@@ -784,7 +877,11 @@ int main(int argc, char** argv) {
             std::cerr << "Error: --fit-normals requires --vis-normals PATH\n";
             return 1;
         }
-        run_fit_normals(input_dir, fs::path(vm["vis-normals"].as<std::string>()), crop);
+        std::optional<fs::path> out_zarr;
+        if (vm.count("output-zarr")) {
+            out_zarr = fs::path(vm["output-zarr"].as<std::string>());
+        }
+        run_fit_normals(input_dir, fs::path(vm["vis-normals"].as<std::string>()), crop, out_zarr);
         return 0;
     }
 
