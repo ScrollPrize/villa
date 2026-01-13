@@ -516,7 +516,7 @@ def fit_cosine_grid(
         "quad_tri": 0.0,
         "step": 1.0,
         "mod_smooth": 0.0,
-        "angle_sym": 1.0,
+        "angle_sym": 10.0,
         "dir_unet": 10.0,
         "use_full_dir_unet" : False,
         # "grad_mag" : 0.001,
@@ -925,32 +925,25 @@ def fit_cosine_grid(
             if (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
                 theta_val = float(model.theta.detach().cpu())
                 sx_val = float(model.log_s.detach().exp().cpu())
-                data_loss = terms["data"]
-                grad_loss = terms["grad_data"]
-                gradmag_loss = terms["grad_mag"]
-                dir_loss = terms["dir_unet"]
                 # Report global step across all stages instead of per-stage step.
                 global_step = global_step_offset + step + 1
                 total_steps_all = total_stage1 + total_stage2 + total_stage3 + total_stage4
-                msg = (
-                    f"stage{stage}(step {global_step}/{total_steps_all}): "
-                    f"loss={loss.item():.6f}, data={data_loss.item():.6f}, "
-                    f"grad={grad_loss.item():.6f}, gmag={gradmag_loss.item():.6f}, "
-                    f"dir={dir_loss.item():.6f}"
-                )
-                if stage >= 2:
-                    smooth_x = terms["smooth_x"]
-                    smooth_y = terms["smooth_y"]
-                    step_reg = terms["step"]
-                    quad_tri_reg = terms["quad_tri"]
-                    line_sy = terms["line_smooth_y"]
-                    msg += (
-                        f", sx_smooth={smooth_x.item():.6f}, sy_smooth={smooth_y.item():.6f}, "
-                        f"step={step_reg.item():.6f}, tri={quad_tri_reg.item():.6f}, "
-                        f"line_sy={line_sy.item():.6f}"
-                    )
-                msg += f", theta={theta_val:.4f}, sx={sx_val:.4f}"
-                print(msg)
+                parts = [
+                    f"stage{stage}(step {global_step}/{total_steps_all}):",
+                    f"loss={loss.item():.6f}",
+                ]
+
+                for name in sorted(lambda_global.keys()):
+                    if _need_term(name, stage_modifiers) == 0.0:
+                        continue
+                    v = terms.get(name, None)
+                    if v is None:
+                        continue
+                    parts.append(f"{name}={float(v.detach().cpu()):.6f}")
+
+                parts.append(f"theta={theta_val:.4f}")
+                parts.append(f"sx={sx_val:.4f}")
+                print(" ".join(parts))
 
             if snapshot is not None and snapshot > 0 and output_prefix is not None:
                 global_step = global_step_offset + step + 1
