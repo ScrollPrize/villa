@@ -430,27 +430,15 @@ def create_scale_bar_tiles(
     box_x = padding
     box_y = padding
 
-    # Draw black background box on scale bar canvas
-    bg_box_x = box_x
-    bg_box_y = box_y
-    bg_box_w = scale_bar_width_px
-    bg_box_h = box_height - 2 * padding
-
-    cv2.rectangle(scale_bar_canvas,
-                  (bg_box_x, bg_box_y),
-                  (bg_box_x + bg_box_w, bg_box_y + bg_box_h),
-                  0, -1)
-
-    # Mark the same region in mask canvas
-    cv2.rectangle(mask_canvas,
-                  (bg_box_x, bg_box_y),
-                  (bg_box_x + bg_box_w, bg_box_y + bg_box_h),
-                  255, -1)
-
     # Draw main horizontal white bar (centered vertically in the major tick area)
-    bar_x = bg_box_x
-    bar_y = bg_box_y + tick_height_major // 2  # Center the bar in the middle of major tick area
+    bar_x = box_x
+    bar_y = box_y + tick_height_major // 2  # Center the bar in the middle of major tick area
     cv2.line(scale_bar_canvas,
+             (bar_x, bar_y),
+             (bar_x + scale_bar_width_px, bar_y),
+             255, line_thickness, cv2.LINE_AA)
+    # Also draw on mask
+    cv2.line(mask_canvas,
              (bar_x, bar_y),
              (bar_x + scale_bar_width_px, bar_y),
              255, line_thickness, cv2.LINE_AA)
@@ -477,6 +465,11 @@ def create_scale_bar_tiles(
                  (tick_x, bar_y - half_tick_height),
                  (tick_x, bar_y + half_tick_height),
                  255, line_thickness, cv2.LINE_AA)
+        # Also draw on mask
+        cv2.line(mask_canvas,
+                 (tick_x, bar_y - half_tick_height),
+                 (tick_x, bar_y + half_tick_height),
+                 255, line_thickness, cv2.LINE_AA)
 
     # Draw text labels below the bar
     label_y = bar_y + tick_height_major // 2 + text_height
@@ -494,6 +487,10 @@ def create_scale_bar_tiles(
             text_x = tick_x_abs - text_w
 
         cv2.putText(scale_bar_canvas, label,
+                    (text_x, label_y),
+                    font, font_scale, 255, font_thickness, cv2.LINE_AA)
+        # Also draw on mask
+        cv2.putText(mask_canvas, label,
                     (text_x, label_y),
                     font, font_scale, 255, font_thickness, cv2.LINE_AA)
 
