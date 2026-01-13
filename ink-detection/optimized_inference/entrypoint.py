@@ -60,6 +60,8 @@ class Inputs:
     prefetch_factor: int = 8  # Prefetch factor for DataLoader
     output_path: str = ""  # Full output path (S3 URI or local path) for prediction result
     pixel_resolution_um: Optional[float] = None  # Real-world pixel resolution in micrometers (µm), None to omit
+    add_scale_bar: bool = False  # Whether to add scale bar overlay to output
+    scale_bar_length_um: float = 10000.0  # Scale bar length in micrometers (default 1cm)
 
 def parse_env() -> Inputs:
     try:
@@ -97,6 +99,10 @@ def parse_env() -> Inputs:
         pixel_resolution_str = os.getenv("PIXEL_RESOLUTION_UM", "").strip()
         pixel_resolution_um = float(pixel_resolution_str) if pixel_resolution_str else None
 
+        # Scale bar configuration
+        add_scale_bar = os.getenv("ADD_SCALE_BAR", "false").lower() == "true"
+        scale_bar_length_um = float(os.getenv("SCALE_BAR_LENGTH_UM", "10000.0"))
+
         # Validate inference parameters
         if tile_size <= 0:
             raise ValueError(f"TILE_SIZE must be positive, got {tile_size}")
@@ -110,6 +116,8 @@ def parse_env() -> Inputs:
             logger.warning(f"STRIDE ({stride}) > TILE_SIZE ({tile_size}) may create gaps in coverage")
         if pixel_resolution_um is not None and pixel_resolution_um <= 0:
             raise ValueError(f"PIXEL_RESOLUTION_UM must be positive, got {pixel_resolution_um}")
+        if scale_bar_length_um <= 0:
+            raise ValueError(f"SCALE_BAR_LENGTH_UM must be positive, got {scale_bar_length_um}")
 
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce"):
@@ -161,6 +169,8 @@ def parse_env() -> Inputs:
             prefetch_factor=prefetch_factor,
             output_path=output_path,
             pixel_resolution_um=pixel_resolution_um,
+            add_scale_bar=add_scale_bar,
+            scale_bar_length_um=scale_bar_length_um,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -713,7 +723,22 @@ def run_reduce_step(inputs: Inputs) -> None:
     # Run reduce/blend (creates lazy tile iterator)
     logger.info(f"Reducing {inputs.num_parts} partitions from {inputs.zarr_output_dir}")
     tile_size = 1024
-    tile_iterator, shape = reduce_partitions(inputs.zarr_output_dir, inputs.num_parts, pred_shape, tile_size)
+    tile_iterator, shape = reduce_partitions(
+        inputs.zarr_output_dir,
+        inputs.num_parts,
+        pred_shape,
+        tile_size,
+        add_scale_bar=inputs.add_scale_bar,
+        pixel_resolution_um=inputs.pixel_resolution_um,
+        scale_bar_length_um=inputs.scale_bar_length_um
+    )
+
+    # Log scale bar status
+    if inputs.add_scale_bar:
+        if inputs.pixel_resolution_um is not None:
+            logger.info(f"Scale bar enabled: {inputs.scale_bar_length_um/1000:.1f}mm at {inputs.pixel_resolution_um:.2f}um/pixel")
+        else:
+            logger.warning("ADD_SCALE_BAR=true but PIXEL_RESOLUTION_UM not set, skipping scale bar")
 
     # Determine output path
     if inputs.output_path:

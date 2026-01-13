@@ -286,11 +286,142 @@ def create_surface_volume_zarr(
 
 # ----------------------------- Partition Reduction ------------------------------
 
+def create_scale_bar_tiles(
+    image_w: int,
+    image_h: int,
+    tile_size: int,
+    pixel_resolution_um: float,
+    scale_bar_length_um: float,
+    padding: int = 50
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """
+    Pre-render scale bar on a strip and split into tiles with alpha masks.
+
+    The scale bar will be positioned at the top-left of the image and span
+    multiple tiles if needed. Returns both the scale bar tiles and mask tiles
+    for proper alpha compositing.
+
+    Args:
+        image_w: Full image width
+        image_h: Full image height
+        tile_size: Size of tiles (e.g., 1024)
+        pixel_resolution_um: Real-world pixel resolution in micrometers
+        scale_bar_length_um: Desired scale bar length in micrometers
+        padding: Padding from edges in pixels (default 50)
+
+    Returns:
+        Tuple of (scale_bar_tiles, mask_tiles):
+        - scale_bar_tiles: List of uint8 arrays (tile_size, tile_size) with scale bar rendered
+        - mask_tiles: List of uint8 arrays (tile_size, tile_size) where 255=scale bar, 0=transparent
+        Returns ([], []) if scale bar doesn't fit or isn't needed.
+    """
+    # Calculate scale bar dimensions in pixels
+    scale_bar_width_px = int(scale_bar_length_um / pixel_resolution_um)
+    bar_height = 10  # pixels
+    text_height = 20  # pixels for font
+
+    # Format scale bar label
+    if scale_bar_length_um >= 1000:
+        label = f"{scale_bar_length_um/1000:.0f}mm"
+    else:
+        label = f"{scale_bar_length_um:.0f}um"
+
+    # Calculate text dimensions
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    font_thickness = 2
+    (text_width, text_baseline), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+
+    # Calculate total box dimensions
+    box_width = max(scale_bar_width_px, text_width) + 2 * padding
+    box_height = bar_height + text_height + 3 * padding  # top, middle, bottom spacing
+
+    # Check if scale bar would exceed image width - if so, scale it down
+    max_allowed_width = image_w - 2 * padding
+    if box_width > max_allowed_width:
+        # Scale down the scale bar
+        scale_factor = max_allowed_width / box_width
+        scale_bar_length_um = scale_bar_length_um * scale_factor
+        scale_bar_width_px = int(scale_bar_length_um / pixel_resolution_um)
+
+        # Recalculate label and dimensions
+        if scale_bar_length_um >= 1000:
+            label = f"{scale_bar_length_um/1000:.1f}mm"
+        else:
+            label = f"{scale_bar_length_um:.0f}um"
+        (text_width, text_baseline), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
+        box_width = max(scale_bar_width_px, text_width) + 2 * padding
+
+        logger.warning(f"Scale bar too wide for image, scaled down to {scale_bar_length_um:.0f}um")
+
+    # Calculate how many horizontal tiles we need
+    num_tiles = math.ceil(box_width / tile_size)
+
+    # Create canvases: width = num_tiles * tile_size, height = tile_size
+    canvas_width = num_tiles * tile_size
+    canvas_height = tile_size
+
+    # Scale bar canvas (contains the actual rendered scale bar)
+    scale_bar_canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+    # Mask canvas (255 where scale bar exists, 0 elsewhere)
+    mask_canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+
+    # Calculate scale bar position on canvas (top-left with padding)
+    box_x = padding
+    box_y = padding
+
+    # Draw black background box on scale bar canvas
+    cv2.rectangle(scale_bar_canvas,
+                  (box_x, box_y),
+                  (box_x + box_width - 2 * padding, box_y + box_height - 2 * padding),
+                  0, -1)
+
+    # Mark the same region in mask canvas
+    cv2.rectangle(mask_canvas,
+                  (box_x, box_y),
+                  (box_x + box_width - 2 * padding, box_y + box_height - 2 * padding),
+                  255, -1)
+
+    # Draw white scale bar (centered horizontally in box)
+    bar_x = box_x + (box_width - 2 * padding - scale_bar_width_px) // 2
+    bar_y = box_y + padding
+    cv2.rectangle(scale_bar_canvas,
+                  (bar_x, bar_y),
+                  (bar_x + scale_bar_width_px, bar_y + bar_height),
+                  255, -1)
+
+    # Draw white text below bar (centered)
+    text_x = box_x + (box_width - 2 * padding - text_width) // 2
+    text_y = bar_y + bar_height + text_height + padding // 2
+    cv2.putText(scale_bar_canvas, label,
+                (text_x, text_y),
+                font, font_scale, 255, font_thickness, cv2.LINE_AA)
+
+    # Split both canvases into tiles
+    scale_bar_tiles = []
+    mask_tiles = []
+    for i in range(num_tiles):
+        tile_x_start = i * tile_size
+        tile_x_end = tile_x_start + tile_size
+
+        scale_bar_tile = scale_bar_canvas[:tile_size, tile_x_start:tile_x_end].copy()
+        mask_tile = mask_canvas[:tile_size, tile_x_start:tile_x_end].copy()
+
+        scale_bar_tiles.append(scale_bar_tile)
+        mask_tiles.append(mask_tile)
+
+    logger.info(f"Pre-rendered scale bar across {num_tiles} tiles ({box_width}px wide)")
+    return scale_bar_tiles, mask_tiles
+
+
 def reduce_partitions(
     zarr_output_dir: str,
     num_parts: int,
     pred_shape: Tuple[int, int],
-    tile_size: int
+    tile_size: int,
+    add_scale_bar: bool = False,
+    pixel_resolution_um: Optional[float] = None,
+    scale_bar_length_um: float = 10000.0
 ) -> Tuple:
     """
     Create a lazy tile generator that blends partition zarr arrays tile-by-tile.
@@ -300,6 +431,9 @@ def reduce_partitions(
         num_parts: Total number of partitions
         pred_shape: Output shape (H, W)
         tile_size: Size of tiles to process (default 1024)
+        add_scale_bar: Whether to overlay scale bar on output (default False)
+        pixel_resolution_um: Real-world pixel resolution in micrometers (None to skip scale bar)
+        scale_bar_length_um: Scale bar length in micrometers (default 10000 = 1cm)
 
     Returns:
         Tuple of (tile_generator, shape) where tile_generator yields uint8 tiles lazily
@@ -355,13 +489,23 @@ def reduce_partitions(
 
     logger.info(f"Successfully cached and opened {len(partition_zarrs)} partition zarr arrays")
 
+    # Pre-render scale bar tiles if enabled
+    scale_bar_tiles = []
+    mask_tiles = []
+    if add_scale_bar and pixel_resolution_um is not None:
+        scale_bar_tiles, mask_tiles = create_scale_bar_tiles(
+            W, H, tile_size, pixel_resolution_um, scale_bar_length_um
+        )
+
     def tile_generator():
         """Lazily generate tiles by blending partitions on-the-fly."""
         total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
 
         with tqdm(total=total_tiles, desc="Processing tiles", unit="tile", **get_tqdm_kwargs()) as pbar:
             # Outer loop: iterate over tile positions
+            tile_idx_x = 0  # Track which tile we're at horizontally
             for y in range(0, H, tile_size):
+                tile_idx_x = 0  # Reset for each row
                 y_end = min(y + tile_size, H)
                 tile_h = y_end - y
 
@@ -388,9 +532,18 @@ def reduce_partitions(
                     result_tile = np.clip(result_tile, 0, 1)
                     result_uint8 = (result_tile * 255).astype(np.uint8)
 
+                    # Overlay scale bar if this is the first row and we have a scale bar tile for this position
+                    if y == 0 and scale_bar_tiles and tile_idx_x < len(scale_bar_tiles):
+                        scale_tile = scale_bar_tiles[tile_idx_x][:tile_h, :tile_w]
+                        mask_tile = mask_tiles[tile_idx_x][:tile_h, :tile_w]
+
+                        # Alpha compositing using mask: where mask==255, use scale_bar; else use original
+                        result_uint8 = np.where(mask_tile == 255, scale_tile, result_uint8)
+
                     # Yield the tile
                     yield result_uint8
                     pbar.update(1)
+                    tile_idx_x += 1
 
     return tile_generator(), pred_shape
 
