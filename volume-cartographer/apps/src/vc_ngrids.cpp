@@ -31,8 +31,8 @@ static void print_usage() {
 }
 
 struct CropBox3i {
-    cv::Point3i min; // inclusive
-    cv::Point3i max; // exclusive
+    cv::Vec3i min; // inclusive
+    cv::Vec3i max; // exclusive
 };
 
 static CropBox3i crop_from_args(const std::vector<int>& v) {
@@ -41,78 +41,125 @@ static CropBox3i crop_from_args(const std::vector<int>& v) {
         throw std::runtime_error("--crop expects 6 integers: x0 y0 z0 x1 y1 z1");
     }
     CropBox3i c;
-    c.min = cv::Point3i(v[0], v[1], v[2]);
-    c.max = cv::Point3i(v[3], v[4], v[5]);
-    if (c.max.x < c.min.x || c.max.y < c.min.y || c.max.z < c.min.z) {
+    c.min = cv::Vec3i(v[0], v[1], v[2]);
+    c.max = cv::Vec3i(v[3], v[4], v[5]);
+    if (c.max[0] < c.min[0] || c.max[1] < c.min[1] || c.max[2] < c.min[2]) {
         throw std::runtime_error("--crop invalid: max must be >= min in all dimensions");
     }
     return c;
 }
 
 struct PlyWriter {
-    struct Vtx {
-        float x, y, z;
-        uint8_t r, g, b;
-    };
-
     explicit PlyWriter(const fs::path& path) : path(path) {}
 
-    void write_polyline(const std::vector<cv::Point3f>& pts, const cv::Vec3b& color) {
-        if (pts.size() < 2) return;
-
-        const size_t base = vertices.size();
-        vertices.reserve(vertices.size() + pts.size());
-        edges.reserve(edges.size() + (pts.size() - 1));
-
-        for (const auto& p : pts) {
-            vertices.push_back(Vtx{
-                p.x,
-                p.y,
-                p.z,
-                color[2], // OpenCV Vec3b is BGR; PLY expects RGB
-                color[1],
-                color[0],
-            });
-        }
-
-        for (size_t i = 0; i + 1 < pts.size(); ++i) {
-            edges.emplace_back(static_cast<uint32_t>(base + i), static_cast<uint32_t>(base + i + 1));
-        }
-    }
-
-    void flush_ascii() const {
-        std::ofstream out(path);
+    void begin_ascii_streaming() {
+        // We must output vertices first, then edges (PLY element order).
+        // To avoid storing all edges in memory OR iterating grids twice,
+        // write edges to a temporary file and append it at the end.
+        out.open(path, std::ios::in | std::ios::out | std::ios::trunc);
         if (!out) {
             throw std::runtime_error("Failed to open output file for writing: " + path.string());
         }
 
+        tmp_edges_path = path;
+        tmp_edges_path += ".edges.tmp";
+        edges_out.open(tmp_edges_path, std::ios::out | std::ios::trunc);
+        if (!edges_out) {
+            throw std::runtime_error("Failed to open temp edge file for writing: " + tmp_edges_path.string());
+        }
+
+        write_header_with_counts(0, 0);
+    }
+
+    void write_polyline_streaming(const std::vector<cv::Point3f>& pts, const cv::Vec3b& color_bgr) {
+        if (pts.size() < 2) return;
+
+        const uint32_t base = next_vertex_idx;
+        const int r = static_cast<int>(color_bgr[2]);
+        const int g = static_cast<int>(color_bgr[1]);
+        const int b = static_cast<int>(color_bgr[0]);
+
+        for (const auto& p : pts) {
+            out << p.x << " " << p.y << " " << p.z << " " << r << " " << g << " " << b << "\n";
+            ++next_vertex_idx;
+        }
+        for (uint32_t i = 0; i + 1 < pts.size(); ++i) {
+            edges_out << (base + i) << " " << (base + i + 1) << "\n";
+        }
+
+        vertex_count += pts.size();
+        edge_count += (pts.size() - 1);
+    }
+
+    void write_segment_streaming(const cv::Point3f& a, const cv::Point3f& b, const cv::Vec3b& color_bgr) {
+        const int r = static_cast<int>(color_bgr[2]);
+        const int g = static_cast<int>(color_bgr[1]);
+        const int bcol = static_cast<int>(color_bgr[0]);
+
+        const uint32_t idx0 = next_vertex_idx++;
+        const uint32_t idx1 = next_vertex_idx++;
+
+        out << a.x << " " << a.y << " " << a.z << " " << r << " " << g << " " << bcol << "\n";
+        out << b.x << " " << b.y << " " << b.z << " " << r << " " << g << " " << bcol << "\n";
+        edges_out << idx0 << " " << idx1 << "\n";
+
+        vertex_count += 2;
+        edge_count += 1;
+    }
+
+    void end_streaming() {
+        edges_out.close();
+
+        // Append edges after vertices.
+        {
+            std::ifstream edges_in(tmp_edges_path, std::ios::in);
+            if (!edges_in) {
+                throw std::runtime_error("Failed to open temp edge file for reading: " + tmp_edges_path.string());
+            }
+            out << edges_in.rdbuf();
+        }
+
+        // Patch header in-place with final counts (fixed width => same header length).
+        out.seekp(0, std::ios::beg);
+        write_header_with_counts(vertex_count, edge_count);
+        out.flush();
+        out.close();
+
+        std::error_code ec;
+        fs::remove(tmp_edges_path, ec);
+    }
+
+private:
+    void write_header_with_counts(size_t vtx, size_t edg) {
+        char vbuf[32];
+        char ebuf[32];
+        snprintf(vbuf, sizeof(vbuf), "%020zu", vtx);
+        snprintf(ebuf, sizeof(ebuf), "%020zu", edg);
+
         out << "ply\n";
         out << "format ascii 1.0\n";
         out << "comment vc_ngrids visualization\n";
-        out << "element vertex " << vertices.size() << "\n";
+        out << "element vertex " << vbuf << "\n";
         out << "property float x\n";
         out << "property float y\n";
         out << "property float z\n";
         out << "property uchar red\n";
         out << "property uchar green\n";
         out << "property uchar blue\n";
-        out << "element edge " << edges.size() << "\n";
+        out << "element edge " << ebuf << "\n";
         out << "property int vertex1\n";
         out << "property int vertex2\n";
         out << "end_header\n";
-
-        for (const auto& v : vertices) {
-            out << v.x << " " << v.y << " " << v.z << " "
-                << static_cast<int>(v.r) << " " << static_cast<int>(v.g) << " " << static_cast<int>(v.b) << "\n";
-        }
-        for (const auto& e : edges) {
-            out << e.first << " " << e.second << "\n";
-        }
     }
 
     fs::path path;
-    std::vector<Vtx> vertices;
-    std::vector<std::pair<uint32_t, uint32_t>> edges;
+    size_t vertex_count = 0;
+    size_t edge_count = 0;
+
+    std::fstream out;
+    fs::path tmp_edges_path;
+    std::ofstream edges_out;
+    uint32_t next_vertex_idx = 0;
 };
 
 static void add_gridstore_paths_as_ply_polylines(
@@ -122,33 +169,87 @@ static void add_gridstore_paths_as_ply_polylines(
     int slice_idx,
     const CropBox3i& crop,
     const cv::Vec3b& color_bgr) {
-    const auto paths = grid.get_all();
+    // Axis mapping for each plane:
+    // plane 0 (xy @ z): (u,v,s) = (x,y,z)
+    // plane 1 (xz @ y): (u,v,s) = (x,z,y)
+    // plane 2 (yz @ x): (u,v,s) = (y,z,x)
+    const int u_axis = (plane_idx == 2) ? 1 : 0;
+    const int v_axis = (plane_idx == 0) ? 1 : 2;
+    const int s_axis = (plane_idx == 0) ? 2 : (plane_idx == 1) ? 1 : 0;
+
+    // Use GridStore ROI query to avoid decompressing/loading all paths in the slice.
+    const cv::Rect query(crop.min[u_axis],
+                         crop.min[v_axis],
+                         crop.max[u_axis] - crop.min[u_axis],
+                         crop.max[v_axis] - crop.min[v_axis]);
+
+    const auto paths = grid.get(query);
     for (const auto& path_ptr : paths) {
         if (!path_ptr || path_ptr->size() < 2) continue;
 
-        std::vector<cv::Point3f> pts;
-        pts.reserve(path_ptr->size());
+        // Clip each segment against the 3D crop box so that segments crossing the bbox are kept,
+        // and segments fully outside are dropped.
+        auto clip_segment = [&](cv::Point3f& a, cv::Point3f& b) -> bool {
+            // Liang–Barsky style clipping in 3D with t in [0,1].
+            float t0 = 0.f;
+            float t1 = 1.f;
+            const float dx = b.x - a.x;
+            const float dy = b.y - a.y;
+            const float dz = b.z - a.z;
 
-        for (const auto& p2 : *path_ptr) {
-            cv::Point3f p3;
-            if (plane_idx == 0) {
-                p3 = cv::Point3f(static_cast<float>(p2.x), static_cast<float>(p2.y), static_cast<float>(slice_idx));
-            } else if (plane_idx == 1) {
-                p3 = cv::Point3f(static_cast<float>(p2.x), static_cast<float>(slice_idx), static_cast<float>(p2.y));
-            } else {
-                p3 = cv::Point3f(static_cast<float>(slice_idx), static_cast<float>(p2.x), static_cast<float>(p2.y));
+            auto clip_1d = [&](float p, float q) -> bool {
+                // p * t <= q
+                if (p == 0.f) {
+                    return q >= 0.f;
+                }
+                const float r = q / p;
+                if (p < 0.f) {
+                    if (r > t1) return false;
+                    if (r > t0) t0 = r;
+                } else {
+                    if (r < t0) return false;
+                    if (r < t1) t1 = r;
+                }
+                return true;
+            };
+
+            // Use closed-open bounds [min, max) by clipping to [min, max-eps].
+            const float xmax = static_cast<float>(crop.max[0]) - 1e-3f;
+            const float ymax = static_cast<float>(crop.max[1]) - 1e-3f;
+            const float zmax = static_cast<float>(crop.max[2]) - 1e-3f;
+            const float xmin = static_cast<float>(crop.min[0]);
+            const float ymin = static_cast<float>(crop.min[1]);
+            const float zmin = static_cast<float>(crop.min[2]);
+
+            if (!clip_1d(-dx, a.x - xmin)) return false;
+            if (!clip_1d(+dx, xmax - a.x)) return false;
+            if (!clip_1d(-dy, a.y - ymin)) return false;
+            if (!clip_1d(+dy, ymax - a.y)) return false;
+            if (!clip_1d(-dz, a.z - zmin)) return false;
+            if (!clip_1d(+dz, zmax - a.z)) return false;
+
+            if (t1 < t0) return false;
+
+            const cv::Point3f a0 = a;
+            a = cv::Point3f(a0.x + t0 * dx, a0.y + t0 * dy, a0.z + t0 * dz);
+            b = cv::Point3f(a0.x + t1 * dx, a0.y + t1 * dy, a0.z + t1 * dz);
+            return true;
+        };
+
+        auto p3_of = [&](const cv::Point& p2) {
+            float coords[3] = {0.f, 0.f, 0.f};
+            coords[u_axis] = static_cast<float>(p2.x);
+            coords[v_axis] = static_cast<float>(p2.y);
+            coords[s_axis] = static_cast<float>(slice_idx);
+            return cv::Point3f(coords[0], coords[1], coords[2]);
+        };
+
+        for (size_t i = 0; i + 1 < path_ptr->size(); ++i) {
+            cv::Point3f a = p3_of((*path_ptr)[i]);
+            cv::Point3f b = p3_of((*path_ptr)[i + 1]);
+            if (clip_segment(a, b)) {
+                ply.write_segment_streaming(a, b, color_bgr);
             }
-
-            if (p3.x < crop.min.x || p3.y < crop.min.y || p3.z < crop.min.z) continue;
-            if (p3.x >= crop.max.x) continue;
-            if (p3.y >= crop.max.y) continue;
-            if (p3.z >= crop.max.z) continue;
-
-            pts.push_back(p3);
-        }
-
-        if (pts.size() >= 2) {
-            ply.write_polyline(pts, color_bgr);
         }
     }
 }
@@ -176,13 +277,14 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
-        cv::Point3i(0, 0, 0),
-        cv::Point3i(std::numeric_limits<int>::max() / 4,
-                    std::numeric_limits<int>::max() / 4,
-                    std::numeric_limits<int>::max() / 4),
+        cv::Vec3i(0, 0, 0),
+        cv::Vec3i(std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4),
     });
 
     PlyWriter ply(out_ply);
+    ply.begin_ascii_streaming();
 
     struct PlaneCfg {
         int plane_idx;
@@ -197,8 +299,8 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
     };
 
     for (const auto& pc : planes) {
-        const int crop_min = (pc.slice_axis == 0) ? crop.min.x : (pc.slice_axis == 1) ? crop.min.y : crop.min.z;
-        const int crop_max = (pc.slice_axis == 0) ? crop.max.x : (pc.slice_axis == 1) ? crop.max.y : crop.max.z;
+        const int crop_min = crop.min[pc.slice_axis];
+        const int crop_max = crop.max[pc.slice_axis];
         int slice_start = align_down(crop_min, sparse_volume);
         if (slice_start < crop_min) slice_start += sparse_volume;
 
@@ -209,7 +311,7 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
         }
     }
 
-    ply.flush_ascii();
+    ply.end_streaming();
 }
 
 } // namespace
