@@ -35,7 +35,7 @@
 
 #include "vc/tracer/Tracer.hpp"
 #include "vc/ui/VCCollection.hpp"
-#include "vc/tracer/NeuralTracerConnection.h"
+#include "vc/tracer/NeuralTracerCache.h"
 
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2
@@ -387,7 +387,7 @@ private:
 };
 
 struct NeuralTracerResidual final {
-    explicit NeuralTracerResidual(NeuralTracerConnection& connection, double w)
+    explicit NeuralTracerResidual(NeuralTracerCache& connection, double w)
         : connection_(connection), w_(w) {}
 
     bool operator()(const double* center,
@@ -416,12 +416,12 @@ struct NeuralTracerResidual final {
         return true;
     }
 
-    NeuralTracerConnection& connection_;
+    NeuralTracerCache& connection_;
     double w_;
 };
 
 struct NeuralTracerCost final : ceres::SizedCostFunction<3, 3, 3, 3, 3, 3> {
-    explicit NeuralTracerCost(NeuralTracerConnection& connection, double w)
+    explicit NeuralTracerCost(NeuralTracerCache& connection, double w)
         : _connection{connection}, _w(w) {}
 
     bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override {
@@ -569,7 +569,7 @@ struct NeuralTracerCost final : ceres::SizedCostFunction<3, 3, 3, 3, 3, 3> {
         }
     }
 
-    static ceres::CostFunction* Create(bool has_prev_v, bool has_prev_diag, NeuralTracerConnection &connection, double w = 1.0, bool use_numeric_diff = false)
+    static ceres::CostFunction* Create(bool has_prev_v, bool has_prev_diag, NeuralTracerCache &connection, double w = 1.0, bool use_numeric_diff = false)
     {
         assert(has_prev_v || has_prev_diag);
         if (has_prev_v && has_prev_diag) {
@@ -588,7 +588,7 @@ struct NeuralTracerCost final : ceres::SizedCostFunction<3, 3, 3, 3, 3, 3> {
         } */
     }
 
-    NeuralTracerConnection& _connection;
+    NeuralTracerCache& _connection;
     double _w;
 };
 
@@ -843,7 +843,7 @@ static NeuralTracerPointInfo compute_neural_tracer_point_info(
 static std::vector<cv::Vec2i> call_neural_tracer_for_points(
     const std::vector<cv::Vec2i>& points,
     TraceParameters& trace_params,
-    NeuralTracerConnection* neural_tracer)
+    NeuralTracerCache* neural_tracer)
 {
     if (!neural_tracer)
         throw std::logic_error("Neural tracer connection is null");
@@ -1842,7 +1842,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 }
 
 static float local_optimization_neural(int radius, const cv::Vec2i &p0, TraceParameters &params,
-    TraceData& trace_data, LossSettings &settings, NeuralTracerConnection &neural_tracer, bool quiet = false,
+    TraceData& trace_data, LossSettings &settings, NeuralTracerCache &neural_tracer, bool quiet = false,
     bool parallel = false, const LocalOptimizationConfig* solver_config = nullptr, bool use_numeric_diff = false)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
@@ -1923,7 +1923,7 @@ static float local_optimization_neural(int radius, const cv::Vec2i &p0, TracePar
     }
     options.minimizer_progress_to_stdout = true;  // TODO: disable
     options.max_num_iterations = solver_config ? solver_config->max_iterations : 1000;
-    options.num_threads = 1;  // TODO: allow parallelism in NeuralTracerConnection somehow
+    options.num_threads = 1;  // TODO: allow parallelism in NeuralTracerConnection (and NeuralTracerCache)
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -2038,7 +2038,7 @@ struct thresholdedDistance
 
 QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
 {
-    std::unique_ptr<NeuralTracerConnection> neural_tracer;
+    std::unique_ptr<NeuralTracerCache> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     bool neural_reoptimization = false;
     bool neural_numeric_diff = false;
@@ -2046,8 +2046,15 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         std::string socket_path = params["neural_socket"];
         if (!socket_path.empty()) {
             try {
-                neural_tracer = std::make_unique<NeuralTracerConnection>(socket_path);
-                std::cout << "Neural tracer connection enabled on " << socket_path << std::endl;
+                float neural_cache_radius = params.value("neural_cache_radius", 0.5f);
+                if (neural_cache_radius < 0.f) {
+                    std::cerr << "neural_cache_radius must be >= 0; clamping to 0" << std::endl;
+                    neural_cache_radius = 0.f;
+                }
+                auto connection = std::make_unique<NeuralTracerConnection>(socket_path);
+                neural_tracer = std::make_unique<NeuralTracerCache>(std::move(connection), neural_cache_radius);
+                std::cout << "Neural tracer connection enabled on " << socket_path
+                          << " (cache radius=" << neural_cache_radius << ")" << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "Failed to connect neural tracer: " << e.what() << std::endl;
                 throw;
