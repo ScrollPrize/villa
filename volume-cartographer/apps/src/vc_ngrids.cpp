@@ -489,18 +489,33 @@ static std::optional<cv::Vec3i> infer_volume_shape_from_grids(const fs::path& ng
     // XY: (width,height)=(X,Y)
     // XZ: (width,height)=(X,Z)
     // YZ: (width,height)=(Y,Z)
-    auto find_any_grid = [&](const fs::path& dir) -> std::optional<fs::path> {
+    auto find_any_valid_grid = [&](const fs::path& dir) -> std::optional<fs::path> {
+        // Note: vc_gen_normalgrids may create empty placeholder files for empty slices.
+        // Those are not valid GridStore files and must be skipped.
         if (!fs::exists(dir) || !fs::is_directory(dir)) return std::nullopt;
         for (const auto& entry : fs::directory_iterator(dir)) {
             if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() == ".grid") return entry.path();
+            if (entry.path().extension() != ".grid") continue;
+            // quick reject: GridStore files have a header; empty placeholder files are size 0
+            std::error_code ec;
+            const auto sz = fs::file_size(entry.path(), ec);
+            if (ec || sz < 16) continue;
+            try {
+                vc::core::util::GridStore g(entry.path().string());
+                const auto s = g.size();
+                if (s.width > 0 && s.height > 0) {
+                    return entry.path();
+                }
+            } catch (...) {
+                continue;
+            }
         }
         return std::nullopt;
     };
 
     std::optional<int> X, Y, Z;
     auto try_xy = [&]() {
-        auto p = find_any_grid(ngv_root / "xy");
+        auto p = find_any_valid_grid(ngv_root / "xy");
         if (!p) return;
         vc::core::util::GridStore g(p->string());
         const auto sz = g.size();
@@ -508,7 +523,7 @@ static std::optional<cv::Vec3i> infer_volume_shape_from_grids(const fs::path& ng
         Y = sz.height;
     };
     auto try_xz = [&]() {
-        auto p = find_any_grid(ngv_root / "xz");
+        auto p = find_any_valid_grid(ngv_root / "xz");
         if (!p) return;
         vc::core::util::GridStore g(p->string());
         const auto sz = g.size();
@@ -516,7 +531,7 @@ static std::optional<cv::Vec3i> infer_volume_shape_from_grids(const fs::path& ng
         Z = sz.height;
     };
     auto try_yz = [&]() {
-        auto p = find_any_grid(ngv_root / "yz");
+        auto p = find_any_valid_grid(ngv_root / "yz");
         if (!p) return;
         vc::core::util::GridStore g(p->string());
         const auto sz = g.size();
@@ -771,6 +786,12 @@ static void run_fit_normals(
             throw std::runtime_error("Failed to infer volume shape from normal grids (need at least two plane dirs with .grid files)");
         }
         const cv::Vec3i vol_xyz = *vol_xyz_opt;
+        if (crop.max[0] > vol_xyz[0] || crop.max[1] > vol_xyz[1] || crop.max[2] > vol_xyz[2]) {
+            std::stringstream msg;
+            msg << "Crop max exceeds inferred volume shape: crop.max=(" << crop.max[0] << "," << crop.max[1] << "," << crop.max[2]
+                << ") vs inferred vol_xyz=(" << vol_xyz[0] << "," << vol_xyz[1] << "," << vol_xyz[2] << ")";
+            throw std::runtime_error(msg.str());
+        }
         nx = (vol_xyz[0] + step - 1) / step;
         ny = (vol_xyz[1] + step - 1) / step;
         nz = (vol_xyz[2] + step - 1) / step;
@@ -788,13 +809,15 @@ static void run_fit_normals(
     const int crop_nz = (crop.max[2] - sz0 + step - 1) / step;
     const int64_t total_samples = static_cast<int64_t>(crop_nx) * static_cast<int64_t>(crop_ny) * static_cast<int64_t>(crop_nz);
 
+    const int64_t full_samples = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) * static_cast<int64_t>(nz);
+
     // Optional output: store fitted normals on the sample lattice.
     // Encoding matches direction-field zarrs: 3 uint8 volumes x,y,z, decoded as (v-128)/127.
     std::vector<uint8_t> enc_x;
     std::vector<uint8_t> enc_y;
     std::vector<uint8_t> enc_z;
     if (out_zarr_opt.has_value()) {
-        const size_t n = static_cast<size_t>(std::max<int64_t>(0, total_samples));
+        const size_t n = static_cast<size_t>(std::max<int64_t>(0, full_samples));
         enc_x.assign(n, 128);
         enc_y.assign(n, 128);
         enc_z.assign(n, 128);
@@ -918,7 +941,25 @@ static void run_fit_normals(
                         const int ix = x / step;
                         const int iy = y / step;
                         const int iz = z / step;
+
+                        if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) {
+                            std::stringstream msg;
+                            msg << "Output index out of range while writing normals zarr:"
+                                << " ix/iy/iz=(" << ix << "," << iy << "," << iz << ")"
+                                << " nx/ny/nz=(" << nx << "," << ny << "," << nz << ")"
+                                << " at xyz=(" << x << "," << y << "," << z << ") step=" << step;
+                            throw std::runtime_error(msg.str());
+                        }
+
                         const size_t lin = (static_cast<size_t>(iz) * static_cast<size_t>(ny) + static_cast<size_t>(iy)) * static_cast<size_t>(nx) + static_cast<size_t>(ix);
+                        if (lin >= enc_x.size()) {
+                            std::stringstream msg;
+                            msg << "Linear index out of range while writing normals zarr:"
+                                << " lin=" << lin << " enc_size=" << enc_x.size()
+                                << " ix/iy/iz=(" << ix << "," << iy << "," << iz << ")"
+                                << " nx/ny/nz=(" << nx << "," << ny << "," << nz << ")";
+                            throw std::runtime_error(msg.str());
+                        }
                         enc_x[lin] = encode_dir_component(n.x);
                         enc_y[lin] = encode_dir_component(n.y);
                         enc_z[lin] = encode_dir_component(n.z);
