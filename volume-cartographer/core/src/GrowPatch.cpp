@@ -17,6 +17,9 @@
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
+#include "z5/factory.hxx"
+#include "z5/filesystem/handle.hxx"
+
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
 
@@ -41,6 +44,7 @@
 #define LOSS_DIST 2
 #define LOSS_NORMALSNAP 4
 #define LOSS_SDIR 8
+#define LOSS_3DNORMAL 16
 
 namespace { // Anonymous namespace for local helpers
 
@@ -235,6 +239,10 @@ struct TraceData {
     PointCorrection point_correction;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     const std::vector<DirectionField> &direction_fields;
+
+    // Optional fitted-3D normals direction-field (zarr root with x/<scale>,y/<scale>,z/<scale> datasets)
+    std::unique_ptr<Chunked3dVec3fFromUint8> normal3d_field;
+    std::unique_ptr<Chunked3dFloatFromUint8> normal3d_weight;
     struct ReferenceRaycastSettings {
         QuadSurface* surface = nullptr;
         double voxel_threshold = 1.0;
@@ -407,6 +415,7 @@ enum LossType {
     DIRECTION,
     SNAP,
     NORMAL,
+    NORMAL3D,
     SDIR,
     CORRECTION,
     COUNT
@@ -419,6 +428,7 @@ struct LossSettings {
     LossSettings() {
         w[LossType::SNAP] = 0.1f;
         w[LossType::NORMAL] = 10.0f;
+        w[LossType::NORMAL3D] = 0.0f;
         w[LossType::STRAIGHT] = 0.2f;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
@@ -441,6 +451,7 @@ struct LossSettings {
 
         set_weight("snap_weight", LossType::SNAP);
         set_weight("normal_weight", LossType::NORMAL);
+        set_weight("normal3d_weight", LossType::NORMAL3D);
         set_weight("straight_weight", LossType::STRAIGHT);
         set_weight("dist_weight", LossType::DIST);
         set_weight("direction_weight", LossType::DIRECTION);
@@ -709,6 +720,8 @@ void set_space_tracing_use_cuda(bool enable) {
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, TraceParameters &params, const LossSettings &settings);
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int gen_3d_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int conditional_3d_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
@@ -983,6 +996,50 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
     return set;
 };
 
+static int gen_3d_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.normal3d_field) return 0;
+
+    const float w = settings(LossType::NORMAL3D, p);
+    if (w <= 0.0f) return 0;
+
+    // Need p, p+u, p+v inside the image; treat (p) as the lower-left of a cell
+    const int rows = params.state.rows;
+    const int cols = params.state.cols;
+    if (p[0] < 0 || p[1] < 0 || p[0] >= rows - 1 || p[1] >= cols - 1) {
+        return 0;
+    }
+
+    const cv::Vec2i pu = p + cv::Vec2i(0, 1);
+    const cv::Vec2i pv = p + cv::Vec2i(1, 0);
+
+    if (!coord_valid(params.state(p)) ||
+        !coord_valid(params.state(pu)) ||
+        !coord_valid(params.state(pv))) {
+        return 0;
+    }
+
+    problem.AddResidualBlock(
+        Normal3DLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_weight.get(), w),
+        nullptr,
+        &params.dpoints(p)[0],
+        &params.dpoints(pu)[0],
+        &params.dpoints(pv)[0]);
+
+    return 1;
+}
+
+static int conditional_3d_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+    ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.normal3d_field) return 0;
+    int set = 0;
+    // One term per cell (keyed at p itself)
+    if (!loss_mask(bit, p, {0,0}, loss_status))
+        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_3d_normal_loss(problem, p, params, trace_data, settings));
+    return set;
+}
+
 // static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out,
 //     cv::Mat_<cv::Vec2d> &loc, cv::Mat_<uint16_t> &loss_status, int inner_flags)
 // {
@@ -1135,6 +1192,22 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_sdirichlet_loss(problem, p, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
         count += gen_sdirichlet_loss(problem, p + cv::Vec2i(-1, 0), params, settings, 1e-8, 1e-2);
         count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
+    }
+
+    if (flags & LOSS_3DNORMAL) {
+        // fitted normals zarr (one per cell)
+        count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
+        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+        count += gen_3d_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
+        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
+    }
+
+    if (flags & LOSS_3DNORMAL) {
+        // one per local cell, around p
+        count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
+        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+        count += gen_3d_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
+        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
     }
 
     count += gen_reference_ray_loss(problem, p, params, trace_data);
@@ -1371,6 +1444,12 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_normal_loss(10, p + cv::Vec2i(-1,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_normal_loss(10, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_normal_loss(10, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
+
+    // fitted 3D normals (direction-field zarr)
+    count += conditional_3d_normal_loss(12, p,                    loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_loss(12, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_loss(12, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_loss(12, p + cv::Vec2i(-1,-1), loss_status, problem, params, trace_data, settings);
 
     //snapping
     count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data, settings);
@@ -1767,6 +1846,52 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
 
+    // Optional fitted-3D normals field (direction-field zarr root with x/<scale>,y/<scale>,z/<scale>)
+    if (params.contains("normal3d_zarr_path") && params["normal3d_zarr_path"].is_string()) {
+        try {
+            const std::string zarr_path = params["normal3d_zarr_path"].get<std::string>();
+            const int ome_scale = params.value("normal3d_zarr_scale", 0);
+            const float scale_factor = std::pow(2.0f, -ome_scale);
+
+            // Determine delimiter from x/<scale>/.zarray (fallback '.')
+            std::string delim = ".";
+            try {
+                const std::filesystem::path zarray_path = std::filesystem::path(zarr_path) / "x" / std::to_string(ome_scale) / ".zarray";
+                if (std::filesystem::exists(zarray_path)) {
+                    nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+                    delim = j.value<std::string>("dimension_separator", ".");
+                }
+            } catch (...) {
+                // ignore
+            }
+
+            z5::filesystem::handle::Group dirs_group(zarr_path, z5::FileMode::FileMode::r);
+            std::vector<std::unique_ptr<z5::Dataset>> dss;
+            for (auto dim : std::string("xyz")) {
+                z5::filesystem::handle::Group dim_group(dirs_group, std::string(&dim, 1));
+                z5::filesystem::handle::Dataset ds_handle(dim_group, std::to_string(ome_scale), delim);
+                dss.push_back(z5::filesystem::openDataset(ds_handle));
+            }
+
+            const std::string unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
+            trace_data.normal3d_field = std::make_unique<Chunked3dVec3fFromUint8>(std::move(dss), scale_factor, cache, cache_root, unique_id + "_n3d");
+
+            if (params.contains("normal3d_weight_zarr_path") && params["normal3d_weight_zarr_path"].is_string()) {
+                const std::string wzarr = params["normal3d_weight_zarr_path"].get<std::string>();
+                z5::filesystem::handle::Group weight_group(wzarr);
+                z5::filesystem::handle::Dataset weight_ds_handle(weight_group, std::to_string(ome_scale), delim);
+                auto weight_ds = z5::filesystem::openDataset(weight_ds_handle);
+                trace_data.normal3d_weight = std::make_unique<Chunked3dFloatFromUint8>(std::move(weight_ds), scale_factor, cache, cache_root, unique_id + "_n3d_w");
+            }
+
+            std::cout << "Loaded normal3d zarr field from " << zarr_path << " (scale=" << ome_scale << ", delim='" << delim << "')" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load normal3d zarr field: " << e.what() << std::endl;
+            trace_data.normal3d_field.reset();
+            trace_data.normal3d_weight.reset();
+        }
+    }
+
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
         const nlohmann::json& ref_cfg = params["reference_surface"];
@@ -1877,6 +2002,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
               << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
               << " SNAP: " << loss_settings.w[LossType::SNAP]
               << " NORMAL: " << loss_settings.w[LossType::NORMAL]
+              << " NORMAL3D: " << loss_settings.w[LossType::NORMAL3D]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
