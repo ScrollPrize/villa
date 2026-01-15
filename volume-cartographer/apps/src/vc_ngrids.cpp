@@ -3,6 +3,7 @@
 #include <iostream>
 #include <limits>
 #include <chrono>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -34,14 +35,15 @@ static void print_usage() {
         << "Usage: vc_ngrids [options]\n\n"
         << "Options:\n"
         << "  -h, --help              Print this help message\n"
-        << "  -i, --input PATH        Input NormalGridVolume directory (required)\n"
+        << "  -i, --input PATH        Input NormalGridVolume directory OR normals zarr root (required)\n"
         << "  -c, --crop x0 y0 z0 x1 y1 z1   Crop bounding box in voxel coords (half-open)\n"
         << "      --vis-ply PATH      Write visualization as PLY with vertex colors\n"
         << "      --fit-normals       Estimate local 3D normals from segments (within crop)\n"
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
         << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n\n"
         << "Notes:\n"
-        << "  - Input is the directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
+        << "  - Input can be a directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
+        << "  - Or, input can be a normals zarr root (contains x/0, y/0, z/0 datasets).\n"
         << "  - Crop is optional; if omitted the full extent from metadata/available grids is used.\n";
 }
 
@@ -425,8 +427,9 @@ static cv::Point3f pca_smallest_evec(const std::vector<cv::Point3f>& dirs_unit) 
     return cv::Point3f(0.f, 0.f, 1.f);
 }
 
-static bool fit_normal_ceres(const std::vector<cv::Point3f>& dirs_unit, cv::Point3f& out_n) {
+static bool fit_normal_ceres(const std::vector<cv::Point3f>& dirs_unit, const std::vector<double>& weights, cv::Point3f& out_n) {
     if (dirs_unit.size() < 3) return false;
+    if (weights.size() != dirs_unit.size()) return false;
 
     double n[3];
     {
@@ -437,8 +440,10 @@ static bool fit_normal_ceres(const std::vector<cv::Point3f>& dirs_unit, cv::Poin
     }
 
     ceres::Problem problem;
-    for (const auto& d : dirs_unit) {
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, 1.0));
+    for (size_t i = 0; i < dirs_unit.size(); ++i) {
+        const auto& d = dirs_unit[i];
+        const double w = weights[i];
+        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
         problem.AddResidualBlock(cost, nullptr, n);
     }
     problem.AddResidualBlock(
@@ -521,12 +526,133 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
     ply.end_streaming();
 }
 
+static bool looks_like_normals_zarr_root(const fs::path& input_dir) {
+    // Minimal heuristic: groups x,y,z exist and each has a scale dataset directory ("0").
+    return fs::is_directory(input_dir / "x") && fs::is_directory(input_dir / "y") && fs::is_directory(input_dir / "z") &&
+           fs::is_directory(input_dir / "x" / "0") && fs::is_directory(input_dir / "y" / "0") && fs::is_directory(input_dir / "z" / "0");
+}
+
+static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::path& out_ply, const std::optional<CropBox3i>& crop_opt) {
+    // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
+    std::string delim = ".";
+    {
+        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
+        if (fs::exists(zarray_path)) {
+            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+            delim = j.value<std::string>("dimension_separator", ".");
+        }
+    }
+
+    // Optional metadata written by vc_ngrids --output-zarr.
+    cv::Vec3i origin_xyz(0, 0, 0);
+    int step = 1;
+    {
+        z5::filesystem::handle::File rootFile(zarr_root);
+        z5::filesystem::handle::Group root(rootFile, "");
+        try {
+            nlohmann::json attrs;
+            z5::filesystem::readAttributes(root, attrs);
+            if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
+            }
+            if (attrs.contains("sample_step")) {
+                step = std::max(1, attrs["sample_step"].get<int>());
+            }
+        } catch (...) {
+            // Attributes are optional; keep defaults.
+        }
+    }
+
+    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<z5::Dataset> {
+        z5::filesystem::handle::File file(zarr_root);
+        z5::filesystem::handle::Group axis_group(file, axis);
+        z5::filesystem::handle::Dataset ds_handle(axis_group, "0", delim);
+        return z5::filesystem::openDataset(ds_handle);
+    };
+
+    auto dsx = open_u8_zyx("x");
+    auto dsy = open_u8_zyx("y");
+    auto dsz = open_u8_zyx("z");
+    if (!dsx || !dsy || !dsz) {
+        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    }
+    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+        throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
+    }
+
+    const auto& shape = dsx->shape();
+    if (shape.size() != 3) {
+        throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
+    }
+    const size_t Z = shape[0];
+    const size_t Y = shape[1];
+    const size_t X = shape[2];
+
+    xt::xarray<uint8_t> ax = xt::zeros<uint8_t>({Z, Y, X});
+    xt::xarray<uint8_t> ay = xt::zeros<uint8_t>({Z, Y, X});
+    xt::xarray<uint8_t> az = xt::zeros<uint8_t>({Z, Y, X});
+    z5::types::ShapeType off = {0, 0, 0};
+    z5::multiarray::readSubarray<uint8_t>(*dsx, ax, off.begin());
+    z5::multiarray::readSubarray<uint8_t>(*dsy, ay, off.begin());
+    z5::multiarray::readSubarray<uint8_t>(*dsz, az, off.begin());
+
+    const CropBox3i crop = crop_opt.value_or(CropBox3i{
+        cv::Vec3i(std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4),
+        cv::Vec3i(std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4),
+    });
+
+    auto decode = [&](uint8_t u) -> float {
+        // (u8 - 128) / 127
+        return (static_cast<int>(u) - 128) / 127.0f;
+    };
+
+    const float vis_scale = static_cast<float>(step) * 0.5f;
+    const cv::Vec3b color_bgr(0, 255, 255); // yellow
+
+    PlyWriter ply(out_ply);
+    ply.begin_ascii_streaming();
+
+    for (size_t iz = 0; iz < Z; ++iz) {
+        for (size_t iy = 0; iy < Y; ++iy) {
+            for (size_t ix = 0; ix < X; ++ix) {
+                const uint8_t ux = ax(iz, iy, ix);
+                const uint8_t uy = ay(iz, iy, ix);
+                const uint8_t uz = az(iz, iy, ix);
+                if (ux == 128 && uy == 128 && uz == 128) continue;
+
+                const float nx = decode(ux);
+                const float ny = decode(uy);
+                const float nz = decode(uz);
+                if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz)) continue;
+
+                const int x = origin_xyz[0] + static_cast<int>(ix) * step;
+                const int y = origin_xyz[1] + static_cast<int>(iy) * step;
+                const int z = origin_xyz[2] + static_cast<int>(iz) * step;
+
+                if (x < crop.min[0] || x >= crop.max[0] || y < crop.min[1] || y >= crop.max[1] || z < crop.min[2] || z >= crop.max[2]) {
+                    continue;
+                }
+
+                const cv::Point3f a(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                const cv::Point3f b = a + vis_scale * cv::Point3f(nx, ny, nz);
+                ply.write_segment_streaming(a, b, color_bgr);
+            }
+        }
+    }
+
+    ply.end_streaming();
+}
+
 static void run_fit_normals(
     const fs::path& input_dir,
     const fs::path& out_ply,
     const std::optional<CropBox3i>& crop_opt,
     const std::optional<fs::path>& out_zarr_opt,
-    int step = 64,
+    int step = 16,
     float radius = 96.f) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
@@ -577,6 +703,8 @@ static void run_fit_normals(
     };
 
     const float r2 = radius * radius;
+    const float sigma = radius / 3.0f;
+    const float inv_two_sigma2 = 1.0f / (2.0f * sigma * sigma + 1e-12f);
     const float normal_vis_scale = static_cast<float>(step) * 0.5f;
 
     const int sx0 = align_down(crop.min[0], step);
@@ -629,6 +757,8 @@ static void run_fit_normals(
 
                 std::vector<cv::Point3f> dirs_unit;
                 dirs_unit.reserve(256);
+                std::vector<double> weights;
+                weights.reserve(256);
 
                 for (const auto& pc : planes) {
                     // plane axes
@@ -672,20 +802,25 @@ static void run_fit_normals(
                                 cv::Point3f b = p3_of((*path_ptr)[i + 1]);
 
                                 if (!clip_segment_to_crop(a, b, crop)) continue;
-                                if (dist_sq_point_segment(sample, a, b) > r2) continue;
+                                const float dist2 = dist_sq_point_segment(sample, a, b);
+                                if (dist2 > r2) continue;
 
                                 const cv::Point3f d = b - a;
-                                const float d2 = d.dot(d);
-                                if (d2 <= 1e-6f) continue;
-                                const float inv = 1.0f / std::sqrt(d2);
+                                const float seglen2 = d.dot(d);
+                                if (seglen2 <= 1e-6f) continue;
+                                const float inv = 1.0f / std::sqrt(seglen2);
                                 dirs_unit.emplace_back(d.x * inv, d.y * inv, d.z * inv);
+
+                                // Gaussian falloff: nearer segments contribute more.
+                                const double w = std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2));
+                                weights.push_back(w);
                             }
                         }
                     }
                 }
 
                 cv::Point3f n;
-                const bool ok = fit_normal_ceres(dirs_unit, n);
+                const bool ok = fit_normal_ceres(dirs_unit, weights, n);
                 if (ok) {
                     const cv::Point3f a = sample;
                     const cv::Point3f b = sample + normal_vis_scale * n;
@@ -862,17 +997,27 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const bool input_is_normals_zarr = looks_like_normals_zarr_root(input_dir);
+
     std::optional<CropBox3i> crop;
     if (vm.count("crop")) {
         crop = crop_from_args(vm["crop"].as<std::vector<int>>());
     }
 
     if (vm.count("vis-ply")) {
-        run_vis_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
+        if (input_is_normals_zarr) {
+            run_vis_normals_zarr_as_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
+        } else {
+            run_vis_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
+        }
         return 0;
     }
 
     if (vm.count("fit-normals")) {
+        if (input_is_normals_zarr) {
+            std::cerr << "Error: --fit-normals is not supported when --input is a normals zarr (use --vis-ply).\n";
+            return 1;
+        }
         if (!vm.count("vis-normals")) {
             std::cerr << "Error: --fit-normals requires --vis-normals PATH\n";
             return 1;
