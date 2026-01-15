@@ -1887,19 +1887,28 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             if (nz <= 0 || ny <= 0 || nx <= 0) {
                 throw std::runtime_error("normal3d x/0 dataset has invalid shape");
             }
-            if (vol_z % nz != 0 || vol_y % ny != 0 || vol_x % nx != 0) {
-                throw std::runtime_error("normal3d shape is not an integer downsample of volume shape");
-            }
-            const int rz = vol_z / nz;
-            const int ry = vol_y / ny;
-            const int rx = vol_x / nx;
+            // The normal3d dataset is typically generated on a lattice with
+            // n = ceil(vol / step), so vol may NOT be divisible by n.
+            // Derive the step (=downsample ratio) by rounding vol/n.
+            const double rz_f = static_cast<double>(vol_z) / static_cast<double>(nz);
+            const double ry_f = static_cast<double>(vol_y) / static_cast<double>(ny);
+            const double rx_f = static_cast<double>(vol_x) / static_cast<double>(nx);
+
+            const int rz = std::max(1, static_cast<int>(std::llround(rz_f)));
+            const int ry = std::max(1, static_cast<int>(std::llround(ry_f)));
+            const int rx = std::max(1, static_cast<int>(std::llround(rx_f)));
+
+            // Be tolerant of off-by-one shape effects from ceil() at the boundary.
+            // Require all axes to agree after rounding.
             if (rz != ry || ry != rx) {
-                throw std::runtime_error("normal3d downsample ratio differs across axes");
+                std::stringstream msg;
+                msg << "normal3d downsample ratio differs across axes after rounding: "
+                    << "rx=" << rx << " ry=" << ry << " rz=" << rz
+                    << " (vol=" << vol_x << "x" << vol_y << "x" << vol_z
+                    << ", n=" << nx << "x" << ny << "x" << nz << ")";
+                throw std::runtime_error(msg.str());
             }
-            const int ratio = rz;
-            if (ratio <= 0) {
-                throw std::runtime_error("normal3d invalid downsample ratio");
-            }
+            const int ratio = rx;
 
             const float scale_factor = 1.0f / static_cast<float>(ratio);
 
