@@ -649,7 +649,7 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
 
 static void run_fit_normals(
     const fs::path& input_dir,
-    const fs::path& out_ply,
+    const std::optional<fs::path>& out_ply_opt,
     const std::optional<CropBox3i>& crop_opt,
     const std::optional<fs::path>& out_zarr_opt,
     int step = 16,
@@ -664,9 +664,7 @@ static void run_fit_normals(
                   std::numeric_limits<int>::max() / 4),
     });
 
-    // We parallelize fitting across sample points.
-    // To avoid locking output, each thread writes raw vertices/edges to its own temp files.
-    // We keep per-thread counts while writing, then merge into the requested PLY without parsing PLY.
+    // Optional PLY output: per-thread temp files then merge.
     const int nthreads = std::max(1, omp_get_max_threads());
     struct ThreadOut {
         fs::path vtx_path;
@@ -676,16 +674,20 @@ static void run_fit_normals(
         size_t vtx_count = 0;
         size_t edg_count = 0;
     };
-    std::vector<ThreadOut> t_out(static_cast<size_t>(nthreads));
-    for (int t = 0; t < nthreads; ++t) {
-        t_out[t].vtx_path = out_ply;
-        t_out[t].vtx_path += ".normals.vtx.part" + std::to_string(t);
-        t_out[t].edg_path = out_ply;
-        t_out[t].edg_path += ".normals.edg.part" + std::to_string(t);
-        t_out[t].vtx.open(t_out[t].vtx_path, std::ios::out | std::ios::trunc);
-        t_out[t].edg.open(t_out[t].edg_path, std::ios::out | std::ios::trunc);
-        if (!t_out[t].vtx || !t_out[t].edg) {
-            throw std::runtime_error("Failed to open temp normal output files for thread " + std::to_string(t));
+    std::vector<ThreadOut> t_out;
+    if (out_ply_opt.has_value()) {
+        const fs::path& out_ply = *out_ply_opt;
+        t_out.resize(static_cast<size_t>(nthreads));
+        for (int t = 0; t < nthreads; ++t) {
+            t_out[t].vtx_path = out_ply;
+            t_out[t].vtx_path += ".normals.vtx.part" + std::to_string(t);
+            t_out[t].edg_path = out_ply;
+            t_out[t].edg_path += ".normals.edg.part" + std::to_string(t);
+            t_out[t].vtx.open(t_out[t].vtx_path, std::ios::out | std::ios::trunc);
+            t_out[t].edg.open(t_out[t].edg_path, std::ios::out | std::ios::trunc);
+            if (!t_out[t].vtx || !t_out[t].edg) {
+                throw std::runtime_error("Failed to open temp normal output files for thread " + std::to_string(t));
+            }
         }
     }
 
@@ -750,7 +752,10 @@ static void run_fit_normals(
         for (int y = sy0; y < crop.max[1]; y += step) {
             for (int x = sx0; x < crop.max[0]; x += step) {
                 const int tid = omp_get_thread_num();
-                ThreadOut& tout = t_out[static_cast<size_t>(tid)];
+                ThreadOut* tout = nullptr;
+                if (out_ply_opt.has_value()) {
+                    tout = &t_out[static_cast<size_t>(tid)];
+                }
 
                 const cv::Point3f sample(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                 const float sample_arr[3] = {sample.x, sample.y, sample.z};
@@ -822,19 +827,21 @@ static void run_fit_normals(
                 cv::Point3f n;
                 const bool ok = fit_normal_ceres(dirs_unit, weights, n);
                 if (ok) {
-                    const cv::Point3f a = sample;
-                    const cv::Point3f b = sample + normal_vis_scale * n;
-                    const int r = static_cast<int>(color_bgr[2]);
-                    const int g = static_cast<int>(color_bgr[1]);
-                    const int bc = static_cast<int>(color_bgr[0]);
+                    if (tout != nullptr) {
+                        const cv::Point3f a = sample;
+                        const cv::Point3f b = sample + normal_vis_scale * n;
+                        const int r = static_cast<int>(color_bgr[2]);
+                        const int g = static_cast<int>(color_bgr[1]);
+                        const int bc = static_cast<int>(color_bgr[0]);
 
-                    const size_t idx0 = tout.vtx_count;
-                    const size_t idx1 = tout.vtx_count + 1;
-                    tout.vtx << a.x << " " << a.y << " " << a.z << " " << r << " " << g << " " << bc << "\n";
-                    tout.vtx << b.x << " " << b.y << " " << b.z << " " << r << " " << g << " " << bc << "\n";
-                    tout.edg << idx0 << " " << idx1 << "\n";
-                    tout.vtx_count += 2;
-                    tout.edg_count += 1;
+                        const size_t idx0 = tout->vtx_count;
+                        const size_t idx1 = tout->vtx_count + 1;
+                        tout->vtx << a.x << " " << a.y << " " << a.z << " " << r << " " << g << " " << bc << "\n";
+                        tout->vtx << b.x << " " << b.y << " " << b.z << " " << r << " " << g << " " << bc << "\n";
+                        tout->edg << idx0 << " " << idx1 << "\n";
+                        tout->vtx_count += 2;
+                        tout->edg_count += 1;
+                    }
 
                     if (out_zarr_opt.has_value()) {
                         const int ix = (x - sx0) / step;
@@ -870,42 +877,39 @@ static void run_fit_normals(
         }
     }
 
-    // Close per-thread temp files before merge.
-    for (auto& to : t_out) {
-        to.vtx.close();
-        to.edg.close();
-    }
+    if (out_ply_opt.has_value()) {
+        const fs::path& out_ply = *out_ply_opt;
 
-    // Merge into a single PLY (streaming).
-    size_t total_v = 0;
-    size_t total_e = 0;
-    for (const auto& to : t_out) {
-        total_v += to.vtx_count;
-        total_e += to.edg_count;
-    }
+        // Close per-thread temp files before merge.
+        for (auto& to : t_out) {
+            to.vtx.close();
+            to.edg.close();
+        }
 
-    PlyWriter merged(out_ply);
-    merged.begin_ascii_streaming();
+        // Merge into a single PLY (streaming).
+        PlyWriter merged(out_ply);
+        merged.begin_ascii_streaming();
 
-    // Write vertices by concatenating temp vertex files.
-    for (const auto& to : t_out) {
-        merged.append_vertex_lines_from_file(to.vtx_path, to.vtx_count);
-    }
+        // Write vertices by concatenating temp vertex files.
+        for (const auto& to : t_out) {
+            merged.append_vertex_lines_from_file(to.vtx_path, to.vtx_count);
+        }
 
-    // Write edges with per-thread vertex offset.
-    size_t vtx_offset = 0;
-    for (const auto& to : t_out) {
-        merged.append_edge_lines_from_file_with_offset(to.edg_path, vtx_offset, to.edg_count);
-        vtx_offset += to.vtx_count;
-    }
+        // Write edges with per-thread vertex offset.
+        size_t vtx_offset = 0;
+        for (const auto& to : t_out) {
+            merged.append_edge_lines_from_file_with_offset(to.edg_path, vtx_offset, to.edg_count);
+            vtx_offset += to.vtx_count;
+        }
 
-    merged.end_streaming();
+        merged.end_streaming();
 
-    // Cleanup temp files.
-    for (const auto& to : t_out) {
-        std::error_code ec;
-        fs::remove(to.vtx_path, ec);
-        fs::remove(to.edg_path, ec);
+        // Cleanup temp files.
+        for (const auto& to : t_out) {
+            std::error_code ec;
+            fs::remove(to.vtx_path, ec);
+            fs::remove(to.edg_path, ec);
+        }
     }
 
     if (out_zarr_opt.has_value()) {
@@ -1018,15 +1022,20 @@ int main(int argc, char** argv) {
             std::cerr << "Error: --fit-normals is not supported when --input is a normals zarr (use --vis-ply).\n";
             return 1;
         }
-        if (!vm.count("vis-normals")) {
-            std::cerr << "Error: --fit-normals requires --vis-normals PATH\n";
+        if (!vm.count("vis-normals") && !vm.count("output-zarr")) {
+            std::cerr << "Error: --fit-normals requires --vis-normals PATH and/or --output-zarr PATH\n";
             return 1;
         }
         std::optional<fs::path> out_zarr;
         if (vm.count("output-zarr")) {
             out_zarr = fs::path(vm["output-zarr"].as<std::string>());
         }
-        run_fit_normals(input_dir, fs::path(vm["vis-normals"].as<std::string>()), crop, out_zarr);
+
+        std::optional<fs::path> out_ply;
+        if (vm.count("vis-normals")) {
+            out_ply = fs::path(vm["vis-normals"].as<std::string>());
+        }
+        run_fit_normals(input_dir, out_ply, crop, out_zarr);
         return 0;
     }
 
