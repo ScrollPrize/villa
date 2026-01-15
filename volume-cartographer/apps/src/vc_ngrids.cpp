@@ -484,6 +484,55 @@ static int align_down(int v, int step) {
     return -(((-v + step - 1) / step) * step);
 }
 
+static std::optional<cv::Vec3i> infer_volume_shape_from_grids(const fs::path& ngv_root) {
+    // Infer (X,Y,Z) from GridStore slice dimensions.
+    // XY: (width,height)=(X,Y)
+    // XZ: (width,height)=(X,Z)
+    // YZ: (width,height)=(Y,Z)
+    auto find_any_grid = [&](const fs::path& dir) -> std::optional<fs::path> {
+        if (!fs::exists(dir) || !fs::is_directory(dir)) return std::nullopt;
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() == ".grid") return entry.path();
+        }
+        return std::nullopt;
+    };
+
+    std::optional<int> X, Y, Z;
+    auto try_xy = [&]() {
+        auto p = find_any_grid(ngv_root / "xy");
+        if (!p) return;
+        vc::core::util::GridStore g(p->string());
+        const auto sz = g.size();
+        X = sz.width;
+        Y = sz.height;
+    };
+    auto try_xz = [&]() {
+        auto p = find_any_grid(ngv_root / "xz");
+        if (!p) return;
+        vc::core::util::GridStore g(p->string());
+        const auto sz = g.size();
+        X = X.value_or(sz.width);
+        Z = sz.height;
+    };
+    auto try_yz = [&]() {
+        auto p = find_any_grid(ngv_root / "yz");
+        if (!p) return;
+        vc::core::util::GridStore g(p->string());
+        const auto sz = g.size();
+        Y = Y.value_or(sz.width);
+        Z = Z.value_or(sz.height);
+    };
+
+    try_xy();
+    try_xz();
+    try_yz();
+
+    if (!X || !Y || !Z) return std::nullopt;
+    if (*X <= 0 || *Y <= 0 || *Z <= 0) return std::nullopt;
+    return cv::Vec3i(*X, *Y, *Z);
+}
+
 static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, const std::optional<CropBox3i>& crop_opt) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
@@ -713,10 +762,31 @@ static void run_fit_normals(
     const int sy0 = align_down(crop.min[1], step);
     const int sz0 = align_down(crop.min[2], step);
 
-    const int nx = (crop.max[0] - sx0 + step - 1) / step;
-    const int ny = (crop.max[1] - sy0 + step - 1) / step;
-    const int nz = (crop.max[2] - sz0 + step - 1) / step;
-    const int64_t total_samples = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) * static_cast<int64_t>(nz);
+    // When writing zarr, allocate a full-sized (downsampled) volume and only fill within crop.
+    // This way downstream tools can use global voxel coordinates without needing crop-origin offsets.
+    int nx = 0, ny = 0, nz = 0;
+    if (out_zarr_opt.has_value()) {
+        const auto vol_xyz_opt = infer_volume_shape_from_grids(input_dir);
+        if (!vol_xyz_opt.has_value()) {
+            throw std::runtime_error("Failed to infer volume shape from normal grids (need at least two plane dirs with .grid files)");
+        }
+        const cv::Vec3i vol_xyz = *vol_xyz_opt;
+        nx = (vol_xyz[0] + step - 1) / step;
+        ny = (vol_xyz[1] + step - 1) / step;
+        nz = (vol_xyz[2] + step - 1) / step;
+    } else {
+        // For PLY-only mode, only consider sample lattice in the crop.
+        nx = (crop.max[0] - sx0 + step - 1) / step;
+        ny = (crop.max[1] - sy0 + step - 1) / step;
+        nz = (crop.max[2] - sz0 + step - 1) / step;
+    }
+
+    // Progress reporting should reflect *work done*, i.e. samples evaluated within the crop,
+    // not the size of the allocated output lattice.
+    const int crop_nx = (crop.max[0] - sx0 + step - 1) / step;
+    const int crop_ny = (crop.max[1] - sy0 + step - 1) / step;
+    const int crop_nz = (crop.max[2] - sz0 + step - 1) / step;
+    const int64_t total_samples = static_cast<int64_t>(crop_nx) * static_cast<int64_t>(crop_ny) * static_cast<int64_t>(crop_nz);
 
     // Optional output: store fitted normals on the sample lattice.
     // Encoding matches direction-field zarrs: 3 uint8 volumes x,y,z, decoded as (v-128)/127.
@@ -747,6 +817,7 @@ static void run_fit_normals(
                   << " | ETA " << eta << "s\n";
     };
 
+    // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
     #pragma omp parallel for collapse(3) schedule(dynamic,1)
     for (int z = sz0; z < crop.max[2]; z += step) {
         for (int y = sy0; y < crop.max[1]; y += step) {
@@ -844,9 +915,9 @@ static void run_fit_normals(
                     }
 
                     if (out_zarr_opt.has_value()) {
-                        const int ix = (x - sx0) / step;
-                        const int iy = (y - sy0) / step;
-                        const int iz = (z - sz0) / step;
+                        const int ix = x / step;
+                        const int iy = y / step;
+                        const int iz = z / step;
                         const size_t lin = (static_cast<size_t>(iz) * static_cast<size_t>(ny) + static_cast<size_t>(iy)) * static_cast<size_t>(nx) + static_cast<size_t>(ix);
                         enc_x[lin] = encode_dir_component(n.x);
                         enc_y[lin] = encode_dir_component(n.y);
@@ -957,7 +1028,6 @@ static void run_fit_normals(
         attrs["radius"] = radius;
         attrs["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
         attrs["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
-        attrs["grid_origin_xyz"] = {sx0, sy0, sz0};
         attrs["grid_shape_zyx"] = {shape[0], shape[1], shape[2]};
         z5::filesystem::handle::Group root(outFile, "");
         z5::filesystem::writeAttributes(root, attrs);

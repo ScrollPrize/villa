@@ -426,14 +426,14 @@ struct LossSettings {
     std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
 
     LossSettings() {
-        w[LossType::SNAP] = 0.1f;
-        w[LossType::NORMAL] = 10.0f;
-        w[LossType::NORMAL3D] = 0.0f;
-        w[LossType::STRAIGHT] = 0.2f;
+        w[LossType::SNAP] = 0.0;
+        w[LossType::NORMAL] = 0.0f;
+        w[LossType::NORMAL3D] = 1.0f;
+        w[LossType::STRAIGHT] = 0.1;
         w[LossType::DIST] = 1.0f;
-        w[LossType::DIRECTION] = 1.0f;
-        w[LossType::SDIR] = 1.0f;
-        w[LossType::CORRECTION] = 1.0f;
+        w[LossType::DIRECTION] = 0.0f;
+        w[LossType::SDIR] = 0.0f;
+        w[LossType::CORRECTION] = 0.0f;
     }
 
     void applyJsonWeights(const nlohmann::json& params) {
@@ -1202,15 +1202,15 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
     }
 
-    if (flags & LOSS_3DNORMAL) {
-        // one per local cell, around p
-        count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
-        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
-        count += gen_3d_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
-        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
-    }
+    // if (flags & LOSS_3DNORMAL) {
+    //     // one per local cell, around p
+    //     count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
+    //     count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
+    //     count += gen_3d_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
+    //     count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
+    // }
 
-    count += gen_reference_ray_loss(problem, p, params, trace_data);
+    // count += gen_reference_ray_loss(problem, p, params, trace_data);
 
     return count;
 }
@@ -1457,7 +1457,7 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data, settings);
     count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data, settings);
 
-    count += gen_reference_ray_loss(problem, p, params, trace_data);
+    // count += gen_reference_ray_loss(problem, p, params, trace_data);
 
     return count;
 }
@@ -1846,17 +1846,19 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
 
-    // Optional fitted-3D normals field (direction-field zarr root with x/<scale>,y/<scale>,z/<scale>)
+    // Optional fitted-3D normals field (direction-field zarr root with x/<scale>,y/<scale>,z/<scale>).
+    // IMPORTANT: We auto-derive the correct scale factor from dataset shapes and ignore any JSON scale parameter.
     if (params.contains("normal3d_zarr_path") && params["normal3d_zarr_path"].is_string()) {
         try {
-            const std::string zarr_path = params["normal3d_zarr_path"].get<std::string>();
-            const int ome_scale = params.value("normal3d_zarr_scale", 0);
-            const float scale_factor = std::pow(2.0f, -ome_scale);
+            const std::filesystem::path zarr_root = params["normal3d_zarr_path"].get<std::string>();
 
-            // Determine delimiter from x/<scale>/.zarray (fallback '.')
+            // Expect fixed layout: <root>/{x,y,z}/0
+            const int scale_level = 0;
+
+            // Read delimiter from x/0/.zarray (fallback '.')
             std::string delim = ".";
             try {
-                const std::filesystem::path zarray_path = std::filesystem::path(zarr_path) / "x" / std::to_string(ome_scale) / ".zarray";
+                const std::filesystem::path zarray_path = zarr_root / "x" / "0" / ".zarray";
                 if (std::filesystem::exists(zarray_path)) {
                     nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
                     delim = j.value<std::string>("dimension_separator", ".");
@@ -1865,26 +1867,64 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 // ignore
             }
 
-            z5::filesystem::handle::Group dirs_group(zarr_path, z5::FileMode::FileMode::r);
+            // Derive scale purely from shapes: main volume is full-res, normal zarr is downsampled.
+            const auto vol_shape_zyx = ds->shape();
+            const int vol_z = static_cast<int>(vol_shape_zyx.at(0));
+            const int vol_y = static_cast<int>(vol_shape_zyx.at(1));
+            const int vol_x = static_cast<int>(vol_shape_zyx.at(2));
+
+            z5::filesystem::handle::Group dirs_group(zarr_root.string(), z5::FileMode::FileMode::r);
+            z5::filesystem::handle::Group x_group(dirs_group, "x");
+            z5::filesystem::handle::Dataset x_ds_handle(x_group, "0", delim);
+            auto x_ds = z5::filesystem::openDataset(x_ds_handle);
+            const auto nshape = x_ds->shape();
+            if (nshape.size() != 3) {
+                throw std::runtime_error("normal3d x/0 dataset is not 3D");
+            }
+            const int nz = static_cast<int>(nshape.at(0));
+            const int ny = static_cast<int>(nshape.at(1));
+            const int nx = static_cast<int>(nshape.at(2));
+            if (nz <= 0 || ny <= 0 || nx <= 0) {
+                throw std::runtime_error("normal3d x/0 dataset has invalid shape");
+            }
+            if (vol_z % nz != 0 || vol_y % ny != 0 || vol_x % nx != 0) {
+                throw std::runtime_error("normal3d shape is not an integer downsample of volume shape");
+            }
+            const int rz = vol_z / nz;
+            const int ry = vol_y / ny;
+            const int rx = vol_x / nx;
+            if (rz != ry || ry != rx) {
+                throw std::runtime_error("normal3d downsample ratio differs across axes");
+            }
+            const int ratio = rz;
+            if (ratio <= 0) {
+                throw std::runtime_error("normal3d invalid downsample ratio");
+            }
+
+            const float scale_factor = 1.0f / static_cast<float>(ratio);
+
             std::vector<std::unique_ptr<z5::Dataset>> dss;
             for (auto dim : std::string("xyz")) {
                 z5::filesystem::handle::Group dim_group(dirs_group, std::string(&dim, 1));
-                z5::filesystem::handle::Dataset ds_handle(dim_group, std::to_string(ome_scale), delim);
+                z5::filesystem::handle::Dataset ds_handle(dim_group, std::to_string(scale_level), delim);
                 dss.push_back(z5::filesystem::openDataset(ds_handle));
             }
 
-            const std::string unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
+            const std::string unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string()));
             trace_data.normal3d_field = std::make_unique<Chunked3dVec3fFromUint8>(std::move(dss), scale_factor, cache, cache_root, unique_id + "_n3d");
 
             if (params.contains("normal3d_weight_zarr_path") && params["normal3d_weight_zarr_path"].is_string()) {
-                const std::string wzarr = params["normal3d_weight_zarr_path"].get<std::string>();
-                z5::filesystem::handle::Group weight_group(wzarr);
-                z5::filesystem::handle::Dataset weight_ds_handle(weight_group, std::to_string(ome_scale), delim);
+                const std::filesystem::path wzarr_root = params["normal3d_weight_zarr_path"].get<std::string>();
+                z5::filesystem::handle::Group weight_group(wzarr_root.string(), z5::FileMode::FileMode::r);
+                z5::filesystem::handle::Dataset weight_ds_handle(weight_group, std::to_string(scale_level), delim);
                 auto weight_ds = z5::filesystem::openDataset(weight_ds_handle);
                 trace_data.normal3d_weight = std::make_unique<Chunked3dFloatFromUint8>(std::move(weight_ds), scale_factor, cache, cache_root, unique_id + "_n3d_w");
             }
 
-            std::cout << "Loaded normal3d zarr field from " << zarr_path << " (scale=" << ome_scale << ", delim='" << delim << "')" << std::endl;
+            std::cout << "Loaded normal3d zarr field from " << zarr_root
+                      << " (ratio=" << ratio
+                      << ", scale_factor=" << scale_factor
+                      << ", delim='" << delim << "')" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "Failed to load normal3d zarr field: " << e.what() << std::endl;
             trace_data.normal3d_field.reset();
