@@ -515,6 +515,61 @@ struct NormalDirectionLoss {
     }
 };
 
+// Penalize mismatch between the *surface* normal of a local quad corner (computed from 3 points)
+// and a target normal field stored in a Zarr direction-field encoding.
+//
+// - Points are provided in XYZ order.
+// - The target normal field is sampled (non-differentiably) at p_base.
+// - The residual is 1 - |dot(n_surface, n_target)| (flip-invariant).
+struct Normal3DLoss {
+    Normal3DLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w)
+        : _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {}
+
+    template <typename E>
+    bool operator()(const E* const p_base, const E* const p_u, const E* const p_v, E* residual) const {
+        // p_* are XYZ, while _normal_dirs is indexed ZYX and returns ZYX-ordered vectors.
+
+        // sample target normal at base point (non-differentiable wrt position)
+        cv::Vec3f target_zyx_vec = _normal_dirs(unjet(p_base[2]), unjet(p_base[1]), unjet(p_base[0]));
+        E target_zyx[3] = {E(target_zyx_vec[0]), E(target_zyx_vec[1]), E(target_zyx_vec[2])};
+
+        // compute surface normal from base/u/v edges, in ZYX ordering
+        E eu_zyx[3] = { p_u[2] - p_base[2], p_u[1] - p_base[1], p_u[0] - p_base[0] };
+        E ev_zyx[3] = { p_v[2] - p_base[2], p_v[1] - p_base[1], p_v[0] - p_base[0] };
+
+        E n_zyx[3] = {
+            eu_zyx[1] * ev_zyx[2] - eu_zyx[2] * ev_zyx[1],
+            eu_zyx[2] * ev_zyx[0] - eu_zyx[0] * ev_zyx[2],
+            eu_zyx[0] * ev_zyx[1] - eu_zyx[1] * ev_zyx[0],
+        };
+
+        E n_len = ceres::sqrt(n_zyx[0]*n_zyx[0] + n_zyx[1]*n_zyx[1] + n_zyx[2]*n_zyx[2] + E(1e-12));
+        n_zyx[0] /= n_len;
+        n_zyx[1] /= n_len;
+        n_zyx[2] /= n_len;
+
+        E abs_dot = ceres::abs(n_zyx[0] * target_zyx[0] + n_zyx[1] * target_zyx[1] + n_zyx[2] * target_zyx[2]);
+
+        E weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(p_base[2]), unjet(p_base[1]), unjet(p_base[0]))) : E(1);
+
+        residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
+        return true;
+    }
+
+    static double unjet(const double& v) { return v; }
+    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
+
+    float _w;
+    Chunked3dVec3fFromUint8 &_normal_dirs;
+    Chunked3dFloatFromUint8 *_maybe_weights;
+
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0f)
+    {
+        return new ceres::AutoDiffCostFunction<Normal3DLoss, 1, 3, 3, 3>(
+            new Normal3DLoss(normal_dirs, maybe_weights, w));
+    }
+};
+
 /**
  * @brief Ceres cost function to enforce that the surface normal aligns with precomputed normal grids.
  *
