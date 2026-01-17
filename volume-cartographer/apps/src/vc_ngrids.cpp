@@ -6,6 +6,8 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <array>
+#include <random>
 
 #include <boost/program_options.hpp>
 #include <opencv2/core/types.hpp>
@@ -417,49 +419,31 @@ struct UnitNormResidual {
     double w_;
 };
 
-static cv::Point3f pca_smallest_evec(const std::vector<cv::Point3f>& dirs_unit) {
-    // Build 3x3 covariance C = sum d d^T.
-    double c[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-    for (const auto& d : dirs_unit) {
-        c[0][0] += d.x * d.x;
-        c[0][1] += d.x * d.y;
-        c[0][2] += d.x * d.z;
-        c[1][0] += d.y * d.x;
-        c[1][1] += d.y * d.y;
-        c[1][2] += d.y * d.z;
-        c[2][0] += d.z * d.x;
-        c[2][1] += d.z * d.y;
-        c[2][2] += d.z * d.z;
-    }
-
-    // Power iteration on inverse is overkill; do a simple heuristic init:
-    // pick cross of two non-parallel directions.
-    for (size_t i = 0; i + 1 < dirs_unit.size(); ++i) {
-        const cv::Point3f a = dirs_unit[i];
-        const cv::Point3f b = dirs_unit[i + 1];
-        const cv::Point3f n(a.y * b.z - a.z * b.y,
-                            a.z * b.x - a.x * b.z,
-                            a.x * b.y - a.y * b.x);
-        const float n2 = n.dot(n);
-        if (n2 > 1e-6f) {
-            return n * (1.0f / std::sqrt(n2));
-        }
-    }
-
-    // Fallback.
-    return cv::Point3f(0.f, 0.f, 1.f);
-}
-
 static bool fit_normal_ceres(
-    const std::vector<cv::Point3f>& dirs_unit,
-    const std::vector<double>& weights,
+    std::array<std::vector<cv::Point3f>, 3>& dirs_unit_by_plane,
+    std::array<std::vector<double>, 3>& weights_by_plane,
     cv::Point3f& out_n,
     int* out_num_iterations,
     double* out_rms,
     double* out_solve_seconds,
     double* inout_init_n) {
-    if (dirs_unit.size() < 3) return false;
-    if (weights.size() != dirs_unit.size()) return false;
+    for (int p = 0; p < 3; ++p) {
+        if (weights_by_plane[p].size() != dirs_unit_by_plane[p].size()) return false;
+    }
+
+    // Determine how many samples we will use per plane.
+    const size_t n0 = dirs_unit_by_plane[0].size();
+    const size_t n1 = dirs_unit_by_plane[1].size();
+    const size_t n2 = dirs_unit_by_plane[2].size();
+    const size_t total = n0 + n1 + n2;
+    if (total < 3) return false;
+
+    // Re-weight so each plane contributes equally (counts only).
+    // scale[p] = (total/3) / n_p (0 if n_p==0)
+    const double target = static_cast<double>(total) / 3.0;
+    const double s0 = (n0 > 0) ? (target / static_cast<double>(n0)) : 0.0;
+    const double s1 = (n1 > 0) ? (target / static_cast<double>(n1)) : 0.0;
+    const double s2 = (n2 > 0) ? (target / static_cast<double>(n2)) : 0.0;
 
     double n[3];
     if (inout_init_n != nullptr) {
@@ -467,28 +451,28 @@ static bool fit_normal_ceres(
         n[0] = inout_init_n[0];
         n[1] = inout_init_n[1];
         n[2] = inout_init_n[2];
-        const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        if (!(len > 1e-12)) {
-            const cv::Point3f init = pca_smallest_evec(dirs_unit);
-            n[0] = init.x;
-            n[1] = init.y;
-            n[2] = init.z;
-        } else {
-            n[0] /= len;
-            n[1] /= len;
-            n[2] /= len;
-        }
     } else {
-        const cv::Point3f init = pca_smallest_evec(dirs_unit);
-        n[0] = init.x;
-        n[1] = init.y;
-        n[2] = init.z;
+        n[0] = 1;
+        n[1] = 1;
+        n[2] = 1;
     }
 
     ceres::Problem problem;
-    for (size_t i = 0; i < dirs_unit.size(); ++i) {
-        const auto& d = dirs_unit[i];
-        const double w = weights[i];
+    for (size_t k = 0; k < n0; ++k) {
+        const auto& d = dirs_unit_by_plane[0][k];
+        const double w = weights_by_plane[0][k] * s0;
+        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
+        problem.AddResidualBlock(cost, nullptr, n);
+    }
+    for (size_t k = 0; k < n1; ++k) {
+        const auto& d = dirs_unit_by_plane[1][k];
+        const double w = weights_by_plane[1][k] * s1;
+        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
+        problem.AddResidualBlock(cost, nullptr, n);
+    }
+    for (size_t k = 0; k < n2; ++k) {
+        const auto& d = dirs_unit_by_plane[2][k];
+        const double w = weights_by_plane[2][k] * s2;
         auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
         problem.AddResidualBlock(cost, nullptr, n);
     }
@@ -498,8 +482,8 @@ static bool fit_normal_ceres(
         n);
 
     ceres::Solver::Options opts;
-    // opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    opts.linear_solver_type = ceres::SPARSE_SCHUR;
+    opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    // opts.linear_solver_type = ceres::SPARSE_SCHUR;
     opts.max_num_iterations = 1000;
     opts.minimizer_progress_to_stdout = false;
 
@@ -917,7 +901,10 @@ static void run_fit_normals(
         uint64_t samples_total = 0;
         double t_ng_read_s = 0.0;
         double t_preproc_s = 0.0;
+        // Time spent inside the Ceres solver call itself (as reported by fit_normal_ceres).
         double t_solve_s = 0.0;
+        // Total time spent in the fit_normal_ceres() call (includes setup, residual creation, etc.).
+        double t_solve_call_s = 0.0;
         double t_overhead_s = 0.0;
 
         // Debug: distance test rejection rate.
@@ -952,11 +939,12 @@ static void run_fit_normals(
             ++rms_fine[fi];
         }
 
-        void add_timing(double ng_read_s, double preproc_s, double solve_s, double overhead_s) {
+        void add_timing(double ng_read_s, double preproc_s, double solve_s, double solve_call_s, double overhead_s) {
             ++samples_total;
             t_ng_read_s += ng_read_s;
             t_preproc_s += preproc_s;
             t_solve_s += solve_s;
+            t_solve_call_s += solve_call_s;
             t_overhead_s += overhead_s;
         }
 
@@ -996,6 +984,7 @@ static void run_fit_normals(
         acc.t_ng_read_s += s.t_ng_read_s;
         acc.t_preproc_s += s.t_preproc_s;
         acc.t_solve_s += s.t_solve_s;
+        acc.t_solve_call_s += s.t_solve_call_s;
         acc.t_overhead_s += s.t_overhead_s;
 
         acc.dist_test_total += s.dist_test_total;
@@ -1060,10 +1049,10 @@ static void run_fit_normals(
         const FitStats acc = summarize_stats(stats);
         const double avg = (acc.ok_count > 0) ? (acc.rms_sum / static_cast<double>(acc.ok_count)) : 0.0;
         const double med = estimate_median_from_fine(acc);
-        const double work = acc.t_ng_read_s + acc.t_preproc_s + acc.t_solve_s + acc.t_overhead_s;
+        const double work = acc.t_ng_read_s + acc.t_preproc_s + acc.t_solve_call_s + acc.t_overhead_s;
         const double png = (work > 1e-12) ? (100.0 * acc.t_ng_read_s / work) : 0.0;
         const double ppp = (work > 1e-12) ? (100.0 * acc.t_preproc_s / work) : 0.0;
-        const double ps = (work > 1e-12) ? (100.0 * acc.t_solve_s / work) : 0.0;
+        const double ps = (work > 1e-12) ? (100.0 * acc.t_solve_call_s / work) : 0.0;
         const double po = (work > 1e-12) ? (100.0 * acc.t_overhead_s / work) : 0.0;
         std::cerr << "fit-normals stats: ok=" << acc.ok_count
                   << " | rms(avg/med/max)=" << avg << "/" << med << "/" << acc.rms_max << "\n";
@@ -1078,10 +1067,11 @@ static void run_fit_normals(
                   << "," << acc.rms_buckets[4] << "," << acc.rms_buckets[5] << "," << acc.rms_buckets[6] << "\n";
 
         // Time breakdown is thread-summed (can exceed wall time with OpenMP).
+        const double solve_call_overhead_s = std::max(0.0, acc.t_solve_call_s - acc.t_solve_s);
         std::cerr << "  time(thread-summed): samples=" << acc.samples_total
                   << " | ng_read=" << acc.t_ng_read_s << "s (" << png << "%)"
                   << " | preproc=" << acc.t_preproc_s << "s (" << ppp << "%)"
-                  << " | solve=" << acc.t_solve_s << "s (" << ps << "%)"
+                  << " | solve_call=" << acc.t_solve_call_s << "s (" << ps << "%); ceres_solve=" << acc.t_solve_s << "s; solve_call_overhead=" << solve_call_overhead_s << "s"
                   << " | overhead=" << acc.t_overhead_s << "s (" << po << "%)\n";
 
         const double rej = (acc.dist_test_total > 0) ? (100.0 * static_cast<double>(acc.dist_test_reject) / static_cast<double>(acc.dist_test_total)) : 0.0;
@@ -1104,10 +1094,12 @@ static void run_fit_normals(
 
                 const auto t_sample0 = std::chrono::steady_clock::now();
 
-                std::vector<cv::Point3f> dirs_unit;
-                dirs_unit.reserve(256);
-                std::vector<double> weights;
-                weights.reserve(256);
+                std::array<std::vector<cv::Point3f>, 3> dirs_unit;
+                std::array<std::vector<double>, 3> weights;
+                for (int p = 0; p < 3; ++p) {
+                    dirs_unit[p].reserve(256);
+                    weights[p].reserve(256);
+                }
 
                 double t_ng_read_s = 0.0;
                 double t_preproc_s = 0.0;
@@ -1178,11 +1170,11 @@ static void run_fit_normals(
                                 const float seglen2 = d.dot(d);
                                 if (seglen2 <= 1e-6f) continue;
                                 const float inv = 1.0f / std::sqrt(seglen2);
-                                dirs_unit.emplace_back(d.x * inv, d.y * inv, d.z * inv);
+                                dirs_unit[pc.plane_idx].emplace_back(d.x * inv, d.y * inv, d.z * inv);
 
                                 // Gaussian falloff: nearer segments contribute more.
                                 const double w = std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2));
-                                weights.push_back(w);
+                                weights[pc.plane_idx].push_back(w);
                             }
                         }
                         const auto t_pp1 = std::chrono::steady_clock::now();
@@ -1194,15 +1186,20 @@ static void run_fit_normals(
                 int iters = 0;
                 double rms = 0.0;
                 double t_solve_s = 0.0;
+                double t_solve_call_s = 0.0;
                 WarmStart& ws = warm[static_cast<size_t>(tid)];
                 double* init_ptr = ws.has ? ws.n : nullptr;
+                const auto t_solve_call0 = std::chrono::steady_clock::now();
                 const bool ok = fit_normal_ceres(dirs_unit, weights, n, &iters, &rms, &t_solve_s, init_ptr);
+                const auto t_solve_call1 = std::chrono::steady_clock::now();
+                t_solve_call_s = std::chrono::duration<double>(t_solve_call1 - t_solve_call0).count();
                 if (ok) {
                     ws.n[0] = n.x;
                     ws.n[1] = n.y;
                     ws.n[2] = n.z;
                     ws.has = true;
-                    stats[static_cast<size_t>(tid)].add(iters, static_cast<int>(dirs_unit.size()), rms);
+                    const int nsamp = static_cast<int>(dirs_unit[0].size() + dirs_unit[1].size() + dirs_unit[2].size());
+                    stats[static_cast<size_t>(tid)].add(iters, nsamp, rms);
                     if (tout != nullptr) {
                         const cv::Point3f a = sample;
                         const cv::Point3f b = sample + normal_vis_scale * n;
@@ -1250,8 +1247,8 @@ static void run_fit_normals(
 
                 const auto t_sample1 = std::chrono::steady_clock::now();
                 const double t_total_s = std::chrono::duration<double>(t_sample1 - t_sample0).count();
-                const double t_overhead_s = std::max(0.0, t_total_s - t_ng_read_s - t_preproc_s - t_solve_s);
-                stats[static_cast<size_t>(tid)].add_timing(t_ng_read_s, t_preproc_s, t_solve_s, t_overhead_s);
+                const double t_overhead_s = std::max(0.0, t_total_s - t_ng_read_s - t_preproc_s - t_solve_call_s);
+                stats[static_cast<size_t>(tid)].add_timing(t_ng_read_s, t_preproc_s, t_solve_s, t_solve_call_s, t_overhead_s);
 
                 #pragma omp atomic
                 processed += 1;
@@ -1438,7 +1435,7 @@ int main(int argc, char** argv) {
         if (vm.count("vis-normals")) {
             out_ply = fs::path(vm["vis-normals"].as<std::string>());
         }
-        run_fit_normals(input_dir, out_ply, crop, out_zarr);
+        run_fit_normals(input_dir, out_ply, crop, out_zarr, /*step=*/16, /*radius=*/64.f);
         return 0;
     }
 
