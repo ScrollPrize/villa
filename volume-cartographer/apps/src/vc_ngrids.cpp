@@ -9,6 +9,8 @@
 #include <array>
 #include <random>
 
+#include <unordered_set>
+
 #include <boost/program_options.hpp>
 #include <opencv2/core/types.hpp>
 
@@ -43,6 +45,7 @@ static void print_usage() {
         << "      --fit-normals       Estimate local 3D normals from segments (within crop)\n"
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
         << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n\n"
+        << "      --align-normals     Align normals in an existing normals zarr (requires --output-zarr)\n\n"
         << "Notes:\n"
         << "  - Input can be a directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
         << "  - Or, input can be a normals zarr root (contains x/0, y/0, z/0 datasets).\n"
@@ -777,6 +780,453 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     ply.end_streaming();
 }
 
+static inline uint8_t flip_u8_dir_component(uint8_t u) {
+    // decode(u)=(u-128)/127. Flipping the decoded value maps approximately to (256-u).
+    const int v = 256 - static_cast<int>(u);
+    return static_cast<uint8_t>(std::max(0, std::min(255, v)));
+}
+
+struct CropIndexBox3z {
+    // ZYX indices (half-open) in the zarr grid.
+    z5::types::ShapeType off = {0, 0, 0};
+    z5::types::ShapeType shape = {0, 0, 0};
+};
+
+static CropIndexBox3z crop_to_zarr_zyx(
+    const CropBox3i& crop_xyz,
+    const cv::Vec3i& origin_xyz,
+    int step,
+    const std::vector<size_t>& full_shape_zyx) {
+    // Convert voxel crop box to zarr indices (ZYX) using floor/ceil so we cover the requested voxel region.
+    const auto floor_div = [](int a, int b) -> int {
+        // b>0
+        if (a >= 0) return a / b;
+        return -(((-a + b - 1) / b));
+    };
+    const auto ceil_div = [&](int a, int b) -> int {
+        // ceil(a/b)
+        if (a >= 0) return (a + b - 1) / b;
+        return -((-a) / b);
+    };
+
+    const int ix0 = floor_div(crop_xyz.min[0] - origin_xyz[0], step);
+    const int iy0 = floor_div(crop_xyz.min[1] - origin_xyz[1], step);
+    const int iz0 = floor_div(crop_xyz.min[2] - origin_xyz[2], step);
+    const int ix1 = ceil_div(crop_xyz.max[0] - origin_xyz[0], step);
+    const int iy1 = ceil_div(crop_xyz.max[1] - origin_xyz[1], step);
+    const int iz1 = ceil_div(crop_xyz.max[2] - origin_xyz[2], step);
+
+    const int X = static_cast<int>(full_shape_zyx.at(2));
+    const int Y = static_cast<int>(full_shape_zyx.at(1));
+    const int Z = static_cast<int>(full_shape_zyx.at(0));
+
+    const int cx0 = std::max(0, std::min(X, ix0));
+    const int cy0 = std::max(0, std::min(Y, iy0));
+    const int cz0 = std::max(0, std::min(Z, iz0));
+    const int cx1 = std::max(0, std::min(X, ix1));
+    const int cy1 = std::max(0, std::min(Y, iy1));
+    const int cz1 = std::max(0, std::min(Z, iz1));
+
+    CropIndexBox3z out;
+    out.off = {static_cast<size_t>(cz0), static_cast<size_t>(cy0), static_cast<size_t>(cx0)};
+    out.shape = {static_cast<size_t>(std::max(0, cz1 - cz0)),
+                 static_cast<size_t>(std::max(0, cy1 - cy0)),
+                 static_cast<size_t>(std::max(0, cx1 - cx0))};
+    return out;
+}
+
+static double dot_decoded_u8(uint8_t ax, uint8_t ay, uint8_t az, uint8_t bx, uint8_t by, uint8_t bz) {
+    const auto d = [](uint8_t u) -> double { return (static_cast<int>(u) - 128) / 127.0; };
+    return d(ax) * d(bx) + d(ay) * d(by) + d(az) * d(bz);
+}
+
+static bool is_valid_normal_u8(uint8_t ux, uint8_t uy, uint8_t uz) {
+    return !(ux == 128 && uy == 128 && uz == 128);
+}
+
+static void run_align_normals_zarr(
+    const fs::path& zarr_root,
+    const fs::path& out_zarr,
+    const std::optional<CropBox3i>& crop_opt,
+    int seed_samples = 100,
+    int radius = 4,
+    int candidate_samples_per_iter = 256) {
+    // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
+    std::string delim = ".";
+    {
+        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
+        if (fs::exists(zarray_path)) {
+            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+            delim = j.value<std::string>("dimension_separator", ".");
+        }
+    }
+
+    // Optional origin/step from attrs (if present) so crop can be applied in voxel coords.
+    cv::Vec3i origin_xyz(0, 0, 0);
+    int step = 1;
+    {
+        z5::filesystem::handle::File rootFile(zarr_root);
+        z5::filesystem::handle::Group root(rootFile, "");
+        try {
+            nlohmann::json attrs;
+            z5::filesystem::readAttributes(root, attrs);
+            if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
+            }
+            if (attrs.contains("sample_step")) {
+                step = std::max(1, attrs["sample_step"].get<int>());
+            }
+        } catch (...) {
+            // attrs optional.
+        }
+    }
+
+    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<z5::Dataset> {
+        z5::filesystem::handle::File file(zarr_root);
+        z5::filesystem::handle::Group axis_group(file, axis);
+        z5::filesystem::handle::Dataset ds_handle(axis_group, "0", delim);
+        return z5::filesystem::openDataset(ds_handle);
+    };
+
+    auto dsx = open_u8_zyx("x");
+    auto dsy = open_u8_zyx("y");
+    auto dsz = open_u8_zyx("z");
+    if (!dsx || !dsy || !dsz) {
+        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    }
+    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+        throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
+    }
+    if (dsx->shape().size() != 3) {
+        throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
+    }
+    const std::vector<size_t> full_shape = {dsx->shape()[0], dsx->shape()[1], dsx->shape()[2]};
+
+    const CropBox3i crop_xyz = crop_opt.value_or(CropBox3i{
+        cv::Vec3i(std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4),
+        cv::Vec3i(std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4),
+    });
+
+    const CropIndexBox3z crop_zyx = crop_to_zarr_zyx(crop_xyz, origin_xyz, step, full_shape);
+    const size_t CZ = crop_zyx.shape[0];
+    const size_t CY = crop_zyx.shape[1];
+    const size_t CX = crop_zyx.shape[2];
+    if (CZ == 0 || CY == 0 || CX == 0) {
+        throw std::runtime_error("--crop maps to empty region in normals zarr index space");
+    }
+
+    // Load the cropped normals into memory.
+    xt::xarray<uint8_t> ax = xt::zeros<uint8_t>({CZ, CY, CX});
+    xt::xarray<uint8_t> ay = xt::zeros<uint8_t>({CZ, CY, CX});
+    xt::xarray<uint8_t> az = xt::zeros<uint8_t>({CZ, CY, CX});
+    z5::multiarray::readSubarray<uint8_t>(*dsx, ax, crop_zyx.off.begin());
+    z5::multiarray::readSubarray<uint8_t>(*dsy, ay, crop_zyx.off.begin());
+    z5::multiarray::readSubarray<uint8_t>(*dsz, az, crop_zyx.off.begin());
+
+    const size_t N = CZ * CY * CX;
+    auto lin_of = [&](size_t iz, size_t iy, size_t ix) -> size_t {
+        return (iz * CY + iy) * CX + ix;
+    };
+    auto idx_of_lin = [&](size_t lin, size_t& iz, size_t& iy, size_t& ix) {
+        ix = lin % CX;
+        const size_t t = lin / CX;
+        iy = t % CY;
+        iz = t / CY;
+    };
+
+    // State bits:
+    // bit0: aligned
+    // bit1: flipped relative to original
+    // bit2: in fringe (internal)
+    constexpr uint8_t kAligned = 1u << 0;
+    constexpr uint8_t kFlip = 1u << 1;
+    constexpr uint8_t kInFringe = 1u << 2;
+    std::vector<uint8_t> state(N, 0);
+    std::vector<size_t> fringe;
+    fringe.reserve(1024);
+
+    auto neighbor_iter = [&](size_t iz, size_t iy, size_t ix, int rad, const auto& fn) {
+        const int z0 = std::max(0, static_cast<int>(iz) - rad);
+        const int y0 = std::max(0, static_cast<int>(iy) - rad);
+        const int x0 = std::max(0, static_cast<int>(ix) - rad);
+        const int z1 = std::min(static_cast<int>(CZ) - 1, static_cast<int>(iz) + rad);
+        const int y1 = std::min(static_cast<int>(CY) - 1, static_cast<int>(iy) + rad);
+        const int x1 = std::min(static_cast<int>(CX) - 1, static_cast<int>(ix) + rad);
+        for (int zz = z0; zz <= z1; ++zz) {
+            for (int yy = y0; yy <= y1; ++yy) {
+                for (int xx = x0; xx <= x1; ++xx) {
+                    fn(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
+                }
+            }
+        }
+    };
+
+    auto divergence_parallel_invariant = [&](size_t lin, int rad, int& out_count) -> double {
+        size_t iz, iy, ix;
+        idx_of_lin(lin, iz, iy, ix);
+        const uint8_t ux = ax(iz, iy, ix);
+        const uint8_t uy = ay(iz, iy, ix);
+        const uint8_t uz = az(iz, iy, ix);
+        if (!is_valid_normal_u8(ux, uy, uz)) {
+            out_count = 0;
+            return 1e9;
+        }
+        double acc = 0.0;
+        int cnt = 0;
+        neighbor_iter(iz, iy, ix, rad, [&](size_t zz, size_t yy, size_t xx) {
+            const uint8_t vx = ax(zz, yy, xx);
+            const uint8_t vy = ay(zz, yy, xx);
+            const uint8_t vz = az(zz, yy, xx);
+            if (!is_valid_normal_u8(vx, vy, vz)) return;
+            const double d = dot_decoded_u8(ux, uy, uz, vx, vy, vz);
+            acc += (1.0 - std::abs(d));
+            ++cnt;
+        });
+        out_count = cnt;
+        if (cnt <= 1) return 1e9;
+        return acc / static_cast<double>(cnt);
+    };
+
+    // Collect valid normals in the crop.
+    std::vector<size_t> valid_lin;
+    valid_lin.reserve(N / 4);
+    for (size_t iz = 0; iz < CZ; ++iz) {
+        for (size_t iy = 0; iy < CY; ++iy) {
+            for (size_t ix = 0; ix < CX; ++ix) {
+                if (is_valid_normal_u8(ax(iz, iy, ix), ay(iz, iy, ix), az(iz, iy, ix))) {
+                    valid_lin.push_back(lin_of(iz, iy, ix));
+                }
+            }
+        }
+    }
+    if (valid_lin.empty()) {
+        throw std::runtime_error("No valid normals found in selected crop region");
+    }
+
+    // Seed selection: pick the locally smoothest (parallel-invariant) from random samples.
+    std::mt19937_64 rng(0xA11F10);
+    std::uniform_int_distribution<size_t> pick_valid(0, valid_lin.size() - 1);
+    size_t seed_lin = valid_lin[pick_valid(rng)];
+    double best_div = 1e9;
+    for (int s = 0; s < std::max(1, seed_samples); ++s) {
+        const size_t lin = valid_lin[pick_valid(rng)];
+        int cnt = 0;
+        const double div = divergence_parallel_invariant(lin, radius, cnt);
+        if (cnt < 8) continue;
+        if (div < best_div) {
+            best_div = div;
+            seed_lin = lin;
+        }
+    }
+
+    // Seed: mark aligned; orientation arbitrary (flip=0).
+    state[seed_lin] |= kAligned;
+
+    auto oriented_u8_at = [&](size_t lin, uint8_t& ox, uint8_t& oy, uint8_t& oz) {
+        size_t iz, iy, ix;
+        idx_of_lin(lin, iz, iy, ix);
+        ox = ax(iz, iy, ix);
+        oy = ay(iz, iy, ix);
+        oz = az(iz, iy, ix);
+        if (state[lin] & kFlip) {
+            ox = flip_u8_dir_component(ox);
+            oy = flip_u8_dir_component(oy);
+            oz = flip_u8_dir_component(oz);
+        }
+    };
+
+    auto add_fringe_neighbors = [&](size_t lin) {
+        size_t iz, iy, ix;
+        idx_of_lin(lin, iz, iy, ix);
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    const int zz = static_cast<int>(iz) + dz;
+                    const int yy = static_cast<int>(iy) + dy;
+                    const int xx = static_cast<int>(ix) + dx;
+                    if (zz < 0 || yy < 0 || xx < 0 || zz >= static_cast<int>(CZ) || yy >= static_cast<int>(CY) || xx >= static_cast<int>(CX)) continue;
+                    const size_t nlin = lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
+                    if (state[nlin] & kAligned) continue;
+                    if (!is_valid_normal_u8(ax(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
+                                            ay(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
+                                            az(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)))) {
+                        continue;
+                    }
+                    if (!(state[nlin] & kInFringe)) {
+                        state[nlin] |= kInFringe;
+                        fringe.push_back(nlin);
+                    }
+                }
+            }
+        }
+    };
+
+    auto score_candidate = [&](size_t cand_lin, int neigh_rad, int& aligned_neighbors, bool& out_flip) -> double {
+        size_t iz, iy, ix;
+        idx_of_lin(cand_lin, iz, iy, ix);
+        const uint8_t cx = ax(iz, iy, ix);
+        const uint8_t cy = ay(iz, iy, ix);
+        const uint8_t cz = az(iz, iy, ix);
+        if (!is_valid_normal_u8(cx, cy, cz)) {
+            aligned_neighbors = 0;
+            out_flip = false;
+            return -1e9;
+        }
+
+        double sum_dot_no = 0.0;
+        double sum_dot_fl = 0.0;
+        int cnt = 0;
+        neighbor_iter(iz, iy, ix, neigh_rad, [&](size_t zz, size_t yy, size_t xx) {
+            const size_t nlin = lin_of(zz, yy, xx);
+            if (!(state[nlin] & kAligned)) return;
+            uint8_t nx, ny, nz;
+            oriented_u8_at(nlin, nx, ny, nz);
+            const double d = dot_decoded_u8(cx, cy, cz, nx, ny, nz);
+            sum_dot_no += d;
+            sum_dot_fl += -d;
+            ++cnt;
+        });
+        aligned_neighbors = cnt;
+        if (cnt == 0) {
+            out_flip = false;
+            return -1e9;
+        }
+        const double mean_no = sum_dot_no / static_cast<double>(cnt);
+        const double mean_fl = sum_dot_fl / static_cast<double>(cnt);
+        if (mean_fl > mean_no) {
+            out_flip = true;
+            return mean_fl;
+        }
+        out_flip = false;
+        return mean_no;
+    };
+
+    add_fringe_neighbors(seed_lin);
+    size_t aligned_count = 1;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto t_last = t0;
+    while (aligned_count < valid_lin.size() && !fringe.empty()) {
+        const auto nowp = std::chrono::steady_clock::now();
+        if (nowp - t_last >= std::chrono::seconds(1)) {
+            const double elapsed = std::chrono::duration<double>(nowp - t0).count();
+            const double rate = (elapsed > 1e-9) ? (static_cast<double>(aligned_count) / elapsed) : 0.0;
+            const double rem = static_cast<double>((valid_lin.size() > aligned_count) ? (valid_lin.size() - aligned_count) : 0);
+            const double eta = (rate > 1e-9) ? (rem / rate) : 0.0;
+            std::cerr << "align-normals: aligned " << aligned_count << "/" << valid_lin.size()
+                      << " | fringe=" << fringe.size()
+                      << " | elapsed=" << elapsed << "s"
+                      << " | rate=" << rate << " vox/s"
+                      << " | ETA=" << eta << "s\n";
+            t_last = nowp;
+        }
+
+        std::uniform_int_distribution<size_t> pick_fr(0, fringe.size() - 1);
+        const int tries = std::min<int>(candidate_samples_per_iter, static_cast<int>(fringe.size()));
+
+        size_t best_cand = fringe[pick_fr(rng)];
+        double best_score = -1e9;
+        int best_cnt = -1;
+        bool best_flip = false;
+
+        for (int t = 0; t < tries; ++t) {
+            const size_t cand = fringe[pick_fr(rng)];
+            if (state[cand] & kAligned) continue;
+            int cnt = 0;
+            bool fl = false;
+            const double s = score_candidate(cand, /*neigh_rad=*/1, cnt, fl);
+            if (cnt <= 0) continue;
+            if (s > best_score || (s == best_score && cnt > best_cnt)) {
+                best_score = s;
+                best_cnt = cnt;
+                best_cand = cand;
+                best_flip = fl;
+            }
+        }
+
+        if (best_cnt <= 0) {
+            // Drop one stale fringe entry.
+            const size_t drop = pick_fr(rng);
+            state[fringe[drop]] &= ~kInFringe;
+            fringe[drop] = fringe.back();
+            fringe.pop_back();
+            continue;
+        }
+
+        state[best_cand] &= ~kInFringe;
+        state[best_cand] |= kAligned;
+        if (best_flip) state[best_cand] |= kFlip;
+        ++aligned_count;
+
+        // Remove best_cand from fringe (swap-erase first occurrence).
+        for (size_t i = 0; i < fringe.size(); ++i) {
+            if (fringe[i] == best_cand) {
+                fringe[i] = fringe.back();
+                fringe.pop_back();
+                break;
+            }
+        }
+
+        add_fringe_neighbors(best_cand);
+    }
+
+    // Apply flips to the crop arrays.
+    for (size_t lin = 0; lin < N; ++lin) {
+        if (!(state[lin] & kAligned)) continue;
+        if (!(state[lin] & kFlip)) continue;
+        size_t iz, iy, ix;
+        idx_of_lin(lin, iz, iy, ix);
+        ax(iz, iy, ix) = flip_u8_dir_component(ax(iz, iy, ix));
+        ay(iz, iy, ix) = flip_u8_dir_component(ay(iz, iy, ix));
+        az(iz, iy, ix) = flip_u8_dir_component(az(iz, iy, ix));
+    }
+
+    // Write output zarr: create full-sized datasets and only write the cropped subarray.
+    z5::filesystem::handle::File outFile(out_zarr);
+    z5::createFile(outFile, true);
+    z5::createGroup(outFile, "x");
+    z5::createGroup(outFile, "y");
+    z5::createGroup(outFile, "z");
+
+    const std::vector<size_t> chunks = {std::min<size_t>(64, full_shape[0]), std::min<size_t>(64, full_shape[1]), std::min<size_t>(64, full_shape[2])};
+    nlohmann::json compOpts = {{"cname", "zstd"}, {"clevel", 1}, {"shuffle", 0}};
+
+    z5::filesystem::handle::Group gx(outFile, "x");
+    z5::filesystem::handle::Group gy(outFile, "y");
+    z5::filesystem::handle::Group gz(outFile, "z");
+    auto out_dsx = z5::createDataset(gx, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+    auto out_dsy = z5::createDataset(gy, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+    auto out_dsz = z5::createDataset(gz, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+
+    z5::multiarray::writeSubarray<uint8_t>(out_dsx, ax, crop_zyx.off.begin());
+    z5::multiarray::writeSubarray<uint8_t>(out_dsy, ay, crop_zyx.off.begin());
+    z5::multiarray::writeSubarray<uint8_t>(out_dsz, az, crop_zyx.off.begin());
+
+    // Minimal attrs on root.
+    nlohmann::json attrs;
+    attrs["source"] = "vc_ngrids";
+    attrs["note_axes_order"] = "ZYX";
+    attrs["encoding"] = "uint8_dir";
+    attrs["decode"] = "(v-128)/127";
+    attrs["grid_origin_xyz"] = {origin_xyz[0], origin_xyz[1], origin_xyz[2]};
+    attrs["sample_step"] = step;
+    attrs["align_normals"] = true;
+    attrs["align_seed_samples"] = seed_samples;
+    attrs["align_radius_step_units"] = radius;
+    attrs["align_candidate_samples_per_iter"] = candidate_samples_per_iter;
+    attrs["crop_min_xyz"] = {crop_xyz.min[0], crop_xyz.min[1], crop_xyz.min[2]};
+    attrs["crop_max_xyz"] = {crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]};
+    attrs["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
+    attrs["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
+    z5::filesystem::handle::Group root(outFile, "");
+    z5::filesystem::writeAttributes(root, attrs);
+}
+
 static void run_fit_normals(
     const fs::path& input_dir,
     const std::optional<fs::path>& out_ply_opt,
@@ -1375,7 +1825,8 @@ int main(int argc, char** argv) {
         ("vis-ply", po::value<std::string>(), "Write visualization PLY file (with colors)")
         ("fit-normals", "Estimate local 3D normals from segments (requires --vis-normals)")
         ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments")
-        ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)");
+        ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
+        ("align-normals", "Align normals in an existing normals zarr (requires --input zarr and --output-zarr)");
 
     po::variables_map vm;
     try {
@@ -1414,6 +1865,19 @@ int main(int argc, char** argv) {
         } else {
             run_vis_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
         }
+        return 0;
+    }
+
+    if (vm.count("align-normals")) {
+        if (!input_is_normals_zarr) {
+            std::cerr << "Error: --align-normals requires --input to be a normals zarr root\n";
+            return 1;
+        }
+        if (!vm.count("output-zarr")) {
+            std::cerr << "Error: --align-normals requires --output-zarr PATH\n";
+            return 1;
+        }
+        run_align_normals_zarr(input_dir, fs::path(vm["output-zarr"].as<std::string>()), crop);
         return 0;
     }
 

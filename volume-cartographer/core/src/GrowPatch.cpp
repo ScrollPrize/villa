@@ -19,6 +19,7 @@
 
 #include "z5/factory.hxx"
 #include "z5/filesystem/handle.hxx"
+#include "z5/dataset.hxx"
 
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
@@ -417,11 +418,11 @@ struct LossSettings {
     std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
 
     LossSettings() {
-        w[LossType::SNAP] = 0.0;
-        w[LossType::NORMAL] = 0.0f;
-        w[LossType::NORMAL3D] = 10.0f;
-        w[LossType::STRAIGHT] = 0.1;
-        w[LossType::DIST] = 0.1f;
+        w[LossType::SNAP] = 1.0;
+        w[LossType::NORMAL] = 0.1f;
+        w[LossType::NORMAL3D] = 0.0f;
+        w[LossType::STRAIGHT] = 1.0;
+        w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
         w[LossType::SDIR] = 0.0f;
         w[LossType::CORRECTION] = 0.0f;
@@ -1861,6 +1862,20 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             } catch (...) {
                 // ignore
             }
+
+            // Assert the direction-field was aligned by vc_ngrids --align-normals.
+            // try {
+            //     z5::filesystem::handle::File rootFile(zarr_root);
+            //     z5::filesystem::handle::Group root(rootFile, "");
+            //     nlohmann::json attrs;
+            //     z5::filesystem::readAttributes(root, attrs);
+            //     const bool aligned = attrs.value("align_normals", false);
+            //     if (!aligned) {
+            //         throw std::runtime_error("normal3d_zarr_path is not marked aligned (missing attrs.align_normals=true); run vc_ngrids --align-normals");
+            //     }
+            // } catch (const std::exception& e) {
+            //     throw std::runtime_error(std::string("Failed normal3d alignment check: ") + e.what());
+            // }
 
             // Derive scale purely from shapes: main volume is full-res, normal zarr is downsampled.
             const auto vol_shape_zyx = ds->shape();
