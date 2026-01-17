@@ -799,7 +799,7 @@ static void run_fit_normals(
     const std::optional<CropBox3i>& crop_opt,
     const std::optional<fs::path>& out_zarr_opt,
     int step = 16,
-    float radius = 96.f) {
+    float radius = 64.f) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
@@ -851,7 +851,7 @@ static void run_fit_normals(
     };
 
     const float r2 = radius * radius;
-    const float sigma = radius / 3.0f;
+    const float sigma = radius / 2.0f;
     const float inv_two_sigma2 = 1.0f / (2.0f * sigma * sigma + 1e-12f);
     const float normal_vis_scale = static_cast<float>(step) * 0.5f;
 
