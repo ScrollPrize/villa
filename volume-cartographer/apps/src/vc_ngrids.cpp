@@ -372,6 +372,29 @@ static float dist_sq_point_segment(const cv::Point3f& p, const cv::Point3f& a, c
     return d.dot(d);
 }
 
+static inline float dist_sq_point_segment_appx(const cv::Point3f& p, const cv::Point3f& a, const cv::Point3f& b) {
+    // Approximate distance: use the segment midpoint instead of true point-to-segment distance.
+    const cv::Point3f m = 0.5f * (a + b);
+    const cv::Point3f d = p - m;
+    return d.dot(d);
+}
+
+static inline bool segment_intersects_local_roi_2d(const cv::Point& a, const cv::Point& b, const cv::Rect& roi) {
+    // Fast 2D early reject: check segment AABB intersects ROI.
+    // This avoids 3D conversion and distance checks for clearly irrelevant segments.
+    const int minx = std::min(a.x, b.x);
+    const int maxx = std::max(a.x, b.x);
+    const int miny = std::min(a.y, b.y);
+    const int maxy = std::max(a.y, b.y);
+
+    // roi is [x, x+w) x [y, y+h)
+    if (maxx < roi.x) return false;
+    if (minx >= roi.x + roi.width) return false;
+    if (maxy < roi.y) return false;
+    if (miny >= roi.y + roi.height) return false;
+    return true;
+}
+
 struct NormalDotResidual {
     NormalDotResidual(const cv::Point3f& d, double w) : d_(d), w_(w) {}
     template <typename T>
@@ -427,7 +450,13 @@ static cv::Point3f pca_smallest_evec(const std::vector<cv::Point3f>& dirs_unit) 
     return cv::Point3f(0.f, 0.f, 1.f);
 }
 
-static bool fit_normal_ceres(const std::vector<cv::Point3f>& dirs_unit, const std::vector<double>& weights, cv::Point3f& out_n) {
+static bool fit_normal_ceres(
+    const std::vector<cv::Point3f>& dirs_unit,
+    const std::vector<double>& weights,
+    cv::Point3f& out_n,
+    int* out_num_iterations,
+    double* out_rms,
+    double* out_solve_seconds) {
     if (dirs_unit.size() < 3) return false;
     if (weights.size() != dirs_unit.size()) return false;
 
@@ -458,7 +487,22 @@ static bool fit_normal_ceres(const std::vector<cv::Point3f>& dirs_unit, const st
     opts.minimizer_progress_to_stdout = false;
 
     ceres::Solver::Summary summary;
+    const auto solve_t0 = std::chrono::steady_clock::now();
     ceres::Solve(opts, &problem, &summary);
+    const auto solve_t1 = std::chrono::steady_clock::now();
+
+    if (out_solve_seconds != nullptr) {
+        *out_solve_seconds = std::chrono::duration<double>(solve_t1 - solve_t0).count();
+    }
+
+    if (out_num_iterations != nullptr) {
+        *out_num_iterations = static_cast<int>(summary.iterations.size());
+    }
+    if (out_rms != nullptr) {
+        // Ceres cost = 1/2 * sum(residual^2)
+        const double denom = std::max(1, summary.num_residuals);
+        *out_rms = std::sqrt(2.0 * summary.final_cost / denom);
+    }
 
     const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (!(len > 1e-12)) return false;
@@ -475,6 +519,21 @@ static std::shared_ptr<const vc::core::util::GridStore> try_load_grid(
     fs::path grid_path = base / plane_dir / filename;
     if (!fs::exists(grid_path)) return nullptr;
     return std::make_shared<vc::core::util::GridStore>(grid_path.string());
+}
+
+static cv::Point3f point_for_slice_query(const cv::Point3f& base, int plane_idx, int slice_idx) {
+    cv::Point3f p = base;
+    if (plane_idx == 0) {
+        // xy @ z
+        p.z = static_cast<float>(slice_idx);
+    } else if (plane_idx == 1) {
+        // xz @ y
+        p.y = static_cast<float>(slice_idx);
+    } else {
+        // yz @ x
+        p.x = static_cast<float>(slice_idx);
+    }
+    return p;
 }
 
 static int align_down(int v, int step) {
@@ -581,7 +640,7 @@ static void run_vis_ply(const fs::path& input_dir, const fs::path& out_ply, cons
         if (slice_start < crop_min) slice_start += sparse_volume;
 
         for (int slice = slice_start; slice < crop_max; slice += std::max(1, sparse_volume)) {
-            auto grid = try_load_grid(input_dir, pc.dir, slice);
+            auto grid = ngv.query_nearest(point_for_slice_query(cv::Point3f(0.f, 0.f, 0.f), pc.plane_idx, slice), pc.plane_idx);
             if (!grid) continue;
             add_gridstore_paths_as_ply_polylines(ply, *grid, pc.plane_idx, slice, crop, pc.color_bgr);
         }
@@ -811,6 +870,133 @@ static void run_fit_normals(
 
     const int64_t full_samples = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) * static_cast<int64_t>(nz);
 
+    // Stats: iterations-to-solved histogram and RMS histogram.
+    // Note: we keep a coarse RMS bucket histogram for printing and a fine histogram for median estimation.
+    constexpr int kFineRmsBins = 1000;
+    struct FitStats {
+        // Iteration buckets: [0-4],[5-9],[10-19],[20-49],[50-99],[100-199],[200+]
+        uint64_t iters_buckets[7] = {0, 0, 0, 0, 0, 0, 0};
+
+        // Sample-count buckets (#segments used): [0-511],[512-1023],[1024-2047],[2048-4095],[4096-8191],[8192-16383],[16384+]
+        uint64_t samples_buckets[7] = {0, 0, 0, 0, 0, 0, 0};
+
+        // Coarse RMS buckets: [0-0.01),[0.01-0.02),[0.02-0.05),[0.05-0.1),[0.1-0.2),[0.2-0.5),[0.5+)
+        uint64_t rms_buckets[7] = {0, 0, 0, 0, 0, 0, 0};
+
+        // Fine RMS histogram for median: bins over [0, 1.0], plus overflow bin.
+        uint64_t rms_fine[kFineRmsBins + 1] = {0};
+
+        uint64_t ok_count = 0;
+        double rms_sum = 0.0;
+        double rms_max = 0.0;
+
+        // Thread-summed timings (seconds).
+        uint64_t samples_total = 0;
+        double t_ng_read_s = 0.0;
+        double t_preproc_s = 0.0;
+        double t_solve_s = 0.0;
+        double t_overhead_s = 0.0;
+
+        // Debug: distance test rejection rate.
+        uint64_t dist_test_total = 0;
+        uint64_t dist_test_reject = 0;
+
+        void add(int iters, int samples, double rms) {
+            ++ok_count;
+            rms_sum += rms;
+            rms_max = std::max(rms_max, rms);
+
+            const int ib = (iters < 5) ? 0 : (iters < 10) ? 1 : (iters < 20) ? 2 : (iters < 50) ? 3 : (iters < 100) ? 4 : (iters < 200) ? 5 : 6;
+            ++iters_buckets[ib];
+
+            const int sb = (samples < 512) ? 0 : (samples < 1024) ? 1 : (samples < 2048) ? 2 : (samples < 4096) ? 3 : (samples < 8192) ? 4 : (samples < 16384) ? 5 : 6;
+            ++samples_buckets[sb];
+
+            const int rb = (rms < 0.01) ? 0 : (rms < 0.02) ? 1 : (rms < 0.05) ? 2 : (rms < 0.10) ? 3 : (rms < 0.20) ? 4 : (rms < 0.50) ? 5 : 6;
+            ++rms_buckets[rb];
+
+            // Fine binning.
+            constexpr double max_rms = 1.0;
+            int fi = 0;
+            if (rms >= max_rms) {
+                fi = kFineRmsBins; // overflow
+            } else if (rms <= 0.0) {
+                fi = 0;
+            } else {
+                fi = static_cast<int>(std::floor((rms / max_rms) * kFineRmsBins));
+                fi = std::max(0, std::min(kFineRmsBins - 1, fi));
+            }
+            ++rms_fine[fi];
+        }
+
+        void add_timing(double ng_read_s, double preproc_s, double solve_s, double overhead_s) {
+            ++samples_total;
+            t_ng_read_s += ng_read_s;
+            t_preproc_s += preproc_s;
+            t_solve_s += solve_s;
+            t_overhead_s += overhead_s;
+        }
+
+        void add_dist_test(bool rejected) {
+            ++dist_test_total;
+            if (rejected) ++dist_test_reject;
+        }
+    };
+
+    auto stats_of = [&]() -> std::vector<FitStats> {
+        return std::vector<FitStats>(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+    };
+
+    std::vector<FitStats> stats = stats_of();
+
+    auto merge_stats = [&](FitStats& acc, const FitStats& s) {
+        for (int i = 0; i < 7; ++i) {
+            acc.iters_buckets[i] += s.iters_buckets[i];
+            acc.samples_buckets[i] += s.samples_buckets[i];
+            acc.rms_buckets[i] += s.rms_buckets[i];
+        }
+        for (int i = 0; i < kFineRmsBins + 1; ++i) {
+            acc.rms_fine[i] += s.rms_fine[i];
+        }
+        acc.ok_count += s.ok_count;
+        acc.rms_sum += s.rms_sum;
+        acc.rms_max = std::max(acc.rms_max, s.rms_max);
+
+        acc.samples_total += s.samples_total;
+        acc.t_ng_read_s += s.t_ng_read_s;
+        acc.t_preproc_s += s.t_preproc_s;
+        acc.t_solve_s += s.t_solve_s;
+        acc.t_overhead_s += s.t_overhead_s;
+
+        acc.dist_test_total += s.dist_test_total;
+        acc.dist_test_reject += s.dist_test_reject;
+    };
+
+    auto summarize_stats = [&](const std::vector<FitStats>& per_thread) -> FitStats {
+        FitStats acc;
+        for (const auto& s : per_thread) {
+            merge_stats(acc, s);
+        }
+        return acc;
+    };
+
+    auto estimate_median_from_fine = [&](const FitStats& acc) -> double {
+        if (acc.ok_count == 0) return 0.0;
+        const uint64_t target = (acc.ok_count - 1) / 2; // lower median
+        uint64_t cum = 0;
+        int idx = 0;
+        for (; idx < kFineRmsBins + 1; ++idx) {
+            cum += acc.rms_fine[idx];
+            if (cum > target) break;
+        }
+        if (idx >= kFineRmsBins) {
+            return 1.0; // overflow bin => >= 1.0
+        }
+        // Bin center.
+        const double bin_w = 1.0 / kFineRmsBins;
+        return (idx + 0.5) * bin_w;
+    };
+
     // Optional output: store fitted normals on the sample lattice.
     // Encoding matches direction-field zarrs: 3 uint8 volumes x,y,z, decoded as (v-128)/127.
     std::vector<uint8_t> enc_x;
@@ -840,6 +1026,38 @@ static void run_fit_normals(
                   << " | ETA " << eta << "s\n";
     };
 
+    auto report_stats = [&]() {
+        const FitStats acc = summarize_stats(stats);
+        const double avg = (acc.ok_count > 0) ? (acc.rms_sum / static_cast<double>(acc.ok_count)) : 0.0;
+        const double med = estimate_median_from_fine(acc);
+        const double work = acc.t_ng_read_s + acc.t_preproc_s + acc.t_solve_s + acc.t_overhead_s;
+        const double png = (work > 1e-12) ? (100.0 * acc.t_ng_read_s / work) : 0.0;
+        const double ppp = (work > 1e-12) ? (100.0 * acc.t_preproc_s / work) : 0.0;
+        const double ps = (work > 1e-12) ? (100.0 * acc.t_solve_s / work) : 0.0;
+        const double po = (work > 1e-12) ? (100.0 * acc.t_overhead_s / work) : 0.0;
+        std::cerr << "fit-normals stats: ok=" << acc.ok_count
+                  << " | rms(avg/med/max)=" << avg << "/" << med << "/" << acc.rms_max << "\n";
+        std::cerr << "  iters buckets [0-4,5-9,10-19,20-49,50-99,100-199,200+]: "
+                  << acc.iters_buckets[0] << "," << acc.iters_buckets[1] << "," << acc.iters_buckets[2] << "," << acc.iters_buckets[3]
+                  << "," << acc.iters_buckets[4] << "," << acc.iters_buckets[5] << "," << acc.iters_buckets[6] << "\n";
+        std::cerr << "  samples buckets [0-511,512-1023,1024-2047,2048-4095,4096-8191,8192-16383,16384+]: "
+                  << acc.samples_buckets[0] << "," << acc.samples_buckets[1] << "," << acc.samples_buckets[2] << "," << acc.samples_buckets[3]
+                  << "," << acc.samples_buckets[4] << "," << acc.samples_buckets[5] << "," << acc.samples_buckets[6] << "\n";
+        std::cerr << "  rms buckets [<0.01,<0.02,<0.05,<0.1,<0.2,<0.5,>=0.5]: "
+                  << acc.rms_buckets[0] << "," << acc.rms_buckets[1] << "," << acc.rms_buckets[2] << "," << acc.rms_buckets[3]
+                  << "," << acc.rms_buckets[4] << "," << acc.rms_buckets[5] << "," << acc.rms_buckets[6] << "\n";
+
+        // Time breakdown is thread-summed (can exceed wall time with OpenMP).
+        std::cerr << "  time(thread-summed): samples=" << acc.samples_total
+                  << " | ng_read=" << acc.t_ng_read_s << "s (" << png << "%)"
+                  << " | preproc=" << acc.t_preproc_s << "s (" << ppp << "%)"
+                  << " | solve=" << acc.t_solve_s << "s (" << ps << "%)"
+                  << " | overhead=" << acc.t_overhead_s << "s (" << po << "%)\n";
+
+        const double rej = (acc.dist_test_total > 0) ? (100.0 * static_cast<double>(acc.dist_test_reject) / static_cast<double>(acc.dist_test_total)) : 0.0;
+        std::cerr << "  dist2>r2 rejects: " << acc.dist_test_reject << "/" << acc.dist_test_total << " (" << rej << "%)\n";
+    };
+
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
     #pragma omp parallel for collapse(3) schedule(dynamic,1)
     for (int z = sz0; z < crop.max[2]; z += step) {
@@ -854,11 +1072,15 @@ static void run_fit_normals(
                 const cv::Point3f sample(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                 const float sample_arr[3] = {sample.x, sample.y, sample.z};
 
+                const auto t_sample0 = std::chrono::steady_clock::now();
+
                 std::vector<cv::Point3f> dirs_unit;
                 dirs_unit.reserve(256);
                 std::vector<double> weights;
                 weights.reserve(256);
 
+                double t_ng_read_s = 0.0;
+                double t_preproc_s = 0.0;
                 for (const auto& pc : planes) {
                     // plane axes
                     const int u_axis = (pc.plane_idx == 2) ? 1 : 0;
@@ -881,10 +1103,15 @@ static void run_fit_normals(
                     const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
 
                     for (int slice = slice_start; slice < s_max; slice += std::max(1, sparse_volume)) {
-                        auto grid = try_load_grid(input_dir, pc.dir, slice);
+                        const auto t_read0 = std::chrono::steady_clock::now();
+                        auto grid = ngv.query_nearest(point_for_slice_query(sample, pc.plane_idx, slice), pc.plane_idx);
                         if (!grid) continue;
 
                         const auto paths = grid->get(query);
+                        const auto t_read1 = std::chrono::steady_clock::now();
+                        t_ng_read_s += std::chrono::duration<double>(t_read1 - t_read0).count();
+
+                        const auto t_pp0 = std::chrono::steady_clock::now();
                         for (const auto& path_ptr : paths) {
                             if (!path_ptr || path_ptr->size() < 2) continue;
 
@@ -897,12 +1124,20 @@ static void run_fit_normals(
                             };
 
                             for (size_t i = 0; i + 1 < path_ptr->size(); ++i) {
-                                cv::Point3f a = p3_of((*path_ptr)[i]);
-                                cv::Point3f b = p3_of((*path_ptr)[i + 1]);
+                                const cv::Point a2 = (*path_ptr)[i];
+                                const cv::Point b2 = (*path_ptr)[i + 1];
+
+                                // 2D early reject before 3D conversion.
+                                if (!segment_intersects_local_roi_2d(a2, b2, query)) continue;
+
+                                cv::Point3f a = p3_of(a2);
+                                cv::Point3f b = p3_of(b2);
 
                                 if (!clip_segment_to_crop(a, b, crop)) continue;
-                                const float dist2 = dist_sq_point_segment(sample, a, b);
-                                if (dist2 > r2) continue;
+                                const float dist2 = dist_sq_point_segment_appx(sample, a, b);
+                                const bool reject = (dist2 > r2);
+                                stats[static_cast<size_t>(tid)].add_dist_test(reject);
+                                if (reject) continue;
 
                                 const cv::Point3f d = b - a;
                                 const float seglen2 = d.dot(d);
@@ -915,12 +1150,18 @@ static void run_fit_normals(
                                 weights.push_back(w);
                             }
                         }
+                        const auto t_pp1 = std::chrono::steady_clock::now();
+                        t_preproc_s += std::chrono::duration<double>(t_pp1 - t_pp0).count();
                     }
                 }
 
                 cv::Point3f n;
-                const bool ok = fit_normal_ceres(dirs_unit, weights, n);
+                int iters = 0;
+                double rms = 0.0;
+                double t_solve_s = 0.0;
+                const bool ok = fit_normal_ceres(dirs_unit, weights, n, &iters, &rms, &t_solve_s);
                 if (ok) {
+                    stats[static_cast<size_t>(tid)].add(iters, static_cast<int>(dirs_unit.size()), rms);
                     if (tout != nullptr) {
                         const cv::Point3f a = sample;
                         const cv::Point3f b = sample + normal_vis_scale * n;
@@ -966,6 +1207,11 @@ static void run_fit_normals(
                     }
                 }
 
+                const auto t_sample1 = std::chrono::steady_clock::now();
+                const double t_total_s = std::chrono::duration<double>(t_sample1 - t_sample0).count();
+                const double t_overhead_s = std::max(0.0, t_total_s - t_ng_read_s - t_preproc_s - t_solve_s);
+                stats[static_cast<size_t>(tid)].add_timing(t_ng_read_s, t_preproc_s, t_solve_s, t_overhead_s);
+
                 #pragma omp atomic
                 processed += 1;
                 if (ok) {
@@ -975,12 +1221,13 @@ static void run_fit_normals(
 
                 // Only one thread reports.
                 const auto now = std::chrono::steady_clock::now();
-                if (tid == 0 && now - t_last >= std::chrono::seconds(2)) {
+                if (tid == 0 && now - t_last >= std::chrono::seconds(10)) {
                     #pragma omp critical
                     {
                         const auto now2 = std::chrono::steady_clock::now();
-                        if (now2 - t_last >= std::chrono::seconds(2)) {
+                        if (now2 - t_last >= std::chrono::seconds(10)) {
                             report_progress();
+                            report_stats();
                             t_last = now2;
                         }
                     }
@@ -988,6 +1235,10 @@ static void run_fit_normals(
             }
         }
     }
+
+    // Final report.
+    report_progress();
+    report_stats();
 
     if (out_ply_opt.has_value()) {
         const fs::path& out_ply = *out_ply_opt;

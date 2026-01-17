@@ -419,9 +419,9 @@ struct LossSettings {
     LossSettings() {
         w[LossType::SNAP] = 0.0;
         w[LossType::NORMAL] = 0.0f;
-        w[LossType::NORMAL3D] = 1.0f;
+        w[LossType::NORMAL3D] = 10.0f;
         w[LossType::STRAIGHT] = 0.1;
-        w[LossType::DIST] = 1.0f;
+        w[LossType::DIST] = 0.1f;
         w[LossType::DIRECTION] = 0.0f;
         w[LossType::SDIR] = 0.0f;
         w[LossType::CORRECTION] = 0.0f;
@@ -463,6 +463,10 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+    int y_min = -1;
+    int y_max = std::numeric_limits<int>::max();
+    int x_min = -1;
+    int x_max = std::numeric_limits<int>::max();
     // Anti-flipback constraint settings
     float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
     float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
@@ -2048,6 +2052,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
+    loss_settings.y_min = params.value("y_min", -1);
+    loss_settings.y_max = params.value("y_max", std::numeric_limits<int>::max());
+    loss_settings.x_min = params.value("x_min", -1);
+    loss_settings.x_max = params.value("x_max", std::numeric_limits<int>::max());
     loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
     loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
     std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
@@ -2968,8 +2976,10 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
                     avg /= ref_count;
 
-                    //"fast" skip based on avg z value out of limits
-                    if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
+                    //"fast" skip based on avg xyz value out of limits
+                    if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max ||
+                        avg[1] < loss_settings.y_min || avg[1] > loss_settings.y_max ||
+                        avg[0] < loss_settings.x_min || avg[0] > loss_settings.x_max)
                         continue;
 
                     cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
