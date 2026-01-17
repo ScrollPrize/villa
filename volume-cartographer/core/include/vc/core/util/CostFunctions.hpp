@@ -520,7 +520,7 @@ struct NormalDirectionLoss {
 //
 // - Points are provided in XYZ order.
 // - The target normal field is sampled (non-differentiably) at p_base.
-// - The residual is 1 - |dot(n_surface, n_target)| (flip-invariant).
+// - The residual is 1 - dot(n_surface, n_target) (assumes target normals are already aligned).
 struct Normal3DLoss {
     Normal3DLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w)
         : _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {}
@@ -529,9 +529,15 @@ struct Normal3DLoss {
     bool operator()(const E* const p_base, const E* const p_u, const E* const p_v, E* residual) const {
         // p_* are XYZ, while _normal_dirs is indexed ZYX and returns ZYX-ordered vectors.
 
-        // sample target normal at base point (non-differentiable wrt position)
-        cv::Vec3f target_zyx_vec = _normal_dirs(unjet(p_base[2]), unjet(p_base[1]), unjet(p_base[0]));
-        E target_zyx[3] = {E(target_zyx_vec[0]), E(target_zyx_vec[1]), E(target_zyx_vec[2])};
+        // Sample target normal at base point.
+        // We want gradients wrt p_base through the trilinear weights, but treat the sampled lattice
+        // values as constants (piecewise-constant dataset). So: indices use `unjet()`, weights use `E`.
+        E target_zyx[3];
+        sample_trilinear_normal_zyx(_normal_dirs,
+                                   /*z=*/p_base[2],
+                                   /*y=*/p_base[1],
+                                   /*x=*/p_base[0],
+                                   target_zyx);
 
         // compute surface normal from base/u/v edges, in ZYX ordering
         E eu_zyx[3] = { p_u[2] - p_base[2], p_u[1] - p_base[1], p_u[0] - p_base[0] };
@@ -548,11 +554,16 @@ struct Normal3DLoss {
         n_zyx[1] /= n_len;
         n_zyx[2] /= n_len;
 
-        E abs_dot = ceres::abs(n_zyx[0] * target_zyx[0] + n_zyx[1] * target_zyx[1] + n_zyx[2] * target_zyx[2]);
+        E dot = (n_zyx[0] * target_zyx[0] + n_zyx[1] * target_zyx[1] + n_zyx[2] * target_zyx[2]);
 
-        E weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(p_base[2]), unjet(p_base[1]), unjet(p_base[0]))) : E(1);
+        E weight_at_point = E(1);
+        if (_maybe_weights)
+            weight_at_point = sample_trilinear_weight(*_maybe_weights,
+                                                      /*z=*/p_base[2],
+                                                      /*y=*/p_base[1],
+                                                      /*x=*/p_base[0]);
 
-        residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
+        residual[0] = E(_w) * (E(1) - dot) * weight_at_point;
         return true;
     }
 
@@ -563,11 +574,175 @@ struct Normal3DLoss {
     Chunked3dVec3fFromUint8 &_normal_dirs;
     Chunked3dFloatFromUint8 *_maybe_weights;
 
+public:
     static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0f)
     {
         return new ceres::AutoDiffCostFunction<Normal3DLoss, 1, 3, 3, 3>(
             new Normal3DLoss(normal_dirs, maybe_weights, w));
     }
+
+private:
+    template <typename E>
+    static inline void clamp01(E& t)
+    {
+        if (val(t) < 0.0) t = E(0);
+        if (val(t) > 1.0) t = E(1);
+    }
+
+    // Trilinear interpolation helper for the (quantized) normal direction-field.
+    // Input coordinates are canonical XYZ, but we sample the underlying datasets in ZYX.
+    // Corner selection is non-differentiable (uses `unjet()`), interpolation weights are differentiable.
+    template <typename E>
+    static inline void sample_trilinear_normal_zyx(Chunked3dVec3fFromUint8 &dirs,
+                                                   const E& z_canon,
+                                                   const E& y_canon,
+                                                   const E& x_canon,
+                                                   E* out_zyx)
+    {
+        const E zf = z_canon * E(dirs._scale);
+        const E yf = y_canon * E(dirs._scale);
+        const E xf = x_canon * E(dirs._scale);
+
+        int z0 = static_cast<int>(std::floor(unjet(zf)));
+        int y0 = static_cast<int>(std::floor(unjet(yf)));
+        int x0 = static_cast<int>(std::floor(unjet(xf)));
+
+        const auto shape = dirs._x.shape(); // z,y,x
+        if (!shape.empty()) {
+            z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
+            y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
+            x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
+        } else {
+            z0 = std::max(0, z0);
+            y0 = std::max(0, y0);
+            x0 = std::max(0, x0);
+        }
+
+        const int z1 = z0 + 1;
+        const int y1 = y0 + 1;
+        const int x1 = x0 + 1;
+
+        E dz = zf - E(z0);
+        E dy = yf - E(y0);
+        E dx = xf - E(x0);
+        clamp01(dz);
+        clamp01(dy);
+        clamp01(dx);
+
+        auto lerp = [](const E& a, const E& b, const E& t) { return (E(1) - t) * a + t * b; };
+        auto decode_u8_to_unit = [](const E& u8) { return (u8 - E(128.0)) / E(127.0); };
+
+        auto tri = [&](const E& c000, const E& c100, const E& c010, const E& c110,
+                       const E& c001, const E& c101, const E& c011, const E& c111) -> E {
+            const E c00 = lerp(c000, c001, dx);
+            const E c01 = lerp(c010, c011, dx);
+            const E c10 = lerp(c100, c101, dx);
+            const E c11 = lerp(c110, c111, dx);
+            const E c0  = lerp(c00,  c01,  dy);
+            const E c1  = lerp(c10,  c11,  dy);
+            return lerp(c0, c1, dz);
+        };
+
+        // Read constants from lattice and decode first.
+        const E x000 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y0, x0))));
+        const E x100 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y0, x0))));
+        const E x010 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y1, x0))));
+        const E x110 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y1, x0))));
+        const E x001 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y0, x1))));
+        const E x101 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y0, x1))));
+        const E x011 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y1, x1))));
+        const E x111 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y1, x1))));
+
+        const E y000 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y0, x0))));
+        const E y100 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y0, x0))));
+        const E y010 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y1, x0))));
+        const E y110 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y1, x0))));
+        const E y001 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y0, x1))));
+        const E y101 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y0, x1))));
+        const E y011 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y1, x1))));
+        const E y111 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y1, x1))));
+
+        const E z000 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y0, x0))));
+        const E z100 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y0, x0))));
+        const E z010 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y1, x0))));
+        const E z110 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y1, x0))));
+        const E z001 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y0, x1))));
+        const E z101 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y0, x1))));
+        const E z011 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y1, x1))));
+        const E z111 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y1, x1))));
+
+        // Output is ZYX-ordered vector.
+        out_zyx[0] = tri(z000, z100, z010, z110, z001, z101, z011, z111);
+        out_zyx[1] = tri(y000, y100, y010, y110, y001, y101, y011, y111);
+        out_zyx[2] = tri(x000, x100, x010, x110, x001, x101, x011, x111);
+
+        const E n = ceres::sqrt(out_zyx[0] * out_zyx[0]
+                                + out_zyx[1] * out_zyx[1]
+                                + out_zyx[2] * out_zyx[2]
+                                + E(1e-12));
+        out_zyx[0] /= n;
+        out_zyx[1] /= n;
+        out_zyx[2] /= n;
+    }
+
+    template <typename E>
+    static inline E sample_trilinear_weight(Chunked3dFloatFromUint8 &w,
+                                            const E& z_canon,
+                                            const E& y_canon,
+                                            const E& x_canon)
+    {
+        const E zf = z_canon * E(w._scale);
+        const E yf = y_canon * E(w._scale);
+        const E xf = x_canon * E(w._scale);
+
+        int z0 = static_cast<int>(std::floor(unjet(zf)));
+        int y0 = static_cast<int>(std::floor(unjet(yf)));
+        int x0 = static_cast<int>(std::floor(unjet(xf)));
+
+        const auto shape = w._x.shape();
+        if (!shape.empty()) {
+            z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
+            y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
+            x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
+        } else {
+            z0 = std::max(0, z0);
+            y0 = std::max(0, y0);
+            x0 = std::max(0, x0);
+        }
+
+        const int z1 = z0 + 1;
+        const int y1 = y0 + 1;
+        const int x1 = x0 + 1;
+
+        E dz = zf - E(z0);
+        E dy = yf - E(y0);
+        E dx = xf - E(x0);
+        clamp01(dz);
+        clamp01(dy);
+        clamp01(dx);
+
+        auto lerp = [](const E& a, const E& b, const E& t) { return (E(1) - t) * a + t * b; };
+
+        const E c000 = E(static_cast<double>(w._x.safe_at(z0, y0, x0)));
+        const E c100 = E(static_cast<double>(w._x.safe_at(z1, y0, x0)));
+        const E c010 = E(static_cast<double>(w._x.safe_at(z0, y1, x0)));
+        const E c110 = E(static_cast<double>(w._x.safe_at(z1, y1, x0)));
+        const E c001 = E(static_cast<double>(w._x.safe_at(z0, y0, x1)));
+        const E c101 = E(static_cast<double>(w._x.safe_at(z1, y0, x1)));
+        const E c011 = E(static_cast<double>(w._x.safe_at(z0, y1, x1)));
+        const E c111 = E(static_cast<double>(w._x.safe_at(z1, y1, x1)));
+
+        const E c00 = lerp(c000, c001, dx);
+        const E c01 = lerp(c010, c011, dx);
+        const E c10 = lerp(c100, c101, dx);
+        const E c11 = lerp(c110, c111, dx);
+        const E c0  = lerp(c00,  c01,  dy);
+        const E c1  = lerp(c10,  c11,  dy);
+        const E v_u8 = lerp(c0, c1, dz);
+
+        return v_u8 / E(255.0);
+    }
+
 };
 
 /**
