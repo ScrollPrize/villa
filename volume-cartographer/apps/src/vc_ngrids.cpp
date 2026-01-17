@@ -456,12 +456,29 @@ static bool fit_normal_ceres(
     cv::Point3f& out_n,
     int* out_num_iterations,
     double* out_rms,
-    double* out_solve_seconds) {
+    double* out_solve_seconds,
+    double* inout_init_n) {
     if (dirs_unit.size() < 3) return false;
     if (weights.size() != dirs_unit.size()) return false;
 
     double n[3];
-    {
+    if (inout_init_n != nullptr) {
+        // Reuse previous solution for warm start.
+        n[0] = inout_init_n[0];
+        n[1] = inout_init_n[1];
+        n[2] = inout_init_n[2];
+        const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (!(len > 1e-12)) {
+            const cv::Point3f init = pca_smallest_evec(dirs_unit);
+            n[0] = init.x;
+            n[1] = init.y;
+            n[2] = init.z;
+        } else {
+            n[0] /= len;
+            n[1] /= len;
+            n[2] /= len;
+        }
+    } else {
         const cv::Point3f init = pca_smallest_evec(dirs_unit);
         n[0] = init.x;
         n[1] = init.y;
@@ -507,6 +524,12 @@ static bool fit_normal_ceres(
     const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (!(len > 1e-12)) return false;
     out_n = cv::Point3f(static_cast<float>(n[0] / len), static_cast<float>(n[1] / len), static_cast<float>(n[2] / len));
+
+    if (inout_init_n != nullptr) {
+        inout_init_n[0] = out_n.x;
+        inout_init_n[1] = out_n.y;
+        inout_init_n[2] = out_n.z;
+    }
     return true;
 }
 
@@ -949,6 +972,13 @@ static void run_fit_normals(
 
     std::vector<FitStats> stats = stats_of();
 
+    // Per-thread warm start for Ceres.
+    struct WarmStart {
+        double n[3] = {0.0, 0.0, 0.0};
+        bool has = false;
+    };
+    std::vector<WarmStart> warm(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+
     auto merge_stats = [&](FitStats& acc, const FitStats& s) {
         for (int i = 0; i < 7; ++i) {
             acc.iters_buckets[i] += s.iters_buckets[i];
@@ -1059,7 +1089,7 @@ static void run_fit_normals(
     };
 
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
-    #pragma omp parallel for collapse(3) schedule(dynamic,1)
+    #pragma omp parallel for collapse(2) schedule(dynamic,1)
     for (int z = sz0; z < crop.max[2]; z += step) {
         for (int y = sy0; y < crop.max[1]; y += step) {
             for (int x = sx0; x < crop.max[0]; x += step) {
@@ -1093,16 +1123,21 @@ static void run_fit_normals(
                     int slice_start = align_down(s_min, sparse_volume);
                     if (slice_start < s_min) slice_start += std::max(1, sparse_volume);
 
-                    // 2D ROI for this plane around the sample
-                    const int u0 = std::max(crop.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - radius)));
-                    const int v0 = std::max(crop.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - radius)));
-                    const int u1 = std::min(crop.max[u_axis], static_cast<int>(std::ceil(sample_arr[u_axis] + radius)) + 1);
-                    const int v1 = std::min(crop.max[v_axis], static_cast<int>(std::ceil(sample_arr[v_axis] + radius)) + 1);
-                    if (u1 <= u0 || v1 <= v0) continue;
-
-                    const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
-
                     for (int slice = slice_start; slice < s_max; slice += std::max(1, sparse_volume)) {
+                        // Shrink the 2D query rect based on distance in the slice axis:
+                        // at offset ds from the center, the in-slice radius is sqrt(r^2 - ds^2).
+                        const float ds = std::abs(static_cast<float>(slice) - sample_arr[s_axis]);
+                        if (ds > radius) continue;
+                        const float r_eff = std::sqrt(std::max(0.0f, radius * radius - ds * ds));
+
+                        const int u0 = std::max(crop.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - r_eff)));
+                        const int v0 = std::max(crop.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - r_eff)));
+                        const int u1 = std::min(crop.max[u_axis], static_cast<int>(std::ceil(sample_arr[u_axis] + r_eff)) + 1);
+                        const int v1 = std::min(crop.max[v_axis], static_cast<int>(std::ceil(sample_arr[v_axis] + r_eff)) + 1);
+                        if (u1 <= u0 || v1 <= v0) continue;
+
+                        const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
+
                         const auto t_read0 = std::chrono::steady_clock::now();
                         auto grid = ngv.query_nearest(point_for_slice_query(sample, pc.plane_idx, slice), pc.plane_idx);
                         if (!grid) continue;
@@ -1159,8 +1194,14 @@ static void run_fit_normals(
                 int iters = 0;
                 double rms = 0.0;
                 double t_solve_s = 0.0;
-                const bool ok = fit_normal_ceres(dirs_unit, weights, n, &iters, &rms, &t_solve_s);
+                WarmStart& ws = warm[static_cast<size_t>(tid)];
+                double* init_ptr = ws.has ? ws.n : nullptr;
+                const bool ok = fit_normal_ceres(dirs_unit, weights, n, &iters, &rms, &t_solve_s, init_ptr);
                 if (ok) {
+                    ws.n[0] = n.x;
+                    ws.n[1] = n.y;
+                    ws.n[2] = n.z;
+                    ws.has = true;
                     stats[static_cast<size_t>(tid)].add(iters, static_cast<int>(dirs_unit.size()), rms);
                     if (tout != nullptr) {
                         const cv::Point3f a = sample;
