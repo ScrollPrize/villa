@@ -811,10 +811,46 @@ struct Normal3DLineLoss {
                                                       /*y=*/mid_xyz[1],
                                                       /*x=*/mid_xyz[0]);
 
-        // Intermediate step: ignore sign/orientation disambiguation.
-        // Just enforce 90°: dot(edge, normal)=0 => cos_angle=0.
-        (void)p_clockwise;
-        residual[0] = E(_w) * weight_at_point * cos_angle;
+        // Use the third point (clockwise neighbor) to disambiguate which *side* of the target normal we're on.
+        // We treat p_clockwise as non-differentiable for this decision.
+        const E pcw_xyz_const[3] = {
+            E(unjet(p_clockwise[0])),
+            E(unjet(p_clockwise[1])),
+            E(unjet(p_clockwise[2])),
+        };
+
+        // v is the clockwise direction in the surface plane.
+        const E v_zyx[3] = {
+            pcw_xyz_const[2] - p_base[2],
+            pcw_xyz_const[1] - p_base[1],
+            pcw_xyz_const[0] - p_base[0],
+        };
+
+        // Surface normal (right-hand rule): n_surf = e x v (in ZYX ordering).
+        E n_surf_zyx[3] = {
+            e_zyx[1] * v_zyx[2] - e_zyx[2] * v_zyx[1],
+            e_zyx[2] * v_zyx[0] - e_zyx[0] * v_zyx[2],
+            e_zyx[0] * v_zyx[1] - e_zyx[1] * v_zyx[0],
+        };
+        const E n_surf_len = ceres::sqrt(n_surf_zyx[0]*n_surf_zyx[0] + n_surf_zyx[1]*n_surf_zyx[1] + n_surf_zyx[2]*n_surf_zyx[2] + E(1e-12));
+        n_surf_zyx[0] /= n_surf_len;
+        n_surf_zyx[1] /= n_surf_len;
+        n_surf_zyx[2] /= n_surf_len;
+
+        // Compare sidedness against target normal.
+        const E side_dot = (n_surf_zyx[0] * target_zyx[0] + n_surf_zyx[1] * target_zyx[1] + n_surf_zyx[2] * target_zyx[2]);
+
+        // We want the edge direction to be in-plane => perpendicular to target normal.
+        // cos_angle_abs is in [0,1].
+        const E cos_angle_abs = ceres::abs(cos_angle);
+
+        // If we're on the right side (side_dot >= 0), optimize as normal.
+        // If we're on the wrong side (side_dot < 0), use the requested escape objective:
+        //   loss = 2 - abs(cos_angle)
+        // so the solver moves until the configuration can flip sidedness.
+        const E loss = (side_dot >= E(0)) ? cos_angle_abs : (E(2) - cos_angle_abs);
+
+        residual[0] = E(_w) * weight_at_point * loss;
         return true;
     }
 
