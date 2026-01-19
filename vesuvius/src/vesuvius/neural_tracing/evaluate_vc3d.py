@@ -61,7 +61,7 @@ def _start_trace_service(checkpoint_path, volume_zarr, volume_scale, socket_path
     "--prefix",
     type=str,
     required=True,
-    help="String added to patch UUIDs, e.g. vc3d-eval_PREFIX_...",
+    help="String added to patch UUIDs, e.g. nt-eval_(x-y-z)_PREFIX_...",
 )
 @click.option(
     "--checkpoint_path",
@@ -137,7 +137,7 @@ def main(points_path, prefix, checkpoint_path, params_path, grow_seg_bin):
             _wait_for_socket(socket_path, service)
             for pt_idx, point in enumerate(volume_points):
                 x, y, z = _parse_point(point)
-                uuid = f"nt-eval_{prefix}_{x}-{y}-{z}_{ckpt_dir}"
+                uuid = f"nt-eval_{x}-{y}-{z}_{prefix}_{ckpt_dir}"
                 out_dir = Path(paths_dir) / uuid
                 out_dir.mkdir(parents=True, exist_ok=True)
 
