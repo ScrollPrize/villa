@@ -19,6 +19,7 @@
 
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include "z5/factory.hxx"
 #include "z5/dataset.hxx"
@@ -41,7 +42,9 @@ static void print_usage() {
         << "  -h, --help              Print this help message\n"
         << "  -i, --input PATH        Input NormalGridVolume directory OR normals zarr root (required)\n"
         << "  -c, --crop x0 y0 z0 x1 y1 z1   Crop bounding box in voxel coords (half-open)\n"
+        << "      --surf PATH         Optional tifxyz surface directory (for edge-sampled normal visualization / mesh export)\n"
         << "      --vis-ply PATH      Write visualization as PLY with vertex colors\n"
+        << "      --vis-surf PATH     Write --surf tifxyz surface as a quad-mesh PLY (faces)\n"
         << "      --fit-normals       Estimate local 3D normals from segments (within crop)\n"
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
         << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n\n"
@@ -224,6 +227,76 @@ private:
     std::ofstream edges_out;
     uint32_t next_vertex_idx = 0;
 };
+
+static void write_quad_surface_as_ply_quads(const ::QuadSurface& surf, const fs::path& out_ply) {
+    const cv::Mat_<cv::Vec3f>* pts = surf.rawPointsPtr();
+    if (!pts || pts->empty()) {
+        throw std::runtime_error("Surface has no points");
+    }
+
+    const int rows = pts->rows;
+    const int cols = pts->cols;
+
+    // Map valid grid points to contiguous vertex indices.
+    std::vector<int> vid(static_cast<size_t>(rows) * static_cast<size_t>(cols), -1);
+    std::vector<cv::Vec3f> verts;
+    verts.reserve(static_cast<size_t>(rows) * static_cast<size_t>(cols) / 2);
+
+    auto lin = [&](int r, int c) -> size_t { return static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c); };
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const cv::Vec3f& p = (*pts)(r, c);
+            if (p[0] == -1.f) continue;
+            const int idx = static_cast<int>(verts.size());
+            vid[lin(r, c)] = idx;
+            verts.push_back(p);
+        }
+    }
+
+    // Count faces (valid quads only).
+    size_t face_count = 0;
+    for (int r = 0; r + 1 < rows; ++r) {
+        for (int c = 0; c + 1 < cols; ++c) {
+            const int v00 = vid[lin(r, c)];
+            const int v01 = vid[lin(r, c + 1)];
+            const int v10 = vid[lin(r + 1, c)];
+            const int v11 = vid[lin(r + 1, c + 1)];
+            if (v00 < 0 || v01 < 0 || v10 < 0 || v11 < 0) continue;
+            ++face_count;
+        }
+    }
+
+    std::ofstream out(out_ply, std::ios::out | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("Failed to open output PLY for writing: " + out_ply.string());
+    }
+
+    out << "ply\n";
+    out << "format ascii 1.0\n";
+    out << "comment vc_ngrids --vis-surf\n";
+    out << "element vertex " << verts.size() << "\n";
+    out << "property float x\n";
+    out << "property float y\n";
+    out << "property float z\n";
+    out << "element face " << face_count << "\n";
+    out << "property list uchar int vertex_indices\n";
+    out << "end_header\n";
+
+    for (const auto& p : verts) {
+        out << p[0] << " " << p[1] << " " << p[2] << "\n";
+    }
+    for (int r = 0; r + 1 < rows; ++r) {
+        for (int c = 0; c + 1 < cols; ++c) {
+            const int v00 = vid[lin(r, c)];
+            const int v01 = vid[lin(r, c + 1)];
+            const int v10 = vid[lin(r + 1, c)];
+            const int v11 = vid[lin(r + 1, c + 1)];
+            if (v00 < 0 || v01 < 0 || v10 < 0 || v11 < 0) continue;
+            // Quad winding: p00 -> p01 -> p11 -> p10 (consistent grid winding).
+            out << "4 " << v00 << " " << v01 << " " << v11 << " " << v10 << "\n";
+        }
+    }
+}
 
 static void add_gridstore_paths_as_ply_polylines(
     PlyWriter& ply,
@@ -774,6 +847,207 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
                 const cv::Point3f b = a + vis_scale * cv::Point3f(nx, ny, nz);
                 ply.write_segment_streaming(a, b, color_bgr);
             }
+        }
+    }
+
+    ply.end_streaming();
+}
+
+static void run_vis_normals_zarr_on_surf_edges_as_ply(
+    const fs::path& zarr_root,
+    const fs::path& surf_tifxyz,
+    const fs::path& out_ply,
+    const std::optional<CropBox3i>& crop_opt) {
+    // Determine delimiter from x/0/.zarray (fallback ".").
+    std::string delim = ".";
+    {
+        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
+        if (fs::exists(zarray_path)) {
+            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+            delim = j.value<std::string>("dimension_separator", ".");
+        }
+    }
+
+    // Optional metadata written by vc_ngrids --output-zarr.
+    cv::Vec3i origin_xyz(0, 0, 0);
+    int step = 1;
+    {
+        z5::filesystem::handle::File rootFile(zarr_root);
+        z5::filesystem::handle::Group root(rootFile, "");
+        try {
+            nlohmann::json attrs;
+            z5::filesystem::readAttributes(root, attrs);
+            if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
+            }
+            if (attrs.contains("sample_step")) {
+                step = std::max(1, attrs["sample_step"].get<int>());
+            }
+        } catch (...) {
+            // optional
+        }
+    }
+
+    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<z5::Dataset> {
+        z5::filesystem::handle::File file(zarr_root);
+        z5::filesystem::handle::Group axis_group(file, axis);
+        z5::filesystem::handle::Dataset ds_handle(axis_group, "0", delim);
+        return z5::filesystem::openDataset(ds_handle);
+    };
+
+    auto dsx = open_u8_zyx("x");
+    auto dsy = open_u8_zyx("y");
+    auto dsz = open_u8_zyx("z");
+    if (!dsx || !dsy || !dsz) {
+        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    }
+    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+        throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
+    }
+    const auto& shape = dsx->shape();
+    if (shape.size() != 3) {
+        throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
+    }
+    const size_t Z = shape[0];
+    const size_t Y = shape[1];
+    const size_t X = shape[2];
+
+    xt::xarray<uint8_t> ax = xt::zeros<uint8_t>({Z, Y, X});
+    xt::xarray<uint8_t> ay = xt::zeros<uint8_t>({Z, Y, X});
+    xt::xarray<uint8_t> az = xt::zeros<uint8_t>({Z, Y, X});
+    z5::types::ShapeType off = {0, 0, 0};
+    z5::multiarray::readSubarray<uint8_t>(*dsx, ax, off.begin());
+    z5::multiarray::readSubarray<uint8_t>(*dsy, ay, off.begin());
+    z5::multiarray::readSubarray<uint8_t>(*dsz, az, off.begin());
+
+    const CropBox3i crop = crop_opt.value_or(CropBox3i{
+        cv::Vec3i(std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4),
+        cv::Vec3i(std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4),
+    });
+
+    auto decode = [&](uint8_t u) -> float { return (static_cast<int>(u) - 128) / 127.0f; };
+    auto is_fill = [&](size_t iz, size_t iy, size_t ix) -> bool {
+        return ax(iz, iy, ix) == 128 && ay(iz, iy, ix) == 128 && az(iz, iy, ix) == 128;
+    };
+
+    auto sample_trilinear = [&](const cv::Point3f& p_xyz, cv::Point3f& out_n_xyz) -> bool {
+        // Convert voxel coordinates to grid coordinates.
+        const double gx = (static_cast<double>(p_xyz.x) - origin_xyz[0]) / static_cast<double>(step);
+        const double gy = (static_cast<double>(p_xyz.y) - origin_xyz[1]) / static_cast<double>(step);
+        const double gz = (static_cast<double>(p_xyz.z) - origin_xyz[2]) / static_cast<double>(step);
+
+        int x0 = static_cast<int>(std::floor(gx));
+        int y0 = static_cast<int>(std::floor(gy));
+        int z0 = static_cast<int>(std::floor(gz));
+        x0 = std::clamp(x0, 0, static_cast<int>(X) - 2);
+        y0 = std::clamp(y0, 0, static_cast<int>(Y) - 2);
+        z0 = std::clamp(z0, 0, static_cast<int>(Z) - 2);
+        const int x1 = x0 + 1;
+        const int y1 = y0 + 1;
+        const int z1 = z0 + 1;
+
+        if (is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
+            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x0)) ||
+            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
+            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x0)) ||
+            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
+            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y0), static_cast<size_t>(x1)) ||
+            is_fill(static_cast<size_t>(z0), static_cast<size_t>(y1), static_cast<size_t>(x1)) ||
+            is_fill(static_cast<size_t>(z1), static_cast<size_t>(y1), static_cast<size_t>(x1))) {
+            return false;
+        }
+
+        double tx = gx - x0;
+        double ty = gy - y0;
+        double tz = gz - z0;
+        tx = std::clamp(tx, 0.0, 1.0);
+        ty = std::clamp(ty, 0.0, 1.0);
+        tz = std::clamp(tz, 0.0, 1.0);
+
+        auto lerp = [](double a, double b, double t) { return (1.0 - t) * a + t * b; };
+        auto tri = [&](double c000, double c100, double c010, double c110,
+                       double c001, double c101, double c011, double c111) -> double {
+            const double c00 = lerp(c000, c001, tx);
+            const double c01 = lerp(c010, c011, tx);
+            const double c10 = lerp(c100, c101, tx);
+            const double c11 = lerp(c110, c111, tx);
+            const double c0 = lerp(c00, c01, ty);
+            const double c1 = lerp(c10, c11, ty);
+            return lerp(c0, c1, tz);
+        };
+
+        auto c = [&](const xt::xarray<uint8_t>& a, int zz, int yy, int xx) -> double {
+            return static_cast<double>(decode(a(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))));
+        };
+
+        const double nx = tri(
+            c(ax, z0, y0, x0), c(ax, z1, y0, x0), c(ax, z0, y1, x0), c(ax, z1, y1, x0),
+            c(ax, z0, y0, x1), c(ax, z1, y0, x1), c(ax, z0, y1, x1), c(ax, z1, y1, x1));
+        const double ny = tri(
+            c(ay, z0, y0, x0), c(ay, z1, y0, x0), c(ay, z0, y1, x0), c(ay, z1, y1, x0),
+            c(ay, z0, y0, x1), c(ay, z1, y0, x1), c(ay, z0, y1, x1), c(ay, z1, y1, x1));
+        const double nz = tri(
+            c(az, z0, y0, x0), c(az, z1, y0, x0), c(az, z0, y1, x0), c(az, z1, y1, x0),
+            c(az, z0, y0, x1), c(az, z1, y0, x1), c(az, z0, y1, x1), c(az, z1, y1, x1));
+
+        const double nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (!(nlen > 1e-12)) return false;
+        out_n_xyz = cv::Point3f(static_cast<float>(nx / nlen), static_cast<float>(ny / nlen), static_cast<float>(nz / nlen));
+        return true;
+    };
+
+    // Load surface.
+    auto surf = load_quad_from_tifxyz(surf_tifxyz.string());
+    if (!surf) {
+        throw std::runtime_error("Failed to load tifxyz surface: " + surf_tifxyz.string());
+    }
+    const cv::Mat_<cv::Vec3f>* pts = surf->rawPointsPtr();
+    if (!pts || pts->empty()) {
+        throw std::runtime_error("Surface has no points: " + surf_tifxyz.string());
+    }
+
+    const cv::Vec3b color_bgr(0, 255, 255); // yellow
+    const float vis_scale = static_cast<float>(step) * 0.5f;
+
+    PlyWriter ply(out_ply);
+    ply.begin_ascii_streaming();
+
+    auto in_crop = [&](const cv::Point3f& p) -> bool {
+        const int x = static_cast<int>(std::floor(p.x));
+        const int y = static_cast<int>(std::floor(p.y));
+        const int z = static_cast<int>(std::floor(p.z));
+        return x >= crop.min[0] && x < crop.max[0] && y >= crop.min[1] && y < crop.max[1] && z >= crop.min[2] && z < crop.max[2];
+    };
+
+    const int rows = pts->rows;
+    const int cols = pts->cols;
+
+    auto emit_edge_normal = [&](const cv::Vec3f& a, const cv::Vec3f& b) {
+        if (a[0] == -1.f || b[0] == -1.f) return;
+        const cv::Point3f mid = 0.5f * cv::Point3f(a[0] + b[0], a[1] + b[1], a[2] + b[2]);
+        if (!in_crop(mid)) return;
+        cv::Point3f n;
+        if (!sample_trilinear(mid, n)) return;
+        const cv::Point3f p0 = mid;
+        const cv::Point3f p1 = mid + vis_scale * n;
+        ply.write_segment_streaming(p0, p1, color_bgr);
+    };
+
+    // Emit normals sampled at edge midpoints along the quad grid lines.
+    // Horizontal edges (row, col) -> (row, col+1)
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c + 1 < cols; ++c) {
+            emit_edge_normal((*pts)(r, c), (*pts)(r, c + 1));
+        }
+    }
+    // Vertical edges (row, col) -> (row+1, col)
+    for (int r = 0; r + 1 < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            emit_edge_normal((*pts)(r, c), (*pts)(r + 1, c));
         }
     }
 
@@ -1850,7 +2124,9 @@ int main(int argc, char** argv) {
         ("help,h", "Print help")
         ("input,i", po::value<std::string>()->required(), "Input NormalGridVolume directory")
         ("crop,c", po::value<std::vector<int>>()->multitoken(), "Crop x0 y0 z0 x1 y1 z1")
+        ("surf", po::value<std::string>(), "Optional tifxyz surface directory")
         ("vis-ply", po::value<std::string>(), "Write visualization PLY file (with colors)")
+        ("vis-surf", po::value<std::string>(), "Write --surf tifxyz surface as a quad-mesh PLY")
         ("fit-normals", "Estimate local 3D normals from segments (requires --vis-normals)")
         ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments")
         ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
@@ -1887,10 +2163,40 @@ int main(int argc, char** argv) {
         crop = crop_from_args(vm["crop"].as<std::vector<int>>());
     }
 
+    std::optional<fs::path> surf_path;
+    if (vm.count("surf")) {
+        surf_path = fs::path(vm["surf"].as<std::string>());
+        if (!fs::exists(*surf_path) || !fs::is_directory(*surf_path)) {
+            std::cerr << "Error: --surf is not a directory: " << *surf_path << "\n";
+            return 1;
+        }
+    }
+
+    if (vm.count("vis-surf")) {
+        if (!surf_path.has_value()) {
+            std::cerr << "Error: --vis-surf requires --surf PATH\n";
+            return 1;
+        }
+        auto surf = load_quad_from_tifxyz(surf_path->string());
+        if (!surf) {
+            std::cerr << "Error: failed to load tifxyz surface: " << surf_path->string() << "\n";
+            return 1;
+        }
+        write_quad_surface_as_ply_quads(*surf, fs::path(vm["vis-surf"].as<std::string>()));
+        return 0;
+    }
+
     if (vm.count("vis-ply")) {
         if (input_is_normals_zarr) {
-            run_vis_normals_zarr_as_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
+            if (surf_path.has_value()) {
+                run_vis_normals_zarr_on_surf_edges_as_ply(input_dir, *surf_path, fs::path(vm["vis-ply"].as<std::string>()), crop);
+            } else {
+                run_vis_normals_zarr_as_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
+            }
         } else {
+            if (surf_path.has_value()) {
+                throw std::runtime_error("--surf is only supported with normals zarr input (--input <zarr_root>) for --vis-ply");
+            }
             run_vis_ply(input_dir, fs::path(vm["vis-ply"].as<std::string>()), crop);
         }
         return 0;
