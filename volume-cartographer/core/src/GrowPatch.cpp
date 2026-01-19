@@ -474,7 +474,7 @@ struct LossSettings {
         w[LossType::SNAP] = 0.1;
         w[LossType::NORMAL] = 0.0f;
         w[LossType::NORMAL3D] = 1.0f;
-        w[LossType::NORMAL3DLINE] = 10.0f;
+        w[LossType::NORMAL3DLINE] = 0.1f;
         w[LossType::STRAIGHT] = 0.2;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
