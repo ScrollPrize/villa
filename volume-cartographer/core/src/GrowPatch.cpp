@@ -46,6 +46,7 @@
 #define LOSS_NORMALSNAP 4
 #define LOSS_SDIR 8
 #define LOSS_3DNORMAL 16
+#define LOSS_3DNORMALLINE 32
 
 namespace { // Anonymous namespace for local helpers
 
@@ -103,6 +104,48 @@ template <typename T>
 static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
 {
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
+}
+
+// Normal3D placeholder / validity check.
+// The fitted normal direction-field stores placeholder/unset normals as raw uint8 triplets (0,0,0).
+// We treat a trilinear sample as invalid if *any* of the 8 lattice corners is a placeholder.
+static inline bool normal3d_trilinear_sample_valid(Chunked3dVec3fFromUint8& dirs, const cv::Vec3d& xyz)
+{
+    const double zf = xyz[2] * static_cast<double>(dirs._scale);
+    const double yf = xyz[1] * static_cast<double>(dirs._scale);
+    const double xf = xyz[0] * static_cast<double>(dirs._scale);
+
+    int z0 = static_cast<int>(std::floor(zf));
+    int y0 = static_cast<int>(std::floor(yf));
+    int x0 = static_cast<int>(std::floor(xf));
+
+    const auto shape = dirs._x.shape(); // z,y,x
+    if (!shape.empty()) {
+        z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
+        y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
+        x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
+    } else {
+        z0 = std::max(0, z0);
+        y0 = std::max(0, y0);
+        x0 = std::max(0, x0);
+    }
+
+    const int z1 = z0 + 1;
+    const int y1 = y0 + 1;
+    const int x1 = x0 + 1;
+
+    auto is_zero_triplet = [&](int z, int y, int x) -> bool {
+        const auto rx = dirs._x.safe_at(z, y, x);
+        const auto ry = dirs._y.safe_at(z, y, x);
+        const auto rz = dirs._z.safe_at(z, y, x);
+        return (rx == 0) && (ry == 0) && (rz == 0);
+    };
+
+    const bool any_zero =
+        is_zero_triplet(z0, y0, x0) || is_zero_triplet(z1, y0, x0) || is_zero_triplet(z0, y1, x0) || is_zero_triplet(z1, y1, x0) ||
+        is_zero_triplet(z0, y0, x1) || is_zero_triplet(z1, y0, x1) || is_zero_triplet(z0, y1, x1) || is_zero_triplet(z1, y1, x1);
+
+    return !any_zero;
 }
 
 class PointCorrection {
@@ -408,6 +451,7 @@ enum LossType {
     SNAP,
     NORMAL,
     NORMAL3D,
+    NORMAL3DLINE,
     SDIR,
     CORRECTION,
     COUNT
@@ -418,9 +462,10 @@ struct LossSettings {
     std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
 
     LossSettings() {
-        w[LossType::SNAP] = 1.0;
-        w[LossType::NORMAL] = 0.1f;
+        w[LossType::SNAP] = 0.0;
+        w[LossType::NORMAL] = 0.0f;
         w[LossType::NORMAL3D] = 0.0f;
+        w[LossType::NORMAL3DLINE] = 0.1f;
         w[LossType::STRAIGHT] = 1.0;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
@@ -444,6 +489,7 @@ struct LossSettings {
         set_weight("snap_weight", LossType::SNAP);
         set_weight("normal_weight", LossType::NORMAL);
         set_weight("normal3d_weight", LossType::NORMAL3D);
+        set_weight("normal3dline_weight", LossType::NORMAL3DLINE);
         set_weight("straight_weight", LossType::STRAIGHT);
         set_weight("dist_weight", LossType::DIST);
         set_weight("direction_weight", LossType::DIRECTION);
@@ -718,6 +764,8 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_3d_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_3d_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int gen_3d_normal_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int conditional_3d_normal_line_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
@@ -846,6 +894,22 @@ static cv::Vec2i lower_p(const cv::Vec2i &point, const cv::Vec2i &offset)
         return point;
 }
 
+// Order two points along the axis implied by their grid relation.
+// - For horizontal edges (same row), order by column.
+// - For vertical edges (same col), order by row.
+// Falls back to lexicographic (row,col) if neither axis matches.
+static inline std::pair<cv::Vec2i, cv::Vec2i> order_p(const cv::Vec2i& p, const cv::Vec2i& q)
+{
+    if (p[0] == q[0]) { // same row => horizontal edge
+        return (p[1] <= q[1]) ? std::make_pair(p, q) : std::make_pair(q, p);
+    }
+    if (p[1] == q[1]) { // same col => vertical edge
+        return (p[0] <= q[0]) ? std::make_pair(p, q) : std::make_pair(q, p);
+    }
+    // fallback
+    return (p[0] < q[0] || (p[0] == q[0] && p[1] <= q[1])) ? std::make_pair(p, q) : std::make_pair(q, p);
+}
+
 static bool loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status)
 {
     return loss_status(lower_p(p, off)) & (1 << bit);
@@ -932,6 +996,52 @@ static int conditional_dist_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o
         set = set_loss_mask(bit, p, off, loss_status, gen_dist_loss(problem, p, off, params, settings));
     return set;
 };
+
+static int gen_3d_normal_line_loss(ceres::Problem &problem,
+                                  const cv::Vec2i &p,
+                                  const cv::Vec2i &off,
+                                  TraceParameters &params,
+                                  const TraceData &trace_data,
+                                  const LossSettings &settings)
+{
+    if (!trace_data.normal3d_field) return 0;
+
+    const float w = settings(LossType::NORMAL3DLINE, p);
+    if (w <= 0.0f) return 0;
+
+    const cv::Vec2i q = p + off;
+    auto const ordered = order_p(p, q);
+    const cv::Vec2i a = ordered.first;
+    const cv::Vec2i b = ordered.second;
+
+    if (!coord_valid(params.state(a)) || !coord_valid(params.state(b))) {
+        return 0;
+    }
+
+    problem.AddResidualBlock(
+        Normal3DLineLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_weight.get(), w),
+        nullptr,
+        &params.dpoints(a)[0],
+        &params.dpoints(b)[0]);
+
+    return 1;
+}
+
+static int conditional_3d_normal_line_loss(int bit,
+                                          const cv::Vec2i &p,
+                                          const cv::Vec2i &off,
+                                          cv::Mat_<uint16_t> &loss_status,
+                                          ceres::Problem &problem,
+                                          TraceParameters &params,
+                                          const TraceData &trace_data,
+                                          const LossSettings &settings)
+{
+    if (!trace_data.normal3d_field) return 0;
+    int set = 0;
+    if (!loss_mask(bit, p, off, loss_status))
+        set = set_loss_mask(bit, p, off, loss_status, gen_3d_normal_line_loss(problem, p, off, params, trace_data, settings));
+    return set;
+}
 
 static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3,
     cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const LossSettings &settings)
@@ -1198,6 +1308,12 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
     }
 
+    if (flags & LOSS_3DNORMALLINE) {
+        // one per edge (use +u and +v edges only)
+        count += gen_3d_normal_line_loss(problem, p, cv::Vec2i(0, 1), params, trace_data, settings);
+        count += gen_3d_normal_line_loss(problem, p, cv::Vec2i(1, 0), params, trace_data, settings);
+    }
+
     // if (flags & LOSS_3DNORMAL) {
     //     // one per local cell, around p
     //     count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
@@ -1446,6 +1562,13 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_3d_normal_loss(12, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
     count += conditional_3d_normal_loss(12, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_3d_normal_loss(12, p + cv::Vec2i(-1,-1), loss_status, problem, params, trace_data, settings);
+
+    // fitted 3D normals: edge-perpendicularity (once per edge)
+    // Add for all edges touching p; the mask makes sure each undirected edge is only added once.
+    count += conditional_3d_normal_line_loss(13, p, cv::Vec2i(0, 1),  loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_line_loss(13, p, cv::Vec2i(0, -1), loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_line_loss(14, p, cv::Vec2i(1, 0),  loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_line_loss(14, p, cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
 
     //snapping
     count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data, settings);
@@ -2062,6 +2185,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
               << " SNAP: " << loss_settings.w[LossType::SNAP]
               << " NORMAL: " << loss_settings.w[LossType::NORMAL]
               << " NORMAL3D: " << loss_settings.w[LossType::NORMAL3D]
+              << " NORMAL3DLINE: " << loss_settings.w[LossType::NORMAL3DLINE]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
@@ -2996,6 +3120,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                         avg[1] < loss_settings.y_min || avg[1] > loss_settings.y_max ||
                         avg[0] < loss_settings.x_min || avg[0] > loss_settings.x_max)
                         continue;
+
+                    // If fitted-3D normal losses are enabled, require that the normal field is defined here.
+                    // Otherwise we permanently stop expansion into this candidate (it stays STATE_PROCESSING).
+                    if (trace_data.normal3d_field &&
+                        (loss_settings.w[LossType::NORMAL3D] > 0.0f || loss_settings.w[LossType::NORMAL3DLINE] > 0.0f) &&
+                        !normal3d_trilinear_sample_valid(*trace_data.normal3d_field, avg)) {
+                        continue;
+                    }
 
                     cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                     trace_params.dpoints(p) = init;
