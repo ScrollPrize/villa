@@ -850,8 +850,8 @@ static void run_align_normals_zarr(
     const fs::path& out_zarr,
     const std::optional<CropBox3i>& crop_opt,
     int seed_samples = 100,
-    int radius = 4,
-    int candidate_samples_per_iter = 256) {
+    int radius = 3,
+    int candidate_samples_per_iter = 16) {
     // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
     std::string delim = ".";
     {
@@ -1152,13 +1152,15 @@ static void run_align_normals_zarr(
         std::uniform_int_distribution<size_t> pick_fr(0, fringe.size() - 1);
         const int tries = std::min<int>(candidate_samples_per_iter, static_cast<int>(fringe.size()));
 
-        size_t best_cand = fringe[pick_fr(rng)];
+        size_t best_idx_in_fringe = pick_fr(rng);
+        size_t best_cand = fringe[best_idx_in_fringe];
         double best_score = -1e9;
         int best_cnt = -1;
         bool best_flip = false;
 
         for (int t = 0; t < tries; ++t) {
-            const size_t cand = fringe[pick_fr(rng)];
+            const size_t cand_idx = pick_fr(rng);
+            const size_t cand = fringe[cand_idx];
             if (state[cand] & kAligned) continue;
             int cnt = 0;
             bool fl = false;
@@ -1168,6 +1170,7 @@ static void run_align_normals_zarr(
                 best_score = s;
                 best_cnt = cnt;
                 best_cand = cand;
+                best_idx_in_fringe = cand_idx;
                 best_flip = fl;
             }
         }
@@ -1186,14 +1189,16 @@ static void run_align_normals_zarr(
         if (best_flip) state[best_cand] |= kFlip;
         ++aligned_count;
 
-        // Remove best_cand from fringe (swap-erase first occurrence).
-        for (size_t i = 0; i < fringe.size(); ++i) {
-            if (fringe[i] == best_cand) {
-                fringe[i] = fringe.back();
-                fringe.pop_back();
-                break;
-            }
+        // Remove best_cand from fringe (swap-erase by index; avoids linear scan).
+        // If this fails, it indicates a bug (e.g. duplicates or stale index), so fail hard.
+        if (!(best_idx_in_fringe < fringe.size() && fringe[best_idx_in_fringe] == best_cand)) {
+            std::stringstream msg;
+            msg << "Invariant violated: best_idx_in_fringe does not point to best_cand (idx=" << best_idx_in_fringe
+                << ", best_cand=" << best_cand << ", fringe_size=" << fringe.size() << ")";
+            throw std::runtime_error(msg.str());
         }
+        fringe[best_idx_in_fringe] = fringe.back();
+        fringe.pop_back();
 
         add_fringe_neighbors(best_cand);
     }
