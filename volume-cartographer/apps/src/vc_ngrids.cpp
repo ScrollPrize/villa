@@ -2183,7 +2183,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         write_quad_surface_as_ply_quads(*surf, fs::path(vm["vis-surf"].as<std::string>()));
-        return 0;
     }
 
     if (vm.count("vis-ply")) {

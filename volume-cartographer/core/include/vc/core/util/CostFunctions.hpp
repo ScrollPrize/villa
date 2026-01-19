@@ -804,21 +804,6 @@ struct Normal3DLineLoss {
         const E e_len = ceres::sqrt(e_zyx[0]*e_zyx[0] + e_zyx[1]*e_zyx[1] + e_zyx[2]*e_zyx[2] + E(1e-12));
         const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len; // want 0
 
-        // Orientation disambiguation: use the third point ONLY to decide which of the two perpendicular orientations we mean.
-        // Construct surface normal from (base->off) and (base->clockwise), then compare its sign with target.
-        const E pcw_xyz_const[3] = { E(unjet(p_clockwise[0])), E(unjet(p_clockwise[1])), E(unjet(p_clockwise[2])) };
-        const E v_zyx[3] = { pcw_xyz_const[2] - p_base[2], pcw_xyz_const[1] - p_base[1], pcw_xyz_const[0] - p_base[0] };
-        E surf_n_zyx[3] = {
-            e_zyx[1] * v_zyx[2] - e_zyx[2] * v_zyx[1],
-            e_zyx[2] * v_zyx[0] - e_zyx[0] * v_zyx[2],
-            e_zyx[0] * v_zyx[1] - e_zyx[1] * v_zyx[0],
-        };
-        const E surf_n_len = ceres::sqrt(surf_n_zyx[0]*surf_n_zyx[0] + surf_n_zyx[1]*surf_n_zyx[1] + surf_n_zyx[2]*surf_n_zyx[2] + E(1e-12));
-        surf_n_zyx[0] /= surf_n_len;
-        surf_n_zyx[1] /= surf_n_len;
-        surf_n_zyx[2] /= surf_n_len;
-        const E orient_dot = (surf_n_zyx[0] * target_zyx[0] + surf_n_zyx[1] * target_zyx[1] + surf_n_zyx[2] * target_zyx[2]);
-
         E weight_at_point = E(1);
         if (_maybe_weights)
             weight_at_point = sample_trilinear_weight(*_maybe_weights,
@@ -826,11 +811,10 @@ struct Normal3DLineLoss {
                                                       /*y=*/mid_xyz[1],
                                                       /*x=*/mid_xyz[0]);
 
-        // One scalar residual; Ceres will square it.
-        // - cos_angle enforces 90° between edge and target normal
-        // - orient_dot disambiguates the "right" vs "wrong" perpendicular orientation (penalize if negative)
-        const E orient_penalty = (orient_dot < E(0)) ? (-orient_dot) : E(0);
-        residual[0] = E(_w) * weight_at_point * (cos_angle + E(1.0) * orient_penalty);
+        // Intermediate step: ignore sign/orientation disambiguation.
+        // Just enforce 90°: dot(edge, normal)=0 => cos_angle=0.
+        (void)p_clockwise;
+        residual[0] = E(_w) * weight_at_point * cos_angle;
         return true;
     }
 
