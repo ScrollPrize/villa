@@ -107,7 +107,7 @@ static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
 }
 
 // Normal3D placeholder / validity check.
-// The fitted normal direction-field stores placeholder/unset normals as raw uint8 triplets (0,0,0).
+// The fitted normal direction-field stores placeholder/unset normals as the neutral uint8 triplet (128,128,128).
 // We treat a trilinear sample as invalid if *any* of the 8 lattice corners is a placeholder.
 static inline bool normal3d_trilinear_sample_valid(Chunked3dVec3fFromUint8& dirs, const cv::Vec3d& xyz)
 {
@@ -134,18 +134,18 @@ static inline bool normal3d_trilinear_sample_valid(Chunked3dVec3fFromUint8& dirs
     const int y1 = y0 + 1;
     const int x1 = x0 + 1;
 
-    auto is_zero_triplet = [&](int z, int y, int x) -> bool {
+    auto is_fill_triplet = [&](int z, int y, int x) -> bool {
         const auto rx = dirs._x.safe_at(z, y, x);
         const auto ry = dirs._y.safe_at(z, y, x);
         const auto rz = dirs._z.safe_at(z, y, x);
-        return (rx == 0) && (ry == 0) && (rz == 0);
+        return (rx == 128) && (ry == 128) && (rz == 128);
     };
 
-    const bool any_zero =
-        is_zero_triplet(z0, y0, x0) || is_zero_triplet(z1, y0, x0) || is_zero_triplet(z0, y1, x0) || is_zero_triplet(z1, y1, x0) ||
-        is_zero_triplet(z0, y0, x1) || is_zero_triplet(z1, y0, x1) || is_zero_triplet(z0, y1, x1) || is_zero_triplet(z1, y1, x1);
+    const bool any_fill =
+        is_fill_triplet(z0, y0, x0) || is_fill_triplet(z1, y0, x0) || is_fill_triplet(z0, y1, x0) || is_fill_triplet(z1, y1, x0) ||
+        is_fill_triplet(z0, y0, x1) || is_fill_triplet(z1, y0, x1) || is_fill_triplet(z0, y1, x1) || is_fill_triplet(z1, y1, x1);
 
-    return !any_zero;
+    return !any_fill;
 }
 
 class PointCorrection {
@@ -1974,17 +1974,33 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             // Expect fixed layout: <root>/{x,y,z}/0
             const int scale_level = 0;
 
-            // Read delimiter from x/0/.zarray (fallback '.')
-            std::string delim = ".";
-            try {
-                const std::filesystem::path zarray_path = zarr_root / "x" / "0" / ".zarray";
-                if (std::filesystem::exists(zarray_path)) {
-                    nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
-                    delim = j.value<std::string>("dimension_separator", ".");
+            // Read delimiter from x/0/.zarray.
+            // Also assert direction-field fill_value uses the neutral (128,128,128) convention.
+            // We treat that triplet as "no normal".
+            const auto assert_fill_value_128 = [&](const char* axis) {
+                const std::filesystem::path zarray_axis = zarr_root / axis / "0" / ".zarray";
+                if (!std::filesystem::exists(zarray_axis)) {
+                    throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
                 }
-            } catch (...) {
-                // ignore
-            }
+                nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_axis));
+                if (!j.contains("fill_value")) {
+                    throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
+                }
+                const int fv = j["fill_value"].get<int>();
+                if (fv != 128) {
+                    std::stringstream msg;
+                    msg << "normal3d_zarr_path fill_value=" << fv << " for " << axis << "/0; expected 128";
+                    throw std::runtime_error(msg.str());
+                }
+            };
+
+            assert_fill_value_128("x");
+            assert_fill_value_128("y");
+            assert_fill_value_128("z");
+
+            const std::filesystem::path zarray_x = zarr_root / "x" / "0" / ".zarray";
+            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_x));
+            std::string delim = j.value<std::string>("dimension_separator", ".");
 
             // Assert the direction-field was aligned by vc_ngrids --align-normals.
             // try {
