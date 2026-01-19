@@ -484,6 +484,44 @@ struct NormalDotResidual {
     double w_;
 };
 
+// First-order normal field around a sample point x0:
+//   n(x) = n0 + J * (x - x0)
+// where J is 3x3 (row-major). We only *output* n0 (normalized), but fitting J
+// improves the local fit when normals vary spatially (curvature).
+struct NormalDotResidualAffine {
+    NormalDotResidualAffine(const cv::Point3f& d_unit, const cv::Point3f& delta_xyz, double w)
+        : d_(d_unit), delta_(delta_xyz), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const n0, const T* const J, T* residual) const {
+        // J is row-major 3x3: rows correspond to x,y,z components of n.
+        const T dx = T(delta_.x);
+        const T dy = T(delta_.y);
+        const T dz = T(delta_.z);
+
+        const T nx = n0[0] + J[0] * dx + J[1] * dy + J[2] * dz;
+        const T ny = n0[1] + J[3] * dx + J[4] * dy + J[5] * dz;
+        const T nz = n0[2] + J[6] * dx + J[7] * dy + J[8] * dz;
+
+        residual[0] = T(w_) * (nx * T(d_.x) + ny * T(d_.y) + nz * T(d_.z));
+        return true;
+    }
+
+    cv::Point3f d_;
+    cv::Point3f delta_;
+    double w_;
+};
+
+struct JacobianL2Residual {
+    explicit JacobianL2Residual(double w) : w_(w) {}
+    template <typename T>
+    bool operator()(const T* const J, T* residual) const {
+        for (int i = 0; i < 9; ++i) residual[i] = T(w_) * J[i];
+        return true;
+    }
+    double w_;
+};
+
 struct UnitNormResidual {
     explicit UnitNormResidual(double w) : w_(w) {}
     template <typename T>
@@ -498,6 +536,8 @@ struct UnitNormResidual {
 static bool fit_normal_ceres(
     std::array<std::vector<cv::Point3f>, 3>& dirs_unit_by_plane,
     std::array<std::vector<double>, 3>& weights_by_plane,
+    const cv::Point3f& sample_xyz,
+    const std::array<std::vector<cv::Point3f>, 3>& deltas_xyz_by_plane,
     cv::Point3f& out_n,
     int* out_num_iterations,
     double* out_rms,
@@ -508,54 +548,70 @@ static bool fit_normal_ceres(
     }
 
     // Determine how many samples we will use per plane.
-    const size_t n0 = dirs_unit_by_plane[0].size();
-    const size_t n1 = dirs_unit_by_plane[1].size();
-    const size_t n2 = dirs_unit_by_plane[2].size();
-    const size_t total = n0 + n1 + n2;
+    const size_t n0_count = dirs_unit_by_plane[0].size();
+    const size_t n1_count = dirs_unit_by_plane[1].size();
+    const size_t n2_count = dirs_unit_by_plane[2].size();
+    const size_t total = n0_count + n1_count + n2_count;
     if (total < 3) return false;
 
     // Re-weight so each plane contributes equally (counts only).
     // scale[p] = (total/3) / n_p (0 if n_p==0)
     const double target = static_cast<double>(total) / 3.0;
-    const double s0 = (n0 > 0) ? (target / static_cast<double>(n0)) : 0.0;
-    const double s1 = (n1 > 0) ? (target / static_cast<double>(n1)) : 0.0;
-    const double s2 = (n2 > 0) ? (target / static_cast<double>(n2)) : 0.0;
+    const double s0 = (n0_count > 0) ? (target / static_cast<double>(n0_count)) : 0.0;
+    const double s1 = (n1_count > 0) ? (target / static_cast<double>(n1_count)) : 0.0;
+    const double s2 = (n2_count > 0) ? (target / static_cast<double>(n2_count)) : 0.0;
 
-    double n[3];
+    double n0[3];
+    double J[9] = {0.0, 0.0, 0.0,
+                   0.0, 0.0, 0.0,
+                   0.0, 0.0, 0.0};
     if (inout_init_n != nullptr) {
         // Reuse previous solution for warm start.
-        n[0] = inout_init_n[0];
-        n[1] = inout_init_n[1];
-        n[2] = inout_init_n[2];
+        n0[0] = inout_init_n[0];
+        n0[1] = inout_init_n[1];
+        n0[2] = inout_init_n[2];
     } else {
-        n[0] = 1;
-        n[1] = 1;
-        n[2] = 1;
+        n0[0] = 1;
+        n0[1] = 1;
+        n0[2] = 1;
     }
 
     ceres::Problem problem;
-    for (size_t k = 0; k < n0; ++k) {
+    for (size_t k = 0; k < n0_count; ++k) {
         const auto& d = dirs_unit_by_plane[0][k];
+        const auto& delta = deltas_xyz_by_plane[0][k];
         const double w = weights_by_plane[0][k] * s0;
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
-        problem.AddResidualBlock(cost, nullptr, n);
+        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
+            new NormalDotResidualAffine(d, delta, w));
+        problem.AddResidualBlock(cost, nullptr, n0, J);
     }
-    for (size_t k = 0; k < n1; ++k) {
+    for (size_t k = 0; k < n1_count; ++k) {
         const auto& d = dirs_unit_by_plane[1][k];
+        const auto& delta = deltas_xyz_by_plane[1][k];
         const double w = weights_by_plane[1][k] * s1;
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
-        problem.AddResidualBlock(cost, nullptr, n);
+        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
+            new NormalDotResidualAffine(d, delta, w));
+        problem.AddResidualBlock(cost, nullptr, n0, J);
     }
-    for (size_t k = 0; k < n2; ++k) {
+    for (size_t k = 0; k < n2_count; ++k) {
         const auto& d = dirs_unit_by_plane[2][k];
+        const auto& delta = deltas_xyz_by_plane[2][k];
         const double w = weights_by_plane[2][k] * s2;
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidual, 1, 3>(new NormalDotResidual(d, w));
-        problem.AddResidualBlock(cost, nullptr, n);
+        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
+            new NormalDotResidualAffine(d, delta, w));
+        problem.AddResidualBlock(cost, nullptr, n0, J);
     }
     problem.AddResidualBlock(
         new ceres::AutoDiffCostFunction<UnitNormResidual, 1, 3>(new UnitNormResidual(10.0)),
         nullptr,
-        n);
+        n0);
+
+    // Regularize the curvature term so we don't overfit noise. Weight chosen empirically.
+    // Units: n is unitless, delta is in voxels => J has ~1/voxel scale.
+    problem.AddResidualBlock(
+        new ceres::AutoDiffCostFunction<JacobianL2Residual, 9, 9>(new JacobianL2Residual(0.05)),
+        nullptr,
+        J);
 
     ceres::Solver::Options opts;
     opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
@@ -581,9 +637,9 @@ static bool fit_normal_ceres(
         *out_rms = std::sqrt(2.0 * summary.final_cost / denom);
     }
 
-    const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    const double len = std::sqrt(n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2]);
     if (!(len > 1e-12)) return false;
-    out_n = cv::Point3f(static_cast<float>(n[0] / len), static_cast<float>(n[1] / len), static_cast<float>(n[2] / len));
+    out_n = cv::Point3f(static_cast<float>(n0[0] / len), static_cast<float>(n0[1] / len), static_cast<float>(n0[2] / len));
 
     if (inout_init_n != nullptr) {
         inout_init_n[0] = out_n.x;
@@ -1124,8 +1180,8 @@ static void run_align_normals_zarr(
     const fs::path& out_zarr,
     const std::optional<CropBox3i>& crop_opt,
     int seed_samples = 100,
-    int radius = 3,
-    int candidate_samples_per_iter = 16) {
+    int radius = 2,
+    int candidate_samples_per_iter = 100) {
     // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
     std::string delim = ".";
     {
@@ -1375,6 +1431,8 @@ static void run_align_normals_zarr(
             return -1e9;
         }
 
+        // We intentionally do NOT normalize by neighbor count.
+        // This biases the selection toward candidates with more already-aligned neighbors.
         double sum_dot_no = 0.0;
         double sum_dot_fl = 0.0;
         int cnt = 0;
@@ -1393,14 +1451,12 @@ static void run_align_normals_zarr(
             out_flip = false;
             return -1e9;
         }
-        const double mean_no = sum_dot_no / static_cast<double>(cnt);
-        const double mean_fl = sum_dot_fl / static_cast<double>(cnt);
-        if (mean_fl > mean_no) {
+        if (sum_dot_fl > sum_dot_no) {
             out_flip = true;
-            return mean_fl;
+            return sum_dot_fl;
         }
         out_flip = false;
-        return mean_no;
+        return sum_dot_no;
     };
 
     add_fringe_neighbors(seed_lin);
@@ -1438,7 +1494,7 @@ static void run_align_normals_zarr(
             if (state[cand] & kAligned) continue;
             int cnt = 0;
             bool fl = false;
-            const double s = score_candidate(cand, /*neigh_rad=*/1, cnt, fl);
+            const double s = score_candidate(cand, /*neigh_rad=*/radius, cnt, fl);
             if (cnt <= 0) continue;
             if (s > best_score || (s == best_score && cnt > best_cnt)) {
                 best_score = s;
@@ -1535,7 +1591,7 @@ static void run_fit_normals(
     const std::optional<CropBox3i>& crop_opt,
     const std::optional<fs::path>& out_zarr_opt,
     int step = 16,
-    float radius = 64.f) {
+    float radius = 128.f) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
@@ -1848,9 +1904,11 @@ static void run_fit_normals(
 
                 std::array<std::vector<cv::Point3f>, 3> dirs_unit;
                 std::array<std::vector<double>, 3> weights;
+                std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
                 for (int p = 0; p < 3; ++p) {
                     dirs_unit[p].reserve(256);
                     weights[p].reserve(256);
+                    deltas_xyz[p].reserve(256);
                 }
 
                 double t_ng_read_s = 0.0;
@@ -1924,6 +1982,11 @@ static void run_fit_normals(
                                 const float inv = 1.0f / std::sqrt(seglen2);
                                 dirs_unit[pc.plane_idx].emplace_back(d.x * inv, d.y * inv, d.z * inv);
 
+                                // Delta from sample point for first-order curvature term.
+                                // Use the segment midpoint as the constraint location.
+                                const cv::Point3f m = 0.5f * (a + b);
+                                deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
+
                                 // Gaussian falloff: nearer segments contribute more.
                                 const double w = std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2));
                                 weights[pc.plane_idx].push_back(w);
@@ -1942,7 +2005,7 @@ static void run_fit_normals(
                 WarmStart& ws = warm[static_cast<size_t>(tid)];
                 double* init_ptr = ws.has ? ws.n : nullptr;
                 const auto t_solve_call0 = std::chrono::steady_clock::now();
-                const bool ok = fit_normal_ceres(dirs_unit, weights, n, &iters, &rms, &t_solve_s, init_ptr);
+                const bool ok = fit_normal_ceres(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
                 const auto t_solve_call1 = std::chrono::steady_clock::now();
                 t_solve_call_s = std::chrono::duration<double>(t_solve_call1 - t_solve_call0).count();
                 if (ok) {
