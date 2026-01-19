@@ -841,6 +841,7 @@ static double dot_decoded_u8(uint8_t ax, uint8_t ay, uint8_t az, uint8_t bx, uin
 }
 
 static bool is_valid_normal_u8(uint8_t ux, uint8_t uy, uint8_t uz) {
+    // In our direction-field encoding, (128,128,128) is the neutral fill value meaning "no normal".
     return !(ux == 128 && uy == 128 && uz == 128);
 }
 
@@ -901,6 +902,28 @@ static void run_align_normals_zarr(
         throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
     }
     const std::vector<size_t> full_shape = {dsx->shape()[0], dsx->shape()[1], dsx->shape()[2]};
+
+    // Assert fill_value is 128 (neutral "no normal"); vc_ngrids relies on this convention.
+    auto assert_fill_value_128 = [&](const char* axis) {
+        const fs::path zarray_path = zarr_root / axis / "0" / ".zarray";
+        if (!fs::exists(zarray_path)) {
+            throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
+        }
+        nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+        if (!j.contains("fill_value")) {
+            throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
+        }
+        const int fv = j["fill_value"].get<int>();
+        if (fv != 128) {
+            std::stringstream msg;
+            msg << "Normals zarr has unexpected fill_value=" << fv
+                << " for " << axis << "/0; expected 128";
+            throw std::runtime_error(msg.str());
+        }
+    };
+    assert_fill_value_128("x");
+    assert_fill_value_128("y");
+    assert_fill_value_128("z");
 
     const CropBox3i crop_xyz = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -1199,9 +1222,9 @@ static void run_align_normals_zarr(
     z5::filesystem::handle::Group gx(outFile, "x");
     z5::filesystem::handle::Group gy(outFile, "y");
     z5::filesystem::handle::Group gz(outFile, "z");
-    auto out_dsx = z5::createDataset(gx, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-    auto out_dsy = z5::createDataset(gy, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-    auto out_dsz = z5::createDataset(gz, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+    auto out_dsx = z5::createDataset(gx, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
+    auto out_dsy = z5::createDataset(gy, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
+    auto out_dsz = z5::createDataset(gz, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
 
     z5::multiarray::writeSubarray<uint8_t>(out_dsx, ax, crop_zyx.off.begin());
     z5::multiarray::writeSubarray<uint8_t>(out_dsy, ay, crop_zyx.off.begin());
@@ -1786,9 +1809,9 @@ static void run_fit_normals(
         z5::filesystem::handle::Group gy(outFile, "y");
         z5::filesystem::handle::Group gz(outFile, "z");
 
-        auto dsx = z5::createDataset(gx, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-        auto dsy = z5::createDataset(gy, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-        auto dsz = z5::createDataset(gz, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+        auto dsx = z5::createDataset(gx, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
+        auto dsy = z5::createDataset(gy, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
+        auto dsz = z5::createDataset(gz, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
 
         auto ax = xt::adapt(enc_x, shape);
         auto ay = xt::adapt(enc_y, shape);

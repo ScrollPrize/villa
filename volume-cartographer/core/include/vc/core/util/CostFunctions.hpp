@@ -625,18 +625,18 @@ private:
         const int y1 = y0 + 1;
         const int x1 = x0 + 1;
 
-        // Placeholder / unset normals are stored as raw uint8 triplets (0,0,0).
+        // Placeholder / unset normals are stored as the neutral uint8 triplet (128,128,128).
         // If *any* trilinear corner is a placeholder, treat the sample as invalid.
-        auto is_zero_triplet = [&](int z, int y, int x) -> bool {
+        auto is_fill_triplet = [&](int z, int y, int x) -> bool {
             const auto rx = dirs._x.safe_at(z, y, x);
             const auto ry = dirs._y.safe_at(z, y, x);
             const auto rz = dirs._z.safe_at(z, y, x);
-            return (rx == 0) && (ry == 0) && (rz == 0);
+            return (rx == 128) && (ry == 128) && (rz == 128);
         };
-        const bool any_zero =
-            is_zero_triplet(z0, y0, x0) || is_zero_triplet(z1, y0, x0) || is_zero_triplet(z0, y1, x0) || is_zero_triplet(z1, y1, x0) ||
-            is_zero_triplet(z0, y0, x1) || is_zero_triplet(z1, y0, x1) || is_zero_triplet(z0, y1, x1) || is_zero_triplet(z1, y1, x1);
-        if (any_zero)
+        const bool any_fill =
+            is_fill_triplet(z0, y0, x0) || is_fill_triplet(z1, y0, x0) || is_fill_triplet(z0, y1, x0) || is_fill_triplet(z1, y1, x0) ||
+            is_fill_triplet(z0, y0, x1) || is_fill_triplet(z1, y0, x1) || is_fill_triplet(z0, y1, x1) || is_fill_triplet(z1, y1, x1);
+        if (any_fill)
             return false;
 
         E dz = zf - E(z0);
@@ -863,18 +863,18 @@ private:
         const int y1 = y0 + 1;
         const int x1 = x0 + 1;
 
-        // Placeholder / unset normals are stored as raw uint8 triplets (0,0,0).
+        // Placeholder / unset normals are stored as the neutral uint8 triplet (128,128,128).
         // If *any* trilinear corner is a placeholder, treat the sample as invalid.
-        auto is_zero_triplet = [&](int z, int y, int x) -> bool {
+        auto is_fill_triplet = [&](int z, int y, int x) -> bool {
             const auto rx = dirs._x.safe_at(z, y, x);
             const auto ry = dirs._y.safe_at(z, y, x);
             const auto rz = dirs._z.safe_at(z, y, x);
-            return (rx == 0) && (ry == 0) && (rz == 0);
+            return (rx == 128) && (ry == 128) && (rz == 128);
         };
-        const bool any_zero =
-            is_zero_triplet(z0, y0, x0) || is_zero_triplet(z1, y0, x0) || is_zero_triplet(z0, y1, x0) || is_zero_triplet(z1, y1, x0) ||
-            is_zero_triplet(z0, y0, x1) || is_zero_triplet(z1, y0, x1) || is_zero_triplet(z0, y1, x1) || is_zero_triplet(z1, y1, x1);
-        if (any_zero)
+        const bool any_fill =
+            is_fill_triplet(z0, y0, x0) || is_fill_triplet(z1, y0, x0) || is_fill_triplet(z0, y1, x0) || is_fill_triplet(z1, y1, x0) ||
+            is_fill_triplet(z0, y0, x1) || is_fill_triplet(z1, y0, x1) || is_fill_triplet(z0, y1, x1) || is_fill_triplet(z1, y1, x1);
+        if (any_fill)
             return false;
 
         E dz = zf - E(z0);
