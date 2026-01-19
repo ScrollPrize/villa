@@ -20,8 +20,27 @@ GPU-accelerated, containerized inference for TimeSformer-based ink detection. Th
 
 ### Optional environment variables
 
-- `CUDA_VISIBLE_DEVICES` (default `0`): GPU selection
-- `HF_TOKEN`: if the model is in private repo
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CUDA_VISIBLE_DEVICES` | GPU selection | `0` |
+| `HF_TOKEN` | Hugging Face token (if model is in private repo) | - |
+| `TILE_SIZE` | Tile size for sliding window inference (pixels, also sets network input size) | `64` |
+| `STRIDE` | Stride for sliding window (pixels) | `16` |
+| `BATCH_SIZE` | Batch size for inference | `256` |
+| `MODEL_TYPE` | Model architecture: `timesformer` or `resnet3d-50` | `timesformer` |
+| `STEP` | Execution step: `prepare`, `inference`, or `reduce` | `inference` |
+| `NUM_PARTS` | Number of partitions for distributed inference | `1` |
+| `PART_ID` | Partition ID (0-indexed) when NUM_PARTS > 1 | `0` |
+| `SURFACE_VOLUME_ZARR` | Path to pre-created surface volume zarr | - |
+| `ZARR_OUTPUT_DIR` | Directory for partition outputs | `/tmp/partitions` |
+| `USE_ZARR_COMPRESSION` | Enable zarr compression | `false` |
+| `COMPILE` | Enable torch.compile | `1` |
+| `COMPILE_MODE` | torch.compile mode | `reduce-overhead` |
+
+**Inference Configuration Notes:**
+- `TILE_SIZE`: Sets both the tile extraction size and network input size. Larger values = more context but more memory. Should match training size for best results (typically 64)
+- `STRIDE`: Controls overlap between tiles. Smaller stride = more overlap = smoother blending but slower inference
+- `BATCH_SIZE`: Number of tiles to process in parallel. Larger values = faster but more GPU memory. Reduce if you encounter OOM errors
 
 ### S3 layout (expected)
 
