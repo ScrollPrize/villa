@@ -767,20 +767,26 @@ private:
 // Penalize that an in-surface edge direction is perpendicular to the directed target normal field.
 //
 // For an edge vector e and (unit) target normal n, we want angle(e,n)=90°, i.e. dot(e,n)=0.
-// This uses two points (p_base, p_other) and assumes the target normal field is already directed.
+// This uses three points:
+// - p_base: edge base point
+// - p_off:  edge end point (the segment whose direction we constrain)
+// - p_clockwise: the next quad corner in clockwise direction from p_base when walking towards p_off.
+//   This is used only to disambiguate the sign / orientation of the directed normal field.
+//
+// The 90° constraint is enforced only from the p_base->p_off segment.
 struct Normal3DLineLoss {
     Normal3DLineLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w)
         : _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {}
 
     template <typename E>
-    bool operator()(const E* const p_base, const E* const p_other, E* residual) const {
+    bool operator()(const E* const p_base, const E* const p_off, const E* const p_clockwise, E* residual) const {
         // p_* are XYZ, while _normal_dirs is indexed ZYX and returns ZYX-ordered vectors.
 
         // Sample at the center of the edge.
         const E mid_xyz[3] = {
-            (p_base[0] + p_other[0]) * E(0.5),
-            (p_base[1] + p_other[1]) * E(0.5),
-            (p_base[2] + p_other[2]) * E(0.5),
+            (p_base[0] + p_off[0]) * E(0.5),
+            (p_base[1] + p_off[1]) * E(0.5),
+            (p_base[2] + p_off[2]) * E(0.5),
         };
 
         E target_zyx[3];
@@ -793,11 +799,25 @@ struct Normal3DLineLoss {
             return true;
         }
 
-        // Edge vector in ZYX ordering
-        const E e_zyx[3] = { p_other[2] - p_base[2], p_other[1] - p_base[1], p_other[0] - p_base[0] };
+        // Edge vector in ZYX ordering (base -> off). This is what the 90° constraint is based on.
+        const E e_zyx[3] = { p_off[2] - p_base[2], p_off[1] - p_base[1], p_off[0] - p_base[0] };
         const E e_len = ceres::sqrt(e_zyx[0]*e_zyx[0] + e_zyx[1]*e_zyx[1] + e_zyx[2]*e_zyx[2] + E(1e-12));
+        const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len; // want 0
 
-        const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len;
+        // Orientation disambiguation: use the third point ONLY to decide which of the two perpendicular orientations we mean.
+        // Construct surface normal from (base->off) and (base->clockwise), then compare its sign with target.
+        const E pcw_xyz_const[3] = { E(unjet(p_clockwise[0])), E(unjet(p_clockwise[1])), E(unjet(p_clockwise[2])) };
+        const E v_zyx[3] = { pcw_xyz_const[2] - p_base[2], pcw_xyz_const[1] - p_base[1], pcw_xyz_const[0] - p_base[0] };
+        E surf_n_zyx[3] = {
+            e_zyx[1] * v_zyx[2] - e_zyx[2] * v_zyx[1],
+            e_zyx[2] * v_zyx[0] - e_zyx[0] * v_zyx[2],
+            e_zyx[0] * v_zyx[1] - e_zyx[1] * v_zyx[0],
+        };
+        const E surf_n_len = ceres::sqrt(surf_n_zyx[0]*surf_n_zyx[0] + surf_n_zyx[1]*surf_n_zyx[1] + surf_n_zyx[2]*surf_n_zyx[2] + E(1e-12));
+        surf_n_zyx[0] /= surf_n_len;
+        surf_n_zyx[1] /= surf_n_len;
+        surf_n_zyx[2] /= surf_n_len;
+        const E orient_dot = (surf_n_zyx[0] * target_zyx[0] + surf_n_zyx[1] * target_zyx[1] + surf_n_zyx[2] * target_zyx[2]);
 
         E weight_at_point = E(1);
         if (_maybe_weights)
@@ -807,7 +827,10 @@ struct Normal3DLineLoss {
                                                       /*x=*/mid_xyz[0]);
 
         // One scalar residual; Ceres will square it.
-        residual[0] = E(_w) * weight_at_point * cos_angle;
+        // - cos_angle enforces 90° between edge and target normal
+        // - orient_dot disambiguates the "right" vs "wrong" perpendicular orientation (penalize if negative)
+        const E orient_penalty = (orient_dot < E(0)) ? (-orient_dot) : E(0);
+        residual[0] = E(_w) * weight_at_point * (cos_angle + E(1.0) * orient_penalty);
         return true;
     }
 
@@ -821,7 +844,7 @@ struct Normal3DLineLoss {
 public:
     static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0f)
     {
-        return new ceres::AutoDiffCostFunction<Normal3DLineLoss, 1, 3, 3>(
+        return new ceres::AutoDiffCostFunction<Normal3DLineLoss, 1, 3, 3, 3>(
             new Normal3DLineLoss(normal_dirs, maybe_weights, w));
     }
 

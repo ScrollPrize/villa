@@ -1009,20 +1009,41 @@ static int gen_3d_normal_line_loss(ceres::Problem &problem,
     const float w = settings(LossType::NORMAL3DLINE, p);
     if (w <= 0.0f) return 0;
 
-    const cv::Vec2i q = p + off;
-    auto const ordered = order_p(p, q);
-    const cv::Vec2i a = ordered.first;
-    const cv::Vec2i b = ordered.second;
+    // We enforce the 90° constraint on the directed segment p_base -> p_off.
+    // For consistent disambiguation of the directed normal field, provide a third point:
+    // the next quad corner in clockwise direction when walking from base towards off.
+    // This third point is treated as non-differentiable inside the loss.
+    const cv::Vec2i base = p;
+    const cv::Vec2i off_p = p + off;
 
-    if (!coord_valid(params.state(a)) || !coord_valid(params.state(b))) {
+    // Determine clockwise neighbor in (row,col) grid coordinates.
+    // Mapping assumes u = +col (right), v = +row (down).
+    // Clockwise around a cell: right -> down -> left -> up.
+    cv::Vec2i cw_off;
+    if (off[0] == 0 && off[1] == 1) {          // right
+        cw_off = cv::Vec2i(1, 0);              // down
+    } else if (off[0] == 1 && off[1] == 0) {   // down
+        cw_off = cv::Vec2i(0, -1);             // left
+    } else if (off[0] == 0 && off[1] == -1) {  // left
+        cw_off = cv::Vec2i(-1, 0);             // up
+    } else if (off[0] == -1 && off[1] == 0) {  // up
+        cw_off = cv::Vec2i(0, 1);              // right
+    } else {
+        // Only defined for direct 4-neighborhood edges.
+        return 0;
+    }
+    const cv::Vec2i cw_p = base + cw_off;
+
+    if (!coord_valid(params.state(base)) || !coord_valid(params.state(off_p)) || !coord_valid(params.state(cw_p))) {
         return 0;
     }
 
     problem.AddResidualBlock(
         Normal3DLineLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_weight.get(), w),
         nullptr,
-        &params.dpoints(a)[0],
-        &params.dpoints(b)[0]);
+        &params.dpoints(base)[0],
+        &params.dpoints(off_p)[0],
+        &params.dpoints(cw_p)[0]);
 
     return 1;
 }
@@ -2994,7 +3015,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 50 && !resume_surf;
+        bool global_opt = generation <= 10 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
