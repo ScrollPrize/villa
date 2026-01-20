@@ -13,6 +13,7 @@
 
 #include <boost/program_options.hpp>
 #include <opencv2/core/types.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <ceres/ceres.h>
 #include <omp.h>
@@ -1656,7 +1657,8 @@ static void run_fit_normals(
     const std::optional<CropBox3i>& crop_opt,
     const std::optional<fs::path>& out_zarr_opt,
     int step = 16,
-    float radius = 128.f) {
+    float radius = 128.f,
+    bool dbg_tif = false) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
@@ -1674,7 +1676,15 @@ static void run_fit_normals(
         throw std::runtime_error("Failed to infer volume shape from normal grids (required to expand fit read region beyond crop)");
     }
     const cv::Vec3i vol_xyz = *vol_xyz_opt;
-    const int rad_i = std::max(0, static_cast<int>(std::ceil(radius)));
+
+    // Adaptive radius (per-sample): start at 32, double to 512, and choose the first
+    // radius for which >=min_samples are found in any 2 of the 3 planes.
+    constexpr int kMinRadius = 32;
+    constexpr int kMaxRadius = 512;
+    constexpr int kMinSamplesPerPlane = 256;
+
+    // Read support must cover the *largest* possible radius, even though we only output inside crop.
+    const int rad_i = kMaxRadius;
     CropBox3i read_box;
     read_box.min = cv::Vec3i(
         std::max(0, crop.min[0] - rad_i),
@@ -1733,9 +1743,25 @@ static void run_fit_normals(
         {2, "yz", 0},
     };
 
-    const float r2 = radius * radius;
-    const float sigma = radius / 2.0f;
-    const float inv_two_sigma2 = 1.0f / (2.0f * sigma * sigma + 1e-12f);
+    auto has_enough_plane_support = [&](const std::array<std::vector<cv::Point3f>, 3>& dirs_unit) -> bool {
+        int ok = 0;
+        for (int p = 0; p < 3; ++p) {
+            if (static_cast<int>(dirs_unit[p].size()) >= kMinSamplesPerPlane) ++ok;
+        }
+        return ok >= 2;
+    };
+
+    auto clear_fit_buffers = [&](std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
+                                 std::array<std::vector<double>, 3>& weights,
+                                 std::array<std::vector<cv::Point3f>, 3>& deltas_xyz) {
+        for (int p = 0; p < 3; ++p) {
+            dirs_unit[p].clear();
+            weights[p].clear();
+            deltas_xyz[p].clear();
+        }
+    };
+
+    // gather_samples_for_radius is defined after FitStats/stats so it can record dist-test stats.
     const float normal_vis_scale = static_cast<float>(step) * 0.5f;
 
     const int sx0 = align_down(crop.min[0], step);
@@ -1853,6 +1879,107 @@ static void run_fit_normals(
     };
 
     std::vector<FitStats> stats = stats_of();
+
+    auto gather_samples_for_radius = [&](
+        const cv::Point3f& sample,
+        float rad,
+        int tid,
+        std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
+        std::array<std::vector<double>, 3>& weights,
+        std::array<std::vector<cv::Point3f>, 3>& deltas_xyz,
+        double& t_ng_read_s,
+        double& t_preproc_s) {
+
+        const float r2 = rad * rad;
+        const float sigma = rad / 2.0f;
+        const float inv_two_sigma2 = 1.0f / (2.0f * sigma * sigma + 1e-12f);
+        (void)inv_two_sigma2;
+        const float sample_arr[3] = {sample.x, sample.y, sample.z};
+
+        for (const auto& pc : planes) {
+            // plane axes
+            const int u_axis = (pc.plane_idx == 2) ? 1 : 0;
+            const int v_axis = (pc.plane_idx == 0) ? 1 : 2;
+            const int s_axis = (pc.plane_idx == 0) ? 2 : (pc.plane_idx == 1) ? 1 : 0;
+
+            const int s_center = static_cast<int>(sample_arr[s_axis]);
+            const int s_min = std::max(read_box.min[s_axis], static_cast<int>(std::floor(s_center - rad)));
+            const int s_max = std::min(read_box.max[s_axis], static_cast<int>(std::ceil(s_center + rad)) + 1);
+            int slice_start = align_down(s_min, sparse_volume);
+            if (slice_start < s_min) slice_start += std::max(1, sparse_volume);
+
+            for (int slice = slice_start; slice < s_max; slice += std::max(1, sparse_volume)) {
+                // Shrink the 2D query rect based on distance in the slice axis:
+                // at offset ds from the center, the in-slice radius is sqrt(r^2 - ds^2).
+                const float ds = std::abs(static_cast<float>(slice) - sample_arr[s_axis]);
+                if (ds > rad) continue;
+                const float r_eff = std::sqrt(std::max(0.0f, rad * rad - ds * ds));
+
+                const int u0 = std::max(read_box.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - r_eff)));
+                const int v0 = std::max(read_box.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - r_eff)));
+                const int u1 = std::min(read_box.max[u_axis], static_cast<int>(std::ceil(sample_arr[u_axis] + r_eff)) + 1);
+                const int v1 = std::min(read_box.max[v_axis], static_cast<int>(std::ceil(sample_arr[v_axis] + r_eff)) + 1);
+                if (u1 <= u0 || v1 <= v0) continue;
+
+                const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
+
+                const auto t_read0 = std::chrono::steady_clock::now();
+                auto grid = ngv.query_nearest(point_for_slice_query(sample, pc.plane_idx, slice), pc.plane_idx);
+                if (!grid) continue;
+
+                const auto paths = grid->get(query);
+                const auto t_read1 = std::chrono::steady_clock::now();
+                t_ng_read_s += std::chrono::duration<double>(t_read1 - t_read0).count();
+
+                const auto t_pp0 = std::chrono::steady_clock::now();
+                for (const auto& path_ptr : paths) {
+                    if (!path_ptr || path_ptr->size() < 2) continue;
+
+                    auto p3_of = [&](const cv::Point& p2) {
+                        float coords[3] = {0.f, 0.f, 0.f};
+                        coords[u_axis] = static_cast<float>(p2.x);
+                        coords[v_axis] = static_cast<float>(p2.y);
+                        coords[s_axis] = static_cast<float>(slice);
+                        return cv::Point3f(coords[0], coords[1], coords[2]);
+                    };
+
+                    for (size_t i = 0; i + 1 < path_ptr->size(); ++i) {
+                        const cv::Point a2 = (*path_ptr)[i];
+                        const cv::Point b2 = (*path_ptr)[i + 1];
+
+                        // 2D early reject before 3D conversion.
+                        if (!segment_intersects_local_roi_2d(a2, b2, query)) continue;
+
+                        cv::Point3f a = p3_of(a2);
+                        cv::Point3f b = p3_of(b2);
+
+                        if (!clip_segment_to_crop(a, b, read_box)) continue;
+                        const float dist2 = dist_sq_point_segment_appx(sample, a, b);
+                        const bool reject = (dist2 > r2);
+                        stats[static_cast<size_t>(tid)].add_dist_test(reject);
+                        if (reject) continue;
+
+                        const cv::Point3f d = b - a;
+                        const float seglen2 = d.dot(d);
+                        if (seglen2 <= 1e-6f) continue;
+                        const float inv = 1.0f / std::sqrt(seglen2);
+                        dirs_unit[pc.plane_idx].emplace_back(d.x * inv, d.y * inv, d.z * inv);
+
+                        // Delta from sample point for first-order curvature term.
+                        // Use the segment midpoint as the constraint location.
+                        const cv::Point3f m = 0.5f * (a + b);
+                        deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
+
+                        // Uniform weights for now (kept switchable).
+                        const double w = 1.0; // switchable: std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
+                        weights[pc.plane_idx].push_back(w);
+                    }
+                }
+                const auto t_pp1 = std::chrono::steady_clock::now();
+                t_preproc_s += std::chrono::duration<double>(t_pp1 - t_pp0).count();
+            }
+        }
+    };
 
     // Per-thread warm start for Ceres.
     struct WarmStart {
@@ -1972,6 +2099,24 @@ static void run_fit_normals(
         std::cerr << "  dist2>r2 rejects: " << acc.dist_test_reject << "/" << acc.dist_test_total << " (" << rej << "%)\n";
     };
 
+    // Optional debug outputs (first z-layer only, output-sample grid size).
+    const int dbg_z = sz0;
+    cv::Mat1f dbg_rms;
+    cv::Mat1f dbg_used_radius;
+    cv::Mat1f dbg_nsamp_sum;
+    cv::Mat1f dbg_nsamp_xy;
+    cv::Mat1f dbg_nsamp_xz;
+    cv::Mat1f dbg_nsamp_yz;
+    if (dbg_tif) {
+        const float nanf = std::numeric_limits<float>::quiet_NaN();
+        dbg_rms = cv::Mat1f(crop_ny, crop_nx, nanf);
+        dbg_used_radius = cv::Mat1f(crop_ny, crop_nx, nanf);
+        dbg_nsamp_sum = cv::Mat1f(crop_ny, crop_nx, nanf);
+        dbg_nsamp_xy = cv::Mat1f(crop_ny, crop_nx, nanf);
+        dbg_nsamp_xz = cv::Mat1f(crop_ny, crop_nx, nanf);
+        dbg_nsamp_yz = cv::Mat1f(crop_ny, crop_nx, nanf);
+    }
+
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
     #pragma omp parallel for collapse(2) schedule(dynamic,1)
     for (int z = sz0; z < crop.max[2]; z += step) {
@@ -1984,7 +2129,6 @@ static void run_fit_normals(
                 }
 
                 const cv::Point3f sample(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-                const float sample_arr[3] = {sample.x, sample.y, sample.z};
 
                 const auto t_sample0 = std::chrono::steady_clock::now();
 
@@ -1992,95 +2136,27 @@ static void run_fit_normals(
                 std::array<std::vector<double>, 3> weights;
                 std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
                 for (int p = 0; p < 3; ++p) {
-                    dirs_unit[p].reserve(256);
-                    weights[p].reserve(256);
-                    deltas_xyz[p].reserve(256);
+                    dirs_unit[p].reserve(512);
+                    weights[p].reserve(512);
+                    deltas_xyz[p].reserve(512);
                 }
 
                 double t_ng_read_s = 0.0;
                 double t_preproc_s = 0.0;
-                for (const auto& pc : planes) {
-                    // plane axes
-                    const int u_axis = (pc.plane_idx == 2) ? 1 : 0;
-                    const int v_axis = (pc.plane_idx == 0) ? 1 : 2;
-                    const int s_axis = (pc.plane_idx == 0) ? 2 : (pc.plane_idx == 1) ? 1 : 0;
 
-                    const int s_center = static_cast<int>(sample_arr[s_axis]);
-                    const int s_min = std::max(read_box.min[s_axis], static_cast<int>(std::floor(s_center - radius)));
-                    const int s_max = std::min(read_box.max[s_axis], static_cast<int>(std::ceil(s_center + radius)) + 1);
-                    int slice_start = align_down(s_min, sparse_volume);
-                    if (slice_start < s_min) slice_start += std::max(1, sparse_volume);
-
-                    for (int slice = slice_start; slice < s_max; slice += std::max(1, sparse_volume)) {
-                        // Shrink the 2D query rect based on distance in the slice axis:
-                        // at offset ds from the center, the in-slice radius is sqrt(r^2 - ds^2).
-                        const float ds = std::abs(static_cast<float>(slice) - sample_arr[s_axis]);
-                        if (ds > radius) continue;
-                        const float r_eff = std::sqrt(std::max(0.0f, radius * radius - ds * ds));
-
-                        const int u0 = std::max(read_box.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - r_eff)));
-                        const int v0 = std::max(read_box.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - r_eff)));
-                        const int u1 = std::min(read_box.max[u_axis], static_cast<int>(std::ceil(sample_arr[u_axis] + r_eff)) + 1);
-                        const int v1 = std::min(read_box.max[v_axis], static_cast<int>(std::ceil(sample_arr[v_axis] + r_eff)) + 1);
-                        if (u1 <= u0 || v1 <= v0) continue;
-
-                        const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
-
-                        const auto t_read0 = std::chrono::steady_clock::now();
-                        auto grid = ngv.query_nearest(point_for_slice_query(sample, pc.plane_idx, slice), pc.plane_idx);
-                        if (!grid) continue;
-
-                        const auto paths = grid->get(query);
-                        const auto t_read1 = std::chrono::steady_clock::now();
-                        t_ng_read_s += std::chrono::duration<double>(t_read1 - t_read0).count();
-
-                        const auto t_pp0 = std::chrono::steady_clock::now();
-                        for (const auto& path_ptr : paths) {
-                            if (!path_ptr || path_ptr->size() < 2) continue;
-
-                            auto p3_of = [&](const cv::Point& p2) {
-                                float coords[3] = {0.f, 0.f, 0.f};
-                                coords[u_axis] = static_cast<float>(p2.x);
-                                coords[v_axis] = static_cast<float>(p2.y);
-                                coords[s_axis] = static_cast<float>(slice);
-                                return cv::Point3f(coords[0], coords[1], coords[2]);
-                            };
-
-                            for (size_t i = 0; i + 1 < path_ptr->size(); ++i) {
-                                const cv::Point a2 = (*path_ptr)[i];
-                                const cv::Point b2 = (*path_ptr)[i + 1];
-
-                                // 2D early reject before 3D conversion.
-                                if (!segment_intersects_local_roi_2d(a2, b2, query)) continue;
-
-                                cv::Point3f a = p3_of(a2);
-                                cv::Point3f b = p3_of(b2);
-
-                                if (!clip_segment_to_crop(a, b, read_box)) continue;
-                                const float dist2 = dist_sq_point_segment_appx(sample, a, b);
-                                const bool reject = (dist2 > r2);
-                                stats[static_cast<size_t>(tid)].add_dist_test(reject);
-                                if (reject) continue;
-
-                                const cv::Point3f d = b - a;
-                                const float seglen2 = d.dot(d);
-                                if (seglen2 <= 1e-6f) continue;
-                                const float inv = 1.0f / std::sqrt(seglen2);
-                                dirs_unit[pc.plane_idx].emplace_back(d.x * inv, d.y * inv, d.z * inv);
-
-                                // Delta from sample point for first-order curvature term.
-                                // Use the segment midpoint as the constraint location.
-                                const cv::Point3f m = 0.5f * (a + b);
-                                deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
-
-                                // Gaussian falloff: nearer segments contribute more.
-                                const double w = 1.0;//std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2));
-                                weights[pc.plane_idx].push_back(w);
-                            }
-                        }
-                        const auto t_pp1 = std::chrono::steady_clock::now();
-                        t_preproc_s += std::chrono::duration<double>(t_pp1 - t_pp0).count();
-                    }
+                int used_rad = kMaxRadius;
+                for (int rad = kMinRadius; rad <= kMaxRadius; rad *= 1.1) {
+                    clear_fit_buffers(dirs_unit, weights, deltas_xyz);
+                    gather_samples_for_radius(sample,
+                                              static_cast<float>(rad),
+                                              tid,
+                                              dirs_unit,
+                                              weights,
+                                              deltas_xyz,
+                                              t_ng_read_s,
+                                              t_preproc_s);
+                    used_rad = rad;
+                    if (has_enough_plane_support(dirs_unit)) break;
                 }
 
                 cv::Point3f n;
@@ -2094,6 +2170,25 @@ static void run_fit_normals(
                 const bool ok = fit_normal_ceres(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
                 const auto t_solve_call1 = std::chrono::steady_clock::now();
                 t_solve_call_s = std::chrono::duration<double>(t_solve_call1 - t_solve_call0).count();
+
+                // Debug images: first z-layer only.
+                if (dbg_tif && z == dbg_z) {
+                    const int col = (x - sx0) / step;
+                    const int row = (y - sy0) / step;
+                    if (row >= 0 && col >= 0 && row < crop_ny && col < crop_nx) {
+                        const int n_xy = static_cast<int>(dirs_unit[0].size());
+                        const int n_xz = static_cast<int>(dirs_unit[1].size());
+                        const int n_yz = static_cast<int>(dirs_unit[2].size());
+                        const int n_sum = n_xy + n_xz + n_yz;
+                        dbg_used_radius(row, col) = static_cast<float>(used_rad);
+                        dbg_nsamp_xy(row, col) = static_cast<float>(n_xy);
+                        dbg_nsamp_xz(row, col) = static_cast<float>(n_xz);
+                        dbg_nsamp_yz(row, col) = static_cast<float>(n_yz);
+                        dbg_nsamp_sum(row, col) = static_cast<float>(n_sum);
+                        dbg_rms(row, col) = ok ? static_cast<float>(rms) : 1.0f;
+                    }
+                }
+
                     if (ok) {
                         ws.n[0] = n.x;
                         ws.n[1] = n.y;
@@ -2179,6 +2274,17 @@ static void run_fit_normals(
     // Final report.
     report_progress();
     report_stats();
+
+    if (dbg_tif) {
+        // Write float TIFFs into the current working directory.
+        // NOTE: OpenCV will write 32-bit float TIFFs when passed CV_32F mats.
+        cv::imwrite((fs::path("dbg_fit_rms.tif")).string(), dbg_rms);
+        cv::imwrite((fs::path("dbg_fit_used_radius.tif")).string(), dbg_used_radius);
+        cv::imwrite((fs::path("dbg_fit_sample_count_sum.tif")).string(), dbg_nsamp_sum);
+        cv::imwrite((fs::path("dbg_fit_sample_count_xy.tif")).string(), dbg_nsamp_xy);
+        cv::imwrite((fs::path("dbg_fit_sample_count_xz.tif")).string(), dbg_nsamp_xz);
+        cv::imwrite((fs::path("dbg_fit_sample_count_yz.tif")).string(), dbg_nsamp_yz);
+    }
 
     if (out_ply_opt.has_value()) {
         const fs::path& out_ply = *out_ply_opt;
@@ -2279,6 +2385,7 @@ int main(int argc, char** argv) {
         ("vis-surf", po::value<std::string>(), "Write --surf tifxyz surface as a quad-mesh PLY")
         ("fit-normals", "Estimate local 3D normals from segments (requires --vis-normals)")
         ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments")
+        ("dbg-tif", "Write debug float TIFFs for --fit-normals (workdir): rms, used radius, sample counts (first z layer only)")
         ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
         ("align-normals", "Align normals in an existing normals zarr (requires --input zarr and --output-zarr)");
 
@@ -2382,7 +2489,7 @@ int main(int argc, char** argv) {
         if (vm.count("vis-normals")) {
             out_ply = fs::path(vm["vis-normals"].as<std::string>());
         }
-        run_fit_normals(input_dir, out_ply, crop, out_zarr, /*step=*/16, /*radius=*/64.f);
+        run_fit_normals(input_dir, out_ply, crop, out_zarr, /*step=*/16, /*radius=*/64.f, /*dbg_tif=*/vm.count("dbg-tif") > 0);
         return 0;
     }
 
