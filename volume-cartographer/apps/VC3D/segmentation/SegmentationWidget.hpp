@@ -63,6 +63,7 @@ public:
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
+    [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -207,6 +208,7 @@ private:
     int _growthSteps{5};
     int _tracerGrowthSteps{5};
     int _growthDirectionMask{0};
+    bool _growthKeybindsEnabled{true};
     int _extrapolationPointCount{7};
     ExtrapolationType _extrapolationType{ExtrapolationType::Linear};
 
@@ -255,6 +257,7 @@ private:
     QCheckBox* _chkGrowthDirDown{nullptr};
     QCheckBox* _chkGrowthDirLeft{nullptr};
     QCheckBox* _chkGrowthDirRight{nullptr};
+    QCheckBox* _chkGrowthKeybindsEnabled{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
     QLabel* _lblAlphaInfo{nullptr};

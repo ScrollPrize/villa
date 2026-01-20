@@ -399,6 +399,14 @@ void SegmentationWidget::buildUi()
     dirRow->addStretch(1);
     growthLayout->addLayout(dirRow);
 
+    auto* keybindsRow = new QHBoxLayout();
+    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6)"), _groupGrowth);
+    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions."));
+    _chkGrowthKeybindsEnabled->setChecked(_growthKeybindsEnabled);
+    keybindsRow->addWidget(_chkGrowthKeybindsEnabled);
+    keybindsRow->addStretch(1);
+    growthLayout->addLayout(keybindsRow);
+
     auto* zRow = new QHBoxLayout();
     _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
     _chkCorrectionsUseZRange->setToolTip(tr("Restrict growth requests to the specified slice range."));
@@ -963,6 +971,11 @@ void SegmentationWidget::buildUi()
     connectDirectionCheckbox(_chkGrowthDirLeft);
     connectDirectionCheckbox(_chkGrowthDirRight);
 
+    connect(_chkGrowthKeybindsEnabled, &QCheckBox::toggled, this, [this](bool checked) {
+        _growthKeybindsEnabled = checked;
+        writeSetting(QStringLiteral("growth_keybinds_enabled"), _growthKeybindsEnabled);
+    });
+
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this](int value) { applyGrowthSteps(value, true, true); });
 
@@ -1496,6 +1509,10 @@ void SegmentationWidget::syncUiState()
     }
 
     applyGrowthDirectionMaskToUi();
+    if (_chkGrowthKeybindsEnabled) {
+        const QSignalBlocker blocker(_chkGrowthKeybindsEnabled);
+        _chkGrowthKeybindsEnabled->setChecked(_growthKeybindsEnabled);
+    }
     refreshDirectionFieldList();
 
     if (_directionFieldPathEdit) {
@@ -1688,6 +1705,8 @@ void SegmentationWidget::restoreSettings()
     applyGrowthSteps(storedGrowthSteps, false, false);
     _growthDirectionMask = normalizeGrowthDirectionMask(
         settings.value(segmentation::GROWTH_DIRECTION_MASK, kGrowDirAllMask).toInt());
+    _growthKeybindsEnabled = settings.value(segmentation::GROWTH_KEYBINDS_ENABLED,
+                                            segmentation::GROWTH_KEYBINDS_ENABLED_DEFAULT).toBool();
 
     QVariantList serialized = settings.value(segmentation::DIRECTION_FIELDS, QVariantList{}).toList();
     _directionFields.clear();

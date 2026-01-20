@@ -173,6 +173,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     if (event->modifiers() == Qt::NoModifier && !event->isAutoRepeat()) {
+        if (!_widget || !_widget->growthKeybindsEnabled()) {
+            return false;
+        }
+
         if (event->key() == Qt::Key_6) {
             const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
             handleGrowSurfaceRequested(method, SegmentationGrowthDirection::All, 1, false);
