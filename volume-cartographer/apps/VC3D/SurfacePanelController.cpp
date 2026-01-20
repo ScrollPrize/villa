@@ -1714,3 +1714,96 @@ void SurfacePanelController::applyHighlightSelection(const std::string& id, bool
         _viewerManager->setHighlightedSurfaceIds(ids);
     }
 }
+
+bool SurfacePanelController::cycleToNextVisibleSegment()
+{
+    return cycleVisibleSegment(1);
+}
+
+bool SurfacePanelController::cycleToPreviousVisibleSegment()
+{
+    return cycleVisibleSegment(-1);
+}
+
+bool SurfacePanelController::cycleVisibleSegment(int direction)
+{
+    if (!_ui.treeWidget) {
+        return false;
+    }
+
+    // Collect all visible (non-hidden) items in tree order
+    std::vector<QTreeWidgetItem*> visibleItems;
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if (!(*it)->isHidden()) {
+            visibleItems.push_back(*it);
+        }
+        ++it;
+    }
+
+    if (visibleItems.empty()) {
+        return false;
+    }
+
+    // Find current selection index
+    int currentIndex = -1;
+    const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
+    if (!selectedItems.isEmpty()) {
+        QTreeWidgetItem* currentItem = selectedItems.first();
+        for (size_t i = 0; i < visibleItems.size(); ++i) {
+            if (visibleItems[i] == currentItem) {
+                currentIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+
+    // Calculate next index with wraparound
+    int nextIndex;
+    if (currentIndex < 0) {
+        nextIndex = (direction > 0) ? 0 : static_cast<int>(visibleItems.size()) - 1;
+    } else {
+        nextIndex = currentIndex + direction;
+        if (nextIndex < 0) {
+            nextIndex = static_cast<int>(visibleItems.size()) - 1;
+        } else if (nextIndex >= static_cast<int>(visibleItems.size())) {
+            nextIndex = 0;
+        }
+    }
+
+    QTreeWidgetItem* nextItem = visibleItems[nextIndex];
+
+    // Block signals to prevent normal handleTreeSelectionChanged
+    const QSignalBlocker blocker{_ui.treeWidget};
+    _ui.treeWidget->clearSelection();
+    nextItem->setSelected(true);
+    _ui.treeWidget->scrollToItem(nextItem);
+
+    // Get surface and update state
+    const QString idQString = nextItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+    const std::string id = idQString.toStdString();
+
+    std::shared_ptr<QuadSurface> surface;
+    if (_volumePkg) {
+        surface = _volumePkg->getSurface(id);
+    }
+
+    if (surface && _surfaces) {
+        if (!_surfaces->surface(id)) {
+            _surfaces->setSurface(id, surface, true, false);
+        }
+        _surfaces->setSurface("segmentation", surface, false, false);
+    }
+
+    _currentSurfaceId = id;
+    syncSelectionUi(id, surface.get());
+
+    if (_segmentationViewerProvider) {
+        if (auto* viewer = _segmentationViewerProvider()) {
+            viewer->setWindowTitle(surface ? tr("Surface %1").arg(idQString) : tr("Surface"));
+        }
+    }
+
+    emit surfaceActivatedPreserveEditing(idQString, surface.get());
+    return true;
+}

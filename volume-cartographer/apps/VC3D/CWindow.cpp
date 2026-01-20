@@ -770,6 +770,24 @@ CWindow::CWindow() :
             if (viewer) viewer->adjustSurfaceOffset(-1.0f);
         });
     });
+
+    // Segment cycling shortcuts (] for next, [ for previous)
+    fCycleNextSegmentShortcut = new QShortcut(QKeySequence("]"), this);
+    fCycleNextSegmentShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fCycleNextSegmentShortcut, &QShortcut::activated, [this]() {
+        if (_surfacePanel) {
+            _surfacePanel->cycleToNextVisibleSegment();
+        }
+    });
+
+    fCyclePrevSegmentShortcut = new QShortcut(QKeySequence("["), this);
+    fCyclePrevSegmentShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fCyclePrevSegmentShortcut, &QShortcut::activated, [this]() {
+        if (_surfacePanel) {
+            _surfacePanel->cycleToPreviousVisibleSegment();
+        }
+    });
+
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
@@ -1518,6 +1536,8 @@ void CWindow::CreateWidgets(void)
 
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
             this, &CWindow::onSurfaceActivated);
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
+            this, &CWindow::onSurfaceActivatedPreserveEditing);
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -2743,6 +2763,35 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         }
+    }
+
+    if (surf) {
+        applySlicePlaneOrientation(surf.get());
+    } else {
+        applySlicePlaneOrientation();
+    }
+
+    if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
+        _surfacePanel->refreshFiltersOnly();
+    }
+}
+
+void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface)
+{
+    const std::string previousSurfId = _surfID;
+    _surfID = surfaceId.toStdString();
+
+    if (fVpkg && !_surfID.empty()) {
+        _surf_weak = fVpkg->getSurface(_surfID);
+    } else {
+        _surf_weak.reset();
+    }
+
+    auto surf = _surf_weak.lock();
+
+    // Unlike onSurfaceActivated, don't disable editing mode
+    if (_surfID != previousSurfId && _segmentationModule) {
+        _segmentationModule->onActiveSegmentChanged(surf.get());
     }
 
     if (surf) {

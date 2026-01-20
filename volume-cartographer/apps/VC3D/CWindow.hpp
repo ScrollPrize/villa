@@ -170,6 +170,7 @@ private slots:
     CVolumeViewer* segmentationViewer() const;
     void clearSurfaceSelection();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
+    void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
     void onAxisAlignedSliceMousePress(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onAxisAlignedSliceMouseMove(CVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onAxisAlignedSliceMouseRelease(CVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -276,6 +277,10 @@ private:
     // Z offset shortcuts (Ctrl+,/. for normal direction)
     QShortcut* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)
     QShortcut* fWorldOffsetZNegShortcut;  // Ctrl+, (closer)
+
+    // Segment cycling shortcuts
+    QShortcut* fCycleNextSegmentShortcut;
+    QShortcut* fCyclePrevSegmentShortcut;
 
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
     void updateAxisAlignedSliceInteraction();

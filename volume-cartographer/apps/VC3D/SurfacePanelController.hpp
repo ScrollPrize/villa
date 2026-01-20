@@ -104,6 +104,8 @@ public:
     void setSelectionLocked(bool locked);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
+    bool cycleToNextVisibleSegment();
+    bool cycleToPreviousVisibleSegment();
 
 signals:
     void surfacesLoaded();
@@ -127,6 +129,7 @@ signals:
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
     void neighborCopyRequested(const QString& segmentId, bool copyOut);
+    void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
 
 
 private:
@@ -156,6 +159,7 @@ private:
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
+    bool cycleVisibleSegment(int direction);
 
     UiRefs _ui;
     CSurfaceCollection* _surfaces{nullptr};
