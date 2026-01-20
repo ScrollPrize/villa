@@ -8,6 +8,7 @@
 #include "SegmentationLineTool.hpp"
 #include "SegmentationPushPullTool.hpp"
 #include "ApprovalMaskBrushTool.hpp"
+#include "CellReoptimizationTool.hpp"
 #include "SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -135,6 +136,19 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
     _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
+
+    _cellReoptTool = std::make_unique<CellReoptimizationTool>(*this, _editManager, _overlay, _pointCollection, this);
+    connect(_cellReoptTool.get(), &CellReoptimizationTool::statusMessage,
+            this, [this](const QString& msg, int timeout) {
+                emit statusMessageRequested(msg, timeout);
+            });
+    connect(_cellReoptTool.get(), &CellReoptimizationTool::collectionCreated,
+            this, [this](uint64_t collectionId) {
+                // Register the new collection with the corrections system so it will be used
+                if (_corrections) {
+                    _corrections->setActiveCollection(collectionId, false);
+                }
+            });
 
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
 
@@ -311,6 +325,24 @@ void SegmentationModule::bindWidgetSignals()
             _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
             this, &SegmentationModule::undoApprovalStroke);
+    connect(_widget, &SegmentationWidget::cellReoptModeChanged,
+            this, &SegmentationModule::setCellReoptimizationMode);
+    connect(_widget, &SegmentationWidget::cellReoptMaxStepsChanged,
+            this, &SegmentationModule::setCellReoptMaxSteps);
+    connect(_widget, &SegmentationWidget::cellReoptMaxPointsChanged,
+            this, &SegmentationModule::setCellReoptMaxPoints);
+    connect(_widget, &SegmentationWidget::cellReoptMinSpacingChanged,
+            this, &SegmentationModule::setCellReoptMinSpacing);
+    connect(_widget, &SegmentationWidget::cellReoptPerimeterOffsetChanged,
+            this, &SegmentationModule::setCellReoptPerimeterOffset);
+    connect(_widget, &SegmentationWidget::cellReoptGrowthRequested,
+            this, [this]() {
+                // Cell reoptimization should not auto-approve the growth region
+                _skipAutoApprovalOnGrowth = true;
+                emit growSurfaceRequested(SegmentationGrowthMethod::Corrections,
+                                          SegmentationGrowthDirection::All,
+                                          0, false);
+            });
 }
 
 void SegmentationModule::bindViewerSignals(CVolumeViewer* viewer)
@@ -680,6 +712,57 @@ void SegmentationModule::undoApprovalStroke()
         refreshOverlay();
         emit statusMessageRequested(tr("Undid last approval stroke."), kStatusShort);
         qCInfo(lcSegModule) << "  Approval stroke undone";
+    }
+}
+
+void SegmentationModule::setCellReoptimizationMode(bool enabled)
+{
+    if (_cellReoptMode == enabled) {
+        return;
+    }
+    _cellReoptMode = enabled;
+
+    // Disable conflicting modes when enabling cell reopt
+    if (enabled) {
+        setCorrectionsAnnotateMode(false, false);
+        setEditApprovedMask(false);
+        setEditUnapprovedMask(false);
+    }
+}
+
+void SegmentationModule::setCellReoptMaxSteps(int steps)
+{
+    if (_cellReoptTool) {
+        auto config = _cellReoptTool->config();
+        config.maxFloodSteps = std::clamp(steps, 10, 10000);
+        _cellReoptTool->setConfig(config);
+    }
+}
+
+void SegmentationModule::setCellReoptMaxPoints(int points)
+{
+    if (_cellReoptTool) {
+        auto config = _cellReoptTool->config();
+        config.maxCorrectionPoints = std::clamp(points, 3, 200);
+        _cellReoptTool->setConfig(config);
+    }
+}
+
+void SegmentationModule::setCellReoptMinSpacing(float spacing)
+{
+    if (_cellReoptTool) {
+        auto config = _cellReoptTool->config();
+        config.minBoundarySpacing = std::clamp(spacing, 1.0f, 50.0f);
+        _cellReoptTool->setConfig(config);
+    }
+}
+
+void SegmentationModule::setCellReoptPerimeterOffset(float offset)
+{
+    if (_cellReoptTool) {
+        auto config = _cellReoptTool->config();
+        config.perimeterOffset = std::clamp(offset, -50.0f, 50.0f);
+        _cellReoptTool->setConfig(config);
     }
 }
 

@@ -48,6 +48,7 @@ class QTimer;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
+class CellReoptimizationTool;
 
 class SegmentationModule : public QObject
 {
@@ -97,6 +98,14 @@ public:
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
     void undoApprovalStroke();
+
+    // Cell reoptimization
+    void setCellReoptimizationMode(bool enabled);
+    [[nodiscard]] bool cellReoptimizationMode() const { return _cellReoptMode; }
+    void setCellReoptMaxSteps(int steps);
+    void setCellReoptMaxPoints(int points);
+    void setCellReoptMinSpacing(float spacing);
+    void setCellReoptPerimeterOffset(float offset);
 
     void applyEdits();
     void resetEdits();
@@ -335,8 +344,11 @@ private:
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
+    std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
 
     bool _showApprovalMask{false};
+    bool _cellReoptMode{false};
+    bool _skipAutoApprovalOnGrowth{false};
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius

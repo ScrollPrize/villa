@@ -41,6 +41,8 @@ set(srcs
     segmentation/SegmentationEditManager.hpp
     segmentation/ApprovalMaskBrushTool.cpp
     segmentation/ApprovalMaskBrushTool.hpp
+    segmentation/CellReoptimizationTool.cpp
+    segmentation/CellReoptimizationTool.hpp
     segmentation/SegmentationLineTool.cpp
     segmentation/SegmentationLineTool.hpp
     segmentation/SegmentationPushPullTool.cpp

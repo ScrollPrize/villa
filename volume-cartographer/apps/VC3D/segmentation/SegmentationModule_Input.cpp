@@ -3,6 +3,7 @@
 #include "CVolumeViewer.hpp"
 #include "SegmentationBrushTool.hpp"
 #include "ApprovalMaskBrushTool.hpp"
+#include "CellReoptimizationTool.hpp"
 #include "SegmentationCorrections.hpp"
 #include "SegmentationEditManager.hpp"
 #include "SegmentationLineTool.hpp"
@@ -324,6 +325,32 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
         // Default: add correction point at clicked position
         handleCorrectionPointAdded(worldPos);
         updateCorrectionsWidget();
+        return;
+    }
+
+    // Handle cell reoptimization mode
+    if (_cellReoptMode && isLeftButton) {
+        if (modifiers.testFlag(Qt::ControlModifier) || modifiers.testFlag(Qt::AltModifier)) {
+            return;
+        }
+        if (_cellReoptTool && _editManager) {
+            auto gridIndex = _editManager->worldToGridIndex(worldPos);
+            if (gridIndex) {
+                // Update the tool's surface reference and config
+                if (_editManager->baseSurface()) {
+                    _cellReoptTool->setSurface(_editManager->baseSurface().get());
+                }
+                if (_widget) {
+                    CellReoptimizationTool::Config config;
+                    config.maxFloodSteps = _widget->cellReoptMaxSteps();
+                    config.maxCorrectionPoints = _widget->cellReoptMaxPoints();
+                    config.minBoundarySpacing = _widget->cellReoptMinSpacing();
+                    config.perimeterOffset = _widget->cellReoptPerimeterOffset();
+                    _cellReoptTool->setConfig(config);
+                }
+                _cellReoptTool->executeAtGridPosition(gridIndex->first, gridIndex->second);
+            }
+        }
         return;
     }
 
