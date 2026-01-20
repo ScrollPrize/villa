@@ -814,6 +814,11 @@ CWindow::CWindow() :
         }
     });
 
+    // Focused view toggle (Shift+Ctrl+F) - hides dock widgets, keeps all viewers
+    fFocusedViewShortcut = new QShortcut(QKeySequence("Shift+Ctrl+F"), this);
+    fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
+
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
@@ -1073,6 +1078,40 @@ void CWindow::toggleVolumeOverlayVisibility()
 {
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
+    }
+}
+
+void CWindow::toggleFocusedView()
+{
+    if (_focusedViewActive) {
+        for (const auto& [dock, state] : _savedDockStates) {
+            if (dock) {
+                dock->setVisible(state.visible);
+            }
+        }
+        for (const auto& [dock, state] : _savedDockStates) {
+            if (dock && state.wasRaised) {
+                dock->raise();
+            }
+        }
+        _savedDockStates.clear();
+        _focusedViewActive = false;
+        statusBar()->showMessage(tr("Restored full view"), 2000);
+    } else {
+        _savedDockStates.clear();
+        const QList<QDockWidget*> docks = findChildren<QDockWidget*>();
+        for (QDockWidget* dock : docks) {
+            bool wasRaised = false;
+            if (dock->isVisible() && !dock->isFloating()) {
+                if (QWidget* content = dock->widget()) {
+                    wasRaised = !content->visibleRegion().isEmpty();
+                }
+            }
+            _savedDockStates[dock] = {dock->isVisible(), dock->isFloating(), wasRaised};
+            dock->hide();
+        }
+        _focusedViewActive = true;
+        statusBar()->showMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
     }
 }
 
