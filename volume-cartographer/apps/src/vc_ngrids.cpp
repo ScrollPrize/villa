@@ -1887,8 +1887,14 @@ static void run_fit_normals(
         std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
         std::array<std::vector<double>, 3>& weights,
         std::array<std::vector<cv::Point3f>, 3>& deltas_xyz,
+        int& used_segments_total,
+        int& used_segments_short_paths,
         double& t_ng_read_s,
         double& t_preproc_s) {
+
+        // Only use paths that are long enough to be meaningful.
+        constexpr int kMinSegmentsPerPath = 1;
+        constexpr int kShortPathMaxSegments = 1;
 
         const float r2 = rad * rad;
         const float sigma = rad / 2.0f;
@@ -1935,6 +1941,10 @@ static void run_fit_normals(
                 for (const auto& path_ptr : paths) {
                     if (!path_ptr || path_ptr->size() < 2) continue;
 
+                    const int seg_count = static_cast<int>(path_ptr->size()) - 1;
+                    if (seg_count < kMinSegmentsPerPath) continue;
+                    const bool is_short_path = (seg_count <= kShortPathMaxSegments);
+
                     auto p3_of = [&](const cv::Point& p2) {
                         float coords[3] = {0.f, 0.f, 0.f};
                         coords[u_axis] = static_cast<float>(p2.x);
@@ -1973,6 +1983,9 @@ static void run_fit_normals(
                         // Uniform weights for now (kept switchable).
                         const double w = 1.0; // switchable: std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
                         weights[pc.plane_idx].push_back(w);
+
+                        ++used_segments_total;
+                        if (is_short_path) ++used_segments_short_paths;
                     }
                 }
                 const auto t_pp1 = std::chrono::steady_clock::now();
@@ -2107,6 +2120,7 @@ static void run_fit_normals(
     cv::Mat1f dbg_nsamp_xy;
     cv::Mat1f dbg_nsamp_xz;
     cv::Mat1f dbg_nsamp_yz;
+    cv::Mat1f dbg_frac_used_short_paths;
     if (dbg_tif) {
         const float nanf = std::numeric_limits<float>::quiet_NaN();
         dbg_rms = cv::Mat1f(crop_ny, crop_nx, nanf);
@@ -2115,6 +2129,7 @@ static void run_fit_normals(
         dbg_nsamp_xy = cv::Mat1f(crop_ny, crop_nx, nanf);
         dbg_nsamp_xz = cv::Mat1f(crop_ny, crop_nx, nanf);
         dbg_nsamp_yz = cv::Mat1f(crop_ny, crop_nx, nanf);
+        dbg_frac_used_short_paths = cv::Mat1f(crop_ny, crop_nx, nanf);
     }
 
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
@@ -2145,14 +2160,20 @@ static void run_fit_normals(
                 double t_preproc_s = 0.0;
 
                 int used_rad = kMaxRadius;
+                int used_segments_total = 0;
+                int used_segments_short_paths = 0;
                 for (int rad = kMinRadius; rad <= kMaxRadius; rad *= 1.1) {
                     clear_fit_buffers(dirs_unit, weights, deltas_xyz);
+                    used_segments_total = 0;
+                    used_segments_short_paths = 0;
                     gather_samples_for_radius(sample,
                                               static_cast<float>(rad),
                                               tid,
                                               dirs_unit,
                                               weights,
                                               deltas_xyz,
+                                              used_segments_total,
+                                              used_segments_short_paths,
                                               t_ng_read_s,
                                               t_preproc_s);
                     used_rad = rad;
@@ -2186,6 +2207,11 @@ static void run_fit_normals(
                         dbg_nsamp_yz(row, col) = static_cast<float>(n_yz);
                         dbg_nsamp_sum(row, col) = static_cast<float>(n_sum);
                         dbg_rms(row, col) = ok ? static_cast<float>(rms) : 1.0f;
+
+                        if (used_segments_total > 0) {
+                            dbg_frac_used_short_paths(row, col) = static_cast<float>(
+                                static_cast<double>(used_segments_short_paths) / static_cast<double>(used_segments_total));
+                        }
                     }
                 }
 
@@ -2284,6 +2310,7 @@ static void run_fit_normals(
         cv::imwrite((fs::path("dbg_fit_sample_count_xy.tif")).string(), dbg_nsamp_xy);
         cv::imwrite((fs::path("dbg_fit_sample_count_xz.tif")).string(), dbg_nsamp_xz);
         cv::imwrite((fs::path("dbg_fit_sample_count_yz.tif")).string(), dbg_nsamp_yz);
+        cv::imwrite((fs::path("dbg_fit_frac_used_short_paths.tif")).string(), dbg_frac_used_short_paths);
     }
 
     if (out_ply_opt.has_value()) {
