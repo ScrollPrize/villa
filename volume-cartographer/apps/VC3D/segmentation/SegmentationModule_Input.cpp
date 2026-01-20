@@ -156,6 +156,17 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return true;
     }
 
+    if (event->key() == Qt::Key_T && event->modifiers() == Qt::ShiftModifier) {
+        if (!_editingEnabled) {
+            setEditingEnabled(true);
+            if (_widget) {
+                _widget->setEditingEnabled(true);
+            }
+        }
+        event->accept();
+        return true;
+    }
+
     if (event->key() == Qt::Key_T && event->modifiers() == Qt::NoModifier) {
         if (!_editingEnabled) {
             setEditingEnabled(true);
