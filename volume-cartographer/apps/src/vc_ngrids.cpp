@@ -1667,6 +1667,24 @@ static void run_fit_normals(
                   std::numeric_limits<int>::max() / 4),
     });
 
+    // We only *output* samples within crop, but we must *read* enough context
+    // (potentially larger than crop) so fits near the crop boundary have full support.
+    const auto vol_xyz_opt = infer_volume_shape_from_grids(input_dir);
+    if (!vol_xyz_opt.has_value()) {
+        throw std::runtime_error("Failed to infer volume shape from normal grids (required to expand fit read region beyond crop)");
+    }
+    const cv::Vec3i vol_xyz = *vol_xyz_opt;
+    const int rad_i = std::max(0, static_cast<int>(std::ceil(radius)));
+    CropBox3i read_box;
+    read_box.min = cv::Vec3i(
+        std::max(0, crop.min[0] - rad_i),
+        std::max(0, crop.min[1] - rad_i),
+        std::max(0, crop.min[2] - rad_i));
+    read_box.max = cv::Vec3i(
+        std::min(vol_xyz[0], crop.max[0] + rad_i),
+        std::min(vol_xyz[1], crop.max[1] + rad_i),
+        std::min(vol_xyz[2], crop.max[2] + rad_i));
+
     // Optional PLY output: per-thread temp files then merge.
     const int nthreads = std::max(1, omp_get_max_threads());
     struct ThreadOut {
@@ -1694,7 +1712,15 @@ static void run_fit_normals(
         }
     }
 
-    const cv::Vec3b color_bgr(0, 255, 255); // yellow
+    // For --fit-normals + --vis-normals: color by fit RMS.
+    // RMS=0 => blue, RMS>=0.5 => red, linear blend in between.
+    auto rms_to_color_bgr = [&](double rms) -> cv::Vec3b {
+        const double t = std::clamp(rms / 0.5, 0.0, 1.0);
+        const int b = static_cast<int>(std::lround((1.0 - t) * 255.0));
+        const int g = 0;
+        const int r = static_cast<int>(std::lround(t * 255.0));
+        return cv::Vec3b(static_cast<uint8_t>(b), static_cast<uint8_t>(g), static_cast<uint8_t>(r));
+    };
 
     struct PlaneCfg {
         int plane_idx;
@@ -1720,11 +1746,6 @@ static void run_fit_normals(
     // This way downstream tools can use global voxel coordinates without needing crop-origin offsets.
     int nx = 0, ny = 0, nz = 0;
     if (out_zarr_opt.has_value()) {
-        const auto vol_xyz_opt = infer_volume_shape_from_grids(input_dir);
-        if (!vol_xyz_opt.has_value()) {
-            throw std::runtime_error("Failed to infer volume shape from normal grids (need at least two plane dirs with .grid files)");
-        }
-        const cv::Vec3i vol_xyz = *vol_xyz_opt;
         if (crop.max[0] > vol_xyz[0] || crop.max[1] > vol_xyz[1] || crop.max[2] > vol_xyz[2]) {
             std::stringstream msg;
             msg << "Crop max exceeds inferred volume shape: crop.max=(" << crop.max[0] << "," << crop.max[1] << "," << crop.max[2]
@@ -1757,7 +1778,7 @@ static void run_fit_normals(
         // Iteration buckets: [0-4],[5-9],[10-19],[20-49],[50-99],[100-199],[200+]
         uint64_t iters_buckets[7] = {0, 0, 0, 0, 0, 0, 0};
 
-        // Sample-count buckets (#segments used): [0-511],[512-1023],[1024-2047],[2048-4095],[4096-8191],[8192-16383],[16384+]
+        // Sample-count buckets (#segments used): [0-127],[128-255],[256-511],[512-1023],[1024-2047],[2048-4095],[4096+]
         uint64_t samples_buckets[7] = {0, 0, 0, 0, 0, 0, 0};
 
         // Coarse RMS buckets: [0-0.01),[0.01-0.02),[0.02-0.05),[0.05-0.1),[0.1-0.2),[0.2-0.5),[0.5+)
@@ -1792,7 +1813,7 @@ static void run_fit_normals(
             const int ib = (iters < 5) ? 0 : (iters < 10) ? 1 : (iters < 20) ? 2 : (iters < 50) ? 3 : (iters < 100) ? 4 : (iters < 200) ? 5 : 6;
             ++iters_buckets[ib];
 
-            const int sb = (samples < 512) ? 0 : (samples < 1024) ? 1 : (samples < 2048) ? 2 : (samples < 4096) ? 3 : (samples < 8192) ? 4 : (samples < 16384) ? 5 : 6;
+            const int sb = (samples < 128) ? 0 : (samples < 256) ? 1 : (samples < 512) ? 2 : (samples < 1024) ? 3 : (samples < 2048) ? 4 : (samples < 4096) ? 5 : 6;
             ++samples_buckets[sb];
 
             const int rb = (rms < 0.01) ? 0 : (rms < 0.02) ? 1 : (rms < 0.05) ? 2 : (rms < 0.10) ? 3 : (rms < 0.20) ? 4 : (rms < 0.50) ? 5 : 6;
@@ -1932,7 +1953,7 @@ static void run_fit_normals(
         std::cerr << "  iters buckets [0-4,5-9,10-19,20-49,50-99,100-199,200+]: "
                   << acc.iters_buckets[0] << "," << acc.iters_buckets[1] << "," << acc.iters_buckets[2] << "," << acc.iters_buckets[3]
                   << "," << acc.iters_buckets[4] << "," << acc.iters_buckets[5] << "," << acc.iters_buckets[6] << "\n";
-        std::cerr << "  samples buckets [0-511,512-1023,1024-2047,2048-4095,4096-8191,8192-16383,16384+]: "
+        std::cerr << "  samples buckets [0-127,128-255,256-511,512-1023,1024-2047,2048-4095,4096+]: "
                   << acc.samples_buckets[0] << "," << acc.samples_buckets[1] << "," << acc.samples_buckets[2] << "," << acc.samples_buckets[3]
                   << "," << acc.samples_buckets[4] << "," << acc.samples_buckets[5] << "," << acc.samples_buckets[6] << "\n";
         std::cerr << "  rms buckets [<0.01,<0.02,<0.05,<0.1,<0.2,<0.5,>=0.5]: "
@@ -1985,8 +2006,8 @@ static void run_fit_normals(
                     const int s_axis = (pc.plane_idx == 0) ? 2 : (pc.plane_idx == 1) ? 1 : 0;
 
                     const int s_center = static_cast<int>(sample_arr[s_axis]);
-                    const int s_min = std::max(crop.min[s_axis], static_cast<int>(std::floor(s_center - radius)));
-                    const int s_max = std::min(crop.max[s_axis], static_cast<int>(std::ceil(s_center + radius)) + 1);
+                    const int s_min = std::max(read_box.min[s_axis], static_cast<int>(std::floor(s_center - radius)));
+                    const int s_max = std::min(read_box.max[s_axis], static_cast<int>(std::ceil(s_center + radius)) + 1);
                     int slice_start = align_down(s_min, sparse_volume);
                     if (slice_start < s_min) slice_start += std::max(1, sparse_volume);
 
@@ -1997,10 +2018,10 @@ static void run_fit_normals(
                         if (ds > radius) continue;
                         const float r_eff = std::sqrt(std::max(0.0f, radius * radius - ds * ds));
 
-                        const int u0 = std::max(crop.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - r_eff)));
-                        const int v0 = std::max(crop.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - r_eff)));
-                        const int u1 = std::min(crop.max[u_axis], static_cast<int>(std::ceil(sample_arr[u_axis] + r_eff)) + 1);
-                        const int v1 = std::min(crop.max[v_axis], static_cast<int>(std::ceil(sample_arr[v_axis] + r_eff)) + 1);
+                        const int u0 = std::max(read_box.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - r_eff)));
+                        const int v0 = std::max(read_box.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - r_eff)));
+                        const int u1 = std::min(read_box.max[u_axis], static_cast<int>(std::ceil(sample_arr[u_axis] + r_eff)) + 1);
+                        const int v1 = std::min(read_box.max[v_axis], static_cast<int>(std::ceil(sample_arr[v_axis] + r_eff)) + 1);
                         if (u1 <= u0 || v1 <= v0) continue;
 
                         const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
@@ -2035,7 +2056,7 @@ static void run_fit_normals(
                                 cv::Point3f a = p3_of(a2);
                                 cv::Point3f b = p3_of(b2);
 
-                                if (!clip_segment_to_crop(a, b, crop)) continue;
+                                if (!clip_segment_to_crop(a, b, read_box)) continue;
                                 const float dist2 = dist_sq_point_segment_appx(sample, a, b);
                                 const bool reject = (dist2 > r2);
                                 stats[static_cast<size_t>(tid)].add_dist_test(reject);
@@ -2053,7 +2074,7 @@ static void run_fit_normals(
                                 deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
 
                                 // Gaussian falloff: nearer segments contribute more.
-                                const double w = std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2));
+                                const double w = 1.0;//std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2));
                                 weights[pc.plane_idx].push_back(w);
                             }
                         }
@@ -2073,19 +2094,20 @@ static void run_fit_normals(
                 const bool ok = fit_normal_ceres(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
                 const auto t_solve_call1 = std::chrono::steady_clock::now();
                 t_solve_call_s = std::chrono::duration<double>(t_solve_call1 - t_solve_call0).count();
-                if (ok) {
-                    ws.n[0] = n.x;
-                    ws.n[1] = n.y;
-                    ws.n[2] = n.z;
-                    ws.has = true;
-                    const int nsamp = static_cast<int>(dirs_unit[0].size() + dirs_unit[1].size() + dirs_unit[2].size());
-                    stats[static_cast<size_t>(tid)].add(iters, nsamp, rms);
-                    if (tout != nullptr) {
-                        const cv::Point3f a = sample;
-                        const cv::Point3f b = sample + normal_vis_scale * n;
-                        const int r = static_cast<int>(color_bgr[2]);
-                        const int g = static_cast<int>(color_bgr[1]);
-                        const int bc = static_cast<int>(color_bgr[0]);
+                    if (ok) {
+                        ws.n[0] = n.x;
+                        ws.n[1] = n.y;
+                        ws.n[2] = n.z;
+                        ws.has = true;
+                        const int nsamp = static_cast<int>(dirs_unit[0].size() + dirs_unit[1].size() + dirs_unit[2].size());
+                        stats[static_cast<size_t>(tid)].add(iters, nsamp, rms);
+                        if (tout != nullptr) {
+                            const cv::Vec3b color_bgr = rms_to_color_bgr(rms);
+                            const cv::Point3f a = sample;
+                            const cv::Point3f b = sample + normal_vis_scale * n;
+                            const int r = static_cast<int>(color_bgr[2]);
+                            const int g = static_cast<int>(color_bgr[1]);
+                            const int bc = static_cast<int>(color_bgr[0]);
 
                         const size_t idx0 = tout->vtx_count;
                         const size_t idx1 = tout->vtx_count + 1;

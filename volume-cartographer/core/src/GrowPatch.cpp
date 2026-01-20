@@ -462,10 +462,10 @@ struct LossSettings {
     std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
 
     LossSettings() {
-        w[LossType::SNAP] = 0.1;
+        w[LossType::SNAP] = 1.0f;
         w[LossType::NORMAL] = 0.0f;
-        w[LossType::NORMAL3D] = 1.0f;
-        w[LossType::NORMAL3DLINE] = 0.1f;
+        w[LossType::NORMAL3D] = 0.0f;
+        w[LossType::NORMAL3DLINE] = 1.0f;
         w[LossType::STRAIGHT] = 0.2;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
