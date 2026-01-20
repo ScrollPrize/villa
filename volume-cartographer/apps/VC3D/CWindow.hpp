@@ -282,6 +282,16 @@ private:
     QShortcut* fCycleNextSegmentShortcut;
     QShortcut* fCyclePrevSegmentShortcut;
 
+    QShortcut* fFocusedViewShortcut;
+    bool _focusedViewActive{false};
+    struct SavedDockState {
+        bool visible;
+        bool floating;
+        bool wasRaised;
+    };
+    std::map<QDockWidget*, SavedDockState> _savedDockStates;
+    void toggleFocusedView();
+
     void applySlicePlaneOrientation(Surface* sourceOverride = nullptr);
     void updateAxisAlignedSliceInteraction();
     float currentAxisAlignedRotationDegrees(const std::string& surfaceName) const;
