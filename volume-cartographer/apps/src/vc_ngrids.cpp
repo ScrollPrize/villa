@@ -1894,7 +1894,8 @@ static void run_fit_normals(
 
         // Only use paths that are long enough to be meaningful.
         constexpr int kMinSegmentsPerPath = 1;
-        constexpr int kShortPathMaxSegments = 1;
+        // "Short path" threshold used for diagnostics (not for filtering; see dbg + zarr outputs).
+        constexpr int kShortPathMaxSegments = 10;
 
         const float r2 = rad * rad;
         const float sigma = rad / 2.0f;
@@ -2055,12 +2056,36 @@ static void run_fit_normals(
     std::vector<uint8_t> enc_x;
     std::vector<uint8_t> enc_y;
     std::vector<uint8_t> enc_z;
+    // Extra fit diagnostics (uint8 with simple linear mappings):
+    // - fit_rms: [0,1] -> [0..255] (failed fits store 255)
+    // - fit_frac_short_paths: [0,1] -> [0..255]
+    // - fit_used_radius: [2,512] -> [0..255]
+    // - fit_segment_count: [0,8192] -> [0..255]
+    std::vector<uint8_t> enc_fit_rms;
+    std::vector<uint8_t> enc_fit_frac_short_paths;
+    std::vector<uint8_t> enc_fit_used_radius;
+    std::vector<uint8_t> enc_fit_segment_count;
     if (out_zarr_opt.has_value()) {
         const size_t n = static_cast<size_t>(std::max<int64_t>(0, full_samples));
         enc_x.assign(n, 128);
         enc_y.assign(n, 128);
         enc_z.assign(n, 128);
+
+        // Fill 0 means "unset" for diagnostics.
+        enc_fit_rms.assign(n, 0);
+        enc_fit_frac_short_paths.assign(n, 0);
+        enc_fit_used_radius.assign(n, 0);
+        enc_fit_segment_count.assign(n, 0);
     }
+
+    auto encode_u8_from_range = [](double v, double lo, double hi) -> uint8_t {
+        if (!(hi > lo)) return 0;
+        if (!std::isfinite(v)) return 0;
+        const double t = (v - lo) / (hi - lo);
+        const double tc = std::max(0.0, std::min(1.0, t));
+        const int q = static_cast<int>(std::lround(tc * 255.0));
+        return static_cast<uint8_t>(std::max(0, std::min(255, q)));
+    };
     int64_t processed = 0;
     int64_t written = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -2162,6 +2187,7 @@ static void run_fit_normals(
                 int used_rad = kMaxRadius;
                 int used_segments_total = 0;
                 int used_segments_short_paths = 0;
+                bool skip_fit_due_to_low_segments = false;
                 for (int rad = kMinRadius; rad <= kMaxRadius; rad *= 1.1) {
                     clear_fit_buffers(dirs_unit, weights, deltas_xyz);
                     used_segments_total = 0;
@@ -2177,6 +2203,14 @@ static void run_fit_normals(
                                               t_ng_read_s,
                                               t_preproc_s);
                     used_rad = rad;
+
+                    // If at the initial radius there are too few segments overall, skip this normal completely.
+                    // Treat as a failed fit (same behavior as fit_normal_ceres returning false).
+                    if (rad == kMinRadius && used_segments_total < 100) {
+                        skip_fit_due_to_low_segments = true;
+                        break;
+                    }
+
                     if (has_enough_plane_support(dirs_unit)) break;
                 }
 
@@ -2188,7 +2222,8 @@ static void run_fit_normals(
                 WarmStart& ws = warm[static_cast<size_t>(tid)];
                 double* init_ptr = ws.has ? ws.n : nullptr;
                 const auto t_solve_call0 = std::chrono::steady_clock::now();
-                const bool ok = fit_normal_ceres(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
+                const bool ok = (!skip_fit_due_to_low_segments) &&
+                                fit_normal_ceres(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
                 const auto t_solve_call1 = std::chrono::steady_clock::now();
                 t_solve_call_s = std::chrono::duration<double>(t_solve_call1 - t_solve_call0).count();
 
@@ -2265,6 +2300,14 @@ static void run_fit_normals(
                         enc_x[lin] = encode_dir_component(n.x);
                         enc_y[lin] = encode_dir_component(n.y);
                         enc_z[lin] = encode_dir_component(n.z);
+
+                        const double frac_short = (used_segments_total > 0)
+                            ? (static_cast<double>(used_segments_short_paths) / static_cast<double>(used_segments_total))
+                            : 0.0;
+                        enc_fit_rms[lin] = ok ? encode_u8_from_range(rms, 0.0, 1.0) : static_cast<uint8_t>(255);
+                        enc_fit_frac_short_paths[lin] = encode_u8_from_range(frac_short, 0.0, 1.0);
+                        enc_fit_used_radius[lin] = encode_u8_from_range(static_cast<double>(used_rad), 2.0, 512.0);
+                        enc_fit_segment_count[lin] = encode_u8_from_range(static_cast<double>(used_segments_total), 0.0, 8192.0);
                     }
                 }
 
@@ -2362,6 +2405,10 @@ static void run_fit_normals(
         z5::createGroup(outFile, "x");
         z5::createGroup(outFile, "y");
         z5::createGroup(outFile, "z");
+        z5::createGroup(outFile, "fit_rms");
+        z5::createGroup(outFile, "fit_frac_short_paths");
+        z5::createGroup(outFile, "fit_used_radius");
+        z5::createGroup(outFile, "fit_segment_count");
 
         const std::vector<size_t> shape = {static_cast<size_t>(nz), static_cast<size_t>(ny), static_cast<size_t>(nx)}; // ZYX
         const std::vector<size_t> chunks = {std::min<size_t>(64, shape[0]), std::min<size_t>(64, shape[1]), std::min<size_t>(64, shape[2])};
@@ -2370,18 +2417,34 @@ static void run_fit_normals(
         z5::filesystem::handle::Group gx(outFile, "x");
         z5::filesystem::handle::Group gy(outFile, "y");
         z5::filesystem::handle::Group gz(outFile, "z");
+        z5::filesystem::handle::Group g_rms(outFile, "fit_rms");
+        z5::filesystem::handle::Group g_frac(outFile, "fit_frac_short_paths");
+        z5::filesystem::handle::Group g_rad(outFile, "fit_used_radius");
+        z5::filesystem::handle::Group g_sc(outFile, "fit_segment_count");
 
         auto dsx = z5::createDataset(gx, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
         auto dsy = z5::createDataset(gy, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
         auto dsz = z5::createDataset(gz, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
+        auto ds_fit_rms = z5::createDataset(g_rms, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+        auto ds_fit_frac = z5::createDataset(g_frac, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+        auto ds_fit_rad = z5::createDataset(g_rad, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
+        auto ds_fit_sc = z5::createDataset(g_sc, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
 
         auto ax = xt::adapt(enc_x, shape);
         auto ay = xt::adapt(enc_y, shape);
         auto az = xt::adapt(enc_z, shape);
+        auto a_fit_rms = xt::adapt(enc_fit_rms, shape);
+        auto a_fit_frac = xt::adapt(enc_fit_frac_short_paths, shape);
+        auto a_fit_rad = xt::adapt(enc_fit_used_radius, shape);
+        auto a_fit_sc = xt::adapt(enc_fit_segment_count, shape);
         z5::types::ShapeType off = {0, 0, 0};
         z5::multiarray::writeSubarray<uint8_t>(dsx, ax, off.begin());
         z5::multiarray::writeSubarray<uint8_t>(dsy, ay, off.begin());
         z5::multiarray::writeSubarray<uint8_t>(dsz, az, off.begin());
+        z5::multiarray::writeSubarray<uint8_t>(ds_fit_rms, a_fit_rms, off.begin());
+        z5::multiarray::writeSubarray<uint8_t>(ds_fit_frac, a_fit_frac, off.begin());
+        z5::multiarray::writeSubarray<uint8_t>(ds_fit_rad, a_fit_rad, off.begin());
+        z5::multiarray::writeSubarray<uint8_t>(ds_fit_sc, a_fit_sc, off.begin());
 
         // Minimal attrs on root.
         nlohmann::json attrs;
@@ -2394,6 +2457,16 @@ static void run_fit_normals(
         attrs["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
         attrs["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
         attrs["grid_shape_zyx"] = {shape[0], shape[1], shape[2]};
+
+        // Diagnostics.
+        attrs["fit_rms_group"] = "fit_rms/0";
+        attrs["fit_frac_short_paths_group"] = "fit_frac_short_paths/0";
+        attrs["fit_used_radius_group"] = "fit_used_radius/0";
+        attrs["fit_segment_count_group"] = "fit_segment_count/0";
+        attrs["fit_rms_decode"] = "ok? (v/255) : 1.0 (failed fits stored as 255)";
+        attrs["fit_frac_short_paths_decode"] = "v/255";
+        attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
+        attrs["fit_segment_count_decode"] = "(v/255)*8192";
         z5::filesystem::handle::Group root(outFile, "");
         z5::filesystem::writeAttributes(root, attrs);
     }
