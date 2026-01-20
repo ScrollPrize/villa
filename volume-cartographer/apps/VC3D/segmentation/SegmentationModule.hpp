@@ -66,6 +66,8 @@ public:
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
     void setEditingEnabled(bool enabled);
+    void setIgnoreSegSurfaceChange(bool ignore);
+    [[nodiscard]] bool ignoreSegSurfaceChange() const { return _ignoreSegSurfaceChange; }
     void setDragRadius(float radiusSteps);
     void setDragSigma(float sigmaSteps);
     void setLineRadius(float radiusSteps);

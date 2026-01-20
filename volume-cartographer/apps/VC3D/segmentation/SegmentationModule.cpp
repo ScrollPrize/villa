@@ -364,6 +364,11 @@ void SegmentationModule::updateViewerCursors()
     }
 }
 
+void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
+{
+    _ignoreSegSurfaceChange = ignore;
+}
+
 void SegmentationModule::setEditingEnabled(bool enabled)
 {
     if (_editingEnabled == enabled) {
