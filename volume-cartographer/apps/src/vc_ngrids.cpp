@@ -1395,27 +1395,50 @@ static void run_align_normals_zarr(
     auto add_fringe_neighbors = [&](size_t lin) {
         size_t iz, iy, ix;
         idx_of_lin(lin, iz, iy, ix);
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0 && dz == 0) continue;
-                    const int zz = static_cast<int>(iz) + dz;
-                    const int yy = static_cast<int>(iy) + dy;
-                    const int xx = static_cast<int>(ix) + dx;
-                    if (zz < 0 || yy < 0 || xx < 0 || zz >= static_cast<int>(CZ) || yy >= static_cast<int>(CY) || xx >= static_cast<int>(CX)) continue;
-                    const size_t nlin = lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
-                    if (state[nlin] & kAligned) continue;
-                    if (!is_valid_normal_u8(ax(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
-                                            ay(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
-                                            az(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)))) {
-                        continue;
-                    }
-                    if (!(state[nlin] & kInFringe)) {
-                        state[nlin] |= kInFringe;
-                        fringe.push_back(nlin);
+
+        // Parallelize neighbor checks, but keep fringe insertions serial (global state).
+        // Use the same threshold as candidate scoring.
+        const size_t fringe_size = fringe.size();
+        std::vector<size_t> to_add;
+        to_add.reserve(26);
+
+        #pragma omp parallel if(fringe_size >= 10000)
+        {
+            std::vector<size_t> local;
+            local.reserve(26);
+            #pragma omp for collapse(3) schedule(dynamic,1) nowait
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        const int zz = static_cast<int>(iz) + dz;
+                        const int yy = static_cast<int>(iy) + dy;
+                        const int xx = static_cast<int>(ix) + dx;
+                        if (zz < 0 || yy < 0 || xx < 0 || zz >= static_cast<int>(CZ) || yy >= static_cast<int>(CY) || xx >= static_cast<int>(CX)) continue;
+                        const size_t nlin = lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
+                        if (state[nlin] & kAligned) continue;
+                        if (!is_valid_normal_u8(ax(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
+                                                ay(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
+                                                az(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)))) {
+                            continue;
+                        }
+                        if (state[nlin] & kInFringe) continue;
+                        local.push_back(nlin);
                     }
                 }
             }
+
+            #pragma omp critical
+            {
+                to_add.insert(to_add.end(), local.begin(), local.end());
+            }
+        }
+
+        for (const size_t nlin : to_add) {
+            if (state[nlin] & kAligned) continue;
+            if (state[nlin] & kInFringe) continue;
+            state[nlin] |= kInFringe;
+            fringe.push_back(nlin);
         }
     };
 
@@ -1462,6 +1485,15 @@ static void run_align_normals_zarr(
     add_fringe_neighbors(seed_lin);
     size_t aligned_count = 1;
 
+    // One RNG per OpenMP thread for the lifetime of this function.
+    // Used for candidate sampling inside the OpenMP candidate loop.
+    const int omp_threads = std::max(1, omp_get_max_threads());
+    std::vector<std::mt19937_64> omp_rng(static_cast<size_t>(omp_threads));
+    for (int t = 0; t < omp_threads; ++t) {
+        // Deterministic but distinct streams.
+        omp_rng[static_cast<size_t>(t)] = std::mt19937_64(0xA11F10ull + 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(t + 1));
+    }
+
     const auto t0 = std::chrono::steady_clock::now();
     auto t_last = t0;
     while (aligned_count < valid_lin.size() && !fringe.empty()) {
@@ -1479,31 +1511,64 @@ static void run_align_normals_zarr(
             t_last = nowp;
         }
 
-        std::uniform_int_distribution<size_t> pick_fr(0, fringe.size() - 1);
-        const int tries = std::min<int>(candidate_samples_per_iter, static_cast<int>(fringe.size()));
+        const size_t fringe_size = fringe.size();
+        std::uniform_int_distribution<size_t> pick_fr(0, fringe_size - 1);
+        const int tries = std::min<int>(candidate_samples_per_iter, static_cast<int>(fringe_size));
 
-        size_t best_idx_in_fringe = pick_fr(rng);
-        size_t best_cand = fringe[best_idx_in_fringe];
-        double best_score = -1e9;
-        int best_cnt = -1;
-        bool best_flip = false;
+        // Candidate selection + scoring: parallelize, but keep state mutations serial.
+        struct BestCand {
+            size_t idx_in_fringe = 0;
+            size_t cand_lin = 0;
+            double score = -1e9;
+            int cnt = -1;
+            bool flip = false;
+        };
 
-        for (int t = 0; t < tries; ++t) {
-            const size_t cand_idx = pick_fr(rng);
-            const size_t cand = fringe[cand_idx];
-            if (state[cand] & kAligned) continue;
-            int cnt = 0;
-            bool fl = false;
-            const double s = score_candidate(cand, /*neigh_rad=*/radius, cnt, fl);
-            if (cnt <= 0) continue;
-            if (s > best_score || (s == best_score && cnt > best_cnt)) {
-                best_score = s;
-                best_cnt = cnt;
-                best_cand = cand;
-                best_idx_in_fringe = cand_idx;
-                best_flip = fl;
+        BestCand best;
+        best.idx_in_fringe = pick_fr(rng);
+        best.cand_lin = fringe[best.idx_in_fringe];
+
+        #pragma omp parallel if(fringe_size >= 10000)
+        {
+            const int tid = omp_get_thread_num();
+            BestCand local;
+            local.score = -1e9;
+            local.cnt = -1;
+            std::uniform_int_distribution<size_t> pick(0, fringe_size - 1);
+
+            // OpenMP loop runs over #cands (tries) with dynamic scheduling.
+            #pragma omp for schedule(dynamic,1) nowait
+            for (int t = 0; t < tries; ++t) {
+                (void)t;
+                const size_t cand_idx = pick(omp_rng[static_cast<size_t>(tid)]);
+                const size_t cand = fringe[cand_idx];
+                if (state[cand] & kAligned) continue;
+                int cnt = 0;
+                bool fl = false;
+                const double s = score_candidate(cand, /*neigh_rad=*/radius, cnt, fl);
+                if (cnt <= 0) continue;
+                if (s > local.score || (s == local.score && cnt > local.cnt)) {
+                    local.score = s;
+                    local.cnt = cnt;
+                    local.cand_lin = cand;
+                    local.idx_in_fringe = cand_idx;
+                    local.flip = fl;
+                }
+            }
+
+            #pragma omp critical
+            {
+                if (local.cnt > 0 && (local.score > best.score || (local.score == best.score && local.cnt > best.cnt))) {
+                    best = local;
+                }
             }
         }
+
+        const size_t best_idx_in_fringe = best.idx_in_fringe;
+        const size_t best_cand = best.cand_lin;
+        const double best_score = best.score;
+        const int best_cnt = best.cnt;
+        const bool best_flip = best.flip;
 
         if (best_cnt <= 0) {
             // Drop one stale fringe entry.
