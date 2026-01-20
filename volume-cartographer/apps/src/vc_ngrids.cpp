@@ -578,29 +578,38 @@ static bool fit_normal_ceres(
     }
 
     ceres::Problem problem;
+    // For RMS reporting: normalize by the *sum of weights* (not sample count).
+    // Note: residual is scaled by sqrt(weight), so Ceres cost is ~ 1/2 * sum(weight * dot^2).
+    double weight_sum = 0.0;
     for (size_t k = 0; k < n0_count; ++k) {
         const auto& d = dirs_unit_by_plane[0][k];
         const auto& delta = deltas_xyz_by_plane[0][k];
-        const double w = weights_by_plane[0][k] * s0;
+        const double w_eff = weights_by_plane[0][k] * s0;
+        const double w = std::sqrt(std::max(0.0, w_eff));
         auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
             new NormalDotResidualAffine(d, delta, w));
         problem.AddResidualBlock(cost, nullptr, n0, J);
+        weight_sum += std::max(0.0, w_eff);
     }
     for (size_t k = 0; k < n1_count; ++k) {
         const auto& d = dirs_unit_by_plane[1][k];
         const auto& delta = deltas_xyz_by_plane[1][k];
-        const double w = weights_by_plane[1][k] * s1;
+        const double w_eff = weights_by_plane[1][k] * s1;
+        const double w = std::sqrt(std::max(0.0, w_eff));
         auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
             new NormalDotResidualAffine(d, delta, w));
         problem.AddResidualBlock(cost, nullptr, n0, J);
+        weight_sum += std::max(0.0, w_eff);
     }
     for (size_t k = 0; k < n2_count; ++k) {
         const auto& d = dirs_unit_by_plane[2][k];
         const auto& delta = deltas_xyz_by_plane[2][k];
-        const double w = weights_by_plane[2][k] * s2;
+        const double w_eff = weights_by_plane[2][k] * s2;
+        const double w = std::sqrt(std::max(0.0, w_eff));
         auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
             new NormalDotResidualAffine(d, delta, w));
         problem.AddResidualBlock(cost, nullptr, n0, J);
+        weight_sum += std::max(0.0, w_eff);
     }
     problem.AddResidualBlock(
         new ceres::AutoDiffCostFunction<UnitNormResidual, 1, 3>(new UnitNormResidual(10.0)),
@@ -634,7 +643,7 @@ static bool fit_normal_ceres(
     }
     if (out_rms != nullptr) {
         // Ceres cost = 1/2 * sum(residual^2)
-        const double denom = std::max(1, summary.num_residuals);
+        const double denom = std::max(1e-12, weight_sum);
         *out_rms = std::sqrt(2.0 * summary.final_cost / denom);
     }
 
@@ -1981,9 +1990,11 @@ static void run_fit_normals(
                         const cv::Point3f m = 0.5f * (a + b);
                         deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
 
-                        // Uniform weights for now (kept switchable).
-                        const double w = 1.0; // switchable: std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
-                        weights[pc.plane_idx].push_back(w);
+                    // Weights are proportional to path length:
+                    // seg_count=1 -> 0.1, seg_count>=10 -> 1.0.
+                    const double path_w = std::max(0.1, std::min(1.0, static_cast<double>(seg_count) / 10.0));
+                    const double w = path_w; // switchable: path_w * std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
+                    weights[pc.plane_idx].push_back(w);
 
                         ++used_segments_total;
                         if (is_short_path) ++used_segments_short_paths;
@@ -2206,7 +2217,7 @@ static void run_fit_normals(
 
                     // If at the initial radius there are too few segments overall, skip this normal completely.
                     // Treat as a failed fit (same behavior as fit_normal_ceres returning false).
-                    if (rad == kMinRadius && used_segments_total < 100) {
+                    if (rad == kMinRadius && used_segments_total < 50) {
                         skip_fit_due_to_low_segments = true;
                         break;
                     }
