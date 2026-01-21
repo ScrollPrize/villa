@@ -471,11 +471,11 @@ struct LossSettings {
     std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
 
     LossSettings() {
-        w[LossType::SNAP] = 1.0f;
+        w[LossType::SNAP] = 0.0f;
         w[LossType::NORMAL] = 0.0f;
         w[LossType::NORMAL3D] = 0.0f;
         w[LossType::NORMAL3DLINE] = 1.0f;
-        w[LossType::STRAIGHT] = 0.2;
+        w[LossType::STRAIGHT] = 10.0;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
         w[LossType::SDIR] = 0.0f;
@@ -3182,20 +3182,19 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                         avg[0] < loss_settings.x_min || avg[0] > loss_settings.x_max)
                         continue;
 
-                    // If fitted-3D normal losses are enabled, require that the normal field is defined here.
-                    // Otherwise we permanently stop expansion into this candidate (it stays STATE_PROCESSING).
-                    if (trace_data.normal3d_field &&
-                        (loss_settings.w[LossType::NORMAL3D] > 0.0f || loss_settings.w[LossType::NORMAL3DLINE] > 0.0f) &&
-                        !normal3d_trilinear_sample_valid(*trace_data.normal3d_field, avg)) {
-                        continue;
-                    }
+
 
                     cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                     trace_params.dpoints(p) = init;
 
                     ceres::Problem problem;
                     trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
+
+                    int flags = LOSS_DIST | LOSS_STRAIGHT;
+                    if (trace_data.normal3d_field)
+                        flags | LOSS_3DNORMALLINE;
+
+                    add_losses(problem, p, trace_params, trace_data, loss_settings, flags);
 
                     std::vector<double*> parameter_blocks;
                     problem.GetParameterBlocks(&parameter_blocks);
