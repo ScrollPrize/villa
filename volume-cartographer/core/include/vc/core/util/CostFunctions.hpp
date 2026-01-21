@@ -16,6 +16,85 @@ static double  val(const double &v) { return v; }
 template <typename JetT>
 double  val(const JetT &v) { return v.a; }
 
+// -----------------------------------------------------------------------------
+// Normal-fit quality weighting (from vc_ngrids diagnostics zarr)
+// -----------------------------------------------------------------------------
+// Encapsulates reading auxiliary uint8 volumes (fit_rms, fit_frac_short_paths)
+// and turning them into a multiplicative weight in [0,1].
+//
+// IMPORTANT:
+// - Sampling is trilinear but NON-differentiable (coordinates are unjetted before sampling).
+// - Weight mapping:
+//     rms: 0.0 -> 1.0, 0.5 -> 0.0 (linear ramp, clamped)
+//     frac_short_paths: 0.0 -> 1.0, 1.0 -> 0.0 (linear ramp, clamped)
+//   final = w_rms * w_frac
+struct NormalFitQualityWeightField {
+    NormalFitQualityWeightField(std::unique_ptr<z5::Dataset>&& rms_ds,
+                                std::unique_ptr<z5::Dataset>&& frac_ds,
+                                float scale,
+                                ChunkCache<uint8_t>* cache,
+                                const std::string& cache_root,
+                                const std::string& unique_id)
+        : _passthrough_rms{unique_id + "_fit_rms"},
+          _passthrough_frac{unique_id + "_fit_frac"},
+          _rms(_passthrough_rms, rms_ds.get(), cache, cache_root),
+          _frac(_passthrough_frac, frac_ds.get(), cache, cache_root),
+          _scale(scale),
+          _rms_ds(std::move(rms_ds)),
+          _frac_ds(std::move(frac_ds)),
+          _interp_rms(_rms),
+          _interp_frac(_frac)
+    {}
+
+    NormalFitQualityWeightField(const NormalFitQualityWeightField&) = delete;
+    NormalFitQualityWeightField& operator=(const NormalFitQualityWeightField&) = delete;
+
+    // Canonical XYZ input.
+    template <typename E>
+    inline double weight_xyz(const E& x, const E& y, const E& z) const {
+        const double xx = unjet(x);
+        const double yy = unjet(y);
+        const double zz = unjet(z);
+        return weight_xyz_d(xx, yy, zz);
+    }
+
+    inline double weight_xyz_d(double x, double y, double z) const {
+        // Convert canonical XYZ to dataset ZYX coordinate space.
+        const double dz = z * static_cast<double>(_scale);
+        const double dy = y * static_cast<double>(_scale);
+        const double dx = x * static_cast<double>(_scale);
+
+        double rms_u8 = 0.0;
+        double frac_u8 = 0.0;
+        _interp_rms.Evaluate(dz, dy, dx, &rms_u8);
+        _interp_frac.Evaluate(dz, dy, dx, &frac_u8);
+
+        const double rms = std::clamp(rms_u8 / 255.0, 0.0, 1.0);
+        const double frac = std::clamp(frac_u8 / 255.0, 0.0, 1.0);
+
+        // rms weighting: 0 -> 1, 0.5 -> 0
+        const double w_rms = std::clamp(1.0 - (rms / 0.5), 0.0, 1.0);
+        // frac-short weighting: 0 -> 1, 1 -> 0
+        const double w_frac = std::clamp(1.0 - frac, 0.0, 1.0);
+        return w_rms * w_frac;
+    }
+
+private:
+    static double unjet(const double& v) { return v; }
+    template <typename JetT>
+    static double unjet(const JetT& v) { return v.a; }
+
+    passTroughComputor _passthrough_rms;
+    passTroughComputor _passthrough_frac;
+    Chunked3d<uint8_t, passTroughComputor> _rms;
+    Chunked3d<uint8_t, passTroughComputor> _frac;
+    float _scale;
+    std::unique_ptr<z5::Dataset> _rms_ds;
+    std::unique_ptr<z5::Dataset> _frac_ds;
+    CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_rms;
+    CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
+};
+
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
@@ -522,8 +601,10 @@ struct NormalDirectionLoss {
 // - The target normal field is sampled (non-differentiably) at p_base.
 // - The residual is 1 - dot(n_surface, n_target) (assumes target normals are already aligned).
 struct Normal3DLoss {
-    Normal3DLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w)
-        : _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {}
+    Normal3DLoss(Chunked3dVec3fFromUint8 &normal_dirs,
+                const NormalFitQualityWeightField* maybe_fit_quality,
+                float w)
+        : _normal_dirs(normal_dirs), _maybe_fit_quality(maybe_fit_quality), _w(w) {}
 
     template <typename E>
     bool operator()(const E* const p_base, const E* const p_u, const E* const p_v, E* residual) const {
@@ -559,14 +640,13 @@ struct Normal3DLoss {
 
         E dot = (n_zyx[0] * target_zyx[0] + n_zyx[1] * target_zyx[1] + n_zyx[2] * target_zyx[2]);
 
-        E weight_at_point = E(1);
-        if (_maybe_weights)
-            weight_at_point = sample_trilinear_weight(*_maybe_weights,
-                                                      /*z=*/p_base[2],
-                                                      /*y=*/p_base[1],
-                                                      /*x=*/p_base[0]);
+        // Additional fit-quality weight (non-differentiable sample).
+        E fit_w = E(1);
+        if (_maybe_fit_quality) {
+            fit_w = E(_maybe_fit_quality->weight_xyz(p_base[0], p_base[1], p_base[2]));
+        }
 
-        residual[0] = E(_w) * (E(1) - dot) * weight_at_point;
+        residual[0] = E(_w) * (E(1) - dot) * fit_w;
         return true;
     }
 
@@ -575,13 +655,15 @@ struct Normal3DLoss {
 
     float _w;
     Chunked3dVec3fFromUint8 &_normal_dirs;
-    Chunked3dFloatFromUint8 *_maybe_weights;
+    const NormalFitQualityWeightField* _maybe_fit_quality;
 
 public:
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0f)
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs,
+                                       const NormalFitQualityWeightField* maybe_fit_quality,
+                                       float w = 1.0f)
     {
         return new ceres::AutoDiffCostFunction<Normal3DLoss, 1, 3, 3, 3>(
-            new Normal3DLoss(normal_dirs, maybe_weights, w));
+            new Normal3DLoss(normal_dirs, maybe_fit_quality, w));
     }
 
 private:
@@ -704,64 +786,6 @@ private:
         return true;
     }
 
-    template <typename E>
-    static inline E sample_trilinear_weight(Chunked3dFloatFromUint8 &w,
-                                            const E& z_canon,
-                                            const E& y_canon,
-                                            const E& x_canon)
-    {
-        const E zf = z_canon * E(w._scale);
-        const E yf = y_canon * E(w._scale);
-        const E xf = x_canon * E(w._scale);
-
-        int z0 = static_cast<int>(std::floor(unjet(zf)));
-        int y0 = static_cast<int>(std::floor(unjet(yf)));
-        int x0 = static_cast<int>(std::floor(unjet(xf)));
-
-        const auto shape = w._x.shape();
-        if (!shape.empty()) {
-            z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
-            y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
-            x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
-        } else {
-            z0 = std::max(0, z0);
-            y0 = std::max(0, y0);
-            x0 = std::max(0, x0);
-        }
-
-        const int z1 = z0 + 1;
-        const int y1 = y0 + 1;
-        const int x1 = x0 + 1;
-
-        E dz = zf - E(z0);
-        E dy = yf - E(y0);
-        E dx = xf - E(x0);
-        clamp01(dz);
-        clamp01(dy);
-        clamp01(dx);
-
-        auto lerp = [](const E& a, const E& b, const E& t) { return (E(1) - t) * a + t * b; };
-
-        const E c000 = E(static_cast<double>(w._x.safe_at(z0, y0, x0)));
-        const E c100 = E(static_cast<double>(w._x.safe_at(z1, y0, x0)));
-        const E c010 = E(static_cast<double>(w._x.safe_at(z0, y1, x0)));
-        const E c110 = E(static_cast<double>(w._x.safe_at(z1, y1, x0)));
-        const E c001 = E(static_cast<double>(w._x.safe_at(z0, y0, x1)));
-        const E c101 = E(static_cast<double>(w._x.safe_at(z1, y0, x1)));
-        const E c011 = E(static_cast<double>(w._x.safe_at(z0, y1, x1)));
-        const E c111 = E(static_cast<double>(w._x.safe_at(z1, y1, x1)));
-
-        const E c00 = lerp(c000, c001, dx);
-        const E c01 = lerp(c010, c011, dx);
-        const E c10 = lerp(c100, c101, dx);
-        const E c11 = lerp(c110, c111, dx);
-        const E c0  = lerp(c00,  c01,  dy);
-        const E c1  = lerp(c10,  c11,  dy);
-        const E v_u8 = lerp(c0, c1, dz);
-
-        return v_u8 / E(255.0);
-    }
-
 };
 
 // Penalize that an in-surface edge direction is perpendicular to the directed target normal field.
@@ -775,8 +799,10 @@ private:
 //
 // The 90° constraint is enforced only from the p_base->p_off segment.
 struct Normal3DLineLoss {
-    Normal3DLineLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w)
-        : _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {}
+    Normal3DLineLoss(Chunked3dVec3fFromUint8 &normal_dirs,
+                     const NormalFitQualityWeightField* maybe_fit_quality,
+                     float w)
+        : _normal_dirs(normal_dirs), _maybe_fit_quality(maybe_fit_quality), _w(w) {}
 
     template <typename E>
     bool operator()(const E* const p_base, const E* const p_off, const E* const p_clockwise, E* residual) const {
@@ -802,14 +828,15 @@ struct Normal3DLineLoss {
         // Edge vector in ZYX ordering (base -> off). This is what the 90° constraint is based on.
         const E e_zyx[3] = { p_off[2] - p_base[2], p_off[1] - p_base[1], p_off[0] - p_base[0] };
         const E e_len = ceres::sqrt(e_zyx[0]*e_zyx[0] + e_zyx[1]*e_zyx[1] + e_zyx[2]*e_zyx[2] + E(1e-12));
-        const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len; // want 0
+        // cos between edge direction and target normal. For the intended 90° constraint
+        // we want this value close to 0.
+        const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len;
 
-        E weight_at_point = E(1);
-        if (_maybe_weights)
-            weight_at_point = sample_trilinear_weight(*_maybe_weights,
-                                                      /*z=*/mid_xyz[2],
-                                                      /*y=*/mid_xyz[1],
-                                                      /*x=*/mid_xyz[0]);
+        // Additional fit-quality weight (non-differentiable sample).
+        E fit_w = E(1);
+        if (_maybe_fit_quality) {
+            fit_w = E(_maybe_fit_quality->weight_xyz(mid_xyz[0], mid_xyz[1], mid_xyz[2]));
+        }
 
         // Use the third point (clockwise neighbor) to disambiguate which *side* of the target normal we're on.
         // We treat p_clockwise as non-differentiable for this decision.
@@ -841,16 +868,15 @@ struct Normal3DLineLoss {
         const E side_dot = (n_surf_zyx[0] * target_zyx[0] + n_surf_zyx[1] * target_zyx[1] + n_surf_zyx[2] * target_zyx[2]);
 
         // We want the edge direction to be in-plane => perpendicular to target normal.
-        // cos_angle_abs is in [0,1].
-        const E cos_angle_abs = ceres::abs(cos_angle);
+        // Use |cos| to keep the objective non-negative and bounded.
+        const E cos = ceres::abs(cos_angle);
 
-        // If we're on the right side (side_dot >= 0), optimize as normal.
-        // If we're on the wrong side (side_dot < 0), use the requested escape objective:
-        //   loss = 2 - abs(cos_angle)
-        // so the solver moves until the configuration can flip sidedness.
-        const E loss = (side_dot >= E(0)) ? cos_angle_abs : (E(2) - cos_angle_abs);
+        // Direction-aware term:
+        // - On the correct side of the directed normal, minimize loss = cos.
+        // - On the wrong side, use loss = 2 - cos (escape objective).
+        const E loss = (side_dot >= E(0)) ? cos : (E(2) - cos);
 
-        residual[0] = E(_w) * weight_at_point * loss;
+        residual[0] = E(_w) * fit_w * loss;
         return true;
     }
 
@@ -859,13 +885,15 @@ struct Normal3DLineLoss {
 
     float _w;
     Chunked3dVec3fFromUint8 &_normal_dirs;
-    Chunked3dFloatFromUint8 *_maybe_weights;
+    const NormalFitQualityWeightField* _maybe_fit_quality;
 
 public:
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0f)
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs,
+                                       const NormalFitQualityWeightField* maybe_fit_quality,
+                                       float w = 1.0f)
     {
         return new ceres::AutoDiffCostFunction<Normal3DLineLoss, 1, 3, 3, 3>(
-            new Normal3DLineLoss(normal_dirs, maybe_weights, w));
+            new Normal3DLineLoss(normal_dirs, maybe_fit_quality, w));
     }
 
 private:
@@ -983,63 +1011,6 @@ private:
         return true;
     }
 
-    template <typename E>
-    static inline E sample_trilinear_weight(Chunked3dFloatFromUint8 &w,
-                                            const E& z_canon,
-                                            const E& y_canon,
-                                            const E& x_canon)
-    {
-        const E zf = z_canon * E(w._scale);
-        const E yf = y_canon * E(w._scale);
-        const E xf = x_canon * E(w._scale);
-
-        int z0 = static_cast<int>(std::floor(unjet(zf)));
-        int y0 = static_cast<int>(std::floor(unjet(yf)));
-        int x0 = static_cast<int>(std::floor(unjet(xf)));
-
-        const auto shape = w._x.shape();
-        if (!shape.empty()) {
-            z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
-            y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
-            x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
-        } else {
-            z0 = std::max(0, z0);
-            y0 = std::max(0, y0);
-            x0 = std::max(0, x0);
-        }
-
-        const int z1 = z0 + 1;
-        const int y1 = y0 + 1;
-        const int x1 = x0 + 1;
-
-        E dz = zf - E(z0);
-        E dy = yf - E(y0);
-        E dx = xf - E(x0);
-        clamp01(dz);
-        clamp01(dy);
-        clamp01(dx);
-
-        auto lerp = [](const E& a, const E& b, const E& t) { return (E(1) - t) * a + t * b; };
-
-        const E c000 = E(static_cast<double>(w._x.safe_at(z0, y0, x0)));
-        const E c100 = E(static_cast<double>(w._x.safe_at(z1, y0, x0)));
-        const E c010 = E(static_cast<double>(w._x.safe_at(z0, y1, x0)));
-        const E c110 = E(static_cast<double>(w._x.safe_at(z1, y1, x0)));
-        const E c001 = E(static_cast<double>(w._x.safe_at(z0, y0, x1)));
-        const E c101 = E(static_cast<double>(w._x.safe_at(z1, y0, x1)));
-        const E c011 = E(static_cast<double>(w._x.safe_at(z0, y1, x1)));
-        const E c111 = E(static_cast<double>(w._x.safe_at(z1, y1, x1)));
-
-        const E c00 = lerp(c000, c001, dx);
-        const E c01 = lerp(c010, c011, dx);
-        const E c10 = lerp(c100, c101, dx);
-        const E c11 = lerp(c110, c111, dx);
-        const E c0  = lerp(c00,  c01,  dy);
-        const E c1  = lerp(c10,  c11,  dy);
-        const E v_u8 = lerp(c0, c1, dz);
-
-        return v_u8 / E(255.0);
-    }
 };
 
 /**
@@ -1063,6 +1034,7 @@ struct NormalConstraintPlane {
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double w_normal;
     const double w_snap;
+    const NormalFitQualityWeightField* maybe_fit_quality;
     const int z_min;
     const int z_max;
     bool invert_dir;
@@ -1109,8 +1081,24 @@ struct NormalConstraintPlane {
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
  
-     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double w_normal, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
-         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), w_normal(w_normal), w_snap(w_snap), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume,
+                           int plane_idx,
+                           double w_normal,
+                           double w_snap,
+                           const NormalFitQualityWeightField* maybe_fit_quality,
+                           bool direction_aware = false,
+                           int z_min = -1,
+                           int z_max = -1,
+                           bool invert_dir = false)
+         : normal_grid_volume(normal_grid_volume),
+           plane_idx(plane_idx),
+           w_normal(w_normal),
+           w_snap(w_snap),
+           maybe_fit_quality(maybe_fit_quality),
+           direction_aware_(direction_aware),
+           z_min(z_min),
+           z_max(z_max),
+           invert_dir(invert_dir) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -1236,7 +1224,10 @@ struct NormalConstraintPlane {
         else if (plane_idx == 1) angle_weight = 0.5 * w_y; // XZ plane
         else angle_weight = 0.5 * w_x; // YZ plane
 
-        residual[0] = interpolated_loss * T(angle_weight);
+        // Optional fit-quality modulation (non-differentiable sample).
+        // Use query_point (based on A) as the canonical XYZ position.
+        const double fit_w = maybe_fit_quality ? maybe_fit_quality->weight_xyz_d(query_point.x, query_point.y, query_point.z) : 1.0;
+        residual[0] = interpolated_loss * T(angle_weight) * T(fit_w);
 
         return true;
     }
@@ -1500,9 +1491,17 @@ struct NormalConstraintPlane {
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double w_normal, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume,
+                                       int plane_idx,
+                                       double w_normal,
+                                       double w_snap,
+                                       const NormalFitQualityWeightField* maybe_fit_quality,
+                                       bool direction_aware = false,
+                                       int z_min = -1,
+                                       int z_max = -1,
+                                       bool invert_dir = false) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, direction_aware, z_min, z_max, invert_dir)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, maybe_fit_quality, direction_aware, z_min, z_max, invert_dir)
         );
     }
 
