@@ -1904,7 +1904,8 @@ static void run_fit_normals(
         // Only use paths that are long enough to be meaningful.
         constexpr int kMinSegmentsPerPath = 1;
         // "Short path" threshold used for diagnostics (not for filtering; see dbg + zarr outputs).
-        constexpr int kShortPathMaxSegments = 10;
+        // A path with a single segment (2 points) is considered "short".
+        constexpr int kShortPathMaxSegments = 1;
 
         const float r2 = rad * rad;
         const float sigma = rad / 2.0f;

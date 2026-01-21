@@ -286,7 +286,7 @@ struct TraceData {
 
     // Optional fitted-3D normals direction-field (zarr root with x/<scale>,y/<scale>,z/<scale> datasets)
     std::unique_ptr<Chunked3dVec3fFromUint8> normal3d_field;
-    std::unique_ptr<Chunked3dFloatFromUint8> normal3d_weight;
+    std::unique_ptr<NormalFitQualityWeightField> normal3d_fit_quality;
     struct ReferenceRaycastSettings {
         QuadSurface* surface = nullptr;
         double voxel_threshold = 1.0;
@@ -1048,7 +1048,7 @@ static int gen_3d_normal_line_loss(ceres::Problem &problem,
     }
 
     problem.AddResidualBlock(
-        Normal3DLineLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_weight.get(), w),
+        Normal3DLineLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_fit_quality.get(), w),
         nullptr,
         &params.dpoints(base)[0],
         &params.dpoints(off_p)[0],
@@ -1107,13 +1107,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
 
         bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
         count += 4;
     }
 
@@ -1156,7 +1156,7 @@ static int gen_3d_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, Trace
     }
 
     problem.AddResidualBlock(
-        Normal3DLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_weight.get(), w),
+        Normal3DLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_fit_quality.get(), w),
         nullptr,
         &params.dpoints(p)[0],
         &params.dpoints(pu)[0],
@@ -2101,12 +2101,22 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             const std::string unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string()));
             trace_data.normal3d_field = std::make_unique<Chunked3dVec3fFromUint8>(std::move(dss), scale_factor, cache, cache_root, unique_id + "_n3d");
 
-            if (params.contains("normal3d_weight_zarr_path") && params["normal3d_weight_zarr_path"].is_string()) {
-                const std::filesystem::path wzarr_root = params["normal3d_weight_zarr_path"].get<std::string>();
-                z5::filesystem::handle::Group weight_group(wzarr_root.string(), z5::FileMode::FileMode::r);
-                z5::filesystem::handle::Dataset weight_ds_handle(weight_group, std::to_string(scale_level), delim);
-                auto weight_ds = z5::filesystem::openDataset(weight_ds_handle);
-                trace_data.normal3d_weight = std::make_unique<Chunked3dFloatFromUint8>(std::move(weight_ds), scale_factor, cache, cache_root, unique_id + "_n3d_w");
+            // Optional normal-fit diagnostics (written by vc_ngrids) to modulate loss weights.
+            // Expected layout: <root>/fit_rms/0 and <root>/fit_frac_short_paths/0 (uint8, ZYX).
+            try {
+                z5::filesystem::handle::Group g_rms(dirs_group, "fit_rms");
+                z5::filesystem::handle::Dataset ds_rms_handle(g_rms, std::to_string(scale_level), delim);
+                auto ds_rms = z5::filesystem::openDataset(ds_rms_handle);
+
+                z5::filesystem::handle::Group g_frac(dirs_group, "fit_frac_short_paths");
+                z5::filesystem::handle::Dataset ds_frac_handle(g_frac, std::to_string(scale_level), delim);
+                auto ds_frac = z5::filesystem::openDataset(ds_frac_handle);
+
+                trace_data.normal3d_fit_quality = std::make_unique<NormalFitQualityWeightField>(
+                    std::move(ds_rms), std::move(ds_frac), scale_factor, cache, cache_root, unique_id + "_n3d_fitq");
+            } catch (const std::exception& e) {
+                std::cerr << "Normal3d fit-quality fields not loaded (optional): " << e.what() << std::endl;
+                trace_data.normal3d_fit_quality.reset();
             }
 
             std::cout << "Loaded normal3d zarr field from " << zarr_root
@@ -2116,7 +2126,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         } catch (const std::exception& e) {
             std::cerr << "Failed to load normal3d zarr field: " << e.what() << std::endl;
             trace_data.normal3d_field.reset();
-            trace_data.normal3d_weight.reset();
+            trace_data.normal3d_fit_quality.reset();
         }
     }
 
