@@ -1657,6 +1657,113 @@ void QuadSurface::orientZUp()
     }
 }
 
+namespace {
+// Helper to flip all layers in a multi-layer TIFF file
+void flipMultiLayerTiff(const std::filesystem::path& tiffPath, int flipCode) {
+    if (!std::filesystem::exists(tiffPath)) {
+        return;
+    }
+
+    // Read all layers
+    std::vector<cv::Mat> layers;
+    if (!cv::imreadmulti(tiffPath.string(), layers, cv::IMREAD_UNCHANGED)) {
+        std::cerr << "Warning: Could not read multi-layer TIFF: " << tiffPath << std::endl;
+        return;
+    }
+
+    if (layers.empty()) {
+        return;
+    }
+
+    // Flip each layer
+    for (auto& layer : layers) {
+        cv::flip(layer, layer, flipCode);
+    }
+
+    // Write back all layers
+    if (!cv::imwritemulti(tiffPath.string(), layers)) {
+        std::cerr << "Warning: Could not write flipped multi-layer TIFF: " << tiffPath << std::endl;
+    }
+}
+
+// Helper to flip a single-layer TIFF file
+void flipSingleTiff(const std::filesystem::path& tiffPath, int flipCode) {
+    if (!std::filesystem::exists(tiffPath)) {
+        return;
+    }
+
+    cv::Mat img = cv::imread(tiffPath.string(), cv::IMREAD_UNCHANGED);
+    if (img.empty()) {
+        std::cerr << "Warning: Could not read TIFF: " << tiffPath << std::endl;
+        return;
+    }
+
+    cv::flip(img, img, flipCode);
+
+    if (!cv::imwrite(tiffPath.string(), img)) {
+        std::cerr << "Warning: Could not write flipped TIFF: " << tiffPath << std::endl;
+    }
+}
+} // anonymous namespace
+
+void QuadSurface::flipU()
+{
+    ensureLoaded();
+    if (!_points || _points->empty()) {
+        return;
+    }
+
+    // Flip over the U axis means reversing the rows (V direction)
+    constexpr int flipCode = 0;  // 0 = flip around x-axis (vertical flip)
+    cv::flip(*_points, *_points, flipCode);
+
+    // Flip all channels the same way
+    for (auto& [name, channel] : _channels) {
+        if (!channel.empty()) {
+            cv::flip(channel, channel, flipCode);
+        }
+    }
+
+    // Flip external TIFF files on disk
+    if (!path.empty()) {
+        flipMultiLayerTiff(path / "multilayer_mask.tif", flipCode);
+        flipSingleTiff(path / "generations.tif", flipCode);
+        flipSingleTiff(path / "approval.tif", flipCode);
+    }
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
+void QuadSurface::flipV()
+{
+    ensureLoaded();
+    if (!_points || _points->empty()) {
+        return;
+    }
+
+    // Flip over the V axis means reversing the columns (U direction)
+    constexpr int flipCode = 1;  // 1 = flip around y-axis (horizontal flip)
+    cv::flip(*_points, *_points, flipCode);
+
+    // Flip all channels the same way
+    for (auto& [name, channel] : _channels) {
+        if (!channel.empty()) {
+            cv::flip(channel, channel, flipCode);
+        }
+    }
+
+    // Flip external TIFF files on disk
+    if (!path.empty()) {
+        flipMultiLayerTiff(path / "multilayer_mask.tif", flipCode);
+        flipSingleTiff(path / "generations.tif", flipCode);
+        flipSingleTiff(path / "approval.tif", flipCode);
+    }
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
 // Overlapping JSON file utilities
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
     nlohmann::json overlap_json;

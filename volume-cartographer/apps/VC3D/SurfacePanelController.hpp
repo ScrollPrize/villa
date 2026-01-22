@@ -129,6 +129,8 @@ signals:
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
     void neighborCopyRequested(const QString& segmentId, bool copyOut);
+    void flipURequested(const QString& segmentId);
+    void flipVRequested(const QString& segmentId);
     void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
 
 

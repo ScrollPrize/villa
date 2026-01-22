@@ -92,6 +92,7 @@ public slots:
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
     void onCropSurfaceToValidRegion(const std::string& segmentId);
+    void onFlipSurface(const std::string& segmentId, bool flipU);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onABFFlatten(const std::string& segmentId);
@@ -270,6 +271,7 @@ private:
     QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
+    QShortcut* fSurfaceNormalsShortcut;
     QShortcut* fAxisAlignedSlicesShortcut;
     QShortcut* fZoomInShortcut;
     QShortcut* fZoomOutShortcut;

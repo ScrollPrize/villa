@@ -113,6 +113,8 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool showHints = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         viewer->setShowDirectionHints(showHints);
+        bool showNormals = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
+        viewer->setShowSurfaceNormals(showNormals);
     }
 
     {

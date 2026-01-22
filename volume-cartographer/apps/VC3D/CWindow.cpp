@@ -690,6 +690,25 @@ CWindow::CWindow() :
         }
     });
 
+    // Toggle surface normals visualization (Ctrl+N)
+    fSurfaceNormalsShortcut = new QShortcut(QKeySequence("Ctrl+N"), this);
+    fSurfaceNormalsShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fSurfaceNormalsShortcut, &QShortcut::activated, [this]() {
+        using namespace vc3d::settings;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        bool current = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
+        bool next = !current;
+        settings.setValue(viewer::SHOW_SURFACE_NORMALS, next ? "1" : "0");
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([next](CVolumeViewer* viewer) {
+                if (viewer) {
+                    viewer->setShowSurfaceNormals(next);
+                }
+            });
+        }
+        statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
+    });
+
     fAxisAlignedSlicesShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
     fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
     connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
@@ -1342,6 +1361,14 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onCropSurfaceToValidRegion(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::flipURequested,
+            this, [this](const QString& segmentId) {
+                onFlipSurface(segmentId.toStdString(), true);
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::flipVRequested,
+            this, [this](const QString& segmentId) {
+                onFlipSurface(segmentId.toStdString(), false);
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
                 onAlphaCompRefine(segmentId.toStdString());
@@ -1753,6 +1780,145 @@ void CWindow::CreateWidgets(void)
             s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
             if (_sliceStepLabel) {
                 _sliceStepLabel->setText(tr("Step: %1").arg(value));
+            }
+        });
+    }
+
+    // Surface normals visualization controls
+    if (auto* chkShowNormals = ui.chkShowSurfaceNormals) {
+        bool showNormals = settings.value(vc3d::settings::viewer::SHOW_SURFACE_NORMALS,
+                                          vc3d::settings::viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
+        QSignalBlocker blocker(chkShowNormals);
+        chkShowNormals->setChecked(showNormals);
+
+        // Enable/disable the arrow length and max arrows controls based on checkbox state
+        if (auto* lblArrowLength = ui.labelNormalArrowLength) {
+            lblArrowLength->setEnabled(showNormals);
+        }
+        if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
+            sliderArrowLength->setEnabled(showNormals);
+        }
+        if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
+            lblArrowLengthValue->setEnabled(showNormals);
+        }
+        if (auto* lblMaxArrows = ui.labelNormalMaxArrows) {
+            lblMaxArrows->setEnabled(showNormals);
+        }
+        if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
+            sliderMaxArrows->setEnabled(showNormals);
+        }
+        if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
+            lblMaxArrowsValue->setEnabled(showNormals);
+        }
+
+        connect(chkShowNormals, &QCheckBox::toggled, this, [this](bool checked) {
+            using namespace vc3d::settings;
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue(viewer::SHOW_SURFACE_NORMALS, checked ? "1" : "0");
+            if (_viewerManager) {
+                _viewerManager->forEachViewer([checked](CVolumeViewer* viewer) {
+                    if (viewer) {
+                        viewer->setShowSurfaceNormals(checked);
+                    }
+                });
+            }
+            // Enable/disable arrow length and max arrows controls
+            if (auto* lblArrowLength = ui.labelNormalArrowLength) {
+                lblArrowLength->setEnabled(checked);
+            }
+            if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
+                sliderArrowLength->setEnabled(checked);
+            }
+            if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
+                lblArrowLengthValue->setEnabled(checked);
+            }
+            if (auto* lblMaxArrows = ui.labelNormalMaxArrows) {
+                lblMaxArrows->setEnabled(checked);
+            }
+            if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
+                sliderMaxArrows->setEnabled(checked);
+            }
+            if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
+                lblMaxArrowsValue->setEnabled(checked);
+            }
+            statusBar()->showMessage(checked ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
+        });
+    }
+
+    if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
+        int savedScale = settings.value(vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE,
+                                        vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE_DEFAULT).toInt();
+        savedScale = std::clamp(savedScale, sliderArrowLength->minimum(), sliderArrowLength->maximum());
+        QSignalBlocker blocker(sliderArrowLength);
+        sliderArrowLength->setValue(savedScale);
+
+        if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
+            lblArrowLengthValue->setText(tr("%1%").arg(savedScale));
+        }
+
+        float scaleFloat = static_cast<float>(savedScale) / 100.0f;
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([scaleFloat](CVolumeViewer* viewer) {
+                if (viewer) {
+                    viewer->setNormalArrowLengthScale(scaleFloat);
+                }
+            });
+        }
+
+        connect(sliderArrowLength, &QSlider::valueChanged, this, [this](int value) {
+            using namespace vc3d::settings;
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue(viewer::NORMAL_ARROW_LENGTH_SCALE, value);
+
+            if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
+                lblArrowLengthValue->setText(tr("%1%").arg(value));
+            }
+
+            float scaleFloat = static_cast<float>(value) / 100.0f;
+            if (_viewerManager) {
+                _viewerManager->forEachViewer([scaleFloat](CVolumeViewer* viewer) {
+                    if (viewer) {
+                        viewer->setNormalArrowLengthScale(scaleFloat);
+                    }
+                });
+            }
+        });
+    }
+
+    if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
+        int savedMaxArrows = settings.value(vc3d::settings::viewer::NORMAL_MAX_ARROWS,
+                                            vc3d::settings::viewer::NORMAL_MAX_ARROWS_DEFAULT).toInt();
+        savedMaxArrows = std::clamp(savedMaxArrows, sliderMaxArrows->minimum(), sliderMaxArrows->maximum());
+        QSignalBlocker blocker(sliderMaxArrows);
+        sliderMaxArrows->setValue(savedMaxArrows);
+
+        if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
+            lblMaxArrowsValue->setText(QString::number(savedMaxArrows));
+        }
+
+        if (_viewerManager) {
+            _viewerManager->forEachViewer([savedMaxArrows](CVolumeViewer* viewer) {
+                if (viewer) {
+                    viewer->setNormalMaxArrows(savedMaxArrows);
+                }
+            });
+        }
+
+        connect(sliderMaxArrows, &QSlider::valueChanged, this, [this](int value) {
+            using namespace vc3d::settings;
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue(viewer::NORMAL_MAX_ARROWS, value);
+
+            if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
+                lblMaxArrowsValue->setText(QString::number(value));
+            }
+
+            if (_viewerManager) {
+                _viewerManager->forEachViewer([value](CVolumeViewer* viewer) {
+                    if (viewer) {
+                        viewer->setNormalMaxArrows(value);
+                    }
+                });
             }
         });
     }

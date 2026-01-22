@@ -369,6 +369,12 @@ public:
     /** Rotate to place highest Z values at top (row 0) */
     void orientZUp();
 
+    /** Flip the surface over the U axis (reverses rows/V direction) */
+    void flipU();
+
+    /** Flip the surface over the V axis (reverses columns/U direction) */
+    void flipV();
+
     // Overlapping surfaces management (by ID/name)
     const std::set<std::string>& overlappingIds() const { return _overlappingIds; }
     void setOverlappingIds(const std::set<std::string>& ids) { _overlappingIds = ids; }

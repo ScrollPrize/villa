@@ -24,6 +24,7 @@ protected:
 
 private:
     void collectDirectionHints(CVolumeViewer* viewer, OverlayBuilder& builder) const;
+    void collectSurfaceNormals(CVolumeViewer* viewer, OverlayBuilder& builder) const;
 
     CSurfaceCollection* _surfaces;
     std::vector<Provider> _providers;
