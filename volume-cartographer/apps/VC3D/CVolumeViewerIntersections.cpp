@@ -17,6 +17,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/LoadJson.hpp"
 
 #include <omp.h>
 
@@ -175,6 +176,12 @@ void CVolumeViewer::renderIntersections()
             }
 
             intersectCandidates.emplace_back(key, segmentation);
+        }
+
+        std::unordered_set<std::string> activeIntersectionKeys;
+        activeIntersectionKeys.reserve(intersectCandidates.size());
+        for (const auto& candidate : intersectCandidates) {
+            activeIntersectionKeys.insert(candidate.first);
         }
 
         // Build set of surfaces to filter query (avoids processing irrelevant triangles)
@@ -455,7 +462,7 @@ void CVolumeViewer::renderIntersections()
         // Remove stale intersections that are no longer requested.
         std::vector<std::string> planeKeysToRemove;
         for (const auto& entry : _intersect_items) {
-            if (!_intersect_tgts.count(entry.first)) {
+            if (!activeIntersectionKeys.count(entry.first)) {
                 planeKeysToRemove.push_back(entry.first);
             }
         }
