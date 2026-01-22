@@ -295,8 +295,18 @@ class Inference:
         # cache base localiser (only depends on crop_size)
         if bool(config.get('use_localiser', True)):
             crop_size = config['crop_size']
+            # Normalize crop_size to tuple of 3 ints [D, H, W]
+            if isinstance(crop_size, (list, tuple)):
+                crop_size_dhw = tuple(crop_size)
+            else:
+                crop_size_dhw = (crop_size, crop_size, crop_size)
             base_localiser = torch.linalg.norm(
-                torch.stack(torch.meshgrid(*[torch.arange(crop_size)] * 3, indexing='ij'), dim=-1).to(torch.float32) - crop_size // 2,
+                torch.stack(torch.meshgrid(
+                    torch.arange(crop_size_dhw[0]),
+                    torch.arange(crop_size_dhw[1]),
+                    torch.arange(crop_size_dhw[2]),
+                    indexing='ij'
+                ), dim=-1).to(torch.float32) - torch.tensor(crop_size_dhw).float() / 2,
                 dim=-1
             )
             self._base_localiser = base_localiser / base_localiser.amax() * 2 - 1
@@ -313,14 +323,19 @@ class Inference:
         else:
             not_originally_batched = False
         crop_size = self.config['crop_size']
+        # Normalize crop_size to tuple of 3 ints [D, H, W]
+        if isinstance(crop_size, (list, tuple)):
+            crop_size_dhw = tuple(crop_size)
+        else:
+            crop_size_dhw = (crop_size, crop_size, crop_size)
         use_localiser = bool(self.config.get('use_localiser', True))
-        zeros = torch.zeros([1, crop_size, crop_size, crop_size])
+        zeros = torch.zeros([1, *crop_size_dhw])
 
         # pre-allocate input tensor (i tested w/o pin memory and it was slower)
         batch_size = len(zyx)
         num_channels = 5 if use_localiser else 4  # volume, [localiser], u, v, diag
         inputs_cpu = torch.empty(
-            (batch_size, num_channels, crop_size, crop_size, crop_size),
+            (batch_size, num_channels, *crop_size_dhw),
             dtype=torch.float32,
             pin_memory=True,
         )
@@ -384,7 +399,7 @@ class Inference:
 
         with torch.no_grad(), torch.autocast('cuda'):
             logits = run_with_tta(inputs)
-            logits = logits.reshape(len(zyx), 2, self.config['step_count'], crop_size, crop_size, crop_size)  # u/v, step, z, y, x
+            logits = logits.reshape(len(zyx), 2, self.config['step_count'], *crop_size_dhw)  # u/v, step, z, y, x
             probs = torch.sigmoid(logits)
 
         if not_originally_batched:
@@ -435,111 +450,7 @@ class Inference:
         return torch.from_numpy(centroid_zyxs)
 
 
-class EdtInference:
-    """Inference wrapper for EDT-trained distance transform models."""
-
-    def __init__(self, model, config, volume_zarr, volume_scale):
-
-        dynamo_plugin = TorchDynamoPlugin(
-            backend="inductor",
-            mode="default",
-            fullgraph=False,
-            dynamic=False,
-            use_regional_compilation=False
-        )
-
-        self.accelerator = accelerate.Accelerator(
-            mixed_precision=config['mixed_precision'],
-            dynamo_plugin=dynamo_plugin
-        )
-
-        self.model = self.accelerator.prepare(model)
-        self.device = self.accelerator.device
-        self.config = config
-
-        self.model.eval()
-
-        print(f"loading volume zarr {volume_zarr}...")
-        ome_zarr = zarr.open_group(volume_zarr, mode='r')
-        self.volume = ome_zarr[str(volume_scale)]
-        with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
-            self.voxel_size_um = json.load(meta_fp)['voxelsize']
-        print(f"volume shape: {self.volume.shape}, dtype: {self.volume.dtype}, voxel-size: {self.voxel_size_um * 2 ** volume_scale}um")
-
-        # cache for prefetching (normalize=False to allow z-score normalization)
-        self.use_crop_cache = config.get('use_crop_cache', True)
-        if self.use_crop_cache:
-            cache_gb = config.get('crop_cache_gb', 4)
-            num_workers = config.get('prefetch_workers', 4)
-            self.crop_cache = CropCache(
-                volume=self.volume,
-                crop_size=config['crop_size'],
-                max_memory_bytes=int(cache_gb * 1024**3),
-                num_workers=num_workers,
-                normalize=False,
-            )
-        else:
-            self.crop_cache = None
-
     def get_distance_transform_at(
-        self,
-        center_zyx: torch.Tensor,
-        conditioning_mask: torch.Tensor,
-        return_debug: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run EDT inference at a given center point.
-
-        Args:
-            center_zyx: Center coordinates in volume space (scaled), shape [3]
-            conditioning_mask: Binary/float mask indicating known surface regions,
-                             shape [D, H, W], must match crop_size from config
-            return_debug: If True, return a third element with debug data dict
-
-        Returns:
-            distance_transform: [D, H, W] float32 distance transform output
-            min_corner_zyx: [3] coordinates of crop origin in volume space
-            debug_data: (only if return_debug=True) dict with intermediate tensors
-        """
-        crop_size = self.config['crop_size']
-
-        # Validate conditioning mask shape
-        expected_shape = (crop_size, crop_size, crop_size)
-        if conditioning_mask.shape != expected_shape:
-            raise ValueError(f"conditioning_mask shape {conditioning_mask.shape} != expected {expected_shape}")
-
-        # Get volume crop (raw, without [-1,1] normalization)
-        if self.crop_cache is not None:
-            volume_crop_raw, min_corner_zyx = self.crop_cache.get(center_zyx)
-        else:
-            volume_crop_raw, min_corner_zyx = get_crop_from_volume(self.volume, center_zyx, crop_size, normalize=False)
-
-        # Apply z-score normalization to match training
-        volume_crop_zscore = torch.from_numpy(normalize_zscore(volume_crop_raw.numpy()))
-
-        # Build 2-channel input: [volume, conditioning]
-        inputs = torch.stack([volume_crop_zscore, conditioning_mask], dim=0)
-        inputs = inputs.unsqueeze(0).to(self.device)  # [1, 2, D, H, W]
-
-        with torch.no_grad(), torch.autocast('cuda'):
-            outputs = self.model(inputs)
-            dt = outputs['dt']  # [B, 1, D, H, W]
-            if isinstance(dt, (list, tuple)):
-                dt = dt[0]  # Handle deep supervision
-
-        dt_cpu = dt[0, 0].cpu()
-
-        if return_debug:
-            debug_data = {
-                'volume_crop_raw': volume_crop_raw,
-                'volume_crop_zscore': volume_crop_zscore,
-                'model_input': inputs[0].cpu(),  # [2, D, H, W]
-            }
-            return dt_cpu, min_corner_zyx, debug_data
-
-        return dt_cpu, min_corner_zyx
-
-    def get_distance_transform_batch(
         self,
         centers_zyx: List[torch.Tensor],
         conditioning_masks: List[torch.Tensor],
@@ -571,7 +482,10 @@ class EdtInference:
         valid_indices = []
 
         # Pre-validate samples
-        expected_shape = (crop_size, crop_size, crop_size)
+        if isinstance(crop_size, (list, tuple)):
+            expected_shape = tuple(crop_size)
+        else:
+            expected_shape = (crop_size, crop_size, crop_size)
         for i, (center_zyx, mask) in enumerate(zip(centers_zyx, conditioning_masks)):
             if mask is None:
                 results[i] = (torch.empty(0), torch.zeros(3), False, "Conditioning mask is None")

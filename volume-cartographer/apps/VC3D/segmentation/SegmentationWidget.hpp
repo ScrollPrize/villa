@@ -48,12 +48,23 @@ public:
     [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
+    [[nodiscard]] int extrapolationPointCount() const { return _extrapolationPointCount; }
+    [[nodiscard]] ExtrapolationType extrapolationType() const { return _extrapolationType; }
+    [[nodiscard]] int sdtMaxSteps() const { return _sdtMaxSteps; }
+    [[nodiscard]] float sdtStepSize() const { return _sdtStepSize; }
+    [[nodiscard]] float sdtConvergence() const { return _sdtConvergence; }
+    [[nodiscard]] int sdtChunkSize() const { return _sdtChunkSize; }
+    [[nodiscard]] int skeletonConnectivity() const { return _skeletonConnectivity; }
+    [[nodiscard]] int skeletonSliceOrientation() const { return _skeletonSliceOrientation; }
+    [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
+    [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
     [[nodiscard]] QString customParamsText() const { return _customParamsText; }
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
     [[nodiscard]] bool correctionsSticky() const { return _correctionsSticky; }
+    [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -107,6 +118,16 @@ public:
     void setApprovalMaskOpacity(int opacity);
     void setApprovalBrushColor(const QColor& color);
 
+    // Cell reoptimization getters
+    [[nodiscard]] bool cellReoptMode() const { return _cellReoptMode; }
+    [[nodiscard]] int cellReoptMaxSteps() const { return _cellReoptMaxSteps; }
+    [[nodiscard]] int cellReoptMaxPoints() const { return _cellReoptMaxPoints; }
+    [[nodiscard]] float cellReoptMinSpacing() const { return _cellReoptMinSpacing; }
+    [[nodiscard]] float cellReoptPerimeterOffset() const { return _cellReoptPerimeterOffset; }
+
+    // Cell reoptimization setters
+    void setCellReoptMode(bool enabled);
+
 signals:
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
@@ -142,6 +163,14 @@ signals:
     void approvalMaskOpacityChanged(int opacity);
     void approvalBrushColorChanged(QColor color);
     void approvalStrokesUndoRequested();
+
+    // Cell reoptimization signals
+    void cellReoptModeChanged(bool enabled);
+    void cellReoptMaxStepsChanged(int steps);
+    void cellReoptMaxPointsChanged(int points);
+    void cellReoptMinSpacingChanged(float spacing);
+    void cellReoptPerimeterOffsetChanged(float offset);
+    void cellReoptGrowthRequested();
 
 private:
     void buildUi();
@@ -199,6 +228,21 @@ private:
     int _growthSteps{5};
     int _tracerGrowthSteps{5};
     int _growthDirectionMask{0};
+    bool _growthKeybindsEnabled{true};
+    int _extrapolationPointCount{7};
+    ExtrapolationType _extrapolationType{ExtrapolationType::Linear};
+
+    // SDT/Newton refinement parameters for Linear+Fit
+    int _sdtMaxSteps{5};
+    float _sdtStepSize{0.8f};
+    float _sdtConvergence{0.5f};
+    int _sdtChunkSize{128};
+
+    // Skeleton path parameters
+    int _skeletonConnectivity{26};  // 6, 18, or 26
+    int _skeletonSliceOrientation{0};  // 0=X, 1=Y for up/down growth
+    int _skeletonChunkSize{128};
+    int _skeletonSearchRadius{5};  // 1-100 pixels
 
     QString _directionFieldPath;
     SegmentationDirectionFieldOrientation _directionFieldOrientation{SegmentationDirectionFieldOrientation::Normal};
@@ -212,12 +256,28 @@ private:
     QLabel* _lblStatus{nullptr};
     QGroupBox* _groupGrowth{nullptr};
     QSpinBox* _spinGrowthSteps{nullptr};
+    QComboBox* _comboGrowthMethod{nullptr};
+    QWidget* _extrapolationOptionsPanel{nullptr};
+    QLabel* _lblExtrapolationPoints{nullptr};
+    QSpinBox* _spinExtrapolationPoints{nullptr};
+    QComboBox* _comboExtrapolationType{nullptr};
+    QWidget* _sdtParamsContainer{nullptr};
+    QSpinBox* _spinSDTMaxSteps{nullptr};
+    QDoubleSpinBox* _spinSDTStepSize{nullptr};
+    QDoubleSpinBox* _spinSDTConvergence{nullptr};
+    QSpinBox* _spinSDTChunkSize{nullptr};
+    QWidget* _skeletonParamsContainer{nullptr};
+    QComboBox* _comboSkeletonConnectivity{nullptr};
+    QComboBox* _comboSkeletonSliceOrientation{nullptr};
+    QSpinBox* _spinSkeletonChunkSize{nullptr};
+    QSpinBox* _spinSkeletonSearchRadius{nullptr};
     QPushButton* _btnGrow{nullptr};
     QPushButton* _btnInpaint{nullptr};
     QCheckBox* _chkGrowthDirUp{nullptr};
     QCheckBox* _chkGrowthDirDown{nullptr};
     QCheckBox* _chkGrowthDirLeft{nullptr};
     QCheckBox* _chkGrowthDirRight{nullptr};
+    QCheckBox* _chkGrowthKeybindsEnabled{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
@@ -303,4 +363,18 @@ private:
     QLabel* _lblApprovalMaskOpacity{nullptr};
     QPushButton* _btnApprovalColor{nullptr};
     QPushButton* _btnUndoApprovalStroke{nullptr};
+
+    // Cell reoptimization state and UI
+    bool _cellReoptMode{false};
+    int _cellReoptMaxSteps{500};
+    int _cellReoptMaxPoints{50};
+    float _cellReoptMinSpacing{5.0f};
+    float _cellReoptPerimeterOffset{0.0f};
+    CollapsibleSettingsGroup* _groupCellReopt{nullptr};
+    QCheckBox* _chkCellReoptMode{nullptr};
+    QSpinBox* _spinCellReoptMaxSteps{nullptr};
+    QSpinBox* _spinCellReoptMaxPoints{nullptr};
+    QDoubleSpinBox* _spinCellReoptMinSpacing{nullptr};
+    QDoubleSpinBox* _spinCellReoptPerimeterOffset{nullptr};
+    QPushButton* _btnCellReoptRun{nullptr};
 };

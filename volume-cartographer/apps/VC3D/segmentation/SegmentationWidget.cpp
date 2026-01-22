@@ -227,6 +227,150 @@ void SegmentationWidget::buildUi()
     _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
     auto* growthLayout = new QVBoxLayout(_groupGrowth);
 
+    // Method selection row
+    auto* methodRow = new QHBoxLayout();
+    auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
+    _comboGrowthMethod = new QComboBox(_groupGrowth);
+    _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
+    _comboGrowthMethod->addItem(tr("Extrapolation"), static_cast<int>(SegmentationGrowthMethod::Extrapolation));
+    _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
+                                      "- Tracer: Neural-guided growth using volume data\n"
+                                      "- Extrapolation: Simple polynomial extrapolation from boundary points"));
+    methodRow->addWidget(methodLabel);
+    methodRow->addWidget(_comboGrowthMethod);
+    methodRow->addStretch(1);
+    growthLayout->addLayout(methodRow);
+
+    // Extrapolation options panel (shown only when Extrapolation method is selected)
+    _extrapolationOptionsPanel = new QWidget(_groupGrowth);
+    auto* extrapLayout = new QHBoxLayout(_extrapolationOptionsPanel);
+    extrapLayout->setContentsMargins(0, 0, 0, 0);
+    _lblExtrapolationPoints = new QLabel(tr("Fit points:"), _extrapolationOptionsPanel);
+    _spinExtrapolationPoints = new QSpinBox(_extrapolationOptionsPanel);
+    _spinExtrapolationPoints->setRange(3, 20);
+    _spinExtrapolationPoints->setValue(7);
+    _spinExtrapolationPoints->setToolTip(tr("Number of boundary points to use for polynomial fitting."));
+    auto* typeLabel = new QLabel(tr("Type:"), _extrapolationOptionsPanel);
+    _comboExtrapolationType = new QComboBox(_extrapolationOptionsPanel);
+    _comboExtrapolationType->addItem(tr("Linear"), static_cast<int>(ExtrapolationType::Linear));
+    _comboExtrapolationType->addItem(tr("Quadratic"), static_cast<int>(ExtrapolationType::Quadratic));
+    _comboExtrapolationType->addItem(tr("Linear+Fit"), static_cast<int>(ExtrapolationType::LinearFit));
+    _comboExtrapolationType->addItem(tr("Skeleton Path"), static_cast<int>(ExtrapolationType::SkeletonPath));
+    _comboExtrapolationType->setToolTip(tr("Extrapolation method:\n"
+                                           "- Linear: Fit a straight line (faster, simpler)\n"
+                                           "- Quadratic: Fit a parabola (better for curved surfaces)\n"
+                                           "- Linear+Fit: Linear extrapolation + Newton refinement to fit selected volume\n"
+                                           "- Skeleton Path: Use 2D skeleton analysis + 3D Dijkstra path following"));
+    extrapLayout->addWidget(_lblExtrapolationPoints);
+    extrapLayout->addWidget(_spinExtrapolationPoints);
+    extrapLayout->addSpacing(12);
+    extrapLayout->addWidget(typeLabel);
+    extrapLayout->addWidget(_comboExtrapolationType);
+    extrapLayout->addStretch(1);
+    growthLayout->addWidget(_extrapolationOptionsPanel);
+    _extrapolationOptionsPanel->setVisible(false);
+
+    // SDT/Newton refinement params (shown only when Linear+Fit is selected)
+    _sdtParamsContainer = new QWidget(_groupGrowth);
+    auto* sdtLayout = new QHBoxLayout(_sdtParamsContainer);
+    sdtLayout->setContentsMargins(0, 0, 0, 0);
+
+    auto* maxStepsLabel = new QLabel(tr("Newton steps:"), _sdtParamsContainer);
+    _spinSDTMaxSteps = new QSpinBox(_sdtParamsContainer);
+    _spinSDTMaxSteps->setRange(1, 10);
+    _spinSDTMaxSteps->setValue(5);
+    _spinSDTMaxSteps->setToolTip(tr("Maximum Newton iterations for surface refinement (1-10)."));
+
+    auto* stepSizeLabel = new QLabel(tr("Step size:"), _sdtParamsContainer);
+    _spinSDTStepSize = new QDoubleSpinBox(_sdtParamsContainer);
+    _spinSDTStepSize->setRange(0.1, 2.0);
+    _spinSDTStepSize->setSingleStep(0.1);
+    _spinSDTStepSize->setValue(0.8);
+    _spinSDTStepSize->setToolTip(tr("Newton step size multiplier (0.1-2.0). Smaller values are more stable."));
+
+    auto* convergenceLabel = new QLabel(tr("Convergence:"), _sdtParamsContainer);
+    _spinSDTConvergence = new QDoubleSpinBox(_sdtParamsContainer);
+    _spinSDTConvergence->setRange(0.1, 2.0);
+    _spinSDTConvergence->setSingleStep(0.1);
+    _spinSDTConvergence->setValue(0.5);
+    _spinSDTConvergence->setToolTip(tr("Stop refinement when distance < this threshold in voxels (0.1-2.0)."));
+
+    auto* chunkSizeLabel = new QLabel(tr("Chunk:"), _sdtParamsContainer);
+    _spinSDTChunkSize = new QSpinBox(_sdtParamsContainer);
+    _spinSDTChunkSize->setRange(32, 256);
+    _spinSDTChunkSize->setSingleStep(32);
+    _spinSDTChunkSize->setValue(128);
+    _spinSDTChunkSize->setToolTip(tr("Size of SDT chunks in voxels (32-256). Larger = faster but more memory."));
+
+    sdtLayout->addWidget(maxStepsLabel);
+    sdtLayout->addWidget(_spinSDTMaxSteps);
+    sdtLayout->addSpacing(8);
+    sdtLayout->addWidget(stepSizeLabel);
+    sdtLayout->addWidget(_spinSDTStepSize);
+    sdtLayout->addSpacing(8);
+    sdtLayout->addWidget(convergenceLabel);
+    sdtLayout->addWidget(_spinSDTConvergence);
+    sdtLayout->addSpacing(8);
+    sdtLayout->addWidget(chunkSizeLabel);
+    sdtLayout->addWidget(_spinSDTChunkSize);
+    sdtLayout->addStretch(1);
+    growthLayout->addWidget(_sdtParamsContainer);
+    _sdtParamsContainer->setVisible(false);
+
+    // Skeleton path params (shown only when Skeleton Path is selected)
+    _skeletonParamsContainer = new QWidget(_groupGrowth);
+    auto* skeletonLayout = new QHBoxLayout(_skeletonParamsContainer);
+    skeletonLayout->setContentsMargins(0, 0, 0, 0);
+
+    auto* connectivityLabel = new QLabel(tr("Connectivity:"), _skeletonParamsContainer);
+    _comboSkeletonConnectivity = new QComboBox(_skeletonParamsContainer);
+    _comboSkeletonConnectivity->addItem(tr("6"), 6);
+    _comboSkeletonConnectivity->addItem(tr("18"), 18);
+    _comboSkeletonConnectivity->addItem(tr("26"), 26);
+    _comboSkeletonConnectivity->setCurrentIndex(2);  // Default to 26
+    _comboSkeletonConnectivity->setToolTip(tr("3D neighborhood connectivity for Dijkstra pathfinding:\n"
+                                              "- 6: Face neighbors only\n"
+                                              "- 18: Face + edge neighbors\n"
+                                              "- 26: Face + edge + corner neighbors"));
+
+    auto* sliceOrientLabel = new QLabel(tr("Up/Down slice:"), _skeletonParamsContainer);
+    _comboSkeletonSliceOrientation = new QComboBox(_skeletonParamsContainer);
+    _comboSkeletonSliceOrientation->addItem(tr("YZ (X-slice)"), 0);
+    _comboSkeletonSliceOrientation->addItem(tr("XZ (Y-slice)"), 1);
+    _comboSkeletonSliceOrientation->setToolTip(tr("For Up/Down growth, which plane to use for 2D skeleton analysis:\n"
+                                                   "- YZ (X-slice): Extract slice perpendicular to X axis\n"
+                                                   "- XZ (Y-slice): Extract slice perpendicular to Y axis\n"
+                                                   "(Left/Right growth always uses XY Z-slices)"));
+
+    auto* skeletonChunkLabel = new QLabel(tr("Chunk:"), _skeletonParamsContainer);
+    _spinSkeletonChunkSize = new QSpinBox(_skeletonParamsContainer);
+    _spinSkeletonChunkSize->setRange(32, 256);
+    _spinSkeletonChunkSize->setSingleStep(32);
+    _spinSkeletonChunkSize->setValue(128);
+    _spinSkeletonChunkSize->setToolTip(tr("Size of chunks for binary volume loading (32-256). Larger = faster but more memory."));
+
+    auto* searchRadiusLabel = new QLabel(tr("Search:"), _skeletonParamsContainer);
+    _spinSkeletonSearchRadius = new QSpinBox(_skeletonParamsContainer);
+    _spinSkeletonSearchRadius->setRange(1, 100);
+    _spinSkeletonSearchRadius->setSingleStep(1);
+    _spinSkeletonSearchRadius->setValue(5);
+    _spinSkeletonSearchRadius->setToolTip(tr("When starting point is on background, search this many pixels for nearest component (1-100)."));
+
+    skeletonLayout->addWidget(connectivityLabel);
+    skeletonLayout->addWidget(_comboSkeletonConnectivity);
+    skeletonLayout->addSpacing(12);
+    skeletonLayout->addWidget(sliceOrientLabel);
+    skeletonLayout->addWidget(_comboSkeletonSliceOrientation);
+    skeletonLayout->addSpacing(12);
+    skeletonLayout->addWidget(skeletonChunkLabel);
+    skeletonLayout->addWidget(_spinSkeletonChunkSize);
+    skeletonLayout->addSpacing(12);
+    skeletonLayout->addWidget(searchRadiusLabel);
+    skeletonLayout->addWidget(_spinSkeletonSearchRadius);
+    skeletonLayout->addStretch(1);
+    growthLayout->addWidget(_skeletonParamsContainer);
+    _skeletonParamsContainer->setVisible(false);
+
     auto* dirRow = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
@@ -254,6 +398,14 @@ void SegmentationWidget::buildUi()
     _chkGrowthDirRight->setToolTip(tr("Allow growth steps to move right across the volume."));
     dirRow->addStretch(1);
     growthLayout->addLayout(dirRow);
+
+    auto* keybindsRow = new QHBoxLayout();
+    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6)"), _groupGrowth);
+    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions."));
+    _chkGrowthKeybindsEnabled->setChecked(_growthKeybindsEnabled);
+    keybindsRow->addWidget(_chkGrowthKeybindsEnabled);
+    keybindsRow->addStretch(1);
+    growthLayout->addLayout(keybindsRow);
 
     auto* zRow = new QHBoxLayout();
     _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
@@ -612,6 +764,82 @@ void SegmentationWidget::buildUi()
 
     layout->addWidget(_groupApprovalMask);
 
+    // Cell Reoptimization Group
+    _groupCellReopt = new CollapsibleSettingsGroup(tr("Cell Reoptimization"), this);
+    auto* cellReoptLayout = _groupCellReopt->contentLayout();
+    auto* cellReoptParent = _groupCellReopt->contentWidget();
+
+    // Enable mode checkbox
+    _chkCellReoptMode = new QCheckBox(tr("Enable Cell Reoptimization"), cellReoptParent);
+    _chkCellReoptMode->setToolTip(tr("Click on unapproved regions to flood fill and place correction points.\n"
+                                      "Requires approval mask to be visible."));
+    cellReoptLayout->addWidget(_chkCellReoptMode);
+
+    // Max flood cells
+    auto* maxFloodRow = new QHBoxLayout();
+    maxFloodRow->setSpacing(8);
+    auto* maxFloodLabel = new QLabel(tr("Max Flood Cells:"), cellReoptParent);
+    _spinCellReoptMaxSteps = new QSpinBox(cellReoptParent);
+    _spinCellReoptMaxSteps->setRange(10, 10000);
+    _spinCellReoptMaxSteps->setValue(_cellReoptMaxSteps);
+    _spinCellReoptMaxSteps->setToolTip(tr("Maximum number of cells to include in the flood fill."));
+    maxFloodRow->addWidget(maxFloodLabel);
+    maxFloodRow->addWidget(_spinCellReoptMaxSteps);
+    maxFloodRow->addStretch(1);
+    cellReoptLayout->addLayout(maxFloodRow);
+
+    // Max correction points
+    auto* maxPointsRow = new QHBoxLayout();
+    maxPointsRow->setSpacing(8);
+    auto* maxPointsLabel = new QLabel(tr("Max Points:"), cellReoptParent);
+    _spinCellReoptMaxPoints = new QSpinBox(cellReoptParent);
+    _spinCellReoptMaxPoints->setRange(3, 200);
+    _spinCellReoptMaxPoints->setValue(_cellReoptMaxPoints);
+    _spinCellReoptMaxPoints->setToolTip(tr("Maximum number of correction points to place on the boundary."));
+    maxPointsRow->addWidget(maxPointsLabel);
+    maxPointsRow->addWidget(_spinCellReoptMaxPoints);
+    maxPointsRow->addStretch(1);
+    cellReoptLayout->addLayout(maxPointsRow);
+
+    // Min point spacing
+    auto* minSpacingRow = new QHBoxLayout();
+    minSpacingRow->setSpacing(8);
+    auto* minSpacingLabel = new QLabel(tr("Min Spacing:"), cellReoptParent);
+    _spinCellReoptMinSpacing = new QDoubleSpinBox(cellReoptParent);
+    _spinCellReoptMinSpacing->setRange(1.0, 50.0);
+    _spinCellReoptMinSpacing->setValue(_cellReoptMinSpacing);
+    _spinCellReoptMinSpacing->setSuffix(tr(" grid"));
+    _spinCellReoptMinSpacing->setToolTip(tr("Minimum spacing between correction points (grid steps)."));
+    minSpacingRow->addWidget(minSpacingLabel);
+    minSpacingRow->addWidget(_spinCellReoptMinSpacing);
+    minSpacingRow->addStretch(1);
+    cellReoptLayout->addLayout(minSpacingRow);
+
+    // Perimeter offset
+    auto* perimeterOffsetRow = new QHBoxLayout();
+    perimeterOffsetRow->setSpacing(8);
+    auto* perimeterOffsetLabel = new QLabel(tr("Perimeter Offset:"), cellReoptParent);
+    _spinCellReoptPerimeterOffset = new QDoubleSpinBox(cellReoptParent);
+    _spinCellReoptPerimeterOffset->setRange(-50.0, 50.0);
+    _spinCellReoptPerimeterOffset->setValue(_cellReoptPerimeterOffset);
+    _spinCellReoptPerimeterOffset->setSuffix(tr(" grid"));
+    _spinCellReoptPerimeterOffset->setToolTip(tr("Offset to expand (+) or shrink (-) the traced perimeter from center of mass."));
+    perimeterOffsetRow->addWidget(perimeterOffsetLabel);
+    perimeterOffsetRow->addWidget(_spinCellReoptPerimeterOffset);
+    perimeterOffsetRow->addStretch(1);
+    cellReoptLayout->addLayout(perimeterOffsetRow);
+
+    // Run reoptimization button
+    auto* runButtonRow = new QHBoxLayout();
+    runButtonRow->setSpacing(8);
+    _btnCellReoptRun = new QPushButton(tr("Run Reoptimization"), cellReoptParent);
+    _btnCellReoptRun->setToolTip(tr("Trigger reoptimization using the placed correction points."));
+    runButtonRow->addWidget(_btnCellReoptRun);
+    runButtonRow->addStretch(1);
+    cellReoptLayout->addLayout(runButtonRow);
+
+    layout->addWidget(_groupCellReopt);
+
     _groupDirectionField = new CollapsibleSettingsGroup(tr("Direction Fields"), this);
 
     auto* directionParent = _groupDirectionField->contentWidget();
@@ -810,6 +1038,57 @@ void SegmentationWidget::buildUi()
 
     connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
 
+    // Cell reoptimization signal connections
+    connect(_chkCellReoptMode, &QCheckBox::toggled, this, [this](bool enabled) {
+        setCellReoptMode(enabled);
+    });
+
+    connect(_spinCellReoptMaxSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (_cellReoptMaxSteps != value) {
+            _cellReoptMaxSteps = value;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_max_steps"), value);
+                emit cellReoptMaxStepsChanged(value);
+            }
+        }
+    });
+
+    connect(_spinCellReoptMaxPoints, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (_cellReoptMaxPoints != value) {
+            _cellReoptMaxPoints = value;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_max_points"), value);
+                emit cellReoptMaxPointsChanged(value);
+            }
+        }
+    });
+
+    connect(_spinCellReoptMinSpacing, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        float floatVal = static_cast<float>(value);
+        if (_cellReoptMinSpacing != floatVal) {
+            _cellReoptMinSpacing = floatVal;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_min_spacing"), value);
+                emit cellReoptMinSpacingChanged(floatVal);
+            }
+        }
+    });
+
+    connect(_spinCellReoptPerimeterOffset, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        float floatVal = static_cast<float>(value);
+        if (_cellReoptPerimeterOffset != floatVal) {
+            _cellReoptPerimeterOffset = floatVal;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_perimeter_offset"), value);
+                emit cellReoptPerimeterOffsetChanged(floatVal);
+            }
+        }
+    });
+
+    connect(_btnCellReoptRun, &QPushButton::clicked, this, [this]() {
+        emit cellReoptGrowthRequested();
+    });
+
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
             return;
@@ -823,8 +1102,89 @@ void SegmentationWidget::buildUi()
     connectDirectionCheckbox(_chkGrowthDirLeft);
     connectDirectionCheckbox(_chkGrowthDirRight);
 
+    connect(_chkGrowthKeybindsEnabled, &QCheckBox::toggled, this, [this](bool checked) {
+        _growthKeybindsEnabled = checked;
+        writeSetting(QStringLiteral("growth_keybinds_enabled"), _growthKeybindsEnabled);
+    });
+
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this](int value) { applyGrowthSteps(value, true, true); });
+
+    connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int index) {
+                const auto method = static_cast<SegmentationGrowthMethod>(
+                    _comboGrowthMethod->itemData(index).toInt());
+                setGrowthMethod(method);
+            });
+
+    connect(_spinExtrapolationPoints, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int value) {
+                _extrapolationPointCount = std::clamp(value, 3, 20);
+                writeSetting(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount);
+            });
+
+    connect(_comboExtrapolationType, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int index) {
+                _extrapolationType = extrapolationTypeFromInt(
+                    _comboExtrapolationType->itemData(index).toInt());
+                writeSetting(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType));
+                // Show SDT params only when Extrapolation method AND Linear+Fit type
+                if (_sdtParamsContainer) {
+                    _sdtParamsContainer->setVisible(
+                        _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+                        _extrapolationType == ExtrapolationType::LinearFit);
+                }
+                // Show skeleton params only when Extrapolation method AND SkeletonPath type
+                if (_skeletonParamsContainer) {
+                    _skeletonParamsContainer->setVisible(
+                        _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+                        _extrapolationType == ExtrapolationType::SkeletonPath);
+                }
+                // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
+                bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
+                if (_lblExtrapolationPoints) {
+                    _lblExtrapolationPoints->setVisible(showFitPoints);
+                }
+                if (_spinExtrapolationPoints) {
+                    _spinExtrapolationPoints->setVisible(showFitPoints);
+                }
+            });
+
+    // SDT/Newton refinement parameter connections
+    connect(_spinSDTMaxSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _sdtMaxSteps = std::clamp(value, 1, 10);
+        writeSetting(QStringLiteral("sdt_max_steps"), _sdtMaxSteps);
+    });
+    connect(_spinSDTStepSize, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        _sdtStepSize = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
+        writeSetting(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize));
+    });
+    connect(_spinSDTConvergence, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        _sdtConvergence = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
+        writeSetting(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence));
+    });
+    connect(_spinSDTChunkSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _sdtChunkSize = std::clamp(value, 32, 256);
+        writeSetting(QStringLiteral("sdt_chunk_size"), _sdtChunkSize);
+    });
+
+    // Skeleton path parameter connections
+    connect(_comboSkeletonConnectivity, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _skeletonConnectivity = _comboSkeletonConnectivity->itemData(index).toInt();
+        writeSetting(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity);
+    });
+    connect(_comboSkeletonSliceOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _skeletonSliceOrientation = _comboSkeletonSliceOrientation->itemData(index).toInt();
+        writeSetting(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation);
+    });
+    connect(_spinSkeletonChunkSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _skeletonChunkSize = std::clamp(value, 32, 256);
+        writeSetting(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize);
+    });
+    connect(_spinSkeletonSearchRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        _skeletonSearchRadius = std::clamp(value, 1, 100);
+        writeSetting(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius);
+    });
 
     const auto triggerConfiguredGrowth = [this]() {
         const auto allowed = allowedGrowthDirections();
@@ -1200,7 +1560,96 @@ void SegmentationWidget::syncUiState()
         _spinGrowthSteps->setValue(_growthSteps);
     }
 
+    if (_comboGrowthMethod) {
+        const QSignalBlocker blocker(_comboGrowthMethod);
+        int idx = _comboGrowthMethod->findData(static_cast<int>(_growthMethod));
+        if (idx >= 0) {
+            _comboGrowthMethod->setCurrentIndex(idx);
+        }
+    }
+
+    if (_extrapolationOptionsPanel) {
+        _extrapolationOptionsPanel->setVisible(_growthMethod == SegmentationGrowthMethod::Extrapolation);
+    }
+
+    if (_spinExtrapolationPoints) {
+        const QSignalBlocker blocker(_spinExtrapolationPoints);
+        _spinExtrapolationPoints->setValue(_extrapolationPointCount);
+    }
+
+    if (_comboExtrapolationType) {
+        const QSignalBlocker blocker(_comboExtrapolationType);
+        int idx = _comboExtrapolationType->findData(static_cast<int>(_extrapolationType));
+        if (idx >= 0) {
+            _comboExtrapolationType->setCurrentIndex(idx);
+        }
+    }
+
+    // SDT params container visibility: only show when Extrapolation method AND Linear+Fit type
+    if (_sdtParamsContainer) {
+        _sdtParamsContainer->setVisible(
+            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+            _extrapolationType == ExtrapolationType::LinearFit);
+    }
+    if (_spinSDTMaxSteps) {
+        const QSignalBlocker blocker(_spinSDTMaxSteps);
+        _spinSDTMaxSteps->setValue(_sdtMaxSteps);
+    }
+    if (_spinSDTStepSize) {
+        const QSignalBlocker blocker(_spinSDTStepSize);
+        _spinSDTStepSize->setValue(static_cast<double>(_sdtStepSize));
+    }
+    if (_spinSDTConvergence) {
+        const QSignalBlocker blocker(_spinSDTConvergence);
+        _spinSDTConvergence->setValue(static_cast<double>(_sdtConvergence));
+    }
+    if (_spinSDTChunkSize) {
+        const QSignalBlocker blocker(_spinSDTChunkSize);
+        _spinSDTChunkSize->setValue(_sdtChunkSize);
+    }
+
+    // Skeleton params container visibility: only show when Extrapolation method AND SkeletonPath type
+    if (_skeletonParamsContainer) {
+        _skeletonParamsContainer->setVisible(
+            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+            _extrapolationType == ExtrapolationType::SkeletonPath);
+    }
+    if (_comboSkeletonConnectivity) {
+        const QSignalBlocker blocker(_comboSkeletonConnectivity);
+        int idx = _comboSkeletonConnectivity->findData(_skeletonConnectivity);
+        if (idx >= 0) {
+            _comboSkeletonConnectivity->setCurrentIndex(idx);
+        }
+    }
+    if (_comboSkeletonSliceOrientation) {
+        const QSignalBlocker blocker(_comboSkeletonSliceOrientation);
+        int idx = _comboSkeletonSliceOrientation->findData(_skeletonSliceOrientation);
+        if (idx >= 0) {
+            _comboSkeletonSliceOrientation->setCurrentIndex(idx);
+        }
+    }
+    if (_spinSkeletonChunkSize) {
+        const QSignalBlocker blocker(_spinSkeletonChunkSize);
+        _spinSkeletonChunkSize->setValue(_skeletonChunkSize);
+    }
+    if (_spinSkeletonSearchRadius) {
+        const QSignalBlocker blocker(_spinSkeletonSearchRadius);
+        _spinSkeletonSearchRadius->setValue(_skeletonSearchRadius);
+    }
+    // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
+    bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
+    if (_lblExtrapolationPoints) {
+        _lblExtrapolationPoints->setVisible(showFitPoints);
+    }
+    if (_spinExtrapolationPoints) {
+        _spinExtrapolationPoints->setVisible(showFitPoints);
+    }
+
     applyGrowthDirectionMaskToUi();
+    if (_chkGrowthKeybindsEnabled) {
+        const QSignalBlocker blocker(_chkGrowthKeybindsEnabled);
+        _chkGrowthKeybindsEnabled->setChecked(_growthKeybindsEnabled);
+    }
     refreshDirectionFieldList();
 
     if (_directionFieldPathEdit) {
@@ -1310,6 +1759,37 @@ void SegmentationWidget::syncUiState()
         _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
     }
 
+    // Cell reoptimization UI state
+    if (_chkCellReoptMode) {
+        const QSignalBlocker blocker(_chkCellReoptMode);
+        _chkCellReoptMode->setChecked(_cellReoptMode);
+        // Only enabled when approval mask is visible
+        _chkCellReoptMode->setEnabled(_showApprovalMask);
+    }
+    if (_spinCellReoptMaxSteps) {
+        const QSignalBlocker blocker(_spinCellReoptMaxSteps);
+        _spinCellReoptMaxSteps->setValue(_cellReoptMaxSteps);
+        _spinCellReoptMaxSteps->setEnabled(_cellReoptMode);
+    }
+    if (_spinCellReoptMaxPoints) {
+        const QSignalBlocker blocker(_spinCellReoptMaxPoints);
+        _spinCellReoptMaxPoints->setValue(_cellReoptMaxPoints);
+        _spinCellReoptMaxPoints->setEnabled(_cellReoptMode);
+    }
+    if (_spinCellReoptMinSpacing) {
+        const QSignalBlocker blocker(_spinCellReoptMinSpacing);
+        _spinCellReoptMinSpacing->setValue(static_cast<double>(_cellReoptMinSpacing));
+        _spinCellReoptMinSpacing->setEnabled(_cellReoptMode);
+    }
+    if (_spinCellReoptPerimeterOffset) {
+        const QSignalBlocker blocker(_spinCellReoptPerimeterOffset);
+        _spinCellReoptPerimeterOffset->setValue(static_cast<double>(_cellReoptPerimeterOffset));
+        _spinCellReoptPerimeterOffset->setEnabled(_cellReoptMode);
+    }
+    if (_btnCellReoptRun) {
+        _btnCellReoptRun->setEnabled(_cellReoptMode && !_growthInProgress);
+    }
+
     updateGrowthUiState();
 }
 
@@ -1367,6 +1847,26 @@ void SegmentationWidget::restoreSettings()
     _smoothIterations = std::clamp(_smoothIterations, 1, 25);
     _growthMethod = segmentationGrowthMethodFromInt(
         settings.value(segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod)).toInt());
+    _extrapolationPointCount = settings.value(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount).toInt();
+    _extrapolationPointCount = std::clamp(_extrapolationPointCount, 3, 20);
+    _extrapolationType = extrapolationTypeFromInt(
+        settings.value(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType)).toInt());
+
+    // Restore SDT/Newton refinement parameters
+    _sdtMaxSteps = std::clamp(settings.value(QStringLiteral("sdt_max_steps"), _sdtMaxSteps).toInt(), 1, 10);
+    _sdtStepSize = std::clamp(settings.value(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize)).toFloat(), 0.1f, 2.0f);
+    _sdtConvergence = std::clamp(settings.value(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence)).toFloat(), 0.1f, 2.0f);
+    _sdtChunkSize = std::clamp(settings.value(QStringLiteral("sdt_chunk_size"), _sdtChunkSize).toInt(), 32, 256);
+
+    // Restore skeleton path parameters
+    int storedConnectivity = settings.value(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity).toInt();
+    if (storedConnectivity == 6 || storedConnectivity == 18 || storedConnectivity == 26) {
+        _skeletonConnectivity = storedConnectivity;
+    }
+    _skeletonSliceOrientation = std::clamp(settings.value(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation).toInt(), 0, 1);
+    _skeletonChunkSize = std::clamp(settings.value(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize).toInt(), 32, 256);
+    _skeletonSearchRadius = std::clamp(settings.value(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius).toInt(), 1, 100);
+
     int storedGrowthSteps = settings.value(segmentation::GROWTH_STEPS, _growthSteps).toInt();
     storedGrowthSteps = std::clamp(storedGrowthSteps, 0, 1024);
     _tracerGrowthSteps = settings
@@ -1377,6 +1877,8 @@ void SegmentationWidget::restoreSettings()
     applyGrowthSteps(storedGrowthSteps, false, false);
     _growthDirectionMask = normalizeGrowthDirectionMask(
         settings.value(segmentation::GROWTH_DIRECTION_MASK, kGrowDirAllMask).toInt());
+    _growthKeybindsEnabled = settings.value(segmentation::GROWTH_KEYBINDS_ENABLED,
+                                            segmentation::GROWTH_KEYBINDS_ENABLED_DEFAULT).toBool();
 
     QVariantList serialized = settings.value(segmentation::DIRECTION_FIELDS, QVariantList{}).toList();
     _directionFields.clear();
@@ -1419,6 +1921,17 @@ void SegmentationWidget::restoreSettings()
     }
     _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
     // Don't restore edit states - user must explicitly enable editing each session
+
+    // Cell reoptimization settings
+    _cellReoptMaxSteps = settings.value(QStringLiteral("cell_reopt_max_steps"), _cellReoptMaxSteps).toInt();
+    _cellReoptMaxSteps = std::clamp(_cellReoptMaxSteps, 10, 10000);
+    _cellReoptMaxPoints = settings.value(QStringLiteral("cell_reopt_max_points"), _cellReoptMaxPoints).toInt();
+    _cellReoptMaxPoints = std::clamp(_cellReoptMaxPoints, 3, 200);
+    _cellReoptMinSpacing = settings.value(QStringLiteral("cell_reopt_min_spacing"), static_cast<double>(_cellReoptMinSpacing)).toFloat();
+    _cellReoptMinSpacing = std::clamp(_cellReoptMinSpacing, 1.0f, 50.0f);
+    _cellReoptPerimeterOffset = settings.value(QStringLiteral("cell_reopt_perimeter_offset"), static_cast<double>(_cellReoptPerimeterOffset)).toFloat();
+    _cellReoptPerimeterOffset = std::clamp(_cellReoptPerimeterOffset, -50.0f, 50.0f);
+    // Don't restore cell reopt mode - user must explicitly enable each session
 
     const bool editingExpanded = settings.value(segmentation::GROUP_EDITING_EXPANDED, segmentation::GROUP_EDITING_EXPANDED_DEFAULT).toBool();
     const bool dragExpanded = settings.value(segmentation::GROUP_DRAG_EXPANDED, segmentation::GROUP_DRAG_EXPANDED_DEFAULT).toBool();
@@ -1621,6 +2134,24 @@ void SegmentationWidget::setApprovalBrushColor(const QColor& color)
         _btnApprovalColor->setStyleSheet(
             QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
+}
+
+void SegmentationWidget::setCellReoptMode(bool enabled)
+{
+    if (_cellReoptMode == enabled) {
+        return;
+    }
+    _cellReoptMode = enabled;
+    qInfo() << "SegmentationWidget: Cell reoptimization mode changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("cell_reopt_mode"), _cellReoptMode);
+        emit cellReoptModeChanged(_cellReoptMode);
+    }
+    if (_chkCellReoptMode) {
+        const QSignalBlocker blocker(_chkCellReoptMode);
+        _chkCellReoptMode->setChecked(_cellReoptMode);
+    }
+    syncUiState();
 }
 
 void SegmentationWidget::setPendingChanges(bool pending)

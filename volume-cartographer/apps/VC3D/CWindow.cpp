@@ -770,6 +770,55 @@ CWindow::CWindow() :
             if (viewer) viewer->adjustSurfaceOffset(-1.0f);
         });
     });
+
+    // Segment cycling shortcuts (] for next, [ for previous)
+    fCycleNextSegmentShortcut = new QShortcut(QKeySequence("]"), this);
+    fCycleNextSegmentShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fCycleNextSegmentShortcut, &QShortcut::activated, [this]() {
+        if (!_surfacePanel) {
+            return;
+        }
+
+        const bool preserveEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
+        bool previousIgnore = false;
+        if (preserveEditing && _segmentationModule) {
+            previousIgnore = _segmentationModule->ignoreSegSurfaceChange();
+            _segmentationModule->setIgnoreSegSurfaceChange(true);
+        }
+
+        _surfacePanel->cycleToNextVisibleSegment();
+
+        if (preserveEditing && _segmentationModule) {
+            _segmentationModule->setIgnoreSegSurfaceChange(previousIgnore);
+        }
+    });
+
+    fCyclePrevSegmentShortcut = new QShortcut(QKeySequence("["), this);
+    fCyclePrevSegmentShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fCyclePrevSegmentShortcut, &QShortcut::activated, [this]() {
+        if (!_surfacePanel) {
+            return;
+        }
+
+        const bool preserveEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
+        bool previousIgnore = false;
+        if (preserveEditing && _segmentationModule) {
+            previousIgnore = _segmentationModule->ignoreSegSurfaceChange();
+            _segmentationModule->setIgnoreSegSurfaceChange(true);
+        }
+
+        _surfacePanel->cycleToPreviousVisibleSegment();
+
+        if (preserveEditing && _segmentationModule) {
+            _segmentationModule->setIgnoreSegSurfaceChange(previousIgnore);
+        }
+    });
+
+    // Focused view toggle (Shift+Ctrl+F) - hides dock widgets, keeps all viewers
+    fFocusedViewShortcut = new QShortcut(QKeySequence("Shift+Ctrl+F"), this);
+    fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
+
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
 }
 
@@ -1029,6 +1078,40 @@ void CWindow::toggleVolumeOverlayVisibility()
 {
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
+    }
+}
+
+void CWindow::toggleFocusedView()
+{
+    if (_focusedViewActive) {
+        for (const auto& [dock, state] : _savedDockStates) {
+            if (dock) {
+                dock->setVisible(state.visible);
+            }
+        }
+        for (const auto& [dock, state] : _savedDockStates) {
+            if (dock && state.wasRaised) {
+                dock->raise();
+            }
+        }
+        _savedDockStates.clear();
+        _focusedViewActive = false;
+        statusBar()->showMessage(tr("Restored full view"), 2000);
+    } else {
+        _savedDockStates.clear();
+        const QList<QDockWidget*> docks = findChildren<QDockWidget*>();
+        for (QDockWidget* dock : docks) {
+            bool wasRaised = false;
+            if (dock->isVisible() && !dock->isFloating()) {
+                if (QWidget* content = dock->widget()) {
+                    wasRaised = !content->visibleRegion().isEmpty();
+                }
+            }
+            _savedDockStates[dock] = {dock->isVisible(), dock->isFloating(), wasRaised};
+            dock->hide();
+        }
+        _focusedViewActive = true;
+        statusBar()->showMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
     }
 }
 
@@ -1518,6 +1601,8 @@ void CWindow::CreateWidgets(void)
 
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
             this, &CWindow::onSurfaceActivated);
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
+            this, &CWindow::onSurfaceActivatedPreserveEditing);
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -2742,6 +2827,57 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         // Handle approval mask when switching segments
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
+        }
+    }
+
+    if (surf) {
+        applySlicePlaneOrientation(surf.get());
+    } else {
+        applySlicePlaneOrientation();
+    }
+
+    if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
+        _surfacePanel->refreshFiltersOnly();
+    }
+}
+
+void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface)
+{
+    const std::string previousSurfId = _surfID;
+    _surfID = surfaceId.toStdString();
+
+    if (fVpkg && !_surfID.empty()) {
+        _surf_weak = fVpkg->getSurface(_surfID);
+    } else {
+        _surf_weak.reset();
+    }
+
+    auto surf = _surf_weak.lock();
+
+    if (_surfID != previousSurfId && _segmentationModule) {
+        _segmentationModule->onActiveSegmentChanged(surf.get());
+
+        const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
+        if (wantsEditing) {
+            if (!_segmentationModule->editingEnabled()) {
+                _segmentationModule->setEditingEnabled(true);
+            } else if (_surf_col) {
+                auto targetSurface = surf;
+                if (!targetSurface) {
+                    targetSurface = std::dynamic_pointer_cast<QuadSurface>(_surf_col->surface("segmentation"));
+                }
+
+                if (targetSurface) {
+                    _segmentationModule->endEditingSession();
+                    if (_segmentationModule->beginEditingSession(targetSurface) && _viewerManager) {
+                        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
+                            if (viewer) {
+                                viewer->clearOverlayGroup("segmentation_radius_indicator");
+                            }
+                        });
+                    }
+                }
+            }
         }
     }
 

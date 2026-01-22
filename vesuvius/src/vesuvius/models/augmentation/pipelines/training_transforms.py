@@ -379,9 +379,10 @@ def create_training_transforms(
         transforms.extend(common_transforms)
     else:
         # 3D-specific transforms
-        if not no_spatial and patch_d == patch_h == patch_w:
+        # Transpose only between axes with equal dimensions (need at least 2 axes)
+        if not no_spatial and len(transpose_allowed_axes) >= 2:
             transforms.append(RandomTransform(
-                TransposeAxesTransform(allowed_axes={0, 1, 2}),
+                TransposeAxesTransform(allowed_axes=transpose_allowed_axes),
                 apply_probability=0.2
             ))
 

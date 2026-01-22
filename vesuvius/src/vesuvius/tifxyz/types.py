@@ -59,7 +59,7 @@ class Tifxyz:
     _valid_quad_mask_cache: Optional[NDArray[np.bool_]] = field(default=None, repr=False)
     _quad_centers_cache: Optional[NDArray[np.float32]] = field(default=None, repr=False)
     _normals_cache: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = field(default=None, repr=False)
-    _patches_cache: Optional[Dict[str, List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]]] = field(default=None, repr=False)
+    _patches_cache: Optional[List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate shapes and ensure arrays are float32."""
@@ -1028,26 +1028,11 @@ class Tifxyz:
         """
         import json
 
-        target_size = (int(target_size[0]), int(target_size[1]), int(target_size[2]))
-
-        def _cache_value(value: float) -> float:
-            return round(float(value), 8)
-
-        cache_payload = {
-            "target_size": list(target_size),
-            "scale": [_cache_value(self._scale[0]), _cache_value(self._scale[1])],
-            "overlap_fraction": _cache_value(overlap_fraction),
-            "coarse_multiplier": _cache_value(coarse_multiplier),
-            "num_calibration_samples": int(num_calibration_samples),
-            "min_new_coverage": _cache_value(min_new_coverage),
-        }
-        cache_key = json.dumps(cache_payload, sort_keys=True, separators=(",", ":"))
+        cache_key = f"{target_size[0]},{target_size[1]},{target_size[2]},{self._scale[0]},{self._scale[1]}"
 
         # Check in-memory cache first
-        if isinstance(self._patches_cache, dict) and not force_recompute:
-            cached = self._patches_cache.get(cache_key)
-            if cached is not None:
-                return cached
+        if self._patches_cache is not None and not force_recompute:
+            return self._patches_cache
 
         # Try to load from disk cache
         cache_file = self.path / "patches_cache.json" if self.path else None
@@ -1061,10 +1046,7 @@ class Tifxyz:
                         (tuple(bbox_2d), tuple(bbox_3d))
                         for bbox_2d, bbox_3d in disk_cache[cache_key]
                     ]
-                    if isinstance(self._patches_cache, dict):
-                        self._patches_cache[cache_key] = patches
-                    else:
-                        object.__setattr__(self, "_patches_cache", {cache_key: patches})
+                    object.__setattr__(self, "_patches_cache", patches)
                     if verbose:
                         print(f"Loaded {len(patches)} patches from {cache_file}")
                     return patches
@@ -1074,28 +1056,18 @@ class Tifxyz:
         # Compute patches
         from .hierarchical_tiling import multipass_hierarchical_tiling
 
-        original_resolution = self.resolution
-        if original_resolution != "stored":
-            object.__setattr__(self, "resolution", "stored")
-        try:
-            patches = multipass_hierarchical_tiling(
-                self,
-                target_size=target_size,
-                num_calibration_samples=num_calibration_samples,
-                coarse_multiplier=coarse_multiplier,
-                overlap_fraction=overlap_fraction,
-                min_new_coverage=min_new_coverage,
-                verbose=verbose,
-            )
-        finally:
-            if self.resolution != original_resolution:
-                object.__setattr__(self, "resolution", original_resolution)
+        patches = multipass_hierarchical_tiling(
+            self,
+            target_size=target_size,
+            num_calibration_samples=num_calibration_samples,
+            coarse_multiplier=coarse_multiplier,
+            overlap_fraction=overlap_fraction,
+            min_new_coverage=min_new_coverage,
+            verbose=verbose,
+        )
 
         # Cache in memory
-        if isinstance(self._patches_cache, dict):
-            self._patches_cache[cache_key] = patches
-        else:
-            object.__setattr__(self, "_patches_cache", {cache_key: patches})
+        object.__setattr__(self, "_patches_cache", patches)
 
         # Persist to disk
         if cache_file:

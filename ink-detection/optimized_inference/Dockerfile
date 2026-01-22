@@ -1,9 +1,7 @@
-ARG BASE_IMAGE=pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+# Build separate images for different steps requiring GPU and CPU-only
 
-FROM ${BASE_IMAGE} as base
+FROM pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime AS gpu
 ENV DEBIAN_FRONTEND=noninteractive
-WORKDIR /app
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
@@ -12,28 +10,68 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libgomp1 \
     ca-certificates \
+    curl \
+    git \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Build venv layer
-FROM base as build
-COPY requirements.txt /tmp/requirements.txt
-RUN python -m venv /opt/venv \
- && . /opt/venv/bin/activate \
- && pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r /tmp/requirements.txt
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
 
-# Runtime image
-FROM base as runtime
-ENV PATH="/opt/venv/bin:$PATH"
+# The pytorch image has everything preinstalled in the conda environment. If we use that
+# one, there's is no need to reinstall everything else
+ENV PATH="/opt/conda/bin:$PATH"
+WORKDIR /app
+
+COPY requirements.txt /app
+# should only install additional dependencies, not torch, cuda, etc.
+RUN uv pip install --system --no-cache -r requirements.txt
+
+COPY entrypoint.py /app
+COPY processing.py /app
+COPY inference.py /app
+COPY model_timesformer.py /app
+COPY model_resnet3d.py /app
+COPY k8s.py /app
+COPY vendored_cache_store.py /app
+COPY models/ /app/models/
+
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 ENV CUDA_VISIBLE_DEVICES=0
 
-COPY --from=build /opt/venv /opt/venv
-COPY entrypoint.py /app
-COPY inference_timesformer.py /app
+ENTRYPOINT ["python", "/app/entrypoint.py"]
 
-# Ensure minimal size
-RUN rm -rf /root/.cache /app/__pycache__
+FROM python:3.11-slim AS cpu
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /app
+
+COPY requirements-cpu-only.txt /app
+RUN uv pip install --system --no-cache -r requirements-cpu-only.txt
+
+COPY entrypoint.py /app
+COPY processing.py /app
+COPY inference.py /app
+COPY model_timesformer.py /app
+COPY model_resnet3d.py /app
+COPY k8s.py /app
+COPY vendored_cache_store.py /app
+COPY models/ /app/models/
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 ENTRYPOINT ["python", "/app/entrypoint.py"]

@@ -1,12 +1,10 @@
 albumentations
-pytorch-lightning
-timesformer-pytorch
 numpy
-torch>=2.0.0
 scipy
 tqdm
 opencv-python-headless>=4.5.0
-boto3
+boto3>=1.26.0,<1.35.0
+botocore>=1.29.0,<1.35.0
 huggingface_hub>=0.23.0
 tifffile
 numcodecs>=0.16.3

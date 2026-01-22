@@ -331,7 +331,10 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
 
     // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected)
     // Now that images are correctly sized, we can safely paint the auto-approval
-    if (_overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
+    // Skip auto-approval for cell reoptimization - user hasn't reviewed results yet
+    const bool skipAutoApproval = _skipAutoApprovalOnGrowth;
+    _skipAutoApprovalOnGrowth = false;  // Clear flag regardless
+    if (!skipAutoApproval && _overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
         std::vector<std::pair<int, int>> gridPositions;
         gridPositions.reserve(static_cast<size_t>(vertexRect.area()));
         for (int row = vertexRect.y; row < vertexRect.y + vertexRect.height; ++row) {

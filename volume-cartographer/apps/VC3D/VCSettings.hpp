@@ -216,6 +216,9 @@ namespace segmentation {
     constexpr auto GROWTH_STEPS = "growth_steps";
     constexpr auto GROWTH_DIRECTION_MASK = "growth_direction_mask";
     constexpr auto DIRECTION_FIELDS = "direction_fields";
+    constexpr auto GROWTH_KEYBINDS_ENABLED = "growth_keybinds_enabled";
+
+    constexpr bool GROWTH_KEYBINDS_ENABLED_DEFAULT = true;
 
     // Corrections
     constexpr auto CORRECTIONS_ENABLED = "corrections_enabled";
