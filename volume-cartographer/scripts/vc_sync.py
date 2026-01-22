@@ -296,13 +296,71 @@ class S3SyncManager:
         print(f"Found {len(files)} S3 files")
         return files
 
-    def _get_report_csv_path(self):
+    def _get_report_csv_path(self, suffix=""):
         """Return the S3 URL and filename for the report based on the volume package name"""
         pkg_name = Path(self.local_dir).resolve().parent.name
         if pkg_name.endswith(".volpkg"):
             pkg_name = pkg_name[:-7]
-        filename = f"{pkg_name}.csv"
+        filename = f"{pkg_name}{suffix}.csv"
         return f"s3://{REPORT_S3_BUCKET}/{REPORT_S3_PREFIX}/{filename}", filename
+
+    def _get_segment_name(self, root, meta_data):
+        """Resolve segment name from meta.json contents or directory name"""
+        return meta_data.get('uuid', os.path.basename(root))
+
+    def _get_volume_voxel_size(self):
+        """Find voxel size from volumes/*/meta.json"""
+        volumes_dir = Path(self.local_dir).resolve().parent / "volumes"
+        if not volumes_dir.exists():
+            return None
+
+        for root, dirs, filenames in os.walk(volumes_dir):
+            if 'meta.json' not in filenames:
+                continue
+            meta_path = os.path.join(root, 'meta.json')
+            try:
+                with open(meta_path, 'r') as f:
+                    meta_data = json.load(f)
+                voxel_size = meta_data.get('voxelsize')
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            if isinstance(voxel_size, (list, tuple)) and voxel_size:
+                voxel_size = voxel_size[0]
+
+            try:
+                return float(voxel_size)
+            except (TypeError, ValueError):
+                continue
+
+        return None
+
+    def _count_non_black_pixels(self, image_path):
+        """Count non-black pixels in an image file"""
+        try:
+            from PIL import Image
+        except ImportError:
+            print("  Warning: Pillow is required to read approval.tif files")
+            return None
+
+        try:
+            with Image.open(image_path) as img:
+                data = img.getdata()
+                if img.mode in ("1", "L", "I", "I;16", "F"):
+                    return sum(1 for p in data if p != 0)
+
+                count = 0
+                for p in data:
+                    if isinstance(p, int):
+                        if p != 0:
+                            count += 1
+                    else:
+                        if any(channel != 0 for channel in p[:3]):
+                            count += 1
+                return count
+        except Exception as e:
+            print(f"  Warning: Could not read {image_path}: {e}")
+            return None
 
     def _collect_segment_areas(self):
         """Collect segment names and area_cm2 values from meta.json files"""
@@ -314,7 +372,7 @@ class S3SyncManager:
                 try:
                     with open(meta_path, 'r') as f:
                         meta_data = json.load(f)
-                    segment_name = meta_data.get('uuid', os.path.basename(root))
+                    segment_name = self._get_segment_name(root, meta_data)
                     area_cm2 = meta_data.get('area_cm2', 0.0)
                     segments[segment_name] = area_cm2
                 except (json.JSONDecodeError, OSError) as e:
@@ -322,18 +380,44 @@ class S3SyncManager:
                     continue
         return segments
 
-    def generate_segment_report(self):
-        """Generate or update the segment area CSV report and upload to S3"""
-        print("\nGenerating report...")
-        s3_csv_path, report_filename = self._get_report_csv_path()
+    def _collect_approval_areas(self):
+        """Collect segment names and approval areas from approval.tif files"""
+        voxel_size = self._get_volume_voxel_size()
+        if voxel_size is None:
+            return {}
+        pixel_area = (20 * voxel_size / 10000) ** 2
+
+        segments = {}
+        for root, dirs, filenames in os.walk(self.local_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and 'layers' not in d.lower() and d != 'backups']
+            if 'meta.json' in filenames:
+                meta_path = os.path.join(root, 'meta.json')
+                try:
+                    with open(meta_path, 'r') as f:
+                        meta_data = json.load(f)
+                    segment_name = self._get_segment_name(root, meta_data)
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"  Warning: Could not read {meta_path}: {e}")
+                    continue
+
+                approval_path = os.path.join(root, 'approval.tif')
+                if os.path.exists(approval_path):
+                    pixel_count = self._count_non_black_pixels(approval_path)
+                    if pixel_count is None:
+                        continue
+                    segments[segment_name] = pixel_count * pixel_area
+                else:
+                    segments[segment_name] = 0.0
+
+        return segments
+
+    def _generate_report(self, current_segments, report_suffix):
+        """Generate or update a CSV report and upload to S3"""
+        s3_csv_path, report_filename = self._get_report_csv_path(report_suffix)
         current_datetime = datetime.now().strftime("%Y%m%d%H%M%S")
 
-        current_segments = self._collect_segment_areas()
         if not current_segments:
-            print("  No segments found with meta.json files")
-            return
-
-        print(f"  Found {len(current_segments)} segments")
+            return False
 
         existing_data = {}
         existing_datetimes = []
@@ -365,11 +449,11 @@ class S3SyncManager:
                         values.extend([0.0] * (len(existing_datetimes) - len(values)))
                     existing_data[segment_name] = values
 
-                print(f"  Loaded existing report ({report_filename})")
+                pass
         except subprocess.CalledProcessError:
-            print(f"  No existing report found at {s3_csv_path}, creating new one")
-        except Exception as e:
-            print(f"  Warning: Could not read existing report: {e}")
+            pass
+        except Exception:
+            pass
         finally:
             try:
                 os.unlink(download_tmp_path)
@@ -402,14 +486,28 @@ class S3SyncManager:
             if self.aws_profile:
                 cmd.extend(['--profile', self.aws_profile])
             subprocess.run(cmd, check=True, capture_output=True)
-            print(f"  ✓ Report uploaded")
+            return True
         except subprocess.CalledProcessError as e:
-            print(f"  ❌ Failed to upload report: {e}")
+            return False
         finally:
             try:
                 os.unlink(upload_tmp_path)
             except OSError:
                 pass
+
+    def generate_segment_report(self):
+        """Generate or update the segment area CSV report and upload to S3"""
+        print("\nGenerating reports...")
+        current_segments = self._collect_segment_areas()
+        segment_ok = self._generate_report(current_segments, "")
+
+        approval_segments = self._collect_approval_areas()
+        approval_ok = self._generate_report(approval_segments, "_approval")
+
+        if segment_ok and approval_ok:
+            print("✓ Reports uploaded")
+        else:
+            print("✗ At least one report failed")
 
     def update_files(self, include_backups=False):
         """Update file tracking with current state"""
