@@ -1,12 +1,12 @@
 {
-    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v6",
-    "seed": 0,
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v16",
+    "load_ckpt":"/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v15/ckpt_012000.pth",
+    "seed": 10,
     "batch_size": 6,
     "num_workers": 12,
     "wandb_entity": "vesuvius-challenge",
     "wandb_project": "neural-tracing",
-    "load_weights_only": false,
-
+    "load_weights_only": true,
 
     "datasets": [
         {
@@ -49,24 +49,27 @@
     "val_fraction": 0.05,
     "use_extrapolation": true,
     "extrapolation_method": "linear_edge",
-    "cond_percent": 0.70,
-    "extrap_degrade_prob": 0.5,
-    "extrap_degrade_curvature_range": [0.01, 0.1],
-    "extrap_degrade_gradient_range": [0.1, 0.3],
+    "cond_percent": 0.50,
+    "extrap_degrade_prob": 0.0,
+    "use_segmentation": false,
+    "lambda_segmentation":0.01,
+    "mask_cond_from_seg_loss": true,
 
     "use_other_wrap_cond": true,
-    "other_wrap_prob": 1.0,
+    "other_wrap_prob": 0.5,
 
     "use_heatmap_targets": false,
     "heatmap_step_size": 10,
     "heatmap_step_count": 5,
     "heatmap_sigma": 2.0,
 
-    "lambda_smooth": 0.0000001,
+    "lambda_smooth": 0.0,
     "displacement_loss_type": "vector_l2",
+    "displacement_huber_beta": 5.0,
+    "lambda_cond_disp": 0.0,
 
-    "use_dilation": true,
-    "dilation_radius": 0.75,
+    "use_dilation": false,
+    "dilation_radius": 1,
 
     "use_sdt": false,
     "lambda_sdt": 1.0,
@@ -82,8 +85,8 @@
 
     "learning_rate": 0.001,
     "weight_decay": 1e-4,
-    "warmup_steps": 5000,
-    "grad_clip": 5,
+    "warmup_steps": 1000,
+    "grad_clip": 7,
 
     "mixed_precision": "bf16",
     "compile_model": true,
