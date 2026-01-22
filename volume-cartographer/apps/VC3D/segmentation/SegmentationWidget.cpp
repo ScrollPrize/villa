@@ -713,8 +713,12 @@ void SegmentationWidget::buildUi()
     correctionsLayout->addWidget(_btnCorrectionsNew);
 
     _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
-    _chkCorrectionsAnnotate->setToolTip(tr("Toggle annotation overlay while reviewing corrections."));
+    _chkCorrectionsAnnotate->setToolTip(tr("Toggle correction input (left-click to add, Shift+drag to apply)."));
     correctionsLayout->addWidget(_chkCorrectionsAnnotate);
+
+    _chkCorrectionsSticky = new QCheckBox(tr("Keep corrections mode enabled"), _groupCorrections);
+    _chkCorrectionsSticky->setToolTip(tr("When enabled, corrections mode auto-restores after growth or editing toggles."));
+    correctionsLayout->addWidget(_chkCorrectionsSticky);
 
     _groupCorrections->setLayout(correctionsLayout);
     layout->addWidget(_groupCorrections);
@@ -1038,6 +1042,12 @@ void SegmentationWidget::buildUi()
         emit correctionsAnnotateToggled(enabled);
     });
 
+    connect(_chkCorrectionsSticky, &QCheckBox::toggled, this, [this](bool enabled) {
+        _correctionsSticky = enabled;
+        writeSetting(QStringLiteral("corrections_sticky"), _correctionsSticky);
+        emit correctionsStickyToggled(enabled);
+    });
+
     connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
         _correctionsZRangeEnabled = enabled;
         writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
@@ -1224,6 +1234,10 @@ void SegmentationWidget::syncUiState()
         const QSignalBlocker blocker(_chkCorrectionsAnnotate);
         _chkCorrectionsAnnotate->setChecked(_correctionsAnnotateChecked);
     }
+    if (_chkCorrectionsSticky) {
+        const QSignalBlocker blocker(_chkCorrectionsSticky);
+        _chkCorrectionsSticky->setChecked(_correctionsSticky);
+    }
     if (_chkCorrectionsUseZRange) {
         const QSignalBlocker blocker(_chkCorrectionsUseZRange);
         _chkCorrectionsUseZRange->setChecked(_correctionsZRangeEnabled);
@@ -1380,6 +1394,7 @@ void SegmentationWidget::restoreSettings()
     }
 
     _correctionsEnabled = settings.value(segmentation::CORRECTIONS_ENABLED, segmentation::CORRECTIONS_ENABLED_DEFAULT).toBool();
+    _correctionsSticky = settings.value(segmentation::CORRECTIONS_STICKY, segmentation::CORRECTIONS_STICKY_DEFAULT).toBool();
     _correctionsZRangeEnabled = settings.value(segmentation::CORRECTIONS_Z_RANGE_ENABLED, segmentation::CORRECTIONS_Z_RANGE_ENABLED_DEFAULT).toBool();
     _correctionsZMin = settings.value(segmentation::CORRECTIONS_Z_MIN, segmentation::CORRECTIONS_Z_MIN_DEFAULT).toInt();
    _correctionsZMax = settings.value(segmentation::CORRECTIONS_Z_MAX, _correctionsZMin).toInt();
@@ -2030,7 +2045,7 @@ void SegmentationWidget::setCorrectionsEnabled(bool enabled)
     }
     _correctionsEnabled = enabled;
     writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
-    if (!enabled) {
+    if (!enabled && !_correctionsSticky) {
         _correctionsAnnotateChecked = false;
         if (_chkCorrectionsAnnotate) {
             const QSignalBlocker blocker(_chkCorrectionsAnnotate);
@@ -2465,6 +2480,9 @@ void SegmentationWidget::updateGrowthUiState()
     }
     if (_chkCorrectionsAnnotate) {
         _chkCorrectionsAnnotate->setEnabled(allowCorrections);
+    }
+    if (_chkCorrectionsSticky) {
+        _chkCorrectionsSticky->setEnabled(allowCorrections);
     }
 }
 

@@ -26,6 +26,7 @@ public:
 
     void setWidget(SegmentationWidget* widget);
     void setCollection(VCCollection* collection);
+    void setStickyMode(bool enabled);
 
     bool setAnnotateMode(bool enabled, bool userInitiated, bool editingEnabled);
     void setActiveCollection(uint64_t collectionId, bool userInitiated);
@@ -41,6 +42,8 @@ public:
     void pruneMissing();
 
     [[nodiscard]] bool annotateMode() const { return _annotateMode; }
+    [[nodiscard]] bool annotateRequested() const { return _annotateRequested; }
+    [[nodiscard]] bool stickyMode() const { return _stickyMode; }
     [[nodiscard]] bool growthInProgress() const { return _growthInProgress; }
     [[nodiscard]] uint64_t activeCollection() const { return _activeCollectionId; }
     [[nodiscard]] std::optional<std::pair<int, int>> zRange() const;
@@ -58,6 +61,8 @@ private:
     VCCollection* _collection{nullptr};
 
     bool _annotateMode{false};
+    bool _annotateRequested{false};
+    bool _stickyMode{false};
     uint64_t _activeCollectionId{0};
     std::vector<uint64_t> _pendingCollectionIds;
     std::unordered_set<uint64_t> _managedCollectionIds;

@@ -53,6 +53,7 @@ public:
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
+    [[nodiscard]] bool correctionsSticky() const { return _correctionsSticky; }
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -130,6 +131,7 @@ signals:
     void correctionsCreateRequested();
     void correctionsCollectionSelected(uint64_t collectionId);
     void correctionsAnnotateToggled(bool enabled);
+    void correctionsStickyToggled(bool enabled);
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
     void showApprovalMaskChanged(bool enabled);
@@ -236,6 +238,7 @@ private:
     QComboBox* _comboCorrections{nullptr};
     QPushButton* _btnCorrectionsNew{nullptr};
     QCheckBox* _chkCorrectionsAnnotate{nullptr};
+    QCheckBox* _chkCorrectionsSticky{nullptr};
     QCheckBox* _chkCorrectionsUseZRange{nullptr};
     QSpinBox* _spinCorrectionsZMin{nullptr};
     QSpinBox* _spinCorrectionsZMax{nullptr};
@@ -275,6 +278,7 @@ private:
     QString _customParamsError;
 
     bool _correctionsEnabled{false};
+    bool _correctionsSticky{false};
     bool _correctionsZRangeEnabled{false};
     int _correctionsZMin{0};
     int _correctionsZMax{0};

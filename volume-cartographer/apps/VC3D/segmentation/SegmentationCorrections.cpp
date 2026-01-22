@@ -53,8 +53,23 @@ void CorrectionsState::setCollection(VCCollection* collection)
     refreshWidget();
 }
 
+void CorrectionsState::setStickyMode(bool enabled)
+{
+    if (_stickyMode == enabled) {
+        return;
+    }
+
+    _stickyMode = enabled;
+    _annotateRequested = _annotateMode;
+    refreshWidget();
+}
+
 bool CorrectionsState::setAnnotateMode(bool enabled, bool userInitiated, bool editingEnabled)
 {
+    if (userInitiated || !_stickyMode) {
+        _annotateRequested = enabled;
+    }
+
     if (!_collection || _growthInProgress || !editingEnabled) {
         enabled = false;
     }
@@ -73,12 +88,14 @@ bool CorrectionsState::setAnnotateMode(bool enabled, bool userInitiated, bool ed
     _annotateMode = enabled;
 
     if (_widget) {
-        _widget->setCorrectionsAnnotateChecked(enabled);
+        const bool showChecked = _stickyMode ? _annotateRequested : _annotateMode;
+        _widget->setCorrectionsAnnotateChecked(showChecked);
     }
 
     if (userInitiated) {
-        const QString message = enabled ? QObject::tr("Correction annotation enabled")
-                                        : QObject::tr("Correction annotation disabled");
+        const bool requested = _stickyMode ? _annotateRequested : _annotateMode;
+        const QString message = requested ? QObject::tr("Corrections mode enabled")
+                                          : QObject::tr("Corrections mode disabled");
         emitStatus(message, kStatusShort);
     }
 
@@ -238,6 +255,8 @@ void CorrectionsState::setGrowthInProgress(bool running)
     }
     if (_growthInProgress) {
         setAnnotateMode(false, false, _module.editingEnabled());
+    } else if (_stickyMode && _annotateRequested) {
+        setAnnotateMode(true, false, _module.editingEnabled());
     }
     refreshWidget();
 }
@@ -289,7 +308,8 @@ void CorrectionsState::refreshWidget()
 
     _widget->setCorrectionCollections(entries, active);
     _widget->setCorrectionsEnabled(correctionsAvailable);
-    _widget->setCorrectionsAnnotateChecked(_annotateMode && correctionsAvailable);
+    const bool showChecked = _stickyMode ? _annotateRequested : _annotateMode;
+    _widget->setCorrectionsAnnotateChecked(showChecked);
 }
 
 void CorrectionsState::pruneMissing()
