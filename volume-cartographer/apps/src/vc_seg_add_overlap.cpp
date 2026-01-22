@@ -4,6 +4,8 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <mutex>
+#include <omp.h>
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -21,15 +23,30 @@ using SegmentTree = bgi::rtree<Entry, bgi::quadratic<16>>;
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3) {
-        std::cout << "usage: " << argv[0] << " <tgt-dir> <single-tiffxyz>" << std::endl;
+    if (argc < 3) {
+        std::cout << "usage: " << argv[0] << " <tgt-dir> <single-tiffxyz> [--iters N] [--threads N]" << std::endl;
         std::cout << "   this will check for overlap between any tiffxyz in target dir and <single-tiffxyz> and add overlap metadata" << std::endl;
+        std::cout << "   --iters N    : number of search iterations (default: 10)" << std::endl;
+        std::cout << "   --threads N  : number of OpenMP threads (default: all available)" << std::endl;
         return EXIT_SUCCESS;
     }
 
     std::filesystem::path tgt_dir = argv[1];
     std::filesystem::path seg_dir = argv[2];
     int search_iters = 10;
+    int num_threads = omp_get_max_threads();
+
+    // Parse optional flags
+    for (int i = 3; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--iters" && i + 1 < argc) {
+            search_iters = std::stoi(argv[++i]);
+        } else if (arg == "--threads" && i + 1 < argc) {
+            num_threads = std::stoi(argv[++i]);
+        }
+    }
+    omp_set_num_threads(num_threads);
+
     srand(clock());
 
     QuadSurface current(seg_dir);
@@ -91,9 +108,14 @@ int main(int argc, char *argv[])
 
     std::cout << "Found " << candidates.size() << " candidates with intersecting bboxes" << std::endl;
 
-    bool found_overlaps = false;
+    // Collect results in thread-local storage, merge after
+    std::vector<std::pair<std::string, std::filesystem::path>> overlaps;  // pairs of (other.id, other.path)
+    std::mutex overlap_mutex;
 
-    for (const auto& [box, seg_path] : candidates) {
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < candidates.size(); i++) {
+        const auto& [box, seg_path] = candidates[i];
+
         std::filesystem::path meta_fn = seg_path / "meta.json";
         std::ifstream meta_f(meta_fn);
         json meta = json::parse(meta_f);
@@ -107,19 +129,21 @@ int main(int argc, char *argv[])
         patchIndex.rebuild(surfaces, 10.0f);  // 10.0 bbox padding
 
         if (overlap(current, other, search_iters, &patchIndex)) {
-            found_overlaps = true;
-
-            // Add to current's overlapping set
-            current_overlapping.insert(other.id);
-
-            // Read and update other's overlapping set
-            std::set<std::string> other_overlapping = read_overlapping_json(other.path);
-            other_overlapping.insert(current.id);
-            write_overlapping_json(other.path, other_overlapping);
-
+            std::lock_guard<std::mutex> lock(overlap_mutex);
+            overlaps.emplace_back(other.id, other.path);
             std::cout << "Found overlap: " << current.id << " <-> " << other.id << std::endl;
         }
     }
+
+    // Apply overlap updates sequentially (I/O not thread-safe)
+    for (const auto& [other_id, other_path] : overlaps) {
+        current_overlapping.insert(other_id);
+
+        std::set<std::string> other_overlapping = read_overlapping_json(other_path);
+        other_overlapping.insert(current.id);
+        write_overlapping_json(other_path, other_overlapping);
+    }
+    bool found_overlaps = !overlaps.empty();
 
     // Write current's overlapping data
     if (found_overlaps || !current_overlapping.empty()) {
