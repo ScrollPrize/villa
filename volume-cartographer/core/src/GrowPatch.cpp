@@ -152,6 +152,15 @@ public:
             if (collection.anchor2d_.has_value()) {
                 // Use the provided 2D anchor directly - this is the drag-and-drop case
                 cv::Vec2f anchor = collection.anchor2d_.value();
+
+                // Bounds check: skip collections where anchor2d is outside surface bounds
+                if (anchor[0] < 0 || anchor[0] >= points.cols ||
+                    anchor[1] < 0 || anchor[1] >= points.rows) {
+                    std::cout << "Warning: skipping correction with out-of-bounds anchor2d: "
+                              << anchor << " (surface size: " << points.cols << "x" << points.rows << ")" << std::endl;
+                    continue;
+                }
+
                 std::cout << "using provided anchor2d: " << anchor << std::endl;
 
                 // Convert 2D grid location to pointer coordinates
@@ -2036,6 +2045,11 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
         if (resume_surf && !resume_surf->id.empty()) {
             (*surf->meta)["seed_surface_id"] = resume_surf->id;
+            // Store grid offset for correction point remapping
+            // new_coord = old_coord + offset
+            const int offset_row = resume_pad_y - used_area_safe.y;
+            const int offset_col = resume_pad_x - used_area_safe.x;
+            (*surf->meta)["grid_offset"] = {offset_col, offset_row};
         }
 
         // Preserve approval and mask channels from resume surface with correct offset

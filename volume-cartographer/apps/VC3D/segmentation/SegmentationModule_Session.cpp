@@ -7,9 +7,11 @@
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include <QLoggingCategory>
+#include <QTimer>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surface)
 {
@@ -52,6 +54,18 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         refreshOverlay();
     }
 
+    // Auto-load persisted corrections and set path for auto-save
+    if (_pointCollection && !surface->path.empty()) {
+        qCInfo(lcSegModule) << "Loading correction points from segment path:"
+                            << QString::fromStdString(surface->path.string());
+        _pointCollection->loadFromSegmentPath(surface->path);
+        _correctionsSegmentPath = surface->path;
+    } else {
+        qCInfo(lcSegModule) << "No segment path for correction points auto-save (path empty:"
+                            << surface->path.empty() << ")";
+        _correctionsSegmentPath.clear();
+    }
+
     emitPendingChanges();
     _pendingAutosave = false;
     _autosaveNotifiedFailure = false;
@@ -82,6 +96,17 @@ void SegmentationModule::endEditingSession()
             _ignoreSegSurfaceChange = previousGuard;
         }
     }
+
+    // Save any pending corrections immediately and clear auto-save state
+    if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
+        _correctionsSaveTimer->stop();
+    }
+    if (_pointCollection && !_correctionsSegmentPath.empty()) {
+        qCInfo(lcSegModule) << "Saving correction points on session end to:"
+                            << QString::fromStdString(_correctionsSegmentPath.string());
+        _pointCollection->saveToSegmentPath(_correctionsSegmentPath);
+    }
+    _correctionsSegmentPath.clear();
 
     if (_pendingAutosave) {
         performAutosave();
@@ -393,5 +418,19 @@ void SegmentationModule::updateApprovalToolAfterGrowth(QuadSurface* surface)
     // Both modes need correct dimensions to render/paint properly
     if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
         _overlay->loadApprovalMaskImage(approvalSurface);
+    }
+}
+
+void SegmentationModule::applyCorrectionAnchorOffset(float offsetX, float offsetY)
+{
+    if (_pointCollection) {
+        _pointCollection->applyAnchorOffset(offsetX, offsetY);
+    }
+}
+
+void SegmentationModule::saveCorrectionPoints(const std::filesystem::path& segmentPath)
+{
+    if (_pointCollection && !segmentPath.empty()) {
+        _pointCollection->saveToSegmentPath(segmentPath);
     }
 }

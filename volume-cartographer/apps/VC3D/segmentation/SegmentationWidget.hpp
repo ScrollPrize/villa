@@ -126,6 +126,7 @@ public:
 
     // Cell reoptimization setters
     void setCellReoptMode(bool enabled);
+    void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -168,7 +169,7 @@ signals:
     void cellReoptMaxPointsChanged(int points);
     void cellReoptMinSpacingChanged(float spacing);
     void cellReoptPerimeterOffsetChanged(float offset);
-    void cellReoptGrowthRequested();
+    void cellReoptGrowthRequested(uint64_t collectionId);
 
 private:
     void buildUi();
@@ -372,5 +373,6 @@ private:
     QSpinBox* _spinCellReoptMaxPoints{nullptr};
     QDoubleSpinBox* _spinCellReoptMinSpacing{nullptr};
     QDoubleSpinBox* _spinCellReoptPerimeterOffset{nullptr};
+    QComboBox* _comboCellReoptCollection{nullptr};
     QPushButton* _btnCellReoptRun{nullptr};
 };

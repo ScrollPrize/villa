@@ -8,6 +8,7 @@
 #include <QLoggingCategory>
 
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -120,6 +121,8 @@ public:
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
     void updateApprovalToolAfterGrowth(QuadSurface* surface);
+    void applyCorrectionAnchorOffset(float offsetX, float offsetY);
+    void saveCorrectionPoints(const std::filesystem::path& segmentPath);
 
     void attachViewer(CVolumeViewer* viewer);
     void updateViewerCursors();
@@ -133,7 +136,7 @@ public:
     void markNextHandlesFromGrowth() { markNextEditsFromGrowth(); }
     void setGrowthInProgress(bool running);
     [[nodiscard]] bool growthInProgress() const { return _growthInProgress; }
-    [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload() const;
+    [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload(bool onlyActiveCollection = false) const;
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
     [[nodiscard]] bool hoverPreviewEnabled() const { return _hoverPreviewEnabled; }
@@ -231,6 +234,7 @@ private:
     void emitPendingChanges();
     void refreshOverlay();
     void updateCorrectionsWidget();
+    void updateCellReoptCollections();
     void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCorrectionCollection(bool announce);
@@ -349,6 +353,7 @@ private:
     bool _showApprovalMask{false};
     bool _cellReoptMode{false};
     bool _skipAutoApprovalOnGrowth{false};
+    uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
@@ -362,6 +367,13 @@ private:
     QTimer* _autosaveTimer{nullptr};
     bool _pendingAutosave{false};
     bool _autosaveNotifiedFailure{false};
+
+    // Correction points auto-save
+    static constexpr int kCorrectionsSaveDelayMs = 2000;
+    QTimer* _correctionsSaveTimer{nullptr};
+    std::filesystem::path _correctionsSegmentPath;
+    void scheduleCorrectionsAutoSave();
+    void performCorrectionsAutoSave();
 
     struct HoverLookupMetrics
     {

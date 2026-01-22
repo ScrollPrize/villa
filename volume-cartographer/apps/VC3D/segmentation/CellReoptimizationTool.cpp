@@ -40,6 +40,15 @@ int CellReoptimizationTool::executeAtGridPosition(int row, int col)
         return 0;
     }
 
+    // Validate that approval mask dimensions match surface grid dimensions
+    auto [gridRows, gridCols] = gridDimensions();
+    auto [maskRows, maskCols] = _overlay->approvalMaskDimensions();
+    if (maskRows != gridRows || maskCols != gridCols) {
+        emit statusMessage(tr("Cell reoptimization: mask/surface dimension mismatch (%1x%2 vs %3x%4)")
+                          .arg(maskRows).arg(maskCols).arg(gridRows).arg(gridCols), 3000);
+        return 0;
+    }
+
     // Check if start position is valid
     if (!isValidGridPosition(row, col)) {
         emit statusMessage(tr("Cell reoptimization: invalid grid position"), 2000);
@@ -74,6 +83,10 @@ int CellReoptimizationTool::executeAtGridPosition(int row, int col)
 
     // Get the collection ID so we can register it with the corrections system
     uint64_t collectionId = _pointCollection->getCollectionId(collectionName);
+
+    // Set anchor2d to the click position - this enables persistence and reuse
+    cv::Vec2f anchor2d(static_cast<float>(col), static_cast<float>(row));
+    _pointCollection->setCollectionAnchor2d(collectionId, anchor2d);
 
     int numPoints = static_cast<int>(boundaryPoints.size());
 
@@ -131,9 +144,9 @@ CellReoptimizationTool::FloodResult CellReoptimizationTool::floodFillBFS(int sta
     queue.push({startRow, startCol});
     visited.insert({startRow, startCol});
 
-    // 4-connected neighbors for flood fill (prevents diagonal leakage)
-    const int dr[] = {-1, 1, 0, 0};
-    const int dc[] = {0, 0, -1, 1};
+    // 8-connected neighbors for flood fill (prevents diagonal leakage through approval boundaries)
+    const int dr[] = {-1, -1, -1, 0, 0, 1, 1, 1};
+    const int dc[] = {-1, 0, 1, -1, 1, -1, 0, 1};
 
     while (!queue.empty() && static_cast<int>(result.floodedCells.size()) < _config.maxFloodSteps) {
         auto [row, col] = queue.front();
@@ -141,7 +154,7 @@ CellReoptimizationTool::FloodResult CellReoptimizationTool::floodFillBFS(int sta
 
         result.floodedCells.push_back({row, col});
 
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 8; ++i) {
             int nr = row + dr[i];
             int nc = col + dc[i];
 

@@ -982,6 +982,18 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     // Rename to make creation atomic
     std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
 
+    // Preserve auxiliary files from the existing directory before replacing
+    if (force_overwrite && std::filesystem::exists(final_path)) {
+        // Copy corrections.json if it exists
+        std::filesystem::path correctionsFile = final_path / "corrections.json";
+        if (std::filesystem::exists(correctionsFile)) {
+            std::error_code copyEc;
+            std::filesystem::copy_file(correctionsFile, temp_path / "corrections.json",
+                std::filesystem::copy_options::overwrite_existing, copyEc);
+            // Ignore errors - corrections are not critical for surface integrity
+        }
+    }
+
     // Atomically move the saved data to the final location
     bool replacedExisting = false;
     if (force_overwrite && std::filesystem::exists(final_path)) {

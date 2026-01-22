@@ -258,6 +258,17 @@ void CorrectionsState::clearAll(bool editingEnabled)
     _managedCollectionIds.clear();
     _activeCollectionId = 0;
 
+    // Repopulate _pendingCollectionIds with surviving persistent collections
+    // (those with anchor2d set that were not cleared above)
+    if (_collection) {
+        const auto& collections = _collection->getAllCollections();
+        for (const auto& entry : collections) {
+            if (entry.second.anchor2d.has_value()) {
+                _pendingCollectionIds.push_back(entry.first);
+            }
+        }
+    }
+
     refreshWidget();
 }
 
@@ -333,7 +344,7 @@ std::optional<std::pair<int, int>> CorrectionsState::zRange() const
     return _zRange;
 }
 
-SegmentationCorrectionsPayload CorrectionsState::buildPayload() const
+SegmentationCorrectionsPayload CorrectionsState::buildPayload(bool onlyActiveCollection) const
 {
     SegmentationCorrectionsPayload payload;
     if (!_collection) {
@@ -341,7 +352,20 @@ SegmentationCorrectionsPayload CorrectionsState::buildPayload() const
     }
 
     const auto& collections = _collection->getAllCollections();
-    for (uint64_t id : _pendingCollectionIds) {
+
+    // Determine which collection IDs to include
+    std::vector<uint64_t> idsToInclude;
+    if (onlyActiveCollection) {
+        // Only include the active collection (if valid)
+        if (_activeCollectionId != 0 && collections.find(_activeCollectionId) != collections.end()) {
+            idsToInclude.push_back(_activeCollectionId);
+        }
+    } else {
+        // Include all pending collections
+        idsToInclude = _pendingCollectionIds;
+    }
+
+    for (uint64_t id : idsToInclude) {
         auto it = collections.find(id);
         if (it == collections.end()) {
             continue;
@@ -352,6 +376,7 @@ SegmentationCorrectionsPayload CorrectionsState::buildPayload() const
         entry.name = it->second.name;
         entry.metadata = it->second.metadata;
         entry.color = it->second.color;
+        entry.anchor2d = it->second.anchor2d;
 
         std::vector<ColPoint> points;
         points.reserve(it->second.points.size());
@@ -368,6 +393,44 @@ SegmentationCorrectionsPayload CorrectionsState::buildPayload() const
         entry.points = std::move(points);
         payload.collections.push_back(std::move(entry));
     }
+
+    return payload;
+}
+
+SegmentationCorrectionsPayload CorrectionsState::buildPayloadForCollection(uint64_t collectionId) const
+{
+    SegmentationCorrectionsPayload payload;
+    if (!_collection || collectionId == 0) {
+        return payload;
+    }
+
+    const auto& collections = _collection->getAllCollections();
+    auto it = collections.find(collectionId);
+    if (it == collections.end()) {
+        return payload;
+    }
+
+    SegmentationCorrectionsPayload::Collection entry;
+    entry.id = it->second.id;
+    entry.name = it->second.name;
+    entry.metadata = it->second.metadata;
+    entry.color = it->second.color;
+    entry.anchor2d = it->second.anchor2d;
+
+    std::vector<ColPoint> points;
+    points.reserve(it->second.points.size());
+    for (const auto& pair : it->second.points) {
+        points.push_back(pair.second);
+    }
+    std::sort(points.begin(), points.end(), [](const ColPoint& a, const ColPoint& b) {
+        return a.id < b.id;
+    });
+    if (points.empty()) {
+        return payload;
+    }
+
+    entry.points = std::move(points);
+    payload.collections.push_back(std::move(entry));
 
     return payload;
 }

@@ -1547,6 +1547,23 @@ void SegmentationGrower::onFutureFinished()
         }
     }
 
+    // Apply grid offset to correction anchors (for surface growth remapping)
+    // and save immediately to persist updated positions
+    if (result.surface && result.surface->meta && _context.module) {
+        auto offsetIt = result.surface->meta->find("grid_offset");
+        if (offsetIt != result.surface->meta->end() && offsetIt->is_array() && offsetIt->size() == 2) {
+            float offsetX = (*offsetIt)[0].get<float>();
+            float offsetY = (*offsetIt)[1].get<float>();
+            if (offsetX != 0.0f || offsetY != 0.0f) {
+                _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
+                // Save corrections with updated anchors to the new surface path
+                if (surfaceToPersist && !surfaceToPersist->path.empty()) {
+                    _context.module->saveCorrectionPoints(surfaceToPersist->path);
+                }
+            }
+        }
+    }
+
     if (request.usingCorrections && _context.module) {
         _context.module->clearPendingCorrections();
     }

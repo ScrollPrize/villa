@@ -44,7 +44,8 @@ public:
     [[nodiscard]] bool growthInProgress() const { return _growthInProgress; }
     [[nodiscard]] uint64_t activeCollection() const { return _activeCollectionId; }
     [[nodiscard]] std::optional<std::pair<int, int>> zRange() const;
-    [[nodiscard]] SegmentationCorrectionsPayload buildPayload() const;
+    [[nodiscard]] SegmentationCorrectionsPayload buildPayload(bool onlyActiveCollection = false) const;
+    [[nodiscard]] SegmentationCorrectionsPayload buildPayloadForCollection(uint64_t collectionId) const;
     [[nodiscard]] bool hasCorrections() const;
 
     void onCollectionRemoved(uint64_t id);

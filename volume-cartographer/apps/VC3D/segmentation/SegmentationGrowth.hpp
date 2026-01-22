@@ -173,6 +173,7 @@ struct SegmentationCorrectionsPayload {
         std::vector<ColPoint> points;
         CollectionMetadata metadata;
         cv::Vec3f color{0.0f, 0.0f, 0.0f};
+        std::optional<cv::Vec2f> anchor2d;  // 2D grid anchor for persistent corrections
     };
 
     std::vector<Collection> collections;

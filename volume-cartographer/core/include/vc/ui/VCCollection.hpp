@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <cmath>
 #include <optional>
+#include <filesystem>
 
 #include <nlohmann/json.hpp>
  
@@ -74,6 +75,14 @@ public:
 
    bool saveToJSON(const std::string& filename) const;
    bool loadFromJSON(const std::string& filename);
+
+   // Path-based persistence for segment-specific corrections
+   // Only saves collections with anchor2d set (2D anchored points only)
+   bool saveToSegmentPath(const std::filesystem::path& segmentPath) const;
+   bool loadFromSegmentPath(const std::filesystem::path& segmentPath);
+
+   // Apply grid offset to all anchor2d values (for surface growth remapping)
+   void applyAnchorOffset(float offsetX, float offsetY);
 
 signals:
    void collectionChanged(uint64_t collectionId); // Generic signal for name/metadata changes

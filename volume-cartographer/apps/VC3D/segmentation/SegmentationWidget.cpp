@@ -829,11 +829,22 @@ void SegmentationWidget::buildUi()
     perimeterOffsetRow->addStretch(1);
     cellReoptLayout->addLayout(perimeterOffsetRow);
 
+    // Collection selector
+    auto* collectionRow = new QHBoxLayout();
+    collectionRow->setSpacing(8);
+    auto* collectionLabel = new QLabel(tr("Collection:"), cellReoptParent);
+    _comboCellReoptCollection = new QComboBox(cellReoptParent);
+    _comboCellReoptCollection->setToolTip(tr("Select which correction point collection to use for reoptimization."));
+    _comboCellReoptCollection->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    collectionRow->addWidget(collectionLabel);
+    collectionRow->addWidget(_comboCellReoptCollection, 1);
+    cellReoptLayout->addLayout(collectionRow);
+
     // Run reoptimization button
     auto* runButtonRow = new QHBoxLayout();
     runButtonRow->setSpacing(8);
     _btnCellReoptRun = new QPushButton(tr("Run Reoptimization"), cellReoptParent);
-    _btnCellReoptRun->setToolTip(tr("Trigger reoptimization using the placed correction points."));
+    _btnCellReoptRun->setToolTip(tr("Trigger reoptimization using the selected correction point collection."));
     runButtonRow->addWidget(_btnCellReoptRun);
     runButtonRow->addStretch(1);
     cellReoptLayout->addLayout(runButtonRow);
@@ -1082,7 +1093,11 @@ void SegmentationWidget::buildUi()
     });
 
     connect(_btnCellReoptRun, &QPushButton::clicked, this, [this]() {
-        emit cellReoptGrowthRequested();
+        uint64_t collectionId = 0;
+        if (_comboCellReoptCollection && _comboCellReoptCollection->currentIndex() >= 0) {
+            collectionId = _comboCellReoptCollection->currentData().toULongLong();
+        }
+        emit cellReoptGrowthRequested(collectionId);
     });
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
@@ -1772,8 +1787,12 @@ void SegmentationWidget::syncUiState()
         _spinCellReoptPerimeterOffset->setValue(static_cast<double>(_cellReoptPerimeterOffset));
         _spinCellReoptPerimeterOffset->setEnabled(_cellReoptMode);
     }
+    if (_comboCellReoptCollection) {
+        _comboCellReoptCollection->setEnabled(_cellReoptMode);
+    }
     if (_btnCellReoptRun) {
-        _btnCellReoptRun->setEnabled(_cellReoptMode && !_growthInProgress);
+        const bool hasCollection = _comboCellReoptCollection && _comboCellReoptCollection->count() > 0;
+        _btnCellReoptRun->setEnabled(_cellReoptMode && !_growthInProgress && hasCollection);
     }
 
     updateGrowthUiState();
@@ -2136,6 +2155,41 @@ void SegmentationWidget::setCellReoptMode(bool enabled)
         const QSignalBlocker blocker(_chkCellReoptMode);
         _chkCellReoptMode->setChecked(_cellReoptMode);
     }
+    syncUiState();
+}
+
+void SegmentationWidget::setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections)
+{
+    if (!_comboCellReoptCollection) {
+        return;
+    }
+
+    // Remember current selection
+    uint64_t currentId = 0;
+    if (_comboCellReoptCollection->currentIndex() >= 0) {
+        currentId = _comboCellReoptCollection->currentData().toULongLong();
+    }
+
+    const QSignalBlocker blocker(_comboCellReoptCollection);
+    _comboCellReoptCollection->clear();
+
+    int indexToSelect = -1;
+    for (int i = 0; i < collections.size(); ++i) {
+        const auto& [id, name] = collections[i];
+        _comboCellReoptCollection->addItem(name, QVariant::fromValue(id));
+        if (id == currentId) {
+            indexToSelect = i;
+        }
+    }
+
+    // Restore selection if possible, otherwise select first item
+    if (indexToSelect >= 0) {
+        _comboCellReoptCollection->setCurrentIndex(indexToSelect);
+    } else if (_comboCellReoptCollection->count() > 0) {
+        _comboCellReoptCollection->setCurrentIndex(0);
+    }
+
+    // Update run button state - need a collection selected to run
     syncUiState();
 }
 

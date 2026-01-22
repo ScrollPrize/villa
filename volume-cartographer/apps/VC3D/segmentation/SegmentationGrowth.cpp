@@ -216,6 +216,9 @@ void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload
         uint64_t id = collection.addCollection(entry.name);
         collection.setCollectionMetadata(id, entry.metadata);
         collection.setCollectionColor(id, entry.color);
+        if (entry.anchor2d.has_value()) {
+            collection.setCollectionAnchor2d(id, entry.anchor2d);
+        }
 
         for (const auto& point : entry.points) {
             ColPoint added = collection.addPoint(entry.name, point.p);

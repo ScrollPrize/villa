@@ -146,6 +146,9 @@ public:
     // Check if approval mask mode is active and we have mask data
     bool hasApprovalMaskData() const;
 
+    // Get approval mask dimensions (rows, cols) - returns (0,0) if no mask loaded
+    std::pair<int, int> approvalMaskDimensions() const;
+
     // Force refresh of all viewer overlays (bypasses state comparison optimization)
     void forceRefreshAllOverlays();
 
