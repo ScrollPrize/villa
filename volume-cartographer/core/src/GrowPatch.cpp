@@ -1225,6 +1225,84 @@ static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t>
     return set;
 };
 
+static cv::Vec3d compute_surface_normal_at(
+    const cv::Vec2i& p,
+    const cv::Mat_<cv::Vec3d>& dpoints,
+    const cv::Mat_<uchar>& state,
+    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr)
+{
+    auto is_valid = [&](const cv::Vec2i& pt) {
+        return pt[0] >= 0 && pt[0] < dpoints.rows &&
+               pt[1] >= 0 && pt[1] < dpoints.cols &&
+               (state(pt) & STATE_LOC_VALID);
+    };
+
+    // Try to get horizontal and vertical tangents
+    cv::Vec3d tangent_h(0,0,0), tangent_v(0,0,0);
+    bool has_h = false, has_v = false;
+
+    // Horizontal tangent
+    cv::Vec2i left = {p[0], p[1] - 1};
+    cv::Vec2i right = {p[0], p[1] + 1};
+    if (is_valid(left) && is_valid(right)) {
+        tangent_h = dpoints(right) - dpoints(left);
+        has_h = true;
+    }
+
+    // Vertical tangent
+    cv::Vec2i up = {p[0] - 1, p[1]};
+    cv::Vec2i down = {p[0] + 1, p[1]};
+    if (is_valid(up) && is_valid(down)) {
+        tangent_v = dpoints(down) - dpoints(up);
+        has_v = true;
+    }
+
+    if (!has_h || !has_v) {
+        return cv::Vec3d(0,0,0);
+    }
+
+    cv::Vec3d normal = tangent_h.cross(tangent_v);
+    double len = cv::norm(normal);
+    if (len < 1e-9) {
+        return cv::Vec3d(0,0,0);
+    }
+    normal /= len;
+
+    // Orient consistently with neighbors if surface_normals provided
+    if (surface_normals) {
+        static const cv::Vec2i neighbor_offsets[] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+        for (const auto& off : neighbor_offsets) {
+            cv::Vec2i neighbor = p + off;
+            if (is_valid(neighbor)) {
+                cv::Vec3d neighbor_normal = (*surface_normals)(neighbor);
+                if (cv::norm(neighbor_normal) > 0.5) {
+                    // Flip if pointing opposite to neighbor
+                    if (normal.dot(neighbor_normal) < 0) {
+                        normal = -normal;
+                    }
+                    break;  // Use first valid neighbor for orientation
+                }
+            }
+        }
+    }
+
+    return normal;
+}
+
+// Compute and store oriented surface normal for a point
+// Uses existing neighbor normals for consistent orientation
+static void update_surface_normal(
+    const cv::Vec2i& p,
+    const cv::Mat_<cv::Vec3d>& dpoints,
+    const cv::Mat_<uchar>& state,
+    cv::Mat_<cv::Vec3d>& surface_normals)
+{
+    cv::Vec3d normal = compute_surface_normal_at(p, dpoints, state, &surface_normals);
+    if (cv::norm(normal) > 0.5) {
+        surface_normals(p) = normal;
+    }
+}
+
 static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_status, const cv::Vec2i &p,
     TraceParameters &params, TraceData& trace_data,
     const LossSettings &settings)
