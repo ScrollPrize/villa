@@ -88,13 +88,16 @@ class DC_SkelREC_and_CE_loss(nn.Module):
         self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
         self.srec = SoftSkeletonRecallLoss(apply_nonlin=softmax_helper_dim1, **soft_skelrec_kwargs)
 
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor, skel: torch.Tensor):
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, skel: torch.Tensor, loss_mask=None):
         """
         target must be b, c, x, y(, z) with c=1
         :param net_output:
         :param target:
+        :param skel: skeleton target for skeleton recall loss
+        :param loss_mask: optional spatial mask to weight/exclude regions from loss (e.g., exclude conditioning region)
         :return:
         """
+        import torch.nn.functional as F
 
         if self.ignore_label is not None:
             assert target.shape[1] == 1, 'ignore label is not implemented for one hot encoded target variables ' \
@@ -110,12 +113,25 @@ class DC_SkelREC_and_CE_loss(nn.Module):
             target_skel = skel
             mask = None
 
-        dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \
+        # Combine external loss_mask with ignore_label mask
+        combined_mask = mask
+        if loss_mask is not None:
+            combined_mask = loss_mask if combined_mask is None else combined_mask * loss_mask
+
+        dc_loss = self.dc(net_output, target_dice, loss_mask=combined_mask) \
             if self.weight_dice != 0 else 0
-        srec_loss = self.srec(net_output, target_skel, loss_mask=mask) \
+        srec_loss = self.srec(net_output, target_skel, loss_mask=combined_mask) \
             if self.weight_srec != 0 else 0
-        ce_loss = self.ce(net_output, target[:, 0]) \
-            if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
+
+        # CE loss with optional masking
+        if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0):
+            if combined_mask is not None:
+                ce_per_voxel = F.cross_entropy(net_output, target[:, 0].long(), reduction='none')
+                ce_loss = (ce_per_voxel * combined_mask[:, 0]).sum() / combined_mask.sum().clamp(min=1)
+            else:
+                ce_loss = self.ce(net_output, target[:, 0])
+        else:
+            ce_loss = 0
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss + self.weight_srec * srec_loss
         return result

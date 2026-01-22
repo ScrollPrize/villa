@@ -20,75 +20,6 @@ os.environ['OMP_NUM_THREADS'] = '1' # this is set to 1 because by default the ed
                                     # which is problematic if you use multiple dataloader workers (thread contention smokes cpu)
 
 
-def degrade_extrapolation(extrap_coords, cond_direction, config):
-    """
-    Randomly degrade extrapolated coordinates to create harder training data.
-
-    Applies either curvature bias (quadratic error) or gradient perturbation (linear tilt)
-    with probability extrap_degrade_prob. The error magnitude grows with distance from
-    the conditioning edge.
-
-    Args:
-        extrap_coords: (N, 3) extrapolated z,y,x coordinates in local crop space
-        cond_direction: "left", "right", "up", or "down" - where conditioning region is
-        config: dataset config dict
-
-    Returns:
-        degraded_coords: (N, 3) degraded coordinates (or original if no degradation applied)
-    """
-    prob = config.get('extrap_degrade_prob', 0.0)
-    if prob <= 0.0 or random.random() > prob:
-        return extrap_coords
-
-    # Compute distance from conditioning edge based on split direction
-    # extrap_coords is (N, 3) in z,y,x order
-    if cond_direction in ("left", "right"):
-        # Split is along x axis (column), use x coordinate (index 2)
-        x_coords = extrap_coords[:, 2]
-        if cond_direction == "left":
-            # Conditioning is on left, extrapolation extends right
-            # Distance increases with x
-            distance = x_coords - x_coords.min()
-        else:
-            # Conditioning is on right, extrapolation extends left
-            # Distance increases as x decreases
-            distance = x_coords.max() - x_coords
-    else:
-        # Split is along y axis (row), use y coordinate (index 1)
-        y_coords = extrap_coords[:, 1]
-        if cond_direction == "up":
-            # Conditioning is on top, extrapolation extends down
-            # Distance increases with y
-            distance = y_coords - y_coords.min()
-        else:
-            # Conditioning is on bottom, extrapolation extends up
-            # Distance increases as y decreases
-            distance = y_coords.max() - y_coords
-
-    # Avoid division by zero if all points at same position
-    if distance.max() < 1e-6:
-        return extrap_coords
-
-    # Choose degradation type randomly
-    if random.random() < 0.5:
-        # Curvature bias: error = k * distance^2
-        k_range = config.get('extrap_degrade_curvature_range', [0.001, 0.01])
-        k = random.uniform(k_range[0], k_range[1])
-        # Random direction for the curvature (in z,y,x space)
-        direction = np.random.randn(3)
-        direction = direction / (np.linalg.norm(direction) + 1e-8)
-        error = k * (distance ** 2)[:, None] * direction
-    else:
-        # Gradient perturbation: smooth tilt that grows linearly with distance
-        mag_range = config.get('extrap_degrade_gradient_range', [0.05, 0.2])
-        magnitude = random.uniform(mag_range[0], mag_range[1])
-        # Random tilt direction
-        tilt = np.random.randn(3) * magnitude
-        error = distance[:, None] * tilt
-
-    return extrap_coords + error
-
-
 class EdtSegDataset(Dataset):
     def __init__(
             self,
@@ -120,6 +51,7 @@ class EdtSegDataset(Dataset):
         config.setdefault('heatmap_step_size', 10)
         config.setdefault('heatmap_step_count', 5)
         config.setdefault('heatmap_sigma', 2.0)
+        config.setdefault('use_segmentation', False)
 
         # other wrap conditioning: provide other wraps from same segment as context
         config.setdefault('use_other_wrap_cond', False)
@@ -355,18 +287,16 @@ class EdtSegDataset(Dataset):
                 min_corner=min_corner,
                 crop_size=crop_size,
                 method=self.config['extrapolation_method'],
+                cond_direction=cond_direction,
+                degrade_prob=self.config.get('extrap_degrade_prob', 0.0),
+                degrade_curvature_range=self.config.get('extrap_degrade_curvature_range', (0.001, 0.01)),
+                degrade_gradient_range=self.config.get('extrap_degrade_gradient_range', (0.05, 0.2)),
             )
             if extrap_result is None:
                 return self[np.random.randint(len(self))]
             extrap_surface = extrap_result['extrap_surface']
             extrap_coords_local = extrap_result['extrap_coords_local']
             gt_coords_local = extrap_result['gt_coords_local']
-
-            # optionally degrade extrapolation to create harder training data
-            # as the extrapolation is sometimes frustratingly good
-            extrap_coords_local = degrade_extrapolation(
-                extrap_coords_local, cond_direction, self.config
-            )
 
         volume = patch.volume
         if isinstance(volume, zarr.Group):
@@ -407,6 +337,8 @@ class EdtSegDataset(Dataset):
         if len(cond_nz[0]) == 0:
             return self[np.random.randint(len(self))]
 
+        cond_segmentation_raw = cond_segmentation.copy()
+
         # add thickness to conditioning segmentation via dilation
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
@@ -414,10 +346,17 @@ class EdtSegDataset(Dataset):
             dist_from_cond = edt.edt(1 - cond_segmentation, parallel=1)
             cond_segmentation = (dist_from_cond <= dilation_radius).astype(np.float32)
 
-        if self.config['use_sdt']:
+        use_segmentation = self.config.get('use_segmentation', False)
+        use_sdt = self.config['use_sdt']
+        full_segmentation = None
+        full_segmentation_raw = None
+        if use_sdt:
             # combine cond + masked into full segmentation
             full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
+        if use_segmentation:
+            full_segmentation_raw = np.maximum(cond_segmentation_raw, masked_segmentation)
 
+        if use_sdt:
             # if already dilated, just compute SDT directly; otherwise dilate first
             if use_dilation:
                 seg_dilated = full_segmentation
@@ -426,6 +365,12 @@ class EdtSegDataset(Dataset):
                 distance_from_surface = edt.edt(1 - full_segmentation, parallel=1)
                 seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
             sdt = edt.sdf(seg_dilated, parallel=1).astype(np.float32)
+
+        if use_segmentation:
+            dilation_radius = self.config.get('dilation_radius', 1.0)
+            distance_from_surface = edt.edt(1 - full_segmentation_raw, parallel=1)
+            seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
+            seg_skel = (distance_from_surface == 0).astype(np.float32)
 
         # generate heatmap targets for expected positions in masked region
         use_heatmap = self.config['use_heatmap_targets']
@@ -514,6 +459,9 @@ class EdtSegDataset(Dataset):
         masked_seg = torch.from_numpy(masked_segmentation).to(torch.float32)
         cond_seg = torch.from_numpy(cond_segmentation).to(torch.float32)
         other_wraps_tensor = torch.from_numpy(other_wraps_vox).to(torch.float32)
+        if use_segmentation:
+            full_seg = torch.from_numpy(seg_dilated).to(torch.float32)
+            seg_skel = torch.from_numpy(seg_skel).to(torch.float32)
 
         use_extrapolation = self.config['use_extrapolation']
         if use_extrapolation:
@@ -530,6 +478,11 @@ class EdtSegDataset(Dataset):
         if self._augmentations is not None:
             seg_list = [masked_seg, cond_seg, other_wraps_tensor]
             seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
+            if use_segmentation:
+                seg_list.append(full_seg)
+                seg_keys.append('full_seg')
+                seg_list.append(seg_skel)
+                seg_keys.append('seg_skel')
             if use_extrapolation:
                 seg_list.append(extrap_surf)
                 seg_keys.append('extrap_surf')
@@ -565,6 +518,10 @@ class EdtSegDataset(Dataset):
                     cond_seg = augmented['segmentation'][i]
                 elif key == 'other_wraps':
                     other_wraps_tensor = augmented['segmentation'][i]
+                elif key == 'full_seg':
+                    full_seg = augmented['segmentation'][i]
+                elif key == 'seg_skel':
+                    seg_skel = augmented['segmentation'][i]
                 elif key == 'extrap_surf':
                     extrap_surf = augmented['segmentation'][i]
 
@@ -607,6 +564,10 @@ class EdtSegDataset(Dataset):
 
         if use_heatmap:
             result["heatmap_target"] = heatmap_tensor  # (D, H, W) gaussian heatmap at expected positions
+
+        if use_segmentation:
+            result["segmentation"] = full_seg           # full segmentation (cond + masked)
+            result["segmentation_skel"] = seg_skel      # skeleton for medial surface recall loss
 
         # Validate all tensors are non-empty and contain no NaN/Inf
         for key, tensor in result.items():
@@ -654,7 +615,8 @@ if __name__ == "__main__":
         sample = train_ds[i]
 
         # Save 3D volumes as tif
-        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'other_wraps', 'sdt', 'heatmap_target']:
+        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'other_wraps', 'sdt', 'heatmap_target',
+                    'segmentation', 'segmentation_skel']:
             if key in sample:
                 subdir = out_dir / key
                 subdir.mkdir(exist_ok=True)

@@ -5,9 +5,76 @@ Supports multiple extrapolation methods via the `method` parameter.
 """
 import numpy as np
 import torch
-from typing import Callable
+import random
+from typing import Callable, Optional
 
 from .common import voxelize_surface_grid
+
+
+def apply_degradation(
+    zyx_local: np.ndarray,
+    uv_shape: tuple,
+    cond_direction: str,
+    degrade_prob: float = 0.0,
+    curvature_range: tuple = (0.001, 0.01),
+    gradient_range: tuple = (0.05, 0.2),
+) -> tuple[np.ndarray, bool]:
+    """
+    Apply degradation to extrapolated coordinates (full grid, before filtering).
+
+    Args:
+        zyx_local: (N, 3) local z,y,x coordinates (full UV grid flattened)
+        uv_shape: (R, C) shape of UV grid for reshaping
+        cond_direction: "left", "right", "up", or "down"
+        degrade_prob: probability of applying degradation
+        curvature_range: (min, max) for quadratic curvature coefficient
+        gradient_range: (min, max) for linear gradient magnitude
+
+    Returns:
+        tuple: (degraded_coords, was_applied)
+    """
+    if degrade_prob <= 0.0 or random.random() > degrade_prob:
+        return zyx_local, False
+
+    # Reshape to grid to compute distance from conditioning edge
+    zyx_grid = zyx_local.reshape(uv_shape + (3,))
+    R, C = uv_shape
+
+    # Compute distance from conditioning edge
+    if cond_direction == "left":
+        # Conditioning on left, distance increases with column
+        distance = np.arange(C)[None, :].repeat(R, axis=0)
+    elif cond_direction == "right":
+        # Conditioning on right, distance increases as column decreases
+        distance = (C - 1 - np.arange(C))[None, :].repeat(R, axis=0)
+    elif cond_direction == "up":
+        # Conditioning on top, distance increases with row
+        distance = np.arange(R)[:, None].repeat(C, axis=1)
+    else:  # down
+        # Conditioning on bottom, distance increases as row decreases
+        distance = (R - 1 - np.arange(R))[:, None].repeat(C, axis=1)
+
+    distance = distance.astype(np.float64)
+
+    # Avoid issues if all same distance
+    if distance.max() < 1e-6:
+        return zyx_local, False
+
+    # Choose degradation type randomly
+    if random.random() < 0.5:
+        # Curvature bias: error = k * distance^2
+        k = random.uniform(curvature_range[0], curvature_range[1])
+        direction = np.random.randn(3)
+        direction = direction / (np.linalg.norm(direction) + 1e-8)
+        error = k * (distance[:, :, None] ** 2) * direction
+    else:
+        # Gradient perturbation: linear tilt
+        magnitude = random.uniform(gradient_range[0], gradient_range[1])
+        tilt = np.random.randn(3) * magnitude
+        error = distance[:, :, None] * tilt
+
+    degraded_grid = zyx_grid + error
+    return degraded_grid.reshape(-1, 3), True
 
 
 # Registry of extrapolation methods
@@ -425,6 +492,10 @@ def compute_extrapolation(
     min_corner: np.ndarray,
     crop_size: tuple,
     method: str = 'rbf',
+    cond_direction: Optional[str] = None,
+    degrade_prob: float = 0.0,
+    degrade_curvature_range: tuple = (0.001, 0.01),
+    degrade_gradient_range: tuple = (0.05, 0.2),
     **method_kwargs,
 ) -> dict:
     """
@@ -438,6 +509,10 @@ def compute_extrapolation(
         min_corner: (3,) origin of crop in world coords (z, y, x)
         crop_size: (D, H, W) size of crop
         method: extrapolation method to use (default: 'rbf')
+        cond_direction: "left", "right", "up", or "down" (required if degrade_prob > 0)
+        degrade_prob: probability of applying degradation to extrapolated coords
+        degrade_curvature_range: (min, max) for quadratic curvature coefficient
+        degrade_gradient_range: (min, max) for linear gradient magnitude
         **method_kwargs: additional kwargs passed to the extrapolation method
 
     Returns:
@@ -492,6 +567,22 @@ def compute_extrapolation(
     z_extrap_local = z_extrap - min_corner[0]
     y_extrap_local = y_extrap - min_corner[1]
     x_extrap_local = x_extrap - min_corner[2]
+
+    # Apply optional degradation before filtering/voxelization
+    if degrade_prob > 0.0 and cond_direction is not None:
+        zyx_extrap_local_full = np.stack([z_extrap_local, y_extrap_local, x_extrap_local], axis=-1)
+        uv_mask_shape = uv_mask.shape[:2]
+        zyx_extrap_local_full, _ = apply_degradation(
+            zyx_extrap_local_full,
+            uv_mask_shape,
+            cond_direction,
+            degrade_prob=degrade_prob,
+            curvature_range=degrade_curvature_range,
+            gradient_range=degrade_gradient_range,
+        )
+        z_extrap_local = zyx_extrap_local_full[:, 0]
+        y_extrap_local = zyx_extrap_local_full[:, 1]
+        x_extrap_local = zyx_extrap_local_full[:, 2]
 
     # Filter to in-bounds points
     in_bounds = (
