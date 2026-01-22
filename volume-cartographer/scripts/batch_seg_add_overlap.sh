@@ -1,16 +1,19 @@
 #!/bin/bash
 
 # Script to batch process tifxyz folders to add overlap metadata
-# Usage: batch_seg_add_overlap.sh <segments_to_process> <segments_to_check_against>
+# Usage: batch_seg_add_overlap.sh <segments_to_process> <segments_to_check_against> [--iters N]
 
 set -e
 
 # Check for minimum required arguments
 if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <segments_to_process> <segments_to_check_against>"
+    echo "Usage: $0 <segments_to_process> <segments_to_check_against> [--iters N]"
     echo ""
     echo "This script will find all tifxyz folders in <segments_to_process> and check"
     echo "each one for overlaps against all tifxyz folders in <segments_to_check_against>."
+    echo ""
+    echo "Options:"
+    echo "  --iters N   Number of search iterations (default: 10)"
     echo ""
     echo "Example: $0 /path/to/hold /path/to/paths"
     echo "  - Creates overlapping.json for each segment in 'hold'"
@@ -20,6 +23,22 @@ fi
 
 INPUT_FOLDER="$1"
 TARGET_FOLDER="$2"
+shift 2
+
+# Parse optional arguments
+EXTRA_ARGS=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --iters)
+            EXTRA_ARGS="$EXTRA_ARGS --iters $2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
 
 # Validate folders exist
 if [ ! -d "$INPUT_FOLDER" ]; then
@@ -69,7 +88,7 @@ while IFS= read -r -d '' dir; do
         echo "[$count] Processing: $folder_name"
 
         # Run vc_seg_add_overlap: check this segment against all in target folder
-        if $VC_SEG_ADD_OVERLAP "$TARGET_FOLDER" "$dir"; then
+        if $VC_SEG_ADD_OVERLAP "$TARGET_FOLDER" "$dir" $EXTRA_ARGS; then
             processed=$((processed + 1))
             echo "    Done"
         else
