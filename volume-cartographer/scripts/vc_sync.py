@@ -43,7 +43,6 @@ BACKUP_PATTERNS = [
 # Report configuration
 REPORT_S3_BUCKET = "philodemos"
 REPORT_S3_PREFIX = "david/reports"
-APPROVAL_PIXEL_AREA = (20 * 7.91 / 10000) ** 2
 
 
 class SyncAction(Enum):
@@ -309,6 +308,33 @@ class S3SyncManager:
         """Resolve segment name from meta.json contents or directory name"""
         return meta_data.get('uuid', os.path.basename(root))
 
+    def _get_volume_voxel_size(self):
+        """Find voxel size from volumes/*/meta.json"""
+        volumes_dir = Path(self.local_dir).resolve().parent / "volumes"
+        if not volumes_dir.exists():
+            return None
+
+        for root, dirs, filenames in os.walk(volumes_dir):
+            if 'meta.json' not in filenames:
+                continue
+            meta_path = os.path.join(root, 'meta.json')
+            try:
+                with open(meta_path, 'r') as f:
+                    meta_data = json.load(f)
+                voxel_size = meta_data.get('voxelsize')
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            if isinstance(voxel_size, (list, tuple)) and voxel_size:
+                voxel_size = voxel_size[0]
+
+            try:
+                return float(voxel_size)
+            except (TypeError, ValueError):
+                continue
+
+        return None
+
     def _count_non_black_pixels(self, image_path):
         """Count non-black pixels in an image file"""
         try:
@@ -356,6 +382,11 @@ class S3SyncManager:
 
     def _collect_approval_areas(self):
         """Collect segment names and approval areas from approval.tif files"""
+        voxel_size = self._get_volume_voxel_size()
+        if voxel_size is None:
+            return {}
+        pixel_area = (20 * voxel_size / 10000) ** 2
+
         segments = {}
         for root, dirs, filenames in os.walk(self.local_dir):
             dirs[:] = [d for d in dirs if not d.startswith('.') and 'layers' not in d.lower() and d != 'backups']
@@ -374,7 +405,7 @@ class S3SyncManager:
                     pixel_count = self._count_non_black_pixels(approval_path)
                     if pixel_count is None:
                         continue
-                    segments[segment_name] = pixel_count * APPROVAL_PIXEL_AREA
+                    segments[segment_name] = pixel_count * pixel_area
                 else:
                     segments[segment_name] = 0.0
 
