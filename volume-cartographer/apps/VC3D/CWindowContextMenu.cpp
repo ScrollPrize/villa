@@ -2086,5 +2086,144 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
     }
 }
 
+void CWindow::onReloadFromBackup(const QString& segmentId, int backupIndex)
+{
+    if (!fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    const std::string segIdStd = segmentId.toStdString();
+    auto surf = fVpkg->getSurface(segIdStd);
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Surface not found: %1").arg(segmentId));
+        return;
+    }
+
+    // Build paths
+    namespace fs = std::filesystem;
+    fs::path volpkgRoot = fVpkg->getVolpkgDirectory();
+    fs::path backupDir = volpkgRoot / "backups" / segIdStd / std::to_string(backupIndex);
+    fs::path segmentDir = surf->path;
+
+    if (!fs::exists(backupDir)) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("Backup directory does not exist: %1").arg(QString::fromStdString(backupDir.string())));
+        return;
+    }
+
+    if (!fs::exists(segmentDir)) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("Segment directory does not exist: %1").arg(QString::fromStdString(segmentDir.string())));
+        return;
+    }
+
+    // Confirm with user
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        tr("Confirm Reload from Backup"),
+        tr("This will replace the current segment '%1' with backup %2.\n\n"
+           "The current segment data will be overwritten. Continue?")
+           .arg(segmentId).arg(backupIndex),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+
+    if (reply != QMessageBox::Yes) {
+        statusBar()->showMessage(tr("Reload from backup cancelled"), 3000);
+        return;
+    }
+
+    // Files to copy from backup
+    std::vector<std::string> filesToCopy = {
+        "mesh.ply",
+        "mask.tif",
+        "meta.json",
+        "generations.tif"
+    };
+
+    std::error_code ec;
+    int copiedCount = 0;
+
+    for (const auto& filename : filesToCopy) {
+        fs::path srcFile = backupDir / filename;
+        fs::path dstFile = segmentDir / filename;
+
+        if (fs::exists(srcFile)) {
+            // Remove existing file first
+            if (fs::exists(dstFile)) {
+                fs::remove(dstFile, ec);
+                if (ec) {
+                    QMessageBox::warning(this, tr("Error"),
+                        tr("Failed to remove existing file %1: %2")
+                           .arg(QString::fromStdString(dstFile.string()))
+                           .arg(QString::fromStdString(ec.message())));
+                    return;
+                }
+            }
+
+            // Copy from backup
+            fs::copy_file(srcFile, dstFile, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                QMessageBox::warning(this, tr("Error"),
+                    tr("Failed to copy %1: %2")
+                       .arg(QString::fromStdString(filename))
+                       .arg(QString::fromStdString(ec.message())));
+                return;
+            }
+            copiedCount++;
+        }
+    }
+
+    if (copiedCount == 0) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("No files found in backup directory."));
+        return;
+    }
+
+    // Reload the surface
+    bool wasSelected = (_surfID == segIdStd);
+
+    if (fVpkg->reloadSingleSegmentation(segIdStd)) {
+        try {
+            auto reloadedSurf = fVpkg->loadSurface(segIdStd);
+            if (reloadedSurf) {
+                if (_surf_col) {
+                    _surf_col->setSurface(segIdStd, reloadedSurf, false, false);
+                }
+
+                if (_surfacePanel) {
+                    _surfacePanel->refreshSurfaceMetrics(segIdStd);
+                }
+
+                if (wasSelected) {
+                    _surfID = segIdStd;
+                    _surf_weak = reloadedSurf;
+
+                    if (_surf_col) {
+                        _surf_col->setSurface("segmentation", reloadedSurf, false, false);
+                    }
+
+                    if (_surfacePanel) {
+                        _surfacePanel->syncSelectionUi(segIdStd, reloadedSurf.get());
+                    }
+                }
+
+                statusBar()->showMessage(
+                    tr("Restored '%1' from backup %2 (%3 files)")
+                       .arg(segmentId).arg(backupIndex).arg(copiedCount),
+                    5000);
+            }
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, tr("Error"),
+                tr("Failed to reload surface after restore: %1")
+                   .arg(QString::fromUtf8(e.what())));
+        }
+    } else {
+        QMessageBox::warning(this, tr("Warning"),
+            tr("Files were copied but failed to reload the segmentation. "
+               "Try using the reload button."));
+    }
+}
+
 // Include the MOC file for Q_OBJECT classes in anonymous namespace
 #include "CWindowContextMenu.moc"

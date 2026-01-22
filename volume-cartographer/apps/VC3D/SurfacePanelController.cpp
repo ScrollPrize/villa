@@ -35,6 +35,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <fstream>
 #include <optional>
 #include <unordered_set>
 #include <set>
@@ -687,6 +688,53 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, false);
         });
+
+        // Reload from Backup submenu
+        std::filesystem::path backupsDir =
+            std::filesystem::path(_volumePkg->getVolpkgDirectory()) / "backups" / segmentId.toStdString();
+        if (std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
+            std::vector<int> availableBackups;
+            for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
+                if (entry.is_directory()) {
+                    try {
+                        int idx = std::stoi(entry.path().filename().string());
+                        if (idx >= 0 && idx <= 9) {
+                            availableBackups.push_back(idx);
+                        }
+                    } catch (...) {
+                        // Not a numeric directory, skip
+                    }
+                }
+            }
+            if (!availableBackups.empty()) {
+                std::sort(availableBackups.begin(), availableBackups.end());
+                QMenu* backupMenu = contextMenu.addMenu(tr("Reload from Backup"));
+                for (int idx : availableBackups) {
+                    std::filesystem::path backupPath = backupsDir / std::to_string(idx);
+                    QString label = tr("Backup %1").arg(idx);
+
+                    // Try to get timestamp from meta.json
+                    std::filesystem::path metaPath = backupPath / "meta.json";
+                    if (std::filesystem::exists(metaPath)) {
+                        try {
+                            std::ifstream f(metaPath);
+                            nlohmann::json meta = nlohmann::json::parse(f);
+                            if (meta.contains("backup_timestamp")) {
+                                label = tr("Backup %1 - %2").arg(idx).arg(
+                                    QString::fromStdString(meta["backup_timestamp"].get<std::string>()));
+                            }
+                        } catch (...) {
+                            // Couldn't read meta, use simple label
+                        }
+                    }
+
+                    QAction* backupAction = backupMenu->addAction(label);
+                    connect(backupAction, &QAction::triggered, this, [this, segmentId, idx]() {
+                        emit reloadFromBackupRequested(segmentId, idx);
+                    });
+                }
+            }
+        }
     }
 
     contextMenu.addSeparator();

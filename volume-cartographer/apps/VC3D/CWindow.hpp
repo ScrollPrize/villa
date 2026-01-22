@@ -100,6 +100,7 @@ public slots:
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
+    void onReloadFromBackup(const QString& segmentId, int backupIndex);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,
