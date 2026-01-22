@@ -1225,87 +1225,6 @@ static int conditional_corr_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t>
     return set;
 };
 
-// Compute local surface normal from neighboring 3D points using cross product of tangent vectors.
-// Returns normalized normal vector, or zero vector if insufficient neighbors.
-// If surface_normals is provided and has valid neighbors, orients the result to be consistent.
-static cv::Vec3d compute_surface_normal_at(
-    const cv::Vec2i& p,
-    const cv::Mat_<cv::Vec3d>& dpoints,
-    const cv::Mat_<uchar>& state,
-    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr)
-{
-    auto is_valid = [&](const cv::Vec2i& pt) {
-        return pt[0] >= 0 && pt[0] < dpoints.rows &&
-               pt[1] >= 0 && pt[1] < dpoints.cols &&
-               (state(pt) & STATE_LOC_VALID);
-    };
-
-    // Try to get horizontal and vertical tangents
-    cv::Vec3d tangent_h(0,0,0), tangent_v(0,0,0);
-    bool has_h = false, has_v = false;
-
-    // Horizontal tangent
-    cv::Vec2i left = {p[0], p[1] - 1};
-    cv::Vec2i right = {p[0], p[1] + 1};
-    if (is_valid(left) && is_valid(right)) {
-        tangent_h = dpoints(right) - dpoints(left);
-        has_h = true;
-    }
-
-    // Vertical tangent
-    cv::Vec2i up = {p[0] - 1, p[1]};
-    cv::Vec2i down = {p[0] + 1, p[1]};
-    if (is_valid(up) && is_valid(down)) {
-        tangent_v = dpoints(down) - dpoints(up);
-        has_v = true;
-    }
-
-    if (!has_h || !has_v) {
-        return cv::Vec3d(0,0,0);
-    }
-
-    cv::Vec3d normal = tangent_h.cross(tangent_v);
-    double len = cv::norm(normal);
-    if (len < 1e-9) {
-        return cv::Vec3d(0,0,0);
-    }
-    normal /= len;
-
-    // Orient consistently with neighbors if surface_normals provided
-    if (surface_normals) {
-        static const cv::Vec2i neighbor_offsets[] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
-        for (const auto& off : neighbor_offsets) {
-            cv::Vec2i neighbor = p + off;
-            if (is_valid(neighbor)) {
-                cv::Vec3d neighbor_normal = (*surface_normals)(neighbor);
-                if (cv::norm(neighbor_normal) > 0.5) {
-                    // Flip if pointing opposite to neighbor
-                    if (normal.dot(neighbor_normal) < 0) {
-                        normal = -normal;
-                    }
-                    break;  // Use first valid neighbor for orientation
-                }
-            }
-        }
-    }
-
-    return normal;
-}
-
-// Compute and store oriented surface normal for a point
-// Uses existing neighbor normals for consistent orientation
-static void update_surface_normal(
-    const cv::Vec2i& p,
-    const cv::Mat_<cv::Vec3d>& dpoints,
-    const cv::Mat_<uchar>& state,
-    cv::Mat_<cv::Vec3d>& surface_normals)
-{
-    cv::Vec3d normal = compute_surface_normal_at(p, dpoints, state, &surface_normals);
-    if (cv::norm(normal) > 0.5) {
-        surface_normals(p) = normal;
-    }
-}
-
 static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_status, const cv::Vec2i &p,
     TraceParameters &params, TraceData& trace_data,
     const LossSettings &settings)
@@ -1757,6 +1676,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
+    float correction_single_point_radius = params.value("correction_single_point_radius", 8.0f);
+    if (correction_single_point_radius <= 0.0f) {
+        std::cerr << "WARNING: correction_single_point_radius must be > 0; defaulting to 8.0" << std::endl;
+        correction_single_point_radius = 8.0f;
+    }
+
+    const std::string resume_opt = params.value("resume_opt", "skip");
 
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
@@ -2203,7 +2129,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                         // Single point - use a radius-based region instead of convex hull
                         // This handles the drag-and-drop case where only one correction point is set
                         cv::Point2f center(collection.grid_locs_[0][0], collection.grid_locs_[0][1]);
-                        float radius = 8.0f;  // Default radius for single-point corrections
+                        float radius = correction_single_point_radius;
                         single_point_regions.emplace_back(center, radius);
                         std::cout << "single-point correction region at " << center << " with radius " << radius << std::endl;
                     } else {
@@ -2280,7 +2206,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     max_dist = std::max(max_dist, (float)cv::norm(loc - avg_loc));
                 }
 
-                int radius = 8 + static_cast<int>(std::ceil(max_dist));
+                int radius = static_cast<int>(std::ceil(correction_single_point_radius + max_dist));
                 cv::Vec2i corr_center_i = { (int)std::round(avg_loc[1]), (int)std::round(avg_loc[0]) };
                 opt_centers.push_back({corr_center_i, radius});
 
@@ -2326,6 +2252,14 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 surf->save(tgt_path, true);
                 delete surf;
                 std::cout << "saved snapshot in " << tgt_path << std::endl;
+            }
+        }
+
+        for (int j = used_area.y; j < used_area.br().y; ++j) {
+            for (int i = used_area.x; i < used_area.br().x; ++i) {
+                if (trace_params.state(j, i) & STATE_LOC_VALID) {
+                    update_surface_normal({j, i}, trace_params.dpoints, trace_params.state, surface_normals);
+                }
             }
         }
 
@@ -2671,7 +2605,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         for(const auto& p : fringe)
         {
             for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
+                if (point_in_bounds(trace_params.state, p + n)
                     && (trace_params.state(p+n) & STATE_PROCESSING) == 0
                     && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
                     trace_params.state(p+n) |= STATE_PROCESSING;
