@@ -16,18 +16,27 @@ static double  val(const double &v) { return v; }
 template <typename JetT>
 double  val(const JetT &v) { return v.a; }
 
+template <typename T>
+inline bool is_invalid_point(const T* const p) {
+    return val(p[0]) == -1 && val(p[1]) == -1 && val(p[2]) == -1;
+}
+
+template <typename T>
+inline T angle_diff_deg_t(const T& a_deg, const T& b_deg) {
+    const T diff_rad = (a_deg - b_deg) * T(M_PI / 180.0);
+    return atan2(sin(diff_rad), cos(diff_rad)) * T(180.0 / M_PI);
+}
+
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
     bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
+        if (is_invalid_point(a)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss CORNER" << std::endl;
             return true;
         }
-        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
+        if (is_invalid_point(b)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss CORNER" << std::endl;
             return true;
         }
 
@@ -64,14 +73,12 @@ struct DistLoss2D {
     DistLoss2D(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
     bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
+        if (is_invalid_point(a)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss2D CORNER" << std::endl;
             return true;
         }
-        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
+        if (is_invalid_point(b)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss2D CORNER" << std::endl;
             return true;
         }
 
@@ -1622,4 +1629,168 @@ struct SdtForwardLoss {
         return new ceres::AutoDiffCostFunction<SdtForwardLoss, 1, 3>(
             new SdtForwardLoss(field, min_forward_dist, w));
     }
+};
+
+struct TangentOrthogonalityLossAnalytic {
+    TangentOrthogonalityLossAnalytic(const cv::Vec3f& center, double w)
+        : _center(center), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p_prev, const T* const p_curr, const T* const p_next, T* residual) const {
+        if (is_invalid_point(p_prev) || is_invalid_point(p_curr) || is_invalid_point(p_next)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T tx = p_next[0] - p_prev[0];
+        const T ty = p_next[1] - p_prev[1];
+        const T rx = p_curr[0] - T(_center[0]);
+        const T ry = p_curr[1] - T(_center[1]);
+        const T tnorm = sqrt(tx * tx + ty * ty);
+        const T rnorm = sqrt(rx * rx + ry * ry);
+        if (val(tnorm) <= 0.0 || val(rnorm) <= 0.0) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dot = (tx * rx + ty * ry) / (tnorm * rnorm);
+        residual[0] = T(_w) * dot;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center, float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<TangentOrthogonalityLossAnalytic, 1, 3, 3, 3>(
+            new TangentOrthogonalityLossAnalytic(center, w));
+    }
+
+    cv::Vec3f _center;
+    double _w;
+};
+
+struct AngleStepLossAnalytic {
+    AngleStepLossAnalytic(const cv::Vec3f& center, double expected_dtheta_deg, double w)
+        : _center(center), _expected_dtheta_deg(expected_dtheta_deg), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p_prev, const T* const p_curr, T* residual) const {
+        if (is_invalid_point(p_prev) || is_invalid_point(p_curr)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dx0 = p_prev[0] - T(_center[0]);
+        const T dy0 = p_prev[1] - T(_center[1]);
+        const T dx1 = p_curr[0] - T(_center[0]);
+        const T dy1 = p_curr[1] - T(_center[1]);
+
+        const T theta0 = atan2(dy0, dx0);
+        const T theta1 = atan2(dy1, dx1);
+        const T diff = atan2(sin(theta1 - theta0), cos(theta1 - theta0));
+        const T diff_deg = diff * T(180.0 / M_PI);
+
+        residual[0] = T(_w) * (diff_deg - T(_expected_dtheta_deg));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center, double expected_dtheta_deg, float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<AngleStepLossAnalytic, 1, 3, 3>(
+            new AngleStepLossAnalytic(center, expected_dtheta_deg, w));
+    }
+
+    cv::Vec3f _center;
+    double _expected_dtheta_deg;
+    double _w;
+};
+
+struct RadialSlopeLossAnalytic {
+    RadialSlopeLossAnalytic(const cv::Vec3f& center,
+                            const cv::Vec3f& center_other,
+                            double expected_slope,
+                            double w)
+        : _center(center),
+          _center_other(center_other),
+          _expected_slope(expected_slope),
+          _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p_curr, const T* const p_other, T* residual) const {
+        if (is_invalid_point(p_curr) || is_invalid_point(p_other)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dx0 = p_curr[0] - T(_center[0]);
+        const T dy0 = p_curr[1] - T(_center[1]);
+        const T dx1 = p_other[0] - T(_center_other[0]);
+        const T dy1 = p_other[1] - T(_center_other[1]);
+        const T r0 = sqrt(dx0 * dx0 + dy0 * dy0);
+        const T r1 = sqrt(dx1 * dx1 + dy1 * dy1);
+        const T dz = p_other[2] - p_curr[2];
+
+        if (std::abs(val(dz)) < 1e-6) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T slope = (r1 - r0) / dz;
+        residual[0] = T(_w) * (slope - T(_expected_slope));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center,
+                                       const cv::Vec3f& center_other,
+                                       double expected_slope,
+                                       float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<RadialSlopeLossAnalytic, 1, 3, 3>(
+            new RadialSlopeLossAnalytic(center, center_other, expected_slope, w));
+    }
+
+    cv::Vec3f _center;
+    cv::Vec3f _center_other;
+    double _expected_slope;
+    double _w;
+};
+
+struct AngleColumnLossAnalytic {
+    AngleColumnLossAnalytic(const cv::Vec3f& center,
+                            double expected_theta_deg,
+                            double base_theta_offset,
+                            double w)
+        : _center(center),
+          _expected_theta_deg(expected_theta_deg),
+          _base_theta_offset(base_theta_offset),
+          _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        if (is_invalid_point(p)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dx = p[0] - T(_center[0]);
+        const T dy = p[1] - T(_center[1]);
+        T theta_deg = atan2(dy, dx) * T(180.0 / M_PI);
+        if (val(theta_deg) < 0.0) {
+            theta_deg += T(360.0);
+        }
+        theta_deg += T(_base_theta_offset);
+
+        const T diff_deg = angle_diff_deg_t(theta_deg, T(_expected_theta_deg));
+        residual[0] = T(_w) * diff_deg;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center,
+                                       double expected_theta_deg,
+                                       double base_theta_offset,
+                                       float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<AngleColumnLossAnalytic, 1, 3>(
+            new AngleColumnLossAnalytic(center, expected_theta_deg, base_theta_offset, w));
+    }
+
+    cv::Vec3f _center;
+    double _expected_theta_deg;
+    double _base_theta_offset;
+    double _w;
 };
