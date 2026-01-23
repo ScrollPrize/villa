@@ -59,6 +59,7 @@ public:
     [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
     [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
     [[nodiscard]] QString customParamsText() const { return _customParamsText; }
+    [[nodiscard]] QString customParamsProfile() const { return _customParamsProfile; }
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
@@ -198,6 +199,8 @@ private:
     void validateCustomParamsText();
     void updateCustomParamsStatus();
     std::optional<nlohmann::json> parseCustomParams(QString* error) const;
+    void applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi);
+    [[nodiscard]] QString paramsTextForProfile(const QString& profile) const;
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     void applyAlphaPushPullConfig(const AlphaPushPullConfig& config, bool emitSignal, bool persist = true);
 
@@ -330,10 +333,13 @@ private:
     QCheckBox* _chkShowHoverMarker{nullptr};
 
     QGroupBox* _groupCustomParams{nullptr};
+    QComboBox* _comboCustomParamsProfile{nullptr};
     QPlainTextEdit* _editCustomParams{nullptr};
     QLabel* _lblCustomParamsStatus{nullptr};
     QString _customParamsText;
     QString _customParamsError;
+    QString _customParamsProfile{QStringLiteral("custom")};
+    bool _updatingCustomParamsProgrammatically{false};
 
     bool _correctionsEnabled{false};
     bool _correctionsZRangeEnabled{false};

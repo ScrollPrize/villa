@@ -966,6 +966,21 @@ void SegmentationWidget::buildUi()
     customParamsDescription->setWordWrap(true);
     customParamsLayout->addWidget(customParamsDescription);
 
+    {
+        auto* profileRow = new QHBoxLayout();
+        auto* profileLabel = new QLabel(tr("Profile:"), _groupCustomParams);
+        _comboCustomParamsProfile = new QComboBox(_groupCustomParams);
+        _comboCustomParamsProfile->addItem(tr("Custom"), QStringLiteral("custom"));
+        _comboCustomParamsProfile->addItem(tr("Default"), QStringLiteral("default"));
+        _comboCustomParamsProfile->addItem(tr("Robust"), QStringLiteral("robust"));
+        _comboCustomParamsProfile->setToolTip(tr("Select a predefined parameter profile.\n"
+                                               "- Custom: editable\n"
+                                               "- Default/Robust: auto-filled and read-only"));
+        profileRow->addWidget(profileLabel);
+        profileRow->addWidget(_comboCustomParamsProfile, 1);
+        customParamsLayout->addLayout(profileRow);
+    }
+
     _editCustomParams = new QPlainTextEdit(_groupCustomParams);
     _editCustomParams->setToolTip(tr("Optional JSON that merges into tracer parameters before growth."));
     _editCustomParams->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
@@ -1409,6 +1424,17 @@ void SegmentationWidget::buildUi()
         handleCustomParamsEdited();
     });
 
+    connect(_comboCustomParamsProfile, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        if (_restoringSettings) {
+            return;
+        }
+        if (!_comboCustomParamsProfile || idx < 0) {
+            return;
+        }
+        const QString profile = _comboCustomParamsProfile->itemData(idx).toString();
+        applyCustomParamsProfile(profile, /*persist=*/true, /*fromUi=*/true);
+    });
+
     connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
         emit correctionsAnnotateToggled(enabled);
     });
@@ -1557,6 +1583,18 @@ void SegmentationWidget::syncUiState()
             const QSignalBlocker blocker(_editCustomParams);
             _editCustomParams->setPlainText(_customParamsText);
         }
+    }
+
+    if (_comboCustomParamsProfile) {
+        const QSignalBlocker blocker(_comboCustomParamsProfile);
+        const int idx = _comboCustomParamsProfile->findData(_customParamsProfile);
+        if (idx >= 0) {
+            _comboCustomParamsProfile->setCurrentIndex(idx);
+        }
+    }
+
+    if (_editCustomParams) {
+        _editCustomParams->setReadOnly(_customParamsProfile != QStringLiteral("custom"));
     }
     updateCustomParamsStatus();
 
@@ -1798,6 +1836,57 @@ void SegmentationWidget::syncUiState()
     updateGrowthUiState();
 }
 
+QString SegmentationWidget::paramsTextForProfile(const QString& profile) const
+{
+    if (profile == QStringLiteral("default")) {
+        // Empty => use GrowPatch defaults.
+        return QString();
+    }
+    if (profile == QStringLiteral("robust")) {
+        // See LossSettings() in core/src/GrowPatch.cpp.
+        return QStringLiteral(
+            "{\n"
+            "  \"snap_weight\": 0.0,\n"
+            "  \"normal_weight\": 0.0,\n"
+            "  \"normal3dline_weight\": 1.0,\n"
+            "  \"straight_weight\": 10.0,\n"
+            "  \"dist_weight\": 1.0,\n"
+            "  \"direction_weight\": 0.0,\n"
+            "  \"sdir_weight\": 1.0,\n"
+            "  \"correction_weight\": 1.0,\n"
+            "  \"reference_ray_weight\": 0.0\n"
+            "}\n");
+    }
+    return _customParamsText;
+}
+
+void SegmentationWidget::applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi)
+{
+    const QString normalized = (profile == QStringLiteral("default") || profile == QStringLiteral("robust"))
+        ? profile
+        : QStringLiteral("custom");
+
+    if (_customParamsProfile == normalized && (!fromUi || normalized == QStringLiteral("custom"))) {
+        // Nothing to do.
+    }
+    _customParamsProfile = normalized;
+    if (persist) {
+        writeSetting(QStringLiteral("custom_params_profile"), _customParamsProfile);
+    }
+
+    if (_customParamsProfile != QStringLiteral("custom")) {
+        _updatingCustomParamsProgrammatically = true;
+        _customParamsText = paramsTextForProfile(_customParamsProfile);
+        if (persist) {
+            writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
+        }
+        validateCustomParamsText();
+        _updatingCustomParamsProgrammatically = false;
+    }
+
+    syncUiState();
+}
+
 void SegmentationWidget::restoreSettings()
 {
     using namespace vc3d::settings;
@@ -1909,7 +1998,18 @@ void SegmentationWidget::restoreSettings()
     }
 
     _customParamsText = settings.value(segmentation::CUSTOM_PARAMS_TEXT, QString()).toString();
+    _customParamsProfile = settings.value(QStringLiteral("custom_params_profile"), _customParamsProfile).toString();
+    if (_customParamsProfile != QStringLiteral("custom") &&
+        _customParamsProfile != QStringLiteral("default") &&
+        _customParamsProfile != QStringLiteral("robust")) {
+        _customParamsProfile = QStringLiteral("custom");
+    }
     validateCustomParamsText();
+
+    // Apply profile behavior (auto-fill + read-only) after restoring.
+    if (_customParamsProfile != QStringLiteral("custom")) {
+        applyCustomParamsProfile(_customParamsProfile, /*persist=*/false, /*fromUi=*/false);
+    }
 
     _approvalBrushRadius = settings.value(segmentation::APPROVAL_BRUSH_RADIUS, _approvalBrushRadius).toFloat();
     _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
@@ -2435,6 +2535,16 @@ void SegmentationWidget::handleCustomParamsEdited()
     if (!_editCustomParams) {
         return;
     }
+
+    if (_updatingCustomParamsProgrammatically) {
+        return;
+    }
+
+    // Edits only allowed in custom profile (UI should already be read-only otherwise).
+    if (_customParamsProfile != QStringLiteral("custom")) {
+        return;
+    }
+
     _customParamsText = _editCustomParams->toPlainText();
     writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
     validateCustomParamsText();
