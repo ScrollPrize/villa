@@ -286,17 +286,6 @@ struct TraceData {
     // Optional fitted-3D normals direction-field (zarr root with x/<scale>,y/<scale>,z/<scale> datasets)
     std::unique_ptr<Chunked3dVec3fFromUint8> normal3d_field;
     std::unique_ptr<NormalFitQualityWeightField> normal3d_fit_quality;
-    struct ReferenceRaycastSettings {
-        QuadSurface* surface = nullptr;
-        double voxel_threshold = 1.0;
-        double penalty_weight = 0.5;
-        double sample_step = 1.0;
-        double max_distance = 250.0;
-        double min_clearance = 4.0;
-        double clearance_weight = 1.0;
-
-        bool enabled() const { return surface && penalty_weight > 0.0; }
-    } reference_raycast;
 
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
 };
@@ -470,15 +459,28 @@ struct LossSettings {
     std::vector<cv::Mat_<float>> w_mats = std::vector<cv::Mat_<float>>(LossType::COUNT);
 
     LossSettings() {
-        w[LossType::SNAP] = 0.0f;
-        w[LossType::NORMAL] = 0.0f;
-        w[LossType::NORMAL3DLINE] = 1.0f;
-        w[LossType::STRAIGHT] = 10.0;
+        w[LossType::SNAP] = 0.1f;
+        w[LossType::NORMAL] = 10.0f;
+        w[LossType::NORMAL3DLINE] = 0.0f;
+        w[LossType::STRAIGHT] = 0.2;
         w[LossType::DIST] = 1.0f;
-        w[LossType::DIRECTION] = 0.0f;
+        w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
-        w[LossType::REFERENCE_RAY] = 0.0f;
+        w[LossType::REFERENCE_RAY] = 0.5f;
+    }
+
+    struct ReferenceRaycastSettings {
+        QuadSurface* surface = nullptr;
+        double voxel_threshold = 1.0;
+        double sample_step = 1.0;
+        double max_distance = 250.0;
+        double min_clearance = 4.0;
+        double clearance_weight = 1.0;
+    } reference_raycast;
+
+    bool reference_raycast_enabled() const {
+        return reference_raycast.surface && w[LossType::REFERENCE_RAY] > 0.0f;
     }
 
     void applyJsonWeights(const nlohmann::json& params) {
@@ -837,7 +839,7 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
 static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                   TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
-    if (!trace_data.reference_raycast.enabled())
+    if (!settings.reference_raycast_enabled())
         return 0;
     if (!trace_data.raw_volume)
         return 0;
@@ -852,41 +854,41 @@ static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
     if (candidate[0] == -1.0 && candidate[1] == -1.0 && candidate[2] == -1.0)
         return 0;
 
-    cv::Vec3f ptr = trace_data.reference_raycast.surface->pointer();
+    cv::Vec3f ptr = settings.reference_raycast.surface->pointer();
     const cv::Vec3f candidate_f(static_cast<float>(candidate[0]),
                                 static_cast<float>(candidate[1]),
                                 static_cast<float>(candidate[2]));
 
-    float dist = trace_data.reference_raycast.surface->pointTo(
+    float dist = settings.reference_raycast.surface->pointTo(
         ptr,
         candidate_f,
         std::numeric_limits<float>::max(),
         1000);
     if (dist < 0.0f)
         return 0;
-    if (trace_data.reference_raycast.max_distance > 0.0 && dist > trace_data.reference_raycast.max_distance)
+    if (settings.reference_raycast.max_distance > 0.0 && dist > settings.reference_raycast.max_distance)
         return 0;
 
-    const cv::Vec3f nearest = trace_data.reference_raycast.surface->coord(ptr);
+    const cv::Vec3f nearest = settings.reference_raycast.surface->coord(ptr);
     const cv::Vec3d target{nearest[0], nearest[1], nearest[2]};
 
-    if (trace_data.reference_raycast.penalty_weight > 0.0) {
+    {
         auto* functor = new ReferenceRayOcclusionCost(trace_data.raw_volume,
                                                       target,
-                                                      trace_data.reference_raycast.voxel_threshold,
-                                                      trace_data.reference_raycast.penalty_weight * static_cast<double>(w),
-                                                      trace_data.reference_raycast.sample_step,
-                                                      trace_data.reference_raycast.max_distance);
+                                                      settings.reference_raycast.voxel_threshold,
+                                                      static_cast<double>(w),
+                                                      settings.reference_raycast.sample_step,
+                                                      settings.reference_raycast.max_distance);
 
         auto* cost = new ceres::NumericDiffCostFunction<ReferenceRayOcclusionCost, ceres::CENTRAL, 1, 3>(functor);
         problem.AddResidualBlock(cost, nullptr, &params.dpoints(p)[0]);
     }
 
-    if (trace_data.reference_raycast.clearance_weight > 0.0 &&
-        trace_data.reference_raycast.min_clearance > 0.0) {
+    if (settings.reference_raycast.clearance_weight > 0.0 &&
+        settings.reference_raycast.min_clearance > 0.0) {
         auto* clearance_functor = new ReferenceClearanceCost(target,
-                                                             trace_data.reference_raycast.min_clearance,
-                                                             trace_data.reference_raycast.clearance_weight * static_cast<double>(w));
+                                                             settings.reference_raycast.min_clearance,
+                                                             settings.reference_raycast.clearance_weight * static_cast<double>(w));
         auto* clearance_cost = new ceres::NumericDiffCostFunction<ReferenceClearanceCost, ceres::CENTRAL, 1, 3>(clearance_functor);
         problem.AddResidualBlock(clearance_cost, nullptr, &params.dpoints(p)[0]);
     }
@@ -2107,7 +2109,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         if (!ref_path.empty()) {
             try {
                 reference_surface = load_quad_from_tifxyz(ref_path);
-                trace_data.reference_raycast.surface = reference_surface.get();
+                loss_settings.reference_raycast.surface = reference_surface.get();
                 std::cout << "Loaded reference surface from " << ref_path << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "Failed to load reference surface '" << ref_path << "': " << e.what() << std::endl;
@@ -2116,7 +2118,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             std::cerr << "reference_surface parameter provided without a valid path" << std::endl;
         }
 
-        if (trace_data.reference_raycast.surface && ref_cfg.is_object()) {
+        if (loss_settings.reference_raycast.surface && ref_cfg.is_object()) {
             auto read_double = [&](const char* key, double current) {
                 const auto it = ref_cfg.find(key);
                 if (it == ref_cfg.end() || it->is_null()) {
@@ -2128,32 +2130,34 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 std::cerr << "reference_surface." << key << " must be numeric" << std::endl;
                 return current;
             };
-            trace_data.reference_raycast.voxel_threshold = read_double("voxel_threshold", trace_data.reference_raycast.voxel_threshold);
-            trace_data.reference_raycast.penalty_weight  = read_double("penalty_weight",  trace_data.reference_raycast.penalty_weight);
-            trace_data.reference_raycast.sample_step     = read_double("sample_step",     trace_data.reference_raycast.sample_step);
-            trace_data.reference_raycast.max_distance    = read_double("max_distance",    trace_data.reference_raycast.max_distance);
-            trace_data.reference_raycast.min_clearance   = read_double("min_clearance",   trace_data.reference_raycast.min_clearance);
-            trace_data.reference_raycast.clearance_weight = read_double("clearance_weight", trace_data.reference_raycast.clearance_weight);
-            trace_data.reference_raycast.voxel_threshold = std::clamp(trace_data.reference_raycast.voxel_threshold, 0.0, 255.0);
-            if (trace_data.reference_raycast.penalty_weight < 0.0)
-                trace_data.reference_raycast.penalty_weight = 0.0;
-            if (trace_data.reference_raycast.sample_step <= 0.0)
-                trace_data.reference_raycast.sample_step = 1.0;
-            if (trace_data.reference_raycast.min_clearance < 0.0)
-                trace_data.reference_raycast.min_clearance = 0.0;
-            if (trace_data.reference_raycast.clearance_weight < 0.0)
-                trace_data.reference_raycast.clearance_weight = 0.0;
+            loss_settings.reference_raycast.voxel_threshold = read_double("voxel_threshold", loss_settings.reference_raycast.voxel_threshold);
+            // Keep JSON key the same, but store it into the REFERENCE_RAY loss weight exclusively.
+            // (This is effectively the same knob as reference_ray_weight.)
+            loss_settings.w[LossType::REFERENCE_RAY] = static_cast<float>(read_double("penalty_weight", static_cast<double>(loss_settings.w[LossType::REFERENCE_RAY])));
+            loss_settings.reference_raycast.sample_step     = read_double("sample_step",     loss_settings.reference_raycast.sample_step);
+            loss_settings.reference_raycast.max_distance    = read_double("max_distance",    loss_settings.reference_raycast.max_distance);
+            loss_settings.reference_raycast.min_clearance   = read_double("min_clearance",   loss_settings.reference_raycast.min_clearance);
+            loss_settings.reference_raycast.clearance_weight = read_double("clearance_weight", loss_settings.reference_raycast.clearance_weight);
+            loss_settings.reference_raycast.voxel_threshold = std::clamp(loss_settings.reference_raycast.voxel_threshold, 0.0, 255.0);
+            if (loss_settings.w[LossType::REFERENCE_RAY] < 0.0f)
+                loss_settings.w[LossType::REFERENCE_RAY] = 0.0f;
+            if (loss_settings.reference_raycast.sample_step <= 0.0)
+                loss_settings.reference_raycast.sample_step = 1.0;
+            if (loss_settings.reference_raycast.min_clearance < 0.0)
+                loss_settings.reference_raycast.min_clearance = 0.0;
+            if (loss_settings.reference_raycast.clearance_weight < 0.0)
+                loss_settings.reference_raycast.clearance_weight = 0.0;
         }
 
-        if (trace_data.reference_raycast.enabled()) {
+        if (loss_settings.reference_raycast_enabled()) {
             std::cout << "Reference raycast penalty enabled (threshold="
-                      << trace_data.reference_raycast.voxel_threshold
-                      << ", weight=" << trace_data.reference_raycast.penalty_weight
-                      << ", step=" << trace_data.reference_raycast.sample_step
-                      << ", min_clearance=" << trace_data.reference_raycast.min_clearance
-                      << " (clear_w=" << trace_data.reference_raycast.clearance_weight << ")";
-            if (trace_data.reference_raycast.max_distance > 0.0) {
-                std::cout << ", max_distance=" << trace_data.reference_raycast.max_distance;
+                      << loss_settings.reference_raycast.voxel_threshold
+                      << ", weight=" << loss_settings.w[LossType::REFERENCE_RAY]
+                      << ", step=" << loss_settings.reference_raycast.sample_step
+                      << ", min_clearance=" << loss_settings.reference_raycast.min_clearance
+                      << " (clear_w=" << loss_settings.reference_raycast.clearance_weight << ")";
+            if (loss_settings.reference_raycast.max_distance > 0.0) {
+                std::cout << ", max_distance=" << loss_settings.reference_raycast.max_distance;
             }
             std::cout << ")" << std::endl;
         }
