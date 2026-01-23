@@ -45,7 +45,6 @@
 #define LOSS_DIST 2
 #define LOSS_NORMALSNAP 4
 #define LOSS_SDIR 8
-#define LOSS_3DNORMAL 16
 #define LOSS_3DNORMALLINE 32
 
 namespace { // Anonymous namespace for local helpers
@@ -459,10 +458,10 @@ enum LossType {
     DIRECTION,
     SNAP,
     NORMAL,
-    NORMAL3D,
     NORMAL3DLINE,
     SDIR,
     CORRECTION,
+    REFERENCE_RAY,
     COUNT
 };
 
@@ -473,13 +472,13 @@ struct LossSettings {
     LossSettings() {
         w[LossType::SNAP] = 0.0f;
         w[LossType::NORMAL] = 0.0f;
-        w[LossType::NORMAL3D] = 0.0f;
         w[LossType::NORMAL3DLINE] = 1.0f;
         w[LossType::STRAIGHT] = 10.0;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 0.0f;
+        w[LossType::REFERENCE_RAY] = 0.0f;
     }
 
     void applyJsonWeights(const nlohmann::json& params) {
@@ -497,13 +496,13 @@ struct LossSettings {
 
         set_weight("snap_weight", LossType::SNAP);
         set_weight("normal_weight", LossType::NORMAL);
-        set_weight("normal3d_weight", LossType::NORMAL3D);
         set_weight("normal3dline_weight", LossType::NORMAL3DLINE);
         set_weight("straight_weight", LossType::STRAIGHT);
         set_weight("dist_weight", LossType::DIST);
         set_weight("direction_weight", LossType::DIRECTION);
         set_weight("sdir_weight", LossType::SDIR);
         set_weight("correction_weight", LossType::CORRECTION);
+        set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -771,8 +770,6 @@ void set_space_tracing_use_cuda(bool enable) {
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, TraceParameters &params, const LossSettings &settings);
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
-static int gen_3d_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
-static int conditional_3d_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_3d_normal_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_3d_normal_line_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
@@ -780,10 +777,13 @@ static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
                                double sdir_eps_abs, double sdir_eps_rel);
 static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-                                       ceres::Problem &problem, TraceParameters &params,
-                                       const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
+                                        ceres::Problem &problem, TraceParameters &params,
+                                        const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
 static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
-                                  TraceParameters &params, const TraceData &trace_data);
+                                  TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int conditional_reference_ray_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+                                          ceres::Problem &problem, TraceParameters &params,
+                                          const TraceData &trace_data, const LossSettings &settings);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -831,13 +831,17 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
 }
 
 static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
-                                  TraceParameters &params, const TraceData &trace_data)
+                                  TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
     if (!trace_data.reference_raycast.enabled())
         return 0;
     if (!trace_data.raw_volume)
         return 0;
     if (!(params.state(p) & STATE_LOC_VALID))
+        return 0;
+
+    const float w = settings(LossType::REFERENCE_RAY, p);
+    if (w <= 0.0f)
         return 0;
 
     const cv::Vec3d& candidate = params.dpoints(p);
@@ -866,7 +870,7 @@ static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
         auto* functor = new ReferenceRayOcclusionCost(trace_data.raw_volume,
                                                       target,
                                                       trace_data.reference_raycast.voxel_threshold,
-                                                      trace_data.reference_raycast.penalty_weight,
+                                                      trace_data.reference_raycast.penalty_weight * static_cast<double>(w),
                                                       trace_data.reference_raycast.sample_step,
                                                       trace_data.reference_raycast.max_distance);
 
@@ -878,12 +882,27 @@ static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
         trace_data.reference_raycast.min_clearance > 0.0) {
         auto* clearance_functor = new ReferenceClearanceCost(target,
                                                              trace_data.reference_raycast.min_clearance,
-                                                             trace_data.reference_raycast.clearance_weight);
+                                                             trace_data.reference_raycast.clearance_weight * static_cast<double>(w));
         auto* clearance_cost = new ceres::NumericDiffCostFunction<ReferenceClearanceCost, ceres::CENTRAL, 1, 3>(clearance_functor);
         problem.AddResidualBlock(clearance_cost, nullptr, &params.dpoints(p)[0]);
     }
 
     return 1;
+}
+
+static int conditional_reference_ray_loss(int bit,
+                                          const cv::Vec2i &p,
+                                          cv::Mat_<uint16_t> &loss_status,
+                                          ceres::Problem &problem,
+                                          TraceParameters &params,
+                                          const TraceData &trace_data,
+                                          const LossSettings &settings)
+{
+    int set = 0;
+    if (!loss_mask(bit, p, {0, 0}, loss_status)) {
+        set = set_loss_mask(bit, p, {0, 0}, loss_status, gen_reference_ray_loss(problem, p, params, trace_data, settings));
+    }
+    return set;
 }
 
 // -------------------------
@@ -1132,50 +1151,6 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
     return set;
 };
 
-static int gen_3d_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
-{
-    if (!trace_data.normal3d_field) return 0;
-
-    const float w = settings(LossType::NORMAL3D, p);
-    if (w <= 0.0f) return 0;
-
-    // Need p, p+u, p+v inside the image; treat (p) as the lower-left of a cell
-    const int rows = params.state.rows;
-    const int cols = params.state.cols;
-    if (p[0] < 0 || p[1] < 0 || p[0] >= rows - 1 || p[1] >= cols - 1) {
-        return 0;
-    }
-
-    const cv::Vec2i pu = p + cv::Vec2i(0, 1);
-    const cv::Vec2i pv = p + cv::Vec2i(1, 0);
-
-    if (!coord_valid(params.state(p)) ||
-        !coord_valid(params.state(pu)) ||
-        !coord_valid(params.state(pv))) {
-        return 0;
-    }
-
-    problem.AddResidualBlock(
-        Normal3DLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_fit_quality.get(), w),
-        nullptr,
-        &params.dpoints(p)[0],
-        &params.dpoints(pu)[0],
-        &params.dpoints(pv)[0]);
-
-    return 1;
-}
-
-static int conditional_3d_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
-{
-    if (!trace_data.normal3d_field) return 0;
-    int set = 0;
-    // One term per cell (keyed at p itself)
-    if (!loss_mask(bit, p, {0,0}, loss_status))
-        set = set_loss_mask(bit, p, {0,0}, loss_status, gen_3d_normal_loss(problem, p, params, trace_data, settings));
-    return set;
-}
-
 // static void freeze_inner_params(ceres::Problem &problem, int edge_dist, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &out,
 //     cv::Mat_<cv::Vec2d> &loc, cv::Mat_<uint16_t> &loss_status, int inner_flags)
 // {
@@ -1330,29 +1305,13 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
     }
 
-    if (flags & LOSS_3DNORMAL) {
-        // fitted normals zarr (one per cell)
-        count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
-        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
-        count += gen_3d_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
-        count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
-    }
-
     if (flags & LOSS_3DNORMALLINE) {
         // one per edge (use +u and +v edges only)
         count += gen_3d_normal_line_loss(problem, p, cv::Vec2i(0, 1), params, trace_data, settings);
         count += gen_3d_normal_line_loss(problem, p, cv::Vec2i(1, 0), params, trace_data, settings);
     }
 
-    // if (flags & LOSS_3DNORMAL) {
-    //     // one per local cell, around p
-    //     count += gen_3d_normal_loss(problem, p, params, trace_data, settings);
-    //     count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1, 0), params, trace_data, settings);
-    //     count += gen_3d_normal_loss(problem, p + cv::Vec2i( 0,-1), params, trace_data, settings);
-    //     count += gen_3d_normal_loss(problem, p + cv::Vec2i(-1,-1), params, trace_data, settings);
-    // }
-
-    // count += gen_reference_ray_loss(problem, p, params, trace_data);
+    count += gen_reference_ray_loss(problem, p, params, trace_data, settings);
 
     return count;
 }
@@ -1587,12 +1546,6 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_normal_loss(10, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_normal_loss(10, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
 
-    // fitted 3D normals (direction-field zarr)
-    count += conditional_3d_normal_loss(12, p,                    loss_status, problem, params, trace_data, settings);
-    count += conditional_3d_normal_loss(12, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
-    count += conditional_3d_normal_loss(12, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
-    count += conditional_3d_normal_loss(12, p + cv::Vec2i(-1,-1), loss_status, problem, params, trace_data, settings);
-
     // fitted 3D normals: edge-perpendicularity (once per edge)
     // Add for all edges touching p; the mask makes sure each undirected edge is only added once.
     count += conditional_3d_normal_line_loss(13, p, cv::Vec2i(0, 1),  loss_status, problem, params, trace_data, settings);
@@ -1606,7 +1559,7 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data, settings);
     count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data, settings);
 
-    // count += gen_reference_ray_loss(problem, p, params, trace_data);
+    count += conditional_reference_ray_loss(15, p, loss_status, problem, params, trace_data, settings);
 
     return count;
 }
@@ -2240,8 +2193,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
               << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
               << " SNAP: " << loss_settings.w[LossType::SNAP]
               << " NORMAL: " << loss_settings.w[LossType::NORMAL]
-              << " NORMAL3D: " << loss_settings.w[LossType::NORMAL3D]
               << " NORMAL3DLINE: " << loss_settings.w[LossType::NORMAL3DLINE]
+              << " REFERENCE_RAY: " << loss_settings.w[LossType::REFERENCE_RAY]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
