@@ -478,7 +478,7 @@ struct LossSettings {
         w[LossType::STRAIGHT] = 10.0;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 0.0f;
-        w[LossType::SDIR] = 0.0f;
+        w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 0.0f;
     }
 
