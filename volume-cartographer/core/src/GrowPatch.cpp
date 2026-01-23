@@ -784,6 +784,10 @@ static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
 static int conditional_reference_ray_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
                                           ceres::Problem &problem, TraceParameters &params,
                                           const TraceData &trace_data, const LossSettings &settings);
+
+// Used by conditional losses.
+static bool loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status);
+static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, int set);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
