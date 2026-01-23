@@ -451,11 +451,21 @@ void SegmentationWidget::buildUi()
     _groupGrowth->setLayout(growthLayout);
     layout->addWidget(_groupGrowth);
 
-    _lblNormalGrid = new QLabel(this);
-    _lblNormalGrid->setTextFormat(Qt::RichText);
-    _lblNormalGrid->setToolTip(tr("Shows whether precomputed normal grids are available for push/pull tools."));
-    _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    layout->addWidget(_lblNormalGrid);
+    {
+        auto* normalGridRow = new QHBoxLayout();
+        _lblNormalGrid = new QLabel(this);
+        _lblNormalGrid->setTextFormat(Qt::RichText);
+        _lblNormalGrid->setToolTip(tr("Shows whether precomputed normal grids are available for push/pull tools."));
+        _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        normalGridRow->addWidget(_lblNormalGrid, 0);
+
+        _editNormalGridPath = new QLineEdit(this);
+        _editNormalGridPath->setReadOnly(true);
+        _editNormalGridPath->setClearButtonEnabled(false);
+        _editNormalGridPath->setVisible(false);
+        normalGridRow->addWidget(_editNormalGridPath, 1);
+        layout->addLayout(normalGridRow);
+    }
 
     // Normal3D zarr selection (optional)
     {
@@ -463,12 +473,18 @@ void SegmentationWidget::buildUi()
         _lblNormal3d = new QLabel(this);
         _lblNormal3d->setTextFormat(Qt::RichText);
         _lblNormal3d->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        normal3dRow->addWidget(_lblNormal3d, 1);
+        normal3dRow->addWidget(_lblNormal3d, 0);
+
+        _editNormal3dPath = new QLineEdit(this);
+        _editNormal3dPath->setReadOnly(true);
+        _editNormal3dPath->setClearButtonEnabled(false);
+        _editNormal3dPath->setVisible(false);
+        normal3dRow->addWidget(_editNormal3dPath, 1);
 
         _comboNormal3d = new QComboBox(this);
         _comboNormal3d->setToolTip(tr("Select Normal3D zarr volume to use for normal3dline constraints."));
         _comboNormal3d->setVisible(false);
-        normal3dRow->addWidget(_comboNormal3d);
+        normal3dRow->addWidget(_comboNormal3d, 0);
 
         layout->addLayout(normal3dRow);
     }
@@ -1777,17 +1793,11 @@ void SegmentationWidget::syncUiState()
             : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
         const bool hasExplicitLocation = !_normalGridDisplayPath.isEmpty() && _normalGridDisplayPath != _normalGridHint;
         QString message;
-        if (hasExplicitLocation) {
-            message = _normalGridAvailable
-                ? tr("Normal grids found at %1").arg(_normalGridDisplayPath)
-                : tr("Normal grids not found at %1").arg(_normalGridDisplayPath);
-        } else {
-            message = _normalGridAvailable ? tr("Normal grids found.") : tr("Normal grids not found.");
-            if (!_normalGridHint.isEmpty()) {
-                message.append(QStringLiteral(" ("));
-                message.append(_normalGridHint);
-                message.append(QLatin1Char(')'));
-            }
+        message = _normalGridAvailable ? tr("Normal grids found.") : tr("Normal grids not found.");
+        if (!_normalGridHint.isEmpty()) {
+            message.append(QStringLiteral(" ("));
+            message.append(_normalGridHint);
+            message.append(QLatin1Char(')'));
         }
 
         QString tooltip = message;
@@ -1803,6 +1813,13 @@ void SegmentationWidget::syncUiState()
         _lblNormalGrid->setText(icon + QStringLiteral("&nbsp;") + message);
         _lblNormalGrid->setToolTip(tooltip);
         _lblNormalGrid->setAccessibleDescription(message);
+    }
+
+    if (_editNormalGridPath) {
+        const bool show = _normalGridAvailable && !_normalGridPath.isEmpty();
+        _editNormalGridPath->setVisible(show);
+        _editNormalGridPath->setText(_normalGridPath);
+        _editNormalGridPath->setToolTip(_normalGridPath);
     }
 
     updateNormal3dUi();
@@ -1913,9 +1930,9 @@ void SegmentationWidget::updateNormal3dUi()
     if (!hasAny) {
         message = tr("Normal3D volume not found.");
     } else if (count == 1) {
-        message = tr("Normal3D volume found at %1").arg(_normal3dSelectedPath);
+        message = tr("Normal3D volume found.");
     } else {
-        message = tr("Normal3D volumes found (%1); selected %2").arg(count).arg(_normal3dSelectedPath);
+        message = tr("Normal3D volumes found (%1). Select one:").arg(count);
     }
 
     QString tooltip = message;
@@ -1931,6 +1948,13 @@ void SegmentationWidget::updateNormal3dUi()
     _lblNormal3d->setText(icon + QStringLiteral("&nbsp;") + message);
     _lblNormal3d->setToolTip(tooltip);
     _lblNormal3d->setAccessibleDescription(message);
+
+    if (_editNormal3dPath) {
+        const bool show = hasAny && !showCombo;
+        _editNormal3dPath->setVisible(show);
+        _editNormal3dPath->setText(_normal3dSelectedPath);
+        _editNormal3dPath->setToolTip(_normal3dSelectedPath);
+    }
 }
 
 void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint)
@@ -2775,6 +2799,12 @@ void SegmentationWidget::setNormalGridPathHint(const QString& hint)
         display = display.mid(colonIndex + 1).trimmed();
     }
     _normalGridDisplayPath = display;
+    syncUiState();
+}
+
+void SegmentationWidget::setNormalGridPath(const QString& path)
+{
+    _normalGridPath = path.trimmed();
     syncUiState();
 }
 

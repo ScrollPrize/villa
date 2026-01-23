@@ -86,6 +86,7 @@ public:
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
+    void setNormalGridPath(const QString& path);
 
     void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
 
@@ -228,6 +229,7 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridHint;
     QString _normalGridDisplayPath;
+    QString _normalGridPath;
 
     QStringList _normal3dCandidates;
     QString _normal3dHint;
@@ -292,8 +294,10 @@ private:
     QCheckBox* _chkGrowthKeybindsEnabled{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
+    QLineEdit* _editNormalGridPath{nullptr};
     QLabel* _lblNormal3d{nullptr};
     QComboBox* _comboNormal3d{nullptr};
+    QLineEdit* _editNormal3dPath{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
 
     CollapsibleSettingsGroup* _groupEditing{nullptr};

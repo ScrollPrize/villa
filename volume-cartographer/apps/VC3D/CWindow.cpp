@@ -1131,9 +1131,9 @@ void CWindow::updateNormalGridAvailability()
 
     if (_segmentationWidget) {
         _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
+        _segmentationWidget->setNormalGridPath(_normalGridPath);
         QString hint;
         if (_normalGridAvailable) {
-            hint = tr("Normal grids directory: %1").arg(_normalGridPath);
         } else if (!checkedPath.isEmpty()) {
             hint = tr("Checked: %1").arg(checkedPath);
         } else {
@@ -1505,8 +1505,9 @@ void CWindow::CreateWidgets(void)
     // Create Segmentation widget
     _segmentationWidget = new SegmentationWidget();
     _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
+    _segmentationWidget->setNormalGridPath(_normalGridPath);
     const QString initialHint = _normalGridAvailable
-        ? tr("Normal grids directory: %1").arg(_normalGridPath)
+        ? tr("Normal grids directory found.")
         : tr("No volume package loaded.");
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
