@@ -428,6 +428,56 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
     return QString();
 }
 
+QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
+                                               QString* hint)
+{
+    if (hint) {
+        *hint = QString();
+    }
+    if (!pkg) {
+        if (hint) {
+            *hint = QObject::tr("Normal3D lookup skipped (no volume package loaded)");
+        }
+        return {};
+    }
+    std::filesystem::path rootPath(pkg->getVolpkgDirectory());
+    if (rootPath.empty()) {
+        if (hint) {
+            *hint = QObject::tr("Normal3D lookup skipped (volume package path empty)");
+        }
+        return {};
+    }
+    const std::filesystem::path base = rootPath / "normal3d";
+    const QString baseStr = QString::fromStdString(base.string());
+    if (hint) {
+        *hint = QObject::tr("Checked: %1").arg(baseStr);
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(base, ec) || !std::filesystem::is_directory(base, ec)) {
+        return {};
+    }
+
+    QStringList candidates;
+    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_directory(ec) || ec) {
+            continue;
+        }
+        const std::filesystem::path p = entry.path();
+        // Heuristic: treat as zarr if it contains x/0, y/0, z/0.
+        if (std::filesystem::is_directory(p / "x" / "0") &&
+            std::filesystem::is_directory(p / "y" / "0") &&
+            std::filesystem::is_directory(p / "z" / "0")) {
+            candidates.push_back(QString::fromStdString(p.string()));
+        }
+    }
+
+    candidates.sort();
+    return candidates;
+}
+
 } // namespace
 
 // Dark mode detection - works on all Qt 6.x versions
@@ -1081,15 +1131,19 @@ void CWindow::updateNormalGridAvailability()
 
     if (_segmentationWidget) {
         _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
+        _segmentationWidget->setNormalGridPath(_normalGridPath);
         QString hint;
         if (_normalGridAvailable) {
-            hint = tr("Normal grids directory: %1").arg(_normalGridPath);
         } else if (!checkedPath.isEmpty()) {
             hint = tr("Checked: %1").arg(checkedPath);
         } else {
             hint = tr("No volume package loaded.");
         }
         _segmentationWidget->setNormalGridPathHint(hint);
+
+        QString normal3dHint;
+        const QStringList normal3d = normal3dZarrCandidatesForVolumePkg(fVpkg, &normal3dHint);
+        _segmentationWidget->setNormal3dZarrCandidates(normal3d, normal3dHint);
     }
 }
 
@@ -1451,8 +1505,9 @@ void CWindow::CreateWidgets(void)
     // Create Segmentation widget
     _segmentationWidget = new SegmentationWidget();
     _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
+    _segmentationWidget->setNormalGridPath(_normalGridPath);
     const QString initialHint = _normalGridAvailable
-        ? tr("Normal grids directory: %1").arg(_normalGridPath)
+        ? tr("Normal grids directory found.")
         : tr("No volume package loaded.");
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
@@ -3766,7 +3821,8 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         currentVolume,
         currentVolumeId,
         _segmentationGrowthVolumeId.empty() ? currentVolumeId : _segmentationGrowthVolumeId,
-        _normalGridPath
+        _normalGridPath,
+        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
     };
 
     if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {

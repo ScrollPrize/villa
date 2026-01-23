@@ -6,6 +6,7 @@
 #include <QStandardPaths>
 #include <QThread>
 #include <QUuid>
+#include <QElapsedTimer>
 
 #include <iostream>
 

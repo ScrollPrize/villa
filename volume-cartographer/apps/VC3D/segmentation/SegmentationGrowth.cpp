@@ -439,6 +439,9 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
     }
+    if (!context.normal3dZarrPath.isEmpty()) {
+        params["normal3d_zarr_path"] = context.normal3dZarrPath.toStdString();
+    }
 
     if (request.correctionsZRange) {
         int zMin = std::max(0, request.correctionsZRange->first);

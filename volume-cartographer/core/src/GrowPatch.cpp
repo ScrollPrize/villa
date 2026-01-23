@@ -17,6 +17,10 @@
 #include "vc/core/util/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
+#include "z5/factory.hxx"
+#include "z5/filesystem/handle.hxx"
+#include "z5/dataset.hxx"
+
 #include "vc/core/util/xtensor_include.hpp"
 #include XTENSORINCLUDE(views, xview.hpp)
 
@@ -41,6 +45,7 @@
 #define LOSS_DIST 2
 #define LOSS_NORMALSNAP 4
 #define LOSS_SDIR 8
+#define LOSS_3DNORMALLINE 32
 
 namespace { // Anonymous namespace for local helpers
 
@@ -98,6 +103,48 @@ template <typename T>
 static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
 {
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
+}
+
+// Normal3D placeholder / validity check.
+// The fitted normal direction-field stores placeholder/unset normals as the neutral uint8 triplet (128,128,128).
+// We treat a trilinear sample as invalid if *any* of the 8 lattice corners is a placeholder.
+static inline bool normal3d_trilinear_sample_valid(Chunked3dVec3fFromUint8& dirs, const cv::Vec3d& xyz)
+{
+    const double zf = xyz[2] * static_cast<double>(dirs._scale);
+    const double yf = xyz[1] * static_cast<double>(dirs._scale);
+    const double xf = xyz[0] * static_cast<double>(dirs._scale);
+
+    int z0 = static_cast<int>(std::floor(zf));
+    int y0 = static_cast<int>(std::floor(yf));
+    int x0 = static_cast<int>(std::floor(xf));
+
+    const auto shape = dirs._x.shape(); // z,y,x
+    if (!shape.empty()) {
+        z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
+        y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
+        x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
+    } else {
+        z0 = std::max(0, z0);
+        y0 = std::max(0, y0);
+        x0 = std::max(0, x0);
+    }
+
+    const int z1 = z0 + 1;
+    const int y1 = y0 + 1;
+    const int x1 = x0 + 1;
+
+    auto is_fill_triplet = [&](int z, int y, int x) -> bool {
+        const auto rx = dirs._x.safe_at(z, y, x);
+        const auto ry = dirs._y.safe_at(z, y, x);
+        const auto rz = dirs._z.safe_at(z, y, x);
+        return (rx == 128) && (ry == 128) && (rz == 128);
+    };
+
+    const bool any_fill =
+        is_fill_triplet(z0, y0, x0) || is_fill_triplet(z1, y0, x0) || is_fill_triplet(z0, y1, x0) || is_fill_triplet(z1, y1, x0) ||
+        is_fill_triplet(z0, y0, x1) || is_fill_triplet(z1, y0, x1) || is_fill_triplet(z0, y1, x1) || is_fill_triplet(z1, y1, x1);
+
+    return !any_fill;
 }
 
 class PointCorrection {
@@ -235,17 +282,10 @@ struct TraceData {
     PointCorrection point_correction;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     const std::vector<DirectionField> &direction_fields;
-    struct ReferenceRaycastSettings {
-        QuadSurface* surface = nullptr;
-        double voxel_threshold = 1.0;
-        double penalty_weight = 0.5;
-        double sample_step = 1.0;
-        double max_distance = 250.0;
-        double min_clearance = 4.0;
-        double clearance_weight = 1.0;
 
-        bool enabled() const { return surface && penalty_weight > 0.0; }
-    } reference_raycast;
+    // Optional fitted-3D normals direction-field (zarr root with x/<scale>,y/<scale>,z/<scale> datasets)
+    std::unique_ptr<Chunked3dVec3fFromUint8> normal3d_field;
+    std::unique_ptr<NormalFitQualityWeightField> normal3d_fit_quality;
 
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
 };
@@ -407,8 +447,10 @@ enum LossType {
     DIRECTION,
     SNAP,
     NORMAL,
+    NORMAL3DLINE,
     SDIR,
     CORRECTION,
+    REFERENCE_RAY,
     COUNT
 };
 
@@ -419,11 +461,26 @@ struct LossSettings {
     LossSettings() {
         w[LossType::SNAP] = 0.1f;
         w[LossType::NORMAL] = 10.0f;
-        w[LossType::STRAIGHT] = 0.2f;
+        w[LossType::NORMAL3DLINE] = 0.0f;
+        w[LossType::STRAIGHT] = 0.2;
         w[LossType::DIST] = 1.0f;
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
+        w[LossType::REFERENCE_RAY] = 0.5f;
+    }
+
+    struct ReferenceRaycastSettings {
+        QuadSurface* surface = nullptr;
+        double voxel_threshold = 1.0;
+        double sample_step = 1.0;
+        double max_distance = 250.0;
+        double min_clearance = 4.0;
+        double clearance_weight = 1.0;
+    } reference_raycast;
+
+    bool reference_raycast_enabled() const {
+        return reference_raycast.surface && w[LossType::REFERENCE_RAY] > 0.0f;
     }
 
     void applyJsonWeights(const nlohmann::json& params) {
@@ -441,11 +498,13 @@ struct LossSettings {
 
         set_weight("snap_weight", LossType::SNAP);
         set_weight("normal_weight", LossType::NORMAL);
+        set_weight("normal3dline_weight", LossType::NORMAL3DLINE);
         set_weight("straight_weight", LossType::STRAIGHT);
         set_weight("dist_weight", LossType::DIST);
         set_weight("direction_weight", LossType::DIRECTION);
         set_weight("sdir_weight", LossType::SDIR);
         set_weight("correction_weight", LossType::CORRECTION);
+        set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -461,6 +520,10 @@ struct LossSettings {
 
     int z_min = -1;
     int z_max = std::numeric_limits<int>::max();
+    int y_min = -1;
+    int y_max = std::numeric_limits<int>::max();
+    int x_min = -1;
+    int x_max = std::numeric_limits<int>::max();
     // Anti-flipback constraint settings
     float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
     float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
@@ -709,15 +772,24 @@ void set_space_tracing_use_cuda(bool enable) {
 static int gen_straight_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3, TraceParameters &params, const LossSettings &settings);
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int gen_3d_normal_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int conditional_3d_normal_line_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
                                double sdir_eps_abs, double sdir_eps_rel);
 static int conditional_sdirichlet_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
-                                       ceres::Problem &problem, TraceParameters &params,
-                                       const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
+                                        ceres::Problem &problem, TraceParameters &params,
+                                        const LossSettings &settings, double sdir_eps_abs, double sdir_eps_rel);
 static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
-                                  TraceParameters &params, const TraceData &trace_data);
+                                  TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int conditional_reference_ray_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_t> &loss_status,
+                                          ceres::Problem &problem, TraceParameters &params,
+                                          const TraceData &trace_data, const LossSettings &settings);
+
+// Used by conditional losses.
+static bool loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status);
+static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, int set);
 static bool loc_valid(int state)
 {
     return state & STATE_LOC_VALID;
@@ -765,59 +837,78 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
 }
 
 static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
-                                  TraceParameters &params, const TraceData &trace_data)
+                                  TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
-    if (!trace_data.reference_raycast.enabled())
+    if (!settings.reference_raycast_enabled())
         return 0;
     if (!trace_data.raw_volume)
         return 0;
     if (!(params.state(p) & STATE_LOC_VALID))
         return 0;
 
+    const float w = settings(LossType::REFERENCE_RAY, p);
+    if (w <= 0.0f)
+        return 0;
+
     const cv::Vec3d& candidate = params.dpoints(p);
     if (candidate[0] == -1.0 && candidate[1] == -1.0 && candidate[2] == -1.0)
         return 0;
 
-    cv::Vec3f ptr = trace_data.reference_raycast.surface->pointer();
+    cv::Vec3f ptr = settings.reference_raycast.surface->pointer();
     const cv::Vec3f candidate_f(static_cast<float>(candidate[0]),
                                 static_cast<float>(candidate[1]),
                                 static_cast<float>(candidate[2]));
 
-    float dist = trace_data.reference_raycast.surface->pointTo(
+    float dist = settings.reference_raycast.surface->pointTo(
         ptr,
         candidate_f,
         std::numeric_limits<float>::max(),
         1000);
     if (dist < 0.0f)
         return 0;
-    if (trace_data.reference_raycast.max_distance > 0.0 && dist > trace_data.reference_raycast.max_distance)
+    if (settings.reference_raycast.max_distance > 0.0 && dist > settings.reference_raycast.max_distance)
         return 0;
 
-    const cv::Vec3f nearest = trace_data.reference_raycast.surface->coord(ptr);
+    const cv::Vec3f nearest = settings.reference_raycast.surface->coord(ptr);
     const cv::Vec3d target{nearest[0], nearest[1], nearest[2]};
 
-    if (trace_data.reference_raycast.penalty_weight > 0.0) {
+    {
         auto* functor = new ReferenceRayOcclusionCost(trace_data.raw_volume,
                                                       target,
-                                                      trace_data.reference_raycast.voxel_threshold,
-                                                      trace_data.reference_raycast.penalty_weight,
-                                                      trace_data.reference_raycast.sample_step,
-                                                      trace_data.reference_raycast.max_distance);
+                                                      settings.reference_raycast.voxel_threshold,
+                                                      static_cast<double>(w),
+                                                      settings.reference_raycast.sample_step,
+                                                      settings.reference_raycast.max_distance);
 
         auto* cost = new ceres::NumericDiffCostFunction<ReferenceRayOcclusionCost, ceres::CENTRAL, 1, 3>(functor);
         problem.AddResidualBlock(cost, nullptr, &params.dpoints(p)[0]);
     }
 
-    if (trace_data.reference_raycast.clearance_weight > 0.0 &&
-        trace_data.reference_raycast.min_clearance > 0.0) {
+    if (settings.reference_raycast.clearance_weight > 0.0 &&
+        settings.reference_raycast.min_clearance > 0.0) {
         auto* clearance_functor = new ReferenceClearanceCost(target,
-                                                             trace_data.reference_raycast.min_clearance,
-                                                             trace_data.reference_raycast.clearance_weight);
+                                                             settings.reference_raycast.min_clearance,
+                                                             settings.reference_raycast.clearance_weight * static_cast<double>(w));
         auto* clearance_cost = new ceres::NumericDiffCostFunction<ReferenceClearanceCost, ceres::CENTRAL, 1, 3>(clearance_functor);
         problem.AddResidualBlock(clearance_cost, nullptr, &params.dpoints(p)[0]);
     }
 
     return 1;
+}
+
+static int conditional_reference_ray_loss(int bit,
+                                          const cv::Vec2i &p,
+                                          cv::Mat_<uint16_t> &loss_status,
+                                          ceres::Problem &problem,
+                                          TraceParameters &params,
+                                          const TraceData &trace_data,
+                                          const LossSettings &settings)
+{
+    int set = 0;
+    if (!loss_mask(bit, p, {0, 0}, loss_status)) {
+        set = set_loss_mask(bit, p, {0, 0}, loss_status, gen_reference_ray_loss(problem, p, params, trace_data, settings));
+    }
+    return set;
 }
 
 // -------------------------
@@ -835,6 +926,22 @@ static cv::Vec2i lower_p(const cv::Vec2i &point, const cv::Vec2i &offset)
         return point+offset;
     else
         return point;
+}
+
+// Order two points along the axis implied by their grid relation.
+// - For horizontal edges (same row), order by column.
+// - For vertical edges (same col), order by row.
+// Falls back to lexicographic (row,col) if neither axis matches.
+static inline std::pair<cv::Vec2i, cv::Vec2i> order_p(const cv::Vec2i& p, const cv::Vec2i& q)
+{
+    if (p[0] == q[0]) { // same row => horizontal edge
+        return (p[1] <= q[1]) ? std::make_pair(p, q) : std::make_pair(q, p);
+    }
+    if (p[1] == q[1]) { // same col => vertical edge
+        return (p[0] <= q[0]) ? std::make_pair(p, q) : std::make_pair(q, p);
+    }
+    // fallback
+    return (p[0] < q[0] || (p[0] == q[0] && p[1] <= q[1])) ? std::make_pair(p, q) : std::make_pair(q, p);
 }
 
 static bool loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status)
@@ -924,6 +1031,73 @@ static int conditional_dist_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o
     return set;
 };
 
+static int gen_3d_normal_line_loss(ceres::Problem &problem,
+                                  const cv::Vec2i &p,
+                                  const cv::Vec2i &off,
+                                  TraceParameters &params,
+                                  const TraceData &trace_data,
+                                  const LossSettings &settings)
+{
+    if (!trace_data.normal3d_field) return 0;
+
+    const float w = settings(LossType::NORMAL3DLINE, p);
+    if (w <= 0.0f) return 0;
+
+    // We enforce the 90° constraint on the directed segment p_base -> p_off.
+    // For consistent disambiguation of the directed normal field, provide a third point:
+    // the next quad corner in clockwise direction when walking from base towards off.
+    // This third point is treated as non-differentiable inside the loss.
+    const cv::Vec2i base = p;
+    const cv::Vec2i off_p = p + off;
+
+    // Determine clockwise neighbor in (row,col) grid coordinates.
+    // Mapping assumes u = +col (right), v = +row (down).
+    // Clockwise around a cell: right -> down -> left -> up.
+    cv::Vec2i cw_off;
+    if (off[0] == 0 && off[1] == 1) {          // right
+        cw_off = cv::Vec2i(1, 0);              // down
+    } else if (off[0] == 1 && off[1] == 0) {   // down
+        cw_off = cv::Vec2i(0, -1);             // left
+    } else if (off[0] == 0 && off[1] == -1) {  // left
+        cw_off = cv::Vec2i(-1, 0);             // up
+    } else if (off[0] == -1 && off[1] == 0) {  // up
+        cw_off = cv::Vec2i(0, 1);              // right
+    } else {
+        // Only defined for direct 4-neighborhood edges.
+        return 0;
+    }
+    const cv::Vec2i cw_p = base + cw_off;
+
+    if (!coord_valid(params.state(base)) || !coord_valid(params.state(off_p)) || !coord_valid(params.state(cw_p))) {
+        return 0;
+    }
+
+    problem.AddResidualBlock(
+        Normal3DLineLoss::Create(*trace_data.normal3d_field, trace_data.normal3d_fit_quality.get(), w),
+        nullptr,
+        &params.dpoints(base)[0],
+        &params.dpoints(off_p)[0],
+        &params.dpoints(cw_p)[0]);
+
+    return 1;
+}
+
+static int conditional_3d_normal_line_loss(int bit,
+                                          const cv::Vec2i &p,
+                                          const cv::Vec2i &off,
+                                          cv::Mat_<uint16_t> &loss_status,
+                                          ceres::Problem &problem,
+                                          TraceParameters &params,
+                                          const TraceData &trace_data,
+                                          const LossSettings &settings)
+{
+    if (!trace_data.normal3d_field) return 0;
+    int set = 0;
+    if (!loss_mask(bit, p, off, loss_status))
+        set = set_loss_mask(bit, p, off, loss_status, gen_3d_normal_line_loss(problem, p, off, params, trace_data, settings));
+    return set;
+}
+
 static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o1, const cv::Vec2i &o2, const cv::Vec2i &o3,
     cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const LossSettings &settings)
 {
@@ -958,13 +1132,13 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
 
         bool direction_aware = false; // this is not that simple ...
         // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
         // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
         // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
         // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
+        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
         count += 4;
     }
 
@@ -1137,7 +1311,13 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_sdirichlet_loss(problem, p + cv::Vec2i( 0,-1), params, settings, 1e-8, 1e-2);
     }
 
-    count += gen_reference_ray_loss(problem, p, params, trace_data);
+    if (flags & LOSS_3DNORMALLINE) {
+        // one per edge (use +u and +v edges only)
+        count += gen_3d_normal_line_loss(problem, p, cv::Vec2i(0, 1), params, trace_data, settings);
+        count += gen_3d_normal_line_loss(problem, p, cv::Vec2i(1, 0), params, trace_data, settings);
+    }
+
+    count += gen_reference_ray_loss(problem, p, params, trace_data, settings);
 
     return count;
 }
@@ -1372,13 +1552,20 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_normal_loss(10, p + cv::Vec2i( 0,-1), loss_status, problem, params, trace_data, settings);
     count += conditional_normal_loss(10, p + cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
 
+    // fitted 3D normals: edge-perpendicularity (once per edge)
+    // Add for all edges touching p; the mask makes sure each undirected edge is only added once.
+    count += conditional_3d_normal_line_loss(13, p, cv::Vec2i(0, 1),  loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_line_loss(13, p, cv::Vec2i(0, -1), loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_line_loss(14, p, cv::Vec2i(1, 0),  loss_status, problem, params, trace_data, settings);
+    count += conditional_3d_normal_line_loss(14, p, cv::Vec2i(-1, 0), loss_status, problem, params, trace_data, settings);
+
     //snapping
     count += conditional_corr_loss(11, p,                    loss_status, problem, params.state, params.dpoints, trace_data, settings);
     count += conditional_corr_loss(11, p + cv::Vec2i(-1,-1), loss_status, problem, params.state, params.dpoints, trace_data, settings);
     count += conditional_corr_loss(11, p + cv::Vec2i( 0,-1), loss_status, problem, params.state, params.dpoints, trace_data, settings);
     count += conditional_corr_loss(11, p + cv::Vec2i(-1, 0), loss_status, problem, params.state, params.dpoints, trace_data, settings);
 
-    count += gen_reference_ray_loss(problem, p, params, trace_data);
+    count += conditional_reference_ray_loss(15, p, loss_status, problem, params, trace_data, settings);
 
     return count;
 }
@@ -1767,6 +1954,141 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
 
+    // Optional fitted-3D normals field (direction-field zarr root with x/<scale>,y/<scale>,z/<scale>).
+    // IMPORTANT: We auto-derive the correct scale factor from dataset shapes and ignore any JSON scale parameter.
+    if (params.contains("normal3d_zarr_path") && params["normal3d_zarr_path"].is_string()) {
+        try {
+            const std::filesystem::path zarr_root = params["normal3d_zarr_path"].get<std::string>();
+
+            // Expect fixed layout: <root>/{x,y,z}/0
+            const int scale_level = 0;
+
+            // Read delimiter from x/0/.zarray.
+            // Also assert direction-field fill_value uses the neutral (128,128,128) convention.
+            // We treat that triplet as "no normal".
+            const auto assert_fill_value_128 = [&](const char* axis) {
+                const std::filesystem::path zarray_axis = zarr_root / axis / "0" / ".zarray";
+                if (!std::filesystem::exists(zarray_axis)) {
+                    throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
+                }
+                nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_axis));
+                if (!j.contains("fill_value")) {
+                    throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
+                }
+                const int fv = j["fill_value"].get<int>();
+                if (fv != 128) {
+                    std::stringstream msg;
+                    msg << "normal3d_zarr_path fill_value=" << fv << " for " << axis << "/0; expected 128";
+                    throw std::runtime_error(msg.str());
+                }
+            };
+
+            assert_fill_value_128("x");
+            assert_fill_value_128("y");
+            assert_fill_value_128("z");
+
+            const std::filesystem::path zarray_x = zarr_root / "x" / "0" / ".zarray";
+            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_x));
+            std::string delim = j.value<std::string>("dimension_separator", ".");
+
+            // Assert the direction-field was aligned by vc_ngrids --align-normals.
+            try {
+                z5::filesystem::handle::File rootFile(zarr_root);
+                z5::filesystem::handle::Group root(rootFile, "");
+                nlohmann::json attrs;
+                z5::filesystem::readAttributes(root, attrs);
+                const bool aligned = attrs.value("align_normals", false);
+                if (!aligned) {
+                    throw std::runtime_error("normal3d_zarr_path is not marked aligned (missing attrs.align_normals=true); run vc_ngrids --align-normals");
+                }
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("Failed normal3d alignment check: ") + e.what());
+            }
+
+            // Derive scale purely from shapes: main volume is full-res, normal zarr is downsampled.
+            const auto vol_shape_zyx = ds->shape();
+            const int vol_z = static_cast<int>(vol_shape_zyx.at(0));
+            const int vol_y = static_cast<int>(vol_shape_zyx.at(1));
+            const int vol_x = static_cast<int>(vol_shape_zyx.at(2));
+
+            z5::filesystem::handle::Group dirs_group(zarr_root.string(), z5::FileMode::FileMode::r);
+            z5::filesystem::handle::Group x_group(dirs_group, "x");
+            z5::filesystem::handle::Dataset x_ds_handle(x_group, "0", delim);
+            auto x_ds = z5::filesystem::openDataset(x_ds_handle);
+            const auto nshape = x_ds->shape();
+            if (nshape.size() != 3) {
+                throw std::runtime_error("normal3d x/0 dataset is not 3D");
+            }
+            const int nz = static_cast<int>(nshape.at(0));
+            const int ny = static_cast<int>(nshape.at(1));
+            const int nx = static_cast<int>(nshape.at(2));
+            if (nz <= 0 || ny <= 0 || nx <= 0) {
+                throw std::runtime_error("normal3d x/0 dataset has invalid shape");
+            }
+            // The normal3d dataset is typically generated on a lattice with
+            // n = ceil(vol / step), so vol may NOT be divisible by n.
+            // Derive the step (=downsample ratio) by rounding vol/n.
+            const double rz_f = static_cast<double>(vol_z) / static_cast<double>(nz);
+            const double ry_f = static_cast<double>(vol_y) / static_cast<double>(ny);
+            const double rx_f = static_cast<double>(vol_x) / static_cast<double>(nx);
+
+            const int rz = std::max(1, static_cast<int>(std::llround(rz_f)));
+            const int ry = std::max(1, static_cast<int>(std::llround(ry_f)));
+            const int rx = std::max(1, static_cast<int>(std::llround(rx_f)));
+
+            // Be tolerant of off-by-one shape effects from ceil() at the boundary.
+            // Require all axes to agree after rounding.
+            if (rz != ry || ry != rx) {
+                std::stringstream msg;
+                msg << "normal3d downsample ratio differs across axes after rounding: "
+                    << "rx=" << rx << " ry=" << ry << " rz=" << rz
+                    << " (vol=" << vol_x << "x" << vol_y << "x" << vol_z
+                    << ", n=" << nx << "x" << ny << "x" << nz << ")";
+                throw std::runtime_error(msg.str());
+            }
+            const int ratio = rx;
+
+            const float scale_factor = 1.0f / static_cast<float>(ratio);
+
+            std::vector<std::unique_ptr<z5::Dataset>> dss;
+            for (auto dim : std::string("xyz")) {
+                z5::filesystem::handle::Group dim_group(dirs_group, std::string(&dim, 1));
+                z5::filesystem::handle::Dataset ds_handle(dim_group, std::to_string(scale_level), delim);
+                dss.push_back(z5::filesystem::openDataset(ds_handle));
+            }
+
+            const std::string unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string()));
+            trace_data.normal3d_field = std::make_unique<Chunked3dVec3fFromUint8>(std::move(dss), scale_factor, cache, cache_root, unique_id + "_n3d");
+
+            // Optional normal-fit diagnostics (written by vc_ngrids) to modulate loss weights.
+            // Expected layout: <root>/fit_rms/0 and <root>/fit_frac_short_paths/0 (uint8, ZYX).
+            try {
+                z5::filesystem::handle::Group g_rms(dirs_group, "fit_rms");
+                z5::filesystem::handle::Dataset ds_rms_handle(g_rms, std::to_string(scale_level), delim);
+                auto ds_rms = z5::filesystem::openDataset(ds_rms_handle);
+
+                z5::filesystem::handle::Group g_frac(dirs_group, "fit_frac_short_paths");
+                z5::filesystem::handle::Dataset ds_frac_handle(g_frac, std::to_string(scale_level), delim);
+                auto ds_frac = z5::filesystem::openDataset(ds_frac_handle);
+
+                trace_data.normal3d_fit_quality = std::make_unique<NormalFitQualityWeightField>(
+                    std::move(ds_rms), std::move(ds_frac), scale_factor, cache, cache_root, unique_id + "_n3d_fitq");
+            } catch (const std::exception& e) {
+                std::cerr << "Normal3d fit-quality fields not loaded (optional): " << e.what() << std::endl;
+                trace_data.normal3d_fit_quality.reset();
+            }
+
+            std::cout << "Loaded normal3d zarr field from " << zarr_root
+                      << " (ratio=" << ratio
+                      << ", scale_factor=" << scale_factor
+                      << ", delim='" << delim << "')" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load normal3d zarr field: " << e.what() << std::endl;
+            trace_data.normal3d_field.reset();
+            trace_data.normal3d_fit_quality.reset();
+        }
+    }
+
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
         const nlohmann::json& ref_cfg = params["reference_surface"];
@@ -1787,7 +2109,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         if (!ref_path.empty()) {
             try {
                 reference_surface = load_quad_from_tifxyz(ref_path);
-                trace_data.reference_raycast.surface = reference_surface.get();
+                loss_settings.reference_raycast.surface = reference_surface.get();
                 std::cout << "Loaded reference surface from " << ref_path << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "Failed to load reference surface '" << ref_path << "': " << e.what() << std::endl;
@@ -1796,7 +2118,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             std::cerr << "reference_surface parameter provided without a valid path" << std::endl;
         }
 
-        if (trace_data.reference_raycast.surface && ref_cfg.is_object()) {
+        if (loss_settings.reference_raycast.surface && ref_cfg.is_object()) {
             auto read_double = [&](const char* key, double current) {
                 const auto it = ref_cfg.find(key);
                 if (it == ref_cfg.end() || it->is_null()) {
@@ -1808,32 +2130,34 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 std::cerr << "reference_surface." << key << " must be numeric" << std::endl;
                 return current;
             };
-            trace_data.reference_raycast.voxel_threshold = read_double("voxel_threshold", trace_data.reference_raycast.voxel_threshold);
-            trace_data.reference_raycast.penalty_weight  = read_double("penalty_weight",  trace_data.reference_raycast.penalty_weight);
-            trace_data.reference_raycast.sample_step     = read_double("sample_step",     trace_data.reference_raycast.sample_step);
-            trace_data.reference_raycast.max_distance    = read_double("max_distance",    trace_data.reference_raycast.max_distance);
-            trace_data.reference_raycast.min_clearance   = read_double("min_clearance",   trace_data.reference_raycast.min_clearance);
-            trace_data.reference_raycast.clearance_weight = read_double("clearance_weight", trace_data.reference_raycast.clearance_weight);
-            trace_data.reference_raycast.voxel_threshold = std::clamp(trace_data.reference_raycast.voxel_threshold, 0.0, 255.0);
-            if (trace_data.reference_raycast.penalty_weight < 0.0)
-                trace_data.reference_raycast.penalty_weight = 0.0;
-            if (trace_data.reference_raycast.sample_step <= 0.0)
-                trace_data.reference_raycast.sample_step = 1.0;
-            if (trace_data.reference_raycast.min_clearance < 0.0)
-                trace_data.reference_raycast.min_clearance = 0.0;
-            if (trace_data.reference_raycast.clearance_weight < 0.0)
-                trace_data.reference_raycast.clearance_weight = 0.0;
+            loss_settings.reference_raycast.voxel_threshold = read_double("voxel_threshold", loss_settings.reference_raycast.voxel_threshold);
+            // Keep JSON key the same, but store it into the REFERENCE_RAY loss weight exclusively.
+            // (This is effectively the same knob as reference_ray_weight.)
+            loss_settings.w[LossType::REFERENCE_RAY] = static_cast<float>(read_double("penalty_weight", static_cast<double>(loss_settings.w[LossType::REFERENCE_RAY])));
+            loss_settings.reference_raycast.sample_step     = read_double("sample_step",     loss_settings.reference_raycast.sample_step);
+            loss_settings.reference_raycast.max_distance    = read_double("max_distance",    loss_settings.reference_raycast.max_distance);
+            loss_settings.reference_raycast.min_clearance   = read_double("min_clearance",   loss_settings.reference_raycast.min_clearance);
+            loss_settings.reference_raycast.clearance_weight = read_double("clearance_weight", loss_settings.reference_raycast.clearance_weight);
+            loss_settings.reference_raycast.voxel_threshold = std::clamp(loss_settings.reference_raycast.voxel_threshold, 0.0, 255.0);
+            if (loss_settings.w[LossType::REFERENCE_RAY] < 0.0f)
+                loss_settings.w[LossType::REFERENCE_RAY] = 0.0f;
+            if (loss_settings.reference_raycast.sample_step <= 0.0)
+                loss_settings.reference_raycast.sample_step = 1.0;
+            if (loss_settings.reference_raycast.min_clearance < 0.0)
+                loss_settings.reference_raycast.min_clearance = 0.0;
+            if (loss_settings.reference_raycast.clearance_weight < 0.0)
+                loss_settings.reference_raycast.clearance_weight = 0.0;
         }
 
-        if (trace_data.reference_raycast.enabled()) {
+        if (loss_settings.reference_raycast_enabled()) {
             std::cout << "Reference raycast penalty enabled (threshold="
-                      << trace_data.reference_raycast.voxel_threshold
-                      << ", weight=" << trace_data.reference_raycast.penalty_weight
-                      << ", step=" << trace_data.reference_raycast.sample_step
-                      << ", min_clearance=" << trace_data.reference_raycast.min_clearance
-                      << " (clear_w=" << trace_data.reference_raycast.clearance_weight << ")";
-            if (trace_data.reference_raycast.max_distance > 0.0) {
-                std::cout << ", max_distance=" << trace_data.reference_raycast.max_distance;
+                      << loss_settings.reference_raycast.voxel_threshold
+                      << ", weight=" << loss_settings.w[LossType::REFERENCE_RAY]
+                      << ", step=" << loss_settings.reference_raycast.sample_step
+                      << ", min_clearance=" << loss_settings.reference_raycast.min_clearance
+                      << " (clear_w=" << loss_settings.reference_raycast.clearance_weight << ")";
+            if (loss_settings.reference_raycast.max_distance > 0.0) {
+                std::cout << ", max_distance=" << loss_settings.reference_raycast.max_distance;
             }
             std::cout << ")" << std::endl;
         }
@@ -1877,11 +2201,17 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
               << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
               << " SNAP: " << loss_settings.w[LossType::SNAP]
               << " NORMAL: " << loss_settings.w[LossType::NORMAL]
+              << " NORMAL3DLINE: " << loss_settings.w[LossType::NORMAL3DLINE]
+              << " REFERENCE_RAY: " << loss_settings.w[LossType::REFERENCE_RAY]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
+    loss_settings.y_min = params.value("y_min", -1);
+    loss_settings.y_max = params.value("y_max", std::numeric_limits<int>::max());
+    loss_settings.x_min = params.value("x_min", -1);
+    loss_settings.x_max = params.value("x_max", std::numeric_limits<int>::max());
     loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
     loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
     std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
@@ -2670,7 +3000,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
-        bool global_opt = generation <= 50 && !resume_surf;
+        bool global_opt = generation <= 10 && !resume_surf;
 
         ALifeTime timer_gen;
         timer_gen.del_msg = "time per generation ";
@@ -2807,16 +3137,25 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
                     avg /= ref_count;
 
-                    //"fast" skip based on avg z value out of limits
-                    if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max)
+                    //"fast" skip based on avg xyz value out of limits
+                    if (avg[2] < loss_settings.z_min || avg[2] > loss_settings.z_max ||
+                        avg[1] < loss_settings.y_min || avg[1] > loss_settings.y_max ||
+                        avg[0] < loss_settings.x_min || avg[0] > loss_settings.x_max)
                         continue;
+
+
 
                     cv::Vec3d init = trace_params.dpoints(best_l) + random_perturbation();
                     trace_params.dpoints(p) = init;
 
                     ceres::Problem problem;
                     trace_params.state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    add_losses(problem, p, trace_params, trace_data, loss_settings, LOSS_DIST | LOSS_STRAIGHT);
+
+                    int flags = LOSS_DIST | LOSS_STRAIGHT;
+                    if (trace_data.normal3d_field)
+                        flags | LOSS_3DNORMALLINE;
+
+                    add_losses(problem, p, trace_params, trace_data, loss_settings, flags);
 
                     std::vector<double*> parameter_blocks;
                     problem.GetParameterBlocks(&parameter_blocks);

@@ -59,12 +59,14 @@ public:
     [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
     [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
     [[nodiscard]] QString customParamsText() const { return _customParamsText; }
+    [[nodiscard]] QString customParamsProfile() const { return _customParamsProfile; }
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
+    [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
     // Neural tracer getters
     [[nodiscard]] bool neuralTracerEnabled() const { return _neuralTracerEnabled; }
     [[nodiscard]] QString neuralCheckpointPath() const { return _neuralCheckpointPath; }
@@ -91,6 +93,9 @@ public:
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
+    void setNormalGridPath(const QString& path);
+
+    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
 
     void setVolumePackagePath(const QString& path);
     void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
@@ -226,8 +231,12 @@ private:
     void validateCustomParamsText();
     void updateCustomParamsStatus();
     std::optional<nlohmann::json> parseCustomParams(QString* error) const;
+    void applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi);
+    [[nodiscard]] QString paramsTextForProfile(const QString& profile) const;
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     void applyAlphaPushPullConfig(const AlphaPushPullConfig& config, bool emitSignal, bool persist = true);
+
+    void updateNormal3dUi();
 
     bool _editingEnabled{false};
     bool _pending{false};
@@ -247,6 +256,11 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridHint;
     QString _normalGridDisplayPath;
+    QString _normalGridPath;
+
+    QStringList _normal3dCandidates;
+    QString _normal3dHint;
+    QString _normal3dSelectedPath;
     QString _volumePackagePath;
     QVector<QPair<QString, QString>> _volumeEntries;
     QString _activeVolumeId;
@@ -307,6 +321,10 @@ private:
     QCheckBox* _chkGrowthKeybindsEnabled{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
+    QLineEdit* _editNormalGridPath{nullptr};
+    QLabel* _lblNormal3d{nullptr};
+    QComboBox* _comboNormal3d{nullptr};
+    QLineEdit* _editNormal3dPath{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
 
     CollapsibleSettingsGroup* _groupEditing{nullptr};
@@ -358,10 +376,13 @@ private:
     QCheckBox* _chkShowHoverMarker{nullptr};
 
     QGroupBox* _groupCustomParams{nullptr};
+    QComboBox* _comboCustomParamsProfile{nullptr};
     QPlainTextEdit* _editCustomParams{nullptr};
     QLabel* _lblCustomParamsStatus{nullptr};
     QString _customParamsText;
     QString _customParamsError;
+    QString _customParamsProfile{QStringLiteral("custom")};
+    bool _updatingCustomParamsProgrammatically{false};
 
     bool _correctionsEnabled{false};
     bool _correctionsZRangeEnabled{false};
