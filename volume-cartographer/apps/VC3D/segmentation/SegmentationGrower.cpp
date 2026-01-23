@@ -1,5 +1,6 @@
 #include "SegmentationGrower.hpp"
 
+#include "NeuralTraceServiceManager.hpp"
 #include "ExtrapolationGrowth.hpp"
 #include "SegmentationModule.hpp"
 #include "SegmentationWidget.hpp"
@@ -1019,6 +1020,50 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
     if (auto customParams = _context.widget->customParamsJson()) {
         request.customParams = std::move(*customParams);
+    }
+
+    // Handle neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
+    if (_context.widget->neuralTracerEnabled()) {
+        const QString checkpointPath = _context.widget->neuralCheckpointPath();
+        const QString pythonPath = _context.widget->neuralPythonPath();
+        const QString volumeZarr = _context.widget->volumeZarrPath();
+        const int volumeScale = _context.widget->neuralVolumeScale();
+        const int batchSize = _context.widget->neuralBatchSize();
+
+        if (checkpointPath.isEmpty()) {
+            showStatus(tr("Neural tracer enabled but no checkpoint path specified."), kStatusLong);
+            return false;
+        }
+        if (volumeZarr.isEmpty()) {
+            showStatus(tr("Neural tracer enabled but no volume zarr path available."), kStatusLong);
+            return false;
+        }
+
+        auto& serviceManager = NeuralTraceServiceManager::instance();
+        showStatus(tr("Starting neural trace service..."), kStatusLong);
+
+        if (!serviceManager.ensureServiceRunning(checkpointPath, volumeZarr, volumeScale, pythonPath)) {
+            const QString error = serviceManager.lastError();
+            showStatus(tr("Failed to start neural trace service: %1").arg(error), kStatusLong);
+            return false;
+        }
+
+        const QString socketPath = serviceManager.socketPath();
+        if (socketPath.isEmpty()) {
+            showStatus(tr("Neural trace service is running but socket path is unavailable."), kStatusLong);
+            return false;
+        }
+
+        // Add neural socket parameters to custom params
+        if (!request.customParams) {
+            request.customParams = nlohmann::json::object();
+        }
+        (*request.customParams)["neural_socket"] = socketPath.toStdString();
+        (*request.customParams)["neural_batch_size"] = batchSize;
+
+        qCInfo(lcSegGrowth) << "Neural tracer enabled:"
+                            << "socket" << socketPath
+                            << "batch_size" << batchSize;
     }
 
     request.corrections = corrections;

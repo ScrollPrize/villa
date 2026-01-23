@@ -78,6 +78,8 @@ set(srcs
     segmentation/SegmentationCorrections.cpp
     segmentation/SegmentationCorrections.hpp
     segmentation/SegmentationUndoHistory.hpp
+    NeuralTraceServiceManager.cpp
+    NeuralTraceServiceManager.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp

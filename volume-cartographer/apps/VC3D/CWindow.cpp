@@ -1539,8 +1539,12 @@ void CWindow::CreateWidgets(void)
 
         const std::string requestedId = volumeId.toStdString();
         try {
-            (void)fVpkg->volume(requestedId);
+            auto vol = fVpkg->volume(requestedId);
             _segmentationGrowthVolumeId = requestedId;
+            // Set volume zarr path for neural tracing
+            if (_segmentationWidget && vol) {
+                _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
+            }
             statusBar()->showMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
         } catch (const std::out_of_range&) {
             statusBar()->showMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
@@ -2804,6 +2808,17 @@ void CWindow::OpenVolume(const QString& path)
 
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes(volumeEntries, bestGrowthVolumeId);
+        // Set initial volume zarr path for neural tracing
+        if (!bestGrowthVolumeId.isEmpty()) {
+            try {
+                auto vol = fVpkg->volume(bestGrowthVolumeId.toStdString());
+                if (vol) {
+                    _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
+                }
+            } catch (...) {
+                // Ignore errors - zarr path will be empty
+            }
+        }
     }
 
     if (_volumeOverlay) {

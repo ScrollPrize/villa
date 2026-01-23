@@ -65,6 +65,14 @@ public:
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
+    // Neural tracer getters
+    [[nodiscard]] bool neuralTracerEnabled() const { return _neuralTracerEnabled; }
+    [[nodiscard]] QString neuralCheckpointPath() const { return _neuralCheckpointPath; }
+    [[nodiscard]] QString neuralPythonPath() const { return _neuralPythonPath; }
+    [[nodiscard]] QString volumeZarrPath() const { return _volumeZarrPath; }
+    [[nodiscard]] int neuralVolumeScale() const { return _neuralVolumeScale; }
+    [[nodiscard]] int neuralBatchSize() const { return _neuralBatchSize; }
+
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
     void setDragRadius(float value);
@@ -117,6 +125,19 @@ public:
     void setApprovalMaskOpacity(int opacity);
     void setApprovalBrushColor(const QColor& color);
 
+    // Neural tracer setters
+    void setNeuralTracerEnabled(bool enabled);
+    void setNeuralCheckpointPath(const QString& path);
+    void setNeuralPythonPath(const QString& path);
+    void setNeuralVolumeScale(int scale);
+    void setNeuralBatchSize(int size);
+
+    /**
+     * Set the volume zarr path for neural tracing.
+     * This is typically set automatically when the volume changes.
+     */
+    void setVolumeZarrPath(const QString& path);
+
     // Cell reoptimization getters
     [[nodiscard]] bool cellReoptMode() const { return _cellReoptMode; }
     [[nodiscard]] int cellReoptMaxSteps() const { return _cellReoptMaxSteps; }
@@ -162,6 +183,13 @@ signals:
     void approvalMaskOpacityChanged(int opacity);
     void approvalBrushColorChanged(QColor color);
     void approvalStrokesUndoRequested();
+
+    // Neural tracer signals
+    void neuralTracerEnabledChanged(bool enabled);
+    void neuralTracerServiceRequested(const QString& checkpointPath,
+                                      const QString& volumeZarr,
+                                      int volumeScale);
+    void neuralTracerStatusMessage(const QString& message);
 
     // Cell reoptimization signals
     void cellReoptModeChanged(bool enabled);
@@ -360,6 +388,25 @@ private:
     QLabel* _lblApprovalMaskOpacity{nullptr};
     QPushButton* _btnApprovalColor{nullptr};
     QPushButton* _btnUndoApprovalStroke{nullptr};
+
+    // Neural tracer state
+    bool _neuralTracerEnabled{false};
+    QString _neuralCheckpointPath;
+    QString _neuralPythonPath;
+    QString _volumeZarrPath;
+    int _neuralVolumeScale{0};
+    int _neuralBatchSize{4};
+
+    // Neural tracer UI
+    CollapsibleSettingsGroup* _groupNeuralTracer{nullptr};
+    QCheckBox* _chkNeuralTracerEnabled{nullptr};
+    QLineEdit* _neuralCheckpointEdit{nullptr};
+    QToolButton* _neuralCheckpointBrowse{nullptr};
+    QLineEdit* _neuralPythonEdit{nullptr};
+    QToolButton* _neuralPythonBrowse{nullptr};
+    QComboBox* _comboNeuralVolumeScale{nullptr};
+    QSpinBox* _spinNeuralBatchSize{nullptr};
+    QLabel* _lblNeuralTracerStatus{nullptr};
 
     // Cell reoptimization state and UI
     bool _cellReoptMode{false};
