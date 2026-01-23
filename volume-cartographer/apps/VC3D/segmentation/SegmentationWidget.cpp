@@ -457,6 +457,22 @@ void SegmentationWidget::buildUi()
     _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     layout->addWidget(_lblNormalGrid);
 
+    // Normal3D zarr selection (optional)
+    {
+        auto* normal3dRow = new QHBoxLayout();
+        _lblNormal3d = new QLabel(this);
+        _lblNormal3d->setTextFormat(Qt::RichText);
+        _lblNormal3d->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        normal3dRow->addWidget(_lblNormal3d, 1);
+
+        _comboNormal3d = new QComboBox(this);
+        _comboNormal3d->setToolTip(tr("Select Normal3D zarr volume to use for normal3dline constraints."));
+        _comboNormal3d->setVisible(false);
+        normal3dRow->addWidget(_comboNormal3d);
+
+        layout->addLayout(normal3dRow);
+    }
+
     auto* hoverRow = new QHBoxLayout();
     hoverRow->addSpacing(4);
     _chkShowHoverMarker = new QCheckBox(tr("Show hover marker"), this);
@@ -1435,6 +1451,22 @@ void SegmentationWidget::buildUi()
         applyCustomParamsProfile(profile, /*persist=*/true, /*fromUi=*/true);
     });
 
+    connect(_comboNormal3d, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        if (_restoringSettings) {
+            return;
+        }
+        if (!_comboNormal3d || idx < 0) {
+            return;
+        }
+        const QString path = _comboNormal3d->itemData(idx).toString();
+        if (path.isEmpty() || path == _normal3dSelectedPath) {
+            return;
+        }
+        _normal3dSelectedPath = path;
+        writeSetting(QStringLiteral("normal3d_selected_path"), _normal3dSelectedPath);
+        updateNormal3dUi();
+    });
+
     connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
         emit correctionsAnnotateToggled(enabled);
     });
@@ -1773,6 +1805,8 @@ void SegmentationWidget::syncUiState()
         _lblNormalGrid->setAccessibleDescription(message);
     }
 
+    updateNormal3dUi();
+
     // Approval mask checkboxes
     if (_chkShowApprovalMask) {
         const QSignalBlocker blocker(_chkShowApprovalMask);
@@ -1834,6 +1868,76 @@ void SegmentationWidget::syncUiState()
     }
 
     updateGrowthUiState();
+}
+
+void SegmentationWidget::updateNormal3dUi()
+{
+    if (!_lblNormal3d) {
+        return;
+    }
+
+    const int count = _normal3dCandidates.size();
+    const bool hasAny = count > 0;
+
+    // Keep selection valid.
+    if (hasAny) {
+        if (_normal3dSelectedPath.isEmpty() || !_normal3dCandidates.contains(_normal3dSelectedPath)) {
+            _normal3dSelectedPath = _normal3dCandidates.front();
+        }
+    } else {
+        _normal3dSelectedPath.clear();
+    }
+
+    const bool showCombo = count > 1;
+    if (_comboNormal3d) {
+        _comboNormal3d->setVisible(showCombo);
+        _comboNormal3d->setEnabled(_editingEnabled && hasAny);
+        if (showCombo) {
+            const QSignalBlocker blocker(_comboNormal3d);
+            _comboNormal3d->clear();
+            for (const QString& p : _normal3dCandidates) {
+                _comboNormal3d->addItem(p, p);
+            }
+            const int idx = _comboNormal3d->findData(_normal3dSelectedPath);
+            if (idx >= 0) {
+                _comboNormal3d->setCurrentIndex(idx);
+            }
+        }
+    }
+
+    const QString icon = hasAny
+        ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
+        : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
+
+    QString message;
+    if (!hasAny) {
+        message = tr("Normal3D volume not found.");
+    } else if (count == 1) {
+        message = tr("Normal3D volume found at %1").arg(_normal3dSelectedPath);
+    } else {
+        message = tr("Normal3D volumes found (%1); selected %2").arg(count).arg(_normal3dSelectedPath);
+    }
+
+    QString tooltip = message;
+    if (!_normal3dHint.isEmpty()) {
+        tooltip.append(QStringLiteral("\n"));
+        tooltip.append(_normal3dHint);
+    }
+    if (!_volumePackagePath.isEmpty()) {
+        tooltip.append(QStringLiteral("\n"));
+        tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
+    }
+
+    _lblNormal3d->setText(icon + QStringLiteral("&nbsp;") + message);
+    _lblNormal3d->setToolTip(tooltip);
+    _lblNormal3d->setAccessibleDescription(message);
+}
+
+void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint)
+{
+    _normal3dCandidates = candidates;
+    _normal3dHint = hint;
+    syncUiState();
 }
 
 QString SegmentationWidget::paramsTextForProfile(const QString& profile) const
@@ -2005,6 +2109,8 @@ void SegmentationWidget::restoreSettings()
         _customParamsProfile = QStringLiteral("custom");
     }
     validateCustomParamsText();
+
+    _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
 
     // Apply profile behavior (auto-fill + read-only) after restoring.
     if (_customParamsProfile != QStringLiteral("custom")) {

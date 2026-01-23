@@ -203,6 +203,7 @@ struct TracerGrowthContext {
     QString cacheRoot;
     double voxelSize{1.0};
     QString normalGridPath;
+    QString normal3dZarrPath;
     // For corrections annotation saving
     std::filesystem::path volpkgRoot;
     std::vector<std::string> volumeIds;

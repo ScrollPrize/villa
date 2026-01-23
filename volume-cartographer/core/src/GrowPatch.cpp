@@ -1992,18 +1992,18 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             std::string delim = j.value<std::string>("dimension_separator", ".");
 
             // Assert the direction-field was aligned by vc_ngrids --align-normals.
-            // try {
-            //     z5::filesystem::handle::File rootFile(zarr_root);
-            //     z5::filesystem::handle::Group root(rootFile, "");
-            //     nlohmann::json attrs;
-            //     z5::filesystem::readAttributes(root, attrs);
-            //     const bool aligned = attrs.value("align_normals", false);
-            //     if (!aligned) {
-            //         throw std::runtime_error("normal3d_zarr_path is not marked aligned (missing attrs.align_normals=true); run vc_ngrids --align-normals");
-            //     }
-            // } catch (const std::exception& e) {
-            //     throw std::runtime_error(std::string("Failed normal3d alignment check: ") + e.what());
-            // }
+            try {
+                z5::filesystem::handle::File rootFile(zarr_root);
+                z5::filesystem::handle::Group root(rootFile, "");
+                nlohmann::json attrs;
+                z5::filesystem::readAttributes(root, attrs);
+                const bool aligned = attrs.value("align_normals", false);
+                if (!aligned) {
+                    throw std::runtime_error("normal3d_zarr_path is not marked aligned (missing attrs.align_normals=true); run vc_ngrids --align-normals");
+                }
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("Failed normal3d alignment check: ") + e.what());
+            }
 
             // Derive scale purely from shapes: main volume is full-res, normal zarr is downsampled.
             const auto vol_shape_zyx = ds->shape();

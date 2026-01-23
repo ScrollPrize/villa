@@ -66,6 +66,8 @@ public:
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
+    [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
+
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
     void setDragRadius(float value);
@@ -84,6 +86,8 @@ public:
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
+
+    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
 
     void setVolumePackagePath(const QString& path);
     void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
@@ -204,6 +208,8 @@ private:
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     void applyAlphaPushPullConfig(const AlphaPushPullConfig& config, bool emitSignal, bool persist = true);
 
+    void updateNormal3dUi();
+
     bool _editingEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
@@ -222,6 +228,10 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridHint;
     QString _normalGridDisplayPath;
+
+    QStringList _normal3dCandidates;
+    QString _normal3dHint;
+    QString _normal3dSelectedPath;
     QString _volumePackagePath;
     QVector<QPair<QString, QString>> _volumeEntries;
     QString _activeVolumeId;
@@ -282,6 +292,8 @@ private:
     QCheckBox* _chkGrowthKeybindsEnabled{nullptr};
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
+    QLabel* _lblNormal3d{nullptr};
+    QComboBox* _comboNormal3d{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
 
     CollapsibleSettingsGroup* _groupEditing{nullptr};
