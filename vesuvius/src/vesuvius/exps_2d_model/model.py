@@ -62,8 +62,10 @@ class Model2D:
 		)
 
 	def _build_base_grid(self) -> torch.Tensor:
-		u = torch.linspace(-1.0, 1.0, self.mesh_w, dtype=torch.float32)
-		v = torch.linspace(-1.0, 1.0, self.mesh_h, dtype=torch.float32)
+		# Model domain is initialized to ~2x image extent in each dimension, so the
+		# canonical winding-space coordinates span [-2,2] (image spans [-1,1]).
+		u = torch.linspace(-2.0, 2.0, self.mesh_w, dtype=torch.float32)
+		v = torch.linspace(-2.0, 2.0, self.mesh_h, dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
 		return torch.stack([uu, vv], dim=0).unsqueeze(0)
 
