@@ -724,40 +724,6 @@ static float sample_sdt(SDTContext& ctx, const cv::Vec3f& world_pt)
                        static_cast<size_t>(y) * chunk->size[0] + static_cast<size_t>(x)];
 }
 
-class SignedDistanceToSurfaceCost {
-public:
-    SignedDistanceToSurfaceCost(std::shared_ptr<SDTContext> ctx, double weight)
-        : ctx_(std::move(ctx)), weight_(weight) {}
-
-    bool operator()(const double* candidate, double* residual) const {
-        if (!ctx_ || weight_ <= 0.0) {
-            residual[0] = 0.0;
-            return true;
-        }
-        if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2])) {
-            residual[0] = 0.0;
-            return true;
-        }
-        const cv::Vec3f p(static_cast<float>(candidate[0]),
-                          static_cast<float>(candidate[1]),
-                          static_cast<float>(candidate[2]));
-        float dist = sample_sdt(*ctx_, p);
-        if (!std::isfinite(dist)) {
-            residual[0] = 0.0;
-            return true;
-        }
-        if (ctx_->max_move > 0.0f) {
-            dist = std::clamp(dist, -ctx_->max_move, ctx_->max_move);
-        }
-        residual[0] = weight_ * static_cast<double>(dist);
-        return true;
-    }
-
-private:
-    std::shared_ptr<SDTContext> ctx_;
-    double weight_;
-};
-
 class NormalOnlyPenalty {
 public:
     NormalOnlyPenalty(cv::Vec3d anchor, cv::Vec3d normal, double weight)
@@ -1350,7 +1316,13 @@ static int gen_surface_sdt_loss(ceres::Problem &problem, const cv::Vec2i &p,
         return 0;
     }
 
-    auto* functor = new SignedDistanceToSurfaceCost(trace_data.sdt_context, static_cast<double>(w));
+    auto sampler = [ctx = trace_data.sdt_context](const cv::Vec3f& sample_pt) -> float {
+        if (!ctx) {
+            return 0.0f;
+        }
+        return sample_sdt(*ctx, sample_pt);
+    };
+    auto* functor = new SignedDistanceToSurfaceCost(sampler, static_cast<double>(w), trace_data.sdt_context->max_move);
     auto* cost = new ceres::NumericDiffCostFunction<SignedDistanceToSurfaceCost, ceres::CENTRAL, 1, 3>(functor);
     problem.AddResidualBlock(cost, nullptr, &params.dpoints(p)[0]);
     return 1;
