@@ -12,8 +12,12 @@ Parts (current placeholders):
 	- UNet inference will move here later
 - model: [`cli_model.py`](cli_model.py)
 	- step-size args (mesh/winding step in pixels)
+	- target subsampling args (`--subsample-mesh`, `--subsample-winding`)
 - opt: [`cli_opt.py`](cli_opt.py)
 	- stages / device args
+
+- vis: [`cli_vis.py`](cli_vis.py)
+	- saves `res_grid_<postfix>.jpg` and `res_tgt_<postfix>.tif`
 
 Each part provides:
 

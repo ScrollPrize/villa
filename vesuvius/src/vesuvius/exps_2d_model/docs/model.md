@@ -89,6 +89,7 @@ Initialization rules:
 - The model initializes its winding-space domain to cover **~2× the image extent** at the assumed steps.
 	- This gives headroom above/below and left/right.
 	- Cropping/expansion utilities will be added later.
+	- Canonical winding-space coordinates span [-2,2] (image spans [-1,1]).
 
 ## Current data contract (FitData)
 
