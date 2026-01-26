@@ -65,6 +65,33 @@ PIL.Image.MAX_IMAGE_PIXELS = 109951162777600
 def log(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def _read_gray(path):
+    if not osp.exists(path):
+        return None
+
+    # OpenCV can emit noisy libpng warnings (e.g. "chunk data is too large") for some PNGs.
+    # Prefer PIL for PNGs to keep logs clean; fall back to OpenCV if PIL fails.
+    if path.lower().endswith(".png"):
+        try:
+            with PIL.Image.open(path) as im:
+                return np.array(im.convert("L"))
+        except Exception:
+            pass
+
+    try:
+        img = cv2.imread(path, 0)
+        if img is not None:
+            return img
+    except cv2.error:
+        pass
+
+    try:
+        with PIL.Image.open(path) as im:
+            return np.array(im.convert("L"))
+    except Exception as e:
+        raise RuntimeError(f"Could not read image: {path}. Error: {e}") from e
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
@@ -363,43 +390,14 @@ def apply_metadata_hyperparameters(cfg, metadata):
     rebuild_augmentations(cfg, hp.get("augmentation"))
     return cfg
 
-def read_image_mask(
+
+def read_image_layers(
     fragment_id,
     start_idx=15,
     end_idx=45,
     *,
     layer_range=None,
-    reverse_layers=False,
-    label_suffix="",
-    mask_suffix="",
 ):
-
-    def _read_gray(path):
-        if not osp.exists(path):
-            return None
-
-        # OpenCV can emit noisy libpng warnings (e.g. "chunk data is too large") for some PNGs.
-        # Prefer PIL for PNGs to keep logs clean; fall back to OpenCV if PIL fails.
-        if path.lower().endswith(".png"):
-            try:
-                with PIL.Image.open(path) as im:
-                    return np.array(im.convert("L"))
-            except Exception:
-                pass
-
-        try:
-            img = cv2.imread(path, 0)
-            if img is not None:
-                return img
-        except cv2.error:
-            pass
-
-        try:
-            with PIL.Image.open(path) as im:
-                return np.array(im.convert("L"))
-        except Exception as e:
-            raise RuntimeError(f"Could not read image: {path}. Error: {e}") from e
-
     layers_dir = osp.join("train_scrolls", fragment_id, "layers")
     layer_exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
@@ -408,8 +406,6 @@ def read_image_mask(
         for fmt in (f"{layer_idx:02}", f"{layer_idx:03}", f"{layer_idx:04}", str(layer_idx)):
             for ext in layer_exts:
                 yield osp.join(layers_dir, f"{fmt}{ext}")
-
-    images = None
 
     if layer_range is not None:
         start_idx, end_idx = layer_range
@@ -455,60 +451,83 @@ def read_image_mask(
 
         images = np.stack(images_list, axis=2)
         del images_list
-    else:
-        first = None
-        for image_path in _iter_layer_paths(idxs[0]):
-            first = _read_gray(image_path)
-            if first is not None:
+        return images
+
+    first = None
+    for image_path in _iter_layer_paths(idxs[0]):
+        first = _read_gray(image_path)
+        if first is not None:
+            break
+    if first is None:
+        raise FileNotFoundError(
+            f"Could not read layer for {fragment_id}: {layers_dir}/{idxs[0]}.[tif|tiff|png|jpg|jpeg]"
+        )
+
+    base_h, base_w = first.shape[:2]
+    pad0 = (256 - base_h % 256)
+    pad1 = (256 - base_w % 256)
+    out_h = base_h + pad0
+    out_w = base_w + pad1
+
+    images = np.zeros((out_h, out_w, len(idxs)), dtype=first.dtype)
+    np.clip(first, 0, 200, out=first)
+    if fragment_id == '20230827161846':
+        first = cv2.flip(first, 0)
+    images[:base_h, :base_w, 0] = first
+
+    def _load_and_write(task):
+        chan, i = task
+        img = None
+        for image_path in _iter_layer_paths(i):
+            img = _read_gray(image_path)
+            if img is not None:
                 break
-        if first is None:
+        if img is None:
             raise FileNotFoundError(
-                f"Could not read layer for {fragment_id}: {layers_dir}/{idxs[0]}.[tif|tiff|png|jpg|jpeg]"
+                f"Could not read layer for {fragment_id}: {layers_dir}/{i}.[tif|tiff|png|jpg|jpeg]"
             )
-
-        base_h, base_w = first.shape[:2]
-        pad0 = (256 - base_h % 256)
-        pad1 = (256 - base_w % 256)
-        out_h = base_h + pad0
-        out_w = base_w + pad1
-
-        images = np.zeros((out_h, out_w, len(idxs)), dtype=first.dtype)
-        np.clip(first, 0, 200, out=first)
+        if img.shape[0] != base_h or img.shape[1] != base_w:
+            raise ValueError(
+                f"{fragment_id}: layer {i:02} has shape {img.shape} but expected {(base_h, base_w)}"
+            )
+        np.clip(img, 0, 200, out=img)
         if fragment_id == '20230827161846':
-            first = cv2.flip(first, 0)
-        images[:base_h, :base_w, 0] = first
+            img = cv2.flip(img, 0)
+        images[:base_h, :base_w, chan] = img
+        return None
 
-        def _load_and_write(task):
-            chan, i = task
-            img = None
-            for image_path in _iter_layer_paths(i):
-                img = _read_gray(image_path)
-                if img is not None:
-                    break
-            if img is None:
-                raise FileNotFoundError(
-                    f"Could not read layer for {fragment_id}: {layers_dir}/{i}.[tif|tiff|png|jpg|jpeg]"
-                )
-            if img.shape[0] != base_h or img.shape[1] != base_w:
-                raise ValueError(
-                    f"{fragment_id}: layer {i:02} has shape {img.shape} but expected {(base_h, base_w)}"
-                )
-            np.clip(img, 0, 200, out=img)
-            if fragment_id == '20230827161846':
-                img = cv2.flip(img, 0)
-            images[:base_h, :base_w, chan] = img
-            return None
+    tasks = [(chan, i) for chan, i in enumerate(idxs[1:], start=1)]
+    if tasks:
+        if layer_read_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
 
-        tasks = [(chan, i) for chan, i in enumerate(idxs[1:], start=1)]
-        if tasks:
-            if layer_read_workers > 1:
-                from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=layer_read_workers) as executor:
+                list(executor.map(_load_and_write, tasks))
+        else:
+            for task in tasks:
+                _load_and_write(task)
 
-                with ThreadPoolExecutor(max_workers=layer_read_workers) as executor:
-                    list(executor.map(_load_and_write, tasks))
-            else:
-                for task in tasks:
-                    _load_and_write(task)
+    return images
+
+
+def read_image_mask(
+    fragment_id,
+    start_idx=15,
+    end_idx=45,
+    *,
+    layer_range=None,
+    reverse_layers=False,
+    label_suffix="",
+    mask_suffix="",
+    images=None,
+):
+    if images is None:
+        images = read_image_layers(
+            fragment_id,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            layer_range=layer_range,
+        )
 
     if reverse_layers or fragment_id in REVERSE_LAYER_FRAGMENT_IDS_FALLBACK:
         images = images[:, :, ::-1]
@@ -530,6 +549,8 @@ def read_image_mask(
         fragment_mask=cv2.flip(fragment_mask,0)
 
     if "frag" in fragment_id:
+        pad0 = max(0, images.shape[0] * 2 - fragment_mask.shape[0])
+        pad1 = max(0, images.shape[1] * 2 - fragment_mask.shape[1])
         fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
     else:
         fragment_mask_padded = np.zeros((images.shape[0], images.shape[1]), dtype=fragment_mask.dtype)
@@ -1366,6 +1387,11 @@ def main():
     stitch_segment_id = None
 
     log("building datasets")
+    train_set = set(train_fragment_ids)
+    val_set = set(val_fragment_ids)
+    overlap_segments = train_set & val_set
+    layers_cache = {}
+
     for fragment_id in train_fragment_ids:
         seg_meta = segments_metadata.get(fragment_id, {}) or {}
         group_idx = fragment_to_group_idx[fragment_id]
@@ -1373,12 +1399,19 @@ def main():
 
         t0 = time.time()
         log(f"load train segment={fragment_id} group={group_name}")
-        image, mask, fragment_mask = read_image_mask(
+        layers = read_image_layers(
             fragment_id,
             layer_range=seg_meta.get("layer_range"),
+        )
+        if fragment_id in overlap_segments:
+            layers_cache[fragment_id] = layers
+
+        image, mask, fragment_mask = read_image_mask(
+            fragment_id,
             reverse_layers=bool(seg_meta.get("reverse_layers", False)),
             label_suffix="",
             mask_suffix="",
+            images=layers,
         )
         log(
             f"loaded train segment={fragment_id} "
@@ -1406,12 +1439,21 @@ def main():
 
         t0 = time.time()
         log(f"load val segment={fragment_id} group={group_name}")
+        layers = layers_cache.get(fragment_id)
+        if layers is None:
+            layers = read_image_layers(
+                fragment_id,
+                layer_range=seg_meta.get("layer_range"),
+            )
+        else:
+            log(f"reuse layers cache for val segment={fragment_id}")
+
         image_val, mask_val, fragment_mask_val = read_image_mask(
             fragment_id,
-            layer_range=seg_meta.get("layer_range"),
             reverse_layers=bool(seg_meta.get("reverse_layers", False)),
             label_suffix="_val",
             mask_suffix="_val",
+            images=layers,
         )
         log(
             f"loaded val segment={fragment_id} "
