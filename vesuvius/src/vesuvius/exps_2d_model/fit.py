@@ -510,6 +510,28 @@ def fit_cosine_grid(
             mods[name] = (float(val) / b) if b != 0.0 else 0.0
         return eff, mods
 
+    def _resolve_stage_params(params_cfg: list) -> list[torch.nn.Parameter]:
+        out: list[torch.nn.Parameter] = []
+        for p in params_cfg:
+            name = str(p)
+            if name == "theta":
+                out.append(model.theta)
+            elif name == "log_s":
+                out.append(model.log_s)
+            elif name == "phase":
+                out.append(model.phase)
+            elif name == "amp_coarse":
+                out.append(model.amp_coarse)
+            elif name == "bias_coarse":
+                out.append(model.bias_coarse)
+            elif name == "line_offset":
+                out.append(model.line_offset)
+            elif name == "offset_ms":
+                out.extend(list(model.offset_ms))
+            else:
+                raise ValueError(f"stages_json: unknown param '{name}'")
+        return out
+
     def _need_term(name: str, stage_modifiers: dict[str, float]) -> float:
         """Return effective weight for a term; 0.0 means 'skip this term'."""
         base = float(lambda_global.get(name, 0.0))
@@ -900,49 +922,26 @@ def fit_cosine_grid(
                         valid_mask=terms.get("_mask_valid", None),
                     )
 
-    stage_opts: dict[str, torch.optim.Optimizer] = {
-        "stage1": opt,
-        "stage2": torch.optim.Adam(
-            [
-                model.amp_coarse,
-                model.bias_coarse,
-                *list(model.offset_ms),
-                model.line_offset,
-            ],
-            lr=0.1 * lr,
-        ),
-        "stage3": torch.optim.Adam(
-            [
-                model.amp_coarse,
-                model.bias_coarse,
-                *list(model.offset_ms),
-                model.line_offset,
-            ],
-            lr=0.1 * lr,
-        ),
-        "stage4": torch.optim.Adam(
-            [
-                model.theta,
-                model.log_s,
-                model.phase,
-                model.amp_coarse,
-                model.bias_coarse,
-                *list(model.offset_ms),
-                model.line_offset,
-            ],
-            lr=0.1 * lr,
-        ),
-    }
-
-    stages: list[tuple[str, int, dict[str, float]]] = []
+    stages: list[tuple[str, int, float, list[torch.nn.Parameter], dict[str, float]]] = []
     use_full_dir_unet_by_stage: dict[int, bool] = {}
     prev_eff: dict[str, float] | None = None
 
     for s in stages_cfg_list:
         name = str(s.get("name", ""))
-        if name not in stage_opts:
-            raise ValueError(f"stages_json: unknown stage name '{name}'")
+        if not name.startswith("stage"):
+            raise ValueError(f"stages_json: invalid stage name '{name}'")
         steps = max(0, int(s.get("steps", 0)))
+
+        lr_stage = s.get("lr", None)
+        if lr_stage is None:
+            lr_stage_f = float(lr)
+        else:
+            lr_stage_f = float(lr_stage)
+
+        params_cfg = s.get("params", None)
+        if not isinstance(params_cfg, list) or not params_cfg:
+            raise ValueError(f"stages_json: stage '{name}' field 'params' must be a non-empty list")
+        params_stage = _resolve_stage_params(params_cfg)
 
         default_mul = s.get("default_mul", None)
         w_fac = s.get("w_fac", None)
@@ -959,19 +958,21 @@ def fit_cosine_grid(
         if use_full_dir_unet is not None:
             use_full_dir_unet_by_stage[stage_idx] = bool(use_full_dir_unet)
 
-        stages.append((name, steps, mods))
+        stages.append((name, steps, lr_stage_f, params_stage, mods))
 
     global_step_offset = 0
-    for stage_name, stage_steps, stage_modifiers in stages:
+    for stage_name, stage_steps, stage_lr, stage_params, stage_modifiers in stages:
         stage_idx = int(stage_name.replace("stage", ""))
         if stage_idx in use_full_dir_unet_by_stage:
             stage_modifiers = dict(stage_modifiers)
             stage_modifiers["use_full_dir_unet"] = bool(use_full_dir_unet_by_stage[stage_idx])
 
+        optimizer = torch.optim.Adam(stage_params, lr=stage_lr)
+
         _optimize_stage(
             stage=stage_idx,
             total_steps=stage_steps,
-            optimizer=stage_opts[stage_name],
+            optimizer=optimizer,
             stage_modifiers=stage_modifiers,
             global_step_offset=global_step_offset,
         )
