@@ -9,8 +9,16 @@ option(VC_BUILD_Z5   "Build (vendor) z5 header-only library" ON)
 #find_package(ZLIB REQUIRED)
 #find_package(glog REQUIRED)
 
+# Prefer repo-local z5 if present.
+set(VC_Z5_LOCAL_DIR "${CMAKE_SOURCE_DIR}/libs/z5")
+if (VC_BUILD_Z5 AND EXISTS "${VC_Z5_LOCAL_DIR}/CMakeLists.txt")
+    set(VC_Z5_USE_LOCAL ON)
+else()
+    set(VC_Z5_USE_LOCAL OFF)
+endif()
+
 # Try a preinstalled z5 first, unless the user explicitly forces vendoring.
-if (VC_BUILD_Z5)
+if (VC_BUILD_Z5 AND NOT VC_Z5_USE_LOCAL)
     find_package(z5 CONFIG QUIET)
     if (z5_FOUND)
         message(STATUS "Using preinstalled z5 at: ${z5_DIR} (set VC_BUILD_Z5=OFF to force this; keep ON to try vendoring).")
@@ -21,11 +29,26 @@ endif()
 if (NOT VC_BUILD_Z5)
     # Use a system / previously installed z5
     find_package(z5 CONFIG REQUIRED)
+elseif(VC_Z5_USE_LOCAL)
+    # Vendoring path: use repo-local z5 if available.
+    # z5 defines options; set them in the cache *before* adding the subproject.
+    set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
+    set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
+    set(WITH_AVIF ON   CACHE BOOL "Enable AVIF compression"    FORCE)
+
+    # On CMake ≥4, compatibility with <3.5 was removed. Setting this floor
+    # avoids errors if z5 asks for 3.1 in its CMakeLists.
+    if (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    endif()
+
+    add_subdirectory("${VC_Z5_LOCAL_DIR}")
 else()
     # Vendoring path: fetch z5 and add it as a subdir.
     # z5 defines options; set them in the cache *before* adding the subproject.
     set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
     set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
+    set(WITH_AVIF ON   CACHE BOOL "Enable AVIF compression"    FORCE)
 
     # On CMake ≥4, compatibility with <3.5 was removed. Setting this floor
     # avoids errors if z5 asks for 3.1 in its CMakeLists.
