@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 def show_meshlib(*meshes: mm.Mesh, show_axis: bool = True):
     trimesh_meshes = []
     for mesh in meshes:
-        with tempfile.NamedTemporaryFile("w", suffix=".stl") as f:
-            mm.saveMesh(mesh, Path(f.name))
-            tri_mesh = trimesh.load(f.name)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir) / "mesh.stl"
+            mm.saveMesh(mesh, temp_path)
+            tri_mesh = trimesh.load(temp_path)
             trimesh_meshes.append(tri_mesh)
     axis = trimesh.creation.axis(origin_size=10)
     if show_axis:
@@ -362,18 +363,20 @@ def combine_brep_case_lining(
     voxel_size_diagonal_percent: float = 0.01,
 ):
     """Combine a BRep case mesh with a lining."""
-    with tempfile.NamedTemporaryFile(suffix=".stl") as temp_file:
-        bd.export_stl(case, temp_file.name)
-        case_mesh = load_mesh(temp_file.name)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / "case.stl"
+        bd.export_stl(case, str(temp_path))
+        case_mesh = load_mesh(str(temp_path))
         return combine_case_lining(
             case_mesh, cavity_mesh, lining_mesh, voxel_size_diagonal_percent
         )
 
 
 def brep_to_mesh(brep: bd.Solid) -> mm.Mesh:
-    with tempfile.NamedTemporaryFile(suffix=".stl") as temp_file:
-        bd.export_stl(brep.solids()[0], temp_file.name)
-        return load_mesh(temp_file.name)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / "brep.stl"
+        bd.export_stl(brep.solids()[0], str(temp_path))
+        return load_mesh(str(temp_path))
 
 
 def combine_case_lining(
