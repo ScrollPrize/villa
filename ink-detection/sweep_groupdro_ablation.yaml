@@ -1,0 +1,35 @@
+program: train_resnet3d.py
+project: ink-group-dro
+entity: vesuvius-challenge
+method: grid
+
+metric:
+  name: val/worst_group_loss
+  goal: minimize
+
+parameters:
+  training.objective:
+    value: group_dro
+  training.loss_mode:
+    value: per_sample
+  training.sampler:
+    value: group_balanced
+
+  group_dro.robust_step_size:
+    values: [0.01, 0.05, 0.1, 0.2]
+
+  # Paper grid searched L2 penalties (lambda) like {1e-4, 1e-1, 1e0} depending on dataset.
+  # We use the same values here, but keep LR/batch size fixed to the metadata.json defaults.
+  training_hyperparameters.training.weight_decay:
+    values: [0.000001, 0.0001, 0.1, 1.0]
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --metadata_json
+  - metadata.json
+  - --outputs_path
+  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/train_scrolls
+  - --wandb_tags
+  - ink-2um,group_dro,ablation_weight_decay_step_size

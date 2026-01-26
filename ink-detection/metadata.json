@@ -1,0 +1,162 @@
+{
+  "dataset_name": "2um_dataset",
+  "description": "Collection of 2um resolution segments for ink detection training",
+  "wandb": {
+    "entity": "vesuvius-challenge",
+    "project": "ink-group-dro"
+  },
+  "segments": {
+    "20250807020208": {
+      "original_path": "0175_2um/20250807020208",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "20250806145318": {
+      "original_path": "0175_2um/20250806145318",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "l2_0": {
+      "original_path": "0139_columns/l2_0",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "658": {
+      "original_path": "train_scrolls/658",
+      "base_path": "343P",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": true
+    },
+    "500p2a": {
+      "original_path": "train_scrolls/500p2a",
+      "base_path": "500p2a",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": true
+    },
+    "-1": {
+      "original_path": "sean_hiddenlayers/-1",
+      "base_path": "500p2a",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "20250910185200": {
+      "original_path": "new_traces9b/david_9b",
+      "base_path": "9b",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "20250919125754-auto_grown_20250919055754487_inp_hr": {
+      "original_path": "9b",
+      "base_path": "9b",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    }
+  },
+  "training_hyperparameters": {
+    "model": {
+      "model_name": "Unet",
+      "backbone": "resnet3d",
+      "in_chans": 62,
+      "encoder_depth": 5,
+      "target_size": 1
+    },
+    "training": {
+      "size": 256,
+      "tile_size": 1024,
+      "stride": 128,
+      "train_batch_size": 4,
+      "valid_batch_size": 4,
+      "use_amp": true,
+      "epochs": 20,
+      "scheduler": "GradualWarmupSchedulerV2",
+      "warmup_factor": 10,
+      "lr": 1e-05,
+      "min_lr": 1e-06,
+      "weight_decay": 1e-06,
+      "max_grad_norm": 100,
+      "pretrained": true,
+      "num_workers": 16,
+      "seed": 130697
+    },
+    "augmentation": {
+      "horizontal_flip": 0.5,
+      "vertical_flip": 0.5,
+      "shift_scale_rotate": {
+        "rotate_limit": 360,
+        "shift_limit": 0.15,
+        "scale_limit": 0.1,
+        "p": 0.75
+      },
+      "blur": {
+        "types": [
+          "GaussianBlur",
+          "MotionBlur"
+        ],
+        "p": 0.4
+      },
+      "coarse_dropout": {
+        "max_holes": 2,
+        "max_width_ratio": 0.2,
+        "max_height_ratio": 0.2,
+        "p": 0.5
+      }
+    }
+  },
+  "training": {
+    "objective": "erm",
+    "sampler": "shuffle",
+    "loss_mode": "batch",
+    "save_every_epoch": true,
+    "train_segments": [
+      "20250806145318",
+      "l2_0",
+      "658",
+      "500p2a",
+      "-1",
+      "20250910185200",
+      "20250919125754-auto_grown_20250919055754487_inp_hr"
+    ],
+    "val_segments": [
+      "20250806145318",
+      "l2_0",
+      "658",
+      "500p2a",
+      "-1",
+      "20250910185200",
+      "20250919125754-auto_grown_20250919055754487_inp_hr",
+      "20250807020208"
+    ]
+  },
+  "group_dro": {
+    "group_key": "base_path",
+    "robust_step_size": 0.01
+  },
+  "source_file": "train_resnet3d.py"
+}

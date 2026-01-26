@@ -1,0 +1,27 @@
+program: train_resnet3d.py
+project: ink-group-dro
+entity: vesuvius-challenge
+method: grid
+
+metric:
+  name: val/worst_group_loss
+  goal: minimize
+
+parameters:
+  training.objective:
+    value: erm
+  training.sampler:
+    value: shuffle
+  training.loss_mode:
+    values: [batch, per_sample]
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --metadata_json
+  - metadata.json
+  - --outputs_path
+  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/train_scrolls
+  - --wandb_tags
+  - ink-2um,group_dro,ablations
