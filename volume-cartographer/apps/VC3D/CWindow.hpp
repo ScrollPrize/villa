@@ -106,9 +106,10 @@ public slots:
     void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
     void onMoveSegmentToPaths(const QString& segmentId);
+    void onRenameSurface(const QString& segmentId);
 
 public:
-    CWindow();
+    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
     ~CWindow(void);
     
     // Helper method to get the current volume path

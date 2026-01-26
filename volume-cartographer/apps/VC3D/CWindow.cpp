@@ -25,10 +25,12 @@
 #include <QDir>
 #include <QProgressDialog>
 #include <QMessageBox>
+#include <QInputDialog>
 #include <QThread>
 #include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
 #include <QFutureWatcher>
+#include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
 #include <QLabel>
@@ -463,7 +465,7 @@ static void applyDarkPalette() {
 }
 
 // Constructor
-CWindow::CWindow() :
+CWindow::CWindow(size_t cacheSizeGB) :
     fVpkg(nullptr),
     _cmdRunner(nullptr),
     _seedingWidget(nullptr),
@@ -496,8 +498,8 @@ CWindow::CWindow() :
     }
     // setAttribute(Qt::WA_DeleteOnClose);
 
-    chunk_cache = new ChunkCache<uint8_t>(CHUNK_CACHE_SIZE_GB*1024ULL*1024ULL*1024ULL);
-    std::cout << "chunk cache size is " << CHUNK_CACHE_SIZE_GB << " gigabytes " << std::endl;
+    chunk_cache = new ChunkCache<uint8_t>(cacheSizeGB * 1024ULL * 1024ULL * 1024ULL);
+    std::cout << "chunk cache size is " << cacheSizeGB << " gigabytes" << std::endl;
 
     _surf_col = new CSurfaceCollection();
 
@@ -820,6 +822,7 @@ CWindow::CWindow() :
     connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
 
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
+    connect(_surfacePanel.get(), &SurfacePanelController::renameSurfaceRequested, this, &CWindow::onRenameSurface);
 }
 
 // Destructor
@@ -4710,6 +4713,179 @@ void CWindow::onMoveSegmentToPaths(const QString& segmentId)
         QMessageBox::critical(this, tr("Error"),
             tr("Failed to move segment: %1\n\n"
                "The segment has been unloaded from the viewer.").arg(e.what()));
+    }
+}
+
+void CWindow::onRenameSurface(const QString& segmentId)
+{
+    if (!fVpkg) {
+        statusBar()->showMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    // Block if surface is currently being edited
+    if (_segmentationModule && _segmentationModule->isEditingApprovalMask()) {
+        QMessageBox::warning(this, tr("Cannot Rename"),
+            tr("Cannot rename surface while editing is in progress.\n"
+               "Please finish or cancel editing first."));
+        return;
+    }
+
+    // Get the segment
+    std::string oldId = segmentId.toStdString();
+    auto seg = fVpkg->segmentation(oldId);
+    if (!seg) {
+        statusBar()->showMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+        return;
+    }
+
+    // Show input dialog to get new name
+    bool ok = false;
+    QString newName = QInputDialog::getText(
+        this,
+        tr("Rename Surface"),
+        tr("Enter new name for '%1':").arg(segmentId),
+        QLineEdit::Normal,
+        segmentId,
+        &ok);
+
+    if (!ok || newName.isEmpty()) {
+        return;
+    }
+
+    std::string newId = newName.toStdString();
+
+    // Validate new name: alphanumeric + underscore + hyphen only
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch()) {
+        QMessageBox::warning(this, tr("Invalid Name"),
+            tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
+        return;
+    }
+
+    // Check if name is unchanged
+    if (newId == oldId) {
+        return;
+    }
+
+    // Check for name collision
+    std::filesystem::path volpkgPath(fVpkg->getVolpkgDirectory());
+    std::filesystem::path currentPath = seg->path();
+    std::filesystem::path parentDir = currentPath.parent_path();
+    std::filesystem::path newPath = parentDir / newId;
+
+    if (std::filesystem::exists(newPath)) {
+        QMessageBox::warning(this, tr("Name Exists"),
+            tr("A surface with the name '%1' already exists.").arg(newName));
+        return;
+    }
+
+    // Check if this is the currently selected segment
+    bool wasSelected = (_surfID == oldId);
+
+    // Store the old UUID for rollback if needed
+    std::string oldUuid = seg->id();
+
+    // === Clean up the segment before renaming ===
+
+    // Wait for any pending index rebuild
+    if (_viewerManager) {
+        _viewerManager->waitForPendingIndexRebuild();
+    }
+
+    // Clear from surface collection (including "segmentation" if it matches)
+    if (_surf_col) {
+        auto currentSurface = _surf_col->surface(oldId);
+        auto segmentationSurface = _surf_col->surface("segmentation");
+
+        // If this surface is currently shown as "segmentation", clear it
+        if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
+            _surf_col->setSurface("segmentation", nullptr, false, false);
+        }
+
+        // Clear the surface from the collection
+        _surf_col->setSurface(oldId, nullptr, false, false);
+    }
+
+    // Unload the surface from VolumePkg
+    fVpkg->unloadSurface(oldId);
+
+    // Clear selection if this was selected
+    if (wasSelected) {
+        clearSurfaceSelection();
+        if (treeWidgetSurfaces) {
+            treeWidgetSurfaces->clearSelection();
+        }
+    }
+
+    // Update meta.json UUID
+    try {
+        seg->setId(newId);
+        seg->saveMetadata();
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to update metadata: %1").arg(e.what()));
+        // Reload the old segment
+        fVpkg->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+        return;
+    }
+
+    // Perform the folder rename
+    try {
+        std::filesystem::rename(currentPath, newPath);
+
+        // Remove old ID from VolumePkg's internal tracking
+        fVpkg->removeSingleSegmentation(oldId);
+
+        // Remove from surface panel
+        if (_surfacePanel) {
+            _surfacePanel->removeSingleSegmentation(oldId);
+        }
+
+        // Refresh segmentations to pick up the new ID
+        fVpkg->refreshSegmentations();
+
+        // Add the new segment
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(newId);
+        }
+
+        // Restore selection if it was the selected surface
+        if (wasSelected && treeWidgetSurfaces) {
+            QTreeWidgetItemIterator it(treeWidgetSurfaces);
+            while (*it) {
+                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == newId) {
+                    treeWidgetSurfaces->setCurrentItem(*it);
+                    break;
+                }
+                ++it;
+            }
+        }
+
+        statusBar()->showMessage(
+            tr("Renamed '%1' to '%2'").arg(segmentId, newName), 5000);
+
+    } catch (const std::exception& e) {
+        // Attempt to rollback metadata change
+        try {
+            seg->setId(oldUuid);
+            seg->saveMetadata();
+        } catch (...) {
+            // Rollback failed - metadata is now inconsistent
+        }
+
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to rename folder: %1\n\n"
+               "The segment has been unloaded. Please reload surfaces.").arg(e.what()));
+
+        // Refresh to get back to a consistent state
+        fVpkg->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
     }
 }
 
