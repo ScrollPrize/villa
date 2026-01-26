@@ -48,6 +48,14 @@ auto main(int argc, char* argv[]) -> int
         "dir");
     parser.addOption(loadFirstOption);
 
+    QCommandLineOption cacheSizeOption(
+        "cache-size",
+        QString("Set the chunk cache size in gigabytes (default: %1 GB).")
+            .arg(CHUNK_CACHE_SIZE_GB),
+        "GB",
+        QString::number(CHUNK_CACHE_SIZE_GB));
+    parser.addOption(cacheSizeOption);
+
     parser.process(app);
 
     if (parser.isSet(skipShapeCheckOption)) {
@@ -60,7 +68,22 @@ auto main(int argc, char* argv[]) -> int
         }
     }
 
-    CWindow aWin;
+    size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB;
+    if (parser.isSet(cacheSizeOption)) {
+        bool ok = false;
+        const qulonglong parsed = parser.value(cacheSizeOption).toULongLong(&ok);
+        if (!ok || parsed == 0) {
+            std::cerr << "Error: Invalid cache size. Must be a positive integer (GB)." << std::endl;
+            return 1;
+        }
+        if (parsed > 256) {
+            std::cerr << "Warning: Cache size " << parsed
+                      << " GB is very large. Ensure sufficient system memory." << std::endl;
+        }
+        cacheSizeGB = static_cast<size_t>(parsed);
+    }
+
+    CWindow aWin(cacheSizeGB);
     aWin.show();
     return QApplication::exec();
 }
