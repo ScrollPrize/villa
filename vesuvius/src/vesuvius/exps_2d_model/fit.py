@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 import fit_mask
+import fit_data
 from fit_model import CosineGridModel
 from fit_vis import _save_snapshot, _to_uint8
 from fit_loss_data import _directional_alignment_loss, _gradient_data_loss
@@ -65,185 +66,16 @@ def fit_cosine_grid(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_device = torch.device(device)
 
-    # Optional UNet direction maps (channels 2 & 3), kept at the same resolution as
-    # `image` so we can define directional losses in sample space. Channel 2 encodes
-    #   dir0 = 0.5 + 0.5*cos(2*theta)
-    # Channel 3 encodes
-    #   dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
-    # matching the training targets used in train_unet.
-    unet_dir0_img: torch.Tensor | None = None
-    unet_dir1_img: torch.Tensor | None = None
-    # Optional UNet magnitude map (channel 1), kept at the same resolution as `image`
-    # so we can define a gradient-magnitude period-sum loss in sample space.
-    unet_mag_img: torch.Tensor | None = None
-
-    # Image we sample from (source resolution).
-    p_input = Path(image_path)
-    if p_input.is_dir():
-        # Directory mode: interpret --input as a directory containing precomputed
-        # tiled UNet outputs (_cos/_mag/_dir0/_dir1). In this mode no UNet checkpoint
-        # should be provided.
-        if unet_checkpoint is not None:
-            raise ValueError(
-                "When --input is a directory, --unet-checkpoint must not be set; "
-                "pass the directory with tiled UNet outputs as --input and omit "
-                "--unet-checkpoint."
-            )
-
-        # There should be exactly one cosine TIFF in the directory. We ignore
-        # --layer here and always use that single *_cos.tif as the intensity
-        # source, together with its matching *_mag/_dir0/_dir1 files.
-        cos_files = sorted(p_input.glob("*_cos.tif"))
-        if len(cos_files) != 1:
-            raise ValueError(
-                f"Expected exactly one *_cos.tif in directory {p_input}, "
-                f"found {len(cos_files)}."
-            )
-
-        cos_path = cos_files[0]
-        base_stem = cos_path.stem
-        if base_stem.endswith("_cos"):
-            base_stem = base_stem[:-4]
-        mag_path = cos_path.with_name(f"{base_stem}_mag.tif")
-        # New tiled UNet outputs use explicit dir0/dir1 naming to avoid mixing
-        # with older single-channel direction files.
-        dir0_path = cos_path.with_name(f"{base_stem}_dir0.tif")
-        dir1_path = cos_path.with_name(f"{base_stem}_dir1.tif")
-        # All tiled UNet outputs are required in directory mode.
-        if (not mag_path.is_file()) or (not dir0_path.is_file()) or (not dir1_path.is_file()):
-            raise FileNotFoundError(
-                f"Missing required tiled UNet file(s) for base '{base_stem}' in {p_input}. "
-                f"Expected files: {cos_path.name}, {mag_path.name}, {dir0_path.name}, {dir1_path.name}."
-            )
-
-        cos_np = tifffile.imread(str(cos_path)).astype("float32")
-        mag_np = tifffile.imread(str(mag_path)).astype("float32")
-        dir0_np = tifffile.imread(str(dir0_path)).astype("float32")
-        dir1_np = tifffile.imread(str(dir1_path)).astype("float32")
-
-        cos_t = torch.from_numpy(cos_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-        mag_t = torch.from_numpy(mag_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-        dir0_t = torch.from_numpy(dir0_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-        dir1_t = torch.from_numpy(dir1_np).unsqueeze(0).unsqueeze(0).to(torch_device)
-
-        image = torch.clamp(cos_t, 0.0, 1.0)
-        unet_mag_img = torch.clamp(mag_t, 0.0, 1.0)
-        # Use dir0/dir1 as the primary & secondary direction channels matching training.
-        unet_dir0_img = torch.clamp(dir0_t, 0.0, 1.0) if dir0_t is not None else None
-        unet_dir1_img = torch.clamp(dir1_t, 0.0, 1.0) if dir1_t is not None else None
-    elif unet_checkpoint is not None:
-        # Use UNet inference on the specified TIFF layer, then fit the cosine grid
-        # directly to the UNet cosine output (channel 0).
-        raw_layer = load_tiff_layer(
-            image_path,
-            torch_device,
-            layer=unet_layer if unet_layer is not None else 0,
-        )
-        unet_model = load_unet(
-            device=torch_device,
-            weights=unet_checkpoint,
-            in_channels=1,
-            out_channels=4,
-            base_channels=32,
-            num_levels=6,
-            max_channels=1024,
-        )
-        unet_model.eval()
-        with torch.no_grad():
-            pred_unet = unet_model(raw_layer)
-
-        # Optional spatial crop after UNet inference, before any downscaling.
-        if unet_crop is not None and unet_crop > 0:
-            c = int(unet_crop)
-            _, _, h_u, w_u = pred_unet.shape
-            if h_u > 2 * c and w_u > 2 * c:
-                pred_unet = pred_unet[:, :, c:-c, c:-c]
-
-        # Optionally visualize all UNet outputs at the beginning (after crop).
-        if output_prefix is not None:
-            p = Path(output_prefix)
-            unet_np = pred_unet[0].detach().cpu().numpy()  # (C,H,W)
-            cos_np = unet_np[0]
-            mag_np = unet_np[1] if unet_np.shape[0] > 1 else None
-            dir0_np = unet_np[2] if unet_np.shape[0] > 2 else None
-            dir1_np = unet_np[3] if unet_np.shape[0] > 3 else None
-            tifffile.imwrite(f"{p}_unet_cos.tif", cos_np.astype("float32"), compression="lzw")
-            if mag_np is not None:
-                tifffile.imwrite(f"{p}_unet_mag.tif", mag_np.astype("float32"), compression="lzw")
-            if dir0_np is not None:
-                tifffile.imwrite(f"{p}_unet_dir0.tif", dir0_np.astype("float32"), compression="lzw")
-            if dir1_np is not None:
-                tifffile.imwrite(f"{p}_unet_dir1.tif", dir1_np.astype("float32"), compression="lzw")
-
-        # Cosine output (channel 0) is the main intensity target for the fit.
-        image = torch.clamp(pred_unet[:, 0:1], 0.0, 1.0)
-        # Magnitude branch (channel 1) encodes gradient magnitude; kept for period-sum loss.
-        unet_mag_img = torch.clamp(pred_unet[:, 1:2], 0.0, 1.0)
-        # Direction branches:
-        #   channel 2: dir0 = 0.5 + 0.5*cos(2*theta)
-        #   channel 3: dir1 = 0.5 + 0.5*cos(2*theta + pi/4)
-        # We keep both for an auxiliary directional loss in sample space.
-        unet_dir0_img = torch.clamp(pred_unet[:, 2:3], 0.0, 1.0)
-        unet_dir1_img = torch.clamp(pred_unet[:, 3:4], 0.0, 1.0) if pred_unet.size(1) > 3 else None
-    else:
-        # If a specific TIFF layer is requested, mirror the UNet branch behavior
-        # and load only that layer; otherwise fall back to generic image loading.
-        if unet_layer is not None:
-            image = load_tiff_layer(
-                image_path,
-                torch_device,
-                layer=unet_layer,
-            )
-        else:
-            image = load_image(image_path, torch_device)
-
-    # Optional spatial crop on the source image/UNet outputs before any downscaling.
-    if crop is not None:
-        x, y, w_c, h_c = (int(v) for v in crop)
-        _, _, h_img0, w_img0 = image.shape
-        x0 = max(0, min(x, w_img0))
-        y0 = max(0, min(y, h_img0))
-        x1 = max(x0, min(x + w_c, w_img0))
-        y1 = max(y0, min(y + h_c, h_img0))
-        image = image[:, :, y0:y1, x0:x1]
-        if unet_dir0_img is not None:
-            unet_dir0_img = unet_dir0_img[:, :, y0:y1, x0:x1]
-        if unet_dir1_img is not None:
-            unet_dir1_img = unet_dir1_img[:, :, y0:y1, x0:x1]
-        if unet_mag_img is not None:
-            unet_mag_img = unet_mag_img[:, :, y0:y1, x0:x1]
-
-    # Optionally downscale the image used for fitting before we derive any geometry
-    # from it. From this point on, only the (possibly downscaled) size is used.
-    if img_downscale_factor is not None and img_downscale_factor > 1.0:
-        scale = 1.0 / float(img_downscale_factor)
-        image = F.interpolate(
-            image,
-            scale_factor=scale,
-            mode="bilinear",
-            align_corners=True,
-        )
-        if unet_dir0_img is not None:
-            unet_dir0_img = F.interpolate(
-                unet_dir0_img,
-                scale_factor=scale,
-                mode="bilinear",
-                align_corners=True,
-            )
-        if unet_dir1_img is not None:
-            unet_dir1_img = F.interpolate(
-                unet_dir1_img,
-                scale_factor=scale,
-                mode="bilinear",
-                align_corners=True,
-            )
-        if unet_mag_img is not None:
-            unet_mag_img = F.interpolate(
-                unet_mag_img,
-                scale_factor=scale,
-                mode="bilinear",
-                align_corners=True,
-            )
+    image, unet_dir0_img, unet_dir1_img, unet_mag_img = fit_data.load_fit_inputs(
+        image_path,
+        torch_device,
+        unet_checkpoint=unet_checkpoint,
+        unet_layer=unet_layer,
+        unet_crop=unet_crop,
+        crop=crop,
+        img_downscale_factor=img_downscale_factor,
+        output_prefix=output_prefix,
+    )
 
     _, _, h_img, w_img = image.shape
 
@@ -581,86 +413,18 @@ def fit_cosine_grid(
         device = image.device
         dtype = image.dtype
 
-        # Normalized progress in [0,1] within this stage.
-        if total_stage_steps > 0:
-            stage_progress = float(step_stage) / float(max(total_stage_steps - 1, 1))
-        else:
-            stage_progress = 0.0
-
         # Effective vertical half-extent for cosine-domain mask for this step.
         cos_v_eff = fit_mask._current_cos_v_extent(stage, step_stage, total_stage_steps)
 
         # Prediction in sample space.
         pred = model(image)
 
-        # Build validity mask and Gaussian loss mask in sample space (no grad),
-        # and a coarse-grid mask for geometry-based losses.
-        with torch.no_grad():
-            grid_ng = model._build_sampling_grid()
-            gx = grid_ng[..., 0]
-            gy = grid_ng[..., 1]
-            valid = (
-                (gx >= -1.0)
-                & (gx <= 1.0)
-                & (gy >= -1.0)
-                & (gy <= 1.0)
-            ).float()
-            valid = valid.unsqueeze(1)  # (1,1,H,W)
-
-            # Coarse validity mask in image space (per coarse vertex).
-            coords_c = model.base_grid + model.offset_coarse()  # (1,2,gh,gw)
-            u_c = coords_c[:, 0:1]
-            v_c = coords_c[:, 1:2]
-            x_c, y_c = model._apply_global_transform(u_c, v_c)
-            valid_coarse = (
-                (x_c >= -1.0)
-                & (x_c <= 1.0)
-                & (y_c >= -1.0)
-                & (y_c <= 1.0)
-            ).float()  # (1,1,gh,gw)
-
-            # Stage 3: shrink the fixed (valid) region a bit so the boundary can adjust.
-            # if stage == 3:
-            valid_coarse_erode_iters = 4
-            for _ in range(valid_coarse_erode_iters):
-                inv = 1.0 - valid_coarse
-                inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
-                valid_coarse = 1.0 - inv
-
-            valid_erode_iters = 0
-            for _ in range(valid_erode_iters):
-                inv = 1.0 - valid
-                inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
-                valid = 1.0 - inv
-
-            # if stage in (1, 2):
-            #     # Stages 1 and 2: use only in-bounds validity; ignore Gaussian mask.
-            weight_full = valid
-            # else:
-            # gauss = fit_mask._gaussian_mask(stage=stage, stage_progress=stage_progress)
-            # if gauss is None:
-            #     w_sample = torch.ones_like(valid)
-            # else:
-            #     w_sample = F.grid_sample(
-            #         gauss,
-            #         grid_ng,
-            #         mode="bilinear",
-            #         padding_mode="zeros",
-            #         align_corners=True,
-            #     )
-            # weight_full = valid * w_sample
-
-            # Apply cosine-domain band mask in sample space so that only selected
-            # periods/rows contribute to the loss, with vertical extent possibly
-            # growing during stage 4.
-            mask_cosine_cur = fit_mask._build_mask_cosine_hr(cos_v_eff)
-            weight_full = weight_full * mask_cosine_cur
-
-            # Coarse-grid masks for geometry losses: sample the same image-space
-            # mask (ones or Gaussian) at the coarse-grid coordinates, and keep
-            # the cosine-domain band separate so we can treat in-band vs
-            # out-of-band regions differently for smoothness.
-            geom_mask_coarse, geom_mask_img, geom_mask_cos = fit_mask._coarse_geom_mask(stage, stage_progress, cos_v_eff)
+        valid, weight_full, valid_coarse, geom_mask_coarse, geom_mask_img, geom_mask_cos = fit_mask.build_step_masks(
+            stage=stage,
+            step_stage=step_stage,
+            total_stage_steps=total_stage_steps,
+            cos_v_eff=cos_v_eff,
+        )
 
         # Grid with gradients for geometry-based losses.
         grid = model._build_sampling_grid()
