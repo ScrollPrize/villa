@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <tiffio.h>
 
+#include "vc/core/util/xtensor_include.hpp"
+#include XTENSORINCLUDE(containers, xarray.hpp)
+#include XTENSORINCLUDE(containers, xtensor.hpp)
+
 // Write single-channel image (8U, 16U, 32F) as tiled TIFF with LZW compression
 // cvType: output type (-1 = same as input). If different, values are scaled:
 //         8U↔16U: scale by 257, 8U↔32F: scale by 1/255, 16U↔32F: scale by 1/65535
@@ -70,3 +74,8 @@ private:
     std::vector<uint8_t> _tileBuf;  // Reusable tile buffer
     std::filesystem::path _path;     // For error messages
 };
+
+// Read a 3D TIFF stack (multi-page TIFF) into an xtensor array.
+// Returns shape (depth, height, width) in ZYX order as float32.
+// Throws runtime_error if file cannot be opened or format is unsupported.
+xt::xarray<float> read3DTiff(const std::filesystem::path& path);
