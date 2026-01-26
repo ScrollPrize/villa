@@ -15,6 +15,7 @@ class Stage:
 	steps: int
 	lr: float
 	params: list[str]
+	min_scaledown: int
 
 
 def load_stages(path: str) -> list[Stage]:
@@ -36,7 +37,8 @@ def load_stages(path: str) -> list[Stage]:
 		if not isinstance(params, list):
 			params = []
 		params = [str(p) for p in params]
-		out.append(Stage(name=name, steps=steps, lr=lr, params=params))
+		min_scaledown = max(0, int(s.get("min_scaledown", 0)))
+		out.append(Stage(name=name, steps=steps, lr=lr, params=params, min_scaledown=min_scaledown))
 	return out
 
 
@@ -52,20 +54,30 @@ def optimize(
 	if snap_int < 0:
 		snap_int = 0
 
-	for stage in stages:
+	for si, stage in enumerate(stages):
 		if stage.steps <= 0:
 			continue
 
 		all_params = model.opt_params()
-		params = [all_params[n] for n in stage.params if n in all_params]
+		params: list[torch.nn.Parameter] = []
+		for name in stage.params:
+			group = all_params.get(name, [])
+			if name == "offset_ms":
+				k0 = max(0, int(stage.min_scaledown))
+				params.extend(group[k0:])
+			else:
+				params.extend(group)
 		if not params:
 			continue
 		opt = torch.optim.Adam(params, lr=stage.lr)
 		with torch.no_grad():
 			loss0 = opt_loss_dir.direction_loss(model=model, data=data)
-			param_vals0 = {k: float(v.detach().cpu()) for k, v in all_params.items()}
-			print(f"{stage.name} step 0/{stage.steps}: loss={loss0.item():.6f} params={param_vals0}")
-		snapshot_fn(stage=stage.name, step=0, loss=float(loss0.detach().cpu()))
+			param_vals0: dict[str, float] = {}
+			for k, vs in all_params.items():
+				if len(vs) == 1 and vs[0].numel() == 1:
+					param_vals0[k] = float(vs[0].detach().cpu())
+			print(f"stage{si} step 0/{stage.steps}: loss={loss0.item():.6f} params={param_vals0}")
+		snapshot_fn(stage=f"stage{si}", step=0, loss=float(loss0.detach().cpu()))
 
 		for step in range(stage.steps):
 			loss = opt_loss_dir.direction_loss(model=model, data=data)
@@ -75,10 +87,13 @@ def optimize(
 
 			step1 = step + 1
 			if step == 0 or step1 == stage.steps or (step1 % 100) == 0:
-				param_vals = {k: float(v.detach().cpu()) for k, v in all_params.items()}
-				print(f"{stage.name} step {step1}/{stage.steps}: loss={loss.item():.6f} params={param_vals}")
+				param_vals: dict[str, float] = {}
+				for k, vs in all_params.items():
+					if len(vs) == 1 and vs[0].numel() == 1:
+						param_vals[k] = float(vs[0].detach().cpu())
+				print(f"stage{si} step {step1}/{stage.steps}: loss={loss.item():.6f} params={param_vals}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
-				snapshot_fn(stage=stage.name, step=step1, loss=float(loss.detach().cpu()))
+				snapshot_fn(stage=f"stage{si}", step=step1, loss=float(loss.detach().cpu()))
 
-		snapshot_fn(stage=stage.name, step=stage.steps, loss=float(loss.detach().cpu()))
+		snapshot_fn(stage=f"stage{si}", step=stage.steps, loss=float(loss.detach().cpu()))

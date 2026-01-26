@@ -40,6 +40,10 @@ class Model2D(nn.Module):
 		self.mesh_w = max(2, (w2 + int(init.winding_step_px) - 1) // int(init.winding_step_px) + 1)
 
 		self.base_grid = self._build_base_grid().to(device=device)
+		offset_scales = 5
+		self.offset_ms = nn.ParameterList(
+			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
+		)
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
@@ -87,17 +91,36 @@ class Model2D(nn.Module):
 		y = s * u + c * v
 		return x, y
 
-	def opt_params(self) -> dict[str, nn.Parameter]:
+	def opt_params(self) -> dict[str, list[nn.Parameter]]:
 		return {
-			"theta": self.theta,
-			"phase": self.phase,
-			"winding_scale": self.winding_scale,
+			"theta": [self.theta],
+			"phase": [self.phase],
+			"winding_scale": [self.winding_scale],
+			"offset_ms": list(self.offset_ms),
 		}
 
 	def grid_uv(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return base (u,v) mesh coordinates."""
-		uv = self.base_grid
+		uv = self.base_grid + self.offset_coarse()
 		return uv[:, 0:1], uv[:, 1:2]
+
+	def offset_coarse(self) -> torch.Tensor:
+		off = self.offset_ms[-1]
+		for d in reversed(self.offset_ms[:-1]):
+			off = F.interpolate(off, size=(int(d.shape[2]), int(d.shape[3])), mode="bilinear", align_corners=True) + d
+		return off
+
+	def _build_offset_ms(self, *, offset_scales: int, device: torch.device, gh0: int, gw0: int) -> list[nn.Parameter]:
+		gh0 = int(gh0)
+		gw0 = int(gw0)
+		n_scales = max(1, int(offset_scales))
+		shapes: list[tuple[int, int]] = [(gh0, gw0)]
+		for _ in range(1, n_scales):
+			gh_prev, gw_prev = shapes[-1]
+			gh_i = max(2, (gh_prev - 1) // 2 + 1)
+			gw_i = max(2, (gw_prev - 1) // 2 + 1)
+			shapes.append((gh_i, gw_i))
+		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
 
 	def grid_xy(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return globally transformed mesh coordinates."""
