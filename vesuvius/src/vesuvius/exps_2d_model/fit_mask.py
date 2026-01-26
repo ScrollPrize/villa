@@ -151,3 +151,56 @@ def _current_cos_v_extent(stage: int, step_stage: int, total_stage_steps: int) -
     if stage == 4:
         return float(cos_mask_v_extent_f + 0.0001 * float(step_stage))
     return float(cos_mask_v_extent_f)
+
+
+def build_step_masks(
+    *,
+    stage: int,
+    step_stage: int,
+    total_stage_steps: int,
+    cos_v_eff: float,
+    valid_coarse_erode_iters: int = 4,
+    valid_erode_iters: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if total_stage_steps > 0:
+        stage_progress = float(step_stage) / float(max(total_stage_steps - 1, 1))
+    else:
+        stage_progress = 0.0
+
+    with torch.no_grad():
+        grid_ng = model._build_sampling_grid()
+        gx = grid_ng[..., 0]
+        gy = grid_ng[..., 1]
+        valid = (
+            (gx >= -1.0)
+            & (gx <= 1.0)
+            & (gy >= -1.0)
+            & (gy <= 1.0)
+        ).float()
+        valid = valid.unsqueeze(1)
+
+        coords_c = model.base_grid + model.offset_coarse()
+        u_c = coords_c[:, 0:1]
+        v_c = coords_c[:, 1:2]
+        x_c, y_c = model._apply_global_transform(u_c, v_c)
+        valid_coarse = (
+            (x_c >= -1.0)
+            & (x_c <= 1.0)
+            & (y_c >= -1.0)
+            & (y_c <= 1.0)
+        ).float()
+
+        for _ in range(int(valid_coarse_erode_iters)):
+            inv = 1.0 - valid_coarse
+            inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
+            valid_coarse = 1.0 - inv
+
+        for _ in range(int(valid_erode_iters)):
+            inv = 1.0 - valid
+            inv = F.max_pool2d(inv, kernel_size=3, stride=1, padding=1)
+            valid = 1.0 - inv
+
+        weight_full = valid * _build_mask_cosine_hr(cos_v_eff)
+        geom_mask_coarse, geom_mask_img, geom_mask_cos = _coarse_geom_mask(stage, stage_progress, cos_v_eff)
+
+    return valid, weight_full, valid_coarse, geom_mask_coarse, geom_mask_img, geom_mask_cos
