@@ -203,6 +203,10 @@ struct StraightLoss {
         
         T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
         T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
+        if (l1 <= T(1e-12) || l2 <= T(1e-12)) {
+            residual[0] = T(0);
+            return true;
+        }
 
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         

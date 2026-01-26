@@ -1021,6 +1021,14 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     if (auto customParams = _context.widget->customParamsJson()) {
         request.customParams = std::move(*customParams);
     }
+    if (method == SegmentationGrowthMethod::Corrections &&
+        _context.module && _context.module->cellReoptCollectionPending()) {
+        if (!request.customParams) {
+            request.customParams = nlohmann::json::object();
+        }
+        (*request.customParams)["cell_reopt_mode"] = true;
+        qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
+    }
 
     // Handle neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
     if (_context.widget->neuralTracerEnabled()) {

@@ -103,6 +103,7 @@ public:
     // Cell reoptimization
     void setCellReoptimizationMode(bool enabled);
     [[nodiscard]] bool cellReoptimizationMode() const { return _cellReoptMode; }
+    [[nodiscard]] bool cellReoptCollectionPending() const { return _cellReoptCollectionId != 0; }
     void setCellReoptMaxSteps(int steps);
     void setCellReoptMaxPoints(int points);
     void setCellReoptMinSpacing(float spacing);

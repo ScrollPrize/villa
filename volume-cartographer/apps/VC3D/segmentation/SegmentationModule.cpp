@@ -359,6 +359,9 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setCellReoptPerimeterOffset);
     connect(_widget, &SegmentationWidget::cellReoptGrowthRequested,
             this, [this](uint64_t collectionId) {
+                if (isEditingApprovalMask()) {
+                    saveApprovalMaskToDisk();
+                }
                 // Cell reoptimization should not auto-approve the growth region
                 _skipAutoApprovalOnGrowth = true;
                 // Store the specific collection ID to use for this growth
