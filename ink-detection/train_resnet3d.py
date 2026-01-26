@@ -980,7 +980,7 @@ class RegressionPLModel(pl.LightningModule):
 
         dice_loss = 1.0 - dice
         per_sample_loss = 0.5 * dice_loss + 0.5 * bce
-        return per_sample_loss, dice
+        return per_sample_loss, dice, bce, dice_loss
 
     def compute_batch_loss(self, logits, targets):
         return 0.5 * self.loss_func1(logits, targets) + 0.5 * self.loss_func2(logits, targets)
@@ -995,10 +995,17 @@ class RegressionPLModel(pl.LightningModule):
 
         if objective == "erm":
             if loss_mode == "batch":
-                loss = self.compute_batch_loss(outputs, y)
+                dice_loss = self.loss_func1(outputs, y)
+                bce_loss = self.loss_func2(outputs, y)
+                loss = 0.5 * dice_loss + 0.5 * bce_loss
+                self.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
+                self.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
             elif loss_mode == "per_sample":
-                per_sample_loss, _per_sample_dice = self.compute_per_sample_loss_and_dice(outputs, y)
+                per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
                 loss = per_sample_loss.mean()
+                self.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
+                self.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
+                self.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
             else:
                 raise ValueError(f"Unknown training.loss_mode: {self.hparams.loss_mode!r}")
         elif objective == "group_dro":
@@ -1007,9 +1014,12 @@ class RegressionPLModel(pl.LightningModule):
             if self.group_dro is None:
                 raise RuntimeError("GroupDRO objective was set but group_dro computer was not initialized")
 
-            per_sample_loss, _per_sample_dice = self.compute_per_sample_loss_and_dice(outputs, y)
+            per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
             robust_loss, group_loss, group_count, _weights = self.group_dro.loss(per_sample_loss, g)
             loss = robust_loss
+            self.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
+            self.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
+            self.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
 
             if self.global_step % CFG.print_freq == 0:
                 present = group_count > 0
@@ -1051,24 +1061,32 @@ class RegressionPLModel(pl.LightningModule):
         device = self.device
         self._val_loss_sum = torch.tensor(0.0, device=device)
         self._val_dice_sum = torch.tensor(0.0, device=device)
+        self._val_bce_sum = torch.tensor(0.0, device=device)
+        self._val_dice_loss_sum = torch.tensor(0.0, device=device)
         self._val_count = torch.tensor(0.0, device=device)
 
         self._val_group_loss_sum = torch.zeros(self.n_groups, device=device)
         self._val_group_dice_sum = torch.zeros(self.n_groups, device=device)
+        self._val_group_bce_sum = torch.zeros(self.n_groups, device=device)
+        self._val_group_dice_loss_sum = torch.zeros(self.n_groups, device=device)
         self._val_group_count = torch.zeros(self.n_groups, device=device)
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, y, xyxys, g = batch
         outputs = self(x)
-        per_sample_loss, per_sample_dice = self.compute_per_sample_loss_and_dice(outputs, y)
+        per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
 
         self._val_loss_sum += per_sample_loss.sum()
         self._val_dice_sum += per_sample_dice.sum()
+        self._val_bce_sum += per_sample_bce.sum()
+        self._val_dice_loss_sum += per_sample_dice_loss.sum()
         self._val_count += float(per_sample_loss.numel())
 
         g = g.long()
         self._val_group_loss_sum.scatter_add_(0, g, per_sample_loss)
         self._val_group_dice_sum.scatter_add_(0, g, per_sample_dice)
+        self._val_group_bce_sum.scatter_add_(0, g, per_sample_bce)
+        self._val_group_dice_loss_sum.scatter_add_(0, g, per_sample_dice_loss)
         self._val_group_count.scatter_add_(0, g, torch.ones_like(per_sample_loss, dtype=self._val_group_count.dtype))
 
         if self._stitch_enabled and int(dataloader_idx) in self._stitch_buffers:
@@ -1109,13 +1127,19 @@ class RegressionPLModel(pl.LightningModule):
         if self._val_count.item() > 0:
             avg_loss = self._val_loss_sum / self._val_count
             avg_dice = self._val_dice_sum / self._val_count
+            avg_bce = self._val_bce_sum / self._val_count
+            avg_dice_loss = self._val_dice_loss_sum / self._val_count
         else:
             avg_loss = torch.tensor(0.0, device=self.device)
             avg_dice = torch.tensor(0.0, device=self.device)
+            avg_bce = torch.tensor(0.0, device=self.device)
+            avg_dice_loss = torch.tensor(0.0, device=self.device)
 
         group_count = self._val_group_count
         group_loss = self._val_group_loss_sum / group_count.clamp_min(1)
         group_dice = self._val_group_dice_sum / group_count.clamp_min(1)
+        group_bce = self._val_group_bce_sum / group_count.clamp_min(1)
+        group_dice_loss = self._val_group_dice_loss_sum / group_count.clamp_min(1)
 
         present = group_count > 0
         if present.any():
@@ -1129,11 +1153,15 @@ class RegressionPLModel(pl.LightningModule):
         self.log("val/worst_group_loss", worst_group_loss, on_epoch=True, prog_bar=True)
         self.log("val/avg_dice", avg_dice, on_epoch=True, prog_bar=False)
         self.log("val/worst_group_dice", worst_group_dice, on_epoch=True, prog_bar=False)
+        self.log("val/avg_bce_loss", avg_bce, on_epoch=True, prog_bar=False)
+        self.log("val/avg_dice_loss", avg_dice_loss, on_epoch=True, prog_bar=False)
 
         for group_idx, group_name in enumerate(self.group_names):
             safe_group_name = str(group_name).replace("/", "_")
             self.log(f"val/group_{group_idx}_{safe_group_name}/loss", group_loss[group_idx], on_epoch=True)
             self.log(f"val/group_{group_idx}_{safe_group_name}/dice", group_dice[group_idx], on_epoch=True)
+            self.log(f"val/group_{group_idx}_{safe_group_name}/bce_loss", group_bce[group_idx], on_epoch=True)
+            self.log(f"val/group_{group_idx}_{safe_group_name}/dice_loss", group_dice_loss[group_idx], on_epoch=True)
             self.log(f"val/group_{group_idx}_{safe_group_name}/count", group_count[group_idx], on_epoch=True)
 
         if self._stitch_enabled and self._stitch_buffers:
