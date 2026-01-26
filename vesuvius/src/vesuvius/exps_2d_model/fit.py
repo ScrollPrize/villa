@@ -5,7 +5,7 @@ import cli_model
 import cli_opt
 import cli_vis
 import model
-import opt_stages
+import optimizer
 import torch
 import vis
 
@@ -50,8 +50,8 @@ def main(argv: list[str] | None = None) -> int:
 	print("mesh:", mdl.mesh_h, mdl.mesh_w)
 
 	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
-	stages = opt_stages.load_stages(opt_cfg.stages_json)
-	def _snapshot(*, stage: str, step: int) -> None:
+	stages = optimizer.load_stages(opt_cfg.stages_json)
+	def _snapshot(*, stage: str, step: int, loss: float) -> None:
 		vis.save(
 			model=mdl,
 			data=data,
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 			scale=vis_cfg.scale,
 		)
 
-	opt_stages.optimize_rotation_only_with_snapshots(
+	optimizer.optimize(
 		model=mdl,
 		data=data,
 		stages=stages,

@@ -47,20 +47,19 @@ class Model2D(nn.Module):
 		if n <= 0 or h <= 0 or w <= 0:
 			raise ValueError(f"invalid shape: {shape}")
 
-		u = self.base_grid[:, 0:1]
-		v = self.base_grid[:, 1:2]
-		x, y = self._apply_global_transform(u, v)
+		x, y = self.grid_xy()
 
-		dx = x.new_zeros(x.shape)
-		dy = y.new_zeros(y.shape)
-		dx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
-		dy[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
+		# Direction is derived only from *vertical* mesh connections (v-edges).
+		dvx = x.new_zeros(x.shape)
+		dvy = y.new_zeros(y.shape)
+		dvx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+		dvy[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
 		if x.shape[2] >= 2:
-			dx[:, :, -1, :] = dx[:, :, -2, :]
-			dy[:, :, -1, :] = dy[:, :, -2, :]
+			dvx[:, :, -1, :] = dvx[:, :, -2, :]
+			dvy[:, :, -1, :] = dvy[:, :, -2, :]
 
-		gx = -dy
-		gy = dx
+		gx = -dvy
+		gy = dvx
 		eps = 1e-8
 		r2 = gx * gx + gy * gy + eps
 		cos2 = (gx * gx - gy * gy) / r2
@@ -84,6 +83,16 @@ class Model2D(nn.Module):
 		x = c * u - s * v
 		y = s * u + c * v
 		return x, y
+
+	def grid_uv(self) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Return base (u,v) mesh coordinates."""
+		uv = self.base_grid
+		return uv[:, 0:1], uv[:, 1:2]
+
+	def grid_xy(self) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Return globally transformed mesh coordinates."""
+		u, v = self.grid_uv()
+		return self._apply_global_transform(u, v)
 
 	@classmethod
 	def from_fit_data(

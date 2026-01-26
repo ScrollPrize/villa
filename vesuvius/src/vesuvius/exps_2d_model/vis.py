@@ -8,6 +8,7 @@ import torch
 import cv2
 
 import fit_data
+import opt_loss_dir
 
 
 def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
@@ -100,16 +101,26 @@ def save(
 	out.mkdir(parents=True, exist_ok=True)
 
 	h_img, w_img = data.size
+	xy = model.grid_xy()
+	grid_xy = torch.cat([xy[0], xy[1]], dim=1)
 
 	grid_vis = _draw_grid_vis(
 		scale=scale,
 		h_img=h_img,
 		w_img=w_img,
 		background=data.cos,
-		base_grid=model.base_grid,
+		base_grid=grid_xy,
 	)
 	grid_path = out / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
+
+	loss_map_t = opt_loss_dir.direction_loss_map(model=model, data=data)
+	lm = loss_map_t.detach().cpu()
+	if lm.ndim == 4:
+		lm = lm[0, 0]
+	loss_np = lm.numpy().astype("float32")
+	loss_path = out / f"res_loss_{postfix}.tif"
+	tifffile.imwrite(str(loss_path), loss_np, compression="lzw")
 
 	tgt = data.cos[0, 0].detach().cpu().numpy()
 	tgt_t = model.target_cos()
