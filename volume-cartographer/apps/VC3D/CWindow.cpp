@@ -25,6 +25,7 @@
 #include <QDir>
 #include <QProgressDialog>
 #include <QMessageBox>
+#include <QInputDialog>
 #include <QThread>
 #include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
