@@ -30,7 +30,7 @@ command:
   - --metadata_json
   - metadata.json
   - --outputs_path
-  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/train_scrolls
+  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls
   - --stitch_all_val
   - --stitch_downsample
   - "8"
