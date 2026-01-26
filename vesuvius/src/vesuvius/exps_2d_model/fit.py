@@ -1,4 +1,5 @@
 import math
+import json
 from pathlib import Path
 
 import tifffile
@@ -14,22 +15,9 @@ from fit_loss_geom import _smoothness_reg, _line_offset_smooth_reg, _mod_smooth_
 
 def fit_cosine_grid(
     image_path: str,
-    steps: int = 5000,
-    steps_stage1: int = 500,
-    steps_stage2: int = 1000,
-    steps_stage4: int = 10000,
     lr: float = 1e-2,
     grid_step: int = 4,
-    lambda_smooth_x: float = 1e-3,
-    lambda_smooth_y: float = 1e-3,
-    lambda_mono: float = 1e-3,
-    lambda_xygrad: float = 1e-3,
-    lambda_angle_sym: float = 1.0,
-    lambda_mod_h: float = 0.0,
-    lambda_mod_v: float = 0.0,
-    lambda_line_smooth_y: float = 0.0,
-    lambda_grad_data: float = 0.0,
-    lambda_grad_mag: float = 0.0,
+    stages_json: str | None = None,
     min_dx_grad: float = 0.0,
     device: str | None = None,
     output_prefix: str | None = None,
@@ -440,10 +428,29 @@ def fit_cosine_grid(
         lr=10*lr,
     )
 
-    total_stage1 = max(0, int(steps_stage1))
-    total_stage2 = max(0, int(steps_stage2))
-    total_stage3 = max(0, int(steps))
-    total_stage4 = max(0, int(steps_stage4))
+    if stages_json is None:
+        raise ValueError("stages_json must be provided (path to JSON defining base weights & stages)")
+
+    with open(stages_json, "r", encoding="utf-8") as f:
+        stages_cfg = json.load(f)
+
+    lambda_global: dict[str, float] = {
+        str(k): float(v) for k, v in (stages_cfg.get("base", {}) or {}).items()
+    }
+    stages_cfg_list = stages_cfg.get("stages", None)
+    if not isinstance(stages_cfg_list, list) or not stages_cfg_list:
+        raise ValueError("stages_json: expected a non-empty list in key 'stages'")
+
+    total_steps_all = 0
+    stage1_steps = 0
+    for s in stages_cfg_list:
+        if not isinstance(s, dict):
+            raise ValueError("stages_json: each stage must be an object")
+        name = str(s.get("name", ""))
+        steps = max(0, int(s.get("steps", 0)))
+        total_steps_all += steps
+        if name == "stage1":
+            stage1_steps = steps
 
     # Optional initialization snapshot.
     if snapshot is not None and snapshot > 0 and output_prefix is not None:
@@ -452,7 +459,7 @@ def fit_cosine_grid(
         _save_snapshot(
             stage=1,
             step_stage=0,
-            total_stage_steps=max(total_stage1, 1),
+            total_stage_steps=max(stage1_steps, 1),
             global_step_idx=0,
             snapshot=snapshot,
             output_prefix=output_prefix,
@@ -472,82 +479,36 @@ def fit_cosine_grid(
             for_video=for_video,
         )
 
-    # Shared weight for UNet directional alignment in both stages.
-    lambda_dir_unet = 10.0
+    def _stage_to_modifiers(
+        base: dict[str, float],
+        prev_eff: dict[str, float] | None,
+        default_mul: float | None,
+        w_fac: dict | None,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        if prev_eff is None:
+            prev_eff = {k: float(v) for k, v in base.items()}
+        if default_mul is None and w_fac is None:
+            eff = dict(prev_eff)
+        else:
+            eff = dict(prev_eff)
+            if default_mul is not None:
+                for name in base.keys():
+                    if w_fac is None or name not in w_fac:
+                        eff[name] = float(base[name]) * float(default_mul)
+            if w_fac is not None:
+                for k, v in w_fac.items():
+                    if v is None:
+                        continue
+                    if isinstance(v, dict) and "abs" in v:
+                        eff[str(k)] = float(v["abs"])
+                    else:
+                        eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
 
-    # Global per-loss base weights (stage independent).
-    lambda_global: dict[str, float] = {
-        "data": 1.0,
-        "grad_data": lambda_grad_data,
-        "grad_mag": lambda_grad_mag,
-        "smooth_x": lambda_smooth_x,
-        "smooth_y": lambda_smooth_y,
-        "step": lambda_xygrad,
-        "mod_smooth": lambda_mod_v,
-        # Quad-based triangle regularizer currently uses a fixed global weight.
-        "quad_tri": 1.0,
-        "angle_sym": lambda_angle_sym,
-        "dir_unet": lambda_dir_unet,
-        "line_smooth_y": lambda_line_smooth_y,
-        "y_straight": 1.0,
-    }
-
-    # Per-stage modifiers. Keys omitted imply modifier 1.0.
-    stage1_modifiers: dict[str, float] = {
-        # Stage 1: focus on global orientation and UNet-aligned geometry.
-        "data": 0.0,
-        "grad_data": 0.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.0,
-        "step": 0.0,
-        "mod_smooth": 0.0,
-        "quad_tri": 0.0,
-        "angle_sym": 0.0,
-        "y_straight": 0.0,
-        # grad_mag and dir_unet default to 1.0 (enabled).
-    }
-
-    stage2_modifiers: dict[str, float] = {
-        # Stage 2: refine coarse grid with full regularization; keep data/grad_data
-        # disabled to match previous behavior (global, no Gaussian mask).
-        "data": 0.0,
-        "grad_data": 0.0,
-        "grad_mag": 1.0,
-        "quad_tri": 0.0,
-        "step": 1.0,
-        "mod_smooth": 0.0,
-        "angle_sym": 10.0,
-        "dir_unet": 10.0,
-        "use_full_dir_unet" : False,
-        # "grad_mag" : 0.001,
-        # "dir_unet": 10.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.0,
-        "line_smooth_y": 0.1,
-        "y_straight": 1.0,
-        # other terms default to 1.0 (enabled).
-    }
-
-    stage3_modifiers: dict[str, float] = {
-        # Stage 2: refine coarse grid with full regularization; keep data/grad_data
-        # disabled to match previous behavior (global, no Gaussian mask).
-        "data": 0.0,
-        "grad_data": 0.0,
-        "grad_mag": 1.0,
-        "quad_tri": 0.0,
-        "step": 1.0,
-        "mod_smooth": 0.0,
-        "angle_sym": 1.0,
-        "dir_unet": 10.0,
-        "use_full_dir_unet" : False,
-        # "grad_mag" : 0.001,
-        # "dir_unet": 10.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.0,
-        "line_smooth_y": 0.1,
-        "y_straight": 1.0,
-        # other terms default to 1.0 (enabled).
-    }
+        mods: dict[str, float] = {}
+        for name, val in eff.items():
+            b = float(base.get(name, 0.0))
+            mods[name] = (float(val) / b) if b != 0.0 else 0.0
+        return eff, mods
 
     def _need_term(name: str, stage_modifiers: dict[str, float]) -> float:
         """Return effective weight for a term; 0.0 means 'skip this term'."""
@@ -787,7 +748,7 @@ def fit_cosine_grid(
 
         # Step regularizer.
         w_step = _need_term("step", stage_modifiers)
-        if w_step != 0.0 and lambda_xygrad > 0.0:
+        if w_step != 0.0 and float(lambda_global.get("step", 0.0)) > 0.0:
             # step_reg = _step_reg(geom_mask_coarse)
             step_reg = _step_reg(model=model, w_img=w_img, h_img=h_img)
             total_loss = total_loss + w_step * step_reg
@@ -807,7 +768,7 @@ def fit_cosine_grid(
 
         # Triangle-area regularizer.
         w_quad = _need_term("quad_tri", stage_modifiers)
-        if w_quad != 0.0 and lambda_xygrad > 0.0:
+        if w_quad != 0.0 and float(lambda_global.get("step", 0.0)) > 0.0:
             # quad_tri_reg = _quad_triangle_reg(geom_mask_coarse)
             quad_tri_reg = _quad_triangle_reg()
             total_loss = total_loss + w_quad * quad_tri_reg
@@ -881,39 +842,6 @@ def fit_cosine_grid(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
-
-            # if stage == 3:
-            #     # Stage 3: update only outside the validity mask.
-            #     # We mask gradients for per-vertex / per-cell parameters.
-            #     valid_coarse = terms.get("_valid_coarse", None)
-            #     if valid_coarse is not None:
-            #         with torch.no_grad():
-            #             m_out = (1.0 - valid_coarse).to(device=model.offset_ms[0].device, dtype=model.offset_ms[0].dtype)
-            #             for p in model.offset_ms:
-            #                 if p.grad is not None:
-            #                     m_p = F.interpolate(
-            #                         m_out,
-            #                         size=(int(p.shape[2]), int(p.shape[3])),
-            #                         mode="bilinear",
-            #                         align_corners=True,
-            #                     )
-            #                     p.grad.mul_(m_p.expand_as(p.grad))
-            #             if model.line_offset.grad is not None:
-            #                 model.line_offset.grad.mul_(m_out.expand_as(model.line_offset.grad))
-            #             if model.amp_coarse.grad is not None or model.bias_coarse.grad is not None:
-            #                 gh_m = int(model.amp_coarse.shape[2])
-            #                 gw_m = int(model.amp_coarse.shape[3])
-            #                 m_out_mod = F.interpolate(
-            #                     m_out,
-            #                     size=(gh_m, gw_m),
-            #                     mode="bilinear",
-            #                     align_corners=True,
-            #                 )
-            #                 if model.amp_coarse.grad is not None:
-            #                     model.amp_coarse.grad.mul_(m_out_mod.expand_as(model.amp_coarse.grad))
-            #                 if model.bias_coarse.grad is not None:
-            #                     model.bias_coarse.grad.mul_(m_out_mod.expand_as(model.bias_coarse.grad))
-
             optimizer.step()
 
             if stage == 1:
@@ -927,7 +855,6 @@ def fit_cosine_grid(
                 sx_val = float(model.log_s.detach().exp().cpu())
                 # Report global step across all stages instead of per-stage step.
                 global_step = global_step_offset + step + 1
-                total_steps_all = total_stage1 + total_stage2 + total_stage3 + total_stage4
                 parts = [
                     f"stage{stage}(step {global_step}/{total_steps_all}):",
                     f"loss={loss.item():.6f}",
@@ -973,70 +900,27 @@ def fit_cosine_grid(
                         valid_mask=terms.get("_mask_valid", None),
                     )
 
-    # -------------------------
-    # Stage 1: global fit only.
-    # -------------------------
-    _optimize_stage(
-        stage=1,
-        total_steps=total_stage1,
-        optimizer=opt,
-        stage_modifiers=stage1_modifiers,
-        global_step_offset=0,
-    )
-
-    # -----------------------------
-    # Stage 2: global + coord grid.
-    # -----------------------------
-    if total_stage2 > 0:
-        # In stage 2, continue optimizing the global x-scale, rotation and phase
-        # together with the coarse grid offsets and modulation fields (no data terms).
-
-        opt2 = torch.optim.Adam(
-            [
-                # model.theta,
-                # model.log_s,
-                # model.phase,
-                model.amp_coarse,
-                model.bias_coarse,
-                *list(model.offset_ms),
-                model.line_offset,
-            ],
-            lr=0.1*lr,
-        )
-        _optimize_stage(
-            stage=2,
-            total_steps=total_stage2,
-            optimizer=opt2,
-            stage_modifiers=stage2_modifiers,
-            global_step_offset=total_stage1,
-        )
-
-    # --------------------------------------------
-    # Stage 3: enable data terms + Gaussian mask.
-    # --------------------------------------------
-    if total_stage3 > 0:
-        opt3 = torch.optim.Adam(
+    stage_opts: dict[str, torch.optim.Optimizer] = {
+        "stage1": opt,
+        "stage2": torch.optim.Adam(
             [
                 model.amp_coarse,
                 model.bias_coarse,
                 *list(model.offset_ms),
                 model.line_offset,
             ],
-            lr=0.1*lr,
-        )
-        _optimize_stage(
-            stage=3,
-            total_steps=total_stage3,
-            optimizer=opt3,
-            stage_modifiers=stage3_modifiers,
-            global_step_offset=total_stage1 + total_stage2,
-        )
-
-    # ---------------------------------------------------------
-    # Stage 4: like stage 3 but with expanding vertical cos mask.
-    # ---------------------------------------------------------
-    if total_stage4 > 0:
-        opt4 = torch.optim.Adam(
+            lr=0.1 * lr,
+        ),
+        "stage3": torch.optim.Adam(
+            [
+                model.amp_coarse,
+                model.bias_coarse,
+                *list(model.offset_ms),
+                model.line_offset,
+            ],
+            lr=0.1 * lr,
+        ),
+        "stage4": torch.optim.Adam(
             [
                 model.theta,
                 model.log_s,
@@ -1046,15 +930,52 @@ def fit_cosine_grid(
                 *list(model.offset_ms),
                 model.line_offset,
             ],
-            lr=0.1*lr,
-        )
+            lr=0.1 * lr,
+        ),
+    }
+
+    stages: list[tuple[str, int, dict[str, float]]] = []
+    use_full_dir_unet_by_stage: dict[int, bool] = {}
+    prev_eff: dict[str, float] | None = None
+
+    for s in stages_cfg_list:
+        name = str(s.get("name", ""))
+        if name not in stage_opts:
+            raise ValueError(f"stages_json: unknown stage name '{name}'")
+        steps = max(0, int(s.get("steps", 0)))
+
+        default_mul = s.get("default_mul", None)
+        w_fac = s.get("w_fac", None)
+        if default_mul is not None:
+            default_mul = float(default_mul)
+        if w_fac is not None and not isinstance(w_fac, dict):
+            raise ValueError(f"stages_json: stage '{name}' field 'w_fac' must be an object or null")
+
+        eff, mods = _stage_to_modifiers(lambda_global, prev_eff, default_mul, w_fac)
+        prev_eff = eff
+
+        stage_idx = int(name.replace("stage", ""))
+        use_full_dir_unet = s.get("use_full_dir_unet", None)
+        if use_full_dir_unet is not None:
+            use_full_dir_unet_by_stage[stage_idx] = bool(use_full_dir_unet)
+
+        stages.append((name, steps, mods))
+
+    global_step_offset = 0
+    for stage_name, stage_steps, stage_modifiers in stages:
+        stage_idx = int(stage_name.replace("stage", ""))
+        if stage_idx in use_full_dir_unet_by_stage:
+            stage_modifiers = dict(stage_modifiers)
+            stage_modifiers["use_full_dir_unet"] = bool(use_full_dir_unet_by_stage[stage_idx])
+
         _optimize_stage(
-            stage=4,
-            total_steps=total_stage4,
-            optimizer=opt4,
-            stage_modifiers=stage3_modifiers,
-            global_step_offset=total_stage1 + total_stage2 + total_stage3,
+            stage=stage_idx,
+            total_steps=stage_steps,
+            optimizer=stage_opts[stage_name],
+            stage_modifiers=stage_modifiers,
+            global_step_offset=global_step_offset,
         )
+        global_step_offset += int(stage_steps)
 
     # Save final outputs: sampled map, plain ground-truth cosine map, and
     # modulation-adjusted ground-truth map.

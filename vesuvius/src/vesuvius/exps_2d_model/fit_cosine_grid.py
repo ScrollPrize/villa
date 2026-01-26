@@ -26,28 +26,10 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--steps",
-        type=int,
-        default=5000,
-        help="Number of optimization steps for stage 3 (data-enabled, masked).",
-    )
-    parser.add_argument(
-        "--steps-stage1",
-        type=int,
-        default=500,
-        help="Number of optimization steps for stage 1 (global rotation + isotropic scale).",
-    )
-    parser.add_argument(
-        "--steps-stage2",
-        type=int,
-        default=1000,
-        help="Number of optimization steps for stage 2 (global + coord grid, no data terms).",
-    )
-    parser.add_argument(
-        "--steps-stage4",
-        type=int,
-        default=10000,
-        help="Number of optimization steps for stage 4 (like stage 3, but with growing vertical cosine mask).",
+        "--stages-json",
+        type=str,
+        default="default_stages.json",
+        help="Path to stages/weights JSON (see default_stages.json).",
     )
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument(
@@ -140,56 +122,6 @@ def main() -> None:
         help="Mask center in pixels (CX CY), 0,0 = top-left; default is image center.",
     )
     parser.add_argument(
-        "--lambda-smooth-x",
-        type=float,
-        default=10000,
-        help="Smoothness weight along x (cosine direction) for the coarse grid.",
-    )
-    parser.add_argument(
-        "--lambda-smooth-y",
-        type=float,
-        default=10000,
-        help="Smoothness weight along y (ridge direction) for the coarse grid.",
-    )
-    parser.add_argument("--lambda-mono", type=float, default=1e-3)
-    parser.add_argument("--lambda-xygrad", type=float, default=1)
-    parser.add_argument(
-        "--lambda-line-smooth-y",
-        type=float,
-        default=0.0,
-        help="Smoothness weight along y for line_offset (neighbor offsets) per direction.",
-    )
-    parser.add_argument(
-        "--lambda-angle-sym",
-        type=float,
-        default=1.0,
-        help="Weight for angle-symmetry loss between horizontal connections and vertical grid lines.",
-    )
-    parser.add_argument(
-        "--lambda-mod-h",
-        type=float,
-        default=1000.0,
-        help="Horizontal smoothness weight for modulation parameters.",
-    )
-    parser.add_argument(
-        "--lambda-mod-v",
-        type=float,
-        default=0.0,
-        help="Vertical smoothness weight for modulation parameters.",
-    )
-    parser.add_argument(
-        "--lambda-grad-data",
-        type=float,
-        default=10.0,
-        help="Weight for gradient data term between sampled image and plain cosine target.",
-    )
-    parser.add_argument(
-        "--lambda-grad-mag",
-        type=float,
-        default=1.0,
-        help="Weight for gradient-magnitude period-sum loss in sample space (UNet channel 1).",
-    )
-    parser.add_argument(
         "--unet-crop",
         type=int,
         default=16,
@@ -248,22 +180,9 @@ def main() -> None:
     args = parser.parse_args()
     fit_cosine_grid(
         image_path=args.input,
-        steps=args.steps,
-        steps_stage1=args.steps_stage1,
-        steps_stage2=args.steps_stage2,
-        steps_stage4=args.steps_stage4,
         lr=args.lr,
         grid_step=args.grid_step,
-        lambda_smooth_x=args.lambda_smooth_x,
-        lambda_smooth_y=args.lambda_smooth_y,
-        lambda_mono=args.lambda_mono,
-        lambda_xygrad=args.lambda_xygrad,
-        lambda_angle_sym=args.lambda_angle_sym,
-        lambda_mod_h=args.lambda_mod_h,
-        lambda_mod_v=args.lambda_mod_v,
-        lambda_line_smooth_y=args.lambda_line_smooth_y,
-        lambda_grad_data=args.lambda_grad_data,
-        lambda_grad_mag=args.lambda_grad_mag,
+        stages_json=args.stages_json,
         min_dx_grad=args.min_dx_grad,
         device=args.device,
         output_prefix=args.output_prefix,
