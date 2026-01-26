@@ -1,0 +1,45 @@
+{
+	"stages": [
+		{
+			"name": "stage0",
+			"steps": 1000,
+			"lr": 0.01,
+			"params": ["theta", "winding_scale", "phase"]
+		},
+		{
+			"name": "stage_scaledown4",
+			"steps": 5000,
+			"lr": 0.001,
+			"params": ["offset_ms"],
+			"min_scaledown": 4
+		},
+		{
+			"name": "stage_scaledown3",
+			"steps": 5000,
+			"lr": 0.001,
+			"params": ["offset_ms"],
+			"min_scaledown": 3
+		},
+		{
+			"name": "stage_scaledown2",
+			"steps": 5000,
+			"lr": 0.001,
+			"params": ["offset_ms"],
+			"min_scaledown": 2
+		},
+		{
+			"name": "stage_scaledown1",
+			"steps": 5000,
+			"lr": 0.001,
+			"params": ["offset_ms"],
+			"min_scaledown": 1
+		},
+		{
+			"name": "stage_scaledown0",
+			"steps": 5000,
+			"lr": 0.001,
+			"params": ["offset_ms"],
+			"min_scaledown": 0
+		}
+	]
+}
