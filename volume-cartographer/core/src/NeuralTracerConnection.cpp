@@ -7,7 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vc/tracer/NeuralTracerConnection.h"
-#include "vc/core/util/Zarr.hpp"
+#include "vc/core/util/Tiff.hpp"
 
 
 namespace
@@ -185,7 +185,7 @@ NeuralTracerConnection::EdtResult NeuralTracerConnection::get_distance_transform
 
     // Read the 3D TIFF file
     std::string zarr_path = dt_response["path"].get<std::string>();
-    result.distance_transform = read3DZarr(zarr_path);
+    result.distance_transform = read3DTiff(zarr_path);
 
     return result;
 }
@@ -243,7 +243,7 @@ NeuralTracerConnection::EdtResult NeuralTracerConnection::get_sdt_from_points(
 
     // Read the 3D TIFF file
     std::string zarr_path = dt_response["path"].get<std::string>();
-    result.distance_transform = read3DZarr(zarr_path);
+    result.distance_transform = read3DTiff(zarr_path);
 
     return result;
 }
@@ -324,7 +324,7 @@ NeuralTracerConnection::BatchEdtResult NeuralTracerConnection::get_sdt_from_poin
 
         // Read zarr volume
         std::string zarr_path = dt_data["path"].get<std::string>();
-        result.distance_transform = read3DZarr(zarr_path);
+        result.distance_transform = read3DTiff(zarr_path);
     }
 
     return batch_result;
@@ -401,7 +401,7 @@ NeuralTracerConnection::BatchEdtResult NeuralTracerConnection::get_distance_tran
 
         // Read zarr volume
         std::string zarr_path = dt_data["path"].get<std::string>();
-        result.distance_transform = read3DZarr(zarr_path);
+        result.distance_transform = read3DTiff(zarr_path);
     }
 
     return batch_result;
