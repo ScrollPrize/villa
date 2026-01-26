@@ -18,7 +18,7 @@
 			"name": "stage1",
 			"steps": 1000,
 			"lr": 0.01,
-			"params": ["theta", "log_s", "phase"],
+			"params": ["theta", "winding_scale", "phase"],
 			"default_mul": 1.0,
 			"w_fac": {
 				"data": 0.0,
@@ -80,7 +80,7 @@
 			"name": "stage4",
 			"steps": 5000,
 			"lr": 0.0001,
-			"params": ["theta", "log_s", "phase", "amp_coarse", "bias_coarse", "offset_ms", "line_offset"],
+			"params": ["theta", "winding_scale", "phase", "amp_coarse", "bias_coarse", "offset_ms", "line_offset"],
 			"default_mul": null,
 			"w_fac": null
 		}
