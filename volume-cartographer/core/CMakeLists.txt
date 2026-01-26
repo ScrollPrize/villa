@@ -18,7 +18,6 @@ add_library(vc_core
         src/QuadSurface.cpp
         src/Render.cpp
         src/Tiff.cpp
-        src/Zarr.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
