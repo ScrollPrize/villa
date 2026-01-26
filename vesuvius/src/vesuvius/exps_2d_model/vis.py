@@ -9,6 +9,7 @@ import cv2
 
 import fit_data
 import opt_loss_dir
+import opt_loss_step
 
 
 def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
@@ -114,13 +115,29 @@ def save(
 	grid_path = out / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
-	loss_map_t, _mask = opt_loss_dir.direction_loss_map(model=model, data=data)
-	lm = loss_map_t.detach().cpu()
-	if lm.ndim == 4:
-		lm = lm[0, 0]
-	loss_np = lm.numpy().astype("float32")
-	loss_path = out / f"res_loss_{postfix}.tif"
-	tifffile.imwrite(str(loss_path), loss_np, compression="lzw")
+	loss_maps = {
+		"dir_unet": {
+			"fn": lambda: opt_loss_dir.direction_loss_map(model=model, data=data)[0],
+			"suffix": "dir_unet",
+			"reduce": True,
+		},
+		"step_h": {
+			"fn": lambda: opt_loss_step.step_loss_maps(model=model)[0],
+			"suffix": "step_h",
+			"reduce": True,
+		},
+		"step_v": {
+			"fn": lambda: opt_loss_step.step_loss_maps(model=model)[1],
+			"suffix": "step_v",
+			"reduce": True,
+		},
+	}
+	for _k, spec in loss_maps.items():
+		m = spec["fn"]().detach().cpu()
+		if bool(spec["reduce"]) and m.ndim == 4:
+			m = m[0, 0]
+		out_path = out / f"res_loss_{spec['suffix']}_{postfix}.tif"
+		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
 
 	tgt = data.cos[0, 0].detach().cpu().numpy()
 	tgt_t = model.target_cos()

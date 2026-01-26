@@ -84,7 +84,9 @@ class Model2D(nn.Module):
 		return dir0, dir1
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		u = self.winding_scale * u + self.phase
+		period = 4.0 / float(max(1, self.mesh_w - 1))
+		phase = torch.remainder(self.phase + 0.5 * period, period) - 0.5 * period
+		u = self.winding_scale * u + phase
 		c = torch.cos(self.theta)
 		s = torch.sin(self.theta)
 		x = c * u - s * v
