@@ -648,6 +648,14 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         contextMenu.addSeparator();
     }
 
+    // Rename only for single selection
+    if (selectedSegmentIds.size() == 1) {
+        QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
+        connect(renameAction, &QAction::triggered, this, [this, segmentId]() {
+            emit renameSurfaceRequested(segmentId);
+        });
+    }
+
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
     connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
         emit copySegmentPathRequested(segmentId);

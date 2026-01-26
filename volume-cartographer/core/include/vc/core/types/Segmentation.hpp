@@ -15,6 +15,7 @@ public:
     static std::shared_ptr<Segmentation> New(const std::filesystem::path& path, const std::string& uuid, const std::string& name);
 
     [[nodiscard]] std::string id() const;
+    void setId(const std::string& newId);
     [[nodiscard]] std::string name() const;
     void setName(const std::string& n);
     [[nodiscard]] std::filesystem::path path() const { return path_; }
