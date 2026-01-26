@@ -1,45 +1,61 @@
 {
+	"base": {
+		"dir_unet": 1.0,
+		"step": 100.0
+	},
 	"stages": [
 		{
 			"name": "stage0",
 			"steps": 1000,
 			"lr": 0.01,
-			"params": ["theta", "winding_scale", "phase"]
+			"params": ["theta", "winding_scale", "phase"],
+			"w_fac": {
+			}
 		},
 		{
 			"name": "stage_scaledown4",
 			"steps": 5000,
 			"lr": 0.001,
 			"params": ["offset_ms"],
-			"min_scaledown": 4
+			"min_scaledown": 4,
+			"w_fac": {
+			}
 		},
 		{
 			"name": "stage_scaledown3",
 			"steps": 5000,
 			"lr": 0.001,
 			"params": ["offset_ms"],
-			"min_scaledown": 3
+			"min_scaledown": 3,
+			"w_fac": {
+			}
 		},
 		{
 			"name": "stage_scaledown2",
 			"steps": 5000,
 			"lr": 0.001,
 			"params": ["offset_ms"],
-			"min_scaledown": 2
+			"min_scaledown": 2,
+			"w_fac": {
+			}
 		},
 		{
 			"name": "stage_scaledown1",
 			"steps": 5000,
 			"lr": 0.001,
 			"params": ["offset_ms"],
-			"min_scaledown": 1
+			"min_scaledown": 1,
+			"w_fac": {
+			}
 		},
 		{
 			"name": "stage_scaledown0",
 			"steps": 5000,
 			"lr": 0.001,
 			"params": ["offset_ms"],
-			"min_scaledown": 0
+			"min_scaledown": 0,
+			"w_fac": {
+			}
 		}
 	]
 }
