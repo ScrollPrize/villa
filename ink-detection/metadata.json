@@ -103,6 +103,7 @@
       "max_grad_norm": 100,
       "pretrained": true,
       "num_workers": 16,
+      "layer_read_workers": 8,
       "seed": 130697
     },
     "augmentation": {
