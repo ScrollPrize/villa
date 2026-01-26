@@ -33,6 +33,11 @@ std::string Segmentation::id() const
     return metadata_["uuid"].get<std::string>();
 }
 
+void Segmentation::setId(const std::string& newId)
+{
+    metadata_["uuid"] = newId;
+}
+
 std::string Segmentation::name() const
 {
     return metadata_["name"].get<std::string>();
