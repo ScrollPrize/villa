@@ -15,9 +15,11 @@ Parts (current placeholders):
 	- target subsampling args (`--subsample-mesh`, `--subsample-winding`)
 - opt: [`cli_opt.py`](cli_opt.py)
 	- stages / device args
+	- `--snapshot-interval` (default 1000) saves a `vis.save(...)` snapshot
 
 - vis: [`cli_vis.py`](cli_vis.py)
 	- saves `res_grid_<postfix>.jpg` and `res_tgt_<postfix>.tif`
+	- during `fit.py` execution we currently save `res_*_init` and `res_*_final`
 
 Each part provides:
 

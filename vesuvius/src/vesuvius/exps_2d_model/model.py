@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 
 import fit_data
 
@@ -15,7 +16,8 @@ class ModelInit:
 	winding_step_px: int
 
 
-class Model2D:
+
+class Model2D(nn.Module):
 	def __init__(
 		self,
 		init: ModelInit,
@@ -24,8 +26,10 @@ class Model2D:
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
 	) -> None:
+		super().__init__()
 		self.init = init
 		self.device = device
+		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 
 		h2 = 2 * int(init.h_img)
 		w2 = 2 * int(init.w_img)
@@ -35,6 +39,22 @@ class Model2D:
 		self.base_grid = self._build_base_grid().to(device=device)
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
+
+	def direction_encoding(self, *, shape: tuple[int, int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Return (dir0, dir1) in the same encoding as the UNet outputs."""
+		n, c, h, w = (int(v) for v in shape)
+		if n <= 0 or h <= 0 or w <= 0:
+			raise ValueError(f"invalid shape: {shape}")
+
+		t = self.theta.to(dtype=torch.float32)
+		cos2 = torch.cos(2.0 * t)
+		sin2 = torch.sin(2.0 * t)
+		inv_sqrt2 = 1.0 / (2.0 ** 0.5)
+		dir0 = 0.5 + 0.5 * cos2
+		dir1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
+		dir0_t = dir0.view(1, 1, 1, 1).expand(n, 1, h, w)
+		dir1_t = dir1.view(1, 1, 1, 1).expand(n, 1, h, w)
+		return dir0_t, dir1_t
 
 	@classmethod
 	def from_fit_data(
