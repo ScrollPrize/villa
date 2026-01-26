@@ -114,7 +114,7 @@ def save(
 	grid_path = out / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
-	loss_map_t = opt_loss_dir.direction_loss_map(model=model, data=data)
+	loss_map_t, _mask = opt_loss_dir.direction_loss_map(model=model, data=data)
 	lm = loss_map_t.detach().cpu()
 	if lm.ndim == 4:
 		lm = lm[0, 0]

@@ -127,6 +127,15 @@ class Model2D(nn.Module):
 		u, v = self.grid_uv()
 		return self._apply_global_transform(u, v)
 
+	def grid_xy_subsampled(self) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Return globally transformed mesh coordinates, bilinear-upsampled to the subsampled eval grid."""
+		x, y = self.grid_xy()
+		h = max(2, (self.mesh_h - 1) * self.subsample_mesh + 1)
+		w = max(2, (self.mesh_w - 1) * self.subsample_winding + 1)
+		x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=True)
+		y = F.interpolate(y, size=(h, w), mode="bilinear", align_corners=True)
+		return x, y
+
 	@classmethod
 	def from_fit_data(
 		cls,
