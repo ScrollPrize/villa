@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import fit_data
 
@@ -42,19 +43,47 @@ class Model2D(nn.Module):
 
 	def direction_encoding(self, *, shape: tuple[int, int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return (dir0, dir1) in the same encoding as the UNet outputs."""
-		n, c, h, w = (int(v) for v in shape)
+		n, _c, h, w = (int(v) for v in shape)
 		if n <= 0 or h <= 0 or w <= 0:
 			raise ValueError(f"invalid shape: {shape}")
 
-		t = self.theta.to(dtype=torch.float32)
-		cos2 = torch.cos(2.0 * t)
-		sin2 = torch.sin(2.0 * t)
+		u = self.base_grid[:, 0:1]
+		v = self.base_grid[:, 1:2]
+		x, y = self._apply_global_transform(u, v)
+
+		dx = x.new_zeros(x.shape)
+		dy = y.new_zeros(y.shape)
+		dx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+		dy[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
+		if x.shape[2] >= 2:
+			dx[:, :, -1, :] = dx[:, :, -2, :]
+			dy[:, :, -1, :] = dy[:, :, -2, :]
+
+		gx = -dy
+		gy = dx
+		eps = 1e-8
+		r2 = gx * gx + gy * gy + eps
+		cos2 = (gx * gx - gy * gy) / r2
+		sin2 = (2.0 * gx * gy) / r2
 		inv_sqrt2 = 1.0 / (2.0 ** 0.5)
 		dir0 = 0.5 + 0.5 * cos2
 		dir1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
-		dir0_t = dir0.view(1, 1, 1, 1).expand(n, 1, h, w)
-		dir1_t = dir1.view(1, 1, 1, 1).expand(n, 1, h, w)
-		return dir0_t, dir1_t
+
+		if dir0.shape[-2:] != (h, w):
+			dir0 = F.interpolate(dir0, size=(h, w), mode="bilinear", align_corners=True)
+			dir1 = F.interpolate(dir1, size=(h, w), mode="bilinear", align_corners=True)
+
+		if n != 1:
+			dir0 = dir0.expand(n, 1, h, w)
+			dir1 = dir1.expand(n, 1, h, w)
+		return dir0, dir1
+
+	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		c = torch.cos(self.theta)
+		s = torch.sin(self.theta)
+		x = c * u - s * v
+		y = s * u + c * v
+		return x, y
 
 	@classmethod
 	def from_fit_data(
