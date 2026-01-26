@@ -3,6 +3,7 @@ import click
 import torch
 import numpy as np
 import random
+import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -330,10 +331,12 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
             i, j = ij
             return 0 <= i < max_size and 0 <= j < max_size and not (patch[i, j] == -1).all()
 
+        start_time = time.perf_counter()
+
         # Bootstrap the first quad -- c.f. trace_strip and trace_patch above. We already have the
         # top-left point; we construct top-right, bottom-left and bottom-right
 
-        # Get hopefully-4 adjacent points; take the one with min or max z-displacement depending on required direction
+        # Get hopefully-4 adjacent points; take the one with min z-displacement
         heatmaps, min_corner_zyx = inference.get_heatmaps_at(start_zyx, prev_u=None, prev_v=None, prev_diag=None)
         coordinates = inference.get_blob_coordinates(heatmaps[:, 0].amax(dim=0), min_corner_zyx)
         if len(coordinates) == 0 or coordinates[0].isnan().any():
@@ -450,7 +453,9 @@ def trace(checkpoint_path, out_path, start_xyz, volume_zarr, volume_scale, steps
                 maybe_add_point(i, j)
 
             _, area_cm2 = get_area(patch, step_size, inference.voxel_size_um)
-            print(f'radius = {radius}, vertex count = {num_vertices}, area = {area_cm2:.2f}cm2')
+            elapsed_s = max(time.perf_counter() - start_time, 1e-6)
+            speed_mm2_s = area_cm2 * 100.0 / elapsed_s
+            print(f'radius = {radius}, vertex count = {num_vertices}, area = {area_cm2:.2f}cm2, speed = {speed_mm2_s:.2f}mm2/s')
 
             if save_partial and num_vertices > 0 and num_vertices % 1000 == 0:
                 partial_uuid = f'{base_uuid}_r{radius:03}'
