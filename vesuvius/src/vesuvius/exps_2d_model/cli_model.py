@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+	mesh_step_px: int
+	winding_step_px: int
+
+
+def add_args(p: argparse.ArgumentParser) -> None:
+	g = p.add_argument_group("model")
+	g.add_argument("--mesh-step", type=int, default=16)
+	g.add_argument("--winding-step", type=int, default=16)
+
+
+def from_args(args: argparse.Namespace) -> ModelConfig:
+	return ModelConfig(
+		mesh_step_px=int(args.mesh_step),
+		winding_step_px=int(args.winding_step),
+	)
+

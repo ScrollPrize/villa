@@ -64,3 +64,5 @@ time python /home/hendrik/business/aiconsulting/vesuviuschallenge/villa/vesuvius
 
 #fit large in vesuviuschallenge/data/model2d_fullsize_exps
 time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit_cosine_grid.py --input res2 --layer 0 --output-prefix res_fit/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --crop 4000 4000 2000 1000 --steps-stage2 5000
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --input res2/  --mesh-step 20 --winding-step 20 --device cuda
