@@ -5,7 +5,11 @@
 Parts (current placeholders):
 
 - data: [`cli_data.py`](cli_data.py)
-	- loading / (optional) UNet inference args
+	- loading args
+		- `--input` currently expects a directory containing `*_cos.tif`, `*_mag.tif`, `*_dir0.tif`, `*_dir1.tif`
+		- `--crop x y w h` crops all channels
+		- `--downscale` (default 4.0) downsamples all channels equally
+	- UNet inference will move here later
 - model: [`cli_model.py`](cli_model.py)
 	- step-size args (mesh/winding step in pixels)
 - opt: [`cli_opt.py`](cli_opt.py)

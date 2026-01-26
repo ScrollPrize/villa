@@ -89,3 +89,11 @@ Initialization rules:
 - The model initializes its winding-space domain to cover **~2× the image extent** at the assumed steps.
 	- This gives headroom above/below and left/right.
 	- Cropping/expansion utilities will be added later.
+
+## Current data contract (FitData)
+
+- Model init uses the supervision container [`fit_data.FitData`](fit_data.py:10) (not raw tensors).
+- Current loader behavior:
+	- expects a directory with 4 float tif channels: `*_cos.tif`, `*_mag.tif`, `*_dir0.tif`, `*_dir1.tif`
+	- optional crop is applied to all channels consistently
+	- optional downscale is applied to all channels consistently
