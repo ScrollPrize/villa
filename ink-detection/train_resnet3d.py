@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 import random
@@ -1679,6 +1679,7 @@ def main():
         gradient_clip_algorithm="norm",
         callbacks=(
             [
+                LearningRateMonitor(logging_interval="step"),
                 ModelCheckpoint(
                     filename="best-epoch{epoch}",
                     dirpath=CFG.model_dir,
