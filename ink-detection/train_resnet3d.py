@@ -556,6 +556,34 @@ def read_image_mask(
     if fragment_id=='20230827161846':
         fragment_mask=cv2.flip(fragment_mask,0)
 
+    def _assert_bottom_right_pad_compatible(a_name, a_hw, b_name, b_hw, multiple):
+        a_h, a_w = [int(x) for x in a_hw]
+        b_h, b_w = [int(x) for x in b_hw]
+
+        def _check_dim(dim_name, a_dim, b_dim):
+            small = min(a_dim, b_dim)
+            big = max(a_dim, b_dim)
+            padded = ((small + multiple - 1) // multiple) * multiple
+            allowed = {small, padded}
+            if small % multiple == 0:
+                allowed.add(small + multiple)  # supports the legacy "always pad one block" variant
+
+            if big not in allowed:
+                raise ValueError(
+                    f"{fragment_id}: {a_name} {a_hw} vs {b_name} {b_hw} mismatch. "
+                    f"Only bottom/right padding to a multiple of {multiple} is allowed "
+                    f"(see inference_resnet3d.py). Got {dim_name}={a_dim} vs {b_dim}."
+                )
+
+        _check_dim("height", a_h, b_h)
+        _check_dim("width", a_w, b_w)
+
+    if "frag" not in fragment_id:
+        pad_multiple = 256
+        _assert_bottom_right_pad_compatible("image", images.shape[:2], "label", mask.shape[:2], pad_multiple)
+        _assert_bottom_right_pad_compatible("image", images.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple)
+        _assert_bottom_right_pad_compatible("label", mask.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple)
+
     if "frag" in fragment_id:
         pad0 = max(0, images.shape[0] * 2 - fragment_mask.shape[0])
         pad1 = max(0, images.shape[1] * 2 - fragment_mask.shape[1])
