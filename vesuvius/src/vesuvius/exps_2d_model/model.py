@@ -31,6 +31,8 @@ class Model2D(nn.Module):
 		self.init = init
 		self.device = device
 		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
+		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
+		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
 
 		h2 = 2 * int(init.h_img)
 		w2 = 2 * int(init.w_img)
@@ -78,11 +80,19 @@ class Model2D(nn.Module):
 		return dir0, dir1
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		u = self.winding_scale * u + self.phase
 		c = torch.cos(self.theta)
 		s = torch.sin(self.theta)
 		x = c * u - s * v
 		y = s * u + c * v
 		return x, y
+
+	def opt_params(self) -> dict[str, nn.Parameter]:
+		return {
+			"theta": self.theta,
+			"phase": self.phase,
+			"winding_scale": self.winding_scale,
+		}
 
 	def grid_uv(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return base (u,v) mesh coordinates."""
