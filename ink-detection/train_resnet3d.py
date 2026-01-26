@@ -134,6 +134,8 @@ class CFG:
     lr = 2e-5
     # ============== fold =============
     valid_id = '20230820203112'
+    stitch_all_val = False
+    stitch_downsample = 1
 
     # ============== group DRO cfg =============
     objective = "erm"  # "erm" | "group_dro"
@@ -386,6 +388,12 @@ def apply_metadata_hyperparameters(cfg, metadata):
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()
     cfg.loss_mode = str(training_cfg.get("loss_mode", getattr(cfg, "loss_mode", "batch"))).lower()
     cfg.save_every_epoch = bool(training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)))
+    cfg.stitch_all_val = bool(training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)))
+    if "stitch_downsample" in training_cfg:
+        cfg.stitch_downsample = int(training_cfg["stitch_downsample"])
+    else:
+        cfg.stitch_downsample = 8 if cfg.stitch_all_val else int(getattr(cfg, "stitch_downsample", 1))
+    cfg.stitch_downsample = max(1, int(cfg.stitch_downsample))
 
     rebuild_augmentations(cfg, hp.get("augmentation"))
     return cfg
@@ -854,6 +862,10 @@ class RegressionPLModel(pl.LightningModule):
         stitch_val_dataloader_idx=None,
         stitch_pred_shape=None,
         stitch_segment_id=None,
+        stitch_all_val=False,
+        stitch_downsample=1,
+        stitch_all_val_shapes=None,
+        stitch_all_val_segment_ids=None,
     ):
         super(RegressionPLModel, self).__init__()
 
@@ -883,13 +895,44 @@ class RegressionPLModel(pl.LightningModule):
                 btl=group_dro_btl,
             )
 
-        self._stitch_enabled = (stitch_val_dataloader_idx is not None) and (stitch_pred_shape is not None)
-        if self._stitch_enabled:
-            self.mask_pred = np.zeros(stitch_pred_shape, dtype=np.float32)
-            self.mask_count = np.zeros(stitch_pred_shape, dtype=np.float32)
+        self._stitch_downsample = max(1, int(stitch_downsample or 1))
+        self._stitch_buffers = {}
+        self._stitch_segment_ids = {}
+
+        if bool(stitch_all_val):
+            if stitch_all_val_shapes is None or stitch_all_val_segment_ids is None:
+                raise ValueError("stitch_all_val requires stitch_all_val_shapes and stitch_all_val_segment_ids")
+            if len(stitch_all_val_shapes) != len(stitch_all_val_segment_ids):
+                raise ValueError(
+                    "stitch_all_val_shapes and stitch_all_val_segment_ids must have the same length "
+                    f"(got {len(stitch_all_val_shapes)} vs {len(stitch_all_val_segment_ids)})"
+                )
+
+            for loader_idx, (segment_id, shape) in enumerate(zip(stitch_all_val_segment_ids, stitch_all_val_shapes)):
+                h = int(shape[0])
+                w = int(shape[1])
+                ds_h = (h + self._stitch_downsample - 1) // self._stitch_downsample
+                ds_w = (w + self._stitch_downsample - 1) // self._stitch_downsample
+                self._stitch_buffers[int(loader_idx)] = (
+                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                )
+                self._stitch_segment_ids[int(loader_idx)] = str(segment_id)
         else:
-            self.mask_pred = None
-            self.mask_count = None
+            stitch_enabled = (stitch_val_dataloader_idx is not None) and (stitch_pred_shape is not None)
+            if stitch_enabled:
+                h = int(stitch_pred_shape[0])
+                w = int(stitch_pred_shape[1])
+                ds_h = (h + self._stitch_downsample - 1) // self._stitch_downsample
+                ds_w = (w + self._stitch_downsample - 1) // self._stitch_downsample
+                idx = int(stitch_val_dataloader_idx)
+                self._stitch_buffers[idx] = (
+                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                )
+                self._stitch_segment_ids[idx] = str(stitch_segment_id or idx)
+
+        self._stitch_enabled = len(self._stitch_buffers) > 0
 
         self.loss_func1 = smp.losses.DiceLoss(mode='binary')
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
@@ -1028,20 +1071,37 @@ class RegressionPLModel(pl.LightningModule):
         self._val_group_dice_sum.scatter_add_(0, g, per_sample_dice)
         self._val_group_count.scatter_add_(0, g, torch.ones_like(per_sample_loss, dtype=self._val_group_count.dtype))
 
-        if self._stitch_enabled and dataloader_idx == self.hparams.stitch_val_dataloader_idx:
+        if self._stitch_enabled and int(dataloader_idx) in self._stitch_buffers:
+            pred_buf, count_buf = self._stitch_buffers[int(dataloader_idx)]
+            ds = self._stitch_downsample
+
             y_preds = torch.sigmoid(outputs).to('cpu')
             for i, (x1, y1, x2, y2) in enumerate(xyxys):
                 x1 = int(x1)
                 y1 = int(y1)
                 x2 = int(x2)
                 y2 = int(y2)
-                self.mask_pred[y1:y2, x1:x2] += (
-                    F.interpolate(y_preds[i].unsqueeze(0).float(), scale_factor=4, mode='bilinear')
-                    .squeeze(0)
-                    .squeeze(0)
-                    .numpy()
-                )
-                self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size), dtype=np.float32)
+
+                x1_ds = x1 // ds
+                y1_ds = y1 // ds
+                x2_ds = (x2 + ds - 1) // ds
+                y2_ds = (y2 + ds - 1) // ds
+                target_h = y2_ds - y1_ds
+                target_w = x2_ds - x1_ds
+                if target_h <= 0 or target_w <= 0:
+                    continue
+
+                pred_patch = y_preds[i].unsqueeze(0).float()
+                if pred_patch.shape[-2:] != (target_h, target_w):
+                    pred_patch = F.interpolate(
+                        pred_patch,
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                pred_buf[y1_ds:y2_ds, x1_ds:x2_ds] += pred_patch.squeeze(0).squeeze(0).numpy()
+                count_buf[y1_ds:y2_ds, x1_ds:x2_ds] += 1.0
 
         return {"loss": per_sample_loss.mean()}
     
@@ -1076,25 +1136,30 @@ class RegressionPLModel(pl.LightningModule):
             self.log(f"val/group_{group_idx}_{safe_group_name}/dice", group_dice[group_idx], on_epoch=True)
             self.log(f"val/group_{group_idx}_{safe_group_name}/count", group_count[group_idx], on_epoch=True)
 
-        if self._stitch_enabled and (self.mask_pred is not None) and (self.mask_count is not None):
-            stitched = np.divide(
-                self.mask_pred,
-                self.mask_count,
-                out=np.zeros_like(self.mask_pred),
-                where=self.mask_count != 0,
-            )
-            if self.trainer is None or self.trainer.is_global_zero:
+        if self._stitch_enabled and self._stitch_buffers:
+            sanity_checking = bool(self.trainer is not None and getattr(self.trainer, "sanity_checking", False))
+
+            images = []
+            captions = []
+            for loader_idx, (pred_buf, count_buf) in self._stitch_buffers.items():
+                stitched = np.divide(
+                    pred_buf,
+                    count_buf,
+                    out=np.zeros_like(pred_buf),
+                    where=count_buf != 0,
+                )
+                images.append(np.clip(stitched, 0, 1))
+                segment_id = self._stitch_segment_ids.get(loader_idx, str(loader_idx))
+                captions.append(f"{segment_id} (ds={self._stitch_downsample})")
+
+            if (not sanity_checking) and (self.trainer is None or self.trainer.is_global_zero):
                 if isinstance(self.logger, WandbLogger):
-                    caption = self.hparams.stitch_segment_id or "probs"
-                    self.logger.log_image(
-                        key="masks",
-                        images=[np.clip(stitched, 0, 1)],
-                        caption=[caption],
-                    )
+                    self.logger.log_image(key="masks", images=images, caption=captions)
 
             # reset stitch buffers
-            self.mask_pred.fill(0)
-            self.mask_count.fill(0)
+            for pred_buf, count_buf in self._stitch_buffers.values():
+                pred_buf.fill(0)
+                count_buf.fill(0)
     def configure_optimizers(self):
 
         optimizer = AdamW(self.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
@@ -1157,6 +1222,8 @@ def parse_args():
     parser.add_argument("--wandb_tags", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--outputs_path", type=str, default=None)
+    parser.add_argument("--stitch_all_val", action="store_true")
+    parser.add_argument("--stitch_downsample", type=int, default=None)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="16-mixed")
@@ -1262,7 +1329,8 @@ def main():
         f"objective={CFG.objective} sampler={CFG.sampler} loss_mode={CFG.loss_mode} "
         f"epochs={CFG.epochs} lr={CFG.lr} batch={CFG.train_batch_size} "
         f"accumulate_grad_batches={CFG.accumulate_grad_batches} "
-        f"num_workers={CFG.num_workers} layer_read_workers={getattr(CFG, 'layer_read_workers', 1)}"
+        f"num_workers={CFG.num_workers} layer_read_workers={getattr(CFG, 'layer_read_workers', 1)} "
+        f"stitch_all_val={getattr(CFG, 'stitch_all_val', False)} stitch_downsample={getattr(CFG, 'stitch_downsample', 1)}"
     )
 
     try:
@@ -1341,6 +1409,10 @@ def main():
 
     if args.outputs_path is not None:
         CFG.outputs_path = str(args.outputs_path)
+    if args.stitch_all_val:
+        CFG.stitch_all_val = True
+    if args.stitch_downsample is not None:
+        CFG.stitch_downsample = max(1, int(args.stitch_downsample))
 
     run_slug = args.run_name or f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_stitch={CFG.valid_id}"
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -1382,6 +1454,8 @@ def main():
     train_groups = []
 
     val_loaders = []
+    val_stitch_shapes = []
+    val_stitch_segment_ids = []
     stitch_val_dataloader_idx = None
     stitch_pred_shape = None
     stitch_segment_id = None
@@ -1492,6 +1566,8 @@ def main():
             drop_last=False,
         )
         val_loaders.append(val_loader)
+        val_stitch_shapes.append(tuple(mask_val.shape))
+        val_stitch_segment_ids.append(fragment_id)
         if fragment_id == CFG.valid_id:
             stitch_val_dataloader_idx = len(val_loaders) - 1
             stitch_pred_shape = mask_val.shape
@@ -1552,6 +1628,10 @@ def main():
         stitch_val_dataloader_idx=stitch_val_dataloader_idx,
         stitch_pred_shape=stitch_pred_shape,
         stitch_segment_id=stitch_segment_id,
+        stitch_all_val=bool(getattr(CFG, "stitch_all_val", False)),
+        stitch_downsample=int(getattr(CFG, "stitch_downsample", 1)),
+        stitch_all_val_shapes=val_stitch_shapes,
+        stitch_all_val_segment_ids=val_stitch_segment_ids,
     )
     try:
         wandb_logger.watch(model, log="all", log_freq=100)
