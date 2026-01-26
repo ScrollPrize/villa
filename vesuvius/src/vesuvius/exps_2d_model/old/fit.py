@@ -253,13 +253,6 @@ def fit_cosine_grid(
         target_plain = _target_plain()
         return 0.25+0.25*torch.sin(bias_hr) + (0.55 + 0.45*torch.sin(amp_hr)) * (target_plain - 0.5)
 
-    # Stage-1 optimizer: global rotation, x-scale, phase (u-offset), and
-    # modulation parameters on the fixed coarse grid (no coordinate offsets yet).
-    opt = torch.optim.Adam(
-        [model.theta, model.log_s, model.phase], #model.amp_coarse, model.bias_coarse
-        lr=10*lr,
-    )
-
     if stages_json is None:
         raise ValueError("stages_json must be provided (path to JSON defining base weights & stages)")
 
@@ -274,42 +267,11 @@ def fit_cosine_grid(
         raise ValueError("stages_json: expected a non-empty list in key 'stages'")
 
     total_steps_all = 0
-    stage1_steps = 0
     for s in stages_cfg_list:
         if not isinstance(s, dict):
             raise ValueError("stages_json: each stage must be an object")
-        name = str(s.get("name", ""))
         steps = max(0, int(s.get("steps", 0)))
         total_steps_all += steps
-        if name == "stage1":
-            stage1_steps = steps
-
-    # Optional initialization snapshot.
-    if snapshot is not None and snapshot > 0 and output_prefix is not None:
-        # Use stage 1, step 0 with a dummy total_stage_steps=1 so that the mask
-        # schedule is well-defined (stage_progress = 0).
-        _save_snapshot(
-            stage=1,
-            step_stage=0,
-            total_stage_steps=max(stage1_steps, 1),
-            global_step_idx=0,
-            snapshot=snapshot,
-            output_prefix=output_prefix,
-            image=image,
-            model=model,
-            modulated_target_fn=_modulated_target,
-            unet_dir0_img=unet_dir0_img,
-            unet_dir1_img=unet_dir1_img,
-            unet_mag_img=unet_mag_img,
-            img_downscale_factor=img_downscale_factor,
-            cosine_periods=cosine_periods,
-            h_img=h_img,
-            w_img=w_img,
-            output_scale=output_scale,
-            eff_output_scale=eff_output_scale,
-            dbg=dbg,
-            for_video=for_video,
-        )
 
     def _stage_to_modifiers(
         base: dict[str, float],
@@ -608,6 +570,7 @@ def fit_cosine_grid(
         total_steps: int,
         optimizer: torch.optim.Optimizer,
         stage_modifiers: dict[str, float],
+        wrap_phase: bool,
         global_step_offset: int = 0,
     ) -> None:
         """
@@ -630,7 +593,7 @@ def fit_cosine_grid(
 
             optimizer.step()
 
-            if stage == 1:
+            if wrap_phase:
                 # Wrap phase into a single cosine period to avoid drift.
                 with torch.no_grad():
                     half_period_u = 0.5 * period_u
@@ -724,6 +687,33 @@ def fit_cosine_grid(
 
         stages.append((name, steps, lr_stage_f, params_stage, mods))
 
+    # Optional initialization snapshot.
+    if snapshot is not None and snapshot > 0 and output_prefix is not None and stages:
+        first_stage_name, first_stage_steps, _, _, _ = stages[0]
+        first_stage_idx = int(first_stage_name.replace("stage", ""))
+        _save_snapshot(
+            stage=first_stage_idx,
+            step_stage=0,
+            total_stage_steps=max(int(first_stage_steps), 1),
+            global_step_idx=0,
+            snapshot=snapshot,
+            output_prefix=output_prefix,
+            image=image,
+            model=model,
+            modulated_target_fn=_modulated_target,
+            unet_dir0_img=unet_dir0_img,
+            unet_dir1_img=unet_dir1_img,
+            unet_mag_img=unet_mag_img,
+            img_downscale_factor=img_downscale_factor,
+            cosine_periods=cosine_periods,
+            h_img=h_img,
+            w_img=w_img,
+            output_scale=output_scale,
+            eff_output_scale=eff_output_scale,
+            dbg=dbg,
+            for_video=for_video,
+        )
+
     global_step_offset = 0
     for stage_name, stage_steps, stage_lr, stage_params, stage_modifiers in stages:
         stage_idx = int(stage_name.replace("stage", ""))
@@ -732,12 +722,14 @@ def fit_cosine_grid(
             stage_modifiers["use_full_dir_unet"] = bool(use_full_dir_unet_by_stage[stage_idx])
 
         optimizer = torch.optim.Adam(stage_params, lr=stage_lr)
+        wrap_phase = any(p is model.phase for p in stage_params)
 
         _optimize_stage(
             stage=stage_idx,
             total_steps=stage_steps,
             optimizer=optimizer,
             stage_modifiers=stage_modifiers,
+            wrap_phase=wrap_phase,
             global_step_offset=global_step_offset,
         )
         global_step_offset += int(stage_steps)
