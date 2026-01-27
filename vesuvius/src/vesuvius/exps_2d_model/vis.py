@@ -31,7 +31,8 @@ def _draw_grid_vis(
 	h_img: int,
 	w_img: int,
 	background: torch.Tensor | None,
-	base_grid: torch.Tensor,
+	xy_lr: torch.Tensor,
+	xy_conn: torch.Tensor | None,
 ) -> "np.ndarray":
 	with torch.no_grad():
 		sf = max(1, int(scale))
@@ -50,12 +51,12 @@ def _draw_grid_vis(
 			y0 = (h_vis - h_im) // 2
 			bg[y0:y0 + h_im, x0:x0 + w_im, :] = img_resized
 
-		uv = base_grid.to(dtype=torch.float32, device="cpu")
-		u = uv[0, 0].numpy()
-		v = uv[0, 1].numpy()
+		xy_lr_cpu = xy_lr.to(dtype=torch.float32, device="cpu")
+		x_norm = xy_lr_cpu[0, 0].numpy()
+		y_norm = xy_lr_cpu[0, 1].numpy()
 
-		x_pix = (0.5 + 0.25 * u) * float(w_vis - 1)
-		y_pix = (0.5 + 0.25 * v) * float(h_vis - 1)
+		x_pix = (0.5 + 0.25 * x_norm) * float(w_vis - 1)
+		y_pix = (0.5 + 0.25 * y_norm) * float(h_vis - 1)
 
 		gh, gw = x_pix.shape
 
@@ -77,6 +78,30 @@ def _draw_grid_vis(
 				y1 = int(round(float(y_pix[iy, ix + 1])))
 				if in_bounds(x0, y0) and in_bounds(x1, y1):
 					cv2.line(bg, (x0, y0), (x1, y1), (0, 0, 255), 1)
+
+		if xy_conn is not None:
+			xy_conn_cpu = xy_conn.to(dtype=torch.float32, device="cpu")
+			w = float(max(1, int(w_img) - 1))
+			h = float(max(1, int(h_img) - 1))
+			xn = (xy_conn_cpu[0, :, 0] / w) * 2.0 - 1.0
+			yn = (xy_conn_cpu[0, :, 1] / h) * 2.0 - 1.0
+			xc = (0.5 + 0.25 * xn.numpy()) * float(w_vis - 1)
+			yc = (0.5 + 0.25 * yn.numpy()) * float(h_vis - 1)
+			for iy in range(gh):
+				for ix in range(gw - 1):
+					x0_lr = int(round(float(x_pix[iy, ix])))
+					y0_lr = int(round(float(y_pix[iy, ix])))
+					x1_lr = int(round(float(xc[2, iy, ix])))
+					y1_lr = int(round(float(yc[2, iy, ix])))
+					if in_bounds(x0_lr, y0_lr) and in_bounds(x1_lr, y1_lr):
+						cv2.line(bg, (x0_lr, y0_lr), (x1_lr, y1_lr), (255, 255, 0), 1)
+
+					x0_rl = int(round(float(x_pix[iy, ix + 1])))
+					y0_rl = int(round(float(y_pix[iy, ix + 1])))
+					x1_rl = int(round(float(xc[0, iy, ix + 1])))
+					y1_rl = int(round(float(yc[0, iy, ix + 1])))
+					if in_bounds(x0_rl, y0_rl) and in_bounds(x1_rl, y1_rl):
+						cv2.line(bg, (x0_rl, y0_rl), (x1_rl, y1_rl), (0, 255, 255), 1)
 
 		for iy in range(gh - 1):
 			for ix in range(gw):
@@ -110,7 +135,8 @@ def save(
 		h_img=h_img,
 		w_img=w_img,
 		background=data.cos,
-		base_grid=grid_xy,
+		xy_lr=grid_xy,
+		xy_conn=res.xy_conn,
 	)
 	grid_path = out / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))

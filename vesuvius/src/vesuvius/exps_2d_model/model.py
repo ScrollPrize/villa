@@ -103,7 +103,9 @@ class Model2D(nn.Module):
 		self.offset_ms = nn.ParameterList(
 			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
-		self.mesh_offset = nn.Parameter(torch.zeros(1, 2, self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
+		self.mesh_offset_ms = nn.ParameterList(
+			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
+		)
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
@@ -192,8 +194,14 @@ class Model2D(nn.Module):
 			"phase": [self.phase],
 			"winding_scale": [self.winding_scale],
 			"offset_ms": list(self.offset_ms),
-			"mesh_offset": [self.mesh_offset],
+			"mesh_offset_ms": list(self.mesh_offset_ms),
 		}
+
+	def mesh_offset_coarse(self) -> torch.Tensor:
+		off = self.mesh_offset_ms[-1]
+		for d in reversed(self.mesh_offset_ms[:-1]):
+			off = F.interpolate(off, size=(int(d.shape[2]), int(d.shape[3])), mode="bilinear", align_corners=True) + d
+		return off
 
 	def _xy_conn_px(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
 		"""Return per-mesh connection positions in pixel coordinates.
@@ -210,7 +218,8 @@ class Model2D(nn.Module):
 		n, _c, hm, wm = (int(v) for v in xy_lr.shape)
 		if hm <= 0 or wm <= 0:
 			raise ValueError("invalid xy_lr shape")
-		if self.mesh_offset.shape[-2:] != (hm, wm):
+		mesh_off = self.mesh_offset_coarse()
+		if mesh_off.shape[-2:] != (hm, wm):
 			raise RuntimeError("mesh_offset must be defined on the base mesh")
 
 		w = float(max(1, int(self.init.w_img) - 1))
@@ -221,8 +230,8 @@ class Model2D(nn.Module):
 
 		left_src = torch.cat([xy_px[:, :, :, 0:1], xy_px[:, :, :, :-1]], dim=3)
 		right_src = torch.cat([xy_px[:, :, :, 1:], xy_px[:, :, :, -1:]], dim=3)
-		off_l = self.mesh_offset[:, 0]
-		off_r = self.mesh_offset[:, 1]
+		off_l = mesh_off[:, 0]
+		off_r = mesh_off[:, 1]
 		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
 		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
 		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
