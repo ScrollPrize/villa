@@ -1,5 +1,20 @@
 \# Modeling notes
 
+## Coordinate conventions
+
+- All `xy` tensors use **pixel coordinates**:
+	- x in `[0, W-1]`, y in `[0, H-1]`.
+- The `(x,y)` pair is always stored in the **last** dimension.
+	- Examples:
+		- sampling grid: `(N,He,We,2)`
+		- base mesh: `(N,Hm,Wm,2)`
+		- conn endpoints: `(N,Hm,Wm,3,2)`
+
+Notes:
+
+- When sampling with `grid_sample`, pixel coords must be converted to normalized coords `[-1,1]`.
+- Validity masks are derived directly from the `xy` tensor being used and are never resized/interpolated.
+
 ## Direction encoding
 
 Given a direction vector `(gx,gy)` (e.g. a gradient direction), define `theta = atan2(gy,gx)`.

@@ -11,12 +11,8 @@ def step_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Ten
 	- step_h: (1,1,H,W-1) for horizontal edges
 	- step_v: (1,1,H-1,W) for vertical edges
 	"""
-	x = res.xy_lr[:, 0:1]
-	y = res.xy_lr[:, 1:2]
-	wi = float(max(2, int(res.w_img)) - 1)
-	hi = float(max(2, int(res.h_img)) - 1)
-	x = (x + 1.0) * (0.5 * wi)
-	y = (y + 1.0) * (0.5 * hi)
+	x = res.xy_lr[..., 0].unsqueeze(1)
+	y = res.xy_lr[..., 1].unsqueeze(1)
 
 	dx_h = x[:, :, :, 1:] - x[:, :, :, :-1]
 	dy_h = y[:, :, :, 1:] - y[:, :, :, :-1]
