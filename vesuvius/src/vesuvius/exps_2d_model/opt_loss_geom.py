@@ -169,6 +169,23 @@ def y_straight_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torc
 	return lm, mask
 
 
+def mean_pos_loss_map(*, res: fit_model.FitResult, target_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Return (lm, mask) penalizing mean(xy_lr) deviating from `target_xy`.
+
+	`target_xy` must be (2,) or (N,2) in pixel xy.
+	"""
+	xy = res.xy_lr
+	mean_xy = xy.mean(dim=(1, 2))
+	if target_xy.ndim == 1:
+		tgt = target_xy.view(1, 2).expand(int(mean_xy.shape[0]), 2)
+	else:
+		tgt = target_xy
+	d = mean_xy - tgt
+	lm = (d * d).sum(dim=-1).view(-1, 1, 1, 1)
+	mask = torch.ones_like(lm)
+	return lm, mask
+
+
 def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 	wsum = mask.sum()
 	if float(wsum) > 0.0:
@@ -218,4 +235,9 @@ def y_straight_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 def angle_symmetry_loss_uv(*, res: fit_model.FitResult) -> torch.Tensor:
 	"""Same as `angle_symmetry_loss`, but averaged over both horizontal directions."""
 	lm, mask = angle_symmetry_loss_map(res=res)
+	return _full_mean(lm)
+
+
+def mean_pos_loss(*, res: fit_model.FitResult, target_xy: torch.Tensor) -> torch.Tensor:
+	lm, mask = mean_pos_loss_map(res=res, target_xy=target_xy)
 	return _full_mean(lm)
