@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
 		data=data,
 		mesh_step_px=model_cfg.mesh_step_px,
 		winding_step_px=model_cfg.winding_step_px,
+		init_size_frac=model_cfg.init_size_frac,
 		device=device,
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,

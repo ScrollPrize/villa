@@ -3,6 +3,7 @@
 		"dir_unet": 1.0,
 		"step": 0.1,
 		"gradmag": 0.1,
+		"mean_pos": 0.1,
 		"smooth_x": 0.0,
 		"smooth_y": 1.0,
 		"meshoff_sy": 1.0,
