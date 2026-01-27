@@ -2,6 +2,7 @@
 	"base": {
 		"dir_unet": 1.0,
 		"step": 0.001,
+		"gradmag": 1.0,
 		"smooth_x": 1.0,
 		"smooth_y": 1.0,
 		"meshoff_sy": 1.0,

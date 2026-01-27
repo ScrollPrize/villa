@@ -1,0 +1,17 @@
+{
+	"base": {
+		"dir_unet": 1.0,
+		"step": 0.001
+	},
+	"stages": [
+		{
+			"name": "only",
+			"steps": 5000,
+			"lr": 0.01,
+			"params": ["mesh_offset_ms"],
+			"min_scaledown": 0,
+			"w_fac": {
+			}
+		}
+	]
+}
