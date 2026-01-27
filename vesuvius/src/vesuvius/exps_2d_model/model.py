@@ -90,7 +90,7 @@ class Model2D(nn.Module):
 		self.init = init
 		self.device = device
 		# FIXME need better init ...
-		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
+		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
 
@@ -215,6 +215,7 @@ class Model2D(nn.Module):
 		n, c, h, w = (int(v) for v in src.shape)
 		if y.shape != (n, h, w):
 			raise ValueError("y must be (N,H,W)")
+		y = y.clamp(0.0, float(h - 1))
 		y0 = torch.floor(y)
 		y1 = y0 + 1.0
 		t = (y - y0).clamp(0.0, 1.0)
