@@ -26,7 +26,7 @@ def step_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Ten
 	t_v = float(res.mesh_step_px)
 	step_h = (len_h - t_h) * (len_h - t_h)
 	step_v = (len_v - t_v) * (len_v - t_v)
-	return step_h, step_v
+	return 0*step_h, step_v
 
 
 def step_loss(*, res: fit_model.FitResult) -> torch.Tensor:

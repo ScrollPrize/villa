@@ -9,6 +9,7 @@ import cv2
 
 import fit_data
 import opt_loss_dir
+import opt_loss_geom
 import opt_loss_step
 
 
@@ -197,6 +198,14 @@ def save(
 	dir_lm_v, dir_lm_conn_l, dir_lm_conn_r, _dir_mask_v, _dir_mask_conn_l, _dir_mask_conn_r = opt_loss_dir.direction_loss_maps(res=res)
 	dir_lm = 0.5 * (dir_lm_v + 0.5 * (dir_lm_conn_l + dir_lm_conn_r))
 
+	smooth_x_lm, _smooth_x_mask = opt_loss_geom.smooth_x_loss_map(res=res)
+	smooth_y_lm, _smooth_y_mask = opt_loss_geom.smooth_y_loss_map(res=res)
+	meshoff_sy_lm, _meshoff_sy_mask = opt_loss_geom.meshoff_smooth_y_loss_map(res=res)
+	conn_sy_l_lm, _conn_sy_l_mask = opt_loss_geom.conn_y_smooth_l_loss_map(res=res)
+	conn_sy_r_lm, _conn_sy_r_mask = opt_loss_geom.conn_y_smooth_r_loss_map(res=res)
+	angle_lm, _angle_mask = opt_loss_geom.angle_symmetry_loss_map(res=res)
+	y_straight_lm, _y_straight_mask = opt_loss_geom.y_straight_loss_map(res=res)
+
 	loss_maps = {
 		"dir": {
 			"fn": lambda: dir_lm,
@@ -226,6 +235,41 @@ def save(
 		"step_v": {
 			"fn": lambda: opt_loss_step.step_loss_maps(res=res)[1],
 			"suffix": "step_v",
+			"reduce": True,
+		},
+		"smooth_x": {
+			"fn": lambda: smooth_x_lm,
+			"suffix": "smooth_x",
+			"reduce": True,
+		},
+		"smooth_y": {
+			"fn": lambda: smooth_y_lm,
+			"suffix": "smooth_y",
+			"reduce": True,
+		},
+		"meshoff_sy": {
+			"fn": lambda: meshoff_sy_lm,
+			"suffix": "meshoff_sy",
+			"reduce": True,
+		},
+		"conn_sy_l": {
+			"fn": lambda: conn_sy_l_lm,
+			"suffix": "conn_sy_l",
+			"reduce": True,
+		},
+		"conn_sy_r": {
+			"fn": lambda: conn_sy_r_lm,
+			"suffix": "conn_sy_r",
+			"reduce": True,
+		},
+		"angle": {
+			"fn": lambda: angle_lm,
+			"suffix": "angle",
+			"reduce": True,
+		},
+		"y_straight": {
+			"fn": lambda: y_straight_lm,
+			"suffix": "y_straight",
 			"reduce": True,
 		},
 	}

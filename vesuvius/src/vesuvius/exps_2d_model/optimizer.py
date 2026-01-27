@@ -7,6 +7,7 @@ import torch
 
 import fit_data
 import opt_loss_dir
+import opt_loss_geom
 import opt_loss_step
 
 
@@ -61,7 +62,17 @@ def load_stages(path: str) -> list[Stage]:
 	with open(path, "r", encoding="utf-8") as f:
 		cfg = json.load(f)
 
-	lambda_global: dict[str, float] = {"dir_unet": 1.0, "step": 0.0}
+	lambda_global: dict[str, float] = {
+		"dir_unet": 1.0,
+		"step": 0.0,
+		"smooth_x": 0.0,
+		"smooth_y": 0.0,
+		"meshoff_sy": 0.0,
+		"conn_sy_l": 0.0,
+		"conn_sy_r": 0.0,
+		"angle": 0.0,
+		"y_straight": 0.0,
+	}
 	base_cfg = cfg.get("base", None)
 	if isinstance(base_cfg, dict):
 		for k, v in base_cfg.items():
@@ -127,6 +138,13 @@ def optimize(
 		terms = {
 			"dir_unet": {"loss": opt_loss_dir.direction_loss},
 			"step": {"loss": opt_loss_step.step_loss},
+			"smooth_x": {"loss": opt_loss_geom.smooth_x_loss},
+			"smooth_y": {"loss": opt_loss_geom.smooth_y_loss},
+			"meshoff_sy": {"loss": opt_loss_geom.meshoff_smooth_y_loss},
+			"conn_sy_l": {"loss": opt_loss_geom.conn_y_smooth_l_loss},
+			"conn_sy_r": {"loss": opt_loss_geom.conn_y_smooth_r_loss},
+			"angle": {"loss": opt_loss_geom.angle_symmetry_loss},
+			"y_straight": {"loss": opt_loss_geom.y_straight_loss},
 		}
 		with torch.no_grad():
 			res0 = model(data)
@@ -144,7 +162,9 @@ def optimize(
 			for k, vs in all_params.items():
 				if len(vs) == 1 and vs[0].numel() == 1:
 					param_vals0[k] = float(vs[0].detach().cpu())
-			print(f"stage{si} step 0/{stage.steps}: loss={loss0.item():.6f} terms={term_vals0} params={param_vals0}")
+			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
+			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
+			print(f"stage{si} step 0/{stage.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
 		snapshot_fn(stage=f"stage{si}", step=0, loss=float(loss0.detach().cpu()))
 
 		for step in range(stage.steps):
@@ -169,7 +189,9 @@ def optimize(
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
 						param_vals[k] = float(vs[0].detach().cpu())
-				print(f"stage{si} step {step1}/{stage.steps}: loss={loss.item():.6f} terms={term_vals} params={param_vals}")
+				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
+				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
+				print(f"stage{si} step {step1}/{stage.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=f"stage{si}", step=step1, loss=float(loss.detach().cpu()))
