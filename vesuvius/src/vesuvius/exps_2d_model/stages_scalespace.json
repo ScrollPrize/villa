@@ -1,7 +1,7 @@
 {
 	"base": {
 		"dir_unet": 1.0,
-		"step": 100.0
+		"step": 0.1
 	},
 	"stages": [
 		{

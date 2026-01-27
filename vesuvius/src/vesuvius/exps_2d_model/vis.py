@@ -142,9 +142,19 @@ def save(
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
 	loss_maps = {
-		"dir_unet": {
+		"dir": {
 			"fn": lambda: opt_loss_dir.direction_loss_map(res=res)[0],
-			"suffix": "dir_unet",
+			"suffix": "dir",
+			"reduce": True,
+		},
+		"dir_v": {
+			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[0],
+			"suffix": "dir_v",
+			"reduce": True,
+		},
+		"dir_conn": {
+			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[1],
+			"suffix": "dir_conn",
 			"reduce": True,
 		},
 		"step_h": {

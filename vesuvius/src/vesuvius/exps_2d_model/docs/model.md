@@ -41,13 +41,13 @@ The fitting/optimization code should consume the model as a black box and not re
 
 FitResult fields:
 
-- `xy_lr`: base mesh grid in normalized image coordinates as `(N,2,Hm,Wm)`.
-- `xy_hr`: evaluation grid (upsampled) in normalized image coordinates as `(N,2,He,We)`.
-- `xy_conn`: per-mesh connection positions in pixel coordinates as `(N,3,2,Hm,Wm)` with `[:,0]` left-connection, `[:,1]` point, `[:,2]` right-connection.
-- `data_s`: [`fit_data.FitData`](fit_data.py:12) sampled at `xy_hr`.
-- `mask`: validity mask `(N,1,He,We)` (1 inside `[-1,1]^2`, else 0).
-- `dir0_pred`, `dir1_pred`: predicted UNet-style direction encodings derived from `xy_lr`.
-	- Direction encoding is documented in [`docs/modeling.md`](docs/modeling.md).
+	- `xy_lr`: base mesh grid in normalized image coordinates as `(N,2,Hm,Wm)`.
+	- `xy_hr`: evaluation grid (upsampled) in normalized image coordinates as `(N,2,He,We)`.
+	- `xy_conn`: per-mesh connection positions in pixel coordinates as `(N,3,2,Hm,Wm)` with `[:,0]` left-connection, `[:,1]` point, `[:,2]` right-connection.
+	- `data_s`: [`fit_data.FitData`](fit_data.py:12) sampled at `xy_hr`.
+	- `mask`: validity mask `(N,1,He,We)` (1 inside `[-1,1]^2`, else 0).
+
+	Direction encoding is documented in [`docs/modeling.md`](docs/modeling.md).
 
 Implementation note:
 

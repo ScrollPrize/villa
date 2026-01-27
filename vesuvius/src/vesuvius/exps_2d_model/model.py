@@ -24,8 +24,6 @@ class FitResult:
 	_xy_conn: torch.Tensor
 	_data_s: fit_data.FitData
 	_mask: torch.Tensor
-	_dir0_pred: torch.Tensor
-	_dir1_pred: torch.Tensor
 	_h_img: int
 	_w_img: int
 	_mesh_step_px: int
@@ -50,14 +48,6 @@ class FitResult:
 	@property
 	def mask(self) -> torch.Tensor:
 		return self._mask
-
-	@property
-	def dir0_pred(self) -> torch.Tensor:
-		return self._dir0_pred
-
-	@property
-	def dir1_pred(self) -> torch.Tensor:
-		return self._dir1_pred
 
 	@property
 	def h_img(self) -> int:
@@ -89,7 +79,7 @@ class Model2D(nn.Module):
 		super().__init__()
 		self.init = init
 		self.device = device
-		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
+		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
 
@@ -109,69 +99,17 @@ class Model2D(nn.Module):
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
-	def direction_encoding(self, *, shape: tuple[int, int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Return (dir0, dir1) in the same encoding as the UNet outputs."""
-		n, _c, h, w = (int(v) for v in shape)
-		if n <= 0 or h <= 0 or w <= 0:
-			raise ValueError(f"invalid shape: {shape}")
-
-		xy_lr = torch.cat(self._grid_xy(), dim=1)
-		dir0, dir1 = self.direction_encoding_from_xy(xy_lr=xy_lr, shape=shape)
-		return dir0, dir1
-
-	@staticmethod
-	def direction_encoding_from_xy(*, xy_lr: torch.Tensor, shape: tuple[int, int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Return (dir0, dir1) predicted from a base-mesh xy grid."""
-		if xy_lr.ndim != 4 or int(xy_lr.shape[1]) != 2:
-			raise ValueError("xy_lr must be (N,2,H,W)")
-		n, _c, h, w = (int(v) for v in shape)
-		if n <= 0 or h <= 0 or w <= 0:
-			raise ValueError(f"invalid shape: {shape}")
-		x = xy_lr[:, 0:1]
-		y = xy_lr[:, 1:2]
-
-		# Direction is derived only from *vertical* mesh connections (v-edges).
-		dvx = x.new_zeros(x.shape)
-		dvy = y.new_zeros(y.shape)
-		dvx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
-		dvy[:, :, :-1, :] = y[:, :, 1:, :] - y[:, :, :-1, :]
-		if x.shape[2] >= 2:
-			dvx[:, :, -1, :] = dvx[:, :, -2, :]
-			dvy[:, :, -1, :] = dvy[:, :, -2, :]
-
-		gx = -dvy
-		gy = dvx
-		eps = 1e-8
-		r2 = gx * gx + gy * gy + eps
-		cos2 = (gx * gx - gy * gy) / r2
-		sin2 = (2.0 * gx * gy) / r2
-		inv_sqrt2 = 1.0 / (2.0 ** 0.5)
-		dir0 = 0.5 + 0.5 * cos2
-		dir1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
-
-		if dir0.shape[-2:] != (h, w):
-			dir0 = F.interpolate(dir0, size=(h, w), mode="bilinear", align_corners=True)
-			dir1 = F.interpolate(dir1, size=(h, w), mode="bilinear", align_corners=True)
-
-		if n != 1:
-			dir0 = dir0.expand(n, 1, h, w)
-			dir1 = dir1.expand(n, 1, h, w)
-		return dir0, dir1
-
 	def forward(self, data: fit_data.FitData) -> FitResult:
 		xy_lr = torch.cat(self._grid_xy(), dim=1)
 		xy_hr = torch.cat(self._grid_xy_subsampled(), dim=1)
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
 		data_s, mask = data.grid_sample_xy(xy=xy_hr)
-		dir0_pred, dir1_pred = self.direction_encoding_from_xy(xy_lr=xy_lr, shape=data_s.dir0.shape)
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
 			_xy_conn=xy_conn,
 			_data_s=data_s,
 			_mask=mask,
-			_dir0_pred=dir0_pred,
-			_dir1_pred=dir1_pred,
 			_h_img=int(self.init.h_img),
 			_w_img=int(self.init.w_img),
 			_mesh_step_px=int(self.init.mesh_step_px),
