@@ -196,7 +196,15 @@ def save(
 
 	loss_maps = {
 		"dir": {
-			"fn": lambda: opt_loss_dir.direction_loss_map(res=res)[0],
+			"fn": lambda: 0.5
+			* (
+				opt_loss_dir.direction_loss_maps(res=res)[0]
+				+ 0.5
+				* (
+					opt_loss_dir.direction_loss_maps(res=res)[1]
+					+ opt_loss_dir.direction_loss_maps(res=res)[2]
+				)
+			),
 			"suffix": "dir",
 			"reduce": True,
 		},
@@ -205,9 +213,14 @@ def save(
 			"suffix": "dir_v",
 			"reduce": True,
 		},
-		"dir_conn": {
+		"dir_conn_l": {
 			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[1],
-			"suffix": "dir_conn",
+			"suffix": "dir_conn_l",
+			"reduce": True,
+		},
+		"dir_conn_r": {
+			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[2],
+			"suffix": "dir_conn_r",
 			"reduce": True,
 		},
 		"step_h": {
