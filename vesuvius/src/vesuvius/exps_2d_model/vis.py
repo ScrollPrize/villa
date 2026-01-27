@@ -42,8 +42,8 @@ def _draw_grid_vis(
 		w_vis = int(w_img * sf)
 
 		bg = np.zeros((h_vis, w_vis, 3), dtype="uint8")
-		x0 = 0
-		y0 = 0
+		x_off = 0
+		y_off = 0
 		w_im = w_vis
 		h_im = h_vis
 		if background is not None:
@@ -53,17 +53,17 @@ def _draw_grid_vis(
 			h_im = max(1, h_vis // 2)
 			img_resized = cv2.resize(img_u8, (w_im, h_im), interpolation=cv2.INTER_LINEAR)
 			img_resized = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2BGR)
-			x0 = (w_vis - w_im) // 2
-			y0 = (h_vis - h_im) // 2
-			bg[y0:y0 + h_im, x0:x0 + w_im, :] = img_resized
+			x_off = (w_vis - w_im) // 2
+			y_off = (h_vis - h_im) // 2
+			bg[y_off:y_off + h_im, x_off:x_off + w_im, :] = img_resized
 
 		xy_lr_cpu = xy_lr.to(dtype=torch.float32, device="cpu")
 		wx = float(max(1, int(w_img) - 1))
 		hy = float(max(1, int(h_img) - 1))
 		sx = float(max(1, int(w_im) - 1)) / wx
 		sy = float(max(1, int(h_im) - 1)) / hy
-		x_pix = x0 + xy_lr_cpu[0, :, :, 0].numpy() * sx
-		y_pix = y0 + xy_lr_cpu[0, :, :, 1].numpy() * sy
+		x_pix = x_off + xy_lr_cpu[0, :, :, 0].numpy() * sx
+		y_pix = y_off + xy_lr_cpu[0, :, :, 1].numpy() * sy
 
 		gh, gw = x_pix.shape
 
@@ -89,63 +89,67 @@ def _draw_grid_vis(
 
 		for iy in range(gh):
 			for ix in range(gw - 1):
-				x0 = int(round(float(x_pix[iy, ix])))
-				y0 = int(round(float(y_pix[iy, ix])))
-				x1 = int(round(float(x_pix[iy, ix + 1])))
-				y1 = int(round(float(y_pix[iy, ix + 1])))
-				if in_bounds(x0, y0) and in_bounds(x1, y1):
+				xp0 = int(round(float(x_pix[iy, ix])))
+				yp0 = int(round(float(y_pix[iy, ix])))
+				xp1 = int(round(float(x_pix[iy, ix + 1])))
+				yp1 = int(round(float(y_pix[iy, ix + 1])))
+				if in_bounds(xp0, yp0) and in_bounds(xp1, yp1):
 					ok = True
 					if mask_lr_cpu is not None:
 						ok = float(mask_lr_cpu[0, 0, iy, ix]) > 0.0 and float(mask_lr_cpu[0, 0, iy, ix + 1]) > 0.0
 					col = (0, 0, 255) if ok else (128, 128, 128)
-					cv2.line(bg, (x0, y0), (x1, y1), col, 1)
+					cv2.line(bg, (xp0, yp0), (xp1, yp1), col, 1)
 
 		mask_conn_cpu = None
 		if mask_conn is not None:
 			mask_conn_cpu = mask_conn.to(dtype=torch.float32, device="cpu")
 
-		if xy_conn is not None:
-			xy_conn_cpu = xy_conn.to(dtype=torch.float32, device="cpu")
-			xc = x0 + xy_conn_cpu[0, :, :, 2, 0].numpy() * sx
-			yc = y0 + xy_conn_cpu[0, :, :, 2, 1].numpy() * sy
-			xc_l = x0 + xy_conn_cpu[0, :, :, 0, 0].numpy() * sx
-			yc_l = y0 + xy_conn_cpu[0, :, :, 0, 1].numpy() * sy
-			for iy in range(gh):
-				for ix in range(gw - 1):
-					x0_lr = int(round(float(x_pix[iy, ix])))
-					y0_lr = int(round(float(y_pix[iy, ix])))
-					x1_lr = int(round(float(xc[iy, ix])))
-					y1_lr = int(round(float(yc[iy, ix])))
-					if in_bounds(x0_lr, y0_lr) and in_bounds(x1_lr, y1_lr):
-						ok = True
-						if mask_conn_cpu is not None:
-							ok = float(mask_conn_cpu[0, 0, iy, ix, 1]) > 0.0 and float(mask_conn_cpu[0, 0, iy, ix, 2]) > 0.0
-						col = (255, 255, 0) if ok else (128, 128, 128)
-						cv2.line(bg, (x0_lr, y0_lr), (x1_lr, y1_lr), col, 1)
-
-					x0_rl = int(round(float(x_pix[iy, ix + 1])))
-					y0_rl = int(round(float(y_pix[iy, ix + 1])))
-					x1_rl = int(round(float(xc_l[iy, ix + 1])))
-					y1_rl = int(round(float(yc_l[iy, ix + 1])))
-					if in_bounds(x0_rl, y0_rl) and in_bounds(x1_rl, y1_rl):
-						ok = True
-						if mask_conn_cpu is not None:
-							ok = float(mask_conn_cpu[0, 0, iy, ix + 1, 1]) > 0.0 and float(mask_conn_cpu[0, 0, iy, ix + 1, 0]) > 0.0
-						col = (0, 255, 255) if ok else (128, 128, 128)
-						cv2.line(bg, (x0_rl, y0_rl), (x1_rl, y1_rl), col, 1)
+		# if xy_conn is not None:
+		# 	xy_conn_cpu = xy_conn.to(dtype=torch.float32, device="cpu")
+		# 	xc = x_off + xy_conn_cpu[0, :, :, 2, 0].numpy() * sx
+		# 	yc = y_off + xy_conn_cpu[0, :, :, 2, 1].numpy() * sy
+		# 	xc_l = x_off + xy_conn_cpu[0, :, :, 0, 0].numpy() * sx
+		# 	yc_l = y_off + xy_conn_cpu[0, :, :, 0, 1].numpy() * sy
+		# 	for iy in range(gh):
+		# 		for ix in range(gw - 1):
+		# 			x0_lr = int(round(float(x_pix[iy, ix])))
+		# 			y0_lr = int(round(float(y_pix[iy, ix])))
+		# 			x1_lr = int(round(float(xc[iy, ix])))
+		# 			y1_lr = int(round(float(yc[iy, ix])))
+		# 			len_lr = ((x1_lr - x0_lr) ** 2 + (y1_lr - y0_lr) ** 2) ** 0.5
+		# 			print(f"conn_dbg R ({iy:02d},{ix:02d}) ({x0_lr},{y0_lr})->({x1_lr},{y1_lr}) len={len_lr:.2f}")
+		# 			if in_bounds(x0_lr, y0_lr) and in_bounds(x1_lr, y1_lr):
+		# 				ok = True
+		# 				if mask_conn_cpu is not None:
+		# 					ok = float(mask_conn_cpu[0, 0, iy, ix, 1]) > 0.0 and float(mask_conn_cpu[0, 0, iy, ix, 2]) > 0.0
+		# 				col = (255, 255, 0) if ok else (128, 128, 128)
+		# 				cv2.line(bg, (x0_lr, y0_lr), (x1_lr, y1_lr), col, 1)
+  #
+		# 			x0_rl = int(round(float(x_pix[iy, ix + 1])))
+		# 			y0_rl = int(round(float(y_pix[iy, ix + 1])))
+		# 			x1_rl = int(round(float(xc_l[iy, ix + 1])))
+		# 			y1_rl = int(round(float(yc_l[iy, ix + 1])))
+		# 			len_rl = ((x1_rl - x0_rl) ** 2 + (y1_rl - y0_rl) ** 2) ** 0.5
+		# 			print(f"conn_dbg L ({iy:02d},{ix+1:02d}) ({x0_rl},{y0_rl})->({x1_rl},{y1_rl}) len={len_rl:.2f}")
+		# 			if in_bounds(x0_rl, y0_rl) and in_bounds(x1_rl, y1_rl):
+		# 				ok = True
+		# 				if mask_conn_cpu is not None:
+		# 					ok = float(mask_conn_cpu[0, 0, iy, ix + 1, 1]) > 0.0 and float(mask_conn_cpu[0, 0, iy, ix + 1, 0]) > 0.0
+		# 				col = (0, 255, 255) if ok else (128, 128, 128)
+		# 				cv2.line(bg, (x0_rl, y0_rl), (x1_rl, y1_rl), col, 1)
 
 		for iy in range(gh - 1):
 			for ix in range(gw):
-				x0 = int(round(float(x_pix[iy, ix])))
-				y0 = int(round(float(y_pix[iy, ix])))
-				x1 = int(round(float(x_pix[iy + 1, ix])))
-				y1 = int(round(float(y_pix[iy + 1, ix])))
-				if in_bounds(x0, y0) and in_bounds(x1, y1):
+				xp0 = int(round(float(x_pix[iy, ix])))
+				yp0 = int(round(float(y_pix[iy, ix])))
+				xp1 = int(round(float(x_pix[iy + 1, ix])))
+				yp1 = int(round(float(y_pix[iy + 1, ix])))
+				if in_bounds(xp0, yp0) and in_bounds(xp1, yp1):
 					ok = True
 					if mask_lr_cpu is not None:
 						ok = float(mask_lr_cpu[0, 0, iy, ix]) > 0.0 and float(mask_lr_cpu[0, 0, iy + 1, ix]) > 0.0
 					col = (255, 0, 0) if ok else (128, 128, 128)
-					cv2.line(bg, (x0, y0), (x1, y1), col, 1)
+					cv2.line(bg, (xp0, yp0), (xp1, yp1), col, 1)
 
 		return bg
 
@@ -163,6 +167,22 @@ def save(
 
 	h_img, w_img = data.size
 	res = model(data)
+	# with torch.no_grad():
+	# 	xy = res.xy_conn[0].detach().cpu().numpy()
+	# 	gh, gw = xy.shape[0], xy.shape[1]
+	# 	print(f"xy_conn dbg: grid={gh}x{gw}")
+	# 	for iy in range(gh):
+	# 		for ix in range(gw):
+	# 			l = xy[iy, ix, 0]
+	# 			p = xy[iy, ix, 1]
+	# 			r = xy[iy, ix, 2]
+	# 			dl = float(((p[0] - l[0]) ** 2 + (p[1] - l[1]) ** 2) ** 0.5)
+	# 			dr = float(((r[0] - p[0]) ** 2 + (r[1] - p[1]) ** 2) ** 0.5)
+	# 			print(
+	# 				f"({iy:02d},{ix:02d}) p=({p[0]:.2f},{p[1]:.2f}) "
+	# 				f"l=({l[0]:.2f},{l[1]:.2f}) dl={dl:.2f} "
+	# 				f"r=({r[0]:.2f},{r[1]:.2f}) dr={dr:.2f}"
+	# 			)
 	grid_xy = res.xy_lr
 
 	grid_vis = _draw_grid_vis(
