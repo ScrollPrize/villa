@@ -2,6 +2,7 @@ import os.path as osp
 import os
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "109951162777600")
 import json
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -133,6 +134,9 @@ class CFG:
     # lr = 1e-4 / warmup_factor
     # lr = 1e-4 / warmup_factor
     lr = 2e-5
+    onecycle_pct_start = 0.15
+    onecycle_div_factor = 25.0
+    onecycle_final_div_factor = 1e2
     # ============== fold =============
     valid_id = '20230820203112'
     stitch_all_val = False
@@ -140,7 +144,7 @@ class CFG:
 
     # ============== group DRO cfg =============
     objective = "erm"  # "erm" | "group_dro"
-    sampler = "shuffle"  # "shuffle" | "group_balanced"
+    sampler = "shuffle"  # "shuffle" | "group_balanced" | "group_stratified"
     loss_mode = "batch"  # "batch" | "per_sample"
     save_every_epoch = False
     accumulate_grad_batches = 1
@@ -371,6 +375,9 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("scheduler", "scheduler"),
         ("warmup_factor", "warmup_factor"),
         ("lr", "lr"),
+        ("onecycle_pct_start", "onecycle_pct_start"),
+        ("onecycle_div_factor", "onecycle_div_factor"),
+        ("onecycle_final_div_factor", "onecycle_final_div_factor"),
         ("min_lr", "min_lr"),
         ("weight_decay", "weight_decay"),
         ("max_grad_norm", "max_grad_norm"),
@@ -1237,13 +1244,20 @@ class RegressionPLModel(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=CFG.lr,
-            pct_start=0.15,
+            pct_start=float(getattr(CFG, "onecycle_pct_start", 0.15)),
             steps_per_epoch=self.hparams.total_steps,
             epochs=CFG.epochs,
-            final_div_factor=1e2,
+            div_factor=float(getattr(CFG, "onecycle_div_factor", 25.0)),
+            final_div_factor=float(getattr(CFG, "onecycle_final_div_factor", 1e2)),
         )
         # scheduler = get_scheduler(CFG, optimizer)
-        return [optimizer],[scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
 
 
 
@@ -1707,6 +1721,11 @@ def main():
             drop_last=True,
         )
 
+    steps_per_epoch = len(train_loader)
+    accum = int(getattr(CFG, "accumulate_grad_batches", 1) or 1)
+    if accum > 1:
+        steps_per_epoch = int(math.ceil(steps_per_epoch / accum))
+
     model = RegressionPLModel(
         enc='i3d',
         size=CFG.size,
@@ -1720,7 +1739,7 @@ def main():
         group_dro_normalize_loss=group_dro_normalize_loss,
         group_dro_min_var_weight=group_dro_min_var_weight,
         group_dro_adj=group_dro_adj,
-        total_steps=len(train_loader),
+        total_steps=steps_per_epoch,
         n_groups=len(group_names),
         group_names=group_names,
         stitch_val_dataloader_idx=stitch_val_dataloader_idx,
