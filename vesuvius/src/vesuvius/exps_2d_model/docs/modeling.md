@@ -15,6 +15,20 @@ Notes:
 - When sampling with `grid_sample`, pixel coords must be converted to normalized coords `[-1,1]`.
 - Validity masks are derived directly from the `xy` tensor being used and are never resized/interpolated.
 
+## Mask correctness (critical)
+
+- Rule: **never interpolate/resize masks**. A mask is only valid for the exact samples it was derived from.
+- If you derive a quantity from *multiple* samples, the derived mask must reflect that:
+	- For a vector computed from two endpoints (e.g. `x1 - x0`), use `mask = min(mask(x0), mask(x1))`.
+	- For a 3-point connection `(left, mid, right)`, treat it as two segments:
+		- left-mid mask: `min(mask(left), mask(mid))`
+		- mid-right mask: `min(mask(mid), mask(right))`
+
+This is required for the direction loss implementation in [`opt_loss_dir.direction_loss_maps()`](../opt_loss_dir.py:1):
+
+- vertical supervision uses the min-mask across the two mesh vertices forming the v-edge
+- connection supervision returns two independent loss maps (left-mid & mid-right) with matching masks
+
 ## Direction encoding
 
 Given a direction vector `(gx,gy)` (e.g. a gradient direction), define `theta = atan2(gy,gx)`.
@@ -30,4 +44,4 @@ Equivalent formulas (avoids computing `theta` explicitly):
 - `sin(2*theta) = 2*gx*gy / (gx^2 + gy^2)`
 - `cos(2*theta + pi/4) = (cos(2*theta) - sin(2*theta)) / sqrt(2)`
 
-This matches `compute_frac_mag_dir()` (training) and the encoding used in [`opt_loss_dir.direction_loss_map()`](../opt_loss_dir.py:22).
+This matches `compute_frac_mag_dir()` (training) and the encoding used in [`opt_loss_dir.direction_loss_maps()`](../opt_loss_dir.py:1).
