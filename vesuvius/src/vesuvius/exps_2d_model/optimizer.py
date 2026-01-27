@@ -116,7 +116,7 @@ def optimize(
 		params: list[torch.nn.Parameter] = []
 		for name in stage.params:
 			group = all_params.get(name, [])
-			if name == "offset_ms":
+			if name in {"offset_ms", "mesh_offset_ms"}:
 				k0 = max(0, int(stage.min_scaledown))
 				params.extend(group[k0:])
 			else:
