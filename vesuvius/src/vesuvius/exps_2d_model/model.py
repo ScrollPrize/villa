@@ -213,7 +213,7 @@ class Model2D(nn.Module):
 	def mesh_offset_coarse(self) -> torch.Tensor:
 		off = self.mesh_offset_ms[-1]
 		for d in reversed(self.mesh_offset_ms[:-1]):
-			off = F.interpolate(off, size=(int(d.shape[2]), int(d.shape[3])), mode="bilinear", align_corners=True) + d
+			off = self._upsample2_crop(src=off, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
 		return off
 
 	def _xy_conn_px(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
@@ -276,8 +276,13 @@ class Model2D(nn.Module):
 	def offset_coarse(self) -> torch.Tensor:
 		off = self.offset_ms[-1]
 		for d in reversed(self.offset_ms[:-1]):
-			off = F.interpolate(off, size=(int(d.shape[2]), int(d.shape[3])), mode="bilinear", align_corners=True) + d
+			off = self._upsample2_crop(src=off, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
 		return off
+
+	@staticmethod
+	def _upsample2_crop(*, src: torch.Tensor, h_t: int, w_t: int) -> torch.Tensor:
+		up = F.interpolate(src, scale_factor=2.0, mode="bilinear", align_corners=True)
+		return up[:, :, :h_t, :w_t]
 
 	def _build_offset_ms(self, *, offset_scales: int, device: torch.device, gh0: int, gw0: int) -> list[nn.Parameter]:
 		gh0 = int(gh0)
@@ -286,8 +291,8 @@ class Model2D(nn.Module):
 		shapes: list[tuple[int, int]] = [(gh0, gw0)]
 		for _ in range(1, n_scales):
 			gh_prev, gw_prev = shapes[-1]
-			gh_i = max(2, (gh_prev - 1) // 2 + 1)
-			gw_i = max(2, (gw_prev - 1) // 2 + 1)
+			gh_i = max(2, gh_prev // 2 + 1)
+			gw_i = max(2, gw_prev // 2 + 1)
 			shapes.append((gh_i, gw_i))
 		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
 

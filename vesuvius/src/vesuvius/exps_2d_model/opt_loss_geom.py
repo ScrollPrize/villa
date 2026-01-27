@@ -176,42 +176,46 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 	return lm.mean()
 
 
+def _full_mean(lm: torch.Tensor) -> torch.Tensor:
+	return lm.mean()
+
+
 def smooth_x_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = smooth_x_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def smooth_y_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = smooth_y_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def meshoff_smooth_y_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = meshoff_smooth_y_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def conn_y_smooth_l_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = conn_y_smooth_l_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def conn_y_smooth_r_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = conn_y_smooth_r_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def angle_symmetry_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = angle_symmetry_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def y_straight_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = y_straight_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
 
 
 def angle_symmetry_loss_uv(*, res: fit_model.FitResult) -> torch.Tensor:
 	"""Same as `angle_symmetry_loss`, but averaged over both horizontal directions."""
 	lm, mask = angle_symmetry_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _full_mean(lm)
