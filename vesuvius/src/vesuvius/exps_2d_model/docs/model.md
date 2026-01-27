@@ -43,6 +43,7 @@ FitResult fields:
 
 - `xy_lr`: base mesh grid in normalized image coordinates as `(N,2,Hm,Wm)`.
 - `xy_hr`: evaluation grid (upsampled) in normalized image coordinates as `(N,2,He,We)`.
+- `xy_conn`: per-mesh connection positions in pixel coordinates as `(N,3,2,Hm,Wm)` with `[:,0]` left-connection, `[:,1]` point, `[:,2]` right-connection.
 - `data_s`: [`fit_data.FitData`](fit_data.py:12) sampled at `xy_hr`.
 - `mask`: validity mask `(N,1,He,We)` (1 inside `[-1,1]^2`, else 0).
 - `dir0_pred`, `dir1_pred`: predicted UNet-style direction encodings derived from `xy_lr`.
@@ -55,6 +56,21 @@ Rules:
 
 - Losses/visualization must consume FitResult and must not recompute model grids or resample FitData.
 - FitData does not depend on the model; it only provides a generic sampler for an `(N,2,H,W)` grid.
+
+## Line-offset modeling (mesh_offset)
+
+- The model has a learnable `mesh_offset` tensor on the base mesh: `(1,2,Hm,Wm)`.
+	- channel 0: vertical offset for the *left* connection
+	- channel 1: vertical offset for the *right* connection
+
+- Interpretation:
+	- For a base mesh point `(i,j)`, the left/right connection endpoint is in the neighboring column `j-1` / `j+1`, but vertically shifted by `mesh_offset[...,i,j]`.
+	- `0` means connect to the same-row neighbor.
+	- `+1` means connect to one row lower.
+	- `-1` means connect to one row higher.
+	- Fractional values are linearly interpolated along the vertical axis.
+
+- The pixel-space connection points are exposed via `FitResult.xy_conn`.
 
 ### Mapping: image → winding coordinates (via sampling)
 
