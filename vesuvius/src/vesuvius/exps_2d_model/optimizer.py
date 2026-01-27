@@ -13,13 +13,22 @@ import opt_loss_step
 
 
 @dataclass(frozen=True)
-class Stage:
-	name: str
+class OptSettings:
 	steps: int
 	lr: float
 	params: list[str]
 	min_scaledown: int
+	default_mul: float | None
+	w_fac: dict | None
 	eff: dict[str, float]
+
+
+@dataclass(frozen=True)
+class Stage:
+	name: str
+	grow: dict | None
+	global_opt: OptSettings
+	local_opt: OptSettings | None
 
 
 def _stage_to_modifiers(
@@ -59,6 +68,38 @@ def _need_term(name: str, stage_eff: dict[str, float]) -> float:
 	return float(stage_eff.get(name, 0.0))
 
 
+def _parse_opt_settings(
+	*,
+	stage_name: str,
+	opt_cfg: dict,
+	base: dict[str, float],
+	prev_eff: dict[str, float] | None,
+) -> OptSettings:
+	steps = max(0, int(opt_cfg.get("steps", 0)))
+	lr = float(opt_cfg.get("lr", 1e-3))
+	params = opt_cfg.get("params", [])
+	if not isinstance(params, list):
+		params = []
+	params = [str(p) for p in params]
+	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
+	default_mul = opt_cfg.get("default_mul", None)
+	w_fac = opt_cfg.get("w_fac", None)
+	if default_mul is not None:
+		default_mul = float(default_mul)
+	if w_fac is not None and not isinstance(w_fac, dict):
+		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object or null")
+	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
+	return OptSettings(
+		steps=steps,
+		lr=lr,
+		params=params,
+		min_scaledown=min_scaledown,
+		default_mul=default_mul,
+		w_fac=w_fac,
+		eff=eff,
+	)
+
+
 def load_stages(path: str) -> list[Stage]:
 	with open(path, "r", encoding="utf-8") as f:
 		cfg = json.load(f)
@@ -91,22 +132,32 @@ def load_stages(path: str) -> list[Stage]:
 		if not isinstance(s, dict):
 			raise ValueError("stages_json: each stage must be an object")
 		name = str(s.get("name", ""))
-		steps = max(0, int(s.get("steps", 0)))
-		lr = float(s.get("lr", 1e-3))
-		params = s.get("params", [])
-		if not isinstance(params, list):
-			params = []
-		params = [str(p) for p in params]
-		min_scaledown = max(0, int(s.get("min_scaledown", 0)))
-		default_mul = s.get("default_mul", None)
-		w_fac = s.get("w_fac", None)
-		if default_mul is not None:
-			default_mul = float(default_mul)
-		if w_fac is not None and not isinstance(w_fac, dict):
-			raise ValueError(f"stages_json: stage '{name}' field 'w_fac' must be an object or null")
-		eff, _mods = _stage_to_modifiers(lambda_global, prev_eff, default_mul, w_fac)
-		prev_eff = eff
-		out.append(Stage(name=name, steps=steps, lr=lr, params=params, min_scaledown=min_scaledown, eff=eff))
+		grow = s.get("grow", None)
+		if grow is not None and not isinstance(grow, dict):
+			raise ValueError(f"stages_json: stage '{name}' field 'grow' must be an object or null")
+
+		global_opt_cfg = s.get("global_opt", None)
+		local_opt_cfg = s.get("local_opt", None)
+		if global_opt_cfg is None and local_opt_cfg is None:
+			# Back-compat: treat the stage itself as global_opt.
+			global_opt_cfg = dict(s)
+			global_opt_cfg.pop("grow", None)
+			global_opt_cfg.pop("global_opt", None)
+			global_opt_cfg.pop("local_opt", None)
+			local_opt_cfg = None
+
+		if not isinstance(global_opt_cfg, dict):
+			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
+		if local_opt_cfg is not None and not isinstance(local_opt_cfg, dict):
+			raise ValueError(f"stages_json: stage '{name}' field 'local_opt' must be an object or null")
+
+		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=lambda_global, prev_eff=prev_eff)
+		prev_eff = global_opt.eff
+		local_opt = None
+		if local_opt_cfg is not None:
+			local_opt = _parse_opt_settings(stage_name=name, opt_cfg=local_opt_cfg, base=lambda_global, prev_eff=prev_eff)
+
+		out.append(Stage(name=name, grow=grow, global_opt=global_opt, local_opt=local_opt))
 	return out
 
 
@@ -118,28 +169,24 @@ def optimize(
 	snapshot_interval: int,
 	snapshot_fn,
 ) -> None:
-	snap_int = int(snapshot_interval)
-	if snap_int < 0:
-		snap_int = 0
-
-	for si, stage in enumerate(stages):
-		if stage.steps <= 0:
-			continue
+	def _run_opt(*, si: int, label: str, opt_cfg: OptSettings) -> None:
+		if opt_cfg.steps <= 0:
+			return
 
 		all_params = model.opt_params()
 		params: list[torch.nn.Parameter] = []
-		for name in stage.params:
+		for name in opt_cfg.params:
 			group = all_params.get(name, [])
 			if name in {"offset_ms", "mesh_offset_ms"}:
-				k0 = max(0, int(stage.min_scaledown))
+				k0 = max(0, int(opt_cfg.min_scaledown))
 				params.extend(group[k0:])
 			else:
 				params.extend(group)
 		if not params:
-			continue
-		opt = torch.optim.Adam(params, lr=stage.lr)
+			return
+		opt = torch.optim.Adam(params, lr=opt_cfg.lr)
 		mean_pos_xy = None
-		if _need_term("mean_pos", stage.eff) != 0.0:
+		if _need_term("mean_pos", opt_cfg.eff) != 0.0:
 			with torch.no_grad():
 				res_init = model(data)
 				mean_pos_xy = res_init.xy_lr.mean(dim=(0, 1, 2))
@@ -161,7 +208,7 @@ def optimize(
 			loss0 = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals0: dict[str, float] = {}
 			for name, t in terms.items():
-				w = _need_term(name, stage.eff)
+				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
 				loss_fn = t["loss"]
@@ -174,15 +221,15 @@ def optimize(
 					param_vals0[k] = float(vs[0].detach().cpu())
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
-			print(f"stage{si} step 0/{stage.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
-		snapshot_fn(stage=f"stage{si}", step=0, loss=float(loss0.detach().cpu()))
+			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
+		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()))
 
-		for step in range(stage.steps):
+		for step in range(opt_cfg.steps):
 			res = model(data)
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
 			for name, t in terms.items():
-				w = _need_term(name, stage.eff)
+				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
 				loss_fn = t["loss"]
@@ -194,16 +241,45 @@ def optimize(
 			opt.step()
 
 			step1 = step + 1
-			if step == 0 or step1 == stage.steps or (step1 % 100) == 0:
+			if step == 0 or step1 == opt_cfg.steps or (step1 % 100) == 0:
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
 						param_vals[k] = float(vs[0].detach().cpu())
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
-				print(f"stage{si} step {step1}/{stage.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
+				print(f"{label} step {step1}/{opt_cfg.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
-				snapshot_fn(stage=f"stage{si}", step=step1, loss=float(loss.detach().cpu()))
+				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()))
 
-		snapshot_fn(stage=f"stage{si}", step=stage.steps, loss=float(loss.detach().cpu()))
+		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()))
+
+	snap_int = int(snapshot_interval)
+	if snap_int < 0:
+		snap_int = 0
+
+	for si, stage in enumerate(stages):
+		_run_opt(si=si, label=f"stage{si}", opt_cfg=stage.global_opt)
+		if stage.grow is None:
+			continue
+		grow = stage.grow
+		directions = grow.get("directions", [])
+		if directions is None:
+			directions = []
+		if not isinstance(directions, list):
+			raise ValueError(f"stages_json: stage '{stage.name}' grow.directions must be a list")
+		generations = max(0, int(grow.get("generations", 0)))
+		grow_steps = max(0, int(grow.get("steps", 0)))
+		local_opt = stage.local_opt if stage.local_opt is not None else stage.global_opt
+		for gi in range(generations):
+			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
+			ins = getattr(model, "_last_grow_insert_lr", None)
+			if ins is None:
+				raise RuntimeError("grow: missing insertion rect")
+			py0, px0, ho, wo = ins
+			cm = torch.zeros(1, 1, int(model.mesh_h), int(model.mesh_w), device=data.cos.device, dtype=torch.float32)
+			cm[:, :, py0:py0 + ho, px0:px0 + wo] = 1.0
+			model.const_mask_lr = cm
+			_run_opt(si=si, label=f"stage{si}_grow{gi}", opt_cfg=local_opt)
+		model.const_mask_lr = None

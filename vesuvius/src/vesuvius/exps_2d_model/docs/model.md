@@ -60,6 +60,12 @@ Rules:
 - Losses/visualization must consume FitResult and must not recompute model grids or resample FitData.
 - FitData does not depend on the model; it only provides a pixel-space sampler.
 
+## Grow stages & const mask (local optimization)
+
+- A stage can optionally include a `grow` block (handled by the optimizer) that expands the mesh size by reallocating the parameter pyramids.
+- After `grow`, the optimizer can set a constant-mask on the model (see [`model.Model2D.const_mask_lr`](../model.py:1)) to keep the pre-existing mesh region fixed during local optimization.
+- When `const_mask_lr` is set, [`model.Model2D.forward()`](../model.py:131) computes the mesh twice (one `no_grad` pass + one grad pass) and merges the results so masked regions do not receive gradients.
+
 ## Line-offset modeling (mesh_offset)
 
 - The model has a learnable multi-scale `mesh_offset_ms` tensor (same scale-space handling as `offset_ms`).

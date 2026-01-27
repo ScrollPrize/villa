@@ -112,6 +112,8 @@ class Model2D(nn.Module):
 		self.mesh_offset_ms = nn.ParameterList(
 			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
+		self.const_mask_lr: torch.Tensor | None = None
+		self._last_grow_insert_lr: tuple[int, int, int, int] | None = None
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
@@ -132,8 +134,20 @@ class Model2D(nn.Module):
 		return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
 
 	def forward(self, data: fit_data.FitData) -> FitResult:
-		xy_lr = self._grid_xy()
-		xy_hr = self._grid_xy_subsampled()
+		if self.const_mask_lr is None:
+			xy_lr = self._grid_xy()
+		else:
+			m = self.const_mask_lr
+			if m.ndim != 4 or int(m.shape[1]) != 1:
+				raise ValueError("const_mask_lr must be (N,1,Hm,Wm)")
+			if m.shape[-2:] != (int(self.mesh_h), int(self.mesh_w)):
+				raise ValueError("const_mask_lr must match current mesh size")
+			with torch.no_grad():
+				xy_lr_ng = self._grid_xy()
+			xy_lr_g = self._grid_xy()
+			m4 = m.permute(0, 2, 3, 1).contiguous()
+			xy_lr = m4 * xy_lr_ng + (1.0 - m4) * xy_lr_g
+		xy_hr = self._grid_xy_subsampled_from_lr(xy_lr=xy_lr)
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
 		data_s = data.grid_sample_px(xy_px=xy_hr)
 		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
@@ -173,6 +187,87 @@ class Model2D(nn.Module):
 			"offset_ms": list(self.offset_ms),
 			"mesh_offset_ms": list(self.mesh_offset_ms),
 		}
+
+	def grow(self, *, directions: list[str], steps: int) -> None:
+		steps = max(0, int(steps))
+		if steps <= 0:
+			return
+
+		dirs = {str(d).strip().lower() for d in directions}
+		if not dirs:
+			dirs = {"left", "right", "up", "down"}
+		bad = dirs - {"left", "right", "up", "down"}
+		if bad:
+			raise ValueError(f"invalid grow direction(s): {sorted(bad)}")
+
+		add_up = steps if "up" in dirs else 0
+		add_dn = steps if "down" in dirs else 0
+		add_l = steps if "left" in dirs else 0
+		add_r = steps if "right" in dirs else 0
+
+		h0 = int(self.mesh_h)
+		w0 = int(self.mesh_w)
+		h1 = max(2, h0 + add_up + add_dn)
+		w1 = max(2, w0 + add_l + add_r)
+		if (h1, w1) == (h0, w0):
+			return
+
+		self.mesh_h = int(h1)
+		self.mesh_w = int(w1)
+		self.base_grid = self._build_base_grid().to(device=self.device)
+		self.offset_ms, ins = self._grow_param_pyramid(src=self.offset_ms, dirs=dirs, h0=h0, w0=w0)
+		self.mesh_offset_ms, _ins2 = self._grow_param_pyramid(src=self.mesh_offset_ms, dirs=dirs, h0=h0, w0=w0)
+		self._last_grow_insert_lr = ins
+		self.const_mask_lr = None
+
+	def _grow_param_pyramid(
+		self,
+		*,
+		src: nn.ParameterList,
+		dirs: set[str],
+		h0: int,
+		w0: int,
+	) -> tuple[nn.ParameterList, tuple[int, int, int, int]]:
+		n_scales = len(src)
+		if n_scales <= 0:
+			return nn.ParameterList([])
+
+		def _build_shapes(gh: int, gw: int) -> list[tuple[int, int]]:
+			shapes: list[tuple[int, int]] = [(int(gh), int(gw))]
+			for _ in range(1, n_scales):
+				gh_prev, gw_prev = shapes[-1]
+				gh_i = max(2, gh_prev // 2 + 1)
+				gw_i = max(2, gw_prev // 2 + 1)
+				shapes.append((gh_i, gw_i))
+			return shapes
+
+		old_shapes = _build_shapes(h0, w0)
+		new_shapes = _build_shapes(int(self.mesh_h), int(self.mesh_w))
+		out = nn.ParameterList()
+		insert0: tuple[int, int, int, int] | None = None
+		for i, (hn, wn) in enumerate(new_shapes):
+			o = src[i]
+			_, c, ho, wo = (int(v) for v in o.shape)
+			if (ho, wo) != old_shapes[i]:
+				raise RuntimeError("grow: unexpected pyramid shape mismatch")
+			n0 = torch.zeros(1, c, hn, wn, device=o.device, dtype=o.dtype)
+			dy = max(0, hn - ho)
+			dx = max(0, wn - wo)
+			if ("up" in dirs) and ("down" in dirs):
+				py0 = dy // 2
+			else:
+				py0 = dy if "up" in dirs else 0
+			if ("left" in dirs) and ("right" in dirs):
+				px0 = dx // 2
+			else:
+				px0 = dx if "left" in dirs else 0
+			n0[:, :, py0:py0 + ho, px0:px0 + wo] = o.data
+			if i == 0:
+				insert0 = (py0, px0, ho, wo)
+			out.append(nn.Parameter(n0))
+		if insert0 is None:
+			raise RuntimeError("grow: failed to compute insertion")
+		return out, insert0
 
 	def save_tiff(self, *, data: fit_data.FitData, path: str) -> None:
 		"""Save raw model tensors as tiff stacks.
@@ -305,12 +400,10 @@ class Model2D(nn.Module):
 		x, y = self._apply_global_transform(u, v)
 		return torch.stack([x[:, 0], y[:, 0]], dim=-1)
 
-	def _grid_xy_subsampled(self) -> torch.Tensor:
-		"""Return pixel xy (N,He,We,2), bilinear-upsampled to the subsampled eval grid."""
-		xy = self._grid_xy()
+	def _grid_xy_subsampled_from_lr(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
 		h = max(2, (self.mesh_h - 1) * self.subsample_mesh + 1)
 		w = max(2, (self.mesh_w - 1) * self.subsample_winding + 1)
-		xy_nchw = xy.permute(0, 3, 1, 2).contiguous()
+		xy_nchw = xy_lr.permute(0, 3, 1, 2).contiguous()
 		xy_nchw = F.interpolate(xy_nchw, size=(h, w), mode="bilinear", align_corners=True)
 		return xy_nchw.permute(0, 2, 3, 1).contiguous()
 
