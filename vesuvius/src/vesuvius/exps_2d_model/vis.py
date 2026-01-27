@@ -162,6 +162,12 @@ def save(
 ) -> None:
 	out = Path(out_dir)
 	out.mkdir(parents=True, exist_ok=True)
+	out_grids = out / "grids"
+	out_loss = out / "loss_maps"
+	out_tgt = out / "targets"
+	out_grids.mkdir(parents=True, exist_ok=True)
+	out_loss.mkdir(parents=True, exist_ok=True)
+	out_tgt.mkdir(parents=True, exist_ok=True)
 
 	h_img, w_img = data.size
 	res = model(data)
@@ -193,7 +199,7 @@ def save(
 		mask_lr=res.mask_lr,
 		mask_conn=res.mask_conn,
 	)
-	grid_path = out / f"res_grid_{postfix}.jpg"
+	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
 	dir_lm_v, dir_lm_conn_l, dir_lm_conn_r, _dir_mask_v, _dir_mask_conn_l, _dir_mask_conn_r = opt_loss_dir.direction_loss_maps(res=res)
@@ -284,11 +290,11 @@ def save(
 		m = spec["fn"]().detach().cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
 			m = m[0, 0]
-		out_path = out / f"res_loss_{spec['suffix']}_{postfix}.tif"
+		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
 		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
 
 	tgt = data.cos[0, 0].detach().cpu().numpy()
 	tgt_t = model.target_cos()
 	tgt = tgt_t[0, 0].detach().cpu().numpy()
-	tgt_path = out / f"res_tgt_{postfix}.tif"
+	tgt_path = out_tgt / f"res_tgt_{postfix}.tif"
 	tifffile.imwrite(str(tgt_path), tgt.astype("float32"), compression="lzw")
