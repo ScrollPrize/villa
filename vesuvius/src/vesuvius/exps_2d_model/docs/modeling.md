@@ -15,4 +15,4 @@ Equivalent formulas (avoids computing `theta` explicitly):
 - `sin(2*theta) = 2*gx*gy / (gx^2 + gy^2)`
 - `cos(2*theta + pi/4) = (cos(2*theta) - sin(2*theta)) / sqrt(2)`
 
-This matches `compute_frac_mag_dir()` (training) and [`model.Model2D.direction_encoding_from_xy()`](../model.py:121).
+This matches `compute_frac_mag_dir()` (training) and the encoding used in [`opt_loss_dir.direction_loss_map()`](../opt_loss_dir.py:22).
