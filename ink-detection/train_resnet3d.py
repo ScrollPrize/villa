@@ -52,6 +52,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset
 from group_dro import GroupDROComputer
+from samplers import GroupStratifiedBatchSampler
 from models.i3dallnl import InceptionI3d
 import torch.nn as nn
 import torch
@@ -1447,7 +1448,7 @@ def main():
 
     if CFG.objective not in {"erm", "group_dro"}:
         raise ValueError(f"Unknown training.objective: {CFG.objective!r}")
-    if CFG.sampler not in {"shuffle", "group_balanced"}:
+    if CFG.sampler not in {"shuffle", "group_balanced", "group_stratified"}:
         raise ValueError(f"Unknown training.sampler: {CFG.sampler!r}")
     if CFG.loss_mode not in {"batch", "per_sample"}:
         raise ValueError(f"Unknown training.loss_mode: {CFG.loss_mode!r}")
@@ -1671,21 +1672,40 @@ def main():
     if CFG.sampler == "shuffle":
         train_sampler = None
         train_shuffle = True
+        train_batch_sampler = None
     elif CFG.sampler == "group_balanced":
         group_weights = len(train_dataset) / group_counts.clamp_min(1)
         weights = group_weights[group_array]
         train_sampler = WeightedRandomSampler(weights, len(train_dataset), replacement=True)
         train_shuffle = False
+        train_batch_sampler = None
+    elif CFG.sampler == "group_stratified":
+        train_sampler = None
+        train_shuffle = False
+        train_batch_sampler = GroupStratifiedBatchSampler(
+            train_groups,
+            batch_size=CFG.train_batch_size,
+            seed=getattr(CFG, "seed", 0),
+            drop_last=True,
+        )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=CFG.train_batch_size,
-        shuffle=train_shuffle,
-        sampler=train_sampler,
-        num_workers=CFG.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    if train_batch_sampler is not None:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            num_workers=CFG.num_workers,
+            pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=CFG.train_batch_size,
+            shuffle=train_shuffle,
+            sampler=train_sampler,
+            num_workers=CFG.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
 
     model = RegressionPLModel(
         enc='i3d',
