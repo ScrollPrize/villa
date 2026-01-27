@@ -34,6 +34,28 @@ The fitting/optimization code should consume the model as a black box and not re
 
 ## What the model computes
 
+## FitResult (runtime contract)
+
+- The model is evaluated exactly once per optimization step via [`model.Model2D.forward()`](model.py:153).
+- It returns a [`model.FitResult`](model.py:21) that caches all derived tensors needed by losses/visualization.
+
+FitResult fields:
+
+- `xy_lr`: base mesh grid in normalized image coordinates as `(N,2,Hm,Wm)`.
+- `xy_hr`: evaluation grid (upsampled) in normalized image coordinates as `(N,2,He,We)`.
+- `data_s`: [`fit_data.FitData`](fit_data.py:12) sampled at `xy_hr`.
+- `mask`: validity mask `(N,1,He,We)` (1 inside `[-1,1]^2`, else 0).
+- `dir0_pred`, `dir1_pred`: predicted UNet-style direction encodings derived from `xy_lr`.
+
+Implementation note:
+
+- FitResult stores internal tensors as `_...` and exposes read-only properties.
+
+Rules:
+
+- Losses/visualization must consume FitResult and must not recompute model grids or resample FitData.
+- FitData does not depend on the model; it only provides a generic sampler for an `(N,2,H,W)` grid.
+
 ### Mapping: image → winding coordinates (via sampling)
 
 - The model attaches a **2D image position** to every mesh point.

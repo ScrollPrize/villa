@@ -17,6 +17,60 @@ class ModelInit:
 	winding_step_px: int
 
 
+@dataclass(frozen=True)
+class FitResult:
+	_xy_lr: torch.Tensor
+	_xy_hr: torch.Tensor
+	_data_s: fit_data.FitData
+	_mask: torch.Tensor
+	_dir0_pred: torch.Tensor
+	_dir1_pred: torch.Tensor
+	_h_img: int
+	_w_img: int
+	_mesh_step_px: int
+	_winding_step_px: int
+
+	@property
+	def xy_lr(self) -> torch.Tensor:
+		return self._xy_lr
+
+	@property
+	def xy_hr(self) -> torch.Tensor:
+		return self._xy_hr
+
+	@property
+	def data_s(self) -> fit_data.FitData:
+		return self._data_s
+
+	@property
+	def mask(self) -> torch.Tensor:
+		return self._mask
+
+	@property
+	def dir0_pred(self) -> torch.Tensor:
+		return self._dir0_pred
+
+	@property
+	def dir1_pred(self) -> torch.Tensor:
+		return self._dir1_pred
+
+	@property
+	def h_img(self) -> int:
+		return int(self._h_img)
+
+	@property
+	def w_img(self) -> int:
+		return int(self._w_img)
+
+	@property
+	def mesh_step_px(self) -> int:
+		return int(self._mesh_step_px)
+
+	@property
+	def winding_step_px(self) -> int:
+		return int(self._winding_step_px)
+
+
 
 class Model2D(nn.Module):
 	def __init__(
@@ -53,7 +107,20 @@ class Model2D(nn.Module):
 		if n <= 0 or h <= 0 or w <= 0:
 			raise ValueError(f"invalid shape: {shape}")
 
-		x, y = self.grid_xy()
+		xy_lr = torch.cat(self._grid_xy(), dim=1)
+		dir0, dir1 = self.direction_encoding_from_xy(xy_lr=xy_lr, shape=shape)
+		return dir0, dir1
+
+	@staticmethod
+	def direction_encoding_from_xy(*, xy_lr: torch.Tensor, shape: tuple[int, int, int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Return (dir0, dir1) predicted from a base-mesh xy grid."""
+		if xy_lr.ndim != 4 or int(xy_lr.shape[1]) != 2:
+			raise ValueError("xy_lr must be (N,2,H,W)")
+		n, _c, h, w = (int(v) for v in shape)
+		if n <= 0 or h <= 0 or w <= 0:
+			raise ValueError(f"invalid shape: {shape}")
+		x = xy_lr[:, 0:1]
+		y = xy_lr[:, 1:2]
 
 		# Direction is derived only from *vertical* mesh connections (v-edges).
 		dvx = x.new_zeros(x.shape)
@@ -82,6 +149,24 @@ class Model2D(nn.Module):
 			dir0 = dir0.expand(n, 1, h, w)
 			dir1 = dir1.expand(n, 1, h, w)
 		return dir0, dir1
+
+	def forward(self, data: fit_data.FitData) -> FitResult:
+		xy_lr = torch.cat(self._grid_xy(), dim=1)
+		xy_hr = torch.cat(self._grid_xy_subsampled(), dim=1)
+		data_s, mask = data.grid_sample_xy(xy=xy_hr)
+		dir0_pred, dir1_pred = self.direction_encoding_from_xy(xy_lr=xy_lr, shape=data_s.dir0.shape)
+		return FitResult(
+			_xy_lr=xy_lr,
+			_xy_hr=xy_hr,
+			_data_s=data_s,
+			_mask=mask,
+			_dir0_pred=dir0_pred,
+			_dir1_pred=dir1_pred,
+			_h_img=int(self.init.h_img),
+			_w_img=int(self.init.w_img),
+			_mesh_step_px=int(self.init.mesh_step_px),
+			_winding_step_px=int(self.init.winding_step_px),
+		)
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 		period = 4.0 / float(max(1, self.mesh_w - 1))
@@ -124,14 +209,14 @@ class Model2D(nn.Module):
 			shapes.append((gh_i, gw_i))
 		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
 
-	def grid_xy(self) -> tuple[torch.Tensor, torch.Tensor]:
+	def _grid_xy(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return globally transformed mesh coordinates."""
 		u, v = self.grid_uv()
 		return self._apply_global_transform(u, v)
 
-	def grid_xy_subsampled(self) -> tuple[torch.Tensor, torch.Tensor]:
+	def _grid_xy_subsampled(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return globally transformed mesh coordinates, bilinear-upsampled to the subsampled eval grid."""
-		x, y = self.grid_xy()
+		x, y = self._grid_xy()
 		h = max(2, (self.mesh_h - 1) * self.subsample_mesh + 1)
 		w = max(2, (self.mesh_w - 1) * self.subsample_winding + 1)
 		x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=True)

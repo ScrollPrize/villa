@@ -68,4 +68,6 @@ time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit_cosine_grid.py -
 
 time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit_cosine_grid.py --input res2 --layer 0 --output-prefix res_fit/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/default_stages.json --samples-per-period 1 --crop 2000 2500 1600 1600 --dbg
 
-python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/default_stages.json
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json

@@ -15,9 +15,10 @@ class FitData:
 	dir0: torch.Tensor
 	dir1: torch.Tensor
 
-	def grid_sample(self, *, model) -> tuple["FitData", torch.Tensor]:
-		x, y = model.grid_xy_subsampled()
-		grid = torch.stack([x.squeeze(1), y.squeeze(1)], dim=-1)
+	def grid_sample_xy(self, *, xy: torch.Tensor) -> tuple["FitData", torch.Tensor]:
+		if xy.ndim != 4 or int(xy.shape[1]) != 2:
+			raise ValueError("xy must be (N,2,H,W)")
+		grid = xy.permute(0, 2, 3, 1).contiguous()
 		inside = (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) & (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
 		mask = inside.to(dtype=torch.float32).unsqueeze(1)
 

@@ -125,10 +125,11 @@ def optimize(
 			continue
 		opt = torch.optim.Adam(params, lr=stage.lr)
 		terms = {
-			"dir_unet": {"loss": opt_loss_dir.direction_loss, "needs_data": True},
-			"step": {"loss": opt_loss_step.step_loss, "needs_data": False},
+			"dir_unet": {"loss": opt_loss_dir.direction_loss},
+			"step": {"loss": opt_loss_step.step_loss},
 		}
 		with torch.no_grad():
+			res0 = model(data)
 			loss0 = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals0: dict[str, float] = {}
 			for name, t in terms.items():
@@ -136,10 +137,7 @@ def optimize(
 				if w == 0.0:
 					continue
 				loss_fn = t["loss"]
-				if bool(t["needs_data"]):
-					lv = loss_fn(model=model, data=data)
-				else:
-					lv = loss_fn(model=model)
+				lv = loss_fn(res=res0)
 				term_vals0[name] = float(lv.detach().cpu())
 				loss0 = loss0 + w * lv
 			param_vals0: dict[str, float] = {}
@@ -150,6 +148,7 @@ def optimize(
 		snapshot_fn(stage=f"stage{si}", step=0, loss=float(loss0.detach().cpu()))
 
 		for step in range(stage.steps):
+			res = model(data)
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
 			for name, t in terms.items():
@@ -157,10 +156,7 @@ def optimize(
 				if w == 0.0:
 					continue
 				loss_fn = t["loss"]
-				if bool(t["needs_data"]):
-					lv = loss_fn(model=model, data=data)
-				else:
-					lv = loss_fn(model=model)
+				lv = loss_fn(res=res)
 				term_vals[name] = float(lv.detach().cpu())
 				loss = loss + w * lv
 			opt.zero_grad(set_to_none=True)
