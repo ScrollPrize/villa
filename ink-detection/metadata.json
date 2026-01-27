@@ -91,7 +91,7 @@
       "size": 256,
       "tile_size": 1024,
       "stride": 128,
-      "train_batch_size": 16,
+      "train_batch_size": 24,
       "valid_batch_size": 32,
       "use_amp": true,
       "epochs": 30,
@@ -102,8 +102,8 @@
       "weight_decay": 1e-06,
       "max_grad_norm": 100,
       "pretrained": true,
-      "num_workers": 16,
-      "layer_read_workers": 16,
+      "num_workers": 12,
+      "layer_read_workers": 12,
       "seed": 130697
     },
     "augmentation": {
