@@ -31,6 +31,8 @@ Notes:
 
 - Some terms may need stage-initialization context computed once (e.g. `mean_pos` captures the current mean position at stage start and penalizes drift).
 
+Optimizer stages can also optionally perform mesh growth + local optimization (see [`docs/model.md`](model.md:1)).
+
 ## 4) Add visualization output (loss map)
 
 - Import the new loss module in [`vis.py`](../vis.py:1).
