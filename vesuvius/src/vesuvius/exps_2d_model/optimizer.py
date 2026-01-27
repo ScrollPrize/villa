@@ -275,6 +275,9 @@ def optimize(
 		local_opt = stage.local_opt if stage.local_opt is not None else stage.global_opt
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
+			snapshot_fn(stage=f"stage{si}_grow{gi}", step=0, loss=0.0)
+			if local_opt.steps <= 0:
+				continue
 			ins = getattr(model, "_last_grow_insert_lr", None)
 			if ins is None:
 				raise RuntimeError("grow: missing insertion rect")
