@@ -970,10 +970,20 @@ class RegressionPLModel(pl.LightningModule):
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
         self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1039)
-        state_dict=torch.load('./r3d50_KM_200ep.pth')["state_dict"]
-        conv1_weight = state_dict['conv1.weight']
-        state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-        self.backbone.load_state_dict(state_dict,strict=False)
+        init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
+        if not init_ckpt_path:
+            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
+            if not osp.exists(backbone_pretrained_path):
+                raise FileNotFoundError(
+                    f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
+                    "Either place r3d50_KM_200ep.pth next to train_resnet3d.py, set CFG.backbone_pretrained_path, "
+                    "or pass --init_ckpt_path to fine-tune from a previous run."
+                )
+            backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
+            state_dict = backbone_ckpt.get("state_dict", backbone_ckpt)
+            conv1_weight = state_dict['conv1.weight']
+            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict, strict=False)
         # self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
         # self.backbone.load_state_dict(torch.load('./pretraining_i3d_epoch=3.pt'),strict=False)
         self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
@@ -1276,6 +1286,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata_json", type=str, default=None)
     parser.add_argument("--valid_id", type=str, default=None)
+    parser.add_argument("--init_ckpt_path", type=str, default=None)
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--entity", type=str, default=None)
     parser.add_argument("--wandb_group", type=str, default=None)
@@ -1300,7 +1311,7 @@ def main():
         "args "
         f"metadata_json={args.metadata_json!r} valid_id={args.valid_id!r} outputs_path={args.outputs_path!r} "
         f"devices={args.devices} accelerator={args.accelerator!r} precision={args.precision!r} "
-        f"run_name={args.run_name!r}"
+        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r}"
     )
     try:
         log(
@@ -1426,6 +1437,13 @@ def main():
 
     group_dro_cfg = merged_config.get("group_dro", {}) or {}
     group_key = group_dro_cfg.get("group_key", "base_path")
+
+    init_ckpt_path = args.init_ckpt_path or training_cfg.get("init_ckpt_path") or training_cfg.get("finetune_from")
+    if init_ckpt_path:
+        init_ckpt_path = osp.expanduser(str(init_ckpt_path))
+        if not osp.isabs(init_ckpt_path):
+            init_ckpt_path = osp.join(os.getcwd(), init_ckpt_path)
+    CFG.init_ckpt_path = init_ckpt_path
 
     if CFG.objective not in {"erm", "group_dro"}:
         raise ValueError(f"Unknown training.objective: {CFG.objective!r}")
@@ -1693,6 +1711,28 @@ def main():
         stitch_all_val_shapes=val_stitch_shapes,
         stitch_all_val_segment_ids=val_stitch_segment_ids,
     )
+    if init_ckpt_path:
+        log(f"loading init weights from {init_ckpt_path}")
+        ckpt = torch.load(init_ckpt_path, map_location="cpu")
+        if isinstance(ckpt, dict) and isinstance(ckpt.get("state_dict"), dict):
+            state_dict = ckpt["state_dict"]
+        elif isinstance(ckpt, dict) and isinstance(ckpt.get("model_state_dict"), dict):
+            state_dict = ckpt["model_state_dict"]
+        elif isinstance(ckpt, dict) and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            state_dict = ckpt
+        else:
+            raise ValueError(f"Unsupported checkpoint format for init_ckpt_path={init_ckpt_path!r}")
+
+        if state_dict and all(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+
+        incompat = model.load_state_dict(state_dict, strict=False)
+        try:
+            missing = len(incompat.missing_keys)
+            unexpected = len(incompat.unexpected_keys)
+            log(f"loaded init weights (missing_keys={missing}, unexpected_keys={unexpected})")
+        except Exception:
+            log("loaded init weights")
     try:
         wandb_logger.watch(model, log="all", log_freq=100)
     except Exception:

@@ -19,6 +19,12 @@ def main():
     parser.add_argument("--wandb_group", type=str, default=None)
     parser.add_argument("--outputs_path", type=str, default=None)
     parser.add_argument(
+        "--init_ckpt_path",
+        type=str,
+        default=None,
+        help="Optional checkpoint to initialize weights from (fine-tune). Passed to train_resnet3d.py.",
+    )
+    parser.add_argument(
         "--groups",
         type=str,
         default=None,
@@ -111,6 +117,8 @@ def main():
                 cmd += ["--wandb_group", str(args.wandb_group)]
             if args.outputs_path is not None:
                 cmd += ["--outputs_path", str(args.outputs_path)]
+            if args.init_ckpt_path is not None:
+                cmd += ["--init_ckpt_path", str(args.init_ckpt_path)]
             cmd += passthrough
 
             print("running:", " ".join(shlex.quote(c) for c in cmd))
