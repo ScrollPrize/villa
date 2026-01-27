@@ -1,7 +1,14 @@
 {
 	"base": {
 		"dir_unet": 1.0,
-		"step": 0.001
+		"step": 0.001,
+		"smooth_x": 1.0,
+		"smooth_y": 1.0,
+		"meshoff_sy": 1.0,
+		"conn_sy_l": 1.0,
+		"conn_sy_r": 1.0,
+		"angle": 1.0,
+		"y_straight": 1.0
 	},
 	"stages": [
 		{
