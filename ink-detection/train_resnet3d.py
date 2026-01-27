@@ -552,7 +552,11 @@ def read_image_mask(
     mask_base = f"train_scrolls/{fragment_id}/{fragment_id}_mask{mask_suffix}"
     fragment_mask = _read_gray(f"{mask_base}.png")
     if fragment_mask is None:
-        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png")
+        fragment_mask = _read_gray(f"{mask_base}.tiff")
+    if fragment_mask is None:
+        fragment_mask = _read_gray(f"{mask_base}.tif")
+    if fragment_mask is None:
+        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
     if fragment_id=='20230827161846':
         fragment_mask=cv2.flip(fragment_mask,0)
 
