@@ -47,6 +47,7 @@ FitResult fields:
 - `data_s`: [`fit_data.FitData`](fit_data.py:12) sampled at `xy_hr`.
 - `mask`: validity mask `(N,1,He,We)` (1 inside `[-1,1]^2`, else 0).
 - `dir0_pred`, `dir1_pred`: predicted UNet-style direction encodings derived from `xy_lr`.
+	- Direction encoding is documented in [`docs/modeling.md`](docs/modeling.md).
 
 Implementation note:
 
