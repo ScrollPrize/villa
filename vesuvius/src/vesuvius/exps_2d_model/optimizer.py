@@ -260,7 +260,8 @@ def optimize(
 		snap_int = 0
 
 	for si, stage in enumerate(stages):
-		_run_opt(si=si, label=f"stage{si}", opt_cfg=stage.global_opt)
+		if stage.global_opt.steps > 0:
+			_run_opt(si=si, label=f"stage{si}", opt_cfg=stage.global_opt)
 		if stage.grow is None:
 			continue
 		grow = stage.grow

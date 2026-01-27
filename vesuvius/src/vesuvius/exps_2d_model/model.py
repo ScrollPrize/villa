@@ -142,10 +142,13 @@ class Model2D(nn.Module):
 				raise ValueError("const_mask_lr must be (N,1,Hm,Wm)")
 			if m.shape[-2:] != (int(self.mesh_h), int(self.mesh_w)):
 				raise ValueError("const_mask_lr must match current mesh size")
+			if int(m.shape[0]) == 1 and int(data.cos.shape[0]) > 1:
+				m = m.expand(int(data.cos.shape[0]), 1, int(self.mesh_h), int(self.mesh_w))
+			m = m.detach().to(device=self.device)
 			with torch.no_grad():
 				xy_lr_ng = self._grid_xy()
 			xy_lr_g = self._grid_xy()
-			m4 = m.permute(0, 2, 3, 1).contiguous()
+			m4 = m.to(dtype=xy_lr_g.dtype).permute(0, 2, 3, 1).contiguous()
 			xy_lr = m4 * xy_lr_ng + (1.0 - m4) * xy_lr_g
 		xy_hr = self._grid_xy_subsampled_from_lr(xy_lr=xy_lr)
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
@@ -230,7 +233,7 @@ class Model2D(nn.Module):
 	) -> tuple[nn.ParameterList, tuple[int, int, int, int]]:
 		n_scales = len(src)
 		if n_scales <= 0:
-			return nn.ParameterList([])
+			return nn.ParameterList([]), (0, 0, 0, 0)
 
 		def _build_shapes(gh: int, gw: int) -> list[tuple[int, int]]:
 			shapes: list[tuple[int, int]] = [(int(gh), int(gw))]
