@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import torch
 
+import model as fit_model
 
-def step_loss_maps(*, model) -> tuple[torch.Tensor, torch.Tensor]:
+
+def step_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (step_h, step_v) squared penalties in pixel units.
 
 	- step_h: (1,1,H,W-1) for horizontal edges
 	- step_v: (1,1,H-1,W) for vertical edges
 	"""
-	x, y = model.grid_xy()
-	wi = float(max(2, int(model.init.w_img)) - 1)
-	hi = float(max(2, int(model.init.h_img)) - 1)
+	x = res.xy_lr[:, 0:1]
+	y = res.xy_lr[:, 1:2]
+	wi = float(max(2, int(res.w_img)) - 1)
+	hi = float(max(2, int(res.h_img)) - 1)
 	x = (x + 1.0) * (0.5 * wi)
 	y = (y + 1.0) * (0.5 * hi)
 
@@ -23,14 +26,14 @@ def step_loss_maps(*, model) -> tuple[torch.Tensor, torch.Tensor]:
 	dy_v = y[:, :, 1:, :] - y[:, :, :-1, :]
 	len_v = torch.sqrt(dx_v * dx_v + dy_v * dy_v + 1e-8)
 
-	t_h = float(model.init.winding_step_px)
-	t_v = float(model.init.mesh_step_px)
+	t_h = float(res.winding_step_px)
+	t_v = float(res.mesh_step_px)
 	step_h = (len_h - t_h) * (len_h - t_h)
 	step_v = (len_v - t_v) * (len_v - t_v)
 	return step_h, step_v
 
 
-def step_loss(*, model) -> torch.Tensor:
+def step_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	"""Penalize mesh edge lengths deviating from the configured pixel step sizes."""
-	step_h, step_v = step_loss_maps(model=model)
+	step_h, step_v = step_loss_maps(res=res)
 	return step_h.mean() + step_v.mean()

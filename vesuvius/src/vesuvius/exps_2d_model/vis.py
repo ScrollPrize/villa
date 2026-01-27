@@ -102,8 +102,8 @@ def save(
 	out.mkdir(parents=True, exist_ok=True)
 
 	h_img, w_img = data.size
-	xy = model.grid_xy()
-	grid_xy = torch.cat([xy[0], xy[1]], dim=1)
+	res = model(data)
+	grid_xy = res.xy_lr
 
 	grid_vis = _draw_grid_vis(
 		scale=scale,
@@ -117,17 +117,17 @@ def save(
 
 	loss_maps = {
 		"dir_unet": {
-			"fn": lambda: opt_loss_dir.direction_loss_map(model=model, data=data)[0],
+			"fn": lambda: opt_loss_dir.direction_loss_map(res=res)[0],
 			"suffix": "dir_unet",
 			"reduce": True,
 		},
 		"step_h": {
-			"fn": lambda: opt_loss_step.step_loss_maps(model=model)[0],
+			"fn": lambda: opt_loss_step.step_loss_maps(res=res)[0],
 			"suffix": "step_h",
 			"reduce": True,
 		},
 		"step_v": {
-			"fn": lambda: opt_loss_step.step_loss_maps(model=model)[1],
+			"fn": lambda: opt_loss_step.step_loss_maps(res=res)[1],
 			"suffix": "step_v",
 			"reduce": True,
 		},
