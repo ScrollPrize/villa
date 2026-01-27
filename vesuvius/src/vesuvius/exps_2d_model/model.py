@@ -79,6 +79,7 @@ class Model2D(nn.Module):
 		super().__init__()
 		self.init = init
 		self.device = device
+		# FIXME need better init ...
 		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))

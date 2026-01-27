@@ -7,7 +7,7 @@
 		{
 			"name": "stage0",
 			"steps": 1000,
-			"lr": 0.01,
+			"lr": 0.1,
 			"params": ["theta", "winding_scale", "phase"],
 			"w_fac": {
 			}
