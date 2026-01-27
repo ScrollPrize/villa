@@ -8,6 +8,7 @@ import torch
 import fit_data
 import opt_loss_dir
 import opt_loss_geom
+import opt_loss_gradmag
 import opt_loss_step
 
 
@@ -62,17 +63,18 @@ def load_stages(path: str) -> list[Stage]:
 	with open(path, "r", encoding="utf-8") as f:
 		cfg = json.load(f)
 
-	lambda_global: dict[str, float] = {
-		"dir_unet": 1.0,
-		"step": 0.0,
-		"smooth_x": 0.0,
-		"smooth_y": 0.0,
-		"meshoff_sy": 0.0,
-		"conn_sy_l": 0.0,
-		"conn_sy_r": 0.0,
-		"angle": 0.0,
-		"y_straight": 0.0,
-	}
+		lambda_global: dict[str, float] = {
+			"dir_unet": 1.0,
+			"step": 0.0,
+			"gradmag": 0.0,
+			"smooth_x": 0.0,
+			"smooth_y": 0.0,
+			"meshoff_sy": 0.0,
+			"conn_sy_l": 0.0,
+			"conn_sy_r": 0.0,
+			"angle": 0.0,
+			"y_straight": 0.0,
+		}
 	base_cfg = cfg.get("base", None)
 	if isinstance(base_cfg, dict):
 		for k, v in base_cfg.items():
@@ -138,6 +140,7 @@ def optimize(
 		terms = {
 			"dir_unet": {"loss": opt_loss_dir.direction_loss},
 			"step": {"loss": opt_loss_step.step_loss},
+			"gradmag": {"loss": opt_loss_gradmag.gradmag_period_loss},
 			"smooth_x": {"loss": opt_loss_geom.smooth_x_loss},
 			"smooth_y": {"loss": opt_loss_geom.smooth_y_loss},
 			"meshoff_sy": {"loss": opt_loss_geom.meshoff_smooth_y_loss},

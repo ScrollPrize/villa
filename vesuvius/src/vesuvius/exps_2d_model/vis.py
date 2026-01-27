@@ -10,6 +10,7 @@ import cv2
 import fit_data
 import opt_loss_dir
 import opt_loss_geom
+import opt_loss_gradmag
 import opt_loss_step
 
 
@@ -205,6 +206,7 @@ def save(
 	conn_sy_r_lm, _conn_sy_r_mask = opt_loss_geom.conn_y_smooth_r_loss_map(res=res)
 	angle_lm, _angle_mask = opt_loss_geom.angle_symmetry_loss_map(res=res)
 	y_straight_lm, _y_straight_mask = opt_loss_geom.y_straight_loss_map(res=res)
+	gradmag_lm, _gradmag_mask = opt_loss_gradmag.gradmag_period_loss_map(res=res)
 
 	loss_maps = {
 		"dir": {
@@ -235,6 +237,11 @@ def save(
 		"step_v": {
 			"fn": lambda: opt_loss_step.step_loss_maps(res=res)[1],
 			"suffix": "step_v",
+			"reduce": True,
+		},
+		"gradmag": {
+			"fn": lambda: gradmag_lm,
+			"suffix": "gradmag",
 			"reduce": True,
 		},
 		"smooth_x": {

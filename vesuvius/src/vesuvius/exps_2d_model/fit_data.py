@@ -14,6 +14,7 @@ class FitData:
 	grad_mag: torch.Tensor
 	dir0: torch.Tensor
 	dir1: torch.Tensor
+	downscale: float = 1.0
 
 	def grid_sample_px(self, *, xy_px: torch.Tensor) -> "FitData":
 		"""Sample using pixel xy positions.
@@ -36,7 +37,7 @@ class FitData:
 		mag_t = F.grid_sample(self.grad_mag, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir0_t = F.grid_sample(self.dir0, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir1_t = F.grid_sample(self.dir1, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-		return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t)
+		return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t, downscale=float(self.downscale))
 
 	@property
 	def size(self) -> tuple[int, int]:
@@ -113,9 +114,4 @@ def load(
 		dir0_t = F.interpolate(dir0_t, scale_factor=scale, mode="bilinear", align_corners=True)
 		dir1_t = F.interpolate(dir1_t, scale_factor=scale, mode="bilinear", align_corners=True)
 
-	return FitData(
-		cos=cos_t,
-		grad_mag=mag_t,
-		dir0=dir0_t,
-		dir1=dir1_t,
-	)
+	return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t, downscale=float(downscale) if downscale is not None else 1.0)
