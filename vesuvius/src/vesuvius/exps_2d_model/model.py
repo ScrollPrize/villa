@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
+from pathlib import Path
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+import tifffile
 
 import fit_data
 
@@ -168,6 +170,45 @@ class Model2D(nn.Module):
 			"offset_ms": list(self.offset_ms),
 			"mesh_offset_ms": list(self.mesh_offset_ms),
 		}
+
+	def save_tiff(self, *, data: fit_data.FitData, path: str) -> None:
+		"""Save raw model tensors as tiff stacks.
+
+	Writes multiple files:
+	- `<path>_xy_lr.tif`: (2,Hm,Wm)
+	- `<path>_xy_hr.tif`: (2,He,We)
+	- `<path>_xy_conn.tif`: (6,Hm,Wm) in order [l.x,l.y,p.x,p.y,r.x,r.y]
+	- `<path>_mask_lr.tif`: (1,Hm,Wm)
+	- `<path>_mask_hr.tif`: (1,He,We)
+	- `<path>_mask_conn.tif`: (3,Hm,Wm)
+	- `<path>_base_grid.tif`: (2,Hm,Wm)
+	- `<path>_offset.tif`: (2,Hm,Wm)
+	- `<path>_mesh_offset.tif`: (2,Hm,Wm)
+	"""
+		p = Path(path)
+		p.parent.mkdir(parents=True, exist_ok=True)
+		stem = p.with_suffix("")
+		with torch.no_grad():
+			res = self(data)
+			xy_lr = res.xy_lr[0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
+			xy_hr = res.xy_hr[0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
+			xy_conn = res.xy_conn[0].detach().cpu().to(dtype=torch.float32).numpy().reshape(xy_lr.shape[1], xy_lr.shape[2], 6).transpose(2, 0, 1)
+			mask_lr = res.mask_lr[0].detach().cpu().to(dtype=torch.float32).numpy()
+			mask_hr = res.mask_hr[0].detach().cpu().to(dtype=torch.float32).numpy()
+			mask_conn = res.mask_conn[0, 0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
+			base_grid = self.base_grid[0].detach().cpu().to(dtype=torch.float32).numpy()
+			off = self.offset_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
+			mesh_off = self.mesh_offset_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
+
+			tifffile.imwrite(str(stem) + "_xy_lr.tif", xy_lr, compression="lzw")
+			tifffile.imwrite(str(stem) + "_xy_hr.tif", xy_hr, compression="lzw")
+			tifffile.imwrite(str(stem) + "_xy_conn.tif", xy_conn, compression="lzw")
+			tifffile.imwrite(str(stem) + "_mask_lr.tif", mask_lr, compression="lzw")
+			tifffile.imwrite(str(stem) + "_mask_hr.tif", mask_hr, compression="lzw")
+			tifffile.imwrite(str(stem) + "_mask_conn.tif", mask_conn, compression="lzw")
+			tifffile.imwrite(str(stem) + "_base_grid.tif", base_grid, compression="lzw")
+			tifffile.imwrite(str(stem) + "_offset.tif", off, compression="lzw")
+			tifffile.imwrite(str(stem) + "_mesh_offset.tif", mesh_off, compression="lzw")
 
 	def mesh_offset_coarse(self) -> torch.Tensor:
 		off = self.mesh_offset_ms[-1]

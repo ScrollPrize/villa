@@ -32,6 +32,7 @@ def _dir_pred_v(*, xy_lr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def direction_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Return (lm_v_lr, lm_conn_lr, mask_lr) at base-mesh resolution."""
+	# print("src:",res.data_s.dir0.shape, "tgt",res.xy_lr.shape[1:3])
 	unet_dir0_lr = F.interpolate(res.data_s.dir0, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
 	unet_dir1_lr = F.interpolate(res.data_s.dir1, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
 	mask_lr = torch.minimum(res.mask_lr, res.mask_conn[..., 1])

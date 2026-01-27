@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
 	print("mesh:", mdl.mesh_h, mdl.mesh_w)
 
 	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
+	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_init.tif")
 	stages = optimizer.load_stages(opt_cfg.stages_json)
 	def _snapshot(*, stage: str, step: int, loss: float) -> None:
 		vis.save(
@@ -59,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 			out_dir=vis_cfg.out_dir,
 			scale=vis_cfg.scale,
 		)
+		mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_{stage}_{step:06d}.tif")
 
 	optimizer.optimize(
 		model=mdl,
@@ -68,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
 		snapshot_fn=_snapshot,
 	)
 	vis.save(model=mdl, data=data, postfix="final", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
+	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_final.tif")
 	return 0
 
 
