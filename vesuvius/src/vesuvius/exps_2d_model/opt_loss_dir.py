@@ -9,8 +9,8 @@ import model as fit_model
 def _dir_pred_v(*, xy_lr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 	# Vertical mesh edge vector (v-edge), then rotate by +90° to match the
 	# connection-supervised direction convention.
-	x = xy_lr[:, 0:1]
-	y = xy_lr[:, 1:2]
+	x = xy_lr[..., 0].unsqueeze(1)
+	y = xy_lr[..., 1].unsqueeze(1)
 	dvx = x.new_zeros(x.shape)
 	dvy = y.new_zeros(y.shape)
 	dvx[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
@@ -32,9 +32,9 @@ def _dir_pred_v(*, xy_lr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def direction_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Return (lm_v_lr, lm_conn_lr, mask_lr) at base-mesh resolution."""
-	unet_dir0_lr = F.interpolate(res.data_s.dir0, size=res.xy_lr.shape[-2:], mode="bilinear", align_corners=True)
-	unet_dir1_lr = F.interpolate(res.data_s.dir1, size=res.xy_lr.shape[-2:], mode="bilinear", align_corners=True)
-	mask_lr = F.interpolate(res.mask, size=res.xy_lr.shape[-2:], mode="nearest")
+	unet_dir0_lr = F.interpolate(res.data_s.dir0, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
+	unet_dir1_lr = F.interpolate(res.data_s.dir1, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
+	mask_lr = torch.minimum(res.mask_lr, res.mask_conn[..., 1])
 
 	dir0_v_lr, dir1_v_lr = _dir_pred_v(xy_lr=res.xy_lr)
 	diff0_v = dir0_v_lr - unet_dir0_lr
@@ -42,10 +42,10 @@ def direction_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torc
 	lm_v_lr = 0.5 * (diff0_v * diff0_v + diff1_v * diff1_v)
 
 	xy = res.xy_conn
-	left = xy[:, 0]
-	right = xy[:, 2]
-	dx = right[:, 0:1] - left[:, 0:1]
-	dy = right[:, 1:2] - left[:, 1:2]
+	left = xy[..., 0, :]
+	right = xy[..., 2, :]
+	dx = (right[..., 0] - left[..., 0]).unsqueeze(1)
+	dy = (right[..., 1] - left[..., 1]).unsqueeze(1)
 	eps = 1e-8
 	r2 = dx * dx + dy * dy + eps
 	cos2 = (dx * dx - dy * dy) / r2

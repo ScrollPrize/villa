@@ -23,7 +23,9 @@ class FitResult:
 	_xy_hr: torch.Tensor
 	_xy_conn: torch.Tensor
 	_data_s: fit_data.FitData
-	_mask: torch.Tensor
+	_mask_hr: torch.Tensor
+	_mask_lr: torch.Tensor
+	_mask_conn: torch.Tensor
 	_h_img: int
 	_w_img: int
 	_mesh_step_px: int
@@ -46,8 +48,16 @@ class FitResult:
 		return self._data_s
 
 	@property
-	def mask(self) -> torch.Tensor:
-		return self._mask
+	def mask_hr(self) -> torch.Tensor:
+		return self._mask_hr
+
+	@property
+	def mask_lr(self) -> torch.Tensor:
+		return self._mask_lr
+
+	@property
+	def mask_conn(self) -> torch.Tensor:
+		return self._mask_conn
 
 	@property
 	def h_img(self) -> int:
@@ -80,7 +90,7 @@ class Model2D(nn.Module):
 		self.init = init
 		self.device = device
 		# FIXME need better init ...
-		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
+		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
 
@@ -100,17 +110,38 @@ class Model2D(nn.Module):
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
+	def xy_img_validity_mask(self, *, xy: torch.Tensor) -> torch.Tensor:
+		"""Return a binary mask for pixel xy image positions.
+
+	`xy` must encode (x,y) in the last dimension (..,2) in pixel coords.
+	Output has shape `xy.shape[:-1]`.
+	"""
+		if xy.ndim < 1 or int(xy.shape[-1]) != 2:
+			raise ValueError("xy must have last dim == 2")
+		h = float(max(1, int(self.init.h_img) - 1))
+		w = float(max(1, int(self.init.w_img) - 1))
+		flat = xy.reshape(-1, 2)
+		x = flat[:, 0]
+		y = flat[:, 1]
+		inside = (x >= 0.0) & (x <= w) & (y >= 0.0) & (y <= h)
+		return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
+
 	def forward(self, data: fit_data.FitData) -> FitResult:
-		xy_lr = torch.cat(self._grid_xy(), dim=1)
-		xy_hr = torch.cat(self._grid_xy_subsampled(), dim=1)
+		xy_lr = self._grid_xy()
+		xy_hr = self._grid_xy_subsampled()
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
-		data_s, mask = data.grid_sample_xy(xy=xy_hr)
+		data_s = data.grid_sample_px(xy_px=xy_hr)
+		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
+		mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
+		mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
 			_xy_conn=xy_conn,
 			_data_s=data_s,
-			_mask=mask,
+			_mask_hr=mask_hr,
+			_mask_lr=mask_lr,
+			_mask_conn=mask_conn,
 			_h_img=int(self.init.h_img),
 			_w_img=int(self.init.w_img),
 			_mesh_step_px=int(self.init.mesh_step_px),
@@ -118,13 +149,15 @@ class Model2D(nn.Module):
 		)
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		period = 4.0 / float(max(1, self.mesh_w - 1))
+		period = (2.0 * float(max(1, int(self.init.w_img) - 1))) / float(max(1, self.mesh_w - 1))
 		phase = torch.remainder(self.phase + 0.5 * period, period) - 0.5 * period
 		u = self.winding_scale * u + phase
 		c = torch.cos(self.theta)
 		s = torch.sin(self.theta)
-		x = c * u - s * v
-		y = s * u + c * v
+		xc = 0.5 * float(max(1, int(self.init.w_img) - 1))
+		yc = 0.5 * float(max(1, int(self.init.h_img) - 1))
+		x = xc + c * (u - xc) - s * (v - yc)
+		y = yc + s * (u - xc) + c * (v - yc)
 		return x, y
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
@@ -150,22 +183,17 @@ class Model2D(nn.Module):
 		- the point itself
 		- right-connection interpolation result (to next column)
 
-		Shape: (N,3,2,Hm,Wm)
+		Shape: (N,Hm,Wm,3,2)
 		"""
-		if xy_lr.ndim != 4 or int(xy_lr.shape[1]) != 2:
-			raise ValueError("xy_lr must be (N,2,H,W)")
-		n, _c, hm, wm = (int(v) for v in xy_lr.shape)
+		if xy_lr.ndim != 4 or int(xy_lr.shape[-1]) != 2:
+			raise ValueError("xy_lr must be (N,H,W,2)")
+		n, hm, wm, _c2 = (int(v) for v in xy_lr.shape)
 		if hm <= 0 or wm <= 0:
 			raise ValueError("invalid xy_lr shape")
 		mesh_off = self.mesh_offset_coarse()
 		if mesh_off.shape[-2:] != (hm, wm):
 			raise RuntimeError("mesh_offset must be defined on the base mesh")
-
-		w = float(max(1, int(self.init.w_img) - 1))
-		h = float(max(1, int(self.init.h_img) - 1))
-		x_px = (xy_lr[:, 0:1] + 1.0) * 0.5 * w
-		y_px = (xy_lr[:, 1:2] + 1.0) * 0.5 * h
-		xy_px = torch.cat([x_px, y_px], dim=1)
+		xy_px = xy_lr.permute(0, 3, 1, 2).contiguous()
 
 		left_src = torch.cat([xy_px[:, :, :, 0:1], xy_px[:, :, :, :-1]], dim=3)
 		right_src = torch.cat([xy_px[:, :, :, 1:], xy_px[:, :, :, -1:]], dim=3)
@@ -174,7 +202,8 @@ class Model2D(nn.Module):
 		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
 		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
 		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
-		return torch.stack([left_conn, xy_px, right_conn], dim=1)
+		conn = torch.stack([left_conn, xy_px, right_conn], dim=1)
+		return conn.permute(0, 3, 4, 1, 2).contiguous()
 
 	@staticmethod
 	def _interp_col(*, src: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -198,7 +227,7 @@ class Model2D(nn.Module):
 		return v0 * (1.0 - t).view(n, 1, h, w) + v1 * t.view(n, 1, h, w)
 
 	def grid_uv(self) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Return base (u,v) mesh coordinates."""
+		"""Return base (u,v) mesh coordinates in pixel units."""
 		uv = self.base_grid + self.offset_coarse()
 		return uv[:, 0:1], uv[:, 1:2]
 
@@ -220,19 +249,20 @@ class Model2D(nn.Module):
 			shapes.append((gh_i, gw_i))
 		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
 
-	def _grid_xy(self) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Return globally transformed mesh coordinates."""
+	def _grid_xy(self) -> torch.Tensor:
+		"""Return globally transformed mesh coordinates in pixel xy (N,Hm,Wm,2)."""
 		u, v = self.grid_uv()
-		return self._apply_global_transform(u, v)
+		x, y = self._apply_global_transform(u, v)
+		return torch.stack([x[:, 0], y[:, 0]], dim=-1)
 
-	def _grid_xy_subsampled(self) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Return globally transformed mesh coordinates, bilinear-upsampled to the subsampled eval grid."""
-		x, y = self._grid_xy()
+	def _grid_xy_subsampled(self) -> torch.Tensor:
+		"""Return pixel xy (N,He,We,2), bilinear-upsampled to the subsampled eval grid."""
+		xy = self._grid_xy()
 		h = max(2, (self.mesh_h - 1) * self.subsample_mesh + 1)
 		w = max(2, (self.mesh_w - 1) * self.subsample_winding + 1)
-		x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=True)
-		y = F.interpolate(y, size=(h, w), mode="bilinear", align_corners=True)
-		return x, y
+		xy_nchw = xy.permute(0, 3, 1, 2).contiguous()
+		xy_nchw = F.interpolate(xy_nchw, size=(h, w), mode="bilinear", align_corners=True)
+		return xy_nchw.permute(0, 2, 3, 1).contiguous()
 
 	@classmethod
 	def from_fit_data(
@@ -260,10 +290,12 @@ class Model2D(nn.Module):
 		)
 
 	def _build_base_grid(self) -> torch.Tensor:
-		# Model domain is initialized to ~2x image extent in each dimension, so the
-		# canonical winding-space coordinates span [-2,2] (image spans [-1,1]).
-		u = torch.linspace(-2.0, 2.0, self.mesh_w, dtype=torch.float32)
-		v = torch.linspace(-2.0, 2.0, self.mesh_h, dtype=torch.float32)
+		# Model domain is initialized to ~2x image extent in each dimension.
+		# Internal coordinates are stored in pixel units.
+		w = float(max(1, int(self.init.w_img) - 1))
+		h = float(max(1, int(self.init.h_img) - 1))
+		u = torch.linspace(-0.5 * w, 1.5 * w, self.mesh_w, dtype=torch.float32)
+		v = torch.linspace(-0.5 * h, 1.5 * h, self.mesh_h, dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
 		return torch.stack([uu, vv], dim=0).unsqueeze(0)
 
@@ -285,10 +317,12 @@ class Model2D(nn.Module):
 		sub_m = max(1, sub_m)
 		h = max(2, (self.mesh_h - 1) * sub_m + 1)
 		w = max(2, (self.mesh_w - 1) * sub_w + 1)
-		us = torch.linspace(-1.0, 1.0, w, device=self.device, dtype=torch.float32)
-		vs = torch.linspace(-1.0, 1.0, h, device=self.device, dtype=torch.float32)
+		xd = float(max(1, int(self.init.w_img) - 1))
+		yd = float(max(1, int(self.init.h_img) - 1))
+		us = torch.linspace(0.0, xd, w, device=self.device, dtype=torch.float32)
+		vs = torch.linspace(0.0, yd, h, device=self.device, dtype=torch.float32)
 		vv, uu = torch.meshgrid(vs, us, indexing="ij")
 		u = uu.view(1, 1, h, w)
 
-		phase = 0.5 * torch.pi * (u + 1.0) * periods
+		phase = torch.pi * (u / xd) * periods
 		return 0.5 + 0.5 * torch.cos(phase)

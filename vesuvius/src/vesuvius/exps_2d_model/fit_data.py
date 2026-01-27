@@ -15,18 +15,28 @@ class FitData:
 	dir0: torch.Tensor
 	dir1: torch.Tensor
 
-	def grid_sample_xy(self, *, xy: torch.Tensor) -> tuple["FitData", torch.Tensor]:
-		if xy.ndim != 4 or int(xy.shape[1]) != 2:
-			raise ValueError("xy must be (N,2,H,W)")
-		grid = xy.permute(0, 2, 3, 1).contiguous()
-		inside = (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) & (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
-		mask = inside.to(dtype=torch.float32).unsqueeze(1)
+	def grid_sample_px(self, *, xy_px: torch.Tensor) -> "FitData":
+		"""Sample using pixel xy positions.
+
+		- `xy_px`: (N,H,W,2) with x in [0,W-1], y in [0,H-1].
+		- Internally converts to normalized coords for `grid_sample`.
+		"""
+		if xy_px.ndim != 4 or int(xy_px.shape[-1]) != 2:
+			raise ValueError("xy_px must be (N,H,W,2)")
+		n, h, w, _c2 = (int(v) for v in xy_px.shape)
+		h_img, w_img = self.size
+		hd = float(max(1, int(h_img) - 1))
+		wd = float(max(1, int(w_img) - 1))
+
+		grid = xy_px.clone()
+		grid[..., 0] = (xy_px[..., 0] / wd) * 2.0 - 1.0
+		grid[..., 1] = (xy_px[..., 1] / hd) * 2.0 - 1.0
 
 		cos_t = F.grid_sample(self.cos, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		mag_t = F.grid_sample(self.grad_mag, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir0_t = F.grid_sample(self.dir0, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir1_t = F.grid_sample(self.dir1, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-		return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t), mask
+		return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t)
 
 	@property
 	def size(self) -> tuple[int, int]:

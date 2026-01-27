@@ -30,7 +30,7 @@ The fitting/optimization code should consume the model as a black box and not re
 ### 2) Image coordinates (data domain)
 
 - The input is an image in 2D pixel space.
-- For sampling we use normalized image coordinates (e.g. as required by `grid_sample`).
+- All `xy` tensors use pixel coordinates (see [`docs/modeling.md`](docs/modeling.md)).
 
 ## What the model computes
 
@@ -41,11 +41,13 @@ The fitting/optimization code should consume the model as a black box and not re
 
 FitResult fields:
 
-	- `xy_lr`: base mesh grid in normalized image coordinates as `(N,2,Hm,Wm)`.
-	- `xy_hr`: evaluation grid (upsampled) in normalized image coordinates as `(N,2,He,We)`.
-	- `xy_conn`: per-mesh connection positions in pixel coordinates as `(N,3,2,Hm,Wm)` with `[:,0]` left-connection, `[:,1]` point, `[:,2]` right-connection.
+	- `xy_lr`: base mesh grid in pixel coordinates as `(N,Hm,Wm,2)`.
+	- `xy_hr`: evaluation grid (upsampled) in pixel coordinates as `(N,He,We,2)`.
+	- `xy_conn`: per-mesh connection positions in pixel coordinates as `(N,Hm,Wm,3,2)` with `[...,0,:]` left-connection, `[...,1,:]` point, `[...,2,:]` right-connection.
 	- `data_s`: [`fit_data.FitData`](fit_data.py:12) sampled at `xy_hr`.
-	- `mask`: validity mask `(N,1,He,We)` (1 inside `[-1,1]^2`, else 0).
+	- `mask_hr`: validity mask for `xy_hr` `(N,1,He,We)`.
+	- `mask_lr`: validity mask for `xy_lr` `(N,1,Hm,Wm)`.
+	- `mask_conn`: validity mask for `xy_conn` `(N,1,Hm,Wm,3)`.
 
 	Direction encoding is documented in [`docs/modeling.md`](docs/modeling.md).
 
@@ -56,7 +58,7 @@ Implementation note:
 Rules:
 
 - Losses/visualization must consume FitResult and must not recompute model grids or resample FitData.
-- FitData does not depend on the model; it only provides a generic sampler for an `(N,2,H,W)` grid.
+- FitData does not depend on the model; it only provides a pixel-space sampler.
 
 ## Line-offset modeling (mesh_offset)
 
@@ -120,7 +122,7 @@ The model should provide:
 
 Losses and visualization code should be able to request these at a consistent resolution (or request resampled versions).
 
-## Initialization (planned API)
+## Initialization
 
 Model init is driven by:
 
@@ -130,10 +132,10 @@ Model init is driven by:
 
 Initialization rules:
 
-- The model initializes its winding-space domain to cover **~2× the image extent** at the assumed steps.
+	- The model initializes its winding-space domain to cover **~2× the image extent** at the assumed steps.
 	- This gives headroom above/below and left/right.
 	- Cropping/expansion utilities will be added later.
-	- Canonical winding-space coordinates span [-2,2] (image spans [-1,1]).
+	- Canonical winding-space coordinates span about `[-0.5*W, 1.5*W]` and `[-0.5*H, 1.5*H]` in pixels.
 
 ## Current data contract (FitData)
 
