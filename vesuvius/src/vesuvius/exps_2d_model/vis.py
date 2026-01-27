@@ -84,8 +84,8 @@ def _draw_grid_vis(
 						ok = float(mask_lr_cpu[0, 0, iy, ix]) > 0.0
 					col = (0, 255, 0) if ok else (128, 128, 128)
 					cv2.circle(bg, (px, py), 1, col, -1)
-					label = f"{int(round(float(xy_lr_cpu[0, iy, ix, 0])))}:{int(round(float(xy_lr_cpu[0, iy, ix, 1])))}"
-					cv2.putText(bg, label, (px + 2, py + 2), cv2.FONT_HERSHEY_PLAIN, 0.6, (255, 255, 255), 1)
+					# label = f"{int(round(float(xy_lr_cpu[0, iy, ix, 0])))}:{int(round(float(xy_lr_cpu[0, iy, ix, 1])))}"
+					# cv2.putText(bg, label, (px + 2, py + 2), cv2.FONT_HERSHEY_PLAIN, 0.6, (255, 255, 255), 1)
 
 		for iy in range(gh):
 			for ix in range(gw - 1):
@@ -194,32 +194,27 @@ def save(
 	grid_path = out / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
+	dir_lm_v, dir_lm_conn_l, dir_lm_conn_r, _dir_mask_v, _dir_mask_conn_l, _dir_mask_conn_r = opt_loss_dir.direction_loss_maps(res=res)
+	dir_lm = 0.5 * (dir_lm_v + 0.5 * (dir_lm_conn_l + dir_lm_conn_r))
+
 	loss_maps = {
 		"dir": {
-			"fn": lambda: 0.5
-			* (
-				opt_loss_dir.direction_loss_maps(res=res)[0]
-				+ 0.5
-				* (
-					opt_loss_dir.direction_loss_maps(res=res)[1]
-					+ opt_loss_dir.direction_loss_maps(res=res)[2]
-				)
-			),
+			"fn": lambda: dir_lm,
 			"suffix": "dir",
 			"reduce": True,
 		},
 		"dir_v": {
-			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[0],
+			"fn": lambda: dir_lm_v,
 			"suffix": "dir_v",
 			"reduce": True,
 		},
 		"dir_conn_l": {
-			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[1],
+			"fn": lambda: dir_lm_conn_l,
 			"suffix": "dir_conn_l",
 			"reduce": True,
 		},
 		"dir_conn_r": {
-			"fn": lambda: opt_loss_dir.direction_loss_maps(res=res)[2],
+			"fn": lambda: dir_lm_conn_r,
 			"suffix": "dir_conn_r",
 			"reduce": True,
 		},
