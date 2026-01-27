@@ -27,6 +27,10 @@ The term name string must match the stage config key.
 
 - Add the term to the `base` map in [`stages_scalespace.json`](../stages_scalespace.json:1).
 
+Notes:
+
+- Some terms may need stage-initialization context computed once (e.g. `mean_pos` captures the current mean position at stage start and penalizes drift).
+
 ## 4) Add visualization output (loss map)
 
 - Import the new loss module in [`vis.py`](../vis.py:1).
@@ -37,4 +41,3 @@ The term name string must match the stage config key.
 
 - Run a syntax check:
 	- `python -m py_compile <changed_files>`
-
