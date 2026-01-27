@@ -42,6 +42,10 @@ def _draw_grid_vis(
 		w_vis = int(w_img * sf)
 
 		bg = np.zeros((h_vis, w_vis, 3), dtype="uint8")
+		x0 = 0
+		y0 = 0
+		w_im = w_vis
+		h_im = h_vis
 		if background is not None:
 			img_np = background[0, 0].detach().cpu().numpy()
 			img_u8 = _to_uint8(img_np)
@@ -54,8 +58,12 @@ def _draw_grid_vis(
 			bg[y0:y0 + h_im, x0:x0 + w_im, :] = img_resized
 
 		xy_lr_cpu = xy_lr.to(dtype=torch.float32, device="cpu")
-		x_pix = xy_lr_cpu[0, :, :, 0].numpy() * float(sf)
-		y_pix = xy_lr_cpu[0, :, :, 1].numpy() * float(sf)
+		wx = float(max(1, int(w_img) - 1))
+		hy = float(max(1, int(h_img) - 1))
+		sx = float(max(1, int(w_im) - 1)) / wx
+		sy = float(max(1, int(h_im) - 1)) / hy
+		x_pix = x0 + xy_lr_cpu[0, :, :, 0].numpy() * sx
+		y_pix = y0 + xy_lr_cpu[0, :, :, 1].numpy() * sy
 
 		gh, gw = x_pix.shape
 
@@ -98,10 +106,10 @@ def _draw_grid_vis(
 
 		if xy_conn is not None:
 			xy_conn_cpu = xy_conn.to(dtype=torch.float32, device="cpu")
-			xc = xy_conn_cpu[0, :, :, 2, 0].numpy() * float(sf)
-			yc = xy_conn_cpu[0, :, :, 2, 1].numpy() * float(sf)
-			xc_l = xy_conn_cpu[0, :, :, 0, 0].numpy() * float(sf)
-			yc_l = xy_conn_cpu[0, :, :, 0, 1].numpy() * float(sf)
+			xc = x0 + xy_conn_cpu[0, :, :, 2, 0].numpy() * sx
+			yc = y0 + xy_conn_cpu[0, :, :, 2, 1].numpy() * sy
+			xc_l = x0 + xy_conn_cpu[0, :, :, 0, 0].numpy() * sx
+			yc_l = y0 + xy_conn_cpu[0, :, :, 0, 1].numpy() * sy
 			for iy in range(gh):
 				for ix in range(gw - 1):
 					x0_lr = int(round(float(x_pix[iy, ix])))
