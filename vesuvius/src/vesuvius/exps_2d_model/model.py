@@ -21,6 +21,7 @@ class ModelInit:
 class FitResult:
 	_xy_lr: torch.Tensor
 	_xy_hr: torch.Tensor
+	_xy_conn: torch.Tensor
 	_data_s: fit_data.FitData
 	_mask: torch.Tensor
 	_dir0_pred: torch.Tensor
@@ -37,6 +38,10 @@ class FitResult:
 	@property
 	def xy_hr(self) -> torch.Tensor:
 		return self._xy_hr
+
+	@property
+	def xy_conn(self) -> torch.Tensor:
+		return self._xy_conn
 
 	@property
 	def data_s(self) -> fit_data.FitData:
@@ -98,6 +103,7 @@ class Model2D(nn.Module):
 		self.offset_ms = nn.ParameterList(
 			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
+		self.mesh_offset = nn.Parameter(torch.zeros(1, 2, self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
@@ -153,11 +159,13 @@ class Model2D(nn.Module):
 	def forward(self, data: fit_data.FitData) -> FitResult:
 		xy_lr = torch.cat(self._grid_xy(), dim=1)
 		xy_hr = torch.cat(self._grid_xy_subsampled(), dim=1)
+		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
 		data_s, mask = data.grid_sample_xy(xy=xy_hr)
 		dir0_pred, dir1_pred = self.direction_encoding_from_xy(xy_lr=xy_lr, shape=data_s.dir0.shape)
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
+			_xy_conn=xy_conn,
 			_data_s=data_s,
 			_mask=mask,
 			_dir0_pred=dir0_pred,
@@ -184,7 +192,62 @@ class Model2D(nn.Module):
 			"phase": [self.phase],
 			"winding_scale": [self.winding_scale],
 			"offset_ms": list(self.offset_ms),
+			"mesh_offset": [self.mesh_offset],
 		}
+
+	def _xy_conn_px(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
+		"""Return per-mesh connection positions in pixel coordinates.
+
+		For each base-mesh point, returns 3 pixel positions:
+		- left-connection interpolation result (to previous column)
+		- the point itself
+		- right-connection interpolation result (to next column)
+
+		Shape: (N,3,2,Hm,Wm)
+		"""
+		if xy_lr.ndim != 4 or int(xy_lr.shape[1]) != 2:
+			raise ValueError("xy_lr must be (N,2,H,W)")
+		n, _c, hm, wm = (int(v) for v in xy_lr.shape)
+		if hm <= 0 or wm <= 0:
+			raise ValueError("invalid xy_lr shape")
+		if self.mesh_offset.shape[-2:] != (hm, wm):
+			raise RuntimeError("mesh_offset must be defined on the base mesh")
+
+		w = float(max(1, int(self.init.w_img) - 1))
+		h = float(max(1, int(self.init.h_img) - 1))
+		x_px = (xy_lr[:, 0:1] + 1.0) * 0.5 * w
+		y_px = (xy_lr[:, 1:2] + 1.0) * 0.5 * h
+		xy_px = torch.cat([x_px, y_px], dim=1)
+
+		left_src = torch.cat([xy_px[:, :, :, 0:1], xy_px[:, :, :, :-1]], dim=3)
+		right_src = torch.cat([xy_px[:, :, :, 1:], xy_px[:, :, :, -1:]], dim=3)
+		off_l = self.mesh_offset[:, 0]
+		off_r = self.mesh_offset[:, 1]
+		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
+		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
+		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
+		return torch.stack([left_conn, xy_px, right_conn], dim=1)
+
+	@staticmethod
+	def _interp_col(*, src: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+		"""Interpolate `src` along height dimension at (possibly fractional) indices `y`.
+
+		src: (N,2,H,W)
+		y: (N,H,W)
+		"""
+		n, c, h, w = (int(v) for v in src.shape)
+		if y.shape != (n, h, w):
+			raise ValueError("y must be (N,H,W)")
+		y0 = torch.floor(y)
+		y1 = y0 + 1.0
+		t = (y - y0).clamp(0.0, 1.0)
+		y0i = y0.clamp(0.0, float(h - 1)).to(dtype=torch.int64)
+		y1i = y1.clamp(0.0, float(h - 1)).to(dtype=torch.int64)
+		idx0 = y0i.view(n, 1, h, w).expand(n, c, h, w)
+		idx1 = y1i.view(n, 1, h, w).expand(n, c, h, w)
+		v0 = torch.take_along_dim(src, idx0, dim=2)
+		v1 = torch.take_along_dim(src, idx1, dim=2)
+		return v0 * (1.0 - t).view(n, 1, h, w) + v1 * t.view(n, 1, h, w)
 
 	def grid_uv(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return base (u,v) mesh coordinates."""
