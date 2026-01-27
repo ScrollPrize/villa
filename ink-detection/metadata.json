@@ -81,12 +81,14 @@
   },
   "training_hyperparameters": {
     "model": {
-      "model_name": "Unet",
-      "backbone": "resnet3d",
-      "in_chans": 62,
-      "encoder_depth": 5,
-      "target_size": 1
-    },
+    "model_name": "Unet",
+    "backbone": "resnet3d",
+    "in_chans": 62,
+    "encoder_depth": 5,
+    "norm": "batch",
+    "group_norm_groups": 32,
+    "target_size": 1
+  },
     "training": {
       "size": 256,
       "tile_size": 1024,

@@ -116,6 +116,8 @@ class CFG:
     backbone='resnet3d'
     in_chans = 30 # 65
     encoder_depth=5
+    norm = "batch"  # "batch" | "group"
+    group_norm_groups = 32
     # ============== training cfg =============
     size = 256
     tile_size = 256
@@ -359,9 +361,14 @@ def apply_metadata_hyperparameters(cfg, metadata):
     train_hp = hp.get("training", {})
     training_cfg = metadata.get("training", {}) or {}
 
-    for k in ["model_name", "backbone", "encoder_depth", "target_size", "in_chans"]:
+    for k in ["model_name", "backbone", "encoder_depth", "target_size", "in_chans", "norm", "group_norm_groups"]:
         if k in model_hp:
-            setattr(cfg, k, model_hp[k])
+            if k == "norm":
+                setattr(cfg, "norm", str(model_hp[k]).lower())
+            elif k == "group_norm_groups":
+                setattr(cfg, "group_norm_groups", int(model_hp[k]))
+            else:
+                setattr(cfg, k, model_hp[k])
 
     for k, attr in [
         ("size", "size"),
@@ -855,13 +862,51 @@ class CustomDatasetTest(Dataset):
 def init_weights(m):
     if isinstance(m, nn.Conv2d):
         nn.init.kaiming_normal_(m, mode='fan_out', nonlinearity='relu')
+
+
+def _pick_group_norm_groups(num_channels: int, desired_groups: int) -> int:
+    num_channels = int(num_channels)
+    desired_groups = int(desired_groups)
+    if num_channels <= 0:
+        raise ValueError(f"num_channels must be > 0, got {num_channels}")
+    desired_groups = max(1, min(desired_groups, num_channels))
+    for g in range(desired_groups, 0, -1):
+        if num_channels % g == 0:
+            return g
+    return 1
+
+
+def replace_batchnorm_with_groupnorm(module: nn.Module, *, desired_groups: int = 32) -> nn.Module:
+    for name, child in list(module.named_children()):
+        if isinstance(child, (nn.BatchNorm2d, nn.BatchNorm3d)):
+            num_channels = int(child.num_features)
+            groups = _pick_group_norm_groups(num_channels, desired_groups)
+            gn = nn.GroupNorm(num_groups=groups, num_channels=num_channels, affine=True)
+            if getattr(child, "affine", False):
+                with torch.no_grad():
+                    gn.weight.copy_(child.weight)
+                    gn.bias.copy_(child.bias)
+            setattr(module, name, gn)
+        else:
+            replace_batchnorm_with_groupnorm(child, desired_groups=desired_groups)
+    return module
 class Decoder(nn.Module):
-    def __init__(self, encoder_dims, upscale):
+    def __init__(self, encoder_dims, upscale, *, norm="batch", group_norm_groups=32):
         super().__init__()
+        norm = str(norm).lower()
+        if norm not in {"batch", "group"}:
+            raise ValueError(f"Unknown norm: {norm!r}")
+
+        def _norm2d(num_channels: int) -> nn.Module:
+            if norm == "group":
+                groups = _pick_group_norm_groups(num_channels, int(group_norm_groups))
+                return nn.GroupNorm(num_groups=groups, num_channels=int(num_channels))
+            return nn.BatchNorm2d(int(num_channels))
+
         self.convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(encoder_dims[i]+encoder_dims[i-1], encoder_dims[i-1], 3, 1, 1, bias=False),
-                nn.BatchNorm2d(encoder_dims[i-1]),
+                _norm2d(encoder_dims[i-1]),
                 nn.ReLU(inplace=True)
             ) for i in range(1, len(encoder_dims))])
 
@@ -906,6 +951,8 @@ class RegressionPLModel(pl.LightningModule):
         stitch_downsample=1,
         stitch_all_val_shapes=None,
         stitch_all_val_segment_ids=None,
+        norm="batch",
+        group_norm_groups=32,
     ):
         super(RegressionPLModel, self).__init__()
 
@@ -978,6 +1025,8 @@ class RegressionPLModel(pl.LightningModule):
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
         self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1039)
+        norm = str(norm).lower()
+        group_norm_groups = int(group_norm_groups)
         init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
         if not init_ckpt_path:
             backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
@@ -994,10 +1043,25 @@ class RegressionPLModel(pl.LightningModule):
             self.backbone.load_state_dict(state_dict, strict=False)
         # self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
         # self.backbone.load_state_dict(torch.load('./pretraining_i3d_epoch=3.pt'),strict=False)
-        self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
+        if norm == "group":
+            replace_batchnorm_with_groupnorm(self.backbone, desired_groups=group_norm_groups)
+
+        was_training = self.backbone.training
+        try:
+            self.backbone.eval()
+            with torch.no_grad():
+                encoder_dims = [x.size(1) for x in self.backbone(torch.rand(1, 1, 20, 256, 256))]
+        finally:
+            if was_training:
+                self.backbone.train()
+
+        self.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
 
         if self.hparams.with_norm:
-            self.normalization=nn.BatchNorm3d(num_features=1)
+            if norm == "group":
+                self.normalization = nn.GroupNorm(num_groups=1, num_channels=1)
+            else:
+                self.normalization = nn.BatchNorm3d(num_features=1)
 
 
 
@@ -1760,6 +1824,8 @@ def main():
     model = RegressionPLModel(
         enc='i3d',
         size=CFG.size,
+        norm=getattr(CFG, "norm", "batch"),
+        group_norm_groups=int(getattr(CFG, "group_norm_groups", 32)),
         objective=CFG.objective,
         loss_mode=CFG.loss_mode,
         robust_step_size=robust_step_size,
