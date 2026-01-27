@@ -1302,6 +1302,12 @@ def parse_args():
     parser.add_argument("--metadata_json", type=str, default=None)
     parser.add_argument("--valid_id", type=str, default=None)
     parser.add_argument("--init_ckpt_path", type=str, default=None)
+    parser.add_argument(
+        "--resume_from_ckpt",
+        type=str,
+        default=None,
+        help="Resume training state (model/optimizer/scheduler/epoch) from a PyTorch Lightning .ckpt.",
+    )
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--entity", type=str, default=None)
     parser.add_argument("--wandb_group", type=str, default=None)
@@ -1326,7 +1332,7 @@ def main():
         "args "
         f"metadata_json={args.metadata_json!r} valid_id={args.valid_id!r} outputs_path={args.outputs_path!r} "
         f"devices={args.devices} accelerator={args.accelerator!r} precision={args.precision!r} "
-        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r}"
+        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} resume_from_ckpt={args.resume_from_ckpt!r}"
     )
     try:
         log(
@@ -1460,6 +1466,17 @@ def main():
             init_ckpt_path = osp.join(os.getcwd(), init_ckpt_path)
     CFG.init_ckpt_path = init_ckpt_path
 
+    resume_ckpt_path = args.resume_from_ckpt or training_cfg.get("resume_from_ckpt") or training_cfg.get("resume_ckpt_path")
+    if resume_ckpt_path:
+        resume_ckpt_path = osp.expanduser(str(resume_ckpt_path))
+        if not osp.isabs(resume_ckpt_path):
+            resume_ckpt_path = osp.join(os.getcwd(), resume_ckpt_path)
+        if not osp.exists(resume_ckpt_path):
+            raise FileNotFoundError(f"resume_from_ckpt not found: {resume_ckpt_path}")
+
+    if resume_ckpt_path and init_ckpt_path:
+        log("resume_from_ckpt is set; init_ckpt_path will be ignored (resume restores model weights).")
+
     if CFG.objective not in {"erm", "group_dro"}:
         raise ValueError(f"Unknown training.objective: {CFG.objective!r}")
     if CFG.sampler not in {"shuffle", "group_balanced", "group_stratified"}:
@@ -1509,7 +1526,21 @@ def main():
 
     run_slug = args.run_name or f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_stitch={CFG.valid_id}"
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    run_dir = osp.join(CFG.outputs_path, "runs", f"{slugify(run_slug)}_{run_id}")
+    run_dir = None
+
+    if resume_ckpt_path and args.outputs_path is None:
+        # Resume in-place if resuming from one of our checkpoints:
+        #   .../runs/<run>/checkpoints/<file>.ckpt
+        ckpt_dir = osp.dirname(resume_ckpt_path)
+        if osp.basename(ckpt_dir) == "checkpoints":
+            inferred_run_dir = osp.dirname(ckpt_dir)
+            if osp.isdir(inferred_run_dir):
+                run_dir = inferred_run_dir
+                run_slug = args.run_name or osp.basename(run_dir)
+                run_id = "resume"
+
+    if run_dir is None:
+        run_dir = osp.join(CFG.outputs_path, "runs", f"{slugify(run_slug)}_{run_id}")
     log(f"run_dir={run_dir}")
 
     try:
@@ -1815,7 +1846,7 @@ def main():
         ),
     )
     log("starting trainer.fit")
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loaders)
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loaders, ckpt_path=resume_ckpt_path)
     wandb.finish()
 
 

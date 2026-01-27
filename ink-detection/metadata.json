@@ -24,8 +24,8 @@
       ],
       "reverse_layers": false
     },
-    "l2_0": {
-      "original_path": "0139_columns/l2_0",
+    "l2_0_crop": {
+      "original_path": "0139_segments/2um/l2_0_crop",
       "base_path": "0139",
       "layer_range": [
         1,
@@ -74,7 +74,7 @@
       "base_path": "9b",
       "layer_range": [
         1,
-        63
+        108
       ],
       "reverse_layers": false
     }
@@ -91,10 +91,10 @@
       "size": 256,
       "tile_size": 1024,
       "stride": 128,
-      "train_batch_size": 4,
-      "valid_batch_size": 4,
+      "train_batch_size": 16,
+      "valid_batch_size": 32,
       "use_amp": true,
-      "epochs": 20,
+      "epochs": 30,
       "scheduler": "GradualWarmupSchedulerV2",
       "warmup_factor": 10,
       "lr": 1e-05,
@@ -103,7 +103,7 @@
       "max_grad_norm": 100,
       "pretrained": true,
       "num_workers": 16,
-      "layer_read_workers": 8,
+      "layer_read_workers": 16,
       "seed": 130697
     },
     "augmentation": {
@@ -137,7 +137,7 @@
     "save_every_epoch": true,
     "train_segments": [
       "20250806145318",
-      "l2_0",
+      "l2_0_crop",
       "658",
       "500p2a",
       "-1",
@@ -145,14 +145,14 @@
       "20250919125754-auto_grown_20250919055754487_inp_hr"
     ],
     "val_segments": [
+      "20250807020208",
       "20250806145318",
-      "l2_0",
+      "l2_0_crop",
       "658",
       "500p2a",
       "-1",
       "20250910185200",
-      "20250919125754-auto_grown_20250919055754487_inp_hr",
-      "20250807020208"
+      "20250919125754-auto_grown_20250919055754487_inp_hr"
     ]
   },
   "group_dro": {
