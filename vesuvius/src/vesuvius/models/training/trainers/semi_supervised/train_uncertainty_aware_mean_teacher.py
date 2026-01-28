@@ -22,8 +22,26 @@ def softmax_mse_loss(input_logits, target_logits):
     input_softmax = F.softmax(input_logits, dim=1)
     target_softmax = F.softmax(target_logits, dim=1)
     mse_loss = (input_softmax - target_softmax) ** 2
-    
+
     return mse_loss
+
+
+def prob_mse_loss(student_logits, target_probs):
+    """MSE loss between student softmax and target probabilities.
+
+    Use this when the target is already softmax probabilities (e.g., from
+    ensemble aggregation) rather than raw logits.
+
+    Args:
+        student_logits: Raw logits from student model [B, C, ...]
+        target_probs: Softmax probabilities from teacher [B, C, ...]
+
+    Returns:
+        Element-wise squared differences [B, C, ...]
+    """
+    assert student_logits.size() == target_probs.size()
+    student_softmax = F.softmax(student_logits, dim=1)
+    return (student_softmax - target_probs) ** 2
 
 
 class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
@@ -37,15 +55,25 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         self.uncertainty_threshold_end = getattr(mgr, 'uncertainty_threshold_end', 1.0)
         self.uncertainty_T = getattr(mgr, 'uncertainty_T', 4)  # Number of stochastic forward passes
 
-        # Validate uncertainty_T is even (required for paired forward passes)
-        if self.uncertainty_T % 2 != 0:
-            old_T = self.uncertainty_T
-            self.uncertainty_T = self.uncertainty_T - 1
-            if self.uncertainty_T < 2:
-                self.uncertainty_T = 2
-            print(f"Warning: uncertainty_T={old_T} is odd. Adjusted to {self.uncertainty_T} for paired forward passes.")
+        # Validate minimum uncertainty_T
+        if self.uncertainty_T < 2:
+            print(f"Warning: uncertainty_T={self.uncertainty_T} is less than 2. Setting to minimum of 2.")
+            self.uncertainty_T = 2
 
         self.noise_scale = getattr(mgr, 'noise_scale', 0.1)  # Noise scale for stochastic augmentation
+
+        # Ensemble model configuration for multi-model uncertainty estimation
+        self.ensemble_model_paths = getattr(mgr, 'ensemble_model_paths', []) or []
+        self.ensemble_aggregation = getattr(mgr, 'ensemble_aggregation', 'max_confidence')
+        self.ensemble_models = []
+
+        # Validate ensemble_aggregation
+        valid_aggregations = ('max_confidence', 'average')
+        if self.ensemble_aggregation not in valid_aggregations:
+            print(f"Warning: Unknown ensemble_aggregation '{self.ensemble_aggregation}'. "
+                  f"Using 'max_confidence'. Valid options: {valid_aggregations}")
+            self.ensemble_aggregation = 'max_confidence'
+
         self.labeled_batch_size = getattr(mgr, 'labeled_batch_size', mgr.train_batch_size // 2)
         
         # Semi-supervised data split parameters
@@ -75,7 +103,65 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         
         ema_model.eval()
         return ema_model
-    
+
+    def _load_ensemble_models(self):
+        """Load additional pre-trained models for ensemble uncertainty estimation.
+
+        Uses the same load_checkpoint pattern as the main model loading,
+        but only loads model weights (not optimizer/scheduler state).
+        Each ensemble model is frozen and set to eval mode.
+
+        Returns:
+            List of loaded models, empty if no paths configured or all fail to load.
+        """
+        from vesuvius.models.utilities.load_checkpoint import load_checkpoint
+        from vesuvius.models.training.lr_schedulers import get_scheduler
+
+        ensemble_models = []
+
+        for path in self.ensemble_model_paths:
+            try:
+                print(f"Loading ensemble model from: {path}")
+
+                # Build a fresh model with the same architecture
+                model = self._build_model()
+                model = model.to(self.device)
+
+                # Create dummy optimizer/scheduler (required by load_checkpoint signature)
+                dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+                dummy_scheduler = get_scheduler(
+                    scheduler_type='poly',
+                    optimizer=dummy_optimizer,
+                    initial_lr=0.01,
+                    max_steps=100
+                )
+
+                # Load weights only
+                model, _, _, _, loaded = load_checkpoint(
+                    checkpoint_path=path,
+                    model=model,
+                    optimizer=dummy_optimizer,
+                    scheduler=dummy_scheduler,
+                    mgr=self.mgr,
+                    device=self.device,
+                    load_weights_only=True
+                )
+
+                if loaded:
+                    # Set to eval mode and freeze all parameters
+                    model.eval()
+                    for param in model.parameters():
+                        param.requires_grad = False
+                    ensemble_models.append(model)
+                    print(f"  Successfully loaded ensemble model ({len(model.state_dict())} tensors)")
+                else:
+                    print(f"  Warning: Failed to load ensemble model from {path}")
+
+            except Exception as e:
+                print(f"  Error loading ensemble model from {path}: {e}")
+
+        return ensemble_models
+
     def _update_ema_variables(self, model, ema_model, alpha, global_step):
         alpha = min(1 - 1 / (global_step + 1), alpha)
         for ema_param, param in zip(ema_model.parameters(), model.parameters()):
@@ -97,6 +183,45 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # For z-score data with std~1, this gives ~0.2 matching original behavior
         bound = 2.0 * self.noise_scale * max(input_std.item(), 0.1)
         return bound
+
+    def _get_first_task_key(self, outputs):
+        """Extract the first task key from model outputs, skipping '_inputs'."""
+        for key in outputs.keys():
+            if key != '_inputs':
+                return key
+        raise ValueError("No task outputs found in model outputs")
+
+    def _aggregate_max_confidence(self, all_preds):
+        """Aggregate predictions by taking max-confidence prediction per voxel.
+
+        For each voxel, selects the prediction from whichever model has the
+        highest max-class probability (i.e., most confident prediction).
+
+        Args:
+            all_preds: [num_passes, B, num_classes, ...] tensor of softmax predictions
+
+        Returns:
+            [B, num_classes, ...] tensor where each voxel has the prediction from
+            the most confident model (highest max probability across classes)
+        """
+        # all_preds: [T, B, C, D, H, W] or [T, B, C, H, W]
+
+        # Get max probability per voxel per model: [T, B, 1, ...]
+        max_probs, _ = all_preds.max(dim=2, keepdim=True)  # max across classes
+
+        # Find which model has highest confidence at each voxel: [1, B, 1, ...]
+        _, best_model_idx = max_probs.max(dim=0, keepdim=True)  # max across models
+
+        # Expand best_model_idx to match all_preds shape for gather
+        # From [1, B, 1, ...] to [1, B, C, ...]
+        expand_shape = list(all_preds.shape)
+        expand_shape[0] = 1
+        best_model_idx = best_model_idx.expand(*expand_shape)
+
+        # Gather predictions from best model at each voxel
+        aggregated = torch.gather(all_preds, dim=0, index=best_model_idx).squeeze(0)
+
+        return aggregated
 
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
         """
@@ -133,7 +258,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         if not used_fast_path:
             raise ValueError(
                 "Dataset does not support fast labeled/unlabeled split. "
-                "Use DatasetOrchestrator with data_format='image' (adapter='image') or implement "
+                "Use ZarrDataset or implement "
                 "get_labeled_unlabeled_patch_indices() on your dataset."
             )
 
@@ -255,50 +380,68 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         return inputs, targets_dict, outputs
     
     def _compute_uncertainty(self, unlabeled_inputs, autocast_ctx):
-        """Compute uncertainty using multiple stochastic forward passes"""
+        """Compute uncertainty using ensemble of models with configurable aggregation.
+
+        Pass distribution for T total passes:
+        - min(len(ensemble_models), T) passes: one with each additional pre-trained model
+        - Remaining passes: EMA teacher model
+
+        Aggregation strategy (configurable via ensemble_aggregation):
+        - 'max_confidence': For each voxel, take prediction from most confident model
+        - 'average': Average all predictions (original behavior)
+        """
         batch_size = unlabeled_inputs.shape[0]
         T = self.uncertainty_T
-        
-        volume_batch_r = unlabeled_inputs.repeat(2, 1, 1, 1, 1)
-        stride = volume_batch_r.shape[0] // 2
-        
-        # Get number of output channels (assuming single task or first task)
+        num_ensemble = len(self.ensemble_models)
+
+        # Calculate pass distribution
+        # Up to num_ensemble for additional models, rest for EMA
+        ensemble_passes = min(num_ensemble, T)  # Don't exceed T
+        ema_passes = max(0, T - num_ensemble)
+
+        # Get number of output channels
         num_classes = self.mgr.out_channels[0] if isinstance(self.mgr.out_channels, tuple) else self.mgr.out_channels
-        
-        if unlabeled_inputs.dim() == 5:  # 3D case: [B, C, D, H, W]
-            _, c, d, h, w = unlabeled_inputs.shape
-            preds = torch.zeros([stride * T, num_classes, d, h, w]).to(self.device)
-        else:  # 2D case: [B, C, H, W]
-            _, c, h, w = unlabeled_inputs.shape
-            preds = torch.zeros([stride * T, num_classes, h, w]).to(self.device)
-        
-        noise_bound = self._get_noise_bounds(volume_batch_r)
+
+        noise_bound = self._get_noise_bounds(unlabeled_inputs)
+
+        # Collect all predictions: list of [B, num_classes, ...] tensors
+        all_preds = []
+
         with torch.no_grad():
-            for i in range(T // 2):
+            # 1. Ensemble model passes (no noise - these are frozen pre-trained models)
+            for i, ensemble_model in enumerate(self.ensemble_models[:ensemble_passes]):
+                with autocast_ctx:
+                    ensemble_outputs = ensemble_model(unlabeled_inputs)
+                    first_task = self._get_first_task_key(ensemble_outputs)
+                    ensemble_pred = F.softmax(ensemble_outputs[first_task], dim=1)
+                    all_preds.append(ensemble_pred)
+
+            # 2. EMA teacher passes with noise (fills remaining T - num_ensemble passes)
+            for i in range(ema_passes):
                 noise = torch.clamp(
-                    torch.randn_like(volume_batch_r) * self.noise_scale,
+                    torch.randn_like(unlabeled_inputs) * self.noise_scale,
                     -noise_bound, noise_bound
                 )
-                ema_inputs = volume_batch_r + noise
+                ema_inputs = unlabeled_inputs + noise
                 with autocast_ctx:
                     ema_outputs = self.ema_model(ema_inputs)
-                    # Extract the first task's output from the dictionary
-                    first_task = list(ema_outputs.keys())[0]
-                    if first_task == '_inputs':
-                        first_task = list(ema_outputs.keys())[1] if len(ema_outputs.keys()) > 1 else list(ema_outputs.keys())[0]
-                    preds[2 * stride * i:2 * stride * (i + 1)] = ema_outputs[first_task]
-        
-        preds = F.softmax(preds, dim=1)
-        if unlabeled_inputs.dim() == 5:
-            preds = preds.reshape(T, stride, num_classes, d, h, w)
+                    first_task = self._get_first_task_key(ema_outputs)
+                    ema_pred = F.softmax(ema_outputs[first_task], dim=1)
+                    all_preds.append(ema_pred)
+
+        # Stack all predictions: [num_passes, B, num_classes, ...]
+        all_preds = torch.stack(all_preds, dim=0)
+
+        # Aggregation based on configured strategy
+        if self.ensemble_aggregation == 'max_confidence':
+            mean_pred = self._aggregate_max_confidence(all_preds)
         else:
-            preds = preds.reshape(T, stride, num_classes, h, w)
-        
-        mean_pred = torch.mean(preds, dim=0)  # [stride, num_classes, ...]
-        
+            # Backward compatible: average predictions
+            mean_pred = torch.mean(all_preds, dim=0)
+
         # Compute entropy as uncertainty measure
         uncertainty = -1.0 * torch.sum(mean_pred * torch.log(mean_pred + 1e-6), dim=1, keepdim=True)
-        
+
         return uncertainty, mean_pred
     
     def _compute_train_loss(self, outputs, targets_dict, loss_fns, autocast_ctx=None):
@@ -346,29 +489,23 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             from contextlib import nullcontext
             autocast_ctx = nullcontext()
         
+        # Compute uncertainty and get ensemble-aggregated predictions as pseudo-labels
+        # mean_pred combines predictions from:
+        # - Frozen pre-trained ensemble models (clean inputs, authoritative)
+        # - EMA teacher (noised inputs for diversity)
         uncertainty, mean_pred = self._compute_uncertainty(unlabeled_inputs, autocast_ctx)
-        
-        noise_bound = self._get_noise_bounds(unlabeled_inputs)
-        with torch.no_grad():
-            noise = torch.clamp(
-                torch.randn_like(unlabeled_inputs) * self.noise_scale,
-                -noise_bound, noise_bound
-            )
-            teacher_inputs = unlabeled_inputs + noise
-            with autocast_ctx:
-                teacher_outputs = self.ema_model(teacher_inputs)
-        
+
         first_task = list(outputs.keys())[0]
         if first_task == '_inputs':
             first_task = list(outputs.keys())[1] if len(outputs.keys()) > 1 else None
             if first_task is None:
                 raise ValueError("No task outputs found besides _inputs")
-        
+
         student_unlabeled = outputs[first_task][unlabeled_mask]
-        teacher_unlabeled = teacher_outputs[first_task]
-        
-        # Compute consistency loss (element-wise)
-        consistency_dist = softmax_mse_loss(student_unlabeled, teacher_unlabeled)
+
+        # Compute consistency loss using ensemble-aggregated predictions as target
+        # mean_pred is already softmax probabilities, so use prob_mse_loss
+        consistency_dist = prob_mse_loss(student_unlabeled, mean_pred)
         
         # Apply uncertainty-based weighting
         # Use sigmoid ramp-up for threshold
@@ -462,7 +599,7 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         return {}
 
     def _initialize_training(self):
-        """Override to initialize EMA model after base initialization"""
+        """Override to initialize EMA model and ensemble models after base initialization"""
         training_state = super()._initialize_training()
 
         # Create EMA model after the student model is initialized
@@ -481,7 +618,25 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         else:
             print(f"Created fresh EMA model with decay factor: {self.ema_decay}")
 
+        # Load ensemble models if configured
+        if self.ensemble_model_paths:
+            self.ensemble_models = self._load_ensemble_models()
+            num_ensemble = len(self.ensemble_models)
+            ensemble_passes = min(num_ensemble, self.uncertainty_T)
+            ema_passes = max(0, self.uncertainty_T - num_ensemble)
+
+            print(f"Loaded {num_ensemble} ensemble models for uncertainty estimation")
+            if num_ensemble > self.uncertainty_T:
+                print(f"  Warning: More ensemble models ({num_ensemble}) than available passes ({self.uncertainty_T}). "
+                      f"Using first {self.uncertainty_T} ensemble models.")
+            print(f"Pass distribution: {ensemble_passes} ensemble + {ema_passes} EMA = {self.uncertainty_T} total")
+        else:
+            self.ensemble_models = []
+            print(f"No ensemble models configured - using EMA teacher only")
+            print(f"Pass distribution: {self.uncertainty_T} EMA passes")
+
         print(f"Uncertainty estimation using {self.uncertainty_T} forward passes")
+        print(f"Aggregation strategy: {self.ensemble_aggregation}")
         print(f"Consistency weight ramp-up over {self.consistency_rampup} epochs")
 
         return training_state
