@@ -63,8 +63,30 @@ Rules:
 ## Grow stages & const mask (local optimization)
 
 - A stage can optionally include a `grow` block (handled by the optimizer) that expands the mesh size by reallocating the parameter pyramids.
-- After `grow`, the optimizer can set a constant-mask on the model (see [`model.Model2D.const_mask_lr`](../model.py:1)) to keep the pre-existing mesh region fixed during local optimization.
-- When `const_mask_lr` is set, [`model.Model2D.forward()`](../model.py:131) computes the mesh twice (one `no_grad` pass + one grad pass) and merges the results so masked regions do not receive gradients.
+
+- After `grow`, the optimizer can set a constant-mask on the model (see [`model.Model2D.const_mask_lr`](../model.py:113)) to keep the pre-existing mesh region fixed during local optimization.
+
+- Implementation: the const region is enforced by masking gradients in the backward pass (parameter hooks) and **not** by doing any forward-time mixing:
+	- `const_mask_lr` has shape `(1,1,Hm,Wm)` and uses `1` for “keep constant” and `0` for “optimize”.
+	- During local-opt, the optimizer registers a backward hook on the base (highest-res) residual tensors `mesh_ms[0]` & `conn_offset_ms[0]` and multiplies their gradients by `(1 - const_mask_lr)`.
+	- The model forward path is unchanged; it always uses the current parameters in [`model.Model2D.forward()`](../model.py:134).
+
+- `opt_window` (local-opt setting): controls how much of the “old” region adjacent to the grown border is allowed to update.
+	- Default is `1` (only the grown cells update).
+	- `opt_window = k` allows updating the grown region plus a band of `k-1` cells into the previously-existing mesh adjacent to the inserted rectangle.
+
+## Scale-space pyramids & grow (reconstruction)
+
+- `mesh_ms` and `conn_offset_ms` are residual scale-space pyramids.
+- During grow, we edit the **integrated/base** tensor and then rebuild a consistent residual pyramid:
+	- integrate → resize/edit (expand) → reconstruct residual pyramid.
+	- this avoids having to “grow” every residual level independently.
+
+Implementation:
+
+- integrate: [`Model2D._integrate_param_pyramid()`](../model.py:275)
+- grow pipeline: [`Model2D._grow_param_pyramid_flat_edit()`](../model.py:263)
+- reconstruct: [`Model2D._construct_param_pyramid_from_flat()`](../model.py:281)
 
 ## Line-offset modeling (conn_offset)
 
