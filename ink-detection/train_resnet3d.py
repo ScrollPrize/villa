@@ -138,6 +138,7 @@ class CFG:
     onecycle_pct_start = 0.15
     onecycle_div_factor = 25.0
     onecycle_final_div_factor = 1e2
+    cosine_warmup_pct = 0.15
     # ============== fold =============
     valid_id = '20230820203112'
     stitch_all_val = False
@@ -385,6 +386,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("onecycle_pct_start", "onecycle_pct_start"),
         ("onecycle_div_factor", "onecycle_div_factor"),
         ("onecycle_final_div_factor", "onecycle_final_div_factor"),
+        ("cosine_warmup_pct", "cosine_warmup_pct"),
         ("min_lr", "min_lr"),
         ("weight_decay", "weight_decay"),
         ("max_grad_norm", "max_grad_norm"),
@@ -1371,11 +1373,41 @@ class RegressionPLModel(pl.LightningModule):
             interval = "step"
         elif scheduler_name == "cosine":
             total_steps = max(1, steps_per_epoch * epochs)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=total_steps,
-                eta_min=float(getattr(CFG, "min_lr", 0.0)),
-            )
+            warmup_pct = float(getattr(CFG, "cosine_warmup_pct", 0.0) or 0.0)
+            warmup_pct = max(0.0, min(1.0, warmup_pct))
+            warmup_steps = int(round(total_steps * warmup_pct))
+            warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+
+            eta_min = float(getattr(CFG, "min_lr", 0.0))
+
+            if warmup_steps > 0:
+                warmup_factor = float(getattr(CFG, "warmup_factor", 1.0) or 1.0)
+                if warmup_factor <= 0:
+                    raise ValueError(f"warmup_factor must be > 0, got {warmup_factor}")
+                start_factor = 1.0 / warmup_factor
+
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=float(start_factor),
+                    end_factor=1.0,
+                    total_iters=int(warmup_steps),
+                )
+                cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=int(total_steps - warmup_steps),
+                    eta_min=float(eta_min),
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[int(warmup_steps)],
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=int(total_steps),
+                    eta_min=float(eta_min),
+                )
             interval = "step"
         else:
             raise ValueError(
