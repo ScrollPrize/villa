@@ -13,6 +13,8 @@ class ModelConfig:
 	init_size_frac: float
 	init_size_frac_h: float | None
 	init_size_frac_v: float | None
+	model_input: str | None
+	model_output: str | None
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -24,6 +26,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--init-size-frac", type=float, default=2.0)
 	g.add_argument("--init-size-frac-h", type=float, default=None)
 	g.add_argument("--init-size-frac-v", type=float, default=None)
+	g.add_argument("--model-input", default=None)
+	g.add_argument("--model-output", default=None)
 
 
 def from_args(args: argparse.Namespace) -> ModelConfig:
@@ -35,4 +39,6 @@ def from_args(args: argparse.Namespace) -> ModelConfig:
 		init_size_frac=float(args.init_size_frac),
 		init_size_frac_h=None if args.init_size_frac_h is None else float(args.init_size_frac_h),
 		init_size_frac_v=None if args.init_size_frac_v is None else float(args.init_size_frac_v),
+		model_input=None if args.model_input is None else str(args.model_input),
+		model_output=None if args.model_output is None else str(args.model_output),
 	)
