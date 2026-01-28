@@ -219,8 +219,18 @@ class Model2D(nn.Module):
 		for _ in range(int(steps)):
 			for d in dirs_list:
 				dim, side, dh, dw, dpy, dpx = grow_specs[d]
-				self.mesh_ms = self._grow_param_pyramid_1(src=self.mesh_ms, dim=dim, side=side)
-				self.conn_offset_ms = self._grow_param_pyramid_1(src=self.conn_offset_ms, dim=dim, side=side)
+				self.mesh_ms = self._grow_param_pyramid_flat_edit(
+					src=self.mesh_ms,
+					dim=dim,
+					side=side,
+					editor=self._expand_linear,
+				)
+				self.conn_offset_ms = self._grow_param_pyramid_flat_edit(
+					src=self.conn_offset_ms,
+					dim=dim,
+					side=side,
+					editor=self._expand_copy_edge,
+				)
 				self.mesh_h = int(self.mesh_h) + dh
 				self.mesh_w = int(self.mesh_w) + dw
 				py0 += dpy
@@ -250,12 +260,61 @@ class Model2D(nn.Module):
 		new = (2.0 * edge - nextv).unsqueeze(dim)
 		return torch.cat([src, new], dim=dim)
 
-	def _grow_param_pyramid_1(self, *, src: nn.ParameterList, dim: int, side: int) -> nn.ParameterList:
+	@staticmethod
+	def _expand_copy_edge(*, src: torch.Tensor, dim: int, side: int) -> torch.Tensor:
+		"""Expand `src` by 1 along `dim` by copying the nearest edge slice."""
+		if src.ndim <= dim:
+			raise ValueError("grow: dim out of range")
+		dim = int(dim)
+		side = int(side)
+		if side not in (-1, +1):
+			raise ValueError("grow: side must be -1 or +1")
+		if side < 0:
+			edge = src.select(dim, 0).unsqueeze(dim)
+			return torch.cat([edge, src], dim=dim)
+		edge = src.select(dim, int(src.shape[dim]) - 1).unsqueeze(dim)
+		return torch.cat([src, edge], dim=dim)
+
+	def _grow_param_pyramid_flat_edit(
+		self,
+		*,
+		src: nn.ParameterList,
+		dim: int,
+		side: int,
+		editor,
+	) -> nn.ParameterList:
+		flat = self._integrate_param_pyramid(src)
+		flat2 = editor(src=flat, dim=int(dim), side=int(side))
+		return self._construct_param_pyramid_from_flat(flat2, n_scales=len(src))
+
+	def _integrate_param_pyramid(self, src: nn.ParameterList) -> torch.Tensor:
+		v = src[-1]
+		for d in reversed(src[:-1]):
+			v = self._upsample2_crop(src=v, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
+		return v
+
+	def _construct_param_pyramid_from_flat(self, flat: torch.Tensor, n_scales: int) -> nn.ParameterList:
+		shapes: list[tuple[int, int]] = [(int(flat.shape[2]), int(flat.shape[3]))]
+		for _ in range(1, max(1, int(n_scales))):
+			gh_prev, gw_prev = shapes[-1]
+			gh_i = max(2, (gh_prev + 1) // 2)
+			gw_i = max(2, (gw_prev + 1) // 2)
+			shapes.append((gh_i, gw_i))
+		targets: list[torch.Tensor] = [flat]
+		for gh_i, gw_i in shapes[1:]:
+			t = F.interpolate(targets[-1], size=(int(gh_i), int(gw_i)), mode="bilinear", align_corners=True)
+			targets.append(t)
+		residuals: list[torch.Tensor] = [torch.empty(0)] * len(targets)
+		recon = targets[-1]
+		residuals[-1] = targets[-1]
+		for i in range(len(targets) - 2, -1, -1):
+			up = self._upsample2_crop(src=recon, h_t=int(targets[i].shape[2]), w_t=int(targets[i].shape[3]))
+			d = targets[i] - up
+			residuals[i] = d
+			recon = up + d
 		out = nn.ParameterList()
-		for p in src:
-			g = p.data
-			g = self._expand_linear(src=g, dim=int(dim), side=int(side))
-			out.append(nn.Parameter(g))
+		for r in residuals:
+			out.append(nn.Parameter(r))
 		return out
 
 	def save_tiff(self, *, data: fit_data.FitData, path: str) -> None:
@@ -375,8 +434,8 @@ class Model2D(nn.Module):
 		shapes: list[tuple[int, int]] = [(gh0, gw0)]
 		for _ in range(1, n_scales):
 			gh_prev, gw_prev = shapes[-1]
-			gh_i = max(2, gh_prev // 2 + 1)
-			gw_i = max(2, gw_prev // 2 + 1)
+			gh_i = max(2, (gh_prev + 1) // 2)
+			gw_i = max(2, (gw_prev + 1) // 2)
 			shapes.append((gh_i, gw_i))
 		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
 
