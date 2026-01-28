@@ -47,7 +47,7 @@
 				}
 			},
 			"local_opt": {
-				"steps": 0,
+				"steps": 1000,
 				"lr": 0.01,
 				"params": ["mesh_ms", "conn_offset_ms"],
 				"min_scaledown": 0,
