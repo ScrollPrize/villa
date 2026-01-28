@@ -38,6 +38,7 @@ def _loss_concat_vis(
 
 	border = int(max(0, border_px))
 	label_h = int(max(0, label_px))
+	label_h = max(1, label_h // 2) if label_h > 0 else 0
 	max_h = 1
 	out_w = 0
 	for _name, arr in loss_maps_2d:
@@ -46,13 +47,13 @@ def _loss_concat_vis(
 	if len(loss_maps_2d) > 1:
 		out_w += border * (len(loss_maps_2d) - 1)
 	max_h = int(max_h)
-	out = np.full((max_h, int(out_w)), 0.5, dtype="float32")
+	out = np.full((label_h + max_h, int(out_w)), 0.5, dtype="float32")
 
 	x = 0
 	for i, (_name, arr) in enumerate(loss_maps_2d):
 		p = arr.astype("float32", copy=False)
 		h, w = int(p.shape[0]), int(p.shape[1])
-		out[0:h, x:x + w] = p
+		out[label_h:label_h + h, x:x + w] = p
 		x += w
 		if border > 0 and i + 1 < len(loss_maps_2d):
 			out[:, x:x + border] = 0.5
@@ -75,7 +76,7 @@ def _loss_concat_vis_u8(
 	s = int(max(1, scale))
 
 	# Build float mosaic first (this is the canonical layout), then convert to u8 and label.
-	concat_f = _loss_concat_vis(loss_maps_2d=loss_maps_2d, border_px=border, label_px=0)
+	concat_f = _loss_concat_vis(loss_maps_2d=loss_maps_2d, border_px=border, label_px=label_h)
 	u8 = (np.clip(concat_f, 0.0, 1.0) * 255.0).astype("uint8")
 	out = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
 	if s != 1:
@@ -84,13 +85,15 @@ def _loss_concat_vis_u8(
 	if label_h <= 0:
 		return out
 
-	y0 = int((label_h - 4) * s)
 	x = 0
 	for i, (name, m) in enumerate(loss_maps_2d):
+		y0 = int(2 * s)
+		if (i % 2) == 1:
+			y0 = int(6 * s)
 		cv2.putText(
 			out,
 			str(name),
-			(int((x + 4) * s), y0),
+			(int(x * s), y0),
 			cv2.FONT_HERSHEY_PLAIN,
 			1.0,
 			(0, 0, 0),
@@ -379,7 +382,7 @@ def save(
 			continue
 		loss_2d.append((str(spec["suffix"]), m2))
 	# Float tif (actual values, no labels).
-	concat_f = _loss_concat_vis(loss_maps_2d=loss_2d, border_px=6, label_px=0)
+	concat_f = _loss_concat_vis(loss_maps_2d=loss_2d, border_px=6, label_px=16)
 	concat_path = out_vis / f"res_loss_concat_{postfix}.tif"
 	tifffile.imwrite(str(concat_path), concat_f.astype("float32"), compression="lzw")
 
