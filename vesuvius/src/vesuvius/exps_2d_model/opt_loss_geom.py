@@ -121,7 +121,14 @@ def conn_y_smooth_r_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor,
 
 
 def angle_symmetry_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
-	"""Return (lm, mask) penalizing non-orthogonality between horizontal & vertical directions."""
+	"""Return (lm, mask) penalizing deviation from a right angle (|sin|=1) with signed convention.
+
+	Uses the same winding sign convention as the grad-mag direction sign:
+	- mesh_dir is inferred from the vertical mesh direction (v-1 -> v+1)
+	- horizontal vectors use (mid-left) and (right-mid) (both point along winding)
+	- we flip vv to align with mesh_dir (dot >= 0)
+	- we penalize so cross(v_dir, h_dir)/(|v||h|) == +1 (right angle with correct sign)
+	"""
 	xy = res.xy_conn
 	left = xy[..., 0, :]
 	mid = xy[..., 1, :]
@@ -130,18 +137,48 @@ def angle_symmetry_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	hv_l = mid - left
 	hv_r = right - mid
 
-	vv = res.xy_lr[:, 1:, :, :] - res.xy_lr[:, :-1, :, :]
-	vv = vv[:, :, :, None, :]
+	xy_lr = res.xy_lr
+	if int(xy_lr.shape[1]) < 2:
+		base = torch.zeros((), device=xy_lr.device, dtype=xy_lr.dtype)
+		mask0 = torch.zeros((), device=xy_lr.device, dtype=xy_lr.dtype)
+		return base, mask0
+
+	# mesh_dir at vertex rows (same as grad-mag sign convention), then use
+	# md_seg (row -> row+1) as the vertical direction for the angle penalty.
+	md = xy_lr.new_zeros(xy_lr.shape)
+	if int(xy_lr.shape[1]) >= 3:
+		md[:, 1:-1, :, :] = xy_lr[:, 2:, :, :] - xy_lr[:, :-2, :, :]
+		md[:, 0, :, :] = xy_lr[:, 1, :, :] - xy_lr[:, 0, :, :]
+		md[:, -1, :, :] = xy_lr[:, -1, :, :] - xy_lr[:, -2, :, :]
+	else:
+		md[:, 0, :, :] = xy_lr[:, 1, :, :] - xy_lr[:, 0, :, :]
+		md[:, 1, :, :] = md[:, 0, :, :]
+	md_seg = md[:, :-1, :, :]
+
+	# Determine winding sign per row/col (same logic as opt_loss_gradmag).
+	v_l = left - mid
+	v_r = right - mid
+	mdx = md[..., 0]
+	mdy = md[..., 1]
+	cross_r = mdx * v_r[..., 1] - mdy * v_r[..., 0]
+	cross_l = mdx * v_l[..., 1] - mdy * v_l[..., 0]
+	ok = (cross_r > 0.0) & (cross_l < 0.0)
+	target_sign = torch.where(ok, torch.ones_like(cross_r), -torch.ones_like(cross_r))
+	target_sign = target_sign[:, :-1, :]
+
+	vv = md_seg[:, :, :, None, :]
 	hv_l = hv_l[:, :-1, :, None, :]
 	hv_r = hv_r[:, :-1, :, None, :]
 	hv = torch.cat([hv_l, hv_r], dim=3)
 
 	eps = 1e-8
-	dot = (hv * vv).sum(dim=-1)
+	cross = vv[..., 0] * hv[..., 1] - vv[..., 1] * hv[..., 0]
 	hn = torch.sqrt((hv * hv).sum(dim=-1) + eps)
 	vn = torch.sqrt((vv * vv).sum(dim=-1) + eps)
-	cos = dot / (hn * vn + eps)
-	lm = (cos * cos).mean(dim=3).unsqueeze(1)
+	sin = cross / (hn * vn + eps)
+	target_sign2 = target_sign.unsqueeze(-1).expand_as(sin)
+	d = sin - target_sign2
+	lm = (d * d).mean(dim=3).unsqueeze(1)
 
 	m_lr = torch.minimum(res.mask_lr[:, :, 1:, :], res.mask_lr[:, :, :-1, :])
 	mc = res.mask_conn
