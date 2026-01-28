@@ -154,28 +154,28 @@ def manage_debug_gifs(debug_gif_history, best_debug_gifs, epoch,
                      checkpoint_dir, model_name,
                      max_recent=3, max_best=2):
     """
-    Manage debug GIF history by keeping only the most recent and best GIFs.
+    Manage debug video history by keeping only the most recent and best files.
     
     Parameters
     ----------
     debug_gif_history : deque
-        Deque of (epoch, path) tuples for recent debug GIFs
+        Deque of (epoch, path) tuples for recent debug videos
     best_debug_gifs : list
-        List of (val_loss, epoch, path) tuples for best debug GIFs
+        List of (val_loss, epoch, path) tuples for best debug videos
     epoch : int
         Current epoch number
     gif_path : str or Path
-        Path to the current debug GIF
+        Path to the current debug video
     validation_loss : float
         Validation loss for the current epoch
     checkpoint_dir : str or Path
-        Directory containing checkpoints and debug GIFs
+        Directory containing checkpoints and debug videos
     model_name : str
-        Model name used in GIF filenames
+        Model name used in debug video filenames
     max_recent : int, default=3
-        Maximum number of recent GIFs to keep
+        Maximum number of recent debug videos to keep
     max_best : int, default=2
-        Maximum number of best GIFs to keep
+        Maximum number of best debug videos to keep
         
     Returns
     -------
@@ -197,7 +197,7 @@ def manage_debug_gifs(debug_gif_history, best_debug_gifs, epoch,
             if removed_gif not in [p for _, p in debug_gif_history]:
                 if Path(removed_gif).exists():
                     Path(removed_gif).unlink()
-                    print(f"Removed debug gif with higher validation loss: {removed_gif}")
+                    print(f"Removed debug video with higher validation loss: {removed_gif}")
     
     all_gifs_to_keep = set()
     
@@ -207,10 +207,11 @@ def manage_debug_gifs(debug_gif_history, best_debug_gifs, epoch,
     for _, _, gif_path_str in best_debug_gifs[:max_best]:
         all_gifs_to_keep.add(Path(gif_path_str))
     
-    for gif_file in checkpoint_dir.glob(f"{model_name}_debug_epoch*.gif"):
-        if gif_file not in all_gifs_to_keep:
-            gif_file.unlink()
-            print(f"Removed debug gif: {gif_file}")
+    for ext in (".mp4", ".gif"):
+        for gif_file in checkpoint_dir.glob(f"{model_name}_debug_epoch*{ext}"):
+            if gif_file not in all_gifs_to_keep:
+                gif_file.unlink()
+                print(f"Removed debug video: {gif_file}")
     
     return debug_gif_history, best_debug_gifs
 
