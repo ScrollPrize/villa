@@ -209,12 +209,31 @@ def optimize(
 			return
 
 		all_params = model.opt_params()
+		hooks: list[torch.utils.hooks.RemovableHandle] = []
+		cm_lr = getattr(model, "const_mask_lr", None)
+		if cm_lr is not None:
+			if cm_lr.ndim != 4 or int(cm_lr.shape[1]) != 1:
+				raise ValueError("const_mask_lr must be (N,1,Hm,Wm)")
+			cm_lr = cm_lr.detach().to(device=data.cos.device, dtype=torch.float32)
+			keep_lr = (1.0 - cm_lr)
 		params: list[torch.nn.Parameter] = []
 		for name in opt_cfg.params:
 			group = all_params.get(name, [])
 			if name in {"mesh_ms", "conn_offset_ms"}:
-				k0 = max(0, int(opt_cfg.min_scaledown))
-				params.extend(group[k0:])
+				if cm_lr is not None:
+					if not group:
+						continue
+					p0 = group[0]
+					if p0.shape[0] != 1 or p0.shape[-2:] != keep_lr.shape[-2:]:
+						raise ValueError("const_mask_lr must match mesh_ms[0]/conn_offset_ms[0] spatial shape")
+					m = keep_lr.to(dtype=p0.dtype)
+					if int(p0.shape[1]) != 1:
+						m = m.expand(1, int(p0.shape[1]), int(p0.shape[2]), int(p0.shape[3]))
+					hooks.append(p0.register_hook(lambda g, mm=m: g * mm))
+					params.append(p0)
+				else:
+					k0 = max(0, int(opt_cfg.min_scaledown))
+					params.extend(group[k0:])
 			else:
 				params.extend(group)
 		if not params:
@@ -289,6 +308,8 @@ def optimize(
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()))
 
 		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()))
+		for h in hooks:
+			h.remove()
 
 	snap_int = int(snapshot_interval)
 	if snap_int < 0:
