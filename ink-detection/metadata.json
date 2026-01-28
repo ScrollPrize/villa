@@ -136,6 +136,7 @@
     "objective": "erm",
     "sampler": "shuffle",
     "loss_mode": "batch",
+    "erm_group_topk": 0,
     "save_every_epoch": true,
     "train_segments": [
       "20250806145318",
@@ -147,7 +148,6 @@
       "20250919125754-auto_grown_20250919055754487_inp_hr"
     ],
     "val_segments": [
-      "20250807020208",
       "20250806145318",
       "l2_0_crop",
       "658",

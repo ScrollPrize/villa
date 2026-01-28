@@ -147,6 +147,7 @@ class CFG:
     objective = "erm"  # "erm" | "group_dro"
     sampler = "shuffle"  # "shuffle" | "group_balanced" | "group_stratified"
     loss_mode = "batch"  # "batch" | "per_sample"
+    erm_group_topk = 0  # if >0 and objective=erm+per_sample: optimize mean(worst-k group losses) per batch
     save_every_epoch = False
     accumulate_grad_batches = 1
 
@@ -401,6 +402,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()
     cfg.loss_mode = str(training_cfg.get("loss_mode", getattr(cfg, "loss_mode", "batch"))).lower()
+    cfg.erm_group_topk = int(training_cfg.get("erm_group_topk", getattr(cfg, "erm_group_topk", 0) or 0))
     cfg.save_every_epoch = bool(training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)))
     cfg.stitch_all_val = bool(training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)))
     if "stitch_downsample" in training_cfg:
@@ -952,6 +954,7 @@ class RegressionPLModel(pl.LightningModule):
         stitch_all_val_segment_ids=None,
         norm="batch",
         group_norm_groups=32,
+        erm_group_topk=0,
     ):
         super(RegressionPLModel, self).__init__()
 
@@ -980,6 +983,10 @@ class RegressionPLModel(pl.LightningModule):
                 normalize_loss=group_dro_normalize_loss,
                 btl=group_dro_btl,
             )
+
+        self.erm_group_topk = int(erm_group_topk or 0)
+        if self.erm_group_topk < 0:
+            raise ValueError(f"erm_group_topk must be >= 0, got {self.erm_group_topk}")
 
         self._stitch_downsample = max(1, int(stitch_downsample or 1))
         self._stitch_buffers = {}
@@ -1095,6 +1102,17 @@ class RegressionPLModel(pl.LightningModule):
         per_sample_loss = 0.5 * dice_loss + 0.5 * bce
         return per_sample_loss, dice, bce, dice_loss
 
+    def compute_group_avg(self, values, group_idx):
+        group_idx = group_idx.long()
+        group_map = (
+            group_idx
+            == torch.arange(self.n_groups, device=group_idx.device).unsqueeze(1).long()
+        ).float()
+        group_count = group_map.sum(1)
+        group_denom = group_count + (group_count == 0).float()
+        group_avg = (group_map @ values.view(-1)) / group_denom
+        return group_avg, group_count
+
     def compute_batch_loss(self, logits, targets):
         return 0.5 * self.loss_func1(logits, targets) + 0.5 * self.loss_func2(logits, targets)
     
@@ -1115,7 +1133,39 @@ class RegressionPLModel(pl.LightningModule):
                 self.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
             elif loss_mode == "per_sample":
                 per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
-                loss = per_sample_loss.mean()
+                if self.erm_group_topk > 0:
+                    group_loss, group_count = self.compute_group_avg(per_sample_loss, g)
+                    present = group_count > 0
+                    if present.any():
+                        present_losses = group_loss[present]
+                        k = min(int(self.erm_group_topk), int(present_losses.numel()))
+                        topk_losses, _ = torch.topk(present_losses, k, largest=True)
+                        loss = topk_losses.mean()
+                    else:
+                        loss = per_sample_loss.mean()
+
+                    if self.global_step % CFG.print_freq == 0:
+                        if present.any():
+                            worst_group_loss = group_loss[present].max()
+                        else:
+                            worst_group_loss = group_loss.max()
+                        self.log("train/worst_group_loss", worst_group_loss, on_step=True, on_epoch=False, prog_bar=False)
+                        for group_idx, group_name in enumerate(self.group_names):
+                            safe_group_name = str(group_name).replace("/", "_")
+                            self.log(
+                                f"train/group_{group_idx}_{safe_group_name}/loss",
+                                group_loss[group_idx],
+                                on_step=True,
+                                on_epoch=False,
+                            )
+                            self.log(
+                                f"train/group_{group_idx}_{safe_group_name}/count",
+                                group_count[group_idx],
+                                on_step=True,
+                                on_epoch=False,
+                            )
+                else:
+                    loss = per_sample_loss.mean()
                 self.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
                 self.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
                 self.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
@@ -1500,6 +1550,7 @@ def main():
     log(
         "config "
         f"objective={CFG.objective} sampler={CFG.sampler} loss_mode={CFG.loss_mode} "
+        f"erm_group_topk={getattr(CFG, 'erm_group_topk', 0)} "
         f"epochs={CFG.epochs} lr={CFG.lr} batch={CFG.train_batch_size} "
         f"accumulate_grad_batches={CFG.accumulate_grad_batches} "
         f"num_workers={CFG.num_workers} layer_read_workers={getattr(CFG, 'layer_read_workers', 1)} "
@@ -1657,10 +1708,12 @@ def main():
     train_images = []
     train_masks = []
     train_groups = []
+    train_patch_counts_by_segment = {}
 
     val_loaders = []
     val_stitch_shapes = []
     val_stitch_segment_ids = []
+    val_patch_counts_by_segment = {}
     stitch_val_dataloader_idx = None
     stitch_pred_shape = None
     stitch_segment_id = None
@@ -1707,6 +1760,7 @@ def main():
             filter_empty_tile=True,
         )
         log(f"patches train segment={fragment_id} n={len(frag_train_images)} in {time.time() - t1:.1f}s")
+        train_patch_counts_by_segment[fragment_id] = int(len(frag_train_images))
         train_images.extend(frag_train_images)
         train_masks.extend(frag_train_masks)
         train_groups.extend([group_idx] * len(frag_train_images))
@@ -1749,6 +1803,7 @@ def main():
             filter_empty_tile=False,
         )
         log(f"patches val segment={fragment_id} n={len(frag_val_images)} in {time.time() - t1:.1f}s")
+        val_patch_counts_by_segment[fragment_id] = int(len(frag_val_images))
         if len(frag_val_images) == 0:
             continue
 
@@ -1777,6 +1832,26 @@ def main():
             stitch_val_dataloader_idx = len(val_loaders) - 1
             stitch_pred_shape = mask_val.shape
             stitch_segment_id = fragment_id
+
+    def _summarize_patch_counts(split_name, fragment_ids_list, counts_by_segment):
+        total = int(sum(int(counts_by_segment.get(fid, 0)) for fid in fragment_ids_list))
+        counts_by_group = {name: 0 for name in group_names}
+        for fid in fragment_ids_list:
+            n = int(counts_by_segment.get(fid, 0))
+            gidx = fragment_to_group_idx.get(fid, 0)
+            gname = group_names[gidx] if gidx < len(group_names) else str(gidx)
+            counts_by_group[gname] = int(counts_by_group.get(gname, 0)) + n
+
+        log(f"{split_name} patch counts total={total}")
+        for fid in fragment_ids_list:
+            n = int(counts_by_segment.get(fid, 0))
+            gidx = fragment_to_group_idx.get(fid, 0)
+            gname = group_names[gidx] if gidx < len(group_names) else str(gidx)
+            log(f"  {split_name} segment={fid} group={gname} patches={n}")
+        log(f"{split_name} patch counts by group {counts_by_group}")
+
+    _summarize_patch_counts("train", train_fragment_ids, train_patch_counts_by_segment)
+    _summarize_patch_counts("val", val_fragment_ids, val_patch_counts_by_segment)
 
     log(f"dataset built train_patches={len(train_images)} val_loaders={len(val_loaders)}")
     if len(val_loaders) == 0:
@@ -1845,6 +1920,7 @@ def main():
         group_norm_groups=int(getattr(CFG, "group_norm_groups", 32)),
         objective=CFG.objective,
         loss_mode=CFG.loss_mode,
+        erm_group_topk=int(getattr(CFG, "erm_group_topk", 0)),
         robust_step_size=robust_step_size,
         group_counts=train_group_counts,
         group_dro_gamma=group_dro_gamma,
