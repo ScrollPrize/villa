@@ -1,10 +1,10 @@
 {
 	"base": {
 		"dir_unet": 1.0,
-		"step": 0.001,
+		"step": 1.0,
 		"smooth_x": 0.0,
-		"smooth_y": 0.001,
-		"gradmag": 0.1,
+		"smooth_y": 0.0,
+		"gradmag": 1.0,
 		"mean_pos": 0.1,
 		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
@@ -15,21 +15,20 @@
 	"stages": [
 		{
 			"name": "init",
-			"steps": 500,
-			"lr": 0.1,
+			"steps": 1000,
+			"lr": 0.01,
 			"params": ["theta", "winding_scale"],
 			"min_scaledown": 0,
 			"w_fac": {
 			}
 		},
 		{
-			"name": "rest",
-			"steps": 10000,
+			"name": "mesh",
+			"steps": 3000,
 			"lr": 0.1,
 			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
-				"gradmag": 1.0
 			}
 		}
 	]

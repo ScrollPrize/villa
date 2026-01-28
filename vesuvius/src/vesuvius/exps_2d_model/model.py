@@ -16,6 +16,8 @@ class ModelInit:
 	h_img: int
 	w_img: int
 	init_size_frac: float
+	init_size_frac_h: float | None
+	init_size_frac_v: float | None
 	mesh_step_px: int
 	winding_step_px: int
 
@@ -93,12 +95,12 @@ class Model2D(nn.Module):
 		self.init = init
 		self.device = device
 		# FIXME need better init ...
-		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
+		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
 
-		fh = float(init.init_size_frac) * float(int(init.h_img))
-		fw = float(init.init_size_frac) * float(int(init.w_img))
+		fh = float(init.init_size_frac if init.init_size_frac_h is None else init.init_size_frac_h) * float(int(init.h_img))
+		fw = float(init.init_size_frac if init.init_size_frac_v is None else init.init_size_frac_v) * float(int(init.w_img))
 		h = max(2, int(round(fh)))
 		w = max(2, int(round(fw)))
 		self.mesh_h = max(2, (h + int(init.mesh_step_px) - 1) // int(init.mesh_step_px) + 1)
@@ -461,6 +463,8 @@ class Model2D(nn.Module):
 		winding_step_px: int,
 		init_size_frac: float,
 		device: torch.device,
+		init_size_frac_h: float | None = None,
+		init_size_frac_v: float | None = None,
 		*,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
@@ -470,6 +474,8 @@ class Model2D(nn.Module):
 			h_img=int(h_img),
 			w_img=int(w_img),
 			init_size_frac=float(init_size_frac),
+			init_size_frac_h=None if init_size_frac_h is None else float(init_size_frac_h),
+			init_size_frac_v=None if init_size_frac_v is None else float(init_size_frac_v),
 			mesh_step_px=int(mesh_step_px),
 			winding_step_px=int(winding_step_px),
 		)
@@ -485,11 +491,12 @@ class Model2D(nn.Module):
 		# Internal coordinates are stored in pixel units.
 		w = float(max(1, int(self.init.w_img) - 1))
 		h = float(max(1, int(self.init.h_img) - 1))
-		f = float(self.init.init_size_frac)
-		u0 = 0.5 * (1.0 - f) * w
-		u1 = 0.5 * (1.0 + f) * w
-		v0 = 0.5 * (1.0 - f) * h
-		v1 = 0.5 * (1.0 + f) * h
+		fh = float(self.init.init_size_frac if self.init.init_size_frac_h is None else self.init.init_size_frac_h)
+		fw = float(self.init.init_size_frac if self.init.init_size_frac_v is None else self.init.init_size_frac_v)
+		u0 = 0.5 * (1.0 - fw) * w
+		u1 = 0.5 * (1.0 + fw) * w
+		v0 = 0.5 * (1.0 - fh) * h
+		v1 = 0.5 * (1.0 + fh) * h
 		u = torch.linspace(u0, u1, int(gw0), dtype=torch.float32)
 		v = torch.linspace(v0, v1, int(gh0), dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
