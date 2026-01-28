@@ -58,6 +58,31 @@ def _loss_concat_vis(
 		if border > 0 and i + 1 < len(loss_maps_2d):
 			out[:, x:x + border] = 0.5
 			x += border
+
+	if label_h > 0:
+		s = 8
+		lab_u8 = np.full((label_h * s, int(out.shape[1]) * s), 128, dtype="uint8")
+		x = 0
+		for i, (name, m) in enumerate(loss_maps_2d):
+			y0 = int(2 * s)
+			if (i % 2) == 1:
+				y0 = int(6 * s)
+			cv2.putText(
+				lab_u8,
+				str(name),
+				(int(x * s), y0),
+				cv2.FONT_HERSHEY_PLAIN,
+				1.0,
+				0,
+				1,
+				lineType=cv2.LINE_8,
+			)
+			x += int(m.shape[1])
+			if border > 0 and i + 1 < len(loss_maps_2d):
+				x += border
+		lab_f = (lab_u8.astype("float32") / 255.0)
+		lab_f = cv2.resize(lab_f, (int(out.shape[1]), label_h), interpolation=cv2.INTER_AREA)
+		out[0:label_h, :] = lab_f
 	return out
 
 
@@ -381,15 +406,34 @@ def save(
 		else:
 			continue
 		loss_2d.append((str(spec["suffix"]), m2))
-	# Float tif (actual values, no labels).
+	# Float tif with a top label band (label pixels are visual-only floats in [0,1]).
 	concat_f = _loss_concat_vis(loss_maps_2d=loss_2d, border_px=6, label_px=16)
+	concat_f = np.repeat(np.repeat(concat_f, 8, axis=0), 8, axis=1)
+	label_h = max(1, 16 // 2)
+	border = 6
+	s = 8
+	lab_u8 = np.full((label_h * s, int(concat_f.shape[1])), 128, dtype="uint8")
+	x = 0
+	for i, (name, m) in enumerate(loss_2d):
+		y0 = int(2 * s)
+		if (i % 2) == 1:
+			y0 = int(6 * s)
+		cv2.putText(
+			lab_u8,
+			str(name),
+			(int(x * s), y0),
+			cv2.FONT_HERSHEY_PLAIN,
+			1.0,
+			0,
+			1,
+			lineType=cv2.LINE_8,
+		)
+		x += int(m.shape[1])
+		if border > 0 and i + 1 < len(loss_2d):
+			x += border
+	concat_f[0:label_h * s, :] = lab_u8.astype("float32") / 255.0
 	concat_path = out_vis / f"res_loss_concat_{postfix}.tif"
 	tifffile.imwrite(str(concat_path), concat_f.astype("float32"), compression="lzw")
-
-	# JPEG preview (8-bit, 8x, labels).
-	concat_u8 = _loss_concat_vis_u8(loss_maps_2d=loss_2d, border_px=6, label_px=16, scale=8)
-	concat_u8_path = out_vis / f"res_loss_concat_{postfix}.jpg"
-	cv2.imwrite(str(concat_u8_path), np.flip(concat_u8, -1))
 
 	tgt = data.cos[0, 0].detach().cpu().numpy()
 	tgt_t = model.target_cos()
