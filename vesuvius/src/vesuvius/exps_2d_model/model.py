@@ -203,74 +203,63 @@ class Model2D(nn.Module):
 		if bad:
 			raise ValueError(f"invalid grow direction(s): {sorted(bad)}")
 
-		add_up = steps if "up" in dirs else 0
-		add_dn = steps if "down" in dirs else 0
-		add_l = steps if "left" in dirs else 0
-		add_r = steps if "right" in dirs else 0
-
 		h0 = int(self.mesh_h)
 		w0 = int(self.mesh_w)
-		h1 = max(2, h0 + add_up + add_dn)
-		w1 = max(2, w0 + add_l + add_r)
-		if (h1, w1) == (h0, w0):
-			return
+		py0 = 0
+		px0 = 0
+		ho = h0
+		wo = w0
+		order = ["up", "down", "left", "right"]
+		dirs_list = [d for d in order if d in dirs]
+		grow_specs: dict[str, tuple[int, int, int, int, int, int]] = {
+			# (dim, side, d_mesh_h, d_mesh_w, d_py0, d_px0)
+			"up": (2, -1, +1, 0, +1, 0),
+			"down": (2, +1, +1, 0, 0, 0),
+			"left": (3, -1, 0, +1, 0, +1),
+			"right": (3, +1, 0, +1, 0, 0),
+		}
+		for _ in range(int(steps)):
+			for d in dirs_list:
+				dim, side, dh, dw, dpy, dpx = grow_specs[d]
+				self.offset_ms = self._grow_param_pyramid_1(src=self.offset_ms, dim=dim, side=side)
+				self.mesh_offset_ms = self._grow_param_pyramid_1(src=self.mesh_offset_ms, dim=dim, side=side)
+				self.base_grid = self._expand_linear(src=self.base_grid, dim=dim, side=side)
+				self.mesh_h = int(self.mesh_h) + dh
+				self.mesh_w = int(self.mesh_w) + dw
+				py0 += dpy
+				px0 += dpx
 
-		self.mesh_h = int(h1)
-		self.mesh_w = int(w1)
-		self.base_grid = self._build_base_grid().to(device=self.device)
-		self.offset_ms, ins = self._grow_param_pyramid(src=self.offset_ms, dirs=dirs, h0=h0, w0=w0)
-		self.mesh_offset_ms, _ins2 = self._grow_param_pyramid(src=self.mesh_offset_ms, dirs=dirs, h0=h0, w0=w0)
-		self._last_grow_insert_lr = ins
+		self._last_grow_insert_lr = (int(py0), int(px0), int(ho), int(wo))
 		self.const_mask_lr = None
 
-	def _grow_param_pyramid(
-		self,
-		*,
-		src: nn.ParameterList,
-		dirs: set[str],
-		h0: int,
-		w0: int,
-	) -> tuple[nn.ParameterList, tuple[int, int, int, int]]:
-		n_scales = len(src)
-		if n_scales <= 0:
-			return nn.ParameterList([]), (0, 0, 0, 0)
+	@staticmethod
+	def _expand_linear(*, src: torch.Tensor, dim: int, side: int) -> torch.Tensor:
+		"""Expand `src` by 1 along `dim` using a 2-point linear extrapolation at the chosen border."""
+		if src.ndim <= dim:
+			raise ValueError("grow: dim out of range")
+		dim = int(dim)
+		side = int(side)
+		if side not in (-1, +1):
+			raise ValueError("grow: side must be -1 or +1")
+		if int(src.shape[dim]) < 2:
+			raise ValueError("grow: need at least 2 samples for linear extrapolation")
+		if side < 0:
+			edge = src.select(dim, 0)
+			nextv = src.select(dim, 1)
+			new = (2.0 * edge - nextv).unsqueeze(dim)
+			return torch.cat([new, src], dim=dim)
+		edge = src.select(dim, int(src.shape[dim]) - 1)
+		nextv = src.select(dim, int(src.shape[dim]) - 2)
+		new = (2.0 * edge - nextv).unsqueeze(dim)
+		return torch.cat([src, new], dim=dim)
 
-		def _build_shapes(gh: int, gw: int) -> list[tuple[int, int]]:
-			shapes: list[tuple[int, int]] = [(int(gh), int(gw))]
-			for _ in range(1, n_scales):
-				gh_prev, gw_prev = shapes[-1]
-				gh_i = max(2, gh_prev // 2 + 1)
-				gw_i = max(2, gw_prev // 2 + 1)
-				shapes.append((gh_i, gw_i))
-			return shapes
-
-		old_shapes = _build_shapes(h0, w0)
-		new_shapes = _build_shapes(int(self.mesh_h), int(self.mesh_w))
+	def _grow_param_pyramid_1(self, *, src: nn.ParameterList, dim: int, side: int) -> nn.ParameterList:
 		out = nn.ParameterList()
-		insert0: tuple[int, int, int, int] | None = None
-		for i, (hn, wn) in enumerate(new_shapes):
-			o = src[i]
-			_, c, ho, wo = (int(v) for v in o.shape)
-			if (ho, wo) != old_shapes[i]:
-				raise RuntimeError("grow: unexpected pyramid shape mismatch")
-			n0 = torch.zeros(1, c, hn, wn, device=o.device, dtype=o.dtype)
-			dy = max(0, hn - ho)
-			dx = max(0, wn - wo)
-			if ("up" in dirs) and ("down" in dirs):
-				py0 = dy // 2
-			else:
-				py0 = dy if "up" in dirs else 0
-			if ("left" in dirs) and ("right" in dirs):
-				px0 = dx // 2
-			else:
-				px0 = dx if "left" in dirs else 0
-			n0[:, :, py0:py0 + ho, px0:px0 + wo] = o.data
-			if i == 0:
-				insert0 = (py0, px0, ho, wo)
-			out.append(nn.Parameter(n0))
-		if insert0 is None:
-			raise RuntimeError("grow: failed to compute insertion")
-		return out, insert0
+		for p in src:
+			g = p.data
+			g = self._expand_linear(src=g, dim=int(dim), side=int(side))
+			out.append(nn.Parameter(g))
+		return out
 
 	def save_tiff(self, *, data: fit_data.FitData, path: str) -> None:
 		"""Save raw model tensors as tiff stacks.
