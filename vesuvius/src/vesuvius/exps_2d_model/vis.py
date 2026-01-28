@@ -27,6 +27,83 @@ def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
 	return (np.clip(norm, 0.0, 1.0) * 255.0).astype("uint8")
 
 
+def _loss_concat_vis(
+	*,
+	loss_maps_2d: list[tuple[str, np.ndarray]],
+	border_px: int,
+	label_px: int,
+) -> np.ndarray:
+	if len(loss_maps_2d) == 0:
+		return np.zeros((1, 1), dtype="float32")
+
+	border = int(max(0, border_px))
+	label_h = int(max(0, label_px))
+	max_h = 1
+	out_w = 0
+	for _name, arr in loss_maps_2d:
+		max_h = max(max_h, int(arr.shape[0]))
+		out_w += int(arr.shape[1])
+	if len(loss_maps_2d) > 1:
+		out_w += border * (len(loss_maps_2d) - 1)
+	max_h = int(max_h)
+	out = np.full((max_h, int(out_w)), 0.5, dtype="float32")
+
+	x = 0
+	for i, (_name, arr) in enumerate(loss_maps_2d):
+		p = arr.astype("float32", copy=False)
+		h, w = int(p.shape[0]), int(p.shape[1])
+		out[0:h, x:x + w] = p
+		x += w
+		if border > 0 and i + 1 < len(loss_maps_2d):
+			out[:, x:x + border] = 0.5
+			x += border
+	return out
+
+
+def _loss_concat_vis_u8(
+	*,
+	loss_maps_2d: list[tuple[str, np.ndarray]],
+	border_px: int,
+	label_px: int,
+	scale: int,
+) -> np.ndarray:
+	if len(loss_maps_2d) == 0:
+		return np.zeros((1, 1, 3), dtype="uint8")
+
+	border = int(max(0, border_px))
+	label_h = int(max(0, label_px))
+	s = int(max(1, scale))
+
+	# Build float mosaic first (this is the canonical layout), then convert to u8 and label.
+	concat_f = _loss_concat_vis(loss_maps_2d=loss_maps_2d, border_px=border, label_px=0)
+	u8 = (np.clip(concat_f, 0.0, 1.0) * 255.0).astype("uint8")
+	out = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+	if s != 1:
+		out = cv2.resize(out, (int(out.shape[1]) * s, int(out.shape[0]) * s), interpolation=cv2.INTER_NEAREST)
+
+	if label_h <= 0:
+		return out
+
+	y0 = int((label_h - 4) * s)
+	x = 0
+	for i, (name, m) in enumerate(loss_maps_2d):
+		cv2.putText(
+			out,
+			str(name),
+			(int((x + 4) * s), y0),
+			cv2.FONT_HERSHEY_PLAIN,
+			1.0,
+			(0, 0, 0),
+			1,
+			lineType=cv2.LINE_8,
+		)
+		x += int(m.shape[1])
+		if border > 0 and i + 1 < len(loss_maps_2d):
+			x += border
+
+	return out
+
+
 def _draw_grid_vis(
 	*,
 	scale: int,
@@ -165,9 +242,11 @@ def save(
 	out_grids = out / "grids"
 	out_loss = out / "loss_maps"
 	out_tgt = out / "targets"
+	out_vis = out / "vis"
 	out_grids.mkdir(parents=True, exist_ok=True)
 	out_loss.mkdir(parents=True, exist_ok=True)
 	out_tgt.mkdir(parents=True, exist_ok=True)
+	out_vis.mkdir(parents=True, exist_ok=True)
 
 	h_img, w_img = data.size
 	res = model(data)
@@ -287,6 +366,27 @@ def save(
 			m = m[0, 0]
 		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
 		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
+
+	# One horizontally-concatenated float tif for quick inspection.
+	loss_2d: list[tuple[str, np.ndarray]] = []
+	for _k, spec in loss_maps.items():
+		m = spec["fn"]().detach().cpu()
+		if m.ndim == 4:
+			m2 = m[0, 0].numpy().astype("float32")
+		elif m.ndim == 2:
+			m2 = m.numpy().astype("float32")
+		else:
+			continue
+		loss_2d.append((str(spec["suffix"]), m2))
+	# Float tif (actual values, no labels).
+	concat_f = _loss_concat_vis(loss_maps_2d=loss_2d, border_px=6, label_px=0)
+	concat_path = out_vis / f"res_loss_concat_{postfix}.tif"
+	tifffile.imwrite(str(concat_path), concat_f.astype("float32"), compression="lzw")
+
+	# JPEG preview (8-bit, 8x, labels).
+	concat_u8 = _loss_concat_vis_u8(loss_maps_2d=loss_2d, border_px=6, label_px=16, scale=8)
+	concat_u8_path = out_vis / f"res_loss_concat_{postfix}.jpg"
+	cv2.imwrite(str(concat_u8_path), np.flip(concat_u8, -1))
 
 	tgt = data.cos[0, 0].detach().cpu().numpy()
 	tgt_t = model.target_cos()
