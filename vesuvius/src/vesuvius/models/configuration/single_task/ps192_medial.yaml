@@ -1,15 +1,26 @@
+tr_setup:
+  wandb_project: "srf_2um"
+  wandb_entity: "vesuvius-challenge"
+  model_name: "ps192_bs2_msr_default"
+  tr_val_split: 0.85
+
 tr_config:
   patch_size: [192,192,192]
+  batch_size: 2
+  num_dataloader_workers: 14
 
-dataset_config:
-  min_labeled_ratio: 0 
-  min_bbox_percent: 0
-  skip_patch_validation: true
+dataset_config:         
+  data_path: "/mnt/raid_nvme/datasets/raw/2um_labels/dataset"    
+                                                                                                                                                                    
+  min_labeled_ratio: 0.001              # Min fraction of labeled voxels                                                                  
+  min_bbox_percent: 0.35               # Min bounding box coverage                                                                       
+  valid_patch_find_resolution: 3       # 0=full, 1=2x downsample, 2=4x                                                                    
   targets:
     surface:
+      valid_patch_value: 1    
       activation: "none"
+      ignore_label: 2
       losses:
         - name: "MedialSurfaceRecall"
           weight: 1.0
-
 

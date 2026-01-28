@@ -54,8 +54,19 @@ dataset_config:
 # Mean Teacher hyperparameters
 mean_teacher_config:
   consistency_rampup: 200.0               # Epochs for consistency ramp-up
-  uncertainty_T: 6                        # Number of stochastic forward passes (must be even)
+  uncertainty_T: 6                        # Number of stochastic forward passes
   uncertainty_weight: 0.1
   uncertainty_threshold_end: 0.65
+
+  # Ensemble model configuration (optional)
+  # Additional pre-trained models for uncertainty estimation
+  # Pass distribution: N ensemble + remaining EMA = T total passes
+  # Example with T=6 and 3 ensemble models: 3 ensemble + 3 EMA = 6
+  ensemble_model_paths: []                # List of checkpoint paths to additional models
+  # ensemble_model_paths:
+  #   - "/path/to/model1.pth"
+  #   - "/path/to/model2.pth"
+  #   - "/path/to/model3.pth"
+  ensemble_aggregation: "max_confidence"  # "max_confidence" or "average"
 
 
