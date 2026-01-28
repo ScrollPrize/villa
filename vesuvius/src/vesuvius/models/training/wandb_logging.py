@@ -27,11 +27,11 @@ def save_train_val_filenames(self, train_dataset, val_dataset, train_indices, va
     # Get volume IDs and patch locations for training set
     for idx in train_indices:
         patch_info = train_dataset.valid_patches[idx]
-        vol_idx = patch_info["volume_index"]
-        position = patch_info.get("position")
+        vol_idx = patch_info.volume_index
+        position = patch_info.position
 
         # Get volume ID from patch info or from volume data
-        volume_id = patch_info.get("volume_name", f"volume_{vol_idx}")
+        volume_id = getattr(patch_info, "volume_name", None) or f"volume_{vol_idx}"
         
         # If not in patch info, try to get from target_volumes
         if volume_id == f"volume_{vol_idx}" and hasattr(train_dataset, 'target_volumes'):
@@ -47,21 +47,21 @@ def save_train_val_filenames(self, train_dataset, val_dataset, train_indices, va
             "position": position
         }
 
-        if 'plane' in patch_info:
-            patch_record['plane'] = patch_info['plane']
-            patch_record['slice_index'] = patch_info.get('slice_index')
-            patch_record['patch_size'] = patch_info.get('patch_size')
+        if hasattr(patch_info, 'plane'):
+            patch_record['plane'] = patch_info.plane
+            patch_record['slice_index'] = getattr(patch_info, 'slice_index', None)
+            patch_record['patch_size'] = getattr(patch_info, 'patch_size', None)
 
         train_patches.append(patch_record)
 
     # Get volume IDs and patch locations for validation set
     for idx in val_indices:
         patch_info = val_dataset.valid_patches[idx]
-        vol_idx = patch_info["volume_index"]
-        position = patch_info.get("position")
+        vol_idx = patch_info.volume_index
+        position = patch_info.position
 
         # Get volume ID from patch info or from volume data
-        volume_id = patch_info.get("volume_name", f"volume_{vol_idx}")
+        volume_id = getattr(patch_info, "volume_name", None) or f"volume_{vol_idx}"
         
         # If not in patch info, try to get from target_volumes
         if volume_id == f"volume_{vol_idx}" and hasattr(val_dataset, 'target_volumes'):
@@ -77,10 +77,10 @@ def save_train_val_filenames(self, train_dataset, val_dataset, train_indices, va
             "position": position
         }
 
-        if 'plane' in patch_info:
-            patch_record['plane'] = patch_info['plane']
-            patch_record['slice_index'] = patch_info.get('slice_index')
-            patch_record['patch_size'] = patch_info.get('patch_size')
+        if hasattr(patch_info, 'plane'):
+            patch_record['plane'] = patch_info.plane
+            patch_record['slice_index'] = getattr(patch_info, 'slice_index', None)
+            patch_record['patch_size'] = getattr(patch_info, 'patch_size', None)
 
         val_patches.append(patch_record)
 
