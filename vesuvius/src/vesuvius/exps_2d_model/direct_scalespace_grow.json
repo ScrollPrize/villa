@@ -3,13 +3,13 @@
 		"dir_unet": 1.0,
 		"step": 1.0,
 		"smooth_x": 0.0,
-		"smooth_y": 0.001,
+		"smooth_y": 0.0,
 		"gradmag": 1.0,
 		"mean_pos": 0.1,
 		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
-		"conn_sy_r": 0.01,
-		"angle": 0.1,
+		"conn_sy_r": 0.0,
+		"angle": 0.0,
 		"y_straight": 0.0
 	},
 	"stages": [
@@ -53,6 +53,7 @@
 				"params": ["mesh_ms", "conn_offset_ms"],
 				"min_scaledown": 0,
 				"w_fac": {
+					"mean_pos": 0.0
 				}
 			}
 		}
