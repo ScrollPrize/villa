@@ -56,6 +56,12 @@ def direction_loss_maps(
 		mask_v_lr[:, :, -1, :] = mask_v_lr[:, :, -2, :]
 	mask_conn_l_lr = torch.minimum(res.mask_conn[..., 0], res.mask_conn[..., 1])
 	mask_conn_r_lr = torch.minimum(res.mask_conn[..., 1], res.mask_conn[..., 2])
+	# At mesh left/right edges we don't have true conn samples to a neighbor column.
+	# Crop those areas out (they were previously edge-copied in the model).
+	if mask_conn_l_lr.shape[3] >= 1:
+		mask_conn_l_lr[:, :, :, 0] = 0.0
+	if mask_conn_r_lr.shape[3] >= 1:
+		mask_conn_r_lr[:, :, :, -1] = 0.0
 
 	dir0_v_lr, dir1_v_lr = _dir_pred_v(xy_lr=res.xy_lr)
 	diff0_v = dir0_v_lr - unet_dir0_lr

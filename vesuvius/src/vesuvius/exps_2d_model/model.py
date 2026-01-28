@@ -369,20 +369,6 @@ class Model2D(nn.Module):
 		off_l = mesh_off[:, 0]
 		off_r = mesh_off[:, 1]
 		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
-		# Expand x by 1 on both sides using 2-point linear extrapolation, matching the
-		# y-edge handling in `_interp_col`.
-		if wm >= 2:
-			c0 = xy_px[:, :, :, 0:1]
-			c1 = xy_px[:, :, :, 1:2]
-			cl = 2.0 * c0 - c1
-			c_1 = xy_px[:, :, :, -1:]
-			c_2 = xy_px[:, :, :, -2:-1]
-			cr = 2.0 * c_1 - c_2
-			xy_px_ext = torch.cat([cl, xy_px, cr], dim=3)
-		else:
-			xy_px_ext = torch.cat([xy_px, xy_px, xy_px], dim=3)
-		left_src = xy_px_ext[:, :, :, 0:wm]
-		right_src = xy_px_ext[:, :, :, 2 : wm + 2]
 		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
 		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
 		conn = torch.stack([left_conn, xy_px, right_conn], dim=1)
