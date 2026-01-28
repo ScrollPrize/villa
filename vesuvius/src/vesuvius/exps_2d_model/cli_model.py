@@ -11,6 +11,8 @@ class ModelConfig:
 	subsample_mesh: int
 	subsample_winding: int
 	init_size_frac: float
+	init_size_frac_h: float | None
+	init_size_frac_v: float | None
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -20,6 +22,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--subsample-mesh", type=int, default=4)
 	g.add_argument("--subsample-winding", type=int, default=4)
 	g.add_argument("--init-size-frac", type=float, default=2.0)
+	g.add_argument("--init-size-frac-h", type=float, default=None)
+	g.add_argument("--init-size-frac-v", type=float, default=None)
 
 
 def from_args(args: argparse.Namespace) -> ModelConfig:
@@ -29,4 +33,6 @@ def from_args(args: argparse.Namespace) -> ModelConfig:
 		subsample_mesh=int(args.subsample_mesh),
 		subsample_winding=int(args.subsample_winding),
 		init_size_frac=float(args.init_size_frac),
+		init_size_frac_h=None if args.init_size_frac_h is None else float(args.init_size_frac_h),
+		init_size_frac_v=None if args.init_size_frac_v is None else float(args.init_size_frac_v),
 	)
