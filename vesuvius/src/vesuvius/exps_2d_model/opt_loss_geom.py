@@ -184,6 +184,11 @@ def angle_symmetry_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	mc = res.mask_conn
 	m_l = torch.minimum(mc[:, :, :-1, :, 0], mc[:, :, :-1, :, 1])
 	m_r = torch.minimum(mc[:, :, :-1, :, 1], mc[:, :, :-1, :, 2])
+	# Crop out left/right mesh edges: no true neighbor conn exists there.
+	if m_l.shape[3] >= 1:
+		m_l[:, :, :, 0] = 0.0
+	if m_r.shape[3] >= 1:
+		m_r[:, :, :, -1] = 0.0
 	mask_h = torch.minimum(m_l, m_r)
 	mask = torch.minimum(m_lr, mask_h)
 	return lm, mask
