@@ -104,6 +104,11 @@ Implementation:
 	- `-1` means connect to one row higher.
 	- Fractional values are linearly interpolated along the vertical axis.
 
+	- Extrapolation:
+		- Offsets are not clamped to `[0, Hm-1]`.
+		- If the sampling index is outside the mesh, the model extrapolates using the nearest valid two-row segment.
+		- This means the interpolation weight can be `< 0` or `> 1`.
+
 - The pixel-space connection points are exposed via `FitResult.xy_conn`.
 
 - Optimization:

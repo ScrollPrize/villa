@@ -235,13 +235,8 @@ def save(
 			"suffix": "dir_conn_r",
 			"reduce": True,
 		},
-		"step_h": {
-			"fn": lambda: opt_loss_step.step_loss_maps(res=res)[0],
-			"suffix": "step_h",
-			"reduce": True,
-		},
 		"step_v": {
-			"fn": lambda: opt_loss_step.step_loss_maps(res=res)[1],
+			"fn": lambda: opt_loss_step.step_loss_maps(res=res),
 			"suffix": "step_v",
 			"reduce": True,
 		},

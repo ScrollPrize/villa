@@ -384,12 +384,21 @@ class Model2D(nn.Module):
 		n, c, h, w = (int(v) for v in src.shape)
 		if y.shape != (n, h, w):
 			raise ValueError("y must be (N,H,W)")
-		y = y.clamp(0.0, float(h - 1))
-		y0 = torch.floor(y)
-		y1 = y0 + 1.0
-		t = (y - y0).clamp(0.0, 1.0)
-		y0i = y0.clamp(0.0, float(h - 1)).to(dtype=torch.int64)
-		y1i = y1.clamp(0.0, float(h - 1)).to(dtype=torch.int64)
+		# Allow extrapolation beyond the mesh by using the nearest valid segment.
+		# This makes weights outside [0,1] possible.
+		yf = y.to(dtype=src.dtype)
+		y0f = torch.floor(yf)
+		t = (yf - y0f)
+		low = yf < 0.0
+		high = yf > float(h - 1)
+		y0f = torch.where(low, torch.zeros_like(y0f), y0f)
+		y0f = torch.where(high, torch.full_like(y0f, float(h - 2)), y0f)
+		y0f = y0f.clamp(0.0, float(h - 2))
+		y1f = y0f + 1.0
+		# Recompute t based on the chosen segment start so it extrapolates correctly.
+		t = yf - y0f
+		y0i = y0f.to(dtype=torch.int64)
+		y1i = y1f.to(dtype=torch.int64)
 		idx0 = y0i.view(n, 1, h, w).expand(n, c, h, w)
 		idx1 = y1i.view(n, 1, h, w).expand(n, c, h, w)
 		v0 = torch.take_along_dim(src, idx0, dim=2)
