@@ -8,7 +8,7 @@
 		"mean_pos": 0.1,
 		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
-		"conn_sy_r": 0.0,
+		"conn_sy_r": 0.01,
 		"angle": 0.1,
 		"y_straight": 0.0
 	},
@@ -34,7 +34,7 @@
 		{
 			"name": "grow_only",
 			"grow": {
-				"directions": ["down"],
+				"directions": ["down","up"],
 				"generations": 30,
 				"steps": 1
 			},
