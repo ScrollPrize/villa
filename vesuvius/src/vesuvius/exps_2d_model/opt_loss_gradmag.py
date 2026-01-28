@@ -53,17 +53,24 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	if dist_x_hr.shape[-2:] != mag_hr.shape[-2:]:
 		raise RuntimeError("dist_x_hr must match mag_hr spatial shape")
 
+	ww = int(mag_hr.shape[-1])
+	samples_per = ww // periods_int
+	if samples_per <= 0:
+		base = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
+		mask0 = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
+		return base, mask0
+	max_cols = samples_per * periods_int
+
 	mag_use = mag_hr
 	if mask_sample is not None and mask_sample.shape[-2:] == mag_hr.shape[-2:]:
 		mag_use = mag_use * mask_sample
 
-	# Apply direction sign: use mesh geometry to determine winding orientation.
+	# Apply direction sign: use LR mesh geometry to determine winding orientation.
 	#
-	# - mesh_dir is the vertical direction at the mid-point (v-1 -> v+1)
-	# - cross(mesh_dir, conn_right) should be < 0
-	# - cross(-mesh_dir, conn_left) should be < 0  (equiv cross(mesh_dir, conn_left) > 0)
+	# We compute a single sign per (row,period) (where period is one LR x-segment),
+	# and apply it uniformly to all HR samples belonging to that period.
 	xy_lr = res.xy_lr
-	if int(xy_lr.shape[1]) >= 2:
+	if int(xy_lr.shape[1]) >= 2 and int(xy_lr.shape[2]) >= 2:
 		md = xy_lr.new_zeros(xy_lr.shape)
 		if int(xy_lr.shape[1]) >= 3:
 			md[:, 1:-1, :, :] = xy_lr[:, 2:, :, :] - xy_lr[:, :-2, :, :]
@@ -85,17 +92,28 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 		cross_r = mdx * v_r[..., 1] - mdy * v_r[..., 0]
 		cross_l = mdx * v_l[..., 1] - mdy * v_l[..., 0]
 		ok = (cross_r > 0.0) & (cross_l < 0.0)
-		sign_lr = torch.where(ok, -torch.ones_like(cross_r), torch.ones_like(cross_r)).unsqueeze(1)
-		sign_hr = F.interpolate(sign_lr, size=mag_hr.shape[-2:], mode="nearest")
-		mag_use = mag_use * sign_hr
 
-	ww = int(mag_hr.shape[-1])
-	samples_per = ww // periods_int
-	if samples_per <= 0:
-		base = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
-		mask0 = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
-		return base, mask0
-	max_cols = samples_per * periods_int
+		# period sign from the right vertex of each LR segment (col 1..Wm-1)
+		ok_period_lr = ok[:, :, 1:]
+		one = torch.ones_like(ok_period_lr, dtype=mag_hr.dtype)
+		sign_period_lr = torch.where(ok_period_lr, -one, one)
+		w_period_lr = torch.where(ok_period_lr, one, 10.0 * one)
+		sign_period_lr = sign_period_lr.unsqueeze(1)
+		w_period_lr = w_period_lr.unsqueeze(1)
+		sign_period_hr = F.interpolate(sign_period_lr, size=(int(mag_hr.shape[-2]), int(sign_period_lr.shape[-1])), mode="nearest")
+		w_period_hr = F.interpolate(w_period_lr, size=(int(mag_hr.shape[-2]), int(w_period_lr.shape[-1])), mode="nearest")
+
+		# expand periods to HR columns
+		sign_hr = sign_period_hr.repeat_interleave(samples_per, dim=-1)
+		w_hr = w_period_hr.repeat_interleave(samples_per, dim=-1)
+		if int(sign_hr.shape[-1]) < int(mag_hr.shape[-1]):
+			pad = int(mag_hr.shape[-1]) - int(sign_hr.shape[-1])
+			sign_hr = torch.cat([sign_hr, sign_hr[..., -1:].expand(*sign_hr.shape[:-1], pad)], dim=-1)
+			w_hr = torch.cat([w_hr, w_hr[..., -1:].expand(*w_hr.shape[:-1], pad)], dim=-1)
+		elif int(sign_hr.shape[-1]) > int(mag_hr.shape[-1]):
+			sign_hr = sign_hr[..., : int(mag_hr.shape[-1])]
+			w_hr = w_hr[..., : int(mag_hr.shape[-1])]
+		mag_use = mag_use * sign_hr
 
 	weighted = (mag_use[:, :, :, :max_cols] * dist_x_hr[:, :, :, :max_cols]).view(
 		int(mag_hr.shape[0]),
@@ -106,6 +124,11 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	)
 	sum_period = weighted.sum(dim=-1)
 	lm = (sum_period - 1.0) * (sum_period - 1.0)
+	if int(xy_lr.shape[1]) >= 2 and int(xy_lr.shape[2]) >= 2:
+		w_period = w_period_hr
+		if w_period.shape[-2:] != lm.shape[-2:]:
+			w_period = w_period.expand_as(lm)
+		lm = lm * w_period
 
 	if mask_sample is None or mask_sample.shape[-2:] != mag_hr.shape[-2:]:
 		mask = torch.ones_like(lm)
