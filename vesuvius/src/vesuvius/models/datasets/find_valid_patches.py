@@ -605,7 +605,7 @@ def find_valid_patches(
     collect_bg_only: bool = False,
     # Unlabeled foreground detection for semi-supervised learning
     image_arrays: Sequence[object] | None = None,
-    collect_unlabeled_fg: bool = False,
+    collect_unlabeled_fg: bool = True,
     unlabeled_fg_threshold: float = 0.05,  # Min fraction of non-zero image voxels
     unlabeled_fg_bbox_threshold: float = 0.15,  # Min bbox coverage for image data
 ):
@@ -649,8 +649,9 @@ def find_valid_patches(
         raise ValueError("ignore_labels must match number of label arrays when provided")
     if valid_patch_values is not None and len(valid_patch_values) != len(label_arrays):
         raise ValueError("valid_patch_values must match number of label arrays when provided")
+    # If unlabeled FG collection is requested but no image arrays provided, disable it silently
     if collect_unlabeled_fg and image_arrays is None:
-        raise ValueError("image_arrays must be provided when collect_unlabeled_fg=True")
+        collect_unlabeled_fg = False
     if image_arrays is not None and len(image_arrays) != len(label_arrays):
         raise ValueError("image_arrays must match number of label arrays when provided")
 
@@ -926,6 +927,20 @@ def find_valid_patches(
                     x_stop = x_group[-1] + dpX
 
                     block = np.asarray(downsampled_array[y_start:y_stop, x_start:x_stop])
+
+                    # Check if block contains ONLY ignore label (before zeroing)
+                    # Used to identify patches that should be treated as unlabeled FG
+                    block_is_ignore_only = False
+                    if ignore_label is not None and should_collect_unlabeled_fg:
+                        block_scalar_pre = reduce_block_to_scalar(
+                            block, spatial_ndim=2, channel_selector=selector
+                        )
+                        # Check: all non-zero values are the ignore label
+                        nonzero_mask_pre = block_scalar_pre != 0
+                        if np.any(nonzero_mask_pre):
+                            ignore_mask_pre = block_scalar_pre == ignore_label
+                            block_is_ignore_only = np.all(nonzero_mask_pre == ignore_mask_pre)
+
                     # Check BG criteria on original block before zeroing ignore labels
                     if should_collect_bg:
                         block_for_bg = reduce_block_to_scalar(
@@ -950,6 +965,58 @@ def find_valid_patches(
                     else:
                         block_mask = np.asarray(block != 0)
                     if not np.any(block_mask):
+                        # Block has no valid labels after ignore masking
+                        # If block was ignore-only, check image data for unlabeled FG
+                        if block_is_ignore_only and should_collect_unlabeled_fg and downsampled_image_array is not None:
+                            y_len = len(y_group)
+                            x_len = len(x_group)
+                            image_block = np.asarray(
+                                downsampled_image_array[y_start:y_stop, x_start:x_stop]
+                            )
+                            if image_block.ndim > 2:
+                                image_block = image_block.reshape(image_block.shape[-2:])
+                            image_nonzero = np.asarray(image_block != 0)
+                            if np.any(image_nonzero):
+                                image_nonzero = np.ascontiguousarray(image_nonzero)
+                                img_patches_view = as_strided(
+                                    image_nonzero,
+                                    shape=(y_len, x_len, dpY, dpX),
+                                    strides=(
+                                        image_nonzero.strides[0] * dpY,
+                                        image_nonzero.strides[1] * dpX,
+                                        image_nonzero.strides[0],
+                                        image_nonzero.strides[1],
+                                    ),
+                                    writeable=False,
+                                )
+                                img_patches_flat = img_patches_view.reshape(y_len, x_len, -1)
+                                img_nonzero_counts = img_patches_flat.sum(axis=-1)
+                                img_fraction = img_nonzero_counts / patch_volume
+
+                                # Compute image bbox coverage
+                                img_y_any = img_patches_view.any(axis=-1)
+                                img_x_any = img_patches_view.any(axis=-2)
+                                img_y_has = img_y_any.any(axis=-1)
+                                img_x_has = img_x_any.any(axis=-1)
+                                img_y_first = np.argmax(img_y_any, axis=-1)
+                                img_y_last = img_y_any.shape[-1] - 1 - np.argmax(img_y_any[..., ::-1], axis=-1)
+                                img_y_width = np.where(img_y_has, (img_y_last - img_y_first + 1), 0)
+                                img_x_first = np.argmax(img_x_any, axis=-1)
+                                img_x_last = img_x_any.shape[-1] - 1 - np.argmax(img_x_any[..., ::-1], axis=-1)
+                                img_x_width = np.where(img_x_has, (img_x_last - img_x_first + 1), 0)
+                                img_bbox_fraction = (img_y_width * img_x_width) / patch_volume
+
+                                # All positions in ignore-only block are unlabeled FG candidates
+                                unlabeled_fg_mask = (
+                                    (img_fraction >= unlabeled_fg_threshold) &
+                                    (img_bbox_fraction >= unlabeled_fg_bbox_threshold)
+                                )
+                                if np.any(unlabeled_fg_mask):
+                                    unlabeled_fg_idx = np.argwhere(unlabeled_fg_mask)
+                                    for (yy, xx) in unlabeled_fg_idx:
+                                        pos_y = y_group[yy]
+                                        pos_x = x_group[xx]
+                                        unlabeled_fg_positions_vol.append((pos_y, pos_x))
                         continue
 
                     block_mask = np.ascontiguousarray(block_mask)
@@ -1075,6 +1142,20 @@ def find_valid_patches(
                         block = np.asarray(
                             downsampled_array[z_start:z_stop, y_start:y_stop, x_start:x_stop]
                         )
+
+                        # Check if block contains ONLY ignore label (before zeroing)
+                        # Used to identify patches that should be treated as unlabeled FG
+                        block_is_ignore_only = False
+                        if ignore_label is not None and should_collect_unlabeled_fg:
+                            block_scalar_pre = reduce_block_to_scalar(
+                                block, spatial_ndim=3, channel_selector=selector
+                            )
+                            # Check: all non-zero values are the ignore label
+                            nonzero_mask_pre = block_scalar_pre != 0
+                            if np.any(nonzero_mask_pre):
+                                ignore_mask_pre = block_scalar_pre == ignore_label
+                                block_is_ignore_only = np.all(nonzero_mask_pre == ignore_mask_pre)
+
                         # Check BG criteria on original block before zeroing ignore labels
                         if should_collect_bg:
                             block_for_bg = reduce_block_to_scalar(
@@ -1100,6 +1181,67 @@ def find_valid_patches(
                         else:
                             block_mask = np.asarray(block != 0)
                         if not np.any(block_mask):
+                            # Block has no valid labels after ignore masking
+                            # If block was ignore-only, check image data for unlabeled FG
+                            if block_is_ignore_only and should_collect_unlabeled_fg and downsampled_image_array is not None:
+                                z_len = len(z_group)
+                                y_len = len(y_group)
+                                x_len = len(x_group)
+                                image_block = np.asarray(
+                                    downsampled_image_array[z_start:z_stop, y_start:y_stop, x_start:x_stop]
+                                )
+                                if image_block.ndim > 3:
+                                    image_block = image_block.reshape(image_block.shape[-3:])
+                                image_nonzero = np.asarray(image_block != 0)
+                                if np.any(image_nonzero):
+                                    image_nonzero = np.ascontiguousarray(image_nonzero)
+                                    img_patches_view = as_strided(
+                                        image_nonzero,
+                                        shape=(z_len, y_len, x_len, dpZ, dpY, dpX),
+                                        strides=(
+                                            image_nonzero.strides[0] * dpZ,
+                                            image_nonzero.strides[1] * dpY,
+                                            image_nonzero.strides[2] * dpX,
+                                            image_nonzero.strides[0],
+                                            image_nonzero.strides[1],
+                                            image_nonzero.strides[2],
+                                        ),
+                                        writeable=False,
+                                    )
+                                    img_patches_flat = img_patches_view.reshape(z_len, y_len, x_len, -1)
+                                    img_nonzero_counts = img_patches_flat.sum(axis=-1)
+                                    img_fraction = img_nonzero_counts / patch_volume
+
+                                    # Compute image bbox coverage (3D)
+                                    img_z_any = img_patches_view.any(axis=(4, 5))
+                                    img_y_any = img_patches_view.any(axis=(3, 5))
+                                    img_x_any = img_patches_view.any(axis=(3, 4))
+                                    img_z_has = img_z_any.any(axis=-1)
+                                    img_y_has = img_y_any.any(axis=-1)
+                                    img_x_has = img_x_any.any(axis=-1)
+                                    img_z_first = np.argmax(img_z_any, axis=-1)
+                                    img_z_last = img_z_any.shape[-1] - 1 - np.argmax(img_z_any[..., ::-1], axis=-1)
+                                    img_z_width = np.where(img_z_has, (img_z_last - img_z_first + 1), 0)
+                                    img_y_first = np.argmax(img_y_any, axis=-1)
+                                    img_y_last = img_y_any.shape[-1] - 1 - np.argmax(img_y_any[..., ::-1], axis=-1)
+                                    img_y_width = np.where(img_y_has, (img_y_last - img_y_first + 1), 0)
+                                    img_x_first = np.argmax(img_x_any, axis=-1)
+                                    img_x_last = img_x_any.shape[-1] - 1 - np.argmax(img_x_any[..., ::-1], axis=-1)
+                                    img_x_width = np.where(img_x_has, (img_x_last - img_x_first + 1), 0)
+                                    img_bbox_fraction = (img_z_width * img_y_width * img_x_width) / patch_volume
+
+                                    # All positions in ignore-only block are unlabeled FG candidates
+                                    unlabeled_fg_mask = (
+                                        (img_fraction >= unlabeled_fg_threshold) &
+                                        (img_bbox_fraction >= unlabeled_fg_bbox_threshold)
+                                    )
+                                    if np.any(unlabeled_fg_mask):
+                                        unlabeled_fg_idx = np.argwhere(unlabeled_fg_mask)
+                                        for (zz, yy, xx) in unlabeled_fg_idx:
+                                            pos_z = z_group[zz]
+                                            pos_y = y_group[yy]
+                                            pos_x = x_group[xx]
+                                            unlabeled_fg_positions_vol.append((pos_z, pos_y, pos_x))
                             continue
 
                         block_mask = np.ascontiguousarray(block_mask)
