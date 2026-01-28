@@ -162,6 +162,7 @@ class CFG:
 
     min_lr = 1e-6
     weight_decay = 1e-6
+    exclude_weight_decay_bias_norm = True
     max_grad_norm = 100
 
     print_freq = 50
@@ -389,6 +390,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("cosine_warmup_pct", "cosine_warmup_pct"),
         ("min_lr", "min_lr"),
         ("weight_decay", "weight_decay"),
+        ("exclude_weight_decay_bias_norm", "exclude_weight_decay_bias_norm"),
         ("max_grad_norm", "max_grad_norm"),
         ("pretrained", "pretrained"),
         ("num_workers", "num_workers"),
@@ -1354,8 +1356,27 @@ class RegressionPLModel(pl.LightningModule):
                 pred_buf.fill(0)
                 count_buf.fill(0)
     def configure_optimizers(self):
+        if bool(getattr(CFG, "exclude_weight_decay_bias_norm", False)) and float(getattr(CFG, "weight_decay", 0.0) or 0.0) > 0:
+            decay_params = []
+            no_decay_params = []
+            for _, param in self.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if int(getattr(param, "ndim", 0)) < 2:
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
 
-        optimizer = AdamW(self.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+            optimizer = AdamW(
+                [
+                    {"params": decay_params, "weight_decay": float(CFG.weight_decay)},
+                    {"params": no_decay_params, "weight_decay": 0.0},
+                ],
+                lr=CFG.lr,
+                weight_decay=0.0,
+            )
+        else:
+            optimizer = AdamW(self.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
         scheduler_name = str(getattr(CFG, "scheduler", "OneCycleLR")).lower()
         steps_per_epoch = int(self.hparams.total_steps)
         epochs = int(CFG.epochs)

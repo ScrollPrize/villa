@@ -103,6 +103,7 @@
       "lr": 1e-05,
       "min_lr": 1e-06,
       "weight_decay": 1e-06,
+      "exclude_weight_decay_bias_norm": true,
       "max_grad_norm": 100,
       "pretrained": true,
       "num_workers": 12,
