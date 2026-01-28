@@ -10,7 +10,7 @@
 		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
 		"conn_sy_r": 0.0,
-		"angle": 0.0,
+		"angle": 0.001,
 		"y_straight": 0.0
 	},
 	"stages": [
@@ -74,7 +74,7 @@
 			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
-				"dir_conn": 10.0,
+				"dir_conn": 100.0,
 				"gradmag": 10.0
 			}
 		}
