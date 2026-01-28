@@ -177,7 +177,7 @@ def optimize(
 		params: list[torch.nn.Parameter] = []
 		for name in opt_cfg.params:
 			group = all_params.get(name, [])
-			if name in {"offset_ms", "mesh_offset_ms"}:
+			if name in {"offset_ms", "mesh_offset_ms", "mesh_ms", "conn_offset_ms"}:
 				k0 = max(0, int(opt_cfg.min_scaledown))
 				params.extend(group[k0:])
 			else:

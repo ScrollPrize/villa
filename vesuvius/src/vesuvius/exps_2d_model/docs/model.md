@@ -66,10 +66,11 @@ Rules:
 - After `grow`, the optimizer can set a constant-mask on the model (see [`model.Model2D.const_mask_lr`](../model.py:1)) to keep the pre-existing mesh region fixed during local optimization.
 - When `const_mask_lr` is set, [`model.Model2D.forward()`](../model.py:131) computes the mesh twice (one `no_grad` pass + one grad pass) and merges the results so masked regions do not receive gradients.
 
-## Line-offset modeling (mesh_offset)
+## Line-offset modeling (conn_offset)
 
-- The model has a learnable multi-scale `mesh_offset_ms` tensor (same scale-space handling as `offset_ms`).
-	- `mesh_offset_coarse()` reconstructs the base-mesh offsets used for outputs.
+
+- The model has a learnable multi-scale `conn_offset_ms` tensor (same scale-space handling as `mesh_ms`, previously `offset_ms`).
+	- `conn_offset_coarse()` reconstructs the base-mesh offsets used for outputs.
 	- The coarse/base result has shape `(1,2,Hm,Wm)`.
 	- channel 0: vertical offset for the *left* connection
 	- channel 1: vertical offset for the *right* connection
@@ -84,7 +85,7 @@ Rules:
 - The pixel-space connection points are exposed via `FitResult.xy_conn`.
 
 - Optimization:
-	- `mesh_offset_ms` is optimized via the same stage plumbing as `offset_ms` (including `min_scaledown` handling).
+	- `conn_offset_ms` is optimized via the same stage plumbing as `mesh_ms` (including `min_scaledown` handling).
 
 ### Mapping: image → winding coordinates (via sampling)
 

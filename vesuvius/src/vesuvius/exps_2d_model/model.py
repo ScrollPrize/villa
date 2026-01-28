@@ -103,13 +103,11 @@ class Model2D(nn.Module):
 		w = max(2, int(round(fw)))
 		self.mesh_h = max(2, (h + int(init.mesh_step_px) - 1) // int(init.mesh_step_px) + 1)
 		self.mesh_w = max(2, (w + int(init.winding_step_px) - 1) // int(init.winding_step_px) + 1)
-
-		self.base_grid = self._build_base_grid().to(device=device)
 		offset_scales = 5
-		self.offset_ms = nn.ParameterList(
-			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
+		self.mesh_ms = nn.ParameterList(
+			self._build_mesh_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
-		self.mesh_offset_ms = nn.ParameterList(
+		self.conn_offset_ms = nn.ParameterList(
 			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
 		self.const_mask_lr: torch.Tensor | None = None
@@ -183,13 +181,17 @@ class Model2D(nn.Module):
 		return x, y
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
-		return {
+		p = {
 			"theta": [self.theta],
 			"phase": [self.phase],
 			"winding_scale": [self.winding_scale],
-			"offset_ms": list(self.offset_ms),
-			"mesh_offset_ms": list(self.mesh_offset_ms),
+			"mesh_ms": list(self.mesh_ms),
+			"conn_offset_ms": list(self.conn_offset_ms),
 		}
+		# Back-compat aliases for stages JSON / older naming.
+		p["offset_ms"] = p["mesh_ms"]
+		p["mesh_offset_ms"] = p["conn_offset_ms"]
+		return p
 
 	def grow(self, *, directions: list[str], steps: int) -> None:
 		steps = max(0, int(steps))
@@ -221,9 +223,8 @@ class Model2D(nn.Module):
 		for _ in range(int(steps)):
 			for d in dirs_list:
 				dim, side, dh, dw, dpy, dpx = grow_specs[d]
-				self.offset_ms = self._grow_param_pyramid_1(src=self.offset_ms, dim=dim, side=side)
-				self.mesh_offset_ms = self._grow_param_pyramid_1(src=self.mesh_offset_ms, dim=dim, side=side)
-				self.base_grid = self._expand_linear(src=self.base_grid, dim=dim, side=side)
+				self.mesh_ms = self._grow_param_pyramid_1(src=self.mesh_ms, dim=dim, side=side)
+				self.conn_offset_ms = self._grow_param_pyramid_1(src=self.conn_offset_ms, dim=dim, side=side)
 				self.mesh_h = int(self.mesh_h) + dh
 				self.mesh_w = int(self.mesh_w) + dw
 				py0 += dpy
@@ -269,11 +270,10 @@ class Model2D(nn.Module):
 	- `<path>_xy_hr.tif`: (2,He,We)
 	- `<path>_xy_conn.tif`: (6,Hm,Wm) in order [l.x,l.y,p.x,p.y,r.x,r.y]
 	- `<path>_mask_lr.tif`: (1,Hm,Wm)
-	- `<path>_mask_hr.tif`: (1,He,We)
-	- `<path>_mask_conn.tif`: (3,Hm,Wm)
-	- `<path>_base_grid.tif`: (2,Hm,Wm)
-	- `<path>_offset.tif`: (2,Hm,Wm)
-	- `<path>_mesh_offset.tif`: (2,Hm,Wm)
+		- `<path>_mask_hr.tif`: (1,He,We)
+		- `<path>_mask_conn.tif`: (3,Hm,Wm)
+		- `<path>_mesh.tif`: (2,Hm,Wm)
+		- `<path>_conn_offset.tif`: (2,Hm,Wm)
 	"""
 		p = Path(path)
 		p.parent.mkdir(parents=True, exist_ok=True)
@@ -286,9 +286,8 @@ class Model2D(nn.Module):
 			mask_lr = res.mask_lr[0].detach().cpu().to(dtype=torch.float32).numpy()
 			mask_hr = res.mask_hr[0].detach().cpu().to(dtype=torch.float32).numpy()
 			mask_conn = res.mask_conn[0, 0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
-			base_grid = self.base_grid[0].detach().cpu().to(dtype=torch.float32).numpy()
-			off = self.offset_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
-			mesh_off = self.mesh_offset_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
+			mesh = self.mesh_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
+			conn_off = self.conn_offset_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
 
 			tifffile.imwrite(str(stem) + "_xy_lr.tif", xy_lr, compression="lzw")
 			tifffile.imwrite(str(stem) + "_xy_hr.tif", xy_hr, compression="lzw")
@@ -296,15 +295,18 @@ class Model2D(nn.Module):
 			tifffile.imwrite(str(stem) + "_mask_lr.tif", mask_lr, compression="lzw")
 			tifffile.imwrite(str(stem) + "_mask_hr.tif", mask_hr, compression="lzw")
 			tifffile.imwrite(str(stem) + "_mask_conn.tif", mask_conn, compression="lzw")
-			tifffile.imwrite(str(stem) + "_base_grid.tif", base_grid, compression="lzw")
-			tifffile.imwrite(str(stem) + "_offset.tif", off, compression="lzw")
-			tifffile.imwrite(str(stem) + "_mesh_offset.tif", mesh_off, compression="lzw")
+			tifffile.imwrite(str(stem) + "_mesh.tif", mesh, compression="lzw")
+			tifffile.imwrite(str(stem) + "_conn_offset.tif", conn_off, compression="lzw")
 
-	def mesh_offset_coarse(self) -> torch.Tensor:
-		off = self.mesh_offset_ms[-1]
-		for d in reversed(self.mesh_offset_ms[:-1]):
+	def conn_offset_coarse(self) -> torch.Tensor:
+		off = self.conn_offset_ms[-1]
+		for d in reversed(self.conn_offset_ms[:-1]):
 			off = self._upsample2_crop(src=off, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
 		return off
+
+	def mesh_offset_coarse(self) -> torch.Tensor:
+		# Back-compat alias.
+		return self.conn_offset_coarse()
 
 	def _xy_conn_px(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
 		"""Return per-mesh connection positions in pixel coordinates.
@@ -321,7 +323,7 @@ class Model2D(nn.Module):
 		n, hm, wm, _c2 = (int(v) for v in xy_lr.shape)
 		if hm <= 0 or wm <= 0:
 			raise ValueError("invalid xy_lr shape")
-		mesh_off = self.mesh_offset_coarse()
+		mesh_off = self.conn_offset_coarse()
 		if mesh_off.shape[-2:] != (hm, wm):
 			raise RuntimeError("mesh_offset must be defined on the base mesh")
 		xy_px = xy_lr.permute(0, 3, 1, 2).contiguous()
@@ -360,14 +362,18 @@ class Model2D(nn.Module):
 
 	def grid_uv(self) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return base (u,v) mesh coordinates in pixel units."""
-		uv = self.base_grid + self.offset_coarse()
+		uv = self.mesh_coarse()
 		return uv[:, 0:1], uv[:, 1:2]
 
+	def mesh_coarse(self) -> torch.Tensor:
+		m = self.mesh_ms[-1]
+		for d in reversed(self.mesh_ms[:-1]):
+			m = self._upsample2_crop(src=m, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
+		return m
+
 	def offset_coarse(self) -> torch.Tensor:
-		off = self.offset_ms[-1]
-		for d in reversed(self.offset_ms[:-1]):
-			off = self._upsample2_crop(src=off, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
-		return off
+		# Back-compat alias.
+		return self.mesh_coarse()
 
 	@staticmethod
 	def _upsample2_crop(*, src: torch.Tensor, h_t: int, w_t: int) -> torch.Tensor:
@@ -385,6 +391,13 @@ class Model2D(nn.Module):
 			gw_i = max(2, gw_prev // 2 + 1)
 			shapes.append((gh_i, gw_i))
 		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
+
+	def _build_mesh_ms(self, *, offset_scales: int, device: torch.device, gh0: int, gw0: int) -> list[nn.Parameter]:
+		"""Build residual pyramid whose reconstruction is the mesh coords in pixel units."""
+		base = self._build_base_grid(gh0=int(gh0), gw0=int(gw0)).to(device=device)
+		ms = self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=int(gh0), gw0=int(gw0))
+		ms[0] = nn.Parameter(base)
+		return ms
 
 	def _grid_xy(self) -> torch.Tensor:
 		"""Return globally transformed mesh coordinates in pixel xy (N,Hm,Wm,2)."""
@@ -426,7 +439,7 @@ class Model2D(nn.Module):
 			subsample_winding=subsample_winding,
 		)
 
-	def _build_base_grid(self) -> torch.Tensor:
+	def _build_base_grid(self, *, gh0: int, gw0: int) -> torch.Tensor:
 		# Model domain is initialized to a configurable fraction of the image extent.
 		# Internal coordinates are stored in pixel units.
 		w = float(max(1, int(self.init.w_img) - 1))
@@ -436,8 +449,8 @@ class Model2D(nn.Module):
 		u1 = 0.5 * (1.0 + f) * w
 		v0 = 0.5 * (1.0 - f) * h
 		v1 = 0.5 * (1.0 + f) * h
-		u = torch.linspace(u0, u1, self.mesh_w, dtype=torch.float32)
-		v = torch.linspace(v0, v1, self.mesh_h, dtype=torch.float32)
+		u = torch.linspace(u0, u1, int(gw0), dtype=torch.float32)
+		v = torch.linspace(v0, v1, int(gh0), dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
 		return torch.stack([uu, vv], dim=0).unsqueeze(0)
 
