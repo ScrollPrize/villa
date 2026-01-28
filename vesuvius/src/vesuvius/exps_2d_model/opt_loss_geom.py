@@ -54,7 +54,7 @@ def meshoff_smooth_y_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor
 	"""Return (lm, mask) for y-smoothness of horizontal connections.
 
 	Regularizes how the connection vectors (left-mid & mid-right) change along y.
-	This captures the effect of `mesh_offset_ms` in the current model.
+	This captures the effect of `conn_offset_ms` (previously `mesh_offset_ms`) in the model.
 	"""
 	xy = res.xy_conn
 	left = xy[..., 0, :]
