@@ -8,7 +8,7 @@
 			"name": "stage_scaledown4",
 			"steps": 5000,
 			"lr": 1.0,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 4,
 			"w_fac": {
 			}
@@ -17,7 +17,7 @@
 			"name": "stage_scaledown3",
 			"steps": 5000,
 			"lr": 1.0,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 3,
 			"w_fac": {
 			}
@@ -26,7 +26,7 @@
 			"name": "stage_scaledown2",
 			"steps": 5000,
 			"lr": 0.1,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 2,
 			"w_fac": {
 			}
@@ -35,7 +35,7 @@
 			"name": "stage_scaledown1",
 			"steps": 5000,
 			"lr": 0.1,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 1,
 			"w_fac": {
 			}
@@ -44,7 +44,7 @@
 			"name": "stage_scaledown0",
 			"steps": 5000,
 			"lr": 0.1,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 			}

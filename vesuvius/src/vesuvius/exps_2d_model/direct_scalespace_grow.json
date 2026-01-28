@@ -26,7 +26,7 @@
 			"name": "mesh",
 			"steps": 3000,
 			"lr": 0.1,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 			}
@@ -41,7 +41,7 @@
 			"global_opt": {
 				"steps": 0,
 				"lr": 0.1,
-				"params": ["offset_ms", "mesh_offset_ms"],
+				"params": ["mesh_ms", "conn_offset_ms"],
 				"min_scaledown": 0,
 				"w_fac": {
 				}
@@ -49,7 +49,7 @@
 			"local_opt": {
 				"steps": 0,
 				"lr": 0.01,
-				"params": ["offset_ms", "mesh_offset_ms"],
+				"params": ["mesh_ms", "conn_offset_ms"],
 				"min_scaledown": 0,
 				"w_fac": {
 					"gradmag": 1.0

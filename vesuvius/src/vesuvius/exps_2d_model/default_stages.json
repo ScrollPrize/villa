@@ -36,7 +36,7 @@
 			"name": "stage2",
 			"steps": 10000,
 			"lr": 0.0001,
-			"params": ["amp_coarse", "bias_coarse", "offset_ms", "line_offset"],
+			"params": ["amp_coarse", "bias_coarse", "mesh_ms", "line_offset"],
 			"default_mul": 1.0,
 			"use_full_dir_unet": false,
 			"w_fac": {
@@ -58,7 +58,7 @@
 			"name": "stage3",
 			"steps": 20000,
 			"lr": 0.0001,
-			"params": ["amp_coarse", "bias_coarse", "offset_ms", "line_offset"],
+			"params": ["amp_coarse", "bias_coarse", "mesh_ms", "line_offset"],
 			"default_mul": 1.0,
 			"use_full_dir_unet": false,
 			"w_fac": {
@@ -80,7 +80,7 @@
 			"name": "stage4",
 			"steps": 5000,
 			"lr": 0.0001,
-			"params": ["theta", "winding_scale", "phase", "amp_coarse", "bias_coarse", "offset_ms", "line_offset"],
+			"params": ["theta", "winding_scale", "phase", "amp_coarse", "bias_coarse", "mesh_ms", "line_offset"],
 			"default_mul": null,
 			"w_fac": null
 		}
