@@ -1,7 +1,7 @@
 program: train_resnet3d.py
 project: ink-group-dro
 entity: vesuvius-challenge
-method: grid
+method: random
 
 metric:
   name: val/worst_group_loss.min
@@ -9,17 +9,24 @@ metric:
 
 parameters:
   training.objective:
-    value: group_dro
+    value: erm
   training.loss_mode:
-    value: per_sample
+    value: batch
   training.sampler:
-    value: group_balanced
+    value: shuffle
 
-  group_dro.robust_step_size:
-    values: [0.01, 0.05, 0.1, 0.2]
+  training_hyperparameters.training.accumulate_grad_batches:
+    value: 1
+
+  training_hyperparameters.training.lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
 
   training_hyperparameters.training.weight_decay:
-    values: [0.000001, 0.0001, 0.1, 1.0]
+    distribution: log_uniform_values
+    min: 1e-8
+    max: 1e-2
 
 command:
   - ${env}
@@ -28,9 +35,9 @@ command:
   - --metadata_json
   - metadata.json
   - --outputs_path
-  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls
+  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/train_scrolls
   - --stitch_all_val
   - --stitch_downsample
   - "8"
   - --wandb_tags
-  - ink-2um,group_dro,ablation_weight_decay_step_size
+  - ink-2um,erm,hparam_sweep,shuffle,accum1

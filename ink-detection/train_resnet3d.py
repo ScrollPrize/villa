@@ -1591,6 +1591,17 @@ def main():
     wandb_logger = WandbLogger(project=wandb_project, name=args.run_name, **wandb_logger_kwargs)
     log(f"wandb ready in {time.time() - wandb_t0:.1f}s")
 
+    # Sweep selection: ensure W&B summarizes robust metrics by the best value over training,
+    # not the last logged value.
+    try:
+        run = wandb_logger.experiment
+        run.define_metric("val/worst_group_loss", summary="min")
+        run.define_metric("val/avg_loss", summary="min")
+        run.define_metric("val/worst_group_dice", summary="max")
+        run.define_metric("val/avg_dice", summary="max")
+    except Exception:
+        pass
+
     try:
         wandb_overrides = unflatten_dict(dict(wandb_logger.experiment.config))
     except Exception:
@@ -1600,15 +1611,10 @@ def main():
     deep_merge_dict(merged_config, wandb_overrides)
 
     apply_metadata_hyperparameters(CFG, merged_config)
-    log(
-        "config "
-        f"objective={CFG.objective} sampler={CFG.sampler} loss_mode={CFG.loss_mode} "
-        f"erm_group_topk={getattr(CFG, 'erm_group_topk', 0)} "
-        f"epochs={CFG.epochs} lr={CFG.lr} batch={CFG.train_batch_size} "
-        f"accumulate_grad_batches={CFG.accumulate_grad_batches} "
-        f"num_workers={CFG.num_workers} layer_read_workers={getattr(CFG, 'layer_read_workers', 1)} "
-        f"stitch_all_val={getattr(CFG, 'stitch_all_val', False)} stitch_downsample={getattr(CFG, 'stitch_downsample', 1)}"
-    )
+    try:
+        log("cfg " + json.dumps(merged_config, sort_keys=True, default=str))
+    except Exception:
+        log(f"cfg {merged_config}")
 
     try:
         wandb_logger.experiment.config.update(merged_config, allow_val_change=True)
@@ -1965,6 +1971,25 @@ def main():
     accum = int(getattr(CFG, "accumulate_grad_batches", 1) or 1)
     if accum > 1:
         steps_per_epoch = int(math.ceil(steps_per_epoch / accum))
+
+    micro_steps_per_epoch = int(len(train_loader))
+    optimizer_steps_per_epoch = int(steps_per_epoch)
+    total_optimizer_steps = int(optimizer_steps_per_epoch * int(CFG.epochs))
+    effective_batch_size = int(int(CFG.train_batch_size) * int(accum))
+
+    log(
+        "train budget "
+        f"len(train_loader)={micro_steps_per_epoch} accumulate_grad_batches={accum} "
+        f"optimizer_steps_per_epoch={optimizer_steps_per_epoch} epochs={int(CFG.epochs)} "
+        f"total_optimizer_steps={total_optimizer_steps} effective_batch_size={effective_batch_size}"
+    )
+    log(
+        "scheduler budget "
+        f"scheduler={getattr(CFG, 'scheduler', None)!r} "
+        f"onecycle steps_per_epoch={optimizer_steps_per_epoch} epochs={int(CFG.epochs)} "
+        f"max_lr={float(CFG.lr)} div_factor={float(getattr(CFG, 'onecycle_div_factor', 25.0))} "
+        f"pct_start={float(getattr(CFG, 'onecycle_pct_start', 0.15))}"
+    )
 
     model = RegressionPLModel(
         enc='i3d',

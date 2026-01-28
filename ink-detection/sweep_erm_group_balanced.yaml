@@ -4,7 +4,7 @@ entity: vesuvius-challenge
 method: grid
 
 metric:
-  name: val/worst_group_loss
+  name: val/worst_group_loss.min
   goal: minimize
 
 parameters:

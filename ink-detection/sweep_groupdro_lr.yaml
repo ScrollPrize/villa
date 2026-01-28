@@ -4,7 +4,7 @@ entity: vesuvius-challenge
 method: grid
 
 metric:
-  name: val/worst_group_loss
+  name: val/worst_group_loss.min
   goal: minimize
 
 parameters:
@@ -15,7 +15,6 @@ parameters:
   training.sampler:
     value: group_balanced
 
-  # Sweep learning rate only; keep robust_step_size + weight_decay in metadata.json.
   training_hyperparameters.training.lr:
     values: [3e-5, 1e-4]
 
