@@ -12,6 +12,8 @@ class OneOfTransform(BasicTransform):
         """
         super().__init__()
         self.list_of_transforms = list_of_transforms
+        # Skip timing for the wrapper; leaf transforms record their own timings.
+        self._perf_exclude = True
 
     def apply(self, data_dict, **params):
         # Randomly select one transform from the list

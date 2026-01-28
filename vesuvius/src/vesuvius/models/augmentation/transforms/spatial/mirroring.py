@@ -6,6 +6,9 @@ from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTr
 
 
 class MirrorTransform(BasicTransform):
+
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(self, allowed_axes: Tuple[int, ...], normal_keys: Optional[Set[str]] = None):
         super().__init__()
         self.allowed_axes = allowed_axes
@@ -110,5 +113,9 @@ class MirrorTransform(BasicTransform):
         for key in vector_keys:
             if data_dict.get(key) is not None:
                 data_dict[key] = self._apply_to_vectors(data_dict[key], **params)
+
+        # Transform padding_mask with the same flip
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
 
         return data_dict

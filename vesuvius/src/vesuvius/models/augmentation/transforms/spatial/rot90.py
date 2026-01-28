@@ -21,6 +21,8 @@ class Rot90Transform(BasicTransform):
                                  (e.g., {0, 1, 2} for 3D).
     """
 
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(
         self,
         num_axis_combinations: RandomScalar = 1,
@@ -31,6 +33,14 @@ class Rot90Transform(BasicTransform):
         self.num_axis_combinations = num_axis_combinations
         self.num_rot_per_combination = num_rot_per_combination
         self.allowed_axes = allowed_axes
+
+    def apply(self, data_dict, **params):
+        # Apply base transform (image, segmentation, etc.)
+        data_dict = super().apply(data_dict, **params)
+        # Also transform padding_mask with the same rotation
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
+        return data_dict
 
     def get_parameters(self, **data_dict) -> dict:
         n_axes_combinations = round(sample_scalar(self.num_axis_combinations))
@@ -44,14 +54,10 @@ class Rot90Transform(BasicTransform):
             # +1 because we skip channel dimension
             axis_combinations.append([a + 1 for a in axes])
 
-        params = {
+        return {
             'num_rot_per_combination': num_rot_per_combination,
             'axis_combinations': axis_combinations
         }
-        # Pass crop_shape through for keypoint transforms
-        if 'crop_shape' in data_dict:
-            params['crop_shape'] = data_dict['crop_shape']
-        return params
 
     def _maybe_rot90(
         self,

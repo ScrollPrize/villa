@@ -14,6 +14,8 @@ class TransposeAxesTransform(BasicTransform):
         image of shape (C, Z, Y, X)). Spatial axes are indexed in (Z=0, Y=1, X=2) order.
     """
 
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(self, allowed_axes: Set[int], normal_keys: Optional[Set[str]] = None):
         """
         Initialize the transform with allowed spatial axes for permutation.
@@ -64,22 +66,7 @@ class TransposeAxesTransform(BasicTransform):
         raise NotImplementedError
 
     def _apply_to_keypoints(self, keypoints, **params):
-        """Permute keypoint coordinate components according to axis transpose."""
-        if keypoints is None:
-            return None
-        axis_order = params['axis_order']
-        # axis_order is for tensors with channel dim, extract spatial permutation
-        spatial_perm = [ax - 1 for ax in axis_order[1:]]
-        return keypoints[:, spatial_perm].contiguous()
-
-    def _apply_to_vectors(self, vectors, **params):
-        """Permute vector components according to axis transpose."""
-        if vectors is None:
-            return None
-        axis_order = params['axis_order']
-        # axis_order is for tensors with channel dim, extract spatial permutation
-        spatial_perm = [ax - 1 for ax in axis_order[1:]]
-        return vectors[:, spatial_perm].contiguous()
+        raise NotImplementedError
 
     def apply(self, data_dict: dict, **params) -> dict:
         """
@@ -134,6 +121,10 @@ class TransposeAxesTransform(BasicTransform):
         for key in vector_keys:
             if data_dict.get(key) is not None:
                 data_dict[key] = self._apply_to_vectors(data_dict[key], **params)
+
+        # Transform padding_mask with the same permutation
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
 
         return data_dict
 
