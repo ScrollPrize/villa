@@ -21,7 +21,10 @@ from vesuvius.models.training.loss.ect_loss import ECTLoss
 
 class MaskingLossWrapper(nn.Module):
     """
-    Loss wrapper which prevents the gradient of the loss to be computed where target is equal to `ignore_index`.
+    Loss wrapper which properly excludes voxels where target equals `ignore_index`.
+
+    Unlike simple masking (multiplying by 0), this computes element-wise loss,
+    excludes ignored voxels, and averages only over the valid (non-ignored) voxels.
     """
 
     def __init__(self, loss, ignore_index):
@@ -30,16 +33,24 @@ class MaskingLossWrapper(nn.Module):
         self.loss = loss
         self.ignore_index = ignore_index
 
+        # Store original reduction and set to 'none' for element-wise computation
+        self._original_reduction = getattr(loss, 'reduction', 'mean')
+        if hasattr(loss, 'reduction'):
+            loss.reduction = 'none'
+
     def forward(self, input, target):
-        mask = target.clone().ne_(self.ignore_index)
-        mask.requires_grad = False
+        # mask is True for voxels to KEEP (not ignored)
+        mask = (target != self.ignore_index)
 
-        # mask out input/target so that the gradient is zero where on the mask
-        input = input * mask
-        target = target * mask
+        # Compute element-wise loss
+        elementwise_loss = self.loss(input, target)
 
-        # forward masked input and target to the loss
-        return self.loss(input, target)
+        # Apply mask - zero out loss for ignored voxels
+        masked_loss = elementwise_loss * mask.float()
+
+        # Average over non-ignored voxels only
+        num_valid = mask.sum().clamp(min=1)  # Avoid division by zero
+        return masked_loss.sum() / num_valid
 
 
 class SkipLastTargetChannelWrapper(nn.Module):
@@ -1184,21 +1195,34 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
 
     elif name == 'ECTLoss':
         base_loss = ECTLoss(
+            ect_variant=loss_config.get('ect_variant', 'mass'),
             num_directions=loss_config.get('num_directions', 32),
             resolution=loss_config.get('resolution', 64),
             scale=loss_config.get('scale', 8.0),
-            normalize=loss_config.get('normalize', False),
-            aggregation=loss_config.get('aggregation', 'mse'),
-            apply_activation=loss_config.get('apply_activation', 'auto'),
+            normalize=loss_config.get('normalize', True),
+            aggregation=loss_config.get('aggregation', 'smooth_l1'),
             seed=loss_config.get('seed', 17),
+            direction_mode=loss_config.get('direction_mode', 'fibonacci'),
             radius_multiplier=loss_config.get('radius_multiplier', 1.1),
-            use_fast_ect=loss_config.get('use_fast_ect', False),
+            direction_chunk_size=loss_config.get('direction_chunk_size', 16),
+            chi_mc_directions=loss_config.get('chi_mc_directions'),
+            chi_mc_thresholds=loss_config.get('chi_mc_thresholds'),
+            filtration_mode=loss_config.get('filtration_mode', 'sigmoid'),
             fast_subsample_ratio=loss_config.get('fast_subsample_ratio'),
             fast_max_points=loss_config.get('fast_max_points'),
-            learnable=loss_config.get('learnable', False),
-            accumulation_mode=loss_config.get('accumulation_mode', 'auto'),
-            soft_sigma=loss_config.get('soft_sigma'),
-            soft_chunk_size=loss_config.get('soft_chunk_size'),
+            ignore_label=ignore_index,
+            label_values=loss_config.get('label_values'),
+            compute_dtype=loss_config.get('compute_dtype'),
+        )
+
+    elif name == 'SphericalBettiLoss':
+        from vesuvius.models.training.loss.spherical_betti_loss import SphericalBettiLoss
+        base_loss = SphericalBettiLoss(
+            num_directions=loss_config.get('num_directions', 32),
+            filtration=loss_config.get('filtration', 'superlevel'),
+            include_unmatched_target=loss_config.get('include_unmatched_target', False),
+            push_unmatched_to=loss_config.get('push_unmatched_to', 'diagonal'),
+            ignore_label=ignore_index,
         )
 
 

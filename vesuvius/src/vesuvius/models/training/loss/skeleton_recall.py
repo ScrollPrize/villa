@@ -1,5 +1,4 @@
-from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss, SoftDiceLoss, AllGatherGrad
-from vesuvius.models.training.loss.robustcrossentropy import RobustCrossEntropyLoss
+from vesuvius.models.training.loss.nnunet_losses import MemoryEfficientSoftDiceLoss, SoftDiceLoss, AllGatherGrad, RobustCrossEntropyLoss
 from vesuvius.models.training.loss.loss_helpers import softmax_helper_dim1, softmax_helper
 import torch.nn as nn
 import torch
@@ -40,7 +39,10 @@ class SoftSkeletonRecallLoss(nn.Module):
                 # if this is the case then gt is probably already a one hot encoding
                 y_onehot = y[:, 1:]
             else:
-                gt = y.long()
+                num_classes = shp_x[1]
+                # Clamp to valid indices to prevent CUDA scatter_ crash
+                # This is safe because ignored pixels are masked out anyway
+                gt = torch.clamp(y.long(), min=0, max=num_classes - 1)
                 y_onehot = torch.zeros(shp_x, device=x.device, dtype=y.dtype)
                 y_onehot.scatter_(1, gt, 1)
                 y_onehot = y_onehot[:, 1:]
@@ -126,7 +128,11 @@ class DC_SkelREC_and_CE_loss(nn.Module):
         # CE loss with optional masking
         if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0):
             if combined_mask is not None:
-                ce_per_voxel = F.cross_entropy(net_output, target[:, 0].long(), reduction='none')
+                # Use target_dice which has ignore_label values replaced with 0
+                # to prevent CUDA assertion failures (values must be in [0, num_classes-1])
+                ce_per_voxel = F.cross_entropy(
+                    net_output, target_dice[:, 0].long(), reduction='none'
+                )
                 ce_loss = (ce_per_voxel * combined_mask[:, 0]).sum() / combined_mask.sum().clamp(min=1)
             else:
                 ce_loss = self.ce(net_output, target[:, 0])
