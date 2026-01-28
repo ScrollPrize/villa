@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import cli_data
 import cli_model
@@ -49,12 +50,29 @@ def main(argv: list[str] | None = None) -> int:
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,
 	)
+	if model_cfg.model_input is not None:
+		st = torch.load(model_cfg.model_input, map_location=device)
+		mdl.load_state_dict(st)
 	print("model_init:", mdl.init)
 	print("mesh:", mdl.mesh_h, mdl.mesh_w)
 
 	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
 	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_init.tif")
 	stages = optimizer.load_stages(opt_cfg.stages_json)
+	def _save_model_snapshot(*, stage: str, step: int) -> None:
+		out = Path(vis_cfg.out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		out_snap = out / "model_snapshots"
+		out_snap.mkdir(parents=True, exist_ok=True)
+		p = out_snap / f"model_{stage}_{step:06d}.pt"
+		torch.save(mdl.state_dict(), str(p))
+
+	def _save_model_output_final() -> None:
+		if model_cfg.model_output is None:
+			return
+		torch.save(mdl.state_dict(), str(model_cfg.model_output))
+
+	_save_model_snapshot(stage="init", step=0)
 	def _snapshot(*, stage: str, step: int, loss: float) -> None:
 		vis.save(
 			model=mdl,
@@ -64,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
 			scale=vis_cfg.scale,
 		)
 		mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_{stage}_{step:06d}.tif")
+		_save_model_snapshot(stage=stage, step=step)
 
 	optimizer.optimize(
 		model=mdl,
@@ -74,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
 	)
 	vis.save(model=mdl, data=data, postfix="final", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
 	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_final.tif")
+	_save_model_snapshot(stage="final", step=0)
+	_save_model_output_final()
 	return 0
 
 
