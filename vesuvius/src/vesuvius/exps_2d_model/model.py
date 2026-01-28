@@ -262,7 +262,7 @@ class Model2D(nn.Module):
 
 	@staticmethod
 	def _expand_copy_edge(*, src: torch.Tensor, dim: int, side: int) -> torch.Tensor:
-		"""Expand `src` by 1 along `dim` by copying the nearest edge slice."""
+		"""Expand `src` by 1 along `dim` by copying the last slice at the grown border."""
 		if src.ndim <= dim:
 			raise ValueError("grow: dim out of range")
 		dim = int(dim)
