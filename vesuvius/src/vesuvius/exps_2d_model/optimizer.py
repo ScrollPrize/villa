@@ -12,6 +12,12 @@ import opt_loss_gradmag
 import opt_loss_step
 
 
+def _require_consumed_dict(*, where: str, cfg: dict) -> None:
+	if cfg:
+		bad = sorted(cfg.keys())
+		raise ValueError(f"stages_json: {where}: unknown key(s): {bad}")
+
+
 @dataclass(frozen=True)
 class OptSettings:
 	steps: int
@@ -75,19 +81,34 @@ def _parse_opt_settings(
 	base: dict[str, float],
 	prev_eff: dict[str, float] | None,
 ) -> OptSettings:
+	opt_cfg = dict(opt_cfg)
 	steps = max(0, int(opt_cfg.get("steps", 0)))
 	lr = float(opt_cfg.get("lr", 1e-3))
 	params = opt_cfg.get("params", [])
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
+	bad_params = sorted(set(params) - {"theta", "phase", "winding_scale", "mesh_ms", "conn_offset_ms"})
+	if bad_params:
+		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
 	default_mul = opt_cfg.get("default_mul", None)
 	w_fac = opt_cfg.get("w_fac", None)
+	opt_cfg.pop("steps", None)
+	opt_cfg.pop("lr", None)
+	opt_cfg.pop("params", None)
+	opt_cfg.pop("min_scaledown", None)
+	opt_cfg.pop("default_mul", None)
+	opt_cfg.pop("w_fac", None)
+	_require_consumed_dict(where=f"stage '{stage_name}' opt", cfg=opt_cfg)
 	if default_mul is not None:
 		default_mul = float(default_mul)
 	if w_fac is not None and not isinstance(w_fac, dict):
 		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object or null")
+	if isinstance(w_fac, dict):
+		bad_terms = sorted(set(str(k) for k in w_fac.keys()) - set(base.keys()))
+		if bad_terms:
+			raise ValueError(f"stages_json: stage '{stage_name}' opt.w_fac: unknown term(s): {bad_terms}")
 	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
 	return OptSettings(
 		steps=steps,
@@ -103,6 +124,7 @@ def _parse_opt_settings(
 def load_stages(path: str) -> list[Stage]:
 	with open(path, "r", encoding="utf-8") as f:
 		cfg = json.load(f)
+		cfg = dict(cfg)
 
 		lambda_global: dict[str, float] = {
 			"dir_unet": 1.0,
@@ -117,34 +139,47 @@ def load_stages(path: str) -> list[Stage]:
 			"angle": 0.0,
 			"y_straight": 0.0,
 		}
-	base_cfg = cfg.get("base", None)
+	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
+		bad_base = sorted(set(str(k) for k in base_cfg.keys()) - set(lambda_global.keys()))
+		if bad_base:
+			raise ValueError(f"stages_json: base: unknown term(s): {bad_base}")
 		for k, v in base_cfg.items():
 			lambda_global[str(k)] = float(v)
 
-	stages_cfg = cfg.get("stages", None)
+	stages_cfg = cfg.pop("stages", None)
 	if not isinstance(stages_cfg, list) or not stages_cfg:
 		raise ValueError("stages_json: expected a non-empty list in key 'stages'")
+	_require_consumed_dict(where="top-level", cfg=cfg)
 
 	out: list[Stage] = []
 	prev_eff: dict[str, float] | None = None
 	for s in stages_cfg:
 		if not isinstance(s, dict):
 			raise ValueError("stages_json: each stage must be an object")
-		name = str(s.get("name", ""))
-		grow = s.get("grow", None)
+		s = dict(s)
+		name = str(s.pop("name", ""))
+		grow = s.pop("grow", None)
 		if grow is not None and not isinstance(grow, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'grow' must be an object or null")
+		if isinstance(grow, dict):
+			g = dict(grow)
+			directions = g.pop("directions", [])
+			generations = g.pop("generations", 0)
+			grow_steps = g.pop("steps", 0)
+			_require_consumed_dict(where=f"stage '{name}' grow", cfg=g)
+			grow = {"directions": directions, "generations": generations, "steps": grow_steps}
 
-		global_opt_cfg = s.get("global_opt", None)
-		local_opt_cfg = s.get("local_opt", None)
+		global_opt_cfg = s.pop("global_opt", None)
+		local_opt_cfg = s.pop("local_opt", None)
 		if global_opt_cfg is None and local_opt_cfg is None:
 			# Back-compat: treat the stage itself as global_opt.
 			global_opt_cfg = dict(s)
-			global_opt_cfg.pop("grow", None)
-			global_opt_cfg.pop("global_opt", None)
-			global_opt_cfg.pop("local_opt", None)
 			local_opt_cfg = None
+			s.clear()
+			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
+		else:
+			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
 
 		if not isinstance(global_opt_cfg, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
