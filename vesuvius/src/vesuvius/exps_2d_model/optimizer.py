@@ -335,7 +335,8 @@ def optimize(
 		local_opt = stage.local_opt if stage.local_opt is not None else stage.global_opt
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
-			snapshot_fn(stage=f"stage{si}_grow{gi}", step=0, loss=0.0)
+			stage_g = f"stage{si}_grow{gi:04d}"
+			snapshot_fn(stage=stage_g, step=0, loss=0.0)
 			if local_opt.steps <= 0:
 				continue
 			ins = getattr(model, "_last_grow_insert_lr", None)
@@ -356,5 +357,5 @@ def optimize(
 			cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
 			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
 			model.const_mask_lr = cm
-			_run_opt(si=si, label=f"stage{si}_grow{gi}", opt_cfg=local_opt)
+			_run_opt(si=si, label=stage_g, opt_cfg=local_opt)
 		model.const_mask_lr = None
