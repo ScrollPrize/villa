@@ -1,11 +1,11 @@
 {
 	"base": {
 		"dir_v": 1.0,
-		"dir_conn": 0.0,
-		"step": 0.001,
+		"dir_conn": 0.1,
+		"step": 0.1,
 		"smooth_x": 0.0,
 		"smooth_y": 0.01,
-		"gradmag": 0.1,
+		"gradmag": 0.01,
 		"mean_pos": 0.0,
 		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
@@ -16,11 +16,66 @@
 	"stages": [
 		{
 			"name": "sd4",
-			"steps": 10000,
+			"steps": 2000,
 			"lr": 1.0,
 			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 4,
 			"w_fac": {
+			}
+		},
+		{
+			"name": "others",
+			"steps": 2000,
+			"lr": 1.0,
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"min_scaledown": 4,
+			"w_fac": {
+				"dir_conn": 10.0,
+				"gradmag": 10.0
+			}
+		},
+		{
+			"name": "sd3",
+			"steps": 2000,
+			"lr": 0.1,
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"min_scaledown": 3,
+			"w_fac": {
+				"dir_conn": 10.0,
+				"gradmag": 10.0
+			}
+		},
+		{
+			"name": "sd2",
+			"steps": 5000,
+			"lr": 0.1,
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"min_scaledown": 2,
+			"w_fac": {
+				"dir_conn": 10.0,
+				"gradmag": 10.0
+			}
+		},
+		{
+			"name": "sd1",
+			"steps": 5000,
+			"lr": 0.1,
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"min_scaledown": 1,
+			"w_fac": {
+				"dir_conn": 10.0,
+				"gradmag": 10.0
+			}
+		},
+		{
+			"name": "sd0",
+			"steps": 5000,
+			"lr": 0.1,
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"dir_conn": 10.0,
+				"gradmag": 10.0
 			}
 		}
 	]
