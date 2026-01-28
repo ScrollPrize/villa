@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 import model as fit_model
 
@@ -55,6 +56,38 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	mag_use = mag_hr
 	if mask_sample is not None and mask_sample.shape[-2:] == mag_hr.shape[-2:]:
 		mag_use = mag_use * mask_sample
+
+	# Apply direction sign: use mesh geometry to determine winding orientation.
+	#
+	# - mesh_dir is the vertical direction at the mid-point (v-1 -> v+1)
+	# - cross(mesh_dir, conn_right) should be < 0
+	# - cross(-mesh_dir, conn_left) should be < 0  (equiv cross(mesh_dir, conn_left) > 0)
+	xy_lr = res.xy_lr
+	if int(xy_lr.shape[1]) >= 2:
+		md = xy_lr.new_zeros(xy_lr.shape)
+		if int(xy_lr.shape[1]) >= 3:
+			md[:, 1:-1, :, :] = xy_lr[:, 2:, :, :] - xy_lr[:, :-2, :, :]
+			md[:, 0, :, :] = xy_lr[:, 1, :, :] - xy_lr[:, 0, :, :]
+			md[:, -1, :, :] = xy_lr[:, -1, :, :] - xy_lr[:, -2, :, :]
+		else:
+			md[:, 0, :, :] = xy_lr[:, 1, :, :] - xy_lr[:, 0, :, :]
+			md[:, 1, :, :] = md[:, 0, :, :]
+
+		xyc = res.xy_conn
+		left = xyc[..., 0, :]
+		mid = xyc[..., 1, :]
+		right = xyc[..., 2, :]
+		v_l = left - mid
+		v_r = right - mid
+
+		mdx = md[..., 0]
+		mdy = md[..., 1]
+		cross_r = mdx * v_r[..., 1] - mdy * v_r[..., 0]
+		cross_l = mdx * v_l[..., 1] - mdy * v_l[..., 0]
+		ok = (cross_r > 0.0) & (cross_l < 0.0)
+		sign_lr = torch.where(ok, -torch.ones_like(cross_r), torch.ones_like(cross_r)).unsqueeze(1)
+		sign_hr = F.interpolate(sign_lr, size=mag_hr.shape[-2:], mode="nearest")
+		mag_use = mag_use * sign_hr
 
 	ww = int(mag_hr.shape[-1])
 	samples_per = ww // periods_int
