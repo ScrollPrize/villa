@@ -26,7 +26,7 @@
 			"name": "rest",
 			"steps": 10000,
 			"lr": 0.1,
-			"params": ["offset_ms", "mesh_offset_ms"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 				"gradmag": 1.0

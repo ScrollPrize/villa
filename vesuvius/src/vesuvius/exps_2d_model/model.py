@@ -181,17 +181,13 @@ class Model2D(nn.Module):
 		return x, y
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
-		p = {
+		return {
 			"theta": [self.theta],
 			"phase": [self.phase],
 			"winding_scale": [self.winding_scale],
 			"mesh_ms": list(self.mesh_ms),
 			"conn_offset_ms": list(self.conn_offset_ms),
 		}
-		# Back-compat aliases for stages JSON / older naming.
-		p["offset_ms"] = p["mesh_ms"]
-		p["mesh_offset_ms"] = p["conn_offset_ms"]
-		return p
 
 	def grow(self, *, directions: list[str], steps: int) -> None:
 		steps = max(0, int(steps))
@@ -304,10 +300,6 @@ class Model2D(nn.Module):
 			off = self._upsample2_crop(src=off, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
 		return off
 
-	def mesh_offset_coarse(self) -> torch.Tensor:
-		# Back-compat alias.
-		return self.conn_offset_coarse()
-
 	def _xy_conn_px(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
 		"""Return per-mesh connection positions in pixel coordinates.
 
@@ -370,10 +362,6 @@ class Model2D(nn.Module):
 		for d in reversed(self.mesh_ms[:-1]):
 			m = self._upsample2_crop(src=m, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
 		return m
-
-	def offset_coarse(self) -> torch.Tensor:
-		# Back-compat alias.
-		return self.mesh_coarse()
 
 	@staticmethod
 	def _upsample2_crop(*, src: torch.Tensor, h_t: int, w_t: int) -> torch.Tensor:

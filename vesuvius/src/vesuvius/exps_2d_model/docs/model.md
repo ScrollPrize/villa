@@ -69,15 +69,15 @@ Rules:
 ## Line-offset modeling (conn_offset)
 
 
-- The model has a learnable multi-scale `conn_offset_ms` tensor (same scale-space handling as `mesh_ms`, previously `offset_ms`).
+- The model has a learnable multi-scale `conn_offset_ms` tensor (same scale-space handling as `mesh_ms`).
 	- `conn_offset_coarse()` reconstructs the base-mesh offsets used for outputs.
 	- The coarse/base result has shape `(1,2,Hm,Wm)`.
 	- channel 0: vertical offset for the *left* connection
 	- channel 1: vertical offset for the *right* connection
 
-- Interpretation:
-	- For a base mesh point `(i,j)`, the left/right connection endpoint is in the neighboring column `j-1` / `j+1`, but vertically shifted by `mesh_offset[...,i,j]`.
-	- `0` means connect to the same-row neighbor.
+	- Interpretation:
+		- For a base mesh point `(i,j)`, the left/right connection endpoint is in the neighboring column `j-1` / `j+1`, but vertically shifted by `conn_offset[...,i,j]`.
+		- `0` means connect to the same-row neighbor.
 	- `+1` means connect to one row lower.
 	- `-1` means connect to one row higher.
 	- Fractional values are linearly interpolated along the vertical axis.
