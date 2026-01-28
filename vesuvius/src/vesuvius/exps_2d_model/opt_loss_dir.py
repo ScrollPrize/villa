@@ -30,43 +30,33 @@ def _dir_pred_v(*, xy_lr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 	return dir0, dir1
 
 
-def direction_loss_maps(
-	*,
-	res: fit_model.FitResult,
-) -> tuple[
-	torch.Tensor,
-	torch.Tensor,
-	torch.Tensor,
-	torch.Tensor,
-	torch.Tensor,
-	torch.Tensor,
-]:
-	"""Return (lm_v_lr, lm_conn_l_lr, lm_conn_r_lr, mask_v_lr, mask_conn_l_lr, mask_conn_r_lr) at base-mesh resolution."""
-	# print("src:",res.data_s.dir0.shape, "tgt",res.xy_lr.shape[1:3])
+def dir_v_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Return (lm_v_lr, mask_v_lr) at base-mesh resolution."""
 	unet_dir0_lr = F.interpolate(res.data_s.dir0, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
 	unet_dir1_lr = F.interpolate(res.data_s.dir1, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
 	mask_lr = res.mask_lr
-
-	# Separate masks:
-	# - vertical uses v-edge (y -> y+1), so mask is min of the two samples
-	# - conn uses left/right endpoints, so mask is min of those endpoints
 	mask_v_lr = mask_lr.clone()
 	if mask_v_lr.shape[2] >= 2:
 		mask_v_lr[:, :, :-1, :] = torch.minimum(mask_lr[:, :, :-1, :], mask_lr[:, :, 1:, :])
 		mask_v_lr[:, :, -1, :] = mask_v_lr[:, :, -2, :]
-	mask_conn_l_lr = torch.minimum(res.mask_conn[..., 0], res.mask_conn[..., 1])
-	mask_conn_r_lr = torch.minimum(res.mask_conn[..., 1], res.mask_conn[..., 2])
-	# At mesh left/right edges we don't have true conn samples to a neighbor column.
-	# Crop those areas out (they were previously edge-copied in the model).
-	if mask_conn_l_lr.shape[3] >= 1:
-		mask_conn_l_lr[:, :, :, 0] = 0.0
-	if mask_conn_r_lr.shape[3] >= 1:
-		mask_conn_r_lr[:, :, :, -1] = 0.0
 
 	dir0_v_lr, dir1_v_lr = _dir_pred_v(xy_lr=res.xy_lr)
 	diff0_v = dir0_v_lr - unet_dir0_lr
 	diff1_v = dir1_v_lr - unet_dir1_lr
 	lm_v_lr = 0.5 * (diff0_v * diff0_v + diff1_v * diff1_v)
+	return lm_v_lr * mask_v_lr, mask_v_lr
+
+
+def dir_conn_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Return (lm_conn_l_lr, lm_conn_r_lr, mask_conn_l_lr, mask_conn_r_lr) at base-mesh resolution."""
+	unet_dir0_lr = F.interpolate(res.data_s.dir0, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
+	unet_dir1_lr = F.interpolate(res.data_s.dir1, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
+	mask_conn_l_lr = torch.minimum(res.mask_conn[..., 0], res.mask_conn[..., 1])
+	mask_conn_r_lr = torch.minimum(res.mask_conn[..., 1], res.mask_conn[..., 2])
+	if mask_conn_l_lr.shape[3] >= 1:
+		mask_conn_l_lr[:, :, :, 0] = 0.0
+	if mask_conn_r_lr.shape[3] >= 1:
+		mask_conn_r_lr[:, :, :, -1] = 0.0
 
 	xy = res.xy_conn
 	left = xy[..., 0, :]
@@ -87,25 +77,21 @@ def direction_loss_maps(
 		diff1 = dir1 - unet_dir1_lr
 		return 0.5 * (diff0 * diff0 + diff1 * diff1)
 
-	lm_conn_l_lr = _dir_lm(x0=left, x1=mid)
-	lm_conn_r_lr = _dir_lm(x0=mid, x1=right)
-
-	return (
-		lm_v_lr * mask_v_lr,
-		lm_conn_l_lr * mask_conn_l_lr,
-		lm_conn_r_lr * mask_conn_r_lr,
-		mask_v_lr,
-		mask_conn_l_lr,
-		mask_conn_r_lr,
-	)
-def direction_loss(*, res: fit_model.FitResult) -> torch.Tensor:
-	"""Direction-only loss vs UNet-style (dir0, dir1) encodings."""
-	lm_v_lr, lm_conn_l_lr, lm_conn_r_lr, mask_v_lr, mask_conn_l_lr, mask_conn_r_lr = direction_loss_maps(res=res)
+	lm_conn_l_lr = _dir_lm(x0=left, x1=mid) * mask_conn_l_lr
+	lm_conn_r_lr = _dir_lm(x0=mid, x1=right) * mask_conn_r_lr
+	return lm_conn_l_lr, lm_conn_r_lr, mask_conn_l_lr, mask_conn_r_lr
+def dir_v_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+	"""Vertical direction loss vs (dir0, dir1) encodings."""
+	lm_v_lr, mask_v_lr = dir_v_loss_maps(res=res)
 	wsum_v = mask_v_lr.sum()
-	wsum_l = mask_conn_l_lr.sum()
-	wsum_r = mask_conn_r_lr.sum()
+	return lm_v_lr.sum() / wsum_v if float(wsum_v.detach().cpu()) > 0.0 else lm_v_lr.mean()
 
-	lv = lm_v_lr.sum() / wsum_v if float(wsum_v.detach().cpu()) > 0.0 else lm_v_lr.mean()
-	ll = lm_conn_l_lr.sum() / wsum_l if float(wsum_l.detach().cpu()) > 0.0 else lm_conn_l_lr.mean()
-	lr = lm_conn_r_lr.sum() / wsum_r if float(wsum_r.detach().cpu()) > 0.0 else lm_conn_r_lr.mean()
-	return (lv + ll + lr) / 3.0
+
+def dir_conn_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+	"""Connection direction loss vs (dir0, dir1) encodings."""
+	lm_l, lm_r, mask_l, mask_r = dir_conn_loss_maps(res=res)
+	wsum_l = mask_l.sum()
+	wsum_r = mask_r.sum()
+	ll = lm_l.sum() / wsum_l if float(wsum_l.detach().cpu()) > 0.0 else lm_l.mean()
+	lr = lm_r.sum() / wsum_r if float(wsum_r.detach().cpu()) > 0.0 else lm_r.mean()
+	return 0.5 * (ll + lr)

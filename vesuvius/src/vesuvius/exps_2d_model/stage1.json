@@ -9,7 +9,8 @@
 		"mod_smooth": 0.0,
 		"quad_tri": 1.0,
 		"angle_sym": 1.0,
-		"dir_unet": 10.0,
+		"dir_v": 10.0,
+		"dir_conn": 10.0,
 		"line_smooth_y": 0.0,
 		"y_straight": 1.0
 	},

@@ -1,6 +1,7 @@
 {
 	"base": {
-		"dir_unet": 1.0,
+		"dir_v": 1.0,
+		"dir_conn": 1.0,
 		"step": 1.0,
 		"smooth_x": 0.0,
 		"smooth_y": 0.0,

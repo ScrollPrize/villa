@@ -1,6 +1,7 @@
 {
 	"base": {
-		"dir_unet": 1.0,
+		"dir_v": 1.0,
+		"dir_conn": 1.0,
 		"step": 0.001
 	},
 	"stages": [
