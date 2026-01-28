@@ -97,7 +97,7 @@
       "valid_batch_size": 32,
       "use_amp": true,
       "epochs": 30,
-      "scheduler": "GradualWarmupSchedulerV2",
+      "scheduler": "OneCycleLR",
       "warmup_factor": 10,
       "lr": 1e-05,
       "min_lr": 1e-06,

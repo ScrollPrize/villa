@@ -127,8 +127,7 @@ class CFG:
     valid_batch_size = train_batch_size
     use_amp = True
 
-    scheduler = 'GradualWarmupSchedulerV2'
-    # scheduler = 'CosineAnnealingLR'
+    scheduler = "OneCycleLR"  # "OneCycleLR" | "cosine"
     epochs = 30 # 30
 
     # adamW warmupあり
@@ -1305,21 +1304,39 @@ class RegressionPLModel(pl.LightningModule):
     def configure_optimizers(self):
 
         optimizer = AdamW(self.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=CFG.lr,
-            pct_start=float(getattr(CFG, "onecycle_pct_start", 0.15)),
-            steps_per_epoch=self.hparams.total_steps,
-            epochs=CFG.epochs,
-            div_factor=float(getattr(CFG, "onecycle_div_factor", 25.0)),
-            final_div_factor=float(getattr(CFG, "onecycle_final_div_factor", 1e2)),
-        )
-        # scheduler = get_scheduler(CFG, optimizer)
+        scheduler_name = str(getattr(CFG, "scheduler", "OneCycleLR")).lower()
+        steps_per_epoch = int(self.hparams.total_steps)
+        epochs = int(CFG.epochs)
+
+        if scheduler_name == "onecyclelr":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=CFG.lr,
+                pct_start=float(getattr(CFG, "onecycle_pct_start", 0.15)),
+                steps_per_epoch=steps_per_epoch,
+                epochs=epochs,
+                div_factor=float(getattr(CFG, "onecycle_div_factor", 25.0)),
+                final_div_factor=float(getattr(CFG, "onecycle_final_div_factor", 1e2)),
+            )
+            interval = "step"
+        elif scheduler_name == "cosine":
+            total_steps = max(1, steps_per_epoch * epochs)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps,
+                eta_min=float(getattr(CFG, "min_lr", 0.0)),
+            )
+            interval = "step"
+        else:
+            raise ValueError(
+                f"Unsupported scheduler={CFG.scheduler!r}. Supported: 'OneCycleLR' | 'cosine'."
+            )
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": interval,
             },
         }
 
