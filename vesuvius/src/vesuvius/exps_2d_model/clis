@@ -81,3 +81,5 @@ python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1
 
 
 [hendrik@staticsheep model2d_fullsize_exps]$ rm -rf res_fit2/* && python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/direct_scalespace_grow.json --init-size-frac 0.15
+
+[hendrik@staticsheep model2d_fullsize_exps]$ rm -rf res_fit2/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json --init-size-frac 0.15 --init-size-frac-h 2.0
