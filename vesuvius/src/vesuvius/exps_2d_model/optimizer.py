@@ -24,6 +24,7 @@ class OptSettings:
 	lr: float
 	params: list[str]
 	min_scaledown: int
+	opt_window: int
 	default_mul: float | None
 	w_fac: dict | None
 	eff: dict[str, float]
@@ -92,12 +93,14 @@ def _parse_opt_settings(
 	if bad_params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
+	opt_window = max(1, int(opt_cfg.get("opt_window", 1)))
 	default_mul = opt_cfg.get("default_mul", None)
 	w_fac = opt_cfg.get("w_fac", None)
 	opt_cfg.pop("steps", None)
 	opt_cfg.pop("lr", None)
 	opt_cfg.pop("params", None)
 	opt_cfg.pop("min_scaledown", None)
+	opt_cfg.pop("opt_window", None)
 	opt_cfg.pop("default_mul", None)
 	opt_cfg.pop("w_fac", None)
 	_require_consumed_dict(where=f"stage '{stage_name}' opt", cfg=opt_cfg)
@@ -115,6 +118,7 @@ def _parse_opt_settings(
 		lr=lr,
 		params=params,
 		min_scaledown=min_scaledown,
+		opt_window=opt_window,
 		default_mul=default_mul,
 		w_fac=w_fac,
 		eff=eff,
@@ -338,8 +342,19 @@ def optimize(
 			if ins is None:
 				raise RuntimeError("grow: missing insertion rect")
 			py0, px0, ho, wo = ins
-			cm = torch.zeros(1, 1, int(model.mesh_h), int(model.mesh_w), device=data.cos.device, dtype=torch.float32)
-			cm[:, :, py0:py0 + ho, px0:px0 + wo] = 1.0
+			hm = int(model.mesh_h)
+			wm = int(model.mesh_w)
+			y0 = int(py0)
+			x0 = int(px0)
+			y1 = int(py0 + ho)
+			x1 = int(px0 + wo)
+			win = max(0, int(local_opt.opt_window) - 1)
+			cm = torch.zeros(1, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
+			cm[:, :, y0:y1, x0:x1] = 1.0
+			cm[:, :, y0:min(y1, y0 + win), x0:x1] = 0.0
+			cm[:, :, max(y0, y1 - win):y1, x0:x1] = 0.0
+			cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
+			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
 			model.const_mask_lr = cm
 			_run_opt(si=si, label=f"stage{si}_grow{gi}", opt_cfg=local_opt)
 		model.const_mask_lr = None
