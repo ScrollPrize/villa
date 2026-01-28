@@ -51,6 +51,8 @@ from .activations import SwiGLUBlock, GLUBlock
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
 
 def get_activation_module(activation_str: str):
+    if activation_str is None:
+        activation_str = "none"
     act_str = activation_str.lower()
     if act_str == "none":
         return None
