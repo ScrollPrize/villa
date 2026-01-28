@@ -310,7 +310,11 @@ def save(
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
 	dir_lm_v, _dir_mask_v = opt_loss_dir.dir_v_loss_maps(res=res)
-	dir_lm_conn_l, dir_lm_conn_r, _dir_mask_conn_l, _dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
+	dir_lm_conn_l, dir_lm_conn_r, dir_mask_conn_l, dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
+	inv_conn_l = (1.0 - dir_mask_conn_l).to(dtype=dir_lm_conn_l.dtype)
+	inv_conn_r = (1.0 - dir_mask_conn_r).to(dtype=dir_lm_conn_r.dtype)
+	dir_lm_conn_l = dir_lm_conn_l * dir_mask_conn_l + 0.5 * inv_conn_l
+	dir_lm_conn_r = dir_lm_conn_r * dir_mask_conn_r + 0.5 * inv_conn_r
 
 	smooth_x_lm, _smooth_x_mask = opt_loss_geom.smooth_x_loss_map(res=res)
 	smooth_y_lm, _smooth_y_mask = opt_loss_geom.smooth_y_loss_map(res=res)

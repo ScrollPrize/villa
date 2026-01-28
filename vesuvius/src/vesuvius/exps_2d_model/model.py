@@ -141,6 +141,10 @@ class Model2D(nn.Module):
 		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
 		mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
 		mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
+		# Edge conn points are synthetic (copied from the nearest column) and should not be used.
+		if mask_conn.shape[3] >= 1:
+			mask_conn[:, :, :, 0, 0] = 0.0
+			mask_conn[:, :, :, -1, 2] = 0.0
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
