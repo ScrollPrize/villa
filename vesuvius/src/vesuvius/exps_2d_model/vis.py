@@ -309,8 +309,8 @@ def save(
 	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
-	dir_lm_v, dir_lm_conn_l, dir_lm_conn_r, _dir_mask_v, _dir_mask_conn_l, _dir_mask_conn_r = opt_loss_dir.direction_loss_maps(res=res)
-	dir_lm = 0.5 * (dir_lm_v + 0.5 * (dir_lm_conn_l + dir_lm_conn_r))
+	dir_lm_v, _dir_mask_v = opt_loss_dir.dir_v_loss_maps(res=res)
+	dir_lm_conn_l, dir_lm_conn_r, _dir_mask_conn_l, _dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
 
 	smooth_x_lm, _smooth_x_mask = opt_loss_geom.smooth_x_loss_map(res=res)
 	smooth_y_lm, _smooth_y_mask = opt_loss_geom.smooth_y_loss_map(res=res)
@@ -322,11 +322,6 @@ def save(
 	gradmag_lm, _gradmag_mask = opt_loss_gradmag.gradmag_period_loss_map(res=res)
 
 	loss_maps = {
-		"dir": {
-			"fn": lambda: dir_lm,
-			"suffix": "dir",
-			"reduce": True,
-		},
 		"dir_v": {
 			"fn": lambda: dir_lm_v,
 			"suffix": "dir_v",

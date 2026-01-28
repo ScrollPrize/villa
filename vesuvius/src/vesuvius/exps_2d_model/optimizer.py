@@ -131,7 +131,8 @@ def load_stages(path: str) -> list[Stage]:
 		cfg = dict(cfg)
 
 		lambda_global: dict[str, float] = {
-			"dir_unet": 1.0,
+			"dir_v": 1.0,
+			"dir_conn": 1.0,
 			"step": 0.0,
 			"gradmag": 0.0,
 			"mean_pos": 0.0,
@@ -249,7 +250,8 @@ def optimize(
 				res_init = model(data)
 				mean_pos_xy = res_init.xy_lr.mean(dim=(0, 1, 2))
 		terms = {
-			"dir_unet": {"loss": opt_loss_dir.direction_loss},
+			"dir_v": {"loss": opt_loss_dir.dir_v_loss},
+			"dir_conn": {"loss": opt_loss_dir.dir_conn_loss},
 			"step": {"loss": opt_loss_step.step_loss},
 			"gradmag": {"loss": opt_loss_gradmag.gradmag_period_loss},
 			"mean_pos": {"loss": lambda *, res: opt_loss_geom.mean_pos_loss(res=res, target_xy=mean_pos_xy)},
