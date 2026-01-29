@@ -810,35 +810,37 @@ CWindow::CWindow(size_t cacheSizeGB) :
     fResetViewShortcut = new QShortcut(QKeySequence("m"), this);
     fResetViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fResetViewShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) {
-            return;
-        }
-        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-            if (viewer) {
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
                 viewer->resetSurfaceOffsets();
                 viewer->fitSurfaceInView();
                 viewer->renderVisible(true);
             }
-        });
+        }
     });
 
     // Z offset: Ctrl+. = +Z (further/deeper), Ctrl+, = -Z (closer)
     fWorldOffsetZPosShortcut = new QShortcut(QKeySequence("Ctrl+."), this);
     fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-            if (viewer) viewer->adjustSurfaceOffset(1.0f);
-        });
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->adjustSurfaceOffset(1.0f);
+            }
+        }
     });
 
     fWorldOffsetZNegShortcut = new QShortcut(QKeySequence("Ctrl+,"), this);
     fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-            if (viewer) viewer->adjustSurfaceOffset(-1.0f);
-        });
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->adjustSurfaceOffset(-1.0f);
+            }
+        }
     });
 
     // Segment cycling shortcuts (] for next, [ for previous)
