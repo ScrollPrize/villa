@@ -2,6 +2,7 @@
 
 #include "VCSettings.hpp"
 #include "elements/JsonProfileEditor.hpp"
+#include "elements/JsonProfilePresets.hpp"
 
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -1142,23 +1143,8 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
         tr("Additional JSON fields merge into the tracer params used for pass 2. Leave empty for defaults."));
     pass2TracerParams_->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
 
-    const QString robustProfile = QStringLiteral(
-        "{\n"
-        "  \"snap_weight\": 0.0,\n"
-        "  \"normal_weight\": 0.0,\n"
-        "  \"normal3dline_weight\": 1.0,\n"
-        "  \"straight_weight\": 10.0,\n"
-        "  \"dist_weight\": 1.0,\n"
-        "  \"direction_weight\": 0.0,\n"
-        "  \"sdir_weight\": 1.0,\n"
-        "  \"correction_weight\": 1.0,\n"
-        "  \"reference_ray_weight\": 0.0\n"
-        "}\n");
-
-    QVector<JsonProfileEditor::Profile> profiles;
-    profiles.push_back({QStringLiteral("custom"), tr("Custom"), QString(), true});
-    profiles.push_back({QStringLiteral("default"), tr("Default"), QString(), false});
-    profiles.push_back({QStringLiteral("robust"), tr("Robust"), robustProfile, false});
+    const auto profiles = vc3d::json_profiles::tracerParamProfiles(
+        [this](const char* text) { return tr(text); });
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QString savedProfile = settings.value(

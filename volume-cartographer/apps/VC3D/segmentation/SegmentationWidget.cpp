@@ -2,6 +2,7 @@
 
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "elements/JsonProfileEditor.hpp"
+#include "elements/JsonProfilePresets.hpp"
 #include "NeuralTraceServiceManager.hpp"
 #include "VCSettings.hpp"
 
@@ -1057,11 +1058,8 @@ void SegmentationWidget::buildUi()
     _customParamsEditor->setTextToolTip(
         tr("Optional JSON that merges into tracer parameters before growth."));
 
-    QVector<JsonProfileEditor::Profile> profiles;
-    profiles.push_back({QStringLiteral("custom"), tr("Custom"), QString(), true});
-    profiles.push_back({QStringLiteral("default"), tr("Default"), QString(), false});
-    profiles.push_back({QStringLiteral("robust"), tr("Robust"),
-                        paramsTextForProfile(QStringLiteral("robust")), false});
+    const auto profiles = vc3d::json_profiles::tracerParamProfiles(
+        [this](const char* text) { return tr(text); });
     _customParamsEditor->setProfiles(profiles, QStringLiteral("custom"));
 
     layout->addWidget(_customParamsEditor);
@@ -2066,31 +2064,19 @@ void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates
 
 QString SegmentationWidget::paramsTextForProfile(const QString& profile) const
 {
+    if (profile == QStringLiteral("custom")) {
+        return _customParamsText;
+    }
     if (profile == QStringLiteral("default")) {
         // Empty => use GrowPatch defaults.
         return QString();
     }
-    if (profile == QStringLiteral("robust")) {
-        // See LossSettings() in core/src/GrowPatch.cpp.
-        return QStringLiteral(
-            "{\n"
-            "  \"snap_weight\": 0.0,\n"
-            "  \"normal_weight\": 0.0,\n"
-            "  \"normal3dline_weight\": 1.0,\n"
-            "  \"straight_weight\": 10.0,\n"
-            "  \"dist_weight\": 1.0,\n"
-            "  \"direction_weight\": 0.0,\n"
-            "  \"sdir_weight\": 1.0,\n"
-            "  \"correction_weight\": 1.0,\n"
-            "  \"reference_ray_weight\": 0.0\n"
-            "}\n");
-    }
-    return _customParamsText;
+    return vc3d::json_profiles::tracerParamProfileJson(profile);
 }
 
 void SegmentationWidget::applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi)
 {
-    const QString normalized = (profile == QStringLiteral("default") || profile == QStringLiteral("robust"))
+    const QString normalized = vc3d::json_profiles::isTracerParamProfileId(profile)
         ? profile
         : QStringLiteral("custom");
 
@@ -2220,9 +2206,7 @@ void SegmentationWidget::restoreSettings()
 
     _customParamsText = settings.value(segmentation::CUSTOM_PARAMS_TEXT, QString()).toString();
     _customParamsProfile = settings.value(QStringLiteral("custom_params_profile"), _customParamsProfile).toString();
-    if (_customParamsProfile != QStringLiteral("custom") &&
-        _customParamsProfile != QStringLiteral("default") &&
-        _customParamsProfile != QStringLiteral("robust")) {
+    if (!vc3d::json_profiles::isTracerParamProfileId(_customParamsProfile)) {
         _customParamsProfile = QStringLiteral("custom");
     }
     if (_customParamsEditor) {
