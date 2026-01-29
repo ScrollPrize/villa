@@ -1359,7 +1359,11 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
         volpkgRoot = QString::fromStdString(fVpkg->getVolpkgDirectory());
     }
 
-    QString outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    std::filesystem::path outputDirFs = surf->path.parent_path();
+    QString outputDirPath = QString::fromStdString(outputDirFs.string());
+    if (outputDirPath.isEmpty()) {
+        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    }
     QDir outDir(outputDirPath);
     if (!outDir.exists() && !outDir.mkpath(".")) {
         QMessageBox::warning(this, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
