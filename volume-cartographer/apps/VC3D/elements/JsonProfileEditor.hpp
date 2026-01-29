@@ -23,6 +23,7 @@ public:
 
     void setDescription(const QString& text);
     void setPlaceholderText(const QString& text);
+    void setTextToolTip(const QString& text);
     void setProfiles(const QVector<Profile>& profiles, const QString& defaultProfileId);
     void setProfile(const QString& profileId, bool fromUi = false);
     QString profile() const;

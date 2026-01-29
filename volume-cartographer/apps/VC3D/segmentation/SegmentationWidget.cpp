@@ -1,6 +1,7 @@
 #include "SegmentationWidget.hpp"
 
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "elements/JsonProfileEditor.hpp"
 #include "NeuralTraceServiceManager.hpp"
 #include "VCSettings.hpp"
 
@@ -22,7 +23,6 @@
 #include <QListWidgetItem>
 #include <QLoggingCategory>
 #include <QMouseEvent>
-#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollBar>
@@ -1050,43 +1050,21 @@ void SegmentationWidget::buildUi()
     _groupCorrections->setLayout(correctionsLayout);
     layout->addWidget(_groupCorrections);
 
-    _groupCustomParams = new QGroupBox(tr("Custom Params"), this);
-    auto* customParamsLayout = new QVBoxLayout(_groupCustomParams);
+    _customParamsEditor = new JsonProfileEditor(tr("Custom Params"), this);
+    _customParamsEditor->setDescription(
+        tr("Additional JSON fields merge into the tracer params. Leave empty for defaults."));
+    _customParamsEditor->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
+    _customParamsEditor->setTextToolTip(
+        tr("Optional JSON that merges into tracer parameters before growth."));
 
-    auto* customParamsDescription = new QLabel(
-        tr("Additional JSON fields merge into the tracer params. Leave empty for defaults."), _groupCustomParams);
-    customParamsDescription->setWordWrap(true);
-    customParamsLayout->addWidget(customParamsDescription);
+    QVector<JsonProfileEditor::Profile> profiles;
+    profiles.push_back({QStringLiteral("custom"), tr("Custom"), QString(), true});
+    profiles.push_back({QStringLiteral("default"), tr("Default"), QString(), false});
+    profiles.push_back({QStringLiteral("robust"), tr("Robust"),
+                        paramsTextForProfile(QStringLiteral("robust")), false});
+    _customParamsEditor->setProfiles(profiles, QStringLiteral("custom"));
 
-    {
-        auto* profileRow = new QHBoxLayout();
-        auto* profileLabel = new QLabel(tr("Profile:"), _groupCustomParams);
-        _comboCustomParamsProfile = new QComboBox(_groupCustomParams);
-        _comboCustomParamsProfile->addItem(tr("Custom"), QStringLiteral("custom"));
-        _comboCustomParamsProfile->addItem(tr("Default"), QStringLiteral("default"));
-        _comboCustomParamsProfile->addItem(tr("Robust"), QStringLiteral("robust"));
-        _comboCustomParamsProfile->setToolTip(tr("Select a predefined parameter profile.\n"
-                                               "- Custom: editable\n"
-                                               "- Default/Robust: auto-filled and read-only"));
-        profileRow->addWidget(profileLabel);
-        profileRow->addWidget(_comboCustomParamsProfile, 1);
-        customParamsLayout->addLayout(profileRow);
-    }
-
-    _editCustomParams = new QPlainTextEdit(_groupCustomParams);
-    _editCustomParams->setToolTip(tr("Optional JSON that merges into tracer parameters before growth."));
-    _editCustomParams->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
-    _editCustomParams->setTabChangesFocus(true);
-    customParamsLayout->addWidget(_editCustomParams);
-
-    _lblCustomParamsStatus = new QLabel(_groupCustomParams);
-    _lblCustomParamsStatus->setWordWrap(true);
-    _lblCustomParamsStatus->setVisible(false);
-    _lblCustomParamsStatus->setStyleSheet(QStringLiteral("color: #c0392b;"));
-    customParamsLayout->addWidget(_lblCustomParamsStatus);
-
-    _groupCustomParams->setLayout(customParamsLayout);
-    layout->addWidget(_groupCustomParams);
+    layout->addWidget(_customParamsEditor);
 
     auto* buttons = new QHBoxLayout();
     _btnApply = new QPushButton(tr("Apply"), this);
@@ -1512,18 +1490,14 @@ void SegmentationWidget::buildUi()
         emit correctionsCreateRequested();
     });
 
-    connect(_editCustomParams, &QPlainTextEdit::textChanged, this, [this]() {
+    connect(_customParamsEditor, &JsonProfileEditor::textChanged, this, [this]() {
         handleCustomParamsEdited();
     });
 
-    connect(_comboCustomParamsProfile, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+    connect(_customParamsEditor, &JsonProfileEditor::profileChanged, this, [this](const QString& profile) {
         if (_restoringSettings) {
             return;
         }
-        if (!_comboCustomParamsProfile || idx < 0) {
-            return;
-        }
-        const QString profile = _comboCustomParamsProfile->itemData(idx).toString();
         applyCustomParamsProfile(profile, /*persist=*/true, /*fromUi=*/true);
     });
 
@@ -1761,25 +1735,16 @@ void SegmentationWidget::syncUiState()
         _spinSmoothIterations->setEnabled(editingActive);
     }
 
-    if (_editCustomParams) {
-        if (_editCustomParams->toPlainText() != _customParamsText) {
-            const QSignalBlocker blocker(_editCustomParams);
-            _editCustomParams->setPlainText(_customParamsText);
+    if (_customParamsEditor) {
+        if (_customParamsEditor->customText() != _customParamsText) {
+            _customParamsEditor->setCustomText(_customParamsText);
+        }
+        if (_customParamsEditor->profile() != _customParamsProfile) {
+            const QSignalBlocker blocker(_customParamsEditor);
+            _customParamsEditor->setProfile(_customParamsProfile, false);
         }
     }
-
-    if (_comboCustomParamsProfile) {
-        const QSignalBlocker blocker(_comboCustomParamsProfile);
-        const int idx = _comboCustomParamsProfile->findData(_customParamsProfile);
-        if (idx >= 0) {
-            _comboCustomParamsProfile->setCurrentIndex(idx);
-        }
-    }
-
-    if (_editCustomParams) {
-        _editCustomParams->setReadOnly(_customParamsProfile != QStringLiteral("custom"));
-    }
-    updateCustomParamsStatus();
+    validateCustomParamsText();
 
     if (_spinGrowthSteps) {
         const QSignalBlocker blocker(_spinGrowthSteps);
@@ -2129,24 +2094,17 @@ void SegmentationWidget::applyCustomParamsProfile(const QString& profile, bool p
         ? profile
         : QStringLiteral("custom");
 
-    if (_customParamsProfile == normalized && (!fromUi || normalized == QStringLiteral("custom"))) {
-        // Nothing to do.
-    }
     _customParamsProfile = normalized;
     if (persist) {
         writeSetting(QStringLiteral("custom_params_profile"), _customParamsProfile);
     }
 
-    if (_customParamsProfile != QStringLiteral("custom")) {
-        _updatingCustomParamsProgrammatically = true;
-        _customParamsText = paramsTextForProfile(_customParamsProfile);
-        if (persist) {
-            writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
-        }
-        validateCustomParamsText();
-        _updatingCustomParamsProgrammatically = false;
+    if (_customParamsEditor && !fromUi) {
+        const QSignalBlocker blocker(_customParamsEditor);
+        _customParamsEditor->setProfile(_customParamsProfile, false);
     }
 
+    validateCustomParamsText();
     syncUiState();
 }
 
@@ -2267,14 +2225,14 @@ void SegmentationWidget::restoreSettings()
         _customParamsProfile != QStringLiteral("robust")) {
         _customParamsProfile = QStringLiteral("custom");
     }
-    validateCustomParamsText();
+    if (_customParamsEditor) {
+        _customParamsEditor->setCustomText(_customParamsText);
+    }
 
     _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
 
-    // Apply profile behavior (auto-fill + read-only) after restoring.
-    if (_customParamsProfile != QStringLiteral("custom")) {
-        applyCustomParamsProfile(_customParamsProfile, /*persist=*/false, /*fromUi=*/false);
-    }
+    // Apply profile behavior after restoring.
+    applyCustomParamsProfile(_customParamsProfile, /*persist=*/false, /*fromUi=*/false);
 
     _approvalBrushRadius = settings.value(segmentation::APPROVAL_BRUSH_RADIUS, _approvalBrushRadius).toFloat();
     _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
@@ -2836,11 +2794,7 @@ void SegmentationWidget::setSmoothingIterations(int value)
 
 void SegmentationWidget::handleCustomParamsEdited()
 {
-    if (!_editCustomParams) {
-        return;
-    }
-
-    if (_updatingCustomParamsProgrammatically) {
+    if (!_customParamsEditor) {
         return;
     }
 
@@ -2849,31 +2803,21 @@ void SegmentationWidget::handleCustomParamsEdited()
         return;
     }
 
-    _customParamsText = _editCustomParams->toPlainText();
+    _customParamsText = _customParamsEditor->customText();
     writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
     validateCustomParamsText();
-    updateCustomParamsStatus();
 }
 
 void SegmentationWidget::validateCustomParamsText()
 {
+    if (_customParamsEditor) {
+        _customParamsError = _customParamsEditor->errorText();
+        return;
+    }
+
     QString error;
     parseCustomParams(&error);
     _customParamsError = error;
-}
-
-void SegmentationWidget::updateCustomParamsStatus()
-{
-    if (!_lblCustomParamsStatus) {
-        return;
-    }
-    if (_customParamsError.isEmpty()) {
-        _lblCustomParamsStatus->clear();
-        _lblCustomParamsStatus->setVisible(false);
-        return;
-    }
-    _lblCustomParamsStatus->setText(_customParamsError);
-    _lblCustomParamsStatus->setVisible(true);
 }
 
 std::optional<nlohmann::json> SegmentationWidget::parseCustomParams(QString* error) const
@@ -2882,7 +2826,7 @@ std::optional<nlohmann::json> SegmentationWidget::parseCustomParams(QString* err
         error->clear();
     }
 
-    const QString trimmed = _customParamsText.trimmed();
+    const QString trimmed = paramsTextForProfile(_customParamsProfile).trimmed();
     if (trimmed.isEmpty()) {
         return std::nullopt;
     }
@@ -3453,8 +3397,8 @@ void SegmentationWidget::updateGrowthUiState()
     if (_spinCorrectionsZMax) {
         _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
     }
-    if (_groupCustomParams) {
-        _groupCustomParams->setEnabled(_editingEnabled);
+    if (_customParamsEditor) {
+        _customParamsEditor->setEnabled(_editingEnabled);
     }
 
     const bool allowCorrections = _editingEnabled && _correctionsEnabled && !_growthInProgress;

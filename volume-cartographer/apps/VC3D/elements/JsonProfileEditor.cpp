@@ -63,6 +63,13 @@ void JsonProfileEditor::setPlaceholderText(const QString& text)
     }
 }
 
+void JsonProfileEditor::setTextToolTip(const QString& text)
+{
+    if (_textEdit) {
+        _textEdit->setToolTip(text);
+    }
+}
+
 void JsonProfileEditor::setProfiles(const QVector<Profile>& profiles, const QString& defaultProfileId)
 {
     _profiles = profiles;
