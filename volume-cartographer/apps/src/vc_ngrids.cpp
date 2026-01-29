@@ -621,7 +621,7 @@ static bool fit_normal_tiny(
     using AutoDiffFn = ceres::TinySolverAutoDiffFunction<AffineNormalFitFunctor, Eigen::Dynamic, 12>;
     AutoDiffFn f(functor);
     ceres::TinySolver<AutoDiffFn> solver;
-    solver.options.max_num_iterations = 50;
+    solver.options.max_num_iterations = 1000;
 
     typename ceres::TinySolver<AutoDiffFn>::Parameters params;
     params.setZero();
