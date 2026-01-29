@@ -100,6 +100,7 @@ public slots:
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
+    void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
@@ -381,6 +382,13 @@ private:
     };
 
     std::optional<NeighborCopyJob> _neighborCopyJob;
+    struct ResumeLocalJob {
+        QString segmentId;
+        QString outputDir;
+        QString paramsPath;
+        std::unique_ptr<QTemporaryFile> paramsFile;
+    };
+    std::optional<ResumeLocalJob> _resumeLocalJob;
     void handleNeighborCopyToolFinished(bool success);
     QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,

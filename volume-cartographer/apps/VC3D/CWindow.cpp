@@ -1409,6 +1409,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId, bool copyOut) {
                 onNeighborCopyRequested(segmentId, copyOut);
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::resumeLocalGrowPatchRequested,
+            this, [this](const QString& segmentId) {
+                onResumeLocalGrowPatchRequested(segmentId);
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::reloadFromBackupRequested,
             this, [this](const QString& segmentId, int backupIndex) {
                 onReloadFromBackup(segmentId, backupIndex);

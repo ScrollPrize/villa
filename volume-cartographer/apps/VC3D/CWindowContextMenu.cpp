@@ -23,6 +23,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QInputDialog>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QVBoxLayout>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QFile>
@@ -47,6 +50,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
+#include "elements/JsonProfilePresets.hpp"
 #include <nlohmann/json.hpp>
 
 // --------- local helpers for running external tools -------------------------
@@ -142,6 +146,71 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     minRow,
                     maxCol - minCol + 1,
                     maxRow - minRow + 1);
+}
+
+bool selectResumeLocalTracerParams(QWidget* parent, std::optional<QJsonObject>* paramsOut)
+{
+    if (!paramsOut) {
+        return false;
+    }
+
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Resume-opt Local (GrowPatch)"));
+
+    auto* main = new QVBoxLayout(&dlg);
+    auto* editor = new JsonProfileEditor(QObject::tr("Tracer Params"), &dlg);
+    editor->setDescription(QObject::tr(
+        "Additional JSON fields merge into the tracer params used for resume-local optimization."));
+    editor->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
+
+    const auto profiles = vc3d::json_profiles::tracerParamProfiles(
+        [](const char* text) { return QObject::tr(text); });
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString savedProfile = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+        QStringLiteral("default")).toString();
+    const QString savedText = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+        QString()).toString();
+
+    editor->setCustomText(savedText);
+    editor->setProfiles(profiles, savedProfile);
+    main->addWidget(editor);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
+        if (!editor->isValid()) {
+            const QString error = editor->errorText();
+            QMessageBox::warning(&dlg,
+                                 QObject::tr("Error"),
+                                 error.isEmpty()
+                                     ? QObject::tr("Tracer params JSON is invalid.")
+                                     : error);
+            return;
+        }
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+                          editor->profile());
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+                          editor->customText());
+        dlg.accept();
+    });
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    main->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) {
+        return false;
+    }
+
+    QString error;
+    auto extra = editor->jsonObject(&error);
+    if (!error.isEmpty()) {
+        QMessageBox::warning(parent, QObject::tr("Error"), error);
+        return false;
+    }
+
+    *paramsOut = extra;
+    return true;
 }
 
 // Owns the lifecycle for the async SLIM run; deletes itself on finish/cancel
@@ -1195,6 +1264,108 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
                              5000);
 }
 
+void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
+{
+    if (!fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    if (currentVolume == nullptr) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume loaded."));
+        return;
+    }
+
+    if (!initializeCommandLineRunner()) return;
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+        QMessageBox::warning(this, tr("Warning"), tr("Another neighbor copy request is already running."));
+        return;
+    }
+
+    if (_resumeLocalJob) {
+        QMessageBox::warning(this, tr("Warning"), tr("A resume-opt local GrowPatch run is already active."));
+        return;
+    }
+
+    auto surf = fVpkg->getSurface(segmentId.toStdString());
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Invalid surface selected."));
+        return;
+    }
+
+    std::optional<QJsonObject> extraParams;
+    if (!selectResumeLocalTracerParams(this, &extraParams)) {
+        statusBar()->showMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
+        return;
+    }
+
+    const QString volumePath = getCurrentVolumePath();
+    if (volumePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume path available for tracing."));
+        return;
+    }
+
+    QString volpkgRoot = fVpkgPath;
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(fVpkg->getVolpkgDirectory());
+    }
+
+    QString outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(".")) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
+        return;
+    }
+    outputDirPath = outDir.absolutePath();
+
+    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+
+    QJsonObject params;
+    params["normal_grid_path"] = normalGridPath;
+    params["max_gen"] = 1;
+    params["generations"] = 1;
+    params["resume_local_opt_step"] = 20;
+    params["resume_local_opt_radius"] = 40;
+    params["resume_local_max_iters"] = 1000;
+    params["resume_local_dense_qr"] = false;
+
+    if (extraParams) {
+        for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
+            params.insert(it.key(), it.value());
+        }
+    }
+
+    auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("growpatch_resume_local_XXXXXX.json"));
+    if (!paramsFile->open()) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file."));
+        return;
+    }
+    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
+    paramsFile->flush();
+
+    _resumeLocalJob = ResumeLocalJob{};
+    auto& job = *_resumeLocalJob;
+    job.segmentId = segmentId;
+    job.outputDir = outputDirPath;
+    job.paramsPath = paramsFile->fileName();
+    job.paramsFile = std::move(paramsFile);
+
+    _cmdRunner->setNeighborCopyParams(volumePath,
+                                      job.paramsPath,
+                                      QString::fromStdString(surf->path.string()),
+                                      outputDirPath,
+                                      QStringLiteral("local"));
+    _cmdRunner->setOmpThreads(12);
+    _cmdRunner->showConsoleOutput();
+    _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
+    statusBar()->showMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
+}
+
 void CWindow::onConvertToObj(const std::string& segmentId)
 {
     if (currentVolume == nullptr || !fVpkg) {
@@ -1588,6 +1759,9 @@ bool CWindow::initializeCommandLineRunner()
                     Q_UNUSED(outputPath);
                     const bool neighborJobActive = _neighborCopyJob.has_value() &&
                         tool == CommandLineToolRunner::Tool::NeighborCopy;
+                    const bool resumeLocalActive = !_neighborCopyJob &&
+                        _resumeLocalJob.has_value() &&
+                        tool == CommandLineToolRunner::Tool::NeighborCopy;
 
                     bool suppressDialogs = neighborJobActive && success &&
                                            _neighborCopyJob->stage == NeighborCopyJob::Stage::FirstPass;
@@ -1608,6 +1782,13 @@ bool CWindow::initializeCommandLineRunner()
 
                     if (neighborJobActive) {
                         handleNeighborCopyToolFinished(success);
+                    }
+                    if (resumeLocalActive) {
+                        if (success && _surfacePanel) {
+                            _surfacePanel->reloadSurfacesFromDisk();
+                        }
+                        _cmdRunner->setOmpThreads(-1);
+                        _resumeLocalJob.reset();
                     }
                 });
     }
