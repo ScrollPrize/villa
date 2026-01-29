@@ -379,7 +379,7 @@
            </widget>
           </item>
           <item>
-           <widget class="QComboBox" name="volSelect"/>
+           <widget class="VolumeSelector" name="volSelect"/>
           </item>
           <item>
            <widget class="QWidget" name="widget" native="true">
@@ -1998,7 +1998,7 @@
       </widget>
      </item>
      <item row="0" column="1" colspan="2">
-      <widget class="QComboBox" name="overlayVolumeSelect"/>
+      <widget class="VolumeSelector" name="overlayVolumeSelect"/>
      </item>
      <item row="1" column="0">
       <widget class="QLabel" name="labelOverlayOpacity">
@@ -2217,9 +2217,14 @@
    <header>../../../../../apps/VC3D/elements/DropdownChecklistButton.hpp</header>
   </customwidget>
   <customwidget>
-   <class>SurfaceTreeWidget</class>
-   <extends>QTreeWidget</extends>
-   <header>../../../../../apps/VC3D/SurfaceTreeWidget.hpp</header>
+   <class>VolumeSelector</class>
+   <extends>QWidget</extends>
+   <header>../../../../../apps/VC3D/elements/VolumeSelector.hpp</header>
+  </customwidget>
+  <customwidget>
+  <class>SurfaceTreeWidget</class>
+  <extends>QTreeWidget</extends>
+  <header>../../../../../apps/VC3D/SurfaceTreeWidget.hpp</header>
   </customwidget>
  </customwidgets>
  <resources/>
