@@ -1671,13 +1671,6 @@ static void run_fit_normals(
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
-    const CropBox3i crop = crop_opt.value_or(CropBox3i{
-        cv::Vec3i(0, 0, 0),
-        cv::Vec3i(std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4),
-    });
-
     // We only *output* samples within crop, but we must *read* enough context
     // (potentially larger than crop) so fits near the crop boundary have full support.
     const auto vol_xyz_opt = infer_volume_shape_from_grids(input_dir);
@@ -1685,6 +1678,10 @@ static void run_fit_normals(
         throw std::runtime_error("Failed to infer volume shape from normal grids (required to expand fit read region beyond crop)");
     }
     const cv::Vec3i vol_xyz = *vol_xyz_opt;
+    const CropBox3i crop = crop_opt.value_or(CropBox3i{
+        cv::Vec3i(0, 0, 0),
+        vol_xyz,
+    });
 
     // Adaptive radius (per-sample): start at 32, double to 512, and choose the first
     // radius for which >=min_samples are found in any 2 of the 3 planes.
