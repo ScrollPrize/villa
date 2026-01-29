@@ -6,6 +6,7 @@
 #include "VCSettings.hpp"
 #include <QKeySequence>
 #include <QHBoxLayout>
+#include <QBoxLayout>
 #include <QGridLayout>
 #include <QKeyEvent>
 #include <QResizeEvent>
@@ -1818,7 +1819,11 @@ void CWindow::CreateWidgets(void)
             layout->removeWidget(ui.volSelect);
             ui.volSelect->setVisible(false);
             if (index >= 0) {
-                layout->insertWidget(index, selector);
+                if (auto* box = qobject_cast<QBoxLayout*>(layout)) {
+                    box->insertWidget(index, selector);
+                } else {
+                    layout->addWidget(selector);
+                }
             } else {
                 layout->addWidget(selector);
             }
@@ -1850,7 +1855,11 @@ void CWindow::CreateWidgets(void)
                 layout->removeWidget(overlayVolumeSelect);
                 overlayVolumeSelect->setVisible(false);
                 if (index >= 0) {
-                    layout->insertWidget(index, selector);
+                    if (auto* box = qobject_cast<QBoxLayout*>(layout)) {
+                        box->insertWidget(index, selector);
+                    } else {
+                        layout->addWidget(selector);
+                    }
                 } else {
                     layout->addWidget(selector);
                 }
