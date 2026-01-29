@@ -1751,6 +1751,14 @@ static void run_fit_normals(
         {2, "yz", 0},
     };
 
+    auto has_enough_plane_support = [&](const std::array<std::vector<cv::Point3f>, 3>& dirs_unit) -> bool {
+        int ok = 0;
+        for (int p = 0; p < 3; ++p) {
+            if (static_cast<int>(dirs_unit[p].size()) >= kMinSamplesPerPlane) ++ok;
+        }
+        return ok >= 2;
+    };
+
     auto clear_fit_buffers = [&](std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
                                  std::array<std::vector<double>, 3>& weights,
                                  std::array<std::vector<cv::Point3f>, 3>& deltas_xyz) {
@@ -1761,6 +1769,7 @@ static void run_fit_normals(
         }
     };
 
+    // gather_samples_for_radius is defined after FitStats/stats so it can record dist-test stats.
     const float normal_vis_scale = static_cast<float>(step) * 0.5f;
 
     const int sx0 = align_down(crop.min[0], step);
@@ -1879,79 +1888,17 @@ static void run_fit_normals(
 
     std::vector<FitStats> stats = stats_of();
 
-    // Per-thread warm start for the solver.
-    struct WarmStart {
-        double n[3] = {0.0, 0.0, 0.0};
-        bool has = false;
-    };
-    std::vector<WarmStart> warm(static_cast<size_t>(std::max(1, omp_get_max_threads())));
-
-    struct FitBuffers {
-        std::array<std::vector<cv::Point3f>, 3> dirs_unit;
-        std::array<std::vector<double>, 3> weights;
-        std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
-    };
-    std::vector<FitBuffers> fit_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
-    for (auto& fb : fit_buffers) {
-        for (int p = 0; p < 3; ++p) {
-            fb.dirs_unit[p].reserve(512);
-            fb.weights[p].reserve(512);
-            fb.deltas_xyz[p].reserve(512);
-        }
-    }
-
-    struct SegmentEntry {
-        cv::Point3f dir_unit;
-        cv::Point3f delta;
-        double weight;
-        float dist2;
-        uint8_t is_short;
-    };
-
-    struct SegmentBuffers {
-        std::array<std::vector<SegmentEntry>, 3> entries;
-    };
-
-    std::vector<SegmentBuffers> segment_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
-    for (auto& sb : segment_buffers) {
-        for (int p = 0; p < 3; ++p) {
-            sb.entries[p].reserve(1024);
-        }
-    }
-
-    auto has_enough_plane_support_counts = [&](const std::array<int, 3>& counts) -> bool {
-        int ok = 0;
-        for (int p = 0; p < 3; ++p) {
-            if (counts[p] >= kMinSamplesPerPlane) ++ok;
-        }
-        return ok >= 2;
-    };
-
-    auto next_rad = [&](int rad) -> int {
-        int next = static_cast<int>(rad * 1.1f);
-        if (next <= rad) next = rad + 1;
-        return next;
-    };
-
-    auto clear_segment_entries = [&](SegmentBuffers& sb) {
-        for (int p = 0; p < 3; ++p) {
-            sb.entries[p].clear();
-        }
-    };
-
-    auto gather_segments_for_radius = [&](
+    auto gather_samples_for_radius = [&](
         const cv::Point3f& sample,
         float rad,
         int tid,
-        SegmentBuffers& sb,
+        std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
+        std::array<std::vector<double>, 3>& weights,
+        std::array<std::vector<cv::Point3f>, 3>& deltas_xyz,
         int& used_segments_total,
         int& used_segments_short_paths,
         double& t_ng_read_s,
         double& t_preproc_s) {
-
-        clear_segment_entries(sb);
-        used_segments_total = 0;
-        used_segments_short_paths = 0;
 
         // Only use paths that are long enough to be meaningful.
         constexpr int kMinSegmentsPerPath = 1;
@@ -2008,11 +1955,6 @@ static void run_fit_normals(
                     if (seg_count < kMinSegmentsPerPath) continue;
                     const bool is_short_path = (seg_count <= kShortPathMaxSegments);
 
-                    // Weights are proportional to path length:
-                    // seg_count=1 -> 0.1, seg_count>=10 -> 1.0.
-                    const double path_w = std::max(0.1, std::min(1.0, static_cast<double>(seg_count) / 10.0));
-                    const double w = path_w; // switchable: path_w * std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
-
                     auto p3_of = [&](const cv::Point& p2) {
                         float coords[3] = {0.f, 0.f, 0.f};
                         coords[u_axis] = static_cast<float>(p2.x);
@@ -2041,14 +1983,19 @@ static void run_fit_normals(
                         const float seglen2 = d.dot(d);
                         if (seglen2 <= 1e-6f) continue;
                         const float inv = 1.0f / std::sqrt(seglen2);
-                        const cv::Point3f dir_unit(d.x * inv, d.y * inv, d.z * inv);
+                        dirs_unit[pc.plane_idx].emplace_back(d.x * inv, d.y * inv, d.z * inv);
 
                         // Delta from sample point for first-order curvature term.
                         // Use the segment midpoint as the constraint location.
                         const cv::Point3f m = 0.5f * (a + b);
-                        const cv::Point3f delta(m.x - sample.x, m.y - sample.y, m.z - sample.z);
+                        deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
 
-                        sb.entries[pc.plane_idx].push_back({dir_unit, delta, w, dist2, static_cast<uint8_t>(is_short_path)});
+                    // Weights are proportional to path length:
+                    // seg_count=1 -> 0.1, seg_count>=10 -> 1.0.
+                    const double path_w = std::max(0.1, std::min(1.0, static_cast<double>(seg_count) / 10.0));
+                    const double w = path_w; // switchable: path_w * std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
+                    weights[pc.plane_idx].push_back(w);
+
                         ++used_segments_total;
                         if (is_short_path) ++used_segments_short_paths;
                     }
@@ -2059,42 +2006,26 @@ static void run_fit_normals(
         }
     };
 
-    auto count_support_for_radius = [&](const SegmentBuffers& sb,
-                                        float rad,
-                                        std::array<int, 3>& per_plane,
-                                        int& total) {
-        const float r2 = rad * rad;
-        per_plane = {0, 0, 0};
-        total = 0;
-        for (int p = 0; p < 3; ++p) {
-            for (const auto& e : sb.entries[p]) {
-                if (e.dist2 > r2) continue;
-                ++per_plane[p];
-                ++total;
-            }
-        }
+    // Per-thread warm start for the solver.
+    struct WarmStart {
+        double n[3] = {0.0, 0.0, 0.0};
+        bool has = false;
     };
+    std::vector<WarmStart> warm(static_cast<size_t>(std::max(1, omp_get_max_threads())));
 
-    auto fill_fit_buffers_for_radius = [&](const SegmentBuffers& sb,
-                                           float rad,
-                                           FitBuffers& fb,
-                                           int& used_segments_total,
-                                           int& used_segments_short_paths) {
-        clear_fit_buffers(fb.dirs_unit, fb.weights, fb.deltas_xyz);
-        used_segments_total = 0;
-        used_segments_short_paths = 0;
-        const float r2 = rad * rad;
-        for (int p = 0; p < 3; ++p) {
-            for (const auto& e : sb.entries[p]) {
-                if (e.dist2 > r2) continue;
-                fb.dirs_unit[p].push_back(e.dir_unit);
-                fb.weights[p].push_back(e.weight);
-                fb.deltas_xyz[p].push_back(e.delta);
-                ++used_segments_total;
-                if (e.is_short) ++used_segments_short_paths;
-            }
-        }
+    struct FitBuffers {
+        std::array<std::vector<cv::Point3f>, 3> dirs_unit;
+        std::array<std::vector<double>, 3> weights;
+        std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
     };
+    std::vector<FitBuffers> fit_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+    for (auto& fb : fit_buffers) {
+        for (int p = 0; p < 3; ++p) {
+            fb.dirs_unit[p].reserve(512);
+            fb.weights[p].reserve(512);
+            fb.deltas_xyz[p].reserve(512);
+        }
+    }
 
     auto merge_stats = [&](FitStats& acc, const FitStats& s) {
         for (int i = 0; i < 7; ++i) {
@@ -2267,7 +2198,6 @@ static void run_fit_normals(
                 const auto t_sample0 = std::chrono::steady_clock::now();
 
                 FitBuffers& fb = fit_buffers[static_cast<size_t>(tid)];
-                SegmentBuffers& sb = segment_buffers[static_cast<size_t>(tid)];
                 auto& dirs_unit = fb.dirs_unit;
                 auto& weights = fb.weights;
                 auto& deltas_xyz = fb.deltas_xyz;
@@ -2279,63 +2209,31 @@ static void run_fit_normals(
                 int used_segments_total = 0;
                 int used_segments_short_paths = 0;
                 bool skip_fit_due_to_low_segments = false;
-                // Gather at progressively larger radii (doubling) to avoid re-reading grids
-                // for every 1.1x candidate radius.
-                int gather_rad = kMinRadius;
-                while (true) {
-                    gather_segments_for_radius(sample,
-                                               static_cast<float>(gather_rad),
-                                               tid,
-                                               sb,
-                                               used_segments_total,
-                                               used_segments_short_paths,
-                                               t_ng_read_s,
-                                               t_preproc_s);
+                for (int rad = kMinRadius; rad <= kMaxRadius; rad *= 1.1) {
+                    clear_fit_buffers(dirs_unit, weights, deltas_xyz);
+                    used_segments_total = 0;
+                    used_segments_short_paths = 0;
+                    gather_samples_for_radius(sample,
+                                              static_cast<float>(rad),
+                                              tid,
+                                              dirs_unit,
+                                              weights,
+                                              deltas_xyz,
+                                              used_segments_total,
+                                              used_segments_short_paths,
+                                              t_ng_read_s,
+                                              t_preproc_s);
+                    used_rad = rad;
 
-                    bool found = false;
-                    const auto t_sel0 = std::chrono::steady_clock::now();
-                    for (int rad = kMinRadius; rad <= gather_rad; rad = next_rad(rad)) {
-                        std::array<int, 3> per_plane = {0, 0, 0};
-                        int total = 0;
-                        count_support_for_radius(sb, static_cast<float>(rad), per_plane, total);
-
-                        // If at the initial radius there are too few segments overall, skip this normal completely.
-                        // Treat as a failed fit (same behavior as fit_normal_tiny returning false).
-                        if (rad == kMinRadius && total < 50) {
-                            skip_fit_due_to_low_segments = true;
-                            break;
-                        }
-
-                        if (has_enough_plane_support_counts(per_plane)) {
-                            used_rad = rad;
-                            found = true;
-                            break;
-                        }
-                    }
-                    const auto t_sel1 = std::chrono::steady_clock::now();
-                    t_preproc_s += std::chrono::duration<double>(t_sel1 - t_sel0).count();
-
-                    if (skip_fit_due_to_low_segments) {
-                        used_rad = kMinRadius;
+                    // If at the initial radius there are too few segments overall, skip this normal completely.
+                    // Treat as a failed fit (same behavior as fit_normal_tiny returning false).
+                    if (rad == kMinRadius && used_segments_total < 50) {
+                        skip_fit_due_to_low_segments = true;
                         break;
                     }
-                    if (found || gather_rad >= kMaxRadius) {
-                        if (!found) {
-                            used_rad = gather_rad;
-                        }
-                        break;
-                    }
-                    gather_rad = std::min(kMaxRadius, gather_rad * 2);
+
+                    if (has_enough_plane_support(dirs_unit)) break;
                 }
-
-                const auto t_fill0 = std::chrono::steady_clock::now();
-                fill_fit_buffers_for_radius(sb,
-                                            static_cast<float>(used_rad),
-                                            fb,
-                                            used_segments_total,
-                                            used_segments_short_paths);
-                const auto t_fill1 = std::chrono::steady_clock::now();
-                t_preproc_s += std::chrono::duration<double>(t_fill1 - t_fill0).count();
 
                 cv::Point3f n;
                 int iters = 0;
