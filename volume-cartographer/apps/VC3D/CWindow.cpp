@@ -1742,10 +1742,6 @@ void CWindow::CreateWidgets(void)
     };
 
     using namespace vc3d::settings;
-    addViewerGroup(tr("Normal Visualization"),
-                   normalVisContainer,
-                   viewer::GROUP_NORMAL_VIS_EXPANDED,
-                   viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
     addViewerGroup(tr("View"),
                    detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
                    viewer::GROUP_VIEW_EXPANDED,
@@ -1754,14 +1750,18 @@ void CWindow::CreateWidgets(void)
                    detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
                    viewer::GROUP_OVERLAY_EXPANDED,
                    viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Render Settings"),
-                   detachScrollContents(ui.scrollAreaRenderSettings, ui.dockWidgetRenderSettingsContents),
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
     addViewerGroup(tr("Composite View"),
                    detachScrollContents(ui.scrollAreaComposite, ui.dockWidgetCompositeContents),
                    viewer::GROUP_COMPOSITE_EXPANDED,
                    viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Render Settings"),
+                   detachScrollContents(ui.scrollAreaRenderSettings, ui.dockWidgetRenderSettingsContents),
+                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
+                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Normal Visualization"),
+                   normalVisContainer,
+                   viewer::GROUP_NORMAL_VIS_EXPANDED,
+                   viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
     addViewerGroup(tr("Preprocessing"),
                    detachScrollContents(ui.scrollAreaPreprocessing, ui.dockWidgetPreprocessingContents),
                    viewer::GROUP_PREPROCESSING_EXPANDED,
