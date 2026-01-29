@@ -20,6 +20,8 @@ set(srcs
     elements/CollapsibleSettingsGroup.hpp
     elements/DropdownChecklistButton.cpp
     elements/DropdownChecklistButton.hpp
+    elements/JsonProfileEditor.cpp
+    elements/JsonProfileEditor.hpp
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
     SettingsDialog.cpp
