@@ -2183,7 +2183,7 @@ static void run_fit_normals(
     }
 
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(dynamic,1)
     for (int z = sz0; z < crop.max[2]; z += step) {
         for (int y = sy0; y < crop.max[1]; y += step) {
             for (int x = sx0; x < crop.max[0]; x += step) {

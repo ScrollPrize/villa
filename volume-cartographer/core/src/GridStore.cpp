@@ -5,8 +5,6 @@
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>
-#include <random>
-#include <cstdlib>
 
 #include <arpa/inet.h>
 
@@ -88,7 +86,7 @@ public:
             }
             result.reserve(offsets.size());
             for (size_t offset : offsets) {
-                result.push_back(get_points_from_offset(offset));
+                result.push_back(get_seglist_from_offset(offset)->get());
             }
         } else {
             std::unordered_set<int> handles;
@@ -121,7 +119,7 @@ public:
             }
             result.reserve(all_offsets.size());
             for (const auto& offset : all_offsets) {
-                result.push_back(get_points_from_offset(offset));
+                result.push_back(get_seglist_from_offset(offset)->get());
             }
         } else {
             result.reserve(storage_.size());
@@ -333,7 +331,6 @@ public:
     void load_mmap(const std::string& path) {
         read_only_ = true;
         mmapped_data_ = std::make_unique<MmappedData>();
-        init_point_cache_from_env();
 
         int fd = open(path.c_str(), O_RDONLY);
         if (fd == -1) {
@@ -505,58 +502,6 @@ private:
         return seglist;
     }
 
-    std::shared_ptr<std::vector<cv::Point>> get_points_from_offset(size_t offset) const {
-        if (max_points_cache_size_ > 0) {
-            {
-                std::lock_guard<std::mutex> lock(seglist_mutex_);
-                auto it = points_cache_.find(offset);
-                if (it != points_cache_.end()) {
-                    return it->second.points;
-                }
-            }
-        }
-
-        auto points = get_seglist_from_offset(offset)->get();
-        if (max_points_cache_size_ == 0) {
-            return points;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(seglist_mutex_);
-            auto it = points_cache_.find(offset);
-            if (it != points_cache_.end()) {
-                return it->second.points;
-            }
-
-            points_cache_[offset] = {points, ++points_generation_};
-
-            if (points_cache_.size() > max_points_cache_size_) {
-                std::vector<size_t> keys;
-                keys.reserve(points_cache_.size());
-                for (const auto& pair : points_cache_) {
-                    keys.push_back(pair.first);
-                }
-                if (!keys.empty()) {
-                    std::mt19937 gen(std::random_device{}());
-                    std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
-                    size_t key_to_evict = keys[dist(gen)];
-                    uint64_t min_generation = points_cache_.at(key_to_evict).generation;
-
-                    for (size_t i = 0; i < points_eviction_sample_size_ && !keys.empty(); ++i) {
-                        const size_t sample_key = keys[dist(gen)];
-                        const auto& entry = points_cache_.at(sample_key);
-                        if (entry.generation < min_generation) {
-                            min_generation = entry.generation;
-                            key_to_evict = sample_key;
-                        }
-                    }
-                    points_cache_.erase(key_to_evict);
-                }
-            }
-        }
-        return points;
-    }
-
     std::shared_ptr<std::vector<size_t>> get_bucket_offsets(int index) const {
         // Acquire lock to check for existence
         bucket_mutex_.lock();
@@ -650,22 +595,6 @@ private:
         return total_size;
     }
 
-    void init_point_cache_from_env() {
-        const char* env = std::getenv("VC_GRIDSTORE_POINT_CACHE");
-        if (env && *env) {
-            max_points_cache_size_ = std::strtoull(env, nullptr, 10);
-        }
-        const char* env_sample = std::getenv("VC_GRIDSTORE_POINT_CACHE_EVICT_SAMPLE");
-        if (env_sample && *env_sample) {
-            points_eviction_sample_size_ = std::max<size_t>(1, std::strtoull(env_sample, nullptr, 10));
-        }
-    }
-
-    struct PointsCacheEntry {
-        std::shared_ptr<std::vector<cv::Point>> points;
-        uint64_t generation = 0;
-    };
-
     cv::Rect bounds_;
     int cell_size_;
     cv::Size grid_size_;
@@ -680,10 +609,6 @@ private:
     std::unique_ptr<MmappedData> mmapped_data_;
     mutable std::mutex bucket_mutex_;
     mutable std::mutex seglist_mutex_;
-    mutable std::unordered_map<size_t, PointsCacheEntry> points_cache_;
-    mutable uint64_t points_generation_ = 0;
-    size_t max_points_cache_size_ = 0;
-    size_t points_eviction_sample_size_ = 8;
 };
  
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
