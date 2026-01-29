@@ -60,4 +60,5 @@ private:
     std::map<std::string, std::string> segmentationDirectories_;
 
     void loadSegmentationsFromDirectory(const std::string& dirName);
+    void ensureSegmentScrollSource();
 };

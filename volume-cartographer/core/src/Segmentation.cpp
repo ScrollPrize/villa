@@ -53,6 +53,22 @@ void Segmentation::saveMetadata()
     }
 }
 
+void Segmentation::ensureScrollSource(const std::string& scrollName, const std::string& volumeUuid)
+{
+    bool changed = false;
+    if (!metadata_.contains("scroll_source") || metadata_["scroll_source"].get<std::string>().empty()) {
+        metadata_["scroll_source"] = scrollName;
+        changed = true;
+    }
+    if (!metadata_.contains("volume") || metadata_["volume"].get<std::string>().empty()) {
+        metadata_["volume"] = volumeUuid;
+        changed = true;
+    }
+    if (changed) {
+        saveMetadata();
+    }
+}
+
 bool Segmentation::checkDir(std::filesystem::path path)
 {
     return std::filesystem::is_directory(path) && std::filesystem::exists(path / METADATA_FILE);

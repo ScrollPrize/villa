@@ -19,6 +19,7 @@ public:
     void setName(const std::string& n);
     [[nodiscard]] std::filesystem::path path() const { return path_; }
     void saveMetadata();
+    void ensureScrollSource(const std::string& scrollName, const std::string& volumeUuid);
 
     // Surface management - returns QuadSurface directly (no SurfaceMeta wrapper)
     [[nodiscard]] bool isSurfaceLoaded() const;
