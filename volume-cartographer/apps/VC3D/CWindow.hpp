@@ -102,6 +102,7 @@ public slots:
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);
+    void onCopySurfaceRequested(const QString& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,

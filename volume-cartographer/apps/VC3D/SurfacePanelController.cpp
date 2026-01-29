@@ -688,11 +688,19 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     if (_volumePkg) {
-        QAction* copyOutAction = contextMenu.addAction(tr("Copy Out"));
+        QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
+        if (selectedSegmentIds.size() == 1) {
+            QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
+            connect(copySurfaceAction, &QAction::triggered, this, [this, segmentId]() {
+                emit copySurfaceRequested(segmentId);
+            });
+            copySurfaceMenu->addSeparator();
+        }
+        QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
         connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, true);
         });
-        QAction* copyInAction = contextMenu.addAction(tr("Copy In"));
+        QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
         connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, false);
         });

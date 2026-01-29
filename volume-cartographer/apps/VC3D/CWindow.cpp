@@ -58,6 +58,7 @@
 #include <atomic>
 #include <cmath>
 #include <cmath>
+#include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
 #include <cctype>
@@ -892,6 +893,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
     connect(_surfacePanel.get(), &SurfacePanelController::renameSurfaceRequested, this, &CWindow::onRenameSurface);
+    connect(_surfacePanel.get(), &SurfacePanelController::copySurfaceRequested, this, &CWindow::onCopySurfaceRequested);
 }
 
 // Destructor
@@ -5247,6 +5249,117 @@ void CWindow::onRenameSurface(const QString& segmentId)
             _surfacePanel->reloadSurfacesFromDisk();
         }
     }
+}
+
+void CWindow::onCopySurfaceRequested(const QString& segmentId)
+{
+    if (!fVpkg) {
+        statusBar()->showMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    // Block if surface is currently being edited
+    if (_segmentationModule && _segmentationModule->isEditingApprovalMask()) {
+        QMessageBox::warning(this, tr("Cannot Copy"),
+            tr("Cannot copy surface while editing is in progress.\n"
+               "Please finish or cancel editing first."));
+        return;
+    }
+
+    // Get the segment
+    std::string oldId = segmentId.toStdString();
+    auto seg = fVpkg->segmentation(oldId);
+    if (!seg) {
+        statusBar()->showMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+        return;
+    }
+
+    std::filesystem::path currentPath = seg->path();
+    std::filesystem::path parentDir = currentPath.parent_path();
+
+    QString baseName = segmentId + "_copy";
+    QString suggestedName = baseName;
+    int suffix = 1;
+    while (std::filesystem::exists(parentDir / suggestedName.toStdString())) {
+        ++suffix;
+        suggestedName = QString("%1_%2").arg(baseName).arg(suffix);
+    }
+
+    bool ok = false;
+    QString newName = QInputDialog::getText(
+        this,
+        tr("Copy Surface"),
+        tr("Enter name for copy of '%1':").arg(segmentId),
+        QLineEdit::Normal,
+        suggestedName,
+        &ok);
+
+    if (!ok) {
+        return;
+    }
+
+    newName = newName.trimmed();
+    if (newName.isEmpty()) {
+        return;
+    }
+
+    // Validate new name: alphanumeric + underscore + hyphen only
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch()) {
+        QMessageBox::warning(this, tr("Invalid Name"),
+            tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
+        return;
+    }
+
+    std::string newId = newName.toStdString();
+    if (newId == oldId) {
+        return;
+    }
+
+    std::filesystem::path newPath = parentDir / newId;
+    if (std::filesystem::exists(newPath)) {
+        QMessageBox::warning(this, tr("Name Exists"),
+            tr("A surface with the name '%1' already exists.").arg(newName));
+        return;
+    }
+
+    try {
+        std::filesystem::copy(currentPath, newPath, std::filesystem::copy_options::recursive);
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to copy surface: %1").arg(e.what()));
+        return;
+    }
+
+    try {
+        auto copiedSeg = Segmentation::New(newPath);
+        copiedSeg->setId(newId);
+        copiedSeg->setName(newId);
+        copiedSeg->saveMetadata();
+    } catch (const std::exception& e) {
+        try {
+            std::filesystem::remove_all(newPath);
+        } catch (...) {
+            // Best-effort cleanup only
+        }
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to update metadata for copied surface: %1").arg(e.what()));
+        return;
+    }
+
+    if (fVpkg->addSingleSegmentation(newId)) {
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(newId);
+        }
+    } else {
+        fVpkg->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+    }
+
+    statusBar()->showMessage(
+        tr("Copied '%1' to '%2'").arg(segmentId, newName), 5000);
 }
 
 void CWindow::updateSurfaceOverlayDropdown()

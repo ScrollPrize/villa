@@ -134,6 +134,7 @@ signals:
     void flipURequested(const QString& segmentId);
     void flipVRequested(const QString& segmentId);
     void renameSurfaceRequested(const QString& segmentId);
+    void copySurfaceRequested(const QString& segmentId);
     void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
 
 
