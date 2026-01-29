@@ -16,6 +16,7 @@
 #include <optional>
 
 class JsonProfileEditor;
+class VolumeSelector;
 
 class RenderParamsDialog : public QDialog {
     Q_OBJECT
@@ -313,7 +314,7 @@ private:
                                const QString& defaultVolumeId);
 
     QLineEdit* edtSurface_{nullptr};
-    QComboBox* cmbVolume_{nullptr};
+    VolumeSelector* volumeSelector_{nullptr};
     QLineEdit* edtOutput_{nullptr};
     QSpinBox* spResumeStep_{nullptr};
     QSpinBox* spResumeRadius_{nullptr};

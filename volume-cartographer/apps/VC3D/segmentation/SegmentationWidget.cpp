@@ -3,6 +3,7 @@
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "elements/JsonProfileEditor.hpp"
 #include "elements/JsonProfilePresets.hpp"
+#include "elements/VolumeSelector.hpp"
 #include "NeuralTraceServiceManager.hpp"
 #include "VCSettings.hpp"
 
@@ -443,11 +444,13 @@ void SegmentationWidget::buildUi()
 
     auto* volumeRow = new QHBoxLayout();
     auto* volumeLabel = new QLabel(tr("Volume:"), _groupGrowth);
-    _comboVolumes = new QComboBox(_groupGrowth);
+    auto* volumeSelector = new VolumeSelector(_groupGrowth);
+    volumeSelector->setLabelVisible(false);
+    _comboVolumes = volumeSelector->comboBox();
     _comboVolumes->setEnabled(false);
     _comboVolumes->setToolTip(tr("Select which volume provides source data for segmentation growth."));
     volumeRow->addWidget(volumeLabel);
-    volumeRow->addWidget(_comboVolumes, 1);
+    volumeRow->addWidget(volumeSelector, 1);
     growthLayout->addLayout(volumeRow);
 
     _groupGrowth->setLayout(growthLayout);

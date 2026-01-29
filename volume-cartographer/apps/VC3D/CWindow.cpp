@@ -75,6 +75,7 @@
 #include "CVolumeViewerView.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
+#include "elements/VolumeSelector.hpp"
 #include "CSurfaceCollection.hpp"
 #include "CPointCollectionWidget.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -1809,11 +1810,58 @@ void CWindow::CreateWidgets(void)
     // connect(ui.btnRemovePath, SIGNAL(clicked()), this, SLOT(OnRemovePathClicked()));
 
     // TODO CHANGE VOLUME LOADING; FIRST CHECK FOR OTHER VOLUMES IN THE STRUCTS
-    volSelect = ui.volSelect;
+    if (ui.volSelect) {
+        auto* selector = new VolumeSelector(ui.volSelect->parentWidget());
+        selector->setLabelVisible(false);
+        if (auto* layout = ui.volSelect->parentWidget() ? ui.volSelect->parentWidget()->layout() : nullptr) {
+            const int index = layout->indexOf(ui.volSelect);
+            layout->removeWidget(ui.volSelect);
+            ui.volSelect->setVisible(false);
+            if (index >= 0) {
+                layout->insertWidget(index, selector);
+            } else {
+                layout->addWidget(selector);
+            }
+        }
+        volSelect = selector->comboBox();
+    } else {
+        volSelect = ui.volSelect;
+    }
+
+    QComboBox* overlayVolumeSelect = ui.overlayVolumeSelect;
+    if (overlayVolumeSelect) {
+        auto* selector = new VolumeSelector(overlayVolumeSelect->parentWidget());
+        selector->setLabelVisible(false);
+        if (auto* layout = overlayVolumeSelect->parentWidget() ? overlayVolumeSelect->parentWidget()->layout() : nullptr) {
+            int row = 0;
+            int column = 0;
+            int rowSpan = 1;
+            int columnSpan = 1;
+            if (auto* grid = qobject_cast<QGridLayout*>(layout)) {
+                const int index = grid->indexOf(overlayVolumeSelect);
+                if (index >= 0) {
+                    grid->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
+                }
+                grid->removeWidget(overlayVolumeSelect);
+                overlayVolumeSelect->setVisible(false);
+                grid->addWidget(selector, row, column, rowSpan, columnSpan);
+            } else {
+                const int index = layout->indexOf(overlayVolumeSelect);
+                layout->removeWidget(overlayVolumeSelect);
+                overlayVolumeSelect->setVisible(false);
+                if (index >= 0) {
+                    layout->insertWidget(index, selector);
+                } else {
+                    layout->addWidget(selector);
+                }
+            }
+        }
+        overlayVolumeSelect = selector->comboBox();
+    }
 
     if (_volumeOverlay) {
         VolumeOverlayController::UiRefs overlayUi{
-            .volumeSelect = ui.overlayVolumeSelect,
+            .volumeSelect = overlayVolumeSelect,
             .colormapSelect = ui.overlayColormapSelect,
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,

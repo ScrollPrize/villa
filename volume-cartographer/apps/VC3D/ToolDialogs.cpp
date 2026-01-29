@@ -3,6 +3,7 @@
 #include "VCSettings.hpp"
 #include "elements/JsonProfileEditor.hpp"
 #include "elements/JsonProfilePresets.hpp"
+#include "elements/VolumeSelector.hpp"
 
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -1045,9 +1046,10 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     edtSurface_->setReadOnly(true);
     form->addRow(tr("Target surface:"), edtSurface_);
 
-    cmbVolume_ = new QComboBox(this);
+    volumeSelector_ = new VolumeSelector(this);
+    volumeSelector_->setLabelVisible(false);
     populateVolumeOptions(volumes, defaultVolumeId);
-    form->addRow(tr("Target volume:"), cmbVolume_);
+    form->addRow(tr("Target volume:"), volumeSelector_);
 
     QWidget* outPick = pathPicker(this, edtOutput_, tr("Select output directory"), true);
     edtOutput_->setText(defaultOutputPath);
@@ -1192,22 +1194,17 @@ void NeighborCopyDialog::accept()
 void NeighborCopyDialog::populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
                                                const QString& defaultVolumeId)
 {
-    cmbVolume_->clear();
-    int defaultIndex = -1;
-    for (int i = 0; i < volumes.size(); ++i) {
-        const auto& opt = volumes[i];
-        QString label = opt.name.isEmpty()
-            ? opt.id
-            : tr("%1 (%2)").arg(opt.name, opt.id);
-        cmbVolume_->addItem(label, opt.path);
-        cmbVolume_->setItemData(i, opt.id, Qt::UserRole + 1);
-        if (defaultIndex == -1 && !defaultVolumeId.isEmpty() && opt.id == defaultVolumeId) {
-            defaultIndex = i;
-        }
+    if (!volumeSelector_) {
+        return;
     }
-    if (cmbVolume_->count() > 0) {
-        cmbVolume_->setCurrentIndex(defaultIndex >= 0 ? defaultIndex : 0);
+
+    QVector<VolumeSelector::VolumeOption> options;
+    options.reserve(volumes.size());
+    for (const auto& opt : volumes) {
+        options.push_back({opt.id, opt.name, opt.path});
     }
+
+    volumeSelector_->setVolumes(options, defaultVolumeId);
 }
 
 QString NeighborCopyDialog::surfacePath() const
@@ -1217,18 +1214,18 @@ QString NeighborCopyDialog::surfacePath() const
 
 QString NeighborCopyDialog::selectedVolumeId() const
 {
-    if (!cmbVolume_) {
+    if (!volumeSelector_) {
         return QString();
     }
-    return cmbVolume_->currentData(Qt::UserRole + 1).toString();
+    return volumeSelector_->selectedVolumeId();
 }
 
 QString NeighborCopyDialog::selectedVolumePath() const
 {
-    if (!cmbVolume_) {
+    if (!volumeSelector_) {
         return QString();
     }
-    return cmbVolume_->currentData(Qt::UserRole).toString();
+    return volumeSelector_->selectedVolumePath();
 }
 
 QString NeighborCopyDialog::outputPath() const
