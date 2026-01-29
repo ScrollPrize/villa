@@ -51,6 +51,7 @@
 #define LOSS_DIST 2
 #define LOSS_NORMALSNAP 4
 #define LOSS_SDIR 8
+#define LOSS_SPACELINE 16
 #define LOSS_3DNORMALLINE 32
 
 namespace { // Anonymous namespace for local helpers
@@ -154,6 +155,73 @@ static cv::Mat_<uchar> make_approved_mask(const cv::Mat& approval,
 
     return approved;
 }
+
+struct lineLossDistance
+{
+    enum {BORDER = 16};
+    enum {CHUNK_SIZE = 64};
+    enum {FILL_V = 0};
+
+    explicit lineLossDistance(float threshold_in = 170.0f, bool invert_in = false)
+        : threshold(threshold_in), invert(invert_in)
+    {
+        UNIQUE_ID_STRING = "spaceline_" + std::to_string(BORDER) + "_" + std::to_string(CHUNK_SIZE) + "_" +
+                           std::to_string(static_cast<int>(std::round(threshold))) + "_" +
+                           std::to_string(static_cast<int>(invert));
+    }
+
+    template <typename T, typename E>
+    void compute(const T &large, T &small, const cv::Vec3i &offset_large)
+    {
+        (void)offset_large;
+        const int s = CHUNK_SIZE + 2 * BORDER;
+        const size_t voxels = static_cast<size_t>(s) * s * s;
+
+        std::vector<uint8_t> binary(voxels, 1);
+        const uint8_t thr = static_cast<uint8_t>(std::clamp(threshold, 0.0f, 255.0f));
+
+#pragma omp parallel for
+        for (int z = 0; z < s; ++z) {
+            for (int y = 0; y < s; ++y) {
+                for (int x = 0; x < s; ++x) {
+                    const uint8_t v = large(z, y, x);
+                    bool fg = v >= thr;
+                    if (invert) {
+                        fg = !fg;
+                    }
+                    const size_t idx = static_cast<size_t>(z) + static_cast<size_t>(y) * s + static_cast<size_t>(x) * s * s;
+                    binary[idx] = fg ? 0 : 1; // distance to foreground (zeros)
+                }
+            }
+        }
+
+        float* edt = edt::binary_edt<uint8_t>(
+            binary.data(), s, s, s, 1.0f, 1.0f, 1.0f, false, 1);
+
+        const int low = BORDER;
+
+        for (int z = 0; z < CHUNK_SIZE; ++z) {
+            for (int y = 0; y < CHUNK_SIZE; ++y) {
+                for (int x = 0; x < CHUNK_SIZE; ++x) {
+                    const size_t idx = static_cast<size_t>(z + low) + static_cast<size_t>(y + low) * s +
+                                       static_cast<size_t>(x + low) * s * s;
+                    float d = edt[idx];
+                    if (!std::isfinite(d)) {
+                        d = 255.0f;
+                    }
+                    d = std::clamp(d, 0.0f, 255.0f);
+                    small(z, y, x) = static_cast<uint8_t>(std::lround(d));
+                }
+            }
+        }
+
+        delete[] edt;
+    }
+
+    float threshold = 170.0f;
+    bool invert = false;
+    std::string UNIQUE_ID_STRING;
+};
 
 static void flood_fill_unapproved(const cv::Mat_<uchar>& approved,
                                   const cv::Vec2i& seed,
@@ -453,6 +521,8 @@ struct TraceData {
     std::unique_ptr<NormalFitQualityWeightField> normal3d_fit_quality;
 
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
+    std::unique_ptr<lineLossDistance> space_line_compute;
+    std::unique_ptr<Chunked3d<uint8_t, lineLossDistance>> space_line_volume;
 };
 
 class ReferenceClearanceCost {
@@ -813,6 +883,7 @@ enum LossType {
     CORRECTION,
     REFERENCE_RAY,
     SURFACE_SDT,
+    SPACELINE,
     COUNT
 };
 
@@ -831,6 +902,7 @@ struct LossSettings {
         w[LossType::CORRECTION] = 1.0f;
         w[LossType::REFERENCE_RAY] = 0.5f;
         w[LossType::SURFACE_SDT] = 0.0f;
+        w[LossType::SPACELINE] = 0.0f;
     }
 
     struct ReferenceRaycastSettings {
@@ -869,6 +941,7 @@ struct LossSettings {
         set_weight("correction_weight", LossType::CORRECTION);
         set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
         set_weight("sdt_weight", LossType::SURFACE_SDT);
+        set_weight("space_line_weight", LossType::SPACELINE);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -891,6 +964,10 @@ struct LossSettings {
     // Anti-flipback constraint settings
     float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
     float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
+
+    int space_line_steps = 8;
+    float space_line_threshold = 170.0f;
+    bool space_line_invert = false;
 };
 
 static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
@@ -1139,6 +1216,8 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 static int gen_3d_normal_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int conditional_3d_normal_line_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const LossSettings &settings);
+static int gen_space_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
+static int conditional_space_line_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings);
 static int gen_sdirichlet_loss(ceres::Problem &problem, const cv::Vec2i &p,
                                TraceParameters &params, const LossSettings &settings,
                                double sdir_eps_abs, double sdir_eps_rel);
@@ -1216,6 +1295,35 @@ static int gen_dist_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::
         return 0;
 
     problem.AddResidualBlock(DistLoss::Create(params.unit*cv::norm(off),settings(LossType::DIST, p)), nullptr, &params.dpoints(p)[0], &params.dpoints(p+off)[0]);
+
+    return 1;
+}
+
+static int gen_space_line_loss(ceres::Problem &problem, const cv::Vec2i &p, const cv::Vec2i &off,
+    TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
+{
+    if (!trace_data.space_line_volume)
+        return 0;
+    if (!coord_valid(params.state(p)))
+        return 0;
+    if (!coord_valid(params.state(p+off)))
+        return 0;
+    if (!dpoint_valid(params.dpoints(p)) || !dpoint_valid(params.dpoints(p+off)))
+        return 0;
+
+    const float w = settings(LossType::SPACELINE, p);
+    if (w <= 0.0f)
+        return 0;
+    if (settings.space_line_steps < 2)
+        return 0;
+
+    problem.AddResidualBlock(
+        SpaceLineLossAcc<uint8_t, lineLossDistance>::Create(*trace_data.space_line_volume,
+                                                            settings.space_line_steps,
+                                                            w),
+        nullptr,
+        &params.dpoints(p)[0],
+        &params.dpoints(p+off)[0]);
 
     return 1;
 }
@@ -1472,6 +1580,22 @@ static int conditional_dist_loss(int bit, const cv::Vec2i &p, const cv::Vec2i &o
         set = set_loss_mask(bit, p, off, loss_status, gen_dist_loss(problem, p, off, params, settings));
     return set;
 };
+
+static int conditional_space_line_loss(int bit,
+    const cv::Vec2i &p,
+    const cv::Vec2i &off,
+    cv::Mat_<uint16_t> &loss_status,
+    ceres::Problem &problem,
+    TraceParameters &params,
+    const TraceData &trace_data,
+    const LossSettings &settings)
+{
+    int set = 0;
+    if (!loss_mask(bit, p, off, loss_status)) {
+        set = set_loss_mask(bit, p, off, loss_status, gen_space_line_loss(problem, p, off, params, trace_data, settings));
+    }
+    return set;
+}
 
 static int gen_3d_normal_line_loss(ceres::Problem &problem,
                                   const cv::Vec2i &p,
@@ -1749,6 +1873,14 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
         count += gen_dist_loss(problem, p, {-1,-1}, params, settings);
     }
 
+    if (flags & LOSS_SPACELINE) {
+        // direct neighbors only (4-neighborhood)
+        count += gen_space_line_loss(problem, p, {0,-1}, params, trace_data, settings);
+        count += gen_space_line_loss(problem, p, {0,1}, params, trace_data, settings);
+        count += gen_space_line_loss(problem, p, {-1,0}, params, trace_data, settings);
+        count += gen_space_line_loss(problem, p, {1,0}, params, trace_data, settings);
+    }
+
     if (flags & LOSS_NORMALSNAP) {
         //gridstore normals
         count += gen_normal_loss(problem, p                   , params, trace_data, settings);
@@ -1991,6 +2123,12 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_dist_loss(5, p, {1,1}, loss_status, problem, params, settings);
     count += conditional_dist_loss(5, p, {-1,-1}, loss_status, problem, params, settings);
 
+    // space-line loss (4-neighborhood)
+    count += conditional_space_line_loss(7, p, {0,-1}, loss_status, problem, params, trace_data, settings);
+    count += conditional_space_line_loss(7, p, {0,1}, loss_status, problem, params, trace_data, settings);
+    count += conditional_space_line_loss(8, p, {-1,0}, loss_status, problem, params, trace_data, settings);
+    count += conditional_space_line_loss(8, p, {1,0}, loss_status, problem, params, trace_data, settings);
+
     //symmetric dirichlet
     count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, 1e-8, 1e-2);
@@ -2133,7 +2271,11 @@ static bool resample_inside_boundary(TraceParameters& params,
     resample_settings[STRAIGHT] *= 0.1f;
     resample_settings[NORMAL] *= 0.1f;
     resample_settings[SURFACE_SDT] = 0.0f;
-    local_optimization(roi, local_mask, params, trace_data, resample_settings, LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP);
+    int flags = LOSS_DIST | LOSS_STRAIGHT | LOSS_NORMALSNAP;
+    if (trace_data.space_line_volume && resample_settings.w[LossType::SPACELINE] > 0.0f) {
+        flags |= LOSS_SPACELINE;
+    }
+    local_optimization(roi, local_mask, params, trace_data, resample_settings, flags);
     return true;
 }
 
@@ -2560,6 +2702,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
+    loss_settings.space_line_steps = std::max(2, params.value("space_line_steps", loss_settings.space_line_steps));
+    loss_settings.space_line_threshold = std::clamp(static_cast<float>(params.value("space_line_threshold", loss_settings.space_line_threshold)), 0.0f, 255.0f);
+    loss_settings.space_line_invert = params.value("space_line_invert", loss_settings.space_line_invert);
     trace_data.cell_reopt_mode = params.value("cell_reopt_mode", false);
     if (trace_data.cell_reopt_mode) {
         std::cout << "Cell reoptimization mode enabled." << std::endl;
@@ -2830,6 +2975,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
               << " NORMAL3DLINE: " << loss_settings.w[LossType::NORMAL3DLINE]
               << " REFERENCE_RAY: " << loss_settings.w[LossType::REFERENCE_RAY]
               << " SURFACE_SDT: " << loss_settings.w[LossType::SURFACE_SDT]
+              << " SPACELINE: " << loss_settings.w[LossType::SPACELINE]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
     int rewind_gen = params.value("rewind_gen", -1);
@@ -2885,6 +3031,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     // Together these represent the cached distance-transform of the thresholded surface volume
     thresholdedDistance compute;
     Chunked3d<uint8_t,thresholdedDistance> proc_tensor(compute, ds, cache, cache_root);
+
+    if (loss_settings.w[LossType::SPACELINE] > 0.0f && loss_settings.space_line_steps >= 2) {
+        trace_data.space_line_compute = std::make_unique<lineLossDistance>(loss_settings.space_line_threshold,
+                                                                           loss_settings.space_line_invert);
+        trace_data.space_line_volume = std::make_unique<Chunked3d<uint8_t, lineLossDistance>>(
+            *trace_data.space_line_compute, ds, cache);
+        std::cout << "Space-line loss EDT enabled (threshold=" << loss_settings.space_line_threshold
+                  << ", steps=" << loss_settings.space_line_steps
+                  << ", invert=" << loss_settings.space_line_invert << ")" << std::endl;
+    }
 
     // Debug: test the chunk cache by reading one voxel
     passTroughComputor pass;
@@ -3915,6 +4071,8 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     int flags = LOSS_DIST | LOSS_STRAIGHT;
                     if (trace_data.normal3d_field)
                         flags | LOSS_3DNORMALLINE;
+                    if (trace_data.space_line_volume && loss_settings.w[LossType::SPACELINE] > 0.0f)
+                        flags |= LOSS_SPACELINE;
 
                     add_losses(problem, p, trace_params, trace_data, loss_settings, flags);
 
