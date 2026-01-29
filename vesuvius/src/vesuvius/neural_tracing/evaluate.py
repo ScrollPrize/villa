@@ -16,7 +16,7 @@ def _parse_point(point):
 
 @click.command()
 @click.option("--points_path", type=click.Path(exists=True, dir_okay=False), required=True, help="Path to JSON file listing evaluation volumes and points")
-@click.option("--prefix", type=str, required=True, help="String added to patch UUIDs, e.g. nt-eval_PREFIX_...")
+@click.option("--prefix", type=str, required=True, help="String added to patch UUIDs, e.g. nt-eval_(x-y-z)_PREFIX_...")
 @click.option("--checkpoint_path", "checkpoint_paths", type=click.Path(exists=True), multiple=True, required=True, help="Path to checkpoint file or directory of checkpoints (can be given multiple times)")
 @click.option("--steps_per_crop", type=int, default=1, help="Number of steps to take before sampling a new crop")
 @click.option("--max_size", type=int, default=60, show_default=True, help="Maximum patch side length (in vertices) for trace_patch_v4")
@@ -49,7 +49,7 @@ def main(points_path, prefix, checkpoint_paths, steps_per_crop, max_size):
             for checkpoint_path in checkpoint_paths:
                 ckpt = Path(checkpoint_path)
                 ckpt_dir = ckpt.parent.name if ckpt.is_file() else ckpt.name
-                uuid = f"nt-eval_{prefix}_{x}-{y}-{z}_{ckpt_dir}"
+                uuid = f"nt-eval_{x}-{y}-{z}_{prefix}_{ckpt_dir}"
                 click.echo(
                     f"Tracing volume={name} "
                     f"point_index={pt_idx} start_xyz=({x}, {y}, {z}) "
