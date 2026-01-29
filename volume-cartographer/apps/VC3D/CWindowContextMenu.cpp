@@ -1140,6 +1140,20 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
     pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
 
+    {
+        QString pass2Error;
+        auto extraParams = dlg.pass2TracerParamsJson(&pass2Error);
+        if (!pass2Error.isEmpty()) {
+            QMessageBox::warning(this, tr("Error"), pass2Error);
+            return;
+        }
+        if (extraParams) {
+            for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
+                pass2Params.insert(it.key(), it.value());
+            }
+        }
+    }
+
     auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
     if (!pass2JsonFile->open()) {
         QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file for pass 2."));

@@ -1,6 +1,7 @@
 #include "ToolDialogs.hpp"
 
 #include "VCSettings.hpp"
+#include "elements/JsonProfileEditor.hpp"
 
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -20,6 +21,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QFile>
+#include <QMessageBox>
 
 #include <cmath>
 
@@ -1135,12 +1137,70 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
 
     main->addWidget(pass2Group);
 
+    pass2TracerParams_ = new JsonProfileEditor(tr("Second pass tracer params"), this);
+    pass2TracerParams_->setDescription(
+        tr("Additional JSON fields merge into the tracer params used for pass 2. Leave empty for defaults."));
+    pass2TracerParams_->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
+
+    const QString robustProfile = QStringLiteral(
+        "{\n"
+        "  \"snap_weight\": 0.0,\n"
+        "  \"normal_weight\": 0.0,\n"
+        "  \"normal3dline_weight\": 1.0,\n"
+        "  \"straight_weight\": 10.0,\n"
+        "  \"dist_weight\": 1.0,\n"
+        "  \"direction_weight\": 0.0,\n"
+        "  \"sdir_weight\": 1.0,\n"
+        "  \"correction_weight\": 1.0,\n"
+        "  \"reference_ray_weight\": 0.0\n"
+        "}\n");
+
+    QVector<JsonProfileEditor::Profile> profiles;
+    profiles.push_back({QStringLiteral("custom"), tr("Custom"), QString(), true});
+    profiles.push_back({QStringLiteral("default"), tr("Default"), QString(), false});
+    profiles.push_back({QStringLiteral("robust"), tr("Robust"), robustProfile, false});
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString savedProfile = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+        QStringLiteral("default")).toString();
+    const QString savedText = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+        QString()).toString();
+
+    pass2TracerParams_->setCustomText(savedText);
+    pass2TracerParams_->setProfiles(profiles, savedProfile);
+    main->addWidget(pass2TracerParams_);
+
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(buttons, &QDialogButtonBox::accepted, this, &NeighborCopyDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &NeighborCopyDialog::reject);
     main->addWidget(buttons);
 
     ensureDialogWidthForEdits(this, {edtSurface_, edtOutput_}, 260);
+}
+
+void NeighborCopyDialog::accept()
+{
+    if (pass2TracerParams_ && !pass2TracerParams_->isValid()) {
+        const QString error = pass2TracerParams_->errorText();
+        QMessageBox::warning(this,
+                             tr("Error"),
+                             error.isEmpty()
+                                 ? tr("Second pass tracer params JSON is invalid.")
+                                 : error);
+        return;
+    }
+
+    if (pass2TracerParams_) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+                          pass2TracerParams_->profile());
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+                          pass2TracerParams_->customText());
+    }
+
+    QDialog::accept();
 }
 
 void NeighborCopyDialog::populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
@@ -1188,6 +1248,17 @@ QString NeighborCopyDialog::selectedVolumePath() const
 QString NeighborCopyDialog::outputPath() const
 {
     return edtOutput_ ? edtOutput_->text().trimmed() : QString();
+}
+
+std::optional<QJsonObject> NeighborCopyDialog::pass2TracerParamsJson(QString* error) const
+{
+    if (!pass2TracerParams_) {
+        if (error) {
+            error->clear();
+        }
+        return std::nullopt;
+    }
+    return pass2TracerParams_->jsonObject(error);
 }
 
 int NeighborCopyDialog::resumeLocalOptStep() const

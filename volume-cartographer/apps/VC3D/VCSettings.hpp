@@ -156,6 +156,14 @@ namespace export_ {  // underscore because 'export' is reserved keyword
 }
 
 // -----------------------------------------------------------------------------
+// Neighbor Copy Settings
+// -----------------------------------------------------------------------------
+namespace neighbor_copy {
+    constexpr auto PASS2_PARAMS_PROFILE = "neighbor_copy/pass2_params_profile";
+    constexpr auto PASS2_PARAMS_TEXT = "neighbor_copy/pass2_params_text";
+}
+
+// -----------------------------------------------------------------------------
 // AWS Settings
 // -----------------------------------------------------------------------------
 namespace aws {
