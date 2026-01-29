@@ -18,6 +18,9 @@ parameters:
   training_hyperparameters.training.accumulate_grad_batches:
     value: 4
 
+  training_hyperparameters.training.epochs:
+    value: 60
+
   training_hyperparameters.training.lr:
     distribution: log_uniform_values
     min: 2e-5

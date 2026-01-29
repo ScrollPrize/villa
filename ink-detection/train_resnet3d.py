@@ -1030,7 +1030,30 @@ class RegressionPLModel(pl.LightningModule):
                 self._stitch_segment_ids[idx] = str(stitch_segment_id or idx)
 
         self._stitch_enabled = len(self._stitch_buffers) > 0
+        
+    def on_train_epoch_start(self):
+        device = self.device
+        self._train_loss_sum = torch.tensor(0.0, device=device)
+        self._train_dice_sum = torch.tensor(0.0, device=device)
+        self._train_count = torch.tensor(0.0, device=device)
 
+        self._train_group_loss_sum = torch.zeros(self.n_groups, device=device)
+        self._train_group_dice_sum = torch.zeros(self.n_groups, device=device)
+        self._train_group_count = torch.zeros(self.n_groups, device=device)
+
+    def _update_train_stats(self, per_sample_loss, per_sample_dice, group_idx):
+        self._train_loss_sum += per_sample_loss.sum()
+        self._train_dice_sum += per_sample_dice.sum()
+        self._train_count += float(per_sample_loss.numel())
+
+        group_idx = group_idx.long()
+        self._train_group_loss_sum.scatter_add_(0, group_idx, per_sample_loss)
+        self._train_group_dice_sum.scatter_add_(0, group_idx, per_sample_dice)
+        self._train_group_count.scatter_add_(
+            0,
+            group_idx,
+            torch.ones_like(per_sample_loss, dtype=self._train_group_count.dtype),
+        )
         self.loss_func1 = smp.losses.DiceLoss(mode='binary')
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
@@ -1127,6 +1150,7 @@ class RegressionPLModel(pl.LightningModule):
         objective = str(self.hparams.objective).lower()
         loss_mode = str(self.hparams.loss_mode).lower()
         g = g.long()
+        per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
 
         if objective == "erm":
             if loss_mode == "batch":
@@ -1136,7 +1160,6 @@ class RegressionPLModel(pl.LightningModule):
                 self.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
                 self.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
             elif loss_mode == "per_sample":
-                per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
                 if self.erm_group_topk > 0:
                     group_loss, group_count = self.compute_group_avg(per_sample_loss, g)
                     present = group_count > 0
@@ -1181,7 +1204,6 @@ class RegressionPLModel(pl.LightningModule):
             if self.group_dro is None:
                 raise RuntimeError("GroupDRO objective was set but group_dro computer was not initialized")
 
-            per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
             robust_loss, group_loss, group_count, _weights = self.group_dro.loss(per_sample_loss, g)
             loss = robust_loss
             self.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
@@ -1219,10 +1241,46 @@ class RegressionPLModel(pl.LightningModule):
         else:
             raise ValueError(f"Unknown training.objective: {self.hparams.objective!r}")
 
+        self._update_train_stats(per_sample_loss, per_sample_dice, g)
         if torch.isnan(loss):
             print("Loss nan encountered")
         self.log("train/total_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss}
+
+    def on_train_epoch_end(self):
+        if self._train_count.item() > 0:
+            avg_loss = self._train_loss_sum / self._train_count
+            avg_dice = self._train_dice_sum / self._train_count
+        else:
+            avg_loss = torch.tensor(0.0, device=self.device)
+            avg_dice = torch.tensor(0.0, device=self.device)
+
+        group_count = self._train_group_count
+        group_loss = self._train_group_loss_sum / group_count.clamp_min(1)
+        group_dice = self._train_group_dice_sum / group_count.clamp_min(1)
+
+        self.log("train/epoch_avg_loss", avg_loss, on_step=False, on_epoch=False, prog_bar=False)
+        self.log("train/epoch_avg_dice", avg_dice, on_step=False, on_epoch=False, prog_bar=False)
+        for group_idx, group_name in enumerate(self.group_names):
+            safe_group_name = str(group_name).replace("/", "_")
+            self.log(
+                f"train/group_{group_idx}_{safe_group_name}/epoch_loss",
+                group_loss[group_idx],
+                on_step=False,
+                on_epoch=False,
+            )
+            self.log(
+                f"train/group_{group_idx}_{safe_group_name}/epoch_dice",
+                group_dice[group_idx],
+                on_step=False,
+                on_epoch=False,
+            )
+            self.log(
+                f"train/group_{group_idx}_{safe_group_name}/epoch_count",
+                group_count[group_idx],
+                on_step=False,
+                on_epoch=False,
+            )
 
     def on_validation_epoch_start(self):
         device = self.device
