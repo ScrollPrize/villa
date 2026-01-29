@@ -696,6 +696,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, false);
         });
+        QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
+        connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
+            emit resumeLocalGrowPatchRequested(segmentId);
+        });
 
         // Reload from Backup submenu
         std::filesystem::path backupsDir =

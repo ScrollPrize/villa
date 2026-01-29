@@ -50,6 +50,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
+#include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include <nlohmann/json.hpp>
 
@@ -148,9 +149,13 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     maxRow - minRow + 1);
 }
 
-bool selectResumeLocalTracerParams(QWidget* parent, std::optional<QJsonObject>* paramsOut)
+bool selectResumeLocalTracerParams(QWidget* parent,
+                                   const QVector<VolumeSelector::VolumeOption>& volumes,
+                                   const QString& defaultVolumeId,
+                                   QString* selectedVolumePath,
+                                   std::optional<QJsonObject>* paramsOut)
 {
-    if (!paramsOut) {
+    if (!paramsOut || !selectedVolumePath) {
         return false;
     }
 
@@ -158,6 +163,10 @@ bool selectResumeLocalTracerParams(QWidget* parent, std::optional<QJsonObject>* 
     dlg.setWindowTitle(QObject::tr("Resume-opt Local (GrowPatch)"));
 
     auto* main = new QVBoxLayout(&dlg);
+    auto* volumeSelector = new VolumeSelector(&dlg);
+    volumeSelector->setVolumes(volumes, defaultVolumeId);
+    main->addWidget(volumeSelector);
+
     auto* editor = new JsonProfileEditor(QObject::tr("Tracer Params"), &dlg);
     editor->setDescription(QObject::tr(
         "Additional JSON fields merge into the tracer params used for resume-local optimization."));
@@ -201,6 +210,8 @@ bool selectResumeLocalTracerParams(QWidget* parent, std::optional<QJsonObject>* 
     if (dlg.exec() != QDialog::Accepted) {
         return false;
     }
+
+    *selectedVolumePath = volumeSelector->selectedVolumePath();
 
     QString error;
     auto extra = editor->jsonObject(&error);
@@ -1298,15 +1309,48 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
         return;
     }
 
+    QVector<VolumeSelector::VolumeOption> volumeOptions;
+    for (const auto& volumeId : fVpkg->volumeIDs()) {
+        auto volume = fVpkg->volume(volumeId);
+        if (!volume) {
+            continue;
+        }
+        VolumeSelector::VolumeOption option;
+        option.id = QString::fromStdString(volumeId);
+        option.name = QString::fromStdString(volume->name());
+        option.path = QString::fromStdString(volume->path().string());
+        volumeOptions.push_back(option);
+    }
+
+    if (volumeOptions.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No volumes available in the volume package."));
+        return;
+    }
+
+    QString defaultVolumeId = volumeOptions.front().id;
+    if (!currentVolumeId.empty()) {
+        const QString currentId = QString::fromStdString(currentVolumeId);
+        for (const auto& opt : volumeOptions) {
+            if (opt.id == currentId) {
+                defaultVolumeId = currentId;
+                break;
+            }
+        }
+    }
+
+    QString selectedVolumePath;
     std::optional<QJsonObject> extraParams;
-    if (!selectResumeLocalTracerParams(this, &extraParams)) {
+    if (!selectResumeLocalTracerParams(this,
+                                       volumeOptions,
+                                       defaultVolumeId,
+                                       &selectedVolumePath,
+                                       &extraParams)) {
         statusBar()->showMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
         return;
     }
 
-    const QString volumePath = getCurrentVolumePath();
-    if (volumePath.isEmpty()) {
-        QMessageBox::warning(this, tr("Error"), tr("No volume path available for tracing."));
+    if (selectedVolumePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No target volume selected."));
         return;
     }
 
@@ -1355,7 +1399,7 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
     job.paramsPath = paramsFile->fileName();
     job.paramsFile = std::move(paramsFile);
 
-    _cmdRunner->setNeighborCopyParams(volumePath,
+    _cmdRunner->setNeighborCopyParams(selectedVolumePath,
                                       job.paramsPath,
                                       QString::fromStdString(surf->path.string()),
                                       outputDirPath,
