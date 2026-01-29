@@ -109,6 +109,23 @@ namespace viewer {
 
     constexpr bool PLAY_SOUND_AFTER_SEG_RUN_DEFAULT = true;
     constexpr auto USERNAME_DEFAULT = "";
+
+    // Viewer control group expansion states
+    constexpr auto GROUP_PREPROCESSING_EXPANDED = "viewer/group_preprocessing_expanded";
+    constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
+    constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
+    constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
+    constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
+    constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
+    constexpr auto GROUP_POSTPROCESSING_EXPANDED = "viewer/group_postprocessing_expanded";
+
+    constexpr bool GROUP_PREPROCESSING_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_POSTPROCESSING_EXPANDED_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------

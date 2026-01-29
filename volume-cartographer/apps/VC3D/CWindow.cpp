@@ -6,6 +6,7 @@
 #include "VCSettings.hpp"
 #include <QKeySequence>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QWheelEvent>
@@ -80,6 +81,7 @@
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
+#include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/SegmentationGrowth.hpp"
 #include "segmentation/SegmentationGrower.hpp"
@@ -667,12 +669,8 @@ CWindow::CWindow(size_t cacheSizeGB) :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
-                               ui.dockWidgetComposite,
-                               ui.dockWidgetPostprocessing,
                                ui.dockWidgetVolumes,
-                               ui.dockWidgetView,
-                               ui.dockWidgetOverlay,
-                               ui.dockWidgetRenderSettings  }) {
+                               ui.dockWidgetViewerControls  }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
         connect(dock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
@@ -1661,36 +1659,140 @@ void CWindow::CreateWidgets(void)
     // Make Drawing dock the active tab by default
     ui.dockWidgetDrawing->raise();
 
-    // Keep the view-related docks on the left and grouped together as tabs
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetView);
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetRenderSettings);
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetComposite);
+    // Build Viewer Controls dock from the existing view-related panels.
+    auto* viewerControlsLayout = qobject_cast<QVBoxLayout*>(ui.dockWidgetViewerControlsContents->layout());
+    if (!viewerControlsLayout) {
+        viewerControlsLayout = new QVBoxLayout(ui.dockWidgetViewerControlsContents);
+        viewerControlsLayout->setContentsMargins(4, 4, 4, 4);
+        viewerControlsLayout->setSpacing(8);
+    }
 
-    auto ensureTabified = [this](QDockWidget* primary, QDockWidget* candidate) {
-        const auto currentTabs = tabifiedDockWidgets(primary);
-        const bool alreadyTabified = std::find(currentTabs.cbegin(), currentTabs.cend(), candidate) != currentTabs.cend();
-        if (!alreadyTabified) {
-            tabifyDockWidget(primary, candidate);
+    auto detachScrollContents = [](QScrollArea* scrollArea, QWidget* contents) -> QWidget* {
+        if (!contents) {
+            return nullptr;
+        }
+        if (scrollArea && scrollArea->widget() == contents) {
+            scrollArea->takeWidget();
+        }
+        contents->setParent(nullptr);
+        return contents;
+    };
+
+    auto moveGridLayoutItems = [](QGridLayout* from, QGridLayout* to, QWidget* newParent) {
+        if (!from || !to) {
+            return;
+        }
+        to->setContentsMargins(from->contentsMargins());
+        to->setHorizontalSpacing(from->horizontalSpacing());
+        to->setVerticalSpacing(from->verticalSpacing());
+        for (int column = 0; column < from->columnCount(); ++column) {
+            to->setColumnStretch(column, from->columnStretch(column));
+            to->setColumnMinimumWidth(column, from->columnMinimumWidth(column));
+        }
+        for (int row = 0; row < from->rowCount(); ++row) {
+            to->setRowStretch(row, from->rowStretch(row));
+            to->setRowMinimumHeight(row, from->rowMinimumHeight(row));
+        }
+        for (int index = from->count() - 1; index >= 0; --index) {
+            int row = 0;
+            int column = 0;
+            int rowSpan = 1;
+            int columnSpan = 1;
+            from->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
+            if (auto* item = from->takeAt(index)) {
+                if (newParent) {
+                    if (auto* widget = item->widget()) {
+                        widget->setParent(newParent);
+                    } else if (auto* layout = item->layout()) {
+                        layout->setParent(newParent);
+                    }
+                }
+                to->addItem(item, row, column, rowSpan, columnSpan, item->alignment());
+            }
         }
     };
 
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetOverlay);
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetRenderSettings);
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetComposite);
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetPostprocessing);
+    auto* normalVisContainer = new QWidget(ui.dockWidgetViewerControlsContents);
+    auto* normalVisLayout = new QGridLayout(normalVisContainer);
+    moveGridLayoutItems(qobject_cast<QGridLayout*>(ui.dockWidgetNormalVisContents->layout()),
+                        normalVisLayout,
+                        normalVisContainer);
 
-    const auto tabOrder = tabifiedDockWidgets(ui.dockWidgetView);
-    for (QDockWidget* dock : tabOrder) {
-        tabifyDockWidget(ui.dockWidgetView, dock);
-    }
-
-    ui.dockWidgetView->show();
-    ui.dockWidgetView->raise();
-    QTimer::singleShot(0, this, [this]() {
-        if (ui.dockWidgetView) {
-            ui.dockWidgetView->raise();
+    auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const char* key) {
+        if (!group) {
+            return;
         }
+        connect(group, &CollapsibleSettingsGroup::toggled, this, [key](bool expanded) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(key, expanded);
+        });
+    };
+
+    auto addViewerGroup = [this, &settings, viewerControlsLayout, &rememberGroupState](
+                              const QString& title, QWidget* contents, const char* key, bool defaultExpanded) {
+        if (!viewerControlsLayout || !contents) {
+            return static_cast<CollapsibleSettingsGroup*>(nullptr);
+        }
+        auto* group = new CollapsibleSettingsGroup(title, ui.dockWidgetViewerControlsContents);
+        group->contentLayout()->addWidget(contents);
+        viewerControlsLayout->addWidget(group);
+        group->setExpanded(settings.value(key, defaultExpanded).toBool());
+        rememberGroupState(group, key);
+        return group;
+    };
+
+    using namespace vc3d::settings;
+    addViewerGroup(tr("Normal Visualization"),
+                   normalVisContainer,
+                   viewer::GROUP_NORMAL_VIS_EXPANDED,
+                   viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
+    addViewerGroup(tr("View"),
+                   detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
+                   viewer::GROUP_VIEW_EXPANDED,
+                   viewer::GROUP_VIEW_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Overlay"),
+                   detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
+                   viewer::GROUP_OVERLAY_EXPANDED,
+                   viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Render Settings"),
+                   detachScrollContents(ui.scrollAreaRenderSettings, ui.dockWidgetRenderSettingsContents),
+                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
+                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Composite View"),
+                   detachScrollContents(ui.scrollAreaComposite, ui.dockWidgetCompositeContents),
+                   viewer::GROUP_COMPOSITE_EXPANDED,
+                   viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Preprocessing"),
+                   detachScrollContents(ui.scrollAreaPreprocessing, ui.dockWidgetPreprocessingContents),
+                   viewer::GROUP_PREPROCESSING_EXPANDED,
+                   viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Postprocessing"),
+                   detachScrollContents(ui.scrollAreaPostprocessing, ui.dockWidgetPostprocessingContents),
+                   viewer::GROUP_POSTPROCESSING_EXPANDED,
+                   viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
+    viewerControlsLayout->addStretch(1);
+
+    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
+    splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
+
+    auto hideLegacyViewerDocks = [this]() {
+        for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
+                                   ui.dockWidgetNormalVis,
+                                   ui.dockWidgetView,
+                                   ui.dockWidgetOverlay,
+                                   ui.dockWidgetRenderSettings,
+                                   ui.dockWidgetComposite,
+                                   ui.dockWidgetPostprocessing }) {
+            if (!dock) {
+                continue;
+            }
+            removeDockWidget(dock);
+            dock->setVisible(false);
+        }
+    };
+    hideLegacyViewerDocks();
+    QTimer::singleShot(0, this, [hideLegacyViewerDocks]() {
+        hideLegacyViewerDocks();
     });
 
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,

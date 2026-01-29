@@ -502,6 +502,61 @@
     </layout>
    </widget>
   </widget>
+  <widget class="QDockWidget" name="dockWidgetViewerControls">
+   <property name="minimumSize">
+    <size>
+     <width>250</width>
+     <height>40</height>
+    </size>
+   </property>
+   <property name="allowedAreas">
+    <set>Qt::DockWidgetArea::LeftDockWidgetArea|Qt::DockWidgetArea::RightDockWidgetArea</set>
+   </property>
+   <property name="windowTitle">
+    <string>Viewer Controls</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>1</number>
+   </attribute>
+   <widget class="QScrollArea" name="scrollAreaViewerControls">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
+    </property>
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetViewerControlsContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>600</height>
+      </rect>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayoutViewerControls">
+      <property name="spacing">
+       <number>8</number>
+      </property>
+      <property name="leftMargin">
+       <number>4</number>
+      </property>
+      <property name="topMargin">
+       <number>4</number>
+      </property>
+      <property name="rightMargin">
+       <number>4</number>
+      </property>
+      <property name="bottomMargin">
+       <number>4</number>
+      </property>
+     </layout>
+    </widget>
+   </widget>
+  </widget>
   <widget class="QDockWidget" name="dockWidgetComposite">
    <property name="minimumSize">
     <size>
