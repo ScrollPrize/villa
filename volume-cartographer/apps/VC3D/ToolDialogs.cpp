@@ -1062,7 +1062,7 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
 
     spMaxDistance_ = new QSpinBox(this);
     spMaxDistance_->setRange(1, 500);
-    spMaxDistance_->setValue(50);
+    spMaxDistance_->setValue(200);
     spMaxDistance_->setToolTip(tr("Maximum distance to search for neighbors."));
     pass1Form->addRow(tr("Max distance:"), spMaxDistance_);
 
