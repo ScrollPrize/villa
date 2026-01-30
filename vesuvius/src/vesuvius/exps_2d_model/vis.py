@@ -520,9 +520,3 @@ def save(
 	concat_f[0:label_h * s, :] = lab_u8.astype("float32") / 255.0
 	concat_path = out_vis / f"res_loss_concat_{postfix}.tif"
 	tifffile.imwrite(str(concat_path), concat_f.astype("float32"), compression="lzw")
-
-	tgt = data.cos[0, 0].detach().cpu().numpy()
-	tgt_t = model.target_cos()
-	tgt = tgt_t[0, 0].detach().cpu().numpy()
-	tgt_path = out_tgt / f"res_tgt_{postfix}.tif"
-	tifffile.imwrite(str(tgt_path), tgt.astype("float32"), compression="lzw")
