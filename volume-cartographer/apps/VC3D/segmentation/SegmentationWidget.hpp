@@ -34,16 +34,16 @@ public:
     explicit SegmentationWidget(QWidget* parent = nullptr);
 
     [[nodiscard]] bool isEditingEnabled() const { return _editingEnabled; }
-    [[nodiscard]] float dragRadius() const { return _dragRadiusSteps; }
-    [[nodiscard]] float dragSigma() const { return _dragSigmaSteps; }
-    [[nodiscard]] float lineRadius() const { return _lineRadiusSteps; }
-    [[nodiscard]] float lineSigma() const { return _lineSigmaSteps; }
-    [[nodiscard]] float pushPullRadius() const { return _pushPullRadiusSteps; }
-    [[nodiscard]] float pushPullSigma() const { return _pushPullSigmaSteps; }
-    [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
+    [[nodiscard]] float dragRadius() const;
+    [[nodiscard]] float dragSigma() const;
+    [[nodiscard]] float lineRadius() const;
+    [[nodiscard]] float lineSigma() const;
+    [[nodiscard]] float pushPullRadius() const;
+    [[nodiscard]] float pushPullSigma() const;
+    [[nodiscard]] float pushPullStep() const;
     [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
-    [[nodiscard]] float smoothingStrength() const { return _smoothStrength; }
-    [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
+    [[nodiscard]] float smoothingStrength() const;
+    [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
     [[nodiscard]] int extrapolationPointCount() const { return _extrapolationPointCount; }
@@ -61,7 +61,7 @@ public:
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
-    [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
+    [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
     [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
@@ -209,14 +209,6 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
 
-    void refreshDirectionFieldList();
-    void persistDirectionFields();
-    SegmentationDirectionFieldConfig buildDirectionFieldDraft() const;
-    void updateDirectionFieldFormFromSelection(int row);
-    void applyDirectionFieldDraftToSelection(int row);
-    void updateDirectionFieldListItem(int row);
-    void updateDirectionFieldListGeometry();
-    void clearDirectionFieldForm();
     [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
                                                    const QString& requestedId) const;
     void applyGrowthSteps(int steps, bool persist, bool fromUi);
@@ -231,24 +223,11 @@ private:
     void applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi);
     [[nodiscard]] QString paramsTextForProfile(const QString& profile) const;
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
-    void applyAlphaPushPullConfig(const AlphaPushPullConfig& config, bool emitSignal, bool persist = true);
-
     void updateNormal3dUi();
 
     bool _editingEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
-    float _dragRadiusSteps{5.75f};
-    float _dragSigmaSteps{2.0f};
-    float _lineRadiusSteps{5.75f};
-    float _lineSigmaSteps{2.0f};
-    float _pushPullRadiusSteps{5.75f};
-    float _pushPullSigmaSteps{2.0f};
-    float _pushPullStep{4.0f};
-    AlphaPushPullConfig _alphaPushPullConfig{};
-    float _smoothStrength{0.4f};
-    int _smoothIterations{2};
-    bool _showHoverMarker{true};
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;
@@ -282,12 +261,6 @@ private:
     int _skeletonChunkSize{128};
     int _skeletonSearchRadius{5};  // 1-100 pixels
 
-    QString _directionFieldPath;
-    SegmentationDirectionFieldOrientation _directionFieldOrientation{SegmentationDirectionFieldOrientation::Normal};
-    int _directionFieldScale{0};
-    double _directionFieldWeight{1.0};
-    std::vector<SegmentationDirectionFieldConfig> _directionFields;
-    bool _updatingDirectionFieldForm{false};
     bool _restoringSettings{false};
 
     SegmentationHeaderRow* _headerRow{nullptr};
@@ -305,10 +278,8 @@ private:
     QString _customParamsError;
     QString _customParamsProfile{QStringLiteral("custom")};
 
-    bool _correctionsEnabled{false};
     bool _correctionsZRangeEnabled{false};
     int _correctionsZMin{0};
     int _correctionsZMax{0};
-    bool _correctionsAnnotateChecked{false};
 
 };

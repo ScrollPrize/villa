@@ -25,23 +25,18 @@
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QEvent>
-#include <QFileDialog>
 #include <QGroupBox>
 #include <QGridLayout>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListWidget>
-#include <QListWidgetItem>
 #include <QLoggingCategory>
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
-#include <QToolButton>
 #include <QVariant>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -61,53 +56,6 @@ constexpr int kGrowDirDownBit = 1 << 1;
 constexpr int kGrowDirLeftBit = 1 << 2;
 constexpr int kGrowDirRightBit = 1 << 3;
 constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
-constexpr int kCompactDirectionFieldRowLimit = 3;
-
-constexpr float kFloatEpsilon = 1e-4f;
-constexpr float kAlphaOpacityScale = 255.0f;
-
-bool nearlyEqual(float lhs, float rhs)
-{
-    return std::fabs(lhs - rhs) < kFloatEpsilon;
-}
-
-float displayOpacityToNormalized(double displayValue)
-{
-    return static_cast<float>(displayValue / kAlphaOpacityScale);
-}
-
-double normalizedOpacityToDisplay(float normalizedValue)
-{
-    return static_cast<double>(normalizedValue * kAlphaOpacityScale);
-}
-
-AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
-{
-    AlphaPushPullConfig sanitized = config;
-
-    sanitized.start = std::clamp(sanitized.start, -128.0f, 128.0f);
-    sanitized.stop = std::clamp(sanitized.stop, -128.0f, 128.0f);
-    if (sanitized.start > sanitized.stop) {
-        std::swap(sanitized.start, sanitized.stop);
-    }
-
-    const float minStep = 0.05f;
-    const float maxStep = 20.0f;
-    const float magnitude = std::clamp(std::fabs(sanitized.step), minStep, maxStep);
-    sanitized.step = (sanitized.step < 0.0f) ? -magnitude : magnitude;
-
-    sanitized.low = std::clamp(sanitized.low, 0.0f, 1.0f);
-    sanitized.high = std::clamp(sanitized.high, 0.0f, 1.0f);
-    if (sanitized.high <= sanitized.low + 0.01f) {
-        sanitized.high = std::min(1.0f, sanitized.low + 0.05f);
-    }
-
-    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -20.0f, 20.0f);
-    sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, 15);
-    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, 128.0f);
-
-    return sanitized;
-}
 
 bool containsSurfKeyword(const QString& text)
 {
@@ -233,7 +181,7 @@ void SegmentationWidget::buildUi()
     _growthPanel = new SegmentationGrowthPanel(_growthKeybindsEnabled, this);
     layout->addWidget(_growthPanel);
 
-    _editingPanel = new SegmentationEditingPanel(this);
+    _editingPanel = new SegmentationEditingPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_editingPanel);
 
     _approvalMaskPanel = new SegmentationApprovalMaskPanel(QStringLiteral("segmentation_edit"), this);
@@ -242,31 +190,13 @@ void SegmentationWidget::buildUi()
     _cellReoptPanel = new SegmentationCellReoptPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_cellReoptPanel);
 
-    _directionFieldPanel = new SegmentationDirectionFieldPanel(this);
+    _directionFieldPanel = new SegmentationDirectionFieldPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_directionFieldPanel);
 
     _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
 
-    auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const QString& key) {
-        if (!group) {
-            return;
-        }
-        connect(group, &CollapsibleSettingsGroup::toggled, this, [this, key](bool expanded) {
-            if (_restoringSettings) {
-                return;
-            }
-            writeSetting(key, expanded);
-        });
-    };
-
-    rememberGroupState(_editingPanel->editingGroup(), QStringLiteral("group_editing_expanded"));
-    rememberGroupState(_editingPanel->dragGroup(), QStringLiteral("group_drag_expanded"));
-    rememberGroupState(_editingPanel->lineGroup(), QStringLiteral("group_line_expanded"));
-    rememberGroupState(_editingPanel->pushPullGroup(), QStringLiteral("group_push_pull_expanded"));
-    rememberGroupState(_directionFieldPanel->directionFieldGroup(), QStringLiteral("group_direction_field_expanded"));
-
-    _correctionsPanel = new SegmentationCorrectionsPanel(this);
+    _correctionsPanel = new SegmentationCorrectionsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_correctionsPanel);
 
     _customParamsPanel = new SegmentationCustomParamsPanel(this);
@@ -278,9 +208,36 @@ void SegmentationWidget::buildUi()
     connect(_headerRow, &SegmentationHeaderRow::editingToggled, this, [this](bool enabled) {
         updateEditingState(enabled, true);
     });
-    connect(_editingPanel->showHoverMarkerCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setShowHoverMarker(enabled);
-    });
+
+    // Forward editing panel signals
+    connect(_editingPanel, &SegmentationEditingPanel::dragRadiusChanged,
+            this, &SegmentationWidget::dragRadiusChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::dragSigmaChanged,
+            this, &SegmentationWidget::dragSigmaChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::lineRadiusChanged,
+            this, &SegmentationWidget::lineRadiusChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::lineSigmaChanged,
+            this, &SegmentationWidget::lineSigmaChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::pushPullRadiusChanged,
+            this, &SegmentationWidget::pushPullRadiusChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::pushPullSigmaChanged,
+            this, &SegmentationWidget::pushPullSigmaChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::pushPullStepChanged,
+            this, &SegmentationWidget::pushPullStepChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::alphaPushPullConfigChanged,
+            this, &SegmentationWidget::alphaPushPullConfigChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::smoothingStrengthChanged,
+            this, &SegmentationWidget::smoothingStrengthChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::smoothingIterationsChanged,
+            this, &SegmentationWidget::smoothingIterationsChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::hoverMarkerToggled,
+            this, &SegmentationWidget::hoverMarkerToggled);
+    connect(_editingPanel, &SegmentationEditingPanel::applyRequested,
+            this, &SegmentationWidget::applyRequested);
+    connect(_editingPanel, &SegmentationEditingPanel::resetRequested,
+            this, &SegmentationWidget::resetRequested);
+    connect(_editingPanel, &SegmentationEditingPanel::stopToolsRequested,
+            this, &SegmentationWidget::stopToolsRequested);
 
     // Forward approval mask panel signals
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::showApprovalMaskChanged,
@@ -480,192 +437,13 @@ void SegmentationWidget::buildUi()
         });
     }
 
-    connect(_editingPanel->dragRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setDragRadius(static_cast<float>(value));
-        emit dragRadiusChanged(_dragRadiusSteps);
-    });
-
-    connect(_editingPanel->dragSigmaSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setDragSigma(static_cast<float>(value));
-        emit dragSigmaChanged(_dragSigmaSteps);
-    });
-
-    connect(_editingPanel->lineRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setLineRadius(static_cast<float>(value));
-        emit lineRadiusChanged(_lineRadiusSteps);
-    });
-
-    connect(_editingPanel->lineSigmaSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setLineSigma(static_cast<float>(value));
-        emit lineSigmaChanged(_lineSigmaSteps);
-    });
-
-    connect(_editingPanel->pushPullRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setPushPullRadius(static_cast<float>(value));
-        emit pushPullRadiusChanged(_pushPullRadiusSteps);
-    });
-
-    connect(_editingPanel->pushPullSigmaSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setPushPullSigma(static_cast<float>(value));
-        emit pushPullSigmaChanged(_pushPullSigmaSteps);
-    });
-
-    connect(_editingPanel->pushPullStepSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setPushPullStep(static_cast<float>(value));
-        emit pushPullStepChanged(_pushPullStep);
-    });
-
-    auto onAlphaValueChanged = [this](auto updater) {
-        AlphaPushPullConfig config = _alphaPushPullConfig;
-        updater(config);
-        applyAlphaPushPullConfig(config, true);
-    };
-
-    connect(_editingPanel->alphaStartSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.start = static_cast<float>(value);
-        });
-    });
-    connect(_editingPanel->alphaStopSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.stop = static_cast<float>(value);
-        });
-    });
-    connect(_editingPanel->alphaStepSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.step = static_cast<float>(value);
-        });
-    });
-    connect(_editingPanel->alphaLowSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.low = displayOpacityToNormalized(value);
-        });
-    });
-    connect(_editingPanel->alphaHighSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.high = displayOpacityToNormalized(value);
-        });
-    });
-    connect(_editingPanel->alphaBorderSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.borderOffset = static_cast<float>(value);
-        });
-    });
-    connect(_editingPanel->alphaBlurRadiusSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this, onAlphaValueChanged](int value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.blurRadius = value;
-        });
-    });
-    connect(_editingPanel->alphaPerVertexLimitSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.perVertexLimit = static_cast<float>(value);
-        });
-    });
-    connect(_editingPanel->alphaPerVertexCheck(), &QCheckBox::toggled, this, [this, onAlphaValueChanged](bool checked) {
-        onAlphaValueChanged([checked](AlphaPushPullConfig& cfg) {
-            cfg.perVertex = checked;
-        });
-    });
-
-    connect(_editingPanel->smoothStrengthSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setSmoothingStrength(static_cast<float>(value));
-        emit smoothingStrengthChanged(_smoothStrength);
-    });
-
-    connect(_editingPanel->smoothIterationsSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        setSmoothingIterations(value);
-        emit smoothingIterationsChanged(_smoothIterations);
-    });
-
-    connect(_directionFieldPanel->pathEdit(), &QLineEdit::textChanged, this, [this](const QString& text) {
-        _directionFieldPath = text.trimmed();
-        if (!_updatingDirectionFieldForm) {
-            auto* list = _directionFieldPanel->listWidget();
-            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
-        }
-    });
-
-    connect(_directionFieldPanel->browseButton(), &QToolButton::clicked, this, [this]() {
-        const QString initial = _directionFieldPath.isEmpty() ? QDir::homePath() : _directionFieldPath;
-        const QString dir = QFileDialog::getExistingDirectory(this, tr("Select direction field"), initial);
-        if (dir.isEmpty()) {
-            return;
-        }
-        _directionFieldPath = dir;
-        _directionFieldPanel->pathEdit()->setText(dir);
-    });
-
-    connect(_directionFieldPanel->orientationCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _directionFieldOrientation = segmentationDirectionFieldOrientationFromInt(
-            _directionFieldPanel->orientationCombo()->itemData(index).toInt());
-        if (!_updatingDirectionFieldForm) {
-            auto* list = _directionFieldPanel->listWidget();
-            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
-        }
-    });
-
-    connect(_directionFieldPanel->scaleCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _directionFieldScale = _directionFieldPanel->scaleCombo()->itemData(index).toInt();
-        if (!_updatingDirectionFieldForm) {
-            auto* list = _directionFieldPanel->listWidget();
-            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
-        }
-    });
-
-    connect(_directionFieldPanel->weightSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        _directionFieldWeight = value;
-        if (!_updatingDirectionFieldForm) {
-            auto* list = _directionFieldPanel->listWidget();
-            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
-        }
-    });
-
-    connect(_directionFieldPanel->addButton(), &QPushButton::clicked, this, [this]() {
-        auto config = buildDirectionFieldDraft();
-        if (!config.isValid()) {
-            qCInfo(lcSegWidget) << "Ignoring direction field add; path empty";
-            return;
-        }
-        _directionFields.push_back(std::move(config));
-        refreshDirectionFieldList();
-        persistDirectionFields();
-        clearDirectionFieldForm();
-    });
-
-    connect(_directionFieldPanel->removeButton(), &QPushButton::clicked, this, [this]() {
-        auto* list = _directionFieldPanel->listWidget();
-        const int row = list ? list->currentRow() : -1;
-        if (row < 0 || row >= static_cast<int>(_directionFields.size())) {
-            return;
-        }
-        _directionFields.erase(_directionFields.begin() + row);
-        refreshDirectionFieldList();
-        persistDirectionFields();
-    });
-
-    connect(_directionFieldPanel->clearButton(), &QPushButton::clicked, this, [this]() {
-        clearDirectionFieldForm();
-    });
-
-    connect(_directionFieldPanel->listWidget(), &QListWidget::currentRowChanged, this, [this](int row) {
-        updateDirectionFieldFormFromSelection(row);
-        if (_directionFieldPanel->removeButton()) {
-            _directionFieldPanel->removeButton()->setEnabled(_editingEnabled && row >= 0);
-        }
-    });
-
-    connect(_correctionsPanel->correctionsCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            emit correctionsCollectionSelected(0);
-            return;
-        }
-        const QVariant data = _correctionsPanel->correctionsCombo()->itemData(index);
-        emit correctionsCollectionSelected(data.toULongLong());
-    });
-
-    connect(_correctionsPanel->correctionsNewButton(), &QPushButton::clicked, this, [this]() {
-        emit correctionsCreateRequested();
-    });
+    // Forward corrections panel signals
+    connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,
+            this, &SegmentationWidget::correctionsCreateRequested);
+    connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCollectionSelected,
+            this, &SegmentationWidget::correctionsCollectionSelected);
+    connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsAnnotateToggled,
+            this, &SegmentationWidget::correctionsAnnotateToggled);
 
     connect(_customParamsEditor, &JsonProfileEditor::textChanged, this, [this]() {
         handleCustomParamsEdited();
@@ -695,10 +473,6 @@ void SegmentationWidget::buildUi()
             updateNormal3dUi();
         });
     }
-
-    connect(_correctionsPanel->correctionsAnnotateCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        emit correctionsAnnotateToggled(enabled);
-    });
 
     if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
         connect(correctionsZRange, &QCheckBox::toggled, this, [this](bool enabled) {
@@ -735,9 +509,6 @@ void SegmentationWidget::buildUi()
         });
     }
 
-    connect(_editingPanel->applyButton(), &QPushButton::clicked, this, &SegmentationWidget::applyRequested);
-    connect(_editingPanel->resetButton(), &QPushButton::clicked, this, &SegmentationWidget::resetRequested);
-    connect(_editingPanel->stopButton(), &QPushButton::clicked, this, &SegmentationWidget::stopToolsRequested);
 
     // Forward neural tracer panel signals
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerEnabledChanged,
@@ -758,94 +529,7 @@ void SegmentationWidget::syncUiState()
         }
     }
 
-    if (_editingPanel->showHoverMarkerCheck()) {
-        const QSignalBlocker blocker(_editingPanel->showHoverMarkerCheck());
-        _editingPanel->showHoverMarkerCheck()->setChecked(_showHoverMarker);
-    }
-
-    const bool editingActive = _editingEnabled && !_growthInProgress;
-
-    auto updateSpin = [&](QDoubleSpinBox* spin, float value) {
-        if (!spin) {
-            return;
-        }
-        const QSignalBlocker blocker(spin);
-        spin->setValue(static_cast<double>(value));
-        spin->setEnabled(editingActive);
-    };
-
-    updateSpin(_editingPanel->dragRadiusSpin(), _dragRadiusSteps);
-    updateSpin(_editingPanel->dragSigmaSpin(), _dragSigmaSteps);
-    updateSpin(_editingPanel->lineRadiusSpin(), _lineRadiusSteps);
-    updateSpin(_editingPanel->lineSigmaSpin(), _lineSigmaSteps);
-    updateSpin(_editingPanel->pushPullRadiusSpin(), _pushPullRadiusSteps);
-    updateSpin(_editingPanel->pushPullSigmaSpin(), _pushPullSigmaSteps);
-
-    if (_editingPanel->dragGroup()) {
-        _editingPanel->dragGroup()->setEnabled(editingActive);
-    }
-    if (_editingPanel->lineGroup()) {
-        _editingPanel->lineGroup()->setEnabled(editingActive);
-    }
-    if (_editingPanel->pushPullGroup()) {
-        _editingPanel->pushPullGroup()->setEnabled(editingActive);
-    }
-
-    if (_editingPanel->pushPullStepSpin()) {
-        const QSignalBlocker blocker(_editingPanel->pushPullStepSpin());
-        _editingPanel->pushPullStepSpin()->setValue(static_cast<double>(_pushPullStep));
-        _editingPanel->pushPullStepSpin()->setEnabled(editingActive);
-    }
-
-    if (_editingPanel->alphaInfoLabel()) {
-        _editingPanel->alphaInfoLabel()->setEnabled(editingActive);
-    }
-
-    auto updateAlphaSpin = [&](QDoubleSpinBox* spin, float value, bool opacitySpin = false) {
-        if (!spin) {
-            return;
-        }
-        const QSignalBlocker blocker(spin);
-        if (opacitySpin) {
-            spin->setValue(normalizedOpacityToDisplay(value));
-        } else {
-            spin->setValue(static_cast<double>(value));
-        }
-        spin->setEnabled(editingActive);
-    };
-
-    updateAlphaSpin(_editingPanel->alphaStartSpin(), _alphaPushPullConfig.start);
-    updateAlphaSpin(_editingPanel->alphaStopSpin(), _alphaPushPullConfig.stop);
-    updateAlphaSpin(_editingPanel->alphaStepSpin(), _alphaPushPullConfig.step);
-    updateAlphaSpin(_editingPanel->alphaLowSpin(), _alphaPushPullConfig.low, true);
-    updateAlphaSpin(_editingPanel->alphaHighSpin(), _alphaPushPullConfig.high, true);
-    updateAlphaSpin(_editingPanel->alphaBorderSpin(), _alphaPushPullConfig.borderOffset);
-
-    if (_editingPanel->alphaBlurRadiusSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaBlurRadiusSpin());
-        _editingPanel->alphaBlurRadiusSpin()->setValue(_alphaPushPullConfig.blurRadius);
-        _editingPanel->alphaBlurRadiusSpin()->setEnabled(editingActive);
-    }
-    updateAlphaSpin(_editingPanel->alphaPerVertexLimitSpin(), _alphaPushPullConfig.perVertexLimit);
-    if (_editingPanel->alphaPerVertexCheck()) {
-        const QSignalBlocker blocker(_editingPanel->alphaPerVertexCheck());
-        _editingPanel->alphaPerVertexCheck()->setChecked(_alphaPushPullConfig.perVertex);
-        _editingPanel->alphaPerVertexCheck()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaPushPullPanel()) {
-        _editingPanel->alphaPushPullPanel()->setEnabled(editingActive);
-    }
-
-    if (_editingPanel->smoothStrengthSpin()) {
-        const QSignalBlocker blocker(_editingPanel->smoothStrengthSpin());
-        _editingPanel->smoothStrengthSpin()->setValue(static_cast<double>(_smoothStrength));
-        _editingPanel->smoothStrengthSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->smoothIterationsSpin()) {
-        const QSignalBlocker blocker(_editingPanel->smoothIterationsSpin());
-        _editingPanel->smoothIterationsSpin()->setValue(_smoothIterations);
-        _editingPanel->smoothIterationsSpin()->setEnabled(editingActive);
-    }
+    _editingPanel->syncUiState(_editingEnabled, _growthInProgress);
 
     if (_customParamsEditor) {
         if (_customParamsEditor->customText() != _customParamsText) {
@@ -970,39 +654,9 @@ void SegmentationWidget::syncUiState()
         const QSignalBlocker blocker(growthKeybinds);
         growthKeybinds->setChecked(_growthKeybindsEnabled);
     }
-    refreshDirectionFieldList();
+    _directionFieldPanel->syncUiState(_editingEnabled);
 
-    if (auto* pathEdit = _directionFieldPanel->pathEdit()) {
-        const QSignalBlocker blocker(pathEdit);
-        pathEdit->setText(_directionFieldPath);
-    }
-    if (auto* orientCombo = _directionFieldPanel->orientationCombo()) {
-        const QSignalBlocker blocker(orientCombo);
-        int idx = orientCombo->findData(static_cast<int>(_directionFieldOrientation));
-        if (idx >= 0) {
-            orientCombo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* scaleCombo = _directionFieldPanel->scaleCombo()) {
-        const QSignalBlocker blocker(scaleCombo);
-        int idx = scaleCombo->findData(_directionFieldScale);
-        if (idx >= 0) {
-            scaleCombo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* weightSpin = _directionFieldPanel->weightSpin()) {
-        const QSignalBlocker blocker(weightSpin);
-        weightSpin->setValue(_directionFieldWeight);
-    }
-
-    if (auto* combo = _correctionsPanel->correctionsCombo()) {
-        const QSignalBlocker blocker(combo);
-        combo->setEnabled(_correctionsEnabled && !_growthInProgress && combo->count() > 0);
-    }
-    if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_correctionsAnnotateChecked);
-    }
+    _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
         const QSignalBlocker blocker(correctionsZRange);
         correctionsZRange->setChecked(_correctionsZRangeEnabled);
@@ -1178,50 +832,7 @@ void SegmentationWidget::restoreSettings()
 
     _restoringSettings = true;
 
-    if (settings.contains(segmentation::DRAG_RADIUS_STEPS)) {
-        _dragRadiusSteps = settings.value(segmentation::DRAG_RADIUS_STEPS, _dragRadiusSteps).toFloat();
-    } else {
-        _dragRadiusSteps = settings.value(segmentation::RADIUS_STEPS, _dragRadiusSteps).toFloat();
-    }
-
-    if (settings.contains(segmentation::DRAG_SIGMA_STEPS)) {
-        _dragSigmaSteps = settings.value(segmentation::DRAG_SIGMA_STEPS, _dragSigmaSteps).toFloat();
-    } else {
-        _dragSigmaSteps = settings.value(segmentation::SIGMA_STEPS, _dragSigmaSteps).toFloat();
-    }
-
-    _lineRadiusSteps = settings.value(segmentation::LINE_RADIUS_STEPS, _dragRadiusSteps).toFloat();
-    _lineSigmaSteps = settings.value(segmentation::LINE_SIGMA_STEPS, _dragSigmaSteps).toFloat();
-
-    _pushPullRadiusSteps = settings.value(segmentation::PUSH_PULL_RADIUS_STEPS, _dragRadiusSteps).toFloat();
-    _pushPullSigmaSteps = settings.value(segmentation::PUSH_PULL_SIGMA_STEPS, _dragSigmaSteps).toFloat();
-    _showHoverMarker = settings.value(segmentation::SHOW_HOVER_MARKER, _showHoverMarker).toBool();
-
-    _dragRadiusSteps = std::clamp(_dragRadiusSteps, 0.25f, 128.0f);
-    _dragSigmaSteps = std::clamp(_dragSigmaSteps, 0.05f, 64.0f);
-    _lineRadiusSteps = std::clamp(_lineRadiusSteps, 0.25f, 128.0f);
-    _lineSigmaSteps = std::clamp(_lineSigmaSteps, 0.05f, 64.0f);
-    _pushPullRadiusSteps = std::clamp(_pushPullRadiusSteps, 0.25f, 128.0f);
-    _pushPullSigmaSteps = std::clamp(_pushPullSigmaSteps, 0.05f, 64.0f);
-
-    _pushPullStep = settings.value(segmentation::PUSH_PULL_STEP, _pushPullStep).toFloat();
-    _pushPullStep = std::clamp(_pushPullStep, 0.05f, 40.0f);
-
-    AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
-    storedAlpha.start = settings.value(segmentation::PUSH_PULL_ALPHA_START, storedAlpha.start).toFloat();
-    storedAlpha.stop = settings.value(segmentation::PUSH_PULL_ALPHA_STOP, storedAlpha.stop).toFloat();
-    storedAlpha.step = settings.value(segmentation::PUSH_PULL_ALPHA_STEP, storedAlpha.step).toFloat();
-    storedAlpha.low = settings.value(segmentation::PUSH_PULL_ALPHA_LOW, storedAlpha.low).toFloat();
-    storedAlpha.high = settings.value(segmentation::PUSH_PULL_ALPHA_HIGH, storedAlpha.high).toFloat();
-    storedAlpha.borderOffset = settings.value(segmentation::PUSH_PULL_ALPHA_BORDER, storedAlpha.borderOffset).toFloat();
-    storedAlpha.blurRadius = settings.value(segmentation::PUSH_PULL_ALPHA_RADIUS, storedAlpha.blurRadius).toInt();
-    storedAlpha.perVertexLimit = settings.value(segmentation::PUSH_PULL_ALPHA_LIMIT, storedAlpha.perVertexLimit).toFloat();
-    storedAlpha.perVertex = settings.value(segmentation::PUSH_PULL_ALPHA_PER_VERTEX, storedAlpha.perVertex).toBool();
-    applyAlphaPushPullConfig(storedAlpha, false, false);
-    _smoothStrength = settings.value(segmentation::SMOOTH_STRENGTH, _smoothStrength).toFloat();
-    _smoothIterations = settings.value(segmentation::SMOOTH_ITERATIONS, _smoothIterations).toInt();
-    _smoothStrength = std::clamp(_smoothStrength, 0.0f, 1.0f);
-    _smoothIterations = std::clamp(_smoothIterations, 1, 25);
+    _editingPanel->restoreSettings(settings);
     _growthMethod = segmentationGrowthMethodFromInt(
         settings.value(segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod)).toInt());
     _extrapolationPointCount = settings.value(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount).toInt();
@@ -1257,22 +868,9 @@ void SegmentationWidget::restoreSettings()
     _growthKeybindsEnabled = settings.value(segmentation::GROWTH_KEYBINDS_ENABLED,
                                             segmentation::GROWTH_KEYBINDS_ENABLED_DEFAULT).toBool();
 
-    QVariantList serialized = settings.value(segmentation::DIRECTION_FIELDS, QVariantList{}).toList();
-    _directionFields.clear();
-    for (const QVariant& entry : serialized) {
-        const QVariantMap map = entry.toMap();
-        SegmentationDirectionFieldConfig config;
-        config.path = map.value(QStringLiteral("path")).toString();
-        config.orientation = segmentationDirectionFieldOrientationFromInt(
-            map.value(QStringLiteral("orientation"), 0).toInt());
-        config.scale = map.value(QStringLiteral("scale"), 0).toInt();
-        config.weight = map.value(QStringLiteral("weight"), 1.0).toDouble();
-        if (config.isValid()) {
-            _directionFields.push_back(std::move(config));
-        }
-    }
+    _directionFieldPanel->restoreSettings(settings);
 
-    _correctionsEnabled = settings.value(segmentation::CORRECTIONS_ENABLED, segmentation::CORRECTIONS_ENABLED_DEFAULT).toBool();
+    _correctionsPanel->restoreSettings(settings);
     _correctionsZRangeEnabled = settings.value(segmentation::CORRECTIONS_Z_RANGE_ENABLED, segmentation::CORRECTIONS_Z_RANGE_ENABLED_DEFAULT).toBool();
     _correctionsZMin = settings.value(segmentation::CORRECTIONS_Z_MIN, segmentation::CORRECTIONS_Z_MIN_DEFAULT).toInt();
    _correctionsZMax = settings.value(segmentation::CORRECTIONS_Z_MAX, _correctionsZMin).toInt();
@@ -1298,38 +896,7 @@ void SegmentationWidget::restoreSettings()
 
     _neuralTracerPanel->restoreSettings(settings);
 
-    // Cell reoptimization settings
-    _cellReoptMaxSteps = settings.value(QStringLiteral("cell_reopt_max_steps"), _cellReoptMaxSteps).toInt();
-    _cellReoptMaxSteps = std::clamp(_cellReoptMaxSteps, 10, 10000);
-    _cellReoptMaxPoints = settings.value(QStringLiteral("cell_reopt_max_points"), _cellReoptMaxPoints).toInt();
-    _cellReoptMaxPoints = std::clamp(_cellReoptMaxPoints, 3, 200);
-    _cellReoptMinSpacing = settings.value(QStringLiteral("cell_reopt_min_spacing"), static_cast<double>(_cellReoptMinSpacing)).toFloat();
-    _cellReoptMinSpacing = std::clamp(_cellReoptMinSpacing, 1.0f, 50.0f);
-    _cellReoptPerimeterOffset = settings.value(QStringLiteral("cell_reopt_perimeter_offset"), static_cast<double>(_cellReoptPerimeterOffset)).toFloat();
-    _cellReoptPerimeterOffset = std::clamp(_cellReoptPerimeterOffset, -50.0f, 50.0f);
-    // Don't restore cell reopt mode - user must explicitly enable each session
-
-    const bool editingExpanded = settings.value(segmentation::GROUP_EDITING_EXPANDED, segmentation::GROUP_EDITING_EXPANDED_DEFAULT).toBool();
-    const bool dragExpanded = settings.value(segmentation::GROUP_DRAG_EXPANDED, segmentation::GROUP_DRAG_EXPANDED_DEFAULT).toBool();
-    const bool lineExpanded = settings.value(segmentation::GROUP_LINE_EXPANDED, segmentation::GROUP_LINE_EXPANDED_DEFAULT).toBool();
-    const bool pushPullExpanded = settings.value(segmentation::GROUP_PUSH_PULL_EXPANDED, segmentation::GROUP_PUSH_PULL_EXPANDED_DEFAULT).toBool();
-    const bool directionExpanded = settings.value(segmentation::GROUP_DIRECTION_FIELD_EXPANDED, segmentation::GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT).toBool();
-
-    if (_editingPanel->editingGroup()) {
-        _editingPanel->editingGroup()->setExpanded(editingExpanded);
-    }
-    if (_editingPanel->dragGroup()) {
-        _editingPanel->dragGroup()->setExpanded(dragExpanded);
-    }
-    if (_editingPanel->lineGroup()) {
-        _editingPanel->lineGroup()->setExpanded(lineExpanded);
-    }
-    if (_editingPanel->pushPullGroup()) {
-        _editingPanel->pushPullGroup()->setExpanded(pushPullExpanded);
-    }
-    if (auto* dirGroup = _directionFieldPanel->directionFieldGroup()) {
-        dirGroup->setExpanded(directionExpanded);
-    }
+    _cellReoptPanel->restoreSettings(settings);
 
     settings.endGroup();
     _restoringSettings = false;
@@ -1357,21 +924,31 @@ void SegmentationWidget::updateEditingState(bool enabled, bool notifyListeners)
     }
 }
 
-void SegmentationWidget::setShowHoverMarker(bool enabled)
-{
-    if (_showHoverMarker == enabled) {
-        return;
-    }
-    _showHoverMarker = enabled;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("show_hover_marker"), _showHoverMarker);
-        emit hoverMarkerToggled(_showHoverMarker);
-    }
-    if (_editingPanel->showHoverMarkerCheck()) {
-        const QSignalBlocker blocker(_editingPanel->showHoverMarkerCheck());
-        _editingPanel->showHoverMarkerCheck()->setChecked(_showHoverMarker);
-    }
-}
+// --- Editing panel delegations ---
+
+float SegmentationWidget::dragRadius() const { return _editingPanel->dragRadius(); }
+float SegmentationWidget::dragSigma() const { return _editingPanel->dragSigma(); }
+float SegmentationWidget::lineRadius() const { return _editingPanel->lineRadius(); }
+float SegmentationWidget::lineSigma() const { return _editingPanel->lineSigma(); }
+float SegmentationWidget::pushPullRadius() const { return _editingPanel->pushPullRadius(); }
+float SegmentationWidget::pushPullSigma() const { return _editingPanel->pushPullSigma(); }
+float SegmentationWidget::pushPullStep() const { return _editingPanel->pushPullStep(); }
+AlphaPushPullConfig SegmentationWidget::alphaPushPullConfig() const { return _editingPanel->alphaPushPullConfig(); }
+float SegmentationWidget::smoothingStrength() const { return _editingPanel->smoothingStrength(); }
+int SegmentationWidget::smoothingIterations() const { return _editingPanel->smoothingIterations(); }
+bool SegmentationWidget::showHoverMarker() const { return _editingPanel->showHoverMarker(); }
+
+void SegmentationWidget::setDragRadius(float value) { _editingPanel->setDragRadius(value); }
+void SegmentationWidget::setDragSigma(float value) { _editingPanel->setDragSigma(value); }
+void SegmentationWidget::setLineRadius(float value) { _editingPanel->setLineRadius(value); }
+void SegmentationWidget::setLineSigma(float value) { _editingPanel->setLineSigma(value); }
+void SegmentationWidget::setPushPullRadius(float value) { _editingPanel->setPushPullRadius(value); }
+void SegmentationWidget::setPushPullSigma(float value) { _editingPanel->setPushPullSigma(value); }
+void SegmentationWidget::setPushPullStep(float value) { _editingPanel->setPushPullStep(value); }
+void SegmentationWidget::setAlphaPushPullConfig(const AlphaPushPullConfig& config) { _editingPanel->setAlphaPushPullConfig(config); }
+void SegmentationWidget::setSmoothingStrength(float value) { _editingPanel->setSmoothingStrength(value); }
+void SegmentationWidget::setSmoothingIterations(int value) { _editingPanel->setSmoothingIterations(value); }
+void SegmentationWidget::setShowHoverMarker(bool enabled) { _editingPanel->setShowHoverMarker(enabled); }
 
 // --- Approval mask delegations ---
 
@@ -1393,59 +970,16 @@ void SegmentationWidget::setApprovalBrushDepth(float depth) { _approvalMaskPanel
 void SegmentationWidget::setApprovalMaskOpacity(int opacity) { _approvalMaskPanel->setApprovalMaskOpacity(opacity); }
 void SegmentationWidget::setApprovalBrushColor(const QColor& color) { _approvalMaskPanel->setApprovalBrushColor(color); }
 
-void SegmentationWidget::setCellReoptMode(bool enabled)
-{
-    if (_cellReoptMode == enabled) {
-        return;
-    }
-    _cellReoptMode = enabled;
-    qInfo() << "SegmentationWidget: Cell reoptimization mode changed to:" << enabled;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("cell_reopt_mode"), _cellReoptMode);
-        emit cellReoptModeChanged(_cellReoptMode);
-    }
-    if (auto* chk = _cellReoptPanel->modeCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_cellReoptMode);
-    }
-    syncUiState();
-}
+// --- Cell reoptimization delegations ---
 
-void SegmentationWidget::setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections)
-{
-    auto* combo = _cellReoptPanel->collectionCombo();
-    if (!combo) {
-        return;
-    }
+bool SegmentationWidget::cellReoptMode() const { return _cellReoptPanel->cellReoptMode(); }
+int SegmentationWidget::cellReoptMaxSteps() const { return _cellReoptPanel->cellReoptMaxSteps(); }
+int SegmentationWidget::cellReoptMaxPoints() const { return _cellReoptPanel->cellReoptMaxPoints(); }
+float SegmentationWidget::cellReoptMinSpacing() const { return _cellReoptPanel->cellReoptMinSpacing(); }
+float SegmentationWidget::cellReoptPerimeterOffset() const { return _cellReoptPanel->cellReoptPerimeterOffset(); }
 
-    // Remember current selection
-    uint64_t currentId = 0;
-    if (combo->currentIndex() >= 0) {
-        currentId = combo->currentData().toULongLong();
-    }
-
-    const QSignalBlocker blocker(combo);
-    combo->clear();
-
-    int indexToSelect = -1;
-    for (int i = 0; i < collections.size(); ++i) {
-        const auto& [id, name] = collections[i];
-        combo->addItem(name, QVariant::fromValue(id));
-        if (id == currentId) {
-            indexToSelect = i;
-        }
-    }
-
-    // Restore selection if possible, otherwise select first item
-    if (indexToSelect >= 0) {
-        combo->setCurrentIndex(indexToSelect);
-    } else if (combo->count() > 0) {
-        combo->setCurrentIndex(0);
-    }
-
-    // Update run button state - need a collection selected to run
-    syncUiState();
-}
+void SegmentationWidget::setCellReoptMode(bool enabled) { _cellReoptPanel->setCellReoptMode(enabled); syncUiState(); }
+void SegmentationWidget::setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections) { _cellReoptPanel->setCellReoptCollections(collections); syncUiState(); }
 
 void SegmentationWidget::setPendingChanges(bool pending)
 {
@@ -1459,229 +993,6 @@ void SegmentationWidget::setPendingChanges(bool pending)
 void SegmentationWidget::setEditingEnabled(bool enabled)
 {
     updateEditingState(enabled, false);
-}
-
-void SegmentationWidget::setDragRadius(float value)
-{
-    const float clamped = std::clamp(value, 0.25f, 128.0f);
-    if (std::fabs(clamped - _dragRadiusSteps) < 1e-4f) {
-        return;
-    }
-    _dragRadiusSteps = clamped;
-    writeSetting(QStringLiteral("drag_radius_steps"), _dragRadiusSteps);
-    if (_editingPanel->dragRadiusSpin()) {
-        const QSignalBlocker blocker(_editingPanel->dragRadiusSpin());
-        _editingPanel->dragRadiusSpin()->setValue(static_cast<double>(_dragRadiusSteps));
-    }
-}
-
-void SegmentationWidget::setDragSigma(float value)
-{
-    const float clamped = std::clamp(value, 0.05f, 64.0f);
-    if (std::fabs(clamped - _dragSigmaSteps) < 1e-4f) {
-        return;
-    }
-    _dragSigmaSteps = clamped;
-    writeSetting(QStringLiteral("drag_sigma_steps"), _dragSigmaSteps);
-    if (_editingPanel->dragSigmaSpin()) {
-        const QSignalBlocker blocker(_editingPanel->dragSigmaSpin());
-        _editingPanel->dragSigmaSpin()->setValue(static_cast<double>(_dragSigmaSteps));
-    }
-}
-
-void SegmentationWidget::setLineRadius(float value)
-{
-    const float clamped = std::clamp(value, 0.25f, 128.0f);
-    if (std::fabs(clamped - _lineRadiusSteps) < 1e-4f) {
-        return;
-    }
-    _lineRadiusSteps = clamped;
-    writeSetting(QStringLiteral("line_radius_steps"), _lineRadiusSteps);
-    if (_editingPanel->lineRadiusSpin()) {
-        const QSignalBlocker blocker(_editingPanel->lineRadiusSpin());
-        _editingPanel->lineRadiusSpin()->setValue(static_cast<double>(_lineRadiusSteps));
-    }
-}
-
-void SegmentationWidget::setLineSigma(float value)
-{
-    const float clamped = std::clamp(value, 0.05f, 64.0f);
-    if (std::fabs(clamped - _lineSigmaSteps) < 1e-4f) {
-        return;
-    }
-    _lineSigmaSteps = clamped;
-    writeSetting(QStringLiteral("line_sigma_steps"), _lineSigmaSteps);
-    if (_editingPanel->lineSigmaSpin()) {
-        const QSignalBlocker blocker(_editingPanel->lineSigmaSpin());
-        _editingPanel->lineSigmaSpin()->setValue(static_cast<double>(_lineSigmaSteps));
-    }
-}
-
-void SegmentationWidget::setPushPullRadius(float value)
-{
-    const float clamped = std::clamp(value, 0.25f, 128.0f);
-    if (std::fabs(clamped - _pushPullRadiusSteps) < 1e-4f) {
-        return;
-    }
-    _pushPullRadiusSteps = clamped;
-    writeSetting(QStringLiteral("push_pull_radius_steps"), _pushPullRadiusSteps);
-    if (_editingPanel->pushPullRadiusSpin()) {
-        const QSignalBlocker blocker(_editingPanel->pushPullRadiusSpin());
-        _editingPanel->pushPullRadiusSpin()->setValue(static_cast<double>(_pushPullRadiusSteps));
-    }
-}
-
-void SegmentationWidget::setPushPullSigma(float value)
-{
-    const float clamped = std::clamp(value, 0.05f, 64.0f);
-    if (std::fabs(clamped - _pushPullSigmaSteps) < 1e-4f) {
-        return;
-    }
-    _pushPullSigmaSteps = clamped;
-    writeSetting(QStringLiteral("push_pull_sigma_steps"), _pushPullSigmaSteps);
-    if (_editingPanel->pushPullSigmaSpin()) {
-        const QSignalBlocker blocker(_editingPanel->pushPullSigmaSpin());
-        _editingPanel->pushPullSigmaSpin()->setValue(static_cast<double>(_pushPullSigmaSteps));
-    }
-}
-
-void SegmentationWidget::setPushPullStep(float value)
-{
-    const float clamped = std::clamp(value, 0.05f, 40.0f);
-    if (std::fabs(clamped - _pushPullStep) < 1e-4f) {
-        return;
-    }
-    _pushPullStep = clamped;
-    writeSetting(QStringLiteral("push_pull_step"), _pushPullStep);
-    if (_editingPanel->pushPullStepSpin()) {
-        const QSignalBlocker blocker(_editingPanel->pushPullStepSpin());
-        _editingPanel->pushPullStepSpin()->setValue(static_cast<double>(_pushPullStep));
-    }
-}
-
-AlphaPushPullConfig SegmentationWidget::alphaPushPullConfig() const
-{
-    return _alphaPushPullConfig;
-}
-
-void SegmentationWidget::setAlphaPushPullConfig(const AlphaPushPullConfig& config)
-{
-    applyAlphaPushPullConfig(config, false);
-}
-
-void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& config,
-                                                  bool emitSignal,
-                                                  bool persist)
-{
-    AlphaPushPullConfig sanitized = sanitizeAlphaConfig(config);
-
-    const bool changed = !nearlyEqual(sanitized.start, _alphaPushPullConfig.start) ||
-                         !nearlyEqual(sanitized.stop, _alphaPushPullConfig.stop) ||
-                         !nearlyEqual(sanitized.step, _alphaPushPullConfig.step) ||
-                         !nearlyEqual(sanitized.low, _alphaPushPullConfig.low) ||
-                         !nearlyEqual(sanitized.high, _alphaPushPullConfig.high) ||
-                         !nearlyEqual(sanitized.borderOffset, _alphaPushPullConfig.borderOffset) ||
-                         sanitized.blurRadius != _alphaPushPullConfig.blurRadius ||
-                         !nearlyEqual(sanitized.perVertexLimit, _alphaPushPullConfig.perVertexLimit) ||
-                         sanitized.perVertex != _alphaPushPullConfig.perVertex;
-
-    if (changed) {
-        _alphaPushPullConfig = sanitized;
-        if (persist) {
-            writeSetting(QStringLiteral("push_pull_alpha_start"), _alphaPushPullConfig.start);
-            writeSetting(QStringLiteral("push_pull_alpha_stop"), _alphaPushPullConfig.stop);
-            writeSetting(QStringLiteral("push_pull_alpha_step"), _alphaPushPullConfig.step);
-            writeSetting(QStringLiteral("push_pull_alpha_low"), _alphaPushPullConfig.low);
-            writeSetting(QStringLiteral("push_pull_alpha_high"), _alphaPushPullConfig.high);
-            writeSetting(QStringLiteral("push_pull_alpha_border"), _alphaPushPullConfig.borderOffset);
-            writeSetting(QStringLiteral("push_pull_alpha_radius"), _alphaPushPullConfig.blurRadius);
-            writeSetting(QStringLiteral("push_pull_alpha_limit"), _alphaPushPullConfig.perVertexLimit);
-            writeSetting(QStringLiteral("push_pull_alpha_per_vertex"), _alphaPushPullConfig.perVertex);
-        }
-    }
-
-    const bool editingActive = _editingEnabled && !_growthInProgress;
-
-    if (_editingPanel->alphaStartSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaStartSpin());
-        _editingPanel->alphaStartSpin()->setValue(static_cast<double>(_alphaPushPullConfig.start));
-        _editingPanel->alphaStartSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaStopSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaStopSpin());
-        _editingPanel->alphaStopSpin()->setValue(static_cast<double>(_alphaPushPullConfig.stop));
-        _editingPanel->alphaStopSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaStepSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaStepSpin());
-        _editingPanel->alphaStepSpin()->setValue(static_cast<double>(_alphaPushPullConfig.step));
-        _editingPanel->alphaStepSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaLowSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaLowSpin());
-        _editingPanel->alphaLowSpin()->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.low));
-        _editingPanel->alphaLowSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaHighSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaHighSpin());
-        _editingPanel->alphaHighSpin()->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.high));
-        _editingPanel->alphaHighSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaBorderSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaBorderSpin());
-        _editingPanel->alphaBorderSpin()->setValue(static_cast<double>(_alphaPushPullConfig.borderOffset));
-        _editingPanel->alphaBorderSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaBlurRadiusSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaBlurRadiusSpin());
-        _editingPanel->alphaBlurRadiusSpin()->setValue(_alphaPushPullConfig.blurRadius);
-        _editingPanel->alphaBlurRadiusSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaPerVertexLimitSpin()) {
-        const QSignalBlocker blocker(_editingPanel->alphaPerVertexLimitSpin());
-        _editingPanel->alphaPerVertexLimitSpin()->setValue(static_cast<double>(_alphaPushPullConfig.perVertexLimit));
-        _editingPanel->alphaPerVertexLimitSpin()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaPerVertexCheck()) {
-        const QSignalBlocker blocker(_editingPanel->alphaPerVertexCheck());
-        _editingPanel->alphaPerVertexCheck()->setChecked(_alphaPushPullConfig.perVertex);
-        _editingPanel->alphaPerVertexCheck()->setEnabled(editingActive);
-    }
-    if (_editingPanel->alphaPushPullPanel()) {
-        _editingPanel->alphaPushPullPanel()->setEnabled(editingActive);
-    }
-
-    if (emitSignal && changed) {
-        emit alphaPushPullConfigChanged();
-    }
-}
-
-void SegmentationWidget::setSmoothingStrength(float value)
-{
-    const float clamped = std::clamp(value, 0.0f, 1.0f);
-    if (std::fabs(clamped - _smoothStrength) < 1e-4f) {
-        return;
-    }
-    _smoothStrength = clamped;
-    writeSetting(QStringLiteral("smooth_strength"), _smoothStrength);
-    if (_editingPanel->smoothStrengthSpin()) {
-        const QSignalBlocker blocker(_editingPanel->smoothStrengthSpin());
-        _editingPanel->smoothStrengthSpin()->setValue(static_cast<double>(_smoothStrength));
-    }
-}
-
-void SegmentationWidget::setSmoothingIterations(int value)
-{
-    const int clamped = std::clamp(value, 1, 25);
-    if (_smoothIterations == clamped) {
-        return;
-    }
-    _smoothIterations = clamped;
-    writeSetting(QStringLiteral("smooth_iterations"), _smoothIterations);
-    if (_editingPanel->smoothIterationsSpin()) {
-        const QSignalBlocker blocker(_editingPanel->smoothIterationsSpin());
-        _editingPanel->smoothIterationsSpin()->setValue(_smoothIterations);
-    }
 }
 
 void SegmentationWidget::handleCustomParamsEdited()
@@ -1864,54 +1175,14 @@ void SegmentationWidget::setActiveVolume(const QString& volumeId)
     }
 }
 
-void SegmentationWidget::setCorrectionsEnabled(bool enabled)
-{
-    if (_correctionsEnabled == enabled) {
-        return;
-    }
-    _correctionsEnabled = enabled;
-    writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
-    if (!enabled) {
-        _correctionsAnnotateChecked = false;
-        if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
-            const QSignalBlocker blocker(chk);
-            chk->setChecked(false);
-        }
-    }
-    updateGrowthUiState();
-}
-
-void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled)
-{
-    _correctionsAnnotateChecked = enabled;
-    if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(enabled);
-    }
-    updateGrowthUiState();
-}
+void SegmentationWidget::setCorrectionsEnabled(bool enabled) { _correctionsPanel->setCorrectionsEnabled(enabled); updateGrowthUiState(); }
+void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled) { _correctionsPanel->setCorrectionsAnnotateChecked(enabled); updateGrowthUiState(); }
 
 void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                                   std::optional<uint64_t> activeId)
 {
-    auto* combo = _correctionsPanel->correctionsCombo();
-    if (!combo) {
-        return;
-    }
-    const QSignalBlocker blocker(combo);
-    combo->clear();
-    for (const auto& pair : collections) {
-        combo->addItem(pair.second, QVariant::fromValue(static_cast<qulonglong>(pair.first)));
-    }
-    if (activeId) {
-        int idx = combo->findData(QVariant::fromValue(static_cast<qulonglong>(*activeId)));
-        if (idx >= 0) {
-            combo->setCurrentIndex(idx);
-        }
-    } else {
-        combo->setCurrentIndex(-1);
-    }
-    combo->setEnabled(_correctionsEnabled && !_growthInProgress && combo->count() > 0);
+    _correctionsPanel->setCorrectionCollections(collections, activeId);
+    _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
 }
 
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const
@@ -1950,243 +1221,7 @@ std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirect
 
 std::vector<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfigs() const
 {
-    std::vector<SegmentationDirectionFieldConfig> configs;
-    configs.reserve(_directionFields.size());
-    for (const auto& config : _directionFields) {
-        if (config.isValid()) {
-            configs.push_back(config);
-        }
-    }
-    return configs;
-}
-
-SegmentationDirectionFieldConfig SegmentationWidget::buildDirectionFieldDraft() const
-{
-    SegmentationDirectionFieldConfig config;
-    config.path = _directionFieldPath.trimmed();
-    config.orientation = _directionFieldOrientation;
-    config.scale = std::clamp(_directionFieldScale, 0, 5);
-    config.weight = std::clamp(_directionFieldWeight, 0.0, 10.0);
-    return config;
-}
-
-void SegmentationWidget::refreshDirectionFieldList()
-{
-    auto* list = _directionFieldPanel->listWidget();
-    if (!list) {
-        return;
-    }
-    const QSignalBlocker blocker(list);
-    const int previousRow = list->currentRow();
-    list->clear();
-
-    for (const auto& config : _directionFields) {
-        QString orientationLabel = segmentationDirectionFieldOrientationKey(config.orientation);
-        const QString weightText = QString::number(std::clamp(config.weight, 0.0, 10.0), 'f', 2);
-        const QString itemText = tr("%1 — %2 (scale %3, weight %4)")
-                                     .arg(config.path,
-                                          orientationLabel,
-                                          QString::number(std::clamp(config.scale, 0, 5)),
-                                          weightText);
-        auto* item = new QListWidgetItem(itemText, list);
-        item->setToolTip(config.path);
-    }
-
-    if (!_directionFields.empty()) {
-        const int clampedRow = std::clamp(previousRow, 0, static_cast<int>(_directionFields.size()) - 1);
-        list->setCurrentRow(clampedRow);
-    }
-    if (auto* removeBtn = _directionFieldPanel->removeButton()) {
-        removeBtn->setEnabled(_editingEnabled && !_directionFields.empty() && list->currentRow() >= 0);
-    }
-
-    updateDirectionFieldFormFromSelection(list->currentRow());
-    updateDirectionFieldListGeometry();
-}
-
-void SegmentationWidget::updateDirectionFieldFormFromSelection(int row)
-{
-    const bool previousUpdating = _updatingDirectionFieldForm;
-    _updatingDirectionFieldForm = true;
-
-    if (row >= 0 && row < static_cast<int>(_directionFields.size())) {
-        const auto& config = _directionFields[static_cast<std::size_t>(row)];
-        _directionFieldPath = config.path;
-        _directionFieldOrientation = config.orientation;
-        _directionFieldScale = config.scale;
-        _directionFieldWeight = config.weight;
-    }
-
-    if (auto* pathEdit = _directionFieldPanel->pathEdit()) {
-        const QSignalBlocker blocker(pathEdit);
-        pathEdit->setText(_directionFieldPath);
-    }
-    if (auto* orientCombo = _directionFieldPanel->orientationCombo()) {
-        const QSignalBlocker blocker(orientCombo);
-        int idx = orientCombo->findData(static_cast<int>(_directionFieldOrientation));
-        if (idx >= 0) {
-            orientCombo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* scaleCombo = _directionFieldPanel->scaleCombo()) {
-        const QSignalBlocker blocker(scaleCombo);
-        int idx = scaleCombo->findData(_directionFieldScale);
-        if (idx >= 0) {
-            scaleCombo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* weightSpin = _directionFieldPanel->weightSpin()) {
-        const QSignalBlocker blocker(weightSpin);
-        weightSpin->setValue(_directionFieldWeight);
-    }
-
-    _updatingDirectionFieldForm = previousUpdating;
-}
-
-void SegmentationWidget::applyDirectionFieldDraftToSelection(int row)
-{
-    if (row < 0 || row >= static_cast<int>(_directionFields.size())) {
-        return;
-    }
-
-    auto config = buildDirectionFieldDraft();
-    if (!config.isValid()) {
-        return;
-    }
-
-    auto& target = _directionFields[static_cast<std::size_t>(row)];
-    if (target.path == config.path &&
-        target.orientation == config.orientation &&
-        target.scale == config.scale &&
-        std::abs(target.weight - config.weight) < 1e-4) {
-        return;
-    }
-
-    target = std::move(config);
-    updateDirectionFieldListItem(row);
-    persistDirectionFields();
-}
-
-void SegmentationWidget::updateDirectionFieldListItem(int row)
-{
-    auto* list = _directionFieldPanel->listWidget();
-    if (!list) {
-        return;
-    }
-    if (row < 0 || row >= list->count()) {
-        return;
-    }
-    if (row >= static_cast<int>(_directionFields.size())) {
-        return;
-    }
-
-    const auto& config = _directionFields[static_cast<std::size_t>(row)];
-    QString orientationLabel = segmentationDirectionFieldOrientationKey(config.orientation);
-    const QString weightText = QString::number(std::clamp(config.weight, 0.0, 10.0), 'f', 2);
-    const QString itemText = tr("%1 — %2 (scale %3, weight %4)")
-                                 .arg(config.path,
-                                      orientationLabel,
-                                      QString::number(std::clamp(config.scale, 0, 5)),
-                                      weightText);
-
-    if (auto* item = list->item(row)) {
-        item->setText(itemText);
-        item->setToolTip(config.path);
-    }
-}
-
-void SegmentationWidget::updateDirectionFieldListGeometry()
-{
-    auto* list = _directionFieldPanel->listWidget();
-    if (!list) {
-        return;
-    }
-
-    auto policy = list->sizePolicy();
-    const int itemCount = list->count();
-
-    if (itemCount <= kCompactDirectionFieldRowLimit) {
-        const int sampleRowHeight = list->sizeHintForRow(0);
-        const int rowHeight = sampleRowHeight > 0 ? sampleRowHeight : list->fontMetrics().height() + 8;
-        const int visibleRows = std::max(1, itemCount);
-        const int frameHeight = 2 * list->frameWidth();
-        const auto* hScroll = list->horizontalScrollBar();
-        const int scrollHeight = (hScroll && hScroll->isVisible()) ? hScroll->sizeHint().height() : 0;
-        const int targetHeight = rowHeight * visibleRows + frameHeight + scrollHeight;
-
-        policy.setVerticalPolicy(QSizePolicy::Fixed);
-        policy.setVerticalStretch(0);
-        list->setSizePolicy(policy);
-        list->setMinimumHeight(targetHeight);
-        list->setMaximumHeight(targetHeight);
-    } else {
-        policy.setVerticalPolicy(QSizePolicy::Expanding);
-        policy.setVerticalStretch(1);
-        list->setSizePolicy(policy);
-        list->setMinimumHeight(0);
-        list->setMaximumHeight(QWIDGETSIZE_MAX);
-    }
-
-    list->updateGeometry();
-}
-
-void SegmentationWidget::clearDirectionFieldForm()
-{
-    // Clear the list selection
-    if (auto* list = _directionFieldPanel->listWidget()) {
-        list->setCurrentRow(-1);
-    }
-
-    // Reset member variables to defaults
-    _directionFieldPath.clear();
-    _directionFieldOrientation = SegmentationDirectionFieldOrientation::Normal;
-    _directionFieldScale = 0;
-    _directionFieldWeight = 1.0;
-
-    // Update the form fields to reflect the cleared state
-    const bool previousUpdating = _updatingDirectionFieldForm;
-    _updatingDirectionFieldForm = true;
-
-    if (auto* pathEdit = _directionFieldPanel->pathEdit()) {
-        pathEdit->clear();
-    }
-    if (auto* orientCombo = _directionFieldPanel->orientationCombo()) {
-        int idx = orientCombo->findData(static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
-        if (idx >= 0) {
-            orientCombo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* scaleCombo = _directionFieldPanel->scaleCombo()) {
-        int idx = scaleCombo->findData(0);
-        if (idx >= 0) {
-            scaleCombo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* weightSpin = _directionFieldPanel->weightSpin()) {
-        weightSpin->setValue(1.0);
-    }
-
-    _updatingDirectionFieldForm = previousUpdating;
-
-    // Update button states
-    if (auto* removeBtn = _directionFieldPanel->removeButton()) {
-        removeBtn->setEnabled(false);
-    }
-}
-
-void SegmentationWidget::persistDirectionFields()
-{
-    QVariantList serialized;
-    serialized.reserve(static_cast<int>(_directionFields.size()));
-    for (const auto& config : _directionFields) {
-        QVariantMap map;
-        map.insert(QStringLiteral("path"), config.path);
-        map.insert(QStringLiteral("orientation"), static_cast<int>(config.orientation));
-        map.insert(QStringLiteral("scale"), std::clamp(config.scale, 0, 5));
-        map.insert(QStringLiteral("weight"), std::clamp(config.weight, 0.0, 10.0));
-        serialized.push_back(map);
-    }
-    writeSetting(QStringLiteral("direction_fields"), serialized);
+    return _directionFieldPanel->directionFieldConfigs();
 }
 
 void SegmentationWidget::setGrowthDirectionMask(int mask)
@@ -2276,17 +1311,7 @@ void SegmentationWidget::updateGrowthUiState()
     if (QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr) {
         growthDirRight->setEnabled(enableDirCheckbox);
     }
-    if (auto* addBtn = _directionFieldPanel->addButton()) {
-        addBtn->setEnabled(_editingEnabled);
-    }
-    if (auto* removeBtn = _directionFieldPanel->removeButton()) {
-        auto* list = _directionFieldPanel->listWidget();
-        const bool hasSelection = list && list->currentRow() >= 0;
-        removeBtn->setEnabled(_editingEnabled && hasSelection);
-    }
-    if (auto* list = _directionFieldPanel->listWidget()) {
-        list->setEnabled(_editingEnabled);
-    }
+    _directionFieldPanel->syncUiState(_editingEnabled);
 
     const bool allowZRange = _editingEnabled && !_growthInProgress;
     if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
@@ -2302,20 +1327,7 @@ void SegmentationWidget::updateGrowthUiState()
         _customParamsEditor->setEnabled(_editingEnabled);
     }
 
-    const bool allowCorrections = _editingEnabled && _correctionsEnabled && !_growthInProgress;
-    if (auto* group = _correctionsPanel->correctionsGroup()) {
-        group->setEnabled(allowCorrections);
-    }
-    if (auto* combo = _correctionsPanel->correctionsCombo()) {
-        const QSignalBlocker blocker(combo);
-        combo->setEnabled(allowCorrections && combo->count() > 0);
-    }
-    if (auto* btn = _correctionsPanel->correctionsNewButton()) {
-        btn->setEnabled(_editingEnabled && !_growthInProgress);
-    }
-    if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
-        chk->setEnabled(allowCorrections);
-    }
+    _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
 }
 
 void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direction,

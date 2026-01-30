@@ -1,11 +1,16 @@
 #pragma once
 
+#include "segmentation/SegmentationCommon.hpp"
+#include "segmentation/SegmentationPushPullConfig.hpp"
+
+#include <QString>
 #include <QWidget>
 
 class QCheckBox;
 class QDoubleSpinBox;
 class QLabel;
 class QPushButton;
+class QSettings;
 class QSpinBox;
 class CollapsibleSettingsGroup;
 
@@ -14,53 +19,63 @@ class SegmentationEditingPanel : public QWidget
     Q_OBJECT
 
 public:
-    explicit SegmentationEditingPanel(QWidget* parent = nullptr);
+    explicit SegmentationEditingPanel(const QString& settingsGroup,
+                                      QWidget* parent = nullptr);
 
-    // Group accessors
+    // Getters
+    [[nodiscard]] float dragRadius() const { return _dragRadiusSteps; }
+    [[nodiscard]] float dragSigma() const { return _dragSigmaSteps; }
+    [[nodiscard]] float lineRadius() const { return _lineRadiusSteps; }
+    [[nodiscard]] float lineSigma() const { return _lineSigmaSteps; }
+    [[nodiscard]] float pushPullRadius() const { return _pushPullRadiusSteps; }
+    [[nodiscard]] float pushPullSigma() const { return _pushPullSigmaSteps; }
+    [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
+    [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const { return _alphaPushPullConfig; }
+    [[nodiscard]] float smoothingStrength() const { return _smoothStrength; }
+    [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
+    [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
+
+    // Setters
+    void setDragRadius(float value);
+    void setDragSigma(float value);
+    void setLineRadius(float value);
+    void setLineSigma(float value);
+    void setPushPullRadius(float value);
+    void setPushPullSigma(float value);
+    void setPushPullStep(float value);
+    void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
+    void setSmoothingStrength(float value);
+    void setSmoothingIterations(int value);
+    void setShowHoverMarker(bool enabled);
+
+    void restoreSettings(QSettings& settings);
+    void syncUiState(bool editingEnabled, bool growthInProgress);
+
+    // Group accessors (still needed for expand/collapse state persistence by coordinator)
     CollapsibleSettingsGroup* editingGroup() const { return _groupEditing; }
-    CollapsibleSettingsGroup* dragGroup() const { return _groupDrag; }
-    CollapsibleSettingsGroup* lineGroup() const { return _groupLine; }
-    CollapsibleSettingsGroup* pushPullGroup() const { return _groupPushPull; }
 
-    // Drag
-    QDoubleSpinBox* dragRadiusSpin() const { return _spinDragRadius; }
-    QDoubleSpinBox* dragSigmaSpin() const { return _spinDragSigma; }
-
-    // Line
-    QDoubleSpinBox* lineRadiusSpin() const { return _spinLineRadius; }
-    QDoubleSpinBox* lineSigmaSpin() const { return _spinLineSigma; }
-
-    // Push/Pull
-    QDoubleSpinBox* pushPullRadiusSpin() const { return _spinPushPullRadius; }
-    QDoubleSpinBox* pushPullSigmaSpin() const { return _spinPushPullSigma; }
-    QDoubleSpinBox* pushPullStepSpin() const { return _spinPushPullStep; }
-
-    // Alpha config
-    QWidget* alphaPushPullPanel() const { return _alphaPushPullPanel; }
-    QLabel* alphaInfoLabel() const { return _lblAlphaInfo; }
-    QCheckBox* alphaPerVertexCheck() const { return _chkAlphaPerVertex; }
-    QDoubleSpinBox* alphaStartSpin() const { return _spinAlphaStart; }
-    QDoubleSpinBox* alphaStopSpin() const { return _spinAlphaStop; }
-    QDoubleSpinBox* alphaStepSpin() const { return _spinAlphaStep; }
-    QDoubleSpinBox* alphaLowSpin() const { return _spinAlphaLow; }
-    QDoubleSpinBox* alphaHighSpin() const { return _spinAlphaHigh; }
-    QDoubleSpinBox* alphaBorderSpin() const { return _spinAlphaBorder; }
-    QSpinBox* alphaBlurRadiusSpin() const { return _spinAlphaBlurRadius; }
-    QDoubleSpinBox* alphaPerVertexLimitSpin() const { return _spinAlphaPerVertexLimit; }
-
-    // Smoothing
-    QDoubleSpinBox* smoothStrengthSpin() const { return _spinSmoothStrength; }
-    QSpinBox* smoothIterationsSpin() const { return _spinSmoothIterations; }
-
-    // Buttons
-    QPushButton* applyButton() const { return _btnApply; }
-    QPushButton* resetButton() const { return _btnReset; }
-    QPushButton* stopButton() const { return _btnStop; }
-
-    // Hover marker
-    QCheckBox* showHoverMarkerCheck() const { return _chkShowHoverMarker; }
+signals:
+    void dragRadiusChanged(float value);
+    void dragSigmaChanged(float value);
+    void lineRadiusChanged(float value);
+    void lineSigmaChanged(float value);
+    void pushPullRadiusChanged(float value);
+    void pushPullSigmaChanged(float value);
+    void pushPullStepChanged(float value);
+    void alphaPushPullConfigChanged();
+    void smoothingStrengthChanged(float value);
+    void smoothingIterationsChanged(int value);
+    void hoverMarkerToggled(bool enabled);
+    void applyRequested();
+    void resetRequested();
+    void stopToolsRequested();
 
 private:
+    void writeSetting(const QString& key, const QVariant& value);
+    void applyAlphaPushPullConfig(const AlphaPushPullConfig& config,
+                                  bool emitSignal,
+                                  bool persist = true);
+
     CollapsibleSettingsGroup* _groupEditing{nullptr};
     CollapsibleSettingsGroup* _groupDrag{nullptr};
     CollapsibleSettingsGroup* _groupLine{nullptr};
@@ -90,4 +105,19 @@ private:
     QPushButton* _btnReset{nullptr};
     QPushButton* _btnStop{nullptr};
     QCheckBox* _chkShowHoverMarker{nullptr};
+
+    float _dragRadiusSteps{5.75f};
+    float _dragSigmaSteps{2.0f};
+    float _lineRadiusSteps{5.75f};
+    float _lineSigmaSteps{2.0f};
+    float _pushPullRadiusSteps{5.75f};
+    float _pushPullSigmaSteps{2.0f};
+    float _pushPullStep{4.0f};
+    AlphaPushPullConfig _alphaPushPullConfig{};
+    float _smoothStrength{0.4f};
+    int _smoothIterations{2};
+    bool _showHoverMarker{true};
+
+    bool _restoringSettings{false};
+    const QString _settingsGroup;
 };
