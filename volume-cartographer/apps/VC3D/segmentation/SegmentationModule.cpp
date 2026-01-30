@@ -254,7 +254,10 @@ bool SegmentationModule::ensureHoverTarget()
         return false;
     }
     if (_hoverPreviewEnabled && _hover.valid) {
-        return true;
+        if (!_hoverPointer.valid || _hover.viewer == _hoverPointer.viewer) {
+            return true;
+        }
+        _hover.clear();
     }
     if (!_hoverPointer.valid) {
         return false;
@@ -1575,6 +1578,13 @@ void SegmentationModule::recordPointerSample(CVolumeViewer* viewer, const cv::Ve
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
         return;
+    }
+
+    // Detect viewer change and reset stale cached state
+    if (_hoverPointer.valid && _hoverPointer.viewer != viewer) {
+        resetHoverLookupDetail();           // Reset velocity tracking
+        _editManager->resetPointerSeed();   // Reset pointTo() seed
+        _hover.clear();                     // Invalidate stale hover
     }
 
     _hoverPointer.valid = true;
