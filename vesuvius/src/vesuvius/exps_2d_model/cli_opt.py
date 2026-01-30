@@ -13,7 +13,7 @@ class OptConfig:
 
 def add_args(p: argparse.ArgumentParser) -> None:
 	g = p.add_argument_group("opt")
-	g.add_argument("--stages-json", default="default_stages.json")
+	g.add_argument("--stages-json", required=True)
 	g.add_argument("--snapshot-interval", type=int, default=1000)
 	# device arg is provided by data part for now
 

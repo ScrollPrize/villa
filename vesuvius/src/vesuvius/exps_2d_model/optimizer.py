@@ -7,8 +7,10 @@ import torch
 
 import fit_data
 import opt_loss_dir
+import opt_loss_data
 import opt_loss_geom
 import opt_loss_gradmag
+import opt_loss_mod
 import opt_loss_step
 
 
@@ -89,7 +91,7 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	bad_params = sorted(set(params) - {"theta", "phase", "winding_scale", "mesh_ms", "conn_offset_ms"})
+	bad_params = sorted(set(params) - {"theta", "phase", "winding_scale", "mesh_ms", "conn_offset_ms", "amp_ms", "bias_ms"})
 	if bad_params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
@@ -133,6 +135,9 @@ def load_stages(path: str) -> list[Stage]:
 		lambda_global: dict[str, float] = {
 			"dir_v": 1.0,
 			"dir_conn": 1.0,
+			"data": 0.0,
+			"data_grad": 0.0,
+			"mod_smooth_y": 0.0,
 			"step": 0.0,
 			"gradmag": 0.0,
 			"mean_pos": 0.0,
@@ -252,6 +257,9 @@ def optimize(
 		terms = {
 			"dir_v": {"loss": opt_loss_dir.dir_v_loss},
 			"dir_conn": {"loss": opt_loss_dir.dir_conn_loss},
+			"data": {"loss": opt_loss_data.data_loss},
+			"data_grad": {"loss": opt_loss_data.data_grad_loss},
+			"mod_smooth_y": {"loss": opt_loss_mod.mod_smooth_y_loss},
 			"step": {"loss": opt_loss_step.step_loss},
 			"gradmag": {"loss": opt_loss_gradmag.gradmag_period_loss},
 			"mean_pos": {"loss": lambda *, res: opt_loss_geom.mean_pos_loss(res=res, target_xy=mean_pos_xy)},
