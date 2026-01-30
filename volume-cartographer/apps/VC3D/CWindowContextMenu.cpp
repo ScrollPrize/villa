@@ -25,6 +25,8 @@
 #include <QInputDialog>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QVBoxLayout>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
@@ -153,9 +155,10 @@ bool selectResumeLocalTracerParams(QWidget* parent,
                                    const QVector<VolumeSelector::VolumeOption>& volumes,
                                    const QString& defaultVolumeId,
                                    QString* selectedVolumePath,
-                                   std::optional<QJsonObject>* paramsOut)
+                                   std::optional<QJsonObject>* paramsOut,
+                                   int* ompThreadsOut)
 {
-    if (!paramsOut || !selectedVolumePath) {
+    if (!paramsOut || !selectedVolumePath || !ompThreadsOut) {
         return false;
     }
 
@@ -166,6 +169,17 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     auto* volumeSelector = new VolumeSelector(&dlg);
     volumeSelector->setVolumes(volumes, defaultVolumeId);
     main->addWidget(volumeSelector);
+
+    auto* ompRow = new QWidget(&dlg);
+    auto* ompLayout = new QHBoxLayout(ompRow);
+    ompLayout->setContentsMargins(0, 0, 0, 0);
+    auto* ompLabel = new QLabel(QObject::tr("OMP Threads:"), ompRow);
+    auto* ompSpin = new QSpinBox(ompRow);
+    ompSpin->setRange(0, 256);
+    ompSpin->setToolTip(QObject::tr("If greater than 0, sets OMP_NUM_THREADS for the reoptimization run."));
+    ompLayout->addWidget(ompLabel);
+    ompLayout->addWidget(ompSpin, 1);
+    main->addWidget(ompRow);
 
     auto* editor = new JsonProfileEditor(QObject::tr("Tracer Params"), &dlg);
     editor->setDescription(QObject::tr(
@@ -182,9 +196,13 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     const QString savedText = settings.value(
         vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
         QString()).toString();
+    const int savedOmpThreads = settings.value(
+        vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS,
+        vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS_DEFAULT).toInt();
 
     editor->setCustomText(savedText);
     editor->setProfiles(profiles, savedProfile);
+    ompSpin->setValue(savedOmpThreads);
     main->addWidget(editor);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -202,6 +220,8 @@ bool selectResumeLocalTracerParams(QWidget* parent,
                           editor->profile());
         settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
                           editor->customText());
+        settings.setValue(vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS,
+                          ompSpin->value());
         dlg.accept();
     });
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -212,6 +232,7 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     }
 
     *selectedVolumePath = volumeSelector->selectedVolumePath();
+    *ompThreadsOut = ompSpin->value();
 
     QString error;
     auto extra = editor->jsonObject(&error);
@@ -1340,11 +1361,13 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
 
     QString selectedVolumePath;
     std::optional<QJsonObject> extraParams;
+    int ompThreads = vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS_DEFAULT;
     if (!selectResumeLocalTracerParams(this,
                                        volumeOptions,
                                        defaultVolumeId,
                                        &selectedVolumePath,
-                                       &extraParams)) {
+                                       &extraParams,
+                                       &ompThreads)) {
         statusBar()->showMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
         return;
     }
@@ -1408,7 +1431,7 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
                                       QString::fromStdString(surf->path.string()),
                                       outputDirPath,
                                       QStringLiteral("local"));
-    _cmdRunner->setOmpThreads(12);
+    _cmdRunner->setOmpThreads(ompThreads);
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
     statusBar()->showMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
