@@ -298,8 +298,13 @@ def save(
 	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
-	def _save_img_loss_vis(*, iters: int, postfix2: str) -> None:
-		uv_img, uv_mask = inv_map.inverse_map_autograd(xy_lr=res.xy_lr, h_out=h_img, w_out=w_img, iters=int(iters))
+	def _save_img_loss_vis(*, iters: int | None = None, postfix2: str | None = None) -> None:
+		it_label = "default" if iters is None else f"it{int(iters)}"
+		p2 = str(postfix2) if postfix2 is not None else f"{postfix}_{it_label}"
+		inv_kwargs: dict[str, object] = {"xy_lr": res.xy_lr, "h_out": h_img, "w_out": w_img}
+		if iters is not None:
+			inv_kwargs["iters"] = int(iters)
+		uv_img, uv_mask = inv_map.inverse_map_autograd(**inv_kwargs)
 		uv_img_nchw = uv_img.permute(0, 3, 1, 2).contiguous()
 		uv_img_nchw = torch.nn.functional.interpolate(uv_img_nchw, size=(h2, w2), mode="bilinear", align_corners=True)
 		uv_img = uv_img_nchw.permute(0, 2, 3, 1).contiguous()
@@ -335,7 +340,7 @@ def save(
 
 		if not img_loss_layers:
 			return
-		out_path_img = out_img_loss / f"res_img_loss_{postfix2}.tif"
+		out_path_img = out_img_loss / f"res_img_loss_{p2}.tif"
 		with tifffile.TiffWriter(str(out_path_img), bigtiff=False) as tw:
 			for name, layer in zip(img_loss_names, img_loss_layers, strict=True):
 				page_name = str(name)
@@ -440,8 +445,7 @@ def save(
 		},
 	}
 
-	_save_img_loss_vis(iters=0, postfix2=f"{postfix}_it0")
-	_save_img_loss_vis(iters=1000, postfix2=f"{postfix}_it50")
+	_save_img_loss_vis()
 
 	for _k, spec in loss_maps.items():
 		m = spec["fn"]().detach().cpu()
