@@ -1,6 +1,6 @@
 {
 	"base": {
-		"dir_v": 1.0,
+		"dir_v": 100.0,
 		"dir_conn": 0.1,
 		"step": 0.1,
 		"smooth_x": 0.0,
@@ -13,13 +13,14 @@
 		"conn_sy_r": 0.0,
 		"angle": 0.001,
 		"y_straight": 0.0,
-		"data": 1.0,
+		"data": 2.0,
+		"data_plain": 2.0,
 		"data_grad": 0.0
 	},
 	"stages": [
 		{
 			"name": "sd0",
-			"steps": 5000,
+			"steps": 10000,
 			"lr": 0.01,
 			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 			"min_scaledown": 0,
