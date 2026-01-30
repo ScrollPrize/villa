@@ -1,6 +1,7 @@
 #pragma once
 
 #include "elements/JsonProfileEditor.hpp"
+#include "elements/UserProfileStore.hpp"
 
 #include <QObject>
 #include <QString>
@@ -116,6 +117,14 @@ inline QString tracerParamProfileJson(const QString& profileId)
         }
     }
     return QString();
+}
+
+inline bool isValidProfileId(const QString& profileId)
+{
+    if (vc3d::user_profiles::isUserProfileId(profileId)) {
+        return true;
+    }
+    return isTracerParamProfileId(profileId);
 }
 
 } // namespace vc3d::json_profiles

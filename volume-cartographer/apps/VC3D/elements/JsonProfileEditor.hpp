@@ -4,6 +4,7 @@
 #include <QComboBox>
 #include <QLabel>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QJsonObject>
 #include <QVector>
 
@@ -35,9 +36,12 @@ public:
     bool isValid() const;
     QString errorText() const;
 
+    void loadUserProfiles();
+
 signals:
     void profileChanged(const QString& profileId);
     void textChanged();
+    void userProfilesChanged();
 
 private:
     void applyProfile(const QString& profileId, bool fromUi);
@@ -46,10 +50,20 @@ private:
     const Profile* findProfile(const QString& id) const;
     void updateStatusLabel();
 
+    void onSaveAs();
+    void onRename();
+    void onDelete();
+    void updateUserProfileButtons();
+    bool isUserProfile() const;
+
     QLabel* _description{nullptr};
     QComboBox* _profileCombo{nullptr};
     QPlainTextEdit* _textEdit{nullptr};
     QLabel* _statusLabel{nullptr};
+
+    QPushButton* _saveAsBtn{nullptr};
+    QPushButton* _renameBtn{nullptr};
+    QPushButton* _deleteBtn{nullptr};
 
     QVector<Profile> _profiles;
     QString _profileId{QStringLiteral("custom")};

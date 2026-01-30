@@ -1351,7 +1351,7 @@ QString SegmentationWidget::paramsTextForProfile(const QString& profile) const
 
 void SegmentationWidget::applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi)
 {
-    const QString normalized = vc3d::json_profiles::isTracerParamProfileId(profile)
+    const QString normalized = vc3d::json_profiles::isValidProfileId(profile)
         ? profile
         : QStringLiteral("custom");
 
@@ -1481,7 +1481,7 @@ void SegmentationWidget::restoreSettings()
 
     _customParamsText = settings.value(segmentation::CUSTOM_PARAMS_TEXT, QString()).toString();
     _customParamsProfile = settings.value(QStringLiteral("custom_params_profile"), _customParamsProfile).toString();
-    if (!vc3d::json_profiles::isTracerParamProfileId(_customParamsProfile)) {
+    if (!vc3d::json_profiles::isValidProfileId(_customParamsProfile)) {
         _customParamsProfile = QStringLiteral("custom");
     }
     if (_customParamsEditor) {
