@@ -15,6 +15,16 @@ def data_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tens
 	return lm * mask, mask
 
 
+def data_plain_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Return (lm, mask) for MSE between sampled cosine and target_plain."""
+	pred = res.data_s.cos
+	tgt = res.target_plain
+	d = pred - tgt
+	lm = d * d
+	mask = res.mask_hr
+	return lm * mask, mask
+
+
 def data_grad_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (lm, mask) for gradient matching between sampled cosine and target_mod.
 
@@ -60,6 +70,11 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def data_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = data_loss_map(res=res)
+	return _masked_mean(lm, mask)
+
+
+def data_plain_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+	lm, mask = data_plain_loss_map(res=res)
 	return _masked_mean(lm, mask)
 
 

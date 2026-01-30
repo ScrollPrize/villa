@@ -12,8 +12,9 @@
 		"conn_sy_r": 0.0,
 		"angle": 0.001,
 		"y_straight": 0.0,
-		"data": 1.0,
-		"data_grad": 0.1
+		"data": 0.1,
+		"data_plain": 0.1,
+		"data_grad": 0.0
 	},
 	"stages": [
 		{
