@@ -27,6 +27,8 @@ class QSpinBox;
 class QToolButton;
 class CollapsibleSettingsGroup;
 class JsonProfileEditor;
+class SegmentationHeaderRow;
+class SegmentationGrowthPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -295,38 +297,8 @@ private:
     bool _updatingDirectionFieldForm{false};
     bool _restoringSettings{false};
 
-    QCheckBox* _chkEditing{nullptr};
-    QLabel* _lblStatus{nullptr};
-    QGroupBox* _groupGrowth{nullptr};
-    QSpinBox* _spinGrowthSteps{nullptr};
-    QComboBox* _comboGrowthMethod{nullptr};
-    QWidget* _extrapolationOptionsPanel{nullptr};
-    QLabel* _lblExtrapolationPoints{nullptr};
-    QSpinBox* _spinExtrapolationPoints{nullptr};
-    QComboBox* _comboExtrapolationType{nullptr};
-    QWidget* _sdtParamsContainer{nullptr};
-    QSpinBox* _spinSDTMaxSteps{nullptr};
-    QDoubleSpinBox* _spinSDTStepSize{nullptr};
-    QDoubleSpinBox* _spinSDTConvergence{nullptr};
-    QSpinBox* _spinSDTChunkSize{nullptr};
-    QWidget* _skeletonParamsContainer{nullptr};
-    QComboBox* _comboSkeletonConnectivity{nullptr};
-    QComboBox* _comboSkeletonSliceOrientation{nullptr};
-    QSpinBox* _spinSkeletonChunkSize{nullptr};
-    QSpinBox* _spinSkeletonSearchRadius{nullptr};
-    QPushButton* _btnGrow{nullptr};
-    QPushButton* _btnInpaint{nullptr};
-    QCheckBox* _chkGrowthDirUp{nullptr};
-    QCheckBox* _chkGrowthDirDown{nullptr};
-    QCheckBox* _chkGrowthDirLeft{nullptr};
-    QCheckBox* _chkGrowthDirRight{nullptr};
-    QCheckBox* _chkGrowthKeybindsEnabled{nullptr};
-    QComboBox* _comboVolumes{nullptr};
-    QLabel* _lblNormalGrid{nullptr};
-    QLineEdit* _editNormalGridPath{nullptr};
-    QLabel* _lblNormal3d{nullptr};
-    QComboBox* _comboNormal3d{nullptr};
-    QLineEdit* _editNormal3dPath{nullptr};
+    SegmentationHeaderRow* _headerRow{nullptr};
+    SegmentationGrowthPanel* _growthPanel{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
 
     CollapsibleSettingsGroup* _groupEditing{nullptr};
@@ -345,9 +317,6 @@ private:
     QComboBox* _comboCorrections{nullptr};
     QPushButton* _btnCorrectionsNew{nullptr};
     QCheckBox* _chkCorrectionsAnnotate{nullptr};
-    QCheckBox* _chkCorrectionsUseZRange{nullptr};
-    QSpinBox* _spinCorrectionsZMin{nullptr};
-    QSpinBox* _spinCorrectionsZMax{nullptr};
 
     CollapsibleSettingsGroup* _groupDrag{nullptr};
     CollapsibleSettingsGroup* _groupLine{nullptr};

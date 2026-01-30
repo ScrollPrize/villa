@@ -38,6 +38,10 @@ set(srcs
     DrawingWidget.hpp
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp
+    segmentation/tools/SegmentationHeaderRow.cpp
+    segmentation/tools/SegmentationHeaderRow.hpp
+    segmentation/tools/SegmentationGrowthPanel.cpp
+    segmentation/tools/SegmentationGrowthPanel.hpp
     segmentation/SegmentationGrowth.cpp
     segmentation/ExtrapolationGrowth.cpp
     segmentation/ExtrapolationGrowth.hpp

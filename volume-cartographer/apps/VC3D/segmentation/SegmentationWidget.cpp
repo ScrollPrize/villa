@@ -3,8 +3,9 @@
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "elements/JsonProfileEditor.hpp"
 #include "elements/JsonProfilePresets.hpp"
-#include "elements/VolumeSelector.hpp"
 #include "NeuralTraceServiceManager.hpp"
+#include "tools/SegmentationGrowthPanel.hpp"
+#include "tools/SegmentationHeaderRow.hpp"
 #include "VCSettings.hpp"
 
 #include <QAbstractItemView>
@@ -180,9 +181,10 @@ void SegmentationWidget::applyGrowthSteps(int steps, bool persist, bool fromUi)
     const int minimum = (_growthMethod == SegmentationGrowthMethod::Corrections) ? 0 : 1;
     const int clamped = std::clamp(steps, minimum, 1024);
 
-    if ((!fromUi || clamped != steps) && _spinGrowthSteps) {
-        QSignalBlocker blocker(_spinGrowthSteps);
-        _spinGrowthSteps->setValue(clamped);
+    QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr;
+    if ((!fromUi || clamped != steps) && growthStepsSpin) {
+        QSignalBlocker blocker(growthStepsSpin);
+        growthStepsSpin->setValue(clamped);
     }
 
     if (clamped > 0) {
@@ -217,282 +219,11 @@ void SegmentationWidget::buildUi()
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(12);
 
-    auto* editingRow = new QHBoxLayout();
-    _chkEditing = new QCheckBox(tr("Enable editing"), this);
-    _chkEditing->setToolTip(tr("Start or stop segmentation editing so brush tools can modify surfaces."));
-    _lblStatus = new QLabel(this);
-    _lblStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    editingRow->addWidget(_chkEditing);
-    editingRow->addSpacing(8);
-    editingRow->addWidget(_lblStatus, 1);
-    layout->addLayout(editingRow);
+    _headerRow = new SegmentationHeaderRow(this);
+    layout->addWidget(_headerRow);
 
-    _groupGrowth = new QGroupBox(tr("Surface Growth"), this);
-    auto* growthLayout = new QVBoxLayout(_groupGrowth);
-
-    // Method selection row
-    auto* methodRow = new QHBoxLayout();
-    auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
-    _comboGrowthMethod = new QComboBox(_groupGrowth);
-    _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
-    _comboGrowthMethod->addItem(tr("Extrapolation"), static_cast<int>(SegmentationGrowthMethod::Extrapolation));
-    _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
-                                      "- Tracer: Neural-guided growth using volume data\n"
-                                      "- Extrapolation: Simple polynomial extrapolation from boundary points"));
-    methodRow->addWidget(methodLabel);
-    methodRow->addWidget(_comboGrowthMethod);
-    methodRow->addStretch(1);
-    growthLayout->addLayout(methodRow);
-
-    // Extrapolation options panel (shown only when Extrapolation method is selected)
-    _extrapolationOptionsPanel = new QWidget(_groupGrowth);
-    auto* extrapLayout = new QHBoxLayout(_extrapolationOptionsPanel);
-    extrapLayout->setContentsMargins(0, 0, 0, 0);
-    _lblExtrapolationPoints = new QLabel(tr("Fit points:"), _extrapolationOptionsPanel);
-    _spinExtrapolationPoints = new QSpinBox(_extrapolationOptionsPanel);
-    _spinExtrapolationPoints->setRange(3, 20);
-    _spinExtrapolationPoints->setValue(7);
-    _spinExtrapolationPoints->setToolTip(tr("Number of boundary points to use for polynomial fitting."));
-    auto* typeLabel = new QLabel(tr("Type:"), _extrapolationOptionsPanel);
-    _comboExtrapolationType = new QComboBox(_extrapolationOptionsPanel);
-    _comboExtrapolationType->addItem(tr("Linear"), static_cast<int>(ExtrapolationType::Linear));
-    _comboExtrapolationType->addItem(tr("Quadratic"), static_cast<int>(ExtrapolationType::Quadratic));
-    _comboExtrapolationType->addItem(tr("Linear+Fit"), static_cast<int>(ExtrapolationType::LinearFit));
-    _comboExtrapolationType->addItem(tr("Skeleton Path"), static_cast<int>(ExtrapolationType::SkeletonPath));
-    _comboExtrapolationType->setToolTip(tr("Extrapolation method:\n"
-                                           "- Linear: Fit a straight line (faster, simpler)\n"
-                                           "- Quadratic: Fit a parabola (better for curved surfaces)\n"
-                                           "- Linear+Fit: Linear extrapolation + Newton refinement to fit selected volume\n"
-                                           "- Skeleton Path: Use 2D skeleton analysis + 3D Dijkstra path following"));
-    extrapLayout->addWidget(_lblExtrapolationPoints);
-    extrapLayout->addWidget(_spinExtrapolationPoints);
-    extrapLayout->addSpacing(12);
-    extrapLayout->addWidget(typeLabel);
-    extrapLayout->addWidget(_comboExtrapolationType);
-    extrapLayout->addStretch(1);
-    growthLayout->addWidget(_extrapolationOptionsPanel);
-    _extrapolationOptionsPanel->setVisible(false);
-
-    // SDT/Newton refinement params (shown only when Linear+Fit is selected)
-    _sdtParamsContainer = new QWidget(_groupGrowth);
-    auto* sdtLayout = new QHBoxLayout(_sdtParamsContainer);
-    sdtLayout->setContentsMargins(0, 0, 0, 0);
-
-    auto* maxStepsLabel = new QLabel(tr("Newton steps:"), _sdtParamsContainer);
-    _spinSDTMaxSteps = new QSpinBox(_sdtParamsContainer);
-    _spinSDTMaxSteps->setRange(1, 10);
-    _spinSDTMaxSteps->setValue(5);
-    _spinSDTMaxSteps->setToolTip(tr("Maximum Newton iterations for surface refinement (1-10)."));
-
-    auto* stepSizeLabel = new QLabel(tr("Step size:"), _sdtParamsContainer);
-    _spinSDTStepSize = new QDoubleSpinBox(_sdtParamsContainer);
-    _spinSDTStepSize->setRange(0.1, 2.0);
-    _spinSDTStepSize->setSingleStep(0.1);
-    _spinSDTStepSize->setValue(0.8);
-    _spinSDTStepSize->setToolTip(tr("Newton step size multiplier (0.1-2.0). Smaller values are more stable."));
-
-    auto* convergenceLabel = new QLabel(tr("Convergence:"), _sdtParamsContainer);
-    _spinSDTConvergence = new QDoubleSpinBox(_sdtParamsContainer);
-    _spinSDTConvergence->setRange(0.1, 2.0);
-    _spinSDTConvergence->setSingleStep(0.1);
-    _spinSDTConvergence->setValue(0.5);
-    _spinSDTConvergence->setToolTip(tr("Stop refinement when distance < this threshold in voxels (0.1-2.0)."));
-
-    auto* chunkSizeLabel = new QLabel(tr("Chunk:"), _sdtParamsContainer);
-    _spinSDTChunkSize = new QSpinBox(_sdtParamsContainer);
-    _spinSDTChunkSize->setRange(32, 256);
-    _spinSDTChunkSize->setSingleStep(32);
-    _spinSDTChunkSize->setValue(128);
-    _spinSDTChunkSize->setToolTip(tr("Size of SDT chunks in voxels (32-256). Larger = faster but more memory."));
-
-    sdtLayout->addWidget(maxStepsLabel);
-    sdtLayout->addWidget(_spinSDTMaxSteps);
-    sdtLayout->addSpacing(8);
-    sdtLayout->addWidget(stepSizeLabel);
-    sdtLayout->addWidget(_spinSDTStepSize);
-    sdtLayout->addSpacing(8);
-    sdtLayout->addWidget(convergenceLabel);
-    sdtLayout->addWidget(_spinSDTConvergence);
-    sdtLayout->addSpacing(8);
-    sdtLayout->addWidget(chunkSizeLabel);
-    sdtLayout->addWidget(_spinSDTChunkSize);
-    sdtLayout->addStretch(1);
-    growthLayout->addWidget(_sdtParamsContainer);
-    _sdtParamsContainer->setVisible(false);
-
-    // Skeleton path params (shown only when Skeleton Path is selected)
-    _skeletonParamsContainer = new QWidget(_groupGrowth);
-    auto* skeletonLayout = new QHBoxLayout(_skeletonParamsContainer);
-    skeletonLayout->setContentsMargins(0, 0, 0, 0);
-
-    auto* connectivityLabel = new QLabel(tr("Connectivity:"), _skeletonParamsContainer);
-    _comboSkeletonConnectivity = new QComboBox(_skeletonParamsContainer);
-    _comboSkeletonConnectivity->addItem(tr("6"), 6);
-    _comboSkeletonConnectivity->addItem(tr("18"), 18);
-    _comboSkeletonConnectivity->addItem(tr("26"), 26);
-    _comboSkeletonConnectivity->setCurrentIndex(2);  // Default to 26
-    _comboSkeletonConnectivity->setToolTip(tr("3D neighborhood connectivity for Dijkstra pathfinding:\n"
-                                              "- 6: Face neighbors only\n"
-                                              "- 18: Face + edge neighbors\n"
-                                              "- 26: Face + edge + corner neighbors"));
-
-    auto* sliceOrientLabel = new QLabel(tr("Up/Down slice:"), _skeletonParamsContainer);
-    _comboSkeletonSliceOrientation = new QComboBox(_skeletonParamsContainer);
-    _comboSkeletonSliceOrientation->addItem(tr("YZ (X-slice)"), 0);
-    _comboSkeletonSliceOrientation->addItem(tr("XZ (Y-slice)"), 1);
-    _comboSkeletonSliceOrientation->setToolTip(tr("For Up/Down growth, which plane to use for 2D skeleton analysis:\n"
-                                                   "- YZ (X-slice): Extract slice perpendicular to X axis\n"
-                                                   "- XZ (Y-slice): Extract slice perpendicular to Y axis\n"
-                                                   "(Left/Right growth always uses XY Z-slices)"));
-
-    auto* skeletonChunkLabel = new QLabel(tr("Chunk:"), _skeletonParamsContainer);
-    _spinSkeletonChunkSize = new QSpinBox(_skeletonParamsContainer);
-    _spinSkeletonChunkSize->setRange(32, 256);
-    _spinSkeletonChunkSize->setSingleStep(32);
-    _spinSkeletonChunkSize->setValue(128);
-    _spinSkeletonChunkSize->setToolTip(tr("Size of chunks for binary volume loading (32-256). Larger = faster but more memory."));
-
-    auto* searchRadiusLabel = new QLabel(tr("Search:"), _skeletonParamsContainer);
-    _spinSkeletonSearchRadius = new QSpinBox(_skeletonParamsContainer);
-    _spinSkeletonSearchRadius->setRange(1, 100);
-    _spinSkeletonSearchRadius->setSingleStep(1);
-    _spinSkeletonSearchRadius->setValue(5);
-    _spinSkeletonSearchRadius->setToolTip(tr("When starting point is on background, search this many pixels for nearest component (1-100)."));
-
-    skeletonLayout->addWidget(connectivityLabel);
-    skeletonLayout->addWidget(_comboSkeletonConnectivity);
-    skeletonLayout->addSpacing(12);
-    skeletonLayout->addWidget(sliceOrientLabel);
-    skeletonLayout->addWidget(_comboSkeletonSliceOrientation);
-    skeletonLayout->addSpacing(12);
-    skeletonLayout->addWidget(skeletonChunkLabel);
-    skeletonLayout->addWidget(_spinSkeletonChunkSize);
-    skeletonLayout->addSpacing(12);
-    skeletonLayout->addWidget(searchRadiusLabel);
-    skeletonLayout->addWidget(_spinSkeletonSearchRadius);
-    skeletonLayout->addStretch(1);
-    growthLayout->addWidget(_skeletonParamsContainer);
-    _skeletonParamsContainer->setVisible(false);
-
-    auto* dirRow = new QHBoxLayout();
-    auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
-    _spinGrowthSteps = new QSpinBox(_groupGrowth);
-    _spinGrowthSteps->setRange(0, 1024);
-    _spinGrowthSteps->setSingleStep(1);
-    _spinGrowthSteps->setToolTip(tr("Number of iterations to run when growing the segmentation."));
-    dirRow->addWidget(stepsLabel);
-    dirRow->addWidget(_spinGrowthSteps);
-    dirRow->addSpacing(16);
-
-    auto* dirLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
-    dirRow->addWidget(dirLabel);
-    auto addDirectionCheckbox = [&](const QString& text) {
-        auto* box = new QCheckBox(text, _groupGrowth);
-        dirRow->addWidget(box);
-        return box;
-    };
-    _chkGrowthDirUp = addDirectionCheckbox(tr("Up"));
-    _chkGrowthDirUp->setToolTip(tr("Allow growth steps to move upward along the volume."));
-    _chkGrowthDirDown = addDirectionCheckbox(tr("Down"));
-    _chkGrowthDirDown->setToolTip(tr("Allow growth steps to move downward along the volume."));
-    _chkGrowthDirLeft = addDirectionCheckbox(tr("Left"));
-    _chkGrowthDirLeft->setToolTip(tr("Allow growth steps to move left across the volume."));
-    _chkGrowthDirRight = addDirectionCheckbox(tr("Right"));
-    _chkGrowthDirRight->setToolTip(tr("Allow growth steps to move right across the volume."));
-    dirRow->addStretch(1);
-    growthLayout->addLayout(dirRow);
-
-    auto* keybindsRow = new QHBoxLayout();
-    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6)"), _groupGrowth);
-    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions."));
-    _chkGrowthKeybindsEnabled->setChecked(_growthKeybindsEnabled);
-    keybindsRow->addWidget(_chkGrowthKeybindsEnabled);
-    keybindsRow->addStretch(1);
-    growthLayout->addLayout(keybindsRow);
-
-    auto* zRow = new QHBoxLayout();
-    _chkCorrectionsUseZRange = new QCheckBox(tr("Limit Z range"), _groupGrowth);
-    _chkCorrectionsUseZRange->setToolTip(tr("Restrict growth requests to the specified slice range."));
-    zRow->addWidget(_chkCorrectionsUseZRange);
-    zRow->addSpacing(12);
-    auto* zMinLabel = new QLabel(tr("Z min"), _groupGrowth);
-    _spinCorrectionsZMin = new QSpinBox(_groupGrowth);
-    _spinCorrectionsZMin->setRange(-100000, 100000);
-    _spinCorrectionsZMin->setToolTip(tr("Lowest slice index used when Z range limits are enabled."));
-    auto* zMaxLabel = new QLabel(tr("Z max"), _groupGrowth);
-    _spinCorrectionsZMax = new QSpinBox(_groupGrowth);
-    _spinCorrectionsZMax->setRange(-100000, 100000);
-    _spinCorrectionsZMax->setToolTip(tr("Highest slice index used when Z range limits are enabled."));
-    zRow->addWidget(zMinLabel);
-    zRow->addWidget(_spinCorrectionsZMin);
-    zRow->addSpacing(8);
-    zRow->addWidget(zMaxLabel);
-    zRow->addWidget(_spinCorrectionsZMax);
-    zRow->addStretch(1);
-    growthLayout->addLayout(zRow);
-
-    auto* growButtonsRow = new QHBoxLayout();
-    _btnGrow = new QPushButton(tr("Grow"), _groupGrowth);
-    _btnGrow->setToolTip(tr("Run surface growth using the configured steps and directions."));
-    growButtonsRow->addWidget(_btnGrow);
-
-    _btnInpaint = new QPushButton(tr("Inpaint"), _groupGrowth);
-    _btnInpaint->setToolTip(tr("Resume the current surface and run tracer inpainting without additional growth."));
-    growButtonsRow->addWidget(_btnInpaint);
-    growButtonsRow->addStretch(1);
-    growthLayout->addLayout(growButtonsRow);
-
-    auto* volumeRow = new QHBoxLayout();
-    auto* volumeLabel = new QLabel(tr("Volume:"), _groupGrowth);
-    auto* volumeSelector = new VolumeSelector(_groupGrowth);
-    volumeSelector->setLabelVisible(false);
-    _comboVolumes = volumeSelector->comboBox();
-    _comboVolumes->setEnabled(false);
-    _comboVolumes->setToolTip(tr("Select which volume provides source data for segmentation growth."));
-    volumeRow->addWidget(volumeLabel);
-    volumeRow->addWidget(volumeSelector, 1);
-    growthLayout->addLayout(volumeRow);
-
-    _groupGrowth->setLayout(growthLayout);
-    layout->addWidget(_groupGrowth);
-
-    {
-        auto* normalGridRow = new QHBoxLayout();
-        _lblNormalGrid = new QLabel(this);
-        _lblNormalGrid->setTextFormat(Qt::RichText);
-        _lblNormalGrid->setToolTip(tr("Shows whether precomputed normal grids are available for push/pull tools."));
-        _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        normalGridRow->addWidget(_lblNormalGrid, 0);
-
-        _editNormalGridPath = new QLineEdit(this);
-        _editNormalGridPath->setReadOnly(true);
-        _editNormalGridPath->setClearButtonEnabled(false);
-        _editNormalGridPath->setVisible(false);
-        normalGridRow->addWidget(_editNormalGridPath, 1);
-        layout->addLayout(normalGridRow);
-    }
-
-    // Normal3D zarr selection (optional)
-    {
-        auto* normal3dRow = new QHBoxLayout();
-        _lblNormal3d = new QLabel(this);
-        _lblNormal3d->setTextFormat(Qt::RichText);
-        _lblNormal3d->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        normal3dRow->addWidget(_lblNormal3d, 0);
-
-        _editNormal3dPath = new QLineEdit(this);
-        _editNormal3dPath->setReadOnly(true);
-        _editNormal3dPath->setClearButtonEnabled(false);
-        _editNormal3dPath->setVisible(false);
-        normal3dRow->addWidget(_editNormal3dPath, 1);
-
-        _comboNormal3d = new QComboBox(this);
-        _comboNormal3d->setToolTip(tr("Select Normal3D zarr volume to use for normal3dline constraints."));
-        _comboNormal3d->setVisible(false);
-        normal3dRow->addWidget(_comboNormal3d, 0);
-
-        layout->addLayout(normal3dRow);
-    }
+    _growthPanel = new SegmentationGrowthPanel(_growthKeybindsEnabled, this);
+    layout->addWidget(_growthPanel);
 
     auto* hoverRow = new QHBoxLayout();
     hoverRow->addSpacing(4);
@@ -1087,7 +818,7 @@ void SegmentationWidget::buildUi()
 
     layout->addStretch(1);
 
-    connect(_chkEditing, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_headerRow, &SegmentationHeaderRow::editingToggled, this, [this](bool enabled) {
         updateEditingState(enabled, true);
     });
     connect(_chkShowHoverMarker, &QCheckBox::toggled, this, [this](bool enabled) {
@@ -1204,94 +935,129 @@ void SegmentationWidget::buildUi()
             updateGrowthDirectionMaskFromUi(box);
         });
     };
-    connectDirectionCheckbox(_chkGrowthDirUp);
-    connectDirectionCheckbox(_chkGrowthDirDown);
-    connectDirectionCheckbox(_chkGrowthDirLeft);
-    connectDirectionCheckbox(_chkGrowthDirRight);
+    QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr;
+    QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr;
+    QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr;
+    QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr;
+    connectDirectionCheckbox(growthDirUp);
+    connectDirectionCheckbox(growthDirDown);
+    connectDirectionCheckbox(growthDirLeft);
+    connectDirectionCheckbox(growthDirRight);
 
-    connect(_chkGrowthKeybindsEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        _growthKeybindsEnabled = checked;
-        writeSetting(QStringLiteral("growth_keybinds_enabled"), _growthKeybindsEnabled);
-    });
+    if (QCheckBox* growthKeybinds = _growthPanel ? _growthPanel->growthKeybindsCheck() : nullptr) {
+        connect(growthKeybinds, &QCheckBox::toggled, this, [this](bool checked) {
+            _growthKeybindsEnabled = checked;
+            writeSetting(QStringLiteral("growth_keybinds_enabled"), _growthKeybindsEnabled);
+        });
+    }
 
-    connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
-            [this](int value) { applyGrowthSteps(value, true, true); });
+    if (QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr) {
+        connect(growthStepsSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                [this](int value) { applyGrowthSteps(value, true, true); });
+    }
 
-    connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-            [this](int index) {
-                const auto method = static_cast<SegmentationGrowthMethod>(
-                    _comboGrowthMethod->itemData(index).toInt());
-                setGrowthMethod(method);
-            });
+    if (QComboBox* growthMethodCombo = _growthPanel ? _growthPanel->growthMethodCombo() : nullptr) {
+        connect(growthMethodCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this, growthMethodCombo](int index) {
+                    const auto method = static_cast<SegmentationGrowthMethod>(
+                        growthMethodCombo->itemData(index).toInt());
+                    setGrowthMethod(method);
+                });
+    }
 
-    connect(_spinExtrapolationPoints, QOverload<int>::of(&QSpinBox::valueChanged), this,
-            [this](int value) {
-                _extrapolationPointCount = std::clamp(value, 3, 20);
-                writeSetting(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount);
-            });
+    if (QSpinBox* extrapPointsSpinControl = _growthPanel ? _growthPanel->extrapolationPointsSpin() : nullptr) {
+        connect(extrapPointsSpinControl, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                [this](int value) {
+                    _extrapolationPointCount = std::clamp(value, 3, 20);
+                    writeSetting(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount);
+                });
+    }
 
-    connect(_comboExtrapolationType, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-            [this](int index) {
-                _extrapolationType = extrapolationTypeFromInt(
-                    _comboExtrapolationType->itemData(index).toInt());
-                writeSetting(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType));
-                // Show SDT params only when Extrapolation method AND Linear+Fit type
-                if (_sdtParamsContainer) {
-                    _sdtParamsContainer->setVisible(
-                        _growthMethod == SegmentationGrowthMethod::Extrapolation &&
-                        _extrapolationType == ExtrapolationType::LinearFit);
-                }
-                // Show skeleton params only when Extrapolation method AND SkeletonPath type
-                if (_skeletonParamsContainer) {
-                    _skeletonParamsContainer->setVisible(
-                        _growthMethod == SegmentationGrowthMethod::Extrapolation &&
-                        _extrapolationType == ExtrapolationType::SkeletonPath);
-                }
-                // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
-                bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
-                if (_lblExtrapolationPoints) {
-                    _lblExtrapolationPoints->setVisible(showFitPoints);
-                }
-                if (_spinExtrapolationPoints) {
-                    _spinExtrapolationPoints->setVisible(showFitPoints);
-                }
-            });
+    QComboBox* extrapTypeCombo = _growthPanel ? _growthPanel->extrapolationTypeCombo() : nullptr;
+    QWidget* sdtParamsContainer = _growthPanel ? _growthPanel->sdtParamsContainer() : nullptr;
+    QWidget* skeletonParamsContainer = _growthPanel ? _growthPanel->skeletonParamsContainer() : nullptr;
+    QLabel* extrapPointsLabel = _growthPanel ? _growthPanel->extrapolationPointsLabel() : nullptr;
+    QSpinBox* extrapPointsSpin = _growthPanel ? _growthPanel->extrapolationPointsSpin() : nullptr;
+    if (extrapTypeCombo) {
+        connect(extrapTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this, extrapTypeCombo, sdtParamsContainer, skeletonParamsContainer, extrapPointsLabel, extrapPointsSpin](int index) {
+                    _extrapolationType = extrapolationTypeFromInt(
+                        extrapTypeCombo->itemData(index).toInt());
+                    writeSetting(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType));
+                    // Show SDT params only when Extrapolation method AND Linear+Fit type
+                    if (sdtParamsContainer) {
+                        sdtParamsContainer->setVisible(
+                            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+                            _extrapolationType == ExtrapolationType::LinearFit);
+                    }
+                    // Show skeleton params only when Extrapolation method AND SkeletonPath type
+                    if (skeletonParamsContainer) {
+                        skeletonParamsContainer->setVisible(
+                            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
+                            _extrapolationType == ExtrapolationType::SkeletonPath);
+                    }
+                    // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
+                    bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
+                    if (extrapPointsLabel) {
+                        extrapPointsLabel->setVisible(showFitPoints);
+                    }
+                    if (extrapPointsSpin) {
+                        extrapPointsSpin->setVisible(showFitPoints);
+                    }
+                });
+    }
 
     // SDT/Newton refinement parameter connections
-    connect(_spinSDTMaxSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        _sdtMaxSteps = std::clamp(value, 1, 10);
-        writeSetting(QStringLiteral("sdt_max_steps"), _sdtMaxSteps);
-    });
-    connect(_spinSDTStepSize, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        _sdtStepSize = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
-        writeSetting(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize));
-    });
-    connect(_spinSDTConvergence, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        _sdtConvergence = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
-        writeSetting(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence));
-    });
-    connect(_spinSDTChunkSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        _sdtChunkSize = std::clamp(value, 32, 256);
-        writeSetting(QStringLiteral("sdt_chunk_size"), _sdtChunkSize);
-    });
+    if (QSpinBox* sdtMaxStepsSpin = _growthPanel ? _growthPanel->sdtMaxStepsSpin() : nullptr) {
+        connect(sdtMaxStepsSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            _sdtMaxSteps = std::clamp(value, 1, 10);
+            writeSetting(QStringLiteral("sdt_max_steps"), _sdtMaxSteps);
+        });
+    }
+    if (QDoubleSpinBox* sdtStepSizeSpin = _growthPanel ? _growthPanel->sdtStepSizeSpin() : nullptr) {
+        connect(sdtStepSizeSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            _sdtStepSize = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
+            writeSetting(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize));
+        });
+    }
+    if (QDoubleSpinBox* sdtConvergenceSpin = _growthPanel ? _growthPanel->sdtConvergenceSpin() : nullptr) {
+        connect(sdtConvergenceSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            _sdtConvergence = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
+            writeSetting(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence));
+        });
+    }
+    if (QSpinBox* sdtChunkSpin = _growthPanel ? _growthPanel->sdtChunkSizeSpin() : nullptr) {
+        connect(sdtChunkSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            _sdtChunkSize = std::clamp(value, 32, 256);
+            writeSetting(QStringLiteral("sdt_chunk_size"), _sdtChunkSize);
+        });
+    }
 
     // Skeleton path parameter connections
-    connect(_comboSkeletonConnectivity, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _skeletonConnectivity = _comboSkeletonConnectivity->itemData(index).toInt();
-        writeSetting(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity);
-    });
-    connect(_comboSkeletonSliceOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _skeletonSliceOrientation = _comboSkeletonSliceOrientation->itemData(index).toInt();
-        writeSetting(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation);
-    });
-    connect(_spinSkeletonChunkSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        _skeletonChunkSize = std::clamp(value, 32, 256);
-        writeSetting(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize);
-    });
-    connect(_spinSkeletonSearchRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        _skeletonSearchRadius = std::clamp(value, 1, 100);
-        writeSetting(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius);
-    });
+    if (QComboBox* skeletonConnCombo = _growthPanel ? _growthPanel->skeletonConnectivityCombo() : nullptr) {
+        connect(skeletonConnCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, skeletonConnCombo](int index) {
+            _skeletonConnectivity = skeletonConnCombo->itemData(index).toInt();
+            writeSetting(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity);
+        });
+    }
+    if (QComboBox* skeletonSliceCombo = _growthPanel ? _growthPanel->skeletonSliceOrientationCombo() : nullptr) {
+        connect(skeletonSliceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, skeletonSliceCombo](int index) {
+            _skeletonSliceOrientation = skeletonSliceCombo->itemData(index).toInt();
+            writeSetting(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation);
+        });
+    }
+    if (QSpinBox* skeletonChunkSpin = _growthPanel ? _growthPanel->skeletonChunkSizeSpin() : nullptr) {
+        connect(skeletonChunkSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            _skeletonChunkSize = std::clamp(value, 32, 256);
+            writeSetting(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize);
+        });
+    }
+    if (QSpinBox* skeletonSearchSpin = _growthPanel ? _growthPanel->skeletonSearchRadiusSpin() : nullptr) {
+        connect(skeletonSearchSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            _skeletonSearchRadius = std::clamp(value, 1, 100);
+            writeSetting(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius);
+        });
+    }
 
     const auto triggerConfiguredGrowth = [this]() {
         const auto allowed = allowedGrowthDirections();
@@ -1302,22 +1068,28 @@ void SegmentationWidget::buildUi()
         triggerGrowthRequest(direction, _growthSteps, false);
     };
 
-    connect(_btnGrow, &QPushButton::clicked, this, triggerConfiguredGrowth);
-    connect(_btnInpaint, &QPushButton::clicked, this, [this]() {
-        triggerGrowthRequest(SegmentationGrowthDirection::All, 0, true);
-    });
+    if (QPushButton* growButton = _growthPanel ? _growthPanel->growButton() : nullptr) {
+        connect(growButton, &QPushButton::clicked, this, triggerConfiguredGrowth);
+    }
+    if (QPushButton* inpaintButton = _growthPanel ? _growthPanel->inpaintButton() : nullptr) {
+        connect(inpaintButton, &QPushButton::clicked, this, [this]() {
+            triggerGrowthRequest(SegmentationGrowthDirection::All, 0, true);
+        });
+    }
 
-    connect(_comboVolumes, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
-        }
-        const QString volumeId = _comboVolumes->itemData(index).toString();
-        if (volumeId.isEmpty() || volumeId == _activeVolumeId) {
-            return;
-        }
-        _activeVolumeId = volumeId;
-        emit volumeSelectionChanged(volumeId);
-    });
+    if (QComboBox* volumesCombo = _growthPanel ? _growthPanel->volumesCombo() : nullptr) {
+        connect(volumesCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, volumesCombo](int index) {
+            if (index < 0) {
+                return;
+            }
+            const QString volumeId = volumesCombo->itemData(index).toString();
+            if (volumeId.isEmpty() || volumeId == _activeVolumeId) {
+                return;
+            }
+            _activeVolumeId = volumeId;
+            emit volumeSelectionChanged(volumeId);
+        });
+    }
 
     connect(_spinDragRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setDragRadius(static_cast<float>(value));
@@ -1512,54 +1284,62 @@ void SegmentationWidget::buildUi()
         applyCustomParamsProfile(profile, /*persist=*/true, /*fromUi=*/true);
     });
 
-    connect(_comboNormal3d, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
-        if (_restoringSettings) {
-            return;
-        }
-        if (!_comboNormal3d || idx < 0) {
-            return;
-        }
-        const QString path = _comboNormal3d->itemData(idx).toString();
-        if (path.isEmpty() || path == _normal3dSelectedPath) {
-            return;
-        }
-        _normal3dSelectedPath = path;
-        writeSetting(QStringLiteral("normal3d_selected_path"), _normal3dSelectedPath);
-        updateNormal3dUi();
-    });
+    if (QComboBox* normal3dCombo = _growthPanel ? _growthPanel->normal3dCombo() : nullptr) {
+        connect(normal3dCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, normal3dCombo](int idx) {
+            if (_restoringSettings) {
+                return;
+            }
+            if (idx < 0) {
+                return;
+            }
+            const QString path = normal3dCombo->itemData(idx).toString();
+            if (path.isEmpty() || path == _normal3dSelectedPath) {
+                return;
+            }
+            _normal3dSelectedPath = path;
+            writeSetting(QStringLiteral("normal3d_selected_path"), _normal3dSelectedPath);
+            updateNormal3dUi();
+        });
+    }
 
     connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
         emit correctionsAnnotateToggled(enabled);
     });
 
-    connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
-        _correctionsZRangeEnabled = enabled;
-        writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
-        updateGrowthUiState();
-        emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
-    });
+    if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
+        connect(correctionsZRange, &QCheckBox::toggled, this, [this](bool enabled) {
+            _correctionsZRangeEnabled = enabled;
+            writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
+            updateGrowthUiState();
+            emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
+        });
+    }
 
-    connect(_spinCorrectionsZMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (_correctionsZMin == value) {
-            return;
-        }
-        _correctionsZMin = value;
-        writeSetting(QStringLiteral("corrections_z_min"), _correctionsZMin);
-        if (_correctionsZRangeEnabled) {
-            emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
-        }
-    });
+    if (QSpinBox* correctionsZMinSpin = _growthPanel ? _growthPanel->correctionsZMinSpin() : nullptr) {
+        connect(correctionsZMinSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            if (_correctionsZMin == value) {
+                return;
+            }
+            _correctionsZMin = value;
+            writeSetting(QStringLiteral("corrections_z_min"), _correctionsZMin);
+            if (_correctionsZRangeEnabled) {
+                emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
+            }
+        });
+    }
 
-    connect(_spinCorrectionsZMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (_correctionsZMax == value) {
-            return;
-        }
-        _correctionsZMax = value;
-        writeSetting(QStringLiteral("corrections_z_max"), _correctionsZMax);
-        if (_correctionsZRangeEnabled) {
-            emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
-        }
-    });
+    if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
+        connect(correctionsZMaxSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            if (_correctionsZMax == value) {
+                return;
+            }
+            _correctionsZMax = value;
+            writeSetting(QStringLiteral("corrections_z_max"), _correctionsZMax);
+            if (_correctionsZRangeEnabled) {
+                emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
+            }
+        });
+    }
 
     connect(_btnApply, &QPushButton::clicked, this, &SegmentationWidget::applyRequested);
     connect(_btnReset, &QPushButton::clicked, this, &SegmentationWidget::resetRequested);
@@ -1643,17 +1423,13 @@ void SegmentationWidget::buildUi()
 
 void SegmentationWidget::syncUiState()
 {
-    if (_chkEditing) {
-        const QSignalBlocker blocker(_chkEditing);
-        _chkEditing->setChecked(_editingEnabled);
-    }
-
-    if (_lblStatus) {
+    if (_headerRow) {
+        _headerRow->setEditingChecked(_editingEnabled);
         if (_editingEnabled) {
-            _lblStatus->setText(_pending ? tr("Editing enabled – pending changes")
-                                         : tr("Editing enabled"));
+            _headerRow->setStatusText(_pending ? tr("Editing enabled – pending changes")
+                                               : tr("Editing enabled"));
         } else {
-            _lblStatus->setText(tr("Editing disabled"));
+            _headerRow->setStatusText(tr("Editing disabled"));
         }
     }
 
@@ -1757,100 +1533,117 @@ void SegmentationWidget::syncUiState()
     }
     validateCustomParamsText();
 
-    if (_spinGrowthSteps) {
-        const QSignalBlocker blocker(_spinGrowthSteps);
-        _spinGrowthSteps->setValue(_growthSteps);
+    QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr;
+    QComboBox* growthMethodCombo = _growthPanel ? _growthPanel->growthMethodCombo() : nullptr;
+    QWidget* extrapOptionsPanel = _growthPanel ? _growthPanel->extrapolationOptionsPanel() : nullptr;
+    QSpinBox* extrapPointsSpin = _growthPanel ? _growthPanel->extrapolationPointsSpin() : nullptr;
+    QComboBox* extrapTypeCombo = _growthPanel ? _growthPanel->extrapolationTypeCombo() : nullptr;
+    QWidget* sdtParamsContainer = _growthPanel ? _growthPanel->sdtParamsContainer() : nullptr;
+    QSpinBox* sdtMaxStepsSpin = _growthPanel ? _growthPanel->sdtMaxStepsSpin() : nullptr;
+    QDoubleSpinBox* sdtStepSizeSpin = _growthPanel ? _growthPanel->sdtStepSizeSpin() : nullptr;
+    QDoubleSpinBox* sdtConvergenceSpin = _growthPanel ? _growthPanel->sdtConvergenceSpin() : nullptr;
+    QSpinBox* sdtChunkSpin = _growthPanel ? _growthPanel->sdtChunkSizeSpin() : nullptr;
+    QWidget* skeletonParamsContainer = _growthPanel ? _growthPanel->skeletonParamsContainer() : nullptr;
+    QComboBox* skeletonConnectivityCombo = _growthPanel ? _growthPanel->skeletonConnectivityCombo() : nullptr;
+    QComboBox* skeletonSliceCombo = _growthPanel ? _growthPanel->skeletonSliceOrientationCombo() : nullptr;
+    QSpinBox* skeletonChunkSpin = _growthPanel ? _growthPanel->skeletonChunkSizeSpin() : nullptr;
+    QSpinBox* skeletonSearchSpin = _growthPanel ? _growthPanel->skeletonSearchRadiusSpin() : nullptr;
+    QLabel* extrapPointsLabel = _growthPanel ? _growthPanel->extrapolationPointsLabel() : nullptr;
+
+    if (growthStepsSpin) {
+        const QSignalBlocker blocker(growthStepsSpin);
+        growthStepsSpin->setValue(_growthSteps);
     }
 
-    if (_comboGrowthMethod) {
-        const QSignalBlocker blocker(_comboGrowthMethod);
-        int idx = _comboGrowthMethod->findData(static_cast<int>(_growthMethod));
+    if (growthMethodCombo) {
+        const QSignalBlocker blocker(growthMethodCombo);
+        int idx = growthMethodCombo->findData(static_cast<int>(_growthMethod));
         if (idx >= 0) {
-            _comboGrowthMethod->setCurrentIndex(idx);
+            growthMethodCombo->setCurrentIndex(idx);
         }
     }
 
-    if (_extrapolationOptionsPanel) {
-        _extrapolationOptionsPanel->setVisible(_growthMethod == SegmentationGrowthMethod::Extrapolation);
+    if (extrapOptionsPanel) {
+        extrapOptionsPanel->setVisible(_growthMethod == SegmentationGrowthMethod::Extrapolation);
     }
 
-    if (_spinExtrapolationPoints) {
-        const QSignalBlocker blocker(_spinExtrapolationPoints);
-        _spinExtrapolationPoints->setValue(_extrapolationPointCount);
+    if (extrapPointsSpin) {
+        const QSignalBlocker blocker(extrapPointsSpin);
+        extrapPointsSpin->setValue(_extrapolationPointCount);
     }
 
-    if (_comboExtrapolationType) {
-        const QSignalBlocker blocker(_comboExtrapolationType);
-        int idx = _comboExtrapolationType->findData(static_cast<int>(_extrapolationType));
+    if (extrapTypeCombo) {
+        const QSignalBlocker blocker(extrapTypeCombo);
+        int idx = extrapTypeCombo->findData(static_cast<int>(_extrapolationType));
         if (idx >= 0) {
-            _comboExtrapolationType->setCurrentIndex(idx);
+            extrapTypeCombo->setCurrentIndex(idx);
         }
     }
 
     // SDT params container visibility: only show when Extrapolation method AND Linear+Fit type
-    if (_sdtParamsContainer) {
-        _sdtParamsContainer->setVisible(
+    if (sdtParamsContainer) {
+        sdtParamsContainer->setVisible(
             _growthMethod == SegmentationGrowthMethod::Extrapolation &&
             _extrapolationType == ExtrapolationType::LinearFit);
     }
-    if (_spinSDTMaxSteps) {
-        const QSignalBlocker blocker(_spinSDTMaxSteps);
-        _spinSDTMaxSteps->setValue(_sdtMaxSteps);
+    if (sdtMaxStepsSpin) {
+        const QSignalBlocker blocker(sdtMaxStepsSpin);
+        sdtMaxStepsSpin->setValue(_sdtMaxSteps);
     }
-    if (_spinSDTStepSize) {
-        const QSignalBlocker blocker(_spinSDTStepSize);
-        _spinSDTStepSize->setValue(static_cast<double>(_sdtStepSize));
+    if (sdtStepSizeSpin) {
+        const QSignalBlocker blocker(sdtStepSizeSpin);
+        sdtStepSizeSpin->setValue(static_cast<double>(_sdtStepSize));
     }
-    if (_spinSDTConvergence) {
-        const QSignalBlocker blocker(_spinSDTConvergence);
-        _spinSDTConvergence->setValue(static_cast<double>(_sdtConvergence));
+    if (sdtConvergenceSpin) {
+        const QSignalBlocker blocker(sdtConvergenceSpin);
+        sdtConvergenceSpin->setValue(static_cast<double>(_sdtConvergence));
     }
-    if (_spinSDTChunkSize) {
-        const QSignalBlocker blocker(_spinSDTChunkSize);
-        _spinSDTChunkSize->setValue(_sdtChunkSize);
+    if (sdtChunkSpin) {
+        const QSignalBlocker blocker(sdtChunkSpin);
+        sdtChunkSpin->setValue(_sdtChunkSize);
     }
 
     // Skeleton params container visibility: only show when Extrapolation method AND SkeletonPath type
-    if (_skeletonParamsContainer) {
-        _skeletonParamsContainer->setVisible(
+    if (skeletonParamsContainer) {
+        skeletonParamsContainer->setVisible(
             _growthMethod == SegmentationGrowthMethod::Extrapolation &&
             _extrapolationType == ExtrapolationType::SkeletonPath);
     }
-    if (_comboSkeletonConnectivity) {
-        const QSignalBlocker blocker(_comboSkeletonConnectivity);
-        int idx = _comboSkeletonConnectivity->findData(_skeletonConnectivity);
+    if (skeletonConnectivityCombo) {
+        const QSignalBlocker blocker(skeletonConnectivityCombo);
+        int idx = skeletonConnectivityCombo->findData(_skeletonConnectivity);
         if (idx >= 0) {
-            _comboSkeletonConnectivity->setCurrentIndex(idx);
+            skeletonConnectivityCombo->setCurrentIndex(idx);
         }
     }
-    if (_comboSkeletonSliceOrientation) {
-        const QSignalBlocker blocker(_comboSkeletonSliceOrientation);
-        int idx = _comboSkeletonSliceOrientation->findData(_skeletonSliceOrientation);
+    if (skeletonSliceCombo) {
+        const QSignalBlocker blocker(skeletonSliceCombo);
+        int idx = skeletonSliceCombo->findData(_skeletonSliceOrientation);
         if (idx >= 0) {
-            _comboSkeletonSliceOrientation->setCurrentIndex(idx);
+            skeletonSliceCombo->setCurrentIndex(idx);
         }
     }
-    if (_spinSkeletonChunkSize) {
-        const QSignalBlocker blocker(_spinSkeletonChunkSize);
-        _spinSkeletonChunkSize->setValue(_skeletonChunkSize);
+    if (skeletonChunkSpin) {
+        const QSignalBlocker blocker(skeletonChunkSpin);
+        skeletonChunkSpin->setValue(_skeletonChunkSize);
     }
-    if (_spinSkeletonSearchRadius) {
-        const QSignalBlocker blocker(_spinSkeletonSearchRadius);
-        _spinSkeletonSearchRadius->setValue(_skeletonSearchRadius);
+    if (skeletonSearchSpin) {
+        const QSignalBlocker blocker(skeletonSearchSpin);
+        skeletonSearchSpin->setValue(_skeletonSearchRadius);
     }
     // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
     bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
-    if (_lblExtrapolationPoints) {
-        _lblExtrapolationPoints->setVisible(showFitPoints);
+    if (extrapPointsLabel) {
+        extrapPointsLabel->setVisible(showFitPoints);
     }
-    if (_spinExtrapolationPoints) {
-        _spinExtrapolationPoints->setVisible(showFitPoints);
+    if (extrapPointsSpin) {
+        extrapPointsSpin->setVisible(showFitPoints);
     }
 
     applyGrowthDirectionMaskToUi();
-    if (_chkGrowthKeybindsEnabled) {
-        const QSignalBlocker blocker(_chkGrowthKeybindsEnabled);
-        _chkGrowthKeybindsEnabled->setChecked(_growthKeybindsEnabled);
+    if (QCheckBox* growthKeybinds = _growthPanel ? _growthPanel->growthKeybindsCheck() : nullptr) {
+        const QSignalBlocker blocker(growthKeybinds);
+        growthKeybinds->setChecked(_growthKeybindsEnabled);
     }
     refreshDirectionFieldList();
 
@@ -1885,20 +1678,20 @@ void SegmentationWidget::syncUiState()
         const QSignalBlocker blocker(_chkCorrectionsAnnotate);
         _chkCorrectionsAnnotate->setChecked(_correctionsAnnotateChecked);
     }
-    if (_chkCorrectionsUseZRange) {
-        const QSignalBlocker blocker(_chkCorrectionsUseZRange);
-        _chkCorrectionsUseZRange->setChecked(_correctionsZRangeEnabled);
+    if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
+        const QSignalBlocker blocker(correctionsZRange);
+        correctionsZRange->setChecked(_correctionsZRangeEnabled);
     }
-    if (_spinCorrectionsZMin) {
-        const QSignalBlocker blocker(_spinCorrectionsZMin);
-        _spinCorrectionsZMin->setValue(_correctionsZMin);
+    if (QSpinBox* correctionsZMinSpin = _growthPanel ? _growthPanel->correctionsZMinSpin() : nullptr) {
+        const QSignalBlocker blocker(correctionsZMinSpin);
+        correctionsZMinSpin->setValue(_correctionsZMin);
     }
-    if (_spinCorrectionsZMax) {
-        const QSignalBlocker blocker(_spinCorrectionsZMax);
-        _spinCorrectionsZMax->setValue(_correctionsZMax);
+    if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
+        const QSignalBlocker blocker(correctionsZMaxSpin);
+        correctionsZMaxSpin->setValue(_correctionsZMax);
     }
 
-    if (_lblNormalGrid) {
+    if (QLabel* normalGridLabel = _growthPanel ? _growthPanel->normalGridLabel() : nullptr) {
         const QString icon = _normalGridAvailable
             ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
             : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
@@ -1921,16 +1714,16 @@ void SegmentationWidget::syncUiState()
             tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
         }
 
-        _lblNormalGrid->setText(icon + QStringLiteral("&nbsp;") + message);
-        _lblNormalGrid->setToolTip(tooltip);
-        _lblNormalGrid->setAccessibleDescription(message);
+        normalGridLabel->setText(icon + QStringLiteral("&nbsp;") + message);
+        normalGridLabel->setToolTip(tooltip);
+        normalGridLabel->setAccessibleDescription(message);
     }
 
-    if (_editNormalGridPath) {
+    if (QLineEdit* normalGridPathEdit = _growthPanel ? _growthPanel->normalGridPathEdit() : nullptr) {
         const bool show = _normalGridAvailable && !_normalGridPath.isEmpty();
-        _editNormalGridPath->setVisible(show);
-        _editNormalGridPath->setText(_normalGridPath);
-        _editNormalGridPath->setToolTip(_normalGridPath);
+        normalGridPathEdit->setVisible(show);
+        normalGridPathEdit->setText(_normalGridPath);
+        normalGridPathEdit->setToolTip(_normalGridPath);
     }
 
     updateNormal3dUi();
@@ -2004,7 +1797,8 @@ void SegmentationWidget::syncUiState()
 
 void SegmentationWidget::updateNormal3dUi()
 {
-    if (!_lblNormal3d) {
+    QLabel* normal3dLabel = _growthPanel ? _growthPanel->normal3dLabel() : nullptr;
+    if (!normal3dLabel) {
         return;
     }
 
@@ -2021,18 +1815,18 @@ void SegmentationWidget::updateNormal3dUi()
     }
 
     const bool showCombo = count > 1;
-    if (_comboNormal3d) {
-        _comboNormal3d->setVisible(showCombo);
-        _comboNormal3d->setEnabled(_editingEnabled && hasAny);
+    if (QComboBox* normal3dCombo = _growthPanel ? _growthPanel->normal3dCombo() : nullptr) {
+        normal3dCombo->setVisible(showCombo);
+        normal3dCombo->setEnabled(_editingEnabled && hasAny);
         if (showCombo) {
-            const QSignalBlocker blocker(_comboNormal3d);
-            _comboNormal3d->clear();
+            const QSignalBlocker blocker(normal3dCombo);
+            normal3dCombo->clear();
             for (const QString& p : _normal3dCandidates) {
-                _comboNormal3d->addItem(p, p);
+                normal3dCombo->addItem(p, p);
             }
-            const int idx = _comboNormal3d->findData(_normal3dSelectedPath);
+            const int idx = normal3dCombo->findData(_normal3dSelectedPath);
             if (idx >= 0) {
-                _comboNormal3d->setCurrentIndex(idx);
+                normal3dCombo->setCurrentIndex(idx);
             }
         }
     }
@@ -2060,15 +1854,15 @@ void SegmentationWidget::updateNormal3dUi()
         tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
     }
 
-    _lblNormal3d->setText(icon + QStringLiteral("&nbsp;") + message);
-    _lblNormal3d->setToolTip(tooltip);
-    _lblNormal3d->setAccessibleDescription(message);
+    normal3dLabel->setText(icon + QStringLiteral("&nbsp;") + message);
+    normal3dLabel->setToolTip(tooltip);
+    normal3dLabel->setAccessibleDescription(message);
 
-    if (_editNormal3dPath) {
+    if (QLineEdit* normal3dPathEdit = _growthPanel ? _growthPanel->normal3dPathEdit() : nullptr) {
         const bool show = hasAny && !showCombo;
-        _editNormal3dPath->setVisible(show);
-        _editNormal3dPath->setText(_normal3dSelectedPath);
-        _editNormal3dPath->setToolTip(_normal3dSelectedPath);
+        normal3dPathEdit->setVisible(show);
+        normal3dPathEdit->setText(_normal3dSelectedPath);
+        normal3dPathEdit->setToolTip(_normal3dSelectedPath);
     }
 }
 
@@ -2956,23 +2750,23 @@ void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QStrin
 {
     _volumeEntries = volumes;
     _activeVolumeId = determineDefaultVolumeId(_volumeEntries, activeId);
-    if (_comboVolumes) {
-        const QSignalBlocker blocker(_comboVolumes);
-        _comboVolumes->clear();
+    if (QComboBox* volumesCombo = _growthPanel ? _growthPanel->volumesCombo() : nullptr) {
+        const QSignalBlocker blocker(volumesCombo);
+        volumesCombo->clear();
         for (const auto& entry : _volumeEntries) {
             const QString& id = entry.first;
             const QString& label = entry.second.isEmpty() ? id : entry.second;
-            _comboVolumes->addItem(label, id);
+            volumesCombo->addItem(label, id);
         }
-        int idx = _comboVolumes->findData(_activeVolumeId);
+        int idx = volumesCombo->findData(_activeVolumeId);
         if (idx < 0 && !_volumeEntries.isEmpty()) {
-            _activeVolumeId = _comboVolumes->itemData(0).toString();
+            _activeVolumeId = volumesCombo->itemData(0).toString();
             idx = 0;
         }
         if (idx >= 0) {
-            _comboVolumes->setCurrentIndex(idx);
+            volumesCombo->setCurrentIndex(idx);
         }
-        _comboVolumes->setEnabled(!_volumeEntries.isEmpty());
+        volumesCombo->setEnabled(!_volumeEntries.isEmpty());
     }
 }
 
@@ -2982,11 +2776,11 @@ void SegmentationWidget::setActiveVolume(const QString& volumeId)
         return;
     }
     _activeVolumeId = volumeId;
-    if (_comboVolumes) {
-        const QSignalBlocker blocker(_comboVolumes);
-        int idx = _comboVolumes->findData(_activeVolumeId);
+    if (QComboBox* volumesCombo = _growthPanel ? _growthPanel->volumesCombo() : nullptr) {
+        const QSignalBlocker blocker(volumesCombo);
+        int idx = volumesCombo->findData(_activeVolumeId);
         if (idx >= 0) {
-            _comboVolumes->setCurrentIndex(idx);
+            volumesCombo->setCurrentIndex(idx);
         }
     }
 }
@@ -3326,16 +3120,20 @@ void SegmentationWidget::setGrowthDirectionMask(int mask)
 void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox)
 {
     int mask = 0;
-    if (_chkGrowthDirUp && _chkGrowthDirUp->isChecked()) {
+    QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr;
+    QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr;
+    QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr;
+    QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr;
+    if (growthDirUp && growthDirUp->isChecked()) {
         mask |= kGrowDirUpBit;
     }
-    if (_chkGrowthDirDown && _chkGrowthDirDown->isChecked()) {
+    if (growthDirDown && growthDirDown->isChecked()) {
         mask |= kGrowDirDownBit;
     }
-    if (_chkGrowthDirLeft && _chkGrowthDirLeft->isChecked()) {
+    if (growthDirLeft && growthDirLeft->isChecked()) {
         mask |= kGrowDirLeftBit;
     }
-    if (_chkGrowthDirRight && _chkGrowthDirRight->isChecked()) {
+    if (growthDirRight && growthDirRight->isChecked()) {
         mask |= kGrowDirRightBit;
     }
 
@@ -3352,48 +3150,48 @@ void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheck
 
 void SegmentationWidget::applyGrowthDirectionMaskToUi()
 {
-    if (_chkGrowthDirUp) {
-        const QSignalBlocker blocker(_chkGrowthDirUp);
-        _chkGrowthDirUp->setChecked((_growthDirectionMask & kGrowDirUpBit) != 0);
+    if (QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr) {
+        const QSignalBlocker blocker(growthDirUp);
+        growthDirUp->setChecked((_growthDirectionMask & kGrowDirUpBit) != 0);
     }
-    if (_chkGrowthDirDown) {
-        const QSignalBlocker blocker(_chkGrowthDirDown);
-        _chkGrowthDirDown->setChecked((_growthDirectionMask & kGrowDirDownBit) != 0);
+    if (QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr) {
+        const QSignalBlocker blocker(growthDirDown);
+        growthDirDown->setChecked((_growthDirectionMask & kGrowDirDownBit) != 0);
     }
-    if (_chkGrowthDirLeft) {
-        const QSignalBlocker blocker(_chkGrowthDirLeft);
-        _chkGrowthDirLeft->setChecked((_growthDirectionMask & kGrowDirLeftBit) != 0);
+    if (QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr) {
+        const QSignalBlocker blocker(growthDirLeft);
+        growthDirLeft->setChecked((_growthDirectionMask & kGrowDirLeftBit) != 0);
     }
-    if (_chkGrowthDirRight) {
-        const QSignalBlocker blocker(_chkGrowthDirRight);
-        _chkGrowthDirRight->setChecked((_growthDirectionMask & kGrowDirRightBit) != 0);
+    if (QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr) {
+        const QSignalBlocker blocker(growthDirRight);
+        growthDirRight->setChecked((_growthDirectionMask & kGrowDirRightBit) != 0);
     }
 }
 
 void SegmentationWidget::updateGrowthUiState()
 {
     const bool enableGrowth = _editingEnabled && !_growthInProgress;
-    if (_spinGrowthSteps) {
-        _spinGrowthSteps->setEnabled(enableGrowth);
+    if (QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr) {
+        growthStepsSpin->setEnabled(enableGrowth);
     }
-    if (_btnGrow) {
-        _btnGrow->setEnabled(enableGrowth);
+    if (QPushButton* growButton = _growthPanel ? _growthPanel->growButton() : nullptr) {
+        growButton->setEnabled(enableGrowth);
     }
-    if (_btnInpaint) {
-        _btnInpaint->setEnabled(enableGrowth);
+    if (QPushButton* inpaintButton = _growthPanel ? _growthPanel->inpaintButton() : nullptr) {
+        inpaintButton->setEnabled(enableGrowth);
     }
     const bool enableDirCheckbox = enableGrowth;
-    if (_chkGrowthDirUp) {
-        _chkGrowthDirUp->setEnabled(enableDirCheckbox);
+    if (QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr) {
+        growthDirUp->setEnabled(enableDirCheckbox);
     }
-    if (_chkGrowthDirDown) {
-        _chkGrowthDirDown->setEnabled(enableDirCheckbox);
+    if (QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr) {
+        growthDirDown->setEnabled(enableDirCheckbox);
     }
-    if (_chkGrowthDirLeft) {
-        _chkGrowthDirLeft->setEnabled(enableDirCheckbox);
+    if (QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr) {
+        growthDirLeft->setEnabled(enableDirCheckbox);
     }
-    if (_chkGrowthDirRight) {
-        _chkGrowthDirRight->setEnabled(enableDirCheckbox);
+    if (QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr) {
+        growthDirRight->setEnabled(enableDirCheckbox);
     }
     if (_directionFieldAddButton) {
         _directionFieldAddButton->setEnabled(_editingEnabled);
@@ -3407,14 +3205,14 @@ void SegmentationWidget::updateGrowthUiState()
     }
 
     const bool allowZRange = _editingEnabled && !_growthInProgress;
-    if (_chkCorrectionsUseZRange) {
-        _chkCorrectionsUseZRange->setEnabled(allowZRange);
+    if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
+        correctionsZRange->setEnabled(allowZRange);
     }
-    if (_spinCorrectionsZMin) {
-        _spinCorrectionsZMin->setEnabled(allowZRange && _correctionsZRangeEnabled);
+    if (QSpinBox* correctionsZMinSpin = _growthPanel ? _growthPanel->correctionsZMinSpin() : nullptr) {
+        correctionsZMinSpin->setEnabled(allowZRange && _correctionsZRangeEnabled);
     }
-    if (_spinCorrectionsZMax) {
-        _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
+    if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
+        correctionsZMaxSpin->setEnabled(allowZRange && _correctionsZRangeEnabled);
     }
     if (_customParamsEditor) {
         _customParamsEditor->setEnabled(_editingEnabled);
