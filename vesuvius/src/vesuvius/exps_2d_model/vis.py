@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import numpy as np
 import tifffile
@@ -309,6 +310,19 @@ def save(
 		uv_img_nchw = torch.nn.functional.interpolate(uv_img_nchw, size=(h2, w2), mode="bilinear", align_corners=True)
 		uv_img = uv_img_nchw.permute(0, 2, 3, 1).contiguous()
 		uv_mask = torch.nn.functional.interpolate(uv_mask, size=(h2, w2), mode="nearest")
+
+		uv_save = uv_img[0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
+		tifffile.imwrite(str(out_img_loss / f"res_uv_{p2}.tif"), uv_save, compression="lzw")
+
+		def _scale_uv_for_src(*, uv_lr: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+			_hm0, _wm0 = (int(res.xy_lr.shape[1]), int(res.xy_lr.shape[2]))
+			_hm1, _wm1 = (int(src.shape[2]), int(src.shape[3]))
+			fx = float(max(1, _wm1 - 1)) / float(max(1, _wm0 - 1))
+			fy = float(max(1, _hm1 - 1)) / float(max(1, _hm0 - 1))
+			uv2 = uv_lr.clone()
+			uv2[..., 0] = uv2[..., 0] * fx
+			uv2[..., 1] = uv2[..., 1] * fy
+			return uv2
 		img_loss_layers: list[np.ndarray] = []
 		img_loss_names: list[str] = []
 
@@ -322,9 +336,7 @@ def save(
 		img_loss_layers.append(crop)
 		img_loss_names.append("grid_crop")
 
-		uv_tgt = uv_img.clone()
-		uv_tgt[..., 0] = uv_tgt[..., 0] * float(model.subsample_winding)
-		uv_tgt[..., 1] = uv_tgt[..., 1] * float(model.subsample_mesh)
+		uv_tgt = _scale_uv_for_src(uv_lr=uv_img, src=res.target_plain)
 		tgt_plain_img = inv_map.warp_nchw_from_uv(src=res.target_plain, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
 		tgt_mod_img = inv_map.warp_nchw_from_uv(src=res.target_mod, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
 		img_loss_layers.append(tgt_plain_img[0, 0].detach().cpu().numpy().astype("float32"))
@@ -335,7 +347,8 @@ def save(
 		for _k, spec in loss_maps.items():
 			mt = spec["fn"]().detach()
 			if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
-				im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_img, uv_mask=uv_mask, fill=0.5)
+				uv_m = _scale_uv_for_src(uv_lr=uv_img, src=mt)
+				im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_m, uv_mask=uv_mask, fill=0.5)
 				img_loss_layers.append(im[0, 0].detach().cpu().numpy().astype("float32"))
 				img_loss_names.append(str(spec["suffix"]))
 
@@ -351,6 +364,7 @@ def save(
 					description=page_name,
 					extratags=[(285, "s", 0, page_name, False)],
 				)
+		return
 	# with torch.no_grad():
 	# 	xy = res.xy_conn[0].detach().cpu().numpy()
 	# 	gh, gw = xy.shape[0], xy.shape[1]
@@ -446,7 +460,8 @@ def save(
 		},
 	}
 
-	_save_img_loss_vis(iters=0)
+	_save_img_loss_vis()
+	# sys.exit(0)
 
 	for _k, spec in loss_maps.items():
 		m = spec["fn"]().detach().cpu()
