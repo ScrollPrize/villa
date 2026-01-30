@@ -4,6 +4,7 @@
 
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
+#include "Keybinds.hpp"
 #include <QKeySequence>
 #include <QHBoxLayout>
 #include <QGridLayout>
@@ -841,7 +842,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
 
     // Create application-wide keyboard shortcuts
-    fDrawingModeShortcut = new QShortcut(QKeySequence("Ctrl+Shift+D"), this);
+    fDrawingModeShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DrawingMode), this);
     fDrawingModeShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDrawingModeShortcut, &QShortcut::activated, [this]() {
         if (_drawingWidget) {
@@ -849,7 +850,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
     });
 
-    fCompositeViewShortcut = new QShortcut(QKeySequence("C"), this);
+    fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
         if (!_viewerManager) {
@@ -863,7 +864,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Toggle direction hints overlay (Ctrl+T)
-    fDirectionHintsShortcut = new QShortcut(QKeySequence("Ctrl+T"), this);
+    fDirectionHintsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DirectionHints), this);
     fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
         using namespace vc3d::settings;
@@ -881,7 +882,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Toggle surface normals visualization (Ctrl+N)
-    fSurfaceNormalsShortcut = new QShortcut(QKeySequence("Ctrl+N"), this);
+    fSurfaceNormalsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::SurfaceNormals), this);
     fSurfaceNormalsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fSurfaceNormalsShortcut, &QShortcut::activated, [this]() {
         using namespace vc3d::settings;
@@ -899,7 +900,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
     });
 
-    fAxisAlignedSlicesShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
+    fAxisAlignedSlicesShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::AxisAlignedSlices), this);
     fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
     connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
         if (chkAxisAlignedSlices) {
@@ -908,7 +909,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Raw points overlay shortcut (P key)
-    auto* rawPointsShortcut = new QShortcut(QKeySequence("P"), this);
+    auto* rawPointsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::RawPointsOverlay), this);
     rawPointsShortcut->setContext(Qt::ApplicationShortcut);
     connect(rawPointsShortcut, &QShortcut::activated, [this]() {
         if (_rawPointsOverlay) {
@@ -923,7 +924,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     // Zoom shortcuts (Shift+= for zoom in, Shift+- for zoom out)
     // Use 15% steps for smooth, proportional zooming - only affects active viewer
     constexpr float ZOOM_FACTOR = 1.15f;
-    fZoomInShortcut = new QShortcut(QKeySequence("Shift+="), this);
+    fZoomInShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomIn), this);
     fZoomInShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomInShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -934,7 +935,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
     });
 
-    fZoomOutShortcut = new QShortcut(QKeySequence("Shift+-"), this);
+    fZoomOutShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomOut), this);
     fZoomOutShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomOutShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -946,7 +947,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Reset view shortcut (m to fit surface in view and reset all offsets)
-    fResetViewShortcut = new QShortcut(QKeySequence("m"), this);
+    fResetViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ResetView), this);
     fResetViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fResetViewShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -960,7 +961,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Z offset: Ctrl+. = +Z (further/deeper), Ctrl+, = -Z (closer)
-    fWorldOffsetZPosShortcut = new QShortcut(QKeySequence("Ctrl+."), this);
+    fWorldOffsetZPosShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZPos), this);
     fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -971,7 +972,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
     });
 
-    fWorldOffsetZNegShortcut = new QShortcut(QKeySequence("Ctrl+,"), this);
+    fWorldOffsetZNegShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZNeg), this);
     fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -983,7 +984,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Segment cycling shortcuts (] for next, [ for previous)
-    fCycleNextSegmentShortcut = new QShortcut(QKeySequence("]"), this);
+    fCycleNextSegmentShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CycleNextSegment), this);
     fCycleNextSegmentShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCycleNextSegmentShortcut, &QShortcut::activated, [this]() {
         if (!_surfacePanel) {
@@ -1004,7 +1005,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
     });
 
-    fCyclePrevSegmentShortcut = new QShortcut(QKeySequence("["), this);
+    fCyclePrevSegmentShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CyclePrevSegment), this);
     fCyclePrevSegmentShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCyclePrevSegmentShortcut, &QShortcut::activated, [this]() {
         if (!_surfacePanel) {
@@ -1026,7 +1027,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     });
 
     // Focused view toggle (Shift+Ctrl+F) - hides dock widgets, keeps all viewers
-    fFocusedViewShortcut = new QShortcut(QKeySequence("Shift+Ctrl+F"), this);
+    fFocusedViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::FocusedView), this);
     fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
 
@@ -2804,25 +2805,27 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
-    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
+        event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
         event->accept();
         return;
     }
 
-    if (event->key() == Qt::Key_R && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::CenterFocusOnCursor.key &&
+        event->modifiers() == vc3d::keybinds::keypress::CenterFocusOnCursor.modifiers) {
         if (centerFocusOnCursor()) {
             event->accept();
             return;
         }
     }
 
-    if (event->key() == Qt::Key_F) {
-        if (event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::FocusHistoryBack.key) {
+        if (event->modifiers() == vc3d::keybinds::keypress::FocusHistoryBack.modifiers) {
             stepFocusHistory(-1);
             event->accept();
             return;
-        } else if (event->modifiers() == Qt::ControlModifier) {
+        } else if (event->modifiers() == vc3d::keybinds::keypress::FocusHistoryForward.modifiers) {
             stepFocusHistory(1);
             event->accept();
             return;
@@ -2830,15 +2833,15 @@ void CWindow::keyPressEvent(QKeyEvent* event)
     }
 
     // Shift+G decreases slice step size, Shift+H increases it
-    if (event->modifiers() == Qt::ShiftModifier && _viewerManager) {
-        if (event->key() == Qt::Key_G) {
+    if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
+        if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
             int currentStep = _viewerManager->sliceStepSize();
             int newStep = std::max(1, currentStep - 1);
             _viewerManager->setSliceStepSize(newStep);
             onSliceStepSizeChanged(newStep);
             event->accept();
             return;
-        } else if (event->key() == Qt::Key_H) {
+        } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
             int currentStep = _viewerManager->sliceStepSize();
             int newStep = std::min(100, currentStep + 1);
             _viewerManager->setSliceStepSize(newStep);

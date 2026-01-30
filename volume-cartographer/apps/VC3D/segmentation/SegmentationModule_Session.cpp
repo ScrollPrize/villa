@@ -3,6 +3,7 @@
 #include "CSurfaceCollection.hpp"
 #include "SegmentationEditManager.hpp"
 #include "ApprovalMaskBrushTool.hpp"
+#include "CellReoptimizationTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 

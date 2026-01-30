@@ -5,6 +5,8 @@ add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
 
 set(srcs
     VCAppMain.cpp
+    Keybinds.cpp
+    Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
     CVolumeViewer.cpp
