@@ -116,6 +116,11 @@ const std::vector<CVolumeViewer::OverlayColormapEntry>& CVolumeViewer::overlayCo
 
 void CVolumeViewer::updateAllOverlays()
 {
+    if (isWindowMinimized()) {
+        _dirtyWhileMinimized = true;
+        return;
+    }
+
     // Validate _surf against collection to prevent use-after-free
     auto surf = _surf_weak.lock();
     if (!surf) {

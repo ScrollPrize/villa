@@ -7,6 +7,7 @@
 #include <QString>
 #include <QList>
 #include <QImage>
+#include <QEvent>
 
 #include <map>
 #include <memory>
@@ -132,6 +133,9 @@ public:
 
     void fitSurfaceInView();
     void updateAllOverlays();
+
+    bool isWindowMinimized() const;
+    bool eventFilter(QObject* watched, QEvent* event) override;
     
     // Generic overlay group management (ad-hoc helper for reuse)
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items);
@@ -420,6 +424,8 @@ protected:
     bool _postStretchValues{false};
     bool _postRemoveSmallComponents{false};
     int _postMinComponentSize{50};
+
+    bool _dirtyWhileMinimized = false;
 
     // Fast composite rendering cache - no mutex, specialized for composite
     FastCompositeCache _fastCompositeCache;

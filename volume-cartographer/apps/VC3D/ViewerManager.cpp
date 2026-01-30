@@ -97,6 +97,7 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     auto* win = mdiArea->addSubWindow(viewer);
     win->setWindowTitle(title);
     win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
+    win->installEventFilter(viewer);
 
     viewer->setCache(_chunkCache);
     viewer->setPointCollection(_points);
