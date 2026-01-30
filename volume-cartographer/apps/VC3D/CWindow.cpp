@@ -15,6 +15,7 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QScreen>
 #include <QStyleHints>
 #include <QDesktopServices>
 #include <QUrl>
@@ -517,6 +518,71 @@ static void applyDarkPalette() {
     QApplication::setPalette(p);
 }
 
+static QString windowStateScreenSignature()
+{
+    QStringList parts;
+    parts << qga::platformName();
+    const auto screens = qga::screens();
+    parts << QString::number(screens.size());
+    for (const QScreen* screen : screens) {
+        if (!screen) {
+            continue;
+        }
+        const QRect geom = screen->geometry();
+        const qreal dpr = screen->devicePixelRatio();
+        const QString name = screen->name().isEmpty() ? QStringLiteral("screen") : screen->name();
+        parts << QString("%1:%2x%3+%4+%5@%6")
+                     .arg(name)
+                     .arg(geom.width())
+                     .arg(geom.height())
+                     .arg(geom.x())
+                     .arg(geom.y())
+                     .arg(dpr, 0, 'f', 2);
+    }
+    return parts.join("|");
+}
+
+static QString windowStateQtVersion()
+{
+    return QString::fromUtf8(qVersion());
+}
+
+static QString windowStateAppVersion()
+{
+    return QString::fromStdString(ProjectInfo::VersionString());
+}
+
+static void writeWindowStateMeta(QSettings& settings,
+                                 const QString& screenSignature,
+                                 const QString& qtVersion,
+                                 const QString& appVersion)
+{
+    settings.setValue(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE, screenSignature);
+    settings.setValue(vc3d::settings::window::STATE_META_QT_VERSION, qtVersion);
+    settings.setValue(vc3d::settings::window::STATE_META_APP_VERSION, appVersion);
+}
+
+static bool windowStateMetaMatches(const QSettings& settings,
+                                   const QString& screenSignature,
+                                   const QString& qtVersion,
+                                   const QString& appVersion)
+{
+    const QString savedSignature =
+        settings.value(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE).toString();
+    const QString savedQtVersion =
+        settings.value(vc3d::settings::window::STATE_META_QT_VERSION).toString();
+    const QString savedAppVersion =
+        settings.value(vc3d::settings::window::STATE_META_APP_VERSION).toString();
+
+    if (savedSignature.isEmpty() || savedQtVersion.isEmpty() || savedAppVersion.isEmpty()) {
+        return false;
+    }
+
+    return savedSignature == screenSignature
+        && savedQtVersion == qtVersion
+        && savedAppVersion == appVersion;
+}
+
 // Constructor
 CWindow::CWindow(size_t cacheSizeGB) :
     fVpkg(nullptr),
@@ -654,25 +720,84 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     // Restore geometry / sizes
     QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const QByteArray savedGeometry = geometry.value(vc3d::settings::window::GEOMETRY).toByteArray();
+    const QString currentScreenSignature = windowStateScreenSignature();
+    const QString currentQtVersion = windowStateQtVersion();
+    const QString currentAppVersion = windowStateAppVersion();
+
+    const bool restoreDisabled =
+        geometry.value(vc3d::settings::window::RESTORE_DISABLED, false).toBool();
+    const bool restoreInProgress =
+        geometry.value(vc3d::settings::window::RESTORE_IN_PROGRESS, false).toBool();
+
+    auto clearSavedWindowState = [&geometry]() {
+        geometry.remove(vc3d::settings::window::GEOMETRY);
+        geometry.remove(vc3d::settings::window::STATE);
+    };
+
+    bool allowRestore = !restoreDisabled && !restoreInProgress;
+    if (restoreInProgress) {
+        Logger()->warn("Previous window-state restore did not complete; clearing saved state");
+        clearSavedWindowState();
+        geometry.setValue(vc3d::settings::window::RESTORE_DISABLED, true);
+        geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+        geometry.sync();
+        allowRestore = false;
+    const bool hasStateMeta =
+        geometry.contains(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE)
+        && geometry.contains(vc3d::settings::window::STATE_META_QT_VERSION)
+        && geometry.contains(vc3d::settings::window::STATE_META_APP_VERSION);
+    if (allowRestore && hasStateMeta
+        && !windowStateMetaMatches(geometry,
+                                   currentScreenSignature,
+                                   currentQtVersion,
+                                   currentAppVersion)) {
+        Logger()->warn("Window state metadata mismatch; skipping restore");
+        clearSavedWindowState();
+        writeWindowStateMeta(geometry, currentScreenSignature, currentQtVersion, currentAppVersion);
+        geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+        geometry.sync();
+        allowRestore = false;
+    }
+
+    if (allowRestore) {
+        geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, true);
+        geometry.sync();
+    }
+
     bool restoredGeometry = false;
-    if (!savedGeometry.isEmpty()) {
-        restoredGeometry = restoreGeometry(savedGeometry);
-        if (!restoredGeometry) {
-            Logger()->warn("Failed to restore main window geometry; clearing saved geometry");
-            geometry.remove(vc3d::settings::window::GEOMETRY);
-            geometry.sync();
+    bool restoredState = false;
+    if (allowRestore) {
+        const QByteArray savedGeometry = geometry.value(vc3d::settings::window::GEOMETRY).toByteArray();
+        if (!savedGeometry.isEmpty()) {
+            restoredGeometry = restoreGeometry(savedGeometry);
+            if (!restoredGeometry) {
+                Logger()->warn("Failed to restore main window geometry; clearing saved geometry");
+                geometry.remove(vc3d::settings::window::GEOMETRY);
+                geometry.sync();
+            }
+        }
+        const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
+        if (!savedState.isEmpty()) {
+            restoredState = restoreState(savedState);
+            if (!restoredState) {
+                Logger()->warn("Failed to restore main window state; clearing saved state");
+                geometry.remove(vc3d::settings::window::STATE);
+                geometry.sync();
+            }
         }
     }
-    const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
-    bool restoredState = false;
-    if (!savedState.isEmpty()) {
-        restoredState = restoreState(savedState);
-        if (!restoredState) {
-            Logger()->warn("Failed to restore main window state; clearing saved state");
-            geometry.remove(vc3d::settings::window::STATE);
-            geometry.sync();
-        }
+    if (allowRestore) {
+        QTimer::singleShot(1500, this, [currentScreenSignature, currentQtVersion, currentAppVersion]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            if (settings.value(vc3d::settings::window::RESTORE_DISABLED, false).toBool()) {
+                settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+                settings.sync();
+                return;
+            }
+            writeWindowStateMeta(settings, currentScreenSignature, currentQtVersion, currentAppVersion);
+            settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+            settings.sync();
+        });
     }
     if (!restoredState) {
         // No saved state - set sensible default sizes for dock widgets
@@ -2757,6 +2882,10 @@ void CWindow::saveWindowState()
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::window::GEOMETRY, saveGeometry());
     settings.setValue(vc3d::settings::window::STATE, saveState());
+    writeWindowStateMeta(settings,
+                         windowStateScreenSignature(),
+                         windowStateQtVersion(),
+                         windowStateAppVersion());
     settings.sync();
 }
 

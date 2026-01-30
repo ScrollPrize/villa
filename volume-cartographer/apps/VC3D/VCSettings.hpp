@@ -155,6 +155,11 @@ namespace perf {
 namespace window {
     constexpr auto GEOMETRY = "mainWin/geometry";
     constexpr auto STATE = "mainWin/state";
+    constexpr auto RESTORE_IN_PROGRESS = "mainWin/restore_in_progress";
+    constexpr auto RESTORE_DISABLED = "mainWin/restore_disabled";
+    constexpr auto STATE_META_SCREEN_SIGNATURE = "mainWin/state_meta/screen_signature";
+    constexpr auto STATE_META_QT_VERSION = "mainWin/state_meta/qt_version";
+    constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
 }
 
 // -----------------------------------------------------------------------------
