@@ -370,3 +370,5 @@ void SegmentationWidget::setNeuralPythonPath(const QString& path) { _neuralTrace
 void SegmentationWidget::setNeuralVolumeScale(int scale) { _neuralTracerPanel->setNeuralVolumeScale(scale); }
 void SegmentationWidget::setNeuralBatchSize(int size) { _neuralTracerPanel->setNeuralBatchSize(size); }
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
+
+void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}

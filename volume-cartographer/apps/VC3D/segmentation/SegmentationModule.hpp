@@ -176,6 +176,7 @@ private:
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
+    friend class SegmentationBrushTool;
     friend class segmentation::CorrectionsState;
 
     enum class FalloffTool

@@ -85,6 +85,7 @@ public:
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
+    void setEraseBrushActive(bool active);
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
