@@ -532,7 +532,7 @@ void SegmentationPushPullTool::stopAll()
         _module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
-        if (_overlay && _overlay->hasApprovalMaskData()) {
+        if (_module.autoApproveEdits() && _overlay && _overlay->hasApprovalMaskData()) {
             const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 std::vector<std::pair<int, int>> gridPositions;

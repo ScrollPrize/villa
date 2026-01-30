@@ -727,6 +727,12 @@ void SegmentationWidget::buildUi()
     editRow->addStretch(1);
     approvalLayout->addLayout(editRow);
 
+    // Auto-approve edits checkbox
+    _chkAutoApproveEdits = new QCheckBox(tr("Auto-Approve Edits"), approvalParent);
+    _chkAutoApproveEdits->setToolTip(tr("Automatically add edited surface regions to the approval mask."));
+    _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    approvalLayout->addWidget(_chkAutoApproveEdits);
+
     // Cylinder brush controls: radius and depth
     // Radius = circle in plane views, width of rectangle in flattened view
     // Depth = height of rectangle in flattened view, cylinder thickness for plane painting
@@ -1108,6 +1114,10 @@ void SegmentationWidget::buildUi()
 
     connect(_chkEditUnapprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
         setEditUnapprovedMask(enabled);
+    });
+
+    connect(_chkAutoApproveEdits, &QCheckBox::toggled, this, [this](bool enabled) {
+        setAutoApproveEdits(enabled);
     });
 
     connect(_spinApprovalBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
@@ -1942,6 +1952,10 @@ void SegmentationWidget::syncUiState()
         // Edit checkboxes only enabled when show is checked
         _chkEditUnapprovedMask->setEnabled(_showApprovalMask);
     }
+    if (_chkAutoApproveEdits) {
+        const QSignalBlocker blocker(_chkAutoApproveEdits);
+        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    }
     if (_sliderApprovalMaskOpacity) {
         const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
         _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
@@ -2234,6 +2248,7 @@ void SegmentationWidget::restoreSettings()
         _approvalBrushColor = QColor::fromString(colorName);
     }
     _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
+    _autoApproveEdits = settings.value(segmentation::APPROVAL_AUTO_APPROVE_EDITS, _autoApproveEdits).toBool();
     // Don't restore edit states - user must explicitly enable editing each session
 
     // Neural tracer settings
@@ -2417,6 +2432,23 @@ void SegmentationWidget::setEditUnapprovedMask(bool enabled)
         _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
     }
     syncUiState();
+}
+
+void SegmentationWidget::setAutoApproveEdits(bool enabled)
+{
+    if (_autoApproveEdits == enabled) {
+        return;
+    }
+    _autoApproveEdits = enabled;
+    qInfo() << "SegmentationWidget: Auto-approve edits changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_auto_approve_edits"), _autoApproveEdits);
+        emit autoApproveEditsChanged(_autoApproveEdits);
+    }
+    if (_chkAutoApproveEdits) {
+        const QSignalBlocker blocker(_chkAutoApproveEdits);
+        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    }
 }
 
 void SegmentationWidget::setApprovalBrushRadius(float radius)

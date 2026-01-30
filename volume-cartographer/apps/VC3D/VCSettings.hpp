@@ -274,6 +274,7 @@ namespace segmentation {
     constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
     constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
     constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
+    constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
 
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;

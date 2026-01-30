@@ -115,6 +115,9 @@ void SegmentationModule::endEditingSession()
     if (_editManager) {
         _editManager->endSession();
     }
+    if (_cellReoptTool) {
+        _cellReoptTool->setSurface(nullptr);
+    }
 
     updateAutosaveState();
 }

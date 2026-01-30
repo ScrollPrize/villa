@@ -120,6 +120,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
         _hoverPreviewEnabled = _widget->showHoverMarker();
+        _autoApproveEdits = _widget->autoApproveEdits();
     }
 
     if (_overlay) {
@@ -337,6 +338,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setEditApprovedMask);
     connect(_widget, &SegmentationWidget::editUnapprovedMaskChanged,
             this, &SegmentationModule::setEditUnapprovedMask);
+    connect(_widget, &SegmentationWidget::autoApproveEditsChanged,
+            this, &SegmentationModule::setAutoApproveEdits);
     connect(_widget, &SegmentationWidget::approvalBrushRadiusChanged,
             this, &SegmentationModule::setApprovalMaskBrushRadius);
     connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
@@ -703,6 +706,12 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
     refreshOverlay();
 }
 
+void SegmentationModule::setAutoApproveEdits(bool enabled)
+{
+    _autoApproveEdits = enabled;
+    qCInfo(lcSegModule) << "Auto-approve edits set to:" << enabled;
+}
+
 void SegmentationModule::saveApprovalMaskToDisk()
 {
     qCInfo(lcSegModule) << "Saving approval mask to disk...";
@@ -831,7 +840,7 @@ void SegmentationModule::applyEdits()
     }
 
     // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
-    if (_overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
+    if (_autoApproveEdits && _overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
         const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
             std::vector<std::pair<int, int>> gridPositions;
@@ -1447,7 +1456,7 @@ void SegmentationModule::finishDrag()
         captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
-        if (_overlay && _overlay->hasApprovalMaskData()) {
+        if (_autoApproveEdits && _overlay && _overlay->hasApprovalMaskData()) {
             const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 std::vector<std::pair<int, int>> gridPositions;
