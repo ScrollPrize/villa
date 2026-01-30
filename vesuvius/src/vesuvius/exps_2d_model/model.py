@@ -590,31 +590,3 @@ class Model2D(nn.Module):
 		v = torch.linspace(v0, v1, int(gh0), dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
 		return torch.stack([uu, vv], dim=0).unsqueeze(0)
-
-	def target_cos(
-		self,
-		*,
-		cosine_periods: float | None = None,
-		subsample_winding: int | None = None,
-		subsample_mesh: int | None = None,
-	) -> torch.Tensor:
-		if cosine_periods is None:
-			periods = max(1, self.mesh_w - 1)
-		else:
-			periods = float(cosine_periods)
-
-		sub_w = int(self.subsample_winding if subsample_winding is None else subsample_winding)
-		sub_m = int(self.subsample_mesh if subsample_mesh is None else subsample_mesh)
-		sub_w = max(1, sub_w)
-		sub_m = max(1, sub_m)
-		h = max(2, (self.mesh_h - 1) * sub_m + 1)
-		w = max(2, (self.mesh_w - 1) * sub_w + 1)
-		xd = float(max(1, int(self.init.w_img) - 1))
-		yd = float(max(1, int(self.init.h_img) - 1))
-		us = torch.linspace(0.0, xd, w, device=self.device, dtype=torch.float32)
-		vs = torch.linspace(0.0, yd, h, device=self.device, dtype=torch.float32)
-		vv, uu = torch.meshgrid(vs, us, indexing="ij")
-		u = uu.view(1, 1, h, w)
-
-		phase = torch.pi * (u / xd) * periods
-		return 0.5 + 0.5 * torch.cos(phase)
