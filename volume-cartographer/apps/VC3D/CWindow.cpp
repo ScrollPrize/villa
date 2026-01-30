@@ -742,6 +742,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
         geometry.sync();
         allowRestore = false;
+    }
     const bool hasStateMeta =
         geometry.contains(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE)
         && geometry.contains(vc3d::settings::window::STATE_META_QT_VERSION)
