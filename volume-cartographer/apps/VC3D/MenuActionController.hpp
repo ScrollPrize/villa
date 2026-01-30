@@ -1,9 +1,11 @@
 #pragma once
 
 #include <QObject>
+#include <QPointer>
 #include <array>
 
 class QAction;
+class QDialog;
 class QMenu;
 class QMenuBar;
 class CWindow;
@@ -72,4 +74,6 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
+
+    QPointer<QDialog> _keybindsDialog;
 };

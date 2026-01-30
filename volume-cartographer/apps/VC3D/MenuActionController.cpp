@@ -411,12 +411,18 @@ void MenuActionController::showKeybindings()
         return;
     }
 
-    QDialog dialog(_window);
-    dialog.setWindowTitle(QObject::tr("Keybindings for Volume Cartographer"));
-    dialog.setModal(true);
+    if (_keybindsDialog) {
+        _keybindsDialog->raise();
+        _keybindsDialog->activateWindow();
+        return;
+    }
 
-    auto* layout = new QVBoxLayout(&dialog);
-    auto* scrollArea = new QScrollArea(&dialog);
+    _keybindsDialog = new QDialog(_window);
+    _keybindsDialog->setAttribute(Qt::WA_DeleteOnClose);
+    _keybindsDialog->setWindowTitle(QObject::tr("Keybindings for Volume Cartographer"));
+
+    auto* layout = new QVBoxLayout(_keybindsDialog);
+    auto* scrollArea = new QScrollArea(_keybindsDialog);
     scrollArea->setWidgetResizable(true);
 
     auto* content = new QWidget(scrollArea);
@@ -433,13 +439,15 @@ void MenuActionController::showKeybindings()
     scrollArea->setWidget(content);
     layout->addWidget(scrollArea);
 
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, _keybindsDialog);
+    connect(buttons, &QDialogButtonBox::accepted, _keybindsDialog, &QDialog::accept);
     layout->addWidget(buttons);
 
-    dialog.resize(640, 520);
-    dialog.setMinimumHeight(360);
-    dialog.exec();
+    _keybindsDialog->resize(640, 520);
+    _keybindsDialog->setMinimumHeight(360);
+    _keybindsDialog->show();
+    _keybindsDialog->raise();
+    _keybindsDialog->activateWindow();
 }
 
 void MenuActionController::exitApplication()
