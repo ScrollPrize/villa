@@ -270,15 +270,51 @@ def save(
 	out.mkdir(parents=True, exist_ok=True)
 	out_grids = out / "grids"
 	out_loss = out / "loss_maps"
+	out_img_loss = out / "img_loss_vis"
 	out_tgt = out / "targets"
 	out_vis = out / "vis"
 	out_grids.mkdir(parents=True, exist_ok=True)
 	out_loss.mkdir(parents=True, exist_ok=True)
+	out_img_loss.mkdir(parents=True, exist_ok=True)
 	out_tgt.mkdir(parents=True, exist_ok=True)
 	out_vis.mkdir(parents=True, exist_ok=True)
 
 	h_img, w_img = data.size
 	res = model(data)
+
+	def _save_img_loss_vis(*, iters: int, postfix2: str) -> None:
+		uv_img, uv_mask = inv_map.inverse_map_autograd(xy_lr=res.xy_lr, h_out=h_img, w_out=w_img, iters=int(iters))
+		img_loss_layers: list[np.ndarray] = []
+		img_loss_names: list[str] = []
+
+		tgt_plain_lr = torch.nn.functional.interpolate(res.target_plain, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
+		tgt_mod_lr = torch.nn.functional.interpolate(res.target_mod, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
+		tgt_plain_img = inv_map.warp_nchw_from_uv(src=tgt_plain_lr, uv=uv_img, uv_mask=uv_mask, fill=0.5)
+		tgt_mod_img = inv_map.warp_nchw_from_uv(src=tgt_mod_lr, uv=uv_img, uv_mask=uv_mask, fill=0.5)
+		img_loss_layers.append(tgt_plain_img[0, 0].detach().cpu().numpy().astype("float32"))
+		img_loss_names.append("target_plain")
+		img_loss_layers.append(tgt_mod_img[0, 0].detach().cpu().numpy().astype("float32"))
+		img_loss_names.append("target_mod")
+
+		for _k, spec in loss_maps.items():
+			mt = spec["fn"]().detach()
+			if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
+				im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_img, uv_mask=uv_mask, fill=0.5)
+				img_loss_layers.append(im[0, 0].detach().cpu().numpy().astype("float32"))
+				img_loss_names.append(str(spec["suffix"]))
+
+		if not img_loss_layers:
+			return
+		out_path_img = out_img_loss / f"res_img_loss_{postfix2}.tif"
+		with tifffile.TiffWriter(str(out_path_img), bigtiff=False) as tw:
+			for name, layer in zip(img_loss_names, img_loss_layers, strict=True):
+				page_name = str(name)
+				tw.write(
+					layer,
+					compression="lzw",
+					description=page_name,
+					extratags=[(285, "s", 0, page_name, False)],
+				)
 	# with torch.no_grad():
 	# 	xy = res.xy_conn[0].detach().cpu().numpy()
 	# 	gh, gw = xy.shape[0], xy.shape[1]
@@ -309,8 +345,6 @@ def save(
 	)
 	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
-
-	uv_img, uv_mask = inv_map.inverse_map_autograd(xy_lr=res.xy_lr, h_out=h_img, w_out=w_img)
 
 	dir_lm_v, _dir_mask_v = opt_loss_dir.dir_v_loss_maps(res=res)
 	dir_lm_conn_l, dir_lm_conn_r, dir_mask_conn_l, dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
@@ -390,18 +424,16 @@ def save(
 			"reduce": True,
 		},
 	}
+
+	_save_img_loss_vis(iters=0, postfix2=f"{postfix}_it0")
+	_save_img_loss_vis(iters=1000, postfix2=f"{postfix}_it50")
+
 	for _k, spec in loss_maps.items():
 		m = spec["fn"]().detach().cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
 			m = m[0, 0]
 		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
 		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
-
-		mt = spec["fn"]().detach()
-		if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
-			im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_img, uv_mask=uv_mask, fill=0.5)
-			out_path_img = out_loss / f"res_loss_img_{spec['suffix']}_{postfix}.tif"
-			tifffile.imwrite(str(out_path_img), im[0, 0].detach().cpu().numpy().astype("float32"), compression="lzw")
 
 	# One horizontally-concatenated float tif for quick inspection.
 	loss_2d: list[tuple[str, np.ndarray]] = []

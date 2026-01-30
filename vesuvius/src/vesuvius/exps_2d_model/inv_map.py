@@ -4,6 +4,50 @@ import torch
 import torch.nn.functional as F
 
 
+def _upsample2_crop(*, src: torch.Tensor, h_t: int, w_t: int) -> torch.Tensor:
+	up = F.interpolate(src, scale_factor=2.0, mode="bilinear", align_corners=True)
+	return up[:, :, :h_t, :w_t]
+
+
+def _integrate_pyr(pyr: torch.nn.ParameterList) -> torch.Tensor:
+	v = pyr[-1]
+	for d in reversed(pyr[:-1]):
+		v = _upsample2_crop(src=v, h_t=int(d.shape[2]), w_t=int(d.shape[3])) + d
+	return v
+
+
+def _pyr_from_flat(*, flat: torch.Tensor, n_scales: int) -> torch.nn.ParameterList:
+	"""Build a residual pyramid whose reconstruction equals `flat`.
+
+	flat: (N,C,H,W)
+	"""
+	shapes: list[tuple[int, int]] = [(int(flat.shape[2]), int(flat.shape[3]))]
+	for _ in range(1, max(1, int(n_scales))):
+		gh_prev, gw_prev = shapes[-1]
+		gh_i = max(2, (gh_prev + 1) // 2)
+		gw_i = max(2, (gw_prev + 1) // 2)
+		shapes.append((gh_i, gw_i))
+
+	targets: list[torch.Tensor] = [flat]
+	for gh_i, gw_i in shapes[1:]:
+		t = F.interpolate(targets[-1], size=(int(gh_i), int(gw_i)), mode="bilinear", align_corners=True)
+		targets.append(t)
+
+	residuals: list[torch.Tensor] = [torch.empty(0)] * len(targets)
+	recon = targets[-1]
+	residuals[-1] = targets[-1]
+	for i in range(len(targets) - 2, -1, -1):
+		up = _upsample2_crop(src=recon, h_t=int(targets[i].shape[2]), w_t=int(targets[i].shape[3]))
+		d = targets[i] - up
+		residuals[i] = d
+		recon = up + d
+
+	out = torch.nn.ParameterList()
+	for r in residuals:
+		out.append(torch.nn.Parameter(r))
+	return out
+
+
 def _sample_xy(*, xy_lr: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
 	"""Sample xy_lr (N,Hm,Wm,2) at uv (N,H,W,2) in index units (x=ix, y=iy)."""
 	if xy_lr.ndim != 4 or int(xy_lr.shape[-1]) != 2:
@@ -28,7 +72,9 @@ def inverse_map_autograd(
 	h_out: int,
 	w_out: int,
 	iters: int = 50,
-	step_size: float = 0.3,
+	step_size: float = 0.01,
+	reg_uv_smooth: float = 10000.0,
+	uv_scales: int = 4,
 	eps_det: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Invert xy_lr by optimizing uv using autograd.
@@ -42,11 +88,15 @@ def inverse_map_autograd(
 	"""
 	if xy_lr.ndim != 4 or int(xy_lr.shape[-1]) != 2:
 		raise ValueError("xy_lr must be (N,Hm,Wm,2)")
+	# Inversion is used for visualization only; treat xy_lr as a constant.
+	xy_lr = xy_lr.detach()
 	n, hm, wm, _c2 = (int(v) for v in xy_lr.shape)
 	h_out = int(max(1, h_out))
 	w_out = int(max(1, w_out))
 	iters = int(max(0, iters))
 	step_size = float(step_size)
+	reg_uv_smooth = float(reg_uv_smooth)
+	uv_scales = int(max(1, uv_scales))
 
 	def clamp_uv(u: torch.Tensor) -> torch.Tensor:
 		x = u[..., 0].clamp(0.0, float(max(1, wm - 1)))
@@ -67,20 +117,44 @@ def inverse_map_autograd(
 	uv0 = (tgt_xy - min_xy) / scale_xy
 	uv0x = uv0[..., 0] * float(max(1, wm - 1))
 	uv0y = uv0[..., 1] * float(max(1, hm - 1))
-	uv = torch.stack([uv0x, uv0y], dim=-1)
-	uv = clamp_uv(uv)
-	uv = uv.detach().requires_grad_(True)
+	uv0 = clamp_uv(torch.stack([uv0x, uv0y], dim=-1))
+	uv0_nchw = uv0.permute(0, 3, 1, 2).contiguous()
+	uv_ms = _pyr_from_flat(flat=uv0_nchw, n_scales=uv_scales)
+	opt = torch.optim.Adam(list(uv_ms), lr=step_size)
 
-	for _ in range(iters):
+	for i in range(iters):
+		opt.zero_grad(set_to_none=True)
+		uv_nchw = _integrate_pyr(uv_ms)
+		uv = clamp_uv(uv_nchw.permute(0, 2, 3, 1).contiguous())
 		xy = _sample_xy(xy_lr=xy_lr, uv=uv)
 		err = xy - tgt_xy
-		loss = 0.5 * (err * err).sum(dim=-1)
-		g = torch.autograd.grad(loss.sum(), uv, create_graph=False, retain_graph=False)[0]
-		uv = clamp_uv(uv - step_size * g).detach().requires_grad_(True)
+		loss_data = 0.5 * (err * err).sum(dim=-1).mean()
+
+		loss_smooth = uv.new_zeros(())
+		if reg_uv_smooth > 0.0:
+			duv_x = uv[:, :, 1:, :] - uv[:, :, :-1, :]
+			duv_y = uv[:, 1:, :, :] - uv[:, :-1, :, :]
+			loss_smooth = 0.5 * (duv_x * duv_x).mean() + 0.5 * (duv_y * duv_y).mean()
+
+		loss = loss_data + reg_uv_smooth * loss_smooth
+		loss.backward()
+		opt.step()
+		# Projection: rebuild pyramid from clamped reconstruction (visualization-only).
+		with torch.no_grad():
+			uv_c = clamp_uv(_integrate_pyr(uv_ms).permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+			uv_ms = _pyr_from_flat(flat=uv_c, n_scales=len(uv_ms))
+			opt = torch.optim.Adam(list(uv_ms), lr=step_size)
+		print(
+			f"inv_map: iter={i + 1:03d}/{iters:03d} "
+			f"loss_data={float(loss_data.detach().cpu()):.6g} "
+			f"loss_smooth={float(loss_smooth.detach().cpu()):.6g}"
+		)
 
 	# Jacobian usability mask (finite-diff is fine here; only for visualization gating).
 	du = 1.0
 	with torch.no_grad():
+		uv_nchw = _integrate_pyr(uv_ms)
+		uv = clamp_uv(uv_nchw.permute(0, 2, 3, 1).contiguous())
 		xy = _sample_xy(xy_lr=xy_lr, uv=uv)
 		uv_u = uv.clone()
 		uv_v = uv.clone()
@@ -97,7 +171,7 @@ def inverse_map_autograd(
 		det = a * d - b * c
 		ok = det.abs() > float(eps_det)
 		mask = ok.to(dtype=torch.float32).view(n, 1, h_out, w_out)
-		return uv.detach(), mask
+		return uv, mask
 
 
 def warp_nchw_from_uv(
