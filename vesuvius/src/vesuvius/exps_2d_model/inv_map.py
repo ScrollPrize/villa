@@ -108,14 +108,10 @@ def inverse_map_autograd(
 	yy, xx = torch.meshgrid(ys, xs, indexing="ij")
 	tgt_xy = torch.stack([xx, yy], dim=-1).view(1, h_out, w_out, 2).expand(n, h_out, w_out, 2)
 
-	xy_flat = xy_lr.view(n, -1, 2)
-	min_xy = xy_flat.amin(dim=1).view(n, 1, 1, 2)
-	max_xy = xy_flat.amax(dim=1).view(n, 1, 1, 2)
-	scale_xy = (max_xy - min_xy).clamp_min(1e-6)
-	uv0 = (tgt_xy - min_xy) / scale_xy
-	uv0x = uv0[..., 0] * float(max(1, wm - 1))
-	uv0y = uv0[..., 1] * float(max(1, hm - 1))
-	uv0 = clamp_uv(torch.stack([uv0x, uv0y], dim=-1))
+	# Init: map full output image domain to full mesh index domain.
+	uv0x = xx * (float(max(1, wm - 1)) / float(max(1, w_out - 1)))
+	uv0y = yy * (float(max(1, hm - 1)) / float(max(1, h_out - 1)))
+	uv0 = clamp_uv(torch.stack([uv0x, uv0y], dim=-1)).view(1, h_out, w_out, 2).expand(n, h_out, w_out, 2)
 	uv0_nchw = uv0.permute(0, 3, 1, 2).contiguous()
 	uv_ms = _pyr_from_flat(flat=uv0_nchw, n_scales=uv_scales)
 	opt = torch.optim.Adam(list(uv_ms), lr=step_size)
