@@ -32,3 +32,9 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def mod_smooth_y_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = mod_smooth_y_loss_map(res=res)
 	return _masked_mean(lm, mask)
+
+
+def contr_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+	amp = res.amp_lr
+	bias = res.bias_lr
+	return ((amp - 1.0) * (amp - 1.0) + bias * bias).mean()
