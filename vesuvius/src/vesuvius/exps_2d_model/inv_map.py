@@ -71,7 +71,7 @@ def inverse_map_autograd(
 	xy_lr: torch.Tensor,
 	h_out: int,
 	w_out: int,
-	iters: int = 50,
+	iters: int = 1000,
 	step_size: float = 0.01,
 	uv_scales: int = 4,
 	eps_det: float = 1e-8,
@@ -137,7 +137,7 @@ def inverse_map_autograd(
 			opt = torch.optim.Adam(list(uv_ms), lr=step_size)
 		loss_v = float(loss.detach().cpu())
 		loss_hist.append(loss_v)
-		print(f"inv_map: iter={i + 1:03d}/{iters:03d} loss={loss_v:.6g}")
+		# print(f"inv_map: iter={i + 1:03d}/{iters:03d} loss={loss_v:.6g}")
 		if len(loss_hist) >= 11:
 			imp10 = loss_hist[-11] - loss_hist[-1]
 			if imp10 < (0.001 * loss_hist[-1]):
