@@ -1,5 +1,6 @@
 #include "SegmentationCellReoptPanel.hpp"
 
+#include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 
 #include <QCheckBox>
@@ -8,11 +9,18 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
+#include <QVariant>
 #include <QVBoxLayout>
 
-SegmentationCellReoptPanel::SegmentationCellReoptPanel(QWidget* parent)
+#include <algorithm>
+
+SegmentationCellReoptPanel::SegmentationCellReoptPanel(const QString& settingsGroup,
+                                                       QWidget* parent)
     : QWidget(parent)
+    , _settingsGroup(settingsGroup)
 {
     auto* panelLayout = new QVBoxLayout(this);
     panelLayout->setContentsMargins(0, 0, 0, 0);
@@ -99,4 +107,171 @@ SegmentationCellReoptPanel::SegmentationCellReoptPanel(QWidget* parent)
     cellReoptLayout->addLayout(runButtonRow);
 
     panelLayout->addWidget(_groupCellReopt);
+
+    // --- Signal wiring (moved from SegmentationWidget::buildUi) ---
+
+    connect(_chkCellReoptMode, &QCheckBox::toggled, this, [this](bool enabled) {
+        setCellReoptMode(enabled);
+    });
+
+    connect(_spinCellReoptMaxSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (_cellReoptMaxSteps != value) {
+            _cellReoptMaxSteps = value;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_max_steps"), value);
+                emit cellReoptMaxStepsChanged(value);
+            }
+        }
+    });
+
+    connect(_spinCellReoptMaxPoints, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (_cellReoptMaxPoints != value) {
+            _cellReoptMaxPoints = value;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_max_points"), value);
+                emit cellReoptMaxPointsChanged(value);
+            }
+        }
+    });
+
+    connect(_spinCellReoptMinSpacing, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        float floatVal = static_cast<float>(value);
+        if (_cellReoptMinSpacing != floatVal) {
+            _cellReoptMinSpacing = floatVal;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_min_spacing"), value);
+                emit cellReoptMinSpacingChanged(floatVal);
+            }
+        }
+    });
+
+    connect(_spinCellReoptPerimeterOffset, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        float floatVal = static_cast<float>(value);
+        if (_cellReoptPerimeterOffset != floatVal) {
+            _cellReoptPerimeterOffset = floatVal;
+            if (!_restoringSettings) {
+                writeSetting(QStringLiteral("cell_reopt_perimeter_offset"), value);
+                emit cellReoptPerimeterOffsetChanged(floatVal);
+            }
+        }
+    });
+
+    connect(_btnCellReoptRun, &QPushButton::clicked, this, [this]() {
+        uint64_t collectionId = 0;
+        if (_comboCellReoptCollection && _comboCellReoptCollection->currentIndex() >= 0) {
+            collectionId = _comboCellReoptCollection->currentData().toULongLong();
+        }
+        emit cellReoptGrowthRequested(collectionId);
+    });
+}
+
+void SegmentationCellReoptPanel::writeSetting(const QString& key, const QVariant& value)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.beginGroup(_settingsGroup);
+    settings.setValue(key, value);
+    settings.endGroup();
+}
+
+void SegmentationCellReoptPanel::setCellReoptMode(bool enabled)
+{
+    if (_cellReoptMode == enabled) {
+        return;
+    }
+    _cellReoptMode = enabled;
+    qInfo() << "SegmentationWidget: Cell reoptimization mode changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("cell_reopt_mode"), _cellReoptMode);
+        emit cellReoptModeChanged(_cellReoptMode);
+    }
+    if (_chkCellReoptMode) {
+        const QSignalBlocker blocker(_chkCellReoptMode);
+        _chkCellReoptMode->setChecked(_cellReoptMode);
+    }
+}
+
+void SegmentationCellReoptPanel::setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections)
+{
+    if (!_comboCellReoptCollection) {
+        return;
+    }
+
+    // Remember current selection
+    uint64_t currentId = 0;
+    if (_comboCellReoptCollection->currentIndex() >= 0) {
+        currentId = _comboCellReoptCollection->currentData().toULongLong();
+    }
+
+    const QSignalBlocker blocker(_comboCellReoptCollection);
+    _comboCellReoptCollection->clear();
+
+    int indexToSelect = -1;
+    for (int i = 0; i < collections.size(); ++i) {
+        const auto& [id, name] = collections[i];
+        _comboCellReoptCollection->addItem(name, QVariant::fromValue(id));
+        if (id == currentId) {
+            indexToSelect = i;
+        }
+    }
+
+    // Restore selection if possible, otherwise select first item
+    if (indexToSelect >= 0) {
+        _comboCellReoptCollection->setCurrentIndex(indexToSelect);
+    } else if (_comboCellReoptCollection->count() > 0) {
+        _comboCellReoptCollection->setCurrentIndex(0);
+    }
+}
+
+void SegmentationCellReoptPanel::restoreSettings(QSettings& settings)
+{
+    _restoringSettings = true;
+
+    _cellReoptMaxSteps = settings.value(QStringLiteral("cell_reopt_max_steps"), _cellReoptMaxSteps).toInt();
+    _cellReoptMaxSteps = std::clamp(_cellReoptMaxSteps, 10, 10000);
+    _cellReoptMaxPoints = settings.value(QStringLiteral("cell_reopt_max_points"), _cellReoptMaxPoints).toInt();
+    _cellReoptMaxPoints = std::clamp(_cellReoptMaxPoints, 3, 200);
+    _cellReoptMinSpacing = settings.value(QStringLiteral("cell_reopt_min_spacing"), static_cast<double>(_cellReoptMinSpacing)).toFloat();
+    _cellReoptMinSpacing = std::clamp(_cellReoptMinSpacing, 1.0f, 50.0f);
+    _cellReoptPerimeterOffset = settings.value(QStringLiteral("cell_reopt_perimeter_offset"), static_cast<double>(_cellReoptPerimeterOffset)).toFloat();
+    _cellReoptPerimeterOffset = std::clamp(_cellReoptPerimeterOffset, -50.0f, 50.0f);
+    // Don't restore cell reopt mode - user must explicitly enable each session
+
+    _restoringSettings = false;
+}
+
+void SegmentationCellReoptPanel::syncUiState(bool showApprovalMask, bool growthInProgress)
+{
+    if (_chkCellReoptMode) {
+        const QSignalBlocker blocker(_chkCellReoptMode);
+        _chkCellReoptMode->setChecked(_cellReoptMode);
+        // Only enabled when approval mask is visible
+        _chkCellReoptMode->setEnabled(showApprovalMask);
+    }
+    if (_spinCellReoptMaxSteps) {
+        const QSignalBlocker blocker(_spinCellReoptMaxSteps);
+        _spinCellReoptMaxSteps->setValue(_cellReoptMaxSteps);
+        _spinCellReoptMaxSteps->setEnabled(_cellReoptMode);
+    }
+    if (_spinCellReoptMaxPoints) {
+        const QSignalBlocker blocker(_spinCellReoptMaxPoints);
+        _spinCellReoptMaxPoints->setValue(_cellReoptMaxPoints);
+        _spinCellReoptMaxPoints->setEnabled(_cellReoptMode);
+    }
+    if (_spinCellReoptMinSpacing) {
+        const QSignalBlocker blocker(_spinCellReoptMinSpacing);
+        _spinCellReoptMinSpacing->setValue(static_cast<double>(_cellReoptMinSpacing));
+        _spinCellReoptMinSpacing->setEnabled(_cellReoptMode);
+    }
+    if (_spinCellReoptPerimeterOffset) {
+        const QSignalBlocker blocker(_spinCellReoptPerimeterOffset);
+        _spinCellReoptPerimeterOffset->setValue(static_cast<double>(_cellReoptPerimeterOffset));
+        _spinCellReoptPerimeterOffset->setEnabled(_cellReoptMode);
+    }
+    if (_comboCellReoptCollection) {
+        _comboCellReoptCollection->setEnabled(_cellReoptMode);
+    }
+    if (_btnCellReoptRun) {
+        const bool hasCollection = _comboCellReoptCollection && _comboCellReoptCollection->count() > 0;
+        _btnCellReoptRun->setEnabled(_cellReoptMode && !growthInProgress && hasCollection);
+    }
 }

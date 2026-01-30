@@ -1,17 +1,26 @@
 #include "SegmentationApprovalMaskPanel.hpp"
 
+#include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QSettings>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QVBoxLayout>
 
-SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(QWidget* parent)
+#include <algorithm>
+#include <cmath>
+
+SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& settingsGroup,
+                                                             QWidget* parent)
     : QWidget(parent)
+    , _settingsGroup(settingsGroup)
 {
     auto* panelLayout = new QVBoxLayout(this);
     panelLayout->setContentsMargins(0, 0, 0, 0);
@@ -113,4 +122,269 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(QWidget* parent)
     approvalLayout->addLayout(buttonRow);
 
     panelLayout->addWidget(_groupApprovalMask);
+
+    // --- Signal wiring (moved from SegmentationWidget::buildUi) ---
+
+    connect(_chkShowApprovalMask, &QCheckBox::toggled, this, [this](bool enabled) {
+        setShowApprovalMask(enabled);
+        // If show is being unchecked and edit modes are active, turn them off
+        if (!enabled) {
+            if (_editApprovedMask) {
+                setEditApprovedMask(false);
+            }
+            if (_editUnapprovedMask) {
+                setEditUnapprovedMask(false);
+            }
+        }
+    });
+
+    connect(_chkEditApprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
+        setEditApprovedMask(enabled);
+    });
+
+    connect(_chkEditUnapprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
+        setEditUnapprovedMask(enabled);
+    });
+
+    connect(_chkAutoApproveEdits, &QCheckBox::toggled, this, [this](bool enabled) {
+        setAutoApproveEdits(enabled);
+    });
+
+    connect(_spinApprovalBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setApprovalBrushRadius(static_cast<float>(value));
+    });
+
+    connect(_spinApprovalBrushDepth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setApprovalBrushDepth(static_cast<float>(value));
+    });
+
+    connect(_sliderApprovalMaskOpacity, &QSlider::valueChanged, this, [this](int value) {
+        setApprovalMaskOpacity(value);
+    });
+
+    connect(_btnApprovalColor, &QPushButton::clicked, this, [this]() {
+        QColor newColor = QColorDialog::getColor(_approvalBrushColor, this, tr("Choose Approval Mask Color"));
+        if (newColor.isValid()) {
+            setApprovalBrushColor(newColor);
+        }
+    });
+
+    connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested);
+}
+
+void SegmentationApprovalMaskPanel::writeSetting(const QString& key, const QVariant& value)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.beginGroup(_settingsGroup);
+    settings.setValue(key, value);
+    settings.endGroup();
+}
+
+void SegmentationApprovalMaskPanel::setShowApprovalMask(bool enabled)
+{
+    if (_showApprovalMask == enabled) {
+        return;
+    }
+    _showApprovalMask = enabled;
+    qInfo() << "SegmentationWidget: Show approval mask changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("show_approval_mask"), _showApprovalMask);
+        qInfo() << "  Emitting showApprovalMaskChanged signal";
+        emit showApprovalMaskChanged(_showApprovalMask);
+    }
+    if (_chkShowApprovalMask) {
+        const QSignalBlocker blocker(_chkShowApprovalMask);
+        _chkShowApprovalMask->setChecked(_showApprovalMask);
+    }
+    syncUiState();
+}
+
+void SegmentationApprovalMaskPanel::setEditApprovedMask(bool enabled)
+{
+    if (_editApprovedMask == enabled) {
+        return;
+    }
+    _editApprovedMask = enabled;
+    qInfo() << "SegmentationWidget: Edit approved mask changed to:" << enabled;
+
+    // Mutual exclusion: if enabling approved, disable unapproved
+    if (enabled && _editUnapprovedMask) {
+        setEditUnapprovedMask(false);
+    }
+
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("edit_approved_mask"), _editApprovedMask);
+        qInfo() << "  Emitting editApprovedMaskChanged signal";
+        emit editApprovedMaskChanged(_editApprovedMask);
+    }
+    if (_chkEditApprovedMask) {
+        const QSignalBlocker blocker(_chkEditApprovedMask);
+        _chkEditApprovedMask->setChecked(_editApprovedMask);
+    }
+    syncUiState();
+}
+
+void SegmentationApprovalMaskPanel::setEditUnapprovedMask(bool enabled)
+{
+    if (_editUnapprovedMask == enabled) {
+        return;
+    }
+    _editUnapprovedMask = enabled;
+    qInfo() << "SegmentationWidget: Edit unapproved mask changed to:" << enabled;
+
+    // Mutual exclusion: if enabling unapproved, disable approved
+    if (enabled && _editApprovedMask) {
+        setEditApprovedMask(false);
+    }
+
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("edit_unapproved_mask"), _editUnapprovedMask);
+        qInfo() << "  Emitting editUnapprovedMaskChanged signal";
+        emit editUnapprovedMaskChanged(_editUnapprovedMask);
+    }
+    if (_chkEditUnapprovedMask) {
+        const QSignalBlocker blocker(_chkEditUnapprovedMask);
+        _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
+    }
+    syncUiState();
+}
+
+void SegmentationApprovalMaskPanel::setAutoApproveEdits(bool enabled)
+{
+    if (_autoApproveEdits == enabled) {
+        return;
+    }
+    _autoApproveEdits = enabled;
+    qInfo() << "SegmentationWidget: Auto-approve edits changed to:" << enabled;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_auto_approve_edits"), _autoApproveEdits);
+        emit autoApproveEditsChanged(_autoApproveEdits);
+    }
+    if (_chkAutoApproveEdits) {
+        const QSignalBlocker blocker(_chkAutoApproveEdits);
+        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    }
+}
+
+void SegmentationApprovalMaskPanel::setApprovalBrushRadius(float radius)
+{
+    const float sanitized = std::clamp(radius, 1.0f, 1000.0f);
+    if (std::abs(_approvalBrushRadius - sanitized) < 1e-4f) {
+        return;
+    }
+    _approvalBrushRadius = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_radius"), _approvalBrushRadius);
+        emit approvalBrushRadiusChanged(_approvalBrushRadius);
+    }
+    if (_spinApprovalBrushRadius) {
+        const QSignalBlocker blocker(_spinApprovalBrushRadius);
+        _spinApprovalBrushRadius->setValue(static_cast<double>(_approvalBrushRadius));
+    }
+}
+
+void SegmentationApprovalMaskPanel::setApprovalBrushDepth(float depth)
+{
+    const float sanitized = std::clamp(depth, 1.0f, 500.0f);
+    if (std::abs(_approvalBrushDepth - sanitized) < 1e-4f) {
+        return;
+    }
+    _approvalBrushDepth = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_depth"), _approvalBrushDepth);
+        emit approvalBrushDepthChanged(_approvalBrushDepth);
+    }
+    if (_spinApprovalBrushDepth) {
+        const QSignalBlocker blocker(_spinApprovalBrushDepth);
+        _spinApprovalBrushDepth->setValue(static_cast<double>(_approvalBrushDepth));
+    }
+}
+
+void SegmentationApprovalMaskPanel::setApprovalMaskOpacity(int opacity)
+{
+    const int sanitized = std::clamp(opacity, 0, 100);
+    if (_approvalMaskOpacity == sanitized) {
+        return;
+    }
+    _approvalMaskOpacity = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity);
+        emit approvalMaskOpacityChanged(_approvalMaskOpacity);
+    }
+    if (_sliderApprovalMaskOpacity) {
+        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
+        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    }
+    if (_lblApprovalMaskOpacity) {
+        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
+}
+
+void SegmentationApprovalMaskPanel::setApprovalBrushColor(const QColor& color)
+{
+    if (!color.isValid() || _approvalBrushColor == color) {
+        return;
+    }
+    _approvalBrushColor = color;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_color"), _approvalBrushColor.name());
+        emit approvalBrushColorChanged(_approvalBrushColor);
+    }
+    if (_btnApprovalColor) {
+        _btnApprovalColor->setStyleSheet(
+            QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
+    }
+}
+
+void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
+{
+    using namespace vc3d::settings;
+
+    _restoringSettings = true;
+
+    _approvalBrushRadius = settings.value(segmentation::APPROVAL_BRUSH_RADIUS, _approvalBrushRadius).toFloat();
+    _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
+    _approvalBrushDepth = settings.value(segmentation::APPROVAL_BRUSH_DEPTH, _approvalBrushDepth).toFloat();
+    _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
+
+    _approvalMaskOpacity = settings.value(segmentation::APPROVAL_MASK_OPACITY, _approvalMaskOpacity).toInt();
+    _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
+    const QString colorName = settings.value(segmentation::APPROVAL_BRUSH_COLOR, _approvalBrushColor.name()).toString();
+    if (QColor::isValidColorName(colorName)) {
+        _approvalBrushColor = QColor::fromString(colorName);
+    }
+    _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
+    _autoApproveEdits = settings.value(segmentation::APPROVAL_AUTO_APPROVE_EDITS, _autoApproveEdits).toBool();
+    // Don't restore edit states - user must explicitly enable editing each session
+
+    _restoringSettings = false;
+}
+
+void SegmentationApprovalMaskPanel::syncUiState()
+{
+    if (_chkShowApprovalMask) {
+        const QSignalBlocker blocker(_chkShowApprovalMask);
+        _chkShowApprovalMask->setChecked(_showApprovalMask);
+    }
+    if (_chkEditApprovedMask) {
+        const QSignalBlocker blocker(_chkEditApprovedMask);
+        _chkEditApprovedMask->setChecked(_editApprovedMask);
+        _chkEditApprovedMask->setEnabled(_showApprovalMask);
+    }
+    if (_chkEditUnapprovedMask) {
+        const QSignalBlocker blocker(_chkEditUnapprovedMask);
+        _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
+        _chkEditUnapprovedMask->setEnabled(_showApprovalMask);
+    }
+    if (_chkAutoApproveEdits) {
+        const QSignalBlocker blocker(_chkAutoApproveEdits);
+        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    }
+    if (_sliderApprovalMaskOpacity) {
+        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
+        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    }
+    if (_lblApprovalMaskOpacity) {
+        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
 }

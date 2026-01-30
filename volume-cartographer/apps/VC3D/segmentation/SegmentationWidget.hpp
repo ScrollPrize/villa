@@ -65,13 +65,13 @@ public:
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
 
     [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
-    // Neural tracer getters
-    [[nodiscard]] bool neuralTracerEnabled() const { return _neuralTracerEnabled; }
-    [[nodiscard]] QString neuralCheckpointPath() const { return _neuralCheckpointPath; }
-    [[nodiscard]] QString neuralPythonPath() const { return _neuralPythonPath; }
-    [[nodiscard]] QString volumeZarrPath() const { return _volumeZarrPath; }
-    [[nodiscard]] int neuralVolumeScale() const { return _neuralVolumeScale; }
-    [[nodiscard]] int neuralBatchSize() const { return _neuralBatchSize; }
+    // Neural tracer getters — delegated to panel
+    [[nodiscard]] bool neuralTracerEnabled() const;
+    [[nodiscard]] QString neuralCheckpointPath() const;
+    [[nodiscard]] QString neuralPythonPath() const;
+    [[nodiscard]] QString volumeZarrPath() const;
+    [[nodiscard]] int neuralVolumeScale() const;
+    [[nodiscard]] int neuralBatchSize() const;
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -110,15 +110,15 @@ public:
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
-    // Approval mask getters
-    [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
-    [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
-    [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
-    [[nodiscard]] bool autoApproveEdits() const { return _autoApproveEdits; }
-    [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
-    [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
-    [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
-    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
+    // Approval mask getters — delegated to panel
+    [[nodiscard]] bool showApprovalMask() const;
+    [[nodiscard]] bool editApprovedMask() const;
+    [[nodiscard]] bool editUnapprovedMask() const;
+    [[nodiscard]] bool autoApproveEdits() const;
+    [[nodiscard]] float approvalBrushRadius() const;
+    [[nodiscard]] float approvalBrushDepth() const;
+    [[nodiscard]] int approvalMaskOpacity() const;
+    [[nodiscard]] QColor approvalBrushColor() const;
 
     // Approval mask setters
     void setShowApprovalMask(bool enabled);
@@ -143,12 +143,12 @@ public:
      */
     void setVolumeZarrPath(const QString& path);
 
-    // Cell reoptimization getters
-    [[nodiscard]] bool cellReoptMode() const { return _cellReoptMode; }
-    [[nodiscard]] int cellReoptMaxSteps() const { return _cellReoptMaxSteps; }
-    [[nodiscard]] int cellReoptMaxPoints() const { return _cellReoptMaxPoints; }
-    [[nodiscard]] float cellReoptMinSpacing() const { return _cellReoptMinSpacing; }
-    [[nodiscard]] float cellReoptPerimeterOffset() const { return _cellReoptPerimeterOffset; }
+    // Cell reoptimization getters — delegated to panel
+    [[nodiscard]] bool cellReoptMode() const;
+    [[nodiscard]] int cellReoptMaxSteps() const;
+    [[nodiscard]] int cellReoptMaxPoints() const;
+    [[nodiscard]] float cellReoptMinSpacing() const;
+    [[nodiscard]] float cellReoptPerimeterOffset() const;
 
     // Cell reoptimization setters
     void setCellReoptMode(bool enabled);
@@ -192,9 +192,6 @@ signals:
 
     // Neural tracer signals
     void neuralTracerEnabledChanged(bool enabled);
-    void neuralTracerServiceRequested(const QString& checkpointPath,
-                                      const QString& volumeZarr,
-                                      int volumeScale);
     void neuralTracerStatusMessage(const QString& message);
 
     // Cell reoptimization signals
@@ -314,29 +311,4 @@ private:
     int _correctionsZMax{0};
     bool _correctionsAnnotateChecked{false};
 
-    // Approval mask state
-    // Cylinder brush model: radius defines circle in plane views, depth defines cylinder height
-    bool _showApprovalMask{false};
-    bool _editApprovedMask{false};    // Editing in approve mode (mutually exclusive with unapprove)
-    bool _editUnapprovedMask{false};  // Editing in unapprove mode (mutually exclusive with approve)
-    bool _autoApproveEdits{true};
-    float _approvalBrushRadius{50.0f};     // Cylinder radius (circle in plane views, rect width in flattened)
-    float _approvalBrushDepth{15.0f};      // Cylinder depth (rect height in flattened view)
-    int _approvalMaskOpacity{50};          // Mask overlay opacity (0-100, default 50%)
-    QColor _approvalBrushColor{0, 255, 0}; // RGB color for approval painting (default pure green)
-
-    // Neural tracer state
-    bool _neuralTracerEnabled{false};
-    QString _neuralCheckpointPath;
-    QString _neuralPythonPath;
-    QString _volumeZarrPath;
-    int _neuralVolumeScale{0};
-    int _neuralBatchSize{4};
-
-    // Cell reoptimization state
-    bool _cellReoptMode{false};
-    int _cellReoptMaxSteps{500};
-    int _cellReoptMaxPoints{50};
-    float _cellReoptMinSpacing{5.0f};
-    float _cellReoptPerimeterOffset{0.0f};
 };

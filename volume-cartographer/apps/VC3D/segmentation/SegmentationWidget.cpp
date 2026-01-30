@@ -1,4 +1,5 @@
 #include "SegmentationWidget.hpp"
+#include "SegmentationCommon.hpp"
 
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "elements/JsonProfileEditor.hpp"
@@ -51,10 +52,10 @@
 
 #include <nlohmann/json.hpp>
 
-namespace
-{
 Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget")
 
+namespace
+{
 constexpr int kGrowDirUpBit = 1 << 0;
 constexpr int kGrowDirDownBit = 1 << 1;
 constexpr int kGrowDirLeftBit = 1 << 2;
@@ -235,16 +236,16 @@ void SegmentationWidget::buildUi()
     _editingPanel = new SegmentationEditingPanel(this);
     layout->addWidget(_editingPanel);
 
-    _approvalMaskPanel = new SegmentationApprovalMaskPanel(this);
+    _approvalMaskPanel = new SegmentationApprovalMaskPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_approvalMaskPanel);
 
-    _cellReoptPanel = new SegmentationCellReoptPanel(this);
+    _cellReoptPanel = new SegmentationCellReoptPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_cellReoptPanel);
 
     _directionFieldPanel = new SegmentationDirectionFieldPanel(this);
     layout->addWidget(_directionFieldPanel);
 
-    _neuralTracerPanel = new SegmentationNeuralTracerPanel(this);
+    _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
 
     auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const QString& key) {
@@ -264,7 +265,6 @@ void SegmentationWidget::buildUi()
     rememberGroupState(_editingPanel->lineGroup(), QStringLiteral("group_line_expanded"));
     rememberGroupState(_editingPanel->pushPullGroup(), QStringLiteral("group_push_pull_expanded"));
     rememberGroupState(_directionFieldPanel->directionFieldGroup(), QStringLiteral("group_direction_field_expanded"));
-    rememberGroupState(_neuralTracerPanel->neuralTracerGroup(), QStringLiteral("group_neural_tracer_expanded"));
 
     _correctionsPanel = new SegmentationCorrectionsPanel(this);
     layout->addWidget(_correctionsPanel);
@@ -282,108 +282,39 @@ void SegmentationWidget::buildUi()
         setShowHoverMarker(enabled);
     });
 
-    // Approval mask signal connections
-    connect(_approvalMaskPanel->showCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setShowApprovalMask(enabled);
-        // If show is being unchecked and edit modes are active, turn them off
-        if (!enabled) {
-            if (_editApprovedMask) {
-                setEditApprovedMask(false);
-            }
-            if (_editUnapprovedMask) {
-                setEditUnapprovedMask(false);
-            }
-        }
-    });
+    // Forward approval mask panel signals
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::showApprovalMaskChanged,
+            this, &SegmentationWidget::showApprovalMaskChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editApprovedMaskChanged,
+            this, &SegmentationWidget::editApprovedMaskChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editUnapprovedMaskChanged,
+            this, &SegmentationWidget::editUnapprovedMaskChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApproveEditsChanged,
+            this, &SegmentationWidget::autoApproveEditsChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushRadiusChanged,
+            this, &SegmentationWidget::approvalBrushRadiusChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushDepthChanged,
+            this, &SegmentationWidget::approvalBrushDepthChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalMaskOpacityChanged,
+            this, &SegmentationWidget::approvalMaskOpacityChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushColorChanged,
+            this, &SegmentationWidget::approvalBrushColorChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested,
+            this, &SegmentationWidget::approvalStrokesUndoRequested);
 
-    connect(_approvalMaskPanel->editApprovedCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setEditApprovedMask(enabled);
-    });
-
-    connect(_approvalMaskPanel->editUnapprovedCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setEditUnapprovedMask(enabled);
-    });
-
-    connect(_approvalMaskPanel->autoApproveCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setAutoApproveEdits(enabled);
-    });
-
-    connect(_approvalMaskPanel->brushRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setApprovalBrushRadius(static_cast<float>(value));
-    });
-
-    connect(_approvalMaskPanel->brushDepthSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setApprovalBrushDepth(static_cast<float>(value));
-    });
-
-    connect(_approvalMaskPanel->opacitySlider(), &QSlider::valueChanged, this, [this](int value) {
-        setApprovalMaskOpacity(value);
-    });
-
-    connect(_approvalMaskPanel->colorButton(), &QPushButton::clicked, this, [this]() {
-        QColor newColor = QColorDialog::getColor(_approvalBrushColor, this, tr("Choose Approval Mask Color"));
-        if (newColor.isValid()) {
-            setApprovalBrushColor(newColor);
-        }
-    });
-
-    connect(_approvalMaskPanel->undoButton(), &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
-
-    // Cell reoptimization signal connections
-    connect(_cellReoptPanel->modeCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setCellReoptMode(enabled);
-    });
-
-    connect(_cellReoptPanel->maxStepsSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (_cellReoptMaxSteps != value) {
-            _cellReoptMaxSteps = value;
-            if (!_restoringSettings) {
-                writeSetting(QStringLiteral("cell_reopt_max_steps"), value);
-                emit cellReoptMaxStepsChanged(value);
-            }
-        }
-    });
-
-    connect(_cellReoptPanel->maxPointsSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (_cellReoptMaxPoints != value) {
-            _cellReoptMaxPoints = value;
-            if (!_restoringSettings) {
-                writeSetting(QStringLiteral("cell_reopt_max_points"), value);
-                emit cellReoptMaxPointsChanged(value);
-            }
-        }
-    });
-
-    connect(_cellReoptPanel->minSpacingSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        float floatVal = static_cast<float>(value);
-        if (_cellReoptMinSpacing != floatVal) {
-            _cellReoptMinSpacing = floatVal;
-            if (!_restoringSettings) {
-                writeSetting(QStringLiteral("cell_reopt_min_spacing"), value);
-                emit cellReoptMinSpacingChanged(floatVal);
-            }
-        }
-    });
-
-    connect(_cellReoptPanel->perimeterOffsetSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        float floatVal = static_cast<float>(value);
-        if (_cellReoptPerimeterOffset != floatVal) {
-            _cellReoptPerimeterOffset = floatVal;
-            if (!_restoringSettings) {
-                writeSetting(QStringLiteral("cell_reopt_perimeter_offset"), value);
-                emit cellReoptPerimeterOffsetChanged(floatVal);
-            }
-        }
-    });
-
-    connect(_cellReoptPanel->runButton(), &QPushButton::clicked, this, [this]() {
-        uint64_t collectionId = 0;
-        auto* combo = _cellReoptPanel->collectionCombo();
-        if (combo && combo->currentIndex() >= 0) {
-            collectionId = combo->currentData().toULongLong();
-        }
-        emit cellReoptGrowthRequested(collectionId);
-    });
+    // Forward cell reopt panel signals
+    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptModeChanged,
+            this, &SegmentationWidget::cellReoptModeChanged);
+    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptMaxStepsChanged,
+            this, &SegmentationWidget::cellReoptMaxStepsChanged);
+    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptMaxPointsChanged,
+            this, &SegmentationWidget::cellReoptMaxPointsChanged);
+    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptMinSpacingChanged,
+            this, &SegmentationWidget::cellReoptMinSpacingChanged);
+    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptPerimeterOffsetChanged,
+            this, &SegmentationWidget::cellReoptPerimeterOffsetChanged);
+    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptGrowthRequested,
+            this, &SegmentationWidget::cellReoptGrowthRequested);
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
         if (!box) {
@@ -808,80 +739,11 @@ void SegmentationWidget::buildUi()
     connect(_editingPanel->resetButton(), &QPushButton::clicked, this, &SegmentationWidget::resetRequested);
     connect(_editingPanel->stopButton(), &QPushButton::clicked, this, &SegmentationWidget::stopToolsRequested);
 
-    // Neural tracer connections
-    connect(_neuralTracerPanel->enabledCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
-        setNeuralTracerEnabled(enabled);
-    });
-
-    connect(_neuralTracerPanel->checkpointEdit(), &QLineEdit::textChanged, this, [this](const QString& text) {
-        _neuralCheckpointPath = text.trimmed();
-        writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
-    });
-
-    connect(_neuralTracerPanel->checkpointBrowse(), &QToolButton::clicked, this, [this]() {
-        const QString initial = _neuralCheckpointPath.isEmpty() ? QDir::homePath() : _neuralCheckpointPath;
-        const QString file = QFileDialog::getOpenFileName(this, tr("Select neural tracer checkpoint"),
-                                                          initial, tr("PyTorch Checkpoint (*.pt *.pth);;All Files (*)"));
-        if (!file.isEmpty()) {
-            _neuralCheckpointPath = file;
-            _neuralTracerPanel->checkpointEdit()->setText(file);
-        }
-    });
-
-    connect(_neuralTracerPanel->pythonEdit(), &QLineEdit::textChanged, this, [this](const QString& text) {
-        _neuralPythonPath = text.trimmed();
-        writeSetting(QStringLiteral("neural_python_path"), _neuralPythonPath);
-    });
-
-    connect(_neuralTracerPanel->pythonBrowse(), &QToolButton::clicked, this, [this]() {
-        const QString initial = _neuralPythonPath.isEmpty() ? QDir::homePath() : QFileInfo(_neuralPythonPath).absolutePath();
-        const QString file = QFileDialog::getOpenFileName(this, tr("Select Python executable"),
-                                                          initial, tr("All Files (*)"));
-        if (!file.isEmpty()) {
-            _neuralPythonPath = file;
-            _neuralTracerPanel->pythonEdit()->setText(file);
-        }
-    });
-
-    connect(_neuralTracerPanel->volumeScaleCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _neuralVolumeScale = _neuralTracerPanel->volumeScaleCombo()->itemData(index).toInt();
-        writeSetting(QStringLiteral("neural_volume_scale"), _neuralVolumeScale);
-    });
-
-    connect(_neuralTracerPanel->batchSizeSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        _neuralBatchSize = value;
-        writeSetting(QStringLiteral("neural_batch_size"), _neuralBatchSize);
-    });
-
-    // Connect to service manager signals
-    auto& serviceManager = NeuralTraceServiceManager::instance();
-    connect(&serviceManager, &NeuralTraceServiceManager::statusMessage, this, [this](const QString& message) {
-        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
-            lbl->setText(message);
-            lbl->setVisible(true);
-            lbl->setStyleSheet(QString());
-        }
-        emit neuralTracerStatusMessage(message);
-    });
-    connect(&serviceManager, &NeuralTraceServiceManager::serviceStarted, this, [this]() {
-        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
-            lbl->setText(tr("Service running"));
-            lbl->setStyleSheet(QStringLiteral("color: #27ae60;"));
-        }
-    });
-    connect(&serviceManager, &NeuralTraceServiceManager::serviceStopped, this, [this]() {
-        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
-            lbl->setText(tr("Service stopped"));
-            lbl->setStyleSheet(QString());
-        }
-    });
-    connect(&serviceManager, &NeuralTraceServiceManager::serviceError, this, [this](const QString& error) {
-        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
-            lbl->setText(tr("Error: %1").arg(error));
-            lbl->setStyleSheet(QStringLiteral("color: #c0392b;"));
-            lbl->setVisible(true);
-        }
-    });
+    // Forward neural tracer panel signals
+    connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerEnabledChanged,
+            this, &SegmentationWidget::neuralTracerEnabledChanged);
+    connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerStatusMessage,
+            this, &SegmentationWidget::neuralTracerStatusMessage);
 }
 
 void SegmentationWidget::syncUiState()
@@ -1191,70 +1053,9 @@ void SegmentationWidget::syncUiState()
 
     updateNormal3dUi();
 
-    // Approval mask checkboxes
-    if (auto* chk = _approvalMaskPanel->showCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_showApprovalMask);
-    }
-    if (auto* chk = _approvalMaskPanel->editApprovedCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_editApprovedMask);
-        // Edit checkboxes only enabled when show is checked
-        chk->setEnabled(_showApprovalMask);
-    }
-    if (auto* chk = _approvalMaskPanel->editUnapprovedCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_editUnapprovedMask);
-        // Edit checkboxes only enabled when show is checked
-        chk->setEnabled(_showApprovalMask);
-    }
-    if (auto* chk = _approvalMaskPanel->autoApproveCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_autoApproveEdits);
-    }
-    if (auto* slider = _approvalMaskPanel->opacitySlider()) {
-        const QSignalBlocker blocker(slider);
-        slider->setValue(_approvalMaskOpacity);
-    }
-    if (auto* lbl = _approvalMaskPanel->opacityLabel()) {
-        lbl->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
-    }
+    _approvalMaskPanel->syncUiState();
 
-    // Cell reoptimization UI state
-    if (auto* chk = _cellReoptPanel->modeCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_cellReoptMode);
-        // Only enabled when approval mask is visible
-        chk->setEnabled(_showApprovalMask);
-    }
-    if (auto* spin = _cellReoptPanel->maxStepsSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(_cellReoptMaxSteps);
-        spin->setEnabled(_cellReoptMode);
-    }
-    if (auto* spin = _cellReoptPanel->maxPointsSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(_cellReoptMaxPoints);
-        spin->setEnabled(_cellReoptMode);
-    }
-    if (auto* spin = _cellReoptPanel->minSpacingSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(static_cast<double>(_cellReoptMinSpacing));
-        spin->setEnabled(_cellReoptMode);
-    }
-    if (auto* spin = _cellReoptPanel->perimeterOffsetSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(static_cast<double>(_cellReoptPerimeterOffset));
-        spin->setEnabled(_cellReoptMode);
-    }
-    if (auto* combo = _cellReoptPanel->collectionCombo()) {
-        combo->setEnabled(_cellReoptMode);
-    }
-    if (auto* btn = _cellReoptPanel->runButton()) {
-        auto* combo = _cellReoptPanel->collectionCombo();
-        const bool hasCollection = combo && combo->count() > 0;
-        btn->setEnabled(_cellReoptMode && !_growthInProgress && hasCollection);
-    }
+    _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
 
     updateGrowthUiState();
 }
@@ -1493,31 +1294,10 @@ void SegmentationWidget::restoreSettings()
     // Apply profile behavior after restoring.
     applyCustomParamsProfile(_customParamsProfile, /*persist=*/false, /*fromUi=*/false);
 
-    _approvalBrushRadius = settings.value(segmentation::APPROVAL_BRUSH_RADIUS, _approvalBrushRadius).toFloat();
-    _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
-    _approvalBrushDepth = settings.value(segmentation::APPROVAL_BRUSH_DEPTH, _approvalBrushDepth).toFloat();
-    _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
-    // Don't restore approval mask show/edit states - user must explicitly enable each session
+    _approvalMaskPanel->restoreSettings(settings);
 
-    _approvalMaskOpacity = settings.value(segmentation::APPROVAL_MASK_OPACITY, _approvalMaskOpacity).toInt();
-    _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
-    const QString colorName = settings.value(segmentation::APPROVAL_BRUSH_COLOR, _approvalBrushColor.name()).toString();
-    if (QColor::isValidColorName(colorName)) {
-        _approvalBrushColor = QColor::fromString(colorName);
-    }
-    _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
-    _autoApproveEdits = settings.value(segmentation::APPROVAL_AUTO_APPROVE_EDITS, _autoApproveEdits).toBool();
-    // Don't restore edit states - user must explicitly enable editing each session
+    _neuralTracerPanel->restoreSettings(settings);
 
-    // Neural tracer settings
-    _neuralTracerEnabled = settings.value(QStringLiteral("neural_tracer_enabled"), false).toBool();
-    _neuralCheckpointPath = settings.value(QStringLiteral("neural_checkpoint_path"), QString()).toString();
-    _neuralPythonPath = settings.value(QStringLiteral("neural_python_path"), QString()).toString();
-    _neuralVolumeScale = settings.value(QStringLiteral("neural_volume_scale"), 0).toInt();
-    _neuralVolumeScale = std::clamp(_neuralVolumeScale, 0, 5);
-    _neuralBatchSize = settings.value(QStringLiteral("neural_batch_size"), 4).toInt();
-    _neuralBatchSize = std::clamp(_neuralBatchSize, 1, 64);
-  
     // Cell reoptimization settings
     _cellReoptMaxSteps = settings.value(QStringLiteral("cell_reopt_max_steps"), _cellReoptMaxSteps).toInt();
     _cellReoptMaxSteps = std::clamp(_cellReoptMaxSteps, 10, 10000);
@@ -1549,36 +1329,6 @@ void SegmentationWidget::restoreSettings()
     }
     if (auto* dirGroup = _directionFieldPanel->directionFieldGroup()) {
         dirGroup->setExpanded(directionExpanded);
-    }
-
-    const bool neuralExpanded = settings.value(QStringLiteral("group_neural_tracer_expanded"), false).toBool();
-    if (auto* neuralGroup = _neuralTracerPanel->neuralTracerGroup()) {
-        neuralGroup->setExpanded(neuralExpanded);
-    }
-
-    // Sync neural tracer UI
-    if (auto* chk = _neuralTracerPanel->enabledCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_neuralTracerEnabled);
-    }
-    if (auto* edit = _neuralTracerPanel->checkpointEdit()) {
-        const QSignalBlocker blocker(edit);
-        edit->setText(_neuralCheckpointPath);
-    }
-    if (auto* edit = _neuralTracerPanel->pythonEdit()) {
-        const QSignalBlocker blocker(edit);
-        edit->setText(_neuralPythonPath);
-    }
-    if (auto* combo = _neuralTracerPanel->volumeScaleCombo()) {
-        const QSignalBlocker blocker(combo);
-        int idx = combo->findData(_neuralVolumeScale);
-        if (idx >= 0) {
-            combo->setCurrentIndex(idx);
-        }
-    }
-    if (auto* spin = _neuralTracerPanel->batchSizeSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(_neuralBatchSize);
     }
 
     settings.endGroup();
@@ -1623,161 +1373,25 @@ void SegmentationWidget::setShowHoverMarker(bool enabled)
     }
 }
 
-void SegmentationWidget::setShowApprovalMask(bool enabled)
-{
-    if (_showApprovalMask == enabled) {
-        return;
-    }
-    _showApprovalMask = enabled;
-    qInfo() << "SegmentationWidget: Show approval mask changed to:" << enabled;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("show_approval_mask"), _showApprovalMask);
-        qInfo() << "  Emitting showApprovalMaskChanged signal";
-        emit showApprovalMaskChanged(_showApprovalMask);
-    }
-    if (auto* chk = _approvalMaskPanel->showCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_showApprovalMask);
-    }
-    syncUiState();
-}
+// --- Approval mask delegations ---
 
-void SegmentationWidget::setEditApprovedMask(bool enabled)
-{
-    if (_editApprovedMask == enabled) {
-        return;
-    }
-    _editApprovedMask = enabled;
-    qInfo() << "SegmentationWidget: Edit approved mask changed to:" << enabled;
+bool SegmentationWidget::showApprovalMask() const { return _approvalMaskPanel->showApprovalMask(); }
+bool SegmentationWidget::editApprovedMask() const { return _approvalMaskPanel->editApprovedMask(); }
+bool SegmentationWidget::editUnapprovedMask() const { return _approvalMaskPanel->editUnapprovedMask(); }
+bool SegmentationWidget::autoApproveEdits() const { return _approvalMaskPanel->autoApproveEdits(); }
+float SegmentationWidget::approvalBrushRadius() const { return _approvalMaskPanel->approvalBrushRadius(); }
+float SegmentationWidget::approvalBrushDepth() const { return _approvalMaskPanel->approvalBrushDepth(); }
+int SegmentationWidget::approvalMaskOpacity() const { return _approvalMaskPanel->approvalMaskOpacity(); }
+QColor SegmentationWidget::approvalBrushColor() const { return _approvalMaskPanel->approvalBrushColor(); }
 
-    // Mutual exclusion: if enabling approved, disable unapproved
-    if (enabled && _editUnapprovedMask) {
-        setEditUnapprovedMask(false);
-    }
-
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("edit_approved_mask"), _editApprovedMask);
-        qInfo() << "  Emitting editApprovedMaskChanged signal";
-        emit editApprovedMaskChanged(_editApprovedMask);
-    }
-    if (auto* chk = _approvalMaskPanel->editApprovedCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_editApprovedMask);
-    }
-    syncUiState();
-}
-
-void SegmentationWidget::setEditUnapprovedMask(bool enabled)
-{
-    if (_editUnapprovedMask == enabled) {
-        return;
-    }
-    _editUnapprovedMask = enabled;
-    qInfo() << "SegmentationWidget: Edit unapproved mask changed to:" << enabled;
-
-    // Mutual exclusion: if enabling unapproved, disable approved
-    if (enabled && _editApprovedMask) {
-        setEditApprovedMask(false);
-    }
-
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("edit_unapproved_mask"), _editUnapprovedMask);
-        qInfo() << "  Emitting editUnapprovedMaskChanged signal";
-        emit editUnapprovedMaskChanged(_editUnapprovedMask);
-    }
-    if (auto* chk = _approvalMaskPanel->editUnapprovedCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_editUnapprovedMask);
-    }
-    syncUiState();
-}
-
-void SegmentationWidget::setAutoApproveEdits(bool enabled)
-{
-    if (_autoApproveEdits == enabled) {
-        return;
-    }
-    _autoApproveEdits = enabled;
-    qInfo() << "SegmentationWidget: Auto-approve edits changed to:" << enabled;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("approval_auto_approve_edits"), _autoApproveEdits);
-        emit autoApproveEditsChanged(_autoApproveEdits);
-    }
-    if (auto* chk = _approvalMaskPanel->autoApproveCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(_autoApproveEdits);
-    }
-}
-
-void SegmentationWidget::setApprovalBrushRadius(float radius)
-{
-    const float sanitized = std::clamp(radius, 1.0f, 1000.0f);
-    if (std::abs(_approvalBrushRadius - sanitized) < 1e-4f) {
-        return;
-    }
-    _approvalBrushRadius = sanitized;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("approval_brush_radius"), _approvalBrushRadius);
-        emit approvalBrushRadiusChanged(_approvalBrushRadius);
-    }
-    if (auto* spin = _approvalMaskPanel->brushRadiusSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(static_cast<double>(_approvalBrushRadius));
-    }
-}
-
-void SegmentationWidget::setApprovalBrushDepth(float depth)
-{
-    const float sanitized = std::clamp(depth, 1.0f, 500.0f);
-    if (std::abs(_approvalBrushDepth - sanitized) < 1e-4f) {
-        return;
-    }
-    _approvalBrushDepth = sanitized;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("approval_brush_depth"), _approvalBrushDepth);
-        emit approvalBrushDepthChanged(_approvalBrushDepth);
-    }
-    if (auto* spin = _approvalMaskPanel->brushDepthSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(static_cast<double>(_approvalBrushDepth));
-    }
-}
-
-void SegmentationWidget::setApprovalMaskOpacity(int opacity)
-{
-    const int sanitized = std::clamp(opacity, 0, 100);
-    if (_approvalMaskOpacity == sanitized) {
-        return;
-    }
-    _approvalMaskOpacity = sanitized;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity);
-        emit approvalMaskOpacityChanged(_approvalMaskOpacity);
-    }
-    if (auto* slider = _approvalMaskPanel->opacitySlider()) {
-        const QSignalBlocker blocker(slider);
-        slider->setValue(_approvalMaskOpacity);
-    }
-    if (auto* lbl = _approvalMaskPanel->opacityLabel()) {
-        lbl->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
-    }
-}
-
-void SegmentationWidget::setApprovalBrushColor(const QColor& color)
-{
-    if (!color.isValid() || _approvalBrushColor == color) {
-        return;
-    }
-    _approvalBrushColor = color;
-    if (!_restoringSettings) {
-        writeSetting(QStringLiteral("approval_brush_color"), _approvalBrushColor.name());
-        emit approvalBrushColorChanged(_approvalBrushColor);
-    }
-    if (auto* btn = _approvalMaskPanel->colorButton()) {
-        btn->setStyleSheet(
-            QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
-    }
-}
+void SegmentationWidget::setShowApprovalMask(bool enabled) { _approvalMaskPanel->setShowApprovalMask(enabled); syncUiState(); }
+void SegmentationWidget::setEditApprovedMask(bool enabled) { _approvalMaskPanel->setEditApprovedMask(enabled); }
+void SegmentationWidget::setEditUnapprovedMask(bool enabled) { _approvalMaskPanel->setEditUnapprovedMask(enabled); }
+void SegmentationWidget::setAutoApproveEdits(bool enabled) { _approvalMaskPanel->setAutoApproveEdits(enabled); }
+void SegmentationWidget::setApprovalBrushRadius(float radius) { _approvalMaskPanel->setApprovalBrushRadius(radius); }
+void SegmentationWidget::setApprovalBrushDepth(float depth) { _approvalMaskPanel->setApprovalBrushDepth(depth); }
+void SegmentationWidget::setApprovalMaskOpacity(int opacity) { _approvalMaskPanel->setApprovalMaskOpacity(opacity); }
+void SegmentationWidget::setApprovalBrushColor(const QColor& color) { _approvalMaskPanel->setApprovalBrushColor(color); }
 
 void SegmentationWidget::setCellReoptMode(bool enabled)
 {
@@ -2739,84 +2353,18 @@ int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
     return mask;
 }
 
-void SegmentationWidget::setNeuralTracerEnabled(bool enabled)
-{
-    if (_neuralTracerEnabled == enabled) {
-        return;
-    }
-    _neuralTracerEnabled = enabled;
-    writeSetting(QStringLiteral("neural_tracer_enabled"), _neuralTracerEnabled);
+// --- Neural tracer delegations ---
 
-    if (auto* chk = _neuralTracerPanel->enabledCheck()) {
-        const QSignalBlocker blocker(chk);
-        chk->setChecked(enabled);
-    }
+bool SegmentationWidget::neuralTracerEnabled() const { return _neuralTracerPanel->neuralTracerEnabled(); }
+QString SegmentationWidget::neuralCheckpointPath() const { return _neuralTracerPanel->neuralCheckpointPath(); }
+QString SegmentationWidget::neuralPythonPath() const { return _neuralTracerPanel->neuralPythonPath(); }
+QString SegmentationWidget::volumeZarrPath() const { return _neuralTracerPanel->volumeZarrPath(); }
+int SegmentationWidget::neuralVolumeScale() const { return _neuralTracerPanel->neuralVolumeScale(); }
+int SegmentationWidget::neuralBatchSize() const { return _neuralTracerPanel->neuralBatchSize(); }
 
-    emit neuralTracerEnabledChanged(enabled);
-}
-
-void SegmentationWidget::setNeuralCheckpointPath(const QString& path)
-{
-    if (_neuralCheckpointPath == path) {
-        return;
-    }
-    _neuralCheckpointPath = path;
-    writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
-
-    if (auto* edit = _neuralTracerPanel->checkpointEdit()) {
-        const QSignalBlocker blocker(edit);
-        edit->setText(path);
-    }
-}
-
-void SegmentationWidget::setNeuralPythonPath(const QString& path)
-{
-    if (_neuralPythonPath == path) {
-        return;
-    }
-    _neuralPythonPath = path;
-    writeSetting(QStringLiteral("neural_python_path"), _neuralPythonPath);
-
-    if (auto* edit = _neuralTracerPanel->pythonEdit()) {
-        const QSignalBlocker blocker(edit);
-        edit->setText(path);
-    }
-}
-
-void SegmentationWidget::setNeuralVolumeScale(int scale)
-{
-    scale = std::clamp(scale, 0, 5);
-    if (_neuralVolumeScale == scale) {
-        return;
-    }
-    _neuralVolumeScale = scale;
-    writeSetting(QStringLiteral("neural_volume_scale"), _neuralVolumeScale);
-
-    if (auto* combo = _neuralTracerPanel->volumeScaleCombo()) {
-        const QSignalBlocker blocker(combo);
-        int idx = combo->findData(scale);
-        if (idx >= 0) {
-            combo->setCurrentIndex(idx);
-        }
-    }
-}
-
-void SegmentationWidget::setNeuralBatchSize(int size)
-{
-    size = std::clamp(size, 1, 64);
-    if (_neuralBatchSize == size) {
-        return;
-    }
-    _neuralBatchSize = size;
-    writeSetting(QStringLiteral("neural_batch_size"), _neuralBatchSize);
-
-    if (auto* spin = _neuralTracerPanel->batchSizeSpin()) {
-        const QSignalBlocker blocker(spin);
-        spin->setValue(size);
-    }
-}
-
-void SegmentationWidget::setVolumeZarrPath(const QString& path)
-{
-    _volumeZarrPath = path;
-}
+void SegmentationWidget::setNeuralTracerEnabled(bool enabled) { _neuralTracerPanel->setNeuralTracerEnabled(enabled); }
+void SegmentationWidget::setNeuralCheckpointPath(const QString& path) { _neuralTracerPanel->setNeuralCheckpointPath(path); }
+void SegmentationWidget::setNeuralPythonPath(const QString& path) { _neuralTracerPanel->setNeuralPythonPath(path); }
+void SegmentationWidget::setNeuralVolumeScale(int scale) { _neuralTracerPanel->setNeuralVolumeScale(scale); }
+void SegmentationWidget::setNeuralBatchSize(int size) { _neuralTracerPanel->setNeuralBatchSize(size); }
+void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
