@@ -73,7 +73,6 @@ def inverse_map_autograd(
 	w_out: int,
 	iters: int = 50,
 	step_size: float = 0.01,
-	reg_uv_smooth: float = 0.0,
 	uv_scales: int = 4,
 	eps_det: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -95,7 +94,6 @@ def inverse_map_autograd(
 	w_out = int(max(1, w_out))
 	iters = int(max(0, iters))
 	step_size = float(step_size)
-	reg_uv_smooth = float(reg_uv_smooth)
 	uv_scales = int(max(1, uv_scales))
 
 	def clamp_uv(u: torch.Tensor) -> torch.Tensor:
@@ -122,21 +120,14 @@ def inverse_map_autograd(
 	uv_ms = _pyr_from_flat(flat=uv0_nchw, n_scales=uv_scales)
 	opt = torch.optim.Adam(list(uv_ms), lr=step_size)
 
+	loss_hist: list[float] = []
 	for i in range(iters):
 		opt.zero_grad(set_to_none=True)
 		uv_nchw = _integrate_pyr(uv_ms)
 		uv = clamp_uv(uv_nchw.permute(0, 2, 3, 1).contiguous())
 		xy = _sample_xy(xy_lr=xy_lr, uv=uv)
 		err = xy - tgt_xy
-		loss_data = 0.5 * (err * err).sum(dim=-1).mean()
-
-		loss_smooth = uv.new_zeros(())
-		if reg_uv_smooth > 0.0:
-			duv_x = uv[:, :, 1:, :] - uv[:, :, :-1, :]
-			duv_y = uv[:, 1:, :, :] - uv[:, :-1, :, :]
-			loss_smooth = 0.5 * (duv_x * duv_x).mean() + 0.5 * (duv_y * duv_y).mean()
-
-		loss = loss_data + reg_uv_smooth * loss_smooth
+		loss = 0.5 * (err * err).sum(dim=-1).mean()
 		loss.backward()
 		opt.step()
 		# Projection: rebuild pyramid from clamped reconstruction (visualization-only).
@@ -144,12 +135,14 @@ def inverse_map_autograd(
 			uv_c = clamp_uv(_integrate_pyr(uv_ms).permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
 			uv_ms = _pyr_from_flat(flat=uv_c, n_scales=len(uv_ms))
 			opt = torch.optim.Adam(list(uv_ms), lr=step_size)
-		print(
-			f"inv_map: iter={i + 1:03d}/{iters:03d} "
-			f"loss_data={float(loss_data.detach().cpu()):.6g} "
-			f"loss_smooth={float(loss_smooth.detach().cpu()):.6g}  "
-			f"loss_smooth_f={float(reg_uv_smooth*loss_smooth.detach().cpu()):.6g}"
-		)
+		loss_v = float(loss.detach().cpu())
+		loss_hist.append(loss_v)
+		print(f"inv_map: iter={i + 1:03d}/{iters:03d} loss={loss_v:.6g}")
+		if len(loss_hist) >= 11:
+			imp10 = loss_hist[-11] - loss_hist[-1]
+			if imp10 < (0.001 * loss_hist[-1]):
+				print(f"inv_map: early_stop imp10={imp10:.6g} loss={loss_hist[-1]:.6g}")
+				break
 
 	# Jacobian usability mask (finite-diff is fine here; only for visualization gating).
 	du = 1.0
