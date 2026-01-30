@@ -653,15 +653,28 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
 
     // Restore geometry / sizes
-    const QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QByteArray savedGeometry = geometry.value(vc3d::settings::window::GEOMETRY).toByteArray();
+    bool restoredGeometry = false;
     if (!savedGeometry.isEmpty()) {
-        restoreGeometry(savedGeometry);
+        restoredGeometry = restoreGeometry(savedGeometry);
+        if (!restoredGeometry) {
+            Logger()->warn("Failed to restore main window geometry; clearing saved geometry");
+            geometry.remove(vc3d::settings::window::GEOMETRY);
+            geometry.sync();
+        }
     }
     const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
+    bool restoredState = false;
     if (!savedState.isEmpty()) {
-        restoreState(savedState);
-    } else {
+        restoredState = restoreState(savedState);
+        if (!restoredState) {
+            Logger()->warn("Failed to restore main window state; clearing saved state");
+            geometry.remove(vc3d::settings::window::STATE);
+            geometry.sync();
+        }
+    }
+    if (!restoredState) {
         // No saved state - set sensible default sizes for dock widgets
         // The Volume Package dock (left side) should have a reasonable width and height
         resizeDocks({ui.dockWidgetVolumes}, {300}, Qt::Horizontal);
