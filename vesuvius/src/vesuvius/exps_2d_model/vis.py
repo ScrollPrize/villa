@@ -322,10 +322,11 @@ def save(
 		img_loss_layers.append(crop)
 		img_loss_names.append("grid_crop")
 
-		tgt_plain_lr = torch.nn.functional.interpolate(res.target_plain, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
-		tgt_mod_lr = torch.nn.functional.interpolate(res.target_mod, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
-		tgt_plain_img = inv_map.warp_nchw_from_uv(src=tgt_plain_lr, uv=uv_img, uv_mask=uv_mask, fill=0.5)
-		tgt_mod_img = inv_map.warp_nchw_from_uv(src=tgt_mod_lr, uv=uv_img, uv_mask=uv_mask, fill=0.5)
+		uv_tgt = uv_img.clone()
+		uv_tgt[..., 0] = uv_tgt[..., 0] * float(model.subsample_winding)
+		uv_tgt[..., 1] = uv_tgt[..., 1] * float(model.subsample_mesh)
+		tgt_plain_img = inv_map.warp_nchw_from_uv(src=res.target_plain, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
+		tgt_mod_img = inv_map.warp_nchw_from_uv(src=res.target_mod, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
 		img_loss_layers.append(tgt_plain_img[0, 0].detach().cpu().numpy().astype("float32"))
 		img_loss_names.append("target_plain")
 		img_loss_layers.append(tgt_mod_img[0, 0].detach().cpu().numpy().astype("float32"))
@@ -445,7 +446,7 @@ def save(
 		},
 	}
 
-	_save_img_loss_vis()
+	_save_img_loss_vis(iters=0)
 
 	for _k, spec in loss_maps.items():
 		m = spec["fn"]().detach().cpu()
@@ -520,3 +521,8 @@ def save(
 	concat_f[0:label_h * s, :] = lab_u8.astype("float32") / 255.0
 	concat_path = out_vis / f"res_loss_concat_{postfix}.tif"
 	tifffile.imwrite(str(concat_path), concat_f.astype("float32"), compression="lzw")
+
+	# Save the mesh-domain target (no image-size dependence).
+	tgt = res.target_plain[0, 0].detach().cpu().numpy().astype("float32")
+	tgt_path = out_tgt / f"res_tgt_{postfix}.tif"
+	tifffile.imwrite(str(tgt_path), tgt, compression="lzw")

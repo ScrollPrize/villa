@@ -162,17 +162,12 @@ class Model2D(nn.Module):
 		xy_hr = self._grid_xy_subsampled_from_lr(xy_lr=xy_lr)
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
 		data_s = data.grid_sample_px(xy_px=xy_hr)
-		# Targets in winding-space at evaluation resolution.
+		# Targets are defined purely in mesh/winding coordinates (no image-size dependence).
 		h, w = int(xy_hr.shape[1]), int(xy_hr.shape[2])
 		periods = max(1, int(self.mesh_w) - 1)
-		wx = float(max(1, int(self.init.w_img) - 1))
-		wy = float(max(1, int(self.init.h_img) - 1))
-		us = torch.linspace(0.0, wx, w, device=self.device, dtype=torch.float32)
-		vs = torch.linspace(0.0, wy, h, device=self.device, dtype=torch.float32)
-		vv, uu = torch.meshgrid(vs, us, indexing="ij")
-		u = uu.view(1, 1, h, w)
-		phase = torch.pi * (u / wx) * float(periods)
-		target_plain = 0.5 + 0.5 * torch.cos(phase)
+		xs = torch.linspace(0.0, float(periods), w, device=self.device, dtype=torch.float32)
+		phase = (2.0 * torch.pi) * xs.view(1, 1, 1, w)
+		target_plain = 0.5 + 0.5 * torch.cos(phase).expand(1, 1, h, w)
 
 		amp_lr = self.amp_ms[0]
 		bias_lr = self.bias_ms[0]
