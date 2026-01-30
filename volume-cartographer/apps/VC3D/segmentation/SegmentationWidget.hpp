@@ -15,7 +15,6 @@
 #include "SegmentationGrowth.hpp"
 
 class QCheckBox;
-class JsonProfileEditor;
 class SegmentationHeaderRow;
 class SegmentationEditingPanel;
 class SegmentationGrowthPanel;
@@ -56,10 +55,10 @@ public:
     [[nodiscard]] int skeletonSliceOrientation() const { return _skeletonSliceOrientation; }
     [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
     [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
-    [[nodiscard]] QString customParamsText() const { return paramsTextForProfile(_customParamsProfile); }
-    [[nodiscard]] QString customParamsProfile() const { return _customParamsProfile; }
-    [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
-    [[nodiscard]] QString customParamsError() const { return _customParamsError; }
+    [[nodiscard]] QString customParamsText() const;
+    [[nodiscard]] QString customParamsProfile() const;
+    [[nodiscard]] bool customParamsValid() const;
+    [[nodiscard]] QString customParamsError() const;
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
@@ -217,11 +216,6 @@ private:
     void applyGrowthDirectionMaskToUi();
     void updateGrowthUiState();
     static int normalizeGrowthDirectionMask(int mask);
-    void handleCustomParamsEdited();
-    void validateCustomParamsText();
-    std::optional<nlohmann::json> parseCustomParams(QString* error) const;
-    void applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi);
-    [[nodiscard]] QString paramsTextForProfile(const QString& profile) const;
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     void updateNormal3dUi();
 
@@ -272,11 +266,6 @@ private:
     SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
-
-    JsonProfileEditor* _customParamsEditor{nullptr};
-    QString _customParamsText;
-    QString _customParamsError;
-    QString _customParamsProfile{QStringLiteral("custom")};
 
     bool _correctionsZRangeEnabled{false};
     int _correctionsZMin{0};

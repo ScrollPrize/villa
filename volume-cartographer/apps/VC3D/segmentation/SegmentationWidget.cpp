@@ -2,8 +2,6 @@
 #include "SegmentationCommon.hpp"
 
 #include "elements/CollapsibleSettingsGroup.hpp"
-#include "elements/JsonProfileEditor.hpp"
-#include "elements/JsonProfilePresets.hpp"
 #include "NeuralTraceServiceManager.hpp"
 #include "tools/SegmentationEditingPanel.hpp"
 #include "tools/SegmentationGrowthPanel.hpp"
@@ -18,7 +16,6 @@
 
 #include <QAbstractItemView>
 #include <QApplication>
-#include <QByteArray>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
@@ -43,7 +40,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <exception>
 
 #include <nlohmann/json.hpp>
 
@@ -199,8 +195,7 @@ void SegmentationWidget::buildUi()
     _correctionsPanel = new SegmentationCorrectionsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_correctionsPanel);
 
-    _customParamsPanel = new SegmentationCustomParamsPanel(this);
-    _customParamsEditor = _customParamsPanel->editor();
+    _customParamsPanel = new SegmentationCustomParamsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_customParamsPanel);
 
     layout->addStretch(1);
@@ -445,17 +440,6 @@ void SegmentationWidget::buildUi()
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsAnnotateToggled,
             this, &SegmentationWidget::correctionsAnnotateToggled);
 
-    connect(_customParamsEditor, &JsonProfileEditor::textChanged, this, [this]() {
-        handleCustomParamsEdited();
-    });
-
-    connect(_customParamsEditor, &JsonProfileEditor::profileChanged, this, [this](const QString& profile) {
-        if (_restoringSettings) {
-            return;
-        }
-        applyCustomParamsProfile(profile, /*persist=*/true, /*fromUi=*/true);
-    });
-
     if (QComboBox* normal3dCombo = _growthPanel ? _growthPanel->normal3dCombo() : nullptr) {
         connect(normal3dCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, normal3dCombo](int idx) {
             if (_restoringSettings) {
@@ -531,16 +515,7 @@ void SegmentationWidget::syncUiState()
 
     _editingPanel->syncUiState(_editingEnabled, _growthInProgress);
 
-    if (_customParamsEditor) {
-        if (_customParamsEditor->customText() != _customParamsText) {
-            _customParamsEditor->setCustomText(_customParamsText);
-        }
-        if (_customParamsEditor->profile() != _customParamsProfile) {
-            const QSignalBlocker blocker(_customParamsEditor);
-            _customParamsEditor->setProfile(_customParamsProfile, false);
-        }
-    }
-    validateCustomParamsText();
+    _customParamsPanel->syncUiState(_editingEnabled);
 
     QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr;
     QComboBox* growthMethodCombo = _growthPanel ? _growthPanel->growthMethodCombo() : nullptr;
@@ -792,38 +767,6 @@ void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates
     syncUiState();
 }
 
-QString SegmentationWidget::paramsTextForProfile(const QString& profile) const
-{
-    if (profile == QStringLiteral("custom")) {
-        return _customParamsText;
-    }
-    if (profile == QStringLiteral("default")) {
-        // Empty => use GrowPatch defaults.
-        return QString();
-    }
-    return vc3d::json_profiles::tracerParamProfileJson(profile);
-}
-
-void SegmentationWidget::applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi)
-{
-    const QString normalized = vc3d::json_profiles::isValidProfileId(profile)
-        ? profile
-        : QStringLiteral("custom");
-
-    _customParamsProfile = normalized;
-    if (persist) {
-        writeSetting(QStringLiteral("custom_params_profile"), _customParamsProfile);
-    }
-
-    if (_customParamsEditor && !fromUi) {
-        const QSignalBlocker blocker(_customParamsEditor);
-        _customParamsEditor->setProfile(_customParamsProfile, false);
-    }
-
-    validateCustomParamsText();
-    syncUiState();
-}
-
 void SegmentationWidget::restoreSettings()
 {
     using namespace vc3d::settings;
@@ -878,19 +821,9 @@ void SegmentationWidget::restoreSettings()
         _correctionsZMax = _correctionsZMin;
     }
 
-    _customParamsText = settings.value(segmentation::CUSTOM_PARAMS_TEXT, QString()).toString();
-    _customParamsProfile = settings.value(QStringLiteral("custom_params_profile"), _customParamsProfile).toString();
-    if (!vc3d::json_profiles::isValidProfileId(_customParamsProfile)) {
-        _customParamsProfile = QStringLiteral("custom");
-    }
-    if (_customParamsEditor) {
-        _customParamsEditor->setCustomText(_customParamsText);
-    }
+    _customParamsPanel->restoreSettings(settings);
 
     _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
-
-    // Apply profile behavior after restoring.
-    applyCustomParamsProfile(_customParamsProfile, /*persist=*/false, /*fromUi=*/false);
 
     _approvalMaskPanel->restoreSettings(settings);
 
@@ -993,85 +926,6 @@ void SegmentationWidget::setPendingChanges(bool pending)
 void SegmentationWidget::setEditingEnabled(bool enabled)
 {
     updateEditingState(enabled, false);
-}
-
-void SegmentationWidget::handleCustomParamsEdited()
-{
-    if (!_customParamsEditor) {
-        return;
-    }
-
-    // Edits only allowed in custom profile (UI should already be read-only otherwise).
-    if (_customParamsProfile != QStringLiteral("custom")) {
-        return;
-    }
-
-    _customParamsText = _customParamsEditor->customText();
-    writeSetting(QStringLiteral("custom_params_text"), _customParamsText);
-    validateCustomParamsText();
-}
-
-void SegmentationWidget::validateCustomParamsText()
-{
-    if (_customParamsEditor) {
-        _customParamsError = _customParamsEditor->errorText();
-        return;
-    }
-
-    QString error;
-    parseCustomParams(&error);
-    _customParamsError = error;
-}
-
-std::optional<nlohmann::json> SegmentationWidget::parseCustomParams(QString* error) const
-{
-    if (error) {
-        error->clear();
-    }
-
-    const QString trimmed = paramsTextForProfile(_customParamsProfile).trimmed();
-    if (trimmed.isEmpty()) {
-        return std::nullopt;
-    }
-
-    try {
-        const QByteArray utf8 = trimmed.toUtf8();
-        nlohmann::json parsed = nlohmann::json::parse(utf8.constData(), utf8.constData() + utf8.size());
-        if (!parsed.is_object()) {
-            if (error) {
-                *error = tr("Custom params must be a JSON object.");
-            }
-            return std::nullopt;
-        }
-        return parsed;
-    } catch (const nlohmann::json::parse_error& ex) {
-        if (error) {
-            *error = tr("Custom params JSON parse error (byte %1): %2")
-                         .arg(static_cast<qulonglong>(ex.byte))
-                         .arg(QString::fromStdString(ex.what()));
-        }
-    } catch (const std::exception& ex) {
-        if (error) {
-            *error = tr("Custom params JSON parse error: %1")
-                         .arg(QString::fromStdString(ex.what()));
-        }
-    } catch (...) {
-        if (error) {
-            *error = tr("Custom params JSON parse error: unknown error");
-        }
-    }
-
-    return std::nullopt;
-}
-
-std::optional<nlohmann::json> SegmentationWidget::customParamsJson() const
-{
-    QString error;
-    auto parsed = parseCustomParams(&error);
-    if (!error.isEmpty()) {
-        return std::nullopt;
-    }
-    return parsed;
 }
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
@@ -1323,9 +1177,7 @@ void SegmentationWidget::updateGrowthUiState()
     if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
         correctionsZMaxSpin->setEnabled(allowZRange && _correctionsZRangeEnabled);
     }
-    if (_customParamsEditor) {
-        _customParamsEditor->setEnabled(_editingEnabled);
-    }
+    _customParamsPanel->syncUiState(_editingEnabled);
 
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
 }
@@ -1364,6 +1216,14 @@ int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
     }
     return mask;
 }
+
+// --- Custom params delegations ---
+
+QString SegmentationWidget::customParamsText() const { return _customParamsPanel->customParamsText(); }
+QString SegmentationWidget::customParamsProfile() const { return _customParamsPanel->customParamsProfile(); }
+bool SegmentationWidget::customParamsValid() const { return _customParamsPanel->customParamsValid(); }
+QString SegmentationWidget::customParamsError() const { return _customParamsPanel->customParamsError(); }
+std::optional<nlohmann::json> SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
 
 // --- Neural tracer delegations ---
 
