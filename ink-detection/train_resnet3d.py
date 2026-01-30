@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 import pandas as pd
 import os
 import random
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import cv2
 
 import scipy as sp
@@ -143,6 +143,8 @@ class CFG:
     valid_id = '20230820203112'
     stitch_all_val = False
     stitch_downsample = 1
+    stitch_train = False
+    stitch_train_every_n_epochs = 1
 
     # ============== group DRO cfg =============
     objective = "erm"  # "erm" | "group_dro"
@@ -409,6 +411,11 @@ def apply_metadata_hyperparameters(cfg, metadata):
     cfg.erm_group_topk = int(training_cfg.get("erm_group_topk", getattr(cfg, "erm_group_topk", 0) or 0))
     cfg.save_every_epoch = bool(training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)))
     cfg.stitch_all_val = bool(training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)))
+    cfg.stitch_train = bool(training_cfg.get("stitch_train", getattr(cfg, "stitch_train", False)))
+    cfg.stitch_train_every_n_epochs = int(
+        training_cfg.get("stitch_train_every_n_epochs", getattr(cfg, "stitch_train_every_n_epochs", 1) or 1)
+    )
+    cfg.stitch_train_every_n_epochs = max(1, int(cfg.stitch_train_every_n_epochs))
     if "stitch_downsample" in training_cfg:
         cfg.stitch_downsample = int(training_cfg["stitch_downsample"])
     else:
@@ -754,6 +761,33 @@ def extract_patches(image, mask, fragment_mask, *, include_xyxys, filter_empty_t
 
     return images, masks, xyxys
 
+
+def _downsample_bool_mask_any(mask: np.ndarray, ds: int) -> np.ndarray:
+    ds = max(1, int(ds))
+    if mask is None:
+        raise ValueError("mask is None")
+    mask_bool = (mask > 0)
+    h = int(mask_bool.shape[0])
+    w = int(mask_bool.shape[1])
+    ds_h = (h + ds - 1) // ds
+    ds_w = (w + ds - 1) // ds
+    pad_h = int(ds_h * ds - h)
+    pad_w = int(ds_w * ds - w)
+    if pad_h or pad_w:
+        mask_bool = np.pad(mask_bool, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
+    mask_bool = mask_bool.reshape(ds_h, ds, ds_w, ds)
+    return mask_bool.any(axis=(1, 3))
+
+
+def _mask_border(mask_bool: np.ndarray) -> np.ndarray:
+    if mask_bool is None:
+        raise ValueError("mask_bool is None")
+    mask_bool = mask_bool.astype(bool, copy=False)
+    if not mask_bool.any():
+        return np.zeros_like(mask_bool, dtype=bool)
+    eroded = ndimage.binary_erosion(mask_bool, structure=np.ones((3, 3), dtype=bool), border_value=0)
+    return mask_bool & ~eroded
+
 def get_transforms(data, cfg):
     if data == 'train':
         aug = A.Compose(cfg.train_aug_list)
@@ -956,6 +990,10 @@ class RegressionPLModel(pl.LightningModule):
         stitch_downsample=1,
         stitch_all_val_shapes=None,
         stitch_all_val_segment_ids=None,
+        stitch_train_shapes=None,
+        stitch_train_segment_ids=None,
+        stitch_train=False,
+        stitch_train_every_n_epochs=1,
         norm="batch",
         group_norm_groups=32,
         erm_group_topk=0,
@@ -992,9 +1030,62 @@ class RegressionPLModel(pl.LightningModule):
         if self.erm_group_topk < 0:
             raise ValueError(f"erm_group_topk must be >= 0, got {self.erm_group_topk}")
 
+        self.loss_func1 = smp.losses.DiceLoss(mode="binary")
+        self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
+
+        self.backbone = generate_model(
+            model_depth=50,
+            n_input_channels=1,
+            forward_features=True,
+            n_classes=1039,
+        )
+
+        norm = str(norm).lower()
+        group_norm_groups = int(group_norm_groups)
+        init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
+        if not init_ckpt_path:
+            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
+            if not osp.exists(backbone_pretrained_path):
+                raise FileNotFoundError(
+                    f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
+                    "Either place r3d50_KM_200ep.pth next to train_resnet3d.py, set CFG.backbone_pretrained_path, "
+                    "or pass --init_ckpt_path to fine-tune from a previous run."
+                )
+            backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
+            state_dict = backbone_ckpt.get("state_dict", backbone_ckpt)
+            conv1_weight = state_dict["conv1.weight"]
+            state_dict["conv1.weight"] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict, strict=False)
+
+        if norm == "group":
+            replace_batchnorm_with_groupnorm(self.backbone, desired_groups=group_norm_groups)
+
+        was_training = self.backbone.training
+        try:
+            self.backbone.eval()
+            with torch.no_grad():
+                encoder_dims = [x.size(1) for x in self.backbone(torch.rand(1, 1, 20, 256, 256))]
+        finally:
+            if was_training:
+                self.backbone.train()
+
+        self.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
+
+        if self.hparams.with_norm:
+            if norm == "group":
+                self.normalization = nn.GroupNorm(num_groups=1, num_channels=1)
+            else:
+                self.normalization = nn.BatchNorm3d(num_features=1)
+
         self._stitch_downsample = max(1, int(stitch_downsample or 1))
         self._stitch_buffers = {}
         self._stitch_segment_ids = {}
+        self._stitch_train_buffers = {}
+        self._stitch_train_segment_ids = []
+        self._stitch_train_loaders = []
+        self._stitch_train_enabled = bool(stitch_train)
+        self._stitch_train_every_n_epochs = max(1, int(stitch_train_every_n_epochs or 1))
+        self._stitch_borders_by_split = {"train": {}, "val": {}}
 
         if bool(stitch_all_val):
             if stitch_all_val_shapes is None or stitch_all_val_segment_ids is None:
@@ -1029,7 +1120,125 @@ class RegressionPLModel(pl.LightningModule):
                 )
                 self._stitch_segment_ids[idx] = str(stitch_segment_id or idx)
 
+        if stitch_train_shapes is not None or stitch_train_segment_ids is not None:
+            stitch_train_shapes = stitch_train_shapes or []
+            stitch_train_segment_ids = stitch_train_segment_ids or []
+            if len(stitch_train_shapes) != len(stitch_train_segment_ids):
+                raise ValueError(
+                    "stitch_train_shapes and stitch_train_segment_ids must have the same length "
+                    f"(got {len(stitch_train_shapes)} vs {len(stitch_train_segment_ids)})"
+                )
+
+            for segment_id, shape in zip(stitch_train_segment_ids, stitch_train_shapes):
+                h = int(shape[0])
+                w = int(shape[1])
+                ds_h = (h + self._stitch_downsample - 1) // self._stitch_downsample
+                ds_w = (w + self._stitch_downsample - 1) // self._stitch_downsample
+                self._stitch_train_buffers[str(segment_id)] = (
+                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                )
+                self._stitch_train_segment_ids.append(str(segment_id))
+
         self._stitch_enabled = len(self._stitch_buffers) > 0
+
+    def set_stitch_borders(self, *, train_borders=None, val_borders=None):
+        if train_borders is not None:
+            self._stitch_borders_by_split["train"] = dict(train_borders)
+        if val_borders is not None:
+            self._stitch_borders_by_split["val"] = dict(val_borders)
+
+    def set_train_stitch_loaders(self, loaders, segment_ids):
+        self._stitch_train_loaders = list(loaders or [])
+        self._stitch_train_segment_ids = [str(x) for x in (segment_ids or [])]
+
+    def _accumulate_stitch_predictions(self, *, outputs, xyxys, pred_buf, count_buf):
+        ds = self._stitch_downsample
+        y_preds = torch.sigmoid(outputs).to("cpu")
+        for i, (x1, y1, x2, y2) in enumerate(xyxys):
+            x1 = int(x1)
+            y1 = int(y1)
+            x2 = int(x2)
+            y2 = int(y2)
+
+            x1_ds = x1 // ds
+            y1_ds = y1 // ds
+            x2_ds = (x2 + ds - 1) // ds
+            y2_ds = (y2 + ds - 1) // ds
+            target_h = y2_ds - y1_ds
+            target_w = x2_ds - x1_ds
+            if target_h <= 0 or target_w <= 0:
+                continue
+
+            pred_patch = y_preds[i].unsqueeze(0).float()
+            if pred_patch.shape[-2:] != (target_h, target_w):
+                pred_patch = F.interpolate(
+                    pred_patch,
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            pred_buf[y1_ds:y2_ds, x1_ds:x2_ds] += pred_patch.squeeze(0).squeeze(0).numpy()
+            count_buf[y1_ds:y2_ds, x1_ds:x2_ds] += 1.0
+
+    def _run_train_stitch_pass(self):
+        if not self._stitch_train_enabled:
+            return False
+        if not self._stitch_train_loaders or not self._stitch_train_segment_ids:
+            return False
+        if len(self._stitch_train_loaders) != len(self._stitch_train_segment_ids):
+            raise ValueError(
+                "train stitch loaders/segment_ids length mismatch "
+                f"({len(self._stitch_train_loaders)} vs {len(self._stitch_train_segment_ids)})"
+            )
+
+        epoch = int(getattr(self, "current_epoch", 0))
+        if self._stitch_train_every_n_epochs > 1:
+            if ((epoch + 1) % self._stitch_train_every_n_epochs) != 0:
+                return False
+
+        t0 = time.perf_counter()
+        log(f"train stitch pass start epoch={epoch}")
+
+        for segment_id in self._stitch_train_segment_ids:
+            if segment_id not in self._stitch_train_buffers:
+                raise ValueError(f"Missing train stitch buffers for segment_id={segment_id!r}")
+            pred_buf, count_buf = self._stitch_train_buffers[segment_id]
+            pred_buf.fill(0)
+            count_buf.fill(0)
+
+        was_training = self.training
+        precision_context = nullcontext()
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None:
+            strategy = getattr(trainer, "strategy", None)
+            precision_plugin = getattr(strategy, "precision_plugin", None) if strategy is not None else None
+            if precision_plugin is None:
+                precision_plugin = getattr(trainer, "precision_plugin", None)
+            if precision_plugin is not None and hasattr(precision_plugin, "forward_context"):
+                precision_context = precision_plugin.forward_context()
+        try:
+            self.eval()
+            with torch.inference_mode(), precision_context:
+                for loader, segment_id in zip(self._stitch_train_loaders, self._stitch_train_segment_ids):
+                    pred_buf, count_buf = self._stitch_train_buffers[str(segment_id)]
+                    for batch in loader:
+                        x, _y, xyxys, _g = batch
+                        x = x.to(self.device, non_blocking=True)
+                        outputs = self(x)
+                        self._accumulate_stitch_predictions(
+                            outputs=outputs,
+                            xyxys=xyxys,
+                            pred_buf=pred_buf,
+                            count_buf=count_buf,
+                        )
+        finally:
+            if was_training:
+                self.train()
+
+        log(f"train stitch pass done epoch={epoch} elapsed={time.perf_counter() - t0:.1f}s")
+        return True
         
     def on_train_epoch_start(self):
         device = self.device
@@ -1054,51 +1263,6 @@ class RegressionPLModel(pl.LightningModule):
             group_idx,
             torch.ones_like(per_sample_loss, dtype=self._train_group_count.dtype),
         )
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary')
-        self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
-
-        self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=1039)
-        norm = str(norm).lower()
-        group_norm_groups = int(group_norm_groups)
-        init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
-        if not init_ckpt_path:
-            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
-            if not osp.exists(backbone_pretrained_path):
-                raise FileNotFoundError(
-                    f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
-                    "Either place r3d50_KM_200ep.pth next to train_resnet3d.py, set CFG.backbone_pretrained_path, "
-                    "or pass --init_ckpt_path to fine-tune from a previous run."
-                )
-            backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
-            state_dict = backbone_ckpt.get("state_dict", backbone_ckpt)
-            conv1_weight = state_dict['conv1.weight']
-            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict, strict=False)
-        # self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
-        # self.backbone.load_state_dict(torch.load('./pretraining_i3d_epoch=3.pt'),strict=False)
-        if norm == "group":
-            replace_batchnorm_with_groupnorm(self.backbone, desired_groups=group_norm_groups)
-
-        was_training = self.backbone.training
-        try:
-            self.backbone.eval()
-            with torch.no_grad():
-                encoder_dims = [x.size(1) for x in self.backbone(torch.rand(1, 1, 20, 256, 256))]
-        finally:
-            if was_training:
-                self.backbone.train()
-
-        self.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
-
-        if self.hparams.with_norm:
-            if norm == "group":
-                self.normalization = nn.GroupNorm(num_groups=1, num_channels=1)
-            else:
-                self.normalization = nn.BatchNorm3d(num_features=1)
-
-
-
-            
     def forward(self, x):
         if x.ndim==4:
             x=x[:,None]
@@ -1259,27 +1423,27 @@ class RegressionPLModel(pl.LightningModule):
         group_loss = self._train_group_loss_sum / group_count.clamp_min(1)
         group_dice = self._train_group_dice_sum / group_count.clamp_min(1)
 
-        self.log("train/epoch_avg_loss", avg_loss, on_step=False, on_epoch=False, prog_bar=False)
-        self.log("train/epoch_avg_dice", avg_dice, on_step=False, on_epoch=False, prog_bar=False)
+        self.log("train/epoch_avg_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("train/epoch_avg_dice", avg_dice, on_step=False, on_epoch=True, prog_bar=False)
         for group_idx, group_name in enumerate(self.group_names):
             safe_group_name = str(group_name).replace("/", "_")
             self.log(
                 f"train/group_{group_idx}_{safe_group_name}/epoch_loss",
                 group_loss[group_idx],
                 on_step=False,
-                on_epoch=False,
+                on_epoch=True,
             )
             self.log(
                 f"train/group_{group_idx}_{safe_group_name}/epoch_dice",
                 group_dice[group_idx],
                 on_step=False,
-                on_epoch=False,
+                on_epoch=True,
             )
             self.log(
                 f"train/group_{group_idx}_{safe_group_name}/epoch_count",
                 group_count[group_idx],
                 on_step=False,
-                on_epoch=False,
+                on_epoch=True,
             )
 
     def on_validation_epoch_start(self):
@@ -1316,35 +1480,12 @@ class RegressionPLModel(pl.LightningModule):
 
         if self._stitch_enabled and int(dataloader_idx) in self._stitch_buffers:
             pred_buf, count_buf = self._stitch_buffers[int(dataloader_idx)]
-            ds = self._stitch_downsample
-
-            y_preds = torch.sigmoid(outputs).to('cpu')
-            for i, (x1, y1, x2, y2) in enumerate(xyxys):
-                x1 = int(x1)
-                y1 = int(y1)
-                x2 = int(x2)
-                y2 = int(y2)
-
-                x1_ds = x1 // ds
-                y1_ds = y1 // ds
-                x2_ds = (x2 + ds - 1) // ds
-                y2_ds = (y2 + ds - 1) // ds
-                target_h = y2_ds - y1_ds
-                target_w = x2_ds - x1_ds
-                if target_h <= 0 or target_w <= 0:
-                    continue
-
-                pred_patch = y_preds[i].unsqueeze(0).float()
-                if pred_patch.shape[-2:] != (target_h, target_w):
-                    pred_patch = F.interpolate(
-                        pred_patch,
-                        size=(target_h, target_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-
-                pred_buf[y1_ds:y2_ds, x1_ds:x2_ds] += pred_patch.squeeze(0).squeeze(0).numpy()
-                count_buf[y1_ds:y2_ds, x1_ds:x2_ds] += 1.0
+            self._accumulate_stitch_predictions(
+                outputs=outputs,
+                xyxys=xyxys,
+                pred_buf=pred_buf,
+                count_buf=count_buf,
+            )
 
         return {"loss": per_sample_loss.mean()}
     
@@ -1391,19 +1532,111 @@ class RegressionPLModel(pl.LightningModule):
 
         if self._stitch_enabled and self._stitch_buffers:
             sanity_checking = bool(self.trainer is not None and getattr(self.trainer, "sanity_checking", False))
+            is_global_zero = bool(self.trainer is None or self.trainer.is_global_zero)
+            train_configured = bool(self._stitch_train_loaders) and bool(self._stitch_train_segment_ids) and bool(self._stitch_train_buffers)
+            stitch_train_mode = bool(self._stitch_train_enabled and train_configured)
+
+            did_run_train_stitch = False
+            if stitch_train_mode and (not is_global_zero):
+                # Only rank-0 runs the extra train visualization pass + logging.
+                for pred_buf, count_buf in self._stitch_buffers.values():
+                    pred_buf.fill(0)
+                    count_buf.fill(0)
+                return
+            if stitch_train_mode and (not sanity_checking):
+                did_run_train_stitch = self._run_train_stitch_pass()
+                if not did_run_train_stitch:
+                    # train stitching is enabled but only runs every N epochs; skip logging this epoch.
+                    for pred_buf, count_buf in self._stitch_buffers.values():
+                        pred_buf.fill(0)
+                        count_buf.fill(0)
+                    return
 
             images = []
             captions = []
-            for loader_idx, (pred_buf, count_buf) in self._stitch_buffers.items():
-                stitched = np.divide(
-                    pred_buf,
-                    count_buf,
-                    out=np.zeros_like(pred_buf),
-                    where=count_buf != 0,
-                )
-                images.append(np.clip(stitched, 0, 1))
-                segment_id = self._stitch_segment_ids.get(loader_idx, str(loader_idx))
-                captions.append(f"{segment_id} (ds={self._stitch_downsample})")
+
+            if stitch_train_mode:
+                segment_to_val = {}
+                for loader_idx, (pred_buf, count_buf) in self._stitch_buffers.items():
+                    segment_id = self._stitch_segment_ids.get(loader_idx, str(loader_idx))
+                    stitched = np.divide(
+                        pred_buf,
+                        count_buf,
+                        out=np.zeros_like(pred_buf),
+                        where=count_buf != 0,
+                    )
+                    segment_to_val[str(segment_id)] = (np.clip(stitched, 0, 1), (count_buf != 0))
+
+                segment_to_train = {}
+                for segment_id in self._stitch_train_segment_ids:
+                    pred_buf, count_buf = self._stitch_train_buffers[str(segment_id)]
+                    stitched = np.divide(
+                        pred_buf,
+                        count_buf,
+                        out=np.zeros_like(pred_buf),
+                        where=count_buf != 0,
+                    )
+                    segment_to_train[str(segment_id)] = (np.clip(stitched, 0, 1), (count_buf != 0))
+
+                segment_ids = sorted(set(segment_to_val.keys()) | set(segment_to_train.keys()))
+                for segment_id in segment_ids:
+                    base = None
+                    if segment_id in segment_to_val:
+                        base = segment_to_val[segment_id][0].copy()
+                    elif segment_id in segment_to_train:
+                        base = segment_to_train[segment_id][0].copy()
+                    else:
+                        continue
+
+                    if segment_id in segment_to_train and segment_id in segment_to_val:
+                        train_img, train_has = segment_to_train[segment_id]
+                        val_img, val_has = segment_to_val[segment_id]
+                        base[train_has] = train_img[train_has]
+                        base[val_has] = val_img[val_has]
+
+                    rgb = np.repeat(base[..., None], 3, axis=2)
+                    train_border = self._stitch_borders_by_split.get("train", {}).get(str(segment_id))
+                    val_border = self._stitch_borders_by_split.get("val", {}).get(str(segment_id))
+                    if train_border is not None:
+                        rgb[train_border.astype(bool)] = np.array([1.0, 0.0, 0.0], dtype=rgb.dtype)
+                    if val_border is not None:
+                        rgb[val_border.astype(bool)] = np.array([0.0, 0.0, 1.0], dtype=rgb.dtype)
+
+                    images.append(rgb)
+                    has_train = segment_id in segment_to_train and bool(segment_to_train[segment_id][1].any())
+                    has_val = segment_id in segment_to_val and bool(segment_to_val[segment_id][1].any())
+                    if has_train and has_val:
+                        split_tag = "train+val"
+                    elif has_train:
+                        split_tag = "train"
+                    elif has_val:
+                        split_tag = "val"
+                    else:
+                        split_tag = "none"
+                    captions.append(f"{segment_id} ({split_tag} ds={self._stitch_downsample})")
+            else:
+                want_color = bool(self._stitch_train_enabled)
+                for loader_idx, (pred_buf, count_buf) in self._stitch_buffers.items():
+                    stitched = np.divide(
+                        pred_buf,
+                        count_buf,
+                        out=np.zeros_like(pred_buf),
+                        where=count_buf != 0,
+                    )
+                    segment_id = self._stitch_segment_ids.get(loader_idx, str(loader_idx))
+                    base = np.clip(stitched, 0, 1)
+                    if want_color:
+                        rgb = np.repeat(base[..., None], 3, axis=2)
+                        train_border = self._stitch_borders_by_split.get("train", {}).get(str(segment_id))
+                        val_border = self._stitch_borders_by_split.get("val", {}).get(str(segment_id))
+                        if train_border is not None:
+                            rgb[train_border.astype(bool)] = np.array([1.0, 0.0, 0.0], dtype=rgb.dtype)
+                        if val_border is not None:
+                            rgb[val_border.astype(bool)] = np.array([0.0, 0.0, 1.0], dtype=rgb.dtype)
+                        images.append(rgb)
+                    else:
+                        images.append(base)
+                    captions.append(f"{segment_id} (val ds={self._stitch_downsample})")
 
             if (not sanity_checking) and (self.trainer is None or self.trainer.is_global_zero):
                 if isinstance(self.logger, WandbLogger):
@@ -1413,6 +1646,10 @@ class RegressionPLModel(pl.LightningModule):
             for pred_buf, count_buf in self._stitch_buffers.values():
                 pred_buf.fill(0)
                 count_buf.fill(0)
+            if stitch_train_mode:
+                for pred_buf, count_buf in self._stitch_train_buffers.values():
+                    pred_buf.fill(0)
+                    count_buf.fill(0)
     def configure_optimizers(self):
         if bool(getattr(CFG, "exclude_weight_decay_bias_norm", False)) and float(getattr(CFG, "weight_decay", 0.0) or 0.0) > 0:
             decay_params = []
@@ -1557,6 +1794,8 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--outputs_path", type=str, default=None)
     parser.add_argument("--stitch_all_val", action="store_true")
+    parser.add_argument("--stitch_train", action="store_true")
+    parser.add_argument("--stitch_train_every_n_epochs", type=int, default=None)
     parser.add_argument("--stitch_downsample", type=int, default=None)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--accelerator", type=str, default="auto")
@@ -1673,6 +1912,10 @@ def main():
         log("cfg " + json.dumps(merged_config, sort_keys=True, default=str))
     except Exception:
         log(f"cfg {merged_config}")
+    try:
+        log("args_json " + json.dumps(vars(args), sort_keys=True, default=str))
+    except Exception:
+        log("args_json (failed to serialize)")
 
     try:
         wandb_logger.experiment.config.update(merged_config, allow_val_change=True)
@@ -1770,8 +2013,13 @@ def main():
         CFG.outputs_path = str(args.outputs_path)
     if args.stitch_all_val:
         CFG.stitch_all_val = True
+    if args.stitch_train:
+        CFG.stitch_train = True
+    if args.stitch_train_every_n_epochs is not None:
+        CFG.stitch_train_every_n_epochs = max(1, int(args.stitch_train_every_n_epochs))
     if args.stitch_downsample is not None:
         CFG.stitch_downsample = max(1, int(args.stitch_downsample))
+
 
     run_slug = args.run_name or f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_stitch={CFG.valid_id}"
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -1826,11 +2074,14 @@ def main():
     train_masks = []
     train_groups = []
     train_patch_counts_by_segment = {}
+    train_stitch_candidates = {}
+    train_mask_borders = {}
 
     val_loaders = []
     val_stitch_shapes = []
     val_stitch_segment_ids = []
     val_patch_counts_by_segment = {}
+    val_mask_borders = {}
     stitch_val_dataloader_idx = None
     stitch_pred_shape = None
     stitch_segment_id = None
@@ -1840,6 +2091,7 @@ def main():
     val_set = set(val_fragment_ids)
     overlap_segments = train_set & val_set
     layers_cache = {}
+    include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
 
     for fragment_id in train_fragment_ids:
         seg_meta = segments_metadata.get(fragment_id, {}) or {}
@@ -1869,15 +2121,30 @@ def main():
         )
         log(f"extract train patches segment={fragment_id}")
         t1 = time.time()
-        frag_train_images, frag_train_masks, _ = extract_patches(
+        frag_train_images, frag_train_masks, frag_train_xyxys = extract_patches(
             image,
             mask,
             fragment_mask,
-            include_xyxys=False,
+            include_xyxys=include_train_xyxys,
             filter_empty_tile=True,
         )
         log(f"patches train segment={fragment_id} n={len(frag_train_images)} in {time.time() - t1:.1f}s")
         train_patch_counts_by_segment[fragment_id] = int(len(frag_train_images))
+        if include_train_xyxys and len(frag_train_images) > 0:
+            frag_train_xyxys = (
+                np.stack(frag_train_xyxys) if len(frag_train_xyxys) > 0 else np.zeros((0, 4), dtype=np.int64)
+            )
+            train_stitch_candidates[str(fragment_id)] = (
+                frag_train_images,
+                frag_train_masks,
+                frag_train_xyxys,
+                group_idx,
+                tuple(mask.shape),
+            )
+        if include_train_xyxys:
+            train_mask_borders[str(fragment_id)] = _mask_border(
+                _downsample_bool_mask_any(fragment_mask, int(getattr(CFG, "stitch_downsample", 1)))
+            )
         train_images.extend(frag_train_images)
         train_masks.extend(frag_train_masks)
         train_groups.extend([group_idx] * len(frag_train_images))
@@ -1945,6 +2212,10 @@ def main():
         val_loaders.append(val_loader)
         val_stitch_shapes.append(tuple(mask_val.shape))
         val_stitch_segment_ids.append(fragment_id)
+        if include_train_xyxys:
+            val_mask_borders[str(fragment_id)] = _mask_border(
+                _downsample_bool_mask_any(fragment_mask_val, int(getattr(CFG, "stitch_downsample", 1)))
+            )
         if fragment_id == CFG.valid_id:
             stitch_val_dataloader_idx = len(val_loaders) - 1
             stitch_pred_shape = mask_val.shape
@@ -2049,6 +2320,53 @@ def main():
         f"pct_start={float(getattr(CFG, 'onecycle_pct_start', 0.15))}"
     )
 
+    train_stitch_loaders = []
+    train_stitch_shapes = []
+    train_stitch_segment_ids = []
+    if bool(getattr(CFG, "stitch_train", False)):
+        if bool(getattr(CFG, "stitch_all_val", False)):
+            requested_ids = [str(fid) for fid in train_fragment_ids if str(fid) in train_stitch_candidates]
+        else:
+            requested_ids = []
+            if stitch_segment_id is not None and str(stitch_segment_id) in train_stitch_candidates:
+                requested_ids = [str(stitch_segment_id)]
+            else:
+                for fid in train_fragment_ids:
+                    if str(fid) in train_stitch_candidates:
+                        requested_ids = [str(fid)]
+                        break
+            if not requested_ids:
+                log(
+                    "WARNING: stitch_train is enabled but no train segments had stitch candidates. "
+                    "No train visualization stitch will be produced."
+                )
+
+        for segment_id in requested_ids:
+            entry = train_stitch_candidates.get(str(segment_id))
+            if entry is None:
+                continue
+            seg_images, seg_masks, seg_xyxys, group_idx, seg_shape = entry
+            seg_groups = [int(group_idx)] * len(seg_images)
+            train_dataset_viz = CustomDataset(
+                seg_images,
+                CFG,
+                xyxys=seg_xyxys,
+                labels=seg_masks,
+                groups=seg_groups,
+                transform=valid_transform,
+            )
+            train_loader_viz = DataLoader(
+                train_dataset_viz,
+                batch_size=CFG.valid_batch_size,
+                shuffle=False,
+                num_workers=CFG.num_workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+            train_stitch_loaders.append(train_loader_viz)
+            train_stitch_shapes.append(tuple(seg_shape))
+            train_stitch_segment_ids.append(str(segment_id))
+
     model = RegressionPLModel(
         enc='i3d',
         size=CFG.size,
@@ -2075,7 +2393,15 @@ def main():
         stitch_downsample=int(getattr(CFG, "stitch_downsample", 1)),
         stitch_all_val_shapes=val_stitch_shapes,
         stitch_all_val_segment_ids=val_stitch_segment_ids,
+        stitch_train_shapes=train_stitch_shapes,
+        stitch_train_segment_ids=train_stitch_segment_ids,
+        stitch_train=bool(getattr(CFG, "stitch_train", False)),
+        stitch_train_every_n_epochs=int(getattr(CFG, "stitch_train_every_n_epochs", 1)),
     )
+    if train_stitch_loaders:
+        model.set_train_stitch_loaders(train_stitch_loaders, train_stitch_segment_ids)
+    if include_train_xyxys:
+        model.set_stitch_borders(train_borders=train_mask_borders, val_borders=val_mask_borders)
     if init_ckpt_path:
         log(f"loading init weights from {init_ckpt_path}")
         ckpt = torch.load(init_ckpt_path, map_location="cpu")

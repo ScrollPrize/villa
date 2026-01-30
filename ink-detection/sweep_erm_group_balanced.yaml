@@ -24,6 +24,7 @@ command:
   - --outputs_path
   - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls
   - --stitch_all_val
+  - --stitch_train
   - --stitch_downsample
   - "8"
   - --wandb_tags
