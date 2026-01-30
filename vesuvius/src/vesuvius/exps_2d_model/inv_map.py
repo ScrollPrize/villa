@@ -73,7 +73,7 @@ def inverse_map_autograd(
 	w_out: int,
 	iters: int = 50,
 	step_size: float = 0.01,
-	reg_uv_smooth: float = 10000.0,
+	reg_uv_smooth: float = 0.0,
 	uv_scales: int = 4,
 	eps_det: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -147,7 +147,8 @@ def inverse_map_autograd(
 		print(
 			f"inv_map: iter={i + 1:03d}/{iters:03d} "
 			f"loss_data={float(loss_data.detach().cpu()):.6g} "
-			f"loss_smooth={float(loss_smooth.detach().cpu()):.6g}"
+			f"loss_smooth={float(loss_smooth.detach().cpu()):.6g}  "
+			f"loss_smooth_f={float(reg_uv_smooth*loss_smooth.detach().cpu()):.6g}"
 		)
 
 	# Jacobian usability mask (finite-diff is fine here; only for visualization gating).
