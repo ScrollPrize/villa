@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 
 import numpy as np
 import tifffile
@@ -311,9 +310,6 @@ def save(
 		uv_img = uv_img_nchw.permute(0, 2, 3, 1).contiguous()
 		uv_mask = torch.nn.functional.interpolate(uv_mask, size=(h2, w2), mode="nearest")
 
-		uv_save = uv_img[0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
-		tifffile.imwrite(str(out_img_loss / f"res_uv_{p2}.tif"), uv_save, compression="lzw")
-
 		def _scale_uv_for_src(*, uv_lr: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
 			_hm0, _wm0 = (int(res.xy_lr.shape[1]), int(res.xy_lr.shape[2]))
 			_hm1, _wm1 = (int(src.shape[2]), int(src.shape[3]))
@@ -461,7 +457,6 @@ def save(
 	}
 
 	_save_img_loss_vis()
-	# sys.exit(0)
 
 	for _k, spec in loss_maps.items():
 		m = spec["fn"]().detach().cpu()
