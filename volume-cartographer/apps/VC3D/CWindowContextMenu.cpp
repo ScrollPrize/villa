@@ -1398,6 +1398,12 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
 
     QJsonObject params;
     params["normal_grid_path"] = normalGridPath;
+    if (_segmentationWidget) {
+        const QString n3dPath = _segmentationWidget->normal3dZarrPath();
+        if (!n3dPath.isEmpty()) {
+            params["normal3d_zarr_path"] = n3dPath;
+        }
+    }
     params["max_gen"] = 1;
     params["generations"] = 1;
     params["resume_local_opt_step"] = 20;
@@ -1408,6 +1414,30 @@ void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
     if (extraParams) {
         for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
             params.insert(it.key(), it.value());
+        }
+    }
+
+    // Check if merged params require normal3d but we don't have it
+    bool needsNormal3d = false;
+    if (params.contains("normal3dline_weight")) {
+        const double w = params["normal3dline_weight"].toDouble(0.0);
+        needsNormal3d = (w > 0.0);
+    }
+
+    if (needsNormal3d && !params.contains("normal3d_zarr_path")) {
+        auto reply = QMessageBox::warning(
+            this, tr("Missing Normal3D"),
+            tr("The selected tracer profile uses normal3dline_weight > 0, "
+               "but no normal3d zarr path is available.\n\n"
+               "The normal3d line constraint will have no effect.\n\n"
+               "To fix this, select a normal3d dataset in the segmentation panel, "
+               "or use a profile without normal3dline_weight.\n\n"
+               "Continue anyway?"),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (reply != QMessageBox::Yes) {
+            statusBar()->showMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
+            return;
         }
     }
 
