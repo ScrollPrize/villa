@@ -52,7 +52,11 @@ def main(argv: list[str] | None = None) -> int:
 	)
 	if model_cfg.model_input is not None:
 		st = torch.load(model_cfg.model_input, map_location=device)
-		mdl.load_state_dict(st)
+		miss, unexp = mdl.load_state_dict_compat(st, strict=False)
+		if unexp:
+			print("state_dict: unexpected keys:", sorted(unexp))
+		if miss:
+			print("state_dict: missing keys:", sorted(miss))
 	print("model_init:", mdl.init)
 	print("mesh:", mdl.mesh_h, mdl.mesh_w)
 

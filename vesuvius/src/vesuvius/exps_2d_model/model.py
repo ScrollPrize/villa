@@ -28,6 +28,10 @@ class FitResult:
 	_xy_hr: torch.Tensor
 	_xy_conn: torch.Tensor
 	_data_s: fit_data.FitData
+	_target_plain: torch.Tensor
+	_target_mod: torch.Tensor
+	_amp_lr: torch.Tensor
+	_bias_lr: torch.Tensor
 	_mask_hr: torch.Tensor
 	_mask_lr: torch.Tensor
 	_mask_conn: torch.Tensor
@@ -51,6 +55,22 @@ class FitResult:
 	@property
 	def data_s(self) -> fit_data.FitData:
 		return self._data_s
+
+	@property
+	def target_plain(self) -> torch.Tensor:
+		return self._target_plain
+
+	@property
+	def target_mod(self) -> torch.Tensor:
+		return self._target_mod
+
+	@property
+	def amp_lr(self) -> torch.Tensor:
+		return self._amp_lr
+
+	@property
+	def bias_lr(self) -> torch.Tensor:
+		return self._bias_lr
 
 	@property
 	def mask_hr(self) -> torch.Tensor:
@@ -112,6 +132,10 @@ class Model2D(nn.Module):
 		self.conn_offset_ms = nn.ParameterList(
 			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
+		amp_init = torch.full((1, 1, int(self.mesh_h), int(self.mesh_w)), 1.0, device=device, dtype=torch.float32)
+		bias_init = torch.full((1, 1, int(self.mesh_h), int(self.mesh_w)), 0.5, device=device, dtype=torch.float32)
+		self.amp_ms = nn.ParameterList([nn.Parameter(amp_init)])
+		self.bias_ms = nn.ParameterList([nn.Parameter(bias_init)])
 		self.const_mask_lr: torch.Tensor | None = None
 		self._last_grow_insert_lr: tuple[int, int, int, int] | None = None
 		self.subsample_winding = int(subsample_winding)
@@ -138,6 +162,24 @@ class Model2D(nn.Module):
 		xy_hr = self._grid_xy_subsampled_from_lr(xy_lr=xy_lr)
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
 		data_s = data.grid_sample_px(xy_px=xy_hr)
+		# Targets in winding-space at evaluation resolution.
+		h, w = int(xy_hr.shape[1]), int(xy_hr.shape[2])
+		periods = max(1, int(self.mesh_w) - 1)
+		wx = float(max(1, int(self.init.w_img) - 1))
+		wy = float(max(1, int(self.init.h_img) - 1))
+		us = torch.linspace(0.0, wx, w, device=self.device, dtype=torch.float32)
+		vs = torch.linspace(0.0, wy, h, device=self.device, dtype=torch.float32)
+		vv, uu = torch.meshgrid(vs, us, indexing="ij")
+		u = uu.view(1, 1, h, w)
+		phase = torch.pi * (u / wx) * float(periods)
+		target_plain = 0.5 + 0.5 * torch.cos(phase)
+
+		amp_lr = self.amp_ms[0]
+		bias_lr = self.bias_ms[0]
+		amp_hr = F.interpolate(amp_lr, size=(h, w), mode="bilinear", align_corners=True)
+		bias_hr = F.interpolate(bias_lr, size=(h, w), mode="bilinear", align_corners=True)
+		target_mod = bias_hr + amp_hr * (target_plain - 0.5)
+		target_mod = target_mod.clamp(0.0, 1.0)
 		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
 		mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
 		mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
@@ -150,6 +192,10 @@ class Model2D(nn.Module):
 			_xy_hr=xy_hr,
 			_xy_conn=xy_conn,
 			_data_s=data_s,
+			_target_plain=target_plain,
+			_target_mod=target_mod,
+			_amp_lr=amp_lr,
+			_bias_lr=bias_lr,
 			_mask_hr=mask_hr,
 			_mask_lr=mask_lr,
 			_mask_conn=mask_conn,
@@ -178,7 +224,34 @@ class Model2D(nn.Module):
 			"winding_scale": [self.winding_scale],
 			"mesh_ms": list(self.mesh_ms),
 			"conn_offset_ms": list(self.conn_offset_ms),
+			"amp_ms": list(self.amp_ms),
+			"bias_ms": list(self.bias_ms),
 		}
+
+	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
+		st = dict(state_dict)
+		# Back-compat renames.
+		for k in list(st.keys()):
+			if k.startswith("mesh_offset_ms."):
+				st["conn_offset_ms." + k[len("mesh_offset_ms."):]] = st.pop(k)
+			elif k == "amp_coarse":
+				st["amp_ms.0"] = st.pop(k)
+			elif k == "bias_coarse":
+				st["bias_ms.0"] = st.pop(k)
+
+		# Fill missing tensors (common when loading older checkpoints).
+		for k, p in self.state_dict().items():
+			if k in st:
+				continue
+			if k.startswith("conn_offset_ms."):
+				st[k] = torch.zeros_like(p)
+			elif k.startswith("amp_ms."):
+				st[k] = torch.ones_like(p)
+			elif k.startswith("bias_ms."):
+				st[k] = torch.full_like(p, 0.5)
+
+		incompat = super().load_state_dict(st, strict=bool(strict))
+		return list(incompat.missing_keys), list(incompat.unexpected_keys)
 
 	def grow(self, *, directions: list[str], steps: int) -> None:
 		steps = max(0, int(steps))
@@ -218,6 +291,18 @@ class Model2D(nn.Module):
 				)
 				self.conn_offset_ms = self._grow_param_pyramid_flat_edit(
 					src=self.conn_offset_ms,
+					dim=dim,
+					side=side,
+					editor=self._expand_copy_edge,
+				)
+				self.amp_ms = self._grow_param_pyramid_flat_edit(
+					src=self.amp_ms,
+					dim=dim,
+					side=side,
+					editor=self._expand_copy_edge,
+				)
+				self.bias_ms = self._grow_param_pyramid_flat_edit(
+					src=self.bias_ms,
 					dim=dim,
 					side=side,
 					editor=self._expand_copy_edge,
