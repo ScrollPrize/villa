@@ -100,6 +100,8 @@ void SegmentationWidget::buildUi()
     // Forward approval mask panel signals
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::showApprovalMaskChanged,
             this, &SegmentationWidget::showApprovalMaskChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::showApprovalMaskChanged,
+            this, &SegmentationWidget::syncUiState);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editApprovedMaskChanged,
             this, &SegmentationWidget::editApprovedMaskChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editUnapprovedMaskChanged,
