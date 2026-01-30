@@ -1,6 +1,16 @@
 #pragma once
 
+#include "segmentation/SegmentationCommon.hpp"
+#include "segmentation/SegmentationGrowth.hpp"
+
+#include <QString>
+#include <QStringList>
+#include <QVector>
 #include <QWidget>
+
+#include <optional>
+#include <utility>
+#include <vector>
 
 class QCheckBox;
 class QComboBox;
@@ -9,58 +19,74 @@ class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
+class QSettings;
 class QSpinBox;
-class QWidget;
 
 class SegmentationGrowthPanel : public QWidget
 {
     Q_OBJECT
 
 public:
-    explicit SegmentationGrowthPanel(bool growthKeybindsEnabled, QWidget* parent = nullptr);
+    explicit SegmentationGrowthPanel(const QString& settingsGroup,
+                                     QWidget* parent = nullptr);
 
-    QComboBox* growthMethodCombo() const { return _comboGrowthMethod; }
-    QSpinBox* growthStepsSpin() const { return _spinGrowthSteps; }
-    QWidget* extrapolationOptionsPanel() const { return _extrapolationOptionsPanel; }
-    QLabel* extrapolationPointsLabel() const { return _lblExtrapolationPoints; }
-    QSpinBox* extrapolationPointsSpin() const { return _spinExtrapolationPoints; }
-    QComboBox* extrapolationTypeCombo() const { return _comboExtrapolationType; }
+    // Getters
+    [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
+    [[nodiscard]] int growthSteps() const { return _growthSteps; }
+    [[nodiscard]] int extrapolationPointCount() const { return _extrapolationPointCount; }
+    [[nodiscard]] ExtrapolationType extrapolationType() const { return _extrapolationType; }
+    [[nodiscard]] int sdtMaxSteps() const { return _sdtMaxSteps; }
+    [[nodiscard]] float sdtStepSize() const { return _sdtStepSize; }
+    [[nodiscard]] float sdtConvergence() const { return _sdtConvergence; }
+    [[nodiscard]] int sdtChunkSize() const { return _sdtChunkSize; }
+    [[nodiscard]] int skeletonConnectivity() const { return _skeletonConnectivity; }
+    [[nodiscard]] int skeletonSliceOrientation() const { return _skeletonSliceOrientation; }
+    [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
+    [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
+    [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
+    [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
+    [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
+    [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
-    QWidget* sdtParamsContainer() const { return _sdtParamsContainer; }
-    QSpinBox* sdtMaxStepsSpin() const { return _spinSDTMaxSteps; }
-    QDoubleSpinBox* sdtStepSizeSpin() const { return _spinSDTStepSize; }
-    QDoubleSpinBox* sdtConvergenceSpin() const { return _spinSDTConvergence; }
-    QSpinBox* sdtChunkSizeSpin() const { return _spinSDTChunkSize; }
+    // Setters
+    void setGrowthMethod(SegmentationGrowthMethod method);
+    void setGrowthSteps(int steps, bool persist = true);
+    void setGrowthInProgress(bool running);
+    void setNormalGridAvailable(bool available);
+    void setNormalGridPathHint(const QString& hint);
+    void setNormalGridPath(const QString& path);
+    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
+    void setVolumePackagePath(const QString& path);
+    void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
+                             const QString& activeId);
+    void setActiveVolume(const QString& volumeId);
 
-    QWidget* skeletonParamsContainer() const { return _skeletonParamsContainer; }
-    QComboBox* skeletonConnectivityCombo() const { return _comboSkeletonConnectivity; }
-    QComboBox* skeletonSliceOrientationCombo() const { return _comboSkeletonSliceOrientation; }
-    QSpinBox* skeletonChunkSizeSpin() const { return _spinSkeletonChunkSize; }
-    QSpinBox* skeletonSearchRadiusSpin() const { return _spinSkeletonSearchRadius; }
+    void restoreSettings(QSettings& settings);
+    void syncUiState(bool editingEnabled, bool growthInProgress);
 
-    QPushButton* growButton() const { return _btnGrow; }
-    QPushButton* inpaintButton() const { return _btnInpaint; }
-
-    QCheckBox* growthDirUpCheck() const { return _chkGrowthDirUp; }
-    QCheckBox* growthDirDownCheck() const { return _chkGrowthDirDown; }
-    QCheckBox* growthDirLeftCheck() const { return _chkGrowthDirLeft; }
-    QCheckBox* growthDirRightCheck() const { return _chkGrowthDirRight; }
-    QCheckBox* growthKeybindsCheck() const { return _chkGrowthKeybindsEnabled; }
-
-    QCheckBox* correctionsZRangeCheck() const { return _chkCorrectionsUseZRange; }
-    QSpinBox* correctionsZMinSpin() const { return _spinCorrectionsZMin; }
-    QSpinBox* correctionsZMaxSpin() const { return _spinCorrectionsZMax; }
-
-    QComboBox* volumesCombo() const { return _comboVolumes; }
-
-    QLabel* normalGridLabel() const { return _lblNormalGrid; }
-    QLineEdit* normalGridPathEdit() const { return _editNormalGridPath; }
-
-    QLabel* normal3dLabel() const { return _lblNormal3d; }
-    QComboBox* normal3dCombo() const { return _comboNormal3d; }
-    QLineEdit* normal3dPathEdit() const { return _editNormal3dPath; }
+signals:
+    void growSurfaceRequested(SegmentationGrowthMethod method,
+                              SegmentationGrowthDirection direction,
+                              int steps,
+                              bool inpaintOnly);
+    void growthMethodChanged(SegmentationGrowthMethod method);
+    void volumeSelectionChanged(const QString& volumeId);
+    void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
 
 private:
+    void writeSetting(const QString& key, const QVariant& value);
+    void applyGrowthSteps(int steps, bool persist, bool fromUi);
+    void setGrowthDirectionMask(int mask);
+    void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
+    void applyGrowthDirectionMaskToUi();
+    static int normalizeGrowthDirectionMask(int mask);
+    void updateGrowthUiState();
+    void updateNormal3dUi();
+    void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
+    [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
+                                                   const QString& requestedId) const;
+
+    // UI widgets
     QGroupBox* _groupGrowth{nullptr};
     QSpinBox* _spinGrowthSteps{nullptr};
     QComboBox* _comboGrowthMethod{nullptr};
@@ -94,4 +120,44 @@ private:
     QLabel* _lblNormal3d{nullptr};
     QComboBox* _comboNormal3d{nullptr};
     QLineEdit* _editNormal3dPath{nullptr};
+
+    // State
+    SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
+    int _growthSteps{5};
+    int _tracerGrowthSteps{5};
+    int _growthDirectionMask{0};
+    bool _growthKeybindsEnabled{true};
+    int _extrapolationPointCount{7};
+    ExtrapolationType _extrapolationType{ExtrapolationType::Linear};
+
+    int _sdtMaxSteps{5};
+    float _sdtStepSize{0.8f};
+    float _sdtConvergence{0.5f};
+    int _sdtChunkSize{128};
+
+    int _skeletonConnectivity{26};
+    int _skeletonSliceOrientation{0};
+    int _skeletonChunkSize{128};
+    int _skeletonSearchRadius{5};
+
+    bool _normalGridAvailable{false};
+    QString _normalGridHint;
+    QString _normalGridDisplayPath;
+    QString _normalGridPath;
+
+    QStringList _normal3dCandidates;
+    QString _normal3dHint;
+    QString _normal3dSelectedPath;
+    QString _volumePackagePath;
+    QVector<QPair<QString, QString>> _volumeEntries;
+    QString _activeVolumeId;
+
+    bool _correctionsZRangeEnabled{false};
+    int _correctionsZMin{0};
+    int _correctionsZMax{0};
+
+    bool _editingEnabled{false};
+    bool _growthInProgress{false};
+    bool _restoringSettings{false};
+    const QString _settingsGroup;
 };

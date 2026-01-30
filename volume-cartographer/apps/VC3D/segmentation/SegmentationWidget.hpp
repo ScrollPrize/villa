@@ -14,7 +14,6 @@
 
 #include "SegmentationGrowth.hpp"
 
-class QCheckBox;
 class SegmentationHeaderRow;
 class SegmentationEditingPanel;
 class SegmentationGrowthPanel;
@@ -43,27 +42,26 @@ public:
     [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
-    [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
-    [[nodiscard]] int growthSteps() const { return _growthSteps; }
-    [[nodiscard]] int extrapolationPointCount() const { return _extrapolationPointCount; }
-    [[nodiscard]] ExtrapolationType extrapolationType() const { return _extrapolationType; }
-    [[nodiscard]] int sdtMaxSteps() const { return _sdtMaxSteps; }
-    [[nodiscard]] float sdtStepSize() const { return _sdtStepSize; }
-    [[nodiscard]] float sdtConvergence() const { return _sdtConvergence; }
-    [[nodiscard]] int sdtChunkSize() const { return _sdtChunkSize; }
-    [[nodiscard]] int skeletonConnectivity() const { return _skeletonConnectivity; }
-    [[nodiscard]] int skeletonSliceOrientation() const { return _skeletonSliceOrientation; }
-    [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
-    [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
+    [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
+    [[nodiscard]] int growthSteps() const;
+    [[nodiscard]] int extrapolationPointCount() const;
+    [[nodiscard]] ExtrapolationType extrapolationType() const;
+    [[nodiscard]] int sdtMaxSteps() const;
+    [[nodiscard]] float sdtStepSize() const;
+    [[nodiscard]] float sdtConvergence() const;
+    [[nodiscard]] int sdtChunkSize() const;
+    [[nodiscard]] int skeletonConnectivity() const;
+    [[nodiscard]] int skeletonSliceOrientation() const;
+    [[nodiscard]] int skeletonChunkSize() const;
+    [[nodiscard]] int skeletonSearchRadius() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
     [[nodiscard]] QString customParamsError() const;
     [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
-    [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
-
-    [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
+    [[nodiscard]] bool growthKeybindsEnabled() const;
+    [[nodiscard]] QString normal3dZarrPath() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;
@@ -208,53 +206,9 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
 
-    [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
-                                                   const QString& requestedId) const;
-    void applyGrowthSteps(int steps, bool persist, bool fromUi);
-    void setGrowthDirectionMask(int mask);
-    void updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox);
-    void applyGrowthDirectionMaskToUi();
-    void updateGrowthUiState();
-    static int normalizeGrowthDirectionMask(int mask);
-    void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
-    void updateNormal3dUi();
-
     bool _editingEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
-
-    bool _normalGridAvailable{false};
-    QString _normalGridHint;
-    QString _normalGridDisplayPath;
-    QString _normalGridPath;
-
-    QStringList _normal3dCandidates;
-    QString _normal3dHint;
-    QString _normal3dSelectedPath;
-    QString _volumePackagePath;
-    QVector<QPair<QString, QString>> _volumeEntries;
-    QString _activeVolumeId;
-
-    SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
-    int _growthSteps{5};
-    int _tracerGrowthSteps{5};
-    int _growthDirectionMask{0};
-    bool _growthKeybindsEnabled{true};
-    int _extrapolationPointCount{7};
-    ExtrapolationType _extrapolationType{ExtrapolationType::Linear};
-
-    // SDT/Newton refinement parameters for Linear+Fit
-    int _sdtMaxSteps{5};
-    float _sdtStepSize{0.8f};
-    float _sdtConvergence{0.5f};
-    int _sdtChunkSize{128};
-
-    // Skeleton path parameters
-    int _skeletonConnectivity{26};  // 6, 18, or 26
-    int _skeletonSliceOrientation{0};  // 0=X, 1=Y for up/down growth
-    int _skeletonChunkSize{128};
-    int _skeletonSearchRadius{5};  // 1-100 pixels
-
     bool _restoringSettings{false};
 
     SegmentationHeaderRow* _headerRow{nullptr};
@@ -266,9 +220,5 @@ private:
     SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
-
-    bool _correctionsZRangeEnabled{false};
-    int _correctionsZMin{0};
-    int _correctionsZMax{0};
 
 };

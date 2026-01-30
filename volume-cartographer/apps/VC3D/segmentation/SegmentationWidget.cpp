@@ -1,8 +1,6 @@
 #include "SegmentationWidget.hpp"
 #include "SegmentationCommon.hpp"
 
-#include "elements/CollapsibleSettingsGroup.hpp"
-#include "NeuralTraceServiceManager.hpp"
 #include "tools/SegmentationEditingPanel.hpp"
 #include "tools/SegmentationGrowthPanel.hpp"
 #include "tools/SegmentationHeaderRow.hpp"
@@ -14,152 +12,17 @@
 #include "tools/SegmentationDirectionFieldPanel.hpp"
 #include "VCSettings.hpp"
 
-#include <QAbstractItemView>
-#include <QApplication>
-#include <QCheckBox>
-#include <QColorDialog>
-#include <QComboBox>
-#include <QDir>
-#include <QDoubleSpinBox>
-#include <QEvent>
-#include <QGroupBox>
-#include <QGridLayout>
-#include <QLabel>
-#include <QLineEdit>
-#include <QLoggingCategory>
-#include <QMouseEvent>
-#include <QPushButton>
-#include <QRegularExpression>
 #include <QSettings>
-#include <QSignalBlocker>
-#include <QSlider>
-#include <QSpinBox>
-#include <QVariant>
 #include <QVBoxLayout>
-#include <QHBoxLayout>
-
-#include <algorithm>
-#include <cmath>
+#include <QVariant>
 
 #include <nlohmann/json.hpp>
 
 Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget")
 
-namespace
-{
-constexpr int kGrowDirUpBit = 1 << 0;
-constexpr int kGrowDirDownBit = 1 << 1;
-constexpr int kGrowDirLeftBit = 1 << 2;
-constexpr int kGrowDirRightBit = 1 << 3;
-constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
-
-bool containsSurfKeyword(const QString& text)
-{
-    if (text.isEmpty()) {
-        return false;
-    }
-    const QString lowered = text.toLower();
-    return lowered.contains(QStringLiteral("surface")) || lowered.contains(QStringLiteral("surf"));
-}
-
-std::optional<int> trailingNumber(const QString& text)
-{
-    static const QRegularExpression numberSuffix(QStringLiteral("(\\d+)$"));
-    const auto match = numberSuffix.match(text.trimmed());
-    if (match.hasMatch()) {
-        return match.captured(1).toInt();
-    }
-    return std::nullopt;
-}
-
-QString settingsGroup()
-{
-    return QStringLiteral("segmentation_edit");
-}
-}
-
-QString SegmentationWidget::determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
-                                                     const QString& requestedId) const
-{
-    const auto hasId = [&volumes](const QString& id) {
-        return std::any_of(volumes.cbegin(), volumes.cend(), [&](const auto& entry) {
-            return entry.first == id;
-        });
-    };
-
-    QString numericCandidate;
-    int numericValue = -1;
-    QString keywordCandidate;
-
-    for (const auto& entry : volumes) {
-        const QString& id = entry.first;
-        const QString& label = entry.second;
-
-        if (!containsSurfKeyword(id) && !containsSurfKeyword(label)) {
-            continue;
-        }
-
-        const auto numberFromId = trailingNumber(id);
-        const auto numberFromLabel = trailingNumber(label);
-        const std::optional<int> number = numberFromId ? numberFromId : numberFromLabel;
-
-        if (number) {
-            if (*number > numericValue) {
-                numericValue = *number;
-                numericCandidate = id;
-            }
-        } else if (keywordCandidate.isEmpty()) {
-            keywordCandidate = id;
-        }
-    }
-
-    if (!numericCandidate.isEmpty()) {
-        return numericCandidate;
-    }
-    if (!keywordCandidate.isEmpty()) {
-        return keywordCandidate;
-    }
-    if (!requestedId.isEmpty() && hasId(requestedId)) {
-        return requestedId;
-    }
-    if (!volumes.isEmpty()) {
-        return volumes.front().first;
-    }
-    return {};
-}
-
-void SegmentationWidget::applyGrowthSteps(int steps, bool persist, bool fromUi)
-{
-    const int minimum = (_growthMethod == SegmentationGrowthMethod::Corrections) ? 0 : 1;
-    const int clamped = std::clamp(steps, minimum, 1024);
-
-    QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr;
-    if ((!fromUi || clamped != steps) && growthStepsSpin) {
-        QSignalBlocker blocker(growthStepsSpin);
-        growthStepsSpin->setValue(clamped);
-    }
-
-    if (clamped > 0) {
-        _tracerGrowthSteps = std::max(1, clamped);
-    }
-
-    _growthSteps = clamped;
-
-    if (persist) {
-        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
-        writeSetting(QStringLiteral("growth_steps_tracer"), _tracerGrowthSteps);
-    }
-}
-
-void SegmentationWidget::setGrowthSteps(int steps, bool persist)
-{
-    applyGrowthSteps(steps, persist, false);
-}
-
 SegmentationWidget::SegmentationWidget(QWidget* parent)
     : QWidget(parent)
 {
-    _growthDirectionMask = kGrowDirAllMask;
     buildUi();
     restoreSettings();
     syncUiState();
@@ -174,7 +37,7 @@ void SegmentationWidget::buildUi()
     _headerRow = new SegmentationHeaderRow(this);
     layout->addWidget(_headerRow);
 
-    _growthPanel = new SegmentationGrowthPanel(_growthKeybindsEnabled, this);
+    _growthPanel = new SegmentationGrowthPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_growthPanel);
 
     _editingPanel = new SegmentationEditingPanel(QStringLiteral("segmentation_edit"), this);
@@ -268,169 +131,15 @@ void SegmentationWidget::buildUi()
     connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptGrowthRequested,
             this, &SegmentationWidget::cellReoptGrowthRequested);
 
-    auto connectDirectionCheckbox = [this](QCheckBox* box) {
-        if (!box) {
-            return;
-        }
-        connect(box, &QCheckBox::toggled, this, [this, box](bool) {
-            updateGrowthDirectionMaskFromUi(box);
-        });
-    };
-    QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr;
-    QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr;
-    QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr;
-    QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr;
-    connectDirectionCheckbox(growthDirUp);
-    connectDirectionCheckbox(growthDirDown);
-    connectDirectionCheckbox(growthDirLeft);
-    connectDirectionCheckbox(growthDirRight);
-
-    if (QCheckBox* growthKeybinds = _growthPanel ? _growthPanel->growthKeybindsCheck() : nullptr) {
-        connect(growthKeybinds, &QCheckBox::toggled, this, [this](bool checked) {
-            _growthKeybindsEnabled = checked;
-            writeSetting(QStringLiteral("growth_keybinds_enabled"), _growthKeybindsEnabled);
-        });
-    }
-
-    if (QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr) {
-        connect(growthStepsSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
-                [this](int value) { applyGrowthSteps(value, true, true); });
-    }
-
-    if (QComboBox* growthMethodCombo = _growthPanel ? _growthPanel->growthMethodCombo() : nullptr) {
-        connect(growthMethodCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-                [this, growthMethodCombo](int index) {
-                    const auto method = static_cast<SegmentationGrowthMethod>(
-                        growthMethodCombo->itemData(index).toInt());
-                    setGrowthMethod(method);
-                });
-    }
-
-    if (QSpinBox* extrapPointsSpinControl = _growthPanel ? _growthPanel->extrapolationPointsSpin() : nullptr) {
-        connect(extrapPointsSpinControl, QOverload<int>::of(&QSpinBox::valueChanged), this,
-                [this](int value) {
-                    _extrapolationPointCount = std::clamp(value, 3, 20);
-                    writeSetting(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount);
-                });
-    }
-
-    QComboBox* extrapTypeCombo = _growthPanel ? _growthPanel->extrapolationTypeCombo() : nullptr;
-    QWidget* sdtParamsContainer = _growthPanel ? _growthPanel->sdtParamsContainer() : nullptr;
-    QWidget* skeletonParamsContainer = _growthPanel ? _growthPanel->skeletonParamsContainer() : nullptr;
-    QLabel* extrapPointsLabel = _growthPanel ? _growthPanel->extrapolationPointsLabel() : nullptr;
-    QSpinBox* extrapPointsSpin = _growthPanel ? _growthPanel->extrapolationPointsSpin() : nullptr;
-    if (extrapTypeCombo) {
-        connect(extrapTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-                [this, extrapTypeCombo, sdtParamsContainer, skeletonParamsContainer, extrapPointsLabel, extrapPointsSpin](int index) {
-                    _extrapolationType = extrapolationTypeFromInt(
-                        extrapTypeCombo->itemData(index).toInt());
-                    writeSetting(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType));
-                    // Show SDT params only when Extrapolation method AND Linear+Fit type
-                    if (sdtParamsContainer) {
-                        sdtParamsContainer->setVisible(
-                            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
-                            _extrapolationType == ExtrapolationType::LinearFit);
-                    }
-                    // Show skeleton params only when Extrapolation method AND SkeletonPath type
-                    if (skeletonParamsContainer) {
-                        skeletonParamsContainer->setVisible(
-                            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
-                            _extrapolationType == ExtrapolationType::SkeletonPath);
-                    }
-                    // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
-                    bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
-                    if (extrapPointsLabel) {
-                        extrapPointsLabel->setVisible(showFitPoints);
-                    }
-                    if (extrapPointsSpin) {
-                        extrapPointsSpin->setVisible(showFitPoints);
-                    }
-                });
-    }
-
-    // SDT/Newton refinement parameter connections
-    if (QSpinBox* sdtMaxStepsSpin = _growthPanel ? _growthPanel->sdtMaxStepsSpin() : nullptr) {
-        connect(sdtMaxStepsSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            _sdtMaxSteps = std::clamp(value, 1, 10);
-            writeSetting(QStringLiteral("sdt_max_steps"), _sdtMaxSteps);
-        });
-    }
-    if (QDoubleSpinBox* sdtStepSizeSpin = _growthPanel ? _growthPanel->sdtStepSizeSpin() : nullptr) {
-        connect(sdtStepSizeSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-            _sdtStepSize = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
-            writeSetting(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize));
-        });
-    }
-    if (QDoubleSpinBox* sdtConvergenceSpin = _growthPanel ? _growthPanel->sdtConvergenceSpin() : nullptr) {
-        connect(sdtConvergenceSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-            _sdtConvergence = std::clamp(static_cast<float>(value), 0.1f, 2.0f);
-            writeSetting(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence));
-        });
-    }
-    if (QSpinBox* sdtChunkSpin = _growthPanel ? _growthPanel->sdtChunkSizeSpin() : nullptr) {
-        connect(sdtChunkSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            _sdtChunkSize = std::clamp(value, 32, 256);
-            writeSetting(QStringLiteral("sdt_chunk_size"), _sdtChunkSize);
-        });
-    }
-
-    // Skeleton path parameter connections
-    if (QComboBox* skeletonConnCombo = _growthPanel ? _growthPanel->skeletonConnectivityCombo() : nullptr) {
-        connect(skeletonConnCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, skeletonConnCombo](int index) {
-            _skeletonConnectivity = skeletonConnCombo->itemData(index).toInt();
-            writeSetting(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity);
-        });
-    }
-    if (QComboBox* skeletonSliceCombo = _growthPanel ? _growthPanel->skeletonSliceOrientationCombo() : nullptr) {
-        connect(skeletonSliceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, skeletonSliceCombo](int index) {
-            _skeletonSliceOrientation = skeletonSliceCombo->itemData(index).toInt();
-            writeSetting(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation);
-        });
-    }
-    if (QSpinBox* skeletonChunkSpin = _growthPanel ? _growthPanel->skeletonChunkSizeSpin() : nullptr) {
-        connect(skeletonChunkSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            _skeletonChunkSize = std::clamp(value, 32, 256);
-            writeSetting(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize);
-        });
-    }
-    if (QSpinBox* skeletonSearchSpin = _growthPanel ? _growthPanel->skeletonSearchRadiusSpin() : nullptr) {
-        connect(skeletonSearchSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            _skeletonSearchRadius = std::clamp(value, 1, 100);
-            writeSetting(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius);
-        });
-    }
-
-    const auto triggerConfiguredGrowth = [this]() {
-        const auto allowed = allowedGrowthDirections();
-        auto direction = SegmentationGrowthDirection::All;
-        if (allowed.size() == 1) {
-            direction = allowed.front();
-        }
-        triggerGrowthRequest(direction, _growthSteps, false);
-    };
-
-    if (QPushButton* growButton = _growthPanel ? _growthPanel->growButton() : nullptr) {
-        connect(growButton, &QPushButton::clicked, this, triggerConfiguredGrowth);
-    }
-    if (QPushButton* inpaintButton = _growthPanel ? _growthPanel->inpaintButton() : nullptr) {
-        connect(inpaintButton, &QPushButton::clicked, this, [this]() {
-            triggerGrowthRequest(SegmentationGrowthDirection::All, 0, true);
-        });
-    }
-
-    if (QComboBox* volumesCombo = _growthPanel ? _growthPanel->volumesCombo() : nullptr) {
-        connect(volumesCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, volumesCombo](int index) {
-            if (index < 0) {
-                return;
-            }
-            const QString volumeId = volumesCombo->itemData(index).toString();
-            if (volumeId.isEmpty() || volumeId == _activeVolumeId) {
-                return;
-            }
-            _activeVolumeId = volumeId;
-            emit volumeSelectionChanged(volumeId);
-        });
-    }
+    // Forward growth panel signals
+    connect(_growthPanel, &SegmentationGrowthPanel::growSurfaceRequested,
+            this, &SegmentationWidget::growSurfaceRequested);
+    connect(_growthPanel, &SegmentationGrowthPanel::growthMethodChanged,
+            this, &SegmentationWidget::growthMethodChanged);
+    connect(_growthPanel, &SegmentationGrowthPanel::volumeSelectionChanged,
+            this, &SegmentationWidget::volumeSelectionChanged);
+    connect(_growthPanel, &SegmentationGrowthPanel::correctionsZRangeChanged,
+            this, &SegmentationWidget::correctionsZRangeChanged);
 
     // Forward corrections panel signals
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,
@@ -439,60 +148,6 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::correctionsCollectionSelected);
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsAnnotateToggled,
             this, &SegmentationWidget::correctionsAnnotateToggled);
-
-    if (QComboBox* normal3dCombo = _growthPanel ? _growthPanel->normal3dCombo() : nullptr) {
-        connect(normal3dCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, normal3dCombo](int idx) {
-            if (_restoringSettings) {
-                return;
-            }
-            if (idx < 0) {
-                return;
-            }
-            const QString path = normal3dCombo->itemData(idx).toString();
-            if (path.isEmpty() || path == _normal3dSelectedPath) {
-                return;
-            }
-            _normal3dSelectedPath = path;
-            writeSetting(QStringLiteral("normal3d_selected_path"), _normal3dSelectedPath);
-            updateNormal3dUi();
-        });
-    }
-
-    if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
-        connect(correctionsZRange, &QCheckBox::toggled, this, [this](bool enabled) {
-            _correctionsZRangeEnabled = enabled;
-            writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
-            updateGrowthUiState();
-            emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
-        });
-    }
-
-    if (QSpinBox* correctionsZMinSpin = _growthPanel ? _growthPanel->correctionsZMinSpin() : nullptr) {
-        connect(correctionsZMinSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_correctionsZMin == value) {
-                return;
-            }
-            _correctionsZMin = value;
-            writeSetting(QStringLiteral("corrections_z_min"), _correctionsZMin);
-            if (_correctionsZRangeEnabled) {
-                emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
-            }
-        });
-    }
-
-    if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
-        connect(correctionsZMaxSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_correctionsZMax == value) {
-                return;
-            }
-            _correctionsZMax = value;
-            writeSetting(QStringLiteral("corrections_z_max"), _correctionsZMax);
-            if (_correctionsZRangeEnabled) {
-                emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
-            }
-        });
-    }
-
 
     // Forward neural tracer panel signals
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerEnabledChanged,
@@ -513,322 +168,30 @@ void SegmentationWidget::syncUiState()
         }
     }
 
+    _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
     _editingPanel->syncUiState(_editingEnabled, _growthInProgress);
-
     _customParamsPanel->syncUiState(_editingEnabled);
-
-    QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr;
-    QComboBox* growthMethodCombo = _growthPanel ? _growthPanel->growthMethodCombo() : nullptr;
-    QWidget* extrapOptionsPanel = _growthPanel ? _growthPanel->extrapolationOptionsPanel() : nullptr;
-    QSpinBox* extrapPointsSpin = _growthPanel ? _growthPanel->extrapolationPointsSpin() : nullptr;
-    QComboBox* extrapTypeCombo = _growthPanel ? _growthPanel->extrapolationTypeCombo() : nullptr;
-    QWidget* sdtParamsContainer = _growthPanel ? _growthPanel->sdtParamsContainer() : nullptr;
-    QSpinBox* sdtMaxStepsSpin = _growthPanel ? _growthPanel->sdtMaxStepsSpin() : nullptr;
-    QDoubleSpinBox* sdtStepSizeSpin = _growthPanel ? _growthPanel->sdtStepSizeSpin() : nullptr;
-    QDoubleSpinBox* sdtConvergenceSpin = _growthPanel ? _growthPanel->sdtConvergenceSpin() : nullptr;
-    QSpinBox* sdtChunkSpin = _growthPanel ? _growthPanel->sdtChunkSizeSpin() : nullptr;
-    QWidget* skeletonParamsContainer = _growthPanel ? _growthPanel->skeletonParamsContainer() : nullptr;
-    QComboBox* skeletonConnectivityCombo = _growthPanel ? _growthPanel->skeletonConnectivityCombo() : nullptr;
-    QComboBox* skeletonSliceCombo = _growthPanel ? _growthPanel->skeletonSliceOrientationCombo() : nullptr;
-    QSpinBox* skeletonChunkSpin = _growthPanel ? _growthPanel->skeletonChunkSizeSpin() : nullptr;
-    QSpinBox* skeletonSearchSpin = _growthPanel ? _growthPanel->skeletonSearchRadiusSpin() : nullptr;
-    QLabel* extrapPointsLabel = _growthPanel ? _growthPanel->extrapolationPointsLabel() : nullptr;
-
-    if (growthStepsSpin) {
-        const QSignalBlocker blocker(growthStepsSpin);
-        growthStepsSpin->setValue(_growthSteps);
-    }
-
-    if (growthMethodCombo) {
-        const QSignalBlocker blocker(growthMethodCombo);
-        int idx = growthMethodCombo->findData(static_cast<int>(_growthMethod));
-        if (idx >= 0) {
-            growthMethodCombo->setCurrentIndex(idx);
-        }
-    }
-
-    if (extrapOptionsPanel) {
-        extrapOptionsPanel->setVisible(_growthMethod == SegmentationGrowthMethod::Extrapolation);
-    }
-
-    if (extrapPointsSpin) {
-        const QSignalBlocker blocker(extrapPointsSpin);
-        extrapPointsSpin->setValue(_extrapolationPointCount);
-    }
-
-    if (extrapTypeCombo) {
-        const QSignalBlocker blocker(extrapTypeCombo);
-        int idx = extrapTypeCombo->findData(static_cast<int>(_extrapolationType));
-        if (idx >= 0) {
-            extrapTypeCombo->setCurrentIndex(idx);
-        }
-    }
-
-    // SDT params container visibility: only show when Extrapolation method AND Linear+Fit type
-    if (sdtParamsContainer) {
-        sdtParamsContainer->setVisible(
-            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
-            _extrapolationType == ExtrapolationType::LinearFit);
-    }
-    if (sdtMaxStepsSpin) {
-        const QSignalBlocker blocker(sdtMaxStepsSpin);
-        sdtMaxStepsSpin->setValue(_sdtMaxSteps);
-    }
-    if (sdtStepSizeSpin) {
-        const QSignalBlocker blocker(sdtStepSizeSpin);
-        sdtStepSizeSpin->setValue(static_cast<double>(_sdtStepSize));
-    }
-    if (sdtConvergenceSpin) {
-        const QSignalBlocker blocker(sdtConvergenceSpin);
-        sdtConvergenceSpin->setValue(static_cast<double>(_sdtConvergence));
-    }
-    if (sdtChunkSpin) {
-        const QSignalBlocker blocker(sdtChunkSpin);
-        sdtChunkSpin->setValue(_sdtChunkSize);
-    }
-
-    // Skeleton params container visibility: only show when Extrapolation method AND SkeletonPath type
-    if (skeletonParamsContainer) {
-        skeletonParamsContainer->setVisible(
-            _growthMethod == SegmentationGrowthMethod::Extrapolation &&
-            _extrapolationType == ExtrapolationType::SkeletonPath);
-    }
-    if (skeletonConnectivityCombo) {
-        const QSignalBlocker blocker(skeletonConnectivityCombo);
-        int idx = skeletonConnectivityCombo->findData(_skeletonConnectivity);
-        if (idx >= 0) {
-            skeletonConnectivityCombo->setCurrentIndex(idx);
-        }
-    }
-    if (skeletonSliceCombo) {
-        const QSignalBlocker blocker(skeletonSliceCombo);
-        int idx = skeletonSliceCombo->findData(_skeletonSliceOrientation);
-        if (idx >= 0) {
-            skeletonSliceCombo->setCurrentIndex(idx);
-        }
-    }
-    if (skeletonChunkSpin) {
-        const QSignalBlocker blocker(skeletonChunkSpin);
-        skeletonChunkSpin->setValue(_skeletonChunkSize);
-    }
-    if (skeletonSearchSpin) {
-        const QSignalBlocker blocker(skeletonSearchSpin);
-        skeletonSearchSpin->setValue(_skeletonSearchRadius);
-    }
-    // Hide fit points label and spinbox for SkeletonPath (it doesn't use polynomial fitting)
-    bool showFitPoints = _extrapolationType != ExtrapolationType::SkeletonPath;
-    if (extrapPointsLabel) {
-        extrapPointsLabel->setVisible(showFitPoints);
-    }
-    if (extrapPointsSpin) {
-        extrapPointsSpin->setVisible(showFitPoints);
-    }
-
-    applyGrowthDirectionMaskToUi();
-    if (QCheckBox* growthKeybinds = _growthPanel ? _growthPanel->growthKeybindsCheck() : nullptr) {
-        const QSignalBlocker blocker(growthKeybinds);
-        growthKeybinds->setChecked(_growthKeybindsEnabled);
-    }
     _directionFieldPanel->syncUiState(_editingEnabled);
-
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
-    if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
-        const QSignalBlocker blocker(correctionsZRange);
-        correctionsZRange->setChecked(_correctionsZRangeEnabled);
-    }
-    if (QSpinBox* correctionsZMinSpin = _growthPanel ? _growthPanel->correctionsZMinSpin() : nullptr) {
-        const QSignalBlocker blocker(correctionsZMinSpin);
-        correctionsZMinSpin->setValue(_correctionsZMin);
-    }
-    if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
-        const QSignalBlocker blocker(correctionsZMaxSpin);
-        correctionsZMaxSpin->setValue(_correctionsZMax);
-    }
-
-    if (QLabel* normalGridLabel = _growthPanel ? _growthPanel->normalGridLabel() : nullptr) {
-        const QString icon = _normalGridAvailable
-            ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
-            : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
-        const bool hasExplicitLocation = !_normalGridDisplayPath.isEmpty() && _normalGridDisplayPath != _normalGridHint;
-        QString message;
-        message = _normalGridAvailable ? tr("Normal grids found.") : tr("Normal grids not found.");
-        if (!_normalGridHint.isEmpty()) {
-            message.append(QStringLiteral(" ("));
-            message.append(_normalGridHint);
-            message.append(QLatin1Char(')'));
-        }
-
-        QString tooltip = message;
-        if (hasExplicitLocation && !_normalGridHint.isEmpty()) {
-            tooltip.append(QStringLiteral("\n"));
-            tooltip.append(_normalGridHint);
-        }
-        if (!_volumePackagePath.isEmpty()) {
-            tooltip.append(QStringLiteral("\n"));
-            tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
-        }
-
-        normalGridLabel->setText(icon + QStringLiteral("&nbsp;") + message);
-        normalGridLabel->setToolTip(tooltip);
-        normalGridLabel->setAccessibleDescription(message);
-    }
-
-    if (QLineEdit* normalGridPathEdit = _growthPanel ? _growthPanel->normalGridPathEdit() : nullptr) {
-        const bool show = _normalGridAvailable && !_normalGridPath.isEmpty();
-        normalGridPathEdit->setVisible(show);
-        normalGridPathEdit->setText(_normalGridPath);
-        normalGridPathEdit->setToolTip(_normalGridPath);
-    }
-
-    updateNormal3dUi();
-
     _approvalMaskPanel->syncUiState();
-
     _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
-
-    updateGrowthUiState();
-}
-
-void SegmentationWidget::updateNormal3dUi()
-{
-    QLabel* normal3dLabel = _growthPanel ? _growthPanel->normal3dLabel() : nullptr;
-    if (!normal3dLabel) {
-        return;
-    }
-
-    const int count = _normal3dCandidates.size();
-    const bool hasAny = count > 0;
-
-    // Keep selection valid.
-    if (hasAny) {
-        if (_normal3dSelectedPath.isEmpty() || !_normal3dCandidates.contains(_normal3dSelectedPath)) {
-            _normal3dSelectedPath = _normal3dCandidates.front();
-        }
-    } else {
-        _normal3dSelectedPath.clear();
-    }
-
-    const bool showCombo = count > 1;
-    if (QComboBox* normal3dCombo = _growthPanel ? _growthPanel->normal3dCombo() : nullptr) {
-        normal3dCombo->setVisible(showCombo);
-        normal3dCombo->setEnabled(_editingEnabled && hasAny);
-        if (showCombo) {
-            const QSignalBlocker blocker(normal3dCombo);
-            normal3dCombo->clear();
-            for (const QString& p : _normal3dCandidates) {
-                normal3dCombo->addItem(p, p);
-            }
-            const int idx = normal3dCombo->findData(_normal3dSelectedPath);
-            if (idx >= 0) {
-                normal3dCombo->setCurrentIndex(idx);
-            }
-        }
-    }
-
-    const QString icon = hasAny
-        ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
-        : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
-
-    QString message;
-    if (!hasAny) {
-        message = tr("Normal3D volume not found.");
-    } else if (count == 1) {
-        message = tr("Normal3D volume found.");
-    } else {
-        message = tr("Normal3D volumes found (%1). Select one:").arg(count);
-    }
-
-    QString tooltip = message;
-    if (!_normal3dHint.isEmpty()) {
-        tooltip.append(QStringLiteral("\n"));
-        tooltip.append(_normal3dHint);
-    }
-    if (!_volumePackagePath.isEmpty()) {
-        tooltip.append(QStringLiteral("\n"));
-        tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
-    }
-
-    normal3dLabel->setText(icon + QStringLiteral("&nbsp;") + message);
-    normal3dLabel->setToolTip(tooltip);
-    normal3dLabel->setAccessibleDescription(message);
-
-    if (QLineEdit* normal3dPathEdit = _growthPanel ? _growthPanel->normal3dPathEdit() : nullptr) {
-        const bool show = hasAny && !showCombo;
-        normal3dPathEdit->setVisible(show);
-        normal3dPathEdit->setText(_normal3dSelectedPath);
-        normal3dPathEdit->setToolTip(_normal3dSelectedPath);
-    }
-}
-
-void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint)
-{
-    _normal3dCandidates = candidates;
-    _normal3dHint = hint;
-    syncUiState();
 }
 
 void SegmentationWidget::restoreSettings()
 {
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.beginGroup(settingsGroup());
+    settings.beginGroup(QStringLiteral("segmentation_edit"));
 
     _restoringSettings = true;
 
     _editingPanel->restoreSettings(settings);
-    _growthMethod = segmentationGrowthMethodFromInt(
-        settings.value(segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod)).toInt());
-    _extrapolationPointCount = settings.value(QStringLiteral("extrapolation_point_count"), _extrapolationPointCount).toInt();
-    _extrapolationPointCount = std::clamp(_extrapolationPointCount, 3, 20);
-    _extrapolationType = extrapolationTypeFromInt(
-        settings.value(QStringLiteral("extrapolation_type"), static_cast<int>(_extrapolationType)).toInt());
-
-    // Restore SDT/Newton refinement parameters
-    _sdtMaxSteps = std::clamp(settings.value(QStringLiteral("sdt_max_steps"), _sdtMaxSteps).toInt(), 1, 10);
-    _sdtStepSize = std::clamp(settings.value(QStringLiteral("sdt_step_size"), static_cast<double>(_sdtStepSize)).toFloat(), 0.1f, 2.0f);
-    _sdtConvergence = std::clamp(settings.value(QStringLiteral("sdt_convergence"), static_cast<double>(_sdtConvergence)).toFloat(), 0.1f, 2.0f);
-    _sdtChunkSize = std::clamp(settings.value(QStringLiteral("sdt_chunk_size"), _sdtChunkSize).toInt(), 32, 256);
-
-    // Restore skeleton path parameters
-    int storedConnectivity = settings.value(QStringLiteral("skeleton_connectivity"), _skeletonConnectivity).toInt();
-    if (storedConnectivity == 6 || storedConnectivity == 18 || storedConnectivity == 26) {
-        _skeletonConnectivity = storedConnectivity;
-    }
-    _skeletonSliceOrientation = std::clamp(settings.value(QStringLiteral("skeleton_slice_orientation"), _skeletonSliceOrientation).toInt(), 0, 1);
-    _skeletonChunkSize = std::clamp(settings.value(QStringLiteral("skeleton_chunk_size"), _skeletonChunkSize).toInt(), 32, 256);
-    _skeletonSearchRadius = std::clamp(settings.value(QStringLiteral("skeleton_search_radius"), _skeletonSearchRadius).toInt(), 1, 100);
-
-    int storedGrowthSteps = settings.value(segmentation::GROWTH_STEPS, _growthSteps).toInt();
-    storedGrowthSteps = std::clamp(storedGrowthSteps, 0, 1024);
-    _tracerGrowthSteps = settings
-                             .value(QStringLiteral("growth_steps_tracer"),
-                                    std::max(1, storedGrowthSteps))
-                             .toInt();
-    _tracerGrowthSteps = std::clamp(_tracerGrowthSteps, 1, 1024);
-    applyGrowthSteps(storedGrowthSteps, false, false);
-    _growthDirectionMask = normalizeGrowthDirectionMask(
-        settings.value(segmentation::GROWTH_DIRECTION_MASK, kGrowDirAllMask).toInt());
-    _growthKeybindsEnabled = settings.value(segmentation::GROWTH_KEYBINDS_ENABLED,
-                                            segmentation::GROWTH_KEYBINDS_ENABLED_DEFAULT).toBool();
-
+    _growthPanel->restoreSettings(settings);
     _directionFieldPanel->restoreSettings(settings);
-
     _correctionsPanel->restoreSettings(settings);
-    _correctionsZRangeEnabled = settings.value(segmentation::CORRECTIONS_Z_RANGE_ENABLED, segmentation::CORRECTIONS_Z_RANGE_ENABLED_DEFAULT).toBool();
-    _correctionsZMin = settings.value(segmentation::CORRECTIONS_Z_MIN, segmentation::CORRECTIONS_Z_MIN_DEFAULT).toInt();
-   _correctionsZMax = settings.value(segmentation::CORRECTIONS_Z_MAX, _correctionsZMin).toInt();
-    if (_correctionsZMax < _correctionsZMin) {
-        _correctionsZMax = _correctionsZMin;
-    }
-
     _customParamsPanel->restoreSettings(settings);
-
-    _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
-
     _approvalMaskPanel->restoreSettings(settings);
-
     _neuralTracerPanel->restoreSettings(settings);
-
     _cellReoptPanel->restoreSettings(settings);
 
     settings.endGroup();
@@ -838,7 +201,7 @@ void SegmentationWidget::restoreSettings()
 void SegmentationWidget::writeSetting(const QString& key, const QVariant& value)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.beginGroup(settingsGroup());
+    settings.beginGroup(QStringLiteral("segmentation_edit"));
     settings.setValue(key, value);
     settings.endGroup();
 }
@@ -928,109 +291,47 @@ void SegmentationWidget::setEditingEnabled(bool enabled)
     updateEditingState(enabled, false);
 }
 
-void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method)
-{
-    if (_growthMethod == method) {
-        return;
-    }
-    const int currentSteps = _growthSteps;
-    if (method == SegmentationGrowthMethod::Corrections) {
-        _tracerGrowthSteps = (currentSteps > 0) ? currentSteps : std::max(1, _tracerGrowthSteps);
-    }
-    _growthMethod = method;
-    int targetSteps = currentSteps;
-    if (method == SegmentationGrowthMethod::Corrections) {
-        targetSteps = 0;
-    } else {
-        targetSteps = (currentSteps < 1) ? std::max(1, _tracerGrowthSteps) : std::max(1, currentSteps);
-    }
-    applyGrowthSteps(targetSteps, true, false);
-    writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
-    syncUiState();
-    emit growthMethodChanged(_growthMethod);
-}
+// --- Growth panel delegations ---
 
+SegmentationGrowthMethod SegmentationWidget::growthMethod() const { return _growthPanel->growthMethod(); }
+int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps(); }
+int SegmentationWidget::extrapolationPointCount() const { return _growthPanel->extrapolationPointCount(); }
+ExtrapolationType SegmentationWidget::extrapolationType() const { return _growthPanel->extrapolationType(); }
+int SegmentationWidget::sdtMaxSteps() const { return _growthPanel->sdtMaxSteps(); }
+float SegmentationWidget::sdtStepSize() const { return _growthPanel->sdtStepSize(); }
+float SegmentationWidget::sdtConvergence() const { return _growthPanel->sdtConvergence(); }
+int SegmentationWidget::sdtChunkSize() const { return _growthPanel->sdtChunkSize(); }
+int SegmentationWidget::skeletonConnectivity() const { return _growthPanel->skeletonConnectivity(); }
+int SegmentationWidget::skeletonSliceOrientation() const { return _growthPanel->skeletonSliceOrientation(); }
+int SegmentationWidget::skeletonChunkSize() const { return _growthPanel->skeletonChunkSize(); }
+int SegmentationWidget::skeletonSearchRadius() const { return _growthPanel->skeletonSearchRadius(); }
+bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
+QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->normal3dZarrPath(); }
+std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
+std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const { return _growthPanel->correctionsZRange(); }
+
+void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method) { _growthPanel->setGrowthMethod(method); }
+void SegmentationWidget::setGrowthSteps(int steps, bool persist) { _growthPanel->setGrowthSteps(steps, persist); }
 void SegmentationWidget::setGrowthInProgress(bool running)
 {
     if (_growthInProgress == running) {
         return;
     }
     _growthInProgress = running;
-    updateGrowthUiState();
+    _growthPanel->setGrowthInProgress(running);
 }
+void SegmentationWidget::setNormalGridAvailable(bool available) { _growthPanel->setNormalGridAvailable(available); }
+void SegmentationWidget::setNormalGridPathHint(const QString& hint) { _growthPanel->setNormalGridPathHint(hint); }
+void SegmentationWidget::setNormalGridPath(const QString& path) { _growthPanel->setNormalGridPath(path); }
+void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint) { _growthPanel->setNormal3dZarrCandidates(candidates, hint); }
+void SegmentationWidget::setVolumePackagePath(const QString& path) { _growthPanel->setVolumePackagePath(path); }
+void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes, const QString& activeId) { _growthPanel->setAvailableVolumes(volumes, activeId); }
+void SegmentationWidget::setActiveVolume(const QString& volumeId) { _growthPanel->setActiveVolume(volumeId); }
 
-void SegmentationWidget::setNormalGridAvailable(bool available)
-{
-    _normalGridAvailable = available;
-    syncUiState();
-}
+// --- Corrections delegations ---
 
-void SegmentationWidget::setNormalGridPathHint(const QString& hint)
-{
-    _normalGridHint = hint;
-    QString display = hint.trimmed();
-    const int colonIndex = display.indexOf(QLatin1Char(':'));
-    if (colonIndex >= 0 && colonIndex + 1 < display.size()) {
-        display = display.mid(colonIndex + 1).trimmed();
-    }
-    _normalGridDisplayPath = display;
-    syncUiState();
-}
-
-void SegmentationWidget::setNormalGridPath(const QString& path)
-{
-    _normalGridPath = path.trimmed();
-    syncUiState();
-}
-
-void SegmentationWidget::setVolumePackagePath(const QString& path)
-{
-    _volumePackagePath = path;
-    syncUiState();
-}
-
-void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
-                                              const QString& activeId)
-{
-    _volumeEntries = volumes;
-    _activeVolumeId = determineDefaultVolumeId(_volumeEntries, activeId);
-    if (QComboBox* volumesCombo = _growthPanel ? _growthPanel->volumesCombo() : nullptr) {
-        const QSignalBlocker blocker(volumesCombo);
-        volumesCombo->clear();
-        for (const auto& entry : _volumeEntries) {
-            const QString& id = entry.first;
-            const QString& label = entry.second.isEmpty() ? id : entry.second;
-            volumesCombo->addItem(label, id);
-        }
-        int idx = volumesCombo->findData(_activeVolumeId);
-        if (idx < 0 && !_volumeEntries.isEmpty()) {
-            _activeVolumeId = volumesCombo->itemData(0).toString();
-            idx = 0;
-        }
-        if (idx >= 0) {
-            volumesCombo->setCurrentIndex(idx);
-        }
-        volumesCombo->setEnabled(!_volumeEntries.isEmpty());
-    }
-}
-
-void SegmentationWidget::setActiveVolume(const QString& volumeId)
-{
-    if (_activeVolumeId == volumeId) {
-        return;
-    }
-    _activeVolumeId = volumeId;
-    if (QComboBox* volumesCombo = _growthPanel ? _growthPanel->volumesCombo() : nullptr) {
-        const QSignalBlocker blocker(volumesCombo);
-        int idx = volumesCombo->findData(_activeVolumeId);
-        if (idx >= 0) {
-            volumesCombo->setCurrentIndex(idx);
-        }
-    }
-}
-
-void SegmentationWidget::setCorrectionsEnabled(bool enabled) { _correctionsPanel->setCorrectionsEnabled(enabled); updateGrowthUiState(); }
-void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled) { _correctionsPanel->setCorrectionsAnnotateChecked(enabled); updateGrowthUiState(); }
+void SegmentationWidget::setCorrectionsEnabled(bool enabled) { _correctionsPanel->setCorrectionsEnabled(enabled); }
+void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled) { _correctionsPanel->setCorrectionsAnnotateChecked(enabled); }
 
 void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                                   std::optional<uint64_t> activeId)
@@ -1039,182 +340,11 @@ void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, 
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
 }
 
-std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const
-{
-    if (!_correctionsZRangeEnabled) {
-        return std::nullopt;
-    }
-    return std::make_pair(_correctionsZMin, _correctionsZMax);
-}
-
-std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const
-{
-    std::vector<SegmentationGrowthDirection> dirs;
-    if (_growthDirectionMask & kGrowDirUpBit) {
-        dirs.push_back(SegmentationGrowthDirection::Up);
-    }
-    if (_growthDirectionMask & kGrowDirDownBit) {
-        dirs.push_back(SegmentationGrowthDirection::Down);
-    }
-    if (_growthDirectionMask & kGrowDirLeftBit) {
-        dirs.push_back(SegmentationGrowthDirection::Left);
-    }
-    if (_growthDirectionMask & kGrowDirRightBit) {
-        dirs.push_back(SegmentationGrowthDirection::Right);
-    }
-    if (dirs.empty()) {
-        dirs = {
-            SegmentationGrowthDirection::Up,
-            SegmentationGrowthDirection::Down,
-            SegmentationGrowthDirection::Left,
-            SegmentationGrowthDirection::Right
-        };
-    }
-    return dirs;
-}
+// --- Direction field delegations ---
 
 std::vector<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfigs() const
 {
     return _directionFieldPanel->directionFieldConfigs();
-}
-
-void SegmentationWidget::setGrowthDirectionMask(int mask)
-{
-    mask = normalizeGrowthDirectionMask(mask);
-    if (_growthDirectionMask == mask) {
-        return;
-    }
-    _growthDirectionMask = mask;
-    writeSetting(QStringLiteral("growth_direction_mask"), _growthDirectionMask);
-    applyGrowthDirectionMaskToUi();
-}
-
-void SegmentationWidget::updateGrowthDirectionMaskFromUi(QCheckBox* changedCheckbox)
-{
-    int mask = 0;
-    QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr;
-    QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr;
-    QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr;
-    QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr;
-    if (growthDirUp && growthDirUp->isChecked()) {
-        mask |= kGrowDirUpBit;
-    }
-    if (growthDirDown && growthDirDown->isChecked()) {
-        mask |= kGrowDirDownBit;
-    }
-    if (growthDirLeft && growthDirLeft->isChecked()) {
-        mask |= kGrowDirLeftBit;
-    }
-    if (growthDirRight && growthDirRight->isChecked()) {
-        mask |= kGrowDirRightBit;
-    }
-
-    if (mask == 0) {
-        if (changedCheckbox) {
-            const QSignalBlocker blocker(changedCheckbox);
-            changedCheckbox->setChecked(true);
-        }
-        mask = kGrowDirAllMask;
-    }
-
-    setGrowthDirectionMask(mask);
-}
-
-void SegmentationWidget::applyGrowthDirectionMaskToUi()
-{
-    if (QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr) {
-        const QSignalBlocker blocker(growthDirUp);
-        growthDirUp->setChecked((_growthDirectionMask & kGrowDirUpBit) != 0);
-    }
-    if (QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr) {
-        const QSignalBlocker blocker(growthDirDown);
-        growthDirDown->setChecked((_growthDirectionMask & kGrowDirDownBit) != 0);
-    }
-    if (QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr) {
-        const QSignalBlocker blocker(growthDirLeft);
-        growthDirLeft->setChecked((_growthDirectionMask & kGrowDirLeftBit) != 0);
-    }
-    if (QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr) {
-        const QSignalBlocker blocker(growthDirRight);
-        growthDirRight->setChecked((_growthDirectionMask & kGrowDirRightBit) != 0);
-    }
-}
-
-void SegmentationWidget::updateGrowthUiState()
-{
-    const bool enableGrowth = _editingEnabled && !_growthInProgress;
-    if (QSpinBox* growthStepsSpin = _growthPanel ? _growthPanel->growthStepsSpin() : nullptr) {
-        growthStepsSpin->setEnabled(enableGrowth);
-    }
-    if (QPushButton* growButton = _growthPanel ? _growthPanel->growButton() : nullptr) {
-        growButton->setEnabled(enableGrowth);
-    }
-    if (QPushButton* inpaintButton = _growthPanel ? _growthPanel->inpaintButton() : nullptr) {
-        inpaintButton->setEnabled(enableGrowth);
-    }
-    const bool enableDirCheckbox = enableGrowth;
-    if (QCheckBox* growthDirUp = _growthPanel ? _growthPanel->growthDirUpCheck() : nullptr) {
-        growthDirUp->setEnabled(enableDirCheckbox);
-    }
-    if (QCheckBox* growthDirDown = _growthPanel ? _growthPanel->growthDirDownCheck() : nullptr) {
-        growthDirDown->setEnabled(enableDirCheckbox);
-    }
-    if (QCheckBox* growthDirLeft = _growthPanel ? _growthPanel->growthDirLeftCheck() : nullptr) {
-        growthDirLeft->setEnabled(enableDirCheckbox);
-    }
-    if (QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr) {
-        growthDirRight->setEnabled(enableDirCheckbox);
-    }
-    _directionFieldPanel->syncUiState(_editingEnabled);
-
-    const bool allowZRange = _editingEnabled && !_growthInProgress;
-    if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
-        correctionsZRange->setEnabled(allowZRange);
-    }
-    if (QSpinBox* correctionsZMinSpin = _growthPanel ? _growthPanel->correctionsZMinSpin() : nullptr) {
-        correctionsZMinSpin->setEnabled(allowZRange && _correctionsZRangeEnabled);
-    }
-    if (QSpinBox* correctionsZMaxSpin = _growthPanel ? _growthPanel->correctionsZMaxSpin() : nullptr) {
-        correctionsZMaxSpin->setEnabled(allowZRange && _correctionsZRangeEnabled);
-    }
-    _customParamsPanel->syncUiState(_editingEnabled);
-
-    _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
-}
-
-void SegmentationWidget::triggerGrowthRequest(SegmentationGrowthDirection direction,
-                                              int steps,
-                                              bool inpaintOnly)
-{
-    if (!_editingEnabled || _growthInProgress) {
-        return;
-    }
-
-    const SegmentationGrowthMethod method = inpaintOnly
-        ? SegmentationGrowthMethod::Tracer
-        : _growthMethod;
-
-    const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
-    const int minSteps = allowZeroSteps ? 0 : 1;
-    const int clampedSteps = std::clamp(steps, minSteps, 1024);
-    const int finalSteps = clampedSteps;
-
-    qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(method)
-                        << segmentationGrowthDirectionToString(direction)
-                        << "steps" << finalSteps
-                        << "inpaintOnly" << inpaintOnly;
-    emit growSurfaceRequested(method, direction, finalSteps, inpaintOnly);
-}
-
-int SegmentationWidget::normalizeGrowthDirectionMask(int mask)
-{
-    mask &= kGrowDirAllMask;
-    if (mask == 0) {
-        // If no directions are selected, enable all directions by default.
-        // This ensures that growth is not unintentionally disabled.
-        mask = kGrowDirAllMask;
-    }
-    return mask;
 }
 
 // --- Custom params delegations ---
