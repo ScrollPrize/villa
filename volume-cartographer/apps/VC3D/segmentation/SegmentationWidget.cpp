@@ -4,6 +4,7 @@
 #include "elements/JsonProfileEditor.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "NeuralTraceServiceManager.hpp"
+#include "tools/SegmentationEditingPanel.hpp"
 #include "tools/SegmentationGrowthPanel.hpp"
 #include "tools/SegmentationHeaderRow.hpp"
 #include "VCSettings.hpp"
@@ -225,211 +226,8 @@ void SegmentationWidget::buildUi()
     _growthPanel = new SegmentationGrowthPanel(_growthKeybindsEnabled, this);
     layout->addWidget(_growthPanel);
 
-    auto* hoverRow = new QHBoxLayout();
-    hoverRow->addSpacing(4);
-    _chkShowHoverMarker = new QCheckBox(tr("Show hover marker"), this);
-    _chkShowHoverMarker->setToolTip(tr("Toggle the hover indicator in the segmentation viewer. "
-                                       "Disabling this hides the preview marker and defers grid lookups "
-                                       "until you drag or use push/pull."));
-    hoverRow->addWidget(_chkShowHoverMarker);
-    hoverRow->addStretch(1);
-    layout->addLayout(hoverRow);
-
-    _groupEditing = new CollapsibleSettingsGroup(tr("Editing"), this);
-    auto* falloffLayout = _groupEditing->contentLayout();
-    auto* falloffParent = _groupEditing->contentWidget();
-
-    auto createToolGroup = [&](const QString& title,
-                               QDoubleSpinBox*& radiusSpin,
-                               QDoubleSpinBox*& sigmaSpin) {
-        auto* group = new CollapsibleSettingsGroup(title, _groupEditing);
-        radiusSpin = group->addDoubleSpinBox(tr("Radius"), 0.25, 128.0, 0.25);
-        sigmaSpin = group->addDoubleSpinBox(tr("Sigma"), 0.05, 64.0, 0.1);
-        return group;
-    };
-
-    _groupDrag = createToolGroup(tr("Drag Brush"), _spinDragRadius, _spinDragSigma);
-    _groupLine = createToolGroup(tr("Line Brush (S)"), _spinLineRadius, _spinLineSigma);
-
-    _groupPushPull = new CollapsibleSettingsGroup(tr("Push/Pull (A / D, Ctrl for alpha)"), _groupEditing);
-    auto* pushGrid = new QGridLayout();
-    pushGrid->setContentsMargins(0, 0, 0, 0);
-    pushGrid->setHorizontalSpacing(12);
-    pushGrid->setVerticalSpacing(8);
-    _groupPushPull->contentLayout()->addLayout(pushGrid);
-
-    auto* pushParent = _groupPushPull->contentWidget();
-
-    auto* ppRadiusLabel = new QLabel(tr("Radius"), pushParent);
-    _spinPushPullRadius = new QDoubleSpinBox(pushParent);
-    _spinPushPullRadius->setDecimals(2);
-    _spinPushPullRadius->setRange(0.25, 128.0);
-    _spinPushPullRadius->setSingleStep(0.25);
-    pushGrid->addWidget(ppRadiusLabel, 0, 0);
-    pushGrid->addWidget(_spinPushPullRadius, 0, 1);
-
-    auto* ppSigmaLabel = new QLabel(tr("Sigma"), pushParent);
-    _spinPushPullSigma = new QDoubleSpinBox(pushParent);
-    _spinPushPullSigma->setDecimals(2);
-    _spinPushPullSigma->setRange(0.05, 64.0);
-    _spinPushPullSigma->setSingleStep(0.1);
-    pushGrid->addWidget(ppSigmaLabel, 0, 2);
-    pushGrid->addWidget(_spinPushPullSigma, 0, 3);
-
-    auto* pushPullLabel = new QLabel(tr("Step"), pushParent);
-    _spinPushPullStep = new QDoubleSpinBox(pushParent);
-    _spinPushPullStep->setDecimals(2);
-    _spinPushPullStep->setRange(0.05, 40.0);
-    _spinPushPullStep->setSingleStep(0.05);
-    pushGrid->addWidget(pushPullLabel, 1, 0);
-    pushGrid->addWidget(_spinPushPullStep, 1, 1);
-
-    _lblAlphaInfo = new QLabel(tr("Hold Ctrl with A/D to sample alpha while pushing or pulling."), pushParent);
-    _lblAlphaInfo->setWordWrap(true);
-    _lblAlphaInfo->setToolTip(tr("Hold Ctrl when starting push/pull to stop at the configured alpha thresholds."));
-    pushGrid->addWidget(_lblAlphaInfo, 2, 0, 1, 4);
-
-    _alphaPushPullPanel = new QWidget(pushParent);
-    auto* alphaGrid = new QGridLayout(_alphaPushPullPanel);
-    alphaGrid->setContentsMargins(0, 0, 0, 0);
-    alphaGrid->setHorizontalSpacing(12);
-    alphaGrid->setVerticalSpacing(6);
-
-    auto addAlphaWidget = [&](const QString& labelText, QWidget* widget, int row, int column, const QString& tooltip) {
-        auto* label = new QLabel(labelText, _alphaPushPullPanel);
-        label->setToolTip(tooltip);
-        widget->setToolTip(tooltip);
-        const int columnBase = column * 2;
-        alphaGrid->addWidget(label, row, columnBase);
-        alphaGrid->addWidget(widget, row, columnBase + 1);
-    };
-
-    auto addAlphaControl = [&](const QString& labelText,
-                               QDoubleSpinBox*& target,
-                               double min,
-                               double max,
-                               double step,
-                               int row,
-                               int column,
-                               const QString& tooltip) {
-        auto* spin = new QDoubleSpinBox(_alphaPushPullPanel);
-        spin->setDecimals(2);
-        spin->setRange(min, max);
-        spin->setSingleStep(step);
-        target = spin;
-        addAlphaWidget(labelText, spin, row, column, tooltip);
-    };
-
-    auto addAlphaIntControl = [&](const QString& labelText,
-                                  QSpinBox*& target,
-                                  int min,
-                                  int max,
-                                  int step,
-                                  int row,
-                                  int column,
-                                  const QString& tooltip) {
-        auto* spin = new QSpinBox(_alphaPushPullPanel);
-        spin->setRange(min, max);
-        spin->setSingleStep(step);
-        target = spin;
-        addAlphaWidget(labelText, spin, row, column, tooltip);
-    };
-
-    int alphaRow = 0;
-    addAlphaControl(tr("Start"), _spinAlphaStart, -64.0, 64.0, 0.5, alphaRow, 0,
-                    tr("Beginning distance (along the brush normal) where alpha sampling starts."));
-    addAlphaControl(tr("Stop"), _spinAlphaStop, -64.0, 64.0, 0.5, alphaRow++, 1,
-                    tr("Ending distance for alpha sampling; the search stops once this depth is reached."));
-    addAlphaControl(tr("Sample step"), _spinAlphaStep, 0.05, 20.0, 0.05, alphaRow, 0,
-                    tr("Spacing between alpha samples inside the start/stop range; smaller steps follow fine features."));
-    addAlphaControl(tr("Border offset"), _spinAlphaBorder, -20.0, 20.0, 0.1, alphaRow++, 1,
-                    tr("Extra offset applied after the alpha front is located, keeping a safety margin."));
-    addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 255.0, 1.0, alphaRow, 0,
-                    tr("Lower bound of the opacity window; voxels below this behave as transparent."));
-    addAlphaControl(tr("Opacity high"), _spinAlphaHigh, 0.0, 255.0, 1.0, alphaRow++, 1,
-                    tr("Upper bound of the opacity window; voxels above this are fully opaque."));
-
-    const QString blurTooltip = tr("Gaussian blur radius for each sampled slice; higher values smooth noisy volumes before thresholding.");
-    addAlphaIntControl(tr("Blur radius"), _spinAlphaBlurRadius, 0, 15, 1, alphaRow++, 0, blurTooltip);
-
-    _chkAlphaPerVertex = new QCheckBox(tr("Independent per-vertex stops"), _alphaPushPullPanel);
-    _chkAlphaPerVertex->setToolTip(tr("Move every vertex within the brush independently to the alpha threshold without Gaussian weighting."));
-    alphaGrid->addWidget(_chkAlphaPerVertex, alphaRow++, 0, 1, 4);
-
-    const QString perVertexLimitTip = tr("Maximum additional distance (world units) a vertex may exceed relative to the smallest movement in the brush when independent stops are enabled.");
-    addAlphaControl(tr("Per-vertex limit"), _spinAlphaPerVertexLimit, 0.0, 128.0, 0.25, alphaRow++, 0, perVertexLimitTip);
-
-    alphaGrid->setColumnStretch(1, 1);
-    alphaGrid->setColumnStretch(3, 1);
-
-    pushGrid->addWidget(_alphaPushPullPanel, 3, 0, 1, 4);
-
-    pushGrid->setColumnStretch(1, 1);
-    pushGrid->setColumnStretch(3, 1);
-
-    auto setGroupTooltips = [](QWidget* group, QDoubleSpinBox* radiusSpin, QDoubleSpinBox* sigmaSpin, const QString& radiusTip, const QString& sigmaTip) {
-        if (group) {
-            group->setToolTip(radiusTip + QLatin1Char('\n') + sigmaTip);
-        }
-        if (radiusSpin) {
-            radiusSpin->setToolTip(radiusTip);
-        }
-        if (sigmaSpin) {
-            sigmaSpin->setToolTip(sigmaTip);
-        }
-    };
-
-    setGroupTooltips(_groupDrag,
-                     _spinDragRadius,
-                     _spinDragSigma,
-                     tr("Brush radius in grid steps for drag edits."),
-                     tr("Gaussian falloff sigma for drag edits."));
-    setGroupTooltips(_groupLine,
-                     _spinLineRadius,
-                     _spinLineSigma,
-                     tr("Brush radius in grid steps for line drags."),
-                     tr("Gaussian falloff sigma for line drags."));
-    setGroupTooltips(_groupPushPull,
-                     _spinPushPullRadius,
-                     _spinPushPullSigma,
-                     tr("Radius in grid steps that participates in push/pull."),
-                     tr("Gaussian falloff sigma for push/pull."));
-    if (_spinPushPullStep) {
-        _spinPushPullStep->setToolTip(tr("Baseline step size (in world units) for classic push/pull when alpha mode is disabled."));
-    }
-
-    auto* brushToolsRow = new QHBoxLayout();
-    brushToolsRow->setSpacing(12);
-    brushToolsRow->addWidget(_groupDrag, 1);
-    brushToolsRow->addWidget(_groupLine, 1);
-    falloffLayout->addLayout(brushToolsRow);
-
-    auto* pushPullRow = new QHBoxLayout();
-    pushPullRow->setSpacing(12);
-    pushPullRow->addWidget(_groupPushPull, 1);
-    falloffLayout->addLayout(pushPullRow);
-
-    auto* smoothingRow = new QHBoxLayout();
-    auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffParent);
-    _spinSmoothStrength = new QDoubleSpinBox(falloffParent);
-    _spinSmoothStrength->setDecimals(2);
-    _spinSmoothStrength->setToolTip(tr("Blend edits toward neighboring vertices; higher values smooth more."));
-    _spinSmoothStrength->setRange(0.0, 1.0);
-    _spinSmoothStrength->setSingleStep(0.05);
-    smoothingRow->addWidget(smoothStrengthLabel);
-    smoothingRow->addWidget(_spinSmoothStrength);
-    smoothingRow->addSpacing(12);
-    auto* smoothIterationsLabel = new QLabel(tr("Iterations"), falloffParent);
-    _spinSmoothIterations = new QSpinBox(falloffParent);
-    _spinSmoothIterations->setRange(1, 25);
-    _spinSmoothIterations->setToolTip(tr("Number of smoothing passes applied after growth."));
-    _spinSmoothIterations->setSingleStep(1);
-    smoothingRow->addWidget(smoothIterationsLabel);
-    smoothingRow->addWidget(_spinSmoothIterations);
-    smoothingRow->addStretch(1);
-    falloffLayout->addLayout(smoothingRow);
-
-    layout->addWidget(_groupEditing);
+    _editingPanel = new SegmentationEditingPanel(this);
+    layout->addWidget(_editingPanel);
 
     // Approval Mask Group
     _groupApprovalMask = new CollapsibleSettingsGroup(tr("Approval Mask"), this);
@@ -760,10 +558,10 @@ void SegmentationWidget::buildUi()
         });
     };
 
-    rememberGroupState(_groupEditing, QStringLiteral("group_editing_expanded"));
-    rememberGroupState(_groupDrag, QStringLiteral("group_drag_expanded"));
-    rememberGroupState(_groupLine, QStringLiteral("group_line_expanded"));
-    rememberGroupState(_groupPushPull, QStringLiteral("group_push_pull_expanded"));
+    rememberGroupState(_editingPanel->editingGroup(), QStringLiteral("group_editing_expanded"));
+    rememberGroupState(_editingPanel->dragGroup(), QStringLiteral("group_drag_expanded"));
+    rememberGroupState(_editingPanel->lineGroup(), QStringLiteral("group_line_expanded"));
+    rememberGroupState(_editingPanel->pushPullGroup(), QStringLiteral("group_push_pull_expanded"));
     rememberGroupState(_groupDirectionField, QStringLiteral("group_direction_field_expanded"));
     rememberGroupState(_groupNeuralTracer, QStringLiteral("group_neural_tracer_expanded"));
 
@@ -804,24 +602,12 @@ void SegmentationWidget::buildUi()
 
     layout->addWidget(_customParamsEditor);
 
-    auto* buttons = new QHBoxLayout();
-    _btnApply = new QPushButton(tr("Apply"), this);
-    _btnApply->setToolTip(tr("Commit pending edits to the segmentation."));
-    _btnReset = new QPushButton(tr("Reset"), this);
-    _btnReset->setToolTip(tr("Discard pending edits and reload the segmentation state."));
-    _btnStop = new QPushButton(tr("Stop tools"), this);
-    _btnStop->setToolTip(tr("Exit the active editing tool and return to selection."));
-    buttons->addWidget(_btnApply);
-    buttons->addWidget(_btnReset);
-    buttons->addWidget(_btnStop);
-    layout->addLayout(buttons);
-
     layout->addStretch(1);
 
     connect(_headerRow, &SegmentationHeaderRow::editingToggled, this, [this](bool enabled) {
         updateEditingState(enabled, true);
     });
-    connect(_chkShowHoverMarker, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_editingPanel->showHoverMarkerCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setShowHoverMarker(enabled);
     });
 
@@ -1091,37 +877,37 @@ void SegmentationWidget::buildUi()
         });
     }
 
-    connect(_spinDragRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->dragRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setDragRadius(static_cast<float>(value));
         emit dragRadiusChanged(_dragRadiusSteps);
     });
 
-    connect(_spinDragSigma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->dragSigmaSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setDragSigma(static_cast<float>(value));
         emit dragSigmaChanged(_dragSigmaSteps);
     });
 
-    connect(_spinLineRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->lineRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setLineRadius(static_cast<float>(value));
         emit lineRadiusChanged(_lineRadiusSteps);
     });
 
-    connect(_spinLineSigma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->lineSigmaSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setLineSigma(static_cast<float>(value));
         emit lineSigmaChanged(_lineSigmaSteps);
     });
 
-    connect(_spinPushPullRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->pushPullRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setPushPullRadius(static_cast<float>(value));
         emit pushPullRadiusChanged(_pushPullRadiusSteps);
     });
 
-    connect(_spinPushPullSigma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->pushPullSigmaSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setPushPullSigma(static_cast<float>(value));
         emit pushPullSigmaChanged(_pushPullSigmaSteps);
     });
 
-    connect(_spinPushPullStep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->pushPullStepSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setPushPullStep(static_cast<float>(value));
         emit pushPullStepChanged(_pushPullStep);
     });
@@ -1132,58 +918,58 @@ void SegmentationWidget::buildUi()
         applyAlphaPushPullConfig(config, true);
     };
 
-    connect(_spinAlphaStart, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaStartSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.start = static_cast<float>(value);
         });
     });
-    connect(_spinAlphaStop, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaStopSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.stop = static_cast<float>(value);
         });
     });
-    connect(_spinAlphaStep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaStepSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.step = static_cast<float>(value);
         });
     });
-    connect(_spinAlphaLow, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaLowSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.low = displayOpacityToNormalized(value);
         });
     });
-    connect(_spinAlphaHigh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaHighSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.high = displayOpacityToNormalized(value);
         });
     });
-    connect(_spinAlphaBorder, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaBorderSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.borderOffset = static_cast<float>(value);
         });
     });
-    connect(_spinAlphaBlurRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, onAlphaValueChanged](int value) {
+    connect(_editingPanel->alphaBlurRadiusSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this, onAlphaValueChanged](int value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.blurRadius = value;
         });
     });
-    connect(_spinAlphaPerVertexLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
+    connect(_editingPanel->alphaPerVertexLimitSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.perVertexLimit = static_cast<float>(value);
         });
     });
-    connect(_chkAlphaPerVertex, &QCheckBox::toggled, this, [this, onAlphaValueChanged](bool checked) {
+    connect(_editingPanel->alphaPerVertexCheck(), &QCheckBox::toggled, this, [this, onAlphaValueChanged](bool checked) {
         onAlphaValueChanged([checked](AlphaPushPullConfig& cfg) {
             cfg.perVertex = checked;
         });
     });
 
-    connect(_spinSmoothStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_editingPanel->smoothStrengthSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setSmoothingStrength(static_cast<float>(value));
         emit smoothingStrengthChanged(_smoothStrength);
     });
 
-    connect(_spinSmoothIterations, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+    connect(_editingPanel->smoothIterationsSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         setSmoothingIterations(value);
         emit smoothingIterationsChanged(_smoothIterations);
     });
@@ -1341,9 +1127,9 @@ void SegmentationWidget::buildUi()
         });
     }
 
-    connect(_btnApply, &QPushButton::clicked, this, &SegmentationWidget::applyRequested);
-    connect(_btnReset, &QPushButton::clicked, this, &SegmentationWidget::resetRequested);
-    connect(_btnStop, &QPushButton::clicked, this, &SegmentationWidget::stopToolsRequested);
+    connect(_editingPanel->applyButton(), &QPushButton::clicked, this, &SegmentationWidget::applyRequested);
+    connect(_editingPanel->resetButton(), &QPushButton::clicked, this, &SegmentationWidget::resetRequested);
+    connect(_editingPanel->stopButton(), &QPushButton::clicked, this, &SegmentationWidget::stopToolsRequested);
 
     // Neural tracer connections
     connect(_chkNeuralTracerEnabled, &QCheckBox::toggled, this, [this](bool enabled) {
@@ -1433,9 +1219,9 @@ void SegmentationWidget::syncUiState()
         }
     }
 
-    if (_chkShowHoverMarker) {
-        const QSignalBlocker blocker(_chkShowHoverMarker);
-        _chkShowHoverMarker->setChecked(_showHoverMarker);
+    if (_editingPanel->showHoverMarkerCheck()) {
+        const QSignalBlocker blocker(_editingPanel->showHoverMarkerCheck());
+        _editingPanel->showHoverMarkerCheck()->setChecked(_showHoverMarker);
     }
 
     const bool editingActive = _editingEnabled && !_growthInProgress;
@@ -1449,31 +1235,31 @@ void SegmentationWidget::syncUiState()
         spin->setEnabled(editingActive);
     };
 
-    updateSpin(_spinDragRadius, _dragRadiusSteps);
-    updateSpin(_spinDragSigma, _dragSigmaSteps);
-    updateSpin(_spinLineRadius, _lineRadiusSteps);
-    updateSpin(_spinLineSigma, _lineSigmaSteps);
-    updateSpin(_spinPushPullRadius, _pushPullRadiusSteps);
-    updateSpin(_spinPushPullSigma, _pushPullSigmaSteps);
+    updateSpin(_editingPanel->dragRadiusSpin(), _dragRadiusSteps);
+    updateSpin(_editingPanel->dragSigmaSpin(), _dragSigmaSteps);
+    updateSpin(_editingPanel->lineRadiusSpin(), _lineRadiusSteps);
+    updateSpin(_editingPanel->lineSigmaSpin(), _lineSigmaSteps);
+    updateSpin(_editingPanel->pushPullRadiusSpin(), _pushPullRadiusSteps);
+    updateSpin(_editingPanel->pushPullSigmaSpin(), _pushPullSigmaSteps);
 
-    if (_groupDrag) {
-        _groupDrag->setEnabled(editingActive);
+    if (_editingPanel->dragGroup()) {
+        _editingPanel->dragGroup()->setEnabled(editingActive);
     }
-    if (_groupLine) {
-        _groupLine->setEnabled(editingActive);
+    if (_editingPanel->lineGroup()) {
+        _editingPanel->lineGroup()->setEnabled(editingActive);
     }
-    if (_groupPushPull) {
-        _groupPushPull->setEnabled(editingActive);
-    }
-
-    if (_spinPushPullStep) {
-        const QSignalBlocker blocker(_spinPushPullStep);
-        _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
-        _spinPushPullStep->setEnabled(editingActive);
+    if (_editingPanel->pushPullGroup()) {
+        _editingPanel->pushPullGroup()->setEnabled(editingActive);
     }
 
-    if (_lblAlphaInfo) {
-        _lblAlphaInfo->setEnabled(editingActive);
+    if (_editingPanel->pushPullStepSpin()) {
+        const QSignalBlocker blocker(_editingPanel->pushPullStepSpin());
+        _editingPanel->pushPullStepSpin()->setValue(static_cast<double>(_pushPullStep));
+        _editingPanel->pushPullStepSpin()->setEnabled(editingActive);
+    }
+
+    if (_editingPanel->alphaInfoLabel()) {
+        _editingPanel->alphaInfoLabel()->setEnabled(editingActive);
     }
 
     auto updateAlphaSpin = [&](QDoubleSpinBox* spin, float value, bool opacitySpin = false) {
@@ -1489,37 +1275,37 @@ void SegmentationWidget::syncUiState()
         spin->setEnabled(editingActive);
     };
 
-    updateAlphaSpin(_spinAlphaStart, _alphaPushPullConfig.start);
-    updateAlphaSpin(_spinAlphaStop, _alphaPushPullConfig.stop);
-    updateAlphaSpin(_spinAlphaStep, _alphaPushPullConfig.step);
-    updateAlphaSpin(_spinAlphaLow, _alphaPushPullConfig.low, true);
-    updateAlphaSpin(_spinAlphaHigh, _alphaPushPullConfig.high, true);
-    updateAlphaSpin(_spinAlphaBorder, _alphaPushPullConfig.borderOffset);
+    updateAlphaSpin(_editingPanel->alphaStartSpin(), _alphaPushPullConfig.start);
+    updateAlphaSpin(_editingPanel->alphaStopSpin(), _alphaPushPullConfig.stop);
+    updateAlphaSpin(_editingPanel->alphaStepSpin(), _alphaPushPullConfig.step);
+    updateAlphaSpin(_editingPanel->alphaLowSpin(), _alphaPushPullConfig.low, true);
+    updateAlphaSpin(_editingPanel->alphaHighSpin(), _alphaPushPullConfig.high, true);
+    updateAlphaSpin(_editingPanel->alphaBorderSpin(), _alphaPushPullConfig.borderOffset);
 
-    if (_spinAlphaBlurRadius) {
-        const QSignalBlocker blocker(_spinAlphaBlurRadius);
-        _spinAlphaBlurRadius->setValue(_alphaPushPullConfig.blurRadius);
-        _spinAlphaBlurRadius->setEnabled(editingActive);
+    if (_editingPanel->alphaBlurRadiusSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaBlurRadiusSpin());
+        _editingPanel->alphaBlurRadiusSpin()->setValue(_alphaPushPullConfig.blurRadius);
+        _editingPanel->alphaBlurRadiusSpin()->setEnabled(editingActive);
     }
-    updateAlphaSpin(_spinAlphaPerVertexLimit, _alphaPushPullConfig.perVertexLimit);
-    if (_chkAlphaPerVertex) {
-        const QSignalBlocker blocker(_chkAlphaPerVertex);
-        _chkAlphaPerVertex->setChecked(_alphaPushPullConfig.perVertex);
-        _chkAlphaPerVertex->setEnabled(editingActive);
+    updateAlphaSpin(_editingPanel->alphaPerVertexLimitSpin(), _alphaPushPullConfig.perVertexLimit);
+    if (_editingPanel->alphaPerVertexCheck()) {
+        const QSignalBlocker blocker(_editingPanel->alphaPerVertexCheck());
+        _editingPanel->alphaPerVertexCheck()->setChecked(_alphaPushPullConfig.perVertex);
+        _editingPanel->alphaPerVertexCheck()->setEnabled(editingActive);
     }
-    if (_alphaPushPullPanel) {
-        _alphaPushPullPanel->setEnabled(editingActive);
+    if (_editingPanel->alphaPushPullPanel()) {
+        _editingPanel->alphaPushPullPanel()->setEnabled(editingActive);
     }
 
-    if (_spinSmoothStrength) {
-        const QSignalBlocker blocker(_spinSmoothStrength);
-        _spinSmoothStrength->setValue(static_cast<double>(_smoothStrength));
-        _spinSmoothStrength->setEnabled(editingActive);
+    if (_editingPanel->smoothStrengthSpin()) {
+        const QSignalBlocker blocker(_editingPanel->smoothStrengthSpin());
+        _editingPanel->smoothStrengthSpin()->setValue(static_cast<double>(_smoothStrength));
+        _editingPanel->smoothStrengthSpin()->setEnabled(editingActive);
     }
-    if (_spinSmoothIterations) {
-        const QSignalBlocker blocker(_spinSmoothIterations);
-        _spinSmoothIterations->setValue(_smoothIterations);
-        _spinSmoothIterations->setEnabled(editingActive);
+    if (_editingPanel->smoothIterationsSpin()) {
+        const QSignalBlocker blocker(_editingPanel->smoothIterationsSpin());
+        _editingPanel->smoothIterationsSpin()->setValue(_smoothIterations);
+        _editingPanel->smoothIterationsSpin()->setEnabled(editingActive);
     }
 
     if (_customParamsEditor) {
@@ -2071,17 +1857,17 @@ void SegmentationWidget::restoreSettings()
     const bool pushPullExpanded = settings.value(segmentation::GROUP_PUSH_PULL_EXPANDED, segmentation::GROUP_PUSH_PULL_EXPANDED_DEFAULT).toBool();
     const bool directionExpanded = settings.value(segmentation::GROUP_DIRECTION_FIELD_EXPANDED, segmentation::GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT).toBool();
 
-    if (_groupEditing) {
-        _groupEditing->setExpanded(editingExpanded);
+    if (_editingPanel->editingGroup()) {
+        _editingPanel->editingGroup()->setExpanded(editingExpanded);
     }
-    if (_groupDrag) {
-        _groupDrag->setExpanded(dragExpanded);
+    if (_editingPanel->dragGroup()) {
+        _editingPanel->dragGroup()->setExpanded(dragExpanded);
     }
-    if (_groupLine) {
-        _groupLine->setExpanded(lineExpanded);
+    if (_editingPanel->lineGroup()) {
+        _editingPanel->lineGroup()->setExpanded(lineExpanded);
     }
-    if (_groupPushPull) {
-        _groupPushPull->setExpanded(pushPullExpanded);
+    if (_editingPanel->pushPullGroup()) {
+        _editingPanel->pushPullGroup()->setExpanded(pushPullExpanded);
     }
     if (_groupDirectionField) {
         _groupDirectionField->setExpanded(directionExpanded);
@@ -2153,9 +1939,9 @@ void SegmentationWidget::setShowHoverMarker(bool enabled)
         writeSetting(QStringLiteral("show_hover_marker"), _showHoverMarker);
         emit hoverMarkerToggled(_showHoverMarker);
     }
-    if (_chkShowHoverMarker) {
-        const QSignalBlocker blocker(_chkShowHoverMarker);
-        _chkShowHoverMarker->setChecked(_showHoverMarker);
+    if (_editingPanel->showHoverMarkerCheck()) {
+        const QSignalBlocker blocker(_editingPanel->showHoverMarkerCheck());
+        _editingPanel->showHoverMarkerCheck()->setChecked(_showHoverMarker);
     }
 }
 
@@ -2390,9 +2176,9 @@ void SegmentationWidget::setDragRadius(float value)
     }
     _dragRadiusSteps = clamped;
     writeSetting(QStringLiteral("drag_radius_steps"), _dragRadiusSteps);
-    if (_spinDragRadius) {
-        const QSignalBlocker blocker(_spinDragRadius);
-        _spinDragRadius->setValue(static_cast<double>(_dragRadiusSteps));
+    if (_editingPanel->dragRadiusSpin()) {
+        const QSignalBlocker blocker(_editingPanel->dragRadiusSpin());
+        _editingPanel->dragRadiusSpin()->setValue(static_cast<double>(_dragRadiusSteps));
     }
 }
 
@@ -2404,9 +2190,9 @@ void SegmentationWidget::setDragSigma(float value)
     }
     _dragSigmaSteps = clamped;
     writeSetting(QStringLiteral("drag_sigma_steps"), _dragSigmaSteps);
-    if (_spinDragSigma) {
-        const QSignalBlocker blocker(_spinDragSigma);
-        _spinDragSigma->setValue(static_cast<double>(_dragSigmaSteps));
+    if (_editingPanel->dragSigmaSpin()) {
+        const QSignalBlocker blocker(_editingPanel->dragSigmaSpin());
+        _editingPanel->dragSigmaSpin()->setValue(static_cast<double>(_dragSigmaSteps));
     }
 }
 
@@ -2418,9 +2204,9 @@ void SegmentationWidget::setLineRadius(float value)
     }
     _lineRadiusSteps = clamped;
     writeSetting(QStringLiteral("line_radius_steps"), _lineRadiusSteps);
-    if (_spinLineRadius) {
-        const QSignalBlocker blocker(_spinLineRadius);
-        _spinLineRadius->setValue(static_cast<double>(_lineRadiusSteps));
+    if (_editingPanel->lineRadiusSpin()) {
+        const QSignalBlocker blocker(_editingPanel->lineRadiusSpin());
+        _editingPanel->lineRadiusSpin()->setValue(static_cast<double>(_lineRadiusSteps));
     }
 }
 
@@ -2432,9 +2218,9 @@ void SegmentationWidget::setLineSigma(float value)
     }
     _lineSigmaSteps = clamped;
     writeSetting(QStringLiteral("line_sigma_steps"), _lineSigmaSteps);
-    if (_spinLineSigma) {
-        const QSignalBlocker blocker(_spinLineSigma);
-        _spinLineSigma->setValue(static_cast<double>(_lineSigmaSteps));
+    if (_editingPanel->lineSigmaSpin()) {
+        const QSignalBlocker blocker(_editingPanel->lineSigmaSpin());
+        _editingPanel->lineSigmaSpin()->setValue(static_cast<double>(_lineSigmaSteps));
     }
 }
 
@@ -2446,9 +2232,9 @@ void SegmentationWidget::setPushPullRadius(float value)
     }
     _pushPullRadiusSteps = clamped;
     writeSetting(QStringLiteral("push_pull_radius_steps"), _pushPullRadiusSteps);
-    if (_spinPushPullRadius) {
-        const QSignalBlocker blocker(_spinPushPullRadius);
-        _spinPushPullRadius->setValue(static_cast<double>(_pushPullRadiusSteps));
+    if (_editingPanel->pushPullRadiusSpin()) {
+        const QSignalBlocker blocker(_editingPanel->pushPullRadiusSpin());
+        _editingPanel->pushPullRadiusSpin()->setValue(static_cast<double>(_pushPullRadiusSteps));
     }
 }
 
@@ -2460,9 +2246,9 @@ void SegmentationWidget::setPushPullSigma(float value)
     }
     _pushPullSigmaSteps = clamped;
     writeSetting(QStringLiteral("push_pull_sigma_steps"), _pushPullSigmaSteps);
-    if (_spinPushPullSigma) {
-        const QSignalBlocker blocker(_spinPushPullSigma);
-        _spinPushPullSigma->setValue(static_cast<double>(_pushPullSigmaSteps));
+    if (_editingPanel->pushPullSigmaSpin()) {
+        const QSignalBlocker blocker(_editingPanel->pushPullSigmaSpin());
+        _editingPanel->pushPullSigmaSpin()->setValue(static_cast<double>(_pushPullSigmaSteps));
     }
 }
 
@@ -2474,9 +2260,9 @@ void SegmentationWidget::setPushPullStep(float value)
     }
     _pushPullStep = clamped;
     writeSetting(QStringLiteral("push_pull_step"), _pushPullStep);
-    if (_spinPushPullStep) {
-        const QSignalBlocker blocker(_spinPushPullStep);
-        _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
+    if (_editingPanel->pushPullStepSpin()) {
+        const QSignalBlocker blocker(_editingPanel->pushPullStepSpin());
+        _editingPanel->pushPullStepSpin()->setValue(static_cast<double>(_pushPullStep));
     }
 }
 
@@ -2523,53 +2309,53 @@ void SegmentationWidget::applyAlphaPushPullConfig(const AlphaPushPullConfig& con
 
     const bool editingActive = _editingEnabled && !_growthInProgress;
 
-    if (_spinAlphaStart) {
-        const QSignalBlocker blocker(_spinAlphaStart);
-        _spinAlphaStart->setValue(static_cast<double>(_alphaPushPullConfig.start));
-        _spinAlphaStart->setEnabled(editingActive);
+    if (_editingPanel->alphaStartSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaStartSpin());
+        _editingPanel->alphaStartSpin()->setValue(static_cast<double>(_alphaPushPullConfig.start));
+        _editingPanel->alphaStartSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaStop) {
-        const QSignalBlocker blocker(_spinAlphaStop);
-        _spinAlphaStop->setValue(static_cast<double>(_alphaPushPullConfig.stop));
-        _spinAlphaStop->setEnabled(editingActive);
+    if (_editingPanel->alphaStopSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaStopSpin());
+        _editingPanel->alphaStopSpin()->setValue(static_cast<double>(_alphaPushPullConfig.stop));
+        _editingPanel->alphaStopSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaStep) {
-        const QSignalBlocker blocker(_spinAlphaStep);
-        _spinAlphaStep->setValue(static_cast<double>(_alphaPushPullConfig.step));
-        _spinAlphaStep->setEnabled(editingActive);
+    if (_editingPanel->alphaStepSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaStepSpin());
+        _editingPanel->alphaStepSpin()->setValue(static_cast<double>(_alphaPushPullConfig.step));
+        _editingPanel->alphaStepSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaLow) {
-        const QSignalBlocker blocker(_spinAlphaLow);
-        _spinAlphaLow->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.low));
-        _spinAlphaLow->setEnabled(editingActive);
+    if (_editingPanel->alphaLowSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaLowSpin());
+        _editingPanel->alphaLowSpin()->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.low));
+        _editingPanel->alphaLowSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaHigh) {
-        const QSignalBlocker blocker(_spinAlphaHigh);
-        _spinAlphaHigh->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.high));
-        _spinAlphaHigh->setEnabled(editingActive);
+    if (_editingPanel->alphaHighSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaHighSpin());
+        _editingPanel->alphaHighSpin()->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.high));
+        _editingPanel->alphaHighSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaBorder) {
-        const QSignalBlocker blocker(_spinAlphaBorder);
-        _spinAlphaBorder->setValue(static_cast<double>(_alphaPushPullConfig.borderOffset));
-        _spinAlphaBorder->setEnabled(editingActive);
+    if (_editingPanel->alphaBorderSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaBorderSpin());
+        _editingPanel->alphaBorderSpin()->setValue(static_cast<double>(_alphaPushPullConfig.borderOffset));
+        _editingPanel->alphaBorderSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaBlurRadius) {
-        const QSignalBlocker blocker(_spinAlphaBlurRadius);
-        _spinAlphaBlurRadius->setValue(_alphaPushPullConfig.blurRadius);
-        _spinAlphaBlurRadius->setEnabled(editingActive);
+    if (_editingPanel->alphaBlurRadiusSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaBlurRadiusSpin());
+        _editingPanel->alphaBlurRadiusSpin()->setValue(_alphaPushPullConfig.blurRadius);
+        _editingPanel->alphaBlurRadiusSpin()->setEnabled(editingActive);
     }
-    if (_spinAlphaPerVertexLimit) {
-        const QSignalBlocker blocker(_spinAlphaPerVertexLimit);
-        _spinAlphaPerVertexLimit->setValue(static_cast<double>(_alphaPushPullConfig.perVertexLimit));
-        _spinAlphaPerVertexLimit->setEnabled(editingActive);
+    if (_editingPanel->alphaPerVertexLimitSpin()) {
+        const QSignalBlocker blocker(_editingPanel->alphaPerVertexLimitSpin());
+        _editingPanel->alphaPerVertexLimitSpin()->setValue(static_cast<double>(_alphaPushPullConfig.perVertexLimit));
+        _editingPanel->alphaPerVertexLimitSpin()->setEnabled(editingActive);
     }
-    if (_chkAlphaPerVertex) {
-        const QSignalBlocker blocker(_chkAlphaPerVertex);
-        _chkAlphaPerVertex->setChecked(_alphaPushPullConfig.perVertex);
-        _chkAlphaPerVertex->setEnabled(editingActive);
+    if (_editingPanel->alphaPerVertexCheck()) {
+        const QSignalBlocker blocker(_editingPanel->alphaPerVertexCheck());
+        _editingPanel->alphaPerVertexCheck()->setChecked(_alphaPushPullConfig.perVertex);
+        _editingPanel->alphaPerVertexCheck()->setEnabled(editingActive);
     }
-    if (_alphaPushPullPanel) {
-        _alphaPushPullPanel->setEnabled(editingActive);
+    if (_editingPanel->alphaPushPullPanel()) {
+        _editingPanel->alphaPushPullPanel()->setEnabled(editingActive);
     }
 
     if (emitSignal && changed) {
@@ -2585,9 +2371,9 @@ void SegmentationWidget::setSmoothingStrength(float value)
     }
     _smoothStrength = clamped;
     writeSetting(QStringLiteral("smooth_strength"), _smoothStrength);
-    if (_spinSmoothStrength) {
-        const QSignalBlocker blocker(_spinSmoothStrength);
-        _spinSmoothStrength->setValue(static_cast<double>(_smoothStrength));
+    if (_editingPanel->smoothStrengthSpin()) {
+        const QSignalBlocker blocker(_editingPanel->smoothStrengthSpin());
+        _editingPanel->smoothStrengthSpin()->setValue(static_cast<double>(_smoothStrength));
     }
 }
 
@@ -2599,9 +2385,9 @@ void SegmentationWidget::setSmoothingIterations(int value)
     }
     _smoothIterations = clamped;
     writeSetting(QStringLiteral("smooth_iterations"), _smoothIterations);
-    if (_spinSmoothIterations) {
-        const QSignalBlocker blocker(_spinSmoothIterations);
-        _spinSmoothIterations->setValue(_smoothIterations);
+    if (_editingPanel->smoothIterationsSpin()) {
+        const QSignalBlocker blocker(_editingPanel->smoothIterationsSpin());
+        _editingPanel->smoothIterationsSpin()->setValue(_smoothIterations);
     }
 }
 

@@ -28,6 +28,7 @@ class QToolButton;
 class CollapsibleSettingsGroup;
 class JsonProfileEditor;
 class SegmentationHeaderRow;
+class SegmentationEditingPanel;
 class SegmentationGrowthPanel;
 
 class SegmentationWidget : public QWidget
@@ -299,9 +300,8 @@ private:
 
     SegmentationHeaderRow* _headerRow{nullptr};
     SegmentationGrowthPanel* _growthPanel{nullptr};
-    QLabel* _lblAlphaInfo{nullptr};
+    SegmentationEditingPanel* _editingPanel{nullptr};
 
-    CollapsibleSettingsGroup* _groupEditing{nullptr};
     CollapsibleSettingsGroup* _groupDirectionField{nullptr};
     QLineEdit* _directionFieldPathEdit{nullptr};
     QToolButton* _directionFieldBrowseButton{nullptr};
@@ -317,34 +317,6 @@ private:
     QComboBox* _comboCorrections{nullptr};
     QPushButton* _btnCorrectionsNew{nullptr};
     QCheckBox* _chkCorrectionsAnnotate{nullptr};
-
-    CollapsibleSettingsGroup* _groupDrag{nullptr};
-    CollapsibleSettingsGroup* _groupLine{nullptr};
-    CollapsibleSettingsGroup* _groupPushPull{nullptr};
-
-    QDoubleSpinBox* _spinDragRadius{nullptr};
-    QDoubleSpinBox* _spinDragSigma{nullptr};
-    QDoubleSpinBox* _spinLineRadius{nullptr};
-    QDoubleSpinBox* _spinLineSigma{nullptr};
-    QDoubleSpinBox* _spinPushPullRadius{nullptr};
-    QDoubleSpinBox* _spinPushPullSigma{nullptr};
-    QDoubleSpinBox* _spinPushPullStep{nullptr};
-    QWidget* _alphaPushPullPanel{nullptr};
-    QCheckBox* _chkAlphaPerVertex{nullptr};
-    QDoubleSpinBox* _spinAlphaStart{nullptr};
-    QDoubleSpinBox* _spinAlphaStop{nullptr};
-    QDoubleSpinBox* _spinAlphaStep{nullptr};
-    QDoubleSpinBox* _spinAlphaLow{nullptr};
-    QDoubleSpinBox* _spinAlphaHigh{nullptr};
-    QDoubleSpinBox* _spinAlphaBorder{nullptr};
-    QSpinBox* _spinAlphaBlurRadius{nullptr};
-    QDoubleSpinBox* _spinAlphaPerVertexLimit{nullptr};
-    QDoubleSpinBox* _spinSmoothStrength{nullptr};
-    QSpinBox* _spinSmoothIterations{nullptr};
-    QPushButton* _btnApply{nullptr};
-    QPushButton* _btnReset{nullptr};
-    QPushButton* _btnStop{nullptr};
-    QCheckBox* _chkShowHoverMarker{nullptr};
 
     JsonProfileEditor* _customParamsEditor{nullptr};
     QString _customParamsText;

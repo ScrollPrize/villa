@@ -40,6 +40,8 @@ set(srcs
     segmentation/SegmentationWidget.hpp
     segmentation/tools/SegmentationHeaderRow.cpp
     segmentation/tools/SegmentationHeaderRow.hpp
+    segmentation/tools/SegmentationEditingPanel.cpp
+    segmentation/tools/SegmentationEditingPanel.hpp
     segmentation/tools/SegmentationGrowthPanel.cpp
     segmentation/tools/SegmentationGrowthPanel.hpp
     segmentation/SegmentationGrowth.cpp

@@ -20,7 +20,8 @@ inline QString robustTracerParamsJson()
         "  \"direction_weight\": 0.0,\n"
         "  \"sdir_weight\": 1.0,\n"
         "  \"correction_weight\": 1.0,\n"
-        "  \"reference_ray_weight\": 0.0\n"
+        "  \"reference_ray_weight\": 0.0,\n"
+        "  \"flipback_weight\": 0.0\n"
         "}\n");
 }
 
@@ -36,7 +37,8 @@ inline QString robustTracerParams2Json()
         "  \"direction_weight\": 0.0,\n"
         "  \"sdir_weight\": 1.0,\n"
         "  \"correction_weight\": 1.0,\n"
-        "  \"reference_ray_weight\": 0.0\n"
+        "  \"reference_ray_weight\": 0.0,\n"
+        "  \"flipback_weight\": 0.0\n"
         "}\n");
 }
 
@@ -53,7 +55,8 @@ inline QString robustTracerParams_w_SpaceLineCopyJson()
         "  \"direction_weight\": 0.0,\n"
         "  \"sdir_weight\": 0.1,\n"
         "  \"correction_weight\": 1.0,\n"
-        "  \"reference_ray_weight\": 0.0\n"
+        "  \"reference_ray_weight\": 0.0,\n"
+        "  \"flipback_weight\": 0.0\n"
         "}\n");
 }
 
@@ -70,7 +73,8 @@ inline QString robustTracerParams_w_SpaceLineGrowJson()
         "  \"direction_weight\": 0.0,\n"
         "  \"sdir_weight\": 0.1,\n"
         "  \"correction_weight\": 1.0,\n"
-        "  \"reference_ray_weight\": 0.0\n"
+        "  \"reference_ray_weight\": 0.0,\n"
+        "  \"flipback_weight\": 0.0\n"
         "}\n");
 }
 
