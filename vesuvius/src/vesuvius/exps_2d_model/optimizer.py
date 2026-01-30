@@ -91,7 +91,7 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	bad_params = sorted(set(params) - {"theta", "phase", "winding_scale", "mesh_ms", "conn_offset_ms", "amp_ms", "bias_ms"})
+	bad_params = sorted(set(params) - {"theta", "winding_scale", "mesh_ms", "conn_offset_ms", "amp_ms", "bias_ms"})
 	if bad_params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))

@@ -116,7 +116,6 @@ class Model2D(nn.Module):
 		self.device = device
 		# FIXME need better init ...
 		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
-		self.phase = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32))
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
 
 		fh = float(init.init_size_frac if init.init_size_frac_h is None else init.init_size_frac_h) * float(int(init.h_img))
@@ -201,9 +200,7 @@ class Model2D(nn.Module):
 		)
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		period = (2.0 * float(max(1, int(self.init.w_img) - 1))) / float(max(1, self.mesh_w - 1))
-		phase = torch.remainder(self.phase + 0.5 * period, period) - 0.5 * period
-		u = self.winding_scale * u + phase
+		u = self.winding_scale * u
 		c = torch.cos(self.theta)
 		s = torch.sin(self.theta)
 		xc = 0.5 * float(max(1, int(self.init.w_img) - 1))
@@ -215,7 +212,6 @@ class Model2D(nn.Module):
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
 		return {
 			"theta": [self.theta],
-			"phase": [self.phase],
 			"winding_scale": [self.winding_scale],
 			"mesh_ms": list(self.mesh_ms),
 			"conn_offset_ms": list(self.conn_offset_ms),
@@ -233,6 +229,8 @@ class Model2D(nn.Module):
 				st["amp_ms.0"] = st.pop(k)
 			elif k == "bias_coarse":
 				st["bias_ms.0"] = st.pop(k)
+			elif k == "phase":
+				st.pop(k)
 
 		# Fill missing tensors (common when loading older checkpoints).
 		for k, p in self.state_dict().items():
