@@ -2221,6 +2221,712 @@ void masked_blur(cv::Mat_<T>& img, const cv::Mat_<uchar>& mask) {
     }
 }
 
+static bool is_loc_valid(const TraceParameters& params, int y, int x)
+{
+    return (params.state(y, x) & STATE_LOC_VALID);
+}
+
+static cv::Vec3d unit_vector_or_zero(const cv::Vec3d& v)
+{
+    const double len = cv::norm(v);
+    if (len < 1e-9) {
+        return cv::Vec3d(0, 0, 0);
+    }
+    return v / len;
+}
+
+static double median_length(std::vector<double>& vals)
+{
+    if (vals.empty()) {
+        return 0.0;
+    }
+    const size_t mid = vals.size() / 2;
+    std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+    double med = vals[mid];
+    if (vals.size() % 2 == 0) {
+        std::nth_element(vals.begin(), vals.begin() + mid - 1, vals.end());
+        med = 0.5 * (med + vals[mid - 1]);
+    }
+    return med;
+}
+
+static bool segments_intersect_2d(const cv::Point2d& p1,
+                                  const cv::Point2d& p2,
+                                  const cv::Point2d& q1,
+                                  const cv::Point2d& q2,
+                                  double eps)
+{
+    auto orient = [](const cv::Point2d& a, const cv::Point2d& b, const cv::Point2d& c) {
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    };
+
+    const double o1 = orient(p1, p2, q1);
+    const double o2 = orient(p1, p2, q2);
+    const double o3 = orient(q1, q2, p1);
+    const double o4 = orient(q1, q2, p2);
+
+    if ((o1 > eps && o2 < -eps) || (o1 < -eps && o2 > eps)) {
+        if ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int add_row_self_intersections_to_mask(const std::vector<int>& xs,
+                                              const std::vector<cv::Vec3d>& pts,
+                                              int row_y,
+                                              const cv::Rect& roi,
+                                              double cell_factor,
+                                              double eps,
+                                              cv::Mat_<uchar>& flip_mask)
+{
+    const int n = static_cast<int>(pts.size());
+    if (n < 4) {
+        return 0;
+    }
+
+    cv::Mat data(n, 3, CV_64F);
+    for (int i = 0; i < n; ++i) {
+        data.at<double>(i, 0) = pts[i][0];
+        data.at<double>(i, 1) = pts[i][1];
+        data.at<double>(i, 2) = pts[i][2];
+    }
+
+    cv::PCA pca(data, cv::Mat(), cv::PCA::DATA_AS_ROW);
+    if (pca.eigenvectors.rows < 2) {
+        return 0;
+    }
+
+    cv::Vec3d e0(pca.eigenvectors.at<double>(0, 0),
+                 pca.eigenvectors.at<double>(0, 1),
+                 pca.eigenvectors.at<double>(0, 2));
+    cv::Vec3d e1(pca.eigenvectors.at<double>(1, 0),
+                 pca.eigenvectors.at<double>(1, 1),
+                 pca.eigenvectors.at<double>(1, 2));
+    cv::Vec3d mean(pca.mean.at<double>(0, 0),
+                   pca.mean.at<double>(0, 1),
+                   pca.mean.at<double>(0, 2));
+
+    std::vector<cv::Point2d> pts2d;
+    pts2d.reserve(n);
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_x = -min_x;
+    double max_y = -min_y;
+    for (int i = 0; i < n; ++i) {
+        cv::Vec3d v = pts[i] - mean;
+        cv::Point2d p(v.dot(e0), v.dot(e1));
+        pts2d.push_back(p);
+        min_x = std::min(min_x, p.x);
+        min_y = std::min(min_y, p.y);
+        max_x = std::max(max_x, p.x);
+        max_y = std::max(max_y, p.y);
+    }
+
+    std::vector<double> seg_lengths;
+    seg_lengths.reserve(n - 1);
+    for (int i = 0; i < n - 1; ++i) {
+        seg_lengths.push_back(cv::norm(pts2d[i + 1] - pts2d[i]));
+    }
+    double cell = median_length(seg_lengths) * cell_factor;
+    if (cell < 1e-6) {
+        cell = std::max(1e-3, (max_x - min_x + max_y - min_y) * 0.01);
+        if (cell < 1e-6) {
+            return 0;
+        }
+    }
+
+    std::unordered_map<long long, std::vector<int>> grid;
+    grid.reserve(static_cast<size_t>(n) * 2);
+
+    auto cell_key = [](int cx, int cy) -> long long {
+        return (static_cast<long long>(cx) << 32) ^ static_cast<unsigned int>(cy);
+    };
+
+    int marked = 0;
+
+    for (int i = 0; i < n - 1; ++i) {
+        const cv::Point2d& a = pts2d[i];
+        const cv::Point2d& b = pts2d[i + 1];
+        const double seg_min_x = std::min(a.x, b.x);
+        const double seg_max_x = std::max(a.x, b.x);
+        const double seg_min_y = std::min(a.y, b.y);
+        const double seg_max_y = std::max(a.y, b.y);
+
+        const int cx0 = static_cast<int>(std::floor((seg_min_x - min_x) / cell));
+        const int cx1 = static_cast<int>(std::floor((seg_max_x - min_x) / cell));
+        const int cy0 = static_cast<int>(std::floor((seg_min_y - min_y) / cell));
+        const int cy1 = static_cast<int>(std::floor((seg_max_y - min_y) / cell));
+
+        for (int cx = cx0; cx <= cx1; ++cx) {
+            for (int cy = cy0; cy <= cy1; ++cy) {
+                const long long key = cell_key(cx, cy);
+                auto it = grid.find(key);
+                if (it != grid.end()) {
+                    for (int j : it->second) {
+                        if (std::abs(i - j) <= 1) {
+                            continue;
+                        }
+                        if (segments_intersect_2d(a, b, pts2d[j], pts2d[j + 1], eps)) {
+                            const int a_idx = std::min(i + 1, j);
+                            const int b_idx = std::max(i + 1, j);
+                            for (int k = a_idx; k <= b_idx; ++k) {
+                                const int x = xs[k];
+                                if (x < roi.x || x >= roi.br().x) {
+                                    continue;
+                                }
+                                flip_mask(row_y - roi.y, x - roi.x) = 255;
+                                marked++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int cx = cx0; cx <= cx1; ++cx) {
+            for (int cy = cy0; cy <= cy1; ++cy) {
+                grid[cell_key(cx, cy)].push_back(i);
+            }
+        }
+    }
+
+    return marked;
+}
+
+static int add_col_self_intersections_to_mask(const std::vector<int>& ys,
+                                              const std::vector<cv::Vec3d>& pts,
+                                              int col_x,
+                                              const cv::Rect& roi,
+                                              double cell_factor,
+                                              double eps,
+                                              cv::Mat_<uchar>& flip_mask)
+{
+    const int n = static_cast<int>(pts.size());
+    if (n < 4) {
+        return 0;
+    }
+
+    cv::Mat data(n, 3, CV_64F);
+    for (int i = 0; i < n; ++i) {
+        data.at<double>(i, 0) = pts[i][0];
+        data.at<double>(i, 1) = pts[i][1];
+        data.at<double>(i, 2) = pts[i][2];
+    }
+
+    cv::PCA pca(data, cv::Mat(), cv::PCA::DATA_AS_ROW);
+    if (pca.eigenvectors.rows < 2) {
+        return 0;
+    }
+
+    cv::Vec3d e0(pca.eigenvectors.at<double>(0, 0),
+                 pca.eigenvectors.at<double>(0, 1),
+                 pca.eigenvectors.at<double>(0, 2));
+    cv::Vec3d e1(pca.eigenvectors.at<double>(1, 0),
+                 pca.eigenvectors.at<double>(1, 1),
+                 pca.eigenvectors.at<double>(1, 2));
+    cv::Vec3d mean(pca.mean.at<double>(0, 0),
+                   pca.mean.at<double>(0, 1),
+                   pca.mean.at<double>(0, 2));
+
+    std::vector<cv::Point2d> pts2d;
+    pts2d.reserve(n);
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_x = -min_x;
+    double max_y = -min_y;
+    for (int i = 0; i < n; ++i) {
+        cv::Vec3d v = pts[i] - mean;
+        cv::Point2d p(v.dot(e0), v.dot(e1));
+        pts2d.push_back(p);
+        min_x = std::min(min_x, p.x);
+        min_y = std::min(min_y, p.y);
+        max_x = std::max(max_x, p.x);
+        max_y = std::max(max_y, p.y);
+    }
+
+    std::vector<double> seg_lengths;
+    seg_lengths.reserve(n - 1);
+    for (int i = 0; i < n - 1; ++i) {
+        seg_lengths.push_back(cv::norm(pts2d[i + 1] - pts2d[i]));
+    }
+    double cell = median_length(seg_lengths) * cell_factor;
+    if (cell < 1e-6) {
+        cell = std::max(1e-3, (max_x - min_x + max_y - min_y) * 0.01);
+        if (cell < 1e-6) {
+            return 0;
+        }
+    }
+
+    std::unordered_map<long long, std::vector<int>> grid;
+    grid.reserve(static_cast<size_t>(n) * 2);
+
+    auto cell_key = [](int cx, int cy) -> long long {
+        return (static_cast<long long>(cx) << 32) ^ static_cast<unsigned int>(cy);
+    };
+
+    int marked = 0;
+
+    for (int i = 0; i < n - 1; ++i) {
+        const cv::Point2d& a = pts2d[i];
+        const cv::Point2d& b = pts2d[i + 1];
+        const double seg_min_x = std::min(a.x, b.x);
+        const double seg_max_x = std::max(a.x, b.x);
+        const double seg_min_y = std::min(a.y, b.y);
+        const double seg_max_y = std::max(a.y, b.y);
+
+        const int cx0 = static_cast<int>(std::floor((seg_min_x - min_x) / cell));
+        const int cx1 = static_cast<int>(std::floor((seg_max_x - min_x) / cell));
+        const int cy0 = static_cast<int>(std::floor((seg_min_y - min_y) / cell));
+        const int cy1 = static_cast<int>(std::floor((seg_max_y - min_y) / cell));
+
+        for (int cx = cx0; cx <= cx1; ++cx) {
+            for (int cy = cy0; cy <= cy1; ++cy) {
+                const long long key = cell_key(cx, cy);
+                auto it = grid.find(key);
+                if (it != grid.end()) {
+                    for (int j : it->second) {
+                        if (std::abs(i - j) <= 1) {
+                            continue;
+                        }
+                        if (segments_intersect_2d(a, b, pts2d[j], pts2d[j + 1], eps)) {
+                            const int a_idx = std::min(i + 1, j);
+                            const int b_idx = std::max(i + 1, j);
+                            for (int k = a_idx; k <= b_idx; ++k) {
+                                const int y = ys[k];
+                                if (y < roi.y || y >= roi.br().y) {
+                                    continue;
+                                }
+                                flip_mask(y - roi.y, col_x - roi.x) = 255;
+                                marked++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int cx = cx0; cx <= cx1; ++cx) {
+            for (int cy = cy0; cy <= cy1; ++cy) {
+                grid[cell_key(cx, cy)].push_back(i);
+            }
+        }
+    }
+
+    return marked;
+}
+
+static bool fit_polynomial_1d(const std::vector<double>& xs,
+                              const std::vector<double>& ys,
+                              int degree,
+                              cv::Mat& coeffs)
+{
+    if (xs.empty() || xs.size() != ys.size()) {
+        return false;
+    }
+    const int max_degree = static_cast<int>(xs.size()) - 1;
+    const int deg = std::max(0, std::min(degree, max_degree));
+    cv::Mat A(static_cast<int>(xs.size()), deg + 1, CV_64F);
+    cv::Mat b(static_cast<int>(xs.size()), 1, CV_64F);
+
+    for (int i = 0; i < static_cast<int>(xs.size()); ++i) {
+        double val = 1.0;
+        for (int d = 0; d <= deg; ++d) {
+            A.at<double>(i, d) = val;
+            val *= xs[i];
+        }
+        b.at<double>(i, 0) = ys[i];
+    }
+
+    return cv::solve(A, b, coeffs, cv::DECOMP_SVD);
+}
+
+static double eval_polynomial_1d(const cv::Mat& coeffs, double x)
+{
+    double val = 1.0;
+    double out = 0.0;
+    for (int d = 0; d < coeffs.rows; ++d) {
+        out += coeffs.at<double>(d, 0) * val;
+        val *= x;
+    }
+    return out;
+}
+
+static int fix_row_flips_in_roi(const cv::Rect& roi,
+                                TraceParameters& params,
+                                int window_edges,
+                                double dot_thresh,
+                                int interp_points_per_side,
+                                int interp_degree,
+                                bool self_intersection_fix,
+                                double self_intersection_cell_factor,
+                                double self_intersection_eps)
+{
+    const int width = roi.width;
+    const int height = roi.height;
+    if (width < 3 || height < 1) {
+        return 0;
+    }
+
+    cv::Mat_<uchar> flip_mask(roi.size(), static_cast<uchar>(0));
+    int flipped_edges = 0;
+
+    for (int y = roi.y; y < roi.br().y; ++y) {
+        for (int x = roi.x; x < roi.br().x - 1; ++x) {
+            if (!is_loc_valid(params, y, x) || !is_loc_valid(params, y, x + 1)) {
+                continue;
+            }
+            const cv::Vec3d edge = params.dpoints(y, x + 1) - params.dpoints(y, x);
+            const cv::Vec3d edge_unit = unit_vector_or_zero(edge);
+            if (cv::norm(edge_unit) < 1e-6) {
+                continue;
+            }
+
+            cv::Vec3d ref_sum(0, 0, 0);
+            int ref_count = 0;
+            for (int k = x - window_edges; k <= x + window_edges; ++k) {
+                if (k < roi.x || k >= roi.br().x - 1 || k == x) {
+                    continue;
+                }
+                if (!is_loc_valid(params, y, k) || !is_loc_valid(params, y, k + 1)) {
+                    continue;
+                }
+                const cv::Vec3d e = params.dpoints(y, k + 1) - params.dpoints(y, k);
+                const cv::Vec3d e_unit = unit_vector_or_zero(e);
+                if (cv::norm(e_unit) < 1e-6) {
+                    continue;
+                }
+                ref_sum += e_unit;
+                ref_count++;
+            }
+            if (ref_count == 0) {
+                continue;
+            }
+            const cv::Vec3d ref_unit = unit_vector_or_zero(ref_sum);
+            if (cv::norm(ref_unit) < 1e-6) {
+                continue;
+            }
+
+            const double dot = edge_unit.dot(ref_unit);
+            if (dot < dot_thresh) {
+                flip_mask(y - roi.y, x - roi.x) = 255;
+                flip_mask(y - roi.y, x + 1 - roi.x) = 255;
+                flipped_edges++;
+            }
+        }
+    }
+
+    int loop_marks = 0;
+    if (self_intersection_fix) {
+        for (int y = roi.y; y < roi.br().y; ++y) {
+            int x = roi.x;
+            while (x < roi.br().x) {
+                while (x < roi.br().x && !is_loc_valid(params, y, x)) {
+                    x++;
+                }
+                if (x >= roi.br().x) {
+                    break;
+                }
+                int run_start = x;
+                while (x < roi.br().x && is_loc_valid(params, y, x)) {
+                    x++;
+                }
+                int run_end = x - 1;
+                if (run_end - run_start + 1 < 4) {
+                    continue;
+                }
+                std::vector<int> xs;
+                std::vector<cv::Vec3d> pts;
+                xs.reserve(run_end - run_start + 1);
+                pts.reserve(run_end - run_start + 1);
+                for (int xi = run_start; xi <= run_end; ++xi) {
+                    xs.push_back(xi);
+                    pts.push_back(params.dpoints(y, xi));
+                }
+                loop_marks += add_row_self_intersections_to_mask(xs, pts, y, roi,
+                                                                 self_intersection_cell_factor,
+                                                                 self_intersection_eps,
+                                                                 flip_mask);
+            }
+        }
+    }
+
+    int fixed_points = 0;
+
+    for (int y = roi.y; y < roi.br().y; ++y) {
+        int x = roi.x;
+        while (x < roi.br().x) {
+            if (!is_loc_valid(params, y, x) || flip_mask(y - roi.y, x - roi.x) == 0) {
+                x++;
+                continue;
+            }
+
+            int seg_start = x;
+            while (x < roi.br().x &&
+                   is_loc_valid(params, y, x) &&
+                   flip_mask(y - roi.y, x - roi.x) != 0) {
+                x++;
+            }
+            int seg_end = x - 1;
+
+            std::vector<double> xs;
+            std::vector<cv::Vec3d> pts;
+
+            int left_count = 0;
+            for (int xl = seg_start - 1; xl >= roi.x; --xl) {
+                if (!is_loc_valid(params, y, xl) || flip_mask(y - roi.y, xl - roi.x) != 0) {
+                    continue;
+                }
+                xs.push_back(static_cast<double>(xl));
+                pts.push_back(params.dpoints(y, xl));
+                left_count++;
+                if (interp_points_per_side > 0 && left_count >= interp_points_per_side) {
+                    break;
+                }
+            }
+
+            int right_count = 0;
+            for (int xr = seg_end + 1; xr < roi.br().x; ++xr) {
+                if (!is_loc_valid(params, y, xr) || flip_mask(y - roi.y, xr - roi.x) != 0) {
+                    continue;
+                }
+                xs.push_back(static_cast<double>(xr));
+                pts.push_back(params.dpoints(y, xr));
+                right_count++;
+                if (interp_points_per_side > 0 && right_count >= interp_points_per_side) {
+                    break;
+                }
+            }
+
+            if (pts.empty()) {
+                continue;
+            }
+
+            std::vector<double> ysx;
+            std::vector<double> ysy;
+            std::vector<double> ysz;
+            ysx.reserve(pts.size());
+            ysy.reserve(pts.size());
+            ysz.reserve(pts.size());
+            for (const auto& p : pts) {
+                ysx.push_back(p[0]);
+                ysy.push_back(p[1]);
+                ysz.push_back(p[2]);
+            }
+
+            const int degree = std::max(0, std::min(interp_degree, static_cast<int>(pts.size()) - 1));
+            cv::Mat cx, cy, cz;
+            const bool okx = fit_polynomial_1d(xs, ysx, degree, cx);
+            const bool oky = fit_polynomial_1d(xs, ysy, degree, cy);
+            const bool okz = fit_polynomial_1d(xs, ysz, degree, cz);
+
+            for (int xi = seg_start; xi <= seg_end; ++xi) {
+                cv::Vec3d value = params.dpoints(y, xi);
+                if (okx && oky && okz) {
+                    const double xval = static_cast<double>(xi);
+                    value = cv::Vec3d(eval_polynomial_1d(cx, xval),
+                                      eval_polynomial_1d(cy, xval),
+                                      eval_polynomial_1d(cz, xval));
+                } else if (!pts.empty()) {
+                    value = pts.front();
+                }
+                params.dpoints(y, xi) = value;
+                fixed_points++;
+            }
+        }
+    }
+
+    return (fixed_points > 0) ? fixed_points : (flipped_edges + loop_marks);
+}
+
+static int fix_col_flips_in_roi(const cv::Rect& roi,
+                                TraceParameters& params,
+                                int window_edges,
+                                double dot_thresh,
+                                int interp_points_per_side,
+                                int interp_degree,
+                                bool self_intersection_fix,
+                                double self_intersection_cell_factor,
+                                double self_intersection_eps)
+{
+    const int width = roi.width;
+    const int height = roi.height;
+    if (height < 3 || width < 1) {
+        return 0;
+    }
+
+    cv::Mat_<uchar> flip_mask(roi.size(), static_cast<uchar>(0));
+    int flipped_edges = 0;
+
+    for (int x = roi.x; x < roi.br().x; ++x) {
+        for (int y = roi.y; y < roi.br().y - 1; ++y) {
+            if (!is_loc_valid(params, y, x) || !is_loc_valid(params, y + 1, x)) {
+                continue;
+            }
+            const cv::Vec3d edge = params.dpoints(y + 1, x) - params.dpoints(y, x);
+            const cv::Vec3d edge_unit = unit_vector_or_zero(edge);
+            if (cv::norm(edge_unit) < 1e-6) {
+                continue;
+            }
+
+            cv::Vec3d ref_sum(0, 0, 0);
+            int ref_count = 0;
+            for (int k = y - window_edges; k <= y + window_edges; ++k) {
+                if (k < roi.y || k >= roi.br().y - 1 || k == y) {
+                    continue;
+                }
+                if (!is_loc_valid(params, k, x) || !is_loc_valid(params, k + 1, x)) {
+                    continue;
+                }
+                const cv::Vec3d e = params.dpoints(k + 1, x) - params.dpoints(k, x);
+                const cv::Vec3d e_unit = unit_vector_or_zero(e);
+                if (cv::norm(e_unit) < 1e-6) {
+                    continue;
+                }
+                ref_sum += e_unit;
+                ref_count++;
+            }
+            if (ref_count == 0) {
+                continue;
+            }
+            const cv::Vec3d ref_unit = unit_vector_or_zero(ref_sum);
+            if (cv::norm(ref_unit) < 1e-6) {
+                continue;
+            }
+
+            const double dot = edge_unit.dot(ref_unit);
+            if (dot < dot_thresh) {
+                flip_mask(y - roi.y, x - roi.x) = 255;
+                flip_mask(y + 1 - roi.y, x - roi.x) = 255;
+                flipped_edges++;
+            }
+        }
+    }
+
+    int loop_marks = 0;
+    if (self_intersection_fix) {
+        for (int x = roi.x; x < roi.br().x; ++x) {
+            int y = roi.y;
+            while (y < roi.br().y) {
+                while (y < roi.br().y && !is_loc_valid(params, y, x)) {
+                    y++;
+                }
+                if (y >= roi.br().y) {
+                    break;
+                }
+                int run_start = y;
+                while (y < roi.br().y && is_loc_valid(params, y, x)) {
+                    y++;
+                }
+                int run_end = y - 1;
+                if (run_end - run_start + 1 < 4) {
+                    continue;
+                }
+                std::vector<int> ys;
+                std::vector<cv::Vec3d> pts;
+                ys.reserve(run_end - run_start + 1);
+                pts.reserve(run_end - run_start + 1);
+                for (int yi = run_start; yi <= run_end; ++yi) {
+                    ys.push_back(yi);
+                    pts.push_back(params.dpoints(yi, x));
+                }
+                loop_marks += add_col_self_intersections_to_mask(ys, pts, x, roi,
+                                                                 self_intersection_cell_factor,
+                                                                 self_intersection_eps,
+                                                                 flip_mask);
+            }
+        }
+    }
+
+    int fixed_points = 0;
+
+    for (int x = roi.x; x < roi.br().x; ++x) {
+        int y = roi.y;
+        while (y < roi.br().y) {
+            if (!is_loc_valid(params, y, x) || flip_mask(y - roi.y, x - roi.x) == 0) {
+                y++;
+                continue;
+            }
+
+            int seg_start = y;
+            while (y < roi.br().y &&
+                   is_loc_valid(params, y, x) &&
+                   flip_mask(y - roi.y, x - roi.x) != 0) {
+                y++;
+            }
+            int seg_end = y - 1;
+
+            std::vector<double> xs;
+            std::vector<cv::Vec3d> pts;
+
+            int up_count = 0;
+            for (int yu = seg_start - 1; yu >= roi.y; --yu) {
+                if (!is_loc_valid(params, yu, x) || flip_mask(yu - roi.y, x - roi.x) != 0) {
+                    continue;
+                }
+                xs.push_back(static_cast<double>(yu));
+                pts.push_back(params.dpoints(yu, x));
+                up_count++;
+                if (interp_points_per_side > 0 && up_count >= interp_points_per_side) {
+                    break;
+                }
+            }
+
+            int down_count = 0;
+            for (int yd = seg_end + 1; yd < roi.br().y; ++yd) {
+                if (!is_loc_valid(params, yd, x) || flip_mask(yd - roi.y, x - roi.x) != 0) {
+                    continue;
+                }
+                xs.push_back(static_cast<double>(yd));
+                pts.push_back(params.dpoints(yd, x));
+                down_count++;
+                if (interp_points_per_side > 0 && down_count >= interp_points_per_side) {
+                    break;
+                }
+            }
+
+            if (pts.empty()) {
+                continue;
+            }
+
+            std::vector<double> ysx;
+            std::vector<double> ysy;
+            std::vector<double> ysz;
+            ysx.reserve(pts.size());
+            ysy.reserve(pts.size());
+            ysz.reserve(pts.size());
+            for (const auto& p : pts) {
+                ysx.push_back(p[0]);
+                ysy.push_back(p[1]);
+                ysz.push_back(p[2]);
+            }
+
+            const int degree = std::max(0, std::min(interp_degree, static_cast<int>(pts.size()) - 1));
+            cv::Mat cx, cy, cz;
+            const bool okx = fit_polynomial_1d(xs, ysx, degree, cx);
+            const bool oky = fit_polynomial_1d(xs, ysy, degree, cy);
+            const bool okz = fit_polynomial_1d(xs, ysz, degree, cz);
+
+            for (int yi = seg_start; yi <= seg_end; ++yi) {
+                cv::Vec3d value = params.dpoints(yi, x);
+                if (okx && oky && okz) {
+                    const double t = static_cast<double>(yi);
+                    value = cv::Vec3d(eval_polynomial_1d(cx, t),
+                                      eval_polynomial_1d(cy, t),
+                                      eval_polynomial_1d(cz, t));
+                } else if (!pts.empty()) {
+                    value = pts.front();
+                }
+                params.dpoints(yi, x) = value;
+                fixed_points++;
+            }
+        }
+    }
+
+    return (fixed_points > 0) ? fixed_points : (flipped_edges + loop_marks);
+}
+
 static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask, TraceParameters &params, const TraceData &trace_data, LossSettings &settings, int flags);
 
 static bool resample_inside_boundary(TraceParameters& params,
@@ -2465,13 +3171,61 @@ struct AntiFlipbackConfig {
     double weight = 1.0;       // Weight of the anti-flipback loss when activated
 };
 
+struct LocalOptTimingAccumulator {
+    std::atomic<double> problem_setup{0.0};
+    std::atomic<double> anti_flipback{0.0};
+    std::atomic<double> cell_reopt{0.0};
+    std::atomic<double> param_fixup{0.0};
+    std::atomic<double> ceres_solve{0.0};
+    std::atomic<int> total_solves{0};
+
+    static void atomic_add(std::atomic<double>& target, double value) {
+        double old_val = target.load(std::memory_order_relaxed);
+        while (!target.compare_exchange_weak(old_val, old_val + value,
+               std::memory_order_relaxed, std::memory_order_relaxed)) {}
+    }
+
+    void accumulate(double ps, double af, double cr, double pf, double cs) {
+        atomic_add(problem_setup, ps);
+        atomic_add(anti_flipback, af);
+        atomic_add(cell_reopt, cr);
+        atomic_add(param_fixup, pf);
+        atomic_add(ceres_solve, cs);
+        total_solves.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void print(double wall_time) const {
+        int n = total_solves.load();
+        double ps = problem_setup.load();
+        double af = anti_flipback.load();
+        double cr = cell_reopt.load();
+        double pf = param_fixup.load();
+        double cs = ceres_solve.load();
+        double total_cpu = ps + af + cr + pf + cs;
+        printf("\nresume opt local timing breakdown:\n");
+        printf("  problem setup:          %8.3fs  (%5.1f%%)\n", ps, 100.0*ps/total_cpu);
+        printf("  anti-flipback losses:   %8.3fs  (%5.1f%%)\n", af, 100.0*af/total_cpu);
+        printf("  cell reopt constraints: %8.3fs  (%5.1f%%)\n", cr, 100.0*cr/total_cpu);
+        printf("  param block fixup:      %8.3fs  (%5.1f%%)\n", pf, 100.0*pf/total_cpu);
+        printf("  ceres solve:            %8.3fs  (%5.1f%%)\n", cs, 100.0*cs/total_cpu);
+        printf("  total cpu time:         %8.3fs\n", total_cpu);
+        printf("  total wall time:        %8.3fs\n", wall_time);
+        printf("  total solves:           %d\n", n);
+        if (n > 0)
+            printf("  avg solve time:         %8.6fs\n", total_cpu / n);
+    }
+};
+
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false,
     const LocalOptimizationConfig* solver_config = nullptr,
-    const AntiFlipbackConfig* flipback_config = nullptr)
+    const AntiFlipbackConfig* flipback_config = nullptr,
+    LocalOptTimingAccumulator* timing = nullptr)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
     // all points in the patch are correct distance in 2D vs 3D space, not too high curvature, near surface prediction, etc.
+    auto t0 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(params.state.size());
 
@@ -2488,6 +3242,8 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
                 add_missing_losses(problem, loss_status, op, params, trace_data, settings);
             }
         }
+
+    auto t1 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     // Add anti-flipback loss if configured
     // This penalizes points that move too far in the inward (negative normal) direction
@@ -2509,7 +3265,11 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
             }
     }
 
+    auto t2 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+
     add_cell_reopt_constraints_radius(problem, radius, p, params, trace_data);
+
+    auto t3 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++) {
@@ -2527,6 +3287,8 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
                 problem.SetParameterBlockConstant(&params.dpoints(op)[0]);
             }
         }
+
+    auto t4 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     ceres::Solver::Options options;
     if (solver_config && solver_config->use_dense_qr) {
@@ -2570,6 +3332,12 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     ceres::Solver::Summary summary;
 
     ceres::Solve(options, &problem, &summary);
+
+    if (timing) {
+        auto t5 = std::chrono::high_resolution_clock::now();
+        auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        timing->accumulate(secs(t0, t1), secs(t1, t2), secs(t2, t3), secs(t3, t4), secs(t4, t5));
+    }
 
     if (!quiet)
         std::cout << "local solve radius " << radius << " " << summary.BriefReport() << std::endl;
@@ -3313,6 +4081,68 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             }
         }
 
+        if (params.value("resume_opt", "skip") == "local" &&
+            params.value("resume_local_row_flip_fix", true)) {
+            cv::Rect roi = used_area;
+            if (roi.width >= 3 && roi.height >= 1) {
+                int window_edges = params.value("resume_local_row_flip_window", 2);
+                if (window_edges < 1) {
+                    window_edges = 1;
+                }
+                const float dot_thresh = params.value("resume_local_row_flip_dot_thresh", 0.0f);
+                int interp_points = params.value("resume_local_row_interp_points", 6);
+                if (interp_points < 0) {
+                    interp_points = 0;
+                }
+                int interp_degree = params.value("resume_local_row_interp_degree", 3);
+                if (interp_degree < 1) {
+                    interp_degree = 1;
+                }
+
+                const bool self_intersection_fix = params.value("resume_local_row_self_intersection_fix", true);
+                double cell_factor = params.value("resume_local_row_self_intersection_cell_factor", 2.0);
+                if (cell_factor < 0.1) {
+                    cell_factor = 0.1;
+                }
+                double self_eps = params.value("resume_local_row_self_intersection_eps", 1e-6);
+                if (self_eps <= 0.0) {
+                    self_eps = 1e-6;
+                }
+
+                const int fixed = fix_row_flips_in_roi(roi, trace_params, window_edges,
+                                                       dot_thresh, interp_points, interp_degree,
+                                                       self_intersection_fix, cell_factor, self_eps);
+                if (fixed > 0) {
+                    std::cout << "resume-local row flip fix: adjusted " << fixed
+                              << " points (window=" << window_edges
+                              << ", dot_thresh=" << dot_thresh
+                              << ", interp_points=" << interp_points
+                              << ", interp_degree=" << interp_degree
+                              << ", self_intersection=" << std::boolalpha << self_intersection_fix
+                              << ", cell_factor=" << cell_factor
+                              << ", eps=" << self_eps << std::noboolalpha
+                              << ")" << std::endl;
+                }
+
+                const int fixed_col = fix_col_flips_in_roi(roi, trace_params, window_edges,
+                                                           dot_thresh, interp_points,
+                                                           interp_degree,
+                                                           self_intersection_fix, cell_factor,
+                                                           self_eps);
+                if (fixed_col > 0) {
+                    std::cout << "resume-local col flip fix: adjusted " << fixed_col
+                              << " points (window=" << window_edges
+                              << ", dot_thresh=" << dot_thresh
+                              << ", interp_points=" << interp_points
+                              << ", interp_degree=" << interp_degree
+                              << ", self_intersection=" << std::boolalpha << self_intersection_fix
+                              << ", cell_factor=" << cell_factor
+                              << ", eps=" << self_eps << std::noboolalpha
+                              << ")" << std::endl;
+                }
+            }
+        }
+
         trace_data.point_correction = PointCorrection(corrections);
 
         if (trace_data.point_correction.isValid()) {
@@ -3733,6 +4563,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             }
 
             std::atomic<int> done = 0;
+            LocalOptTimingAccumulator timing_accum;
             if (!opt_local.empty()) {
                 OmpThreadPointCol opt_local_threadcol(opt_step*2+1, opt_local);
                 int total = opt_local.size();
@@ -3745,7 +4576,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config);
+                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config, nullptr, &timing_accum);
                     done++;
 #pragma omp critical
                     {
@@ -3759,6 +4590,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                     }
                 }
                 printf("\n");
+                auto end_time = std::chrono::high_resolution_clock::now();
+                double wall_time = std::chrono::duration<double>(end_time - start_time).count();
+                timing_accum.print(wall_time);
             }
         }
         else if (params.value("inpaint", false)) {
