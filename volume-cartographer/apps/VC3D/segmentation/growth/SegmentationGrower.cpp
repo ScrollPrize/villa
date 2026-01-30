@@ -1,14 +1,14 @@
 #include "SegmentationGrower.hpp"
 
-#include "NeuralTraceServiceManager.hpp"
+#include "../../NeuralTraceServiceManager.hpp"
 #include "ExtrapolationGrowth.hpp"
-#include "SegmentationModule.hpp"
-#include "SegmentationWidget.hpp"
+#include "../SegmentationModule.hpp"
+#include "../SegmentationWidget.hpp"
 
-#include "CVolumeViewer.hpp"
-#include "CSurfaceCollection.hpp"
-#include "ViewerManager.hpp"
-#include "SurfacePanelController.hpp"
+#include "../../CVolumeViewer.hpp"
+#include "../../CSurfaceCollection.hpp"
+#include "../../ViewerManager.hpp"
+#include "../../SurfacePanelController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"

@@ -20,8 +20,8 @@
 #include <opencv2/core.hpp>
 
 #include "../CVolumeViewer.hpp"
-#include "SegmentationEditManager.hpp"
-#include "SegmentationGrowth.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 

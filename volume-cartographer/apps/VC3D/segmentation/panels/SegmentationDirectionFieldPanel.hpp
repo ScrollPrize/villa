@@ -1,7 +1,7 @@
 #pragma once
 
 #include "segmentation/SegmentationCommon.hpp"
-#include "segmentation/SegmentationGrowth.hpp"
+#include "segmentation/growth/SegmentationGrowth.hpp"
 
 #include <QString>
 #include <QWidget>

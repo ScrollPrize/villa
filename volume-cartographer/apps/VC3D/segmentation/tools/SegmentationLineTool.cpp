@@ -1,9 +1,9 @@
 #include "SegmentationLineTool.hpp"
 
-#include "SegmentationModule.hpp"
+#include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
-#include "CSurfaceCollection.hpp"
-#include "overlays/SegmentationOverlayController.hpp"
+#include "../../CSurfaceCollection.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
 
 #include <QCoreApplication>
 #include <QLoggingCategory>

@@ -1,12 +1,12 @@
 #include "SegmentationPushPullTool.hpp"
 
-#include "SegmentationModule.hpp"
-#include "ViewerManager.hpp"
-#include "CVolumeViewer.hpp"
+#include "../SegmentationModule.hpp"
+#include "../../ViewerManager.hpp"
+#include "../../CVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
-#include "SegmentationWidget.hpp"
-#include "overlays/SegmentationOverlayController.hpp"
-#include "CSurfaceCollection.hpp"
+#include "../SegmentationWidget.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
+#include "../../CSurfaceCollection.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Surface.hpp"

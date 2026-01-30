@@ -12,7 +12,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
-#include "SegmentationGrowth.hpp"
+#include "growth/SegmentationGrowth.hpp"
 
 class SegmentationHeaderRow;
 class SegmentationEditingPanel;

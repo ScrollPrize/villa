@@ -3,7 +3,7 @@
 #include "VCSettings.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "segmentation/SegmentationCommon.hpp"
-#include "segmentation/SegmentationGrowth.hpp"
+#include "segmentation/growth/SegmentationGrowth.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>

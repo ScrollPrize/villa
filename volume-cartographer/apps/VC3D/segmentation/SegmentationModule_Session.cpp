@@ -1,9 +1,9 @@
 #include "SegmentationModule.hpp"
 
 #include "CSurfaceCollection.hpp"
-#include "SegmentationEditManager.hpp"
-#include "ApprovalMaskBrushTool.hpp"
-#include "CellReoptimizationTool.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/CellReoptimizationTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 

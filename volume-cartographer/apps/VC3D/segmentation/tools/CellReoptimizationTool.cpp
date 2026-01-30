@@ -3,9 +3,9 @@
 #include <queue>
 #include <cmath>
 
-#include "SegmentationModule.hpp"
+#include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
-#include "../overlays/SegmentationOverlayController.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 

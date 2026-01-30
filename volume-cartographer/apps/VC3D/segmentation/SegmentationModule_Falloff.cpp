@@ -1,8 +1,8 @@
 #include "SegmentationModule.hpp"
 
-#include "SegmentationEditManager.hpp"
-#include "SegmentationLineTool.hpp"
-#include "SegmentationPushPullTool.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "tools/SegmentationLineTool.hpp"
+#include "tools/SegmentationPushPullTool.hpp"
 #include "SegmentationWidget.hpp"
 
 #include <algorithm>
