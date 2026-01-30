@@ -210,13 +210,17 @@ class Model2D(nn.Module):
 		return x, y
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
+		amp_ms = list(self.amp_ms)
+		bias_ms = list(self.bias_ms)
 		return {
 			"theta": [self.theta],
 			"winding_scale": [self.winding_scale],
 			"mesh_ms": list(self.mesh_ms),
 			"conn_offset_ms": list(self.conn_offset_ms),
-			"amp_ms": list(self.amp_ms),
-			"bias_ms": list(self.bias_ms),
+			"amp_ms": amp_ms,
+			"bias_ms": bias_ms,
+			"amp": amp_ms,
+			"bias": bias_ms,
 		}
 
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
@@ -225,9 +229,9 @@ class Model2D(nn.Module):
 		for k in list(st.keys()):
 			if k.startswith("mesh_offset_ms."):
 				st["conn_offset_ms." + k[len("mesh_offset_ms."):]] = st.pop(k)
-			elif k == "amp_coarse":
+			elif k in {"amp_coarse", "amp"}:
 				st["amp_ms.0"] = st.pop(k)
-			elif k == "bias_coarse":
+			elif k in {"bias_coarse", "bias"}:
 				st["bias_ms.0"] = st.pop(k)
 			elif k == "phase":
 				st.pop(k)
