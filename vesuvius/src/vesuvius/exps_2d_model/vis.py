@@ -12,6 +12,7 @@ import opt_loss_dir
 import opt_loss_geom
 import opt_loss_gradmag
 import opt_loss_step
+import inv_map
 
 
 def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
@@ -309,6 +310,8 @@ def save(
 	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
+	uv_img, uv_mask = inv_map.inverse_map_autograd(xy_lr=res.xy_lr, h_out=h_img, w_out=w_img)
+
 	dir_lm_v, _dir_mask_v = opt_loss_dir.dir_v_loss_maps(res=res)
 	dir_lm_conn_l, dir_lm_conn_r, dir_mask_conn_l, dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
 	inv_conn_l = (1.0 - dir_mask_conn_l).to(dtype=dir_lm_conn_l.dtype)
@@ -393,6 +396,12 @@ def save(
 			m = m[0, 0]
 		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
 		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
+
+		mt = spec["fn"]().detach()
+		if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
+			im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_img, uv_mask=uv_mask, fill=0.5)
+			out_path_img = out_loss / f"res_loss_img_{spec['suffix']}_{postfix}.tif"
+			tifffile.imwrite(str(out_path_img), im[0, 0].detach().cpu().numpy().astype("float32"), compression="lzw")
 
 	# One horizontally-concatenated float tif for quick inspection.
 	loss_2d: list[tuple[str, np.ndarray]] = []
