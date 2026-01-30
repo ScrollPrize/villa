@@ -281,11 +281,41 @@ def save(
 
 	h_img, w_img = data.size
 	res = model(data)
+	h2 = int(h_img) * 2
+	w2 = int(w_img) * 2
+
+	grid_xy = res.xy_lr
+	grid_vis = _draw_grid_vis(
+		scale=scale,
+		h_img=h_img,
+		w_img=w_img,
+		background=data.cos,
+		xy_lr=grid_xy,
+		xy_conn=res.xy_conn,
+		mask_lr=res.mask_lr,
+		mask_conn=res.mask_conn,
+	)
+	grid_path = out_grids / f"res_grid_{postfix}.jpg"
+	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
 	def _save_img_loss_vis(*, iters: int, postfix2: str) -> None:
 		uv_img, uv_mask = inv_map.inverse_map_autograd(xy_lr=res.xy_lr, h_out=h_img, w_out=w_img, iters=int(iters))
+		uv_img_nchw = uv_img.permute(0, 3, 1, 2).contiguous()
+		uv_img_nchw = torch.nn.functional.interpolate(uv_img_nchw, size=(h2, w2), mode="bilinear", align_corners=True)
+		uv_img = uv_img_nchw.permute(0, 2, 3, 1).contiguous()
+		uv_mask = torch.nn.functional.interpolate(uv_mask, size=(h2, w2), mode="nearest")
 		img_loss_layers: list[np.ndarray] = []
 		img_loss_names: list[str] = []
+
+		grid_vis2 = grid_vis
+		grid_gray = (cv2.cvtColor(grid_vis2, cv2.COLOR_BGR2GRAY).astype("float32") / 255.0)
+		hg, wg = int(grid_gray.shape[0]), int(grid_gray.shape[1])
+		ch, cw = int(uv_mask.shape[2]), int(uv_mask.shape[3])
+		y0 = (hg - ch) // 2
+		x0 = (wg - cw) // 2
+		crop = grid_gray[y0:y0 + ch, x0:x0 + cw].copy()
+		img_loss_layers.append(crop)
+		img_loss_names.append("grid_crop")
 
 		tgt_plain_lr = torch.nn.functional.interpolate(res.target_plain, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
 		tgt_mod_lr = torch.nn.functional.interpolate(res.target_mod, size=res.xy_lr.shape[1:3], mode="bilinear", align_corners=True)
@@ -331,21 +361,6 @@ def save(
 	# 				f"l=({l[0]:.2f},{l[1]:.2f}) dl={dl:.2f} "
 	# 				f"r=({r[0]:.2f},{r[1]:.2f}) dr={dr:.2f}"
 	# 			)
-	grid_xy = res.xy_lr
-
-	grid_vis = _draw_grid_vis(
-		scale=scale,
-		h_img=h_img,
-		w_img=w_img,
-		background=data.cos,
-		xy_lr=grid_xy,
-		xy_conn=res.xy_conn,
-		mask_lr=res.mask_lr,
-		mask_conn=res.mask_conn,
-	)
-	grid_path = out_grids / f"res_grid_{postfix}.jpg"
-	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
-
 	dir_lm_v, _dir_mask_v = opt_loss_dir.dir_v_loss_maps(res=res)
 	dir_lm_conn_l, dir_lm_conn_r, dir_mask_conn_l, dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
 	inv_conn_l = (1.0 - dir_mask_conn_l).to(dtype=dir_lm_conn_l.dtype)
