@@ -133,8 +133,8 @@ class Model2D(nn.Module):
 		)
 		amp_init = torch.full((1, 1, int(self.mesh_h), int(self.mesh_w)), 1.0, device=device, dtype=torch.float32)
 		bias_init = torch.full((1, 1, int(self.mesh_h), int(self.mesh_w)), 0.5, device=device, dtype=torch.float32)
-		self.amp_ms = nn.ParameterList([nn.Parameter(amp_init)])
-		self.bias_ms = nn.ParameterList([nn.Parameter(bias_init)])
+		self.amp = nn.Parameter(amp_init)
+		self.bias = nn.Parameter(bias_init)
 		self.const_mask_lr: torch.Tensor | None = None
 		self._last_grow_insert_lr: tuple[int, int, int, int] | None = None
 		self.subsample_winding = int(subsample_winding)
@@ -168,8 +168,10 @@ class Model2D(nn.Module):
 		phase = (2.0 * torch.pi) * xs.view(1, 1, 1, w)
 		target_plain = 0.5 + 0.5 * torch.cos(phase).expand(1, 1, h, w)
 
-		amp_lr = self.amp_ms[0]
-		bias_lr = self.bias_ms[0]
+		amp_lr = self.amp
+		bias_lr = self.bias
+		amp_lr = amp_lr.clamp(0.1, 1.0)
+		bias_lr = bias_lr.clamp(0.0, 0.45)
 		amp_hr = F.interpolate(amp_lr, size=(h, w), mode="bilinear", align_corners=True)
 		bias_hr = F.interpolate(bias_lr, size=(h, w), mode="bilinear", align_corners=True)
 		target_mod = bias_hr + amp_hr * (target_plain - 0.5)
@@ -210,17 +212,17 @@ class Model2D(nn.Module):
 		return x, y
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
-		amp_ms = list(self.amp_ms)
-		bias_ms = list(self.bias_ms)
+		amp = [self.amp]
+		bias = [self.bias]
 		return {
 			"theta": [self.theta],
 			"winding_scale": [self.winding_scale],
 			"mesh_ms": list(self.mesh_ms),
 			"conn_offset_ms": list(self.conn_offset_ms),
-			"amp_ms": amp_ms,
-			"bias_ms": bias_ms,
-			"amp": amp_ms,
-			"bias": bias_ms,
+			"amp": amp,
+			"bias": bias,
+			"amp_ms": amp,
+			"bias_ms": bias,
 		}
 
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
@@ -229,10 +231,10 @@ class Model2D(nn.Module):
 		for k in list(st.keys()):
 			if k.startswith("mesh_offset_ms."):
 				st["conn_offset_ms." + k[len("mesh_offset_ms."):]] = st.pop(k)
-			elif k in {"amp_coarse", "amp"}:
-				st["amp_ms.0"] = st.pop(k)
-			elif k in {"bias_coarse", "bias"}:
-				st["bias_ms.0"] = st.pop(k)
+			elif k == "amp_ms.0" or k == "amp_coarse":
+				st["amp"] = st.pop(k)
+			elif k == "bias_ms.0" or k == "bias_coarse":
+				st["bias"] = st.pop(k)
 			elif k == "phase":
 				st.pop(k)
 
@@ -242,9 +244,9 @@ class Model2D(nn.Module):
 				continue
 			if k.startswith("conn_offset_ms."):
 				st[k] = torch.zeros_like(p)
-			elif k.startswith("amp_ms."):
+			elif k == "amp":
 				st[k] = torch.ones_like(p)
-			elif k.startswith("bias_ms."):
+			elif k == "bias":
 				st[k] = torch.full_like(p, 0.5)
 
 		incompat = super().load_state_dict(st, strict=bool(strict))
@@ -292,18 +294,10 @@ class Model2D(nn.Module):
 					side=side,
 					editor=self._expand_copy_edge,
 				)
-				self.amp_ms = self._grow_param_pyramid_flat_edit(
-					src=self.amp_ms,
-					dim=dim,
-					side=side,
-					editor=self._expand_copy_edge,
-				)
-				self.bias_ms = self._grow_param_pyramid_flat_edit(
-					src=self.bias_ms,
-					dim=dim,
-					side=side,
-					editor=self._expand_copy_edge,
-				)
+				amp2 = self._expand_copy_edge(src=self.amp, dim=dim, side=side)
+				bias2 = self._expand_copy_edge(src=self.bias, dim=dim, side=side)
+				self.amp = nn.Parameter(amp2)
+				self.bias = nn.Parameter(bias2)
 				self.mesh_h = int(self.mesh_h) + dh
 				self.mesh_w = int(self.mesh_w) + dw
 				py0 += dpy
