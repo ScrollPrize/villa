@@ -15,21 +15,16 @@
 #include "SegmentationGrowth.hpp"
 
 class QCheckBox;
-class QComboBox;
-class QDoubleSpinBox;
-class QGroupBox;
-class QLabel;
-class QLineEdit;
-class QListWidget;
-class QPushButton;
-class QSlider;
-class QSpinBox;
-class QToolButton;
-class CollapsibleSettingsGroup;
 class JsonProfileEditor;
 class SegmentationHeaderRow;
 class SegmentationEditingPanel;
 class SegmentationGrowthPanel;
+class SegmentationCorrectionsPanel;
+class SegmentationCustomParamsPanel;
+class SegmentationApprovalMaskPanel;
+class SegmentationCellReoptPanel;
+class SegmentationNeuralTracerPanel;
+class SegmentationDirectionFieldPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -301,22 +296,12 @@ private:
     SegmentationHeaderRow* _headerRow{nullptr};
     SegmentationGrowthPanel* _growthPanel{nullptr};
     SegmentationEditingPanel* _editingPanel{nullptr};
-
-    CollapsibleSettingsGroup* _groupDirectionField{nullptr};
-    QLineEdit* _directionFieldPathEdit{nullptr};
-    QToolButton* _directionFieldBrowseButton{nullptr};
-    QComboBox* _comboDirectionFieldOrientation{nullptr};
-    QComboBox* _comboDirectionFieldScale{nullptr};
-    QDoubleSpinBox* _spinDirectionFieldWeight{nullptr};
-    QPushButton* _directionFieldAddButton{nullptr};
-    QPushButton* _directionFieldRemoveButton{nullptr};
-    QPushButton* _directionFieldClearButton{nullptr};
-    QListWidget* _directionFieldList{nullptr};
-
-    QGroupBox* _groupCorrections{nullptr};
-    QComboBox* _comboCorrections{nullptr};
-    QPushButton* _btnCorrectionsNew{nullptr};
-    QCheckBox* _chkCorrectionsAnnotate{nullptr};
+    SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
+    SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
+    SegmentationApprovalMaskPanel* _approvalMaskPanel{nullptr};
+    SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
+    SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
+    SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
 
     JsonProfileEditor* _customParamsEditor{nullptr};
     QString _customParamsText;
@@ -329,7 +314,7 @@ private:
     int _correctionsZMax{0};
     bool _correctionsAnnotateChecked{false};
 
-    // Approval mask state and UI
+    // Approval mask state
     // Cylinder brush model: radius defines circle in plane views, depth defines cylinder height
     bool _showApprovalMask{false};
     bool _editApprovedMask{false};    // Editing in approve mode (mutually exclusive with unapprove)
@@ -339,17 +324,6 @@ private:
     float _approvalBrushDepth{15.0f};      // Cylinder depth (rect height in flattened view)
     int _approvalMaskOpacity{50};          // Mask overlay opacity (0-100, default 50%)
     QColor _approvalBrushColor{0, 255, 0}; // RGB color for approval painting (default pure green)
-    CollapsibleSettingsGroup* _groupApprovalMask{nullptr};
-    QCheckBox* _chkShowApprovalMask{nullptr};
-    QCheckBox* _chkEditApprovedMask{nullptr};
-    QCheckBox* _chkEditUnapprovedMask{nullptr};
-    QCheckBox* _chkAutoApproveEdits{nullptr};
-    QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
-    QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
-    QSlider* _sliderApprovalMaskOpacity{nullptr};
-    QLabel* _lblApprovalMaskOpacity{nullptr};
-    QPushButton* _btnApprovalColor{nullptr};
-    QPushButton* _btnUndoApprovalStroke{nullptr};
 
     // Neural tracer state
     bool _neuralTracerEnabled{false};
@@ -359,29 +333,10 @@ private:
     int _neuralVolumeScale{0};
     int _neuralBatchSize{4};
 
-    // Neural tracer UI
-    CollapsibleSettingsGroup* _groupNeuralTracer{nullptr};
-    QCheckBox* _chkNeuralTracerEnabled{nullptr};
-    QLineEdit* _neuralCheckpointEdit{nullptr};
-    QToolButton* _neuralCheckpointBrowse{nullptr};
-    QLineEdit* _neuralPythonEdit{nullptr};
-    QToolButton* _neuralPythonBrowse{nullptr};
-    QComboBox* _comboNeuralVolumeScale{nullptr};
-    QSpinBox* _spinNeuralBatchSize{nullptr};
-    QLabel* _lblNeuralTracerStatus{nullptr};
-
-    // Cell reoptimization state and UI
+    // Cell reoptimization state
     bool _cellReoptMode{false};
     int _cellReoptMaxSteps{500};
     int _cellReoptMaxPoints{50};
     float _cellReoptMinSpacing{5.0f};
     float _cellReoptPerimeterOffset{0.0f};
-    CollapsibleSettingsGroup* _groupCellReopt{nullptr};
-    QCheckBox* _chkCellReoptMode{nullptr};
-    QSpinBox* _spinCellReoptMaxSteps{nullptr};
-    QSpinBox* _spinCellReoptMaxPoints{nullptr};
-    QDoubleSpinBox* _spinCellReoptMinSpacing{nullptr};
-    QDoubleSpinBox* _spinCellReoptPerimeterOffset{nullptr};
-    QComboBox* _comboCellReoptCollection{nullptr};
-    QPushButton* _btnCellReoptRun{nullptr};
 };

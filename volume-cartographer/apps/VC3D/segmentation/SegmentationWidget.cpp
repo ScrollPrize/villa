@@ -7,6 +7,12 @@
 #include "tools/SegmentationEditingPanel.hpp"
 #include "tools/SegmentationGrowthPanel.hpp"
 #include "tools/SegmentationHeaderRow.hpp"
+#include "tools/SegmentationCorrectionsPanel.hpp"
+#include "tools/SegmentationCustomParamsPanel.hpp"
+#include "tools/SegmentationApprovalMaskPanel.hpp"
+#include "tools/SegmentationCellReoptPanel.hpp"
+#include "tools/SegmentationNeuralTracerPanel.hpp"
+#include "tools/SegmentationDirectionFieldPanel.hpp"
 #include "VCSettings.hpp"
 
 #include <QAbstractItemView>
@@ -229,322 +235,17 @@ void SegmentationWidget::buildUi()
     _editingPanel = new SegmentationEditingPanel(this);
     layout->addWidget(_editingPanel);
 
-    // Approval Mask Group
-    _groupApprovalMask = new CollapsibleSettingsGroup(tr("Approval Mask"), this);
-    auto* approvalLayout = _groupApprovalMask->contentLayout();
-    auto* approvalParent = _groupApprovalMask->contentWidget();
+    _approvalMaskPanel = new SegmentationApprovalMaskPanel(this);
+    layout->addWidget(_approvalMaskPanel);
 
-    // Show approval mask checkbox
-    _chkShowApprovalMask = new QCheckBox(tr("Show Approval Mask"), approvalParent);
-    _chkShowApprovalMask->setToolTip(tr("Display the approval mask overlay on the surface."));
-    approvalLayout->addWidget(_chkShowApprovalMask);
+    _cellReoptPanel = new SegmentationCellReoptPanel(this);
+    layout->addWidget(_cellReoptPanel);
 
-    // Edit checkboxes row - mutually exclusive approve/unapprove modes
-    auto* editRow = new QHBoxLayout();
-    editRow->setSpacing(8);
+    _directionFieldPanel = new SegmentationDirectionFieldPanel(this);
+    layout->addWidget(_directionFieldPanel);
 
-    _chkEditApprovedMask = new QCheckBox(tr("Edit Approved (B)"), approvalParent);
-    _chkEditApprovedMask->setToolTip(tr("Paint regions as approved. Saves to disk when toggled off."));
-    _chkEditApprovedMask->setEnabled(false);  // Only enabled when show is checked
-
-    _chkEditUnapprovedMask = new QCheckBox(tr("Edit Unapproved (N)"), approvalParent);
-    _chkEditUnapprovedMask->setToolTip(tr("Paint regions as unapproved. Saves to disk when toggled off."));
-    _chkEditUnapprovedMask->setEnabled(false);  // Only enabled when show is checked
-
-    editRow->addWidget(_chkEditApprovedMask);
-    editRow->addWidget(_chkEditUnapprovedMask);
-    editRow->addStretch(1);
-    approvalLayout->addLayout(editRow);
-
-    // Auto-approve edits checkbox
-    _chkAutoApproveEdits = new QCheckBox(tr("Auto-Approve Edits"), approvalParent);
-    _chkAutoApproveEdits->setToolTip(tr("Automatically add edited surface regions to the approval mask."));
-    _chkAutoApproveEdits->setChecked(_autoApproveEdits);
-    approvalLayout->addWidget(_chkAutoApproveEdits);
-
-    // Cylinder brush controls: radius and depth
-    // Radius = circle in plane views, width of rectangle in flattened view
-    // Depth = height of rectangle in flattened view, cylinder thickness for plane painting
-    auto* approvalBrushRow = new QHBoxLayout();
-    approvalBrushRow->setSpacing(8);
-
-    auto* brushRadiusLabel = new QLabel(tr("Radius:"), approvalParent);
-    _spinApprovalBrushRadius = new QDoubleSpinBox(approvalParent);
-    _spinApprovalBrushRadius->setDecimals(0);
-    _spinApprovalBrushRadius->setRange(1.0, 1000.0);
-    _spinApprovalBrushRadius->setSingleStep(10.0);
-    _spinApprovalBrushRadius->setValue(_approvalBrushRadius);
-    _spinApprovalBrushRadius->setToolTip(tr("Cylinder radius: circle size in plane views, rectangle width in flattened view (native voxels)."));
-    approvalBrushRow->addWidget(brushRadiusLabel);
-    approvalBrushRow->addWidget(_spinApprovalBrushRadius);
-
-    auto* brushDepthLabel = new QLabel(tr("Depth:"), approvalParent);
-    _spinApprovalBrushDepth = new QDoubleSpinBox(approvalParent);
-    _spinApprovalBrushDepth->setDecimals(0);
-    _spinApprovalBrushDepth->setRange(1.0, 500.0);
-    _spinApprovalBrushDepth->setSingleStep(5.0);
-    _spinApprovalBrushDepth->setValue(_approvalBrushDepth);
-    _spinApprovalBrushDepth->setToolTip(tr("Cylinder depth: rectangle height in flattened view, painting thickness from plane views (native voxels)."));
-    approvalBrushRow->addWidget(brushDepthLabel);
-    approvalBrushRow->addWidget(_spinApprovalBrushDepth);
-    approvalBrushRow->addStretch(1);
-    approvalLayout->addLayout(approvalBrushRow);
-
-    // Opacity slider row
-    auto* opacityRow = new QHBoxLayout();
-    opacityRow->setSpacing(8);
-
-    auto* opacityLabel = new QLabel(tr("Opacity:"), approvalParent);
-    _sliderApprovalMaskOpacity = new QSlider(Qt::Horizontal, approvalParent);
-    _sliderApprovalMaskOpacity->setRange(0, 100);
-    _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
-    _sliderApprovalMaskOpacity->setToolTip(tr("Mask overlay transparency (0 = transparent, 100 = opaque)."));
-
-    _lblApprovalMaskOpacity = new QLabel(QString::number(_approvalMaskOpacity) + QStringLiteral("%"), approvalParent);
-    _lblApprovalMaskOpacity->setMinimumWidth(35);
-
-    opacityRow->addWidget(opacityLabel);
-    opacityRow->addWidget(_sliderApprovalMaskOpacity, 1);
-    opacityRow->addWidget(_lblApprovalMaskOpacity);
-    approvalLayout->addLayout(opacityRow);
-
-    // Color picker row
-    auto* colorRow = new QHBoxLayout();
-    colorRow->setSpacing(8);
-
-    auto* colorLabel = new QLabel(tr("Brush Color:"), approvalParent);
-    _btnApprovalColor = new QPushButton(approvalParent);
-    _btnApprovalColor->setFixedSize(60, 24);
-    _btnApprovalColor->setToolTip(tr("Click to choose the color for approval mask painting."));
-    // Set initial color preview
-    _btnApprovalColor->setStyleSheet(
-        QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
-
-    colorRow->addWidget(colorLabel);
-    colorRow->addWidget(_btnApprovalColor);
-    colorRow->addStretch(1);
-    approvalLayout->addLayout(colorRow);
-
-    // Undo button
-    auto* buttonRow = new QHBoxLayout();
-    buttonRow->setSpacing(8);
-    _btnUndoApprovalStroke = new QPushButton(tr("Undo (Ctrl+B)"), approvalParent);
-    _btnUndoApprovalStroke->setToolTip(tr("Undo the last approval mask brush stroke."));
-    buttonRow->addWidget(_btnUndoApprovalStroke);
-    buttonRow->addStretch(1);
-    approvalLayout->addLayout(buttonRow);
-
-    layout->addWidget(_groupApprovalMask);
-
-    // Cell Reoptimization Group
-    _groupCellReopt = new CollapsibleSettingsGroup(tr("Cell Reoptimization"), this);
-    auto* cellReoptLayout = _groupCellReopt->contentLayout();
-    auto* cellReoptParent = _groupCellReopt->contentWidget();
-
-    // Enable mode checkbox
-    _chkCellReoptMode = new QCheckBox(tr("Enable Cell Reoptimization"), cellReoptParent);
-    _chkCellReoptMode->setToolTip(tr("Click on unapproved regions to flood fill and place correction points.\n"
-                                      "Requires approval mask to be visible."));
-    cellReoptLayout->addWidget(_chkCellReoptMode);
-
-    // Max flood cells
-    auto* maxFloodRow = new QHBoxLayout();
-    maxFloodRow->setSpacing(8);
-    auto* maxFloodLabel = new QLabel(tr("Max Flood Cells:"), cellReoptParent);
-    _spinCellReoptMaxSteps = new QSpinBox(cellReoptParent);
-    _spinCellReoptMaxSteps->setRange(10, 10000);
-    _spinCellReoptMaxSteps->setValue(_cellReoptMaxSteps);
-    _spinCellReoptMaxSteps->setToolTip(tr("Maximum number of cells to include in the flood fill."));
-    maxFloodRow->addWidget(maxFloodLabel);
-    maxFloodRow->addWidget(_spinCellReoptMaxSteps);
-    maxFloodRow->addStretch(1);
-    cellReoptLayout->addLayout(maxFloodRow);
-
-    // Max correction points
-    auto* maxPointsRow = new QHBoxLayout();
-    maxPointsRow->setSpacing(8);
-    auto* maxPointsLabel = new QLabel(tr("Max Points:"), cellReoptParent);
-    _spinCellReoptMaxPoints = new QSpinBox(cellReoptParent);
-    _spinCellReoptMaxPoints->setRange(3, 200);
-    _spinCellReoptMaxPoints->setValue(_cellReoptMaxPoints);
-    _spinCellReoptMaxPoints->setToolTip(tr("Maximum number of correction points to place on the boundary."));
-    maxPointsRow->addWidget(maxPointsLabel);
-    maxPointsRow->addWidget(_spinCellReoptMaxPoints);
-    maxPointsRow->addStretch(1);
-    cellReoptLayout->addLayout(maxPointsRow);
-
-    // Min point spacing
-    auto* minSpacingRow = new QHBoxLayout();
-    minSpacingRow->setSpacing(8);
-    auto* minSpacingLabel = new QLabel(tr("Min Spacing:"), cellReoptParent);
-    _spinCellReoptMinSpacing = new QDoubleSpinBox(cellReoptParent);
-    _spinCellReoptMinSpacing->setRange(1.0, 50.0);
-    _spinCellReoptMinSpacing->setValue(_cellReoptMinSpacing);
-    _spinCellReoptMinSpacing->setSuffix(tr(" grid"));
-    _spinCellReoptMinSpacing->setToolTip(tr("Minimum spacing between correction points (grid steps)."));
-    minSpacingRow->addWidget(minSpacingLabel);
-    minSpacingRow->addWidget(_spinCellReoptMinSpacing);
-    minSpacingRow->addStretch(1);
-    cellReoptLayout->addLayout(minSpacingRow);
-
-    // Perimeter offset
-    auto* perimeterOffsetRow = new QHBoxLayout();
-    perimeterOffsetRow->setSpacing(8);
-    auto* perimeterOffsetLabel = new QLabel(tr("Perimeter Offset:"), cellReoptParent);
-    _spinCellReoptPerimeterOffset = new QDoubleSpinBox(cellReoptParent);
-    _spinCellReoptPerimeterOffset->setRange(-50.0, 50.0);
-    _spinCellReoptPerimeterOffset->setValue(_cellReoptPerimeterOffset);
-    _spinCellReoptPerimeterOffset->setSuffix(tr(" grid"));
-    _spinCellReoptPerimeterOffset->setToolTip(tr("Offset to expand (+) or shrink (-) the traced perimeter from center of mass."));
-    perimeterOffsetRow->addWidget(perimeterOffsetLabel);
-    perimeterOffsetRow->addWidget(_spinCellReoptPerimeterOffset);
-    perimeterOffsetRow->addStretch(1);
-    cellReoptLayout->addLayout(perimeterOffsetRow);
-
-    // Collection selector
-    auto* collectionRow = new QHBoxLayout();
-    collectionRow->setSpacing(8);
-    auto* collectionLabel = new QLabel(tr("Collection:"), cellReoptParent);
-    _comboCellReoptCollection = new QComboBox(cellReoptParent);
-    _comboCellReoptCollection->setToolTip(tr("Select which correction point collection to use for reoptimization."));
-    _comboCellReoptCollection->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    collectionRow->addWidget(collectionLabel);
-    collectionRow->addWidget(_comboCellReoptCollection, 1);
-    cellReoptLayout->addLayout(collectionRow);
-
-    // Run reoptimization button
-    auto* runButtonRow = new QHBoxLayout();
-    runButtonRow->setSpacing(8);
-    _btnCellReoptRun = new QPushButton(tr("Run Reoptimization"), cellReoptParent);
-    _btnCellReoptRun->setToolTip(tr("Trigger reoptimization using the selected correction point collection."));
-    runButtonRow->addWidget(_btnCellReoptRun);
-    runButtonRow->addStretch(1);
-    cellReoptLayout->addLayout(runButtonRow);
-
-    layout->addWidget(_groupCellReopt);
-
-    _groupDirectionField = new CollapsibleSettingsGroup(tr("Direction Fields"), this);
-
-    auto* directionParent = _groupDirectionField->contentWidget();
-
-    _groupDirectionField->addRow(tr("Zarr folder:"), [&](QHBoxLayout* row) {
-        _directionFieldPathEdit = new QLineEdit(directionParent);
-        _directionFieldPathEdit->setToolTip(tr("Filesystem path to the direction field zarr folder."));
-        _directionFieldBrowseButton = new QToolButton(directionParent);
-        _directionFieldBrowseButton->setText(QStringLiteral("..."));
-        _directionFieldBrowseButton->setToolTip(tr("Browse for a direction field dataset on disk."));
-        row->addWidget(_directionFieldPathEdit, 1);
-        row->addWidget(_directionFieldBrowseButton);
-    }, tr("Filesystem path to the direction field zarr folder."));
-
-    _groupDirectionField->addRow(tr("Orientation:"), [&](QHBoxLayout* row) {
-        _comboDirectionFieldOrientation = new QComboBox(directionParent);
-        _comboDirectionFieldOrientation->setToolTip(tr("Select which axis the direction field describes."));
-        _comboDirectionFieldOrientation->addItem(tr("Normal"), static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
-        _comboDirectionFieldOrientation->addItem(tr("Horizontal"), static_cast<int>(SegmentationDirectionFieldOrientation::Horizontal));
-        _comboDirectionFieldOrientation->addItem(tr("Vertical"), static_cast<int>(SegmentationDirectionFieldOrientation::Vertical));
-        row->addWidget(_comboDirectionFieldOrientation);
-        row->addSpacing(12);
-
-        auto* scaleLabel = new QLabel(tr("Scale level:"), directionParent);
-        _comboDirectionFieldScale = new QComboBox(directionParent);
-        _comboDirectionFieldScale->setToolTip(tr("Choose the multiscale level sampled from the direction field."));
-        for (int scale = 0; scale <= 5; ++scale) {
-            _comboDirectionFieldScale->addItem(QString::number(scale), scale);
-        }
-        row->addWidget(scaleLabel);
-        row->addWidget(_comboDirectionFieldScale);
-        row->addSpacing(12);
-
-        auto* weightLabel = new QLabel(tr("Weight:"), directionParent);
-        _spinDirectionFieldWeight = new QDoubleSpinBox(directionParent);
-        _spinDirectionFieldWeight->setDecimals(2);
-        _spinDirectionFieldWeight->setToolTip(tr("Relative influence of this direction field during growth."));
-        _spinDirectionFieldWeight->setRange(0.0, 10.0);
-        _spinDirectionFieldWeight->setSingleStep(0.1);
-        row->addWidget(weightLabel);
-        row->addWidget(_spinDirectionFieldWeight);
-        row->addStretch(1);
-    });
-
-    _groupDirectionField->addRow(QString(), [&](QHBoxLayout* row) {
-        _directionFieldAddButton = new QPushButton(tr("Add"), directionParent);
-        _directionFieldAddButton->setToolTip(tr("Save the current direction field parameters to the list."));
-        _directionFieldRemoveButton = new QPushButton(tr("Remove"), directionParent);
-        _directionFieldRemoveButton->setToolTip(tr("Delete the selected direction field entry."));
-        _directionFieldRemoveButton->setEnabled(false);
-        _directionFieldClearButton = new QPushButton(tr("Clear"), directionParent);
-        _directionFieldClearButton->setToolTip(tr("Clear selection and reset the form for adding a new entry."));
-        row->addWidget(_directionFieldAddButton);
-        row->addWidget(_directionFieldRemoveButton);
-        row->addWidget(_directionFieldClearButton);
-        row->addStretch(1);
-    });
-
-    _directionFieldList = new QListWidget(directionParent);
-    _directionFieldList->setToolTip(tr("Direction field configurations applied during growth."));
-    _directionFieldList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _groupDirectionField->addFullWidthWidget(_directionFieldList);
-
-    layout->addWidget(_groupDirectionField);
-
-    // Neural Tracer group
-    _groupNeuralTracer = new CollapsibleSettingsGroup(tr("Neural Tracer"), this);
-    auto* neuralParent = _groupNeuralTracer->contentWidget();
-
-    _chkNeuralTracerEnabled = new QCheckBox(tr("Enable neural tracer"), neuralParent);
-    _chkNeuralTracerEnabled->setToolTip(tr("Use neural network-based tracing instead of the default tracer. "
-                                           "Requires a trained model checkpoint."));
-    _groupNeuralTracer->contentLayout()->addWidget(_chkNeuralTracerEnabled);
-
-    _groupNeuralTracer->addRow(tr("Checkpoint:"), [&](QHBoxLayout* row) {
-        _neuralCheckpointEdit = new QLineEdit(neuralParent);
-        _neuralCheckpointEdit->setPlaceholderText(tr("Path to model checkpoint (.pt)"));
-        _neuralCheckpointEdit->setToolTip(tr("Path to the trained neural network checkpoint file."));
-        _neuralCheckpointBrowse = new QToolButton(neuralParent);
-        _neuralCheckpointBrowse->setText(QStringLiteral("..."));
-        _neuralCheckpointBrowse->setToolTip(tr("Browse for checkpoint file."));
-        row->addWidget(_neuralCheckpointEdit, 1);
-        row->addWidget(_neuralCheckpointBrowse);
-    }, tr("Path to the trained neural network checkpoint file."));
-
-    _groupNeuralTracer->addRow(tr("Python:"), [&](QHBoxLayout* row) {
-        _neuralPythonEdit = new QLineEdit(neuralParent);
-        _neuralPythonEdit->setPlaceholderText(tr("Path to Python executable (leave empty for auto-detect)"));
-        _neuralPythonEdit->setToolTip(tr("Path to the Python executable with torch installed (e.g. ~/miniconda3/bin/python). "
-                                         "Leave empty to auto-detect."));
-        _neuralPythonBrowse = new QToolButton(neuralParent);
-        _neuralPythonBrowse->setText(QStringLiteral("..."));
-        _neuralPythonBrowse->setToolTip(tr("Browse for Python executable."));
-        row->addWidget(_neuralPythonEdit, 1);
-        row->addWidget(_neuralPythonBrowse);
-    }, tr("Python executable with torch installed."));
-
-    _groupNeuralTracer->addRow(tr("Volume scale:"), [&](QHBoxLayout* row) {
-        _comboNeuralVolumeScale = new QComboBox(neuralParent);
-        _comboNeuralVolumeScale->setToolTip(tr("OME-Zarr scale level to use for neural tracing (0 = full resolution)."));
-        for (int scale = 0; scale <= 5; ++scale) {
-            _comboNeuralVolumeScale->addItem(QString::number(scale), scale);
-        }
-        row->addWidget(_comboNeuralVolumeScale);
-
-        auto* batchLabel = new QLabel(tr("Batch size:"), neuralParent);
-        _spinNeuralBatchSize = new QSpinBox(neuralParent);
-        _spinNeuralBatchSize->setRange(1, 64);
-        _spinNeuralBatchSize->setValue(_neuralBatchSize);
-        _spinNeuralBatchSize->setToolTip(tr("Number of points to process in parallel (higher = faster but more memory)."));
-        row->addSpacing(12);
-        row->addWidget(batchLabel);
-        row->addWidget(_spinNeuralBatchSize);
-        row->addStretch(1);
-    });
-
-    _lblNeuralTracerStatus = new QLabel(neuralParent);
-    _lblNeuralTracerStatus->setWordWrap(true);
-    _lblNeuralTracerStatus->setVisible(false);
-    _groupNeuralTracer->contentLayout()->addWidget(_lblNeuralTracerStatus);
-
-    layout->addWidget(_groupNeuralTracer);
+    _neuralTracerPanel = new SegmentationNeuralTracerPanel(this);
+    layout->addWidget(_neuralTracerPanel);
 
     auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const QString& key) {
         if (!group) {
@@ -562,45 +263,15 @@ void SegmentationWidget::buildUi()
     rememberGroupState(_editingPanel->dragGroup(), QStringLiteral("group_drag_expanded"));
     rememberGroupState(_editingPanel->lineGroup(), QStringLiteral("group_line_expanded"));
     rememberGroupState(_editingPanel->pushPullGroup(), QStringLiteral("group_push_pull_expanded"));
-    rememberGroupState(_groupDirectionField, QStringLiteral("group_direction_field_expanded"));
-    rememberGroupState(_groupNeuralTracer, QStringLiteral("group_neural_tracer_expanded"));
+    rememberGroupState(_directionFieldPanel->directionFieldGroup(), QStringLiteral("group_direction_field_expanded"));
+    rememberGroupState(_neuralTracerPanel->neuralTracerGroup(), QStringLiteral("group_neural_tracer_expanded"));
 
-    _groupCorrections = new QGroupBox(tr("Corrections"), this);
-    auto* correctionsLayout = new QVBoxLayout(_groupCorrections);
+    _correctionsPanel = new SegmentationCorrectionsPanel(this);
+    layout->addWidget(_correctionsPanel);
 
-    auto* correctionsComboRow = new QHBoxLayout();
-    auto* correctionsLabel = new QLabel(tr("Active set:"), _groupCorrections);
-    _comboCorrections = new QComboBox(_groupCorrections);
-    _comboCorrections->setEnabled(false);
-    _comboCorrections->setToolTip(tr("Choose an existing correction set to apply."));
-    correctionsComboRow->addWidget(correctionsLabel);
-    correctionsComboRow->addStretch(1);
-    correctionsComboRow->addWidget(_comboCorrections, 1);
-    correctionsLayout->addLayout(correctionsComboRow);
-
-    _btnCorrectionsNew = new QPushButton(tr("New correction set"), _groupCorrections);
-    _btnCorrectionsNew->setToolTip(tr("Create a new, empty correction set for this segmentation."));
-    correctionsLayout->addWidget(_btnCorrectionsNew);
-
-    _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
-    _chkCorrectionsAnnotate->setToolTip(tr("Toggle annotation overlay while reviewing corrections."));
-    correctionsLayout->addWidget(_chkCorrectionsAnnotate);
-
-    _groupCorrections->setLayout(correctionsLayout);
-    layout->addWidget(_groupCorrections);
-
-    _customParamsEditor = new JsonProfileEditor(tr("Custom Params"), this);
-    _customParamsEditor->setDescription(
-        tr("Additional JSON fields merge into the tracer params. Leave empty for defaults."));
-    _customParamsEditor->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
-    _customParamsEditor->setTextToolTip(
-        tr("Optional JSON that merges into tracer parameters before growth."));
-
-    const auto profiles = vc3d::json_profiles::tracerParamProfiles(
-        [this](const char* text) { return tr(text); });
-    _customParamsEditor->setProfiles(profiles, QStringLiteral("custom"));
-
-    layout->addWidget(_customParamsEditor);
+    _customParamsPanel = new SegmentationCustomParamsPanel(this);
+    _customParamsEditor = _customParamsPanel->editor();
+    layout->addWidget(_customParamsPanel);
 
     layout->addStretch(1);
 
@@ -612,7 +283,7 @@ void SegmentationWidget::buildUi()
     });
 
     // Approval mask signal connections
-    connect(_chkShowApprovalMask, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_approvalMaskPanel->showCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setShowApprovalMask(enabled);
         // If show is being unchecked and edit modes are active, turn them off
         if (!enabled) {
@@ -625,45 +296,45 @@ void SegmentationWidget::buildUi()
         }
     });
 
-    connect(_chkEditApprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_approvalMaskPanel->editApprovedCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setEditApprovedMask(enabled);
     });
 
-    connect(_chkEditUnapprovedMask, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_approvalMaskPanel->editUnapprovedCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setEditUnapprovedMask(enabled);
     });
 
-    connect(_chkAutoApproveEdits, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_approvalMaskPanel->autoApproveCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setAutoApproveEdits(enabled);
     });
 
-    connect(_spinApprovalBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_approvalMaskPanel->brushRadiusSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setApprovalBrushRadius(static_cast<float>(value));
     });
 
-    connect(_spinApprovalBrushDepth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_approvalMaskPanel->brushDepthSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setApprovalBrushDepth(static_cast<float>(value));
     });
 
-    connect(_sliderApprovalMaskOpacity, &QSlider::valueChanged, this, [this](int value) {
+    connect(_approvalMaskPanel->opacitySlider(), &QSlider::valueChanged, this, [this](int value) {
         setApprovalMaskOpacity(value);
     });
 
-    connect(_btnApprovalColor, &QPushButton::clicked, this, [this]() {
+    connect(_approvalMaskPanel->colorButton(), &QPushButton::clicked, this, [this]() {
         QColor newColor = QColorDialog::getColor(_approvalBrushColor, this, tr("Choose Approval Mask Color"));
         if (newColor.isValid()) {
             setApprovalBrushColor(newColor);
         }
     });
 
-    connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
+    connect(_approvalMaskPanel->undoButton(), &QPushButton::clicked, this, &SegmentationWidget::approvalStrokesUndoRequested);
 
     // Cell reoptimization signal connections
-    connect(_chkCellReoptMode, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_cellReoptPanel->modeCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setCellReoptMode(enabled);
     });
 
-    connect(_spinCellReoptMaxSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+    connect(_cellReoptPanel->maxStepsSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (_cellReoptMaxSteps != value) {
             _cellReoptMaxSteps = value;
             if (!_restoringSettings) {
@@ -673,7 +344,7 @@ void SegmentationWidget::buildUi()
         }
     });
 
-    connect(_spinCellReoptMaxPoints, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+    connect(_cellReoptPanel->maxPointsSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (_cellReoptMaxPoints != value) {
             _cellReoptMaxPoints = value;
             if (!_restoringSettings) {
@@ -683,7 +354,7 @@ void SegmentationWidget::buildUi()
         }
     });
 
-    connect(_spinCellReoptMinSpacing, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_cellReoptPanel->minSpacingSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         float floatVal = static_cast<float>(value);
         if (_cellReoptMinSpacing != floatVal) {
             _cellReoptMinSpacing = floatVal;
@@ -694,7 +365,7 @@ void SegmentationWidget::buildUi()
         }
     });
 
-    connect(_spinCellReoptPerimeterOffset, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_cellReoptPanel->perimeterOffsetSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         float floatVal = static_cast<float>(value);
         if (_cellReoptPerimeterOffset != floatVal) {
             _cellReoptPerimeterOffset = floatVal;
@@ -705,10 +376,11 @@ void SegmentationWidget::buildUi()
         }
     });
 
-    connect(_btnCellReoptRun, &QPushButton::clicked, this, [this]() {
+    connect(_cellReoptPanel->runButton(), &QPushButton::clicked, this, [this]() {
         uint64_t collectionId = 0;
-        if (_comboCellReoptCollection && _comboCellReoptCollection->currentIndex() >= 0) {
-            collectionId = _comboCellReoptCollection->currentData().toULongLong();
+        auto* combo = _cellReoptPanel->collectionCombo();
+        if (combo && combo->currentIndex() >= 0) {
+            collectionId = combo->currentData().toULongLong();
         }
         emit cellReoptGrowthRequested(collectionId);
     });
@@ -974,46 +646,50 @@ void SegmentationWidget::buildUi()
         emit smoothingIterationsChanged(_smoothIterations);
     });
 
-    connect(_directionFieldPathEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+    connect(_directionFieldPanel->pathEdit(), &QLineEdit::textChanged, this, [this](const QString& text) {
         _directionFieldPath = text.trimmed();
         if (!_updatingDirectionFieldForm) {
-            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+            auto* list = _directionFieldPanel->listWidget();
+            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
         }
     });
 
-    connect(_directionFieldBrowseButton, &QToolButton::clicked, this, [this]() {
+    connect(_directionFieldPanel->browseButton(), &QToolButton::clicked, this, [this]() {
         const QString initial = _directionFieldPath.isEmpty() ? QDir::homePath() : _directionFieldPath;
         const QString dir = QFileDialog::getExistingDirectory(this, tr("Select direction field"), initial);
         if (dir.isEmpty()) {
             return;
         }
         _directionFieldPath = dir;
-        _directionFieldPathEdit->setText(dir);
+        _directionFieldPanel->pathEdit()->setText(dir);
     });
 
-    connect(_comboDirectionFieldOrientation, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+    connect(_directionFieldPanel->orientationCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         _directionFieldOrientation = segmentationDirectionFieldOrientationFromInt(
-            _comboDirectionFieldOrientation->itemData(index).toInt());
+            _directionFieldPanel->orientationCombo()->itemData(index).toInt());
         if (!_updatingDirectionFieldForm) {
-            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+            auto* list = _directionFieldPanel->listWidget();
+            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
         }
     });
 
-    connect(_comboDirectionFieldScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _directionFieldScale = _comboDirectionFieldScale->itemData(index).toInt();
+    connect(_directionFieldPanel->scaleCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _directionFieldScale = _directionFieldPanel->scaleCombo()->itemData(index).toInt();
         if (!_updatingDirectionFieldForm) {
-            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+            auto* list = _directionFieldPanel->listWidget();
+            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
         }
     });
 
-    connect(_spinDirectionFieldWeight, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+    connect(_directionFieldPanel->weightSpin(), QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         _directionFieldWeight = value;
         if (!_updatingDirectionFieldForm) {
-            applyDirectionFieldDraftToSelection(_directionFieldList ? _directionFieldList->currentRow() : -1);
+            auto* list = _directionFieldPanel->listWidget();
+            applyDirectionFieldDraftToSelection(list ? list->currentRow() : -1);
         }
     });
 
-    connect(_directionFieldAddButton, &QPushButton::clicked, this, [this]() {
+    connect(_directionFieldPanel->addButton(), &QPushButton::clicked, this, [this]() {
         auto config = buildDirectionFieldDraft();
         if (!config.isValid()) {
             qCInfo(lcSegWidget) << "Ignoring direction field add; path empty";
@@ -1025,8 +701,9 @@ void SegmentationWidget::buildUi()
         clearDirectionFieldForm();
     });
 
-    connect(_directionFieldRemoveButton, &QPushButton::clicked, this, [this]() {
-        const int row = _directionFieldList ? _directionFieldList->currentRow() : -1;
+    connect(_directionFieldPanel->removeButton(), &QPushButton::clicked, this, [this]() {
+        auto* list = _directionFieldPanel->listWidget();
+        const int row = list ? list->currentRow() : -1;
         if (row < 0 || row >= static_cast<int>(_directionFields.size())) {
             return;
         }
@@ -1035,27 +712,27 @@ void SegmentationWidget::buildUi()
         persistDirectionFields();
     });
 
-    connect(_directionFieldClearButton, &QPushButton::clicked, this, [this]() {
+    connect(_directionFieldPanel->clearButton(), &QPushButton::clicked, this, [this]() {
         clearDirectionFieldForm();
     });
 
-    connect(_directionFieldList, &QListWidget::currentRowChanged, this, [this](int row) {
+    connect(_directionFieldPanel->listWidget(), &QListWidget::currentRowChanged, this, [this](int row) {
         updateDirectionFieldFormFromSelection(row);
-        if (_directionFieldRemoveButton) {
-            _directionFieldRemoveButton->setEnabled(_editingEnabled && row >= 0);
+        if (_directionFieldPanel->removeButton()) {
+            _directionFieldPanel->removeButton()->setEnabled(_editingEnabled && row >= 0);
         }
     });
 
-    connect(_comboCorrections, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+    connect(_correctionsPanel->correctionsCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0) {
             emit correctionsCollectionSelected(0);
             return;
         }
-        const QVariant data = _comboCorrections->itemData(index);
+        const QVariant data = _correctionsPanel->correctionsCombo()->itemData(index);
         emit correctionsCollectionSelected(data.toULongLong());
     });
 
-    connect(_btnCorrectionsNew, &QPushButton::clicked, this, [this]() {
+    connect(_correctionsPanel->correctionsNewButton(), &QPushButton::clicked, this, [this]() {
         emit correctionsCreateRequested();
     });
 
@@ -1088,7 +765,7 @@ void SegmentationWidget::buildUi()
         });
     }
 
-    connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_correctionsPanel->correctionsAnnotateCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         emit correctionsAnnotateToggled(enabled);
     });
 
@@ -1132,46 +809,46 @@ void SegmentationWidget::buildUi()
     connect(_editingPanel->stopButton(), &QPushButton::clicked, this, &SegmentationWidget::stopToolsRequested);
 
     // Neural tracer connections
-    connect(_chkNeuralTracerEnabled, &QCheckBox::toggled, this, [this](bool enabled) {
+    connect(_neuralTracerPanel->enabledCheck(), &QCheckBox::toggled, this, [this](bool enabled) {
         setNeuralTracerEnabled(enabled);
     });
 
-    connect(_neuralCheckpointEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+    connect(_neuralTracerPanel->checkpointEdit(), &QLineEdit::textChanged, this, [this](const QString& text) {
         _neuralCheckpointPath = text.trimmed();
         writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
     });
 
-    connect(_neuralCheckpointBrowse, &QToolButton::clicked, this, [this]() {
+    connect(_neuralTracerPanel->checkpointBrowse(), &QToolButton::clicked, this, [this]() {
         const QString initial = _neuralCheckpointPath.isEmpty() ? QDir::homePath() : _neuralCheckpointPath;
         const QString file = QFileDialog::getOpenFileName(this, tr("Select neural tracer checkpoint"),
                                                           initial, tr("PyTorch Checkpoint (*.pt *.pth);;All Files (*)"));
         if (!file.isEmpty()) {
             _neuralCheckpointPath = file;
-            _neuralCheckpointEdit->setText(file);
+            _neuralTracerPanel->checkpointEdit()->setText(file);
         }
     });
 
-    connect(_neuralPythonEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+    connect(_neuralTracerPanel->pythonEdit(), &QLineEdit::textChanged, this, [this](const QString& text) {
         _neuralPythonPath = text.trimmed();
         writeSetting(QStringLiteral("neural_python_path"), _neuralPythonPath);
     });
 
-    connect(_neuralPythonBrowse, &QToolButton::clicked, this, [this]() {
+    connect(_neuralTracerPanel->pythonBrowse(), &QToolButton::clicked, this, [this]() {
         const QString initial = _neuralPythonPath.isEmpty() ? QDir::homePath() : QFileInfo(_neuralPythonPath).absolutePath();
         const QString file = QFileDialog::getOpenFileName(this, tr("Select Python executable"),
                                                           initial, tr("All Files (*)"));
         if (!file.isEmpty()) {
             _neuralPythonPath = file;
-            _neuralPythonEdit->setText(file);
+            _neuralTracerPanel->pythonEdit()->setText(file);
         }
     });
 
-    connect(_comboNeuralVolumeScale, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        _neuralVolumeScale = _comboNeuralVolumeScale->itemData(index).toInt();
+    connect(_neuralTracerPanel->volumeScaleCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _neuralVolumeScale = _neuralTracerPanel->volumeScaleCombo()->itemData(index).toInt();
         writeSetting(QStringLiteral("neural_volume_scale"), _neuralVolumeScale);
     });
 
-    connect(_spinNeuralBatchSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+    connect(_neuralTracerPanel->batchSizeSpin(), QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         _neuralBatchSize = value;
         writeSetting(QStringLiteral("neural_batch_size"), _neuralBatchSize);
     });
@@ -1179,30 +856,30 @@ void SegmentationWidget::buildUi()
     // Connect to service manager signals
     auto& serviceManager = NeuralTraceServiceManager::instance();
     connect(&serviceManager, &NeuralTraceServiceManager::statusMessage, this, [this](const QString& message) {
-        if (_lblNeuralTracerStatus) {
-            _lblNeuralTracerStatus->setText(message);
-            _lblNeuralTracerStatus->setVisible(true);
-            _lblNeuralTracerStatus->setStyleSheet(QString());
+        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
+            lbl->setText(message);
+            lbl->setVisible(true);
+            lbl->setStyleSheet(QString());
         }
         emit neuralTracerStatusMessage(message);
     });
     connect(&serviceManager, &NeuralTraceServiceManager::serviceStarted, this, [this]() {
-        if (_lblNeuralTracerStatus) {
-            _lblNeuralTracerStatus->setText(tr("Service running"));
-            _lblNeuralTracerStatus->setStyleSheet(QStringLiteral("color: #27ae60;"));
+        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
+            lbl->setText(tr("Service running"));
+            lbl->setStyleSheet(QStringLiteral("color: #27ae60;"));
         }
     });
     connect(&serviceManager, &NeuralTraceServiceManager::serviceStopped, this, [this]() {
-        if (_lblNeuralTracerStatus) {
-            _lblNeuralTracerStatus->setText(tr("Service stopped"));
-            _lblNeuralTracerStatus->setStyleSheet(QString());
+        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
+            lbl->setText(tr("Service stopped"));
+            lbl->setStyleSheet(QString());
         }
     });
     connect(&serviceManager, &NeuralTraceServiceManager::serviceError, this, [this](const QString& error) {
-        if (_lblNeuralTracerStatus) {
-            _lblNeuralTracerStatus->setText(tr("Error: %1").arg(error));
-            _lblNeuralTracerStatus->setStyleSheet(QStringLiteral("color: #c0392b;"));
-            _lblNeuralTracerStatus->setVisible(true);
+        if (auto* lbl = _neuralTracerPanel->statusLabel()) {
+            lbl->setText(tr("Error: %1").arg(error));
+            lbl->setStyleSheet(QStringLiteral("color: #c0392b;"));
+            lbl->setVisible(true);
         }
     });
 }
@@ -1433,36 +1110,36 @@ void SegmentationWidget::syncUiState()
     }
     refreshDirectionFieldList();
 
-    if (_directionFieldPathEdit) {
-        const QSignalBlocker blocker(_directionFieldPathEdit);
-        _directionFieldPathEdit->setText(_directionFieldPath);
+    if (auto* pathEdit = _directionFieldPanel->pathEdit()) {
+        const QSignalBlocker blocker(pathEdit);
+        pathEdit->setText(_directionFieldPath);
     }
-    if (_comboDirectionFieldOrientation) {
-        const QSignalBlocker blocker(_comboDirectionFieldOrientation);
-        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(_directionFieldOrientation));
+    if (auto* orientCombo = _directionFieldPanel->orientationCombo()) {
+        const QSignalBlocker blocker(orientCombo);
+        int idx = orientCombo->findData(static_cast<int>(_directionFieldOrientation));
         if (idx >= 0) {
-            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+            orientCombo->setCurrentIndex(idx);
         }
     }
-    if (_comboDirectionFieldScale) {
-        const QSignalBlocker blocker(_comboDirectionFieldScale);
-        int idx = _comboDirectionFieldScale->findData(_directionFieldScale);
+    if (auto* scaleCombo = _directionFieldPanel->scaleCombo()) {
+        const QSignalBlocker blocker(scaleCombo);
+        int idx = scaleCombo->findData(_directionFieldScale);
         if (idx >= 0) {
-            _comboDirectionFieldScale->setCurrentIndex(idx);
+            scaleCombo->setCurrentIndex(idx);
         }
     }
-    if (_spinDirectionFieldWeight) {
-        const QSignalBlocker blocker(_spinDirectionFieldWeight);
-        _spinDirectionFieldWeight->setValue(_directionFieldWeight);
+    if (auto* weightSpin = _directionFieldPanel->weightSpin()) {
+        const QSignalBlocker blocker(weightSpin);
+        weightSpin->setValue(_directionFieldWeight);
     }
 
-    if (_comboCorrections) {
-        const QSignalBlocker blocker(_comboCorrections);
-        _comboCorrections->setEnabled(_correctionsEnabled && !_growthInProgress && _comboCorrections->count() > 0);
+    if (auto* combo = _correctionsPanel->correctionsCombo()) {
+        const QSignalBlocker blocker(combo);
+        combo->setEnabled(_correctionsEnabled && !_growthInProgress && combo->count() > 0);
     }
-    if (_chkCorrectionsAnnotate) {
-        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-        _chkCorrectionsAnnotate->setChecked(_correctionsAnnotateChecked);
+    if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_correctionsAnnotateChecked);
     }
     if (QCheckBox* correctionsZRange = _growthPanel ? _growthPanel->correctionsZRangeCheck() : nullptr) {
         const QSignalBlocker blocker(correctionsZRange);
@@ -1515,67 +1192,68 @@ void SegmentationWidget::syncUiState()
     updateNormal3dUi();
 
     // Approval mask checkboxes
-    if (_chkShowApprovalMask) {
-        const QSignalBlocker blocker(_chkShowApprovalMask);
-        _chkShowApprovalMask->setChecked(_showApprovalMask);
+    if (auto* chk = _approvalMaskPanel->showCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_showApprovalMask);
     }
-    if (_chkEditApprovedMask) {
-        const QSignalBlocker blocker(_chkEditApprovedMask);
-        _chkEditApprovedMask->setChecked(_editApprovedMask);
+    if (auto* chk = _approvalMaskPanel->editApprovedCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_editApprovedMask);
         // Edit checkboxes only enabled when show is checked
-        _chkEditApprovedMask->setEnabled(_showApprovalMask);
+        chk->setEnabled(_showApprovalMask);
     }
-    if (_chkEditUnapprovedMask) {
-        const QSignalBlocker blocker(_chkEditUnapprovedMask);
-        _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
+    if (auto* chk = _approvalMaskPanel->editUnapprovedCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_editUnapprovedMask);
         // Edit checkboxes only enabled when show is checked
-        _chkEditUnapprovedMask->setEnabled(_showApprovalMask);
+        chk->setEnabled(_showApprovalMask);
     }
-    if (_chkAutoApproveEdits) {
-        const QSignalBlocker blocker(_chkAutoApproveEdits);
-        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    if (auto* chk = _approvalMaskPanel->autoApproveCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_autoApproveEdits);
     }
-    if (_sliderApprovalMaskOpacity) {
-        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
-        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    if (auto* slider = _approvalMaskPanel->opacitySlider()) {
+        const QSignalBlocker blocker(slider);
+        slider->setValue(_approvalMaskOpacity);
     }
-    if (_lblApprovalMaskOpacity) {
-        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    if (auto* lbl = _approvalMaskPanel->opacityLabel()) {
+        lbl->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
     }
 
     // Cell reoptimization UI state
-    if (_chkCellReoptMode) {
-        const QSignalBlocker blocker(_chkCellReoptMode);
-        _chkCellReoptMode->setChecked(_cellReoptMode);
+    if (auto* chk = _cellReoptPanel->modeCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_cellReoptMode);
         // Only enabled when approval mask is visible
-        _chkCellReoptMode->setEnabled(_showApprovalMask);
+        chk->setEnabled(_showApprovalMask);
     }
-    if (_spinCellReoptMaxSteps) {
-        const QSignalBlocker blocker(_spinCellReoptMaxSteps);
-        _spinCellReoptMaxSteps->setValue(_cellReoptMaxSteps);
-        _spinCellReoptMaxSteps->setEnabled(_cellReoptMode);
+    if (auto* spin = _cellReoptPanel->maxStepsSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(_cellReoptMaxSteps);
+        spin->setEnabled(_cellReoptMode);
     }
-    if (_spinCellReoptMaxPoints) {
-        const QSignalBlocker blocker(_spinCellReoptMaxPoints);
-        _spinCellReoptMaxPoints->setValue(_cellReoptMaxPoints);
-        _spinCellReoptMaxPoints->setEnabled(_cellReoptMode);
+    if (auto* spin = _cellReoptPanel->maxPointsSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(_cellReoptMaxPoints);
+        spin->setEnabled(_cellReoptMode);
     }
-    if (_spinCellReoptMinSpacing) {
-        const QSignalBlocker blocker(_spinCellReoptMinSpacing);
-        _spinCellReoptMinSpacing->setValue(static_cast<double>(_cellReoptMinSpacing));
-        _spinCellReoptMinSpacing->setEnabled(_cellReoptMode);
+    if (auto* spin = _cellReoptPanel->minSpacingSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(static_cast<double>(_cellReoptMinSpacing));
+        spin->setEnabled(_cellReoptMode);
     }
-    if (_spinCellReoptPerimeterOffset) {
-        const QSignalBlocker blocker(_spinCellReoptPerimeterOffset);
-        _spinCellReoptPerimeterOffset->setValue(static_cast<double>(_cellReoptPerimeterOffset));
-        _spinCellReoptPerimeterOffset->setEnabled(_cellReoptMode);
+    if (auto* spin = _cellReoptPanel->perimeterOffsetSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(static_cast<double>(_cellReoptPerimeterOffset));
+        spin->setEnabled(_cellReoptMode);
     }
-    if (_comboCellReoptCollection) {
-        _comboCellReoptCollection->setEnabled(_cellReoptMode);
+    if (auto* combo = _cellReoptPanel->collectionCombo()) {
+        combo->setEnabled(_cellReoptMode);
     }
-    if (_btnCellReoptRun) {
-        const bool hasCollection = _comboCellReoptCollection && _comboCellReoptCollection->count() > 0;
-        _btnCellReoptRun->setEnabled(_cellReoptMode && !_growthInProgress && hasCollection);
+    if (auto* btn = _cellReoptPanel->runButton()) {
+        auto* combo = _cellReoptPanel->collectionCombo();
+        const bool hasCollection = combo && combo->count() > 0;
+        btn->setEnabled(_cellReoptMode && !_growthInProgress && hasCollection);
     }
 
     updateGrowthUiState();
@@ -1869,38 +1547,38 @@ void SegmentationWidget::restoreSettings()
     if (_editingPanel->pushPullGroup()) {
         _editingPanel->pushPullGroup()->setExpanded(pushPullExpanded);
     }
-    if (_groupDirectionField) {
-        _groupDirectionField->setExpanded(directionExpanded);
+    if (auto* dirGroup = _directionFieldPanel->directionFieldGroup()) {
+        dirGroup->setExpanded(directionExpanded);
     }
 
     const bool neuralExpanded = settings.value(QStringLiteral("group_neural_tracer_expanded"), false).toBool();
-    if (_groupNeuralTracer) {
-        _groupNeuralTracer->setExpanded(neuralExpanded);
+    if (auto* neuralGroup = _neuralTracerPanel->neuralTracerGroup()) {
+        neuralGroup->setExpanded(neuralExpanded);
     }
 
     // Sync neural tracer UI
-    if (_chkNeuralTracerEnabled) {
-        const QSignalBlocker blocker(_chkNeuralTracerEnabled);
-        _chkNeuralTracerEnabled->setChecked(_neuralTracerEnabled);
+    if (auto* chk = _neuralTracerPanel->enabledCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_neuralTracerEnabled);
     }
-    if (_neuralCheckpointEdit) {
-        const QSignalBlocker blocker(_neuralCheckpointEdit);
-        _neuralCheckpointEdit->setText(_neuralCheckpointPath);
+    if (auto* edit = _neuralTracerPanel->checkpointEdit()) {
+        const QSignalBlocker blocker(edit);
+        edit->setText(_neuralCheckpointPath);
     }
-    if (_neuralPythonEdit) {
-        const QSignalBlocker blocker(_neuralPythonEdit);
-        _neuralPythonEdit->setText(_neuralPythonPath);
+    if (auto* edit = _neuralTracerPanel->pythonEdit()) {
+        const QSignalBlocker blocker(edit);
+        edit->setText(_neuralPythonPath);
     }
-    if (_comboNeuralVolumeScale) {
-        const QSignalBlocker blocker(_comboNeuralVolumeScale);
-        int idx = _comboNeuralVolumeScale->findData(_neuralVolumeScale);
+    if (auto* combo = _neuralTracerPanel->volumeScaleCombo()) {
+        const QSignalBlocker blocker(combo);
+        int idx = combo->findData(_neuralVolumeScale);
         if (idx >= 0) {
-            _comboNeuralVolumeScale->setCurrentIndex(idx);
+            combo->setCurrentIndex(idx);
         }
     }
-    if (_spinNeuralBatchSize) {
-        const QSignalBlocker blocker(_spinNeuralBatchSize);
-        _spinNeuralBatchSize->setValue(_neuralBatchSize);
+    if (auto* spin = _neuralTracerPanel->batchSizeSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(_neuralBatchSize);
     }
 
     settings.endGroup();
@@ -1957,9 +1635,9 @@ void SegmentationWidget::setShowApprovalMask(bool enabled)
         qInfo() << "  Emitting showApprovalMaskChanged signal";
         emit showApprovalMaskChanged(_showApprovalMask);
     }
-    if (_chkShowApprovalMask) {
-        const QSignalBlocker blocker(_chkShowApprovalMask);
-        _chkShowApprovalMask->setChecked(_showApprovalMask);
+    if (auto* chk = _approvalMaskPanel->showCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_showApprovalMask);
     }
     syncUiState();
 }
@@ -1982,9 +1660,9 @@ void SegmentationWidget::setEditApprovedMask(bool enabled)
         qInfo() << "  Emitting editApprovedMaskChanged signal";
         emit editApprovedMaskChanged(_editApprovedMask);
     }
-    if (_chkEditApprovedMask) {
-        const QSignalBlocker blocker(_chkEditApprovedMask);
-        _chkEditApprovedMask->setChecked(_editApprovedMask);
+    if (auto* chk = _approvalMaskPanel->editApprovedCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_editApprovedMask);
     }
     syncUiState();
 }
@@ -2007,9 +1685,9 @@ void SegmentationWidget::setEditUnapprovedMask(bool enabled)
         qInfo() << "  Emitting editUnapprovedMaskChanged signal";
         emit editUnapprovedMaskChanged(_editUnapprovedMask);
     }
-    if (_chkEditUnapprovedMask) {
-        const QSignalBlocker blocker(_chkEditUnapprovedMask);
-        _chkEditUnapprovedMask->setChecked(_editUnapprovedMask);
+    if (auto* chk = _approvalMaskPanel->editUnapprovedCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_editUnapprovedMask);
     }
     syncUiState();
 }
@@ -2025,9 +1703,9 @@ void SegmentationWidget::setAutoApproveEdits(bool enabled)
         writeSetting(QStringLiteral("approval_auto_approve_edits"), _autoApproveEdits);
         emit autoApproveEditsChanged(_autoApproveEdits);
     }
-    if (_chkAutoApproveEdits) {
-        const QSignalBlocker blocker(_chkAutoApproveEdits);
-        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+    if (auto* chk = _approvalMaskPanel->autoApproveCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_autoApproveEdits);
     }
 }
 
@@ -2042,9 +1720,9 @@ void SegmentationWidget::setApprovalBrushRadius(float radius)
         writeSetting(QStringLiteral("approval_brush_radius"), _approvalBrushRadius);
         emit approvalBrushRadiusChanged(_approvalBrushRadius);
     }
-    if (_spinApprovalBrushRadius) {
-        const QSignalBlocker blocker(_spinApprovalBrushRadius);
-        _spinApprovalBrushRadius->setValue(static_cast<double>(_approvalBrushRadius));
+    if (auto* spin = _approvalMaskPanel->brushRadiusSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(static_cast<double>(_approvalBrushRadius));
     }
 }
 
@@ -2059,9 +1737,9 @@ void SegmentationWidget::setApprovalBrushDepth(float depth)
         writeSetting(QStringLiteral("approval_brush_depth"), _approvalBrushDepth);
         emit approvalBrushDepthChanged(_approvalBrushDepth);
     }
-    if (_spinApprovalBrushDepth) {
-        const QSignalBlocker blocker(_spinApprovalBrushDepth);
-        _spinApprovalBrushDepth->setValue(static_cast<double>(_approvalBrushDepth));
+    if (auto* spin = _approvalMaskPanel->brushDepthSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(static_cast<double>(_approvalBrushDepth));
     }
 }
 
@@ -2076,12 +1754,12 @@ void SegmentationWidget::setApprovalMaskOpacity(int opacity)
         writeSetting(QStringLiteral("approval_mask_opacity"), _approvalMaskOpacity);
         emit approvalMaskOpacityChanged(_approvalMaskOpacity);
     }
-    if (_sliderApprovalMaskOpacity) {
-        const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
-        _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
+    if (auto* slider = _approvalMaskPanel->opacitySlider()) {
+        const QSignalBlocker blocker(slider);
+        slider->setValue(_approvalMaskOpacity);
     }
-    if (_lblApprovalMaskOpacity) {
-        _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    if (auto* lbl = _approvalMaskPanel->opacityLabel()) {
+        lbl->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
     }
 }
 
@@ -2095,8 +1773,8 @@ void SegmentationWidget::setApprovalBrushColor(const QColor& color)
         writeSetting(QStringLiteral("approval_brush_color"), _approvalBrushColor.name());
         emit approvalBrushColorChanged(_approvalBrushColor);
     }
-    if (_btnApprovalColor) {
-        _btnApprovalColor->setStyleSheet(
+    if (auto* btn = _approvalMaskPanel->colorButton()) {
+        btn->setStyleSheet(
             QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
 }
@@ -2112,32 +1790,33 @@ void SegmentationWidget::setCellReoptMode(bool enabled)
         writeSetting(QStringLiteral("cell_reopt_mode"), _cellReoptMode);
         emit cellReoptModeChanged(_cellReoptMode);
     }
-    if (_chkCellReoptMode) {
-        const QSignalBlocker blocker(_chkCellReoptMode);
-        _chkCellReoptMode->setChecked(_cellReoptMode);
+    if (auto* chk = _cellReoptPanel->modeCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(_cellReoptMode);
     }
     syncUiState();
 }
 
 void SegmentationWidget::setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections)
 {
-    if (!_comboCellReoptCollection) {
+    auto* combo = _cellReoptPanel->collectionCombo();
+    if (!combo) {
         return;
     }
 
     // Remember current selection
     uint64_t currentId = 0;
-    if (_comboCellReoptCollection->currentIndex() >= 0) {
-        currentId = _comboCellReoptCollection->currentData().toULongLong();
+    if (combo->currentIndex() >= 0) {
+        currentId = combo->currentData().toULongLong();
     }
 
-    const QSignalBlocker blocker(_comboCellReoptCollection);
-    _comboCellReoptCollection->clear();
+    const QSignalBlocker blocker(combo);
+    combo->clear();
 
     int indexToSelect = -1;
     for (int i = 0; i < collections.size(); ++i) {
         const auto& [id, name] = collections[i];
-        _comboCellReoptCollection->addItem(name, QVariant::fromValue(id));
+        combo->addItem(name, QVariant::fromValue(id));
         if (id == currentId) {
             indexToSelect = i;
         }
@@ -2145,9 +1824,9 @@ void SegmentationWidget::setCellReoptCollections(const QVector<QPair<uint64_t, Q
 
     // Restore selection if possible, otherwise select first item
     if (indexToSelect >= 0) {
-        _comboCellReoptCollection->setCurrentIndex(indexToSelect);
-    } else if (_comboCellReoptCollection->count() > 0) {
-        _comboCellReoptCollection->setCurrentIndex(0);
+        combo->setCurrentIndex(indexToSelect);
+    } else if (combo->count() > 0) {
+        combo->setCurrentIndex(0);
     }
 
     // Update run button state - need a collection selected to run
@@ -2580,9 +2259,9 @@ void SegmentationWidget::setCorrectionsEnabled(bool enabled)
     writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
     if (!enabled) {
         _correctionsAnnotateChecked = false;
-        if (_chkCorrectionsAnnotate) {
-            const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-            _chkCorrectionsAnnotate->setChecked(false);
+        if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
+            const QSignalBlocker blocker(chk);
+            chk->setChecked(false);
         }
     }
     updateGrowthUiState();
@@ -2591,9 +2270,9 @@ void SegmentationWidget::setCorrectionsEnabled(bool enabled)
 void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled)
 {
     _correctionsAnnotateChecked = enabled;
-    if (_chkCorrectionsAnnotate) {
-        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-        _chkCorrectionsAnnotate->setChecked(enabled);
+    if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(enabled);
     }
     updateGrowthUiState();
 }
@@ -2601,23 +2280,24 @@ void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled)
 void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                                   std::optional<uint64_t> activeId)
 {
-    if (!_comboCorrections) {
+    auto* combo = _correctionsPanel->correctionsCombo();
+    if (!combo) {
         return;
     }
-    const QSignalBlocker blocker(_comboCorrections);
-    _comboCorrections->clear();
+    const QSignalBlocker blocker(combo);
+    combo->clear();
     for (const auto& pair : collections) {
-        _comboCorrections->addItem(pair.second, QVariant::fromValue(static_cast<qulonglong>(pair.first)));
+        combo->addItem(pair.second, QVariant::fromValue(static_cast<qulonglong>(pair.first)));
     }
     if (activeId) {
-        int idx = _comboCorrections->findData(QVariant::fromValue(static_cast<qulonglong>(*activeId)));
+        int idx = combo->findData(QVariant::fromValue(static_cast<qulonglong>(*activeId)));
         if (idx >= 0) {
-            _comboCorrections->setCurrentIndex(idx);
+            combo->setCurrentIndex(idx);
         }
     } else {
-        _comboCorrections->setCurrentIndex(-1);
+        combo->setCurrentIndex(-1);
     }
-    _comboCorrections->setEnabled(_correctionsEnabled && !_growthInProgress && _comboCorrections->count() > 0);
+    combo->setEnabled(_correctionsEnabled && !_growthInProgress && combo->count() > 0);
 }
 
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const
@@ -2678,12 +2358,13 @@ SegmentationDirectionFieldConfig SegmentationWidget::buildDirectionFieldDraft() 
 
 void SegmentationWidget::refreshDirectionFieldList()
 {
-    if (!_directionFieldList) {
+    auto* list = _directionFieldPanel->listWidget();
+    if (!list) {
         return;
     }
-    const QSignalBlocker blocker(_directionFieldList);
-    const int previousRow = _directionFieldList->currentRow();
-    _directionFieldList->clear();
+    const QSignalBlocker blocker(list);
+    const int previousRow = list->currentRow();
+    list->clear();
 
     for (const auto& config : _directionFields) {
         QString orientationLabel = segmentationDirectionFieldOrientationKey(config.orientation);
@@ -2693,19 +2374,19 @@ void SegmentationWidget::refreshDirectionFieldList()
                                           orientationLabel,
                                           QString::number(std::clamp(config.scale, 0, 5)),
                                           weightText);
-        auto* item = new QListWidgetItem(itemText, _directionFieldList);
+        auto* item = new QListWidgetItem(itemText, list);
         item->setToolTip(config.path);
     }
 
     if (!_directionFields.empty()) {
         const int clampedRow = std::clamp(previousRow, 0, static_cast<int>(_directionFields.size()) - 1);
-        _directionFieldList->setCurrentRow(clampedRow);
+        list->setCurrentRow(clampedRow);
     }
-    if (_directionFieldRemoveButton) {
-        _directionFieldRemoveButton->setEnabled(_editingEnabled && !_directionFields.empty() && _directionFieldList->currentRow() >= 0);
+    if (auto* removeBtn = _directionFieldPanel->removeButton()) {
+        removeBtn->setEnabled(_editingEnabled && !_directionFields.empty() && list->currentRow() >= 0);
     }
 
-    updateDirectionFieldFormFromSelection(_directionFieldList->currentRow());
+    updateDirectionFieldFormFromSelection(list->currentRow());
     updateDirectionFieldListGeometry();
 }
 
@@ -2722,27 +2403,27 @@ void SegmentationWidget::updateDirectionFieldFormFromSelection(int row)
         _directionFieldWeight = config.weight;
     }
 
-    if (_directionFieldPathEdit) {
-        const QSignalBlocker blocker(_directionFieldPathEdit);
-        _directionFieldPathEdit->setText(_directionFieldPath);
+    if (auto* pathEdit = _directionFieldPanel->pathEdit()) {
+        const QSignalBlocker blocker(pathEdit);
+        pathEdit->setText(_directionFieldPath);
     }
-    if (_comboDirectionFieldOrientation) {
-        const QSignalBlocker blocker(_comboDirectionFieldOrientation);
-        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(_directionFieldOrientation));
+    if (auto* orientCombo = _directionFieldPanel->orientationCombo()) {
+        const QSignalBlocker blocker(orientCombo);
+        int idx = orientCombo->findData(static_cast<int>(_directionFieldOrientation));
         if (idx >= 0) {
-            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+            orientCombo->setCurrentIndex(idx);
         }
     }
-    if (_comboDirectionFieldScale) {
-        const QSignalBlocker blocker(_comboDirectionFieldScale);
-        int idx = _comboDirectionFieldScale->findData(_directionFieldScale);
+    if (auto* scaleCombo = _directionFieldPanel->scaleCombo()) {
+        const QSignalBlocker blocker(scaleCombo);
+        int idx = scaleCombo->findData(_directionFieldScale);
         if (idx >= 0) {
-            _comboDirectionFieldScale->setCurrentIndex(idx);
+            scaleCombo->setCurrentIndex(idx);
         }
     }
-    if (_spinDirectionFieldWeight) {
-        const QSignalBlocker blocker(_spinDirectionFieldWeight);
-        _spinDirectionFieldWeight->setValue(_directionFieldWeight);
+    if (auto* weightSpin = _directionFieldPanel->weightSpin()) {
+        const QSignalBlocker blocker(weightSpin);
+        weightSpin->setValue(_directionFieldWeight);
     }
 
     _updatingDirectionFieldForm = previousUpdating;
@@ -2774,10 +2455,11 @@ void SegmentationWidget::applyDirectionFieldDraftToSelection(int row)
 
 void SegmentationWidget::updateDirectionFieldListItem(int row)
 {
-    if (!_directionFieldList) {
+    auto* list = _directionFieldPanel->listWidget();
+    if (!list) {
         return;
     }
-    if (row < 0 || row >= _directionFieldList->count()) {
+    if (row < 0 || row >= list->count()) {
         return;
     }
     if (row >= static_cast<int>(_directionFields.size())) {
@@ -2793,7 +2475,7 @@ void SegmentationWidget::updateDirectionFieldListItem(int row)
                                       QString::number(std::clamp(config.scale, 0, 5)),
                                       weightText);
 
-    if (auto* item = _directionFieldList->item(row)) {
+    if (auto* item = list->item(row)) {
         item->setText(itemText);
         item->setToolTip(config.path);
     }
@@ -2801,43 +2483,44 @@ void SegmentationWidget::updateDirectionFieldListItem(int row)
 
 void SegmentationWidget::updateDirectionFieldListGeometry()
 {
-    if (!_directionFieldList) {
+    auto* list = _directionFieldPanel->listWidget();
+    if (!list) {
         return;
     }
 
-    auto policy = _directionFieldList->sizePolicy();
-    const int itemCount = _directionFieldList->count();
+    auto policy = list->sizePolicy();
+    const int itemCount = list->count();
 
     if (itemCount <= kCompactDirectionFieldRowLimit) {
-        const int sampleRowHeight = _directionFieldList->sizeHintForRow(0);
-        const int rowHeight = sampleRowHeight > 0 ? sampleRowHeight : _directionFieldList->fontMetrics().height() + 8;
+        const int sampleRowHeight = list->sizeHintForRow(0);
+        const int rowHeight = sampleRowHeight > 0 ? sampleRowHeight : list->fontMetrics().height() + 8;
         const int visibleRows = std::max(1, itemCount);
-        const int frameHeight = 2 * _directionFieldList->frameWidth();
-        const auto* hScroll = _directionFieldList->horizontalScrollBar();
+        const int frameHeight = 2 * list->frameWidth();
+        const auto* hScroll = list->horizontalScrollBar();
         const int scrollHeight = (hScroll && hScroll->isVisible()) ? hScroll->sizeHint().height() : 0;
         const int targetHeight = rowHeight * visibleRows + frameHeight + scrollHeight;
 
         policy.setVerticalPolicy(QSizePolicy::Fixed);
         policy.setVerticalStretch(0);
-        _directionFieldList->setSizePolicy(policy);
-        _directionFieldList->setMinimumHeight(targetHeight);
-        _directionFieldList->setMaximumHeight(targetHeight);
+        list->setSizePolicy(policy);
+        list->setMinimumHeight(targetHeight);
+        list->setMaximumHeight(targetHeight);
     } else {
         policy.setVerticalPolicy(QSizePolicy::Expanding);
         policy.setVerticalStretch(1);
-        _directionFieldList->setSizePolicy(policy);
-        _directionFieldList->setMinimumHeight(0);
-        _directionFieldList->setMaximumHeight(QWIDGETSIZE_MAX);
+        list->setSizePolicy(policy);
+        list->setMinimumHeight(0);
+        list->setMaximumHeight(QWIDGETSIZE_MAX);
     }
 
-    _directionFieldList->updateGeometry();
+    list->updateGeometry();
 }
 
 void SegmentationWidget::clearDirectionFieldForm()
 {
     // Clear the list selection
-    if (_directionFieldList) {
-        _directionFieldList->setCurrentRow(-1);
+    if (auto* list = _directionFieldPanel->listWidget()) {
+        list->setCurrentRow(-1);
     }
 
     // Reset member variables to defaults
@@ -2850,30 +2533,30 @@ void SegmentationWidget::clearDirectionFieldForm()
     const bool previousUpdating = _updatingDirectionFieldForm;
     _updatingDirectionFieldForm = true;
 
-    if (_directionFieldPathEdit) {
-        _directionFieldPathEdit->clear();
+    if (auto* pathEdit = _directionFieldPanel->pathEdit()) {
+        pathEdit->clear();
     }
-    if (_comboDirectionFieldOrientation) {
-        int idx = _comboDirectionFieldOrientation->findData(static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
+    if (auto* orientCombo = _directionFieldPanel->orientationCombo()) {
+        int idx = orientCombo->findData(static_cast<int>(SegmentationDirectionFieldOrientation::Normal));
         if (idx >= 0) {
-            _comboDirectionFieldOrientation->setCurrentIndex(idx);
+            orientCombo->setCurrentIndex(idx);
         }
     }
-    if (_comboDirectionFieldScale) {
-        int idx = _comboDirectionFieldScale->findData(0);
+    if (auto* scaleCombo = _directionFieldPanel->scaleCombo()) {
+        int idx = scaleCombo->findData(0);
         if (idx >= 0) {
-            _comboDirectionFieldScale->setCurrentIndex(idx);
+            scaleCombo->setCurrentIndex(idx);
         }
     }
-    if (_spinDirectionFieldWeight) {
-        _spinDirectionFieldWeight->setValue(1.0);
+    if (auto* weightSpin = _directionFieldPanel->weightSpin()) {
+        weightSpin->setValue(1.0);
     }
 
     _updatingDirectionFieldForm = previousUpdating;
 
     // Update button states
-    if (_directionFieldRemoveButton) {
-        _directionFieldRemoveButton->setEnabled(false);
+    if (auto* removeBtn = _directionFieldPanel->removeButton()) {
+        removeBtn->setEnabled(false);
     }
 }
 
@@ -2979,15 +2662,16 @@ void SegmentationWidget::updateGrowthUiState()
     if (QCheckBox* growthDirRight = _growthPanel ? _growthPanel->growthDirRightCheck() : nullptr) {
         growthDirRight->setEnabled(enableDirCheckbox);
     }
-    if (_directionFieldAddButton) {
-        _directionFieldAddButton->setEnabled(_editingEnabled);
+    if (auto* addBtn = _directionFieldPanel->addButton()) {
+        addBtn->setEnabled(_editingEnabled);
     }
-    if (_directionFieldRemoveButton) {
-        const bool hasSelection = _directionFieldList && _directionFieldList->currentRow() >= 0;
-        _directionFieldRemoveButton->setEnabled(_editingEnabled && hasSelection);
+    if (auto* removeBtn = _directionFieldPanel->removeButton()) {
+        auto* list = _directionFieldPanel->listWidget();
+        const bool hasSelection = list && list->currentRow() >= 0;
+        removeBtn->setEnabled(_editingEnabled && hasSelection);
     }
-    if (_directionFieldList) {
-        _directionFieldList->setEnabled(_editingEnabled);
+    if (auto* list = _directionFieldPanel->listWidget()) {
+        list->setEnabled(_editingEnabled);
     }
 
     const bool allowZRange = _editingEnabled && !_growthInProgress;
@@ -3005,18 +2689,18 @@ void SegmentationWidget::updateGrowthUiState()
     }
 
     const bool allowCorrections = _editingEnabled && _correctionsEnabled && !_growthInProgress;
-    if (_groupCorrections) {
-        _groupCorrections->setEnabled(allowCorrections);
+    if (auto* group = _correctionsPanel->correctionsGroup()) {
+        group->setEnabled(allowCorrections);
     }
-    if (_comboCorrections) {
-        const QSignalBlocker blocker(_comboCorrections);
-        _comboCorrections->setEnabled(allowCorrections && _comboCorrections->count() > 0);
+    if (auto* combo = _correctionsPanel->correctionsCombo()) {
+        const QSignalBlocker blocker(combo);
+        combo->setEnabled(allowCorrections && combo->count() > 0);
     }
-    if (_btnCorrectionsNew) {
-        _btnCorrectionsNew->setEnabled(_editingEnabled && !_growthInProgress);
+    if (auto* btn = _correctionsPanel->correctionsNewButton()) {
+        btn->setEnabled(_editingEnabled && !_growthInProgress);
     }
-    if (_chkCorrectionsAnnotate) {
-        _chkCorrectionsAnnotate->setEnabled(allowCorrections);
+    if (auto* chk = _correctionsPanel->correctionsAnnotateCheck()) {
+        chk->setEnabled(allowCorrections);
     }
 }
 
@@ -3063,9 +2747,9 @@ void SegmentationWidget::setNeuralTracerEnabled(bool enabled)
     _neuralTracerEnabled = enabled;
     writeSetting(QStringLiteral("neural_tracer_enabled"), _neuralTracerEnabled);
 
-    if (_chkNeuralTracerEnabled) {
-        const QSignalBlocker blocker(_chkNeuralTracerEnabled);
-        _chkNeuralTracerEnabled->setChecked(enabled);
+    if (auto* chk = _neuralTracerPanel->enabledCheck()) {
+        const QSignalBlocker blocker(chk);
+        chk->setChecked(enabled);
     }
 
     emit neuralTracerEnabledChanged(enabled);
@@ -3079,9 +2763,9 @@ void SegmentationWidget::setNeuralCheckpointPath(const QString& path)
     _neuralCheckpointPath = path;
     writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
 
-    if (_neuralCheckpointEdit) {
-        const QSignalBlocker blocker(_neuralCheckpointEdit);
-        _neuralCheckpointEdit->setText(path);
+    if (auto* edit = _neuralTracerPanel->checkpointEdit()) {
+        const QSignalBlocker blocker(edit);
+        edit->setText(path);
     }
 }
 
@@ -3093,9 +2777,9 @@ void SegmentationWidget::setNeuralPythonPath(const QString& path)
     _neuralPythonPath = path;
     writeSetting(QStringLiteral("neural_python_path"), _neuralPythonPath);
 
-    if (_neuralPythonEdit) {
-        const QSignalBlocker blocker(_neuralPythonEdit);
-        _neuralPythonEdit->setText(path);
+    if (auto* edit = _neuralTracerPanel->pythonEdit()) {
+        const QSignalBlocker blocker(edit);
+        edit->setText(path);
     }
 }
 
@@ -3108,11 +2792,11 @@ void SegmentationWidget::setNeuralVolumeScale(int scale)
     _neuralVolumeScale = scale;
     writeSetting(QStringLiteral("neural_volume_scale"), _neuralVolumeScale);
 
-    if (_comboNeuralVolumeScale) {
-        const QSignalBlocker blocker(_comboNeuralVolumeScale);
-        int idx = _comboNeuralVolumeScale->findData(scale);
+    if (auto* combo = _neuralTracerPanel->volumeScaleCombo()) {
+        const QSignalBlocker blocker(combo);
+        int idx = combo->findData(scale);
         if (idx >= 0) {
-            _comboNeuralVolumeScale->setCurrentIndex(idx);
+            combo->setCurrentIndex(idx);
         }
     }
 }
@@ -3126,9 +2810,9 @@ void SegmentationWidget::setNeuralBatchSize(int size)
     _neuralBatchSize = size;
     writeSetting(QStringLiteral("neural_batch_size"), _neuralBatchSize);
 
-    if (_spinNeuralBatchSize) {
-        const QSignalBlocker blocker(_spinNeuralBatchSize);
-        _spinNeuralBatchSize->setValue(size);
+    if (auto* spin = _neuralTracerPanel->batchSizeSpin()) {
+        const QSignalBlocker blocker(spin);
+        spin->setValue(size);
     }
 }
 

@@ -44,6 +44,18 @@ set(srcs
     segmentation/tools/SegmentationEditingPanel.hpp
     segmentation/tools/SegmentationGrowthPanel.cpp
     segmentation/tools/SegmentationGrowthPanel.hpp
+    segmentation/tools/SegmentationCorrectionsPanel.cpp
+    segmentation/tools/SegmentationCorrectionsPanel.hpp
+    segmentation/tools/SegmentationCustomParamsPanel.cpp
+    segmentation/tools/SegmentationCustomParamsPanel.hpp
+    segmentation/tools/SegmentationApprovalMaskPanel.cpp
+    segmentation/tools/SegmentationApprovalMaskPanel.hpp
+    segmentation/tools/SegmentationCellReoptPanel.cpp
+    segmentation/tools/SegmentationCellReoptPanel.hpp
+    segmentation/tools/SegmentationNeuralTracerPanel.cpp
+    segmentation/tools/SegmentationNeuralTracerPanel.hpp
+    segmentation/tools/SegmentationDirectionFieldPanel.cpp
+    segmentation/tools/SegmentationDirectionFieldPanel.hpp
     segmentation/SegmentationGrowth.cpp
     segmentation/ExtrapolationGrowth.cpp
     segmentation/ExtrapolationGrowth.hpp
