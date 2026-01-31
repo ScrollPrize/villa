@@ -142,6 +142,7 @@
     "save_every_epoch": true,
     "stitch_all_val": true,
     "stitch_train": true,
+    "stitch_train_every_n_epochs": 10,
     "stitch_downsample": 8,
     "train_segments": [
       "20250806145318",
