@@ -32,116 +32,55 @@ def _grid_segment_length_x_px(*, xy_px: torch.Tensor) -> torch.Tensor:
 def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (lm, mask) for gradient-magnitude period-sum loss.
 
-	- Uses `res.data_s.grad_mag` sampled at `res.xy_hr`.
-	- Groups the x-axis into `periods = Wm-1` periods (base-mesh winding intervals).
-	- For each (row,period), enforces that the distance-weighted sum of magnitudes is ~1.
+	This integrates `grad_mag` along the *connection* polyline (left→mid→right)
+	from [`FitResult.xy_conn`](model.py:51), i.e. along the observed normal.
 
 	Outputs:
-	- lm: (N,1,He,periods)
-	- mask: (N,1,He,periods) from MIN mask over each period interval.
+	- lm: (N,1,Hm,Wm)
+	- mask: (N,1,Hm,Wm) from MIN mask over (left,mid,right)
 	"""
-	mag_hr = res.data_s.grad_mag
-	mask_sample = res.mask_hr
-	m = float(res.data_s.downscale)
-	periods_int = max(1, int(res.xy_lr.shape[2]) - 1)
-	if int(mag_hr.shape[-1]) < periods_int:
-		base = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
-		mask0 = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
-		return base, mask0
+	xyc = res.xy_conn
+	if xyc.ndim != 5 or int(xyc.shape[-2]) != 3 or int(xyc.shape[-1]) != 2:
+		raise ValueError("xy_conn must be (N,Hm,Wm,3,2)")
 
-	dist_x_hr = _grid_segment_length_x_px(xy_px=res.xy_hr) * m
-	if dist_x_hr.shape[-2:] != mag_hr.shape[-2:]:
-		raise RuntimeError("dist_x_hr must match mag_hr spatial shape")
+	# Upsample the strip along both dimensions to match HR sampling density.
+	n, hm, wm, _k3, _c2 = (int(v) for v in xyc.shape)
+	he = int(res.xy_hr.shape[1])
+	we = int(res.xy_hr.shape[2])
+	xy_strip_lr = xyc.reshape(n, hm, wm * 3, 2)
+	xy_strip_lr_nchw = xy_strip_lr.permute(0, 3, 1, 2).contiguous()
+	xy_strip_hr_nchw = F.interpolate(xy_strip_lr_nchw, size=(he, int(we * 3)), mode="bilinear", align_corners=True)
+	xy_strip_hr = xy_strip_hr_nchw.permute(0, 2, 3, 1).contiguous()
 
-	ww = int(mag_hr.shape[-1])
-	samples_per = ww // periods_int
-	if samples_per <= 0:
-		base = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
-		mask0 = torch.zeros((), device=mag_hr.device, dtype=mag_hr.dtype)
-		return base, mask0
-	max_cols = samples_per * periods_int
+	mag_flat = res.data.grid_sample_px(xy_px=xy_strip_hr).grad_mag
+	mag3 = mag_flat.view(n, 1, he, we, 3)
+	mag_l = mag3[..., 0]
+	mag_m = mag3[..., 1]
+	mag_r = mag3[..., 2]
 
-	mag_use = mag_hr
-	if mask_sample is not None and mask_sample.shape[-2:] == mag_hr.shape[-2:]:
-		mag_use = mag_use * mask_sample
+	xy3 = xy_strip_hr.view(n, he, we, 3, 2)
+	left = xy3[..., 0, :]
+	mid = xy3[..., 1, :]
+	right = xy3[..., 2, :]
 
-	# Apply direction sign: use LR mesh geometry to determine winding orientation.
-	#
-	# We compute a single sign per (row,period) (where period is one LR x-segment),
-	# and apply it uniformly to all HR samples belonging to that period.
-	xy_lr = res.xy_lr
-	if int(xy_lr.shape[1]) >= 2 and int(xy_lr.shape[2]) >= 2:
-		md = xy_lr.new_zeros(xy_lr.shape)
-		if int(xy_lr.shape[1]) >= 3:
-			md[:, 1:-1, :, :] = xy_lr[:, 2:, :, :] - xy_lr[:, :-2, :, :]
-			md[:, 0, :, :] = xy_lr[:, 1, :, :] - xy_lr[:, 0, :, :]
-			md[:, -1, :, :] = xy_lr[:, -1, :, :] - xy_lr[:, -2, :, :]
-		else:
-			md[:, 0, :, :] = xy_lr[:, 1, :, :] - xy_lr[:, 0, :, :]
-			md[:, 1, :, :] = md[:, 0, :, :]
+	dl = left - mid
+	dr = right - mid
+	eps = 1e-12
+	len_lm = torch.sqrt((dl * dl).sum(dim=-1) + eps) * float(res.data.downscale)
+	len_mr = torch.sqrt((dr * dr).sum(dim=-1) + eps) * float(res.data.downscale)
 
-		xyc = res.xy_conn
-		left = xyc[..., 0, :]
-		mid = xyc[..., 1, :]
-		right = xyc[..., 2, :]
-		v_l = left - mid
-		v_r = right - mid
+	# Trapezoidal rule along the two segments.
+	integ = 0.5 * (mag_l + mag_m) * len_lm + 0.5 * (mag_m + mag_r) * len_mr
+	# Conn strip integrates two segments (left-mid & mid-right). Empirically this
+	# corresponds to ~2x the intended per-period integral, so target half.
+	lm = (integ - 0.5) * (integ - 0.5)
 
-		mdx = md[..., 0]
-		mdy = md[..., 1]
-		cross_r = mdx * v_r[..., 1] - mdy * v_r[..., 0]
-		cross_l = mdx * v_l[..., 1] - mdy * v_l[..., 0]
-		ok = (cross_r > 0.0) & (cross_l < 0.0)
 
-		# period sign from the right vertex of each LR segment (col 1..Wm-1)
-		ok_period_lr = ok[:, :, 1:]
-		one = torch.ones_like(ok_period_lr, dtype=mag_hr.dtype)
-		sign_period_lr = torch.where(ok_period_lr, -one, one)
-		w_period_lr = torch.where(ok_period_lr, one, 10.0 * one)
-		sign_period_lr = sign_period_lr.unsqueeze(1)
-		w_period_lr = w_period_lr.unsqueeze(1)
-		sign_period_hr = F.interpolate(sign_period_lr, size=(int(mag_hr.shape[-2]), int(sign_period_lr.shape[-1])), mode="nearest")
-		w_period_hr = F.interpolate(w_period_lr, size=(int(mag_hr.shape[-2]), int(w_period_lr.shape[-1])), mode="nearest")
-
-		# expand periods to HR columns
-		sign_hr = sign_period_hr.repeat_interleave(samples_per, dim=-1)
-		w_hr = w_period_hr.repeat_interleave(samples_per, dim=-1)
-		if int(sign_hr.shape[-1]) < int(mag_hr.shape[-1]):
-			pad = int(mag_hr.shape[-1]) - int(sign_hr.shape[-1])
-			sign_hr = torch.cat([sign_hr, sign_hr[..., -1:].expand(*sign_hr.shape[:-1], pad)], dim=-1)
-			w_hr = torch.cat([w_hr, w_hr[..., -1:].expand(*w_hr.shape[:-1], pad)], dim=-1)
-		elif int(sign_hr.shape[-1]) > int(mag_hr.shape[-1]):
-			sign_hr = sign_hr[..., : int(mag_hr.shape[-1])]
-			w_hr = w_hr[..., : int(mag_hr.shape[-1])]
-		mag_use = mag_use * sign_hr
-
-	weighted = (mag_use[:, :, :, :max_cols] * dist_x_hr[:, :, :, :max_cols]).view(
-		int(mag_hr.shape[0]),
-		1,
-		int(mag_hr.shape[-2]),
-		periods_int,
-		samples_per,
-	)
-	sum_period = weighted.sum(dim=-1)
-	lm = (sum_period - 1.0) * (sum_period - 1.0)
-	if int(xy_lr.shape[1]) >= 2 and int(xy_lr.shape[2]) >= 2:
-		w_period = w_period_hr
-		if w_period.shape[-2:] != lm.shape[-2:]:
-			w_period = w_period.expand_as(lm)
-		lm = lm * w_period
-
-	if mask_sample is None or mask_sample.shape[-2:] != mag_hr.shape[-2:]:
-		mask = torch.ones_like(lm)
-		return lm, mask
-
-	mask_reshaped = mask_sample[:, :, :, :max_cols].view(
-		int(mag_hr.shape[0]),
-		1,
-		int(mag_hr.shape[-2]),
-		periods_int,
-		samples_per,
-	)
-	mask, _ = mask_reshaped.min(dim=-1)
+	mc_lr = res.mask_conn
+	mc_strip_lr = mc_lr.reshape(n, 1, hm, wm * 3)
+	mc_strip_hr = F.interpolate(mc_strip_lr, size=(he, int(we * 3)), mode="nearest")
+	mc3 = mc_strip_hr.view(n, 1, he, we, 3)
+	mask = torch.minimum(torch.minimum(mc3[..., 0], mc3[..., 1]), mc3[..., 2])
 	return lm, mask
 
 

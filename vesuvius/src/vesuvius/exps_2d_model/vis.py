@@ -459,7 +459,9 @@ def save(
 	_save_img_loss_vis()
 
 	for _k, spec in loss_maps.items():
-		m = spec["fn"]().detach().cpu()
+		mt0 = spec["fn"]().detach()
+		print(f"loss_map {spec['suffix']}: shape={tuple(mt0.shape)}")
+		m = mt0.cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
 			m = m[0, 0]
 		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
@@ -467,7 +469,6 @@ def save(
 
 	# One horizontally-concatenated float tif for quick inspection.
 	loss_2d: list[tuple[str, np.ndarray]] = []
-	gradmag_2d: np.ndarray | None = None
 	for _k, spec in loss_maps.items():
 		m = spec["fn"]().detach().cpu()
 		if m.ndim == 4:
@@ -477,37 +478,13 @@ def save(
 		else:
 			continue
 		name = str(spec["suffix"])
-		if name == "gradmag":
-			gradmag_2d = m2
-			continue
 		loss_2d.append((name, m2))
-	if gradmag_2d is not None:
-		max_h = 1
-		for _name, arr in loss_2d:
-			max_h = max(max_h, int(arr.shape[0]))
-		gradmag_w = int(gradmag_2d.shape[1])
-		loss_2d.insert(2, ("gradmag", np.full((int(max_h), gradmag_w), 0.5, dtype="float32")))
 	# Float tif with a top label band (label pixels are visual-only floats in [0,1]).
 	concat_f = _loss_concat_vis(loss_maps_2d=loss_2d, border_px=6, label_px=16)
 	concat_f = np.repeat(np.repeat(concat_f, 8, axis=0), 8, axis=1)
 	label_h = max(1, 16 // 2)
 	border = 6
 	s = 8
-
-	# Paste gradmag after resize, scaling in height to match the other (full-res) maps.
-	if gradmag_2d is not None:
-		tgt_h = int(max_h) * s
-		x = 0
-		for i, (name, m) in enumerate(loss_2d):
-			if name == "gradmag":
-				w = int(m.shape[1])
-				gm = gradmag_2d
-				gm_resized = cv2.resize(gm, (int(w) * s, tgt_h), interpolation=cv2.INTER_NEAREST)
-				concat_f[label_h * s:label_h * s + tgt_h, int(x) * s:int(x) * s + int(w) * s] = gm_resized.astype("float32", copy=False)
-				break
-			x += int(m.shape[1])
-			if border > 0 and i + 1 < len(loss_2d):
-				x += border
 
 	lab_u8 = np.full((label_h * s, int(concat_f.shape[1])), 128, dtype="uint8")
 	x = 0
