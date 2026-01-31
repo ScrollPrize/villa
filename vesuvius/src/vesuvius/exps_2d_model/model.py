@@ -27,6 +27,7 @@ class FitResult:
 	_xy_lr: torch.Tensor
 	_xy_hr: torch.Tensor
 	_xy_conn: torch.Tensor
+	_data: fit_data.FitData
 	_data_s: fit_data.FitData
 	_target_plain: torch.Tensor
 	_target_mod: torch.Tensor
@@ -51,6 +52,10 @@ class FitResult:
 	@property
 	def xy_conn(self) -> torch.Tensor:
 		return self._xy_conn
+
+	@property
+	def data(self) -> fit_data.FitData:
+		return self._data
 
 	@property
 	def data_s(self) -> fit_data.FitData:
@@ -187,6 +192,7 @@ class Model2D(nn.Module):
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
 			_xy_conn=xy_conn,
+			_data=data,
 			_data_s=data_s,
 			_target_plain=target_plain,
 			_target_mod=target_mod,

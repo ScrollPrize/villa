@@ -1,19 +1,19 @@
 {
 	"base": {
-		"dir_v": 100.0,
-		"dir_conn": 0.1,
+		"dir_v": 1.0,
+		"dir_conn": 1.0,
 		"step": 0.1,
 		"smooth_x": 0.0,
 		"smooth_y": 0.01,
 		"contr": 0.1,
-		"gradmag": 1.0,
+		"gradmag": 10.0,
 		"mean_pos": 0.0,
 		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
 		"conn_sy_r": 0.0,
 		"angle": 0.001,
 		"y_straight": 0.0,
-		"data": 2.0,
+		"data": 4.0,
 		"data_plain": 2.0,
 		"data_grad": 0.0
 	},
