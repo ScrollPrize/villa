@@ -432,7 +432,7 @@ def parse_args():
     parser.add_argument("--segment-idx", type=int, default=0)
     parser.add_argument("--crop-size", type=int, nargs=3, default=[128, 128, 128])
     parser.add_argument("--no-full-resolution", dest="full_resolution", action="store_false")
-    parser.add_argument("--window-pad", type=int, default=4)
+    parser.add_argument("--window-pad", type=int, default=10)
     parser.add_argument("--no-extrapolation", dest="use_extrapolation", action="store_false")
     parser.add_argument("--no-extrapolate-outside", dest="extrapolate_outside", action="store_false")
     parser.add_argument("--no-visualize-full-seg", dest="visualize_full_seg", action="store_false")
