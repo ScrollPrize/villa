@@ -388,7 +388,15 @@ class StitchManager:
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             if isinstance(model.logger, WandbLogger):
-                model.logger.log_image(key="masks", images=images, caption=captions)
+                step = None
+                try:
+                    step = int(getattr(model.trainer, "global_step", 0))
+                except Exception:
+                    step = None
+                if step is None:
+                    model.logger.log_image(key="masks", images=images, caption=captions)
+                else:
+                    model.logger.log_image(key="masks", images=images, caption=captions, step=step)
 
         # reset stitch buffers
         for pred_buf, count_buf in self.buffers.values():
