@@ -40,5 +40,7 @@ command:
   - --stitch_train
   - --stitch_downsample
   - "8"
+  - --wandb_group
+  - split_1
   - --wandb_tags
-  - ink-2um,erm,hparam_sweep,group_balanced,accum1
+  - ink-2um,erm,hparam_sweep,group_balanced,accum1,split_1
