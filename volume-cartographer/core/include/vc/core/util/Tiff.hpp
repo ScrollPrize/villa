@@ -6,16 +6,18 @@
 #include <cstdint>
 #include <tiffio.h>
 
-// Write single-channel image (8U, 16U, 32F) as tiled TIFF with LZW compression
+// Write single-channel image (8U, 16U, 32F) as tiled TIFF
 // cvType: output type (-1 = same as input). If different, values are scaled:
 //         8U↔16U: scale by 257, 8U↔32F: scale by 1/255, 16U↔32F: scale by 1/65535
+// compression: libtiff compression constant (e.g. COMPRESSION_LZW, COMPRESSION_PACKBITS)
 // padValue: value for padding partial tiles (default -1.0f, used for float; int types use 0)
 void writeTiff(const std::filesystem::path& outPath,
                const cv::Mat& img,
                int cvType = -1,
                uint32_t tileW = 1024,
                uint32_t tileH = 1024,
-               float padValue = -1.0f);
+               float padValue = -1.0f,
+               uint16_t compression = COMPRESSION_LZW);
 
 // Class for incremental tiled TIFF writing
 // Useful for writing tiles in parallel or from streaming data
@@ -29,7 +31,8 @@ public:
                int cvType,
                uint32_t tileW = 1024,
                uint32_t tileH = 1024,
-               float padValue = -1.0f);
+               float padValue = -1.0f,
+               uint16_t compression = COMPRESSION_LZW);
 
     ~TiffWriter();
 

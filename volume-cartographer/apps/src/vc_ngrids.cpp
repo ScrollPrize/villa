@@ -27,8 +27,7 @@
 #include "z5/multiarray/xtensor_access.hxx"
 #include "z5/filesystem/handle.hxx"
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xadapt.hpp)
+#include <xtensor/containers/xadapt.hpp>
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;

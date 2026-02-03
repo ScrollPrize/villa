@@ -13,8 +13,7 @@
 #include <opencv2/ximgproc.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xtensor.hpp)
+#include <xtensor/containers/xtensor.hpp>
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 

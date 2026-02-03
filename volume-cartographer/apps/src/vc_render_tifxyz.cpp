@@ -20,6 +20,10 @@
 #include <cmath>
 #include <set>
 #include <cctype>
+#include <chrono>
+#include <thread>
+#include <tiffio.h>
+#include <omp.h>
 
 namespace po = boost::program_options;
 
@@ -30,7 +34,7 @@ using json = nlohmann::json;
  */
 struct AffineTransform {
     cv::Mat_<double> matrix;  // 4x4 matrix in XYZ format
-    
+
     AffineTransform() {
         matrix = cv::Mat_<double>::eye(4, 4);
     }
@@ -70,22 +74,22 @@ static inline bool invertAffineInPlace(AffineTransform& T)
 
 /**
  * @brief Load affine transform from file (JSON)
- * 
+ *
  * @param filename Path to affine transform file
  * @return AffineTransform Loaded transform data
  */
 AffineTransform loadAffineTransform(const std::string& filename) {
     AffineTransform transform;
-    
+
     std::ifstream file(filename);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open affine transform file: " + filename);
     }
-    
+
     try {
         json j;
         file >> j;
-        
+
         if (j.contains("transformation_matrix")) {
             auto mat = j["transformation_matrix"];
             if (mat.size() != 3 && mat.size() != 4) {
@@ -173,7 +177,7 @@ static inline std::pair<std::string, bool> parseAffineSpec(const std::string& sp
 
 /**
  * @brief Apply affine transform to a single point
- * 
+ *
  * @param point Point to transform
  * @param transform Affine transform to apply
  * @return cv::Vec3f Transformed point
@@ -182,12 +186,12 @@ cv::Vec3f applyAffineTransformToPoint(const cv::Vec3f& point, const AffineTransf
     const double ptx = static_cast<double>(point[0]);
     const double pty = static_cast<double>(point[1]);
     const double ptz = static_cast<double>(point[2]);
-    
+
     // Apply affine transform (note: matrix is in XYZ format)
     const double ptx_new = transform.matrix(0, 0) * ptx + transform.matrix(0, 1) * pty + transform.matrix(0, 2) * ptz + transform.matrix(0, 3);
     const double pty_new = transform.matrix(1, 0) * ptx + transform.matrix(1, 1) * pty + transform.matrix(1, 2) * ptz + transform.matrix(1, 3);
     const double ptz_new = transform.matrix(2, 0) * ptx + transform.matrix(2, 1) * pty + transform.matrix(2, 2) * ptz + transform.matrix(2, 3);
-    
+
     return cv::Vec3f(
         static_cast<float>(ptx_new),
         static_cast<float>(pty_new),
@@ -196,13 +200,13 @@ cv::Vec3f applyAffineTransformToPoint(const cv::Vec3f& point, const AffineTransf
 
 /**
  * @brief Apply affine transform to points and normals
- * 
+ *
  * @param points Points to transform (modified in-place)
  * @param normals Normals to transform (modified in-place)
  * @param transform Affine transform to apply
  */
-void applyAffineTransform(cv::Mat_<cv::Vec3f>& points, 
-                         cv::Mat_<cv::Vec3f>& normals, 
+void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
+                         cv::Mat_<cv::Vec3f>& normals,
                          const AffineTransform& transform) {
     // Precompute linear part A and its inverse-transpose for proper normal transform
     const cv::Matx33d A(
@@ -217,7 +221,7 @@ void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
     for (int y = 0; y < points.rows; y++) {
         for (int x = 0; x < points.cols; x++) {
             cv::Vec3f& pt = points(y, x);
-            
+
             // Skip NaN points
             if (std::isnan(pt[0]) || std::isnan(pt[1]) || std::isnan(pt[2])) {
                 continue;
@@ -226,7 +230,7 @@ void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
             pt = applyAffineTransformToPoint(pt, transform);
         }
     }
-    
+
     // Apply correct normal transform: n' ∝ (A^{-1})^T * n (then normalize)
     for (int y = 0; y < normals.rows; y++) {
         for (int x = 0; x < normals.cols; x++) {
@@ -664,6 +668,8 @@ static inline void renderAccumulatedSlice(
 
 int main(int argc, char *argv[])
 {
+    //kmp_set_blocktime(0);
+
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
@@ -703,6 +709,8 @@ int main(int argc, char *argv[])
             "Crop region width (0 = no crop)")
         ("crop-height", po::value<int>()->default_value(0),
             "Crop region height (0 = no crop)")
+        ("auto-crop", po::bool_switch()->default_value(false),
+            "Automatically crop to bounding box of valid surface points")
         // Multi-affine interface (preferred):
         ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(),
             "One or more affine JSON files, in application order (first listed applies first). "
@@ -728,7 +736,19 @@ int main(int argc, char *argv[])
         ("flatten-iterations", po::value<int>()->default_value(10),
             "Maximum ABF++ iterations when --flatten is enabled")
         ("flatten-downsample", po::value<int>()->default_value(1),
-            "Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality");
+            "Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality")
+        ("num-parts", po::value<int>()->default_value(1),
+            "Number of parts to split processing into (for multi-VM runs)")
+        ("part-id", po::value<int>()->default_value(0),
+            "Part ID to process, 0-indexed (for multi-VM runs)")
+        ("merge-parts", po::bool_switch()->default_value(false),
+            "Merge partial TIFF files (*.partN.tif) into final TIFFs. "
+            "Run after all parts have completed. Requires --num-parts.")
+        ("finalize", po::bool_switch()->default_value(false),
+            "Build pyramid levels and write attrs for a zarr whose L0 tiles are already complete "
+            "(run after all multi-part jobs finish)")
+        ("barrier-timeout", po::value<int>()->default_value(300),
+            "Timeout in seconds for slave parts waiting for master (part 0) to create the zarr (default 300)");
     // clang-format on
 
     po::options_description all("Usage");
@@ -743,12 +763,135 @@ int main(int argc, char *argv[])
             std::cout << all << '\n';
             return EXIT_SUCCESS;
         }
-        
+
         po::notify(parsed);
     } catch (po::error& e) {
         std::cerr << "Error: " << e.what() << '\n';
         std::cerr << "Use --help for usage information\n";
         return EXIT_FAILURE;
+    }
+
+    const int numParts = parsed["num-parts"].as<int>();
+    const int partId = parsed["part-id"].as<int>();
+    if (numParts < 1 || partId < 0 || partId >= numParts) {
+        std::cerr << "Error: need 0 <= part-id < num-parts, got part-id=" << partId << " num-parts=" << numParts << "\n";
+        return EXIT_FAILURE;
+    }
+    const bool mergeParts = parsed["merge-parts"].as<bool>();
+    const int barrierTimeout = parsed["barrier-timeout"].as<int>();
+    if (numParts > 1) {
+        std::cout << "Multi-part mode: part " << partId << " of " << numParts << std::endl;
+    }
+
+    const bool finalize_flag = parsed["finalize"].as<bool>();
+
+    // --merge-parts or --finalize for TIFFs: combine *.partN.tif files into final TIFFs, then exit
+    // (--finalize for zarr goes through the normal path and builds the pyramid there)
+    const bool outputIsZarr = std::filesystem::path(parsed["output"].as<std::string>()).extension() == ".zarr";
+    if (mergeParts || (finalize_flag && numParts >= 2 && !outputIsZarr)) {
+        if (numParts < 2) {
+            std::cerr << "Error: --merge-parts requires --num-parts >= 2\n";
+            return EXIT_FAILURE;
+        }
+        // Discover part files by scanning for *.part0.tif pattern in output dir
+        std::filesystem::path outArg = parsed["output"].as<std::string>();
+        std::filesystem::path outDir = outArg;
+        if (!std::filesystem::is_directory(outDir)) outDir = outDir.parent_path();
+        if (outDir.empty()) outDir = ".";
+
+        // Find all unique base names: foo.part0.tif -> foo.tif
+        std::map<std::filesystem::path, std::vector<std::filesystem::path>> groups;
+        for (auto& entry : std::filesystem::directory_iterator(outDir)) {
+            std::string fname = entry.path().filename().string();
+            // Match *.part0.tif through *.part{N-1}.tif
+            auto pos = fname.find(".part");
+            if (pos == std::string::npos) continue;
+            auto dotTif = fname.find(".tif", pos);
+            if (dotTif == std::string::npos) continue;
+            std::string baseName = fname.substr(0, pos) + ".tif";
+            std::filesystem::path finalPath = outDir / baseName;
+            groups[finalPath].push_back(entry.path());
+        }
+
+        if (groups.empty()) {
+            std::cerr << "No .partN.tif files found in " << outDir << "\n";
+            return EXIT_FAILURE;
+        }
+
+        std::cout << "Merging " << groups.size() << " TIFF(s) from " << numParts << " parts..." << std::endl;
+        for (auto& [finalPath, partFiles] : groups) {
+            std::sort(partFiles.begin(), partFiles.end());
+            // Open first part to get dimensions and tile info
+            TIFF* first = TIFFOpen(partFiles[0].c_str(), "r");
+            if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; continue; }
+            uint32_t w, h, tw, th;
+            uint16_t bps, spp, sf, comp;
+            TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w);
+            TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h);
+            TIFFGetField(first, TIFFTAG_TILEWIDTH, &tw);
+            TIFFGetField(first, TIFFTAG_TILELENGTH, &th);
+            TIFFGetField(first, TIFFTAG_BITSPERSAMPLE, &bps);
+            TIFFGetField(first, TIFFTAG_SAMPLESPERPIXEL, &spp);
+            TIFFGetField(first, TIFFTAG_SAMPLEFORMAT, &sf);
+            TIFFGetField(first, TIFFTAG_COMPRESSION, &comp);
+            TIFFClose(first);
+
+            // Create output
+            TIFF* out = TIFFOpen(finalPath.c_str(), "w");
+            if (!out) { std::cerr << "Cannot create " << finalPath << "\n"; continue; }
+            TIFFSetField(out, TIFFTAG_IMAGEWIDTH, w);
+            TIFFSetField(out, TIFFTAG_IMAGELENGTH, h);
+            TIFFSetField(out, TIFFTAG_TILEWIDTH, tw);
+            TIFFSetField(out, TIFFTAG_TILELENGTH, th);
+            TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, bps);
+            TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, spp);
+            TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, sf);
+            TIFFSetField(out, TIFFTAG_COMPRESSION, comp);
+            TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+
+            tmsize_t tileSizeBytes = TIFFTileSize(out);
+            std::vector<uint8_t> buf(static_cast<size_t>(tileSizeBytes), 0);
+            std::vector<uint8_t> zeroBuf(static_cast<size_t>(tileSizeBytes), 0);
+
+            // For each tile position, find the part that has non-zero data
+            uint32_t tilesX = (w + tw - 1) / tw;
+            uint32_t tilesY = (h + th - 1) / th;
+            size_t tilesMerged = 0;
+            for (uint32_t ty = 0; ty < tilesY; ty++) {
+                for (uint32_t tx = 0; tx < tilesX; tx++) {
+                    bool found = false;
+                    for (auto& pf : partFiles) {
+                        TIFF* pt = TIFFOpen(pf.c_str(), "r");
+                        if (!pt) continue;
+                        ttile_t ti = TIFFComputeTile(pt, tx * tw, ty * th, 0, 0);
+                        tmsize_t r = TIFFReadEncodedTile(pt, ti, buf.data(), tileSizeBytes);
+                        TIFFClose(pt);
+                        if (r > 0 && buf != zeroBuf) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    ttile_t outTi = TIFFComputeTile(out, tx * tw, ty * th, 0, 0);
+                    if (found) {
+                        TIFFWriteEncodedTile(out, outTi, buf.data(), tileSizeBytes);
+                        tilesMerged++;
+                    } else {
+                        TIFFWriteEncodedTile(out, outTi, zeroBuf.data(), tileSizeBytes);
+                    }
+                }
+            }
+            TIFFWriteDirectory(out);
+            TIFFClose(out);
+
+            // Delete part files
+            for (auto& pf : partFiles)
+                std::filesystem::remove(pf);
+
+            std::cout << "  " << finalPath.filename().string() << ": merged " << tilesMerged
+                      << " tiles from " << partFiles.size() << " parts" << std::endl;
+        }
+        std::cout << "Merge complete." << std::endl;
+        return EXIT_SUCCESS;
     }
 
     std::filesystem::path vol_path = parsed["volume"].as<std::string>();
@@ -842,7 +985,7 @@ int main(int argc, char *argv[])
 
     AffineTransform affineTransform;
     bool hasAffine = false;
-    
+
     // --- New multi-affine loading & composition ---
     std::vector<std::pair<std::string,bool>> affineSpecs; // (path, invert?)
     if (parsed.count("affine") > 0) {
@@ -902,7 +1045,7 @@ int main(int argc, char *argv[])
         affineTransform = composed;
         printMat4x4(affineTransform.matrix, "Final composed affine (applied to points first):");
     }
-    
+
     z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
     z5::filesystem::handle::Dataset ds_handle(group, std::to_string(group_idx), json::parse(std::ifstream(vol_path/std::to_string(group_idx)/".zarray")).value<std::string>("dimension_separator","."));
     std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
@@ -1001,7 +1144,19 @@ int main(int argc, char *argv[])
         for(int i=0;i<raw_points->cols;i++)
             if ((*raw_points)(j,i)[0] == -1)
                 (*raw_points)(j,i) = {NAN,NAN,NAN};
-    
+
+    // Compute bounding box of valid (non-NaN) surface points in raw grid coords
+    int raw_col_min = raw_points->cols, raw_col_max = -1;
+    int raw_row_min = raw_points->rows, raw_row_max = -1;
+    for (int j = 0; j < raw_points->rows; j++)
+        for (int i = 0; i < raw_points->cols; i++)
+            if (std::isfinite((*raw_points)(j,i)[0])) {
+                if (i < raw_col_min) raw_col_min = i;
+                if (i > raw_col_max) raw_col_max = i;
+                if (j < raw_row_min) raw_row_min = j;
+                if (j > raw_row_max) raw_row_max = j;
+            }
+
     cv::Size full_size = raw_points->size();
 
     // Interpret --scale as Pg = pixels per level-g voxel.
@@ -1031,23 +1186,47 @@ int main(int argc, char *argv[])
         full_size.width  = std::max(1, static_cast<int>(std::lround(full_size.width  * sx)));
         full_size.height = std::max(1, static_cast<int>(std::lround(full_size.height * sy)));
     }
-    
+
     // The uncropped, scaled canvas:
     cv::Size tgt_size = full_size;
     // 'crop' is expressed in the *uncropped* canvas coordinate system
     cv::Rect crop = {0, 0, full_size.width, full_size.height};
-    
+    const cv::Rect canvasROI{0, 0, full_size.width, full_size.height};
+
     std::cout << "downsample level " << group_idx
               << " (ds_scale=" << ds_scale << ", sA=" << sA
               << ", Pg=" << Pg << ", render_scale=" << render_scale << ")\n";
 
-    // Handle crop parameters (clamped to canvas)
+    // Handle crop: --auto-crop and --crop-* are mutually exclusive
     const int crop_x = parsed["crop-x"].as<int>();
     const int crop_y = parsed["crop-y"].as<int>();
     const int crop_width  = parsed["crop-width"].as<int>();
     const int crop_height = parsed["crop-height"].as<int>();
-    const cv::Rect canvasROI{0, 0, full_size.width, full_size.height};
-    if (crop_width > 0 && crop_height > 0) {
+    const bool manualCrop = (crop_width > 0 && crop_height > 0);
+    const bool autoCropEnabled = parsed["auto-crop"].as<bool>();
+
+    if (autoCropEnabled && manualCrop) {
+        std::cerr << "Error: --auto-crop and --crop-* options are mutually exclusive" << std::endl;
+        return;
+    }
+
+    if (autoCropEnabled && raw_col_max >= raw_col_min) {
+        const double sx = render_scale / static_cast<double>(surf->_scale[0]);
+        const double sy = render_scale / static_cast<double>(surf->_scale[1]);
+        const int ac_x = static_cast<int>(std::floor(raw_col_min * sx));
+        const int ac_y = static_cast<int>(std::floor(raw_row_min * sy));
+        const int ac_r = static_cast<int>(std::ceil((raw_col_max + 1) * sx));
+        const int ac_b = static_cast<int>(std::ceil((raw_row_max + 1) * sy));
+        cv::Rect autoCrop{ac_x, ac_y, ac_r - ac_x, ac_b - ac_y};
+        crop = autoCrop & canvasROI;
+        tgt_size = crop.size();
+        std::cout << "auto-crop: raw bbox [" << raw_col_min << "," << raw_row_min
+                  << "]-[" << raw_col_max << "," << raw_row_max
+                  << "] → canvas crop " << crop << std::endl;
+    }
+
+    // Handle manual crop parameters (clamped to canvas)
+    if (manualCrop) {
         const cv::Rect req{crop_x, crop_y, crop_width, crop_height};
         crop = (req & canvasROI); // intersect with canvas
         if (crop.width <= 0 || crop.height <= 0) {
@@ -1056,19 +1235,19 @@ int main(int argc, char *argv[])
             return;
         }
         tgt_size = crop.size();
-    } else {
+    } else if (!autoCropEnabled) {
         crop = canvasROI;              // no crop requested
         tgt_size = crop.size();
     }
-    
+
     std::cout << "rendering size " << tgt_size
               << " at scale " << tgt_scale
-              << " crop " << crop << std::endl;    
-              
+              << " crop " << crop << std::endl;
+
     cv::Mat_<cv::Vec3f> points, normals;
-    
+
     bool slice_gen = false;
-    
+
     // Global normal orientation decision (for consistency across chunks)
     bool globalFlipDecision = false;
     bool orientationDetermined = false;
@@ -1106,7 +1285,6 @@ int main(int argc, char *argv[])
         const size_t baseX = static_cast<size_t>(zarr_xy_size.width);
 
         z5::filesystem::handle::File outFile(output_path_local);
-        z5::createFile(outFile, true);
 
         auto make_shape = [](size_t z, size_t y, size_t x){
             return std::vector<size_t>{z, y, x};
@@ -1124,8 +1302,30 @@ int main(int argc, char *argv[])
             {"shuffle", 0}
         };
         const std::string out_dtype0 = output_is_u16 ? "uint16" : "uint8";
-        auto dsOut0 = z5::createDataset(
-            outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
+        const bool finalize = parsed["finalize"].as<bool>();
+        std::unique_ptr<z5::Dataset> dsOut0;
+        if (finalize) {
+            // Finalize: zarr and L0 must already exist
+            dsOut0 = z5::openDataset(outFile, "0");
+        } else if (partId == 0) {
+            // Master: create zarr file and L0 dataset
+            z5::createFile(outFile, true);
+            dsOut0 = z5::createDataset(outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
+        } else {
+            // Slave: wait for master to create the zarr dataset
+            const auto dsPath = output_path_local / "0" / ".zarray";
+            for (int wait = 0; !std::filesystem::exists(dsPath); ++wait) {
+                if (wait >= barrierTimeout) {
+                    std::cerr << "Error: timed out after " << barrierTimeout
+                              << "s waiting for master (part 0) to create " << dsPath << std::endl;
+                    return;
+                }
+                if (wait % 10 == 0 && wait > 0)
+                    std::cout << "[part " << partId << "] waiting for master to create zarr..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            dsOut0 = z5::openDataset(outFile, "0");
+        }
 
         const size_t tilesY_src = (static_cast<size_t>(tgt_size.height) + CH - 1) / CH;
         const size_t tilesX_src = (static_cast<size_t>(tgt_size.width)  + CW - 1) / CW;
@@ -1145,11 +1345,12 @@ int main(int argc, char *argv[])
                 meshCentroid);
         }
 
+        if (!finalize) {
         // Iterate output chunks and render directly into them (parallel over XY tiles)
         for (size_t z0 = 0; z0 < shape0[0]; z0 += CZ) {
             const size_t dz = std::min(CZ, shape0[0] - z0);
-            #pragma omp parallel for schedule(dynamic) collapse(2)
-            for (long long ty = 0; ty < static_cast<long long>(tilesY_src); ++ty) {
+            #pragma omp parallel for schedule(dynamic, 2)
+            for (long long ty = partId; ty < static_cast<long long>(tilesY_src); ty += numParts) {
                 for (long long tx = 0; tx < static_cast<long long>(tilesX_src); ++tx) {
                     const size_t y0_src = static_cast<size_t>(ty) * CH;
                     const size_t x0_src = static_cast<size_t>(tx) * CW;
@@ -1177,7 +1378,7 @@ int main(int argc, char *argv[])
                     const bool swapWH = (rotQuad >= 0) && ((rotQuad % 2) == 1);
                     const size_t dy_dst = swapWH ? dx : dy;
                     const size_t dx_dst = swapWH ? dy : dx;
-                    
+
                     cv::Mat tileOut; // will be CV_8UC1 or CV_16UC1
 
                     if (output_is_u16) {
@@ -1269,6 +1470,18 @@ int main(int argc, char *argv[])
         // After finishing L0 tiles, add newline for the progress line
         std::cout << std::endl;
 
+        // In multi-part mode, skip pyramid/attrs — run --finalize after all parts complete
+        if (numParts > 1 && !finalize) {
+            std::cout << "[multi-part] part " << partId << " finished L0. "
+                      << "Run with --finalize after all parts complete to build pyramid." << std::endl;
+            return;
+        }
+        } // end if (!finalize)
+
+        if (finalize) {
+            std::cout << "[finalize] building pyramid from existing L0..." << std::endl;
+        }
+
         // Build multi-resolution pyramid levels 1..5 by averaging 2x blocks in Z, Y, and X
         auto downsample_avg = [&](int targetLevel){
             auto src = z5::openDataset(outFile, std::to_string(targetLevel - 1));
@@ -1286,10 +1499,15 @@ int main(int argc, char *argv[])
                 {"clevel",  1},
                 {"shuffle", 0}
             };
-            auto dst = z5::createDataset(
-                outFile, std::to_string(targetLevel),
-                output_is_u16 ? "uint16" : "uint8",
-                dShape, dChunks, std::string("blosc"), compOpts);
+            std::unique_ptr<z5::Dataset> dst;
+            try {
+                dst = z5::createDataset(
+                    outFile, std::to_string(targetLevel),
+                    output_is_u16 ? "uint16" : "uint8",
+                    dShape, dChunks, std::string("blosc"), compOpts);
+            } catch (const std::invalid_argument&) {
+                dst = z5::openDataset(outFile, std::to_string(targetLevel));
+            }
 
             const size_t tileZ = dShape[0], tileY = CH, tileX = CW;
             const size_t tilesY = (dShape[1] + tileY - 1) / tileY;
@@ -1299,8 +1517,8 @@ int main(int argc, char *argv[])
 
             for (size_t z = 0; z < dShape[0]; z += tileZ) {
                 const size_t lz = std::min(tileZ, dShape[0] - z);
-                #pragma omp parallel for schedule(dynamic) collapse(2)
-                for (long long y = 0; y < static_cast<long long>(dShape[1]); y += tileY) {
+                #pragma omp parallel for schedule(dynamic, 2)
+                for (long long y = 0; y < static_cast<long long>(dShape[1]); y += static_cast<long long>(tileY)) {
                     for (long long x = 0; x < static_cast<long long>(dShape[2]); x += tileX) {
                         const size_t ly = std::min(tileY, static_cast<size_t>(dShape[1] - y));
                         const size_t lx = std::min(tileX, static_cast<size_t>(dShape[2] - x));
@@ -1347,7 +1565,7 @@ int main(int argc, char *argv[])
                                     }
                             z5::types::ShapeType dOff = {z, static_cast<size_t>(y), static_cast<size_t>(x)};
                             z5::multiarray::writeSubarray<uint8_t>(dst, dstChunk, dOff.begin());
-                        }                        
+                        }
 
                         size_t done = ++tilesDone;
                         int pct = static_cast<int>(100.0 * double(done) / double(totalTiles));
@@ -1366,6 +1584,7 @@ int main(int argc, char *argv[])
             downsample_avg(level);
         }
 
+        {
         nlohmann::json attrs;
         attrs["source_zarr"] = vol_path.string();
         attrs["source_group"] = group_idx;
@@ -1409,9 +1628,14 @@ int main(int argc, char *argv[])
         attrs["multiscales"] = nlohmann::json::array({multiscale});
 
         z5::filesystem::writeAttributes(outFile, attrs);
+        }
 
         // Optionally export per-Z TIFFs from level 0 into layers_{zarrname}
-        if (include_tifs) {
+        // Skipped in multi-part mode; run single-part afterwards to export.
+        if (include_tifs && numParts > 1) {
+            std::cout << "[tif export] skipped in multi-part mode; re-run without --num-parts to export." << std::endl;
+        }
+        if (include_tifs && numParts <= 1) {
             try {
                 auto dsL0 = z5::openDataset(outFile, "0");
                 const auto& shape0_check = dsL0->shape(); // [Z, Y, X]
@@ -1460,8 +1684,8 @@ int main(int argc, char *argv[])
                     writers.emplace_back(outPath, outW, outH, cvType, tileW, tileH, 0.0f);
                 }
 
-                #pragma omp parallel for schedule(dynamic) collapse(2)
-                for (long long ty = 0; ty < static_cast<long long>(tilesY_src); ++ty) {
+                #pragma omp parallel for schedule(dynamic, 2)
+                for (long long ty = partId; ty < static_cast<long long>(tilesY_src); ty += numParts) {
                     for (long long tx = 0; tx < static_cast<long long>(tilesX_src); ++tx) {
                         const uint32_t x0_src = static_cast<uint32_t>(tx) * tileW;
                         const uint32_t y0_src = static_cast<uint32_t>(ty) * tileH;
@@ -1530,11 +1754,10 @@ int main(int argc, char *argv[])
                 const int outW = ((rotQuad >= 0) && (rotQuad % 2 == 1)) ? tgt_size.height : tgt_size.width;
                 const int outH = ((rotQuad >= 0) && (rotQuad % 2 == 1)) ? tgt_size.width  : tgt_size.height;
 
-                const uint32_t tileW = 128;
-                const uint32_t tileH = 128;
+                const uint32_t bandH = 128;
                 const double num_slices_center = 0.5 * (static_cast<double>(std::max(1, num_slices)) - 1.0);
 
-                auto make_out_path = [&](int sliceIdx) -> std::filesystem::path {
+                auto make_out_path_base = [&](int sliceIdx) -> std::filesystem::path {
                     if (output_path_local.string().find('%') == std::string::npos) {
                         int pad = 2; int v = std::max(0, num_slices-1);
                         while (v >= 100) { pad++; v /= 10; }
@@ -1547,33 +1770,47 @@ int main(int argc, char *argv[])
                         return std::filesystem::path(buf);
                     }
                 };
+                auto make_out_path = [&](int sliceIdx) -> std::filesystem::path {
+                    auto p = make_out_path_base(sliceIdx);
+                    if (numParts > 1) {
+                        // e.g. 00.tif -> 00.part0.tif
+                        auto stem = p.stem().string();
+                        auto ext = p.extension().string();
+                        return p.parent_path() / (stem + ".part" + std::to_string(partId) + ext);
+                    }
+                    return p;
+                };
 
                 // If all expected TIFFs exist, skip this segmentation
-                {
+                if (numParts <= 1) {
                     bool all_exist = true;
                     for (int z = 0; z < num_slices; ++z) {
                         std::filesystem::path outPath = make_out_path(z);
                         if (!std::filesystem::exists(outPath)) { all_exist = false; break; }
                     }
                     if (all_exist) {
-                        std::cout << "[tif tiled] all slices exist in " << output_path_local.string() << ", skipping." << std::endl;
+                        std::cout << "[tif] all slices exist in " << output_path_local.string() << ", skipping." << std::endl;
                         return;
                     }
                 }
 
+                // TIFF tile = full output width x 16 rows
+                const uint32_t tiffTileW = (static_cast<uint32_t>(outW) + 15u) & ~15u;
+                const uint32_t tiffTileH = 16;
+
                 std::vector<TiffWriter> writers;
-                std::vector<std::mutex> writerLocks(static_cast<size_t>(num_slices));
                 writers.reserve(static_cast<size_t>(num_slices));
                 const int cvType = output_is_u16 ? CV_16UC1 : CV_8UC1;
                 for (int z = 0; z < num_slices; ++z) {
                     std::filesystem::path outPath = make_out_path(z);
                     writers.emplace_back(outPath, static_cast<uint32_t>(outW), static_cast<uint32_t>(outH),
-                                         cvType, tileW, tileH, 0.0f);
+                                         cvType, tiffTileW, tiffTileH, 0.0f, COMPRESSION_PACKBITS);
                 }
 
+                // Compute global flip decision
                 {
-                    const int dx0 = std::min<int>(static_cast<int>(tileW), tgt_size.width);
-                    const int dy0 = std::min<int>(static_cast<int>(tileH), tgt_size.height);
+                    const int dx0 = std::min<int>(128, tgt_size.width);
+                    const int dy0 = std::min<int>(128, tgt_size.height);
                     float u0, v0; computeCanvasOrigin(full_size, u0, v0);
                     u0 += static_cast<float>(crop.x);
                     v0 += static_cast<float>(crop.y);
@@ -1584,101 +1821,174 @@ int main(int argc, char *argv[])
                         meshCentroid);
                 }
 
-                const uint32_t tilesX_src = (static_cast<uint32_t>(tgt_size.width)  + tileW - 1) / tileW;
-                const uint32_t tilesY_src = (static_cast<uint32_t>(tgt_size.height) + tileH - 1) / tileH;
-                const size_t totalTiles = static_cast<size_t>(tilesX_src) * static_cast<size_t>(tilesY_src);
-                std::atomic<size_t> tilesDone{0};
+                // Build offset list for readMultiSlice (includes accum sub-samples)
+                const size_t samplesPerSlice = std::max<size_t>(1, accumOffsets.size());
+                std::vector<float> allOffsets;
+                allOffsets.reserve(static_cast<size_t>(num_slices) * samplesPerSlice);
+                for (int zi = 0; zi < num_slices; ++zi) {
+                    const float baseOff = static_cast<float>(
+                        (static_cast<double>(zi) - num_slices_center) * slice_step);
+                    if (accumOffsets.empty()) {
+                        allOffsets.push_back(baseOff * static_cast<float>(ds_scale));
+                    } else {
+                        for (float ao : accumOffsets)
+                            allOffsets.push_back((baseOff + ao) * static_cast<float>(ds_scale));
+                    }
+                }
 
-                #pragma omp parallel for schedule(dynamic) collapse(2)
-                for (long long ty = 0; ty < static_cast<long long>(tilesY_src); ++ty) {
-                    for (long long tx = 0; tx < static_cast<long long>(tilesX_src); ++tx) {
-                        const uint32_t x0_src = static_cast<uint32_t>(tx) * tileW;
-                        const uint32_t y0_src = static_cast<uint32_t>(ty) * tileH;
-                        const uint32_t dx = std::min<uint32_t>(tileW, static_cast<uint32_t>(tgt_size.width)  - x0_src);
-                        const uint32_t dy = std::min<uint32_t>(tileH, static_cast<uint32_t>(tgt_size.height) - y0_src);
+                const uint32_t numBands = (static_cast<uint32_t>(tgt_size.height) + bandH - 1) / bandH;
+                auto bandWallStart = std::chrono::steady_clock::now();
+                auto lastPrint = bandWallStart;
 
-                        // Generate base coordinates/normals for this tile once
-                        float u0, v0;
-                        computeTileOrigin(full_size,
-                                          x0_src + static_cast<size_t>(crop.x),
-                                          y0_src + static_cast<size_t>(crop.y),
-                                          u0, v0);
-                        cv::Mat_<cv::Vec3f> tilePoints, tileNormals;
-                        genTile(surf.get(), cv::Size(static_cast<int>(dx), static_cast<int>(dy)),
-                                static_cast<float>(render_scale), u0, v0, tilePoints, tileNormals);
+                // Process one full-width band at a time, top to bottom.
+                // readMultiSlice parallelizes rows internally via OMP.
+                // In multi-part mode, each part handles a subset of bands.
+                for (uint32_t bandIdx = static_cast<uint32_t>(partId); bandIdx < numBands; bandIdx += static_cast<uint32_t>(numParts)) {
+                    const uint32_t y0 = bandIdx * bandH;
+                    const uint32_t dy = std::min(bandH, static_cast<uint32_t>(tgt_size.height) - y0);
 
-                        cv::Mat_<cv::Vec3f> basePoints, stepDirs;
-                        prepareBasePointsAndStepDirs(
-                            tilePoints, tileNormals,
-                            scale_seg, ds_scale,
-                            hasAffine, affineTransform,
-                            globalFlipDecision,
-                            basePoints, stepDirs);
+                    // Generate surface points for this band (full width)
+                    float u0, v0;
+                    computeTileOrigin(full_size,
+                                      static_cast<size_t>(crop.x),
+                                      y0 + static_cast<size_t>(crop.y),
+                                      u0, v0);
+                    cv::Mat_<cv::Vec3f> bandPoints, bandNormals;
+                    genTile(surf.get(), cv::Size(tgt_size.width, static_cast<int>(dy)),
+                            static_cast<float>(render_scale), u0, v0, bandPoints, bandNormals);
 
-                        if (output_is_u16) {
-                            auto renderOne16 = [&](cv::Mat& dst, float offset) {
-                                renderSliceFromBase16(dst, ds.get(), &chunk_cache_u16,
-                                                      basePoints, stepDirs, offset, static_cast<float>(ds_scale));
-                            };
-                            cv::Mat tileOut;
-                            for (int zi = 0; zi < num_slices; ++zi) {
-                                const float off = static_cast<float>(
-                                    (static_cast<double>(zi) - num_slices_center) * slice_step);
-                                renderAccumulatedSlice(
-                                    tileOut, renderOne16, off, accumOffsets, accumType, CV_16UC1);
-                                cv::Mat tileTransformed = tileOut;
-                                rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
-                                int dstTx, dstTy, rTilesX, rTilesY;
-                                mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
-                                             static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
-                                             std::max(rotQuad, 0), flip_axis,
-                                             dstTx, dstTy, rTilesX, rTilesY);
-                                const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
-                                const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
-                                std::lock_guard<std::mutex> guard(writerLocks[static_cast<size_t>(zi)]);
-                                writers[static_cast<size_t>(zi)].writeTile(x0_dst, y0_dst, tileTransformed);
+                    cv::Mat_<cv::Vec3f> basePoints, stepDirs;
+                    prepareBasePointsAndStepDirs(
+                        bandPoints, bandNormals,
+                        scale_seg, ds_scale,
+                        hasAffine, affineTransform,
+                        globalFlipDecision,
+                        basePoints, stepDirs);
+
+                    // Bulk read all slices for this band in one pass
+                    if (output_is_u16) {
+                        std::vector<cv::Mat_<uint16_t>> rawSlices;
+                        readMultiSlice(rawSlices, ds.get(), &chunk_cache_u16, basePoints, stepDirs, allOffsets);
+
+                        for (int zi = 0; zi < num_slices; ++zi) {
+                            cv::Mat sliceOut;
+                            if (accumOffsets.empty()) {
+                                sliceOut = rawSlices[zi];
+                            } else {
+                                size_t si = static_cast<size_t>(zi) * samplesPerSlice;
+                                if (accumType == AccumType::Max) {
+                                    sliceOut = rawSlices[si].clone();
+                                    for (size_t j = 1; j < samplesPerSlice; ++j)
+                                        cv::max(sliceOut, cv::Mat(rawSlices[si + j]), sliceOut);
+                                } else if (accumType == AccumType::Mean) {
+                                    cv::Mat sum;
+                                    rawSlices[si].convertTo(sum, CV_64F);
+                                    for (size_t j = 1; j < samplesPerSlice; ++j) {
+                                        cv::Mat tmp; rawSlices[si + j].convertTo(tmp, CV_64F);
+                                        sum += tmp;
+                                    }
+                                    sum /= static_cast<double>(samplesPerSlice);
+                                    sum.convertTo(sliceOut, CV_16UC1);
+                                } else {
+                                    std::vector<cv::Mat> samples;
+                                    for (size_t j = 0; j < samplesPerSlice; ++j)
+                                        samples.push_back(rawSlices[si + j]);
+                                    computeMedianFromSamples<uint16_t>(samples, sliceOut);
+                                }
                             }
-                        } else {
-                            auto renderOne8 = [&](cv::Mat& dst, float offset) {
-                                renderSliceFromBase(dst, ds.get(), &chunk_cache_u8,
-                                                    basePoints, stepDirs, offset, static_cast<float>(ds_scale));
-                            };
-                            cv::Mat tileOut;
-                            for (int zi = 0; zi < num_slices; ++zi) {
-                                const float off = static_cast<float>(
-                                    (static_cast<double>(zi) - num_slices_center) * slice_step);
-                                renderAccumulatedSlice(
-                                    tileOut, renderOne8, off, accumOffsets, accumType, CV_8UC1);
-                                cv::Mat tileTransformed = tileOut;
-                                rotateFlipIfNeeded(tileTransformed, rotQuad, flip_axis);
-                                int dstTx, dstTy, rTilesX, rTilesY;
-                                mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
-                                             static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
-                                             std::max(rotQuad, 0), flip_axis,
-                                             dstTx, dstTy, rTilesX, rTilesY);
-                                const uint32_t x0_dst = static_cast<uint32_t>(dstTx) * tileW;
-                                const uint32_t y0_dst = static_cast<uint32_t>(dstTy) * tileH;
-                                std::lock_guard<std::mutex> guard(writerLocks[static_cast<size_t>(zi)]);
-                                writers[static_cast<size_t>(zi)].writeTile(x0_dst, y0_dst, tileTransformed);
+                            rotateFlipIfNeeded(sliceOut, rotQuad, flip_axis);
+                            // Write as multiple TIFF tiles (tiffTileH rows each)
+                            for (uint32_t ty = 0; ty < static_cast<uint32_t>(sliceOut.rows); ty += tiffTileH) {
+                                uint32_t tdy = std::min(tiffTileH, static_cast<uint32_t>(sliceOut.rows) - ty);
+                                cv::Mat subTile = sliceOut(cv::Rect(0, ty, sliceOut.cols, tdy));
+                                int dstBx, dstBy, rBX, rBY;
+                                uint32_t srcTileIdx = (y0 + ty) / tiffTileH;
+                                uint32_t numTiffTiles = (static_cast<uint32_t>(tgt_size.height) + tiffTileH - 1) / tiffTileH;
+                                mapTileIndex(0, static_cast<int>(srcTileIdx), 1, static_cast<int>(numTiffTiles),
+                                             std::max(rotQuad, 0), flip_axis, dstBx, dstBy, rBX, rBY);
+                                writers[static_cast<size_t>(zi)].writeTile(0, static_cast<uint32_t>(dstBy) * tiffTileH, subTile);
                             }
                         }
+                    } else {
+                        std::vector<cv::Mat_<uint8_t>> rawSlices;
+                        readMultiSlice(rawSlices, ds.get(), &chunk_cache_u8, basePoints, stepDirs, allOffsets);
 
-                        size_t done = ++tilesDone;
-                        int pct = static_cast<int>(100.0 * double(done) / double(totalTiles));
-                        #pragma omp critical(progress_print)
-                        {
-                            std::cout << "\r[tif tiled] tiles " << done << "/" << totalTiles
-                                      << " (" << pct << "%)" << std::flush;
+                        for (int zi = 0; zi < num_slices; ++zi) {
+                            cv::Mat sliceOut;
+                            if (accumOffsets.empty()) {
+                                sliceOut = rawSlices[zi];
+                            } else {
+                                size_t si = static_cast<size_t>(zi) * samplesPerSlice;
+                                if (accumType == AccumType::Max) {
+                                    sliceOut = rawSlices[si].clone();
+                                    for (size_t j = 1; j < samplesPerSlice; ++j)
+                                        cv::max(sliceOut, cv::Mat(rawSlices[si + j]), sliceOut);
+                                } else if (accumType == AccumType::Mean) {
+                                    cv::Mat sum;
+                                    rawSlices[si].convertTo(sum, CV_64F);
+                                    for (size_t j = 1; j < samplesPerSlice; ++j) {
+                                        cv::Mat tmp; rawSlices[si + j].convertTo(tmp, CV_64F);
+                                        sum += tmp;
+                                    }
+                                    sum /= static_cast<double>(samplesPerSlice);
+                                    sum.convertTo(sliceOut, CV_8UC1);
+                                } else {
+                                    std::vector<cv::Mat> samples;
+                                    for (size_t j = 0; j < samplesPerSlice; ++j)
+                                        samples.push_back(rawSlices[si + j]);
+                                    computeMedianFromSamples<uint8_t>(samples, sliceOut);
+                                }
+                            }
+                            rotateFlipIfNeeded(sliceOut, rotQuad, flip_axis);
+                            // Write as multiple TIFF tiles (tiffTileH rows each)
+                            for (uint32_t ty = 0; ty < static_cast<uint32_t>(sliceOut.rows); ty += tiffTileH) {
+                                uint32_t tdy = std::min(tiffTileH, static_cast<uint32_t>(sliceOut.rows) - ty);
+                                cv::Mat subTile = sliceOut(cv::Rect(0, ty, sliceOut.cols, tdy));
+                                int dstBx, dstBy, rBX, rBY;
+                                uint32_t srcTileIdx = (y0 + ty) / tiffTileH;
+                                uint32_t numTiffTiles = (static_cast<uint32_t>(tgt_size.height) + tiffTileH - 1) / tiffTileH;
+                                mapTileIndex(0, static_cast<int>(srcTileIdx), 1, static_cast<int>(numTiffTiles),
+                                             std::max(rotQuad, 0), flip_axis, dstBx, dstBy, rBX, rBY);
+                                writers[static_cast<size_t>(zi)].writeTile(0, static_cast<uint32_t>(dstBy) * tiffTileH, subTile);
+                            }
                         }
+                    }
+
+                    // Progress with cache stats (throttled to ~1/sec)
+                    auto now = std::chrono::steady_clock::now();
+                    double sinceLast = std::chrono::duration<double>(now - lastPrint).count();
+                    uint32_t bandsThisPart = (numBands - static_cast<uint32_t>(partId) + static_cast<uint32_t>(numParts) - 1) / static_cast<uint32_t>(numParts);
+                    uint32_t bandsDone = (bandIdx - static_cast<uint32_t>(partId)) / static_cast<uint32_t>(numParts) + 1;
+                    if (sinceLast >= 1.0 || bandsDone == bandsThisPart) {
+                        lastPrint = now;
+                        double elapsed = std::chrono::duration<double>(now - bandWallStart).count();
+                        double eta = (bandsDone > 0) ? elapsed * (double(bandsThisPart) / bandsDone - 1.0) : 0.0;
+                        auto cs8 = chunk_cache_u8.stats();
+                        auto cs16 = chunk_cache_u16.stats();
+                        uint64_t hits = cs8.hits + cs16.hits;
+                        uint64_t misses = cs8.misses + cs16.misses;
+                        uint64_t tot = hits + misses;
+                        double hr = tot > 0 ? 100.0 * hits / tot : 0.0;
+                        double gbRead = (cs8.bytesRead + cs16.bytesRead) / (1024.0*1024.0*1024.0);
+                        uint64_t evictions = cs8.evictions + cs16.evictions;
+                        int pct = static_cast<int>(100.0 * (bandIdx + 1) / numBands);
+                        std::cout << "[tif] band " << (bandIdx + 1) << "/" << numBands
+                                  << " (" << pct << "%)  "
+                                  << int(elapsed)/60 << "m" << std::setw(2) << std::setfill('0') << int(elapsed)%60 << "s"
+                                  << "  eta " << int(eta)/60 << "m" << std::setw(2) << std::setfill('0') << int(eta)%60 << "s"
+                                  << std::setfill(' ')
+                                  << "  cache " << std::fixed << std::setprecision(1) << hr << "%"
+                                  << " evict " << evictions
+                                  << " read " << std::setprecision(2) << gbRead << "GB"
+                                  << "\n" << std::flush;
                     }
                 }
 
                 writers.clear(); // Explicitly close all writers
-                std::cout << std::endl;
 
                 return;
             } catch (const std::exception& e) {
-                std::cerr << "[tif tiled] error: " << e.what() << std::endl;
+                std::cerr << "[tif] error: " << e.what() << std::endl;
                 return;
             }
         }
@@ -1730,6 +2040,23 @@ int main(int argc, char *argv[])
         }
     } else {
         process_one(seg_path, base_output_arg, false);
+    }
+
+    // Print cache statistics
+    {
+        auto printStats = [](const char* name, const auto& s) {
+            uint64_t total = s.hits + s.misses;
+            if (total == 0) return;
+            double hitRate = 100.0 * s.hits / total;
+            double gbRead = s.bytesRead / (1024.0 * 1024.0 * 1024.0);
+            std::cout << "[" << name << " cache] hits: " << s.hits
+                      << "  misses: " << s.misses
+                      << "  hit rate: " << std::fixed << std::setprecision(1) << hitRate << "%"
+                      << "  evictions: " << s.evictions
+                      << "  read: " << std::setprecision(2) << gbRead << " GB\n";
+        };
+        printStats("u8", chunk_cache_u8.stats());
+        printStats("u16", chunk_cache_u16.stats());
     }
 
     return EXIT_SUCCESS;

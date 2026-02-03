@@ -43,7 +43,7 @@ option(VC_WITH_PASTIX "Build with PaStiX support" OFF)
 include(VCFindDependencies)
 
 
-set(CMAKE_CXX_FLAGS "  -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1 " )
+set(CMAKE_CXX_FLAGS "  -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1  " )
 set(CMAKE_EXE_LINKER_FLAGS " ")
 include_directories(core/include)
 
@@ -55,6 +55,7 @@ endif()
 # Set LTO type and linker based on compiler
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(VC_LTO_FLAGS "-flto=thin")
+    #set(VC_LTO_FLAGS "-fno-lto")
     set(VC_LINKER_FLAGS "-fuse-ld=lld")
     message(STATUS "Using Clang: thin LTO with lld linker")
 else()

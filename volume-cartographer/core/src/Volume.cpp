@@ -11,9 +11,11 @@
 #include "z5/handle.hxx"
 #include "z5/types/types.hxx"
 #include "z5/factory.hxx"
+#include "z5/filesystem/metadata.hxx"
 #include "z5/multiarray/xtensor_access.hxx"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
+static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
 
 Volume::Volume(std::filesystem::path path) : path_(std::move(path))
 {
@@ -51,7 +53,21 @@ Volume::~Volume() = default;
 void Volume::loadMetadata()
 {
     auto metaPath = path_ / METADATA_FILE;
-    metadata_ = vc::json::load_json_file(metaPath);
+    if (std::filesystem::exists(metaPath)) {
+        metadata_ = vc::json::load_json_file(metaPath);
+    } else {
+        auto altPath = path_ / METADATA_FILE_ALT;
+        auto full = vc::json::load_json_file(altPath);
+        if (!full.contains("scan")) {
+            throw std::runtime_error(
+                "metadata.json missing 'scan' key: " + altPath.string());
+        }
+        metadata_ = full["scan"];
+        if (!metadata_.contains("format")) {
+            metadata_["format"] = "zarr";
+        }
+        metaPath = altPath;
+    }
     vc::json::require_type(metadata_, "type", "vol", metaPath.string());
     vc::json::require_fields(metadata_, {"uuid", "width", "height", "slices"}, metaPath.string());
 }
@@ -83,7 +99,9 @@ void Volume::saveMetadata()
 
 bool Volume::checkDir(std::filesystem::path path)
 {
-    return std::filesystem::is_directory(path) && std::filesystem::exists(path / METADATA_FILE);
+    return std::filesystem::is_directory(path) &&
+           (std::filesystem::exists(path / METADATA_FILE) ||
+            std::filesystem::exists(path / METADATA_FILE_ALT));
 }
 
 void Volume::zarrOpen()
@@ -101,7 +119,13 @@ void Volume::zarrOpen()
 
     //FIXME hardcoded assumption that groups correspond to power-2 scaledowns ...
     for(auto name : groups) {
-        z5::filesystem::handle::Dataset ds_handle(group, name, nlohmann::json::parse(std::ifstream(path_/name/".zarray")).value<std::string>("dimension_separator","."));
+        // Read metadata first to discover the dimension separator
+        z5::filesystem::handle::Dataset tmp_handle(path_ / name, z5::FileMode::FileMode::r);
+        z5::DatasetMetadata dsMeta;
+        z5::filesystem::readMetadata(tmp_handle, dsMeta);
+
+        // Re-create handle with correct delimiter so chunk keys resolve properly
+        z5::filesystem::handle::Dataset ds_handle(group, name, dsMeta.zarrDelimiter);
 
         zarrDs_.push_back(z5::filesystem::openDataset(ds_handle));
         if (zarrDs_.back()->getDtype() != z5::types::Datatype::uint8 && zarrDs_.back()->getDtype() != z5::types::Datatype::uint16)

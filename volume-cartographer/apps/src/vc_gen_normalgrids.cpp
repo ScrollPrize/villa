@@ -15,8 +15,7 @@
 
 #include <omp.h>
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xarray.hpp)
+#include <xtensor/containers/xarray.hpp>
 #include "z5/factory.hxx"
 #include "z5/filesystem/handle.hxx"
 #include "z5/common.hxx"

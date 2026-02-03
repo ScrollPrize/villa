@@ -1,14 +1,14 @@
 #pragma once
 
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/HashFunctions.hpp"
 
 #include <opencv2/core.hpp>
 #include "z5/dataset.hxx"
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xtensor.hpp)
-#include XTENSORINCLUDE(containers, xadapt.hpp)
-#include XTENSORINCLUDE(views, xview.hpp)
+#include <xtensor/containers/xtensor.hpp>
+#include <xtensor/containers/xadapt.hpp>
+#include <xtensor/views/xview.hpp>
 
 #include "z5/multiarray/xtensor_access.hxx"
 

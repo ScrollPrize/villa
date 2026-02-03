@@ -9,38 +9,46 @@ option(VC_BUILD_Z5   "Build (vendor) z5 header-only library" ON)
 #find_package(ZLIB REQUIRED)
 #find_package(glog REQUIRED)
 
-# Try a preinstalled z5 first, unless the user explicitly forces vendoring.
-if (VC_BUILD_Z5)
-    find_package(z5 CONFIG QUIET)
-    if (z5_FOUND)
-        message(STATUS "Using preinstalled z5 at: ${z5_DIR} (set VC_BUILD_Z5=OFF to force this; keep ON to try vendoring).")
-        set(VC_BUILD_Z5 OFF CACHE BOOL "" FORCE)
-    endif()
-endif()
+set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
+set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
 
-if (NOT VC_BUILD_Z5)
-    # Use a system / previously installed z5
-    find_package(z5 CONFIG REQUIRED)
-else()
-    # Vendoring path: fetch z5 and add it as a subdir.
-    # z5 defines options; set them in the cache *before* adding the subproject.
-    set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
-    set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
+# ---- xtl / xsimd / xtensor from source (before z5, which needs them) --------
+set(XTENSOR_USE_XSIMD 1)
 
-    # On CMake ≥4, compatibility with <3.5 was removed. Setting this floor
-    # avoids errors if z5 asks for 3.1 in its CMakeLists.
-    if (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
-        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-    endif()
+FetchContent_Declare(
+    xtl
+    GIT_REPOSITORY https://github.com/xtensor-stack/xtl.git
+    GIT_TAG        master
+)
+FetchContent_Declare(
+    xsimd
+    GIT_REPOSITORY https://github.com/xtensor-stack/xsimd.git
+    GIT_TAG        13.2.0
+)
+FetchContent_Declare(
+    xtensor
+    GIT_REPOSITORY https://github.com/xtensor-stack/xtensor.git
+    GIT_TAG        master
+)
+FetchContent_MakeAvailable(xtl xsimd xtensor)
 
-    # FetchContent: prefer MakeAvailable over deprecated Populate/add_subdirectory
-    FetchContent_Declare(
-        z5
-        GIT_REPOSITORY https://github.com/constantinpape/z5.git
-        GIT_TAG        ee2081bb974fe0d0d702538400c31c38b09f1629
-    )
-    FetchContent_MakeAvailable(z5)
-endif()
+# xtensor sets cxx_std_20 INTERFACE which can downgrade our C++23; upgrade it
+set_property(TARGET xtensor PROPERTY INTERFACE_COMPILE_FEATURES cxx_std_23)
+
+# Point z5's find_package(xtensor) (and transitive deps) at FetchContent builds
+set(xtl_DIR     "${FETCHCONTENT_BASE_DIR}/xtl-build"     CACHE PATH "" FORCE)
+set(xsimd_DIR   "${FETCHCONTENT_BASE_DIR}/xsimd-build"   CACHE PATH "" FORCE)
+set(xtensor_DIR "${FETCHCONTENT_BASE_DIR}/xtensor-build" CACHE PATH "" FORCE)
+
+FetchContent_Declare(
+    z5
+    GIT_REPOSITORY https://github.com/constantinpape/z5.git
+)
+FetchContent_MakeAvailable(z5)
+
+# z5's CMakeLists uses include_directories() which doesn't propagate;
+# link xtensor onto the z5 INTERFACE target so consumers get the headers.
+target_link_libraries(z5 INTERFACE xtensor)
 
 # ---- Qt (apps / utils) -------------------------------------------------------
 find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network)
@@ -94,9 +102,7 @@ else()
     install(TARGETS openmp_stub EXPORT "${targets_export_name}")
 endif()
 
-# ---- xtensor/xsimd toggle used by your code ---------------------------------
-set(XTENSOR_USE_XSIMD 1)
-find_package(xtensor REQUIRED)
+# ---- xtensor/xsimd (already fetched above, before z5) -----------------------
 
 # ---- nlohmann/json -----------------------------------------------------------
 if (VC_BUILD_JSON)

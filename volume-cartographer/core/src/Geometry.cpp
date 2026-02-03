@@ -1,9 +1,8 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(generators, xbuilder.hpp)
-#include XTENSORINCLUDE(views, xview.hpp)
+#include <xtensor/generators/xbuilder.hpp>
+#include <xtensor/views/xview.hpp>
 
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>

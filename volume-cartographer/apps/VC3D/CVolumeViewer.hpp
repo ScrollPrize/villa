@@ -421,9 +421,6 @@ protected:
     bool _postRemoveSmallComponents{false};
     int _postMinComponentSize{50};
 
-    // Fast composite rendering cache - no mutex, specialized for composite
-    FastCompositeCache _fastCompositeCache;
-
     // Cached normals for composite rendering - invalidated on surface/ptr change
     cv::Mat_<cv::Vec3f> _cachedNormals;
     cv::Mat_<cv::Vec3f> _cachedBaseCoords;

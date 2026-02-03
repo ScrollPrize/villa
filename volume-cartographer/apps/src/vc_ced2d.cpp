@@ -23,8 +23,7 @@
 #include "z5/filesystem/dataset.hxx"
 #include "z5/attributes.hxx"
 #include "z5/multiarray/xtensor_access.hxx"
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xarray.hpp)
+#include <xtensor/containers/xarray.hpp>
 
 namespace po = boost::program_options;
 using json = nlohmann::json;

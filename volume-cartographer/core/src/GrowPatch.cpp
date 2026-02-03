@@ -21,8 +21,7 @@
 #include "z5/filesystem/handle.hxx"
 #include "z5/dataset.hxx"
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(views, xview.hpp)
+#include <xtensor/views/xview.hpp>
 
 #include <iostream>
 #include <cctype>
