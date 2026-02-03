@@ -132,6 +132,7 @@ signals:
     void reloadFromBackupRequested(const QString& segmentId, int backupIndex);
     void flipURequested(const QString& segmentId);
     void flipVRequested(const QString& segmentId);
+    void rotateSurfaceRequested(const QString& segmentId);
     void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
 
 

@@ -1424,6 +1424,48 @@ void CWindow::onFlipSurface(const std::string& segmentId, bool flipU)
     }
 }
 
+void CWindow::onRotateSurface(const std::string& segmentId)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot rotate surface: No volume package loaded"));
+        return;
+    }
+
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot rotate surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    QuadSurface* surface = surf.get();
+    surface->rotate(90.0f);
+
+    try {
+        surface->save(surface->path.string(), surface->id, true);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this,
+                              tr("Rotate failed"),
+                              tr("Failed to save rotated surface %1: %2")
+                                  .arg(QString::fromStdString(segmentId))
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    if (_surf_col) {
+        _surf_col->setSurface(segmentId, surf, false, false);
+        if (_surfID == segmentId) {
+            _surf_col->setSurface("segmentation", surf, false, false);
+        }
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Rotated %1 by 90° clockwise")
+                .arg(QString::fromStdString(segmentId)),
+            5000);
+    }
+}
+
 void CWindow::onAlphaCompRefine(const std::string& segmentId)
 {
     if (currentVolume == nullptr || !fVpkg) {

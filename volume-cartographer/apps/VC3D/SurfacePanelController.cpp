@@ -763,6 +763,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit flipVRequested(segmentId);
     });
 
+    QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));
+    connect(rotateAction, &QAction::triggered, this, [this, segmentId]() {
+        emit rotateSurfaceRequested(segmentId);
+    });
+
     QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
     connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
         emit alphaCompRefineRequested(segmentId);

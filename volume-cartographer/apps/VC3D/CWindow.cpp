@@ -1427,6 +1427,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onFlipSurface(segmentId.toStdString(), false);
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::rotateSurfaceRequested,
+            this, [this](const QString& segmentId) {
+                onRotateSurface(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
                 onAlphaCompRefine(segmentId.toStdString());
