@@ -15,14 +15,6 @@ from vesuvius.data.volume import Volume
 from vesuvius.utils import list_files, is_aws_ec2_instance
 # Import get_max_value from data.utils to avoid import errors
 from vesuvius.data.utils import get_max_value, open_zarr
-from vesuvius.data.chunks_filter import (
-    load_chunks_json,
-    chunk_indices_to_voxel_bounds,
-    generate_exact_chunk_positions,
-    generate_bounded_sliding_window_positions,
-    filter_positions_by_chunk_overlap,
-)
-
 
 class VCDataset(Dataset):
     def __init__(
@@ -50,9 +42,6 @@ class VCDataset(Dataset):
             # return_as_tensor: bool = True, # Forcing True below
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
-            # --- Chunk filtering parameters ---
-            chunks_filter_mode: str = 'auto',  # 'auto', 'exact_chunk', 'sliding_window', 'disabled'
-            auto_detect_chunks_json: bool = True,  # Auto-detect chunks.json in zarr dir
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -83,12 +72,6 @@ class VCDataset(Dataset):
             return_as_type: Target NumPy dtype string for Volume output *before* tensor conversion
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
             domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
-            chunks_filter_mode: Chunk filtering mode:
-                - 'auto': Use 'exact_chunk' if chunks.json exists, otherwise full volume
-                - 'exact_chunk': One patch per valid zarr chunk (aligned to chunk boundaries)
-                - 'sliding_window': Overlapping patches within tight bounding box of valid chunks
-                - 'disabled': Ignore chunks.json even if present
-            auto_detect_chunks_json: If True, auto-detect chunks.json in zarr directory.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -101,14 +84,6 @@ class VCDataset(Dataset):
         self.return_as_tensor = True # Dataset __getitem__ always returns tensors
         self.skip_empty_patches = skip_empty_patches
         self.empty_patches_skipped = 0  # Counter for skipped patches
-
-        # Chunk filtering parameters
-        self.chunks_filter_mode = chunks_filter_mode
-        self.auto_detect_chunks_json = auto_detect_chunks_json
-        self.chunks_metadata = None  # Will be populated if chunks.json is loaded
-        self._effective_bounds = None  # Will store (min_zyx, max_zyx) if filtering
-        self._chunk_indices = None  # Will store chunk indices from chunks.json
-        self._zarr_chunk_size = None  # Will store zarr chunk size
 
         # Data partitioning parameters
         if num_parts < 1:
@@ -261,36 +236,6 @@ class VCDataset(Dataset):
             raise ValueError(f"Error initializing Volume: {e}") from e
 
 
-        # --- Load chunks.json if available ---
-        if self.chunks_filter_mode != 'disabled' and type_value == "zarr" and use_path:
-            if self.auto_detect_chunks_json:
-                chunks_json = load_chunks_json(use_path)
-                if chunks_json:
-                    self.chunks_metadata = chunks_json
-                    # Get level 0 chunks (primary resolution)
-                    level0_chunks = chunks_json.get('chunks_by_level', {}).get('0', [])
-
-                    if level0_chunks:
-                        # Get chunk size from chunks.json metadata or default to 128
-                        zarr_chunk_size = tuple(chunks_json.get('chunk_size', [128, 128, 128]))
-
-                        self._chunk_indices = level0_chunks
-                        self._zarr_chunk_size = zarr_chunk_size
-
-                        # Compute voxel bounds
-                        min_bounds, max_bounds = chunk_indices_to_voxel_bounds(
-                            level0_chunks, zarr_chunk_size
-                        )
-                        self._effective_bounds = (min_bounds, max_bounds)
-
-                        if self.verbose:
-                            print(f"\nLoaded chunks.json with {len(level0_chunks)} valid chunks")
-                            print(f"  Zarr chunk size: {zarr_chunk_size}")
-                            print(f"  Voxel bounds: {min_bounds} to {max_bounds}")
-                    else:
-                        if self.verbose:
-                            print("chunks.json found but level 0 has no chunks, using full volume")
-
         # --- Position Calculation (for infer mode) ---
         self.all_positions = []
         if mode == 'infer':
@@ -306,90 +251,29 @@ class VCDataset(Dataset):
             else:
                 raise ValueError(f"Unsupported input shape dimension from Volume: {self.input_shape}")
 
-            # Determine position generation strategy based on chunks.json availability and mode
-            use_exact_chunk = (
-                self.chunks_metadata is not None
-                and self._chunk_indices is not None
-                and self.chunks_filter_mode in ('auto', 'exact_chunk')
-            )
-            use_bounded_sliding = (
-                self.chunks_metadata is not None
-                and self._effective_bounds is not None
-                and self.chunks_filter_mode == 'sliding_window'
-            )
+            # Full-volume sliding window
+            if self.verbose:
+                print("\nUsing full volume sliding window")
 
-            if use_exact_chunk:
-                # Exact chunk mode: one patch per valid zarr chunk
-                if self.verbose:
-                    print(f"\nUsing exact_chunk mode with {len(self._chunk_indices)} chunks")
-                    print(f"  Chunk size: {self._zarr_chunk_size}, Patch size: {self.patch_size}")
+            # Generate all potential coordinates
+            z_positions = compute_steps_for_sliding_window(image_size[0], pZ, self.step_size)
+            y_positions = compute_steps_for_sliding_window(image_size[1], pY, self.step_size)
+            x_positions = compute_steps_for_sliding_window(image_size[2], pX, self.step_size)
 
-                self.all_positions = generate_exact_chunk_positions(
-                    chunk_indices=self._chunk_indices,
-                    chunk_size=self._zarr_chunk_size,
-                    patch_size=self.patch_size,
-                    volume_shape=image_size
-                )
+            if self.verbose:
+                print(f"  Image Size (Z, Y, X): {image_size}")
+                print(f"  Patch Size (Z, Y, X): {self.patch_size}")
+                print(f"  Step Size Factor: {self.step_size}")
+                print(f"  Skip Empty Patches: {self.skip_empty_patches}")
+                print(f"  Num Positions (Z, Y, X): ({len(z_positions)}, {len(y_positions)}, {len(x_positions)})")
+                total_patches = len(z_positions) * len(y_positions) * len(x_positions)
+                print(f"  Total potential patches: {total_patches}")
 
-                if self.verbose:
-                    print(f"  Generated {len(self.all_positions)} patch positions")
-
-            elif use_bounded_sliding:
-                # Sliding window constrained to bounding box of valid chunks
-                min_bounds, max_bounds = self._effective_bounds
-
-                if self.verbose:
-                    print(f"\nUsing sliding_window mode within bounds")
-                    print(f"  Bounds: {min_bounds} to {max_bounds}")
-                    print(f"  Patch Size: {self.patch_size}")
-                    print(f"  Step Size Factor: {self.step_size}")
-
-                self.all_positions = generate_bounded_sliding_window_positions(
-                    min_bounds=min_bounds,
-                    max_bounds=max_bounds,
-                    patch_size=self.patch_size,
-                    step_size=self.step_size,
-                    volume_shape=image_size
-                )
-
-                if self.verbose:
-                    print(f"  Generated {len(self.all_positions)} candidate positions")
-
-                # Filter to only positions overlapping valid chunks (for sparse volumes)
-                self.all_positions = filter_positions_by_chunk_overlap(
-                    positions=self.all_positions,
-                    chunk_indices=self._chunk_indices,
-                    chunk_size=self._zarr_chunk_size,
-                    patch_size=self.patch_size
-                )
-
-                if self.verbose:
-                    print(f"  After filtering: {len(self.all_positions)} positions overlap valid chunks")
-
-            else:
-                # Original full-volume sliding window (no chunks.json or disabled)
-                if self.verbose:
-                    print("\nUsing full volume sliding window (no chunk filtering)")
-
-                # Generate all potential coordinates
-                z_positions = compute_steps_for_sliding_window(image_size[0], pZ, self.step_size)
-                y_positions = compute_steps_for_sliding_window(image_size[1], pY, self.step_size)
-                x_positions = compute_steps_for_sliding_window(image_size[2], pX, self.step_size)
-
-                if self.verbose:
-                    print(f"  Image Size (Z, Y, X): {image_size}")
-                    print(f"  Patch Size (Z, Y, X): {self.patch_size}")
-                    print(f"  Step Size Factor: {self.step_size}")
-                    print(f"  Skip Empty Patches: {self.skip_empty_patches}")
-                    print(f"  Num Positions (Z, Y, X): ({len(z_positions)}, {len(y_positions)}, {len(x_positions)})")
-                    total_patches = len(z_positions) * len(y_positions) * len(x_positions)
-                    print(f"  Total potential patches: {total_patches}")
-
-                # Combine positions
-                for z in z_positions:
-                    for y in y_positions:
-                        for x in x_positions:
-                            self.all_positions.append((z, y, x))
+            # Combine positions
+            for z in z_positions:
+                for y in y_positions:
+                    for x in x_positions:
+                        self.all_positions.append((z, y, x))
 
             # Optional coverage diagnostics in verbose mode
             if self.verbose and self.all_positions:
