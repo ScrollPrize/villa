@@ -13,7 +13,7 @@ function AtlasBrowserInner() {
     // Dynamically load the atlas CSS
     const link = document.createElement('link');
     link.rel = 'stylesheet';
-    link.href = '/atlas/assets/index-DFHlRhaq.css';
+    link.href = '/atlas/assets/index-DTew6H5x.css';
     link.onload = () => console.log('CSS loaded');
     link.onerror = () => setError('Failed to load CSS');
     document.head.appendChild(link);
@@ -21,7 +21,7 @@ function AtlasBrowserInner() {
     // Dynamically load the atlas JS
     const script = document.createElement('script');
     script.type = 'module';
-    script.src = '/atlas/assets/index-Dns3DuQW.js';
+    script.src = '/atlas/assets/index-w88ywSx7.js';
     script.onload = () => {
       console.log('JS loaded');
       setLoaded(true);
