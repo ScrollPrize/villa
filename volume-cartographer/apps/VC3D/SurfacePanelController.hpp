@@ -128,8 +128,14 @@ signals:
     void alphaCompRefineRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
-    void neighborCopyRequested(const QString& segmentId, bool copyOut);
     void renameSurfaceRequested(const QString& segmentId);
+    void copySurfaceRequested(const QString& segmentId);
+    void resumeLocalGrowPatchRequested(const QString& segmentId);
+    void neighborCopyRequested(const QString& segmentId, bool copyOut);
+    void reloadFromBackupRequested(const QString& segmentId, int backupIndex);
+    void flipURequested(const QString& segmentId);
+    void flipVRequested(const QString& segmentId);
+    void rotateSurfaceRequested(const QString& segmentId);
     void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
 
 

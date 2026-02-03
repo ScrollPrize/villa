@@ -1,9 +1,8 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(generators, xbuilder.hpp)
-#include XTENSORINCLUDE(views, xview.hpp)
+#include <xtensor/generators/xbuilder.hpp>
+#include <xtensor/views/xview.hpp>
 
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
@@ -54,7 +53,8 @@ cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
     cv::Vec3f xv = normed(at_int(points,inb_loc+cv::Vec2f(1,0))-at_int(points,inb_loc-cv::Vec2f(1,0)));
     cv::Vec3f yv = normed(at_int(points,inb_loc+cv::Vec2f(0,1))-at_int(points,inb_loc-cv::Vec2f(0,1)));
 
-    cv::Vec3f n = yv.cross(xv);
+    // Left-hand rule: +U (xv) × +V (yv) = +Z (toward viewer)
+    cv::Vec3f n = xv.cross(yv);
 
     if (std::isnan(n[0]))
         return {NAN,NAN,NAN};

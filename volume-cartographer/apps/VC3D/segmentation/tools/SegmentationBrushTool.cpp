@@ -1,9 +1,9 @@
 #include "SegmentationBrushTool.hpp"
 
-#include "SegmentationModule.hpp"
+#include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
-#include "SegmentationWidget.hpp"
-#include "CSurfaceCollection.hpp"
+#include "../SegmentationWidget.hpp"
+#include "../../CSurfaceCollection.hpp"
 
 #include <QCoreApplication>
 #include <QObject>

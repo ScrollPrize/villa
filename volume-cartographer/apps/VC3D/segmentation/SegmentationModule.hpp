@@ -8,6 +8,7 @@
 #include <QLoggingCategory>
 
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -19,8 +20,8 @@
 #include <opencv2/core.hpp>
 
 #include "../CVolumeViewer.hpp"
-#include "SegmentationEditManager.hpp"
-#include "SegmentationGrowth.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 
@@ -88,7 +89,9 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
+    [[nodiscard]] bool autoApproveEdits() const { return _autoApproveEdits; }
     [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
+    void setAutoApproveEdits(bool enabled);
     void setApprovalMaskBrushRadius(float radiusSteps);
     void setApprovalBrushDepth(float depth);
     void setApprovalBrushColor(const QColor& color);
@@ -102,6 +105,7 @@ public:
     // Cell reoptimization
     void setCellReoptimizationMode(bool enabled);
     [[nodiscard]] bool cellReoptimizationMode() const { return _cellReoptMode; }
+    [[nodiscard]] bool cellReoptCollectionPending() const { return _cellReoptCollectionId != 0; }
     void setCellReoptMaxSteps(int steps);
     void setCellReoptMaxPoints(int points);
     void setCellReoptMinSpacing(float spacing);
@@ -120,6 +124,8 @@ public:
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
     void updateApprovalToolAfterGrowth(QuadSurface* surface);
+    void applyCorrectionAnchorOffset(float offsetX, float offsetY);
+    void saveCorrectionPoints(const std::filesystem::path& segmentPath);
 
     void attachViewer(CVolumeViewer* viewer);
     void updateViewerCursors();
@@ -133,7 +139,7 @@ public:
     void markNextHandlesFromGrowth() { markNextEditsFromGrowth(); }
     void setGrowthInProgress(bool running);
     [[nodiscard]] bool growthInProgress() const { return _growthInProgress; }
-    [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload() const;
+    [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload(bool onlyActiveCollection = false) const;
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
     [[nodiscard]] bool hoverPreviewEnabled() const { return _hoverPreviewEnabled; }
@@ -170,6 +176,7 @@ private:
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
+    friend class SegmentationBrushTool;
     friend class segmentation::CorrectionsState;
 
     enum class FalloffTool
@@ -231,6 +238,7 @@ private:
     void emitPendingChanges();
     void refreshOverlay();
     void updateCorrectionsWidget();
+    void updateCellReoptCollections();
     void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCorrectionCollection(bool announce);
@@ -350,8 +358,10 @@ private:
     bool _showApprovalMask{false};
     bool _cellReoptMode{false};
     bool _skipAutoApprovalOnGrowth{false};
+    uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
+    bool _autoApproveEdits{true};
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
     float _approvalBrushDepth{15.0f};       // Cylinder depth
     QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
@@ -363,6 +373,13 @@ private:
     QTimer* _autosaveTimer{nullptr};
     bool _pendingAutosave{false};
     bool _autosaveNotifiedFailure{false};
+
+    // Correction points auto-save
+    static constexpr int kCorrectionsSaveDelayMs = 2000;
+    QTimer* _correctionsSaveTimer{nullptr};
+    std::filesystem::path _correctionsSegmentPath;
+    void scheduleCorrectionsAutoSave();
+    void performCorrectionsAutoSave();
 
     struct HoverLookupMetrics
     {

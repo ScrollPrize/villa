@@ -1,5 +1,7 @@
 #include "CPointCollectionWidget.hpp"
 
+#include "Keybinds.hpp"
+
 #include <QStandardItem>
 #include <stdexcept>
 #include <vector>
@@ -634,7 +636,7 @@ void CPointCollectionWidget::onClearAnchorClicked()
 
 void CPointCollectionWidget::keyPressEvent(QKeyEvent *event)
 {
-    if (event->key() == Qt::Key_Delete && _selected_point_id != 0) {
+    if (event->key() == vc3d::keybinds::keypress::DeletePoint.key && _selected_point_id != 0) {
         _point_collection->removePoint(_selected_point_id);
         event->accept();
     } else {
@@ -653,5 +655,4 @@ CPointCollectionWidget::~CPointCollectionWidget() {
         _model->clear();
     }
 }
-
 

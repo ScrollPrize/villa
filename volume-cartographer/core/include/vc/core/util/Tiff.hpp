@@ -6,20 +6,18 @@
 #include <cstdint>
 #include <tiffio.h>
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xarray.hpp)
-#include XTENSORINCLUDE(containers, xtensor.hpp)
-
-// Write single-channel image (8U, 16U, 32F) as tiled TIFF with LZW compression
+// Write single-channel image (8U, 16U, 32F) as tiled TIFF
 // cvType: output type (-1 = same as input). If different, values are scaled:
 //         8U↔16U: scale by 257, 8U↔32F: scale by 1/255, 16U↔32F: scale by 1/65535
+// compression: libtiff compression constant (e.g. COMPRESSION_LZW, COMPRESSION_PACKBITS)
 // padValue: value for padding partial tiles (default -1.0f, used for float; int types use 0)
 void writeTiff(const std::filesystem::path& outPath,
                const cv::Mat& img,
                int cvType = -1,
                uint32_t tileW = 1024,
                uint32_t tileH = 1024,
-               float padValue = -1.0f);
+               float padValue = -1.0f,
+               uint16_t compression = COMPRESSION_LZW);
 
 // Class for incremental tiled TIFF writing
 // Useful for writing tiles in parallel or from streaming data
@@ -33,7 +31,8 @@ public:
                int cvType,
                uint32_t tileW = 1024,
                uint32_t tileH = 1024,
-               float padValue = -1.0f);
+               float padValue = -1.0f,
+               uint16_t compression = COMPRESSION_LZW);
 
     ~TiffWriter();
 
@@ -74,8 +73,3 @@ private:
     std::vector<uint8_t> _tileBuf;  // Reusable tile buffer
     std::filesystem::path _path;     // For error messages
 };
-
-// Read a 3D TIFF stack (multi-page TIFF) into an xtensor array.
-// Returns shape (depth, height, width) in ZYX order as float32.
-// Throws runtime_error if file cannot be opened or format is unsupported.
-xt::xarray<float> read3DTiff(const std::filesystem::path& path);

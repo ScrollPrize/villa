@@ -13,6 +13,11 @@
 #include <QVector>
 #include <QSettings>
 
+#include <optional>
+
+class JsonProfileEditor;
+class VolumeSelector;
+
 class RenderParamsDialog : public QDialog {
     Q_OBJECT
 public:
@@ -284,6 +289,8 @@ public:
                        const QString& defaultVolumeId,
                        const QString& defaultOutputPath);
 
+    void accept() override;
+
     QString surfacePath() const;
     QString selectedVolumeId() const;
     QString selectedVolumePath() const;
@@ -292,6 +299,7 @@ public:
     int resumeLocalOptRadius() const;
     int resumeLocalMaxIters() const;
     bool resumeLocalDenseQr() const;
+    std::optional<QJsonObject> pass2TracerParamsJson(QString* error) const;
 
     // First pass parameters
     int neighborMaxDistance() const;
@@ -306,12 +314,13 @@ private:
                                const QString& defaultVolumeId);
 
     QLineEdit* edtSurface_{nullptr};
-    QComboBox* cmbVolume_{nullptr};
+    VolumeSelector* volumeSelector_{nullptr};
     QLineEdit* edtOutput_{nullptr};
     QSpinBox* spResumeStep_{nullptr};
     QSpinBox* spResumeRadius_{nullptr};
     QSpinBox* spResumeMaxIters_{nullptr};
     QCheckBox* chkResumeDenseQr_{nullptr};
+    JsonProfileEditor* pass2TracerParams_{nullptr};
 
     // First pass parameter widgets
     QSpinBox* spMaxDistance_{nullptr};

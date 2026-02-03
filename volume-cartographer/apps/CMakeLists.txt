@@ -112,6 +112,10 @@ add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.c
 target_link_libraries(vc_gen_normalgrids vc_core z5 Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
 target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 
+# Read / visualize NormalGridVolume
+add_executable(vc_ngrids src/vc_ngrids.cpp)
+target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
+
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
     vc_core
@@ -142,6 +146,9 @@ target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
+add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
+target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options tiff)
+
 # Install targets
 if(VC_INSTALL_APPS)
 install(
@@ -166,9 +173,11 @@ install(
         vc_ced2d
         vc_transform_geom
         vc_gen_normalgrids
+        vc_ngrids
         vc_telea_inpaint
         vc_thinning
         vc_tifxyz
+        vc_zarr_to_tiff
         ${extra_apps}
     RUNTIME DESTINATION bin
     COMPONENT Programs

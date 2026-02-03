@@ -19,6 +19,8 @@
 #include <QGraphicsItem>
 #include <QGraphicsPixmapItem>
 #include <QGraphicsEllipseItem>
+#include <QMdiSubWindow>
+#include <QWindowStateChangeEvent>
 
 #include "CVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
@@ -156,6 +158,30 @@ CVolumeViewer::~CVolumeViewer()
 {
     delete fGraphicsView;
     delete fScene;
+}
+
+bool CVolumeViewer::isWindowMinimized() const
+{
+    auto* subWindow = qobject_cast<QMdiSubWindow*>(parentWidget());
+    return subWindow && subWindow->isMinimized();
+}
+
+bool CVolumeViewer::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event->type() == QEvent::WindowStateChange) {
+        auto* subWindow = qobject_cast<QMdiSubWindow*>(watched);
+        if (subWindow && !subWindow->isMinimized()) {
+            auto* stateEvent = static_cast<QWindowStateChangeEvent*>(event);
+            if (stateEvent->oldState() & Qt::WindowMinimized) {
+                if (_dirtyWhileMinimized) {
+                    _dirtyWhileMinimized = false;
+                    renderVisible(true);
+                    updateAllOverlays();
+                }
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 float round_scale(float scale)

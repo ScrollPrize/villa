@@ -243,8 +243,24 @@ cv::Vec3f QuadSurface::gridNormal(int row, int col) const
     if (!_points) {
         return {NAN, NAN, NAN};
     }
-    // grid_normal expects (col, row) order in the Vec3f
-    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col), static_cast<float>(row), 0.0f));
+    if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
+        return {NAN, NAN, NAN};
+
+    // Build normal cache on first access
+    if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+        _normalCache.create(_points->rows, _points->cols);
+        for (int r = 0; r < _points->rows; r++) {
+            for (int c = 0; c < _points->cols; c++) {
+                if ((*_points)(r, c)[0] == -1.f) {
+                    _normalCache(r, c) = {NAN, NAN, NAN};
+                } else {
+                    _normalCache(r, c) = grid_normal(*_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
+                }
+            }
+        }
+    }
+
+    return _normalCache(row, col);
 }
 
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
@@ -317,6 +333,13 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     if (!_points || _points->empty()) {
         return cv::Mat_<uint8_t>();
     }
+
+    if (!_validMaskCache.empty() &&
+        _validMaskCache.rows == _points->rows &&
+        _validMaskCache.cols == _points->cols) {
+        return _validMaskCache;
+    }
+
     const int rows = _points->rows;
     const int cols = _points->cols;
     cv::Mat_<uint8_t> mask(rows, cols);
@@ -330,6 +353,7 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
             mask(j, i) = ok ? 255 : 0;
         }
     }
+    _validMaskCache = mask;
     return mask;
 }
 
@@ -364,6 +388,8 @@ void QuadSurface::invalidateCache()
     }
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _normalCache = cv::Mat_<cv::Vec3f>();
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -840,6 +866,7 @@ void QuadSurface::invalidateMask()
 {
     // Clear from memory
     _channels.erase("mask");
+    _validMaskCache = cv::Mat_<uint8_t>();
 
     // Delete from disk
     if (!path.empty()) {
@@ -1047,6 +1074,18 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
 
     // Rename to make creation atomic
     std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
+
+    // Preserve auxiliary files from the existing directory before replacing
+    if (force_overwrite && std::filesystem::exists(final_path)) {
+        // Copy corrections.json if it exists
+        std::filesystem::path correctionsFile = final_path / "corrections.json";
+        if (std::filesystem::exists(correctionsFile)) {
+            std::error_code copyEc;
+            std::filesystem::copy_file(correctionsFile, temp_path / "corrections.json",
+                std::filesystem::copy_options::overwrite_existing, copyEc);
+            // Ignore errors - corrections are not critical for surface integrity
+        }
+    }
 
     // Atomically move the saved data to the final location
     bool replacedExisting = false;
@@ -1758,6 +1797,113 @@ void QuadSurface::orientZUp()
                   << " degrees to place high-Z at top" << std::endl;
         rotate(angle);
     }
+}
+
+namespace {
+// Helper to flip all layers in a multi-layer TIFF file
+void flipMultiLayerTiff(const std::filesystem::path& tiffPath, int flipCode) {
+    if (!std::filesystem::exists(tiffPath)) {
+        return;
+    }
+
+    // Read all layers
+    std::vector<cv::Mat> layers;
+    if (!cv::imreadmulti(tiffPath.string(), layers, cv::IMREAD_UNCHANGED)) {
+        std::cerr << "Warning: Could not read multi-layer TIFF: " << tiffPath << std::endl;
+        return;
+    }
+
+    if (layers.empty()) {
+        return;
+    }
+
+    // Flip each layer
+    for (auto& layer : layers) {
+        cv::flip(layer, layer, flipCode);
+    }
+
+    // Write back all layers
+    if (!cv::imwritemulti(tiffPath.string(), layers)) {
+        std::cerr << "Warning: Could not write flipped multi-layer TIFF: " << tiffPath << std::endl;
+    }
+}
+
+// Helper to flip a single-layer TIFF file
+void flipSingleTiff(const std::filesystem::path& tiffPath, int flipCode) {
+    if (!std::filesystem::exists(tiffPath)) {
+        return;
+    }
+
+    cv::Mat img = cv::imread(tiffPath.string(), cv::IMREAD_UNCHANGED);
+    if (img.empty()) {
+        std::cerr << "Warning: Could not read TIFF: " << tiffPath << std::endl;
+        return;
+    }
+
+    cv::flip(img, img, flipCode);
+
+    if (!cv::imwrite(tiffPath.string(), img)) {
+        std::cerr << "Warning: Could not write flipped TIFF: " << tiffPath << std::endl;
+    }
+}
+} // anonymous namespace
+
+void QuadSurface::flipU()
+{
+    ensureLoaded();
+    if (!_points || _points->empty()) {
+        return;
+    }
+
+    // Flip over the U axis means reversing the rows (V direction)
+    constexpr int flipCode = 0;  // 0 = flip around x-axis (vertical flip)
+    cv::flip(*_points, *_points, flipCode);
+
+    // Flip all channels the same way
+    for (auto& [name, channel] : _channels) {
+        if (!channel.empty()) {
+            cv::flip(channel, channel, flipCode);
+        }
+    }
+
+    // Flip external TIFF files on disk
+    if (!path.empty()) {
+        flipMultiLayerTiff(path / "multilayer_mask.tif", flipCode);
+        flipSingleTiff(path / "generations.tif", flipCode);
+        flipSingleTiff(path / "approval.tif", flipCode);
+    }
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
+void QuadSurface::flipV()
+{
+    ensureLoaded();
+    if (!_points || _points->empty()) {
+        return;
+    }
+
+    // Flip over the V axis means reversing the columns (U direction)
+    constexpr int flipCode = 1;  // 1 = flip around y-axis (horizontal flip)
+    cv::flip(*_points, *_points, flipCode);
+
+    // Flip all channels the same way
+    for (auto& [name, channel] : _channels) {
+        if (!channel.empty()) {
+            cv::flip(channel, channel, flipCode);
+        }
+    }
+
+    // Flip external TIFF files on disk
+    if (!path.empty()) {
+        flipMultiLayerTiff(path / "multilayer_mask.tif", flipCode);
+        flipSingleTiff(path / "generations.tif", flipCode);
+        flipSingleTiff(path / "approval.tif", flipCode);
+    }
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
 }
 
 // Overlapping JSON file utilities

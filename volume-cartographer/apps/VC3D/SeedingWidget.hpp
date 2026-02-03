@@ -8,8 +8,10 @@
 #include <QLabel>
 #include <QProgressBar>
 #include <QHBoxLayout>
+#include <QLineEdit>
 #include <QProcess>
 #include <QPointer>
+#include <QToolButton>
 #include <opencv2/core.hpp>
 #include <memory>
 
@@ -59,6 +61,8 @@ private slots:
     void onExpandSeedsClicked();
     void onResetPointsClicked();
     void onCancelClicked();
+    void onNeuralTraceClicked();
+    void onNeuralCheckpointBrowseClicked();
     
 private:
     // Mode enum
@@ -73,6 +77,8 @@ private:
     void findPeaksAlongRay(const cv::Vec2f& rayDir, const cv::Vec3f& startPoint);
     void runSegmentation();
     QString findExecutablePath();
+    QString findNeuralTracePyPath();
+    QString findPythonExecutable();
     void updateParameterPreview();
     void updateModeUI();
     void analyzePaths();
@@ -144,4 +150,19 @@ private:
     // Process management
     QList<QPointer<QProcess>> runningProcesses;
     bool jobsRunning;
+
+    // Neural trace UI and state
+    QLineEdit* _neuralCheckpointEdit{nullptr};
+    QToolButton* _neuralCheckpointBrowse{nullptr};
+    QLineEdit* _neuralPythonEdit{nullptr};
+    QToolButton* _neuralPythonBrowse{nullptr};
+    QComboBox* _comboNeuralVolumeScale{nullptr};
+    QSpinBox* _spinNeuralMaxSize{nullptr};
+    QSpinBox* _spinNeuralStepsPerCrop{nullptr};
+    QPushButton* _btnNeuralTrace{nullptr};
+    QString _neuralCheckpointPath;
+    QString _neuralPythonPath;
+    int _neuralVolumeScale{0};
+    int _neuralMaxSize{60};
+    int _neuralStepsPerCrop{1};
 };

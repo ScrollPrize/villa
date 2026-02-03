@@ -7,6 +7,11 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QFileDialog>
+#include <QGroupBox>
+#include <QSettings>
+#include <QDir>
+#include <QFile>
 
 #include <opencv2/imgproc.hpp>
 
@@ -201,7 +206,91 @@ void SeedingWidget::setupUI()
     labelWrapsButton = new QPushButton("Start Label Wraps", this);
     labelWrapsButton->setToolTip("Enable 'Label Wraps' mode: draw a line to auto-create a new collection with winding labels. Hold Shift for decreasing order.");
     mainLayout->addWidget(labelWrapsButton);
-    
+
+    // Neural Trace from Scratch section
+    auto neuralTraceGroup = new QGroupBox("Neural Trace (Python)", this);
+    auto neuralLayout = new QVBoxLayout(neuralTraceGroup);
+    neuralLayout->setContentsMargins(6, 6, 6, 6);
+    neuralLayout->setSpacing(4);
+
+    // Checkpoint path
+    auto checkpointLayout = new QHBoxLayout();
+    checkpointLayout->addWidget(new QLabel("Checkpoint:", this));
+    _neuralCheckpointEdit = new QLineEdit(this);
+    _neuralCheckpointEdit->setPlaceholderText("Path to checkpoint file...");
+    _neuralCheckpointEdit->setToolTip("Path to the neural tracer model checkpoint");
+    checkpointLayout->addWidget(_neuralCheckpointEdit, 1);
+    _neuralCheckpointBrowse = new QToolButton(this);
+    _neuralCheckpointBrowse->setText("...");
+    _neuralCheckpointBrowse->setToolTip("Browse for checkpoint file");
+    checkpointLayout->addWidget(_neuralCheckpointBrowse);
+    neuralLayout->addLayout(checkpointLayout);
+
+    // Python path
+    auto pythonLayout = new QHBoxLayout();
+    pythonLayout->addWidget(new QLabel("Python:", this));
+    _neuralPythonEdit = new QLineEdit(this);
+    _neuralPythonEdit->setPlaceholderText("Path to Python (leave empty for auto-detect)...");
+    _neuralPythonEdit->setToolTip("Path to Python executable with torch installed (e.g. ~/miniconda3/bin/python)");
+    pythonLayout->addWidget(_neuralPythonEdit, 1);
+    _neuralPythonBrowse = new QToolButton(this);
+    _neuralPythonBrowse->setText("...");
+    _neuralPythonBrowse->setToolTip("Browse for Python executable");
+    pythonLayout->addWidget(_neuralPythonBrowse);
+    neuralLayout->addLayout(pythonLayout);
+
+    // Volume scale
+    auto scaleLayout = new QHBoxLayout();
+    scaleLayout->addWidget(new QLabel("Volume Scale:", this));
+    _comboNeuralVolumeScale = new QComboBox(this);
+    for (int i = 0; i <= 4; ++i) {
+        _comboNeuralVolumeScale->addItem(QString("Scale %1").arg(i), i);
+    }
+    _comboNeuralVolumeScale->setToolTip("OME-Zarr scale level to use (0 = highest resolution)");
+    scaleLayout->addWidget(_comboNeuralVolumeScale);
+    neuralLayout->addLayout(scaleLayout);
+
+    // Max size
+    auto maxSizeLayout = new QHBoxLayout();
+    maxSizeLayout->addWidget(new QLabel("Max Size:", this));
+    _spinNeuralMaxSize = new QSpinBox(this);
+    _spinNeuralMaxSize->setRange(10, 200);
+    _spinNeuralMaxSize->setValue(60);
+    _spinNeuralMaxSize->setToolTip("Maximum patch side length in vertices");
+    maxSizeLayout->addWidget(_spinNeuralMaxSize);
+    neuralLayout->addLayout(maxSizeLayout);
+
+    // Steps per crop
+    auto stepsLayout = new QHBoxLayout();
+    stepsLayout->addWidget(new QLabel("Steps/Crop:", this));
+    _spinNeuralStepsPerCrop = new QSpinBox(this);
+    _spinNeuralStepsPerCrop->setRange(1, 10);
+    _spinNeuralStepsPerCrop->setValue(1);
+    _spinNeuralStepsPerCrop->setToolTip("Number of steps to take before sampling a new crop");
+    stepsLayout->addWidget(_spinNeuralStepsPerCrop);
+    neuralLayout->addLayout(stepsLayout);
+
+    // Trace button
+    _btnNeuralTrace = new QPushButton("Run Neural Trace", this);
+    _btnNeuralTrace->setToolTip("Run neural tracing from the focus point using Python trace.py");
+    _btnNeuralTrace->setEnabled(false);
+    neuralLayout->addWidget(_btnNeuralTrace);
+
+    mainLayout->addWidget(neuralTraceGroup);
+
+    // Restore neural trace settings
+    QSettings settings;
+    _neuralCheckpointPath = settings.value("seeding/neuralCheckpointPath", "").toString();
+    _neuralCheckpointEdit->setText(_neuralCheckpointPath);
+    _neuralPythonPath = settings.value("seeding/neuralPythonPath", "").toString();
+    _neuralPythonEdit->setText(_neuralPythonPath);
+    _neuralVolumeScale = settings.value("seeding/neuralVolumeScale", 0).toInt();
+    _comboNeuralVolumeScale->setCurrentIndex(_neuralVolumeScale);
+    _neuralMaxSize = settings.value("seeding/neuralMaxSize", 60).toInt();
+    _spinNeuralMaxSize->setValue(_neuralMaxSize);
+    _neuralStepsPerCrop = settings.value("seeding/neuralStepsPerCrop", 1).toInt();
+    _spinNeuralStepsPerCrop->setValue(_neuralStepsPerCrop);
+
     // Cancel button (only visible when jobs are running)
     cancelButton = new QPushButton("Cancel", this);
     cancelButton->setVisible(false);
@@ -250,7 +339,45 @@ void SeedingWidget::setupUI()
     connect(labelWrapsButton, &QPushButton::clicked, [this]() {
         setLabelWrapsMode(!labelWrapsMode);
     });
-    
+
+    // Connect neural trace signals
+    connect(_btnNeuralTrace, &QPushButton::clicked, this, &SeedingWidget::onNeuralTraceClicked);
+    connect(_neuralCheckpointBrowse, &QToolButton::clicked, this, &SeedingWidget::onNeuralCheckpointBrowseClicked);
+    connect(_neuralCheckpointEdit, &QLineEdit::textChanged, [this](const QString& text) {
+        _neuralCheckpointPath = text;
+        QSettings settings;
+        settings.setValue("seeding/neuralCheckpointPath", text);
+        updateButtonStates();
+    });
+    connect(_neuralPythonEdit, &QLineEdit::textChanged, [this](const QString& text) {
+        _neuralPythonPath = text;
+        QSettings settings;
+        settings.setValue("seeding/neuralPythonPath", text);
+    });
+    connect(_neuralPythonBrowse, &QToolButton::clicked, [this]() {
+        const QString initial = _neuralPythonPath.isEmpty() ? QDir::homePath() : QFileInfo(_neuralPythonPath).absolutePath();
+        const QString file = QFileDialog::getOpenFileName(this, "Select Python executable", initial);
+        if (!file.isEmpty()) {
+            _neuralPythonPath = file;
+            _neuralPythonEdit->setText(file);
+        }
+    });
+    connect(_comboNeuralVolumeScale, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+        _neuralVolumeScale = index;
+        QSettings settings;
+        settings.setValue("seeding/neuralVolumeScale", index);
+    });
+    connect(_spinNeuralMaxSize, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+        _neuralMaxSize = value;
+        QSettings settings;
+        settings.setValue("seeding/neuralMaxSize", value);
+    });
+    connect(_spinNeuralStepsPerCrop, QOverload<int>::of(&QSpinBox::valueChanged), [this](int value) {
+        _neuralStepsPerCrop = value;
+        QSettings settings;
+        settings.setValue("seeding/neuralStepsPerCrop", value);
+    });
+
     // Connect parameter changes to preview update
     connect(maxRadiusSpinBox, QOverload<int>::of(&QSpinBox::valueChanged), 
             this, &SeedingWidget::updateParameterPreview);
@@ -1296,20 +1423,25 @@ void SeedingWidget::updateButtonStates()
     // Enable segmentation if we have any points (analysis results OR user points)
     bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty() || !_point_collection->getPoints("seeding_seeds").empty();
     runSegmentationButton->setEnabled(hasAnyPoints && currentVolume != nullptr);
-    
+
     // Enable expansion if we have a volume AND at least one segmentation
     bool hasSegmentations = fVpkg && fVpkg->hasSegmentations();
     expandSeedsButton->setEnabled(currentVolume != nullptr && hasSegmentations);
-    
+
     // Enable reset if we have any points or paths
     bool hasAnyData = hasAnyPoints || !paths.empty();
     resetPointsButton->setEnabled(hasAnyData);
-    
+
     if (currentMode == Mode::PointMode) {
         castRaysButton->setEnabled(currentVolume != nullptr);
     } else {
         castRaysButton->setEnabled(!paths.empty());
     }
+
+    // Enable neural trace if we have volume, checkpoint, and focus point
+    bool hasFocus = _surface_collection && _surface_collection->poi("focus") != nullptr;
+    bool hasCheckpoint = !_neuralCheckpointPath.isEmpty() && QFile::exists(_neuralCheckpointPath);
+    _btnNeuralTrace->setEnabled(currentVolume != nullptr && hasFocus && hasCheckpoint && !jobsRunning);
 }
 
 void SeedingWidget::onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -1553,4 +1685,216 @@ void SeedingWidget::onSurfacesLoaded()
 {
     // Update button states when surfaces are loaded/reloaded
     updateButtonStates();
+}
+
+QString SeedingWidget::findPythonExecutable()
+{
+    QStringList candidates;
+
+    // Check for explicit PYTHON_EXECUTABLE override first
+    QString envPython = qEnvironmentVariable("PYTHON_EXECUTABLE");
+    if (!envPython.isEmpty()) {
+        candidates.append(envPython);
+    }
+
+    // Check for active conda environment (CONDA_PREFIX is set when env is active)
+    QString condaPrefix = qEnvironmentVariable("CONDA_PREFIX");
+    if (!condaPrefix.isEmpty()) {
+        candidates.append(QDir(condaPrefix).filePath("bin/python"));
+        candidates.append(QDir(condaPrefix).filePath("bin/python3"));
+    }
+
+    // Check for miniconda in home directory
+    QString home = QDir::homePath();
+    candidates.append(QDir(home).filePath("miniconda3/bin/python"));
+    candidates.append(QDir(home).filePath("miniconda3/bin/python3"));
+    candidates.append(QDir(home).filePath("anaconda3/bin/python"));
+    candidates.append(QDir(home).filePath("anaconda3/bin/python3"));
+
+    // System Python as fallback
+    candidates.append("python3");
+    candidates.append("python");
+    candidates.append("/usr/bin/python3");
+    candidates.append("/usr/local/bin/python3");
+
+    for (const QString& candidate : candidates) {
+        QProcess test;
+        test.start(candidate, {"--version"});
+        if (test.waitForFinished(1000) && test.exitCode() == 0) {
+            return candidate;
+        }
+    }
+
+    return "python3"; // Default fallback
+}
+
+QString SeedingWidget::findNeuralTracePyPath()
+{
+    QString appDir = QCoreApplication::applicationDirPath();
+    QStringList searchPaths = {
+        // Development paths
+        QDir(appDir).filePath("../../vesuvius/src/vesuvius/neural_tracing/trace.py"),
+        QDir(appDir).filePath("../../../vesuvius/src/vesuvius/neural_tracing/trace.py"),
+        // Installed paths
+        QDir(appDir).filePath("../share/vesuvius/neural_tracing/trace.py"),
+        // Environment variable
+        qEnvironmentVariable("NEURAL_TRACE_PY_PATH"),
+    };
+
+    for (const QString& path : searchPaths) {
+        if (!path.isEmpty() && QFile::exists(path)) {
+            return QFileInfo(path).absoluteFilePath();
+        }
+    }
+
+    return QString();
+}
+
+void SeedingWidget::onNeuralCheckpointBrowseClicked()
+{
+    QString startDir = _neuralCheckpointPath.isEmpty()
+        ? QDir::homePath()
+        : QFileInfo(_neuralCheckpointPath).absolutePath();
+
+    QString path = QFileDialog::getOpenFileName(
+        this,
+        tr("Select Neural Tracer Checkpoint"),
+        startDir,
+        tr("Checkpoint Files (*.pt *.pth *.ckpt);;All Files (*)")
+    );
+
+    if (!path.isEmpty()) {
+        _neuralCheckpointEdit->setText(path);
+    }
+}
+
+void SeedingWidget::onNeuralTraceClicked()
+{
+    // Validate prerequisites
+    if (!currentVolume) {
+        QMessageBox::warning(this, "Error", "No volume selected.");
+        return;
+    }
+
+    POI* focusPoi = _surface_collection ? _surface_collection->poi("focus") : nullptr;
+    if (!focusPoi) {
+        QMessageBox::warning(this, "Error", "No focus point set. Please set a focus point first.");
+        return;
+    }
+
+    if (_neuralCheckpointPath.isEmpty() || !QFile::exists(_neuralCheckpointPath)) {
+        QMessageBox::warning(this, "Error", "Please select a valid checkpoint file.");
+        return;
+    }
+
+    QString tracePyPath = findNeuralTracePyPath();
+    if (tracePyPath.isEmpty()) {
+        QMessageBox::warning(this, "Error",
+            "Could not find trace.py. Set NEURAL_TRACE_PY_PATH environment variable.");
+        return;
+    }
+
+    // Get volume zarr path
+    std::filesystem::path volumePath = currentVolume->path();
+    QString volumeZarr = QString::fromStdString(volumePath.string());
+
+    // Get output path (paths directory in the volume package)
+    std::filesystem::path pathsDir;
+    if (fVpkg && fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
+        auto segID = fVpkg->segmentationIDs()[0];
+        auto seg = fVpkg->segmentation(segID);
+        pathsDir = seg->path().parent_path();
+    } else if (fVpkg && fVpkg->hasVolumes()) {
+        auto vol = fVpkg->volume();
+        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
+        pathsDir = vpkgPath / "paths";
+    } else {
+        QMessageBox::warning(this, "Error", "Could not determine output directory.");
+        return;
+    }
+
+    QString outPath = QString::fromStdString(pathsDir.string());
+
+    // Get focus point coordinates (trace.py expects XYZ)
+    const cv::Vec3f& p = focusPoi->p;
+    int startX = static_cast<int>(p[0]);
+    int startY = static_cast<int>(p[1]);
+    int startZ = static_cast<int>(p[2]);
+
+    // Find Python executable - use custom path if specified, otherwise auto-detect
+    QString python = _neuralPythonPath.isEmpty() ? findPythonExecutable() : _neuralPythonPath;
+
+    // Build arguments
+    QStringList args = {
+        tracePyPath,
+        "--checkpoint_path", _neuralCheckpointPath,
+        "--out_path", outPath,
+        "--start_xyz", QString::number(startX), QString::number(startY), QString::number(startZ),
+        "--volume_zarr", volumeZarr,
+        "--volume_scale", QString::number(_neuralVolumeScale),
+        "--steps_per_crop", QString::number(_neuralStepsPerCrop),
+        "--max_size", QString::number(_neuralMaxSize),
+        "--save_partial"
+    };
+
+    // Update UI
+    infoLabel->setText("Running neural trace...");
+    _btnNeuralTrace->setEnabled(false);
+    jobsRunning = true;
+    cancelButton->setVisible(true);
+
+    // Create process
+    QProcess* process = new QProcess(this);
+    process->setProcessChannelMode(QProcess::MergedChannels);
+    process->setWorkingDirectory(outPath);
+
+    // Connect finished signal
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+        [this, process](int exitCode, QProcess::ExitStatus exitStatus) {
+            jobsRunning = false;
+            cancelButton->setVisible(false);
+            runningProcesses.removeOne(process);
+            process->deleteLater();
+
+            if (exitStatus == QProcess::CrashExit) {
+                infoLabel->setText("Neural trace crashed.");
+                emit sendStatusMessageAvailable("Neural trace process crashed", 5000);
+            } else if (exitCode != 0) {
+                infoLabel->setText(QString("Neural trace failed (exit code %1)").arg(exitCode));
+                emit sendStatusMessageAvailable(QString("Neural trace failed with exit code %1").arg(exitCode), 5000);
+            } else {
+                infoLabel->setText("Neural trace completed successfully.");
+                emit sendStatusMessageAvailable("Neural trace completed successfully", 5000);
+            }
+
+            updateButtonStates();
+        });
+
+    // Connect output signal for logging
+    connect(process, &QProcess::readyReadStandardOutput, [process]() {
+        QString output = QString::fromUtf8(process->readAllStandardOutput());
+        std::cout << "[neural-trace] " << output.toStdString();
+    });
+
+    // Log command and start
+    std::cout << "Starting neural trace: " << python.toStdString();
+    for (const QString& arg : args) {
+        std::cout << " " << arg.toStdString();
+    }
+    std::cout << std::endl;
+
+    process->start(python, args);
+    runningProcesses.append(QPointer<QProcess>(process));
+
+    if (!process->waitForStarted(5000)) {
+        QMessageBox::warning(this, "Error", "Failed to start neural trace process.");
+        jobsRunning = false;
+        cancelButton->setVisible(false);
+        runningProcesses.removeOne(process);
+        process->deleteLater();
+        updateButtonStates();
+        return;
+    }
+
+    emit sendStatusMessageAvailable(QString("Neural trace started from (%1, %2, %3)").arg(startX).arg(startY).arg(startZ), 5000);
 }

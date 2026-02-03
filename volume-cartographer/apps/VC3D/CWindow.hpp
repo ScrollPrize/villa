@@ -27,7 +27,7 @@
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
-#include "segmentation/SegmentationEditManager.hpp"
+#include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"
@@ -38,7 +38,7 @@
 #include "overlays/VolumeOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationWidget.hpp"
-#include "segmentation/SegmentationGrowth.hpp"
+#include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -92,6 +92,8 @@ public slots:
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
     void onCropSurfaceToValidRegion(const std::string& segmentId);
+    void onFlipSurface(const std::string& segmentId, bool flipU);
+    void onRotateSurface(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onABFFlatten(const std::string& segmentId);
@@ -99,6 +101,9 @@ public slots:
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
+    void onResumeLocalGrowPatchRequested(const QString& segmentId);
+    void onReloadFromBackup(const QString& segmentId, int backupIndex);
+    void onCopySurfaceRequested(const QString& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,
@@ -271,6 +276,7 @@ private:
     QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
+    QShortcut* fSurfaceNormalsShortcut;
     QShortcut* fAxisAlignedSlicesShortcut;
     QShortcut* fZoomInShortcut;
     QShortcut* fZoomOutShortcut;
@@ -378,6 +384,13 @@ private:
     };
 
     std::optional<NeighborCopyJob> _neighborCopyJob;
+    struct ResumeLocalJob {
+        QString segmentId;
+        QString outputDir;
+        QString paramsPath;
+        std::unique_ptr<QTemporaryFile> paramsFile;
+    };
+    std::optional<ResumeLocalJob> _resumeLocalJob;
     void handleNeighborCopyToolFinished(bool success);
     QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,

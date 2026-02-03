@@ -7,6 +7,7 @@
 #include <QString>
 #include <QList>
 #include <QImage>
+#include <QEvent>
 
 #include <map>
 #include <memory>
@@ -109,6 +110,18 @@ public:
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
     bool isShowDirectionHints() const { return _showDirectionHints; }
 
+    // Surface normals visualization toggle
+    void setShowSurfaceNormals(bool on) { _showSurfaceNormals = on; updateAllOverlays(); }
+    bool isShowSurfaceNormals() const { return _showSurfaceNormals; }
+
+    // Surface normals arrow length scale (1.0 = default)
+    void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; updateAllOverlays(); }
+    float normalArrowLengthScale() const { return _normalArrowLengthScale; }
+
+    // Surface normals max arrows per axis
+    void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; updateAllOverlays(); }
+    int normalMaxArrows() const { return _normalMaxArrows; }
+
     // Surface-relative offset controls (normal direction only)
     void adjustSurfaceOffset(float dn);
     void resetSurfaceOffsets();
@@ -120,7 +133,10 @@ public:
 
     void fitSurfaceInView();
     void updateAllOverlays();
-    
+
+    bool isWindowMinimized() const;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
     // Generic overlay group management (ad-hoc helper for reuse)
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items);
     void clearOverlayGroup(const std::string& key);
@@ -362,6 +378,9 @@ protected:
     bool _brushIsSquare = false;
     bool _resetViewOnSurfaceChange = true;
     bool _showDirectionHints = true;
+    bool _showSurfaceNormals = false;
+    float _normalArrowLengthScale = 1.0f;
+    int _normalMaxArrows = 32;
     bool _segmentationEditActive = false;
     bool _suppressFocusRecentering = false;
 
@@ -406,8 +425,7 @@ protected:
     bool _postRemoveSmallComponents{false};
     int _postMinComponentSize{50};
 
-    // Fast composite rendering cache - no mutex, specialized for composite
-    FastCompositeCache _fastCompositeCache;
+    bool _dirtyWhileMinimized = false;
 
     // Cached normals for composite rendering - invalidated on surface/ptr change
     cv::Mat_<cv::Vec3f> _cachedNormals;

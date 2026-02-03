@@ -1,13 +1,14 @@
 #include "SegmentationGrower.hpp"
 
+#include "../../NeuralTraceServiceManager.hpp"
 #include "ExtrapolationGrowth.hpp"
-#include "SegmentationModule.hpp"
-#include "SegmentationWidget.hpp"
+#include "../SegmentationModule.hpp"
+#include "../SegmentationWidget.hpp"
 
-#include "CVolumeViewer.hpp"
-#include "CSurfaceCollection.hpp"
-#include "ViewerManager.hpp"
-#include "SurfacePanelController.hpp"
+#include "../../CVolumeViewer.hpp"
+#include "../../CSurfaceCollection.hpp"
+#include "../../ViewerManager.hpp"
+#include "../../SurfacePanelController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -1020,6 +1021,58 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     if (auto customParams = _context.widget->customParamsJson()) {
         request.customParams = std::move(*customParams);
     }
+    if (method == SegmentationGrowthMethod::Corrections &&
+        _context.module && _context.module->cellReoptCollectionPending()) {
+        if (!request.customParams) {
+            request.customParams = nlohmann::json::object();
+        }
+        (*request.customParams)["cell_reopt_mode"] = true;
+        qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
+    }
+
+    // Handle neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
+    if (_context.widget->neuralTracerEnabled()) {
+        const QString checkpointPath = _context.widget->neuralCheckpointPath();
+        const QString pythonPath = _context.widget->neuralPythonPath();
+        const QString volumeZarr = _context.widget->volumeZarrPath();
+        const int volumeScale = _context.widget->neuralVolumeScale();
+        const int batchSize = _context.widget->neuralBatchSize();
+
+        if (checkpointPath.isEmpty()) {
+            showStatus(tr("Neural tracer enabled but no checkpoint path specified."), kStatusLong);
+            return false;
+        }
+        if (volumeZarr.isEmpty()) {
+            showStatus(tr("Neural tracer enabled but no volume zarr path available."), kStatusLong);
+            return false;
+        }
+
+        auto& serviceManager = NeuralTraceServiceManager::instance();
+        showStatus(tr("Starting neural trace service..."), kStatusLong);
+
+        if (!serviceManager.ensureServiceRunning(checkpointPath, volumeZarr, volumeScale, pythonPath)) {
+            const QString error = serviceManager.lastError();
+            showStatus(tr("Failed to start neural trace service: %1").arg(error), kStatusLong);
+            return false;
+        }
+
+        const QString socketPath = serviceManager.socketPath();
+        if (socketPath.isEmpty()) {
+            showStatus(tr("Neural trace service is running but socket path is unavailable."), kStatusLong);
+            return false;
+        }
+
+        // Add neural socket parameters to custom params
+        if (!request.customParams) {
+            request.customParams = nlohmann::json::object();
+        }
+        (*request.customParams)["neural_socket"] = socketPath.toStdString();
+        (*request.customParams)["neural_batch_size"] = batchSize;
+
+        qCInfo(lcSegGrowth) << "Neural tracer enabled:"
+                            << "socket" << socketPath
+                            << "batch_size" << batchSize;
+    }
 
     request.corrections = corrections;
     if (method == SegmentationGrowthMethod::Corrections) {
@@ -1051,6 +1104,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
+    ctx.normal3dZarrPath = volumeContext.normal3dZarrPath;
 
     // Populate fields for corrections annotation saving
     if (volumeContext.package) {
@@ -1543,6 +1597,23 @@ void SegmentationGrower::onFutureFinished()
                     volumeIds,
                     request.growthVolumeId,
                     *request.correctionsBounds);
+            }
+        }
+    }
+
+    // Apply grid offset to correction anchors (for surface growth remapping)
+    // and save immediately to persist updated positions
+    if (result.surface && result.surface->meta && _context.module) {
+        auto offsetIt = result.surface->meta->find("grid_offset");
+        if (offsetIt != result.surface->meta->end() && offsetIt->is_array() && offsetIt->size() == 2) {
+            float offsetX = (*offsetIt)[0].get<float>();
+            float offsetY = (*offsetIt)[1].get<float>();
+            if (offsetX != 0.0f || offsetY != 0.0f) {
+                _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
+                // Save corrections with updated anchors to the new surface path
+                if (surfaceToPersist && !surfaceToPersist->path.empty()) {
+                    _context.module->saveCorrectionPoints(surfaceToPersist->path);
+                }
             }
         }
     }

@@ -556,6 +556,8 @@ int main(int argc, char *argv[])
         dst_points.setTo(invalid_marker);
         cv::Mat_<cv::Vec3f> new_points(src_points.size());
         new_points.setTo(invalid_marker);
+        cv::Mat_<float> hit_dist(rows, cols);
+        hit_dist.setTo(-1.0f);
 
         cv::Mat_<uchar> src_valid(rows, cols);
         for (int r = 0; r < rows; ++r) {
@@ -615,7 +617,6 @@ int main(int argc, char *argv[])
                 cv::normalize(n, n);
 
                 // March along the ray until threshold is hit or max distance reached
-                bool placed = false;
                 bool clearance_met = (required_clearance_steps == 0);
                 bool left_surface = false;
                 int below_counter = 0;
@@ -649,13 +650,83 @@ int main(int argc, char *argv[])
                     }
 
                     if (v >= neighbor_threshold) {
-                        new_points(r, c) = cv::Vec3f(static_cast<float>(pos[0]), static_cast<float>(pos[1]), static_cast<float>(pos[2]));
-                        placed = true;
+                        hit_dist(r, c) = static_cast<float>(t);
                         break;
                     }
                 }
-                // If not placed, leave invalid (-1,-1,-1)
-                (void)placed; // silences unused warning in some builds
+            }
+        }
+
+        // Smooth hit distances with a 9x9 sliding window (median of valid distances).
+        const int window_radius = 4;
+        cv::Mat_<float> smooth_dist(rows, cols);
+        smooth_dist.setTo(-1.0f);
+
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (!src_valid(r, c)) {
+                    continue;
+                }
+
+                float samples[81];
+                int count = 0;
+                const int r0 = std::max(0, r - window_radius);
+                const int r1 = std::min(rows - 1, r + window_radius);
+                const int c0 = std::max(0, c - window_radius);
+                const int c1 = std::min(cols - 1, c + window_radius);
+
+                for (int rr = r0; rr <= r1; ++rr) {
+                    for (int cc = c0; cc <= c1; ++cc) {
+                        const float d = hit_dist(rr, cc);
+                        if (d > 0.0f) {
+                            samples[count++] = d;
+                        }
+                    }
+                }
+
+                if (count == 0) {
+                    continue;
+                }
+
+                const int mid = count / 2;
+                std::nth_element(samples, samples + mid, samples + count);
+                float median = samples[mid];
+                if ((count % 2) == 0) {
+                    std::nth_element(samples, samples + mid - 1, samples + count);
+                    median = 0.5f * (median + samples[mid - 1]);
+                }
+                smooth_dist(r, c) = median;
+            }
+        }
+
+        // Reconstruct points along each vertex normal using the smoothed distances.
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (!src_valid(r, c)) {
+                    continue;
+                }
+                const float t = smooth_dist(r, c);
+                if (t <= 0.0f) {
+                    continue;
+                }
+
+                cv::Vec3f n = src_surface->gridNormal(r, c);
+                if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
+                    continue;
+                }
+                if (!cast_out) {
+                    n *= -1.f;
+                }
+                const float nlen = cv::norm(n);
+                if (nlen <= 1e-6f) {
+                    continue;
+                }
+                n *= (1.0f / nlen);
+
+                const cv::Vec3f start = src_points(r, c);
+                new_points(r, c) = start + n * t;
             }
         }
 

@@ -35,6 +35,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <fstream>
 #include <optional>
 #include <unordered_set>
 #include <set>
@@ -687,14 +688,73 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     if (_volumePkg) {
-        QAction* copyOutAction = contextMenu.addAction(tr("Copy Out"));
+        QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
+        if (selectedSegmentIds.size() == 1) {
+            QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
+            connect(copySurfaceAction, &QAction::triggered, this, [this, segmentId]() {
+                emit copySurfaceRequested(segmentId);
+            });
+            copySurfaceMenu->addSeparator();
+        }
+        QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
         connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, true);
         });
-        QAction* copyInAction = contextMenu.addAction(tr("Copy In"));
+        QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
         connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, false);
         });
+        QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
+        connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
+            emit resumeLocalGrowPatchRequested(segmentId);
+        });
+
+        // Reload from Backup submenu
+        std::filesystem::path backupsDir =
+            std::filesystem::path(_volumePkg->getVolpkgDirectory()) / "backups" / segmentId.toStdString();
+        if (std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
+            std::vector<int> availableBackups;
+            for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
+                if (entry.is_directory()) {
+                    try {
+                        int idx = std::stoi(entry.path().filename().string());
+                        if (idx >= 0 && idx <= 9) {
+                            availableBackups.push_back(idx);
+                        }
+                    } catch (...) {
+                        // Not a numeric directory, skip
+                    }
+                }
+            }
+            if (!availableBackups.empty()) {
+                std::sort(availableBackups.begin(), availableBackups.end());
+                QMenu* backupMenu = contextMenu.addMenu(tr("Reload from Backup"));
+                for (int idx : availableBackups) {
+                    std::filesystem::path backupPath = backupsDir / std::to_string(idx);
+                    QString label = tr("Backup %1").arg(idx);
+
+                    // Try to get timestamp from meta.json
+                    std::filesystem::path metaPath = backupPath / "meta.json";
+                    if (std::filesystem::exists(metaPath)) {
+                        try {
+                            std::ifstream f(metaPath);
+                            nlohmann::json meta = nlohmann::json::parse(f);
+                            if (meta.contains("backup_timestamp")) {
+                                label = tr("Backup %1 - %2").arg(idx).arg(
+                                    QString::fromStdString(meta["backup_timestamp"].get<std::string>()));
+                            }
+                        } catch (...) {
+                            // Couldn't read meta, use simple label
+                        }
+                    }
+
+                    QAction* backupAction = backupMenu->addAction(label);
+                    connect(backupAction, &QAction::triggered, this, [this, segmentId, idx]() {
+                        emit reloadFromBackupRequested(segmentId, idx);
+                    });
+                }
+            }
+        }
     }
 
     contextMenu.addSeparator();
@@ -711,6 +771,21 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     QAction* cropBoundsAction = contextMenu.addAction(tr("Crop bounds to valid region"));
     connect(cropBoundsAction, &QAction::triggered, this, [this, segmentId]() {
         emit cropBoundsRequested(segmentId);
+    });
+
+    QMenu* flipMenu = contextMenu.addMenu(tr("Flip Surface"));
+    QAction* flipUAction = flipMenu->addAction(tr("Flip over U axis (reverse V)"));
+    connect(flipUAction, &QAction::triggered, this, [this, segmentId]() {
+        emit flipURequested(segmentId);
+    });
+    QAction* flipVAction = flipMenu->addAction(tr("Flip over V axis (reverse U)"));
+    connect(flipVAction, &QAction::triggered, this, [this, segmentId]() {
+        emit flipVRequested(segmentId);
+    });
+
+    QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));
+    connect(rotateAction, &QAction::triggered, this, [this, segmentId]() {
+        emit rotateSurfaceRequested(segmentId);
     });
 
     QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));

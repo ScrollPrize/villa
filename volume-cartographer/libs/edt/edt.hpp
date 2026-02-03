@@ -32,7 +32,7 @@
 namespace pyedt {
 
 template <typename T>
-double sq(T x) {
+inline double sq(T x) {
   return static_cast<double>(x) * static_cast<double>(x);
 }
 
@@ -68,7 +68,7 @@ inline void toinfinite(float *f, const int64_t voxels) {
  * Writes output to *d
  */
 template <typename T>
-void squared_edt_1d_multi_seg(
+inline void squared_edt_1d_multi_seg(
     T* segids, float *d, const int64_t n, 
     const int64_t stride, const float anistropy,
     const bool black_border=false
@@ -165,7 +165,7 @@ void squared_edt_1d_multi_seg(
  * 
  * Returns: writes distance transform of f to d
  */
-void squared_edt_1d_parabolic(
+inline void squared_edt_1d_parabolic(
     float* f,
     const int64_t n, 
     const int64_t stride, 
@@ -244,7 +244,7 @@ void squared_edt_1d_parabolic(
 }
 
 // about 5% faster
-void squared_edt_1d_parabolic(
+inline void squared_edt_1d_parabolic(
     float* f,
     const int64_t n, 
     const int64_t stride, 
@@ -312,7 +312,7 @@ void squared_edt_1d_parabolic(
   }
 }
 
-void _squared_edt_1d_parabolic(
+inline void _squared_edt_1d_parabolic(
     float* f, 
     const int64_t n, 
     const int64_t stride, 
@@ -342,7 +342,7 @@ void _squared_edt_1d_parabolic(
  * Returns: writes squared distance transform in f
  */
 template <typename T>
-void squared_edt_1d_parabolic_multi_seg(
+inline void squared_edt_1d_parabolic_multi_seg(
   T* segids, float* f,
   const int64_t n, const int64_t stride, const float anisotropy,
   const bool black_border=false
@@ -409,7 +409,7 @@ void squared_edt_1d_parabolic_multi_seg(
  * Returns: writes squared distance transform of f to d
  */
 template <typename T>
-float* _edt3dsq(
+inline float* _edt3dsq(
   T* labels, 
   const int64_t sx, const int64_t sy, const int64_t sz, 
   const float wx, const float wy, const float wz,
@@ -485,7 +485,7 @@ float* _edt3dsq(
 
 // skipping multi-seg logic results in a large speedup
 template <typename T>
-float* _binary_edt3dsq(
+inline float* _binary_edt3dsq(
   T* binaryimg, 
   const int64_t sx, const int64_t sy, const int64_t sz, 
   const float wx, const float wy, const float wz,
@@ -578,7 +578,7 @@ float* _binary_edt3dsq(
 // about 20% faster on binary images by skipping
 // multisegment logic in parabolic
 template <typename T>
-float* _edt3dsq(bool* binaryimg, 
+inline float* _edt3dsq(bool* binaryimg, 
   const int64_t sx, const int64_t sy, const int64_t sz, 
   const float wx, const float wy, const float wz, 
   const bool black_border=false, const int parallel=1, float* workspace=NULL) {
@@ -589,7 +589,7 @@ float* _edt3dsq(bool* binaryimg,
 // Same as _edt3dsq, but applies square root to get
 // euclidean distance.
 template <typename T>
-float* _edt3d(T* input, 
+inline float* _edt3d(T* input, 
   const int64_t sx, const int64_t sy, const int64_t sz, 
   const float wx, const float wy, const float wz,
   const bool black_border=false, const int parallel=1, float* workspace=NULL) {
@@ -605,7 +605,7 @@ float* _edt3d(T* input,
 
 // skipping multi-seg logic results in a large speedup
 template <typename T>
-float* _binary_edt3d(
+inline float* _binary_edt3d(
     T* input, 
     const int64_t sx, const int64_t sy, const int64_t sz, 
     const float wx, const float wy, const float wz,
@@ -630,7 +630,7 @@ float* _binary_edt3d(
 
 // 2D version of _edt3dsq
 template <typename T>
-float* _edt2dsq(
+inline float* _edt2dsq(
     T* input, 
     const int64_t sx, const int64_t sy,
     const float wx, const float wy,
@@ -679,7 +679,7 @@ float* _edt2dsq(
 
 // skipping multi-seg logic results in a large speedup
 template <typename T>
-float* _binary_edt2dsq(T* binaryimg, 
+inline float* _binary_edt2dsq(T* binaryimg, 
   const int64_t sx, const int64_t sy,
   const float wx, const float wy,
   const bool black_border=false, const int parallel=1,
@@ -733,7 +733,7 @@ float* _binary_edt2dsq(T* binaryimg,
 
 // skipping multi-seg logic results in a large speedup
 template <typename T>
-float* _binary_edt2d(T* binaryimg, 
+inline float* _binary_edt2d(T* binaryimg, 
   const int64_t sx, const int64_t sy,
   const float wx, const float wy,
   const bool black_border=false, const int parallel=1,
@@ -756,7 +756,7 @@ float* _binary_edt2d(T* binaryimg,
 
 // 2D version of _edt3dsq
 template <typename T>
-float* _edt2dsq(bool* binaryimg, 
+inline float* _edt2dsq(bool* binaryimg, 
   const int64_t sx, const int64_t sy,
   const float wx, const float wy,
   const bool black_border=false, const int parallel=1,
@@ -773,7 +773,7 @@ float* _edt2dsq(bool* binaryimg,
 
 // returns euclidean distance instead of squared distance
 template <typename T>
-float* _edt2d(
+inline float* _edt2d(
     T* input, 
     const int64_t sx, const int64_t sy,
     const float wx, const float wy,
@@ -805,7 +805,7 @@ float* _edt2d(
 namespace edt {
 
 template <typename T>
-float* edt(
+inline float* edt(
   T* labels, 
   const int sx, const float wx, 
   const bool black_border=false) {
@@ -821,7 +821,7 @@ float* edt(
 }
 
 template <typename T>
-float* edt(
+inline float* edt(
     T* labels, 
     const int sx, const int sy, 
     const float wx, const float wy,
@@ -834,7 +834,7 @@ float* edt(
 
 
 template <typename T>
-float* edt(
+inline float* edt(
   T* labels, 
   const int sx, const int sy, const int sz, 
   const float wx, const float wy, const float wz,
@@ -844,7 +844,7 @@ float* edt(
 }
 
 template <typename T>
-float* binary_edt(
+inline float* binary_edt(
   T* labels, 
   const int sx, 
   const float wx, 
@@ -854,7 +854,7 @@ float* binary_edt(
 }
 
 template <typename T>
-float* binary_edt(
+inline float* binary_edt(
     T* labels, 
     const int sx, const int sy, 
     const float wx, const float wy, 
@@ -872,7 +872,7 @@ float* binary_edt(
 }
 
 template <typename T>
-float* binary_edt(
+inline float* binary_edt(
   T* labels, 
   const int sx, const int sy, const int sz, 
   const float wx, const float wy, const float wz,
@@ -882,7 +882,7 @@ float* binary_edt(
 }
 
 template <typename T>
-float* edtsq(
+inline float* edtsq(
   T* labels, 
   const int sx, const float wx, 
   const bool black_border=false) {
@@ -893,7 +893,7 @@ float* edtsq(
 }
 
 template <typename T>
-float* edtsq(
+inline float* edtsq(
     T* labels, 
     const int sx, const int sy, 
     const float wx, const float wy,
@@ -905,7 +905,7 @@ float* edtsq(
 }
 
 template <typename T>
-float* edtsq(
+inline float* edtsq(
     T* labels, 
     const int sx, const int sy, const int sz, 
     const float wx, const float wy, const float wz,
@@ -922,7 +922,7 @@ float* edtsq(
 }
 
 template <typename T>
-float* binary_edtsq(
+inline float* binary_edtsq(
   T* labels, 
   const int sx, const float wx, 
   const bool black_border=false, const int parallel=1) {
@@ -931,7 +931,7 @@ float* binary_edtsq(
 }
 
 template <typename T>
-float* binary_edtsq(
+inline float* binary_edtsq(
   T* labels, 
   const int sx, const int sy, 
   const float wx, const float wy,
@@ -941,7 +941,7 @@ float* binary_edtsq(
 }
 
 template <typename T>
-float* binary_edtsq(
+inline float* binary_edtsq(
   T* labels, 
   const int sx, const int sy, const int sz, 
   const float wx, const float wy, const float wz,

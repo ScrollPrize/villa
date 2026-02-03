@@ -69,6 +69,8 @@ VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileL
             loadedSegmentationDirs_.insert(dirName);
         }
     }
+
+    ensureSegmentScrollSource();
 }
 
 std::shared_ptr<VolumePkg> VolumePkg::New(const std::filesystem::path& fileLocation)
@@ -210,6 +212,21 @@ void VolumePkg::loadSegmentationsFromDirectory(const std::string& dirName)
     }
     Logger()->info("Loaded {} segments from '{}' (skipped={}, failed={})",
                    loadedCount, dirName, skippedCount, failedCount);
+}
+
+void VolumePkg::ensureSegmentScrollSource()
+{
+    if (segmentations_.empty() || volumes_.empty()) {
+        return;
+    }
+
+    auto scrollName = config_["name"].get<std::string>();
+    auto vol = volumes_.begin()->second;
+    auto volumeUuid = vol->id();
+
+    for (auto& [id, seg] : segmentations_) {
+        seg->ensureScrollSource(scrollName, volumeUuid);
+    }
 }
 
 void VolumePkg::setSegmentationDirectory(const std::string& dirName)
@@ -450,6 +467,11 @@ bool VolumePkg::addSingleSegmentation(const std::string& id)
 
     try {
         auto s = Segmentation::New(segPath);
+        if (!volumes_.empty()) {
+            auto scrollName = config_["name"].get<std::string>();
+            auto volumeUuid = volumes_.begin()->second->id();
+            s->ensureScrollSource(scrollName, volumeUuid);
+        }
         segmentations_.emplace(s->id(), s);
         segmentationDirectories_[s->id()] = currentSegmentationDir_;
         Logger()->info("Added segmentation: {}", id);

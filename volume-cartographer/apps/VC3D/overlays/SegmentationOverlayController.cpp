@@ -3,7 +3,7 @@
 #include "../CSurfaceCollection.hpp"
 #include "../CVolumeViewer.hpp"
 #include "../ViewerManager.hpp"
-#include "../segmentation/SegmentationEditManager.hpp"
+#include "../segmentation/tools/SegmentationEditManager.hpp"
 
 #include <QColor>
 #include <QDebug>
@@ -941,6 +941,18 @@ QColor SegmentationOverlayController::queryApprovalColor(int row, int col) const
     }
 
     return QColor();  // Invalid color if not approved
+}
+
+std::pair<int, int> SegmentationOverlayController::approvalMaskDimensions() const
+{
+    // Return dimensions from pending mask (preferred) or saved mask
+    if (!_pendingApprovalMaskImage.isNull()) {
+        return {_pendingApprovalMaskImage.height(), _pendingApprovalMaskImage.width()};
+    }
+    if (!_savedApprovalMaskImage.isNull()) {
+        return {_savedApprovalMaskImage.height(), _savedApprovalMaskImage.width()};
+    }
+    return {0, 0};
 }
 
 float SegmentationOverlayController::sampleImageBilinear(const QImage& image, float row, float col)

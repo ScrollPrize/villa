@@ -1,9 +1,8 @@
 #include <nlohmann/json.hpp>
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xarray.hpp)
-#include XTENSORINCLUDE(io, xio.hpp)
-#include XTENSORINCLUDE(views, xview.hpp)
+#include <xtensor/containers/xarray.hpp>
+#include <xtensor/io/xio.hpp>
+#include <xtensor/views/xview.hpp>
 
 #include "z5/factory.hxx"
 #include "z5/filesystem/handle.hxx"

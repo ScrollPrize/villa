@@ -71,7 +71,7 @@ inline ThreadPool::ThreadPool(size_t threads)
     start(threads);
 }
 
-void ThreadPool::start(size_t threads) {
+inline void ThreadPool::start(size_t threads) {
     stop = false;
     for(size_t i = 0;i<threads;++i)
         workers.emplace_back(

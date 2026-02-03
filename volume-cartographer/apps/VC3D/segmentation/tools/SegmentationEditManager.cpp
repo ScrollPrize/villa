@@ -1,6 +1,6 @@
 #include "SegmentationEditManager.hpp"
 
-#include "ViewerManager.hpp"
+#include "../../ViewerManager.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"

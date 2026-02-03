@@ -1,5 +1,7 @@
 #include "RangeSlider.hpp"
 
+#include "../Keybinds.hpp"
+
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
@@ -240,22 +242,18 @@ void RangeSlider::mouseReleaseEvent(QMouseEvent* event)
 void RangeSlider::keyPressEvent(QKeyEvent* event)
 {
     int step = 0;
-    switch (event->key()) {
-    case Qt::Key_Left:
-    case Qt::Key_Down:
+    const int key = event->key();
+    if (key == vc3d::keybinds::range_slider::StepDownLeft.key ||
+        key == vc3d::keybinds::range_slider::StepDownDown.key) {
         step = -1;
-        break;
-    case Qt::Key_Right:
-    case Qt::Key_Up:
+    } else if (key == vc3d::keybinds::range_slider::StepUpRight.key ||
+               key == vc3d::keybinds::range_slider::StepUpUp.key) {
         step = 1;
-        break;
-    case Qt::Key_PageDown:
+    } else if (key == vc3d::keybinds::range_slider::PageDown.key) {
         step = -5;
-        break;
-    case Qt::Key_PageUp:
+    } else if (key == vc3d::keybinds::range_slider::PageUp.key) {
         step = 5;
-        break;
-    default:
+    } else {
         QWidget::keyPressEvent(event);
         return;
     }

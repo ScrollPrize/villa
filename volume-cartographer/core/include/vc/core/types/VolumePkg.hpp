@@ -65,4 +65,5 @@ private:
     static std::optional<std::string> loadFirstSegmentationDir_;
 
     void loadSegmentationsFromDirectory(const std::string& dirName);
+    void ensureSegmentScrollSource();
 };

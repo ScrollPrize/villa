@@ -97,6 +97,7 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     auto* win = mdiArea->addSubWindow(viewer);
     win->setWindowTitle(title);
     win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
+    win->installEventFilter(viewer);
 
     viewer->setCache(_chunkCache);
     viewer->setPointCollection(_points);
@@ -113,6 +114,8 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool showHints = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         viewer->setShowDirectionHints(showHints);
+        bool showNormals = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
+        viewer->setShowSurfaceNormals(showNormals);
     }
 
     {

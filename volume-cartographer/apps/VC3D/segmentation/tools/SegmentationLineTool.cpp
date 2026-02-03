@@ -1,9 +1,9 @@
 #include "SegmentationLineTool.hpp"
 
-#include "SegmentationModule.hpp"
+#include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
-#include "CSurfaceCollection.hpp"
-#include "overlays/SegmentationOverlayController.hpp"
+#include "../../CSurfaceCollection.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
 
 #include <QCoreApplication>
 #include <QLoggingCategory>
@@ -170,7 +170,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
 
     // Auto-approve edited regions before applyPreview() clears them
     auto* overlay = _module.overlay();
-    if (overlay && overlay->hasApprovalMaskData()) {
+    if (_module.autoApproveEdits() && overlay && overlay->hasApprovalMaskData()) {
         const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
             std::vector<std::pair<int, int>> gridPositions;

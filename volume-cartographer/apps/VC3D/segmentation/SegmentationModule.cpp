@@ -3,13 +3,13 @@
 #include "CVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
-#include "SegmentationEditManager.hpp"
+#include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
-#include "SegmentationLineTool.hpp"
-#include "SegmentationPushPullTool.hpp"
-#include "ApprovalMaskBrushTool.hpp"
-#include "CellReoptimizationTool.hpp"
-#include "SegmentationCorrections.hpp"
+#include "tools/SegmentationLineTool.hpp"
+#include "tools/SegmentationPushPullTool.hpp"
+#include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/CellReoptimizationTool.hpp"
+#include "growth/SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -120,6 +120,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
         _hoverPreviewEnabled = _widget->showHoverMarker();
+        _autoApproveEdits = _widget->autoApproveEdits();
     }
 
     if (_overlay) {
@@ -174,16 +175,38 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
                 _corrections->onCollectionRemoved(id);
                 updateCorrectionsWidget();
             }
+            updateCellReoptCollections();
+            scheduleCorrectionsAutoSave();
         });
 
         connect(_pointCollection, &VCCollection::collectionChanged, this, [this](uint64_t id) {
             if (_corrections) {
                 _corrections->onCollectionChanged(id);
             }
+            updateCellReoptCollections();
+            scheduleCorrectionsAutoSave();
+        });
+
+        connect(_pointCollection, &VCCollection::collectionsAdded, this, [this](const std::vector<uint64_t>&) {
+            updateCellReoptCollections();
+            scheduleCorrectionsAutoSave();
+        });
+
+        connect(_pointCollection, &VCCollection::pointAdded, this, [this](const ColPoint&) {
+            scheduleCorrectionsAutoSave();
+        });
+
+        connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
+            scheduleCorrectionsAutoSave();
+        });
+
+        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+            scheduleCorrectionsAutoSave();
         });
     }
 
     updateCorrectionsWidget();
+    updateCellReoptCollections();
 
     if (_widget) {
         if (auto range = _widget->correctionsZRange()) {
@@ -234,7 +257,10 @@ bool SegmentationModule::ensureHoverTarget()
         return false;
     }
     if (_hoverPreviewEnabled && _hover.valid) {
-        return true;
+        if (!_hoverPointer.valid || _hover.viewer == _hoverPointer.viewer) {
+            return true;
+        }
+        _hover.clear();
     }
     if (!_hoverPointer.valid) {
         return false;
@@ -320,6 +346,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setEditApprovedMask);
     connect(_widget, &SegmentationWidget::editUnapprovedMaskChanged,
             this, &SegmentationModule::setEditUnapprovedMask);
+    connect(_widget, &SegmentationWidget::autoApproveEditsChanged,
+            this, &SegmentationModule::setAutoApproveEdits);
     connect(_widget, &SegmentationWidget::approvalBrushRadiusChanged,
             this, &SegmentationModule::setApprovalMaskBrushRadius);
     connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
@@ -341,9 +369,14 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::cellReoptPerimeterOffsetChanged,
             this, &SegmentationModule::setCellReoptPerimeterOffset);
     connect(_widget, &SegmentationWidget::cellReoptGrowthRequested,
-            this, [this]() {
+            this, [this](uint64_t collectionId) {
+                if (isEditingApprovalMask()) {
+                    saveApprovalMaskToDisk();
+                }
                 // Cell reoptimization should not auto-approve the growth region
                 _skipAutoApprovalOnGrowth = true;
+                // Store the specific collection ID to use for this growth
+                _cellReoptCollectionId = collectionId;
                 emit growSurfaceRequested(SegmentationGrowthMethod::Corrections,
                                           SegmentationGrowthDirection::All,
                                           0, false);
@@ -531,6 +564,31 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
         }
     }
 
+    // Save corrections for old segment and load for new segment
+    if (_pointCollection) {
+        // Save pending corrections for the old segment
+        if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
+            _correctionsSaveTimer->stop();
+        }
+        if (!_correctionsSegmentPath.empty()) {
+            qCInfo(lcSegModule) << "  Saving correction points for previous segment";
+            _pointCollection->saveToSegmentPath(_correctionsSegmentPath);
+        }
+
+        // Load corrections for new segment
+        if (newSurface && !newSurface->path.empty()) {
+            qCInfo(lcSegModule) << "  Loading correction points for new segment:"
+                                << QString::fromStdString(newSurface->path.string());
+            _pointCollection->loadFromSegmentPath(newSurface->path);
+            _correctionsSegmentPath = newSurface->path;
+        } else {
+            // No valid path - clear anchored collections and path
+            qCInfo(lcSegModule) << "  No segment path, clearing anchored corrections";
+            _pointCollection->loadFromSegmentPath({});  // Clears anchored collections
+            _correctionsSegmentPath.clear();
+        }
+    }
+
     refreshOverlay();
 }
 
@@ -656,6 +714,12 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
     }
 
     refreshOverlay();
+}
+
+void SegmentationModule::setAutoApproveEdits(bool enabled)
+{
+    _autoApproveEdits = enabled;
+    qCInfo(lcSegModule) << "Auto-approve edits set to:" << enabled;
 }
 
 void SegmentationModule::saveApprovalMaskToDisk()
@@ -786,7 +850,7 @@ void SegmentationModule::applyEdits()
     }
 
     // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
-    if (_overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
+    if (_autoApproveEdits && _overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
         const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
             std::vector<std::pair<int, int>> gridPositions;
@@ -875,6 +939,8 @@ void SegmentationModule::setGrowthInProgress(bool running)
         _corrections->setGrowthInProgress(running);
     }
     if (running) {
+        // Clear the cell reopt collection ID now that payload has been built
+        _cellReoptCollectionId = 0;
         setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
@@ -1047,6 +1113,26 @@ void SegmentationModule::updateCorrectionsWidget()
     if (_corrections) {
         _corrections->refreshWidget();
     }
+}
+
+void SegmentationModule::updateCellReoptCollections()
+{
+    if (!_widget || !_pointCollection) {
+        return;
+    }
+
+    QVector<QPair<uint64_t, QString>> entries;
+    const auto& collections = _pointCollection->getAllCollections();
+    entries.reserve(static_cast<int>(collections.size()));
+    for (const auto& [id, col] : collections) {
+        entries.append({id, QString::fromStdString(col.name)});
+    }
+
+    // Sort by collection name for consistent ordering
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    _widget->setCellReoptCollections(entries);
 }
 
 void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userInitiated)
@@ -1246,9 +1332,18 @@ std::optional<std::pair<int, int>> SegmentationModule::correctionsZRange() const
     return _corrections ? _corrections->zRange() : std::nullopt;
 }
 
-SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload() const
+SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload(bool onlyActiveCollection) const
 {
-    return _corrections ? _corrections->buildPayload() : SegmentationCorrectionsPayload{};
+    if (!_corrections) {
+        return SegmentationCorrectionsPayload{};
+    }
+
+    // If a specific collection ID is set for cell reoptimization, build payload with only that
+    if (_cellReoptCollectionId != 0) {
+        return _corrections->buildPayloadForCollection(_cellReoptCollectionId);
+    }
+
+    return _corrections->buildPayload(onlyActiveCollection);
 }
 void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
                                                     SegmentationGrowthDirection direction,
@@ -1381,7 +1476,7 @@ void SegmentationModule::finishDrag()
         captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
-        if (_overlay && _overlay->hasApprovalMaskData()) {
+        if (_autoApproveEdits && _overlay && _overlay->hasApprovalMaskData()) {
             const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 std::vector<std::pair<int, int>> gridPositions;
@@ -1500,6 +1595,13 @@ void SegmentationModule::recordPointerSample(CVolumeViewer* viewer, const cv::Ve
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
         return;
+    }
+
+    // Detect viewer change and reset stale cached state
+    if (_hoverPointer.valid && _hoverPointer.viewer != viewer) {
+        resetHoverLookupDetail();           // Reset velocity tracking
+        _editManager->resetPointerSeed();   // Reset pointTo() seed
+        _hover.clear();                     // Invalidate stale hover
     }
 
     _hoverPointer.valid = true;
@@ -1667,5 +1769,34 @@ void SegmentationModule::updateAutosaveState()
         }
     } else if (_autosaveTimer->isActive()) {
         _autosaveTimer->stop();
+    }
+}
+
+void SegmentationModule::scheduleCorrectionsAutoSave()
+{
+    // Only auto-save if we have a valid segment path
+    if (_correctionsSegmentPath.empty() || !_pointCollection) {
+        return;
+    }
+
+    if (!_correctionsSaveTimer) {
+        _correctionsSaveTimer = new QTimer(this);
+        _correctionsSaveTimer->setSingleShot(true);
+        connect(_correctionsSaveTimer, &QTimer::timeout, this, &SegmentationModule::performCorrectionsAutoSave);
+    }
+
+    _correctionsSaveTimer->start(kCorrectionsSaveDelayMs);
+}
+
+void SegmentationModule::performCorrectionsAutoSave()
+{
+    if (_correctionsSegmentPath.empty() || !_pointCollection) {
+        return;
+    }
+
+    if (_pointCollection->saveToSegmentPath(_correctionsSegmentPath)) {
+        qCDebug(lcSegModule) << "Auto-saved correction points to" << QString::fromStdString(_correctionsSegmentPath.string());
+    } else {
+        qCWarning(lcSegModule) << "Failed to auto-save correction points";
     }
 }

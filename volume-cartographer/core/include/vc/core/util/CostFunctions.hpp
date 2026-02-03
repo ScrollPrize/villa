@@ -10,33 +10,105 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <utility>
 
 
 static double  val(const double &v) { return v; }
 template <typename JetT>
 double  val(const JetT &v) { return v.a; }
 
-template <typename T>
-inline bool is_invalid_point(const T* const p) {
-    return val(p[0]) == -1 && val(p[1]) == -1 && val(p[2]) == -1;
-}
+// -----------------------------------------------------------------------------
+// Normal-fit quality weighting (from vc_ngrids diagnostics zarr)
+// -----------------------------------------------------------------------------
+// Encapsulates reading auxiliary uint8 volumes (fit_rms, fit_frac_short_paths)
+// and turning them into a multiplicative weight in [0,1].
+//
+// IMPORTANT:
+// - Sampling is trilinear but NON-differentiable (coordinates are unjetted before sampling).
+// - Weight mapping:
+//     rms: 0.0 -> 1.0, 0.5 -> 0.0 (linear ramp, clamped)
+//     frac_short_paths: 0.0 -> 1.0, 1.0 -> 0.0 (linear ramp, clamped)
+//   final = w_rms * w_frac
+struct NormalFitQualityWeightField {
+    NormalFitQualityWeightField(std::unique_ptr<z5::Dataset>&& rms_ds,
+                                std::unique_ptr<z5::Dataset>&& frac_ds,
+                                float scale,
+                                ChunkCache<uint8_t>* cache,
+                                const std::string& cache_root,
+                                const std::string& unique_id)
+        : _passthrough_rms{unique_id + "_fit_rms"},
+          _passthrough_frac{unique_id + "_fit_frac"},
+          _rms(_passthrough_rms, rms_ds.get(), cache, cache_root),
+          _frac(_passthrough_frac, frac_ds.get(), cache, cache_root),
+          _scale(scale),
+          _rms_ds(std::move(rms_ds)),
+          _frac_ds(std::move(frac_ds)),
+          _interp_rms(_rms),
+          _interp_frac(_frac)
+    {}
 
-template <typename T>
-inline T angle_diff_deg_t(const T& a_deg, const T& b_deg) {
-    const T diff_rad = (a_deg - b_deg) * T(M_PI / 180.0);
-    return atan2(sin(diff_rad), cos(diff_rad)) * T(180.0 / M_PI);
-}
+    NormalFitQualityWeightField(const NormalFitQualityWeightField&) = delete;
+    NormalFitQualityWeightField& operator=(const NormalFitQualityWeightField&) = delete;
+
+    // Canonical XYZ input.
+    template <typename E>
+    inline double weight_xyz(const E& x, const E& y, const E& z) const {
+        const double xx = unjet(x);
+        const double yy = unjet(y);
+        const double zz = unjet(z);
+        return weight_xyz_d(xx, yy, zz);
+    }
+
+    inline double weight_xyz_d(double x, double y, double z) const {
+        // Convert canonical XYZ to dataset ZYX coordinate space.
+        const double dz = z * static_cast<double>(_scale);
+        const double dy = y * static_cast<double>(_scale);
+        const double dx = x * static_cast<double>(_scale);
+
+        double rms_u8 = 0.0;
+        double frac_u8 = 0.0;
+        _interp_rms.Evaluate(dz, dy, dx, &rms_u8);
+        _interp_frac.Evaluate(dz, dy, dx, &frac_u8);
+
+        const double rms = std::clamp(rms_u8 / 255.0, 0.0, 1.0);
+        const double frac = std::clamp(frac_u8 / 255.0, 0.0, 1.0);
+
+        // rms weighting: 0 -> 1, 0.5 -> 0
+        const double w_rms = std::clamp(1.0 - (rms / 0.5), 0.0, 1.0);
+        // frac-short weighting: 0 -> 1, 1 -> 0
+        const double w_frac = std::clamp(1.0 - frac, 0.0, 1.0);
+        return w_rms * w_frac;
+    }
+
+private:
+    static double unjet(const double& v) { return v; }
+    template <typename JetT>
+    static double unjet(const JetT& v) { return v.a; }
+
+    passTroughComputor _passthrough_rms;
+    passTroughComputor _passthrough_frac;
+    Chunked3d<uint8_t, passTroughComputor> _rms;
+    Chunked3d<uint8_t, passTroughComputor> _frac;
+    float _scale;
+    std::unique_ptr<z5::Dataset> _rms_ds;
+    std::unique_ptr<z5::Dataset> _frac_ds;
+    CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_rms;
+    CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
+};
 
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
     bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (is_invalid_point(a)) {
+        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
             residual[0] = T(0);
+            std::cout << "invalid DistLoss CORNER" << std::endl;
             return true;
         }
-        if (is_invalid_point(b)) {
+        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
             residual[0] = T(0);
+            std::cout << "invalid DistLoss CORNER" << std::endl;
             return true;
         }
 
@@ -73,12 +145,14 @@ struct DistLoss2D {
     DistLoss2D(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
     bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (is_invalid_point(a)) {
+        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
             residual[0] = T(0);
+            std::cout << "invalid DistLoss2D CORNER" << std::endl;
             return true;
         }
-        if (is_invalid_point(b)) {
+        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
             residual[0] = T(0);
+            std::cout << "invalid DistLoss2D CORNER" << std::endl;
             return true;
         }
 
@@ -113,6 +187,42 @@ struct DistLoss2D {
     }
 };
 
+struct SignedDistanceToSurfaceCost {
+    using Sampler = std::function<float(const cv::Vec3f&)>;
+
+    SignedDistanceToSurfaceCost(Sampler sampler, double weight, float max_move)
+        : sampler_(std::move(sampler)), weight_(weight), max_move_(max_move) {}
+
+    bool operator()(const double* candidate, double* residual) const {
+        if (!sampler_ || weight_ <= 0.0) {
+            residual[0] = 0.0;
+            return true;
+        }
+        if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2])) {
+            residual[0] = 0.0;
+            return true;
+        }
+        const cv::Vec3f p(static_cast<float>(candidate[0]),
+                          static_cast<float>(candidate[1]),
+                          static_cast<float>(candidate[2]));
+        float dist = sampler_(p);
+        if (!std::isfinite(dist)) {
+            residual[0] = 0.0;
+            return true;
+        }
+        if (max_move_ > 0.0f) {
+            dist = std::clamp(dist, -max_move_, max_move_);
+        }
+        residual[0] = weight_ * static_cast<double>(dist);
+        return true;
+    }
+
+private:
+    Sampler sampler_;
+    double weight_;
+    float max_move_;
+};
+
 
 
 struct StraightLoss {
@@ -131,6 +241,10 @@ struct StraightLoss {
         
         T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
         T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
+        if (l1 <= T(1e-12) || l2 <= T(1e-12)) {
+            residual[0] = T(0);
+            return true;
+        }
 
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         
@@ -412,14 +526,9 @@ struct SpaceLineLossAcc {
 
 };
 
-// Templated fiber direction loss - works with any field type that supports operator()(z, y, x)
-// FieldT must provide operator()(double z, double y, double x) -> cv::Vec3f (in ZYX order)
-// WeightT is optional, can be nullptr
-template<typename FieldT, typename WeightT = Chunked3dFloatFromUint8>
-struct FiberDirectionLossT {
-    FiberDirectionLossT(FieldT& fiber_dirs, WeightT* maybe_weights, float w) :
+struct FiberDirectionLoss {
+    FiberDirectionLoss(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
         _fiber_dirs(fiber_dirs), _maybe_weights(maybe_weights), _w(w) {};
-
     template <typename E>
     bool operator()(const E* const l_base, const E* const l_u_off, E* residual) const {
 
@@ -459,27 +568,18 @@ struct FiberDirectionLossT {
     template<typename JetT> static double unjet(const JetT& v) { return v.a; }
 
     float _w;
-    FieldT& _fiber_dirs;
-    WeightT* _maybe_weights;
+    Chunked3dVec3fFromUint8 &_fiber_dirs;
+    Chunked3dFloatFromUint8 *_maybe_weights;
 
-    static ceres::CostFunction* Create(FieldT& fiber_dirs, WeightT* maybe_weights, float w = 1.0)
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
     {
-        return new ceres::AutoDiffCostFunction<FiberDirectionLossT<FieldT, WeightT>, 1, 3, 3>(
-            new FiberDirectionLossT<FieldT, WeightT>(fiber_dirs, maybe_weights, w));
+        return new ceres::AutoDiffCostFunction<FiberDirectionLoss, 1, 3, 3>(new FiberDirectionLoss(fiber_dirs, maybe_weights, w));
     }
 };
 
-// Backward-compatible alias using original Chunked3d types
-using FiberDirectionLoss = FiberDirectionLossT<Chunked3dVec3fFromUint8, Chunked3dFloatFromUint8>;
-
-// Templated normal direction loss - works with any field type that supports operator()(z, y, x)
-// FieldT must provide operator()(double z, double y, double x) -> cv::Vec3f (in ZYX order)
-// WeightT is optional, can be nullptr
-template<typename FieldT, typename WeightT = Chunked3dFloatFromUint8>
-struct NormalDirectionLossT {
-    NormalDirectionLossT(FieldT& normal_dirs, WeightT* maybe_weights, float w) :
+struct NormalDirectionLoss {
+    NormalDirectionLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
         _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {};
-
     template <typename E>
     bool operator()(const E* const l_base, const E* const l_u_off, const E* const l_v_off, E* residual) const {
 
@@ -527,18 +627,239 @@ struct NormalDirectionLossT {
     template<typename JetT> static double unjet(const JetT& v) { return v.a; }
 
     float _w;
-    FieldT& _normal_dirs;
-    WeightT* _maybe_weights;
+    Chunked3dVec3fFromUint8 &_normal_dirs;
+    Chunked3dFloatFromUint8 *_maybe_weights;
 
-    static ceres::CostFunction* Create(FieldT& normal_dirs, WeightT* maybe_weights, float w = 1.0)
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
     {
-        return new ceres::AutoDiffCostFunction<NormalDirectionLossT<FieldT, WeightT>, 1, 3, 3, 3>(
-            new NormalDirectionLossT<FieldT, WeightT>(normal_dirs, maybe_weights, w));
+        return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(normal_dirs, maybe_weights, w));
     }
 };
 
-// Backward-compatible alias using original Chunked3d types
-using NormalDirectionLoss = NormalDirectionLossT<Chunked3dVec3fFromUint8, Chunked3dFloatFromUint8>;
+// Penalize that an in-surface edge direction is perpendicular to the directed target normal field.
+//
+// For an edge vector e and (unit) target normal n, we want angle(e,n)=90°, i.e. dot(e,n)=0.
+// This uses three points:
+// - p_base: edge base point
+// - p_off:  edge end point (the segment whose direction we constrain)
+// - p_clockwise: the next quad corner in clockwise direction from p_base when walking towards p_off.
+//   This is used only to disambiguate the sign / orientation of the directed normal field.
+//
+// The 90° constraint is enforced only from the p_base->p_off segment.
+struct Normal3DLineLoss {
+    Normal3DLineLoss(Chunked3dVec3fFromUint8 &normal_dirs,
+                     const NormalFitQualityWeightField* maybe_fit_quality,
+                     float w)
+        : _normal_dirs(normal_dirs), _maybe_fit_quality(maybe_fit_quality), _w(w) {}
+
+    template <typename E>
+    bool operator()(const E* const p_base, const E* const p_off, const E* const p_clockwise, E* residual) const {
+        // p_* are XYZ, while _normal_dirs is indexed ZYX and returns ZYX-ordered vectors.
+
+        // Sample at the center of the edge.
+        const E mid_xyz[3] = {
+            (p_base[0] + p_off[0]) * E(0.5),
+            (p_base[1] + p_off[1]) * E(0.5),
+            (p_base[2] + p_off[2]) * E(0.5),
+        };
+
+        E target_zyx[3];
+        if (!sample_trilinear_normal_zyx(_normal_dirs,
+                                         /*z=*/mid_xyz[2],
+                                         /*y=*/mid_xyz[1],
+                                         /*x=*/mid_xyz[0],
+                                         target_zyx)) {
+            residual[0] = E(0);
+            return true;
+        }
+
+        // Edge vector in ZYX ordering (base -> off). This is what the 90° constraint is based on.
+        const E e_zyx[3] = { p_off[2] - p_base[2], p_off[1] - p_base[1], p_off[0] - p_base[0] };
+        const E e_len = ceres::sqrt(e_zyx[0]*e_zyx[0] + e_zyx[1]*e_zyx[1] + e_zyx[2]*e_zyx[2] + E(1e-12));
+        // cos between edge direction and target normal. For the intended 90° constraint
+        // we want this value close to 0.
+        const E cos_angle = (e_zyx[0] * target_zyx[0] + e_zyx[1] * target_zyx[1] + e_zyx[2] * target_zyx[2]) / e_len;
+
+        // Additional fit-quality weight (non-differentiable sample).
+        E fit_w = E(1);
+        if (_maybe_fit_quality) {
+            fit_w = E(_maybe_fit_quality->weight_xyz(mid_xyz[0], mid_xyz[1], mid_xyz[2]));
+        }
+
+        // Use the third point (clockwise neighbor) to disambiguate which *side* of the target normal we're on.
+        // We treat p_clockwise as non-differentiable for this decision.
+        const E pcw_xyz_const[3] = {
+            E(unjet(p_clockwise[0])),
+            E(unjet(p_clockwise[1])),
+            E(unjet(p_clockwise[2])),
+        };
+
+        // v is the clockwise direction in the surface plane.
+        const E v_zyx[3] = {
+            pcw_xyz_const[2] - p_base[2],
+            pcw_xyz_const[1] - p_base[1],
+            pcw_xyz_const[0] - p_base[0],
+        };
+
+        // Surface normal (right-hand rule): n_surf = e x v (in ZYX ordering).
+        E n_surf_zyx[3] = {
+            e_zyx[1] * v_zyx[2] - e_zyx[2] * v_zyx[1],
+            e_zyx[2] * v_zyx[0] - e_zyx[0] * v_zyx[2],
+            e_zyx[0] * v_zyx[1] - e_zyx[1] * v_zyx[0],
+        };
+        const E n_surf_len = ceres::sqrt(n_surf_zyx[0]*n_surf_zyx[0] + n_surf_zyx[1]*n_surf_zyx[1] + n_surf_zyx[2]*n_surf_zyx[2] + E(1e-12));
+        n_surf_zyx[0] /= n_surf_len;
+        n_surf_zyx[1] /= n_surf_len;
+        n_surf_zyx[2] /= n_surf_len;
+
+        // Compare sidedness against target normal.
+        const E side_dot = (n_surf_zyx[0] * target_zyx[0] + n_surf_zyx[1] * target_zyx[1] + n_surf_zyx[2] * target_zyx[2]);
+
+        // We want the edge direction to be in-plane => perpendicular to target normal.
+        // Use |cos| to keep the objective non-negative and bounded.
+        const E cos = ceres::abs(cos_angle);
+
+        // Direction-aware term:
+        // - On the correct side of the directed normal, minimize loss = cos.
+        // - On the wrong side, use loss = 2 - cos (escape objective).
+        const E loss = (side_dot >= E(0)) ? cos : (E(2) - cos);
+
+        residual[0] = E(_w) * fit_w * loss;
+        return true;
+    }
+
+    static double unjet(const double& v) { return v; }
+    template<typename JetT> static double unjet(const JetT& v) { return v.a; }
+
+    float _w;
+    Chunked3dVec3fFromUint8 &_normal_dirs;
+    const NormalFitQualityWeightField* _maybe_fit_quality;
+
+public:
+    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs,
+                                       const NormalFitQualityWeightField* maybe_fit_quality,
+                                       float w = 1.0f)
+    {
+        return new ceres::AutoDiffCostFunction<Normal3DLineLoss, 1, 3, 3, 3>(
+            new Normal3DLineLoss(normal_dirs, maybe_fit_quality, w));
+    }
+
+private:
+    template <typename E>
+    static inline void clamp01(E& t)
+    {
+        if (val(t) < 0.0) t = E(0);
+        if (val(t) > 1.0) t = E(1);
+    }
+
+    template <typename E>
+    static inline bool sample_trilinear_normal_zyx(Chunked3dVec3fFromUint8 &dirs,
+                                                   const E& z_canon,
+                                                   const E& y_canon,
+                                                   const E& x_canon,
+                                                   E* out_zyx)
+    {
+        const E zf = z_canon * E(dirs._scale);
+        const E yf = y_canon * E(dirs._scale);
+        const E xf = x_canon * E(dirs._scale);
+
+        int z0 = static_cast<int>(std::floor(unjet(zf)));
+        int y0 = static_cast<int>(std::floor(unjet(yf)));
+        int x0 = static_cast<int>(std::floor(unjet(xf)));
+
+        const auto shape = dirs._x.shape(); // z,y,x
+        if (!shape.empty()) {
+            z0 = std::clamp(z0, 0, std::max(0, shape[0] - 2));
+            y0 = std::clamp(y0, 0, std::max(0, shape[1] - 2));
+            x0 = std::clamp(x0, 0, std::max(0, shape[2] - 2));
+        } else {
+            z0 = std::max(0, z0);
+            y0 = std::max(0, y0);
+            x0 = std::max(0, x0);
+        }
+
+        const int z1 = z0 + 1;
+        const int y1 = y0 + 1;
+        const int x1 = x0 + 1;
+
+        // Placeholder / unset normals are stored as the neutral uint8 triplet (128,128,128).
+        // If *any* trilinear corner is a placeholder, treat the sample as invalid.
+        auto is_fill_triplet = [&](int z, int y, int x) -> bool {
+            const auto rx = dirs._x.safe_at(z, y, x);
+            const auto ry = dirs._y.safe_at(z, y, x);
+            const auto rz = dirs._z.safe_at(z, y, x);
+            return (rx == 128) && (ry == 128) && (rz == 128);
+        };
+        const bool any_fill =
+            is_fill_triplet(z0, y0, x0) || is_fill_triplet(z1, y0, x0) || is_fill_triplet(z0, y1, x0) || is_fill_triplet(z1, y1, x0) ||
+            is_fill_triplet(z0, y0, x1) || is_fill_triplet(z1, y0, x1) || is_fill_triplet(z0, y1, x1) || is_fill_triplet(z1, y1, x1);
+        if (any_fill)
+            return false;
+
+        E dz = zf - E(z0);
+        E dy = yf - E(y0);
+        E dx = xf - E(x0);
+        clamp01(dz);
+        clamp01(dy);
+        clamp01(dx);
+
+        auto lerp = [](const E& a, const E& b, const E& t) { return (E(1) - t) * a + t * b; };
+        auto decode_u8_to_unit = [](const E& u8) { return (u8 - E(128.0)) / E(127.0); };
+
+        auto tri = [&](const E& c000, const E& c100, const E& c010, const E& c110,
+                       const E& c001, const E& c101, const E& c011, const E& c111) -> E {
+            const E c00 = lerp(c000, c001, dx);
+            const E c01 = lerp(c010, c011, dx);
+            const E c10 = lerp(c100, c101, dx);
+            const E c11 = lerp(c110, c111, dx);
+            const E c0  = lerp(c00,  c01,  dy);
+            const E c1  = lerp(c10,  c11,  dy);
+            return lerp(c0, c1, dz);
+        };
+
+        const E x000 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y0, x0))));
+        const E x100 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y0, x0))));
+        const E x010 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y1, x0))));
+        const E x110 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y1, x0))));
+        const E x001 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y0, x1))));
+        const E x101 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y0, x1))));
+        const E x011 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z0, y1, x1))));
+        const E x111 = decode_u8_to_unit(E(static_cast<double>(dirs._x.safe_at(z1, y1, x1))));
+
+        const E y000 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y0, x0))));
+        const E y100 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y0, x0))));
+        const E y010 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y1, x0))));
+        const E y110 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y1, x0))));
+        const E y001 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y0, x1))));
+        const E y101 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y0, x1))));
+        const E y011 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z0, y1, x1))));
+        const E y111 = decode_u8_to_unit(E(static_cast<double>(dirs._y.safe_at(z1, y1, x1))));
+
+        const E z000 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y0, x0))));
+        const E z100 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y0, x0))));
+        const E z010 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y1, x0))));
+        const E z110 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y1, x0))));
+        const E z001 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y0, x1))));
+        const E z101 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y0, x1))));
+        const E z011 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z0, y1, x1))));
+        const E z111 = decode_u8_to_unit(E(static_cast<double>(dirs._z.safe_at(z1, y1, x1))));
+
+        out_zyx[0] = tri(z000, z100, z010, z110, z001, z101, z011, z111);
+        out_zyx[1] = tri(y000, y100, y010, y110, y001, y101, y011, y111);
+        out_zyx[2] = tri(x000, x100, x010, x110, x001, x101, x011, x111);
+
+        const E n = ceres::sqrt(out_zyx[0] * out_zyx[0]
+                                + out_zyx[1] * out_zyx[1]
+                                + out_zyx[2] * out_zyx[2]
+                                + E(1e-12));
+        out_zyx[0] /= n;
+        out_zyx[1] /= n;
+        out_zyx[2] /= n;
+
+        return true;
+    }
+
+};
 
 /**
  * @brief Ceres cost function to enforce that the surface normal aligns with precomputed normal grids.
@@ -561,6 +882,7 @@ struct NormalConstraintPlane {
     const int plane_idx; // 0: XY, 1: XZ, 2: YZ
     const double w_normal;
     const double w_snap;
+    const NormalFitQualityWeightField* maybe_fit_quality;
     const int z_min;
     const int z_max;
     bool invert_dir;
@@ -607,8 +929,24 @@ struct NormalConstraintPlane {
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
  
-     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double w_normal, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false)
-         : normal_grid_volume(normal_grid_volume), plane_idx(plane_idx), w_normal(w_normal), w_snap(w_snap), direction_aware_(direction_aware), z_min(z_min), z_max(z_max), invert_dir(invert_dir) {}
+     NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume,
+                           int plane_idx,
+                           double w_normal,
+                           double w_snap,
+                           const NormalFitQualityWeightField* maybe_fit_quality,
+                           bool direction_aware = false,
+                           int z_min = -1,
+                           int z_max = -1,
+                           bool invert_dir = false)
+         : normal_grid_volume(normal_grid_volume),
+           plane_idx(plane_idx),
+           w_normal(w_normal),
+           w_snap(w_snap),
+           maybe_fit_quality(maybe_fit_quality),
+           direction_aware_(direction_aware),
+           z_min(z_min),
+           z_max(z_max),
+           invert_dir(invert_dir) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -734,7 +1072,10 @@ struct NormalConstraintPlane {
         else if (plane_idx == 1) angle_weight = 0.5 * w_y; // XZ plane
         else angle_weight = 0.5 * w_x; // YZ plane
 
-        residual[0] = interpolated_loss * T(angle_weight);
+        // Optional fit-quality modulation (non-differentiable sample).
+        // Use query_point (based on A) as the canonical XYZ position.
+        const double fit_w = maybe_fit_quality ? maybe_fit_quality->weight_xyz_d(query_point.x, query_point.y, query_point.z) : 1.0;
+        residual[0] = interpolated_loss * T(angle_weight) * T(fit_w);
 
         return true;
     }
@@ -998,9 +1339,17 @@ struct NormalConstraintPlane {
         return dist_sq(dP);
     }
 
-    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume, int plane_idx, double w_normal, double w_snap, bool direction_aware = false, int z_min = -1, int z_max = -1, bool invert_dir = false) {
+    static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume,
+                                       int plane_idx,
+                                       double w_normal,
+                                       double w_snap,
+                                       const NormalFitQualityWeightField* maybe_fit_quality,
+                                       bool direction_aware = false,
+                                       int z_min = -1,
+                                       int z_max = -1,
+                                       bool invert_dir = false) {
         return new ceres::AutoDiffCostFunction<NormalConstraintPlane, 1, 3, 3, 3, 3>(
-            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, direction_aware, z_min, z_max, invert_dir)
+            new NormalConstraintPlane(normal_grid_volume, plane_idx, w_normal, w_snap, maybe_fit_quality, direction_aware, z_min, z_max, invert_dir)
         );
     }
 
@@ -1335,462 +1684,5 @@ struct AntiFlipbackLoss {
     cv::Vec3d _anchor;
     cv::Vec3d _normal;
     double _threshold;
-    double _w;
-};
-
-// ============================================================================
-// SDT-based Ceres Cost Functions for Neural Tracer Integration
-// ============================================================================
-
-// Forward declaration for SDT field data holder
-// This struct wraps the SDT prediction data needed by the cost functions
-struct SdtFieldData {
-    const float* sdt_data;          // Pointer to SDT array data (ZYX order)
-    int sdt_shape[3];               // Shape: [D, H, W] in ZYX order
-    cv::Vec3f min_corner_xyz;       // Full-res XYZ of array origin
-    float scale_factor;             // 2^volume_scale for coordinate conversion
-    cv::Vec3f forward_dir;          // Normalized growth direction
-    cv::Vec3f center_xyz;           // Center position (for forward loss)
-    float normal_sign;              // +1 or -1 based on conditioning orientation
-
-    // Sample SDT with trilinear interpolation at world position (returns NaN if out of bounds)
-    float sample(const cv::Vec3f& world_pos_xyz) const {
-        cv::Vec3f local_fullres = world_pos_xyz - min_corner_xyz;
-        cv::Vec3f local_model = local_fullres / scale_factor;
-
-        float x = local_model[0];
-        float y = local_model[1];
-        float z = local_model[2];
-
-        int D = sdt_shape[0], H = sdt_shape[1], W = sdt_shape[2];
-        if (x < 0 || x >= W-1 || y < 0 || y >= H-1 || z < 0 || z >= D-1)
-            return std::numeric_limits<float>::quiet_NaN();
-
-        int x0 = (int)x, y0 = (int)y, z0 = (int)z;
-        int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-        float xf = x - x0, yf = y - y0, zf = z - z0;
-
-        // Array indexing: [z][y][x] -> z*H*W + y*W + x
-        auto idx = [&](int zi, int yi, int xi) { return zi * H * W + yi * W + xi; };
-
-        float c000 = sdt_data[idx(z0, y0, x0)], c001 = sdt_data[idx(z0, y0, x1)];
-        float c010 = sdt_data[idx(z0, y1, x0)], c011 = sdt_data[idx(z0, y1, x1)];
-        float c100 = sdt_data[idx(z1, y0, x0)], c101 = sdt_data[idx(z1, y0, x1)];
-        float c110 = sdt_data[idx(z1, y1, x0)], c111 = sdt_data[idx(z1, y1, x1)];
-
-        float c00 = c000 * (1-xf) + c001 * xf;
-        float c01 = c010 * (1-xf) + c011 * xf;
-        float c10 = c100 * (1-xf) + c101 * xf;
-        float c11 = c110 * (1-xf) + c111 * xf;
-
-        float c0 = c00 * (1-yf) + c01 * yf;
-        float c1 = c10 * (1-yf) + c11 * yf;
-
-        return c0 * (1-zf) + c1 * zf;
-    }
-
-    // Compute gradient via central differences (in full-res XYZ space)
-    cv::Vec3f gradient(const cv::Vec3f& world_pos_xyz) const {
-        const float h = scale_factor;  // Step in full-res = 1 model voxel
-
-        float dx = sample(world_pos_xyz + cv::Vec3f(h,0,0)) - sample(world_pos_xyz - cv::Vec3f(h,0,0));
-        float dy = sample(world_pos_xyz + cv::Vec3f(0,h,0)) - sample(world_pos_xyz - cv::Vec3f(0,h,0));
-        float dz = sample(world_pos_xyz + cv::Vec3f(0,0,h)) - sample(world_pos_xyz - cv::Vec3f(0,0,h));
-
-        if (std::isnan(dx) || std::isnan(dy) || std::isnan(dz) ||
-            std::isinf(dx) || std::isinf(dy) || std::isinf(dz)) {
-            return cv::Vec3f(0, 0, 0);
-        }
-
-        return cv::Vec3f(dx, dy, dz) / (2 * h);
-    }
-};
-
-// ============================================================================
-// SDT Field Adapters - Make SDT data compatible with FiberDirectionLoss/NormalDirectionLoss
-// These adapters implement operator()(z, y, x) -> cv::Vec3f in ZYX order,
-// matching the interface of Chunked3dVec3fFromUint8
-// ============================================================================
-
-// Adapter for SDT gradient as normal direction field
-// Returns the normalized SDT gradient (which points normal to the surface) in ZYX order
-struct SdtNormalFieldAdapter {
-    const SdtFieldData* sdt;
-
-    explicit SdtNormalFieldAdapter(const SdtFieldData* sdt_field) : sdt(sdt_field) {}
-
-    cv::Vec3f operator()(double z, double y, double x) const {
-        if (!sdt) return cv::Vec3f(0, 0, 0);
-
-        // Convert ZYX coordinates to XYZ for SdtFieldData
-        cv::Vec3f pos_xyz(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-        cv::Vec3f grad_xyz = sdt->gradient(pos_xyz);
-
-        float len = cv::norm(grad_xyz);
-        if (len < 1e-6f) return cv::Vec3f(0, 0, 0);
-
-        // Normalize and apply sign for consistent orientation
-        cv::Vec3f normal_xyz = (sdt->normal_sign * grad_xyz) / len;
-
-        // Convert XYZ to ZYX order for return (matches Chunked3dVec3fFromUint8 convention)
-        return cv::Vec3f(normal_xyz[2], normal_xyz[1], normal_xyz[0]);
-    }
-
-    cv::Vec3f operator()(cv::Vec3d p) const {
-        return operator()(p[0], p[1], p[2]);
-    }
-};
-
-// Adapter for SDT-derived fiber direction (tangent to surface)
-// Projects a tangent hint onto the surface tangent plane (perpendicular to gradient)
-// The hint should be the expected fiber direction (e.g. from patch geometry)
-struct SdtFiberFieldAdapter {
-    const SdtFieldData* sdt;
-    cv::Vec3f tangent_hint_xyz;  // Approximate fiber direction in XYZ order
-
-    SdtFiberFieldAdapter(const SdtFieldData* sdt_field, const cv::Vec3f& hint_xyz)
-        : sdt(sdt_field), tangent_hint_xyz(hint_xyz) {}
-
-    cv::Vec3f operator()(double z, double y, double x) const {
-        if (!sdt) return cv::Vec3f(0, 0, 0);
-
-        // Convert ZYX coordinates to XYZ for SdtFieldData
-        cv::Vec3f pos_xyz(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-        cv::Vec3f grad_xyz = sdt->gradient(pos_xyz);
-
-        float grad_len = cv::norm(grad_xyz);
-        if (grad_len < 1e-6f) return cv::Vec3f(0, 0, 0);
-
-        // Normalize gradient to get surface normal
-        cv::Vec3f normal_xyz = grad_xyz / grad_len;
-
-        // Project hint onto tangent plane: hint - (hint . normal) * normal
-        float dot = tangent_hint_xyz.dot(normal_xyz);
-        cv::Vec3f fiber_xyz = tangent_hint_xyz - dot * normal_xyz;
-
-        float fiber_len = cv::norm(fiber_xyz);
-        if (fiber_len < 1e-6f) return cv::Vec3f(0, 0, 0);
-
-        // Normalize the fiber direction
-        fiber_xyz /= fiber_len;
-
-        // Convert XYZ to ZYX order for return
-        return cv::Vec3f(fiber_xyz[2], fiber_xyz[1], fiber_xyz[0]);
-    }
-
-    cv::Vec3f operator()(cv::Vec3d p) const {
-        return operator()(p[0], p[1], p[2]);
-    }
-};
-
-// SDT Surface Loss: Soft penalty for deviation from SDT=0 surface
-// Encourages points to lie on the predicted surface but doesn't hard-gate
-struct SdtSurfaceLoss {
-    const SdtFieldData& sdt_field;
-    double _w;
-
-    SdtSurfaceLoss(const SdtFieldData& field, double w) : sdt_field(field), _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const p, T* residual) const {
-        // Sample SDT at current point position (non-differentiable in position for sampling)
-        cv::Vec3f pos(val(p[0]), val(p[1]), val(p[2]));
-        float sdt_val = sdt_field.sample(pos);
-
-        if (std::isnan(sdt_val)) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        // Soft penalty: weight * |sdt_value|
-        // Use smooth abs: sqrt(x^2 + eps) for better gradients near zero
-        residual[0] = T(_w) * T(std::abs(sdt_val));
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const SdtFieldData& field, double w = 1.0) {
-        return new ceres::AutoDiffCostFunction<SdtSurfaceLoss, 1, 3>(
-            new SdtSurfaceLoss(field, w));
-    }
-};
-
-// SDT Normal Loss: Aligns surface normal with SDT gradient direction
-// The sign is determined from conditioning to ensure consistent orientation
-struct SdtNormalLoss {
-    const SdtFieldData& sdt_field;
-    double _w;
-
-    SdtNormalLoss(const SdtFieldData& field, double w) : sdt_field(field), _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const l_base, const T* const l_u_off, const T* const l_v_off, T* residual) const {
-        // Compute surface normal from the three points (cross product of tangent vectors)
-        // Points are in XYZ order
-        T patch_u_disp[3] = {
-            l_u_off[0] - l_base[0],
-            l_u_off[1] - l_base[1],
-            l_u_off[2] - l_base[2]
-        };
-        T patch_v_disp[3] = {
-            l_v_off[0] - l_base[0],
-            l_v_off[1] - l_base[1],
-            l_v_off[2] - l_base[2]
-        };
-
-        // Cross product: u × v gives surface normal
-        T patch_normal[3] = {
-            patch_u_disp[1] * patch_v_disp[2] - patch_u_disp[2] * patch_v_disp[1],
-            patch_u_disp[2] * patch_v_disp[0] - patch_u_disp[0] * patch_v_disp[2],
-            patch_u_disp[0] * patch_v_disp[1] - patch_u_disp[1] * patch_v_disp[0]
-        };
-
-        T patch_normal_length = sqrt(patch_normal[0] * patch_normal[0] +
-                                      patch_normal[1] * patch_normal[1] +
-                                      patch_normal[2] * patch_normal[2] + T(1e-12));
-
-        // Sample SDT gradient at base point (non-differentiable)
-        cv::Vec3f base_pos(val(l_base[0]), val(l_base[1]), val(l_base[2]));
-        cv::Vec3f grad = sdt_field.gradient(base_pos);
-
-        float grad_len = cv::norm(grad);
-        if (grad_len < 1e-6f) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        // Normalize gradient and apply sign
-        cv::Vec3f target_normal = (sdt_field.normal_sign * grad) / grad_len;
-
-        // Dot product between computed surface normal and target normal
-        // Use abs since we want alignment regardless of which way the cross product went
-        T dot = (patch_normal[0] * T(target_normal[0]) +
-                 patch_normal[1] * T(target_normal[1]) +
-                 patch_normal[2] * T(target_normal[2])) / patch_normal_length;
-
-        T abs_dot = ceres::abs(dot);
-
-        // Penalty: weight * (1 - |dot|) - zero when perfectly aligned
-        residual[0] = T(_w) * (T(1) - abs_dot);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const SdtFieldData& field, double w = 1.0) {
-        return new ceres::AutoDiffCostFunction<SdtNormalLoss, 1, 3, 3, 3>(
-            new SdtNormalLoss(field, w));
-    }
-};
-
-// SDT Forward Loss: Ensures point moves forward relative to growth direction
-// Penalizes backward movement through the conditioning region
-struct SdtForwardLoss {
-    const SdtFieldData& sdt_field;
-    double _min_forward_dist;
-    double _w;
-
-    SdtForwardLoss(const SdtFieldData& field, double min_forward_dist, double w)
-        : sdt_field(field), _min_forward_dist(min_forward_dist), _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const p, T* residual) const {
-        // Compute displacement from center
-        T disp[3] = {
-            p[0] - T(sdt_field.center_xyz[0]),
-            p[1] - T(sdt_field.center_xyz[1]),
-            p[2] - T(sdt_field.center_xyz[2])
-        };
-
-        // Project onto forward direction
-        T forward_dist = disp[0] * T(sdt_field.forward_dir[0]) +
-                         disp[1] * T(sdt_field.forward_dir[1]) +
-                         disp[2] * T(sdt_field.forward_dir[2]);
-
-        // Penalty when forward_dist < min_forward_dist
-        // Use softplus for smooth gradient: log(1 + exp(-x)) where x = forward_dist - min
-        T deficit = T(_min_forward_dist) - forward_dist;
-
-        // Softplus with clamping for numerical stability
-        T softplus_val;
-        if (val(deficit) > T(20)) {
-            softplus_val = deficit;
-        } else if (val(deficit) < T(-20)) {
-            softplus_val = T(0);
-        } else {
-            softplus_val = log(T(1) + exp(deficit));
-        }
-
-        residual[0] = T(_w) * softplus_val;
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const SdtFieldData& field, double min_forward_dist, double w = 1.0) {
-        return new ceres::AutoDiffCostFunction<SdtForwardLoss, 1, 3>(
-            new SdtForwardLoss(field, min_forward_dist, w));
-    }
-};
-
-struct TangentOrthogonalityLossAnalytic {
-    TangentOrthogonalityLossAnalytic(const cv::Vec3f& center, double w)
-        : _center(center), _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const p_prev, const T* const p_curr, const T* const p_next, T* residual) const {
-        if (is_invalid_point(p_prev) || is_invalid_point(p_curr) || is_invalid_point(p_next)) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        const T tx = p_next[0] - p_prev[0];
-        const T ty = p_next[1] - p_prev[1];
-        const T rx = p_curr[0] - T(_center[0]);
-        const T ry = p_curr[1] - T(_center[1]);
-        const T tnorm = sqrt(tx * tx + ty * ty);
-        const T rnorm = sqrt(rx * rx + ry * ry);
-        if (val(tnorm) <= 0.0 || val(rnorm) <= 0.0) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        const T dot = (tx * rx + ty * ry) / (tnorm * rnorm);
-        residual[0] = T(_w) * dot;
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& center, float w = 1.0f) {
-        return new ceres::AutoDiffCostFunction<TangentOrthogonalityLossAnalytic, 1, 3, 3, 3>(
-            new TangentOrthogonalityLossAnalytic(center, w));
-    }
-
-    cv::Vec3f _center;
-    double _w;
-};
-
-struct AngleStepLossAnalytic {
-    AngleStepLossAnalytic(const cv::Vec3f& center, double expected_dtheta_deg, double w)
-        : _center(center), _expected_dtheta_deg(expected_dtheta_deg), _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const p_prev, const T* const p_curr, T* residual) const {
-        if (is_invalid_point(p_prev) || is_invalid_point(p_curr)) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        const T dx0 = p_prev[0] - T(_center[0]);
-        const T dy0 = p_prev[1] - T(_center[1]);
-        const T dx1 = p_curr[0] - T(_center[0]);
-        const T dy1 = p_curr[1] - T(_center[1]);
-
-        const T theta0 = atan2(dy0, dx0);
-        const T theta1 = atan2(dy1, dx1);
-        const T diff = atan2(sin(theta1 - theta0), cos(theta1 - theta0));
-        const T diff_deg = diff * T(180.0 / M_PI);
-
-        residual[0] = T(_w) * (diff_deg - T(_expected_dtheta_deg));
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& center, double expected_dtheta_deg, float w = 1.0f) {
-        return new ceres::AutoDiffCostFunction<AngleStepLossAnalytic, 1, 3, 3>(
-            new AngleStepLossAnalytic(center, expected_dtheta_deg, w));
-    }
-
-    cv::Vec3f _center;
-    double _expected_dtheta_deg;
-    double _w;
-};
-
-struct RadialSlopeLossAnalytic {
-    RadialSlopeLossAnalytic(const cv::Vec3f& center,
-                            const cv::Vec3f& center_other,
-                            double expected_slope,
-                            double w)
-        : _center(center),
-          _center_other(center_other),
-          _expected_slope(expected_slope),
-          _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const p_curr, const T* const p_other, T* residual) const {
-        if (is_invalid_point(p_curr) || is_invalid_point(p_other)) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        const T dx0 = p_curr[0] - T(_center[0]);
-        const T dy0 = p_curr[1] - T(_center[1]);
-        const T dx1 = p_other[0] - T(_center_other[0]);
-        const T dy1 = p_other[1] - T(_center_other[1]);
-        const T r0 = sqrt(dx0 * dx0 + dy0 * dy0);
-        const T r1 = sqrt(dx1 * dx1 + dy1 * dy1);
-        const T dz = p_other[2] - p_curr[2];
-
-        if (std::abs(val(dz)) < 1e-6) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        const T slope = (r1 - r0) / dz;
-        residual[0] = T(_w) * (slope - T(_expected_slope));
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& center,
-                                       const cv::Vec3f& center_other,
-                                       double expected_slope,
-                                       float w = 1.0f) {
-        return new ceres::AutoDiffCostFunction<RadialSlopeLossAnalytic, 1, 3, 3>(
-            new RadialSlopeLossAnalytic(center, center_other, expected_slope, w));
-    }
-
-    cv::Vec3f _center;
-    cv::Vec3f _center_other;
-    double _expected_slope;
-    double _w;
-};
-
-struct AngleColumnLossAnalytic {
-    AngleColumnLossAnalytic(const cv::Vec3f& center,
-                            double expected_theta_deg,
-                            double base_theta_offset,
-                            double w)
-        : _center(center),
-          _expected_theta_deg(expected_theta_deg),
-          _base_theta_offset(base_theta_offset),
-          _w(w) {}
-
-    template <typename T>
-    bool operator()(const T* const p, T* residual) const {
-        if (is_invalid_point(p)) {
-            residual[0] = T(0);
-            return true;
-        }
-
-        const T dx = p[0] - T(_center[0]);
-        const T dy = p[1] - T(_center[1]);
-        T theta_deg = atan2(dy, dx) * T(180.0 / M_PI);
-        if (val(theta_deg) < 0.0) {
-            theta_deg += T(360.0);
-        }
-        theta_deg += T(_base_theta_offset);
-
-        const T diff_deg = angle_diff_deg_t(theta_deg, T(_expected_theta_deg));
-        residual[0] = T(_w) * diff_deg;
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& center,
-                                       double expected_theta_deg,
-                                       double base_theta_offset,
-                                       float w = 1.0f) {
-        return new ceres::AutoDiffCostFunction<AngleColumnLossAnalytic, 1, 3>(
-            new AngleColumnLossAnalytic(center, expected_theta_deg, base_theta_offset, w));
-    }
-
-    cv::Vec3f _center;
-    double _expected_theta_deg;
-    double _base_theta_offset;
     double _w;
 };

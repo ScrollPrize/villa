@@ -23,6 +23,11 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QInputDialog>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QVBoxLayout>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QFile>
@@ -47,6 +52,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
+#include "elements/VolumeSelector.hpp"
+#include "elements/JsonProfilePresets.hpp"
 #include <nlohmann/json.hpp>
 
 // --------- local helpers for running external tools -------------------------
@@ -142,6 +149,100 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     minRow,
                     maxCol - minCol + 1,
                     maxRow - minRow + 1);
+}
+
+bool selectResumeLocalTracerParams(QWidget* parent,
+                                   const QVector<VolumeSelector::VolumeOption>& volumes,
+                                   const QString& defaultVolumeId,
+                                   QString* selectedVolumePath,
+                                   std::optional<QJsonObject>* paramsOut,
+                                   int* ompThreadsOut)
+{
+    if (!paramsOut || !selectedVolumePath || !ompThreadsOut) {
+        return false;
+    }
+
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Resume-opt Local (GrowPatch)"));
+
+    auto* main = new QVBoxLayout(&dlg);
+    auto* volumeSelector = new VolumeSelector(&dlg);
+    volumeSelector->setVolumes(volumes, defaultVolumeId);
+    main->addWidget(volumeSelector);
+
+    auto* ompRow = new QWidget(&dlg);
+    auto* ompLayout = new QHBoxLayout(ompRow);
+    ompLayout->setContentsMargins(0, 0, 0, 0);
+    auto* ompLabel = new QLabel(QObject::tr("OMP Threads:"), ompRow);
+    auto* ompSpin = new QSpinBox(ompRow);
+    ompSpin->setRange(0, 256);
+    ompSpin->setToolTip(QObject::tr("If greater than 0, sets OMP_NUM_THREADS for the reoptimization run."));
+    ompLayout->addWidget(ompLabel);
+    ompLayout->addWidget(ompSpin, 1);
+    main->addWidget(ompRow);
+
+    auto* editor = new JsonProfileEditor(QObject::tr("Tracer Params"), &dlg);
+    editor->setDescription(QObject::tr(
+        "Additional JSON fields merge into the tracer params used for resume-local optimization."));
+    editor->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
+
+    const auto profiles = vc3d::json_profiles::tracerParamProfiles(
+        [](const char* text) { return QObject::tr(text); });
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString savedProfile = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+        QStringLiteral("default")).toString();
+    const QString savedText = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+        QString()).toString();
+    const int savedOmpThreads = settings.value(
+        vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS,
+        vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS_DEFAULT).toInt();
+
+    editor->setCustomText(savedText);
+    editor->setProfiles(profiles, savedProfile);
+    ompSpin->setValue(savedOmpThreads);
+    main->addWidget(editor);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
+        if (!editor->isValid()) {
+            const QString error = editor->errorText();
+            QMessageBox::warning(&dlg,
+                                 QObject::tr("Error"),
+                                 error.isEmpty()
+                                     ? QObject::tr("Tracer params JSON is invalid.")
+                                     : error);
+            return;
+        }
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+                          editor->profile());
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+                          editor->customText());
+        settings.setValue(vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS,
+                          ompSpin->value());
+        dlg.accept();
+    });
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    main->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) {
+        return false;
+    }
+
+    *selectedVolumePath = volumeSelector->selectedVolumePath();
+    *ompThreadsOut = ompSpin->value();
+
+    QString error;
+    auto extra = editor->jsonObject(&error);
+    if (!error.isEmpty()) {
+        QMessageBox::warning(parent, QObject::tr("Error"), error);
+        return false;
+    }
+
+    *paramsOut = extra;
+    return true;
 }
 
 // Owns the lifecycle for the async SLIM run; deletes itself on finish/cancel
@@ -1140,6 +1241,20 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
     pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
 
+    {
+        QString pass2Error;
+        auto extraParams = dlg.pass2TracerParamsJson(&pass2Error);
+        if (!pass2Error.isEmpty()) {
+            QMessageBox::warning(this, tr("Error"), pass2Error);
+            return;
+        }
+        if (extraParams) {
+            for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
+                pass2Params.insert(it.key(), it.value());
+            }
+        }
+    }
+
     auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
     if (!pass2JsonFile->open()) {
         QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file for pass 2."));
@@ -1179,6 +1294,177 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
                                  .arg(copyOut ? tr("out") : tr("in"))
                                  .arg(dirName.isEmpty() ? segmentId : dirName),
                              5000);
+}
+
+void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
+{
+    if (!fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    if (currentVolume == nullptr) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume loaded."));
+        return;
+    }
+
+    if (!initializeCommandLineRunner()) return;
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(this, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+        QMessageBox::warning(this, tr("Warning"), tr("Another neighbor copy request is already running."));
+        return;
+    }
+
+    if (_resumeLocalJob) {
+        QMessageBox::warning(this, tr("Warning"), tr("A resume-opt local GrowPatch run is already active."));
+        return;
+    }
+
+    auto surf = fVpkg->getSurface(segmentId.toStdString());
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Invalid surface selected."));
+        return;
+    }
+
+    QVector<VolumeSelector::VolumeOption> volumeOptions;
+    for (const auto& volumeId : fVpkg->volumeIDs()) {
+        auto volume = fVpkg->volume(volumeId);
+        if (!volume) {
+            continue;
+        }
+        VolumeSelector::VolumeOption option;
+        option.id = QString::fromStdString(volumeId);
+        option.name = QString::fromStdString(volume->name());
+        option.path = QString::fromStdString(volume->path().string());
+        volumeOptions.push_back(option);
+    }
+
+    if (volumeOptions.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No volumes available in the volume package."));
+        return;
+    }
+
+    QString defaultVolumeId = volumeOptions.front().id;
+    if (!currentVolumeId.empty()) {
+        const QString currentId = QString::fromStdString(currentVolumeId);
+        for (const auto& opt : volumeOptions) {
+            if (opt.id == currentId) {
+                defaultVolumeId = currentId;
+                break;
+            }
+        }
+    }
+
+    QString selectedVolumePath;
+    std::optional<QJsonObject> extraParams;
+    int ompThreads = vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS_DEFAULT;
+    if (!selectResumeLocalTracerParams(this,
+                                       volumeOptions,
+                                       defaultVolumeId,
+                                       &selectedVolumePath,
+                                       &extraParams,
+                                       &ompThreads)) {
+        statusBar()->showMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
+        return;
+    }
+
+    if (selectedVolumePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No target volume selected."));
+        return;
+    }
+
+    QString volpkgRoot = fVpkgPath;
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(fVpkg->getVolpkgDirectory());
+    }
+
+    std::filesystem::path outputDirFs = surf->path.parent_path();
+    QString outputDirPath = QString::fromStdString(outputDirFs.string());
+    if (outputDirPath.isEmpty()) {
+        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    }
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(".")) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
+        return;
+    }
+    outputDirPath = outDir.absolutePath();
+
+    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+
+    QJsonObject params;
+    params["normal_grid_path"] = normalGridPath;
+    if (_segmentationWidget) {
+        const QString n3dPath = _segmentationWidget->normal3dZarrPath();
+        if (!n3dPath.isEmpty()) {
+            params["normal3d_zarr_path"] = n3dPath;
+        }
+    }
+    params["max_gen"] = 1;
+    params["generations"] = 1;
+    params["resume_local_opt_step"] = 20;
+    params["resume_local_opt_radius"] = 40;
+    params["resume_local_max_iters"] = 1000;
+    params["resume_local_dense_qr"] = false;
+
+    if (extraParams) {
+        for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
+            params.insert(it.key(), it.value());
+        }
+    }
+
+    // Check if merged params require normal3d but we don't have it
+    bool needsNormal3d = false;
+    if (params.contains("normal3dline_weight")) {
+        const double w = params["normal3dline_weight"].toDouble(0.0);
+        needsNormal3d = (w > 0.0);
+    }
+
+    if (needsNormal3d && !params.contains("normal3d_zarr_path")) {
+        auto reply = QMessageBox::warning(
+            this, tr("Missing Normal3D"),
+            tr("The selected tracer profile uses normal3dline_weight > 0, "
+               "but no normal3d zarr path is available.\n\n"
+               "The normal3d line constraint will have no effect.\n\n"
+               "To fix this, select a normal3d dataset in the segmentation panel, "
+               "or use a profile without normal3dline_weight.\n\n"
+               "Continue anyway?"),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (reply != QMessageBox::Yes) {
+            statusBar()->showMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
+            return;
+        }
+    }
+
+    auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("growpatch_resume_local_XXXXXX.json"));
+    if (!paramsFile->open()) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file."));
+        return;
+    }
+    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
+    paramsFile->flush();
+
+    _resumeLocalJob = ResumeLocalJob{};
+    auto& job = *_resumeLocalJob;
+    job.segmentId = segmentId;
+    job.outputDir = outputDirPath;
+    job.paramsPath = paramsFile->fileName();
+    job.paramsFile = std::move(paramsFile);
+
+    _cmdRunner->setNeighborCopyParams(selectedVolumePath,
+                                      job.paramsPath,
+                                      QString::fromStdString(surf->path.string()),
+                                      outputDirPath,
+                                      QStringLiteral("local"));
+    _cmdRunner->setOmpThreads(ompThreads);
+    _cmdRunner->showConsoleOutput();
+    _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
+    statusBar()->showMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
 }
 
 void CWindow::onConvertToObj(const std::string& segmentId)
@@ -1375,6 +1661,97 @@ void CWindow::onCropSurfaceToValidRegion(const std::string& segmentId)
     }
 }
 
+void CWindow::onFlipSurface(const std::string& segmentId, bool flipU)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot flip surface: No volume package loaded"));
+        return;
+    }
+
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot flip surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    QuadSurface* surface = surf.get();
+
+    if (flipU) {
+        surface->flipU();
+    } else {
+        surface->flipV();
+    }
+
+    try {
+        surface->save(surface->path.string(), surface->id, true);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this,
+                              tr("Flip failed"),
+                              tr("Failed to save flipped surface %1: %2")
+                                  .arg(QString::fromStdString(segmentId))
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    if (_surf_col) {
+        _surf_col->setSurface(segmentId, surf, false, false);
+        if (_surfID == segmentId) {
+            _surf_col->setSurface("segmentation", surf, false, false);
+        }
+    }
+
+    const QString axisLabel = flipU ? tr("U") : tr("V");
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Flipped %1 over %2 axis")
+                .arg(QString::fromStdString(segmentId))
+                .arg(axisLabel),
+            5000);
+    }
+}
+
+void CWindow::onRotateSurface(const std::string& segmentId)
+{
+    if (currentVolume == nullptr || !fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot rotate surface: No volume package loaded"));
+        return;
+    }
+
+    auto surf = fVpkg->getSurface(segmentId);
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Cannot rotate surface: Invalid segment or segment not loaded"));
+        return;
+    }
+
+    QuadSurface* surface = surf.get();
+    surface->rotate(90.0f);
+
+    try {
+        surface->save(surface->path.string(), surface->id, true);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this,
+                              tr("Rotate failed"),
+                              tr("Failed to save rotated surface %1: %2")
+                                  .arg(QString::fromStdString(segmentId))
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    if (_surf_col) {
+        _surf_col->setSurface(segmentId, surf, false, false);
+        if (_surfID == segmentId) {
+            _surf_col->setSurface("segmentation", surf, false, false);
+        }
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Rotated %1 by 90° clockwise")
+                .arg(QString::fromStdString(segmentId)),
+            5000);
+    }
+}
+
 void CWindow::onAlphaCompRefine(const std::string& segmentId)
 {
     if (currentVolume == nullptr || !fVpkg) {
@@ -1525,6 +1902,9 @@ bool CWindow::initializeCommandLineRunner()
                     Q_UNUSED(outputPath);
                     const bool neighborJobActive = _neighborCopyJob.has_value() &&
                         tool == CommandLineToolRunner::Tool::NeighborCopy;
+                    const bool resumeLocalActive = !_neighborCopyJob &&
+                        _resumeLocalJob.has_value() &&
+                        tool == CommandLineToolRunner::Tool::NeighborCopy;
 
                     bool suppressDialogs = neighborJobActive && success &&
                                            _neighborCopyJob->stage == NeighborCopyJob::Stage::FirstPass;
@@ -1545,6 +1925,13 @@ bool CWindow::initializeCommandLineRunner()
 
                     if (neighborJobActive) {
                         handleNeighborCopyToolFinished(success);
+                    }
+                    if (resumeLocalActive) {
+                        if (success && _surfacePanel) {
+                            _surfacePanel->reloadSurfacesFromDisk();
+                        }
+                        _cmdRunner->setOmpThreads(-1);
+                        _resumeLocalJob.reset();
                     }
                 });
     }
@@ -2034,6 +2421,145 @@ void CWindow::onExportWidthChunks(const std::string& segmentId)
         statusBar()->showMessage(tr("Export failed"), 5000);
     } else {
         statusBar()->showMessage(tr("Export cancelled"), 3000);
+    }
+}
+
+void CWindow::onReloadFromBackup(const QString& segmentId, int backupIndex)
+{
+    if (!fVpkg) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    const std::string segIdStd = segmentId.toStdString();
+    auto surf = fVpkg->getSurface(segIdStd);
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("Surface not found: %1").arg(segmentId));
+        return;
+    }
+
+    // Build paths
+    namespace fs = std::filesystem;
+    fs::path volpkgRoot = fVpkg->getVolpkgDirectory();
+    fs::path backupDir = volpkgRoot / "backups" / segIdStd / std::to_string(backupIndex);
+    fs::path segmentDir = surf->path;
+
+    if (!fs::exists(backupDir)) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("Backup directory does not exist: %1").arg(QString::fromStdString(backupDir.string())));
+        return;
+    }
+
+    if (!fs::exists(segmentDir)) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("Segment directory does not exist: %1").arg(QString::fromStdString(segmentDir.string())));
+        return;
+    }
+
+    // Confirm with user
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        tr("Confirm Reload from Backup"),
+        tr("This will replace the current segment '%1' with backup %2.\n\n"
+           "The current segment data will be overwritten. Continue?")
+           .arg(segmentId).arg(backupIndex),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+
+    if (reply != QMessageBox::Yes) {
+        statusBar()->showMessage(tr("Reload from backup cancelled"), 3000);
+        return;
+    }
+
+    // Files to copy from backup
+    std::vector<std::string> filesToCopy = {
+        "mesh.ply",
+        "mask.tif",
+        "meta.json",
+        "generations.tif"
+    };
+
+    std::error_code ec;
+    int copiedCount = 0;
+
+    for (const auto& filename : filesToCopy) {
+        fs::path srcFile = backupDir / filename;
+        fs::path dstFile = segmentDir / filename;
+
+        if (fs::exists(srcFile)) {
+            // Remove existing file first
+            if (fs::exists(dstFile)) {
+                fs::remove(dstFile, ec);
+                if (ec) {
+                    QMessageBox::warning(this, tr("Error"),
+                        tr("Failed to remove existing file %1: %2")
+                           .arg(QString::fromStdString(dstFile.string()))
+                           .arg(QString::fromStdString(ec.message())));
+                    return;
+                }
+            }
+
+            // Copy from backup
+            fs::copy_file(srcFile, dstFile, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                QMessageBox::warning(this, tr("Error"),
+                    tr("Failed to copy %1: %2")
+                       .arg(QString::fromStdString(filename))
+                       .arg(QString::fromStdString(ec.message())));
+                return;
+            }
+            copiedCount++;
+        }
+    }
+
+    if (copiedCount == 0) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("No files found in backup directory."));
+        return;
+    }
+
+    // Reload the surface
+    bool wasSelected = (_surfID == segIdStd);
+
+    if (fVpkg->reloadSingleSegmentation(segIdStd)) {
+        try {
+            auto reloadedSurf = fVpkg->loadSurface(segIdStd);
+            if (reloadedSurf) {
+                if (_surf_col) {
+                    _surf_col->setSurface(segIdStd, reloadedSurf, false, false);
+                }
+
+                if (_surfacePanel) {
+                    _surfacePanel->refreshSurfaceMetrics(segIdStd);
+                }
+
+                if (wasSelected) {
+                    _surfID = segIdStd;
+                    _surf_weak = reloadedSurf;
+
+                    if (_surf_col) {
+                        _surf_col->setSurface("segmentation", reloadedSurf, false, false);
+                    }
+
+                    if (_surfacePanel) {
+                        _surfacePanel->syncSelectionUi(segIdStd, reloadedSurf.get());
+                    }
+                }
+
+                statusBar()->showMessage(
+                    tr("Restored '%1' from backup %2 (%3 files)")
+                       .arg(segmentId).arg(backupIndex).arg(copiedCount),
+                    5000);
+            }
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, tr("Error"),
+                tr("Failed to reload surface after restore: %1")
+                   .arg(QString::fromUtf8(e.what())));
+        }
+    } else {
+        QMessageBox::warning(this, tr("Warning"),
+            tr("Files were copied but failed to reload the segmentation. "
+               "Try using the reload button."));
     }
 }
 
