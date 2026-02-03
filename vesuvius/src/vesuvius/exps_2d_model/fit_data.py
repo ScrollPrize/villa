@@ -7,6 +7,9 @@ import tifffile
 import torch
 import torch.nn.functional as F
 
+import tiled_infer
+from common import load_unet, unet_infer_tiled
+
 
 @dataclass(frozen=True)
 class FitData:
@@ -69,31 +72,129 @@ def load(
 	device: torch.device,
 	downscale: float = 4.0,
 	crop: tuple[int, int, int, int] | None = None,
+	unet_checkpoint: str | None = None,
+	unet_layer: int | None = None,
+	unet_z: int | None = None,
+	unet_tile_size: int = 512,
+	unet_overlap: int = 128,
+	unet_border: int = 0,
+	unet_group: str | None = None,
+	unet_out_dir_base: str | None = None,
 ) -> FitData:
 	p = Path(path)
-	if not p.is_dir():
-		raise ValueError("FitData currently requires a directory input")
+	s = str(p)
+	is_omezarr = (
+		s.endswith(".zarr")
+		or s.endswith(".ome.zarr")
+		or (".zarr/" in s)
+		or (".ome.zarr/" in s)
+	)
 
-	cos_files = sorted(p.glob("*_cos.tif"))
-	if len(cos_files) != 1:
-		raise ValueError(f"expected exactly one '*_cos.tif' in {p}, found {len(cos_files)}")
-	cos_path = cos_files[0]
+	if p.is_dir() and not is_omezarr:
+		cos_files = sorted(p.glob("*_cos.tif"))
+		if len(cos_files) != 1:
+			raise ValueError(f"expected exactly one '*_cos.tif' in {p}, found {len(cos_files)}")
+		cos_path = cos_files[0]
 
-	base_stem = cos_path.stem
-	if base_stem.endswith("_cos"):
-		base_stem = base_stem[:-4]
+		base_stem = cos_path.stem
+		if base_stem.endswith("_cos"):
+			base_stem = base_stem[:-4]
 
-	mag_path = cos_path.with_name(f"{base_stem}_mag.tif")
-	dir0_path = cos_path.with_name(f"{base_stem}_dir0.tif")
-	dir1_path = cos_path.with_name(f"{base_stem}_dir1.tif")
-	missing = [pp.name for pp in (mag_path, dir0_path, dir1_path) if not pp.is_file()]
-	if missing:
-		raise FileNotFoundError(f"missing required tif(s) in {p}: {', '.join(missing)}")
+		mag_path = cos_path.with_name(f"{base_stem}_mag.tif")
+		dir0_path = cos_path.with_name(f"{base_stem}_dir0.tif")
+		dir1_path = cos_path.with_name(f"{base_stem}_dir1.tif")
+		missing = [pp.name for pp in (mag_path, dir0_path, dir1_path) if not pp.is_file()]
+		if missing:
+			raise FileNotFoundError(f"missing required tif(s) in {p}: {', '.join(missing)}")
 
-	cos_t = _read_tif_float(cos_path, device=device)
-	mag_t = _read_tif_float(mag_path, device=device)
-	dir0_t = _read_tif_float(dir0_path, device=device)
-	dir1_t = _read_tif_float(dir1_path, device=device)
+		cos_t = _read_tif_float(cos_path, device=device)
+		mag_t = _read_tif_float(mag_path, device=device)
+		dir0_t = _read_tif_float(dir0_path, device=device)
+		dir1_t = _read_tif_float(dir1_path, device=device)
+	else:
+		# Non-directory input: run UNet inference and return predictions as FitData.
+		if unet_checkpoint is None:
+			raise ValueError("non-directory input requires --unet-checkpoint")
+
+		xywh = crop
+		if xywh is None:
+			raise ValueError("non-directory input requires --crop x y w h")
+		x, y, w_c, h_c = (int(v) for v in xywh)
+		ov = max(0, int(unet_overlap))
+		# Expanded crop for tiling/blending, then trimmed back to target crop.
+		xe = x - ov
+		ye = y - ov
+		we = w_c + 2 * ov
+		he = h_c + 2 * ov
+		expanded_crop = (xe, ye, we, he)
+
+		# Load raw 2D slice as (1,1,H,W).
+		if is_omezarr:
+			raw = tiled_infer._load_omezarr_z_uint8(
+				path=str(p),
+				z=unet_z,
+				crop=expanded_crop,
+				device=device,
+			)
+		else:
+			raw = tiled_infer._load_tiff_layer_uint8_norm(
+				Path(path),
+				layer=unet_layer,
+				device=device,
+			)
+		# Note: TIFF path currently ignores crop in loader; crop via slicing.
+		if not is_omezarr:
+			_, _, hh, ww = raw.shape
+			x0 = max(0, min(xe, ww))
+			y0 = max(0, min(ye, hh))
+			x1 = max(x0, min(xe + we, ww))
+			y1 = max(y0, min(ye + he, hh))
+			raw = raw[:, :, y0:y1, x0:x1]
+
+		mdl = load_unet(
+			device=device,
+			weights=unet_checkpoint,
+			in_channels=1,
+			out_channels=4,
+			base_channels=32,
+			num_levels=6,
+			max_channels=1024,
+		)
+		mdl.eval()
+		with torch.no_grad():
+			pred = unet_infer_tiled(
+				mdl,
+				raw,
+				tile_size=int(unet_tile_size),
+				overlap=int(unet_overlap),
+				border=int(unet_border),
+			)
+
+		if unet_out_dir_base is not None:
+			out_p = Path(unet_out_dir_base) / "unet_pred"
+			out_p.mkdir(parents=True, exist_ok=True)
+			prefix = out_p / "unet"
+			pred_np = pred[0].detach().cpu().numpy().astype("float32")
+			tifffile.imwrite(str(prefix) + "_cos.tif", pred_np[0], compression="lzw")
+			tifffile.imwrite(str(prefix) + "_mag.tif", pred_np[1], compression="lzw")
+			tifffile.imwrite(str(prefix) + "_dir0.tif", pred_np[2], compression="lzw")
+			tifffile.imwrite(str(prefix) + "_dir1.tif", pred_np[3], compression="lzw")
+
+		# Trim expanded crop back to requested target crop.
+		_, _, ph, pw = pred.shape
+		x0t = max(0, min(ov, pw))
+		y0t = max(0, min(ov, ph))
+		x1t = max(x0t, min(x0t + w_c, pw))
+		y1t = max(y0t, min(y0t + h_c, ph))
+		pred = pred[:, :, y0t:y1t, x0t:x1t]
+
+		cos_t = pred[:, 0:1]
+		mag_t = pred[:, 1:2]
+		dir0_t = pred[:, 2:3]
+		dir1_t = pred[:, 3:4]
+
+		# For UNet input, interpret downscale as post-prediction downscale.
+		crop = None
 
 	if crop is not None:
 		x, y, w_c, h_c = (int(v) for v in crop)
