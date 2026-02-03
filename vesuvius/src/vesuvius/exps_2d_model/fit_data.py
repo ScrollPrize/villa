@@ -75,6 +75,8 @@ def load(
 	unet_checkpoint: str | None = None,
 	unet_layer: int | None = None,
 	unet_z: int | None = None,
+	z_size: int = 1,
+	z_step: int = 1,
 	unet_tile_size: int = 512,
 	unet_overlap: int = 128,
 	unet_border: int = 0,
@@ -132,28 +134,27 @@ def load(
 		he = h_c + 2 * pad
 		expanded_crop = (xe, ye, we, he)
 
-		# Load raw 2D slice as (1,1,H,W).
-		if is_omezarr:
-			raw = tiled_infer._load_omezarr_z_uint8_norm(
-				path=str(p),
-				z=unet_z,
-				crop=expanded_crop,
-				device=device,
-			)
-		else:
-			raw = tiled_infer._load_tiff_layer_uint8_norm(
-				Path(path),
-				layer=unet_layer,
-				device=device,
-			)
-		# Note: TIFF path currently ignores crop in loader; crop via slicing.
-		if not is_omezarr:
-			_, _, hh, ww = raw.shape
-			x0 = max(0, min(xe, ww))
-			y0 = max(0, min(ye, hh))
-			x1 = max(x0, min(xe + we, ww))
-			y1 = max(y0, min(ye + he, hh))
-			raw = raw[:, :, y0:y1, x0:x1]
+		z0 = unet_z
+		if z0 is None:
+			raise ValueError("OME-Zarr inference requires --unet-z")
+		zs = max(1, int(z_size))
+		zst = max(1, int(z_step))
+		# Load raw 2D slice(s) as (N,1,H,W).
+		raws: list[torch.Tensor] = []
+		for zi in range(zs):
+			zv = int(z0) + int(zi) * int(zst)
+			if is_omezarr:
+				raw_i = tiled_infer._load_omezarr_z_uint8_norm(
+					path=str(p),
+					z=zv,
+					crop=expanded_crop,
+					device=device,
+				)
+			else:
+				# Non-OME-Zarr paths are single-slice only.
+				raise ValueError("z_size>1 requires OME-Zarr input")
+			raws.append(raw_i)
+		raw = torch.cat(raws, dim=0)
 
 		mdl = load_unet(
 			device=device,

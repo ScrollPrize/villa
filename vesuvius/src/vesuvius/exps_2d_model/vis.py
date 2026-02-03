@@ -340,9 +340,11 @@ def save(
 		img_loss_layers.append(crop)
 		img_loss_names.append("grid_crop")
 
-		uv_tgt = _scale_uv_for_src(uv_lr=uv_img, src=res.target_plain)
-		tgt_plain_img = inv_map.warp_nchw_from_uv(src=res.target_plain, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
-		tgt_mod_img = inv_map.warp_nchw_from_uv(src=res.target_mod, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
+		tgt_plain = res.target_plain[z_i:z_i + 1]
+		tgt_mod = res.target_mod[z_i:z_i + 1]
+		uv_tgt = _scale_uv_for_src(uv_lr=uv_img, src=tgt_plain)
+		tgt_plain_img = inv_map.warp_nchw_from_uv(src=tgt_plain, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
+		tgt_mod_img = inv_map.warp_nchw_from_uv(src=tgt_mod, uv=uv_tgt, uv_mask=uv_mask, fill=0.5)
 		img_loss_layers.append(tgt_plain_img[0, 0].detach().cpu().numpy().astype("float32"))
 		img_loss_names.append("target_plain")
 		img_loss_layers.append(tgt_mod_img[0, 0].detach().cpu().numpy().astype("float32"))
@@ -350,6 +352,8 @@ def save(
 
 		for _k, spec in loss_maps.items():
 			mt = spec["fn"]().detach()
+			if mt.ndim == 4 and int(mt.shape[0]) > 1:
+				mt = mt[z_i:z_i + 1]
 			if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
 				uv_m = _scale_uv_for_src(uv_lr=uv_img, src=mt)
 				im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_m, uv_mask=uv_mask, fill=0.5)
