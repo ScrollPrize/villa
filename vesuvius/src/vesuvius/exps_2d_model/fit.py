@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
 		torch.save(mdl.state_dict(), str(model_cfg.model_output))
 
 	_save_model_snapshot(stage="init", step=0)
-	def _snapshot(*, stage: str, step: int, loss: float) -> None:
+	def _snapshot(*, stage: str, step: int, loss: float, data) -> None:
 		vis.save(
 			model=mdl,
 			data=data,
@@ -89,9 +89,11 @@ def main(argv: list[str] | None = None) -> int:
 		mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_{stage}_{step:06d}.tif")
 		_save_model_snapshot(stage=stage, step=step)
 
-	optimizer.optimize(
+	data = optimizer.optimize(
 		model=mdl,
 		data=data,
+		data_cfg=data_cfg,
+		data_out_dir_base=vis_cfg.out_dir,
 		stages=stages,
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,

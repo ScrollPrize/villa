@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
+import cli_data
 import fit_data
 import opt_loss_dir
 import opt_loss_data
@@ -213,10 +214,13 @@ def optimize(
 	*,
 	model,
 	data: fit_data.FitData,
+	data_cfg: cli_data.DataConfig | None = None,
+	data_out_dir_base: str | None = None,
 	stages: list[Stage],
 	snapshot_interval: int,
 	snapshot_fn,
-) -> None:
+) -> fit_data.FitData:
+	data_z0 = data_cfg.unet_z if data_cfg is not None else None
 	def _run_opt(*, si: int, label: str, opt_cfg: OptSettings) -> None:
 		if opt_cfg.steps <= 0:
 			return
@@ -312,7 +316,7 @@ def optimize(
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
-		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()))
+		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data)
 
 		for step in range(opt_cfg.steps):
 			res = model(data)
@@ -341,9 +345,9 @@ def optimize(
 				print(f"{label} step {step1}/{opt_cfg.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
-				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()))
+				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data)
 
-		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()))
+		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data)
 		for h in hooks:
 			h.remove()
 
@@ -367,8 +371,30 @@ def optimize(
 		local_opt = stage.local_opt if stage.local_opt is not None else stage.global_opt
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
+			if model._last_grow_insert_z is not None:
+				print(
+					"dbg grow_z: before data_grow"
+					+ f" data.N={int(data.cos.shape[0])} model.z_size={int(model.z_size)} insert_z={int(model._last_grow_insert_z)}"
+				)
+				if int(data.cos.shape[0]) != int(model.z_size):
+					if data_cfg is None:
+						raise ValueError("grow fw/bw requires passing data_cfg")
+					if data_z0 is None:
+						raise ValueError("grow fw/bw requires --unet-z")
+					data, data_z0 = fit_data.grow_z_from_omezarr_unet(
+						data=data,
+						cfg=data_cfg,
+						unet_z0=int(data_z0),
+						new_z_size=int(model.z_size),
+						insert_z=int(model._last_grow_insert_z),
+						out_dir_base=data_out_dir_base,
+					)
+					print(
+						"dbg grow_z: after data_grow"
+						+ f" data.N={int(data.cos.shape[0])} model.z_size={int(model.z_size)} unet_z0={int(data_z0)}"
+					)
 			stage_g = f"stage{si}_grow{gi:04d}"
-			snapshot_fn(stage=stage_g, step=0, loss=0.0)
+			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
 			if local_opt.steps <= 0:
 				continue
 			ins = model._last_grow_insert_lr
@@ -396,3 +422,4 @@ def optimize(
 			model.const_mask_lr = cm
 			_run_opt(si=si, label=stage_g, opt_cfg=local_opt)
 		model.const_mask_lr = None
+	return data
