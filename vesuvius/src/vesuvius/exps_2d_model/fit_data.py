@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 import tiled_infer
 from common import load_unet, unet_infer_tiled
+import cli_data
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,77 @@ class FitData:
 			raise ValueError("FitData.cos must be (N,C,H,W)")
 		_, _, h, w = self.cos.shape
 		return int(h), int(w)
+
+
+def grow_z_from_omezarr_unet(
+	*,
+	data: FitData,
+	cfg: "cli_data.DataConfig",
+	unet_z0: int,
+	new_z_size: int,
+	insert_z: int,
+	out_dir_base: str | None,
+) -> tuple[FitData, int]:
+	"""Expand `data` along Z by running UNet inference for the missing slice(s).
+
+	Contract:
+	- Only supports growing by 1 slice.
+	- Only supports prepend (insert_z==0) or append (insert_z==old_N).
+	- Requires OME-Zarr input.
+	- Returns (expanded_data, new_unet_z0).
+	"""
+	old_n = int(data.cos.shape[0])
+	new_n = int(new_z_size)
+	if new_n != old_n + 1:
+		raise ValueError("grow_z: new_z_size must be old_N+1")
+	ins = int(insert_z)
+	if ins not in (0, old_n):
+		raise ValueError("grow_z: only prepend/append supported")
+	if ins == 0:
+		unet_z0 = int(unet_z0) - int(max(1, int(cfg.z_step)))
+		z_inf = int(unet_z0)
+	else:
+		z_inf = int(unet_z0) + int(old_n) * int(max(1, int(cfg.z_step)))
+
+	d_new = load(
+		path=str(cfg.input),
+		device=data.cos.device,
+		downscale=float(cfg.downscale),
+		crop=cfg.crop,
+		unet_checkpoint=str(cfg.unet_checkpoint),
+		unet_layer=cfg.unet_layer,
+		unet_z=int(z_inf),
+		z_size=1,
+		z_step=1,
+		unet_tile_size=int(cfg.unet_tile_size),
+		unet_overlap=int(cfg.unet_overlap),
+		unet_border=int(cfg.unet_border),
+		unet_group=cfg.unet_group,
+		unet_out_dir_base=out_dir_base,
+	)
+	if int(d_new.cos.shape[0]) != 1:
+		raise RuntimeError("grow_z: expected 1 inferred slice")
+	if ins == 0:
+		return (
+			FitData(
+				cos=torch.cat([d_new.cos, data.cos], dim=0),
+				grad_mag=torch.cat([d_new.grad_mag, data.grad_mag], dim=0),
+				dir0=torch.cat([d_new.dir0, data.dir0], dim=0),
+				dir1=torch.cat([d_new.dir1, data.dir1], dim=0),
+				downscale=float(data.downscale),
+			),
+			int(unet_z0),
+		)
+	return (
+		FitData(
+			cos=torch.cat([data.cos, d_new.cos], dim=0),
+			grad_mag=torch.cat([data.grad_mag, d_new.grad_mag], dim=0),
+			dir0=torch.cat([data.dir0, d_new.dir0], dim=0),
+			dir1=torch.cat([data.dir1, d_new.dir1], dim=0),
+			downscale=float(data.downscale),
+		),
+		int(unet_z0),
+	)
 
 
 def _to_nchw(img: object) -> torch.Tensor:

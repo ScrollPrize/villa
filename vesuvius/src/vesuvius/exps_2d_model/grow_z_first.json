@@ -22,14 +22,14 @@
 			"name": "grow_only",
 			"grow": {
 				"directions": ["fw"],
-				"generations": 1,
+				"generations": 100,
 				"steps": 1
 			},
 			"global_opt": {
 				"steps": 0
 			},
 			"local_opt": {
-				"steps": 1000,
+				"steps": 200,
 				"lr": 0.01,
 				"params": ["mesh_ms", "conn_offset_ms"],
 				"min_scaledown": 0,
