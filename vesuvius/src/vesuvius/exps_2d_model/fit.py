@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
 		init_size_frac=model_cfg.init_size_frac,
 		init_size_frac_h=model_cfg.init_size_frac_h,
 		init_size_frac_v=model_cfg.init_size_frac_v,
+		z_size=model_cfg.z_size,
 		device=device,
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,

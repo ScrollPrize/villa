@@ -113,12 +113,14 @@ class Model2D(nn.Module):
 		init: ModelInit,
 		device: torch.device,
 		*,
+		z_size: int = 1,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
 	) -> None:
 		super().__init__()
 		self.init = init
 		self.device = device
+		self.z_size = max(1, int(z_size))
 		# FIXME need better init ...
 		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
@@ -136,8 +138,8 @@ class Model2D(nn.Module):
 		self.conn_offset_ms = nn.ParameterList(
 			self._build_offset_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
 		)
-		amp_init = torch.full((1, 1, int(self.mesh_h), int(self.mesh_w)), 1.0, device=device, dtype=torch.float32)
-		bias_init = torch.full((1, 1, int(self.mesh_h), int(self.mesh_w)), 0.5, device=device, dtype=torch.float32)
+		amp_init = torch.full((int(self.z_size), 1, int(self.mesh_h), int(self.mesh_w)), 1.0, device=device, dtype=torch.float32)
+		bias_init = torch.full((int(self.z_size), 1, int(self.mesh_h), int(self.mesh_w)), 0.5, device=device, dtype=torch.float32)
 		self.amp = nn.Parameter(amp_init)
 		self.bias = nn.Parameter(bias_init)
 		self.const_mask_lr: torch.Tensor | None = None
@@ -162,6 +164,8 @@ class Model2D(nn.Module):
 		return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
 
 	def forward(self, data: fit_data.FitData) -> FitResult:
+		if int(data.cos.shape[0]) != int(self.z_size):
+			raise ValueError(f"data batch (z) mismatch: data.N={int(data.cos.shape[0])} model.z_size={int(self.z_size)}")
 		xy_lr = self._grid_xy()
 		xy_hr = self._grid_xy_subsampled_from_lr(xy_lr=xy_lr)
 		xy_conn = self._xy_conn_px(xy_lr=xy_lr)
@@ -171,7 +175,7 @@ class Model2D(nn.Module):
 		periods = max(1, int(self.mesh_w) - 1)
 		xs = torch.linspace(0.0, float(periods), w, device=self.device, dtype=torch.float32)
 		phase = (2.0 * torch.pi) * xs.view(1, 1, 1, w)
-		target_plain = 0.5 + 0.5 * torch.cos(phase).expand(1, 1, h, w)
+		target_plain = 0.5 + 0.5 * torch.cos(phase).expand(int(self.z_size), 1, h, w)
 
 		amp_lr = self.amp
 		bias_lr = self.bias
@@ -408,14 +412,14 @@ class Model2D(nn.Module):
 		stem = p.with_suffix("")
 		with torch.no_grad():
 			res = self(data)
-			xy_lr = res.xy_lr[0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
-			xy_hr = res.xy_hr[0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
-			xy_conn = res.xy_conn[0].detach().cpu().to(dtype=torch.float32).numpy().reshape(xy_lr.shape[1], xy_lr.shape[2], 6).transpose(2, 0, 1)
-			mask_lr = res.mask_lr[0].detach().cpu().to(dtype=torch.float32).numpy()
-			mask_hr = res.mask_hr[0].detach().cpu().to(dtype=torch.float32).numpy()
-			mask_conn = res.mask_conn[0, 0].detach().cpu().to(dtype=torch.float32).numpy().transpose(2, 0, 1)
-			mesh = self.mesh_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
-			conn_off = self.conn_offset_coarse()[0].detach().cpu().to(dtype=torch.float32).numpy()
+			xy_lr = res.xy_lr.detach().cpu().to(dtype=torch.float32).numpy().transpose(0, 3, 1, 2)
+			xy_hr = res.xy_hr.detach().cpu().to(dtype=torch.float32).numpy().transpose(0, 3, 1, 2)
+			xy_conn = res.xy_conn.detach().cpu().to(dtype=torch.float32).numpy().transpose(0, 3, 4, 1, 2).reshape(int(xy_lr.shape[0]), 6, int(xy_lr.shape[2]), int(xy_lr.shape[3]))
+			mask_lr = res.mask_lr.detach().cpu().to(dtype=torch.float32).numpy()
+			mask_hr = res.mask_hr.detach().cpu().to(dtype=torch.float32).numpy()
+			mask_conn = res.mask_conn[:, 0].detach().cpu().to(dtype=torch.float32).numpy().transpose(0, 3, 1, 2)
+			mesh = self.mesh_coarse().detach().cpu().to(dtype=torch.float32).numpy()
+			conn_off = self.conn_offset_coarse().detach().cpu().to(dtype=torch.float32).numpy()
 
 			tifffile.imwrite(str(stem) + "_xy_lr.tif", xy_lr, compression="lzw")
 			tifffile.imwrite(str(stem) + "_xy_hr.tif", xy_hr, compression="lzw")
@@ -551,6 +555,7 @@ class Model2D(nn.Module):
 		device: torch.device,
 		init_size_frac_h: float | None = None,
 		init_size_frac_v: float | None = None,
+		z_size: int = 1,
 		*,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
@@ -568,6 +573,7 @@ class Model2D(nn.Module):
 		return cls(
 			init=init,
 			device=device,
+			z_size=max(1, int(z_size)),
 			subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding,
 		)
@@ -586,4 +592,5 @@ class Model2D(nn.Module):
 		u = torch.linspace(u0, u1, int(gw0), dtype=torch.float32)
 		v = torch.linspace(v0, v1, int(gh0), dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
-		return torch.stack([uu, vv], dim=0).unsqueeze(0)
+		grid = torch.stack([uu, vv], dim=0).unsqueeze(0)
+		return grid.expand(int(self.z_size), -1, -1, -1).contiguous()

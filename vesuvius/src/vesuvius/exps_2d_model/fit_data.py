@@ -55,7 +55,7 @@ def _to_nchw(img: object) -> torch.Tensor:
 	if img_t.ndim == 2:
 		img_t = img_t[None, None, :, :]
 	elif img_t.ndim == 3:
-		img_t = img_t[None, :, :, :]
+		img_t = img_t[:, None, :, :]
 	else:
 		raise ValueError(f"unsupported image shape: {tuple(img_t.shape)}")
 	return img_t
