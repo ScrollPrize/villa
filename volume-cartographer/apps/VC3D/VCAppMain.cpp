@@ -10,11 +10,15 @@
 #include <thread>
 #include <omp.h>
 
+// Weak stub for Intel OpenMP's kmp_set_blocktime.
+// If the real function exists (Intel/LLVM OpenMP runtime), it overrides this.
+// If not (e.g., GCC's libgomp), this no-op stub is used instead.
+extern "C" __attribute__((weak)) void kmp_set_blocktime(int) {}
 
 auto main(int argc, char* argv[]) -> int
 {
     cv::setNumThreads(std::thread::hardware_concurrency());
-    //kmp_set_blocktime(0);
+    kmp_set_blocktime(0);
 
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
     // Floating dock widgets become unmovable after initial drag on Wayland.
