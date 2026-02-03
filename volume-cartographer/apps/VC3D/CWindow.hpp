@@ -93,6 +93,7 @@ public slots:
     void onConvertToObj(const std::string& segmentId);
     void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onFlipSurface(const std::string& segmentId, bool flipU);
+    void onRotateSurface(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onABFFlatten(const std::string& segmentId);
