@@ -253,7 +253,6 @@ private:
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
     void onCorrectionsAnnotateToggled(bool enabled);
-    void onCorrectionsStickyToggled(bool enabled);
     void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
 
     void handleGrowSurfaceRequested(SegmentationGrowthMethod method,

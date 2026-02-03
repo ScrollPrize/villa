@@ -152,9 +152,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             });
 
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
-    if (_widget && _corrections) {
-        _corrections->setStickyMode(_widget->correctionsSticky());
-    }
 
     useFalloff(FalloffTool::Drag);
 
@@ -336,8 +333,6 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsCollectionSelected);
     connect(_widget, &SegmentationWidget::correctionsAnnotateToggled,
             this, &SegmentationModule::onCorrectionsAnnotateToggled);
-    connect(_widget, &SegmentationWidget::correctionsStickyToggled,
-            this, &SegmentationModule::onCorrectionsStickyToggled);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
     connect(_widget, &SegmentationWidget::showApprovalMaskChanged,
@@ -462,8 +457,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         if (_pendingAutosave) {
             performAutosave();
         }
-    } else if (_corrections && _corrections->stickyMode() && _corrections->annotateRequested()) {
-        setCorrectionsAnnotateMode(true, false);
     }
     updateCorrectionsWidget();
     refreshOverlay();
@@ -1301,16 +1294,6 @@ void SegmentationModule::onCorrectionsCollectionSelected(uint64_t id)
 void SegmentationModule::onCorrectionsAnnotateToggled(bool enabled)
 {
     setCorrectionsAnnotateMode(enabled, true);
-}
-
-void SegmentationModule::onCorrectionsStickyToggled(bool enabled)
-{
-    if (_corrections) {
-        _corrections->setStickyMode(enabled);
-        if (enabled && _corrections->annotateRequested()) {
-            setCorrectionsAnnotateMode(true, false);
-        }
-    }
 }
 
 void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax)

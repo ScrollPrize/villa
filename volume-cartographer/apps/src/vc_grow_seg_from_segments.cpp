@@ -10,7 +10,6 @@
 
 #include <opencv2/core.hpp>
 
-#include "vc/core/util/ArgParse.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 
@@ -33,45 +32,16 @@ using json = nlohmann::json;
 
 int main(int argc, char *argv[])
 {
-    vc::cli::ArgParser parser;
-    parser.add_option("volume", {"v"}, true, "Path to zarr volume");
-    parser.add_option("src-dir", {"s"}, true, "Source directory containing segments");
-    parser.add_option("target-dir", {"t"}, true, "Target directory for output");
-    parser.add_option("params", {"p"}, true, "Path to JSON parameters file");
-    parser.add_option("src-segment", {}, false, "Source segment path");
-    parser.add_option("resume", {"r"}, false, "Resume from a previous output surface (becomes source segment)");
-
-    std::string error;
-    auto args = parser.parse(argc, argv, &error);
-    if (!error.empty()) {
-        std::cerr << error << "\n\n" << parser.help_text("Usage: " + std::string(argv[0]));
-        return EXIT_FAILURE;
+    if (argc != 6) {
+        std::cout << "usage: " << argv[0] << " <zarr-volume> <src-dir> <tgt-dir> <json-params> <src-segment>" << std::endl;
+        return EXIT_SUCCESS;
     }
 
-    std::filesystem::path vol_path = args.value("volume");
-    std::filesystem::path src_dir = args.value("src-dir");
-    std::filesystem::path tgt_dir = args.value("target-dir");
-    std::filesystem::path params_path = args.value("params");
-
-    // Handle src-segment vs resume options
-    std::filesystem::path src_path;
-    bool resume_mode = args.has("resume");
-
-    if (resume_mode && args.has("src-segment")) {
-        std::cerr << "Error: Cannot specify both --src-segment and --resume\n";
-        return EXIT_FAILURE;
-    }
-
-    if (resume_mode) {
-        src_path = args.value("resume");
-    } else if (args.has("src-segment")) {
-        src_path = args.value("src-segment");
-    } else {
-        std::cerr << "Error: Must specify either --src-segment or --resume\n\n"
-                  << parser.help_text("Usage: " + std::string(argv[0]));
-        return EXIT_FAILURE;
-    }
-
+    std::filesystem::path vol_path = argv[1];
+    std::filesystem::path src_dir = argv[2];
+    std::filesystem::path tgt_dir = argv[3];
+    std::filesystem::path params_path = argv[4];
+    std::filesystem::path src_path = argv[5];
     while (src_path.filename().empty())
         src_path = src_path.parent_path();
 
@@ -84,9 +54,6 @@ int main(int argc, char *argv[])
         set_space_tracing_use_cuda(true);
     }
     params["tgt_dir"] = tgt_dir;
-    if (resume_mode) {
-        params["resume"] = true;
-    }
 
     z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
     z5::filesystem::handle::Dataset ds_handle(group, "0", json::parse(std::ifstream(vol_path/"0/.zarray")).value<std::string>("dimension_separator","."));
@@ -97,6 +64,7 @@ int main(int argc, char *argv[])
 
     float voxelsize = json::parse(std::ifstream(vol_path/"meta.json"))["voxelsize"];
 
+    std::string name_prefix = "auto_grown_";
     std::vector<QuadSurface*> surfaces;
 
     std::filesystem::path meta_fn = src_path / "meta.json";
@@ -117,6 +85,10 @@ int main(int argc, char *argv[])
 
     for (const auto& entry : std::filesystem::directory_iterator(src_dir))
         if (std::filesystem::is_directory(entry)) {
+            std::string name = entry.path().filename();
+            if (name.compare(0, name_prefix.size(), name_prefix))
+                continue;
+
             std::filesystem::path meta_fn = entry.path() / "meta.json";
             if (!std::filesystem::exists(meta_fn))
                 continue;

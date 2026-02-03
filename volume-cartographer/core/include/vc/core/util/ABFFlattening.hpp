@@ -21,15 +21,6 @@ struct ABFConfig {
     /** If true, scale the output to match the original 3D surface area */
     bool scaleToOriginalArea = true;
 
-    /** If true, use robust per-triangle area ratios for global scale */
-    bool robustAreaScale = true;
-
-    /** If true, filter outlier points before building the ABF mesh */
-    bool filterOutliers = true;
-
-    /** Sigma multiplier for robust outlier filtering (higher = less aggressive) */
-    float outlierSigma = 5.0f;
-
     /**
      * Downsample factor for ABF++ computation (default: 1 = full resolution).
      * Higher values (2, 4, 8) reduce grid resolution before ABF++ for faster

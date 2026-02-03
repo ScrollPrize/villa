@@ -260,7 +260,6 @@ namespace segmentation {
 
     // Corrections
     constexpr auto CORRECTIONS_ENABLED = "corrections_enabled";
-    constexpr auto CORRECTIONS_STICKY = "corrections_sticky";
     constexpr auto CORRECTIONS_Z_RANGE_ENABLED = "corrections_z_range_enabled";
     constexpr auto CORRECTIONS_Z_MIN = "corrections_z_min";
     constexpr auto CORRECTIONS_Z_MAX = "corrections_z_max";
@@ -280,7 +279,6 @@ namespace segmentation {
     constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
 
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
-    constexpr bool CORRECTIONS_STICKY_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;
     constexpr int CORRECTIONS_Z_MIN_DEFAULT = 0;
 }
