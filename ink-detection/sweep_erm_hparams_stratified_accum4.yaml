@@ -44,6 +44,6 @@ command:
   - --stitch_downsample
   - "8"
   - --wandb_group
-  - split_1
+  - split2
   - --wandb_tags
-  - ink-2um,erm,hparam_sweep,group_stratified,accum4,split_1
+  - ink-2um,erm,hparam_sweep,group_stratified,accum4,split2
