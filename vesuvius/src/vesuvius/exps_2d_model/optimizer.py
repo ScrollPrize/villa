@@ -17,7 +17,8 @@ import opt_loss_step
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
 	if cfg:
 		bad = sorted(cfg.keys())
-		raise ValueError(f"stages_json: {where}: unknown key(s): {bad}")
+		# raise ValueError(f"stages_json: {where}: unknown key(s): {bad}")
+		print(f"WARNING stages_json: {where}: unknown key(s): {bad}")
 
 
 @dataclass(frozen=True)
@@ -222,7 +223,7 @@ def optimize(
 
 		all_params = model.opt_params()
 		hooks: list[torch.utils.hooks.RemovableHandle] = []
-		cm_lr = getattr(model, "const_mask_lr", None)
+		cm_lr = model.const_mask_lr
 		if cm_lr is not None:
 			if cm_lr.ndim != 4 or int(cm_lr.shape[1]) != 1:
 				raise ValueError("const_mask_lr must be (N,1,Hm,Wm)")
@@ -231,7 +232,7 @@ def optimize(
 				raise ValueError("const_mask_lr batch must match data batch")
 			keep_lr = (1.0 - cm_lr)
 
-		ins_z = getattr(model, "_last_grow_insert_z", None)
+		ins_z = model._last_grow_insert_z
 		z_keep = None
 		if ins_z is not None:
 			ins_z = int(ins_z)
@@ -370,8 +371,12 @@ def optimize(
 			snapshot_fn(stage=stage_g, step=0, loss=0.0)
 			if local_opt.steps <= 0:
 				continue
-			ins = getattr(model, "_last_grow_insert_lr", None)
+			ins = model._last_grow_insert_lr
 			if ins is None:
+				if model._last_grow_insert_z is not None:
+					model.const_mask_lr = None
+					_run_opt(si=si, label=stage_g, opt_cfg=local_opt)
+					continue
 				raise RuntimeError("grow: missing insertion rect")
 			py0, px0, ho, wo = ins
 			hm = int(model.mesh_h)
@@ -381,7 +386,8 @@ def optimize(
 			y1 = int(py0 + ho)
 			x1 = int(px0 + wo)
 			win = max(0, int(local_opt.opt_window) - 1)
-			cm = torch.zeros(1, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
+			n = int(data.cos.shape[0])
+			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
 			cm[:, :, y0:y1, x0:x1] = 1.0
 			cm[:, :, y0:min(y1, y0 + win), x0:x1] = 0.0
 			cm[:, :, max(y0, y1 - win):y1, x0:x1] = 0.0

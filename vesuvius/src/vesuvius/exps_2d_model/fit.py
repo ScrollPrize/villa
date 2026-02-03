@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
 	print("opt:", opt_cfg)
 	print("vis:", vis_cfg)
 
-	data = cli_data.load_fit_data(data_cfg, out_dir_base=vis_cfg.out_dir)
+	data = cli_data.load_fit_data(data_cfg, z_size=model_cfg.z_size, out_dir_base=vis_cfg.out_dir)
 	device = data.cos.device
 	mdl = model.Model2D.from_fit_data(
 		data=data,

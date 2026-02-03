@@ -51,6 +51,46 @@ FitResult fields:
 
 	Direction encoding is documented in [`docs/modeling.md`](docs/modeling.md).
 
+## Z (depth) semantics
+
+- Convention: the leading dimension `N` of all tensors is used as **Z**.
+	- This is treated as a batch dimension (no cross-Z mixing).
+	- A “single slice” run has `N=1` everywhere.
+
+- Model Z size:
+	- The model stores the current Z slice count in [`Model2D.z_size`](model.py:123).
+	- Parameter tensors that live on the mesh are shaped `(N, ..., Hm, Wm)`.
+
+- Data Z size:
+	- [`fit_data.FitData`](fit_data.py:14) stores supervision as `(N,C,H,W)`.
+	- The batch size `N` must match the model Z size.
+		- If `Model2D.z_size` changes (e.g. grow fw/bw), the caller must also provide `FitData` with matching `N`.
+		- CLI note: for OME-Zarr inputs, `FitData` is built by running UNet inference for `N` slices starting at `--unet-z` with stride `--z-step`.
+
+## Grow fw/bw (Z growth) & local optimization
+
+- Z-growth is implemented via [`Model2D.grow()`](model.py:279) directions `fw`/`bw`:
+	- It expands the leading dimension `N` by **duplicating the edge slice**.
+	- It increments [`Model2D.z_size`](model.py:307).
+	- It records which new slice was inserted in [`Model2D._last_grow_insert_z`](model.py:147).
+		- `fw`: append, inserted index is the previous `z_size`.
+		- `bw`: prepend, inserted index is `0`.
+	- For fw/bw grows, [`Model2D._last_grow_insert_lr`](model.py:146) stays `None`.
+
+- Contract for `_last_grow_insert_*` fields:
+	- They are written by [`Model2D.grow()`](model.py:279) and are otherwise not mutated.
+	- The optimizer/visualization read them to decide which region/slice to optimize/visualize.
+	- They are not derived from data and should not be changed in [`Model2D.forward()`](model.py:167).
+
+- Local optimization behavior:
+	- Spatial grows use [`Model2D._last_grow_insert_lr`](model.py:146) to build a spatial mask (`const_mask_lr`).
+	- Z grows use [`Model2D._last_grow_insert_z`](model.py:147) and the optimizer masks gradients so **only that Z slice** updates.
+		- This is implemented in [`optimizer.optimize()`](optimizer.py:212) via backward hooks.
+
+- Visualization behavior:
+	- Visualization selects the slice `z_i = model._last_grow_insert_z` (fallback 0) so the optimized slice is shown.
+	- See [`vis.save()`](vis.py:261).
+
 Implementation note:
 
 - FitResult stores internal tensors as `_...` and exposes read-only properties.
