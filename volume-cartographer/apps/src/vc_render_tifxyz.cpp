@@ -747,8 +747,9 @@ int main(int argc, char *argv[])
         ("finalize", po::bool_switch()->default_value(false),
             "Build pyramid levels and write attrs for a zarr whose L0 tiles are already complete "
             "(run after all multi-part jobs finish)")
-        ("barrier-timeout", po::value<int>()->default_value(300),
-            "Timeout in seconds for slave parts waiting for master (part 0) to create the zarr (default 300)");
+        ("pre", po::bool_switch()->default_value(false),
+            "Create the zarr file and L0 dataset only (run before multi-part jobs). "
+            "This allows all parts to use the same code path.");
     // clang-format on
 
     po::options_description all("Usage");
@@ -778,12 +779,19 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     const bool mergeParts = parsed["merge-parts"].as<bool>();
-    const int barrierTimeout = parsed["barrier-timeout"].as<int>();
     if (numParts > 1) {
         std::cout << "Multi-part mode: part " << partId << " of " << numParts << std::endl;
     }
 
     const bool finalize_flag = parsed["finalize"].as<bool>();
+    const bool pre_flag = parsed["pre"].as<bool>();
+
+    if (pre_flag && finalize_flag) {
+        std::cerr << "Error: --pre and --finalize are mutually exclusive.\n";
+        std::cerr << "  --pre creates the zarr (run first)\n";
+        std::cerr << "  --finalize builds the pyramid (run last)\n";
+        return EXIT_FAILURE;
+    }
 
     // --merge-parts or --finalize for TIFFs: combine *.partN.tif files into final TIFFs, then exit
     // (--finalize for zarr goes through the normal path and builds the pyramid there)
@@ -1303,28 +1311,33 @@ int main(int argc, char *argv[])
         };
         const std::string out_dtype0 = output_is_u16 ? "uint16" : "uint8";
         const bool finalize = parsed["finalize"].as<bool>();
+        const bool pre = parsed["pre"].as<bool>();
         std::unique_ptr<z5::Dataset> dsOut0;
-        if (finalize) {
+        if (pre) {
+            // Pre-step: create zarr file and L0 dataset, then exit
+            std::cout << "[pre] creating zarr file and L0 dataset..." << std::endl;
+            z5::createFile(outFile, true);
+            z5::createDataset(outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
+            std::cout << "[pre] zarr created at " << output_path_local << std::endl;
+            std::cout << "[pre] L0 shape: [" << shape0[0] << ", " << shape0[1] << ", " << shape0[2] << "]" << std::endl;
+            std::cout << "[pre] done. Run multi-part jobs now." << std::endl;
+            return;
+        } else if (finalize) {
             // Finalize: zarr and L0 must already exist
             dsOut0 = z5::openDataset(outFile, "0");
-        } else if (partId == 0) {
-            // Master: create zarr file and L0 dataset
-            z5::createFile(outFile, true);
-            dsOut0 = z5::createDataset(outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
-        } else {
-            // Slave: wait for master to create the zarr dataset
+        } else if (numParts > 1) {
+            // Multi-part mode: --pre must have already created the zarr dataset
             const auto dsPath = output_path_local / "0" / ".zarray";
-            for (int wait = 0; !std::filesystem::exists(dsPath); ++wait) {
-                if (wait >= barrierTimeout) {
-                    std::cerr << "Error: timed out after " << barrierTimeout
-                              << "s waiting for master (part 0) to create " << dsPath << std::endl;
-                    return;
-                }
-                if (wait % 10 == 0 && wait > 0)
-                    std::cout << "[part " << partId << "] waiting for master to create zarr..." << std::endl;
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!std::filesystem::exists(dsPath)) {
+                std::cerr << "Error: zarr dataset not found at " << dsPath << std::endl;
+                std::cerr << "In multi-part mode, run --pre first to create the zarr before starting render jobs." << std::endl;
+                return;
             }
             dsOut0 = z5::openDataset(outFile, "0");
+        } else {
+            // Single-part mode: create zarr file and L0 dataset directly
+            z5::createFile(outFile, true);
+            dsOut0 = z5::createDataset(outFile, "0", out_dtype0, shape0, chunks0, std::string("blosc"), compOpts0);
         }
 
         const size_t tilesY_src = (static_cast<size_t>(tgt_size.height) + CH - 1) / CH;
