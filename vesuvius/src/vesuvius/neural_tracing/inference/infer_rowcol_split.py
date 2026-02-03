@@ -371,6 +371,7 @@ def compute_extrapolation_infer(
         uv_query=uv_query_flat,
         min_corner=min_corner,
         crop_size=crop_size,
+        cond_direction=cond_direction,
         **method_kwargs,
     )
 
@@ -741,9 +742,16 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, crop_size, tgt_segment, volume
         if extrap_pts_world is not None:
             extrap_mask = _filter_points_in_bbox_mask(extrap_pts_world, bbox)
             extrap_world_in = extrap_pts_world[extrap_mask]
-            if extrap_uv_world is not None:
-                extrap_uv = extrap_uv_world[extrap_mask]
-            extrap_local = _points_world_to_local(extrap_world_in, min_corner, crop_size)
+            extrap_uv_in = extrap_uv_world[extrap_mask] if extrap_uv_world is not None else None
+            # Convert to local and apply the same in-bounds filter to both
+            if extrap_world_in is not None and len(extrap_world_in) > 0:
+                local = extrap_world_in - min_corner[None, :]
+                bounds_mask = _in_bounds_mask(local, crop_size)
+                extrap_local = local[bounds_mask].astype(np.float32)
+                if extrap_uv_in is not None:
+                    extrap_uv = extrap_uv_in[bounds_mask]
+            else:
+                extrap_local = np.zeros((0, 3), dtype=np.float32)
 
         cond_vox = _points_to_voxels(cond_local, crop_size)
         extrap_vox = _points_to_voxels(extrap_local, crop_size) if extrap_local is not None else None

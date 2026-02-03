@@ -132,6 +132,7 @@ def _extrapolate_linear_edge(
     uv_cond: np.ndarray,
     zyx_cond: np.ndarray,
     uv_query: np.ndarray,
+    cond_direction: Optional[str] = None,
     **kwargs,
 ) -> np.ndarray:
     """
@@ -144,26 +145,36 @@ def _extrapolate_linear_edge(
         uv_cond: (N, 2) flattened UV coordinates of conditioning points
         zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
         uv_query: (M, 2) flattened UV coordinates to extrapolate to
+        cond_direction: optional "left", "right", "up", or "down" to override
+            UV-center-based direction inference
 
     Returns:
         (M, 3) extrapolated ZYX coordinates
     """
-    # Detect extrapolation direction by comparing UV centers
-    cond_center = uv_cond.mean(axis=0)
-    query_center = uv_query.mean(axis=0)
-
-    delta_row = query_center[0] - cond_center[0]
-    delta_col = query_center[1] - cond_center[1]
-
-    # Determine primary direction (row vs col)
-    if abs(delta_col) > abs(delta_row):
-        # Horizontal extrapolation (left/right)
-        is_horizontal = True
-        direction = 1 if delta_col > 0 else -1  # +1 = rightward, -1 = leftward
+    if cond_direction is not None:
+        # Use explicit direction instead of UV center inference
+        is_horizontal = cond_direction in ("left", "right")
+        if is_horizontal:
+            direction = 1 if cond_direction == "left" else -1
+        else:
+            direction = 1 if cond_direction == "up" else -1
     else:
-        # Vertical extrapolation (up/down)
-        is_horizontal = False
-        direction = 1 if delta_row > 0 else -1  # +1 = downward, -1 = upward
+        # Detect extrapolation direction by comparing UV centers
+        cond_center = uv_cond.mean(axis=0)
+        query_center = uv_query.mean(axis=0)
+
+        delta_row = query_center[0] - cond_center[0]
+        delta_col = query_center[1] - cond_center[1]
+
+        # Determine primary direction (row vs col)
+        if abs(delta_col) > abs(delta_row):
+            # Horizontal extrapolation (left/right)
+            is_horizontal = True
+            direction = 1 if delta_col > 0 else -1  # +1 = rightward, -1 = leftward
+        else:
+            # Vertical extrapolation (up/down)
+            is_horizontal = False
+            direction = 1 if delta_row > 0 else -1  # +1 = downward, -1 = upward
 
     # Reconstruct 2D grid from flattened conditioning data
     rows_unique = np.unique(uv_cond[:, 0])
@@ -174,8 +185,8 @@ def _extrapolate_linear_edge(
     row_to_idx = {r: i for i, r in enumerate(rows_unique)}
     col_to_idx = {c: i for i, c in enumerate(cols_unique)}
 
-    # Build 2D grids for ZYX
-    zyx_grid = np.zeros((n_rows, n_cols, 3), dtype=np.float64)
+    # Build 2D grids for ZYX (NaN for missing entries to avoid zero corruption)
+    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float64)
     for i, (uv, zyx) in enumerate(zip(uv_cond, zyx_cond)):
         ri, ci = row_to_idx[uv[0]], col_to_idx[uv[1]]
         zyx_grid[ri, ci] = zyx
@@ -200,6 +211,25 @@ def _extrapolate_linear_edge(
 
         # Gradient per row: dZYX / dcol
         gradient = (edge_zyx - prev_zyx) / col_step  # (n_rows, 3)
+
+        # Identify rows where both edge and prev are valid (not NaN)
+        valid_rows_mask = ~(np.isnan(edge_zyx).any(axis=1) | np.isnan(prev_zyx).any(axis=1))
+        if valid_rows_mask.any():
+            median_gradient = np.nanmedian(gradient[valid_rows_mask], axis=0)
+        else:
+            median_gradient = np.zeros(3, dtype=np.float64)
+
+        # For rows with NaN edge or gradient, use median gradient fallback
+        for ri in range(n_rows):
+            if np.isnan(edge_zyx[ri]).any():
+                # Use nearest valid edge row
+                valid_indices = np.where(~np.isnan(edge_zyx[:, 0]))[0]
+                if len(valid_indices) > 0:
+                    nearest = valid_indices[np.argmin(np.abs(valid_indices - ri))]
+                    edge_zyx[ri] = edge_zyx[nearest]
+                    gradient[ri] = median_gradient
+            elif np.isnan(gradient[ri]).any():
+                gradient[ri] = median_gradient
 
         # For each query point, find matching row and extrapolate
         zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
@@ -235,6 +265,25 @@ def _extrapolate_linear_edge(
 
         # Gradient per col: dZYX / drow
         gradient = (edge_zyx - prev_zyx) / row_step  # (n_cols, 3)
+
+        # Identify cols where both edge and prev are valid (not NaN)
+        valid_cols_mask = ~(np.isnan(edge_zyx).any(axis=1) | np.isnan(prev_zyx).any(axis=1))
+        if valid_cols_mask.any():
+            median_gradient = np.nanmedian(gradient[valid_cols_mask], axis=0)
+        else:
+            median_gradient = np.zeros(3, dtype=np.float64)
+
+        # For cols with NaN edge or gradient, use median gradient fallback
+        for ci in range(n_cols):
+            if np.isnan(edge_zyx[ci]).any():
+                # Use nearest valid edge col
+                valid_indices = np.where(~np.isnan(edge_zyx[:, 0]))[0]
+                if len(valid_indices) > 0:
+                    nearest = valid_indices[np.argmin(np.abs(valid_indices - ci))]
+                    edge_zyx[ci] = edge_zyx[nearest]
+                    gradient[ci] = median_gradient
+            elif np.isnan(gradient[ci]).any():
+                gradient[ci] = median_gradient
 
         # For each query point, find matching col and extrapolate
         zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
@@ -308,6 +357,7 @@ def _extrapolate_linear_rowcol(
     uv_cond: np.ndarray,
     zyx_cond: np.ndarray,
     uv_query: np.ndarray,
+    cond_direction: Optional[str] = None,
     **kwargs,
 ) -> np.ndarray:
     """
@@ -323,17 +373,22 @@ def _extrapolate_linear_rowcol(
         uv_cond: (N, 2) flattened UV coordinates of conditioning points
         zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
         uv_query: (M, 2) flattened UV coordinates to extrapolate to
+        cond_direction: optional "left", "right", "up", or "down" to override
+            UV-center-based direction inference
 
     Returns:
         (M, 3) extrapolated ZYX coordinates
     """
-    # Detect extrapolation direction
-    cond_center = uv_cond.mean(axis=0)
-    query_center = uv_query.mean(axis=0)
-    delta_row = query_center[0] - cond_center[0]
-    delta_col = query_center[1] - cond_center[1]
+    if cond_direction is not None:
+        is_horizontal = cond_direction in ("left", "right")
+    else:
+        # Detect extrapolation direction
+        cond_center = uv_cond.mean(axis=0)
+        query_center = uv_query.mean(axis=0)
+        delta_row = query_center[0] - cond_center[0]
+        delta_col = query_center[1] - cond_center[1]
 
-    is_horizontal = abs(delta_col) > abs(delta_row)
+        is_horizontal = abs(delta_col) > abs(delta_row)
 
     # Get unique rows and cols
     rows_unique = np.unique(uv_cond[:, 0])
@@ -545,6 +600,7 @@ def compute_extrapolation(
         uv_query=uv_mask_flat,
         min_corner=min_corner,
         crop_size=crop_size,
+        cond_direction=cond_direction,
         **method_kwargs,
     )
 
