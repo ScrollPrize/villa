@@ -221,6 +221,57 @@ def optimize(
 	snapshot_fn,
 ) -> fit_data.FitData:
 	data_z0 = data_cfg.unet_z if data_cfg is not None else None
+	def _masked_mean_per_z(*, lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+		if lm.ndim != 4 or mask.ndim != 4:
+			raise ValueError("loss map must be (N,1,H,W)")
+		if int(lm.shape[0]) != int(mask.shape[0]):
+			raise ValueError("loss map batch mismatch")
+		m = mask.to(dtype=lm.dtype)
+		n = int(lm.shape[0])
+		wsum = m.view(n, -1).sum(dim=1)
+		lsum = (lm * m).view(n, -1).sum(dim=1)
+		fallback = lm.view(n, -1).mean(dim=1)
+		return torch.where(wsum > 0.0, lsum / wsum, fallback)
+
+	def _print_losses_per_z(*, label: str, res, eff: dict[str, float], mean_pos_xy: torch.Tensor | None) -> None:
+		term_to_maps = {
+			"data": lambda: opt_loss_data.data_loss_map(res=res),
+			"data_plain": lambda: opt_loss_data.data_plain_loss_map(res=res),
+			"data_grad": lambda: opt_loss_data.data_grad_loss_map(res=res),
+			"dir_v": lambda: opt_loss_dir.dir_v_loss_maps(res=res),
+			"gradmag": lambda: opt_loss_gradmag.gradmag_period_loss_map(res=res),
+			"mod_smooth_y": lambda: opt_loss_mod.mod_smooth_y_loss_map(res=res),
+			"smooth_x": lambda: opt_loss_geom.smooth_x_loss_map(res=res),
+			"smooth_y": lambda: opt_loss_geom.smooth_y_loss_map(res=res),
+			"meshoff_sy": lambda: opt_loss_geom.meshoff_smooth_y_loss_map(res=res),
+			"conn_sy_l": lambda: opt_loss_geom.conn_y_smooth_l_loss_map(res=res),
+			"conn_sy_r": lambda: opt_loss_geom.conn_y_smooth_r_loss_map(res=res),
+			"angle": lambda: opt_loss_geom.angle_symmetry_loss_map(res=res),
+			"y_straight": lambda: opt_loss_geom.y_straight_loss_map(res=res),
+			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
+		}
+		if mean_pos_xy is not None:
+			term_to_maps["mean_pos"] = lambda: opt_loss_geom.mean_pos_loss_map(res=res, target_xy=mean_pos_xy)
+
+		out: dict[str, list[float]] = {}
+		for name, w in eff.items():
+			if float(w) == 0.0:
+				continue
+			if name == "dir_conn":
+				lm_l, lm_r, mask_l, mask_r = opt_loss_dir.dir_conn_loss_maps(res=res)
+				l = _masked_mean_per_z(lm=lm_l, mask=mask_l)
+				r = _masked_mean_per_z(lm=lm_r, mask=mask_r)
+				out[name] = [float(x) for x in (0.5 * (l + r)).detach().cpu().tolist()]
+				continue
+			fn = term_to_maps.get(name)
+			if fn is None:
+				continue
+			lm, mask = fn()
+			out[name] = [float(x) for x in _masked_mean_per_z(lm=lm, mask=mask).detach().cpu().tolist()]
+		if not out:
+			return
+		msg = {k: [round(float(x), 6) for x in v] for k, v in out.items()}
+		print(f"{label} losses_per_z: {msg}")
 	def _run_opt(*, si: int, label: str, opt_cfg: OptSettings) -> None:
 		if opt_cfg.steps <= 0:
 			return
@@ -316,6 +367,7 @@ def optimize(
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
+			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data)
 
 		for step in range(opt_cfg.steps):
@@ -348,6 +400,8 @@ def optimize(
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data)
 
 		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data)
+		with torch.no_grad():
+			_print_losses_per_z(label=f"{label} step {opt_cfg.steps}/{opt_cfg.steps}", res=model(data), eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		for h in hooks:
 			h.remove()
 
