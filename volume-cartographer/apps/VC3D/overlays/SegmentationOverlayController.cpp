@@ -3,7 +3,7 @@
 #include "../CSurfaceCollection.hpp"
 #include "../CVolumeViewer.hpp"
 #include "../ViewerManager.hpp"
-#include "../segmentation/SegmentationEditManager.hpp"
+#include "../segmentation/tools/SegmentationEditManager.hpp"
 
 #include <QColor>
 #include <QDebug>

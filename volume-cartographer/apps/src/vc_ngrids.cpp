@@ -15,7 +15,8 @@
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-#include <ceres/ceres.h>
+#include <ceres/tiny_solver.h>
+#include <ceres/tiny_solver_autodiff_function.h>
 #include <omp.h>
 
 #include "vc/core/util/GridStore.hpp"
@@ -473,67 +474,84 @@ static inline bool segment_intersects_local_roi_2d(const cv::Point& a, const cv:
     return true;
 }
 
-struct NormalDotResidual {
-    NormalDotResidual(const cv::Point3f& d, double w) : d_(d), w_(w) {}
-    template <typename T>
-    bool operator()(const T* const n, T* residual) const {
-        residual[0] = T(w_) * (n[0] * T(d_.x) + n[1] * T(d_.y) + n[2] * T(d_.z));
-        return true;
-    }
-    cv::Point3f d_;
-    double w_;
-};
-
 // First-order normal field around a sample point x0:
 //   n(x) = n0 + J * (x - x0)
 // where J is 3x3 (row-major). We only *output* n0 (normalized), but fitting J
 // improves the local fit when normals vary spatially (curvature).
-struct NormalDotResidualAffine {
-    NormalDotResidualAffine(const cv::Point3f& d_unit, const cv::Point3f& delta_xyz, double w)
-        : d_(d_unit), delta_(delta_xyz), w_(w) {}
+struct AffineNormalFitFunctor {
+    using Scalar = double;
+    enum { NUM_RESIDUALS = Eigen::Dynamic, NUM_PARAMETERS = 12 };
+
+    AffineNormalFitFunctor(const std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
+                           const std::array<std::vector<double>, 3>& weights,
+                           const std::array<std::vector<cv::Point3f>, 3>& deltas_xyz,
+                           const std::array<double, 3>& plane_scales,
+                           double unit_norm_w,
+                           double jacobian_w)
+        : dirs_unit_(dirs_unit),
+          weights_(weights),
+          deltas_xyz_(deltas_xyz),
+          plane_scales_(plane_scales),
+          unit_norm_w_(unit_norm_w),
+          jacobian_w_(jacobian_w) {
+        num_residuals_ = static_cast<int>(dirs_unit_[0].size() + dirs_unit_[1].size() + dirs_unit_[2].size()) + 1 + 9;
+    }
+
+    int NumResiduals() const {
+        return num_residuals_;
+    }
 
     template <typename T>
-    bool operator()(const T* const n0, const T* const J, T* residual) const {
-        // J is row-major 3x3: rows correspond to x,y,z components of n.
-        const T dx = T(delta_.x);
-        const T dy = T(delta_.y);
-        const T dz = T(delta_.z);
+    bool operator()(const T* const parameters, T* residuals) const {
+        const T* n0 = parameters;
+        const T* J = parameters + 3;
+        int idx = 0;
+        for (int p = 0; p < 3; ++p) {
+            const auto& dirs = dirs_unit_[p];
+            const auto& deltas = deltas_xyz_[p];
+            const auto& wts = weights_[p];
+            const double s = plane_scales_[p];
+            for (size_t k = 0; k < dirs.size(); ++k) {
+                const auto& d = dirs[k];
+                const auto& delta = deltas[k];
+                const double w_eff = wts[k] * s;
+                const double w_sqrt = std::sqrt(std::max(0.0, w_eff));
+                const T w = T(w_sqrt);
 
-        const T nx = n0[0] + J[0] * dx + J[1] * dy + J[2] * dz;
-        const T ny = n0[1] + J[3] * dx + J[4] * dy + J[5] * dz;
-        const T nz = n0[2] + J[6] * dx + J[7] * dy + J[8] * dz;
+                const T dx = T(delta.x);
+                const T dy = T(delta.y);
+                const T dz = T(delta.z);
 
-        residual[0] = T(w_) * (nx * T(d_.x) + ny * T(d_.y) + nz * T(d_.z));
+                const T nx = n0[0] + J[0] * dx + J[1] * dy + J[2] * dz;
+                const T ny = n0[1] + J[3] * dx + J[4] * dy + J[5] * dz;
+                const T nz = n0[2] + J[6] * dx + J[7] * dy + J[8] * dz;
+
+                residuals[idx++] = w * (nx * T(d.x) + ny * T(d.y) + nz * T(d.z));
+            }
+        }
+
+        using std::sqrt;
+        using ceres::sqrt;
+        const T len = sqrt(n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2] + T(1e-12));
+        residuals[idx++] = T(unit_norm_w_) * (len - T(1.0));
+
+        for (int i = 0; i < 9; ++i) {
+            residuals[idx++] = T(jacobian_w_) * J[i];
+        }
         return true;
     }
 
-    cv::Point3f d_;
-    cv::Point3f delta_;
-    double w_;
+  private:
+    const std::array<std::vector<cv::Point3f>, 3>& dirs_unit_;
+    const std::array<std::vector<double>, 3>& weights_;
+    const std::array<std::vector<cv::Point3f>, 3>& deltas_xyz_;
+    const std::array<double, 3> plane_scales_;
+    const double unit_norm_w_;
+    const double jacobian_w_;
+    int num_residuals_ = 0;
 };
 
-struct JacobianL2Residual {
-    explicit JacobianL2Residual(double w) : w_(w) {}
-    template <typename T>
-    bool operator()(const T* const J, T* residual) const {
-        for (int i = 0; i < 9; ++i) residual[i] = T(w_) * J[i];
-        return true;
-    }
-    double w_;
-};
-
-struct UnitNormResidual {
-    explicit UnitNormResidual(double w) : w_(w) {}
-    template <typename T>
-    bool operator()(const T* const n, T* residual) const {
-        const T len = ceres::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] + T(1e-12));
-        residual[0] = T(w_) * (len - T(1.0));
-        return true;
-    }
-    double w_;
-};
-
-static bool fit_normal_ceres(
+static bool fit_normal_tiny(
     std::array<std::vector<cv::Point3f>, 3>& dirs_unit_by_plane,
     std::array<std::vector<double>, 3>& weights_by_plane,
     const cv::Point3f& sample_xyz,
@@ -543,6 +561,7 @@ static bool fit_normal_ceres(
     double* out_rms,
     double* out_solve_seconds,
     double* inout_init_n) {
+    (void)sample_xyz;
     for (int p = 0; p < 3; ++p) {
         if (weights_by_plane[p].size() != dirs_unit_by_plane[p].size()) return false;
     }
@@ -562,9 +581,6 @@ static bool fit_normal_ceres(
     const double s2 = (n2_count > 0) ? (target / static_cast<double>(n2_count)) : 0.0;
 
     double n0[3];
-    double J[9] = {0.0, 0.0, 0.0,
-                   0.0, 0.0, 0.0,
-                   0.0, 0.0, 0.0};
     if (inout_init_n != nullptr) {
         // Reuse previous solution for warm start.
         n0[0] = inout_init_n[0];
@@ -576,61 +592,44 @@ static bool fit_normal_ceres(
         n0[2] = 1;
     }
 
-    ceres::Problem problem;
     // For RMS reporting: normalize by the *sum of weights* (not sample count).
-    // Note: residual is scaled by sqrt(weight), so Ceres cost is ~ 1/2 * sum(weight * dot^2).
+    // Note: residual is scaled by sqrt(weight), so cost is ~ 1/2 * sum(weight * dot^2).
     double weight_sum = 0.0;
     for (size_t k = 0; k < n0_count; ++k) {
-        const auto& d = dirs_unit_by_plane[0][k];
-        const auto& delta = deltas_xyz_by_plane[0][k];
         const double w_eff = weights_by_plane[0][k] * s0;
-        const double w = std::sqrt(std::max(0.0, w_eff));
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
-            new NormalDotResidualAffine(d, delta, w));
-        problem.AddResidualBlock(cost, nullptr, n0, J);
         weight_sum += std::max(0.0, w_eff);
     }
     for (size_t k = 0; k < n1_count; ++k) {
-        const auto& d = dirs_unit_by_plane[1][k];
-        const auto& delta = deltas_xyz_by_plane[1][k];
         const double w_eff = weights_by_plane[1][k] * s1;
-        const double w = std::sqrt(std::max(0.0, w_eff));
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
-            new NormalDotResidualAffine(d, delta, w));
-        problem.AddResidualBlock(cost, nullptr, n0, J);
         weight_sum += std::max(0.0, w_eff);
     }
     for (size_t k = 0; k < n2_count; ++k) {
-        const auto& d = dirs_unit_by_plane[2][k];
-        const auto& delta = deltas_xyz_by_plane[2][k];
         const double w_eff = weights_by_plane[2][k] * s2;
-        const double w = std::sqrt(std::max(0.0, w_eff));
-        auto* cost = new ceres::AutoDiffCostFunction<NormalDotResidualAffine, 1, 3, 9>(
-            new NormalDotResidualAffine(d, delta, w));
-        problem.AddResidualBlock(cost, nullptr, n0, J);
         weight_sum += std::max(0.0, w_eff);
     }
-    problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<UnitNormResidual, 1, 3>(new UnitNormResidual(10.0)),
-        nullptr,
-        n0);
 
-    // Regularize the curvature term so we don't overfit noise. Weight chosen empirically.
-    // Units: n is unitless, delta is in voxels => J has ~1/voxel scale.
-    problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<JacobianL2Residual, 9, 9>(new JacobianL2Residual(0.05)),
-        nullptr,
-        J);
+    const std::array<double, 3> plane_scales = {s0, s1, s2};
+    constexpr double kUnitNormWeight = 10.0;
+    constexpr double kJacobianWeight = 0.05;
+    AffineNormalFitFunctor functor(dirs_unit_by_plane,
+                                   weights_by_plane,
+                                   deltas_xyz_by_plane,
+                                   plane_scales,
+                                   kUnitNormWeight,
+                                   kJacobianWeight);
+    using AutoDiffFn = ceres::TinySolverAutoDiffFunction<AffineNormalFitFunctor, Eigen::Dynamic, 12>;
+    AutoDiffFn f(functor);
+    ceres::TinySolver<AutoDiffFn> solver;
+    solver.options.max_num_iterations = 1000;
 
-    ceres::Solver::Options opts;
-    opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    // opts.linear_solver_type = ceres::SPARSE_SCHUR;
-    opts.max_num_iterations = 1000;
-    opts.minimizer_progress_to_stdout = false;
+    typename ceres::TinySolver<AutoDiffFn>::Parameters params;
+    params.setZero();
+    params[0] = n0[0];
+    params[1] = n0[1];
+    params[2] = n0[2];
 
-    ceres::Solver::Summary summary;
     const auto solve_t0 = std::chrono::steady_clock::now();
-    ceres::Solve(opts, &problem, &summary);
+    const auto summary = solver.Solve(f, &params);
     const auto solve_t1 = std::chrono::steady_clock::now();
 
     if (out_solve_seconds != nullptr) {
@@ -638,14 +637,17 @@ static bool fit_normal_ceres(
     }
 
     if (out_num_iterations != nullptr) {
-        *out_num_iterations = static_cast<int>(summary.iterations.size());
+        *out_num_iterations = static_cast<int>(summary.iterations);
     }
     if (out_rms != nullptr) {
-        // Ceres cost = 1/2 * sum(residual^2)
+        // cost = 1/2 * sum(residual^2)
         const double denom = std::max(1e-12, weight_sum);
         *out_rms = std::sqrt(2.0 * summary.final_cost / denom);
     }
 
+    n0[0] = params[0];
+    n0[1] = params[1];
+    n0[2] = params[2];
     const double len = std::sqrt(n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2]);
     if (!(len > 1e-12)) return false;
     out_n = cv::Point3f(static_cast<float>(n0[0] / len), static_cast<float>(n0[1] / len), static_cast<float>(n0[2] / len));
@@ -1670,13 +1672,6 @@ static void run_fit_normals(
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
-    const CropBox3i crop = crop_opt.value_or(CropBox3i{
-        cv::Vec3i(0, 0, 0),
-        cv::Vec3i(std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4,
-                  std::numeric_limits<int>::max() / 4),
-    });
-
     // We only *output* samples within crop, but we must *read* enough context
     // (potentially larger than crop) so fits near the crop boundary have full support.
     const auto vol_xyz_opt = infer_volume_shape_from_grids(input_dir);
@@ -1684,6 +1679,10 @@ static void run_fit_normals(
         throw std::runtime_error("Failed to infer volume shape from normal grids (required to expand fit read region beyond crop)");
     }
     const cv::Vec3i vol_xyz = *vol_xyz_opt;
+    const CropBox3i crop = crop_opt.value_or(CropBox3i{
+        cv::Vec3i(0, 0, 0),
+        vol_xyz,
+    });
 
     // Adaptive radius (per-sample): start at 32, double to 512, and choose the first
     // radius for which >=min_samples are found in any 2 of the 3 planes.
@@ -1829,9 +1828,9 @@ static void run_fit_normals(
         uint64_t samples_total = 0;
         double t_ng_read_s = 0.0;
         double t_preproc_s = 0.0;
-        // Time spent inside the Ceres solver call itself (as reported by fit_normal_ceres).
+        // Time spent inside the solver call itself (as reported by fit_normal_tiny).
         double t_solve_s = 0.0;
-        // Total time spent in the fit_normal_ceres() call (includes setup, residual creation, etc.).
+        // Total time spent in the fit_normal_tiny() call (includes setup, residual creation, etc.).
         double t_solve_call_s = 0.0;
         double t_overhead_s = 0.0;
 
@@ -2006,12 +2005,26 @@ static void run_fit_normals(
         }
     };
 
-    // Per-thread warm start for Ceres.
+    // Per-thread warm start for the solver.
     struct WarmStart {
         double n[3] = {0.0, 0.0, 0.0};
         bool has = false;
     };
     std::vector<WarmStart> warm(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+
+    struct FitBuffers {
+        std::array<std::vector<cv::Point3f>, 3> dirs_unit;
+        std::array<std::vector<double>, 3> weights;
+        std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
+    };
+    std::vector<FitBuffers> fit_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+    for (auto& fb : fit_buffers) {
+        for (int p = 0; p < 3; ++p) {
+            fb.dirs_unit[p].reserve(512);
+            fb.weights[p].reserve(512);
+            fb.deltas_xyz[p].reserve(512);
+        }
+    }
 
     auto merge_stats = [&](FitStats& acc, const FitStats& s) {
         for (int i = 0; i < 7; ++i) {
@@ -2141,7 +2154,7 @@ static void run_fit_normals(
         std::cerr << "  time(thread-summed): samples=" << acc.samples_total
                   << " | ng_read=" << acc.t_ng_read_s << "s (" << png << "%)"
                   << " | preproc=" << acc.t_preproc_s << "s (" << ppp << "%)"
-                  << " | solve_call=" << acc.t_solve_call_s << "s (" << ps << "%); ceres_solve=" << acc.t_solve_s << "s; solve_call_overhead=" << solve_call_overhead_s << "s"
+                  << " | solve_call=" << acc.t_solve_call_s << "s (" << ps << "%); tiny_solve=" << acc.t_solve_s << "s; solve_call_overhead=" << solve_call_overhead_s << "s"
                   << " | overhead=" << acc.t_overhead_s << "s (" << po << "%)\n";
 
         const double rej = (acc.dist_test_total > 0) ? (100.0 * static_cast<double>(acc.dist_test_reject) / static_cast<double>(acc.dist_test_total)) : 0.0;
@@ -2183,14 +2196,10 @@ static void run_fit_normals(
 
                 const auto t_sample0 = std::chrono::steady_clock::now();
 
-                std::array<std::vector<cv::Point3f>, 3> dirs_unit;
-                std::array<std::vector<double>, 3> weights;
-                std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
-                for (int p = 0; p < 3; ++p) {
-                    dirs_unit[p].reserve(512);
-                    weights[p].reserve(512);
-                    deltas_xyz[p].reserve(512);
-                }
+                FitBuffers& fb = fit_buffers[static_cast<size_t>(tid)];
+                auto& dirs_unit = fb.dirs_unit;
+                auto& weights = fb.weights;
+                auto& deltas_xyz = fb.deltas_xyz;
 
                 double t_ng_read_s = 0.0;
                 double t_preproc_s = 0.0;
@@ -2216,7 +2225,7 @@ static void run_fit_normals(
                     used_rad = rad;
 
                     // If at the initial radius there are too few segments overall, skip this normal completely.
-                    // Treat as a failed fit (same behavior as fit_normal_ceres returning false).
+                    // Treat as a failed fit (same behavior as fit_normal_tiny returning false).
                     if (rad == kMinRadius && used_segments_total < 50) {
                         skip_fit_due_to_low_segments = true;
                         break;
@@ -2234,7 +2243,7 @@ static void run_fit_normals(
                 double* init_ptr = ws.has ? ws.n : nullptr;
                 const auto t_solve_call0 = std::chrono::steady_clock::now();
                 const bool ok = (!skip_fit_due_to_low_segments) &&
-                                fit_normal_ceres(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
+                                fit_normal_tiny(dirs_unit, weights, sample, deltas_xyz, n, &iters, &rms, &t_solve_s, init_ptr);
                 const auto t_solve_call1 = std::chrono::steady_clock::now();
                 t_solve_call_s = std::chrono::duration<double>(t_solve_call1 - t_solve_call0).count();
 

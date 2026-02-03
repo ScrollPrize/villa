@@ -5,6 +5,8 @@ add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
 
 set(srcs
     VCAppMain.cpp
+    Keybinds.cpp
+    Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
     CVolumeViewer.cpp
@@ -20,6 +22,10 @@ set(srcs
     elements/CollapsibleSettingsGroup.hpp
     elements/DropdownChecklistButton.cpp
     elements/DropdownChecklistButton.hpp
+    elements/JsonProfileEditor.cpp
+    elements/JsonProfileEditor.hpp
+    elements/VolumeSelector.cpp
+    elements/VolumeSelector.hpp
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
     SettingsDialog.cpp
@@ -30,24 +36,45 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
+    segmentation/SegmentationCommon.hpp
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp
-    segmentation/SegmentationGrowth.cpp
-    segmentation/ExtrapolationGrowth.cpp
-    segmentation/ExtrapolationGrowth.hpp
-    segmentation/SegmentationGrower.cpp
-    segmentation/SegmentationGrower.hpp
-    segmentation/SegmentationEditManager.cpp
-    segmentation/SegmentationEditManager.hpp
-    segmentation/ApprovalMaskBrushTool.cpp
-    segmentation/ApprovalMaskBrushTool.hpp
-    segmentation/CellReoptimizationTool.cpp
-    segmentation/CellReoptimizationTool.hpp
-    segmentation/SegmentationLineTool.cpp
-    segmentation/SegmentationLineTool.hpp
-    segmentation/SegmentationPushPullTool.cpp
-    segmentation/SegmentationPushPullTool.hpp
-    segmentation/SegmentationTool.hpp
+    segmentation/panels/SegmentationHeaderRow.cpp
+    segmentation/panels/SegmentationHeaderRow.hpp
+    segmentation/panels/SegmentationEditingPanel.cpp
+    segmentation/panels/SegmentationEditingPanel.hpp
+    segmentation/panels/SegmentationGrowthPanel.cpp
+    segmentation/panels/SegmentationGrowthPanel.hpp
+    segmentation/panels/SegmentationCorrectionsPanel.cpp
+    segmentation/panels/SegmentationCorrectionsPanel.hpp
+    segmentation/panels/SegmentationCustomParamsPanel.cpp
+    segmentation/panels/SegmentationCustomParamsPanel.hpp
+    segmentation/panels/SegmentationApprovalMaskPanel.cpp
+    segmentation/panels/SegmentationApprovalMaskPanel.hpp
+    segmentation/panels/SegmentationCellReoptPanel.cpp
+    segmentation/panels/SegmentationCellReoptPanel.hpp
+    segmentation/panels/SegmentationNeuralTracerPanel.cpp
+    segmentation/panels/SegmentationNeuralTracerPanel.hpp
+    segmentation/panels/SegmentationDirectionFieldPanel.cpp
+    segmentation/panels/SegmentationDirectionFieldPanel.hpp
+    segmentation/growth/SegmentationGrowth.cpp
+    segmentation/growth/ExtrapolationGrowth.cpp
+    segmentation/growth/ExtrapolationGrowth.hpp
+    segmentation/growth/SegmentationGrower.cpp
+    segmentation/growth/SegmentationGrower.hpp
+    segmentation/tools/SegmentationEditManager.cpp
+    segmentation/tools/SegmentationEditManager.hpp
+    segmentation/tools/ApprovalMaskBrushTool.cpp
+    segmentation/tools/ApprovalMaskBrushTool.hpp
+    segmentation/tools/CellReoptimizationTool.cpp
+    segmentation/tools/CellReoptimizationTool.hpp
+    segmentation/tools/SegmentationLineTool.cpp
+    segmentation/tools/SegmentationLineTool.hpp
+    segmentation/tools/SegmentationPushPullTool.cpp
+    segmentation/tools/SegmentationPushPullTool.hpp
+    segmentation/tools/SegmentationTool.hpp
+    segmentation/tools/SegmentationBrushTool.cpp
+    segmentation/tools/SegmentationBrushTool.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp
@@ -75,8 +102,8 @@ set(srcs
     MenuActionController.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SegmentationModule.hpp
-    segmentation/SegmentationCorrections.cpp
-    segmentation/SegmentationCorrections.hpp
+    segmentation/growth/SegmentationCorrections.cpp
+    segmentation/growth/SegmentationCorrections.hpp
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp

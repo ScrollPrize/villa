@@ -109,6 +109,23 @@ namespace viewer {
 
     constexpr bool PLAY_SOUND_AFTER_SEG_RUN_DEFAULT = true;
     constexpr auto USERNAME_DEFAULT = "";
+
+    // Viewer control group expansion states
+    constexpr auto GROUP_PREPROCESSING_EXPANDED = "viewer/group_preprocessing_expanded";
+    constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
+    constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
+    constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
+    constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
+    constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
+    constexpr auto GROUP_POSTPROCESSING_EXPANDED = "viewer/group_postprocessing_expanded";
+
+    constexpr bool GROUP_PREPROCESSING_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_POSTPROCESSING_EXPANDED_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -138,6 +155,11 @@ namespace perf {
 namespace window {
     constexpr auto GEOMETRY = "mainWin/geometry";
     constexpr auto STATE = "mainWin/state";
+    constexpr auto RESTORE_IN_PROGRESS = "mainWin/restore_in_progress";
+    constexpr auto RESTORE_DISABLED = "mainWin/restore_disabled";
+    constexpr auto STATE_META_SCREEN_SIGNATURE = "mainWin/state_meta/screen_signature";
+    constexpr auto STATE_META_QT_VERSION = "mainWin/state_meta/qt_version";
+    constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
 }
 
 // -----------------------------------------------------------------------------
@@ -153,6 +175,16 @@ namespace export_ {  // underscore because 'export' is reserved keyword
     constexpr int CHUNK_OVERLAP_PX_DEFAULT = 0;
     constexpr bool OVERWRITE_DEFAULT = true;
     constexpr auto DIR_DEFAULT = "";
+}
+
+// -----------------------------------------------------------------------------
+// Neighbor Copy Settings
+// -----------------------------------------------------------------------------
+namespace neighbor_copy {
+    constexpr auto PASS2_PARAMS_PROFILE = "neighbor_copy/pass2_params_profile";
+    constexpr auto PASS2_PARAMS_TEXT = "neighbor_copy/pass2_params_text";
+    constexpr auto RESUME_LOCAL_OMP_THREADS = "neighbor_copy/resume_local_omp_threads";
+    constexpr int RESUME_LOCAL_OMP_THREADS_DEFAULT = 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -244,6 +276,7 @@ namespace segmentation {
     constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
     constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
     constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
+    constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
 
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;

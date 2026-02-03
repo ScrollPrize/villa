@@ -1593,6 +1593,57 @@ void QuadSurface::rotate(float angleDeg)
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
 }
 
+void QuadSurface::resample(float factor, int interpolation)
+{
+    ensureLoaded();
+    if (!_points || _points->empty() || std::abs(factor - 1.0f) < 0.001f) {
+        return;
+    }
+
+    // Calculate new size
+    cv::Size newSize(
+        static_cast<int>(std::round(_points->cols * factor)),
+        static_cast<int>(std::round(_points->rows * factor))
+    );
+
+    // Resample points
+    cv::Mat resampledMat;
+    cv::resize(*_points, resampledMat, newSize, 0, 0, interpolation);
+
+    // Clean up edge artifacts: invalidate points near original invalid regions
+    cv::Mat origMask;
+    cv::inRange(*_points, cv::Scalar(-1, -1, -1), cv::Scalar(-1, -1, -1), origMask);
+    cv::Mat scaledMask;
+    cv::resize(origMask, scaledMask, newSize, 0, 0, cv::INTER_NEAREST);
+
+    // Dilate invalid mask to clean interpolation artifacts at boundaries
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::dilate(scaledMask, scaledMask, kernel, cv::Point(-1, -1), 1);
+    resampledMat.setTo(cv::Scalar(-1.f, -1.f, -1.f), scaledMask);
+
+    // Update points
+    *_points = resampledMat;
+
+    // Resample all channels
+    for (auto& [name, channel] : _channels) {
+        if (channel.empty()) continue;
+
+        cv::Mat resampledChannel;
+        // Use nearest neighbor for mask-like channels, linear for others
+        int chanInterp = (name == "mask" || name == "generations")
+                         ? cv::INTER_NEAREST : interpolation;
+        cv::resize(channel, resampledChannel, newSize, 0, 0, chanInterp);
+        channel = resampledChannel;
+    }
+
+    // Update scale to maintain physical size
+    _scale[0] /= factor;
+    _scale[1] /= factor;
+
+    // Invalidate cached bbox
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+}
+
 float QuadSurface::computeZOrientationAngle() const
 {
     const_cast<QuadSurface*>(this)->ensureLoaded();
@@ -1600,72 +1651,70 @@ float QuadSurface::computeZOrientationAngle() const
         return 0.0f;
     }
 
-    // Find the row with the highest average Z value
-    double maxAvgZ = std::numeric_limits<double>::lowest();
-    int bestRow = -1;
-
+    // Find min/max Z to build a stable weighting for the high-Z centroid.
+    double minZ = std::numeric_limits<double>::max();
+    double maxZ = std::numeric_limits<double>::lowest();
     for (int row = 0; row < _points->rows; ++row) {
-        double sumZ = 0.0;
-        int count = 0;
         for (int col = 0; col < _points->cols; ++col) {
             const cv::Vec3f& pt = (*_points)(row, col);
-            if (pt[0] != -1.f) {
-                sumZ += pt[2];
-                count++;
+            if (pt[0] == -1.f || !std::isfinite(pt[2])) {
+                continue;
             }
-        }
-        if (count > 0) {
-            double avgZ = sumZ / count;
-            if (avgZ > maxAvgZ) {
-                maxAvgZ = avgZ;
-                bestRow = row;
-            }
+            minZ = std::min(minZ, static_cast<double>(pt[2]));
+            maxZ = std::max(maxZ, static_cast<double>(pt[2]));
         }
     }
 
-    if (bestRow < 0) {
+    if (!(minZ < maxZ)) {
         return 0.0f;
     }
 
-    // Compute column centroid of valid points in the highest-Z row
+    // Compute a Z-weighted centroid so the orientation follows the dominant Z gradient.
+    double sumW = 0.0;
+    double sumRow = 0.0;
     double sumCol = 0.0;
-    int colCount = 0;
-    for (int col = 0; col < _points->cols; ++col) {
-        const cv::Vec3f& pt = (*_points)(bestRow, col);
-        if (pt[0] != -1.f) {
-            sumCol += col;
-            colCount++;
+    for (int row = 0; row < _points->rows; ++row) {
+        for (int col = 0; col < _points->cols; ++col) {
+            const cv::Vec3f& pt = (*_points)(row, col);
+            if (pt[0] == -1.f || !std::isfinite(pt[2])) {
+                continue;
+            }
+            const double w = static_cast<double>(pt[2]) - minZ;
+            if (w <= 0.0) {
+                continue;
+            }
+            sumW += w;
+            sumRow += static_cast<double>(row) * w;
+            sumCol += static_cast<double>(col) * w;
         }
     }
 
-    // Use the center of the highest-Z row as the target point
-    double centroidRow = static_cast<double>(bestRow);
-    double centroidCol = sumCol / colCount;
-
-    // Grid center
-    double centerRow = (_points->rows - 1) / 2.0;
-    double centerCol = (_points->cols - 1) / 2.0;
-
-    // Vector from center to highest-Z row centroid
-    double dRow = centroidRow - centerRow;
-    double dCol = centroidCol - centerCol;
-
-    // If centroid is at center, no rotation needed
-    if (std::abs(dRow) < 1e-6 && std::abs(dCol) < 1e-6) {
+    if (sumW <= 0.0) {
         return 0.0f;
     }
 
-    // Compute angle of this vector
-    // atan2(dCol, dRow) gives angle where:
-    //   0 degrees = pointing down (positive row direction)
-    //   90 degrees = pointing right (positive col direction)
-    double angleRad = std::atan2(dCol, dRow);
-    double angleDeg = angleRad * 180.0 / M_PI;
+    const double centroidRow = sumRow / sumW;
+    const double centroidCol = sumCol / sumW;
 
-    // We want the highest-Z row to end up at row 0 (top)
-    // "Up" in image coordinates is -row direction, which is 180 degrees
-    // So we need to rotate by: 180 - angleDeg
-    float rotationDeg = static_cast<float>(angleDeg + 180.0);
+    // Grid center (OpenCV: x = col, y = row)
+    const double centerRow = (_points->rows - 1) / 2.0;
+    const double centerCol = (_points->cols - 1) / 2.0;
+
+    // Vector from center to Z-weighted centroid in OpenCV coordinates.
+    const double dx = centroidCol - centerCol;  // x = col (right)
+    const double dy = centroidRow - centerRow;  // y = row (down)
+
+    // If centroid is at center, no rotation needed.
+    if (std::abs(dx) < 1e-6 && std::abs(dy) < 1e-6) {
+        return 0.0f;
+    }
+
+    // Angle from +X (right) in OpenCV image coordinates.
+    const double angleRad = std::atan2(dy, dx);
+    const double angleDeg = angleRad * 180.0 / M_PI;
+
+    // We want high-Z to end up at row 0 (top). "Up" is -Y (angle -90 deg).
+    float rotationDeg = static_cast<float>(-90.0 - angleDeg);
 
     // Normalize to [-180, 180] range
     while (rotationDeg > 180.0f) rotationDeg -= 360.0f;

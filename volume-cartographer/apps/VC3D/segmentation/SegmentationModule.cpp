@@ -3,13 +3,13 @@
 #include "CVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CSurfaceCollection.hpp"
-#include "SegmentationEditManager.hpp"
+#include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
-#include "SegmentationLineTool.hpp"
-#include "SegmentationPushPullTool.hpp"
-#include "ApprovalMaskBrushTool.hpp"
-#include "CellReoptimizationTool.hpp"
-#include "SegmentationCorrections.hpp"
+#include "tools/SegmentationLineTool.hpp"
+#include "tools/SegmentationPushPullTool.hpp"
+#include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/CellReoptimizationTool.hpp"
+#include "growth/SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -120,6 +120,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
         _hoverPreviewEnabled = _widget->showHoverMarker();
+        _autoApproveEdits = _widget->autoApproveEdits();
     }
 
     if (_overlay) {
@@ -253,7 +254,10 @@ bool SegmentationModule::ensureHoverTarget()
         return false;
     }
     if (_hoverPreviewEnabled && _hover.valid) {
-        return true;
+        if (!_hoverPointer.valid || _hover.viewer == _hoverPointer.viewer) {
+            return true;
+        }
+        _hover.clear();
     }
     if (!_hoverPointer.valid) {
         return false;
@@ -337,6 +341,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setEditApprovedMask);
     connect(_widget, &SegmentationWidget::editUnapprovedMaskChanged,
             this, &SegmentationModule::setEditUnapprovedMask);
+    connect(_widget, &SegmentationWidget::autoApproveEditsChanged,
+            this, &SegmentationModule::setAutoApproveEdits);
     connect(_widget, &SegmentationWidget::approvalBrushRadiusChanged,
             this, &SegmentationModule::setApprovalMaskBrushRadius);
     connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
@@ -359,6 +365,9 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setCellReoptPerimeterOffset);
     connect(_widget, &SegmentationWidget::cellReoptGrowthRequested,
             this, [this](uint64_t collectionId) {
+                if (isEditingApprovalMask()) {
+                    saveApprovalMaskToDisk();
+                }
                 // Cell reoptimization should not auto-approve the growth region
                 _skipAutoApprovalOnGrowth = true;
                 // Store the specific collection ID to use for this growth
@@ -700,6 +709,12 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
     refreshOverlay();
 }
 
+void SegmentationModule::setAutoApproveEdits(bool enabled)
+{
+    _autoApproveEdits = enabled;
+    qCInfo(lcSegModule) << "Auto-approve edits set to:" << enabled;
+}
+
 void SegmentationModule::saveApprovalMaskToDisk()
 {
     qCInfo(lcSegModule) << "Saving approval mask to disk...";
@@ -828,7 +843,7 @@ void SegmentationModule::applyEdits()
     }
 
     // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
-    if (_overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
+    if (_autoApproveEdits && _overlay && _overlay->hasApprovalMaskData() && hadPendingChanges) {
         const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
             std::vector<std::pair<int, int>> gridPositions;
@@ -1444,7 +1459,7 @@ void SegmentationModule::finishDrag()
         captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
-        if (_overlay && _overlay->hasApprovalMaskData()) {
+        if (_autoApproveEdits && _overlay && _overlay->hasApprovalMaskData()) {
             const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 std::vector<std::pair<int, int>> gridPositions;
@@ -1563,6 +1578,13 @@ void SegmentationModule::recordPointerSample(CVolumeViewer* viewer, const cv::Ve
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
         return;
+    }
+
+    // Detect viewer change and reset stale cached state
+    if (_hoverPointer.valid && _hoverPointer.viewer != viewer) {
+        resetHoverLookupDetail();           // Reset velocity tracking
+        _editManager->resetPointerSeed();   // Reset pointTo() seed
+        _hover.clear();                     // Invalidate stale hover
     }
 
     _hoverPointer.valid = true;

@@ -27,7 +27,7 @@
 #include "CSurfaceCollection.hpp"
 #include "CVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
-#include "segmentation/SegmentationEditManager.hpp"
+#include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"
@@ -38,7 +38,7 @@
 #include "overlays/VolumeOverlayController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationWidget.hpp"
-#include "segmentation/SegmentationGrowth.hpp"
+#include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -101,7 +101,9 @@ public slots:
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
+    void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);
+    void onCopySurfaceRequested(const QString& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,
@@ -109,9 +111,10 @@ public slots:
     void onFocusPOIChanged(std::string name, POI* poi);
     void onPointDoubleClicked(uint64_t pointId);
     void onMoveSegmentToPaths(const QString& segmentId);
+    void onRenameSurface(const QString& segmentId);
 
 public:
-    CWindow();
+    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
     ~CWindow(void);
     
     // Helper method to get the current volume path
@@ -381,6 +384,13 @@ private:
     };
 
     std::optional<NeighborCopyJob> _neighborCopyJob;
+    struct ResumeLocalJob {
+        QString segmentId;
+        QString outputDir;
+        QString paramsPath;
+        std::unique_ptr<QTemporaryFile> paramsFile;
+    };
+    std::optional<ResumeLocalJob> _resumeLocalJob;
     void handleNeighborCopyToolFinished(bool success);
     QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,

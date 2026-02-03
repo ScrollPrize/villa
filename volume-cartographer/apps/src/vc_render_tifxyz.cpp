@@ -578,7 +578,9 @@ static inline void renderSliceFromBase16(
 enum class AccumType {
     Max,
     Mean,
-    Median
+    Median,
+    Alpha,
+    BeerLambert
 };
 
 template <typename T>
@@ -737,6 +739,27 @@ int main(int argc, char *argv[])
             "Maximum ABF++ iterations when --flatten is enabled")
         ("flatten-downsample", po::value<int>()->default_value(1),
             "Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality")
+        // Composite rendering parameters (for alpha/beerLambert modes)
+        ("alpha-min", po::value<float>()->default_value(0.0f),
+            "Alpha compositing: minimum value threshold (0-255)")
+        ("alpha-max", po::value<float>()->default_value(255.0f),
+            "Alpha compositing: maximum value threshold (0-255)")
+        ("alpha-opacity", po::value<float>()->default_value(230.0f),
+            "Alpha compositing: material opacity (0-255)")
+        ("alpha-cutoff", po::value<float>()->default_value(9950.0f),
+            "Alpha compositing: early termination threshold (0-10000)")
+        ("bl-extinction", po::value<float>()->default_value(1.5f),
+            "Beer-Lambert: absorption coefficient")
+        ("bl-emission", po::value<float>()->default_value(1.5f),
+            "Beer-Lambert: emission scale")
+        ("bl-ambient", po::value<float>()->default_value(0.1f),
+            "Beer-Lambert: ambient light")
+        ("iso-cutoff", po::value<int>()->default_value(0),
+            "Highpass filter: values below this become 0 (0-255)")
+        ("composite-start", po::value<int>(),
+            "Composite rendering: start offset along normal (default: 0, negative = behind surface)")
+        ("composite-end", po::value<int>(),
+            "Composite rendering: end offset along normal (default: num-slices - 1)")
         ("num-parts", po::value<int>()->default_value(1),
             "Number of parts to split processing into (for multi-VM runs)")
         ("part-id", po::value<int>()->default_value(0),
@@ -955,9 +978,64 @@ int main(int argc, char *argv[])
         accumType = AccumType::Mean;
     } else if (accum_type_str == "median") {
         accumType = AccumType::Median;
+    } else if (accum_type_str == "alpha") {
+        accumType = AccumType::Alpha;
+    } else if (accum_type_str == "beerlam" || accum_type_str == "beerlambert") {
+        accumType = AccumType::BeerLambert;
     } else {
-        std::cerr << "Error: --accum-type must be one of: max, mean, median.\n";
+        std::cerr << "Error: --accum-type must be one of: max, mean, median, alpha, beerlambert.\n";
         return EXIT_FAILURE;
+    }
+
+    // Check if we're in composite mode
+    const bool isCompositeMode = (accumType == AccumType::Alpha || accumType == AccumType::BeerLambert);
+
+    // Composite start/end offsets (used when isCompositeMode is true)
+    int compositeStart = 0;
+    int compositeEnd = num_slices - 1;
+
+    // Build CompositeParams for alpha/beerlambert modes
+    CompositeParams compositeParams;
+    if (isCompositeMode) {
+        compositeParams.method = (accumType == AccumType::Alpha) ? "alpha" : "beerLambert";
+        compositeParams.alphaMin = parsed["alpha-min"].as<float>() / 255.0f;
+        compositeParams.alphaMax = parsed["alpha-max"].as<float>() / 255.0f;
+        compositeParams.alphaOpacity = parsed["alpha-opacity"].as<float>() / 255.0f;
+        compositeParams.alphaCutoff = parsed["alpha-cutoff"].as<float>() / 10000.0f;
+        compositeParams.blExtinction = parsed["bl-extinction"].as<float>();
+        compositeParams.blEmission = parsed["bl-emission"].as<float>();
+        compositeParams.blAmbient = parsed["bl-ambient"].as<float>();
+        compositeParams.isoCutoff = static_cast<uint8_t>(std::clamp(parsed["iso-cutoff"].as<int>(), 0, 255));
+
+        // Get composite start/end offsets from CLI
+        if (parsed.count("composite-start")) {
+            compositeStart = parsed["composite-start"].as<int>();
+        }
+        if (parsed.count("composite-end")) {
+            compositeEnd = parsed["composite-end"].as<int>();
+        }
+
+        if (compositeEnd < compositeStart) {
+            std::cerr << "Error: --composite-end must be >= --composite-start.\n";
+            return EXIT_FAILURE;
+        }
+
+        const int compositeLayers = compositeEnd - compositeStart + 1;
+        std::cout << "Composite mode enabled: " << compositeParams.method
+                  << " (compositing " << compositeLayers << " layers [" << compositeStart << " to " << compositeEnd << "] into 1 output slice)" << std::endl;
+        if (compositeParams.method == "alpha") {
+            std::cout << "  Alpha params: min=" << (compositeParams.alphaMin * 255.0f)
+                      << ", max=" << (compositeParams.alphaMax * 255.0f)
+                      << ", opacity=" << (compositeParams.alphaOpacity * 255.0f)
+                      << ", cutoff=" << (compositeParams.alphaCutoff * 10000.0f) << std::endl;
+        } else {
+            std::cout << "  Beer-Lambert params: extinction=" << compositeParams.blExtinction
+                      << ", emission=" << compositeParams.blEmission
+                      << ", ambient=" << compositeParams.blAmbient << std::endl;
+        }
+        if (compositeParams.isoCutoff > 0) {
+            std::cout << "  Iso cutoff: " << static_cast<int>(compositeParams.isoCutoff) << std::endl;
+        }
     }
     std::vector<float> accumOffsets;
     if (accum_step > 0.0) {
@@ -1060,10 +1138,14 @@ int main(int argc, char *argv[])
 
     std::cout << "zarr dataset size for scale group " << group_idx << ds->shape() << std::endl;
     const bool output_is_u16 = (ds->getDtype() == z5::types::Datatype::uint16);
-    if (output_is_u16)
+    if (output_is_u16) {
         std::cout << "Detected source dtype=uint16 -> rendering as uint16" << std::endl;
-    else
+        if (isCompositeMode) {
+            std::cerr << "Warning: alpha/beerlambert composite forces 8-bit output (source is 16-bit)" << std::endl;
+        }
+    } else {
         std::cout << "Detected source dtype!=uint16 -> rendering as uint8 (default)" << std::endl;
+    }
     std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
     std::cout << "output argument: " << base_output_arg << std::endl;
 
@@ -1105,8 +1187,11 @@ int main(int argc, char *argv[])
         }
         bool output_is_zarr = force_zarr || (output_path_local.extension() == ".zarr");
         if (!output_is_zarr) {
-            // May be a directory target (no printf pattern): create directory
-            if (output_path_local.string().find('%') == std::string::npos) {
+            // For composite mode with a .tif path, just create parent directory
+            // Otherwise, treat path as directory for multiple slices
+            if (isCompositeMode && output_path_local.extension() == ".tif") {
+                std::filesystem::create_directories(output_path_local.parent_path());
+            } else if (output_path_local.string().find('%') == std::string::npos) {
                 std::filesystem::create_directories(output_path_local);
             } else {
                 std::filesystem::create_directories(output_path_local.parent_path());
@@ -1280,8 +1365,9 @@ int main(int argc, char *argv[])
         u0_base += static_cast<float>(crop.x);
         v0_base += static_cast<float>(crop.y);
         const size_t CH = 128, CW = 128;
-        const size_t baseZ = std::max(1, num_slices);
-        const double baseZ_center = 0.5 * (static_cast<double>(baseZ) - 1.0);
+        // For composite modes, output is always 1 slice (all layers composited into one)
+        const size_t baseZ = isCompositeMode ? 1 : static_cast<size_t>(std::max(1, num_slices));
+        const double baseZ_center = 0.5 * (static_cast<double>(std::max(1, num_slices)) - 1.0);
         const size_t CZ = baseZ;
         const int rotQuad = normalizeQuadrantRotation(rotate_angle);
         cv::Size zarr_xy_size = tgt_size;
@@ -1309,7 +1395,8 @@ int main(int argc, char *argv[])
             {"clevel",  1},
             {"shuffle", 0}
         };
-        const std::string out_dtype0 = output_is_u16 ? "uint16" : "uint8";
+        // Composite mode always outputs uint8 (readCompositeFast limitation)
+        const std::string out_dtype0 = (output_is_u16 && !isCompositeMode) ? "uint16" : "uint8";
         const bool finalize = parsed["finalize"].as<bool>();
         const bool pre = parsed["pre"].as<bool>();
         std::unique_ptr<z5::Dataset> dsOut0;
@@ -1394,7 +1481,53 @@ int main(int argc, char *argv[])
 
                     cv::Mat tileOut; // will be CV_8UC1 or CV_16UC1
 
-                    if (output_is_u16) {
+                    if (isCompositeMode) {
+                        // Composite mode: use readCompositeFast to composite all layers into single output
+                        // Note: readCompositeFast only supports uint8 output
+                        ChunkCache<uint8_t> cache;
+
+                        cv::Mat_<uint8_t> compositeOut;
+                        readCompositeFast(
+                            compositeOut,
+                            ds.get(),
+                            basePoints,
+                            stepDirs,
+                            static_cast<float>(slice_step * ds_scale),
+                            compositeStart,
+                            compositeEnd,
+                            compositeParams,
+                            cache
+                        );
+
+                        tileOut = compositeOut;
+                        if (rotQuad >= 0 || flip_axis >= 0) {
+                            rotateFlipIfNeeded(tileOut, rotQuad, flip_axis);
+                        }
+
+                        // Write single composite slice
+                        xt::xarray<uint8_t> outChunk = xt::empty<uint8_t>({size_t(1), dy_dst, dx_dst});
+                        const size_t cH = static_cast<size_t>(tileOut.rows);
+                        const size_t cW = static_cast<size_t>(tileOut.cols);
+                        for (size_t yy = 0; yy < cH; ++yy) {
+                            const uint8_t* src = tileOut.ptr<uint8_t>(static_cast<int>(yy));
+                            for (size_t xx = 0; xx < cW; ++xx) {
+                                outChunk(0, yy, xx) = src[xx];
+                            }
+                        }
+
+                        int dstTx = static_cast<int>(tx), dstTy = static_cast<int>(ty);
+                        int dstTilesX = static_cast<int>(tilesX_src), dstTilesY = static_cast<int>(tilesY_src);
+                        if (rotQuad >= 0 || flip_axis >= 0) {
+                            mapTileIndex(static_cast<int>(tx), static_cast<int>(ty),
+                                         static_cast<int>(tilesX_src), static_cast<int>(tilesY_src),
+                                         std::max(rotQuad, 0), flip_axis,
+                                         dstTx, dstTy, dstTilesX, dstTilesY);
+                        }
+                        const size_t x0_dst = static_cast<size_t>(dstTx) * CW;
+                        const size_t y0_dst = static_cast<size_t>(dstTy) * CH;
+                        z5::types::ShapeType outOffset = {0, y0_dst, x0_dst};
+                        z5::multiarray::writeSubarray<uint8_t>(dsOut0, outChunk, outOffset.begin());
+                    } else if (output_is_u16) {
                         auto renderOne16 = [&](cv::Mat& dst, float offset) {
                             renderSliceFromBase16(dst, ds.get(), &chunk_cache_u16,
                                                   basePoints, stepDirs, offset, static_cast<float>(ds_scale));
@@ -1516,7 +1649,7 @@ int main(int argc, char *argv[])
             try {
                 dst = z5::createDataset(
                     outFile, std::to_string(targetLevel),
-                    output_is_u16 ? "uint16" : "uint8",
+                    (output_is_u16 && !isCompositeMode) ? "uint16" : "uint8",
                     dShape, dChunks, std::string("blosc"), compOpts);
             } catch (const std::invalid_argument&) {
                 dst = z5::openDataset(outFile, std::to_string(targetLevel));
@@ -1540,7 +1673,7 @@ int main(int argc, char *argv[])
                         const size_t sy = std::min<size_t>(2*ly, sShape[1] - y*2);
                         const size_t sx = std::min<size_t>(2*lx, sShape[2] - x*2);
 
-                        if (output_is_u16) {
+                        if (output_is_u16 && !isCompositeMode) {
                             xt::xarray<uint16_t> srcChunk = xt::empty<uint16_t>({sz, sy, sx});
                             z5::types::ShapeType sOff = {static_cast<size_t>(2*z), static_cast<size_t>(2*y), static_cast<size_t>(2*x)};
                             z5::multiarray::readSubarray<uint16_t>(src, srcChunk, sOff.begin());
@@ -1689,7 +1822,8 @@ int main(int argc, char *argv[])
                 std::vector<TiffWriter> writers;
                 std::vector<std::mutex> writerLocks(Z);
                 writers.reserve(Z);
-                const int cvType = output_is_u16 ? CV_16UC1 : CV_8UC1;
+                // Composite mode always outputs 8-bit
+                const int cvType = (output_is_u16 && !isCompositeMode) ? CV_16UC1 : CV_8UC1;
                 for (size_t z = 0; z < Z; ++z) {
                     std::ostringstream fn;
                     fn << std::setw(pad) << std::setfill('0') << z;
@@ -1707,7 +1841,7 @@ int main(int argc, char *argv[])
                         const uint32_t x0_dst = static_cast<uint32_t>(tx) * tileW;
                         const uint32_t y0_dst = static_cast<uint32_t>(ty) * tileH;
 
-                        if (output_is_u16) {
+                        if (output_is_u16 && !isCompositeMode) {
                             xt::xarray<uint16_t> tile = xt::empty<uint16_t>({Z, static_cast<size_t>(dy), static_cast<size_t>(dx)});
                             z5::types::ShapeType off = {0, static_cast<size_t>(y0_src), static_cast<size_t>(x0_src)};
                             z5::multiarray::readSubarray<uint16_t>(dsL0, tile, off.begin());
@@ -1771,6 +1905,10 @@ int main(int argc, char *argv[])
                 const double num_slices_center = 0.5 * (static_cast<double>(std::max(1, num_slices)) - 1.0);
 
                 auto make_out_path_base = [&](int sliceIdx) -> std::filesystem::path {
+                    // For composite mode with a .tif path, write directly to that file
+                    if (isCompositeMode && output_path_local.extension() == ".tif") {
+                        return output_path_local;
+                    }
                     if (output_path_local.string().find('%') == std::string::npos) {
                         int pad = 2; int v = std::max(0, num_slices-1);
                         while (v >= 100) { pad++; v /= 10; }
@@ -1795,9 +1933,11 @@ int main(int argc, char *argv[])
                 };
 
                 // If all expected TIFFs exist, skip this segmentation
+                // For composite mode, we only have 1 output slice
+                const int tif_num_slices = isCompositeMode ? 1 : num_slices;
                 if (numParts <= 1) {
                     bool all_exist = true;
-                    for (int z = 0; z < num_slices; ++z) {
+                    for (int z = 0; z < tif_num_slices; ++z) {
                         std::filesystem::path outPath = make_out_path(z);
                         if (!std::filesystem::exists(outPath)) { all_exist = false; break; }
                     }
@@ -1812,9 +1952,11 @@ int main(int argc, char *argv[])
                 const uint32_t tiffTileH = 16;
 
                 std::vector<TiffWriter> writers;
-                writers.reserve(static_cast<size_t>(num_slices));
-                const int cvType = output_is_u16 ? CV_16UC1 : CV_8UC1;
-                for (int z = 0; z < num_slices; ++z) {
+                std::vector<std::mutex> writerLocks(static_cast<size_t>(tif_num_slices));
+                writers.reserve(static_cast<size_t>(tif_num_slices));
+                // Composite mode always outputs 8-bit
+                const int cvType = (output_is_u16 && !isCompositeMode) ? CV_16UC1 : CV_8UC1;
+                for (int z = 0; z < tif_num_slices; ++z) {
                     std::filesystem::path outPath = make_out_path(z);
                     writers.emplace_back(outPath, static_cast<uint32_t>(outW), static_cast<uint32_t>(outH),
                                          cvType, tiffTileW, tiffTileH, 0.0f, COMPRESSION_PACKBITS);
@@ -1878,8 +2020,38 @@ int main(int argc, char *argv[])
                         globalFlipDecision,
                         basePoints, stepDirs);
 
-                    // Bulk read all slices for this band in one pass
-                    if (output_is_u16) {
+                    if (isCompositeMode) {
+                        // Composite mode: use readCompositeFast to composite all layers into single output
+                        ChunkCache<uint8_t> cache;
+
+                        cv::Mat_<uint8_t> compositeOut;
+                        readCompositeFast(
+                            compositeOut,
+                            ds.get(),
+                            basePoints,
+                            stepDirs,
+                            static_cast<float>(slice_step * ds_scale),
+                            compositeStart,
+                            compositeEnd,
+                            compositeParams,
+                            cache
+                        );
+
+                        cv::Mat sliceOut = compositeOut;
+                        rotateFlipIfNeeded(sliceOut, rotQuad, flip_axis);
+                        // Write as multiple TIFF tiles (tiffTileH rows each)
+                        for (uint32_t ty = 0; ty < static_cast<uint32_t>(sliceOut.rows); ty += tiffTileH) {
+                            uint32_t tdy = std::min(tiffTileH, static_cast<uint32_t>(sliceOut.rows) - ty);
+                            cv::Mat subTile = sliceOut(cv::Rect(0, ty, sliceOut.cols, tdy));
+                            int dstBx, dstBy, rBX, rBY;
+                            uint32_t srcTileIdx = (y0 + ty) / tiffTileH;
+                            uint32_t numTiffTiles = (static_cast<uint32_t>(tgt_size.height) + tiffTileH - 1) / tiffTileH;
+                            mapTileIndex(0, static_cast<int>(srcTileIdx), 1, static_cast<int>(numTiffTiles),
+                                         std::max(rotQuad, 0), flip_axis, dstBx, dstBy, rBX, rBY);
+                            writers[0].writeTile(0, static_cast<uint32_t>(dstBy) * tiffTileH, subTile);
+                        }
+                    } else if (output_is_u16) {
+                        // Bulk read all slices for this band in one pass
                         std::vector<cv::Mat_<uint16_t>> rawSlices;
                         readMultiSlice(rawSlices, ds.get(), &chunk_cache_u16, basePoints, stepDirs, allOffsets);
 

@@ -3,9 +3,9 @@
 #include <queue>
 #include <cmath>
 
-#include "SegmentationModule.hpp"
+#include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
-#include "../overlays/SegmentationOverlayController.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -35,10 +35,23 @@ void CellReoptimizationTool::setSurface(QuadSurface* surface)
 
 int CellReoptimizationTool::executeAtGridPosition(int row, int col)
 {
-    if (!_surface || !_overlay || !_pointCollection || !_editManager) {
+    if (!_overlay || !_pointCollection || !_editManager) {
         emit statusMessage(tr("Cell reoptimization: missing dependencies"), 2000);
         return 0;
     }
+
+    // Always use the most recent surface data (preview preferred, fallback to base).
+    QuadSurface* surface = nullptr;
+    if (auto preview = _editManager->previewSurface()) {
+        surface = preview.get();
+    } else if (auto base = _editManager->baseSurface()) {
+        surface = base.get();
+    }
+    if (!surface) {
+        emit statusMessage(tr("Cell reoptimization: missing surface"), 2000);
+        return 0;
+    }
+    _surface = surface;
 
     // Validate that approval mask dimensions match surface grid dimensions
     auto [gridRows, gridCols] = gridDimensions();

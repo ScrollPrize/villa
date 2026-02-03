@@ -1,12 +1,12 @@
 #include "SegmentationPushPullTool.hpp"
 
-#include "SegmentationModule.hpp"
-#include "ViewerManager.hpp"
-#include "CVolumeViewer.hpp"
+#include "../SegmentationModule.hpp"
+#include "../../ViewerManager.hpp"
+#include "../../CVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
-#include "SegmentationWidget.hpp"
-#include "overlays/SegmentationOverlayController.hpp"
-#include "CSurfaceCollection.hpp"
+#include "../SegmentationWidget.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
+#include "../../CSurfaceCollection.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -532,7 +532,7 @@ void SegmentationPushPullTool::stopAll()
         _module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
-        if (_overlay && _overlay->hasApprovalMaskData()) {
+        if (_module.autoApproveEdits() && _overlay && _overlay->hasApprovalMaskData()) {
             const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 std::vector<std::pair<int, int>> gridPositions;

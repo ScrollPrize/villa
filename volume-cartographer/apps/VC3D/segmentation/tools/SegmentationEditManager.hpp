@@ -131,6 +131,8 @@ public:
     bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
 
+    void resetPointerSeed();
+
 private:
     static bool isInvalidPoint(const cv::Vec3f& value);
     void rebuildPreviewFromOriginal();
@@ -139,7 +141,6 @@ private:
     void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld);
     void clearActiveDrag();
     float stepNormalization() const;
-    void resetPointerSeed();
 
     std::shared_ptr<QuadSurface> _baseSurface;
     ViewerManager* _viewerManager{nullptr};

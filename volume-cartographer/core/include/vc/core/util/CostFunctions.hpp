@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <utility>
 
 
 static double  val(const double &v) { return v; }
@@ -185,6 +187,42 @@ struct DistLoss2D {
     }
 };
 
+struct SignedDistanceToSurfaceCost {
+    using Sampler = std::function<float(const cv::Vec3f&)>;
+
+    SignedDistanceToSurfaceCost(Sampler sampler, double weight, float max_move)
+        : sampler_(std::move(sampler)), weight_(weight), max_move_(max_move) {}
+
+    bool operator()(const double* candidate, double* residual) const {
+        if (!sampler_ || weight_ <= 0.0) {
+            residual[0] = 0.0;
+            return true;
+        }
+        if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2])) {
+            residual[0] = 0.0;
+            return true;
+        }
+        const cv::Vec3f p(static_cast<float>(candidate[0]),
+                          static_cast<float>(candidate[1]),
+                          static_cast<float>(candidate[2]));
+        float dist = sampler_(p);
+        if (!std::isfinite(dist)) {
+            residual[0] = 0.0;
+            return true;
+        }
+        if (max_move_ > 0.0f) {
+            dist = std::clamp(dist, -max_move_, max_move_);
+        }
+        residual[0] = weight_ * static_cast<double>(dist);
+        return true;
+    }
+
+private:
+    Sampler sampler_;
+    double weight_;
+    float max_move_;
+};
+
 
 
 struct StraightLoss {
@@ -203,6 +241,10 @@ struct StraightLoss {
         
         T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
         T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
+        if (l1 <= T(1e-12) || l2 <= T(1e-12)) {
+            residual[0] = T(0);
+            return true;
+        }
 
         T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
         

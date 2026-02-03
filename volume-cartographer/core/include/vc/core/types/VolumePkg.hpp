@@ -4,6 +4,8 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
+#include <set>
 
 #include <filesystem>
 #include <fstream>
@@ -37,6 +39,7 @@ public:
     [[nodiscard]] std::string getVolpkgDirectory() const;
 
     void refreshSegmentations();
+    static void setLoadFirstSegmentationDirectory(const std::string& dirName);
 
 
     // Surface management - returns QuadSurface directly (no SurfaceMeta wrapper)
@@ -58,6 +61,8 @@ private:
     std::map<std::string, std::shared_ptr<Segmentation>> segmentations_;
     std::string currentSegmentationDir_ = "paths";
     std::map<std::string, std::string> segmentationDirectories_;
+    std::set<std::string> loadedSegmentationDirs_;
+    static std::optional<std::string> loadFirstSegmentationDir_;
 
     void loadSegmentationsFromDirectory(const std::string& dirName);
     void ensureSegmentScrollSource();

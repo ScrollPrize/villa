@@ -1,14 +1,14 @@
 #include "SegmentationGrower.hpp"
 
-#include "NeuralTraceServiceManager.hpp"
+#include "../../NeuralTraceServiceManager.hpp"
 #include "ExtrapolationGrowth.hpp"
-#include "SegmentationModule.hpp"
-#include "SegmentationWidget.hpp"
+#include "../SegmentationModule.hpp"
+#include "../SegmentationWidget.hpp"
 
-#include "CVolumeViewer.hpp"
-#include "CSurfaceCollection.hpp"
-#include "ViewerManager.hpp"
-#include "SurfacePanelController.hpp"
+#include "../../CVolumeViewer.hpp"
+#include "../../CSurfaceCollection.hpp"
+#include "../../ViewerManager.hpp"
+#include "../../SurfacePanelController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -1020,6 +1020,14 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
     if (auto customParams = _context.widget->customParamsJson()) {
         request.customParams = std::move(*customParams);
+    }
+    if (method == SegmentationGrowthMethod::Corrections &&
+        _context.module && _context.module->cellReoptCollectionPending()) {
+        if (!request.customParams) {
+            request.customParams = nlohmann::json::object();
+        }
+        (*request.customParams)["cell_reopt_mode"] = true;
+        qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
     }
 
     // Handle neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed

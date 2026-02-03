@@ -165,6 +165,11 @@ cv::Mat_<cv::Vec3f> computeVolumeGradientsNative(
 
 void CVolumeViewer::renderVisible(bool force)
 {
+    if (isWindowMinimized()) {
+        _dirtyWhileMinimized = true;
+        return;
+    }
+
     auto surf = _surf_weak.lock();
     if (surf && _surf_col) {
         auto currentSurface = _surf_col->surface(_surf_name);

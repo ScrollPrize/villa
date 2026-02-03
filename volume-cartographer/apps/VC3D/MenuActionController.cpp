@@ -12,6 +12,7 @@
 #include "SettingsDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
+#include "Keybinds.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
@@ -23,10 +24,13 @@
 #include <QClipboard>
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QLabel>
 #include <QMainWindow>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -34,6 +38,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QProcess>
+#include <QScrollArea>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
@@ -42,6 +47,7 @@
 #include <QTreeWidgetItem>
 #include <QTextStream>
 #include <QUrl>
+#include <QVBoxLayout>
 
 #include <algorithm>
 #include <filesystem>
@@ -110,7 +116,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     // Create actions
     _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open volpkg..."), this);
-    _openAct->setShortcut(QKeySequence::Open);
+    _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
 
     _settingsAct = new QAction(QObject::tr("Settings"), this);
@@ -154,7 +160,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _teleaAct = new QAction(QObject::tr("Inpaint (Telea) && Rebuild Segment"), this);
     _teleaAct->setToolTip(QObject::tr("Generate RGB, Telea-inpaint it, then convert back to tifxyz into a new segment"));
 #if (QT_VERSION >= QT_VERSION_CHECK(5, 10, 0))
-    _teleaAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_I));
+    _teleaAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::TeleaInpaint));
 #endif
     connect(_teleaAct, &QAction::triggered, this, &MenuActionController::runTeleaInpaint);
 
@@ -187,13 +193,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(qWindow->ui.dockWidgetSegmentation->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDistanceTransform->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDrawing->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetComposite->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetPreprocessing->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetPostprocessing->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetView->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetNormalVis->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetOverlay->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetRenderSettings->toggleViewAction());
+    _viewMenu->addAction(qWindow->ui.dockWidgetViewerControls->toggleViewAction());
 
     if (qWindow->_point_collection_widget) {
         _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
@@ -411,80 +411,43 @@ void MenuActionController::showKeybindings()
         return;
     }
 
-    QMessageBox::information(
-        _window,
-        QObject::tr("Keybindings for Volume Cartographer"),
-        QObject::tr(
-            "=== File Menu ===\n"
-            "Ctrl+O: Open Volume Package\n"
-            "Ctrl+I: Inpaint (Telea) & Rebuild Segment\n"
-            "\n"
-            "=== View Menu ===\n"
-            "Ctrl+J: Toggle axis-aligned slice planes\n"
-            "Ctrl+N: Toggle surface normals visualization\n"
-            "Ctrl+T: Toggle direction hints (flip_x arrows)\n"
-            "C: Toggle composite view\n"
-            "Ctrl+Shift+D: Toggle drawing mode\n"
-            "Space: Toggle volume overlay visibility\n"
-            "\n"
-            "=== Viewer Controls ===\n"
-            "Ctrl+Tab: Cycle between viewers\n"
-            "Shift+=: Zoom in (active viewer)\n"
-            "Shift+-: Zoom out (active viewer)\n"
-            "M: Reset view (fit surface and reset Z offset)\n"
-            "Ctrl+.: Z offset deeper (surface normal direction)\n"
-            "Ctrl+,: Z offset closer (surface normal direction)\n"
-            "Arrow Keys: Pan view\n"
-            "\n"
-            "=== Navigation ===\n"
-            "R: Center focus on cursor\n"
-            "F: Step backward in focus history\n"
-            "Ctrl+F: Step forward in focus history\n"
-            "\n"
-            "=== Segmentation Editing ===\n"
-            "Ctrl+Z: Undo last change (segmentation or approval mask)\n"
-            "S (hold): Line draw mode\n"
-            "T: Toggle correction annotation mode\n"
-            "  Click: Add correction point\n"
-            "  Shift+Drag: Move existing correction point\n"
-            "  Right-click: Remove correction point\n"
-            "Escape: Cancel current drag/operation\n"
-            "\n"
-            "=== Approval Mask ===\n"
-            "B: Toggle approval painting (when mask is shown)\n"
-            "N: Toggle unapproval painting (when mask is shown)\n"
-            "Ctrl+B: Undo last approval mask stroke\n"
-            "\n"
-            "=== Segmentation Growth ===\n"
-            "Ctrl+G: Grow segmentation (all directions)\n"
-            "1: Grow left\n"
-            "2: Grow up\n"
-            "3: Grow down\n"
-            "4: Grow right\n"
-            "5: Grow all directions\n"
-            "6: Grow one step (all directions)\n"
-            "\n"
-            "=== Push/Pull ===\n"
-            "A (hold): Push (move inward)\n"
-            "D (hold): Pull (move outward)\n"
-            "Ctrl+A/D: Push/Pull with alpha override\n"
-            "Q: Decrease push/pull radius\n"
-            "E: Increase push/pull radius\n"
-            "\n"
-            "=== Point Collection ===\n"
-            "Delete: Remove selected point\n"
-            "\n"
-            "=== Mouse Controls ===\n"
-            "Left Click: Select/Add point or drag surface\n"
-            "Left Drag: Drag surface point or draw with active tool\n"
-            "Right Drag: Pan slice image\n"
-            "Middle Drag: Pan (if enabled)\n"
-            "Mouse Wheel: Zoom in/out (when editing: adjust tool radius)\n"
-            "Shift+Scroll Wheel: Pan through slices\n"
-            "\n"
-            "=== Slice Step Size ===\n"
-            "Shift+G: Decrease slice step size\n"
-            "Shift+H: Increase slice step size\n"));
+    if (_keybindsDialog) {
+        _keybindsDialog->raise();
+        _keybindsDialog->activateWindow();
+        return;
+    }
+
+    _keybindsDialog = new QDialog(_window);
+    _keybindsDialog->setAttribute(Qt::WA_DeleteOnClose);
+    _keybindsDialog->setWindowTitle(QObject::tr("Keybindings for Volume Cartographer"));
+
+    auto* layout = new QVBoxLayout(_keybindsDialog);
+    auto* scrollArea = new QScrollArea(_keybindsDialog);
+    scrollArea->setWidgetResizable(true);
+
+    auto* content = new QWidget(scrollArea);
+    auto* contentLayout = new QVBoxLayout(content);
+    auto* label = new QLabel(content);
+    label->setTextFormat(Qt::PlainText);
+    label->setText(vc3d::keybinds::buildKeybindsHelpText());
+    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    label->setWordWrap(false);
+    contentLayout->addWidget(label);
+    contentLayout->addStretch();
+    content->setLayout(contentLayout);
+
+    scrollArea->setWidget(content);
+    layout->addWidget(scrollArea);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, _keybindsDialog);
+    connect(buttons, &QDialogButtonBox::accepted, _keybindsDialog, &QDialog::accept);
+    layout->addWidget(buttons);
+
+    _keybindsDialog->resize(640, 520);
+    _keybindsDialog->setMinimumHeight(360);
+    _keybindsDialog->show();
+    _keybindsDialog->raise();
+    _keybindsDialog->activateWindow();
 }
 
 void MenuActionController::exitApplication()

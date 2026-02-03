@@ -1,15 +1,16 @@
 #include "SegmentationModule.hpp"
 
 #include "CVolumeViewer.hpp"
-#include "SegmentationBrushTool.hpp"
-#include "ApprovalMaskBrushTool.hpp"
-#include "CellReoptimizationTool.hpp"
-#include "SegmentationCorrections.hpp"
-#include "SegmentationEditManager.hpp"
-#include "SegmentationLineTool.hpp"
-#include "SegmentationPushPullTool.hpp"
+#include "tools/SegmentationBrushTool.hpp"
+#include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/CellReoptimizationTool.hpp"
+#include "growth/SegmentationCorrections.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "tools/SegmentationLineTool.hpp"
+#include "tools/SegmentationPushPullTool.hpp"
 #include "SegmentationWidget.hpp"
 #include "../overlays/SegmentationOverlayController.hpp"
+#include "../Keybinds.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
 
@@ -28,7 +29,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     // B: Toggle edit approved mask (only if show approval mask is enabled)
-    if (event->key() == Qt::Key_B && !event->isAutoRepeat() && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::ApprovalPaintToggle.key &&
+        !event->isAutoRepeat() &&
+        event->modifiers() == vc3d::keybinds::keypress::ApprovalPaintToggle.modifiers) {
         if (_showApprovalMask) {
             setEditApprovedMask(!_editApprovedMask);
             if (_widget) {
@@ -43,7 +46,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     // N: Toggle edit unapproved mask (only if show approval mask is enabled)
-    if (event->key() == Qt::Key_N && !event->isAutoRepeat() && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::UnapprovalPaintToggle.key &&
+        !event->isAutoRepeat() &&
+        event->modifiers() == vc3d::keybinds::keypress::UnapprovalPaintToggle.modifiers) {
         if (_showApprovalMask) {
             setEditUnapprovedMask(!_editUnapprovedMask);
             if (_widget) {
@@ -58,8 +63,8 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     // Ctrl+B: Undo approval mask stroke (only when editing approval mask)
-    if (event->key() == Qt::Key_B && !event->isAutoRepeat() &&
-        event->modifiers() == Qt::ControlModifier) {
+    if (event->key() == vc3d::keybinds::keypress::ApprovalUndo.key && !event->isAutoRepeat() &&
+        event->modifiers() == vc3d::keybinds::keypress::ApprovalUndo.modifiers) {
         if (isEditingApprovalMask() && _overlay && _overlay->canUndoApprovalMaskPaint()) {
             undoApprovalStroke();
             event->accept();
@@ -68,8 +73,11 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     if (!event->isAutoRepeat()) {
-        const bool undoRequested = (event->matches(QKeySequence::Undo) == QKeySequence::ExactMatch) ||
-                                   (event->key() == Qt::Key_Z && event->modifiers().testFlag(Qt::ControlModifier));
+        const bool undoRequested =
+            (event->matches(vc3d::keybinds::standard::Undo) == QKeySequence::ExactMatch) ||
+            (event->key() == vc3d::keybinds::keypress::SegmentationUndo.key &&
+             (event->modifiers() & vc3d::keybinds::keypress::SegmentationUndo.modifiers) ==
+                 vc3d::keybinds::keypress::SegmentationUndo.modifiers);
         if (undoRequested) {
             if (restoreUndoSnapshot()) {
                 emit statusMessageRequested(tr("Undid last segmentation change."), kStatusShort);
@@ -80,7 +88,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
-    if (event->key() == Qt::Key_S && !event->isAutoRepeat()) {
+    if (event->key() == vc3d::keybinds::keypress::LineDrawHold.key && !event->isAutoRepeat()) {
         if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
             _lineDrawKeyActive = true;
             stopAllPushPull();
@@ -92,8 +100,8 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         _lineDrawKeyActive = false;
     }
 
-    if (!event->isAutoRepeat() && event->key() == Qt::Key_G &&
-        event->modifiers() == Qt::ControlModifier) {
+    if (!event->isAutoRepeat() && event->key() == vc3d::keybinds::keypress::GrowSegmentation.key &&
+        event->modifiers() == vc3d::keybinds::keypress::GrowSegmentation.modifiers) {
         if (!_editingEnabled || _growthInProgress || !_widget || !_widget->isEditingEnabled()) {
             return false;
         }
@@ -117,7 +125,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return true;
     }
 
-    if (event->key() == Qt::Key_Escape) {
+    if (event->key() == vc3d::keybinds::keypress::CancelOperation.key) {
         if (_drag.active) {
             cancelDrag();
             return true;
@@ -128,7 +136,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
-    const bool pushPullKey = (event->key() == Qt::Key_A || event->key() == Qt::Key_D);
+    const bool pushPullKey =
+        (event->key() == vc3d::keybinds::keypress::PushPullIn.key ||
+         event->key() == vc3d::keybinds::keypress::PushPullOut.key);
     const Qt::KeyboardModifiers pushPullMods = event->modifiers();
     const bool controlActive = pushPullMods.testFlag(Qt::ControlModifier);
     const Qt::KeyboardModifiers disallowedMods = pushPullMods &
@@ -138,7 +148,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             return false;
         }
 
-        const int direction = (event->key() == Qt::Key_D) ? 1 : -1;
+        const int direction = (event->key() == vc3d::keybinds::keypress::PushPullOut.key) ? 1 : -1;
         const std::optional<bool> alphaOverride = controlActive ? std::optional<bool>{true} : std::nullopt;
         if (startPushPull(direction, alphaOverride)) {
             event->accept();
@@ -148,16 +158,19 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     // Q and E keys to adjust push pull radius
-    const bool radiusAdjustKey = (event->key() == Qt::Key_Q || event->key() == Qt::Key_E);
+    const bool radiusAdjustKey =
+        (event->key() == vc3d::keybinds::keypress::PushPullRadiusDown.key ||
+         event->key() == vc3d::keybinds::keypress::PushPullRadiusUp.key);
     if (radiusAdjustKey && event->modifiers() == Qt::NoModifier) {
-        const float step = (event->key() == Qt::Key_E) ? 0.25f : -0.25f;
+        const float step = (event->key() == vc3d::keybinds::keypress::PushPullRadiusUp.key) ? 0.25f : -0.25f;
         const float newRadius = _pushPullRadiusSteps + step;
         setPushPullRadius(newRadius);
         event->accept();
         return true;
     }
 
-    if (event->key() == Qt::Key_T && event->modifiers() == Qt::ShiftModifier) {
+    if (event->key() == vc3d::keybinds::keypress::EnableEditing.key &&
+        event->modifiers() == vc3d::keybinds::keypress::EnableEditing.modifiers) {
         if (!_editingEnabled) {
             setEditingEnabled(true);
             if (_widget) {
@@ -168,7 +181,8 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return true;
     }
 
-    if (event->key() == Qt::Key_T && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::ToggleAnnotation.key &&
+        event->modifiers() == vc3d::keybinds::keypress::ToggleAnnotation.modifiers) {
         if (!_editingEnabled) {
             setEditingEnabled(true);
             if (_widget) {
@@ -189,7 +203,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             return false;
         }
 
-        if (event->key() == Qt::Key_6) {
+        if (event->key() == vc3d::keybinds::keypress::GrowthStepAll.key) {
             const SegmentationGrowthMethod method = _widget ? _widget->growthMethod() : _growthMethod;
             handleGrowSurfaceRequested(method, SegmentationGrowthDirection::All, 1, false);
             event->accept();
@@ -198,25 +212,19 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 
         SegmentationGrowthDirection shortcutDirection{SegmentationGrowthDirection::All};
         bool matchedShortcut = true;
-        switch (event->key()) {
-        case Qt::Key_1:
+        const int key = event->key();
+        if (key == vc3d::keybinds::keypress::GrowthLeft.key) {
             shortcutDirection = SegmentationGrowthDirection::Left;
-            break;
-        case Qt::Key_2:
+        } else if (key == vc3d::keybinds::keypress::GrowthUp.key) {
             shortcutDirection = SegmentationGrowthDirection::Up;
-            break;
-        case Qt::Key_3:
+        } else if (key == vc3d::keybinds::keypress::GrowthDown.key) {
             shortcutDirection = SegmentationGrowthDirection::Down;
-            break;
-        case Qt::Key_4:
+        } else if (key == vc3d::keybinds::keypress::GrowthRight.key) {
             shortcutDirection = SegmentationGrowthDirection::Right;
-            break;
-        case Qt::Key_5:
+        } else if (key == vc3d::keybinds::keypress::GrowthAll.key) {
             shortcutDirection = SegmentationGrowthDirection::All;
-            break;
-        default:
+        } else {
             matchedShortcut = false;
-            break;
         }
 
         if (matchedShortcut) {
@@ -238,7 +246,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         return false;
     }
 
-    if (event->key() == Qt::Key_S && !event->isAutoRepeat()) {
+    if (event->key() == vc3d::keybinds::keypress::LineDrawHold.key && !event->isAutoRepeat()) {
         _lineDrawKeyActive = false;
         if (_lineTool && _lineTool->strokeActive()) {
             _lineTool->finishStroke(_lineDrawKeyActive);
@@ -247,12 +255,14 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         return true;
     }
 
-    const bool pushPullKey = (event->key() == Qt::Key_A || event->key() == Qt::Key_D);
+    const bool pushPullKey =
+        (event->key() == vc3d::keybinds::keypress::PushPullIn.key ||
+         event->key() == vc3d::keybinds::keypress::PushPullOut.key);
     const Qt::KeyboardModifiers pushPullMods = event->modifiers();
     const Qt::KeyboardModifiers disallowedMods = pushPullMods &
                                                  ~(Qt::ControlModifier | Qt::KeypadModifier);
     if (pushPullKey && disallowedMods == Qt::NoModifier) {
-        const int direction = (event->key() == Qt::Key_D) ? 1 : -1;
+        const int direction = (event->key() == vc3d::keybinds::keypress::PushPullOut.key) ? 1 : -1;
         stopPushPull(direction);
         event->accept();
         return true;

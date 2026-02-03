@@ -4,8 +4,10 @@
 
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
+#include "Keybinds.hpp"
 #include <QKeySequence>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QWheelEvent>
@@ -14,6 +16,7 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QScreen>
 #include <QStyleHints>
 #include <QDesktopServices>
 #include <QUrl>
@@ -25,6 +28,7 @@
 #include <QDir>
 #include <QProgressDialog>
 #include <QMessageBox>
+#include <QInputDialog>
 #include <QThread>
 #include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
@@ -56,6 +60,7 @@
 #include <atomic>
 #include <cmath>
 #include <cmath>
+#include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
 #include <cctype>
@@ -73,15 +78,17 @@
 #include "CVolumeViewerView.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
+#include "elements/VolumeSelector.hpp"
 #include "CSurfaceCollection.hpp"
 #include "CPointCollectionWidget.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
+#include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "segmentation/SegmentationGrowth.hpp"
-#include "segmentation/SegmentationGrower.hpp"
+#include "segmentation/growth/SegmentationGrowth.hpp"
+#include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
 #include "vc/core/Version.hpp"
@@ -512,8 +519,73 @@ static void applyDarkPalette() {
     QApplication::setPalette(p);
 }
 
+static QString windowStateScreenSignature()
+{
+    QStringList parts;
+    parts << qga::platformName();
+    const auto screens = qga::screens();
+    parts << QString::number(screens.size());
+    for (const QScreen* screen : screens) {
+        if (!screen) {
+            continue;
+        }
+        const QRect geom = screen->geometry();
+        const qreal dpr = screen->devicePixelRatio();
+        const QString name = screen->name().isEmpty() ? QStringLiteral("screen") : screen->name();
+        parts << QString("%1:%2x%3+%4+%5@%6")
+                     .arg(name)
+                     .arg(geom.width())
+                     .arg(geom.height())
+                     .arg(geom.x())
+                     .arg(geom.y())
+                     .arg(dpr, 0, 'f', 2);
+    }
+    return parts.join("|");
+}
+
+static QString windowStateQtVersion()
+{
+    return QString::fromUtf8(qVersion());
+}
+
+static QString windowStateAppVersion()
+{
+    return QString::fromStdString(ProjectInfo::VersionString());
+}
+
+static void writeWindowStateMeta(QSettings& settings,
+                                 const QString& screenSignature,
+                                 const QString& qtVersion,
+                                 const QString& appVersion)
+{
+    settings.setValue(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE, screenSignature);
+    settings.setValue(vc3d::settings::window::STATE_META_QT_VERSION, qtVersion);
+    settings.setValue(vc3d::settings::window::STATE_META_APP_VERSION, appVersion);
+}
+
+static bool windowStateMetaMatches(const QSettings& settings,
+                                   const QString& screenSignature,
+                                   const QString& qtVersion,
+                                   const QString& appVersion)
+{
+    const QString savedSignature =
+        settings.value(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE).toString();
+    const QString savedQtVersion =
+        settings.value(vc3d::settings::window::STATE_META_QT_VERSION).toString();
+    const QString savedAppVersion =
+        settings.value(vc3d::settings::window::STATE_META_APP_VERSION).toString();
+
+    if (savedSignature.isEmpty() || savedQtVersion.isEmpty() || savedAppVersion.isEmpty()) {
+        return false;
+    }
+
+    return savedSignature == screenSignature
+        && savedQtVersion == qtVersion
+        && savedAppVersion == appVersion;
+}
+
 // Constructor
-CWindow::CWindow() :
+CWindow::CWindow(size_t cacheSizeGB) :
     fVpkg(nullptr),
     _cmdRunner(nullptr),
     _seedingWidget(nullptr),
@@ -546,8 +618,8 @@ CWindow::CWindow() :
     }
     // setAttribute(Qt::WA_DeleteOnClose);
 
-    chunk_cache = new ChunkCache<uint8_t>(CHUNK_CACHE_SIZE_GB*1024ULL*1024ULL*1024ULL);
-    std::cout << "chunk cache size is " << CHUNK_CACHE_SIZE_GB << " gigabytes " << std::endl;
+    chunk_cache = new ChunkCache<uint8_t>(cacheSizeGB * 1024ULL * 1024ULL * 1024ULL);
+    std::cout << "chunk cache size is " << cacheSizeGB << " gigabytes" << std::endl;
 
     _surf_col = new CSurfaceCollection();
 
@@ -648,15 +720,88 @@ CWindow::CWindow() :
     }
 
     // Restore geometry / sizes
-    const QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const QByteArray savedGeometry = geometry.value(vc3d::settings::window::GEOMETRY).toByteArray();
-    if (!savedGeometry.isEmpty()) {
-        restoreGeometry(savedGeometry);
+    QSettings geometry(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString currentScreenSignature = windowStateScreenSignature();
+    const QString currentQtVersion = windowStateQtVersion();
+    const QString currentAppVersion = windowStateAppVersion();
+
+    const bool restoreDisabled =
+        geometry.value(vc3d::settings::window::RESTORE_DISABLED, false).toBool();
+    const bool restoreInProgress =
+        geometry.value(vc3d::settings::window::RESTORE_IN_PROGRESS, false).toBool();
+
+    auto clearSavedWindowState = [&geometry]() {
+        geometry.remove(vc3d::settings::window::GEOMETRY);
+        geometry.remove(vc3d::settings::window::STATE);
+    };
+
+    bool allowRestore = !restoreDisabled && !restoreInProgress;
+    if (restoreInProgress) {
+        Logger()->warn("Previous window-state restore did not complete; clearing saved state");
+        clearSavedWindowState();
+        geometry.setValue(vc3d::settings::window::RESTORE_DISABLED, true);
+        geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+        geometry.sync();
+        allowRestore = false;
     }
-    const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
-    if (!savedState.isEmpty()) {
-        restoreState(savedState);
-    } else {
+    const bool hasStateMeta =
+        geometry.contains(vc3d::settings::window::STATE_META_SCREEN_SIGNATURE)
+        && geometry.contains(vc3d::settings::window::STATE_META_QT_VERSION)
+        && geometry.contains(vc3d::settings::window::STATE_META_APP_VERSION);
+    if (allowRestore && hasStateMeta
+        && !windowStateMetaMatches(geometry,
+                                   currentScreenSignature,
+                                   currentQtVersion,
+                                   currentAppVersion)) {
+        Logger()->warn("Window state metadata mismatch; skipping restore");
+        clearSavedWindowState();
+        writeWindowStateMeta(geometry, currentScreenSignature, currentQtVersion, currentAppVersion);
+        geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+        geometry.sync();
+        allowRestore = false;
+    }
+
+    if (allowRestore) {
+        geometry.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, true);
+        geometry.sync();
+    }
+
+    bool restoredGeometry = false;
+    bool restoredState = false;
+    if (allowRestore) {
+        const QByteArray savedGeometry = geometry.value(vc3d::settings::window::GEOMETRY).toByteArray();
+        if (!savedGeometry.isEmpty()) {
+            restoredGeometry = restoreGeometry(savedGeometry);
+            if (!restoredGeometry) {
+                Logger()->warn("Failed to restore main window geometry; clearing saved geometry");
+                geometry.remove(vc3d::settings::window::GEOMETRY);
+                geometry.sync();
+            }
+        }
+        const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
+        if (!savedState.isEmpty()) {
+            restoredState = restoreState(savedState);
+            if (!restoredState) {
+                Logger()->warn("Failed to restore main window state; clearing saved state");
+                geometry.remove(vc3d::settings::window::STATE);
+                geometry.sync();
+            }
+        }
+    }
+    if (allowRestore) {
+        QTimer::singleShot(1500, this, [currentScreenSignature, currentQtVersion, currentAppVersion]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            if (settings.value(vc3d::settings::window::RESTORE_DISABLED, false).toBool()) {
+                settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+                settings.sync();
+                return;
+            }
+            writeWindowStateMeta(settings, currentScreenSignature, currentQtVersion, currentAppVersion);
+            settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
+            settings.sync();
+        });
+    }
+    if (!restoredState) {
         // No saved state - set sensible default sizes for dock widgets
         // The Volume Package dock (left side) should have a reasonable width and height
         resizeDocks({ui.dockWidgetVolumes}, {300}, Qt::Horizontal);
@@ -666,12 +811,8 @@ CWindow::CWindow() :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
-                               ui.dockWidgetComposite,
-                               ui.dockWidgetPostprocessing,
                                ui.dockWidgetVolumes,
-                               ui.dockWidgetView,
-                               ui.dockWidgetOverlay,
-                               ui.dockWidgetRenderSettings  }) {
+                               ui.dockWidgetViewerControls  }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
         connect(dock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
@@ -701,7 +842,7 @@ CWindow::CWindow() :
     }
 
     // Create application-wide keyboard shortcuts
-    fDrawingModeShortcut = new QShortcut(QKeySequence("Ctrl+Shift+D"), this);
+    fDrawingModeShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DrawingMode), this);
     fDrawingModeShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDrawingModeShortcut, &QShortcut::activated, [this]() {
         if (_drawingWidget) {
@@ -709,7 +850,7 @@ CWindow::CWindow() :
         }
     });
 
-    fCompositeViewShortcut = new QShortcut(QKeySequence("C"), this);
+    fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
         if (!_viewerManager) {
@@ -723,7 +864,7 @@ CWindow::CWindow() :
     });
 
     // Toggle direction hints overlay (Ctrl+T)
-    fDirectionHintsShortcut = new QShortcut(QKeySequence("Ctrl+T"), this);
+    fDirectionHintsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DirectionHints), this);
     fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
         using namespace vc3d::settings;
@@ -741,7 +882,7 @@ CWindow::CWindow() :
     });
 
     // Toggle surface normals visualization (Ctrl+N)
-    fSurfaceNormalsShortcut = new QShortcut(QKeySequence("Ctrl+N"), this);
+    fSurfaceNormalsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::SurfaceNormals), this);
     fSurfaceNormalsShortcut->setContext(Qt::ApplicationShortcut);
     connect(fSurfaceNormalsShortcut, &QShortcut::activated, [this]() {
         using namespace vc3d::settings;
@@ -759,7 +900,7 @@ CWindow::CWindow() :
         statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
     });
 
-    fAxisAlignedSlicesShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
+    fAxisAlignedSlicesShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::AxisAlignedSlices), this);
     fAxisAlignedSlicesShortcut->setContext(Qt::ApplicationShortcut);
     connect(fAxisAlignedSlicesShortcut, &QShortcut::activated, [this]() {
         if (chkAxisAlignedSlices) {
@@ -768,7 +909,7 @@ CWindow::CWindow() :
     });
 
     // Raw points overlay shortcut (P key)
-    auto* rawPointsShortcut = new QShortcut(QKeySequence("P"), this);
+    auto* rawPointsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::RawPointsOverlay), this);
     rawPointsShortcut->setContext(Qt::ApplicationShortcut);
     connect(rawPointsShortcut, &QShortcut::activated, [this]() {
         if (_rawPointsOverlay) {
@@ -783,7 +924,7 @@ CWindow::CWindow() :
     // Zoom shortcuts (Shift+= for zoom in, Shift+- for zoom out)
     // Use 15% steps for smooth, proportional zooming - only affects active viewer
     constexpr float ZOOM_FACTOR = 1.15f;
-    fZoomInShortcut = new QShortcut(QKeySequence("Shift+="), this);
+    fZoomInShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomIn), this);
     fZoomInShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomInShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -794,7 +935,7 @@ CWindow::CWindow() :
         }
     });
 
-    fZoomOutShortcut = new QShortcut(QKeySequence("Shift+-"), this);
+    fZoomOutShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomOut), this);
     fZoomOutShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomOutShortcut, &QShortcut::activated, [this]() {
         if (!mdiArea) return;
@@ -806,42 +947,44 @@ CWindow::CWindow() :
     });
 
     // Reset view shortcut (m to fit surface in view and reset all offsets)
-    fResetViewShortcut = new QShortcut(QKeySequence("m"), this);
+    fResetViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ResetView), this);
     fResetViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fResetViewShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) {
-            return;
-        }
-        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-            if (viewer) {
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
                 viewer->resetSurfaceOffsets();
                 viewer->fitSurfaceInView();
                 viewer->renderVisible(true);
             }
-        });
+        }
     });
 
     // Z offset: Ctrl+. = +Z (further/deeper), Ctrl+, = -Z (closer)
-    fWorldOffsetZPosShortcut = new QShortcut(QKeySequence("Ctrl+."), this);
+    fWorldOffsetZPosShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZPos), this);
     fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-            if (viewer) viewer->adjustSurfaceOffset(1.0f);
-        });
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->adjustSurfaceOffset(1.0f);
+            }
+        }
     });
 
-    fWorldOffsetZNegShortcut = new QShortcut(QKeySequence("Ctrl+,"), this);
+    fWorldOffsetZNegShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZNeg), this);
     fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
-            if (viewer) viewer->adjustSurfaceOffset(-1.0f);
-        });
+        if (!mdiArea) return;
+        if (auto* subWindow = mdiArea->activeSubWindow()) {
+            if (auto* viewer = qobject_cast<CVolumeViewer*>(subWindow->widget())) {
+                viewer->adjustSurfaceOffset(-1.0f);
+            }
+        }
     });
 
     // Segment cycling shortcuts (] for next, [ for previous)
-    fCycleNextSegmentShortcut = new QShortcut(QKeySequence("]"), this);
+    fCycleNextSegmentShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CycleNextSegment), this);
     fCycleNextSegmentShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCycleNextSegmentShortcut, &QShortcut::activated, [this]() {
         if (!_surfacePanel) {
@@ -862,7 +1005,7 @@ CWindow::CWindow() :
         }
     });
 
-    fCyclePrevSegmentShortcut = new QShortcut(QKeySequence("["), this);
+    fCyclePrevSegmentShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CyclePrevSegment), this);
     fCyclePrevSegmentShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCyclePrevSegmentShortcut, &QShortcut::activated, [this]() {
         if (!_surfacePanel) {
@@ -884,11 +1027,13 @@ CWindow::CWindow() :
     });
 
     // Focused view toggle (Shift+Ctrl+F) - hides dock widgets, keeps all viewers
-    fFocusedViewShortcut = new QShortcut(QKeySequence("Shift+Ctrl+F"), this);
+    fFocusedViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::FocusedView), this);
     fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
 
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested, this, &CWindow::onMoveSegmentToPaths);
+    connect(_surfacePanel.get(), &SurfacePanelController::renameSurfaceRequested, this, &CWindow::onRenameSurface);
+    connect(_surfacePanel.get(), &SurfacePanelController::copySurfaceRequested, this, &CWindow::onCopySurfaceRequested);
 }
 
 // Destructor
@@ -1407,6 +1552,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId, bool copyOut) {
                 onNeighborCopyRequested(segmentId, copyOut);
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::resumeLocalGrowPatchRequested,
+            this, [this](const QString& segmentId) {
+                onResumeLocalGrowPatchRequested(segmentId);
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::reloadFromBackupRequested,
             this, [this](const QString& segmentId, int backupIndex) {
                 onReloadFromBackup(segmentId, backupIndex);
@@ -1661,36 +1810,140 @@ void CWindow::CreateWidgets(void)
     // Make Drawing dock the active tab by default
     ui.dockWidgetDrawing->raise();
 
-    // Keep the view-related docks on the left and grouped together as tabs
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetView);
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetRenderSettings);
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetComposite);
+    // Build Viewer Controls dock from the existing view-related panels.
+    auto* viewerControlsLayout = qobject_cast<QVBoxLayout*>(ui.dockWidgetViewerControlsContents->layout());
+    if (!viewerControlsLayout) {
+        viewerControlsLayout = new QVBoxLayout(ui.dockWidgetViewerControlsContents);
+        viewerControlsLayout->setContentsMargins(4, 4, 4, 4);
+        viewerControlsLayout->setSpacing(8);
+    }
 
-    auto ensureTabified = [this](QDockWidget* primary, QDockWidget* candidate) {
-        const auto currentTabs = tabifiedDockWidgets(primary);
-        const bool alreadyTabified = std::find(currentTabs.cbegin(), currentTabs.cend(), candidate) != currentTabs.cend();
-        if (!alreadyTabified) {
-            tabifyDockWidget(primary, candidate);
+    auto detachScrollContents = [](QScrollArea* scrollArea, QWidget* contents) -> QWidget* {
+        if (!contents) {
+            return nullptr;
+        }
+        if (scrollArea && scrollArea->widget() == contents) {
+            scrollArea->takeWidget();
+        }
+        contents->setParent(nullptr);
+        return contents;
+    };
+
+    auto moveGridLayoutItems = [](QGridLayout* from, QGridLayout* to, QWidget* newParent) {
+        if (!from || !to) {
+            return;
+        }
+        to->setContentsMargins(from->contentsMargins());
+        to->setHorizontalSpacing(from->horizontalSpacing());
+        to->setVerticalSpacing(from->verticalSpacing());
+        for (int column = 0; column < from->columnCount(); ++column) {
+            to->setColumnStretch(column, from->columnStretch(column));
+            to->setColumnMinimumWidth(column, from->columnMinimumWidth(column));
+        }
+        for (int row = 0; row < from->rowCount(); ++row) {
+            to->setRowStretch(row, from->rowStretch(row));
+            to->setRowMinimumHeight(row, from->rowMinimumHeight(row));
+        }
+        for (int index = from->count() - 1; index >= 0; --index) {
+            int row = 0;
+            int column = 0;
+            int rowSpan = 1;
+            int columnSpan = 1;
+            from->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
+            if (auto* item = from->takeAt(index)) {
+                if (newParent) {
+                    if (auto* widget = item->widget()) {
+                        widget->setParent(newParent);
+                    } else if (auto* layout = item->layout()) {
+                        layout->setParent(newParent);
+                    }
+                }
+                to->addItem(item, row, column, rowSpan, columnSpan, item->alignment());
+            }
         }
     };
 
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetOverlay);
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetRenderSettings);
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetComposite);
-    ensureTabified(ui.dockWidgetView, ui.dockWidgetPostprocessing);
+    auto* normalVisContainer = new QWidget(ui.dockWidgetViewerControlsContents);
+    auto* normalVisLayout = new QGridLayout(normalVisContainer);
+    moveGridLayoutItems(qobject_cast<QGridLayout*>(ui.dockWidgetNormalVisContents->layout()),
+                        normalVisLayout,
+                        normalVisContainer);
 
-    const auto tabOrder = tabifiedDockWidgets(ui.dockWidgetView);
-    for (QDockWidget* dock : tabOrder) {
-        tabifyDockWidget(ui.dockWidgetView, dock);
-    }
-
-    ui.dockWidgetView->show();
-    ui.dockWidgetView->raise();
-    QTimer::singleShot(0, this, [this]() {
-        if (ui.dockWidgetView) {
-            ui.dockWidgetView->raise();
+    auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const char* key) {
+        if (!group) {
+            return;
         }
+        connect(group, &CollapsibleSettingsGroup::toggled, this, [key](bool expanded) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(key, expanded);
+        });
+    };
+
+    auto addViewerGroup = [this, &settings, viewerControlsLayout, &rememberGroupState](
+                              const QString& title, QWidget* contents, const char* key, bool defaultExpanded) {
+        if (!viewerControlsLayout || !contents) {
+            return static_cast<CollapsibleSettingsGroup*>(nullptr);
+        }
+        auto* group = new CollapsibleSettingsGroup(title, ui.dockWidgetViewerControlsContents);
+        group->contentLayout()->addWidget(contents);
+        viewerControlsLayout->addWidget(group);
+        group->setExpanded(settings.value(key, defaultExpanded).toBool());
+        rememberGroupState(group, key);
+        return group;
+    };
+
+    using namespace vc3d::settings;
+    addViewerGroup(tr("View"),
+                   detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
+                   viewer::GROUP_VIEW_EXPANDED,
+                   viewer::GROUP_VIEW_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Overlay"),
+                   detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
+                   viewer::GROUP_OVERLAY_EXPANDED,
+                   viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Composite View"),
+                   detachScrollContents(ui.scrollAreaComposite, ui.dockWidgetCompositeContents),
+                   viewer::GROUP_COMPOSITE_EXPANDED,
+                   viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Render Settings"),
+                   detachScrollContents(ui.scrollAreaRenderSettings, ui.dockWidgetRenderSettingsContents),
+                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
+                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Normal Visualization"),
+                   normalVisContainer,
+                   viewer::GROUP_NORMAL_VIS_EXPANDED,
+                   viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Preprocessing"),
+                   detachScrollContents(ui.scrollAreaPreprocessing, ui.dockWidgetPreprocessingContents),
+                   viewer::GROUP_PREPROCESSING_EXPANDED,
+                   viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Postprocessing"),
+                   detachScrollContents(ui.scrollAreaPostprocessing, ui.dockWidgetPostprocessingContents),
+                   viewer::GROUP_POSTPROCESSING_EXPANDED,
+                   viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
+    viewerControlsLayout->addStretch(1);
+
+    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
+    splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
+
+    auto hideLegacyViewerDocks = [this]() {
+        for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
+                                   ui.dockWidgetNormalVis,
+                                   ui.dockWidgetView,
+                                   ui.dockWidgetOverlay,
+                                   ui.dockWidgetRenderSettings,
+                                   ui.dockWidgetComposite,
+                                   ui.dockWidgetPostprocessing }) {
+            if (!dock) {
+                continue;
+            }
+            removeDockWidget(dock);
+            dock->setVisible(false);
+        }
+    };
+    hideLegacyViewerDocks();
+    QTimer::singleShot(0, this, [hideLegacyViewerDocks]() {
+        hideLegacyViewerDocks();
     });
 
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
@@ -1703,11 +1956,22 @@ void CWindow::CreateWidgets(void)
     // connect(ui.btnRemovePath, SIGNAL(clicked()), this, SLOT(OnRemovePathClicked()));
 
     // TODO CHANGE VOLUME LOADING; FIRST CHECK FOR OTHER VOLUMES IN THE STRUCTS
-    volSelect = ui.volSelect;
+    if (ui.volSelect) {
+        ui.volSelect->setLabelVisible(false);
+        volSelect = ui.volSelect->comboBox();
+    } else {
+        volSelect = nullptr;
+    }
+
+    QComboBox* overlayVolumeSelect = nullptr;
+    if (ui.overlayVolumeSelect) {
+        ui.overlayVolumeSelect->setLabelVisible(false);
+        overlayVolumeSelect = ui.overlayVolumeSelect->comboBox();
+    }
 
     if (_volumeOverlay) {
         VolumeOverlayController::UiRefs overlayUi{
-            .volumeSelect = ui.overlayVolumeSelect,
+            .volumeSelect = overlayVolumeSelect,
             .colormapSelect = ui.overlayColormapSelect,
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
@@ -2545,25 +2809,27 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
-    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
+        event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
         event->accept();
         return;
     }
 
-    if (event->key() == Qt::Key_R && event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::CenterFocusOnCursor.key &&
+        event->modifiers() == vc3d::keybinds::keypress::CenterFocusOnCursor.modifiers) {
         if (centerFocusOnCursor()) {
             event->accept();
             return;
         }
     }
 
-    if (event->key() == Qt::Key_F) {
-        if (event->modifiers() == Qt::NoModifier) {
+    if (event->key() == vc3d::keybinds::keypress::FocusHistoryBack.key) {
+        if (event->modifiers() == vc3d::keybinds::keypress::FocusHistoryBack.modifiers) {
             stepFocusHistory(-1);
             event->accept();
             return;
-        } else if (event->modifiers() == Qt::ControlModifier) {
+        } else if (event->modifiers() == vc3d::keybinds::keypress::FocusHistoryForward.modifiers) {
             stepFocusHistory(1);
             event->accept();
             return;
@@ -2571,15 +2837,15 @@ void CWindow::keyPressEvent(QKeyEvent* event)
     }
 
     // Shift+G decreases slice step size, Shift+H increases it
-    if (event->modifiers() == Qt::ShiftModifier && _viewerManager) {
-        if (event->key() == Qt::Key_G) {
+    if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
+        if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
             int currentStep = _viewerManager->sliceStepSize();
             int newStep = std::max(1, currentStep - 1);
             _viewerManager->setSliceStepSize(newStep);
             onSliceStepSizeChanged(newStep);
             event->accept();
             return;
-        } else if (event->key() == Qt::Key_H) {
+        } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
             int currentStep = _viewerManager->sliceStepSize();
             int newStep = std::min(100, currentStep + 1);
             _viewerManager->setSliceStepSize(newStep);
@@ -2624,6 +2890,10 @@ void CWindow::saveWindowState()
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::window::GEOMETRY, saveGeometry());
     settings.setValue(vc3d::settings::window::STATE, saveState());
+    writeWindowStateMeta(settings,
+                         windowStateScreenSignature(),
+                         windowStateQtVersion(),
+                         windowStateAppVersion());
     settings.sync();
 }
 
@@ -4956,6 +5226,290 @@ void CWindow::onMoveSegmentToPaths(const QString& segmentId)
             tr("Failed to move segment: %1\n\n"
                "The segment has been unloaded from the viewer.").arg(e.what()));
     }
+}
+
+void CWindow::onRenameSurface(const QString& segmentId)
+{
+    if (!fVpkg) {
+        statusBar()->showMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    // Block if surface is currently being edited
+    if (_segmentationModule && _segmentationModule->isEditingApprovalMask()) {
+        QMessageBox::warning(this, tr("Cannot Rename"),
+            tr("Cannot rename surface while editing is in progress.\n"
+               "Please finish or cancel editing first."));
+        return;
+    }
+
+    // Get the segment
+    std::string oldId = segmentId.toStdString();
+    auto seg = fVpkg->segmentation(oldId);
+    if (!seg) {
+        statusBar()->showMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+        return;
+    }
+
+    // Show input dialog to get new name
+    bool ok = false;
+    QString newName = QInputDialog::getText(
+        this,
+        tr("Rename Surface"),
+        tr("Enter new name for '%1':").arg(segmentId),
+        QLineEdit::Normal,
+        segmentId,
+        &ok);
+
+    if (!ok || newName.isEmpty()) {
+        return;
+    }
+
+    std::string newId = newName.toStdString();
+
+    // Validate new name: alphanumeric + underscore + hyphen only
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch()) {
+        QMessageBox::warning(this, tr("Invalid Name"),
+            tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
+        return;
+    }
+
+    // Check if name is unchanged
+    if (newId == oldId) {
+        return;
+    }
+
+    // Check for name collision
+    std::filesystem::path volpkgPath(fVpkg->getVolpkgDirectory());
+    std::filesystem::path currentPath = seg->path();
+    std::filesystem::path parentDir = currentPath.parent_path();
+    std::filesystem::path newPath = parentDir / newId;
+
+    if (std::filesystem::exists(newPath)) {
+        QMessageBox::warning(this, tr("Name Exists"),
+            tr("A surface with the name '%1' already exists.").arg(newName));
+        return;
+    }
+
+    // Check if this is the currently selected segment
+    bool wasSelected = (_surfID == oldId);
+
+    // Store the old UUID for rollback if needed
+    std::string oldUuid = seg->id();
+
+    // === Clean up the segment before renaming ===
+
+    // Wait for any pending index rebuild
+    if (_viewerManager) {
+        _viewerManager->waitForPendingIndexRebuild();
+    }
+
+    // Clear from surface collection (including "segmentation" if it matches)
+    if (_surf_col) {
+        auto currentSurface = _surf_col->surface(oldId);
+        auto segmentationSurface = _surf_col->surface("segmentation");
+
+        // If this surface is currently shown as "segmentation", clear it
+        if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
+            _surf_col->setSurface("segmentation", nullptr, false, false);
+        }
+
+        // Clear the surface from the collection
+        _surf_col->setSurface(oldId, nullptr, false, false);
+    }
+
+    // Unload the surface from VolumePkg
+    fVpkg->unloadSurface(oldId);
+
+    // Clear selection if this was selected
+    if (wasSelected) {
+        clearSurfaceSelection();
+        if (treeWidgetSurfaces) {
+            treeWidgetSurfaces->clearSelection();
+        }
+    }
+
+    // Update meta.json UUID
+    try {
+        seg->setId(newId);
+        seg->saveMetadata();
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to update metadata: %1").arg(e.what()));
+        // Reload the old segment
+        fVpkg->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+        return;
+    }
+
+    // Perform the folder rename
+    try {
+        std::filesystem::rename(currentPath, newPath);
+
+        // Remove old ID from VolumePkg's internal tracking
+        fVpkg->removeSingleSegmentation(oldId);
+
+        // Remove from surface panel
+        if (_surfacePanel) {
+            _surfacePanel->removeSingleSegmentation(oldId);
+        }
+
+        // Refresh segmentations to pick up the new ID
+        fVpkg->refreshSegmentations();
+
+        // Add the new segment
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(newId);
+        }
+
+        // Restore selection if it was the selected surface
+        if (wasSelected && treeWidgetSurfaces) {
+            QTreeWidgetItemIterator it(treeWidgetSurfaces);
+            while (*it) {
+                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == newId) {
+                    treeWidgetSurfaces->setCurrentItem(*it);
+                    break;
+                }
+                ++it;
+            }
+        }
+
+        statusBar()->showMessage(
+            tr("Renamed '%1' to '%2'").arg(segmentId, newName), 5000);
+
+    } catch (const std::exception& e) {
+        // Attempt to rollback metadata change
+        try {
+            seg->setId(oldUuid);
+            seg->saveMetadata();
+        } catch (...) {
+            // Rollback failed - metadata is now inconsistent
+        }
+
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to rename folder: %1\n\n"
+               "The segment has been unloaded. Please reload surfaces.").arg(e.what()));
+
+        // Refresh to get back to a consistent state
+        fVpkg->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+    }
+}
+
+void CWindow::onCopySurfaceRequested(const QString& segmentId)
+{
+    if (!fVpkg) {
+        statusBar()->showMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    // Block if surface is currently being edited
+    if (_segmentationModule && _segmentationModule->isEditingApprovalMask()) {
+        QMessageBox::warning(this, tr("Cannot Copy"),
+            tr("Cannot copy surface while editing is in progress.\n"
+               "Please finish or cancel editing first."));
+        return;
+    }
+
+    // Get the segment
+    std::string oldId = segmentId.toStdString();
+    auto seg = fVpkg->segmentation(oldId);
+    if (!seg) {
+        statusBar()->showMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+        return;
+    }
+
+    std::filesystem::path currentPath = seg->path();
+    std::filesystem::path parentDir = currentPath.parent_path();
+
+    QString baseName = segmentId + "_copy";
+    QString suggestedName = baseName;
+    int suffix = 1;
+    while (std::filesystem::exists(parentDir / suggestedName.toStdString())) {
+        ++suffix;
+        suggestedName = QString("%1_%2").arg(baseName).arg(suffix);
+    }
+
+    bool ok = false;
+    QString newName = QInputDialog::getText(
+        this,
+        tr("Copy Surface"),
+        tr("Enter name for copy of '%1':").arg(segmentId),
+        QLineEdit::Normal,
+        suggestedName,
+        &ok);
+
+    if (!ok) {
+        return;
+    }
+
+    newName = newName.trimmed();
+    if (newName.isEmpty()) {
+        return;
+    }
+
+    // Validate new name: alphanumeric + underscore + hyphen only
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch()) {
+        QMessageBox::warning(this, tr("Invalid Name"),
+            tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
+        return;
+    }
+
+    std::string newId = newName.toStdString();
+    if (newId == oldId) {
+        return;
+    }
+
+    std::filesystem::path newPath = parentDir / newId;
+    if (std::filesystem::exists(newPath)) {
+        QMessageBox::warning(this, tr("Name Exists"),
+            tr("A surface with the name '%1' already exists.").arg(newName));
+        return;
+    }
+
+    try {
+        std::filesystem::copy(currentPath, newPath, std::filesystem::copy_options::recursive);
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to copy surface: %1").arg(e.what()));
+        return;
+    }
+
+    try {
+        auto copiedSeg = Segmentation::New(newPath);
+        copiedSeg->setId(newId);
+        copiedSeg->setName(newId);
+        copiedSeg->saveMetadata();
+    } catch (const std::exception& e) {
+        try {
+            std::filesystem::remove_all(newPath);
+        } catch (...) {
+            // Best-effort cleanup only
+        }
+        QMessageBox::critical(this, tr("Error"),
+            tr("Failed to update metadata for copied surface: %1").arg(e.what()));
+        return;
+    }
+
+    if (fVpkg->addSingleSegmentation(newId)) {
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(newId);
+        }
+    } else {
+        fVpkg->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+    }
+
+    statusBar()->showMessage(
+        tr("Copied '%1' to '%2'").arg(segmentId, newName), 5000);
 }
 
 void CWindow::updateSurfaceOverlayDropdown()

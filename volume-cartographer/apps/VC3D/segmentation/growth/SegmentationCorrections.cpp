@@ -1,7 +1,7 @@
 #include "SegmentationCorrections.hpp"
 
-#include "SegmentationModule.hpp"
-#include "SegmentationWidget.hpp"
+#include "../SegmentationModule.hpp"
+#include "../SegmentationWidget.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 

@@ -379,7 +379,7 @@
            </widget>
           </item>
           <item>
-           <widget class="QComboBox" name="volSelect"/>
+           <widget class="VolumeSelector" name="volSelect"/>
           </item>
           <item>
            <widget class="QWidget" name="widget" native="true">
@@ -500,6 +500,61 @@
       </widget>
      </item>
     </layout>
+   </widget>
+  </widget>
+  <widget class="QDockWidget" name="dockWidgetViewerControls">
+   <property name="minimumSize">
+    <size>
+     <width>250</width>
+     <height>40</height>
+    </size>
+   </property>
+   <property name="allowedAreas">
+    <set>Qt::DockWidgetArea::LeftDockWidgetArea|Qt::DockWidgetArea::RightDockWidgetArea</set>
+   </property>
+   <property name="windowTitle">
+    <string>Viewer Controls</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>1</number>
+   </attribute>
+   <widget class="QScrollArea" name="scrollAreaViewerControls">
+    <property name="frameShape">
+     <enum>QFrame::NoFrame</enum>
+    </property>
+    <property name="widgetResizable">
+     <bool>true</bool>
+    </property>
+    <property name="horizontalScrollBarPolicy">
+     <enum>Qt::ScrollBarAlwaysOff</enum>
+    </property>
+    <widget class="QWidget" name="dockWidgetViewerControlsContents">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>250</width>
+       <height>600</height>
+      </rect>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayoutViewerControls">
+      <property name="spacing">
+       <number>8</number>
+      </property>
+      <property name="leftMargin">
+       <number>4</number>
+      </property>
+      <property name="topMargin">
+       <number>4</number>
+      </property>
+      <property name="rightMargin">
+       <number>4</number>
+      </property>
+      <property name="bottomMargin">
+       <number>4</number>
+      </property>
+     </layout>
+    </widget>
    </widget>
   </widget>
   <widget class="QDockWidget" name="dockWidgetComposite">
@@ -1943,7 +1998,7 @@
       </widget>
      </item>
      <item row="0" column="1" colspan="2">
-      <widget class="QComboBox" name="overlayVolumeSelect"/>
+      <widget class="VolumeSelector" name="overlayVolumeSelect"/>
      </item>
      <item row="1" column="0">
       <widget class="QLabel" name="labelOverlayOpacity">
@@ -2162,9 +2217,14 @@
    <header>../../../../../apps/VC3D/elements/DropdownChecklistButton.hpp</header>
   </customwidget>
   <customwidget>
-   <class>SurfaceTreeWidget</class>
-   <extends>QTreeWidget</extends>
-   <header>../../../../../apps/VC3D/SurfaceTreeWidget.hpp</header>
+   <class>VolumeSelector</class>
+   <extends>QWidget</extends>
+   <header>../../../../../apps/VC3D/elements/VolumeSelector.hpp</header>
+  </customwidget>
+  <customwidget>
+  <class>SurfaceTreeWidget</class>
+  <extends>QTreeWidget</extends>
+  <header>../../../../../apps/VC3D/SurfaceTreeWidget.hpp</header>
   </customwidget>
  </customwidgets>
  <resources/>

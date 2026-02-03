@@ -50,25 +50,25 @@ static inline cv::Vec3f fd_fallback_normal(const cv::Mat_<cv::Vec3f>& P, int y, 
 static cv::Mat_<cv::Vec3f> decimate_grid(const cv::Mat_<cv::Vec3f>& points, int iterations = 1)
 {
     if (iterations <= 0) return points.clone();
-    
+
     cv::Mat_<cv::Vec3f> result = points.clone();
-    
+
     for (int iter = 0; iter < iterations; ++iter) {
         // Use stride of 3 to achieve ~89% reduction (keeping ~11%)
         const int stride = 3;
-        
+
         // Calculate new dimensions
         int new_rows = (result.rows + stride - 1) / stride;
         int new_cols = (result.cols + stride - 1) / stride;
-        
+
         cv::Mat_<cv::Vec3f> decimated(new_rows, new_cols);
-        
+
         // Sample every stride-th point
         for (int j = 0; j < new_rows; ++j) {
             for (int i = 0; i < new_cols; ++i) {
                 int src_j = j * stride;
                 int src_i = i * stride;
-                
+
                 // Ensure we don't go out of bounds
                 if (src_j < result.rows && src_i < result.cols) {
                     decimated(j, i) = result(src_j, src_i);
@@ -80,15 +80,57 @@ static cv::Mat_<cv::Vec3f> decimate_grid(const cv::Mat_<cv::Vec3f>& points, int 
                 }
             }
         }
-        
+
         result = decimated;
-        
-        std::cout << "Decimation iteration " << (iter + 1) << ": " 
-                  << "reduced to " << new_rows << " x " << new_cols 
+
+        std::cout << "Decimation iteration " << (iter + 1) << ": "
+                  << "reduced to " << new_rows << " x " << new_cols
                   << " (" << (new_rows * new_cols) << " points)" << std::endl;
     }
-    
+
     return result;
+}
+
+// Decimates a grid by a target ratio (e.g., 0.5 keeps ~50% of points)
+// Computes the appropriate stride from the ratio: stride = 1/sqrt(ratio)
+static cv::Mat_<cv::Vec3f> decimate_grid_ratio(const cv::Mat_<cv::Vec3f>& points, float ratio)
+{
+    if (ratio <= 0.0f || ratio >= 1.0f) return points.clone();
+
+    // For ratio r, we want 1/s² = r, so s = 1/sqrt(r)
+    int stride = std::max(2, static_cast<int>(std::round(1.0f / std::sqrt(ratio))));
+
+    // Calculate new dimensions
+    int new_rows = (points.rows + stride - 1) / stride;
+    int new_cols = (points.cols + stride - 1) / stride;
+
+    cv::Mat_<cv::Vec3f> decimated(new_rows, new_cols);
+
+    // Sample every stride-th point
+    for (int j = 0; j < new_rows; ++j) {
+        for (int i = 0; i < new_cols; ++i) {
+            int src_j = j * stride;
+            int src_i = i * stride;
+
+            // Ensure we don't go out of bounds
+            if (src_j < points.rows && src_i < points.cols) {
+                decimated(j, i) = points(src_j, src_i);
+            } else {
+                // Handle edge case - use the last valid point
+                src_j = std::min(src_j, points.rows - 1);
+                src_i = std::min(src_i, points.cols - 1);
+                decimated(j, i) = points(src_j, src_i);
+            }
+        }
+    }
+
+    float actual_ratio = float(new_rows * new_cols) / float(points.rows * points.cols);
+    std::cout << "Decimation with ratio " << ratio << " (stride=" << stride << "): "
+              << "reduced to " << new_rows << " x " << new_cols
+              << " (" << (new_rows * new_cols) << " points, actual ratio: "
+              << std::fixed << std::setprecision(3) << actual_ratio << ")" << std::endl;
+
+    return decimated;
 }
 
 

@@ -648,6 +648,14 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         contextMenu.addSeparator();
     }
 
+    // Rename only for single selection
+    if (selectedSegmentIds.size() == 1) {
+        QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
+        connect(renameAction, &QAction::triggered, this, [this, segmentId]() {
+            emit renameSurfaceRequested(segmentId);
+        });
+    }
+
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
     connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
         emit copySegmentPathRequested(segmentId);
@@ -680,13 +688,25 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     if (_volumePkg) {
-        QAction* copyOutAction = contextMenu.addAction(tr("Copy Out"));
+        QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
+        if (selectedSegmentIds.size() == 1) {
+            QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
+            connect(copySurfaceAction, &QAction::triggered, this, [this, segmentId]() {
+                emit copySurfaceRequested(segmentId);
+            });
+            copySurfaceMenu->addSeparator();
+        }
+        QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
         connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, true);
         });
-        QAction* copyInAction = contextMenu.addAction(tr("Copy In"));
+        QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
         connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
             emit neighborCopyRequested(segmentId, false);
+        });
+        QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
+        connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
+            emit resumeLocalGrowPatchRequested(segmentId);
         });
 
         // Reload from Backup submenu

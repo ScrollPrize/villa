@@ -1,10 +1,10 @@
 #include "ApprovalMaskBrushTool.hpp"
 
 #include "SegmentationEditManager.hpp"
-#include "SegmentationModule.hpp"
-#include "SegmentationWidget.hpp"
-#include "ViewerManager.hpp"
-#include "../overlays/SegmentationOverlayController.hpp"
+#include "../SegmentationModule.hpp"
+#include "../SegmentationWidget.hpp"
+#include "../../ViewerManager.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>

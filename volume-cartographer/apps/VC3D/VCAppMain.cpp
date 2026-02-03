@@ -4,6 +4,7 @@
 #include "CWindow.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 #include <opencv2/core.hpp>
 #include <iostream>
@@ -47,13 +48,48 @@ auto main(int argc, char* argv[]) -> int
         "Skip validation of zarr shape against meta.json dimensions");
     parser.addOption(skipShapeCheckOption);
 
+    QCommandLineOption loadFirstOption(
+        "load-first",
+        "Load segmentations from the specified directory first and defer others (e.g. paths or traces).",
+        "dir");
+    parser.addOption(loadFirstOption);
+
+    QCommandLineOption cacheSizeOption(
+        "cache-size",
+        QString("Set the chunk cache size in gigabytes (default: %1 GB).")
+            .arg(CHUNK_CACHE_SIZE_GB),
+        "GB",
+        QString::number(CHUNK_CACHE_SIZE_GB));
+    parser.addOption(cacheSizeOption);
+
     parser.process(app);
 
     if (parser.isSet(skipShapeCheckOption)) {
         Volume::skipShapeCheck = true;
     }
+    if (parser.isSet(loadFirstOption)) {
+        QString loadFirstDir = parser.value(loadFirstOption).trimmed().toLower();
+        if (!loadFirstDir.isEmpty()) {
+            VolumePkg::setLoadFirstSegmentationDirectory(loadFirstDir.toStdString());
+        }
+    }
 
-    CWindow aWin;
+    size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB;
+    if (parser.isSet(cacheSizeOption)) {
+        bool ok = false;
+        const qulonglong parsed = parser.value(cacheSizeOption).toULongLong(&ok);
+        if (!ok || parsed == 0) {
+            std::cerr << "Error: Invalid cache size. Must be a positive integer (GB)." << std::endl;
+            return 1;
+        }
+        if (parsed > 256) {
+            std::cerr << "Warning: Cache size " << parsed
+                      << " GB is very large. Ensure sufficient system memory." << std::endl;
+        }
+        cacheSizeGB = static_cast<size_t>(parsed);
+    }
+
+    CWindow aWin(cacheSizeGB);
     aWin.show();
     return QApplication::exec();
 }

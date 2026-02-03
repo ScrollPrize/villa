@@ -1,8 +1,9 @@
 #include "SegmentationModule.hpp"
 
 #include "CSurfaceCollection.hpp"
-#include "SegmentationEditManager.hpp"
-#include "ApprovalMaskBrushTool.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/CellReoptimizationTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -114,6 +115,9 @@ void SegmentationModule::endEditingSession()
 
     if (_editManager) {
         _editManager->endSession();
+    }
+    if (_cellReoptTool) {
+        _cellReoptTool->setSurface(nullptr);
     }
 
     updateAutosaveState();

@@ -1,5 +1,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <algorithm>
 #include <set>
 #include <utility>
 #include <cstring>
@@ -9,6 +10,17 @@
 #include "vc/core/util/Logging.hpp"
 
 constexpr auto CONFIG = "config.json";
+
+std::optional<std::string> VolumePkg::loadFirstSegmentationDir_{};
+
+void VolumePkg::setLoadFirstSegmentationDirectory(const std::string& dirName)
+{
+    if (dirName.empty()) {
+        loadFirstSegmentationDir_.reset();
+        return;
+    }
+    loadFirstSegmentationDir_ = dirName;
+}
 
 VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileLocation}
 {
@@ -34,8 +46,28 @@ VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileL
     }
 
     auto availableDirs = getAvailableSegmentationDirectories();
-    for (const auto& dirName : availableDirs) {
-        loadSegmentationsFromDirectory(dirName);
+    bool loadFirstOnly = false;
+    std::string loadFirstDir = currentSegmentationDir_;
+    if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
+        loadFirstOnly = true;
+        loadFirstDir = *loadFirstSegmentationDir_;
+        if (std::find(availableDirs.begin(), availableDirs.end(), loadFirstDir) == availableDirs.end()) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; loading all segmentations.",
+                           loadFirstDir);
+            loadFirstOnly = false;
+        } else {
+            currentSegmentationDir_ = loadFirstDir;
+        }
+    }
+
+    if (loadFirstOnly) {
+        loadSegmentationsFromDirectory(loadFirstDir);
+        loadedSegmentationDirs_.insert(loadFirstDir);
+    } else {
+        for (const auto& dirName : availableDirs) {
+            loadSegmentationsFromDirectory(dirName);
+            loadedSegmentationDirs_.insert(dirName);
+        }
     }
 
     ensureSegmentScrollSource();
@@ -201,6 +233,15 @@ void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 {
     if (currentSegmentationDir_ == dirName) {
         return;
+    }
+    if (loadedSegmentationDirs_.find(dirName) == loadedSegmentationDirs_.end()) {
+        const auto segDir = rootDir_ / dirName;
+        if (!std::filesystem::exists(segDir)) {
+            Logger()->warn("Segmentation directory '{}' does not exist", dirName);
+        } else {
+            loadSegmentationsFromDirectory(dirName);
+            loadedSegmentationDirs_.insert(dirName);
+        }
     }
     currentSegmentationDir_ = dirName;
 }

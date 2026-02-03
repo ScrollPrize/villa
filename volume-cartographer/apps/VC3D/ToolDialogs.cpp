@@ -1,6 +1,9 @@
 #include "ToolDialogs.hpp"
 
 #include "VCSettings.hpp"
+#include "elements/JsonProfileEditor.hpp"
+#include "elements/JsonProfilePresets.hpp"
+#include "elements/VolumeSelector.hpp"
 
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -20,6 +23,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QFile>
+#include <QMessageBox>
 
 #include <cmath>
 
@@ -1042,9 +1046,10 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     edtSurface_->setReadOnly(true);
     form->addRow(tr("Target surface:"), edtSurface_);
 
-    cmbVolume_ = new QComboBox(this);
+    volumeSelector_ = new VolumeSelector(this);
+    volumeSelector_->setLabelVisible(false);
     populateVolumeOptions(volumes, defaultVolumeId);
-    form->addRow(tr("Target volume:"), cmbVolume_);
+    form->addRow(tr("Target volume:"), volumeSelector_);
 
     QWidget* outPick = pathPicker(this, edtOutput_, tr("Select output directory"), true);
     edtOutput_->setText(defaultOutputPath);
@@ -1059,7 +1064,7 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
 
     spMaxDistance_ = new QSpinBox(this);
     spMaxDistance_->setRange(1, 500);
-    spMaxDistance_->setValue(50);
+    spMaxDistance_->setValue(200);
     spMaxDistance_->setToolTip(tr("Maximum distance to search for neighbors."));
     pass1Form->addRow(tr("Max distance:"), spMaxDistance_);
 
@@ -1135,6 +1140,26 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
 
     main->addWidget(pass2Group);
 
+    pass2TracerParams_ = new JsonProfileEditor(tr("Second pass tracer params"), this);
+    pass2TracerParams_->setDescription(
+        tr("Additional JSON fields merge into the tracer params used for pass 2. Leave empty for defaults."));
+    pass2TracerParams_->setPlaceholderText(QStringLiteral("{\n    \"example_param\": 1\n}"));
+
+    const auto profiles = vc3d::json_profiles::tracerParamProfiles(
+        [this](const char* text) { return tr(text); });
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString savedProfile = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+        QStringLiteral("default")).toString();
+    const QString savedText = settings.value(
+        vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+        QString()).toString();
+
+    pass2TracerParams_->setCustomText(savedText);
+    pass2TracerParams_->setProfiles(profiles, savedProfile);
+    main->addWidget(pass2TracerParams_);
+
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(buttons, &QDialogButtonBox::accepted, this, &NeighborCopyDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &NeighborCopyDialog::reject);
@@ -1143,25 +1168,43 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     ensureDialogWidthForEdits(this, {edtSurface_, edtOutput_}, 260);
 }
 
+void NeighborCopyDialog::accept()
+{
+    if (pass2TracerParams_ && !pass2TracerParams_->isValid()) {
+        const QString error = pass2TracerParams_->errorText();
+        QMessageBox::warning(this,
+                             tr("Error"),
+                             error.isEmpty()
+                                 ? tr("Second pass tracer params JSON is invalid.")
+                                 : error);
+        return;
+    }
+
+    if (pass2TracerParams_) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
+                          pass2TracerParams_->profile());
+        settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
+                          pass2TracerParams_->customText());
+    }
+
+    QDialog::accept();
+}
+
 void NeighborCopyDialog::populateVolumeOptions(const QVector<NeighborCopyVolumeOption>& volumes,
                                                const QString& defaultVolumeId)
 {
-    cmbVolume_->clear();
-    int defaultIndex = -1;
-    for (int i = 0; i < volumes.size(); ++i) {
-        const auto& opt = volumes[i];
-        QString label = opt.name.isEmpty()
-            ? opt.id
-            : tr("%1 (%2)").arg(opt.name, opt.id);
-        cmbVolume_->addItem(label, opt.path);
-        cmbVolume_->setItemData(i, opt.id, Qt::UserRole + 1);
-        if (defaultIndex == -1 && !defaultVolumeId.isEmpty() && opt.id == defaultVolumeId) {
-            defaultIndex = i;
-        }
+    if (!volumeSelector_) {
+        return;
     }
-    if (cmbVolume_->count() > 0) {
-        cmbVolume_->setCurrentIndex(defaultIndex >= 0 ? defaultIndex : 0);
+
+    QVector<VolumeSelector::VolumeOption> options;
+    options.reserve(volumes.size());
+    for (const auto& opt : volumes) {
+        options.push_back({opt.id, opt.name, opt.path});
     }
+
+    volumeSelector_->setVolumes(options, defaultVolumeId);
 }
 
 QString NeighborCopyDialog::surfacePath() const
@@ -1171,23 +1214,34 @@ QString NeighborCopyDialog::surfacePath() const
 
 QString NeighborCopyDialog::selectedVolumeId() const
 {
-    if (!cmbVolume_) {
+    if (!volumeSelector_) {
         return QString();
     }
-    return cmbVolume_->currentData(Qt::UserRole + 1).toString();
+    return volumeSelector_->selectedVolumeId();
 }
 
 QString NeighborCopyDialog::selectedVolumePath() const
 {
-    if (!cmbVolume_) {
+    if (!volumeSelector_) {
         return QString();
     }
-    return cmbVolume_->currentData(Qt::UserRole).toString();
+    return volumeSelector_->selectedVolumePath();
 }
 
 QString NeighborCopyDialog::outputPath() const
 {
     return edtOutput_ ? edtOutput_->text().trimmed() : QString();
+}
+
+std::optional<QJsonObject> NeighborCopyDialog::pass2TracerParamsJson(QString* error) const
+{
+    if (!pass2TracerParams_) {
+        if (error) {
+            error->clear();
+        }
+        return std::nullopt;
+    }
+    return pass2TracerParams_->jsonObject(error);
 }
 
 int NeighborCopyDialog::resumeLocalOptStep() const

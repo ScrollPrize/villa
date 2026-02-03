@@ -20,8 +20,8 @@
 #include <opencv2/core.hpp>
 
 #include "../CVolumeViewer.hpp"
-#include "SegmentationEditManager.hpp"
-#include "SegmentationGrowth.hpp"
+#include "tools/SegmentationEditManager.hpp"
+#include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 
@@ -89,7 +89,9 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
+    [[nodiscard]] bool autoApproveEdits() const { return _autoApproveEdits; }
     [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
+    void setAutoApproveEdits(bool enabled);
     void setApprovalMaskBrushRadius(float radiusSteps);
     void setApprovalBrushDepth(float depth);
     void setApprovalBrushColor(const QColor& color);
@@ -103,6 +105,7 @@ public:
     // Cell reoptimization
     void setCellReoptimizationMode(bool enabled);
     [[nodiscard]] bool cellReoptimizationMode() const { return _cellReoptMode; }
+    [[nodiscard]] bool cellReoptCollectionPending() const { return _cellReoptCollectionId != 0; }
     void setCellReoptMaxSteps(int steps);
     void setCellReoptMaxPoints(int points);
     void setCellReoptMinSpacing(float spacing);
@@ -173,6 +176,7 @@ private:
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
+    friend class SegmentationBrushTool;
     friend class segmentation::CorrectionsState;
 
     enum class FalloffTool
@@ -356,6 +360,7 @@ private:
     uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
+    bool _autoApproveEdits{true};
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
     float _approvalBrushDepth{15.0f};       // Cylinder depth
     QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting

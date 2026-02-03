@@ -1,7 +1,7 @@
 #pragma once
 
 #include "SegmentationTool.hpp"
-#include "SegmentationPushPullConfig.hpp"
+#include "../SegmentationPushPullConfig.hpp"
 
 #include <memory>
 #include <optional>
