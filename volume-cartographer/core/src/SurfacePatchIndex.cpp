@@ -346,7 +346,6 @@ struct SurfacePatchIndex::Impl {
 
     size_t patchCount = 0;
     float bboxPadding = 0.0f;
-    float minSearchRadius = 100.0f;
     int samplingStride = 1;
 
     // Maps raw pointer -> record (for fast lookup while keeping surface alive via shared_ptr in record)
@@ -528,21 +527,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    std::vector<SurfacePtr> uniqueSurfaces;
-    uniqueSurfaces.reserve(surfaces.size());
-    std::unordered_set<QuadSurface*> seenSurfaces;
-    seenSurfaces.reserve(surfaces.size());
-    for (const SurfacePtr& surface : surfaces) {
-        if (!surface) {
-            continue;
-        }
-        QuadSurface* raw = surface.get();
-        if (seenSurfaces.insert(raw).second) {
-            uniqueSurfaces.push_back(surface);
-        }
-    }
-
-    const size_t surfaceCount = uniqueSurfaces.size();
+    const size_t surfaceCount = surfaces.size();
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);
@@ -554,7 +539,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const float padding = bboxPadding;
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
-    for (const SurfacePtr& surface : uniqueSurfaces) {
+    for (const SurfacePtr& surface : surfaces) {
         impl_->ensureMask(surface);
     }
 
@@ -566,7 +551,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < surfaceCount; ++i) {
         perSurfaceCells[i] = Impl::collectEntriesForSurface(
-            uniqueSurfaces[i],
+            surfaces[i],
             padding,
             stride,
             0,
@@ -575,7 +560,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
             std::numeric_limits<int>::max());
 
         // Update mask for this surface (each surface has its own mask, no contention)
-        auto* rec = impl_->getRecord(uniqueSurfaces[i].get());
+        auto* rec = impl_->getRecord(surfaces[i].get());
         if (rec) {
             for (auto& cell : perSurfaceCells[i]) {
                 rec->mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);
@@ -621,7 +606,6 @@ void SurfacePatchIndex::clear()
         impl_->tree.reset();
         impl_->patchCount = 0;
         impl_->bboxPadding = 0.0f;
-        impl_->minSearchRadius = 100.0f;
         impl_->surfaceRecords.clear();
         impl_->samplingStride = 1;
     }
@@ -630,19 +614,6 @@ void SurfacePatchIndex::clear()
 bool SurfacePatchIndex::empty() const
 {
     return !impl_ || !impl_->tree || impl_->patchCount == 0;
-}
-
-void SurfacePatchIndex::setMinSearchRadius(float radius)
-{
-    if (!impl_) {
-        impl_ = std::make_unique<Impl>();
-    }
-    impl_->minSearchRadius = std::max(0.0f, radius);
-}
-
-float SurfacePatchIndex::minSearchRadius() const
-{
-    return impl_ ? impl_->minSearchRadius : 100.0f;
 }
 
 std::optional<SurfacePatchIndex::LookupResult>
@@ -726,16 +697,6 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
 }
 
 void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
-                                       QuadSurface* targetSurface,
-                                       std::vector<TriangleCandidate>& outCandidates) const
-{
-    outCandidates.clear();
-    forEachTriangle(bounds, targetSurface, [&](const TriangleCandidate& candidate) {
-        outCandidates.push_back(candidate);
-    });
-}
-
-void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
                                        const std::unordered_set<SurfacePtr>& targetSurfaces,
                                        std::vector<TriangleCandidate>& outCandidates) const
 {
@@ -750,13 +711,6 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
 
 void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         const SurfacePtr& targetSurface,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const
-{
-    forEachTriangleImpl(bounds, targetSurface ? targetSurface.get() : nullptr, nullptr, visitor);
-}
-
-void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
-                                        QuadSurface* targetSurface,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const
 {
     forEachTriangleImpl(bounds, targetSurface, nullptr, visitor);
@@ -774,7 +728,7 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
 
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,
-    QuadSurface* targetSurface,
+    const SurfacePtr& targetSurface,
     const std::unordered_set<SurfacePtr>* filterSurfaces,
     const std::function<void(const TriangleCandidate&)>& visitor) const
 {
@@ -798,7 +752,7 @@ void SurfacePatchIndex::forEachTriangleImpl(
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface.get() != targetSurface) {
+        if (targetSurface && rec.surface.get() != targetSurface.get()) {
             return;
         }
         if (filterSurfaces) {
@@ -1665,157 +1619,6 @@ bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
         }
     }
     return false;
-}
-
-// ============================================================================
-// Ray intersection methods
-// ============================================================================
-
-std::optional<SurfacePatchIndex::RayHit> SurfacePatchIndex::rayTriangleIntersect(
-    const cv::Vec3f& rayOrigin,
-    const cv::Vec3f& rayDir,
-    const TriangleCandidate& tri,
-    float epsilon)
-{
-    // Moller-Trumbore ray-triangle intersection algorithm
-    const cv::Vec3f& v0 = tri.world[0];
-    const cv::Vec3f& v1 = tri.world[1];
-    const cv::Vec3f& v2 = tri.world[2];
-
-    cv::Vec3f edge1 = v1 - v0;
-    cv::Vec3f edge2 = v2 - v0;
-    cv::Vec3f h = rayDir.cross(edge2);
-    float a = edge1.dot(h);
-
-    // Ray is parallel to the triangle
-    if (std::abs(a) < epsilon) {
-        return std::nullopt;
-    }
-
-    float f = 1.0f / a;
-    cv::Vec3f s = rayOrigin - v0;
-    float u = f * s.dot(h);
-
-    // Intersection is outside the triangle (barycentric u)
-    if (u < 0.0f || u > 1.0f) {
-        return std::nullopt;
-    }
-
-    cv::Vec3f q = s.cross(edge1);
-    float v = f * rayDir.dot(q);
-
-    // Intersection is outside the triangle (barycentric v)
-    if (v < 0.0f || u + v > 1.0f) {
-        return std::nullopt;
-    }
-
-    // Compute t to find the intersection point
-    float t = f * edge2.dot(q);
-
-    // Intersection is behind the ray origin (we'll allow this, caller can filter)
-    RayHit hit;
-    hit.t = t;
-    hit.hitPoint = rayOrigin + t * rayDir;
-    hit.surface = tri.surface;
-
-    // Interpolate surface parameters using barycentric coordinates
-    float w = 1.0f - u - v;  // w + u + v = 1
-    hit.surfaceParam = w * tri.surfaceParams[0] + u * tri.surfaceParams[1] + v * tri.surfaceParams[2];
-
-    return hit;
-}
-
-void SurfacePatchIndex::rayIntersect(
-    const cv::Vec3f& rayOrigin,
-    const cv::Vec3f& rayDir,
-    float maxDistance,
-    const SurfacePtr& targetSurface,
-    std::vector<RayHit>& outHits) const
-{
-    rayIntersect(rayOrigin, rayDir, maxDistance, targetSurface.get(), outHits);
-}
-
-void SurfacePatchIndex::rayIntersect(
-    const cv::Vec3f& rayOrigin,
-    const cv::Vec3f& rayDir,
-    float maxDistance,
-    QuadSurface* targetSurface,
-    std::vector<RayHit>& outHits) const
-{
-    outHits.clear();
-
-    if (!impl_ || !impl_->tree || maxDistance <= 0.0f) {
-        return;
-    }
-
-    // Normalize ray direction for consistent distance calculations
-    float rayLen = cv::norm(rayDir);
-    if (rayLen < 1e-9f) {
-        return;
-    }
-    cv::Vec3f rayDirNorm = rayDir / rayLen;
-
-    // Build a bounding box that encompasses the ray in both directions
-    // We expand in both positive and negative ray directions to find all intersections
-    cv::Vec3f extent = maxDistance * cv::Vec3f(
-        std::abs(rayDirNorm[0]) + 0.001f,
-        std::abs(rayDirNorm[1]) + 0.001f,
-        std::abs(rayDirNorm[2]) + 0.001f);
-
-    Rect3D bounds;
-    bounds.low = rayOrigin - extent;
-    bounds.high = rayOrigin + extent;
-
-    // Track unique hits (avoid duplicates from shared triangle edges)
-    // Key: grid location packed as (row << 16 | col)
-    std::unordered_map<uint64_t, RayHit> uniqueHits;
-
-    auto processTriangle = [&](const TriangleCandidate& tri) {
-        auto hitOpt = rayTriangleIntersect(rayOrigin, rayDirNorm, tri);
-        if (!hitOpt) {
-            return;
-        }
-
-        RayHit& hit = *hitOpt;
-
-        // Filter by distance
-        if (std::abs(hit.t) > maxDistance) {
-            return;
-        }
-
-        // Deduplicate by grid location (within tolerance)
-        // Use the surface param to identify location
-        int gridRow = static_cast<int>(std::round(hit.surfaceParam[1]));
-        int gridCol = static_cast<int>(std::round(hit.surfaceParam[0]));
-        uint64_t key = (static_cast<uint64_t>(gridRow) << 32) | static_cast<uint64_t>(gridCol);
-
-        auto existingIt = uniqueHits.find(key);
-        if (existingIt == uniqueHits.end()) {
-            uniqueHits[key] = hit;
-        } else {
-            // Keep the hit that is closer to the exact grid location
-            // (prefer more accurate surface param interpolation)
-            float existingDist = std::abs(existingIt->second.surfaceParam[0] - gridCol) +
-                                 std::abs(existingIt->second.surfaceParam[1] - gridRow);
-            float newDist = std::abs(hit.surfaceParam[0] - gridCol) +
-                           std::abs(hit.surfaceParam[1] - gridRow);
-            if (newDist < existingDist) {
-                uniqueHits[key] = hit;
-            }
-        }
-    };
-
-    forEachTriangle(bounds, targetSurface, processTriangle);
-
-    // Copy unique hits to output
-    outHits.reserve(uniqueHits.size());
-    for (auto& [key, hit] : uniqueHits) {
-        outHits.push_back(std::move(hit));
-    }
-
-    // Sort by distance along ray (smallest t first, including negative)
-    std::sort(outHits.begin(), outHits.end(),
-              [](const RayHit& a, const RayHit& b) { return a.t < b.t; });
 }
 
 // ============================================================================

@@ -430,8 +430,8 @@ void write_overlapping_json(const std::filesystem::path& seg_path, const std::se
 std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path);
 
 // Surface overlap/containment tests
-bool overlap(QuadSurface& a, QuadSurface& b, int max_iters = 1000,
-             SurfacePatchIndex* surfaceIndex = nullptr);
+bool overlap(QuadSurface& a, QuadSurface& b, int max_iters = 1000);
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
 bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
 bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
+

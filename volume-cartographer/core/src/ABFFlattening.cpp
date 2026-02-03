@@ -1,5 +1,4 @@
 #include "vc/core/util/ABFFlattening.hpp"
-#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <OpenABF/OpenABF.hpp>
@@ -7,8 +6,6 @@
 #include <Eigen/Core>
 #include <opencv2/imgproc.hpp>
 
-#include <algorithm>
-#include <vector>
 #include <unordered_map>
 #include <iostream>
 #include <cmath>
@@ -24,20 +21,17 @@ using LSCM = OpenABF::AngleBasedLSCM<double, HalfEdgeMesh>;
 /**
  * @brief Compute 3D surface area using triangulation of valid quads (parallelized)
  */
-static bool uvValid(const cv::Vec2f& uv) {
-    return uv[0] != -1.f && uv[1] != -1.f;
-}
-
-static double computeSurfaceArea3D(const cv::Mat_<cv::Vec3f>& points) {
+static double computeSurfaceArea3D(const QuadSurface& surface) {
     double area = 0.0;
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
 
     #pragma omp parallel for collapse(2) reduction(+:area)
-    for (int row = 0; row < points.rows - 1; ++row) {
-        for (int col = 0; col < points.cols - 1; ++col) {
-            const cv::Vec3f& p00 = points(row, col);
-            const cv::Vec3f& p01 = points(row, col + 1);
-            const cv::Vec3f& p10 = points(row + 1, col);
-            const cv::Vec3f& p11 = points(row + 1, col + 1);
+    for (int row = 0; row < points->rows - 1; ++row) {
+        for (int col = 0; col < points->cols - 1; ++col) {
+            const cv::Vec3f& p00 = (*points)(row, col);
+            const cv::Vec3f& p01 = (*points)(row, col + 1);
+            const cv::Vec3f& p10 = (*points)(row + 1, col);
+            const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
 
             // Skip invalid quads
             if (p00[0] == -1.f || p01[0] == -1.f || p10[0] == -1.f || p11[0] == -1.f)
@@ -70,16 +64,17 @@ static double computeSurfaceArea3D(const cv::Mat_<cv::Vec3f>& points) {
 /**
  * @brief Compute 2D area from UV coordinates (parallelized)
  */
-static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const cv::Mat_<cv::Vec3f>& points) {
+static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const QuadSurface& surface) {
     double area = 0.0;
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
 
     #pragma omp parallel for collapse(2) reduction(+:area)
-    for (int row = 0; row < points.rows - 1; ++row) {
-        for (int col = 0; col < points.cols - 1; ++col) {
-            const cv::Vec3f& p00 = points(row, col);
-            const cv::Vec3f& p01 = points(row, col + 1);
-            const cv::Vec3f& p10 = points(row + 1, col);
-            const cv::Vec3f& p11 = points(row + 1, col + 1);
+    for (int row = 0; row < points->rows - 1; ++row) {
+        for (int col = 0; col < points->cols - 1; ++col) {
+            const cv::Vec3f& p00 = (*points)(row, col);
+            const cv::Vec3f& p01 = (*points)(row, col + 1);
+            const cv::Vec3f& p10 = (*points)(row + 1, col);
+            const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
 
             // Skip invalid quads
             if (p00[0] == -1.f || p01[0] == -1.f || p10[0] == -1.f || p11[0] == -1.f)
@@ -89,8 +84,6 @@ static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const cv::Mat_<cv::V
             const cv::Vec2f& uv01 = uvs(row, col + 1);
             const cv::Vec2f& uv10 = uvs(row + 1, col);
             const cv::Vec2f& uv11 = uvs(row + 1, col + 1);
-            if (!uvValid(uv00) || !uvValid(uv01) || !uvValid(uv10) || !uvValid(uv11))
-                continue;
 
             // Triangle 1: uv10, uv00, uv01
             cv::Vec2f e1 = uv00 - uv10;
@@ -106,117 +99,6 @@ static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const cv::Mat_<cv::V
         }
     }
     return area;
-}
-
-static double median_in_place(std::vector<double>& values) {
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    std::sort(values.begin(), values.end());
-    const size_t mid = values.size() / 2;
-    if (values.size() % 2 == 0) {
-        return 0.5 * (values[mid - 1] + values[mid]);
-    }
-    return values[mid];
-}
-
-static double triangleArea3D(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c) {
-    cv::Vec3f e1 = b - a;
-    cv::Vec3f e2 = c - a;
-    cv::Vec3f cross(
-        e1[1] * e2[2] - e1[2] * e2[1],
-        e1[2] * e2[0] - e1[0] * e2[2],
-        e1[0] * e2[1] - e1[1] * e2[0]
-    );
-    return 0.5 * std::sqrt(cross.dot(cross));
-}
-
-static double triangleArea2D(const cv::Vec2f& a, const cv::Vec2f& b, const cv::Vec2f& c) {
-    cv::Vec2f e1 = b - a;
-    cv::Vec2f e2 = c - a;
-    return 0.5 * std::abs(e1[0] * e2[1] - e1[1] * e2[0]);
-}
-
-static double computeRobustScaleFromRatios(const cv::Mat_<cv::Vec2f>& uvs,
-                                           const cv::Mat_<cv::Vec3f>& points,
-                                           float sigmaScale) {
-    std::vector<double> ratios;
-    ratios.reserve(static_cast<size_t>(points.rows - 1) * static_cast<size_t>(points.cols - 1) * 2);
-
-    for (int row = 0; row < points.rows - 1; ++row) {
-        for (int col = 0; col < points.cols - 1; ++col) {
-            const cv::Vec3f& p00 = points(row, col);
-            const cv::Vec3f& p01 = points(row, col + 1);
-            const cv::Vec3f& p10 = points(row + 1, col);
-            const cv::Vec3f& p11 = points(row + 1, col + 1);
-
-            if (p00[0] == -1.f || p01[0] == -1.f || p10[0] == -1.f || p11[0] == -1.f)
-                continue;
-
-            const cv::Vec2f& uv00 = uvs(row, col);
-            const cv::Vec2f& uv01 = uvs(row, col + 1);
-            const cv::Vec2f& uv10 = uvs(row + 1, col);
-            const cv::Vec2f& uv11 = uvs(row + 1, col + 1);
-            if (!uvValid(uv00) || !uvValid(uv01) || !uvValid(uv10) || !uvValid(uv11))
-                continue;
-
-            auto add_ratio = [&](const cv::Vec3f& a3, const cv::Vec3f& b3, const cv::Vec3f& c3,
-                                 const cv::Vec2f& a2, const cv::Vec2f& b2, const cv::Vec2f& c2) {
-                const double area3d = triangleArea3D(a3, b3, c3);
-                const double area2d = triangleArea2D(a2, b2, c2);
-                if (area3d <= 0.0 || area2d <= 1e-12) {
-                    return;
-                }
-                const double ratio = area3d / area2d;
-                if (std::isfinite(ratio) && ratio > 0.0) {
-                    ratios.push_back(ratio);
-                }
-            };
-
-            add_ratio(p10, p00, p01, uv10, uv00, uv01);
-            add_ratio(p10, p01, p11, uv10, uv01, uv11);
-        }
-    }
-
-    if (ratios.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
-    const double median = median_in_place(ratios);
-    if (!std::isfinite(median) || median <= 0.0) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
-    std::vector<double> deviations;
-    deviations.reserve(ratios.size());
-    for (double r : ratios) {
-        deviations.push_back(std::abs(r - median));
-    }
-    const double mad = median_in_place(deviations);
-    if (!std::isfinite(mad) || mad <= 0.0) {
-        return std::sqrt(median);
-    }
-
-    const double sigma = mad / 0.6745;
-    const double max_dev = sigmaScale * sigma;
-    std::vector<double> filtered;
-    filtered.reserve(ratios.size());
-    for (double r : ratios) {
-        if (std::abs(r - median) <= max_dev) {
-            filtered.push_back(r);
-        }
-    }
-
-    if (filtered.empty()) {
-        return std::sqrt(median);
-    }
-
-    const double filteredMedian = median_in_place(filtered);
-    if (!std::isfinite(filteredMedian) || filteredMedian <= 0.0) {
-        return std::sqrt(median);
-    }
-
-    return std::sqrt(filteredMedian);
 }
 
 /**
@@ -321,12 +203,6 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface, const 
     if (!points || points->empty()) {
         std::cerr << "ABF++: Empty surface" << std::endl;
         return cv::Mat_<cv::Vec2f>();
-    }
-
-    cv::Mat_<cv::Vec3f> cleanedPoints;
-    if (config.filterOutliers) {
-        cleanedPoints = clean_surface_outliers(*points, config.outlierSigma, false);
-        points = &cleanedPoints;
     }
 
     // Initialize UV output with invalid values
@@ -466,27 +342,16 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface, const 
 
     // Step 7: Scale to match original surface area (optional)
     if (config.scaleToOriginalArea) {
-        double area3D = computeSurfaceArea3D(*points);
-        double area2D = computeArea2D(uvs, *points);
+        double area3D = computeSurfaceArea3D(surface);
+        double area2D = computeArea2D(uvs, surface);
 
-        double scale = std::numeric_limits<double>::quiet_NaN();
         if (area2D > 1e-10) {
-            scale = std::sqrt(area3D / area2D);
-        }
-
-        if (config.robustAreaScale) {
-            double robustScale = computeRobustScaleFromRatios(uvs, *points, config.outlierSigma);
-            if (std::isfinite(robustScale) && robustScale > 0.0) {
-                scale = robustScale;
-            }
-        }
-
-        if (std::isfinite(scale) && scale > 0.0) {
+            double scale = std::sqrt(area3D / area2D);
             std::cout << "ABF++: Scaling UVs by " << scale << " to match 3D area" << std::endl;
 
             for (int row = 0; row < uvs.rows; ++row) {
                 for (int col = 0; col < uvs.cols; ++col) {
-                    if (uvValid(uvs(row, col))) {
+                    if (uvs(row, col)[0] != -1.f) {
                         uvs(row, col) *= static_cast<float>(scale);
                     }
                 }
@@ -676,9 +541,6 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
             const cv::Vec2f& uv01 = uvs(row, col + 1);
             const cv::Vec2f& uv10 = uvs(row + 1, col);
             const cv::Vec2f& uv11 = uvs(row + 1, col + 1);
-
-            if (!uvValid(uv00) || !uvValid(uv01) || !uvValid(uv10) || !uvValid(uv11))
-                continue;
 
             // Transform UVs to grid coordinates (inlined for performance)
             cv::Vec2f guv00((uv00[0] - uvMin[0]) * rxInv, (uv00[1] - uvMin[1]) * ryInv);

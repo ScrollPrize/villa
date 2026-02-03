@@ -16,11 +16,6 @@ static cv::Vec3f normed(const cv::Vec3f& v)
     return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
 }
 
-static cv::Vec3d normed_d(const cv::Vec3d& v)
-{
-    return v / std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-}
-
 static cv::Vec2f vmin(const cv::Vec2f &a, const cv::Vec2f &b)
 {
     return {std::min(a[0],b[0]),std::min(a[1],b[1])};
@@ -60,37 +55,6 @@ cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
         return {NAN,NAN,NAN};
 
     return normed(n);
-}
-
-cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &loc)
-{
-    cv::Vec2f inb_loc = {loc[0], loc[1]};
-    //move inside from the grid border so w can access required locations
-    inb_loc = vmax(inb_loc, {1.f,1.f});
-    inb_loc = vmin(inb_loc, {static_cast<float>(points.cols-3), static_cast<float>(points.rows-3)});
-
-    if (!loc_valid_xy(points, inb_loc))
-        return {NAN,NAN,NAN};
-
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(1,0)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(-1,0)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(0,1)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(0,-1)))
-        return {NAN,NAN,NAN};
-
-    cv::Vec3d xv = normed_d(at_int(points,inb_loc+cv::Vec2f(1,0))-at_int(points,inb_loc-cv::Vec2f(1,0)));
-    cv::Vec3d yv = normed_d(at_int(points,inb_loc+cv::Vec2f(0,1))-at_int(points,inb_loc-cv::Vec2f(0,1)));
-
-    cv::Vec3d n = yv.cross(xv);
-
-    if (std::isnan(n[0]))
-        return {NAN,NAN,NAN};
-
-    cv::Vec3d nn = normed_d(n);
-    return {static_cast<float>(nn[0]), static_cast<float>(nn[1]), static_cast<float>(nn[2])};
 }
 
 template <typename E>

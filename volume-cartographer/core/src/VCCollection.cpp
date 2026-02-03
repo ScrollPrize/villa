@@ -377,55 +377,23 @@ bool VCCollection::loadFromJSON(const std::string& filename)
     clearAll();
 
     try {
-        // Detect format and load accordingly
-        if (j.contains("vc_pointcollections_json_version")) {
-            // Point collections format
-            if (j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
-                throw std::runtime_error("JSON file has incorrect version.");
-            }
+       if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+           throw std::runtime_error("JSON file has incorrect version or is missing version info.");
+       }
 
-            json collections_obj = j.at("collections");
-            if (!collections_obj.is_object()) {
-                return false;
-            }
-
-            for (auto& [id_str, col_json] : collections_obj.items()) {
-                uint64_t id = std::stoull(id_str);
-                Collection col = col_json.get<Collection>();
-                col.id = id;
-                _collections[col.id] = col;
-                for (auto& point_pair : _collections.at(col.id).points) {
-                    point_pair.second.collectionId = col.id;
-                }
-            }
-        }
-        else if (j.contains("control_points") && j["control_points"].is_array()) {
-            // Estimated umbilicus format (from WrapTracker)
-            uint64_t col_id = getNextCollectionId();
-            Collection col;
-            col.id = col_id;
-            col.name = "Estimated Umbilicus";
-            col.color = {0.2f, 0.8f, 0.9f}; // Cyan
-
-            for (const auto& pt : j["control_points"]) {
-                ColPoint point;
-                point.id = getNextPointId();
-                point.collectionId = col_id;
-                point.p = {
-                    pt["x"].get<float>(),
-                    pt["y"].get<float>(),
-                    pt["z"].get<float>()
-                };
-                point.winding_annotation = std::nan("");
-                point.creation_time = QDateTime::currentMSecsSinceEpoch();
-                col.points[point.id] = point;
-            }
-
-            _collections[col_id] = col;
-        }
-        else {
-            qWarning() << "Unrecognized JSON format";
+        json collections_obj = j.at("collections");
+        if (!collections_obj.is_object()) {
             return false;
+        }
+
+        for (auto& [id_str, col_json] : collections_obj.items()) {
+           uint64_t id = std::stoull(id_str);
+            Collection col = col_json.get<Collection>();
+            col.id = id;
+            _collections[col.id] = col;
+            for (auto& point_pair : _collections.at(col.id).points) {
+                point_pair.second.collectionId = col.id;
+            }
         }
 
     } catch (json::exception& e) {

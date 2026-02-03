@@ -39,13 +39,6 @@ public:
         std::array<cv::Vec3f, 2> surfaceParams{};
     };
 
-    struct RayHit {
-        float t = -1.0f;              // Distance along ray (signed)
-        cv::Vec3f hitPoint{};         // World space hit point
-        cv::Vec3f surfaceParam{};     // Interpolated surface coords (ptr-space)
-        SurfacePtr surface;           // Surface that was hit
-    };
-
     SurfacePatchIndex();
     ~SurfacePatchIndex();
 
@@ -58,8 +51,6 @@ public:
     void rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding = 0.0f);
     void clear();
     bool empty() const;
-    void setMinSearchRadius(float radius);
-    float minSearchRadius() const;
 
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,
@@ -67,9 +58,6 @@ public:
 
     void queryTriangles(const Rect3D& bounds,
                         const SurfacePtr& targetSurface,
-                        std::vector<TriangleCandidate>& outCandidates) const;
-    void queryTriangles(const Rect3D& bounds,
-                        QuadSurface* targetSurface,
                         std::vector<TriangleCandidate>& outCandidates) const;
 
     void queryTriangles(const Rect3D& bounds,
@@ -79,9 +67,6 @@ public:
     void forEachTriangle(const Rect3D& bounds,
                          const SurfacePtr& targetSurface,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
-    void forEachTriangle(const Rect3D& bounds,
-                         QuadSurface* targetSurface,
-                         const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     void forEachTriangle(const Rect3D& bounds,
                          const std::unordered_set<SurfacePtr>& targetSurfaces,
@@ -90,29 +75,6 @@ public:
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
                                                               const PlaneSurface& plane,
                                                               float epsilon = 1e-4f);
-
-    // Moller-Trumbore ray-triangle intersection
-    static std::optional<RayHit> rayTriangleIntersect(
-        const cv::Vec3f& rayOrigin,
-        const cv::Vec3f& rayDir,
-        const TriangleCandidate& tri,
-        float epsilon = 1e-6f);
-
-    // Find all ray intersections with indexed surface
-    // Queries both directions along ray (positive and negative t)
-    void rayIntersect(
-        const cv::Vec3f& rayOrigin,
-        const cv::Vec3f& rayDir,
-        float maxDistance,
-        QuadSurface* targetSurface,
-        std::vector<RayHit>& outHits) const;
-
-    void rayIntersect(
-        const cv::Vec3f& rayOrigin,
-        const cv::Vec3f& rayDir,
-        float maxDistance,
-        const SurfacePtr& targetSurface,
-        std::vector<RayHit>& outHits) const;
 
     bool updateSurface(const SurfacePtr& surface);
     bool updateSurfaceRegion(const SurfacePtr& surface,
@@ -145,7 +107,7 @@ public:
 
 private:
     void forEachTriangleImpl(const Rect3D& bounds,
-                             QuadSurface* targetSurface,
+                             const SurfacePtr& targetSurface,
                              const std::unordered_set<SurfacePtr>* filterSurfaces,
                              const std::function<void(const TriangleCandidate&)>& visitor) const;
 
