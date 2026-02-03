@@ -121,16 +121,20 @@ def load(
 			raise ValueError("non-directory input requires --crop x y w h")
 		x, y, w_c, h_c = (int(v) for v in xywh)
 		ov = max(0, int(unet_overlap))
+		b = max(0, int(unet_border))
+		pad = ov + b
 		# Expanded crop for tiling/blending, then trimmed back to target crop.
-		xe = x - ov
-		ye = y - ov
-		we = w_c + 2 * ov
-		he = h_c + 2 * ov
+		# Include `border` in the padding so the final crop is unaffected by
+		# tile-edge discard regions.
+		xe = x - pad
+		ye = y - pad
+		we = w_c + 2 * pad
+		he = h_c + 2 * pad
 		expanded_crop = (xe, ye, we, he)
 
 		# Load raw 2D slice as (1,1,H,W).
 		if is_omezarr:
-			raw = tiled_infer._load_omezarr_z_uint8(
+			raw = tiled_infer._load_omezarr_z_uint8_norm(
 				path=str(p),
 				z=unet_z,
 				crop=expanded_crop,
@@ -154,6 +158,7 @@ def load(
 		mdl = load_unet(
 			device=device,
 			weights=unet_checkpoint,
+			strict=True,
 			in_channels=1,
 			out_channels=4,
 			base_channels=32,
@@ -173,6 +178,9 @@ def load(
 		if unet_out_dir_base is not None:
 			out_p = Path(unet_out_dir_base) / "unet_pred"
 			out_p.mkdir(parents=True, exist_ok=True)
+			# Save the extracted slice/crop fed into the UNet.
+			raw_np = raw[0, 0].detach().cpu().numpy().astype("float32")
+			tifffile.imwrite(str(out_p / "raw.tif"), raw_np, compression="lzw")
 			prefix = out_p / "unet"
 			pred_np = pred[0].detach().cpu().numpy().astype("float32")
 			tifffile.imwrite(str(prefix) + "_cos.tif", pred_np[0], compression="lzw")
@@ -182,8 +190,8 @@ def load(
 
 		# Trim expanded crop back to requested target crop.
 		_, _, ph, pw = pred.shape
-		x0t = max(0, min(ov, pw))
-		y0t = max(0, min(ov, ph))
+		x0t = max(0, min(pad, pw))
+		y0t = max(0, min(pad, ph))
 		x1t = max(x0t, min(x0t + w_c, pw))
 		y1t = max(y0t, min(y0t + h_c, ph))
 		pred = pred[:, :, y0t:y1t, x0t:x1t]

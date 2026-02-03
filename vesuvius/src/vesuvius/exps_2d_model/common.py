@@ -135,6 +135,8 @@ class UNet(nn.Module):
 def load_unet(
 	device: Union[str, torch.device],
 	weights: Optional[str] = None,
+	*,
+	strict: bool = True,
 	in_channels: int = 1,
 	out_channels: int = 3,
 	base_channels: int = 32,
@@ -163,6 +165,13 @@ def load_unet(
 			state_dict = ckpt["state_dict"]
 		else:
 			state_dict = ckpt
+
+		if isinstance(state_dict, dict) and any(k.startswith("module.") for k in state_dict.keys()):
+			state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+
+		if strict:
+			model.load_state_dict(state_dict, strict=True)
+			return model
 
 		model_state = model.state_dict()
 		filtered = {}
