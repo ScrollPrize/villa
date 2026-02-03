@@ -67,6 +67,55 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
     return (np.clip(norm, 0.0, 1.0) * 255.0).astype("uint8")
 
 
+def _load_omezarr_z_uint8(
+	*,
+	path: str,
+	z: int | None,
+	crop: tuple[int, int, int, int] | None,
+	device: torch.device,
+) -> torch.Tensor:
+	"""Load one z-slice from an OME-Zarr array as (1,1,H,W) float32.
+
+	Requirements:
+	- `path` must point directly to a zarr array (not a group).
+	- array must have exactly 3 dims: (Z,Y,X).
+	"""
+	try:
+		import zarr  # type: ignore
+	except Exception as e:  # pragma: no cover
+		raise ImportError("OME-Zarr loading requires the 'zarr' package") from e
+
+	a = zarr.open(str(path), mode="r")
+	if not hasattr(a, "shape"):
+		raise ValueError(f"OME-Zarr path must point to an array, got non-array: {path}")
+	sh = tuple(int(v) for v in a.shape)
+	if len(sh) != 3:
+		raise ValueError(f"OME-Zarr array must have shape (Z,Y,X), got {sh} for {path}")
+
+	zz = 0 if z is None else int(z)
+	if zz < 0 or zz >= sh[0]:
+		raise ValueError(f"z out of range: z={zz} shape={sh} for {path}")
+
+	x0 = 0
+	y0 = 0
+	x1 = sh[2]
+	y1 = sh[1]
+	if crop is not None:
+		x, y, w, h = (int(v) for v in crop)
+		x0 = max(0, min(x, sh[2]))
+		y0 = max(0, min(y, sh[1]))
+		x1 = max(x0, min(x + w, sh[2]))
+		y1 = max(y0, min(y + h, sh[1]))
+
+	img = np.asarray(a[zz, y0:y1, x0:x1])
+	if img.dtype == np.uint16:
+		img = (img // 257).astype(np.uint8)
+
+	img_t = torch.from_numpy(img.astype("float32"))
+	img_t = img_t.unsqueeze(0).unsqueeze(0)
+	return img_t.to(device)
+
+
 def tiled_unet_infer(
     image_path: str,
     out_dir: str,
