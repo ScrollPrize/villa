@@ -350,6 +350,9 @@ public:
     // Write validity mask to path/mask.tif. If img is provided, writes multi-layer TIFF.
     void writeValidMask(const cv::Mat& img = cv::Mat());
 
+    mutable cv::Mat_<uint8_t> _validMaskCache;
+    mutable cv::Mat_<cv::Vec3f> _normalCache;
+
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);

@@ -1,79 +1,120 @@
 #pragma once
 
-#include "vc/core/util/xtensor_include.hpp"
-#include XTENSORINCLUDE(containers, xarray.hpp)
-#include <vc/core/util/HashFunctions.hpp>
+#include <xtensor/containers/xarray.hpp>
 
-#include <shared_mutex>
+#include <atomic>
 #include <memory>
 #include <unordered_map>
-#include <string>
+#include <vector>
+#include <cstdint>
+#include <mutex>
+#include <shared_mutex>
+
+// Forward declaration
+namespace z5 { class Dataset; }
 
 /**
- * @brief Thread-safe LRU cache for volume chunks
+ * @brief Thread-safe chunk cache with shared_ptr lifetime management
  *
  * @tparam T Data type of cached chunks (uint8_t or uint16_t)
  *
- * The cache uses a generation-based LRU eviction strategy. When the cache
- * is full, it removes the 10% oldest entries to amortize sorting costs.
+ * Supports caching chunks from multiple z5::Dataset instances simultaneously.
+ * Chunks are stored as shared_ptr so eviction removes from the cache but
+ * doesn't free memory until all readers are done.
+ *
+ * Uses a hash map keyed by (dataset pointer, chunk z, chunk y, chunk x).
+ * LRU eviction based on generation counter.
  */
 template<typename T>
 class ChunkCache
 {
 public:
-    /**
-     * @brief Construct a new Chunk Cache object
-     * @param size Maximum cache size in bytes
-     */
-    explicit ChunkCache(size_t size);
+    using ChunkPtr = std::shared_ptr<xt::xarray<T>>;
 
+    explicit ChunkCache(size_t maxBytes = 0);
     ~ChunkCache();
 
-    /**
-     * @brief Get or create a group index for a dataset path
-     * @param name Unique identifier for the group (e.g., dataset path + group name)
-     * @return int Group index (used as high 16 bits of cache key)
-     */
-    int groupIdx(const std::string& name);
+    ChunkCache(const ChunkCache&) = delete;
+    ChunkCache& operator=(const ChunkCache&) = delete;
+    ChunkCache(ChunkCache&&) = delete;
+    ChunkCache& operator=(ChunkCache&&) = delete;
+
+    void setMaxBytes(size_t maxBytes);
+    size_t cachedCount() const { return _cachedCount.load(std::memory_order_relaxed); }
+
+    // Cache statistics
+    struct Stats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t evictions = 0;
+        uint64_t bytesRead = 0;
+    };
+    Stats stats() const;
+    void resetStats();
 
     /**
-     * @brief Store a chunk in the cache
-     * @param key Cache key (group_idx, z, y, x)
-     * @param ar Chunk data (ownership transferred to cache)
+     * @brief Get a chunk, loading from disk if needed.
+     * Returns shared_ptr — caller holds the chunk alive even if evicted.
      */
-    void put(const cv::Vec4i& key, xt::xarray<T>* ar);
+    ChunkPtr get(z5::Dataset* ds, int iz, int iy, int ix);
 
     /**
-     * @brief Retrieve a chunk from the cache
-     * @param key Cache key
-     * @return std::shared_ptr<xt::xarray<T>> Cached chunk or nullptr if not found
+     * @brief Check if chunk is cached without loading.
      */
-    std::shared_ptr<xt::xarray<T>> get(const cv::Vec4i& key);
+    ChunkPtr getIfCached(z5::Dataset* ds, int iz, int iy, int ix) const;
 
-    /**
-     * @brief Check if a chunk exists in the cache
-     * @param idx Cache key
-     * @return true if chunk is cached
-     */
-    bool has(const cv::Vec4i& idx);
-
-    /**
-     * @brief Clear all cached data
-     */
-    void reset();
-
-    std::shared_mutex mutex;
+    void prefetch(z5::Dataset* ds, int minIz, int minIy, int minIx, int maxIz, int maxIy, int maxIx);
+    void clear();
+    void flush();
 
 private:
-    uint64_t _generation = 0;
-    size_t _size = 0;
-    size_t _stored = 0;
-    std::unordered_map<cv::Vec4i, std::shared_ptr<xt::xarray<T>>, vec4i_hash> _store;
-    std::unordered_map<cv::Vec4i, uint64_t, vec4i_hash> _gen_store;
-    std::unordered_map<std::string, int> _group_store;
-    std::shared_mutex _mutex;
+    struct ChunkKey {
+        z5::Dataset* ds;
+        int iz, iy, ix;
+        bool operator==(const ChunkKey& o) const {
+            return ds == o.ds && iz == o.iz && iy == o.iy && ix == o.ix;
+        }
+    };
+
+    struct ChunkKeyHash {
+        size_t operator()(const ChunkKey& k) const {
+            size_t h = std::hash<const void*>()(k.ds);
+            h ^= std::hash<int>()(k.iz) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(k.iy) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(k.ix) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    struct CacheEntry {
+        ChunkPtr chunk;
+        size_t bytes;
+        uint64_t lastAccess;
+    };
+
+    size_t _maxBytes = 0;
+    std::atomic<size_t> _storedBytes{0};
+    std::atomic<size_t> _cachedCount{0};
+    std::atomic<uint64_t> _generation{0};
+
+    mutable std::shared_mutex _mapMutex;
+    std::unordered_map<ChunkKey, CacheEntry, ChunkKeyHash> _map;
+
+    static constexpr int kLockPoolSize = 64;
+    std::mutex _lockPool[kLockPoolSize];
+    std::mutex _evictionMutex;
+
+    size_t lockIndex(const ChunkKey& k) const { return ChunkKeyHash()(k) % kLockPoolSize; }
+
+    ChunkPtr loadChunk(z5::Dataset* ds, int iz, int iy, int ix);
+    void evictIfNeeded();
+
+    // Stats counters
+    mutable std::atomic<uint64_t> _hits{0};
+    std::atomic<uint64_t> _misses{0};
+    std::atomic<uint64_t> _evictions{0};
+    std::atomic<uint64_t> _bytesRead{0};
 };
 
-// Explicit template instantiations (defined in ChunkCache.cpp)
 extern template class ChunkCache<uint8_t>;
 extern template class ChunkCache<uint16_t>;

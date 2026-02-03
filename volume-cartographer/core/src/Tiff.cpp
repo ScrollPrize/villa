@@ -82,7 +82,8 @@ void writeTiff(const std::filesystem::path& outPath,
                int cvType,
                uint32_t tileW,
                uint32_t tileH,
-               float padValue)
+               float padValue,
+               uint16_t compression)
 {
     if (img.empty())
         throw std::runtime_error("Empty image for " + outPath.string());
@@ -108,8 +109,10 @@ void writeTiff(const std::filesystem::path& outPath,
     TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE,   params.bits);
     TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,    params.sampleFormat);
     TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(tf, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
-    TIFFSetField(tf, TIFFTAG_PREDICTOR,       PREDICTOR_HORIZONTAL);
+    TIFFSetField(tf, TIFFTAG_COMPRESSION,     compression);
+    if (compression == COMPRESSION_LZW || compression == COMPRESSION_DEFLATE ||
+        compression == COMPRESSION_ADOBE_DEFLATE)
+        TIFFSetField(tf, TIFFTAG_PREDICTOR,   PREDICTOR_HORIZONTAL);
     TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
     TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
 
@@ -158,7 +161,8 @@ TiffWriter::TiffWriter(const std::filesystem::path& path,
                        int cvType,
                        uint32_t tileW,
                        uint32_t tileH,
-                       float padValue)
+                       float padValue,
+                       uint16_t compression)
     : _width(width), _height(height), _tileW(tileW), _tileH(tileH),
       _cvType(cvType), _padValue(padValue), _path(path)
 {
@@ -175,8 +179,10 @@ TiffWriter::TiffWriter(const std::filesystem::path& path,
     TIFFSetField(_tiff, TIFFTAG_BITSPERSAMPLE,   params.bits);
     TIFFSetField(_tiff, TIFFTAG_SAMPLEFORMAT,    params.sampleFormat);
     TIFFSetField(_tiff, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(_tiff, TIFFTAG_COMPRESSION,     COMPRESSION_LZW);
-    TIFFSetField(_tiff, TIFFTAG_PREDICTOR,       PREDICTOR_HORIZONTAL);
+    TIFFSetField(_tiff, TIFFTAG_COMPRESSION,     compression);
+    if (compression == COMPRESSION_LZW || compression == COMPRESSION_DEFLATE ||
+        compression == COMPRESSION_ADOBE_DEFLATE)
+        TIFFSetField(_tiff, TIFFTAG_PREDICTOR,   PREDICTOR_HORIZONTAL);
     TIFFSetField(_tiff, TIFFTAG_TILEWIDTH,       tileW);
     TIFFSetField(_tiff, TIFFTAG_TILELENGTH,      tileH);
 

@@ -240,8 +240,24 @@ cv::Vec3f QuadSurface::gridNormal(int row, int col) const
     if (!_points) {
         return {NAN, NAN, NAN};
     }
-    // grid_normal expects (col, row) order in the Vec3f
-    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col), static_cast<float>(row), 0.0f));
+    if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
+        return {NAN, NAN, NAN};
+
+    // Build normal cache on first access
+    if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+        _normalCache.create(_points->rows, _points->cols);
+        for (int r = 0; r < _points->rows; r++) {
+            for (int c = 0; c < _points->cols; c++) {
+                if ((*_points)(r, c)[0] == -1.f) {
+                    _normalCache(r, c) = {NAN, NAN, NAN};
+                } else {
+                    _normalCache(r, c) = grid_normal(*_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
+                }
+            }
+        }
+    }
+
+    return _normalCache(row, col);
 }
 
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
@@ -314,6 +330,13 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     if (!_points || _points->empty()) {
         return cv::Mat_<uint8_t>();
     }
+
+    if (!_validMaskCache.empty() &&
+        _validMaskCache.rows == _points->rows &&
+        _validMaskCache.cols == _points->cols) {
+        return _validMaskCache;
+    }
+
     const int rows = _points->rows;
     const int cols = _points->cols;
     cv::Mat_<uint8_t> mask(rows, cols);
@@ -327,6 +350,7 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
             mask(j, i) = ok ? 255 : 0;
         }
     }
+    _validMaskCache = mask;
     return mask;
 }
 
@@ -361,6 +385,8 @@ void QuadSurface::invalidateCache()
     }
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _normalCache = cv::Mat_<cv::Vec3f>();
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -774,6 +800,7 @@ void QuadSurface::invalidateMask()
 {
     // Clear from memory
     _channels.erase("mask");
+    _validMaskCache = cv::Mat_<uint8_t>();
 
     // Delete from disk
     if (!path.empty()) {

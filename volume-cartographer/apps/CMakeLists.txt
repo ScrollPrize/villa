@@ -146,6 +146,9 @@ target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
+add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
+target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options tiff)
+
 # Install targets
 if(VC_INSTALL_APPS)
 install(
@@ -174,6 +177,7 @@ install(
         vc_telea_inpaint
         vc_thinning
         vc_tifxyz
+        vc_zarr_to_tiff
         ${extra_apps}
     RUNTIME DESTINATION bin
     COMPONENT Programs

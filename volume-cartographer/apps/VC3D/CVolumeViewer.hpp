@@ -136,7 +136,7 @@ public:
 
     bool isWindowMinimized() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
-    
+
     // Generic overlay group management (ad-hoc helper for reuse)
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items);
     void clearOverlayGroup(const std::string& key);

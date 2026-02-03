@@ -900,7 +900,7 @@ struct LossSettings {
         w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
-        w[LossType::REFERENCE_RAY] = 0.5f;
+        w[LossType::REFERENCE_RAY] = 0.0f;
         w[LossType::SURFACE_SDT] = 0.0f;
         w[LossType::SPACELINE] = 0.0f;
     }
@@ -1701,7 +1701,7 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
         !dpoint_valid(params.dpoints(p_br))) {
         return 0;
     }
-    
+
     int count = 0;
     // int i = 1;
     for (int i = 0; i < 3; ++i) { // For each plane
