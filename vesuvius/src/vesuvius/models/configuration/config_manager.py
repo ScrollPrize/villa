@@ -91,6 +91,48 @@ class ConfigManager:
 
         return config
 
+    def _explicit_volumes_require_unlabeled(self) -> bool:
+        volumes_cfg = self.dataset_config.get("volumes")
+        if not volumes_cfg:
+            return False
+
+        if isinstance(volumes_cfg, dict):
+            volume_specs = list(volumes_cfg.values())
+        elif isinstance(volumes_cfg, (list, tuple)):
+            volume_specs = list(volumes_cfg)
+        else:
+            raise ValueError("dataset_config.volumes must be a list or mapping")
+
+        target_names = list((self.targets or {}).keys())
+
+        for spec in volume_specs:
+            if spec is None:
+                return True
+            if isinstance(spec, (str, Path)):
+                # Treat as image-only entry; labels are missing.
+                return True
+            if not isinstance(spec, dict):
+                raise ValueError("Each volume entry must be a mapping or path string")
+
+            labels = spec.get("labels")
+            if labels is None:
+                labels = spec.get("label_paths")
+            if labels is None or labels == {}:
+                return True
+            if not isinstance(labels, dict):
+                raise ValueError("Volume labels must be a mapping of target -> path")
+
+            if not target_names:
+                # If targets are unknown, assume labels are incomplete.
+                return True
+
+            for target in target_names:
+                value = labels.get(target)
+                if value in (None, ""):
+                    return True
+
+        return False
+
     def _init_attributes(self):
 
 
@@ -121,7 +163,7 @@ class ConfigManager:
         self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 250))
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
-        self.max_epoch = int(self.tr_configs.get("max_epoch", 1000))
+        self.max_epoch = int(self.tr_configs.get("max_epoch", 5000))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
@@ -134,6 +176,8 @@ class ConfigManager:
         allow_unlabeled_cfg = self.dataset_config.get("allow_unlabeled_data")
         if allow_unlabeled_cfg is None:
             allow_unlabeled_cfg = self.dataset_config.get("allow_unlabeled")
+        if allow_unlabeled_cfg is None and self._explicit_volumes_require_unlabeled():
+            allow_unlabeled_cfg = True
         if allow_unlabeled_cfg is None and mesh_cfg.get("enabled"):
             allow_unlabeled_cfg = True
         self.allow_unlabeled_data = bool(allow_unlabeled_cfg)
@@ -334,6 +378,8 @@ class ConfigManager:
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
         # Control where augmentations run; default to CPU (in Dataset workers)
         self.augment_on_device = bool(self.tr_configs.get("augment_on_device", False))
+        # Enable per-augmentation timing (disabled by default)
+        self.profile_augmentations = bool(self.tr_configs.get("profile_augmentations", False))
 
         # Normalization configuration
         self.normalization_scheme = self.dataset_config.get("normalization_scheme", "zscore")

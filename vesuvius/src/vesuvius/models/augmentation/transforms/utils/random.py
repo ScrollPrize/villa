@@ -9,6 +9,8 @@ class RandomTransform(BasicTransform):
         self.transform = transform
         self.apply_probability = apply_probability
         self._skip_when_vector = getattr(transform, "_skip_when_vector", False)
+        # Skip timing for the wrapper; leaf transforms record their own timings.
+        self._perf_exclude = True
 
     def get_parameters(self, **data_dict) -> dict:
         return {"apply_transform": torch.rand(1).item() < self.apply_probability}

@@ -7,6 +7,8 @@ class ComposeTransforms(BasicTransform):
     def __init__(self, transforms: List[BasicTransform]):
         super().__init__()
         self.transforms = transforms
+        # Skip timing for the wrapper; leaf transforms record their own timings.
+        self._perf_exclude = True
 
     def apply(self, data_dict, **params):
         for t in self.transforms:

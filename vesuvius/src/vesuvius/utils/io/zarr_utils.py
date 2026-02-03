@@ -1,6 +1,9 @@
 from pathlib import Path
 import zarr
 import json
+import os
+import fsspec
+import time
 
 def _is_ome_zarr(zarr_path):
     """
@@ -70,3 +73,55 @@ def _get_zarr_path(zarr_dir, resolution_level=None):
     else:
         # Regular zarr file
         return str(zarr_dir)
+
+def zarr_array_exists(zarr_path):
+    """
+    Check if a zarr array exists at the given path.
+    Works for both local paths and S3 paths.
+
+    Args:
+        zarr_path: Path to the zarr array directory
+
+    Returns:
+        bool: True if the zarr array exists, False otherwise
+    """
+    try:
+        if zarr_path.startswith('s3://'):
+            fs = fsspec.filesystem('s3', anon=False)
+            # Check if .zarray file exists within the zarr directory
+            return fs.exists(os.path.join(zarr_path, '.zarray'))
+        else:
+            # For local paths, check if the .zarray file exists
+            return os.path.exists(os.path.join(zarr_path, '.zarray'))
+    except Exception:
+        return False
+
+
+def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbose=True, part_id=None):
+    """
+    Wait for a zarr array to be created by another process.
+
+    Args:
+        zarr_path: Path to the zarr array to wait for
+        max_wait_time: Maximum time to wait in seconds (default: 300 = 5 minutes)
+        sleep_interval: Time to sleep between checks in seconds (default: 5)
+        verbose: Whether to print progress messages
+        part_id: Optional part ID for logging purposes
+
+    Raises:
+        RuntimeError: If timeout is reached without array being created
+    """
+    wait_time = 0
+    part_str = f"Part {part_id} " if part_id is not None else ""
+
+    while not zarr_array_exists(zarr_path):
+        if wait_time >= max_wait_time:
+            raise RuntimeError(f"Timeout waiting for zarr array to be created. Waited {max_wait_time} seconds.")
+
+        if verbose:
+            print(f"  {part_str}waiting for array to be created... ({wait_time}s elapsed)")
+        time.sleep(sleep_interval)
+        wait_time += sleep_interval
+
+    if verbose:
+        print(f"Array found! {part_str}can now proceed.")

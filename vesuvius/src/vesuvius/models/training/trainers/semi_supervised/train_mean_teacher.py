@@ -116,7 +116,7 @@ class TrainMeanTeacher(BaseTrainer):
         if not used_fast_path:
             raise ValueError(
                 "Dataset does not support fast labeled/unlabeled split. "
-                "Use DatasetOrchestrator with data_format='image' (adapter='image') or implement "
+                "Use ZarrDataset or implement "
                 "get_labeled_unlabeled_patch_indices() on your dataset."
             )
 

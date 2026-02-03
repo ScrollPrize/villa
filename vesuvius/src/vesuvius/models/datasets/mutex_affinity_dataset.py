@@ -1,34 +1,132 @@
+"""
+MutexAffinityDataset - Dataset for mutex watershed affinity graphs.
+
+This dataset pairs raw volumes with Mutex Watershed affinity graphs,
+supporting both attractive and repulsive affinity targets.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
+import logging
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import zarr
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from torch.utils.data import Dataset
 
-from .base_dataset import BaseDataset
-from .adapters.base_io import TiffArrayHandle, ZarrArrayHandle
+from vesuvius.utils.utils import pad_or_crop_3d
+from .find_valid_patches import find_valid_patches
+from .intensity_properties import initialize_intensity_properties
+from ..training.normalization import get_normalization
+from ..augmentation.pipelines import create_training_transforms
+from ..augmentation.transforms.utils.perf import collect_augmentation_names
 
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Simple ArrayHandle classes (inlined from deleted adapters)
+# -----------------------------------------------------------------------------
+
+class ZarrArrayHandle:
+    """Handle for zarr arrays with windowed read support."""
+
+    def __init__(self, array, *, path: Optional[Path] = None, spatial_shape: Optional[Tuple[int, ...]] = None):
+        self._array = array
+        self._path = path
+        self._spatial_shape = spatial_shape or self._infer_spatial_shape(array)
+
+    @staticmethod
+    def _infer_spatial_shape(array) -> Tuple[int, ...]:
+        shape = tuple(int(v) for v in getattr(array, "shape", ()))
+        if len(shape) >= 3:
+            return tuple(shape[-3:])
+        if len(shape) == 2:
+            return shape
+        return shape
+
+    @property
+    def spatial_shape(self) -> Tuple[int, ...]:
+        return self._spatial_shape
+
+    def read(self) -> np.ndarray:
+        return np.asarray(self._array[:])
+
+    def read_window(self, start: Tuple[int, ...], size: Tuple[int, ...]) -> np.ndarray:
+        slices = tuple(slice(s, s + sz) for s, sz in zip(start, size))
+        return np.asarray(self._array[slices])
+
+    def raw(self):
+        return self._array
+
+
+class TiffArrayHandle:
+    """Handle for TIFF files with windowed read support."""
+
+    def __init__(self, path: Path, *, spatial_shape: Tuple[int, ...], dtype: np.dtype):
+        self._path = path
+        self._spatial_shape = spatial_shape
+        self._dtype = dtype
+        self._zarr_store = None
+
+    @property
+    def spatial_shape(self) -> Tuple[int, ...]:
+        return self._spatial_shape
+
+    def _ensure_zarr(self):
+        if self._zarr_store is None:
+            import tifffile
+            self._zarr_store = tifffile.imread(str(self._path), aszarr=True)
+        return self._zarr_store
+
+    def read(self) -> np.ndarray:
+        import tifffile
+        return tifffile.imread(str(self._path))
+
+    def read_window(self, start: Tuple[int, ...], size: Tuple[int, ...]) -> np.ndarray:
+        store = self._ensure_zarr()
+        arr = zarr.open(store, mode='r')
+        slices = tuple(slice(s, s + sz) for s, sz in zip(start, size))
+        return np.asarray(arr[slices])
+
+
+# -----------------------------------------------------------------------------
+# Patch and Volume dataclasses
+# -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class TargetSpec:
     """Configuration describing how to load a single affinity target."""
-
     affinity_key: str
     mask_key: Optional[str]
     invert_for_loss: bool = False
 
 
-class MutexAffinityDataset(BaseDataset):
+@dataclass
+class PatchInfo:
+    """Describes a single extractable patch."""
+    volume_index: int
+    volume_name: str
+    position: Tuple[int, ...]
+    patch_size: Tuple[int, ...]
+
+
+# -----------------------------------------------------------------------------
+# MutexAffinityDataset
+# -----------------------------------------------------------------------------
+
+class MutexAffinityDataset(Dataset):
     """
     Dataset that pairs raw volumes with Mutex Watershed affinity graphs.
 
-    The dataset expects two sibling directories under ``dataset_config.data_path``:
+    The dataset expects directories under ``dataset_config.data_path``:
 
     - ``image_dirname`` (default ``images``) holding volumetric intensities
       either as ``.zarr`` stores or 3D ``.tif/.tiff`` stacks.
@@ -47,13 +145,6 @@ class MutexAffinityDataset(BaseDataset):
             affinity_key: "affinities/repulsive"
             mask_key: "mask/repulsive"
             invert: false
-
-    Only targets that appear both in ``mgr.targets`` and in
-    ``affinity_targets`` are loaded.
-
-    For each sample, the dataset returns tensors named after the targets plus
-    an additional ``f\"{target}_mask\"`` entry containing the corresponding
-    validity mask (values in {0, 1}).
     """
 
     DEFAULT_TARGETS: Mapping[str, TargetSpec] = {
@@ -70,79 +161,78 @@ class MutexAffinityDataset(BaseDataset):
     }
 
     def __init__(self, mgr, is_training: bool = True) -> None:
+        super().__init__()
+        self.mgr = mgr
+        self.is_training = is_training
+        self.targets = getattr(mgr, 'targets', {})
+        self._profile_augmentations = bool(getattr(mgr, 'profile_augmentations', False))
+        self._augmentation_names: List[str] = []
+
+        # Configuration
+        self.patch_size = tuple(mgr.train_patch_size)
+        self.is_2d = len(self.patch_size) == 2
+
+        # Validation parameters
+        self.min_labeled_ratio = getattr(mgr, 'min_labeled_ratio', 0.10)
+        self.min_bbox_percent = getattr(mgr, 'min_bbox_percent', 0.95)
+        self.skip_patch_validation = getattr(mgr, 'skip_patch_validation', False)
+
+        # Storage
         self._affinity_specs: Dict[str, TargetSpec] = {}
         self._mask_handles: Dict[str, List[Optional[ZarrArrayHandle]]] = {}
         self._volume_ids: List[str] = []
-        self._preserve_label_dtype = True
-        super().__init__(mgr, is_training=is_training)
+        self._image_handles: List = []
+        self._affinity_handles: Dict[str, List] = {}
+        self._patches: List[PatchInfo] = []
 
-    # ------------------------------------------------------------------
-    # BaseDataset hooks
-    # ------------------------------------------------------------------
+        # Normalization
+        self.normalization_scheme = getattr(mgr, 'normalization_scheme', 'zscore')
+        self.intensity_properties = getattr(mgr, 'intensity_properties', None) or {}
+        self.normalizer = None
+
+        # Transforms
+        self.transforms = None
+
+        # target_volumes for compatibility
+        self.target_volumes: Dict[str, List[Dict]] = {}
+
+        # Initialize
+        self._initialize_volumes()
+        self._initialize_normalization()
+        self._build_patch_index()
+        self._initialize_transforms()
+
+        logger.info(
+            "MutexAffinityDataset initialized: %d volumes, %d patches",
+            len(self._volume_ids), len(self._patches)
+        )
+
     def _initialize_volumes(self) -> None:
+        """Discover and load image volumes and affinity graphs."""
         dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
         data_path = Path(dataset_cfg.get("data_path", getattr(self.mgr, "data_path", "."))).resolve()
+
         image_dirname = dataset_cfg.get("image_dirname", "images")
-        label_dirname = dataset_cfg.get("label_dirname", "labels")
         affinity_dirname = dataset_cfg.get("affinity_dirname", "affinity_graph")
-        image_extensions = tuple(
-            ext if ext.startswith(".") else f".{ext}"
-            for ext in dataset_cfg.get(
-                "image_extensions",
-                [".zarr", ".tif", ".tiff"],
-            )
-        )
-        label_extensions = tuple(
-            ext if ext.startswith(".") else f".{ext}"
-            for ext in dataset_cfg.get(
-                "label_extensions",
-                dataset_cfg.get("image_extensions", [".zarr", ".tif", ".tiff"]),
-            )
-        )
-        allow_unlabeled = bool(getattr(self.mgr, "allow_unlabeled_data", False))
 
         image_root = data_path / image_dirname
-        label_root = data_path / label_dirname
         affinity_root = data_path / affinity_dirname
 
         if not image_root.exists():
             raise FileNotFoundError(f"Images directory not found: {image_root}")
         if not affinity_root.exists():
             raise FileNotFoundError(f"Affinity directory not found: {affinity_root}")
-        if not label_root.exists() and not allow_unlabeled:
-            raise FileNotFoundError(f"Labels directory not found: {label_root}")
 
         # Discover raw image volumes
         image_map: Dict[str, Path] = {}
         for path in image_root.iterdir():
             if path.suffix == ".zarr" and path.is_dir():
                 image_map[path.stem] = path
-            elif path.is_file() and path.suffix.lower() in image_extensions:
+            elif path.is_file() and path.suffix.lower() in {".tif", ".tiff"}:
                 image_map[path.stem] = path
 
         if not image_map:
             raise ValueError(f"No image volumes discovered in {image_root}")
-
-        # Build lookup for standard label targets (e.g., surfaces)
-        label_lookup: Dict[Tuple[str, str], Path] = {}
-        if label_root.exists():
-            for path in label_root.iterdir():
-                if path.is_dir():
-                    continue
-                suffix = path.suffix.lower()
-                if suffix not in label_extensions:
-                    continue
-                stem = path.stem
-                parts = stem.rsplit("_", 1)
-                if len(parts) != 2:
-                    continue
-                volume_id, target_name = parts
-                key = (volume_id, target_name)
-                if key in label_lookup:
-                    raise ValueError(f"Duplicate label detected for volume '{volume_id}' target '{target_name}'")
-                label_lookup[key] = path
-
-        primary_targets = list(self.targets.keys())
 
         # Resolve affinity targets configuration
         configured_targets = dataset_cfg.get("affinity_targets") or {}
@@ -165,35 +255,12 @@ class MutexAffinityDataset(BaseDataset):
                 "both dataset_config.affinity_targets and mgr.targets"
             )
 
-        # Persist normalized settings so the trainer can reuse them
         self._affinity_specs = active_targets
-        dataset_cfg.setdefault("affinity_targets", {})
-        stored_targets = dataset_cfg["affinity_targets"]
-        for name, spec in active_targets.items():
-            existing_cfg = configured_targets.get(name, {})
-            stored_targets[name] = {
-                "affinity_key": spec.affinity_key,
-                "mask_key": spec.mask_key,
-                "invert": bool(spec.invert_for_loss),
-                "visualization": existing_cfg.get("visualization", "affinity"),
-            }
-            # also ensure mgr.targets has visualization defaults
-            target_cfg = self.mgr.targets.get(name, {})
-            if "activation" not in target_cfg:
-                target_cfg["activation"] = "sigmoid"
-            target_cfg.setdefault("visualization", "affinity")
-            self.mgr.targets[name] = target_cfg
-
-        non_affinity_targets = [t for t in primary_targets if t not in active_targets]
-
-        # Prepare containers expected by BaseDataset
-        self.target_volumes = {target: [] for target in primary_targets}
-        self.zarr_arrays = []
-        self.zarr_names = []
-        self.data_paths = []
         self._mask_handles = {target: [] for target in active_targets}
-        self._volume_ids = []
+        self._affinity_handles = {target: [] for target in active_targets}
+        self.target_volumes = {target: [] for target in active_targets}
 
+        # Handle uint8 conversions
         affinity_paths = sorted(
             path
             for path in affinity_root.iterdir()
@@ -214,6 +281,7 @@ class MutexAffinityDataset(BaseDataset):
         for affinity_path in affinity_paths:
             volume_id = affinity_path.stem
 
+            # Find matching image
             candidate_names = [volume_id]
             for suffix in suffixes:
                 if suffix and volume_id.endswith(suffix):
@@ -232,27 +300,24 @@ class MutexAffinityDataset(BaseDataset):
 
             image_handle = self._open_image_handle(image_path)
             graph_root = zarr.open_group(str(affinity_path), mode="r")
-            image_stem = image_path.stem
 
             self._volume_ids.append(volume_id)
+            self._image_handles.append(image_handle)
 
             for target_name, spec in active_targets.items():
                 affinity_array = self._extract_required_array(
-                    graph_root,
-                    spec.affinity_key,
-                    store_path=affinity_path,
+                    graph_root, spec.affinity_key, store_path=affinity_path
                 )
                 affinity_handle = ZarrArrayHandle(
                     affinity_array,
                     path=affinity_path,
                     spatial_shape=self._infer_spatial_shape(affinity_array),
                 )
+
                 mask_handle = None
                 if spec.mask_key is not None:
                     mask_array = self._extract_required_array(
-                        graph_root,
-                        spec.mask_key,
-                        store_path=affinity_path,
+                        graph_root, spec.mask_key, store_path=affinity_path
                     )
                     mask_handle = ZarrArrayHandle(
                         mask_array,
@@ -260,99 +325,218 @@ class MutexAffinityDataset(BaseDataset):
                         spatial_shape=self._infer_spatial_shape(mask_array),
                     )
 
+                self._affinity_handles[target_name].append(affinity_handle)
+                self._mask_handles[target_name].append(mask_handle)
+
+                # Build target_volumes for compatibility
                 entry = {
                     "volume_id": volume_id,
-                    "image": image_handle,
-                    "label": affinity_handle,
-                    "label_path": str(affinity_path),
-                    "label_source": affinity_array,
-                    "has_label": True,
+                    "data": {
+                        "data": image_handle._array if hasattr(image_handle, '_array') else None,
+                        "label": affinity_array,
+                    }
                 }
-
                 self.target_volumes[target_name].append(entry)
-                self._mask_handles[target_name].append(mask_handle)
-                self.zarr_arrays.append(affinity_array)
-                self.zarr_names.append(f"{volume_id}_{target_name}")
-                self.data_paths.append(str(affinity_path))
 
-            for target_name in non_affinity_targets:
-                label_path = label_lookup.get((image_stem, target_name))
-                if label_path is None:
-                    # Fallback: allow matching volume_id variants (e.g., *_surface suffix)
-                    for candidate in candidate_names:
-                        label_path = label_lookup.get((candidate, target_name))
-                        if label_path is not None:
-                            break
+    def _initialize_normalization(self) -> None:
+        """Initialize intensity properties and normalizer."""
+        skip_sampling = getattr(self.mgr, 'skip_intensity_sampling', True)
 
-                if label_path is None:
-                    if allow_unlabeled:
-                        entry = {
-                            "volume_id": volume_id,
-                            "image": image_handle,
-                            "label": None,
-                            "label_path": None,
-                            "label_source": None,
-                            "has_label": False,
-                        }
-                        self.target_volumes[target_name].append(entry)
-                        continue
-                    raise FileNotFoundError(
-                        f"Label for target '{target_name}' not found for volume '{image_stem}'"
+        if not skip_sampling and not self.intensity_properties and self.normalization_scheme in ['zscore', 'ct']:
+            if self.target_volumes:
+                self.intensity_properties = initialize_intensity_properties(
+                    target_volumes=self.target_volumes,
+                    normalization_scheme=self.normalization_scheme,
+                    existing_properties=None,
+                    cache_enabled=True,
+                    cache_dir=Path(self.mgr.data_path) / '.patches_cache',
+                    mgr=self.mgr,
+                )
+
+        self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
+
+    def _build_patch_index(self) -> None:
+        """Build the index of valid patches."""
+        if not self._image_handles:
+            return
+
+        stride = tuple(self.patch_size)
+        first_target = list(self._affinity_specs.keys())[0]
+
+        for vol_idx, (volume_id, image_handle) in enumerate(zip(self._volume_ids, self._image_handles)):
+            spatial_shape = image_handle.spatial_shape
+
+            if self.skip_patch_validation:
+                # Enumerate all positions
+                if self.is_2d:
+                    ph, pw = self.patch_size
+                    sh, sw = stride
+                    y_positions = list(range(0, max(1, spatial_shape[0] - ph + 1), sh))
+                    x_positions = list(range(0, max(1, spatial_shape[1] - pw + 1), sw))
+                    for y in y_positions:
+                        for x in x_positions:
+                            self._patches.append(PatchInfo(
+                                volume_index=vol_idx,
+                                volume_name=volume_id,
+                                position=(y, x),
+                                patch_size=self.patch_size,
+                            ))
+                else:
+                    pd, ph, pw = self.patch_size
+                    sd, sh, sw = stride
+                    z_positions = list(range(0, max(1, spatial_shape[0] - pd + 1), sd))
+                    y_positions = list(range(0, max(1, spatial_shape[1] - ph + 1), sh))
+                    x_positions = list(range(0, max(1, spatial_shape[2] - pw + 1), sw))
+                    for z in z_positions:
+                        for y in y_positions:
+                            for x in x_positions:
+                                self._patches.append(PatchInfo(
+                                    volume_index=vol_idx,
+                                    volume_name=volume_id,
+                                    position=(z, y, x),
+                                    patch_size=self.patch_size,
+                                ))
+            else:
+                # Use find_valid_patches
+                label_handle = self._affinity_handles[first_target][vol_idx]
+                label_array = label_handle.raw() if label_handle else None
+
+                if label_array is not None:
+                    result = find_valid_patches(
+                        label_arrays=[label_array],
+                        label_names=[volume_id],
+                        patch_size=self.patch_size,
+                        bbox_threshold=self.min_bbox_percent,
+                        label_threshold=self.min_labeled_ratio,
+                        valid_patch_find_resolution=getattr(self.mgr, 'valid_patch_find_resolution', 1),
                     )
 
-                label_handle = self._open_image_handle(label_path)
-                label_source = None
-                if hasattr(label_handle, "raw"):
-                    try:
-                        label_source = label_handle.raw()
-                    except Exception:
-                        label_source = None
+                    for entry in result['fg_patches']:
+                        pos = tuple(entry['start_pos'])
+                        self._patches.append(PatchInfo(
+                            volume_index=vol_idx,
+                            volume_name=volume_id,
+                            position=pos,
+                            patch_size=self.patch_size,
+                        ))
 
-                entry = {
-                    "volume_id": volume_id,
-                    "image": image_handle,
-                    "label": label_handle,
-                    "label_path": str(label_path),
-                    "label_source": label_source,
-                    "has_label": True,
-                }
-                self.target_volumes[target_name].append(entry)
-                if label_source is not None:
-                    self.zarr_arrays.append(label_source)
-                    self.zarr_names.append(f"{volume_id}_{target_name}")
-                    self.data_paths.append(str(label_path))
+    def _get_skeleton_targets(self) -> tuple[List[str], Dict[str, int]]:
+        """Detect targets that need skeleton computation based on loss config.
 
-        self.mgr.dataset_config = dataset_cfg
+        Returns
+        -------
+        tuple[List[str], Dict[str, int]]
+            A tuple of (skeleton_targets, skeleton_ignore_values) where:
+            - skeleton_targets: List of target names needing skeleton computation
+            - skeleton_ignore_values: Dict mapping target_name -> ignore_label value
+        """
+        SKELETON_LOSSES = {'MedialSurfaceRecall', 'SoftSkeletonRecallLoss', 'DC_SkelREC_and_CE_loss'}
+        skeleton_targets = []
+        skeleton_ignore_values = {}
 
-    # ------------------------------------------------------------------
-    # Overrides
-    # ------------------------------------------------------------------
-    def _extract_chunk_patch(self, chunk_patch):
-        data_dict = super()._extract_chunk_patch(chunk_patch)
+        for target_name, target_info in self.targets.items():
+            if 'losses' in target_info:
+                for loss_cfg in target_info['losses']:
+                    if loss_cfg.get('name') in SKELETON_LOSSES:
+                        skeleton_targets.append(target_name)
+                        # Extract ignore_label if configured
+                        ignore_label = target_info.get('ignore_label')
+                        if ignore_label is None:
+                            ignore_label = target_info.get('ignore_index')
+                        if ignore_label is None:
+                            ignore_label = target_info.get('ignore_value')
+                        if ignore_label is not None:
+                            skeleton_ignore_values[target_name] = ignore_label
+                        break
 
-        if not self._mask_handles:
-            return data_dict
+        return skeleton_targets, skeleton_ignore_values
 
-        start = tuple(int(v) for v in chunk_patch.position)
-        size = tuple(int(v) for v in chunk_patch.patch_size)
+    def _initialize_transforms(self) -> None:
+        """Initialize augmentation transforms."""
+        skeleton_targets, skeleton_ignore_values = self._get_skeleton_targets()
 
-        for target_name, handles in self._mask_handles.items():
-            handle = handles[chunk_patch.volume_index]
-            if handle is None:
-                continue
-            mask_patch = handle.read_window(start, size)
-            mask_array = np.asarray(mask_patch)
-            if mask_array.size == 0:
-                continue
-            mask_bool = np.asarray(mask_array != 0)
-            mask_tensor = torch.from_numpy(np.ascontiguousarray(mask_bool))
-            data_dict[f"{target_name}_mask"] = mask_tensor
+        if self.is_training:
+            no_spatial = getattr(self.mgr, 'no_spatial_augmentation', False)
+            no_scaling = getattr(self.mgr, 'no_scaling_augmentation', False)
+
+            self.transforms = create_training_transforms(
+                patch_size=self.patch_size,
+                no_spatial=no_spatial,
+                no_scaling=no_scaling,
+                skeleton_targets=skeleton_targets if skeleton_targets else None,
+                skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
+            )
+            if self._profile_augmentations:
+                self._augmentation_names = collect_augmentation_names(self.transforms)
+        elif skeleton_targets:
+            # Validation: only apply skeleton generation (no augmentation)
+            from vesuvius.models.augmentation.pipelines.training_transforms import create_validation_transforms
+            self.transforms = create_validation_transforms(
+                skeleton_targets=skeleton_targets,
+                skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
+            )
+            if self._profile_augmentations:
+                self._augmentation_names = collect_augmentation_names(self.transforms)
+
+    def _extract_patch(self, patch: PatchInfo) -> Dict[str, Any]:
+        """Extract image and affinity patches."""
+        vol_idx = patch.volume_index
+        start = patch.position
+        size = patch.patch_size
+
+        image_handle = self._image_handles[vol_idx]
+
+        # Extract image
+        image_data = image_handle.read_window(start, size)
+        if self.normalizer is not None:
+            image_data = self.normalizer.run(image_data)
+        if self.is_2d:
+            from vesuvius.utils.utils import pad_or_crop_2d
+            image_data = pad_or_crop_2d(image_data.astype(np.float32), size)
+        else:
+            image_data = pad_or_crop_3d(image_data.astype(np.float32), size)
+        image_tensor = torch.from_numpy(image_data[np.newaxis, ...])
+
+        result = {'image': image_tensor, 'is_unlabeled': False}
+
+        # Extract affinity targets and masks
+        for target_name, handles in self._affinity_handles.items():
+            handle = handles[vol_idx]
+            affinity_data = handle.read_window(start, size)
+            if self.is_2d:
+                from vesuvius.utils.utils import pad_or_crop_2d
+                affinity_data = pad_or_crop_2d(affinity_data.astype(np.float32), size)
+            else:
+                affinity_data = pad_or_crop_3d(affinity_data.astype(np.float32), size)
+            result[target_name] = torch.from_numpy(affinity_data[np.newaxis, ...])
+
+            # Extract mask if available
+            mask_handle = self._mask_handles[target_name][vol_idx]
+            if mask_handle is not None:
+                mask_data = mask_handle.read_window(start, size)
+                mask_bool = np.asarray(mask_data != 0)
+                result[f"{target_name}_mask"] = torch.from_numpy(np.ascontiguousarray(mask_bool))
+
+        return result
+
+    def __len__(self) -> int:
+        return len(self._patches)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        patch = self._patches[index]
+        data_dict = self._extract_patch(patch)
+
+        if self.transforms is not None:
+            if self._profile_augmentations and self._augmentation_names:
+                data_dict['_aug_perf'] = {name: 0.0 for name in self._augmentation_names}
+            data_dict = self.transforms(**data_dict)
 
         return data_dict
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Helper utilities
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+
     @staticmethod
     def _normalize_target_specs(raw: Mapping[str, Mapping[str, object]]) -> Dict[str, TargetSpec]:
         specs: Dict[str, TargetSpec] = {}
@@ -379,6 +563,35 @@ class MutexAffinityDataset(BaseDataset):
         if not hasattr(array, "shape"):
             raise TypeError(f"Expected zarr array for key '{key}' in {store_path}")
         return array
+
+    @staticmethod
+    def _infer_spatial_shape(array) -> Tuple[int, ...]:
+        shape = tuple(int(v) for v in getattr(array, "shape", ()))
+        if not shape:
+            raise ValueError("Unable to infer spatial shape from empty array")
+        if len(shape) >= 3:
+            return tuple(shape[-3:])
+        if len(shape) == 2:
+            return shape
+        raise ValueError(f"Unsupported array shape {shape} for affinity volume")
+
+    def _open_image_handle(self, path: Path):
+        if path.suffix == ".zarr" and path.is_dir():
+            array = zarr.open(str(path), mode="r")
+            spatial_shape = self._infer_spatial_shape(array)
+            return ZarrArrayHandle(array, path=path, spatial_shape=spatial_shape)
+
+        suffix = path.suffix.lower()
+        if suffix not in {".tif", ".tiff"}:
+            raise ValueError(f"Unsupported image format for {path}")
+
+        import tifffile
+        with tifffile.TiffFile(str(path)) as tif:
+            series = tif.series[0]
+            spatial_shape = tuple(int(v) for v in series.shape)
+            dtype = np.dtype(series.dtype)
+
+        return TiffArrayHandle(path, spatial_shape=spatial_shape, dtype=dtype)
 
     def _plan_uint8_conversions(
         self,
@@ -418,29 +631,17 @@ class MutexAffinityDataset(BaseDataset):
             return
 
         items = list(plan.items())
-        print(
-            f"[MutexDataset] Converting {len(items)} affinity store(s) to uint8...",
-            flush=True,
-        )
+        print(f"[MutexDataset] Converting {len(items)} affinity store(s) to uint8...", flush=True)
 
         if len(items) == 1:
             path, keys = items[0]
-            print(
-                f"[MutexDataset]   -> {path.name}: {len(keys)} dataset(s)",
-                flush=True,
-            )
+            print(f"[MutexDataset]   -> {path.name}: {len(keys)} dataset(s)", flush=True)
             try:
                 _, converted, skipped = _convert_store_to_uint8((str(path), keys))
                 if converted:
-                    print(
-                        f"[MutexDataset]   -> {path.name}: converted {len(converted)} dataset(s)",
-                        flush=True,
-                    )
+                    print(f"[MutexDataset]   -> {path.name}: converted {len(converted)} dataset(s)", flush=True)
                 if skipped:
-                    print(
-                        f"[MutexDataset]   -> {path.name}: skipped {len(skipped)} dataset(s)",
-                        flush=True,
-                    )
+                    print(f"[MutexDataset]   -> {path.name}: skipped {len(skipped)} dataset(s)", flush=True)
             except Exception as exc:
                 print(f"[MutexDataset]   -> {path.name}: conversion failed ({exc})", flush=True)
             return
@@ -449,10 +650,7 @@ class MutexAffinityDataset(BaseDataset):
         futures = {}
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             for path, keys in items:
-                print(
-                    f"[MutexDataset]   -> {path.name}: {len(keys)} dataset(s)",
-                    flush=True,
-                )
+                print(f"[MutexDataset]   -> {path.name}: {len(keys)} dataset(s)", flush=True)
                 future = pool.submit(_convert_store_to_uint8, (str(path), keys))
                 futures[future] = path
 
@@ -461,52 +659,16 @@ class MutexAffinityDataset(BaseDataset):
                 try:
                     _, converted, skipped = future.result()
                     if converted:
-                        print(
-                            f"[MutexDataset]   -> {path.name}: converted {len(converted)} dataset(s)",
-                            flush=True,
-                        )
+                        print(f"[MutexDataset]   -> {path.name}: converted {len(converted)} dataset(s)", flush=True)
                     if skipped:
-                        print(
-                            f"[MutexDataset]   -> {path.name}: skipped {len(skipped)} dataset(s)",
-                            flush=True,
-                        )
+                        print(f"[MutexDataset]   -> {path.name}: skipped {len(skipped)} dataset(s)", flush=True)
                 except Exception as exc:
                     print(f"[MutexDataset]   -> {path.name}: conversion failed ({exc})", flush=True)
 
-    @staticmethod
-    def _infer_spatial_shape(array) -> Tuple[int, ...]:
-        shape = tuple(int(v) for v in getattr(array, "shape", ()))
-        if not shape:
-            raise ValueError("Unable to infer spatial shape from empty array")
-        if len(shape) >= 3:
-            return tuple(shape[-3:])
-        if len(shape) == 2:
-            return shape
-        raise ValueError(f"Unsupported array shape {shape} for affinity volume")
-
-    @staticmethod
-    def _open_image_handle(path: Path):
-        if path.suffix == ".zarr" and path.is_dir():
-            array = zarr.open(str(path), mode="r")
-            spatial_shape = MutexAffinityDataset._infer_spatial_shape(array)
-            return ZarrArrayHandle(array, path=path, spatial_shape=spatial_shape)
-
-        suffix = path.suffix.lower()
-        if suffix not in {".tif", ".tiff"}:
-            raise ValueError(f"Unsupported image format for {path}")
-
-        import tifffile
-
-        with tifffile.TiffFile(str(path)) as tif:
-            series = tif.series[0]
-            spatial_shape = tuple(int(v) for v in series.shape)
-            dtype = np.dtype(series.dtype)
-
-        return TiffArrayHandle(path, spatial_shape=spatial_shape, dtype=dtype)
-
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Public accessors
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+
     @property
     def affinity_specs(self) -> Mapping[str, TargetSpec]:
         return self._affinity_specs
@@ -515,6 +677,18 @@ class MutexAffinityDataset(BaseDataset):
     def volume_ids(self) -> Sequence[str]:
         return tuple(self._volume_ids)
 
+    @property
+    def valid_patches(self) -> List[PatchInfo]:
+        return self._patches
+
+    def get_labeled_unlabeled_patch_indices(self) -> Tuple[List[int], List[int]]:
+        """All patches are labeled in MutexAffinityDataset."""
+        return list(range(len(self._patches))), []
+
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
 
 def _iter_chunk_slices(shape: Sequence[int], chunks: Sequence[int]) -> Iterable[Tuple[slice, ...]]:
     actual = []

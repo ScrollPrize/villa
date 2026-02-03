@@ -1,0 +1,110 @@
+{
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v16",
+    "load_ckpt":"/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v15/ckpt_012000.pth",
+    "seed": 10,
+    "batch_size": 6,
+    "num_workers": 12,
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "neural-tracing",
+    "load_weights_only": true,
+
+    "datasets": [
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0139.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0139"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_rewindowed.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0172"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0332.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0332"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1451.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1451"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1667.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1667"
+        },
+        {
+            "volume_path": "/mnt/raid_nvme/volpkgs/PHercParis4.volpkg/volumes/Scroll1_8um_uint8.zarr",
+            "volume_scale": 1,
+            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHercParis4"
+        }
+    ],
+
+    "verbose": false,
+
+    "crop_size": 128,
+    "chunk_pad": 20.0,
+    "force_recompute_patches": false,
+    "val_fraction": 0.05,
+    "use_extrapolation": true,
+    "extrapolation_method": "linear_edge",
+    "cond_percent": 0.50,
+    "extrap_degrade_prob": 0.0,
+    "use_segmentation": false,
+    "lambda_segmentation":0.01,
+    "mask_cond_from_seg_loss": true,
+
+    "use_other_wrap_cond": true,
+    "other_wrap_prob": 0.5,
+
+    "use_heatmap_targets": false,
+    "heatmap_step_size": 10,
+    "heatmap_step_count": 5,
+    "heatmap_sigma": 2.0,
+
+    "lambda_smooth": 0.0,
+    "displacement_loss_type": "vector_l2",
+    "displacement_huber_beta": 5.0,
+    "lambda_cond_disp": 0.0,
+
+    "use_dilation": false,
+    "dilation_radius": 1,
+
+    "use_sdt": false,
+    "lambda_sdt": 1.0,
+    "sdt_surface_sigma": 3.0,
+    "sdt_eikonal": true,
+    "sdt_eikonal_weight": 0.01,
+    "sdt_laplacian": true,
+    "sdt_laplacian_weight": 0.01,
+
+    "num_iterations": 250000,
+    "log_frequency": 350,
+    "ckpt_frequency": 1000,
+
+    "learning_rate": 0.001,
+    "weight_decay": 1e-4,
+    "warmup_steps": 1000,
+    "grad_clip": 7,
+
+    "mixed_precision": "bf16",
+    "compile_model": true,
+
+    "in_channels": 4,
+    "model_type": "unet",
+
+    "model_config": {
+        "autoconfigure": true,
+        "squeeze_excitation": true,
+        "squeeze_excitation_type": "scse",
+        "basic_decoder_block": "BasicBlockD"
+    },
+
+    "augmentation": {
+        "enabled": true,
+        "allow_transposes": true,
+        "allow_mirroring": true,
+        "intensity": true
+    }
+}

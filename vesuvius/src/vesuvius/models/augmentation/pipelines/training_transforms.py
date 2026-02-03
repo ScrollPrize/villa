@@ -150,23 +150,23 @@ def create_training_transforms(
         # SpatialTransform for scaling (rotation handled by Rot90 + Transpose)
         # Scaling can be disabled for semi-supervised trainers (mean teacher) since
         # scaling requires padding which causes issues with consistency loss.
-        scaling_prob = 0 if no_scaling else 0.2
-        transforms.append(
-            SpatialTransform(
-                patch_size,
-                patch_center_dist_from_border=0,
-                random_crop=False,
-                p_elastic_deform=0,
-                p_rotation=0,
-                rotation=rotation_for_DA,
-                p_scaling=scaling_prob,
-                scaling=(0.7, 1.4),
-                p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False,
-                elastic_deform_magnitude=(5, 25),
-                allowed_rotation_axes=allowed_rotation_axes
-            )
-        )
+        # scaling_prob = 0 if no_scaling else 0.2
+        # transforms.append(
+        #     SpatialTransform(
+        #         patch_size,
+        #         patch_center_dist_from_border=0,
+        #         random_crop=False,
+        #         p_elastic_deform=0,
+        #         p_rotation=0,
+        #         rotation=rotation_for_DA,
+        #         p_scaling=scaling_prob,
+        #         scaling=(0.7, 1.4),
+        #         p_synchronize_scaling_across_axes=1,
+        #         bg_style_seg_sampling=False,
+        #         elastic_deform_magnitude=(5, 25),
+        #         allowed_rotation_axes=allowed_rotation_axes
+        #     )
+        # )
 
         # Rot90 for 3D (only if there are valid rotation axes), Mirror for 2D
         if dimension == 3 and rot90_allowed_axes:
@@ -181,42 +181,42 @@ def create_training_transforms(
         elif dimension == 2:
             transforms.append(MirrorTransform(allowed_axes=mirror_axes))
 
-        # Single-axis low resolution simulation (3D only)
-        if dimension == 3:
-            transforms.append(
-                OneOfTransform([
-                    RandomTransform(
-                        SimulateLowResolutionTransform(
-                            scale=(0.1, 0.9),
-                            synchronize_channels=True,
-                            synchronize_axes=False,
-                            ignore_axes=[0, 1],  # Only affect axis 2
-                            allowed_channels=None,
-                        ),
-                        apply_probability=0.3,
-                    ),
-                    RandomTransform(
-                        SimulateLowResolutionTransform(
-                            scale=(0.1, 0.9),
-                            synchronize_channels=True,
-                            synchronize_axes=False,
-                            ignore_axes=[0, 2],  # Only affect axis 1
-                            allowed_channels=None,
-                        ),
-                        apply_probability=0.3,
-                    ),
-                    RandomTransform(
-                        SimulateLowResolutionTransform(
-                            scale=(0.1, 0.9),
-                            synchronize_channels=True,
-                            synchronize_axes=False,
-                            ignore_axes=[1, 2],  # Only affect axis 0
-                            allowed_channels=None,
-                        ),
-                        apply_probability=0.3,
-                    ),
-                ])
-            )
+        # # Single-axis low resolution simulation (3D only)
+        # if dimension == 3:
+        #     transforms.append(
+        #         OneOfTransform([
+        #             RandomTransform(
+        #                 SimulateLowResolutionTransform(
+        #                     scale=(0.1, 0.9),
+        #                     synchronize_channels=True,
+        #                     synchronize_axes=False,
+        #                     ignore_axes=[0, 1],  # Only affect axis 2
+        #                     allowed_channels=None,
+        #                 ),
+        #                 apply_probability=0.3,
+        #             ),
+        #             RandomTransform(
+        #                 SimulateLowResolutionTransform(
+        #                     scale=(0.1, 0.9),
+        #                     synchronize_channels=True,
+        #                     synchronize_axes=False,
+        #                     ignore_axes=[0, 2],  # Only affect axis 1
+        #                     allowed_channels=None,
+        #                 ),
+        #                 apply_probability=0.3,
+        #             ),
+        #             RandomTransform(
+        #                 SimulateLowResolutionTransform(
+        #                     scale=(0.1, 0.9),
+        #                     synchronize_channels=True,
+        #                     synchronize_axes=False,
+        #                     ignore_axes=[1, 2],  # Only affect axis 0
+        #                     allowed_channels=None,
+        #                 ),
+        #                 apply_probability=0.3,
+        #             ),
+        #         ])
+        #     )
 
     # =========================================================================
     # BLANK RECTANGLE (conditional)
@@ -246,14 +246,14 @@ def create_training_transforms(
         # Blur OR Median filter (one of)
         common_transforms.append(
             OneOfTransform([
-                RandomTransform(
-                    MedianFilterTransform(
-                        filter_size=(2, 8),
-                        p_same_for_each_channel=0.5,
-                        p_per_channel=0.5,
-                    ),
-                    apply_probability=0.0,
-                ),
+                # RandomTransform(
+                #     MedianFilterTransform(
+                #         filter_size=(2, 8),
+                #         p_same_for_each_channel=0.5,
+                #         p_per_channel=0.5,
+                #     ),
+                #     apply_probability=0.5,
+                # ),
                 RandomTransform(
                     GaussianBlurTransform(
                         blur_sigma=(0.3, 1.5),
@@ -464,5 +464,43 @@ def create_training_transforms(
 
     if only_spatial_and_intensity:
         print("Only spatial and intensity augmentations enabled (only_spatial_and_intensity=True)")
+
+    return ComposeTransforms(transforms)
+
+
+def create_validation_transforms(
+    skeleton_targets: Optional[List[str]] = None,
+    skeleton_ignore_values: Optional[Dict[str, int]] = None,
+) -> Optional[ComposeTransforms]:
+    """
+    Create minimal transforms for validation.
+
+    Only applies MedialSurfaceTransform for skeleton generation when needed.
+    No augmentation is applied.
+
+    Parameters
+    ----------
+    skeleton_targets : Optional[List[str]]
+        List of target names that need skeleton/medial surface transform.
+    skeleton_ignore_values : Optional[Dict[str, int]]
+        Ignore values for skeleton targets.
+
+    Returns
+    -------
+    Optional[ComposeTransforms]
+        The composed validation transforms, or None if no transforms needed.
+    """
+    if not skeleton_targets:
+        return None
+
+    from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
+
+    transforms = [
+        MedialSurfaceTransform(
+            do_tube=False,
+            target_keys=skeleton_targets,
+            ignore_values=skeleton_ignore_values or None,
+        )
+    ]
 
     return ComposeTransforms(transforms)

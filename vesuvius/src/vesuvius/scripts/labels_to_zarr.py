@@ -955,8 +955,9 @@ def preprocess_surface(
     # Load label image
     label_img = read_label_image(label_file)
 
-    # Load surface to get shape
+    # Load surface to get shape - use full resolution to match label images
     surface = read_tifxyz(tifxyz_dir, load_mask=True)
+    surface.use_full_resolution()
     surf_h, surf_w = surface.shape
 
     # Handle shape mismatch
@@ -1086,9 +1087,11 @@ def _get_surface_and_label(
     """
     global _SURFACE_CACHE, _LABEL_CACHE
 
-    # Load surface if not cached
+    # Load surface if not cached - use full resolution to match label images
     if surface_dir not in _SURFACE_CACHE:
-        _SURFACE_CACHE[surface_dir] = read_tifxyz(Path(surface_dir), load_mask=True)
+        surface = read_tifxyz(Path(surface_dir), load_mask=True)
+        surface.use_full_resolution()
+        _SURFACE_CACHE[surface_dir] = surface
 
     # Load label if not cached
     if label_file not in _LABEL_CACHE:

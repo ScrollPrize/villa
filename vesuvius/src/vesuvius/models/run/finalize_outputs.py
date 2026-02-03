@@ -7,64 +7,13 @@ import fsspec
 import numcodecs
 import shutil
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from vesuvius.data.utils import open_zarr
-from vesuvius.data.chunks_filter import load_chunks_json
-from math import ceil
-from scipy.ndimage import zoom
-import json
-from datetime import datetime
+from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
+from vesuvius.utils.k8s import get_tqdm_kwargs
 
-
-def _safe_normalize(vec: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Normalize a vector field along axis 0 while avoiding division by zero."""
-    norms = np.sqrt(np.sum(vec * vec, axis=0, keepdims=True))
-    inv = np.divide(1.0, norms, out=np.zeros_like(norms), where=norms > eps)
-    return vec * inv
-
-
-def _orthonormalize_surface_frame(tu: np.ndarray, tv: np.ndarray, n: np.ndarray, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Project and re-orthonormalize a predicted surface frame (tu, tv, n)."""
-    n_unit = _safe_normalize(n, eps)
-
-    tu_proj = tu - (np.sum(tu * n_unit, axis=0, keepdims=True) * n_unit)
-    tu_unit = _safe_normalize(tu_proj, eps)
-
-    tv_proj = tv - (np.sum(tv * n_unit, axis=0, keepdims=True) * n_unit)
-    tv_proj = tv_proj - (np.sum(tv_proj * tu_unit, axis=0, keepdims=True) * tu_unit)
-    tv_unit = _safe_normalize(tv_proj, eps)
-
-    # Fallback to n × tu when tv collapses
-    tv_norm_sq = np.sum(tv_unit * tv_unit, axis=0, keepdims=True)
-    if np.any(tv_norm_sq <= eps):
-        fallback = np.stack([
-            n_unit[1] * tu_unit[2] - n_unit[2] * tu_unit[1],
-            n_unit[2] * tu_unit[0] - n_unit[0] * tu_unit[2],
-            n_unit[0] * tu_unit[1] - n_unit[1] * tu_unit[0],
-        ], axis=0)
-        fallback_unit = _safe_normalize(fallback, eps)
-        tv_unit = np.where(tv_norm_sq <= eps, fallback_unit, tv_unit)
-
-    n_recomputed = np.stack([
-        tu_unit[1] * tv_unit[2] - tu_unit[2] * tv_unit[1],
-        tu_unit[2] * tv_unit[0] - tu_unit[0] * tv_unit[2],
-        tu_unit[0] * tv_unit[1] - tu_unit[1] * tv_unit[0],
-    ], axis=0)
-    n_unit = _safe_normalize(n_recomputed, eps)
-
-    # Align orientation with the original normal prediction
-    orig_n_unit = _safe_normalize(n, eps)
-    dot_sign = np.sum(n_unit * orig_n_unit, axis=0, keepdims=True)
-    flip_mask = dot_sign < 0
-    if np.any(flip_mask):
-        tv_unit = np.where(flip_mask, -tv_unit, tv_unit)
-        n_unit = np.where(flip_mask, -n_unit, n_unit)
-
-    return tu_unit, tv_unit, n_unit
-
-
-def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, spatial_chunks, is_multi_task=False, target_info=None, squeeze_single_channel: bool = False):
+def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
     Process a single chunk of the volume in parallel.
     
@@ -85,7 +34,7 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     spatial_slices = tuple(
         slice(idx * chunk, min((idx + 1) * chunk, shape_dim))
-        for idx, chunk, shape_dim in zip(chunk_idx, spatial_chunks, spatial_shape)
+        for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
     )
     
     input_store = open_zarr(
@@ -102,22 +51,17 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     input_slice = (slice(None),) + spatial_slices 
     logits_np = input_store[input_slice]
-
-    if mode == "surface_frame":
-        logits_np = logits_np.astype(np.float32, copy=False)
-        tu_unit, tv_unit, n_unit = _orthonormalize_surface_frame(
-            logits_np[0:3], logits_np[3:6], logits_np[6:9]
-        )
-        output_np = np.concatenate([tu_unit, tv_unit, n_unit], axis=0).astype(np.float32, copy=False)
-
-        # Skip writing empty chunks (all zeros)
-        if not np.any(np.abs(output_np) > 0):
-            return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-
-        output_slice = (slice(None),) + spatial_slices
-        output_store[output_slice] = output_np
-        return {'chunk_idx': chunk_idx, 'processed_voxels': output_np.size}
-
+    
+    # Check if this is an empty chunk (all values are the same, indicating no meaningful data)
+    # This handles empty patches that have been filled with any constant value
+    first_value = logits_np.flat[0]  # Get the first value
+    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
+    
+    if is_empty:
+        # For empty/homogeneous patches, don't write anything to the output store
+        # This ensures write_empty_chunks=False works correctly
+        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
+    
     if mode == "binary":
         if is_multi_task and target_info:
             # For multi-task binary, process each target separately
@@ -198,11 +142,8 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         # Processed chunk is homogeneous (e.g., all 0s or all 255s), skip writing
         return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
 
-    if squeeze_single_channel:
-        output_store[spatial_slices] = output_np[0]
-    else:
-        output_slice = (slice(None),) + spatial_slices
-        output_store[output_slice] = output_np
+    output_slice = (slice(None),) + spatial_slices
+    output_store[output_slice] = output_np
     return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_data.shape)}
 
 
@@ -215,12 +156,12 @@ def finalize_logits(
     chunk_size: tuple = None,  # Optional custom chunk size for output
     num_workers: int = None,  # Number of worker processes to use
     verbose: bool = True,
-    input_zarr_path: str = None,  # Path to original input zarr for chunks.json detection
-    chunks_filter_mode: str = 'auto',  # 'auto', 'disabled'
+    num_parts: int = 1,  # Number of parts to split processing into
+    part_id: int = 0  # Part ID for this process (0-indexed)
 ):
     """
     Process merged logits and apply softmax/argmax to produce final outputs.
-
+    
     Args:
         input_path: Path to the merged logits Zarr store
         output_path: Path for the finalized output Zarr store
@@ -230,16 +171,24 @@ def finalize_logits(
         chunk_size: Optional custom chunk size for output (Z,Y,X)
         num_workers: Number of worker processes to use for parallel processing
         verbose: Print progress messages
-        input_zarr_path: Path to original input zarr for chunks.json detection.
-        chunks_filter_mode: 'auto' (use chunks.json if present) or 'disabled'.
+        num_parts: Number of parts to split the finalization process into
+        part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning
     """
+    tqdm_kwargs = get_tqdm_kwargs()
+    if not verbose:
+        tqdm_kwargs['disable'] = True
+
     numcodecs.blosc.use_threads = False
     
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() // 2)
     
     print(f"Using {num_workers} worker processes")
-    
+
+    # Add partitioning information
+    if num_parts > 1:
+        print(f"Partitioned finalization: Processing part {part_id}/{num_parts}")
+
     compressor = numcodecs.Blosc(
         cname='zstd',
         clevel=1,  # compression level is 1 because we're only using this for mostly empty chunks
@@ -254,20 +203,10 @@ def finalize_logits(
         storage_options={'anon': False} if input_path.startswith('s3://') else None,
         verbose=verbose
     )
-
-    stored_mode = input_store.attrs.get('processing_mode') if hasattr(input_store, 'attrs') else None
-    if stored_mode and stored_mode != mode:
-        raise ValueError(
-            f"Requested mode '{mode}' does not match blended logits metadata ('{stored_mode}'). "
-            "Re-run with --mode matching the stored processing_mode."
-        )
-
+    
     input_shape = input_store.shape
     num_classes = input_shape[0]
     spatial_shape = input_shape[1:]  # (Z, Y, X)
-
-    if mode == 'surface_frame' and num_classes != 9:
-        raise ValueError(f"Surface-frame mode expects 9 channels, but input has {num_classes}.")
     
     # Check for multi-task metadata
     is_multi_task = False
@@ -306,174 +245,118 @@ def finalize_logits(
         if verbose:
             print(f"Using specified chunk size: {output_chunks}")
     
-    output_dtype = np.uint8
-    if mode == "surface_frame":
-        out_channels = num_classes
-        output_shape = (out_channels, *spatial_shape)
-        squeeze_single_channel = False
-        output_dtype = np.float32
-        print("Output will have 9 channels ordered as [t_u(3), t_v(3), n(3)] with float32 precision.")
-    elif mode == "binary":
+    if mode == "binary":
         if is_multi_task and target_info:
+            # For multi-task binary, output one channel per target
             num_targets = len(target_info)
-            output_shape = (num_targets, *spatial_shape)
+            output_shape = (num_targets, *spatial_shape)  # One mask per target
             if threshold:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_binary_mask" for k in sorted(target_info.keys())) + "]")
             else:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
-            out_channels = num_targets
         else:
-            output_shape = (1, *spatial_shape)
             if threshold:
+                # If thresholding, only output argmax channel for binary
+                output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
                 print("Output will have 1 channel: [binary_mask]")
             else:
+                 # Just softmax of FG class
+                output_shape = (1, *spatial_shape)
                 print("Output will have 1 channel: [softmax_fg]")
-            out_channels = 1
-        squeeze_single_channel = (out_channels == 1)
     else:  # multiclass
         if threshold:
+            # If threshold is provided for multiclass, only save the argmax
             output_shape = (1, *spatial_shape)
-            out_channels = 1
             print("Output will have 1 channel: [argmax]")
         else:
+            # For multiclass, we'll output num_classes channels (all softmax values)
+            # Plus 1 channel for the argmax
             output_shape = (num_classes + 1, *spatial_shape)
-            out_channels = num_classes + 1
             print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
-        squeeze_single_channel = (out_channels == 1)
 
-    # Prepare shapes and chunks for level 0
-    if squeeze_single_channel:
-        final_shape_lvl0 = spatial_shape
-        spatial_chunks = output_chunks
-        chunks_lvl0 = spatial_chunks
+    output_chunks = (1, *output_chunks)  # Chunk each channel separately
+
+    # --- Create or Open Output Array ---
+    if part_id == 0:
+        # Part 0 creates the array
+        print(f"Creating output store: {output_path}")
+        print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
+
+        output_store = open_zarr(
+            path=output_path,
+            mode='w',
+            storage_options={'anon': False} if output_path.startswith('s3://') else None,
+            verbose=verbose,
+            shape=output_shape,
+            chunks=output_chunks,
+            dtype=np.uint8,
+            compressor=compressor,
+            write_empty_chunks=False,
+            overwrite=True
+        )
     else:
-        final_shape_lvl0 = (out_channels, *spatial_shape)
-        spatial_chunks = output_chunks
-        chunks_lvl0 = (1, *spatial_chunks)
+        # Other parts wait for part 0 to create the array, then open it in r+ mode
+        print(f"Waiting for part 0 to create output array...")
 
-    # Create multiscale root level 0 array at <output_path>/0
-    root_path = output_path.rstrip('/')
-    level0_path = os.path.join(root_path, '0')
-    print(f"Creating output multiscale level 0 store: {level0_path}")
-    output_store = open_zarr(
-        path=level0_path,
-        mode='w',
-        storage_options={'anon': False} if level0_path.startswith('s3://') else None,
-        verbose=verbose,
-        shape=final_shape_lvl0,
-        chunks=chunks_lvl0,
-        dtype=output_dtype,
-        compressor=compressor,
-        write_empty_chunks=False,
-        overwrite=True
-    )
-    
-    def get_chunk_indices(spatial_shape, spatial_chunks, valid_chunk_indices=None, zarr_chunk_size=None):
+        wait_for_zarr_creation(output_path, verbose=verbose, part_id=part_id)
+
+        print(f"Array found! Opening in r+ mode for part {part_id}")
+
+        # Open existing array in r+ mode (no need to specify shape/chunks)
+        output_store = open_zarr(
+            path=output_path,
+            mode='r+',
+            storage_options={'anon': False} if output_path.startswith('s3://') else None,
+            verbose=verbose
+        )
+
+    def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
-
+        # Skip first dimension (channels)
+        spatial_shape = shape[1:]
+        spatial_chunks = chunks[1:]
+        
         # Generate all combinations of chunk indices
         from itertools import product
         chunk_counts = [int(np.ceil(s / c)) for s, c in zip(spatial_shape, spatial_chunks)]
         chunk_indices = list(product(*[range(count) for count in chunk_counts]))
-
-        # Build set of valid regions if chunks.json filtering is enabled
-        valid_regions = None
-        if valid_chunk_indices is not None and zarr_chunk_size is not None:
-            valid_regions = set()
-            for chunk_idx in valid_chunk_indices:
-                ci_z, ci_y, ci_x = chunk_idx
-                valid_regions.add((ci_z, ci_y, ci_x))
-
+        
         # list of dicts with indices for each chunk
         # Each dict will have 'indices' key with the chunk indices
         # we pass these to the worker functions
         chunks_info = []
         for idx in chunk_indices:
-            # If filtering by chunks.json, check if this chunk overlaps with any valid region
-            if valid_regions is not None:
-                cZ, cY, cX = zarr_chunk_size
-                sZ, sY, sX = spatial_chunks
-
-                # Calculate voxel range for this processing chunk
-                z_start = idx[0] * sZ
-                z_end = min((idx[0] + 1) * sZ, spatial_shape[0])
-                y_start = idx[1] * sY
-                y_end = min((idx[1] + 1) * sY, spatial_shape[1])
-                x_start = idx[2] * sX
-                x_end = min((idx[2] + 1) * sX, spatial_shape[2])
-
-                # Find which zarr chunks this processing chunk overlaps with
-                ci_z_start = z_start // cZ
-                ci_z_end = (z_end - 1) // cZ + 1
-                ci_y_start = y_start // cY
-                ci_y_end = (y_end - 1) // cY + 1
-                ci_x_start = x_start // cX
-                ci_x_end = (x_end - 1) // cX + 1
-
-                # Check if any overlapping zarr chunk is in the valid set
-                overlaps_valid = False
-                for ci_z in range(ci_z_start, ci_z_end):
-                    for ci_y in range(ci_y_start, ci_y_end):
-                        for ci_x in range(ci_x_start, ci_x_end):
-                            if (ci_z, ci_y, ci_x) in valid_regions:
-                                overlaps_valid = True
-                                break
-                        if overlaps_valid:
-                            break
-                    if overlaps_valid:
-                        break
-
-                if not overlaps_valid:
-                    continue  # Skip this chunk
-
             chunks_info.append({'indices': idx})
-
+        
         return chunks_info
 
-    # --- Load chunk indices for filtering ---
-    # First try to get touched_chunk_indices from blending step (saved in attrs)
-    # This is more accurate than chunks.json because it accounts for patch overlap
-    valid_chunk_indices = None
-    zarr_chunk_size = None
-    if chunks_filter_mode != 'disabled':
-        # Check if blending saved touched_chunk_indices
-        if hasattr(input_store, 'attrs'):
-            touched_indices = input_store.attrs.get('touched_chunk_indices')
-            output_chunk_size = input_store.attrs.get('output_chunk_size')
-            if touched_indices is not None and output_chunk_size is not None:
-                valid_chunk_indices = touched_indices
-                zarr_chunk_size = tuple(output_chunk_size)
-                if verbose:
-                    print(f"\nLoaded {len(touched_indices)} touched chunks from blending metadata")
-                    print(f"  Output chunk size: {zarr_chunk_size}")
+    # --- Calculate Z-range for this part ---
+    all_chunk_infos = get_chunk_indices(input_shape, output_chunks)
 
-        # Fallback to chunks.json if no blending metadata
-        if valid_chunk_indices is None:
-            if input_zarr_path is None and hasattr(input_store, 'attrs'):
-                input_zarr_path = input_store.attrs.get('input_zarr_path')
-                if input_zarr_path is None:
-                    inference_args = input_store.attrs.get('inference_args', {})
-                    input_zarr_path = inference_args.get('input_dir')
+    if num_parts > 1:
+        total_z = spatial_shape[0]  # Z dimension
+        z_start = (part_id * total_z) // num_parts
+        z_end = ((part_id + 1) * total_z) // num_parts
+        print(f"Part {part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
 
-            if input_zarr_path:
-                chunks_json = load_chunks_json(input_zarr_path)
-                if chunks_json:
-                    level0_chunks = chunks_json.get('chunks_by_level', {}).get('0', [])
-                    if level0_chunks:
-                        valid_chunk_indices = level0_chunks
-                        zarr_chunk_size = tuple(chunks_json.get('chunk_size', [128, 128, 128]))
-                        if verbose:
-                            print(f"\nLoaded chunks.json with {len(level0_chunks)} valid chunks (fallback)")
-                            print(f"  Zarr chunk size: {zarr_chunk_size}")
+        # Filter chunks to only include those intersecting with this Z-range
+        chunk_infos = []
+        for chunk_info in all_chunk_infos:
+            z_idx, y_idx, x_idx = chunk_info['indices']
+            # Calculate actual Z coordinates for this chunk
+            chunk_z_start = z_idx * output_chunks[1]  # output_chunks[1] is Z chunk size
+            chunk_z_end = min(chunk_z_start + output_chunks[1], spatial_shape[0])
 
-    chunk_infos = get_chunk_indices(spatial_shape, spatial_chunks, valid_chunk_indices, zarr_chunk_size)
-    total_chunks = len(chunk_infos)
+            # Check if chunk intersects with our Z-range
+            if chunk_z_end > z_start and chunk_z_start < z_end:
+                chunk_infos.append(chunk_info)
 
-    if valid_chunk_indices is not None:
-        full_chunks = get_chunk_indices(spatial_shape, spatial_chunks)
-        print(f"Filtered to {total_chunks} chunks (from {len(full_chunks)} total) based on chunk metadata")
+        print(f"Filtered to {len(chunk_infos)} chunks for part {part_id} (from {len(all_chunk_infos)} total)")
     else:
-        print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
+        chunk_infos = all_chunk_infos
+
+    total_chunks = len(chunk_infos)
+    print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
     
     # main processing function with partial application of common arguments
     # This allows us to pass only the chunk_info to the worker function
@@ -481,13 +364,12 @@ def finalize_logits(
     process_chunk_partial = partial(
         process_chunk,
         input_path=input_path,
-        output_path=level0_path,
+        output_path=output_path,
         mode=mode,
         threshold=threshold,
         num_classes=num_classes,
         spatial_shape=spatial_shape,
-        spatial_chunks=spatial_chunks,
-        squeeze_single_channel=squeeze_single_channel,
+        output_chunks=output_chunks,
         is_multi_task=is_multi_task,
         target_info=target_info
     )
@@ -498,11 +380,12 @@ def finalize_logits(
 
         future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunk_infos}
         
+        from concurrent.futures import as_completed
         for future in tqdm(
             as_completed(future_to_chunk),
             total=total_chunks,
             desc="Processing Chunks",
-            disable=not verbose
+            **tqdm_kwargs,
         ):
             try:
                 result = future.result()
@@ -515,219 +398,26 @@ def finalize_logits(
                 raise e
     
     print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_chunks/total_chunks:.2%}).")
-    
-    try:
-        if hasattr(input_store, 'attrs') and hasattr(output_store, 'attrs'):
-            for key in input_store.attrs:
-                output_store.attrs[key] = input_store.attrs[key]
-                
-            output_store.attrs['threshold_applied'] = threshold
-            output_store.attrs['empty_chunks_skipped'] = empty_chunks
-            output_store.attrs['total_chunks'] = total_chunks
-            output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
-            output_store.attrs['processing_mode'] = mode
-            if mode == "surface_frame":
-                output_store.attrs['surface_frame_layout'] = [
-                    't_u_x', 't_u_y', 't_u_z',
-                    't_v_x', 't_v_y', 't_v_z',
-                    'n_x', 'n_y', 'n_z'
-                ]
-                output_store.attrs['surface_frame_orthonormalized'] = True
-                output_store.attrs['value_dtype'] = 'float32'
-    except Exception as e:
-        print(f"Warning: Failed to copy metadata: {e}")
 
-    # Build multiscale pyramid (levels 1..5) with 2x downsampling
-    def build_multiscales(root_path: str, levels: int = 6):
-        if verbose:
-            print(f"Building multiscale pyramid (levels 1-{levels - 1})")
+    # Only part 0 updates metadata to avoid conflicts
+    if part_id == 0:
         try:
-            # Open level 0 lazily
-            lvl0 = open_zarr(os.path.join(root_path, '0'), mode='r', storage_options={'anon': False} if root_path.startswith('s3://') else None)
-            lvl0_shape = lvl0.shape
-            has_channel = (len(lvl0_shape) == 4)
-            datasets = [{'path': '0'}]
+            if hasattr(input_store, 'attrs') and hasattr(output_store, 'attrs'):
+                for key in input_store.attrs:
+                    output_store.attrs[key] = input_store.attrs[key]
 
-            prev_path = os.path.join(root_path, '0')
-            prev_shape = lvl0_shape
+                output_store.attrs['processing_mode'] = mode
+                output_store.attrs['threshold_applied'] = threshold
+                output_store.attrs['empty_chunks_skipped'] = empty_chunks
+                output_store.attrs['total_chunks'] = total_chunks
+                output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
+        except Exception as e:
+            print(f"Warning: Failed to copy metadata: {e}")
+    elif verbose:
+        print(f"Part {part_id} skipping metadata update (handled by part 0)")
 
-            for i in range(1, levels):
-                # Compute next level shape
-                if has_channel:
-                    C, Z, Y, X = prev_shape
-                    tZ, tY, tX = max(1, ceil(Z/2)), max(1, ceil(Y/2)), max(1, ceil(X/2))
-                    next_shape = (C, tZ, tY, tX)
-                    # Use the same chunks as level 0 (channel, z, y, x), clipped to shape when necessary
-                    zc = min(chunks_lvl0[1], tZ)
-                    yc = min(chunks_lvl0[2], tY)
-                    xc = min(chunks_lvl0[3], tX)
-                    chunks = (chunks_lvl0[0], zc, yc, xc)
-                else:
-                    Z, Y, X = prev_shape
-                    tZ, tY, tX = max(1, ceil(Z/2)), max(1, ceil(Y/2)), max(1, ceil(X/2))
-                    next_shape = (tZ, tY, tX)
-                    # Use the same spatial chunks as level 0, clipped to shape
-                    zc = min(chunks_lvl0[0], tZ)
-                    yc = min(chunks_lvl0[1], tY)
-                    xc = min(chunks_lvl0[2], tX)
-                    chunks = (zc, yc, xc)
-
-                if verbose:
-                    print(f"Downsampling level {i}/{levels - 1}: shape {next_shape}, chunks {chunks}")
-
-                lvl_path = os.path.join(root_path, str(i))
-                ds_store = open_zarr(
-                    path=lvl_path,
-                    mode='w',
-                    storage_options={'anon': False} if lvl_path.startswith('s3://') else None,
-                    shape=next_shape,
-                    chunks=chunks,
-                    dtype=lvl0.dtype,
-                    compressor=compressor,
-                    write_empty_chunks=False,
-                    overwrite=True
-                )
-
-                # Iterate output tiles and compute from prev level tiles
-                # Open prev store lazily
-                prev_store = open_zarr(prev_path, mode='r', storage_options={'anon': False} if prev_path.startswith('s3://') else None)
-
-                # Determine iteration grid based on ds_store chunks
-                if has_channel:
-                    _, Zp, Yp, Xp = next_shape
-                    zc, yc, xc = chunks[1], chunks[2], chunks[3]
-                else:
-                    Zp, Yp, Xp = next_shape
-                    zc, yc, xc = chunks[0], chunks[1], chunks[2]
-
-                prev_z, prev_y, prev_x = prev_shape[-3], prev_shape[-2], prev_shape[-1]
-                total_tiles = ((Zp + zc - 1) // zc) * ((Yp + yc - 1) // yc) * ((Xp + xc - 1) // xc)
-                downsample_workers = max(1, min(num_workers, total_tiles))
-                if verbose:
-                    print(f"Using {downsample_workers} workers for downsampling level {i}")
-
-                def iter_blocks():
-                    for oz in range(0, Zp, zc):
-                        for oy in range(0, Yp, yc):
-                            for ox in range(0, Xp, xc):
-                                yield oz, oy, ox
-
-                def downsample_block(block_coords):
-                    oz, oy, ox = block_coords
-                    oz1 = min(oz + zc, Zp)
-                    oy1 = min(oy + yc, Yp)
-                    ox1 = min(ox + xc, Xp)
-
-                    # Corresponding prev indices
-                    pz0, py0, px0 = oz * 2, oy * 2, ox * 2
-                    pz1 = min(oz1 * 2, prev_z)
-                    py1 = min(oy1 * 2, prev_y)
-                    px1 = min(ox1 * 2, prev_x)
-
-                    if has_channel:
-                        prev_block = prev_store[(slice(None), slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
-                        # Pad to even along spatial dims
-                        pad_z = (0, (prev_block.shape[1] % 2))
-                        pad_y = (0, (prev_block.shape[2] % 2))
-                        pad_x = (0, (prev_block.shape[3] % 2))
-                        prev_block = np.pad(prev_block, ((0, 0), pad_z, pad_y, pad_x), mode='edge')
-                        # Reshape and average
-                        Cb, Zb, Yb, Xb = prev_block.shape
-                        block_ds = prev_block.reshape(Cb, Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(2, 4, 6))
-                        if mode == "surface_frame" and Cb == 9:
-                            tu_ds, tv_ds, n_ds = _orthonormalize_surface_frame(
-                                block_ds[0:3], block_ds[3:6], block_ds[6:9]
-                            )
-                            block_ds = np.concatenate([tu_ds, tv_ds, n_ds], axis=0).astype(block_ds.dtype, copy=False)
-                        ds_store[(slice(None), slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
-                    else:
-                        prev_block = prev_store[(slice(pz0, pz1), slice(py0, py1), slice(px0, px1))]
-                        pad_z = (0, (prev_block.shape[0] % 2))
-                        pad_y = (0, (prev_block.shape[1] % 2))
-                        pad_x = (0, (prev_block.shape[2] % 2))
-                        prev_block = np.pad(prev_block, (pad_z, pad_y, pad_x), mode='edge')
-                        Zb, Yb, Xb = prev_block.shape
-                        block_ds = prev_block.reshape(Zb//2, 2, Yb//2, 2, Xb//2, 2).mean(axis=(1, 3, 5))
-                        ds_store[(slice(oz, oz1), slice(oy, oy1), slice(ox, ox1))] = block_ds
-
-                if downsample_workers == 1:
-                    for block_coords in tqdm(
-                        iter_blocks(),
-                        total=total_tiles,
-                        desc=f"Downsample level {i}",
-                        unit="blocks",
-                        disable=not verbose
-                    ):
-                        downsample_block(block_coords)
-                else:
-                    with ThreadPoolExecutor(max_workers=downsample_workers) as executor:
-                        futures = [executor.submit(downsample_block, block_coords) for block_coords in iter_blocks()]
-                        for future in tqdm(
-                            as_completed(futures),
-                            total=total_tiles,
-                            desc=f"Downsample level {i}",
-                            unit="blocks",
-                            disable=not verbose
-                        ):
-                            future.result()
-
-                datasets.append({'path': str(i)})
-                prev_path = lvl_path
-                prev_shape = next_shape
-
-            # Write OME-NGFF multiscales metadata on the root group
-            try:
-                root = zarr.open_group(root_path, mode='a', storage_options={'anon': False} if root_path.startswith('s3://') else None)
-                axes = []
-                if has_channel:
-                    axes.append({'name': 'c', 'type': 'channel'})
-                axes.extend([
-                    {'name': 'z', 'type': 'space'},
-                    {'name': 'y', 'type': 'space'},
-                    {'name': 'x', 'type': 'space'}
-                ])
-                root.attrs['multiscales'] = [{
-                    'version': '0.4',
-                    'axes': axes,
-                    'datasets': datasets
-                }]
-            except Exception as me:
-                print(f"Warning: Failed to write multiscales metadata: {me}")
-        except Exception as be:
-            print(f"Warning: Failed to build multiscales: {be}")
-
-    build_multiscales(root_path)
-
-    # Write metadata.json at the root of the zarr with inference args and run time
-    try:
-        meta = {}
-        if hasattr(input_store, 'attrs') and 'inference_args' in input_store.attrs:
-            meta.update(input_store.attrs['inference_args'])
-        # Add/override finalize context
-        meta.update({
-            'finalize_mode': mode,
-            'finalize_threshold': bool(threshold),
-            'finalize_time': datetime.utcnow().isoformat() + 'Z',
-            'input_logits_path': input_path,
-            'output_path': output_path
-        })
-        # Write using fsspec so it works for local and remote
-        proto = output_path.split('://', 1)[0] if '://' in output_path else None
-        meta_path = os.path.join(output_path, 'metadata.json')
-        if proto in ('s3', 'gs', 'azure'):
-            fs = fsspec.filesystem(proto, anon=False if proto == 's3' else None)
-            with fs.open(meta_path, 'w') as f:
-                json.dump(meta, f, indent=2)
-        else:
-            os.makedirs(output_path, exist_ok=True)
-            with open(meta_path, 'w') as f:
-                json.dump(meta, f, indent=2)
-        if verbose:
-            print(f"Wrote metadata.json to {meta_path}")
-    except Exception as me:
-        print(f"Warning: Failed to write metadata.json: {me}")
-    
-    if delete_intermediates:
+    if delete_intermediates and num_parts == 1:
+        # Only delete intermediates when not using partitioning
         print(f"Deleting intermediate logits: {input_path}")
         try:
             # we have to use fsspec for s3/gs/azure paths 
@@ -748,8 +438,10 @@ def finalize_logits(
         except Exception as e:
             print(f"Warning: Failed to delete intermediate logits: {e}")
             print(f"You may need to delete them manually: {input_path}")
-    
-    print(f"Final multiscale output saved to: {output_path}")
+    elif delete_intermediates and num_parts > 1:
+        print(f"Skipping intermediate deletion in partitioned mode. Delete manually after all parts complete: {input_path}")
+
+    print(f"Final output saved to: {output_path}")
 
 
 # --- Command Line Interface ---
@@ -760,8 +452,8 @@ def main():
                       help='Path to the merged logits Zarr store')
     parser.add_argument('output_path', type=str,
                       help='Path for the finalized output Zarr store')
-    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass', 'surface_frame'], default='binary',
-                      help='Processing mode. Use "binary"/"multiclass" for segmentation or "surface_frame" for 9-channel frame regression.')
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
+                      help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
     parser.add_argument('--threshold', dest='threshold', action='store_true',
                       help='If set, applies argmax and only saves the class predictions (no probabilities). Works for both binary and multiclass.')
     parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
@@ -772,16 +464,16 @@ def main():
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')
-    parser.add_argument('--input-zarr', type=str, default=None,
-                      help='Path to original input zarr for chunks.json detection (auto-detected from logits metadata if not provided)')
-    parser.add_argument('--chunks-filter-mode', type=str, default='auto',
-                      choices=['auto', 'disabled'],
-                      help='Chunk filtering: auto (use chunks.json if present), disabled (process full volume)')
+    parser.add_argument('--num_parts', type=int, default=1,
+                      help='Number of parts to split the finalization process into. Default: 1')
+    parser.add_argument('--part_id', type=int, default=0,
+                      help='Part ID for this process (0-indexed). Default: 0')
 
     args = parser.parse_args()
 
-    if args.mode == 'surface_frame' and args.threshold:
-        parser.error("--threshold is not supported when mode is 'surface_frame'.")
+    # Validate partitioning arguments
+    if args.part_id < 0 or args.part_id >= args.num_parts:
+        parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}. part_id must be 0 <= part_id < num_parts")
 
     chunks = None
     if args.chunk_size:
@@ -801,8 +493,8 @@ def main():
             chunk_size=chunks,
             num_workers=args.num_workers,
             verbose=not args.quiet,
-            input_zarr_path=args.input_zarr,
-            chunks_filter_mode=args.chunks_filter_mode,
+            num_parts=args.num_parts,
+            part_id=args.part_id
         )
         return 0
     except Exception as e:

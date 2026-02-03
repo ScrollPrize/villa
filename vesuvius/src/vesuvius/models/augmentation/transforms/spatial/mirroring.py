@@ -6,6 +6,9 @@ from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTr
 
 
 class MirrorTransform(BasicTransform):
+
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(self, allowed_axes: Tuple[int, ...], normal_keys: Optional[Set[str]] = None):
         super().__init__()
         self.allowed_axes = allowed_axes
@@ -14,9 +17,11 @@ class MirrorTransform(BasicTransform):
 
     def get_parameters(self, **data_dict) -> dict:
         axes = [i for i in self.allowed_axes if torch.rand(1) < 0.5]
-        return {
-            'axes': axes
-        }
+        params = {'axes': axes}
+        # Pass crop_shape through for keypoint transforms
+        if 'crop_shape' in data_dict:
+            params['crop_shape'] = data_dict['crop_shape']
+        return params
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
         if len(params['axes']) == 0:
@@ -40,7 +45,33 @@ class MirrorTransform(BasicTransform):
         raise NotImplementedError
 
     def _apply_to_keypoints(self, keypoints, **params):
-        raise NotImplementedError
+        """Flip keypoint coordinates along mirrored axes."""
+        if keypoints is None:
+            return None
+        axes = params['axes']
+        if len(axes) == 0:
+            return keypoints
+        crop_shape = params.get('crop_shape')
+        if crop_shape is None:
+            raise ValueError("MirrorTransform._apply_to_keypoints requires 'crop_shape' in params")
+
+        keypoints = keypoints.clone()
+        for axis in axes:
+            keypoints[:, axis] = crop_shape[axis] - 1 - keypoints[:, axis]
+        return keypoints
+
+    def _apply_to_vectors(self, vectors, **params):
+        """Negate vector components along mirrored axes."""
+        if vectors is None:
+            return None
+        axes = params['axes']
+        if len(axes) == 0:
+            return vectors
+
+        vectors = vectors.clone()
+        for axis in axes:
+            vectors[:, axis] = -vectors[:, axis]
+        return vectors
 
     def apply(self, data_dict: dict, **params) -> dict:
         """
@@ -72,5 +103,19 @@ class MirrorTransform(BasicTransform):
                 for axis in axes:
                     normals[axis] = -normals[axis]
                 data_dict[key] = normals
+
+        # Handle keypoints
+        if data_dict.get('keypoints') is not None:
+            data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
+
+        # Handle vector_keys
+        vector_keys = set(data_dict.get('vector_keys', []) or [])
+        for key in vector_keys:
+            if data_dict.get(key) is not None:
+                data_dict[key] = self._apply_to_vectors(data_dict[key], **params)
+
+        # Transform padding_mask with the same flip
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
 
         return data_dict

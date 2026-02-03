@@ -1,15 +1,3 @@
-import multiprocessing
-import sys
-
-### this is at the top because s3fs/fsspec do not work with fork
-if __name__ == '__main__' and len(sys.argv) > 1:
-    # Quick check for S3 paths in command line args
-    if any('s3://' in str(arg) for arg in sys.argv) or '--config-path' in sys.argv:
-        try:
-            multiprocessing.set_start_method('spawn', force=True)
-        except RuntimeError:
-            pass
-
 from pathlib import Path
 from copy import deepcopy
 import os
@@ -20,11 +8,11 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
-from vesuvius.models.training.lr_schedulers import get_scheduler, PolyLRScheduler
+from vesuvius.models.training.lr_schedulers import get_scheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
-from vesuvius.models.datasets import DatasetOrchestrator
+from vesuvius.models.datasets import ZarrDataset
 from vesuvius.utils.plotting import save_debug
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
@@ -41,21 +29,14 @@ from vesuvius.models.training.save_checkpoint import (
 
 from vesuvius.models.utilities.load_checkpoint import load_checkpoint
 from vesuvius.models.utilities.get_accelerator import get_accelerator
-from vesuvius.models.utilities.compute_gradient_norm import compute_gradient_norm
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
-from vesuvius.models.utilities.cli_utils import update_config_from_args
-from vesuvius.models.configuration.config_utils import configure_targets
 from vesuvius.models.evaluation.connected_components import ConnectedComponentsMetric
 from vesuvius.models.evaluation.critical_components import CriticalComponentsMetric
 from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
-from vesuvius.models.evaluation.hausdorff import HausdorffDistanceMetric
-from vesuvius.models.datasets.intensity_properties import load_intensity_props_formatted
-from vesuvius.models.evaluation.skeleton_branch_points import SkeletonBranchPointsMetric
-
-from itertools import cycle
+from vesuvius.models.evaluation.voi import VOIMetric
 from contextlib import nullcontext
-from collections import deque
+from collections import deque, defaultdict
 import gc
 
 
@@ -153,6 +134,10 @@ class BaseTrainer:
         # Default AMP dtype; resolved during training initialization
         self.amp_dtype = torch.float16
         self.amp_dtype_str = 'float16'
+        self._profile_augmentations = bool(getattr(self.mgr, 'profile_augmentations', False))
+        self._augmentation_names = None
+        self._epoch_aug_time = None
+        self._epoch_aug_count = None
 
     # --- build model --- #
     def _build_model(self):
@@ -181,38 +166,12 @@ class BaseTrainer:
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
         dataset = self._build_dataset_for_mgr(self.mgr, is_training=is_training)
-
-        data_format = getattr(self.mgr, 'data_format', 'zarr').lower()
-        print(f"Using {data_format} dataset format ({'training' if is_training else 'validation'})")
-
+        print(f"Using ZarrDataset ({'training' if is_training else 'validation'})")
         return dataset
 
-    def _build_dataset_for_mgr(self, mgr, *, is_training: bool) -> DatasetOrchestrator:
-        data_format = getattr(mgr, 'data_format', 'zarr').lower()
-
-        adapter_lookup = {
-            'napari': 'napari',
-            'image': 'image',
-            'zarr': 'zarr',
-        }
-
-        try:
-            adapter_name = adapter_lookup[data_format]
-        except KeyError as exc:
-            raise ValueError(
-                f"Unsupported data format: {data_format}. Supported formats are: {sorted(adapter_lookup)}"
-            ) from exc
-
-        adapter_kwargs = {}
-        if adapter_name == 'napari' and hasattr(mgr, 'napari_viewer'):
-            adapter_kwargs['viewer'] = mgr.napari_viewer
-
-        return DatasetOrchestrator(
-            mgr=mgr,
-            adapter=adapter_name,
-            adapter_kwargs=adapter_kwargs,
-            is_training=is_training,
-        )
+    def _build_dataset_for_mgr(self, mgr, *, is_training: bool) -> ZarrDataset:
+        """Build a ZarrDataset for the given config manager."""
+        return ZarrDataset(mgr=mgr, is_training=is_training)
 
     # --- hooks for subclasses --------------------------------------------------------------- #
 
@@ -223,6 +182,72 @@ class BaseTrainer:
     def _prepare_batch(self, batch: dict, *, is_training: bool) -> dict:
         """Allow subclasses to inject additional data into a batch dictionary."""
         return batch
+
+    def _reset_epoch_aug_timers(self) -> None:
+        if not self._profile_augmentations:
+            return
+        self._epoch_aug_time = defaultdict(float)
+        self._epoch_aug_count = defaultdict(int)
+
+    def _reduce_aug_value(self, value):
+        if torch.is_tensor(value):
+            return float(value.sum().item()), int(value.numel())
+        if isinstance(value, np.ndarray):
+            return float(value.sum()), int(value.size)
+        if isinstance(value, (list, tuple)):
+            total = 0.0
+            count = 0
+            for item in value:
+                t, c = self._reduce_aug_value(item)
+                total += t
+                count += c
+            return total, count
+        try:
+            return float(value), 1
+        except (TypeError, ValueError):
+            return 0.0, 0
+
+    def _accumulate_aug_timers(self, data_dict: dict) -> None:
+        if not self._profile_augmentations:
+            return
+        if not data_dict:
+            return
+        perf = data_dict.get('_aug_perf')
+        if perf is None:
+            return
+        if isinstance(perf, list):
+            for item in perf:
+                if isinstance(item, dict):
+                    self._accumulate_aug_timers({'_aug_perf': item})
+            return
+        if not isinstance(perf, dict):
+            return
+        if self._epoch_aug_time is None or self._epoch_aug_count is None:
+            self._reset_epoch_aug_timers()
+        for name, value in perf.items():
+            total, count = self._reduce_aug_value(value)
+            if count == 0:
+                continue
+            self._epoch_aug_time[name] += total
+            self._epoch_aug_count[name] += count
+
+    def _report_epoch_aug_timers(self, epoch: int) -> None:
+        if not self._profile_augmentations:
+            return
+        if not self._epoch_aug_time:
+            return
+        if self.is_distributed and self.rank != 0:
+            return
+
+        total_time = sum(self._epoch_aug_time.values())
+        if total_time <= 0:
+            return
+        print(f"\n[Perf] Augmentation timing for epoch {epoch + 1}: total={total_time:.2f}s")
+        for name, elapsed in sorted(self._epoch_aug_time.items(), key=lambda kv: kv[1], reverse=True):
+            count = max(1, self._epoch_aug_count.get(name, 1))
+            avg_ms = (elapsed / count) * 1000.0
+            pct = (elapsed / total_time) * 100.0 if total_time > 0 else 0.0
+            print(f"  {name}: {elapsed:.2f}s ({pct:.1f}%) avg={avg_ms:.2f}ms/sample")
 
     def _should_include_target_in_loss(self, target_name: str) -> bool:
         if target_name == 'is_unlabeled':
@@ -313,7 +338,8 @@ class BaseTrainer:
                             mgr=self.mgr
                         )
                         # If deep supervision is enabled, wrap the loss in nnUNet-style DS wrapper
-                        if getattr(self.mgr, 'enable_deep_supervision', False) and getattr(self, '_ds_weights', None) is not None:
+                        skip_ds = loss_cfg.get("skip_deep_supervision", False)
+                        if getattr(self.mgr, 'enable_deep_supervision', False) and getattr(self, '_ds_weights', None) is not None and not skip_ds:
                             # Wrap all losses incl. skeleton-aware; wrapper now forwards extra args
                             loss_fn = DeepSupervisionWrapper(loss_fn, self._ds_weights)
                         
@@ -358,6 +384,10 @@ class BaseTrainer:
                 target_override["losses"] = deepcopy(cfg["losses"])
             elif cfg.get("loss_fn"):
                 target_override["loss_fn"] = cfg["loss_fn"]
+            # Preserve ignore label/index so CE doesn't crash after checkpoint overrides
+            for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                if alias in cfg:
+                    target_override[alias] = cfg[alias]
             if target_override:
                 overrides[target_name] = target_override
         return overrides
@@ -391,6 +421,11 @@ class BaseTrainer:
                     "kwargs": {}
                 }]
                 applied = True
+            # Reapply ignore_label/index/value if provided in overrides
+            for alias in ("ignore_index", "ignore_label", "ignore_value"):
+                if alias in override:
+                    targets[target_name][alias] = override[alias]
+                    applied = True
 
         if applied:
             if isinstance(getattr(self.mgr, 'model_config', None), dict):
@@ -641,8 +676,10 @@ class BaseTrainer:
 
             if target_ignore_value is not None:
                 task_metrics.append(IOUDiceMetric(num_classes=num_classes, ignore_index=target_ignore_value))
+                task_metrics.append(VOIMetric(ignore_index=target_ignore_value))
             else:
                 task_metrics.append(IOUDiceMetric(num_classes=num_classes))
+                task_metrics.append(VOIMetric())
             # task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
@@ -674,6 +711,17 @@ class BaseTrainer:
         else:
             # Not using amp or not on cuda - no gradient scaling needed
             return DummyScaler()
+
+    def _autocast_context(self, use_amp: bool):
+        if not use_amp:
+            return nullcontext()
+        if self.device.type == 'cuda':
+            return torch.amp.autocast('cuda', dtype=self.amp_dtype)
+        if self.device.type == 'cpu':
+            return torch.amp.autocast('cpu')
+        if self.device.type in ['mlx', 'mps']:
+            return torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
+        return torch.amp.autocast(self.device.type)
 
     # --- dataloaders --- #
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
@@ -722,21 +770,25 @@ class BaseTrainer:
             if self.mgr.verbose:
                 print(f"Split: {len(train_fg)} FG + {len(bg_indices)} BG patches for training, {len(val_fg)} FG patches for validation")
         else:
-            # Separate validation dataset provided. Use full validation set, and
-            # exclude any training patches whose volume_name appears in validation.
+            # Separate validation dataset provided.
+            # Check for patch position overlap to avoid data leakage when volumes are shared.
             val_indices = list(range(len(val_dataset)))
 
-            # Build set of validation volume names to filter training patches
-            val_volume_names = set()
+            # Build set of (volume_name, position) tuples from validation patches
+            val_patch_positions = set()
             for vp in getattr(val_dataset, 'valid_patches', []):
-                name = vp.get('volume_name')
-                if name is not None:
-                    val_volume_names.add(name)
+                name = vp.volume_name or 'default'
+                val_patch_positions.add((name, vp.position))
 
+            # Include training patches that don't have exact position overlap with validation
             train_indices = []
+            excluded_count = 0
             for i, vp in enumerate(getattr(train_dataset, 'valid_patches', [])):
-                name = vp.get('volume_name')
-                if name is None or name not in val_volume_names:
+                name = vp.volume_name or 'default'
+                if (name, vp.position) in val_patch_positions:
+                    # Exact same patch position in same volume - exclude to prevent leakage
+                    excluded_count += 1
+                else:
                     train_indices.append(i)
 
             # Count FG/BG in training indices for weighted sampling
@@ -746,7 +798,9 @@ class BaseTrainer:
 
             if self.mgr.verbose:
                 print(f"Using external validation set: {len(val_indices)} val patches")
-                print(f"Excluding {len(train_dataset) - len(train_indices)} train patches overlapping validation volumes")
+                if excluded_count > 0:
+                    print(f"Excluded {excluded_count} train patches with same position as validation (leakage prevention)")
+                print(f"Training with {len(train_indices)} patches ({n_train_fg} FG, {n_train_bg} BG)")
 
         # Batch size semantics: in all modes, --batch-size is per-GPU (per process)
         per_device_batch = self.mgr.train_batch_size
@@ -806,7 +860,7 @@ class BaseTrainer:
         pin_mem = True if self.device.type == 'cuda' else False
         dl_kwargs = {}
         if self.mgr.train_num_dataloader_workers and self.mgr.train_num_dataloader_workers > 0:
-            dl_kwargs['prefetch_factor'] = 1
+            dl_kwargs['prefetch_factor'] = 2
 
         train_dataloader = DataLoader(
             train_subset,
@@ -842,6 +896,8 @@ class BaseTrainer:
         train_dataset = self._configure_dataset(is_training=True)
         # Keep a handle to the training dataset for on-device augmentation
         self._train_dataset = train_dataset
+        if self._profile_augmentations:
+            self._augmentation_names = getattr(train_dataset, '_augmentation_names', None)
 
         if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
             from copy import deepcopy
@@ -873,7 +929,6 @@ class BaseTrainer:
         self._ds_scales = None
         self._ds_weights = None
         optimizer = self._get_optimizer(model)
-        loss_fns = self._build_loss()
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
         self._is_per_iteration_scheduler = is_per_iteration_scheduler  # Store for later use
 
@@ -881,8 +936,7 @@ class BaseTrainer:
         model = model.to(self.device)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
-
-        if not use_amp and getattr(self.mgr, 'no_amp', False):
+        if not use_amp:
             print("Automatic Mixed Precision (AMP) is disabled")
 
         amp_dtype_setting = getattr(self.mgr, 'amp_dtype', 'float16')
@@ -1059,15 +1113,18 @@ class BaseTrainer:
             artifact.add_file(splits_filepath)
             wandb.log_artifact(artifact)
 
-    def _get_model_outputs(self, model, data_dict):
-        inputs = data_dict["image"].to(self.device)
+    def _extract_targets(self, data_dict):
         # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
-        targets_dict = {
+        return {
             k: v.to(self.device)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
             and hasattr(v, "to")
         }
+
+    def _get_model_outputs(self, model, data_dict):
+        inputs = data_dict["image"].to(self.device)
+        targets_dict = self._extract_targets(data_dict)
         
         outputs = model(inputs)
 
@@ -1086,6 +1143,7 @@ class BaseTrainer:
             return batched_dict
         B = batched_dict['image'].shape[0]
         out_accum = {}
+        perf_names = self._augmentation_names if (self._profile_augmentations and self._augmentation_names) else None
         for b in range(B):
             sample = {}
             for k, v in batched_dict.items():
@@ -1095,6 +1153,8 @@ class BaseTrainer:
                     sample[k] = v[b]
                 else:
                     sample[k] = v
+            if perf_names is not None:
+                sample['_aug_perf'] = {name: 0.0 for name in perf_names}
             sample_out = tfm(**sample)
             for k, v in sample_out.items():
                 out_accum.setdefault(k, []).append(v)
@@ -1143,6 +1203,8 @@ class BaseTrainer:
         else:
             data_for_forward = data_dict
 
+        self._accumulate_aug_timers(data_for_forward)
+
         with autocast_ctx:
             inputs, targets_dict, outputs = self._get_model_outputs(model, data_for_forward)
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
@@ -1165,7 +1227,7 @@ class BaseTrainer:
 
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
-    def _compute_train_loss(self, outputs, targets_dict, loss_fns):
+    def _compute_task_losses(self, outputs, targets_dict, loss_fns, *, apply_task_weights: bool):
         total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
         task_losses = {}
 
@@ -1175,13 +1237,9 @@ class BaseTrainer:
 
             t_pred = outputs[t_name]
             task_loss_fns = loss_fns[t_name]
-            task_weight = self.mgr.targets[t_name].get("weight", 1.0)
+            task_weight = self.mgr.targets[t_name].get("weight", 1.0) if apply_task_weights else 1.0
 
-            if isinstance(t_pred, (list, tuple)):
-                ref_tensor = t_pred[0]
-            else:
-                ref_tensor = t_pred
-
+            ref_tensor = t_pred[0] if isinstance(t_pred, (list, tuple)) else t_pred
             task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=torch.float32)
             for loss_fn, loss_weight in task_loss_fns:
                 pred_for_loss, gt_for_loss = t_pred, t_gt
@@ -1198,6 +1256,20 @@ class BaseTrainer:
                     targets_dict=targets_dict,
                     outputs=outputs,
                 )
+                # Some losses (e.g., Betti) return (loss, aux_dict); extract loss
+                if isinstance(loss_value, tuple) and len(loss_value) == 2:
+                    loss_value = loss_value[0]
+                # DEBUG: Accumulate raw loss values for epoch-end summary
+                loss_fn_name = type(loss_fn).__name__
+                if hasattr(loss_fn, 'loss'):  # Unwrap DeepSupervisionWrapper
+                    loss_fn_name = type(loss_fn.loss).__name__
+                key = f"{t_name}/{loss_fn_name}"
+                if not hasattr(self, '_debug_raw_losses'):
+                    self._debug_raw_losses = {}
+                if key not in self._debug_raw_losses:
+                    self._debug_raw_losses[key] = {'values': [], 'weight': loss_weight}
+                self._debug_raw_losses[key]['values'].append(loss_value.item())
+
                 task_total_loss += loss_weight * loss_value
 
             weighted_loss = task_weight * task_total_loss
@@ -1206,73 +1278,21 @@ class BaseTrainer:
 
         return total_loss, task_losses
 
+    def _compute_train_loss(self, outputs, targets_dict, loss_fns):
+        return self._compute_task_losses(outputs, targets_dict, loss_fns, apply_task_weights=True)
 
     def _validation_step(self, model, data_dict, loss_fns, use_amp):
         data_dict = self._prepare_batch(data_dict, is_training=False)
-        inputs = data_dict["image"].to(self.device)
-        # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
-        targets_dict = {
-            k: v.to(self.device)
-            for k, v in data_dict.items()
-            if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
-            and hasattr(v, "to")
-        }
-
-        if use_amp:
-            if self.device.type == 'cuda':
-                context = torch.amp.autocast('cuda', dtype=self.amp_dtype)
-            elif self.device.type == 'cpu':
-                context = torch.amp.autocast('cpu')
-            elif self.device.type in ['mlx', 'mps']:
-                context = torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
-            else:
-                context = torch.amp.autocast(self.device.type)
-        else:
-            context = nullcontext()
-
-        with context:
-            outputs = model(inputs)
-            if getattr(self.mgr, 'enable_deep_supervision', False):
-                targets_dict = self._downsample_targets_for_ds(outputs, targets_dict)
+        with self._autocast_context(use_amp):
+            inputs, targets_dict, outputs = self._get_model_outputs(model, data_dict)
             task_losses = self._compute_validation_loss(outputs, targets_dict, loss_fns)
-        
+
         return task_losses, inputs, targets_dict, outputs
 
     def _compute_validation_loss(self, outputs, targets_dict, loss_fns):
-        task_losses = {}
-
-        for t_name, t_gt in targets_dict.items():
-            if not self._should_include_target_in_loss(t_name):
-                continue
-
-            t_pred = outputs[t_name]
-            task_loss_fns = loss_fns[t_name]
-
-            if isinstance(t_pred, (list, tuple)):
-                ref_tensor = t_pred[0]
-            else:
-                ref_tensor = t_pred
-
-            task_total_loss = torch.zeros((), device=ref_tensor.device, dtype=torch.float32)
-            for loss_fn, loss_weight in task_loss_fns:
-                pred_for_loss, gt_for_loss = t_pred, t_gt
-                if isinstance(t_pred, (list, tuple)) and not isinstance(loss_fn, DeepSupervisionWrapper):
-                    pred_for_loss = t_pred[0]
-                    if isinstance(t_gt, (list, tuple)):
-                        gt_for_loss = t_gt[0]
-
-                loss_value = self._compute_loss_value(
-                    loss_fn,
-                    pred_for_loss,
-                    gt_for_loss,
-                    target_name=t_name,
-                    targets_dict=targets_dict,
-                    outputs=outputs,
-                )
-                task_total_loss += loss_weight * loss_value
-
-            task_losses[t_name] = task_total_loss.detach().cpu().item()
-
+        _, task_losses = self._compute_task_losses(
+            outputs, targets_dict, loss_fns, apply_task_weights=False
+        )
         return task_losses
 
     def _on_epoch_end(self, epoch, model, optimizer, scheduler, train_dataset,
@@ -1432,6 +1452,7 @@ class BaseTrainer:
             else:
                 num_iters = len(train_dataloader)
 
+            self._reset_epoch_aug_timers()
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
             # Progress bar for training iterations
@@ -1454,14 +1475,7 @@ class BaseTrainer:
                 global_step += 1
                 
                 # Setup autocast context (dtype resolved based on CLI/config)
-                if use_amp and self.device.type == 'cuda':
-                    autocast_ctx = torch.amp.autocast('cuda', dtype=self.amp_dtype)
-                elif use_amp and self.device.type == 'cpu':
-                    autocast_ctx = torch.amp.autocast('cpu')
-                elif use_amp and self.device.type in ['mlx', 'mps']:
-                    autocast_ctx = torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
-                else:
-                    autocast_ctx = nullcontext()
+                autocast_ctx = self._autocast_context(use_amp)
 
                 # Execute training step
                 total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped = self._train_step(
@@ -1555,6 +1569,8 @@ class BaseTrainer:
             if pbar is not None:
                 pbar.close()
 
+            self._report_epoch_aug_timers(epoch)
+
             if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()
 
@@ -1572,6 +1588,14 @@ class BaseTrainer:
                 for t_name in self.mgr.targets:
                     avg_loss = np.mean(epoch_losses[t_name]) if epoch_losses[t_name] else 0
                     print(f"  {t_name}: Avg Loss = {avg_loss:.4f}")
+
+                # DEBUG: Print average raw loss values per loss function
+                if hasattr(self, '_debug_raw_losses') and self._debug_raw_losses:
+                    print("  [DEBUG] Raw loss averages:")
+                    for key, data in self._debug_raw_losses.items():
+                        avg_raw = np.mean(data['values']) if data['values'] else 0
+                        print(f"    {key}: raw={avg_raw:.6f}, weight={data['weight']}, weighted={avg_raw * data['weight']:.6f}")
+                    self._debug_raw_losses = {}  # Reset for next epoch
 
             # ---- validation ----- #
             val_every_n = int(getattr(self.mgr, 'val_every_n', 1))
@@ -1799,7 +1823,7 @@ class BaseTrainer:
                         avg_val_loss=avg_val_loss
                     )
 
-                    # Manage debug GIFs
+                    # Manage debug videos
                     if epoch in [e for e, _ in debug_gif_history]:
                         debug_gif_history, best_debug_gifs = manage_debug_gifs(
                             debug_gif_history=debug_gif_history,
@@ -1836,358 +1860,19 @@ class BaseTrainer:
             dist.destroy_process_group()
 
 def main():
-    """Main entry point for the training script."""
-    import argparse
-    import ast
-
-    parser = argparse.ArgumentParser(
-        description="Train Vesuvius neural networks for ink detection and segmentation",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    grp_required = parser.add_argument_group("Required")
-    grp_paths = parser.add_argument_group("Paths & Format")
-    grp_data = parser.add_argument_group("Data & Splits")
-    grp_model = parser.add_argument_group("Model")
-    grp_train = parser.add_argument_group("Training Control")
-    grp_optim = parser.add_argument_group("Optimization")
-    grp_sched = parser.add_argument_group("Scheduler")
-    grp_trainer = parser.add_argument_group("Trainer Selection")
-    grp_logging = parser.add_argument_group("Logging & Tracking")
-
-    # Required
-    grp_required.add_argument("-i", "--input", required=True,
-                              help="Input directory containing images/ and labels/ subdirectories.")
-    grp_required.add_argument("--config", "--config-path", dest="config_path", type=str, required=True,
-                              help="Path to configuration YAML file")
-
-    # Paths & Format
-    grp_paths.add_argument("-o", "--output", default="checkpoints",
-                           help="Output directory for saving checkpoints and configs")
-    grp_paths.add_argument("--format", choices=["image", "zarr", "napari"],
-                           help="Data format (auto-detected if omitted)")
-    grp_paths.add_argument("--val-dir", type=str,
-                           help="Optional validation directory with images/ and labels/")
-    grp_paths.add_argument("--checkpoint", "--checkpoint-path", dest="checkpoint_path", type=str,
-                           help="Path to checkpoint (.pt/.pth) or weights-only state_dict file")
-    grp_paths.add_argument("--load-weights-only", action="store_true",
-                           help="Load only model weights from checkpoint; ignore optimizer/scheduler and allow partial load")
-    grp_paths.add_argument("--rebuild-from-ckpt-config", action="store_true",
-                           help="Rebuild model from checkpoint's model_config before loading weights")
-    grp_paths.add_argument("--intensity-properties-json", type=str, default=None,
-                           help="nnU-Net style intensity properties JSON for CT normalization")
-    grp_paths.add_argument("--skip-image-checks", action="store_true",
-                           help="Skip expensive image/zarr existence checks and conversions; assumes images.zarr/labels.zarr already exist")
-
-    # Data & Splits
-    grp_data.add_argument("--batch-size", type=int,
-                          help="Training batch size")
-    grp_data.add_argument("--patch-size", type=str,
-                          help="Patch size CSV, e.g. '192,192,192' (3D) or '256,256' (2D)")
-    grp_data.add_argument("--loss", type=str,
-                          help="Loss functions, e.g. '[SoftDiceLoss, BCEWithLogitsLoss]' or CSV")
-    grp_data.add_argument("--train-split", type=float,
-                          help="Training/validation split ratio in [0,1]")
-    grp_data.add_argument("--seed", type=int, default=42,
-                          help="Random seed for split/initialization")
-    grp_data.add_argument("--skip-intensity-sampling", dest="skip_intensity_sampling",
-                          action="store_true", default=True,
-                          help="Skip intensity sampling during dataset init")
-    grp_data.add_argument("--no-skip-intensity-sampling", dest="skip_intensity_sampling",
-                          action="store_false",
-                          help="Enable intensity sampling during dataset init")
-    grp_data.add_argument("--no-spatial", action="store_true",
-                          help="Disable spatial/geometric augmentations")
-    grp_data.add_argument("--rotation-axes", type=str,
-                          help="Comma-separated axes (subset of x,y,z / width,height,depth) that may be rotated; e.g. 'z' keeps the depth axis upright")
-
-    # Model
-    grp_model.add_argument("--model-name", type=str,
-                           help="Model name for checkpoints and logging")
-    grp_model.add_argument("--nonlin", type=str, choices=["LeakyReLU", "ReLU", "SwiGLU", "swiglu", "GLU", "glu"],
-                           help="Activation function")
-    grp_model.add_argument("--se", action="store_true", help="Enable squeeze and excitation modules in the encoder")
-    grp_model.add_argument("--se-reduction-ratio", type=float, default=0.0625,
-                           help="Squeeze excitation reduction ratio")
-    grp_model.add_argument("--pool-type", type=str, choices=["avg", "max", "conv"],
-                           help="Type of pooling in encoder ('conv' = strided conv)")
-
-    # Training Control
-    grp_train.add_argument("--max-epoch", type=int, default=1000,
-                           help="Maximum number of epochs")
-    grp_train.add_argument("--max-steps-per-epoch", type=int, default=200,
-                           help="Max training steps per epoch (use all data if unset)")
-    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=30,
-                           help="Max validation steps per epoch (use all data if unset)")
-    grp_train.add_argument("--full-epoch", action="store_true",
-                           help="Iterate over entire train/val set per epoch (overrides max-steps)")
-    grp_train.add_argument("--early-stopping-patience", type=int, default=20,
-                           help="Epochs to wait for val loss improvement (0 disables)")
-    grp_train.add_argument("--ddp", action="store_true",
-                           help="Enable DistributedDataParallel (use with torchrun)")
-    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
-                           help="Perform validation every N epochs (1=every epoch)")
-    grp_train.add_argument("--gpus", type=str, default=None,
-                           help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
-    grp_train.add_argument("--nproc-per-node", type=int, default=None,
-                           help="Number of processes to spawn locally for DDP (use instead of torchrun)")
-    grp_train.add_argument("--master-addr", type=str, default="127.0.0.1",
-                           help="Master address for DDP when spawning without torchrun")
-    grp_train.add_argument("--master-port", type=int, default=None,
-                           help="Master port for DDP when spawning without torchrun (default: auto)")
-
-    # Optimization
-    grp_optim.add_argument("--optimizer", type=str,
-                           help="Optimizer (see models/optimizers.py)")
-    grp_optim.add_argument("--grad-accum", "--gradient-accumulation", dest="gradient_accumulation", type=int, default=None,
-                           help="Number of steps to accumulate gradients before optimizer.step()")
-    grp_optim.add_argument("--grad-clip", type=float, default=12.0,
-                           help="Gradient clipping value")
-    grp_optim.add_argument("--amp-dtype", type=str, choices=["float16", "bfloat16"], default="float16",
-                           help="Autocast dtype when AMP is enabled (float16 uses GradScaler; bfloat16 skips scaling)")
-    grp_optim.add_argument("--no-amp", action="store_true",
-                           help="Disable Automatic Mixed Precision (AMP)")
-
-    # Scheduler
-    grp_sched.add_argument("--scheduler", type=str,
-                           help="Learning rate scheduler (default: from config or 'poly')")
-    grp_sched.add_argument("--warmup-steps", type=int,
-                           help="Number of warmup steps for cosine_warmup scheduler")
-
-    # Trainer Selection
-    grp_trainer.add_argument("--trainer", "--tr", type=str, default="base",
-                             help="Trainer: base, surface_frame, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
-    grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
-                             help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
-    # Semi-supervised sampling controls (used by mean_teacher/uncertainty_aware_mean_teacher)
-    grp_trainer.add_argument("--labeled-ratio", type=float, default=None,
-                             help="Fraction of labeled patches to use (0-1). If set, overrides trainer default")
-    grp_trainer.add_argument("--num-labeled", type=int, default=None,
-                             help="Absolute number of labeled patches to use (overrides --labeled-ratio if provided)")
-    grp_trainer.add_argument("--labeled-batch-size", type=int, default=None,
-                             help="Number of labeled patches per batch (rest are unlabeled) for two-stream sampler")
-
-    # Only valid for finetune_mae_unet: path to the pretrained MAE checkpoint to initialize from
-    grp_trainer.add_argument("--pretrained_checkpoint", type=str, default=None,
-                             help="Pretrained MAE checkpoint path (required when --trainer finetune_mae_unet). Invalid for other trainers.")
-
-    # Logging & Tracking
-    grp_logging.add_argument("--wandb-project", type=str, default=None,
-                             help="Weights & Biases project (omit to disable wandb)")
-    grp_logging.add_argument("--wandb-entity", type=str, default=None,
-                             help="Weights & Biases team/username")
-    grp_logging.add_argument("--wandb-run-name", type=str, default=None,
-                             help="Optional custom name for the Weights & Biases run")
-    grp_logging.add_argument("--wandb-resume", nargs='?', const='allow', default=None,
-                             help="Weights & Biases resume mode or run id. Provide a resume policy ('allow', 'auto', 'must', 'never') or a run id (defaults to 'allow' if flag used without value).")
-    grp_logging.add_argument("--verbose", action="store_true",
-                             help="Enable verbose debug output")
-
-    args = parser.parse_args()
-
-    from vesuvius.models.configuration.config_manager import ConfigManager
-    mgr = ConfigManager(verbose=args.verbose)
-
-    if not Path(args.config_path).exists():
-        print(f"\nError: Config file does not exist: {args.config_path}")
-        print("\nPlease provide a valid configuration file.")
-        print("\nExample usage:")
-        print("  vesuvius.train --config path/to/config.yaml --input path/to/data --output path/to/output")
-        print("\nFor more options, use: vesuvius.train --help")
-        sys.exit(1)
-
-    mgr.load_config(args.config_path)
-    print(f"Loaded configuration from: {args.config_path}")
-
-    if not Path(args.input).exists():
-        raise ValueError(f"Input directory does not exist: {args.input}")
-
-    if args.val_dir is not None and not Path(args.val_dir).exists():
-        raise ValueError(f"Validation directory does not exist: {args.val_dir}")
-
-    Path(args.output).mkdir(parents=True, exist_ok=True)
-
-    update_config_from_args(mgr, args)
-
-    # Validation frequency
-    if hasattr(args, 'val_every_n') and args.val_every_n is not None:
-        if int(args.val_every_n) < 1:
-            raise ValueError(f"--val-every-n must be >= 1, got {args.val_every_n}")
-        setattr(mgr, 'val_every_n', int(args.val_every_n))
-        mgr.tr_configs["val_every_n"] = int(args.val_every_n)
-        if args.verbose:
-            print(f"Validate every {args.val_every_n} epoch(s)")
-
-    # Enable DDP if requested or if torchrun sets WORLD_SIZE>1
-    if getattr(args, 'ddp', False) or int(os.environ.get('WORLD_SIZE', '1')) > 1:
-        setattr(mgr, 'use_ddp', True)
-        # In DDP, --batch-size is per-GPU; no extra adjustment needed.
-
-    # Parse GPUs selection if provided
-    if getattr(args, 'gpus', None):
-        try:
-            gpu_ids = [int(x) for x in str(args.gpus).split(',') if x.strip() != '']
-        except ValueError:
-            raise ValueError("--gpus must be a comma-separated list of integers, e.g. '0,1,3'")
-        setattr(mgr, 'gpu_ids', gpu_ids)
-
-    if args.val_dir is not None:
-        from pathlib import Path as _Path
-        mgr.val_data_path = _Path(args.val_dir)
-
-    # If user supplies intensity properties JSON, load and inject into config for CT normalization
-    if args.intensity_properties_json is not None:
-        ip_path = Path(args.intensity_properties_json)
-        if not ip_path.exists():
-            raise ValueError(f"Intensity properties JSON not found: {ip_path}")
-        props = load_intensity_props_formatted(ip_path, channel=0)
-        if not props:
-            raise ValueError(f"Failed to parse intensity properties JSON: {ip_path}")
-        if hasattr(mgr, 'update_config'):
-            mgr.update_config(normalization_scheme='ct', intensity_properties=props)
-        else:
-            mgr.dataset_config = getattr(mgr, 'dataset_config', {})
-            mgr.dataset_config['normalization_scheme'] = 'ct'
-            mgr.dataset_config['intensity_properties'] = props
-        setattr(mgr, 'skip_intensity_sampling', True)
-        print("Using provided intensity properties for CT normalization. Sampling disabled.")
-
-    # If DDP is requested but not launched with torchrun, optionally self-spawn processes
-    if getattr(mgr, 'use_ddp', False) and int(os.environ.get('WORLD_SIZE', '1')) == 1:
-        import subprocess, sys, shlex, socket
-
-        # Determine process count
-        nproc = args.nproc_per_node
-        if nproc is None:
-            # Default to number of requested GPUs, else CUDA device count, else 1
-            gpu_ids = getattr(mgr, 'gpu_ids', None)
-            if gpu_ids:
-                nproc = len(gpu_ids)
-            elif torch.cuda.is_available():
-                try:
-                    nproc = torch.cuda.device_count()
-                except Exception:
-                    nproc = 1
-            else:
-                nproc = 1
-
-        if nproc > 1:
-            # Validate GPU mapping length if provided
-            gpu_ids = getattr(mgr, 'gpu_ids', None)
-            if gpu_ids and len(gpu_ids) != nproc:
-                raise ValueError(f"--gpus specifies {len(gpu_ids)} GPUs but --nproc-per-node is {nproc}. They must match.")
-
-            # Find a free port if not provided
-            master_port = args.master_port
-            if master_port is None:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind((args.master_addr, 0))
-                    master_port = s.getsockname()[1]
-
-            print(f"Spawning {nproc} DDP processes (master {args.master_addr}:{master_port}) without torchrun...")
-
-            # Rebuild argv without the spawn-only flags; children don't need them
-            skip_next = False
-            child_argv = []
-            for i, a in enumerate(sys.argv[1:]):
-                if skip_next:
-                    skip_next = False
-                    continue
-                if a in ("--nproc-per-node", "--master-addr", "--master-port"):
-                    skip_next = True
-                    continue
-                child_argv.append(a)
-
-            procs = []
-            for rank in range(nproc):
-                env = os.environ.copy()
-                env.update({
-                    'RANK': str(rank),
-                    'LOCAL_RANK': str(rank),
-                    'WORLD_SIZE': str(nproc),
-                    'MASTER_ADDR': args.master_addr,
-                    'MASTER_PORT': str(master_port),
-                })
-                cmd = [sys.executable, sys.argv[0], *child_argv]
-                # Use unbuffered -u for timely logs on Windows/Unix
-                if '-u' not in cmd:
-                    cmd.insert(1, '-u')
-                procs.append(subprocess.Popen(cmd, env=env))
-
-            exit_code = 0
-            for p in procs:
-                ret = p.wait()
-                if ret != 0:
-                    exit_code = ret
-            sys.exit(exit_code)
-        else:
-            print("DDP requested but only one process determined; proceeding single-process.")
-
-    trainer_name = args.trainer.lower()
-    mgr.trainer_class = trainer_name
-
-    # Enforce usage of --pretrained_checkpoint only for the MAE finetune trainer, and require it there
-    if getattr(args, 'pretrained_checkpoint', None):
-        if trainer_name != "finetune_mae_unet":
-            raise ValueError("--pretrained_checkpoint is only valid when using --trainer finetune_mae_unet")
-        # Stash onto mgr so the finetune trainer can load it
-        setattr(mgr, 'pretrained_mae_checkpoint', args.pretrained_checkpoint)
-        mgr.tr_info["pretrained_mae_checkpoint"] = args.pretrained_checkpoint
-    elif trainer_name == "finetune_mae_unet":
-        # For finetune trainer the pretrained checkpoint is mandatory
-        raise ValueError("Missing --pretrained_checkpoint: required for --trainer finetune_mae_unet")
-    
-    if trainer_name == "uncertainty_aware_mean_teacher":
-        mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.semi_supervised.train_uncertainty_aware_mean_teacher import TrainUncertaintyAwareMeanTeacher
-        trainer = TrainUncertaintyAwareMeanTeacher(mgr=mgr, verbose=args.verbose)
-        print("Using Uncertainty-Aware Mean Teacher Trainer for semi-supervised 3D training")
-    elif trainer_name == "mean_teacher":
-        mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.semi_supervised.train_mean_teacher import TrainMeanTeacher
-        trainer = TrainMeanTeacher(mgr=mgr, verbose=args.verbose)
-        print("Using Regular Mean Teacher Trainer for semi-supervised training")
-    elif trainer_name == "primus_mae":
-        mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.self_supervised.train_eva_mae import TrainEVAMAE
-        trainer = TrainEVAMAE(mgr=mgr, verbose=args.verbose)
-        print("Using EVA (Primus) Architecture for MAE Pretraining")
-    elif trainer_name == "unet_mae":
-        mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.self_supervised.train_unet_mae import TrainUNetMAE
-        trainer = TrainUNetMAE(mgr=mgr, verbose=args.verbose)
-        print("Using UNet-style MAE Trainer (NetworkFromConfig)")
-    elif trainer_name == "finetune_mae_unet":
-        from vesuvius.models.training.trainers.self_supervised.train_finetune_mae_unet import TrainFineTuneMAEUNet
-        trainer = TrainFineTuneMAEUNet(mgr=mgr, verbose=args.verbose)
-        print("Using Fine-Tune MAE->UNet Trainer (NetworkFromConfig)")
-    elif trainer_name == "lejepa":
-        mgr.allow_unlabeled_data = True
-        from vesuvius.models.training.trainers.self_supervised.train_lejepa import TrainLeJEPA
-        trainer = TrainLeJEPA(mgr=mgr, verbose=args.verbose)
-        print("Using LeJEPA Trainer (Primus + SIGReg) for unsupervised pretraining")
-    elif trainer_name == "mutex_affinity":
-        from vesuvius.models.training.trainers.mutex_affinity_trainer import MutexAffinityTrainer
-        trainer = MutexAffinityTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Mutex Affinity Trainer")
-    elif trainer_name == "base":
-        trainer = BaseTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Base Trainer for supervised training")
-    elif trainer_name == "surface_frame":
-        from vesuvius.models.training.trainers.surface_frame_trainer import SurfaceFrameTrainer
-
-        trainer = SurfaceFrameTrainer(mgr=mgr, verbose=args.verbose)
-        print("Using Surface Frame Trainer")
-    else:
-        raise ValueError(
-            "Unknown trainer: {trainer}. Available options: base, surface_frame, mutex_affinity, mean_teacher, "
-            "uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet, lejepa".format(trainer=trainer_name)
-        )
-
-    print("Starting training...")
-    trainer.train()
-    print("Training completed!")
+    from vesuvius.models.training.cli import main as cli_main
+    cli_main()
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    import sys
+
+    if len(sys.argv) > 1:
+        # Quick check for S3 paths in command line args
+        if any('s3://' in str(arg) for arg in sys.argv) or '--config-path' in sys.argv:
+            try:
+                multiprocessing.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass
     main()

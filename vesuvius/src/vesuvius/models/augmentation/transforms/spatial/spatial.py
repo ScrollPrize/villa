@@ -26,6 +26,9 @@ _PERMUTE_ZYX_TO_XYZ = np.array([[0, 0, 1],
 
 
 class SpatialTransform(BasicTransform):
+
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(self,
                  patch_size: Tuple[int, ...],
                  patch_center_dist_from_border: Union[int, List[int], Tuple[int, ...]],
@@ -69,6 +72,42 @@ class SpatialTransform(BasicTransform):
             normalized_axes = sorted({int(axis) for axis in allowed_rotation_axes if 0 <= int(axis) <= 2})
             self.allowed_rotation_axes = tuple(normalized_axes)
         self._skip_when_vector = True
+
+    def apply(self, data_dict, **params):
+        # Apply base transform (image, segmentation, etc.)
+        data_dict = super().apply(data_dict, **params)
+        # Also transform padding_mask with nearest-neighbor to keep it binary
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_padding_mask(data_dict['padding_mask'], **params)
+        return data_dict
+
+    def _apply_to_padding_mask(self, mask: torch.Tensor, **params) -> torch.Tensor:
+        """Transform padding mask using nearest-neighbor interpolation to keep it binary."""
+        if params['affine'] is None and params['elastic_offsets'] is None:
+            # No spatial transformation - just crop
+            mask = crop_tensor(mask, [math.floor(i) for i in params['center_location_in_pixels']],
+                              self.patch_size, pad_mode='constant', pad_kwargs={'value': 0})
+            return mask
+        else:
+            # Build grid and apply transform with nearest-neighbor interpolation
+            grid = _create_centered_identity_grid2(self.patch_size).to(mask.device)
+            if params['elastic_offsets'] is not None:
+                if params['elastic_offsets'].device != grid.device:
+                    params['elastic_offsets'] = params['elastic_offsets'].to(grid.device)
+                grid += params['elastic_offsets']
+            if params['affine'] is not None:
+                affine_t = torch.from_numpy(params['affine']).float().to(grid.device)
+                grid = torch.matmul(grid, affine_t)
+            if params['elastic_offsets'] is not None:
+                mn = grid.mean(dim=list(range(mask.ndim - 1)))
+            else:
+                mn = 0
+            new_center = torch.tensor([c - s / 2 for c, s in zip(params['center_location_in_pixels'], mask.shape[1:])],
+                                      dtype=grid.dtype, device=grid.device)
+            grid += (new_center - mn)
+            # Use nearest-neighbor to keep mask binary, zeros padding for new regions
+            return grid_sample(mask[None], _convert_my_grid_to_grid_sample_grid(grid, mask.shape[1:])[None],
+                               mode='nearest', padding_mode="zeros", align_corners=False)[0]
 
     def get_parameters(self, **data_dict) -> dict:
         dim = data_dict['image'].ndim - 1
@@ -328,7 +367,14 @@ class SpatialTransform(BasicTransform):
         return self._apply_to_image(regression_target, **params)
 
     def _apply_to_keypoints(self, keypoints, **params):
-        raise NotImplementedError
+        # TODO: Implement proper keypoint transformation for affine/elastic
+        # For now, pass through unchanged (Rot90/Transpose/Mirror handle discrete transforms)
+        return keypoints
+
+    def _apply_to_vectors(self, vectors, **params):
+        # TODO: Implement proper vector transformation for affine/elastic
+        # For now, pass through unchanged (Rot90/Transpose/Mirror handle discrete transforms)
+        return vectors
 
     def _apply_to_bbox(self, bbox, **params):
         raise NotImplementedError

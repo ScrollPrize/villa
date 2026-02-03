@@ -21,6 +21,8 @@ class Rot90Transform(BasicTransform):
                                  (e.g., {0, 1, 2} for 3D).
     """
 
+    _is_spatial = True  # Skip per-transform padding restoration
+
     def __init__(
         self,
         num_axis_combinations: RandomScalar = 1,
@@ -31,6 +33,14 @@ class Rot90Transform(BasicTransform):
         self.num_axis_combinations = num_axis_combinations
         self.num_rot_per_combination = num_rot_per_combination
         self.allowed_axes = allowed_axes
+
+    def apply(self, data_dict, **params):
+        # Apply base transform (image, segmentation, etc.)
+        data_dict = super().apply(data_dict, **params)
+        # Also transform padding_mask with the same rotation
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
+        return data_dict
 
     def get_parameters(self, **data_dict) -> dict:
         n_axes_combinations = round(sample_scalar(self.num_axis_combinations))
@@ -92,4 +102,85 @@ class Rot90Transform(BasicTransform):
         raise NotImplementedError("Rot90Transform does not support bounding boxes")
 
     def _apply_to_keypoints(self, keypoints, **params):
-        raise NotImplementedError("Rot90Transform does not support keypoints")
+        """
+        Transform keypoint coordinates for rot90.
+
+        keypoints: (N, 3) tensor in (z, y, x) order
+        Requires 'crop_shape' in params (tuple of spatial dimensions).
+        """
+        if keypoints is None:
+            return None
+        crop_shape = params.get('crop_shape')
+        if crop_shape is None:
+            raise ValueError("Rot90Transform._apply_to_keypoints requires 'crop_shape' in params")
+
+        keypoints = keypoints.clone()
+        for n_rot, axes in zip(params['num_rot_per_combination'], params['axis_combinations']):
+            # axes are 1-indexed (skip channel dim), convert to 0-indexed for keypoints
+            a, b = axes[0] - 1, axes[1] - 1
+            k = n_rot % 4
+            if k == 1:
+                # 90° rotation: new_a = old_b, new_b = shape[a] - 1 - old_a
+                new_a = keypoints[:, b].clone()
+                new_b = crop_shape[a] - 1 - keypoints[:, a]
+                keypoints[:, a] = new_a
+                keypoints[:, b] = new_b
+            elif k == 2:
+                # 180° rotation: both axes flip
+                keypoints[:, a] = crop_shape[a] - 1 - keypoints[:, a]
+                keypoints[:, b] = crop_shape[b] - 1 - keypoints[:, b]
+            elif k == 3:
+                # 270° rotation: new_a = shape[b] - 1 - old_b, new_b = old_a
+                new_a = crop_shape[b] - 1 - keypoints[:, b]
+                new_b = keypoints[:, a].clone()
+                keypoints[:, a] = new_a
+                keypoints[:, b] = new_b
+        return keypoints
+
+    def _apply_to_vectors(self, vectors, **params):
+        """
+        Transform vector components for rot90 (rotation only, no translation).
+
+        vectors: (N, 3) tensor in (z, y, x) order
+        """
+        if vectors is None:
+            return None
+
+        vectors = vectors.clone()
+        for n_rot, axes in zip(params['num_rot_per_combination'], params['axis_combinations']):
+            # axes are 1-indexed (skip channel dim), convert to 0-indexed
+            a, b = axes[0] - 1, axes[1] - 1
+            k = n_rot % 4
+            if k == 1:
+                # 90° rotation: (va, vb) -> (vb, -va)
+                new_a = vectors[:, b].clone()
+                new_b = -vectors[:, a]
+                vectors[:, a] = new_a
+                vectors[:, b] = new_b
+            elif k == 2:
+                # 180° rotation: (va, vb) -> (-va, -vb)
+                vectors[:, a] = -vectors[:, a]
+                vectors[:, b] = -vectors[:, b]
+            elif k == 3:
+                # 270° rotation: (va, vb) -> (-vb, va)
+                new_a = -vectors[:, b]
+                new_b = vectors[:, a].clone()
+                vectors[:, a] = new_a
+                vectors[:, b] = new_b
+        return vectors
+
+    def apply(self, data_dict: dict, **params) -> dict:
+        """Override to handle keypoints and vector_keys."""
+        data_dict = super().apply(data_dict, **params)
+
+        # Handle keypoints
+        if data_dict.get('keypoints') is not None:
+            data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
+
+        # Handle vector_keys
+        vector_keys = set(data_dict.get('vector_keys', []) or [])
+        for key in vector_keys:
+            if data_dict.get(key) is not None:
+                data_dict[key] = self._apply_to_vectors(data_dict[key], **params)
+
+        return data_dict

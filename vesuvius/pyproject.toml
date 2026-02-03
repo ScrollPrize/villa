@@ -184,9 +184,9 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.napari_trainer" = "vesuvius.napari_trainer.main_window:main"
 "vesuvius.voxelize_obj" = "vesuvius.image_proc.voxelize_objs:main"
 "vesuvius.refine_labels" = "vesuvius.image_proc.edt_frangi_label:main"
-"vesuvius.render_obj" = "vesuvius.rendering.mesh_to_surface:main"
-"vesuvius.flatten_obj" = "vesuvius.rendering.slim_uv:main"
 "vesuvius.train" = "vesuvius.models.training.train:main"
+"vesuvius.zarr_tasks" = "vesuvius.image_proc.run.zarr_tasks.__main__:main"
+"vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
 
 [tool.setuptools]
 include-package-data = true

@@ -9,20 +9,30 @@ def update_config_from_args(mgr, args):
             mgr.dataset_config = {}
         mgr.dataset_config["data_path"] = str(mgr.data_path)
 
-        if args.format:
+        volumes_cfg = mgr.dataset_config.get("volumes")
+        if volumes_cfg:
+            mgr.data_format = "explicit"
+            mgr.dataset_config["data_format"] = mgr.data_format
+            if args.format and args.format.lower() not in {"explicit", "mixed"}:
+                print("Ignoring --format because dataset_config.volumes is set (using explicit volumes).")
+        elif args.format:
             mgr.data_format = args.format;
             print(f"Using specified data format: {mgr.data_format}")
+            mgr.dataset_config["data_format"] = mgr.data_format
         else:
             detected = detect_data_format(mgr.data_path)
             if detected:
                 mgr.data_format = detected;
                 print(f"Auto-detected data format: {mgr.data_format}")
+                mgr.dataset_config["data_format"] = mgr.data_format
             else:
                 raise ValueError("Data format could not be determined. Please specify --format.")
-
-        mgr.dataset_config["data_format"] = mgr.data_format
     else:
         print("No input directory specified - using data_paths from config")
+        volumes_cfg = getattr(mgr, "dataset_config", {}).get("volumes")
+        if volumes_cfg and not hasattr(mgr, "data_format"):
+            mgr.data_format = "explicit"
+            mgr.dataset_config["data_format"] = mgr.data_format
 
     mgr.ckpt_out_base = Path(args.output)
     mgr.tr_info["ckpt_out_base"] = str(mgr.ckpt_out_base)
@@ -71,6 +81,12 @@ def update_config_from_args(mgr, args):
     if args.max_val_steps_per_epoch is not None:
         mgr.max_val_steps_per_epoch = args.max_val_steps_per_epoch
         mgr.tr_configs["max_val_steps_per_epoch"] = args.max_val_steps_per_epoch
+
+    if getattr(args, 'profile_augmentations', False):
+        mgr.profile_augmentations = True
+        mgr.tr_configs["profile_augmentations"] = True
+        if mgr.verbose:
+            print("Augmentation profiling enabled")
     
     # Handle full_epoch flag - overrides max_steps_per_epoch and max_val_steps_per_epoch
     if args.full_epoch:
@@ -324,8 +340,12 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print("Will rebuild model from checkpoint's model_config before loading weights")
 
-    mgr.wandb_project = args.wandb_project
-    mgr.wandb_entity = args.wandb_entity
+    if args.wandb_project is not None:
+        mgr.wandb_project = args.wandb_project
+        mgr.tr_info["wandb_project"] = args.wandb_project
+    if args.wandb_entity is not None:
+        mgr.wandb_entity = args.wandb_entity
+        mgr.tr_info["wandb_entity"] = args.wandb_entity
     mgr.wandb_run_name = getattr(args, 'wandb_run_name', None)
     if mgr.wandb_run_name:
         mgr.model_name = mgr.wandb_run_name
