@@ -144,6 +144,7 @@ class Model2D(nn.Module):
 		self.bias = nn.Parameter(bias_init)
 		self.const_mask_lr: torch.Tensor | None = None
 		self._last_grow_insert_lr: tuple[int, int, int, int] | None = None
+		self._last_grow_insert_z: int | None = None
 		self.subsample_winding = int(subsample_winding)
 		self.subsample_mesh = int(subsample_mesh)
 
@@ -270,9 +271,31 @@ class Model2D(nn.Module):
 		dirs = {str(d).strip().lower() for d in directions}
 		if not dirs:
 			dirs = {"left", "right", "up", "down"}
-		bad = dirs - {"left", "right", "up", "down"}
+		bad = dirs - {"left", "right", "up", "down", "fw", "bw"}
 		if bad:
 			raise ValueError(f"invalid grow direction(s): {sorted(bad)}")
+		if ("fw" in dirs or "bw" in dirs) and (dirs - {"fw", "bw"}):
+			raise ValueError("grow: fw/bw may only be used alone")
+		if "fw" in dirs and "bw" in dirs:
+			raise ValueError("grow: cannot combine fw and bw")
+
+		self._last_grow_insert_z = None
+		if "fw" in dirs or "bw" in dirs:
+			side = +1 if "fw" in dirs else -1
+			z0 = int(self.z_size)
+			self.mesh_ms = nn.ParameterList(
+				[nn.Parameter(self._expand_copy_edge(src=p, dim=0, side=side)) for p in list(self.mesh_ms)]
+			)
+			self.conn_offset_ms = nn.ParameterList(
+				[nn.Parameter(self._expand_copy_edge(src=p, dim=0, side=side)) for p in list(self.conn_offset_ms)]
+			)
+			self.amp = nn.Parameter(self._expand_copy_edge(src=self.amp, dim=0, side=side))
+			self.bias = nn.Parameter(self._expand_copy_edge(src=self.bias, dim=0, side=side))
+			self.z_size = int(self.z_size) + 1
+			self._last_grow_insert_z = z0 if side > 0 else 0
+			self._last_grow_insert_lr = None
+			self.const_mask_lr = None
+			return
 
 		h0 = int(self.mesh_h)
 		w0 = int(self.mesh_w)
@@ -523,7 +546,8 @@ class Model2D(nn.Module):
 			gh_i = max(2, (gh_prev + 1) // 2)
 			gw_i = max(2, (gw_prev + 1) // 2)
 			shapes.append((gh_i, gw_i))
-		return [nn.Parameter(torch.zeros(1, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
+		n = int(self.z_size)
+		return [nn.Parameter(torch.zeros(n, 2, gh_i, gw_i, device=device, dtype=torch.float32)) for (gh_i, gw_i) in shapes]
 
 	def _build_mesh_ms(self, *, offset_scales: int, device: torch.device, gh0: int, gw0: int) -> list[nn.Parameter]:
 		"""Build residual pyramid whose reconstruction is the mesh coords in pixel units."""

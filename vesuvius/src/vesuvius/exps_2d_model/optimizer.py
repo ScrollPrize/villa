@@ -227,7 +227,19 @@ def optimize(
 			if cm_lr.ndim != 4 or int(cm_lr.shape[1]) != 1:
 				raise ValueError("const_mask_lr must be (N,1,Hm,Wm)")
 			cm_lr = cm_lr.detach().to(device=data.cos.device, dtype=torch.float32)
+			if int(cm_lr.shape[0]) != int(data.cos.shape[0]):
+				raise ValueError("const_mask_lr batch must match data batch")
 			keep_lr = (1.0 - cm_lr)
+
+		ins_z = getattr(model, "_last_grow_insert_z", None)
+		z_keep = None
+		if ins_z is not None:
+			ins_z = int(ins_z)
+			n = int(data.cos.shape[0])
+			if not (0 <= ins_z < n):
+				raise ValueError("grow z index out of range")
+			z_keep = torch.zeros(n, 1, 1, 1, device=data.cos.device, dtype=torch.float32)
+			z_keep[ins_z, 0, 0, 0] = 1.0
 		params: list[torch.nn.Parameter] = []
 		for name in opt_cfg.params:
 			group = all_params.get(name, [])
@@ -236,11 +248,11 @@ def optimize(
 					if not group:
 						continue
 					p0 = group[0]
-					if p0.shape[0] != 1 or p0.shape[-2:] != keep_lr.shape[-2:]:
+					if p0.shape[0] != keep_lr.shape[0] or p0.shape[-2:] != keep_lr.shape[-2:]:
 						raise ValueError("const_mask_lr must match mesh_ms[0]/conn_offset_ms[0] spatial shape")
 					m = keep_lr.to(dtype=p0.dtype)
 					if int(p0.shape[1]) != 1:
-						m = m.expand(1, int(p0.shape[1]), int(p0.shape[2]), int(p0.shape[3]))
+						m = m.expand(int(m.shape[0]), int(p0.shape[1]), int(p0.shape[2]), int(p0.shape[3]))
 					hooks.append(p0.register_hook(lambda g, mm=m: g * mm))
 					params.append(p0)
 				else:
@@ -250,6 +262,11 @@ def optimize(
 				params.extend(group)
 		if not params:
 			return
+		if z_keep is not None:
+			for p in params:
+				if p.ndim >= 1 and int(p.shape[0]) == int(z_keep.shape[0]):
+					m = z_keep.to(dtype=p.dtype).view(int(p.shape[0]), *([1] * (int(p.ndim) - 1)))
+					hooks.append(p.register_hook(lambda g, mm=m: g * mm))
 		opt = torch.optim.Adam(params, lr=opt_cfg.lr)
 		mean_pos_xy = None
 		if _need_term("mean_pos", opt_cfg.eff) != 0.0:

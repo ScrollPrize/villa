@@ -281,12 +281,14 @@ def save(
 
 	h_img, w_img = data.size
 	res = model(data)
-	# z support: for now visualization operates on the first z-slice.
-	bg = data.cos[0:1]
-	xy_lr = res.xy_lr[0:1]
-	xy_conn = res.xy_conn[0:1]
-	mask_lr = res.mask_lr[0:1]
-	mask_conn = res.mask_conn[0:1]
+	# z support: visualize the currently optimized z-slice (grow fw/bw), fallback z=0.
+	z_i = int(getattr(model, "_last_grow_insert_z", 0) or 0)
+	z_i = max(0, min(z_i, int(data.cos.shape[0]) - 1))
+	bg = data.cos[z_i:z_i + 1]
+	xy_lr = res.xy_lr[z_i:z_i + 1]
+	xy_conn = res.xy_conn[z_i:z_i + 1]
+	mask_lr = res.mask_lr[z_i:z_i + 1]
+	mask_conn = res.mask_conn[z_i:z_i + 1]
 	h2 = int(h_img) * 2
 	w2 = int(w_img) * 2
 
