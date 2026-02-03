@@ -1484,8 +1484,7 @@ int main(int argc, char *argv[])
                     if (isCompositeMode) {
                         // Composite mode: use readCompositeFast to composite all layers into single output
                         // Note: readCompositeFast only supports uint8 output
-                        FastCompositeCache fastCache;
-                        fastCache.setDataset(ds.get());
+                        ChunkCache<uint8_t> cache;
 
                         cv::Mat_<uint8_t> compositeOut;
                         readCompositeFast(
@@ -1497,7 +1496,7 @@ int main(int argc, char *argv[])
                             compositeStart,
                             compositeEnd,
                             compositeParams,
-                            fastCache
+                            cache
                         );
 
                         tileOut = compositeOut;
@@ -2023,8 +2022,7 @@ int main(int argc, char *argv[])
 
                     if (isCompositeMode) {
                         // Composite mode: use readCompositeFast to composite all layers into single output
-                        FastCompositeCache fastCache;
-                        fastCache.setDataset(ds.get());
+                        ChunkCache<uint8_t> cache;
 
                         cv::Mat_<uint8_t> compositeOut;
                         readCompositeFast(
@@ -2036,7 +2034,7 @@ int main(int argc, char *argv[])
                             compositeStart,
                             compositeEnd,
                             compositeParams,
-                            fastCache
+                            cache
                         );
 
                         cv::Mat sliceOut = compositeOut;

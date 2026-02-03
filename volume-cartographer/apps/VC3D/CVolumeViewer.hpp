@@ -427,9 +427,6 @@ protected:
 
     bool _dirtyWhileMinimized = false;
 
-    // Fast composite rendering cache - no mutex, specialized for composite
-    FastCompositeCache _fastCompositeCache;
-
     // Cached normals for composite rendering - invalidated on surface/ptr change
     cv::Mat_<cv::Vec3f> _cachedNormals;
     cv::Mat_<cv::Vec3f> _cachedBaseCoords;
