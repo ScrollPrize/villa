@@ -473,6 +473,9 @@ class RegressionPLModel(pl.LightningModule):
         if self.erm_group_topk < 0:
             raise ValueError(f"erm_group_topk must be >= 0, got {self.erm_group_topk}")
 
+        self._ema_decay = float(getattr(CFG, "ema_decay", 0.9))
+        self._ema_metrics = {}
+
         self.loss_func1 = smp.losses.DiceLoss(mode="binary")
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
@@ -614,6 +617,20 @@ class RegressionPLModel(pl.LightningModule):
     def compute_batch_loss(self, logits, targets):
         return 0.5 * self.loss_func1(logits, targets) + 0.5 * self.loss_func2(logits, targets)
 
+    def _update_ema_metric(self, name, value):
+        decay = float(self._ema_decay)
+        try:
+            val = float(value.detach().cpu().item())
+        except Exception:
+            val = float(value)
+        prev = self._ema_metrics.get(name)
+        if prev is None:
+            ema = val
+        else:
+            ema = decay * prev + (1.0 - decay) * val
+        self._ema_metrics[name] = ema
+        self.log(f"{name}_ema", ema, on_step=False, on_epoch=True, prog_bar=False)
+
     def training_step(self, batch, batch_idx):
         x, y, g = batch
         outputs = self(x)
@@ -729,9 +746,13 @@ class RegressionPLModel(pl.LightningModule):
         group_count = self._train_group_count
         group_loss = self._train_group_loss_sum / group_count.clamp_min(1)
         group_dice = self._train_group_dice_sum / group_count.clamp_min(1)
+        worst_group_loss = group_loss.max() if group_loss.numel() else torch.tensor(0.0, device=self.device)
 
         self.log("train/epoch_avg_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
         self.log("train/epoch_avg_dice", avg_dice, on_step=False, on_epoch=True, prog_bar=False)
+        self._update_ema_metric("train/total_loss", avg_loss)
+        self._update_ema_metric("train/dice", avg_dice)
+        self._update_ema_metric("train/worst_group_loss", worst_group_loss)
         for group_idx, group_name in enumerate(self.group_names):
             safe_group_name = str(group_name).replace("/", "_")
             self.log(
@@ -821,6 +842,10 @@ class RegressionPLModel(pl.LightningModule):
         self.log("val/worst_group_dice", worst_group_dice, on_epoch=True, prog_bar=False)
         self.log("val/avg_bce_loss", avg_bce, on_epoch=True, prog_bar=False)
         self.log("val/avg_dice_loss", avg_dice_loss, on_epoch=True, prog_bar=False)
+        self._update_ema_metric("val/avg_loss", avg_loss)
+        self._update_ema_metric("val/worst_group_loss", worst_group_loss)
+        self._update_ema_metric("val/avg_dice", avg_dice)
+        self._update_ema_metric("val/worst_group_dice", worst_group_dice)
 
         for group_idx, group_name in enumerate(self.group_names):
             safe_group_name = str(group_name).replace("/", "_")

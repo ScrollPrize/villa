@@ -154,6 +154,13 @@ def init_wandb_logger(args, base_config):
         run.define_metric("val/avg_loss", summary="min")
         run.define_metric("val/worst_group_dice", summary="max")
         run.define_metric("val/avg_dice", summary="max")
+        run.define_metric("val/worst_group_loss_ema", summary="min")
+        run.define_metric("val/avg_loss_ema", summary="min")
+        run.define_metric("val/worst_group_dice_ema", summary="max")
+        run.define_metric("val/avg_dice_ema", summary="max")
+        run.define_metric("train/total_loss_ema", summary="min")
+        run.define_metric("train/dice_ema", summary="max")
+        run.define_metric("train/worst_group_loss_ema", summary="min")
     except Exception:
         pass
 
