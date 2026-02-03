@@ -281,19 +281,25 @@ def save(
 
 	h_img, w_img = data.size
 	res = model(data)
+	# z support: for now visualization operates on the first z-slice.
+	bg = data.cos[0:1]
+	xy_lr = res.xy_lr[0:1]
+	xy_conn = res.xy_conn[0:1]
+	mask_lr = res.mask_lr[0:1]
+	mask_conn = res.mask_conn[0:1]
 	h2 = int(h_img) * 2
 	w2 = int(w_img) * 2
 
-	grid_xy = res.xy_lr
+	grid_xy = xy_lr
 	grid_vis = _draw_grid_vis(
 		scale=scale,
 		h_img=h_img,
 		w_img=w_img,
-		background=data.cos,
+		background=bg,
 		xy_lr=grid_xy,
-		xy_conn=res.xy_conn,
-		mask_lr=res.mask_lr,
-		mask_conn=res.mask_conn,
+		xy_conn=xy_conn,
+		mask_lr=mask_lr,
+		mask_conn=mask_conn,
 	)
 	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
@@ -301,7 +307,7 @@ def save(
 	def _save_img_loss_vis(*, iters: int | None = None, postfix2: str | None = None) -> None:
 		it_label = "default" if iters is None else f"it{int(iters)}"
 		p2 = str(postfix2) if postfix2 is not None else f"{postfix}_{it_label}"
-		inv_kwargs: dict[str, object] = {"xy_lr": res.xy_lr, "h_out": h_img, "w_out": w_img}
+		inv_kwargs: dict[str, object] = {"xy_lr": xy_lr, "h_out": h_img, "w_out": w_img}
 		if iters is not None:
 			inv_kwargs["iters"] = int(iters)
 		uv_img, uv_mask = inv_map.inverse_map_autograd(**inv_kwargs)
@@ -311,7 +317,7 @@ def save(
 		uv_mask = torch.nn.functional.interpolate(uv_mask, size=(h2, w2), mode="nearest")
 
 		def _scale_uv_for_src(*, uv_lr: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-			_hm0, _wm0 = (int(res.xy_lr.shape[1]), int(res.xy_lr.shape[2]))
+			_hm0, _wm0 = (int(xy_lr.shape[1]), int(xy_lr.shape[2]))
 			_hm1, _wm1 = (int(src.shape[2]), int(src.shape[3]))
 			fx = float(max(1, _wm1 - 1)) / float(max(1, _wm0 - 1))
 			fy = float(max(1, _hm1 - 1)) / float(max(1, _hm0 - 1))
@@ -463,7 +469,7 @@ def save(
 		print(f"loss_map {spec['suffix']}: shape={tuple(mt0.shape)}")
 		m = mt0.cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
-			m = m[0, 0]
+			m = m[:, 0]
 		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
 		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
 
