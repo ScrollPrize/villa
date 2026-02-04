@@ -26,7 +26,7 @@ class DataConfig:
 
 def add_args(p: argparse.ArgumentParser) -> None:
 	g = p.add_argument_group("data")
-	g.add_argument("--input", required=True)
+	g.add_argument("--input", default=None)
 	g.add_argument("--unet-checkpoint", default=None)
 	g.add_argument("--unet-layer", type=int, default=None)
 	g.add_argument("--unet-z", type=int, default=None)
@@ -41,6 +41,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
+	if args.input in (None, ""):
+		raise ValueError("missing --input (can be provided via JSON config args)")
 	return DataConfig(
 		input=str(args.input),
 		unet_checkpoint=None if args.unet_checkpoint in (None, "") else str(args.unet_checkpoint),
