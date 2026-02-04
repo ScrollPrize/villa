@@ -297,6 +297,8 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
         CFG.stitch_downsample = max(1, int(args.stitch_downsample))
 
     run_slug = args.run_name or f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_stitch={CFG.valid_id}"
+    if args.run_name is None and getattr(CFG, "cv_fold", None) is not None:
+        run_slug = f"{run_slug}_fold={CFG.cv_fold}"
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     run_dir = None
 

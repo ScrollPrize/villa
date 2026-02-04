@@ -74,6 +74,11 @@ class CFG:
     stitch_downsample = 1
     stitch_train = False
     stitch_train_every_n_epochs = 1
+    cv_fold = None
+    train_label_suffix = ""
+    train_mask_suffix = ""
+    val_label_suffix = "_val"
+    val_mask_suffix = "_val"
 
     # ============== group DRO cfg =============
     objective = "erm"  # "erm" | "group_dro"
@@ -344,5 +349,50 @@ def apply_metadata_hyperparameters(cfg, metadata):
     else:
         cfg.stitch_downsample = 8 if cfg.stitch_all_val else int(getattr(cfg, "stitch_downsample", 1))
     cfg.stitch_downsample = max(1, int(cfg.stitch_downsample))
+
+    cv_fold = training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None))
+    if isinstance(cv_fold, str) and cv_fold.strip().lower() in {"", "none", "null"}:
+        cv_fold = None
+    if isinstance(cv_fold, str):
+        cv_fold = cv_fold.strip()
+        if cv_fold.isdigit():
+            cv_fold = int(cv_fold)
+    if isinstance(cv_fold, float) and float(cv_fold).is_integer():
+        cv_fold = int(cv_fold)
+    cfg.cv_fold = cv_fold
+
+    def _suffix_or_default(value, default):
+        if value is None:
+            return default
+        return str(value)
+
+    cfg.train_label_suffix = _suffix_or_default(
+        training_cfg.get("train_label_suffix", getattr(cfg, "train_label_suffix", "")),
+        "",
+    )
+    cfg.train_mask_suffix = _suffix_or_default(
+        training_cfg.get("train_mask_suffix", getattr(cfg, "train_mask_suffix", "")),
+        "",
+    )
+    cfg.val_label_suffix = _suffix_or_default(
+        training_cfg.get("val_label_suffix", getattr(cfg, "val_label_suffix", "_val")),
+        "_val",
+    )
+    cfg.val_mask_suffix = _suffix_or_default(
+        training_cfg.get("val_mask_suffix", getattr(cfg, "val_mask_suffix", "_val")),
+        "_val",
+    )
+
+    if cfg.cv_fold is not None:
+        fold_suffix = f"_{cfg.cv_fold}"
+        if "train_label_suffix" not in training_cfg:
+            cfg.train_label_suffix = fold_suffix
+        if "train_mask_suffix" not in training_cfg:
+            cfg.train_mask_suffix = fold_suffix
+        if "val_label_suffix" not in training_cfg:
+            cfg.val_label_suffix = f"_val_{cfg.cv_fold}"
+        if "val_mask_suffix" not in training_cfg:
+            cfg.val_mask_suffix = f"_val_{cfg.cv_fold}"
+
     rebuild_augmentations(cfg, hp.get("augmentation"))
     return cfg

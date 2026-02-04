@@ -39,6 +39,8 @@ def load_train_segment(
     overlap_segments,
     layers_cache,
     include_train_xyxys,
+    label_suffix,
+    mask_suffix,
 ):
     t0 = time.time()
     log(f"load train segment={fragment_id} group={group_name}")
@@ -52,8 +54,8 @@ def load_train_segment(
     image, mask, fragment_mask = read_image_mask(
         fragment_id,
         reverse_layers=bool(seg_meta.get("reverse_layers", False)),
-        label_suffix="",
-        mask_suffix="",
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
         images=layers,
     )
     log(
@@ -111,6 +113,8 @@ def load_val_segment(
     layers_cache,
     include_train_xyxys,
     valid_transform,
+    label_suffix,
+    mask_suffix,
 ):
     t0 = time.time()
     log(f"load val segment={fragment_id} group={group_name}")
@@ -126,8 +130,8 @@ def load_val_segment(
     image_val, mask_val, fragment_mask_val = read_image_mask(
         fragment_id,
         reverse_layers=bool(seg_meta.get("reverse_layers", False)),
-        label_suffix="_val",
-        mask_suffix="_val",
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
         images=layers,
     )
     log(
@@ -357,6 +361,18 @@ def build_datasets(run_state):
     train_transform = get_transforms(data="train", cfg=CFG)
     valid_transform = get_transforms(data="valid", cfg=CFG)
 
+    train_label_suffix = getattr(CFG, "train_label_suffix", "")
+    train_mask_suffix = getattr(CFG, "train_mask_suffix", "")
+    val_label_suffix = getattr(CFG, "val_label_suffix", "_val")
+    val_mask_suffix = getattr(CFG, "val_mask_suffix", "_val")
+    cv_fold = getattr(CFG, "cv_fold", None)
+    log(
+        "label/mask suffixes "
+        f"cv_fold={cv_fold!r} "
+        f"train=(label={train_label_suffix!r}, mask={train_mask_suffix!r}) "
+        f"val=(label={val_label_suffix!r}, mask={val_mask_suffix!r})"
+    )
+
     train_images = []
     train_masks = []
     train_groups = []
@@ -393,6 +409,8 @@ def build_datasets(run_state):
             overlap_segments=overlap_segments,
             layers_cache=layers_cache,
             include_train_xyxys=include_train_xyxys,
+            label_suffix=train_label_suffix,
+            mask_suffix=train_mask_suffix,
         )
 
         train_patch_counts_by_segment[fragment_id] = result["patch_count"]
@@ -417,6 +435,8 @@ def build_datasets(run_state):
             layers_cache=layers_cache,
             include_train_xyxys=include_train_xyxys,
             valid_transform=valid_transform,
+            label_suffix=val_label_suffix,
+            mask_suffix=val_mask_suffix,
         )
 
         val_patch_counts_by_segment[fragment_id] = result["patch_count"]
