@@ -39,7 +39,7 @@ class Stage:
 	name: str
 	grow: dict | None
 	global_opt: OptSettings
-	local_opt: OptSettings | None
+	local_opt: list[OptSettings] | None
 
 
 def _stage_to_modifiers(
@@ -197,14 +197,24 @@ def load_stages(path: str) -> list[Stage]:
 
 		if not isinstance(global_opt_cfg, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-		if local_opt_cfg is not None and not isinstance(local_opt_cfg, dict):
-			raise ValueError(f"stages_json: stage '{name}' field 'local_opt' must be an object or null")
+		if local_opt_cfg is not None and not isinstance(local_opt_cfg, (dict, list)):
+			raise ValueError(f"stages_json: stage '{name}' field 'local_opt' must be an object, list, or null")
 
 		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=lambda_global, prev_eff=prev_eff)
 		prev_eff = global_opt.eff
 		local_opt = None
 		if local_opt_cfg is not None:
-			local_opt = _parse_opt_settings(stage_name=name, opt_cfg=local_opt_cfg, base=lambda_global, prev_eff=prev_eff)
+			if isinstance(local_opt_cfg, dict):
+				local_opt_cfg = [local_opt_cfg]
+			if not isinstance(local_opt_cfg, list) or not local_opt_cfg:
+				raise ValueError(f"stages_json: stage '{name}' field 'local_opt' must be a non-empty list, object, or null")
+			local_opt = []
+			for li, opt_cfg in enumerate(local_opt_cfg):
+				if not isinstance(opt_cfg, dict):
+					raise ValueError(f"stages_json: stage '{name}' field 'local_opt[{li}]' must be an object")
+				local_opt.append(
+					_parse_opt_settings(stage_name=name, opt_cfg=opt_cfg, base=lambda_global, prev_eff=prev_eff)
+				)
 
 		out.append(Stage(name=name, grow=grow, global_opt=global_opt, local_opt=local_opt))
 	return out
@@ -422,7 +432,7 @@ def optimize(
 			raise ValueError(f"stages_json: stage '{stage.name}' grow.directions must be a list")
 		generations = max(0, int(grow.get("generations", 0)))
 		grow_steps = max(0, int(grow.get("steps", 0)))
-		local_opt = stage.local_opt if stage.local_opt is not None else stage.global_opt
+		local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
 			if model._last_grow_insert_z is not None:
@@ -449,13 +459,14 @@ def optimize(
 					)
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
-			if local_opt.steps <= 0:
+			if not local_opts or all(int(o.steps) <= 0 for o in local_opts):
 				continue
 			ins = model._last_grow_insert_lr
 			if ins is None:
 				if model._last_grow_insert_z is not None:
 					model.const_mask_lr = None
-					_run_opt(si=si, label=stage_g, opt_cfg=local_opt)
+					for li, opt_cfg in enumerate(local_opts):
+						_run_opt(si=si, label=f"{stage_g}_local{li}", opt_cfg=opt_cfg)
 					continue
 				raise RuntimeError("grow: missing insertion rect")
 			py0, px0, ho, wo = ins
@@ -474,6 +485,7 @@ def optimize(
 			cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
 			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
 			model.const_mask_lr = cm
-			_run_opt(si=si, label=stage_g, opt_cfg=local_opt)
+			for li, opt_cfg in enumerate(local_opts):
+				_run_opt(si=si, label=f"{stage_g}_local{li}", opt_cfg=opt_cfg)
 		model.const_mask_lr = None
 	return data

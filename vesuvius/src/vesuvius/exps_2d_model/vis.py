@@ -592,7 +592,7 @@ def save(
 		mask_all = res.mask_lr.detach().to(dtype=torch.float32, device="cpu")
 	meta_sf = float(getattr(data, "downscale", 1.0) or 1.0)
 	nz, hm, wm, _c2 = (int(v) for v in xy_all.shape)
-	out_ply = out_vis / "ply"
+	out_ply = out / "ply"
 	for wi in range(wm):
 		x = (xy_all[:, :, wi, 0].numpy().astype("float32") * meta_sf)
 		y = (xy_all[:, :, wi, 1].numpy().astype("float32") * meta_sf)
