@@ -1,8 +1,8 @@
 import argparse
+import sys
 from pathlib import Path
 
 import cli_data
-import cli_json
 import cli_model
 import cli_opt
 import cli_vis
@@ -11,13 +11,14 @@ import optimizer
 import torch
 import vis
 
+import cli_json
+
 
 def _build_parser() -> argparse.ArgumentParser:
 	p = argparse.ArgumentParser(
 		prog="fit.py",
 		description="2D fit entrypoint (CLI composition)",
 	)
-	cli_json.add_args(p)
 	cli_data.add_args(p)
 	cli_model.add_args(p)
 	cli_opt.add_args(p)
@@ -26,8 +27,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+	if argv is None:
+		argv = sys.argv[1:]
 	parser = _build_parser()
-	args = cli_json.parse_args(parser, argv)
+	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv)
+	cfg_paths = [str(x) for x in cfg_paths]
+	cfg = cli_json.merge_cfgs(cfg_paths)
+	cli_json.apply_defaults_from_cfg_args(parser, cfg)
+	args = parser.parse_args(argv_rest)
 
 	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)
@@ -65,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
 	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_init.tif")
-	stages = optimizer.load_stages(opt_cfg.stages_json)
+	stages = optimizer.load_stages_cfg(cfg)
 	def _save_model_snapshot(*, stage: str, step: int) -> None:
 		out = Path(vis_cfg.out_dir)
 		out.mkdir(parents=True, exist_ok=True)

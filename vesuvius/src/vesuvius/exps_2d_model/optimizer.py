@@ -129,12 +129,10 @@ def _parse_opt_settings(
 	)
 
 
-def load_stages(path: str) -> list[Stage]:
-	with open(path, "r", encoding="utf-8") as f:
-		cfg = json.load(f)
-		cfg = dict(cfg)
+def load_stages_cfg(cfg: dict) -> list[Stage]:
+	cfg = dict(cfg)
 
-		lambda_global: dict[str, float] = {
+	lambda_global: dict[str, float] = {
 			"dir_v": 1.0,
 			"dir_conn": 1.0,
 			"data": 0.0,
@@ -152,7 +150,7 @@ def load_stages(path: str) -> list[Stage]:
 			"conn_sy_r": 0.0,
 			"angle": 0.0,
 			"y_straight": 0.0,
-		}
+	}
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
 		bad_base = sorted(set(str(k) for k in base_cfg.keys()) - set(lambda_global.keys()))
@@ -218,6 +216,14 @@ def load_stages(path: str) -> list[Stage]:
 
 		out.append(Stage(name=name, grow=grow, global_opt=global_opt, local_opt=local_opt))
 	return out
+
+
+def load_stages(path: str) -> list[Stage]:
+	with open(path, "r", encoding="utf-8") as f:
+		cfg = json.load(f)
+		if not isinstance(cfg, dict):
+			raise ValueError("stages_json: expected an object")
+		return load_stages_cfg(cfg)
 
 
 def optimize(
