@@ -96,3 +96,9 @@ rm -rf res_growz/*/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_mo
 source env.sh
 
 ffmpeg -framerate 10 -pattern_type glob -i 'res_growz/grids/res_grid_stage0_grow00*.jpg' -vf "crop=in_w/2:in_h/2:in_w/4:in_h/4" -c:v libx264 -pix_fmt yuv420p direct_fit.mkv
+
+# retry global init stages - this works!
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit3  --mesh-step 10 --winding-step 10 --device cuda ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json --init-size-frac 0.15 --init-size-frac-h 2.0 --mesh-step 10 --winding-step 10
+
+# snapping
+

@@ -31,7 +31,7 @@
 			"local_opt": {
 				"steps": 1000,
 				"lr": 0.01,
-				"params": ["mesh_ms", "conn_offset_ms"],
+				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 				"min_scaledown": 0,
 				"w_fac": {
 				}
