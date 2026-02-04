@@ -15,6 +15,64 @@ import opt_loss_step
 import inv_map
 
 
+def _write_ply_mesh(
+	*,
+	out_path: Path,
+	x: np.ndarray,
+	y: np.ndarray,
+	z: np.ndarray,
+	mask: np.ndarray | None,
+) -> None:
+	"""Write a simple connected grid mesh as ASCII PLY.
+
+	Grid layout is (Z,H) where Z is depth and H is the winding height.
+	Faces are created as two triangles per quad.
+	"""
+	z_size, h_size = (int(x.shape[0]), int(x.shape[1]))
+	if x.shape != (z_size, h_size) or y.shape != (z_size, h_size) or z.shape != (z_size, h_size):
+		raise ValueError("x/y/z must all be (Z,H)")
+
+	msk = None
+	if mask is not None:
+		msk = mask.astype("bool", copy=False)
+		if msk.shape != (z_size, h_size):
+			raise ValueError("mask must be (Z,H)")
+
+	verts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+	faces: list[tuple[int, int, int]] = []
+
+	def vid(zi: int, hi: int) -> int:
+		return int(zi * h_size + hi)
+
+	for zi in range(z_size - 1):
+		for hi in range(h_size - 1):
+			if msk is not None:
+				if not (msk[zi, hi] and msk[zi, hi + 1] and msk[zi + 1, hi] and msk[zi + 1, hi + 1]):
+					continue
+			v00 = vid(zi, hi)
+			v01 = vid(zi, hi + 1)
+			v10 = vid(zi + 1, hi)
+			v11 = vid(zi + 1, hi + 1)
+			faces.append((v00, v10, v11))
+			faces.append((v00, v11, v01))
+
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	with out_path.open("w", encoding="utf-8") as f:
+		f.write("ply\n")
+		f.write("format ascii 1.0\n")
+		f.write(f"element vertex {int(verts.shape[0])}\n")
+		f.write("property float x\n")
+		f.write("property float y\n")
+		f.write("property float z\n")
+		f.write(f"element face {int(len(faces))}\n")
+		f.write("property list uchar int vertex_indices\n")
+		f.write("end_header\n")
+		for vx, vy, vz in verts:
+			f.write(f"{float(vx):.6f} {float(vy):.6f} {float(vz):.6f}\n")
+		for a, b, c in faces:
+			f.write(f"3 {int(a)} {int(b)} {int(c)}\n")
+
+
 def _to_uint8(arr: "np.ndarray") -> "np.ndarray":
 	if arr.dtype == np.uint8:
 		return arr
@@ -525,3 +583,22 @@ def save(
 	tgt = res.target_plain[0, 0].detach().cpu().numpy().astype("float32")
 	tgt_path = out_tgt / f"res_tgt_{postfix}.tif"
 	tifffile.imwrite(str(tgt_path), tgt, compression="lzw")
+
+	# Write connected PLY meshes (one per winding) using all z slices (no skipping).
+	# Grid layout per winding: (Z,Hm), where Hm is mesh height (winding direction).
+	xy_all = res.xy_lr.detach().to(dtype=torch.float32, device="cpu")
+	mask_all = None
+	if res.mask_lr is not None:
+		mask_all = res.mask_lr.detach().to(dtype=torch.float32, device="cpu")
+	meta_sf = float(getattr(data, "downscale", 1.0) or 1.0)
+	nz, hm, wm, _c2 = (int(v) for v in xy_all.shape)
+	out_ply = out_vis / "ply"
+	for wi in range(wm):
+		x = (xy_all[:, :, wi, 0].numpy().astype("float32") * meta_sf)
+		y = (xy_all[:, :, wi, 1].numpy().astype("float32") * meta_sf)
+		z = np.broadcast_to(np.arange(nz, dtype="float32")[:, None], (nz, hm))
+		msk = None
+		if mask_all is not None:
+			msk = (mask_all[:, 0, :, wi].numpy().astype("float32") > 0.0)
+		out_path = out_ply / f"winding_{wi:04d}" / f"{postfix}.ply"
+		_write_ply_mesh(out_path=out_path, x=x, y=y, z=z, mask=msk)
