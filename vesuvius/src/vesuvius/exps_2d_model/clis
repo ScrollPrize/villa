@@ -93,3 +93,4 @@ rm -rf res_fit2/*/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_mod
 # grow in z after snapping
 rm -rf res_growz/*/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 2000 2500 1600 1600 --input /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/  --out-dir res_growz  --mesh-step 10 --winding-step 10 --device cuda --init-size-frac 0.15 --init-size-frac-h 2.0 --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/grow_z_first.json --unet-z 6000 --model-input res_fit2_nice/model_snapshots/model_stage0_010000.pt
 
+ffmpeg -framerate 10 -pattern_type glob -i 'res_growz/grids/res_grid_stage0_grow00*.jpg' -vf "crop=in_w/2:in_h/2:in_w/4:in_h/4" -c:v libx264 -pix_fmt yuv420p direct_fit.mkv
