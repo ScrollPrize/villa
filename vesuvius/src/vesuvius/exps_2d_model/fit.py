@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 import cli_data
+import cli_json
 import cli_model
 import cli_opt
 import cli_vis
@@ -16,6 +17,7 @@ def _build_parser() -> argparse.ArgumentParser:
 		prog="fit.py",
 		description="2D fit entrypoint (CLI composition)",
 	)
+	cli_json.add_args(p)
 	cli_data.add_args(p)
 	cli_model.add_args(p)
 	cli_opt.add_args(p)
@@ -25,7 +27,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
 	parser = _build_parser()
-	args = parser.parse_args(argv)
+	args = cli_json.parse_args(parser, argv)
 
 	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)

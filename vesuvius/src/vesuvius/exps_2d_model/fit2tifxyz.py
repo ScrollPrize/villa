@@ -11,6 +11,8 @@ import torch
 
 import torch.nn.functional as F
 
+import cli_json
+
 
 @dataclass(frozen=True)
 class ExportConfig:
@@ -32,6 +34,7 @@ class ExportConfig:
 
 def _build_parser() -> argparse.ArgumentParser:
 	p = argparse.ArgumentParser(description="Export fit model grid as tifxyz surfaces (one per winding)")
+	cli_json.add_args(p)
 	g = p.add_argument_group("io")
 	g.add_argument("--input", required=True, help="Model checkpoint (.pt) produced by fit")
 	g.add_argument("--output", required=True, help="Output directory (will contain one tifxyz dir per winding)")
@@ -116,7 +119,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 
 
 def main(argv: list[str] | None = None) -> int:
-	args = _build_parser().parse_args(argv)
+	parser = _build_parser()
+	args = cli_json.parse_args(parser, argv)
 	cfg = ExportConfig(
 		input=str(args.input),
 		output=str(args.output),
