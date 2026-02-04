@@ -1,10 +1,10 @@
 program: train_resnet3d.py
-project: ink-group-dro
+project: ink-2um-experiments
 entity: vesuvius-challenge
 method: random
 
 metric:
-  name: val/worst_group_loss.min
+  name: val/worst_group_loss_ema.min
   goal: minimize
 
 parameters:
@@ -14,6 +14,9 @@ parameters:
     value: batch
   training.sampler:
     value: shuffle
+  training.cv_fold:
+    value: 0
+
 
   training_hyperparameters.training.accumulate_grad_batches:
     value: 4
@@ -42,8 +45,6 @@ command:
   - --stitch_all_val
   - --stitch_train
   - --stitch_downsample
-  - "8"
-  - --wandb_group
-  - split2
+  - "1"
   - --wandb_tags
-  - ink-2um,erm,hparam_sweep,shuffle,accum4,split2
+  - ink-2um,erm,hparam_sweep,shuffle,accum4,fold0

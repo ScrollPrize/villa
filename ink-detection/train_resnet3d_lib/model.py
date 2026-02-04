@@ -11,6 +11,8 @@ from torch.optim import AdamW
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 
+from metrics import StreamingBinarySegmentationMetrics
+
 from group_dro import GroupDROComputer
 from warmup_scheduler import GradualWarmupScheduler
 from models.resnetall import generate_model
@@ -100,18 +102,58 @@ class StitchManager:
         stitch_all_val_segment_ids=None,
         stitch_train_shapes=None,
         stitch_train_segment_ids=None,
+        stitch_use_roi=False,
+        stitch_val_bboxes=None,
+        stitch_train_bboxes=None,
+        stitch_log_only_shapes=None,
+        stitch_log_only_segment_ids=None,
+        stitch_log_only_bboxes=None,
+        stitch_log_only_downsample=None,
+        stitch_log_only_every_n_epochs=10,
         stitch_train=False,
         stitch_train_every_n_epochs=1,
     ):
         self.downsample = max(1, int(stitch_downsample or 1))
         self.buffers = {}
         self.segment_ids = {}
+        self.buffer_meta = {}
         self.train_buffers = {}
+        self.train_buffer_meta = {}
         self.train_segment_ids = []
         self.train_loaders = []
         self.train_enabled = bool(stitch_train)
         self.train_every_n_epochs = max(1, int(stitch_train_every_n_epochs or 1))
+        self.log_only_buffers = {}
+        self.log_only_buffer_meta = {}
+        self.log_only_segment_ids = []
+        self.log_only_loaders = []
+        self.log_only_enabled = bool(stitch_log_only_shapes) and bool(stitch_log_only_segment_ids)
+        self.log_only_every_n_epochs = max(1, int(stitch_log_only_every_n_epochs or 10))
+        self.log_only_downsample = int(stitch_log_only_downsample or self.downsample)
         self.borders_by_split = {"train": {}, "val": {}}
+        self.use_roi = bool(stitch_use_roi)
+        self.val_bboxes = dict(stitch_val_bboxes or {})
+        self.train_bboxes = dict(stitch_train_bboxes or {})
+        self.log_only_bboxes = dict(stitch_log_only_bboxes or {})
+
+        def _resolve_roi(shape, bbox, ds):
+            h = int(shape[0])
+            w = int(shape[1])
+            ds = max(1, int(ds))
+            ds_h = (h + ds - 1) // ds
+            ds_w = (w + ds - 1) // ds
+            if self.use_roi and bbox is not None:
+                try:
+                    y0, y1, x0, x1 = [int(v) for v in bbox]
+                except Exception:
+                    y0, y1, x0, x1 = 0, 0, 0, 0
+                y0 = max(0, min(y0, ds_h))
+                y1 = max(0, min(y1, ds_h))
+                x0 = max(0, min(x0, ds_w))
+                x1 = max(0, min(x1, ds_w))
+                if y1 > y0 and x1 > x0:
+                    return (y0, y1, x0, x1), (ds_h, ds_w)
+            return (0, ds_h, 0, ds_w), (ds_h, ds_w)
 
         if bool(stitch_all_val):
             if stitch_all_val_shapes is None or stitch_all_val_segment_ids is None:
@@ -123,28 +165,37 @@ class StitchManager:
                 )
 
             for loader_idx, (segment_id, shape) in enumerate(zip(stitch_all_val_segment_ids, stitch_all_val_shapes)):
-                h = int(shape[0])
-                w = int(shape[1])
-                ds_h = (h + self.downsample - 1) // self.downsample
-                ds_w = (w + self.downsample - 1) // self.downsample
+                bbox = self.val_bboxes.get(str(segment_id))
+                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.downsample)
+                buf_h = max(1, int(y1 - y0))
+                buf_w = max(1, int(x1 - x0))
                 self.buffers[int(loader_idx)] = (
-                    np.zeros((ds_h, ds_w), dtype=np.float32),
-                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
                 )
                 self.segment_ids[int(loader_idx)] = str(segment_id)
+                self.buffer_meta[int(loader_idx)] = {
+                    "offset": (int(y0), int(x0)),
+                    "full_shape": (int(ds_h), int(ds_w)),
+                }
         else:
             stitch_enabled = (stitch_val_dataloader_idx is not None) and (stitch_pred_shape is not None)
             if stitch_enabled:
-                h = int(stitch_pred_shape[0])
-                w = int(stitch_pred_shape[1])
-                ds_h = (h + self.downsample - 1) // self.downsample
-                ds_w = (w + self.downsample - 1) // self.downsample
                 idx = int(stitch_val_dataloader_idx)
+                segment_id = str(stitch_segment_id or idx)
+                bbox = self.val_bboxes.get(segment_id)
+                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(stitch_pred_shape, bbox, self.downsample)
+                buf_h = max(1, int(y1 - y0))
+                buf_w = max(1, int(x1 - x0))
                 self.buffers[idx] = (
-                    np.zeros((ds_h, ds_w), dtype=np.float32),
-                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
                 )
-                self.segment_ids[idx] = str(stitch_segment_id or idx)
+                self.segment_ids[idx] = segment_id
+                self.buffer_meta[idx] = {
+                    "offset": (int(y0), int(x0)),
+                    "full_shape": (int(ds_h), int(ds_w)),
+                }
 
         if stitch_train_shapes is not None or stitch_train_segment_ids is not None:
             stitch_train_shapes = stitch_train_shapes or []
@@ -156,15 +207,42 @@ class StitchManager:
                 )
 
             for segment_id, shape in zip(stitch_train_segment_ids, stitch_train_shapes):
-                h = int(shape[0])
-                w = int(shape[1])
-                ds_h = (h + self.downsample - 1) // self.downsample
-                ds_w = (w + self.downsample - 1) // self.downsample
-                self.train_buffers[str(segment_id)] = (
-                    np.zeros((ds_h, ds_w), dtype=np.float32),
-                    np.zeros((ds_h, ds_w), dtype=np.float32),
+                seg_id = str(segment_id)
+                bbox = self.train_bboxes.get(seg_id)
+                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.downsample)
+                buf_h = max(1, int(y1 - y0))
+                buf_w = max(1, int(x1 - x0))
+                self.train_buffers[seg_id] = (
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
                 )
-                self.train_segment_ids.append(str(segment_id))
+                self.train_buffer_meta[seg_id] = {
+                    "offset": (int(y0), int(x0)),
+                    "full_shape": (int(ds_h), int(ds_w)),
+                }
+                self.train_segment_ids.append(seg_id)
+
+        if stitch_log_only_shapes is not None and stitch_log_only_segment_ids is not None:
+            if len(stitch_log_only_shapes) != len(stitch_log_only_segment_ids):
+                raise ValueError(
+                    "log-only stitch shapes/segment_ids length mismatch "
+                    f"({len(stitch_log_only_shapes)} vs {len(stitch_log_only_segment_ids)})"
+                )
+            for segment_id, shape in zip(stitch_log_only_segment_ids, stitch_log_only_shapes):
+                seg_id = str(segment_id)
+                bbox = self.log_only_bboxes.get(seg_id)
+                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.log_only_downsample)
+                buf_h = max(1, int(y1 - y0))
+                buf_w = max(1, int(x1 - x0))
+                self.log_only_buffers[seg_id] = (
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                )
+                self.log_only_buffer_meta[seg_id] = {
+                    "offset": (int(y0), int(x0)),
+                    "full_shape": (int(ds_h), int(ds_w)),
+                }
+                self.log_only_segment_ids.append(seg_id)
 
         self.enabled = len(self.buffers) > 0
 
@@ -178,9 +256,15 @@ class StitchManager:
         self.train_loaders = list(loaders or [])
         self.train_segment_ids = [str(x) for x in (segment_ids or [])]
 
-    def accumulate_to_buffers(self, *, outputs, xyxys, pred_buf, count_buf):
-        ds = self.downsample
+    def set_log_only_loaders(self, loaders, segment_ids):
+        self.log_only_loaders = list(loaders or [])
+        self.log_only_segment_ids = [str(x) for x in (segment_ids or [])]
+
+    def accumulate_to_buffers(self, *, outputs, xyxys, pred_buf, count_buf, offset=(0, 0), ds_override=None):
+        ds = int(ds_override or self.downsample)
         y_preds = torch.sigmoid(outputs).to("cpu")
+        buf_h, buf_w = pred_buf.shape[:2]
+        off_y, off_x = offset
         for i, (x1, y1, x2, y2) in enumerate(xyxys):
             x1 = int(x1)
             y1 = int(y1)
@@ -191,6 +275,10 @@ class StitchManager:
             y1_ds = y1 // ds
             x2_ds = (x2 + ds - 1) // ds
             y2_ds = (y2 + ds - 1) // ds
+            x1_ds -= int(off_x)
+            x2_ds -= int(off_x)
+            y1_ds -= int(off_y)
+            y2_ds -= int(off_y)
             target_h = y2_ds - y1_ds
             target_w = x2_ds - x1_ds
             if target_h <= 0 or target_w <= 0:
@@ -205,8 +293,24 @@ class StitchManager:
                     align_corners=False,
                 )
 
-            pred_buf[y1_ds:y2_ds, x1_ds:x2_ds] += pred_patch.squeeze(0).squeeze(0).numpy()
-            count_buf[y1_ds:y2_ds, x1_ds:x2_ds] += 1.0
+            if x2_ds <= 0 or y2_ds <= 0 or x1_ds >= buf_w or y1_ds >= buf_h:
+                continue
+
+            y1_clamped = max(0, y1_ds)
+            x1_clamped = max(0, x1_ds)
+            y2_clamped = min(buf_h, y2_ds)
+            x2_clamped = min(buf_w, x2_ds)
+
+            py0 = y1_clamped - y1_ds
+            px0 = x1_clamped - x1_ds
+            py1 = py0 + (y2_clamped - y1_clamped)
+            px1 = px0 + (x2_clamped - x1_clamped)
+            if py1 <= py0 or px1 <= px0:
+                continue
+
+            pred_crop = pred_patch[..., py0:py1, px0:px1]
+            pred_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += pred_crop.squeeze(0).squeeze(0).numpy()
+            count_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += 1.0
 
     def accumulate_val(self, *, outputs, xyxys, dataloader_idx):
         if not self.enabled:
@@ -215,7 +319,9 @@ class StitchManager:
         if idx not in self.buffers:
             return
         pred_buf, count_buf = self.buffers[idx]
-        self.accumulate_to_buffers(outputs=outputs, xyxys=xyxys, pred_buf=pred_buf, count_buf=count_buf)
+        meta = self.buffer_meta.get(idx, {})
+        offset = meta.get("offset", (0, 0))
+        self.accumulate_to_buffers(outputs=outputs, xyxys=xyxys, pred_buf=pred_buf, count_buf=count_buf, offset=offset)
 
     def run_train_stitch_pass(self, model):
         if not self.train_enabled:
@@ -259,6 +365,8 @@ class StitchManager:
             with torch.inference_mode(), precision_context:
                 for loader, segment_id in zip(self.train_loaders, self.train_segment_ids):
                     pred_buf, count_buf = self.train_buffers[str(segment_id)]
+                    meta = self.train_buffer_meta.get(str(segment_id), {})
+                    offset = meta.get("offset", (0, 0))
                     for batch in loader:
                         x, _y, xyxys, _g = batch
                         x = x.to(model.device, non_blocking=True)
@@ -268,12 +376,108 @@ class StitchManager:
                             xyxys=xyxys,
                             pred_buf=pred_buf,
                             count_buf=count_buf,
+                            offset=offset,
+                            ds_override=self.downsample,
                         )
         finally:
             if was_training:
                 model.train()
 
+        for segment_id in self.train_segment_ids:
+            pred_buf, count_buf = self.train_buffers[str(segment_id)]
+            covered = count_buf > 0
+            covered_px = int(covered.sum())
+            total_px = int(covered.size)
+            coverage = float(covered_px) / float(max(1, total_px))
+            if covered_px > 0:
+                stitched = np.divide(
+                    pred_buf,
+                    count_buf,
+                    out=np.zeros_like(pred_buf),
+                    where=covered,
+                )
+                vals = stitched[covered]
+                prob_mean = float(vals.mean()) if vals.size else float("nan")
+                prob_max = float(vals.max()) if vals.size else float("nan")
+            else:
+                prob_mean = float("nan")
+                prob_max = float("nan")
+            log(
+                f"train stitch summary segment={segment_id} "
+                f"coverage={coverage:.4f} covered_px={covered_px}/{total_px} "
+                f"prob_mean={prob_mean:.4f} prob_max={prob_max:.4f}"
+            )
+
         log(f"train stitch pass done epoch={epoch} elapsed={time.perf_counter() - t0:.1f}s")
+        return True
+
+    def run_log_only_stitch_pass(self, model):
+        if not self.log_only_loaders or not self.log_only_segment_ids:
+            return False
+        if len(self.log_only_loaders) != len(self.log_only_segment_ids):
+            raise ValueError(
+                "log-only stitch loaders/segment_ids length mismatch "
+                f"({len(self.log_only_loaders)} vs {len(self.log_only_segment_ids)})"
+            )
+
+        epoch = int(getattr(model, "current_epoch", 0))
+        if self.log_only_every_n_epochs > 1:
+            if ((epoch + 1) % self.log_only_every_n_epochs) != 0:
+                return False
+
+        t0 = time.perf_counter()
+        from train_resnet3d_lib.config import log
+        log(f"log-only stitch pass start epoch={epoch}")
+
+        for segment_id in self.log_only_segment_ids:
+            if segment_id not in self.log_only_buffers:
+                raise ValueError(f"Missing log-only stitch buffers for segment_id={segment_id!r}")
+            pred_buf, count_buf = self.log_only_buffers[segment_id]
+            pred_buf.fill(0)
+            count_buf.fill(0)
+
+        def _unpack(batch):
+            if isinstance(batch, (list, tuple)):
+                if len(batch) == 2:
+                    return batch[0], batch[1]
+                if len(batch) >= 3:
+                    return batch[0], batch[2]
+            raise ValueError("log-only stitch batch must be (x, xyxys) or (x, y, xyxys, g)")
+
+        was_training = model.training
+        precision_context = nullcontext()
+        trainer = getattr(model, "trainer", None)
+        if trainer is not None:
+            strategy = getattr(trainer, "strategy", None)
+            precision_plugin = getattr(strategy, "precision_plugin", None) if strategy is not None else None
+            if precision_plugin is None:
+                precision_plugin = getattr(trainer, "precision_plugin", None)
+            if precision_plugin is not None and hasattr(precision_plugin, "forward_context"):
+                precision_context = precision_plugin.forward_context()
+        try:
+            model.eval()
+            with torch.inference_mode(), precision_context:
+                for loader, segment_id in zip(self.log_only_loaders, self.log_only_segment_ids):
+                    pred_buf, count_buf = self.log_only_buffers[str(segment_id)]
+                    meta = self.log_only_buffer_meta.get(str(segment_id), {})
+                    offset = meta.get("offset", (0, 0))
+                    for batch in loader:
+                        x, xyxys = _unpack(batch)
+                        x = x.to(model.device, non_blocking=True)
+                        outputs = model(x)
+                        self.accumulate_to_buffers(
+                            outputs=outputs,
+                            xyxys=xyxys,
+                            pred_buf=pred_buf,
+                            count_buf=count_buf,
+                            offset=offset,
+                            ds_override=self.log_only_downsample,
+                        )
+        finally:
+            if was_training:
+                model.train()
+
+        log(f"log-only stitch pass done epoch={epoch} elapsed={time.perf_counter() - t0:.1f}s")
         return True
 
     def on_validation_epoch_end(self, model):
@@ -284,8 +488,10 @@ class StitchManager:
         is_global_zero = bool(model.trainer is None or model.trainer.is_global_zero)
         train_configured = bool(self.train_loaders) and bool(self.train_segment_ids) and bool(self.train_buffers)
         stitch_train_mode = bool(self.train_enabled and train_configured)
+        log_only_configured = bool(self.log_only_loaders) and bool(self.log_only_segment_ids) and bool(self.log_only_buffers)
 
         did_run_train_stitch = False
+        did_run_log_only = False
         if stitch_train_mode and (not is_global_zero):
             # Only rank-0 runs the extra train visualization pass + logging.
             for pred_buf, count_buf in self.buffers.values():
@@ -298,24 +504,56 @@ class StitchManager:
                 # train stitching is enabled but only runs every N epochs; fall back to val-only logging.
                 stitch_train_mode = False
 
+        log_only_mode = bool(log_only_configured)
+        if log_only_mode and (not is_global_zero):
+            for pred_buf, count_buf in self.log_only_buffers.values():
+                pred_buf.fill(0)
+                count_buf.fill(0)
+            log_only_mode = False
+        if log_only_mode and (not sanity_checking):
+            did_run_log_only = self.run_log_only_stitch_pass(model)
+            if not did_run_log_only:
+                log_only_mode = False
+
         log_train_stitch = bool(stitch_train_mode and did_run_train_stitch)
 
         images = []
         captions = []
 
-        if log_train_stitch:
-            segment_to_val = {}
-            for loader_idx, (pred_buf, count_buf) in self.buffers.items():
-                segment_id = self.segment_ids.get(loader_idx, str(loader_idx))
-                stitched = np.divide(
-                    pred_buf,
-                    count_buf,
-                    out=np.zeros_like(pred_buf),
-                    where=count_buf != 0,
-                )
-                segment_to_val[str(segment_id)] = (np.clip(stitched, 0, 1), (count_buf != 0))
+        segment_to_val = {}
+        segment_to_val_meta = {}
+        for loader_idx, (pred_buf, count_buf) in self.buffers.items():
+            segment_id = self.segment_ids.get(loader_idx, str(loader_idx))
+            stitched = np.divide(
+                pred_buf,
+                count_buf,
+                out=np.zeros_like(pred_buf),
+                where=count_buf != 0,
+            )
+            segment_id = str(segment_id)
+            segment_to_val[segment_id] = (np.clip(stitched, 0, 1), (count_buf != 0))
+            meta = self.buffer_meta.get(int(loader_idx), {})
+            segment_to_val_meta[segment_id] = {
+                "offset": meta.get("offset", (0, 0)),
+                "full_shape": meta.get("full_shape", stitched.shape),
+            }
 
+        def _expand_to_full(img, has, meta):
+            offset = meta.get("offset", (0, 0))
+            full_shape = meta.get("full_shape", img.shape)
+            if offset == (0, 0) and tuple(full_shape) == tuple(img.shape):
+                return img, has
+            y0, x0 = [int(v) for v in offset]
+            full = np.zeros(tuple(full_shape), dtype=img.dtype)
+            full_has = np.zeros(tuple(full_shape), dtype=bool)
+            h, w = img.shape
+            full[y0 : y0 + h, x0 : x0 + w] = img
+            full_has[y0 : y0 + h, x0 : x0 + w] = has
+            return full, full_has
+
+        if log_train_stitch:
             segment_to_train = {}
+            segment_to_train_meta = {}
             for segment_id in self.train_segment_ids:
                 pred_buf, count_buf = self.train_buffers[str(segment_id)]
                 stitched = np.divide(
@@ -324,21 +562,37 @@ class StitchManager:
                     out=np.zeros_like(pred_buf),
                     where=count_buf != 0,
                 )
-                segment_to_train[str(segment_id)] = (np.clip(stitched, 0, 1), (count_buf != 0))
+                segment_id = str(segment_id)
+                segment_to_train[segment_id] = (np.clip(stitched, 0, 1), (count_buf != 0))
+                meta = self.train_buffer_meta.get(segment_id, {})
+                segment_to_train_meta[segment_id] = {
+                    "offset": meta.get("offset", (0, 0)),
+                    "full_shape": meta.get("full_shape", stitched.shape),
+                }
 
             segment_ids = sorted(set(segment_to_val.keys()) | set(segment_to_train.keys()))
             for segment_id in segment_ids:
                 base = None
                 if segment_id in segment_to_val:
-                    base = segment_to_val[segment_id][0].copy()
+                    val_img, val_has = segment_to_val[segment_id]
+                    val_meta = segment_to_val_meta.get(segment_id, {})
+                    base, _ = _expand_to_full(val_img, val_has, val_meta)
+                    base = base.copy()
                 elif segment_id in segment_to_train:
-                    base = segment_to_train[segment_id][0].copy()
+                    train_img, train_has = segment_to_train[segment_id]
+                    train_meta = segment_to_train_meta.get(segment_id, {})
+                    base, _ = _expand_to_full(train_img, train_has, train_meta)
+                    base = base.copy()
                 else:
                     continue
 
                 if segment_id in segment_to_train and segment_id in segment_to_val:
                     train_img, train_has = segment_to_train[segment_id]
                     val_img, val_has = segment_to_val[segment_id]
+                    train_meta = segment_to_train_meta.get(segment_id, {})
+                    val_meta = segment_to_val_meta.get(segment_id, {})
+                    train_img, train_has = _expand_to_full(train_img, train_has, train_meta)
+                    val_img, val_has = _expand_to_full(val_img, val_has, val_meta)
                     base[train_has] = train_img[train_has]
                     base[val_has] = val_img[val_has]
 
@@ -372,7 +626,9 @@ class StitchManager:
                     where=count_buf != 0,
                 )
                 segment_id = self.segment_ids.get(loader_idx, str(loader_idx))
+                segment_id = str(segment_id)
                 base = np.clip(stitched, 0, 1)
+                base, _ = _expand_to_full(base, count_buf != 0, segment_to_val_meta.get(segment_id, {}))
                 if want_color:
                     rgb = np.repeat(base[..., None], 3, axis=2)
                     train_border = self.borders_by_split.get("train", {}).get(str(segment_id))
@@ -386,6 +642,23 @@ class StitchManager:
                     images.append(base)
                 captions.append(f"{segment_id} (val ds={self.downsample})")
 
+        log_only_images = []
+        log_only_captions = []
+        if log_only_mode:
+            for segment_id in self.log_only_segment_ids:
+                pred_buf, count_buf = self.log_only_buffers[str(segment_id)]
+                stitched = np.divide(
+                    pred_buf,
+                    count_buf,
+                    out=np.zeros_like(pred_buf),
+                    where=count_buf != 0,
+                )
+                meta = self.log_only_buffer_meta.get(str(segment_id), {})
+                base = np.clip(stitched, 0, 1)
+                base, _ = _expand_to_full(base, count_buf != 0, meta)
+                log_only_images.append(base)
+                log_only_captions.append(f"{segment_id} (log-only ds={self.log_only_downsample})")
+
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             if isinstance(model.logger, WandbLogger):
                 step = None
@@ -397,6 +670,127 @@ class StitchManager:
                     model.logger.log_image(key="masks", images=images, caption=captions)
                 else:
                     model.logger.log_image(key="masks", images=images, caption=captions, step=step)
+                if log_only_images:
+                    if step is None:
+                        model.logger.log_image(key="masks_log_only", images=log_only_images, caption=log_only_captions)
+                    else:
+                        model.logger.log_image(
+                            key="masks_log_only",
+                            images=log_only_images,
+                            caption=log_only_captions,
+                            step=step,
+                        )
+
+        if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
+            if bool(getattr(CFG, "eval_stitch_metrics", True)) and segment_to_val:
+                try:
+                    from metrics.textseg_metrics import compute_stitched_metrics
+                except Exception as e:
+                    compute_stitched_metrics = None
+                    log(f"WARNING: stitch metrics disabled (failed import metrics.textseg_metrics): {e}")
+
+                if compute_stitched_metrics is not None:
+                    label_suffix = str(getattr(CFG, "val_label_suffix", "_val"))
+                    mask_suffix = str(getattr(CFG, "val_mask_suffix", "_val"))
+                    threshold = float(getattr(CFG, "eval_threshold", 0.5))
+                    fbeta = float(getattr(CFG, "eval_fbeta", 0.5))
+                    betti_connectivity = int(getattr(CFG, "eval_betti_connectivity", 2))
+                    drd_block_size = int(getattr(CFG, "eval_drd_block_size", 8))
+                    boundary_k = int(getattr(CFG, "eval_boundary_k", 3))
+                    component_iou_thr = float(getattr(CFG, "eval_component_iou_thr", 0.5))
+                    component_worst_q = getattr(CFG, "eval_component_worst_q", 0.1)
+                    if isinstance(component_worst_q, str) and component_worst_q.strip().lower() in {"", "none", "null"}:
+                        component_worst_q = None
+                    if component_worst_q is not None:
+                        component_worst_q = float(component_worst_q)
+                    component_worst_k = getattr(CFG, "eval_component_worst_k", None)
+                    if isinstance(component_worst_k, str) and component_worst_k.strip().lower() in {"", "none", "null"}:
+                        component_worst_k = None
+                    if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
+                        component_worst_k = int(component_worst_k)
+                    component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
+                    component_ssim = bool(getattr(CFG, "eval_component_ssim", False))
+                    component_ssim_pad = int(getattr(CFG, "eval_component_ssim_pad", 2))
+                    pr_num_bins = int(getattr(CFG, "eval_pr_num_bins", 200))
+                    ssim_mode = str(getattr(CFG, "eval_ssim_mode", "prob"))
+                    compute_persistence = bool(getattr(CFG, "eval_persistence", False))
+                    persistence_downsample = int(getattr(CFG, "eval_persistence_downsample", 4) or 1)
+                    save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
+                    skeleton_images_dir = str(getattr(CFG, "eval_skeleton_images_dir", "metrics_skeletons"))
+                    output_dir = osp.join(str(getattr(CFG, "figures_dir", ".")), skeleton_images_dir)
+                    component_output_dir = osp.join(
+                        str(getattr(CFG, "figures_dir", ".")),
+                        "metrics_components",
+                    )
+
+                    def _parse_list(value, cast_fn):
+                        if value is None:
+                            return None
+                        if isinstance(value, str):
+                            parts = [p.strip() for p in value.replace(";", ",").split(",")]
+                            return [cast_fn(p) for p in parts if p]
+                        if isinstance(value, (list, tuple, np.ndarray)):
+                            return [cast_fn(v) for v in value]
+                        return [cast_fn(value)]
+
+                    boundary_tols = _parse_list(getattr(CFG, "eval_boundary_tols", None), float)
+                    skeleton_radius = _parse_list(getattr(CFG, "eval_skeleton_radius", None), int)
+
+                    threshold_grid = _parse_list(getattr(CFG, "eval_threshold_grid", None), float)
+                    if threshold_grid is None:
+                        tmin = float(getattr(CFG, "eval_threshold_grid_min", 0.05))
+                        tmax = float(getattr(CFG, "eval_threshold_grid_max", 0.95))
+                        steps = int(getattr(CFG, "eval_threshold_grid_steps", 19))
+                        if steps >= 2:
+                            threshold_grid = np.linspace(tmin, tmax, steps).tolist()
+
+                    multi = len(segment_to_val) > 1
+                    for segment_id, (pred_prob, pred_has) in segment_to_val.items():
+                        try:
+                            meta = segment_to_val_meta.get(str(segment_id), {})
+                            roi_offset = meta.get("offset", (0, 0))
+                            cache_max = int(max(1, len(segment_to_val))) if segment_to_val else 1
+                            metrics = compute_stitched_metrics(
+                                fragment_id=segment_id,
+                                pred_prob=pred_prob,
+                                pred_has=pred_has,
+                                label_suffix=label_suffix,
+                                mask_suffix=mask_suffix,
+                                downsample=self.downsample,
+                                roi_offset=roi_offset,
+                                threshold=threshold,
+                                fbeta=fbeta,
+                                betti_connectivity=betti_connectivity,
+                                drd_block_size=drd_block_size,
+                                boundary_k=boundary_k,
+                                boundary_tols=boundary_tols,
+                                skeleton_radius=skeleton_radius,
+                                component_iou_thr=component_iou_thr,
+                                component_worst_q=component_worst_q,
+                                component_worst_k=component_worst_k,
+                                component_min_area=component_min_area,
+                                component_ssim=component_ssim,
+                                component_ssim_pad=component_ssim_pad,
+                                pr_num_bins=pr_num_bins,
+                                threshold_grid=threshold_grid,
+                                ssim_mode=ssim_mode,
+                                compute_persistence=compute_persistence,
+                                persistence_downsample=persistence_downsample,
+                                output_dir=output_dir,
+                                component_output_dir=component_output_dir,
+                                save_skeleton_images=save_skeleton_images,
+                                gt_cache_max=cache_max,
+                            )
+                        except Exception as e:
+                            log(f"WARNING: failed stitch metrics for segment={segment_id!r}: {e}")
+                            continue
+
+                        base_key = "metrics/val_stitch"
+                        if multi:
+                            safe_segment_id = str(segment_id).replace("/", "_")
+                            base_key = f"{base_key}/{safe_segment_id}"
+                        for k, v in (metrics or {}).items():
+                            model.log(f"{base_key}/{k}", v, on_epoch=True, prog_bar=False)
 
         # reset stitch buffers
         for pred_buf, count_buf in self.buffers.values():
@@ -404,6 +798,10 @@ class StitchManager:
             count_buf.fill(0)
         if log_train_stitch:
             for pred_buf, count_buf in self.train_buffers.values():
+                pred_buf.fill(0)
+                count_buf.fill(0)
+        if log_only_mode:
+            for pred_buf, count_buf in self.log_only_buffers.values():
                 pred_buf.fill(0)
                 count_buf.fill(0)
 
@@ -435,6 +833,14 @@ class RegressionPLModel(pl.LightningModule):
         stitch_all_val_segment_ids=None,
         stitch_train_shapes=None,
         stitch_train_segment_ids=None,
+        stitch_use_roi=False,
+        stitch_val_bboxes=None,
+        stitch_train_bboxes=None,
+        stitch_log_only_shapes=None,
+        stitch_log_only_segment_ids=None,
+        stitch_log_only_bboxes=None,
+        stitch_log_only_downsample=1,
+        stitch_log_only_every_n_epochs=10,
         stitch_train=False,
         stitch_train_every_n_epochs=1,
         norm="batch",
@@ -475,6 +881,12 @@ class RegressionPLModel(pl.LightningModule):
 
         self._ema_decay = float(getattr(CFG, "ema_decay", 0.9))
         self._ema_metrics = {}
+
+        # Evaluation-only metrics (kept separate from the optimization objective).
+        self._eval_threshold = float(getattr(CFG, "eval_threshold", 0.5))
+        self._eval_fbeta = float(getattr(CFG, "eval_fbeta", 0.5))
+        self._eval_num_bins = int(getattr(CFG, "eval_num_bins", 1000))
+        self._val_eval_metrics = None
 
         self.loss_func1 = smp.losses.DiceLoss(mode="binary")
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
@@ -533,6 +945,14 @@ class RegressionPLModel(pl.LightningModule):
             stitch_all_val_segment_ids=stitch_all_val_segment_ids,
             stitch_train_shapes=stitch_train_shapes,
             stitch_train_segment_ids=stitch_train_segment_ids,
+            stitch_use_roi=bool(stitch_use_roi),
+            stitch_val_bboxes=stitch_val_bboxes,
+            stitch_train_bboxes=stitch_train_bboxes,
+            stitch_log_only_shapes=stitch_log_only_shapes,
+            stitch_log_only_segment_ids=stitch_log_only_segment_ids,
+            stitch_log_only_bboxes=stitch_log_only_bboxes,
+            stitch_log_only_downsample=stitch_log_only_downsample,
+            stitch_log_only_every_n_epochs=int(stitch_log_only_every_n_epochs or 10),
             stitch_train=bool(stitch_train),
             stitch_train_every_n_epochs=int(stitch_train_every_n_epochs or 1),
         )
@@ -543,8 +963,17 @@ class RegressionPLModel(pl.LightningModule):
     def set_train_stitch_loaders(self, loaders, segment_ids):
         self._stitcher.set_train_loaders(loaders, segment_ids)
 
-    def _accumulate_stitch_predictions(self, *, outputs, xyxys, pred_buf, count_buf):
-        self._stitcher.accumulate_to_buffers(outputs=outputs, xyxys=xyxys, pred_buf=pred_buf, count_buf=count_buf)
+    def set_log_only_stitch_loaders(self, loaders, segment_ids):
+        self._stitcher.set_log_only_loaders(loaders, segment_ids)
+
+    def _accumulate_stitch_predictions(self, *, outputs, xyxys, pred_buf, count_buf, offset=(0, 0)):
+        self._stitcher.accumulate_to_buffers(
+            outputs=outputs,
+            xyxys=xyxys,
+            pred_buf=pred_buf,
+            count_buf=count_buf,
+            offset=offset,
+        )
 
     def _run_train_stitch_pass(self):
         return self._stitcher.run_train_stitch_pass(self)
@@ -788,6 +1217,13 @@ class RegressionPLModel(pl.LightningModule):
         self._val_group_dice_loss_sum = torch.zeros(self.n_groups, device=device)
         self._val_group_count = torch.zeros(self.n_groups, device=device)
 
+        self._val_eval_metrics = StreamingBinarySegmentationMetrics(
+            threshold=self._eval_threshold,
+            beta=self._eval_fbeta,
+            num_bins=self._eval_num_bins,
+            device=device,
+        )
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, y, xyxys, g = batch
         outputs = self(x)
@@ -805,6 +1241,9 @@ class RegressionPLModel(pl.LightningModule):
         self._val_group_bce_sum.scatter_add_(0, g, per_sample_bce)
         self._val_group_dice_loss_sum.scatter_add_(0, g, per_sample_dice_loss)
         self._val_group_count.scatter_add_(0, g, torch.ones_like(per_sample_loss, dtype=self._val_group_count.dtype))
+
+        if self._val_eval_metrics is not None:
+            self._val_eval_metrics.update(logits=outputs, targets=y)
 
         self._stitcher.accumulate_val(outputs=outputs, xyxys=xyxys, dataloader_idx=dataloader_idx)
 
@@ -846,6 +1285,14 @@ class RegressionPLModel(pl.LightningModule):
         self._update_ema_metric("val/worst_group_loss", worst_group_loss)
         self._update_ema_metric("val/avg_dice", avg_dice)
         self._update_ema_metric("val/worst_group_dice", worst_group_dice)
+
+        if self._val_eval_metrics is not None:
+            eval_metrics = self._val_eval_metrics.compute()
+            for k, v in eval_metrics.items():
+                self.log(f"metrics/val/{k}", v, on_epoch=True, prog_bar=False)
+            # Helpful context in W&B charts, even if constant per run.
+            self.log("metrics/val/threshold", float(self._eval_threshold), on_epoch=True, prog_bar=False)
+            self.log("metrics/val/beta", float(self._eval_fbeta), on_epoch=True, prog_bar=False)
 
         for group_idx, group_name in enumerate(self.group_names):
             safe_group_name = str(group_name).replace("/", "_")

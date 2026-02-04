@@ -13,11 +13,15 @@ from train_resnet3d_lib.data_ops import (
     build_group_mappings,
     read_image_layers,
     read_image_mask,
+    read_image_fragment_mask,
     extract_patches,
+    extract_patches_infer,
     get_transforms,
     CustomDataset,
+    CustomDatasetTest,
     _mask_border,
     _downsample_bool_mask_any,
+    _mask_bbox_downsample,
 )
 
 
@@ -93,6 +97,9 @@ def load_train_segment(
         mask_border = _mask_border(
             _downsample_bool_mask_any(fragment_mask, int(getattr(CFG, "stitch_downsample", 1)))
         )
+    mask_bbox = None
+    if bool(getattr(CFG, "stitch_use_roi", False)):
+        mask_bbox = _mask_bbox_downsample(fragment_mask, int(getattr(CFG, "stitch_downsample", 1)))
 
     return {
         "patch_count": patch_count,
@@ -101,6 +108,7 @@ def load_train_segment(
         "group_idx": group_idx,
         "stitch_candidate": stitch_candidate,
         "mask_border": mask_border,
+        "mask_bbox": mask_bbox,
     }
 
 
@@ -183,12 +191,16 @@ def load_val_segment(
         mask_border = _mask_border(
             _downsample_bool_mask_any(fragment_mask_val, int(getattr(CFG, "stitch_downsample", 1)))
         )
+    mask_bbox = None
+    if bool(getattr(CFG, "stitch_use_roi", False)):
+        mask_bbox = _mask_bbox_downsample(fragment_mask_val, int(getattr(CFG, "stitch_downsample", 1)))
 
     return {
         "patch_count": patch_count,
         "val_loader": val_loader,
         "mask_shape": tuple(mask_val.shape),
         "mask_border": mask_border,
+        "mask_bbox": mask_bbox,
     }
 
 
@@ -345,6 +357,67 @@ def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stit
     return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
 
 
+def build_log_only_stitch_loaders(
+    log_only_segments,
+    *,
+    segments_metadata,
+    layers_cache,
+    valid_transform,
+    mask_suffix,
+    log_only_downsample,
+):
+    log_only_loaders = []
+    log_only_shapes = []
+    log_only_segment_ids = []
+    log_only_bboxes = {}
+
+    for fragment_id in log_only_segments:
+        seg_meta = segments_metadata.get(fragment_id, {}) or {}
+        layers = layers_cache.get(fragment_id)
+        if layers is None:
+            layers = read_image_layers(
+                fragment_id,
+                layer_range=seg_meta.get("layer_range"),
+            )
+        else:
+            log(f"reuse layers cache for log-only segment={fragment_id}")
+
+        image, fragment_mask = read_image_fragment_mask(
+            fragment_id,
+            reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+            mask_suffix=mask_suffix,
+            images=layers,
+        )
+
+        log(f"extract log-only patches segment={fragment_id}")
+        t0 = time.time()
+        images, xyxys = extract_patches_infer(image, fragment_mask, include_xyxys=True)
+        log(f"patches log-only segment={fragment_id} n={len(images)} in {time.time() - t0:.1f}s")
+        if len(images) == 0:
+            continue
+
+        xyxys = np.stack(xyxys) if len(xyxys) > 0 else np.zeros((0, 4), dtype=np.int64)
+        dataset = CustomDatasetTest(images, xyxys, CFG, transform=valid_transform)
+        loader = DataLoader(
+            dataset,
+            batch_size=CFG.valid_batch_size,
+            shuffle=False,
+            num_workers=CFG.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        log_only_loaders.append(loader)
+        log_only_shapes.append(tuple(fragment_mask.shape))
+        log_only_segment_ids.append(str(fragment_id))
+
+        bbox = _mask_bbox_downsample(fragment_mask, int(log_only_downsample))
+        if bbox is not None:
+            log_only_bboxes[str(fragment_id)] = bbox
+
+    return log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes
+
+
 def build_datasets(run_state):
     segments_metadata = run_state["segments_metadata"]
     fragment_ids = run_state["fragment_ids"]
@@ -379,12 +452,14 @@ def build_datasets(run_state):
     train_patch_counts_by_segment = {}
     train_stitch_candidates = {}
     train_mask_borders = {}
+    train_mask_bboxes = {}
 
     val_loaders = []
     val_stitch_shapes = []
     val_stitch_segment_ids = []
     val_patch_counts_by_segment = {}
     val_mask_borders = {}
+    val_mask_bboxes = {}
     stitch_val_dataloader_idx = None
     stitch_pred_shape = None
     stitch_segment_id = None
@@ -418,6 +493,8 @@ def build_datasets(run_state):
             train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
         if result["mask_border"] is not None:
             train_mask_borders[str(fragment_id)] = result["mask_border"]
+        if result.get("mask_bbox") is not None:
+            train_mask_bboxes[str(fragment_id)] = result["mask_bbox"]
         train_images.extend(result["images"])
         train_masks.extend(result["masks"])
         train_groups.extend([group_idx] * len(result["images"]))
@@ -448,6 +525,8 @@ def build_datasets(run_state):
         val_stitch_segment_ids.append(fragment_id)
         if result["mask_border"] is not None:
             val_mask_borders[str(fragment_id)] = result["mask_border"]
+        if result.get("mask_bbox") is not None:
+            val_mask_bboxes[str(fragment_id)] = result["mask_bbox"]
         if fragment_id == CFG.valid_id:
             stitch_val_dataloader_idx = len(val_loaders) - 1
             stitch_pred_shape = result["mask_shape"]
@@ -488,6 +567,21 @@ def build_datasets(run_state):
         valid_transform=valid_transform,
     )
 
+    log_only_segments = list(getattr(CFG, "stitch_log_only_segments", []) or [])
+    log_only_loaders = []
+    log_only_shapes = []
+    log_only_segment_ids = []
+    log_only_bboxes = {}
+    if log_only_segments:
+        log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_stitch_loaders(
+            log_only_segments,
+            segments_metadata=segments_metadata,
+            layers_cache=layers_cache,
+            valid_transform=valid_transform,
+            mask_suffix=val_mask_suffix,
+            log_only_downsample=int(getattr(CFG, "stitch_log_only_downsample", getattr(CFG, "stitch_downsample", 1))),
+        )
+
     return {
         "train_loader": train_loader,
         "val_loaders": val_loaders,
@@ -498,7 +592,13 @@ def build_datasets(run_state):
         "train_stitch_shapes": train_stitch_shapes,
         "train_stitch_segment_ids": train_stitch_segment_ids,
         "train_mask_borders": train_mask_borders,
+        "train_mask_bboxes": train_mask_bboxes,
         "val_mask_borders": val_mask_borders,
+        "val_mask_bboxes": val_mask_bboxes,
+        "log_only_stitch_loaders": log_only_loaders,
+        "log_only_stitch_shapes": log_only_shapes,
+        "log_only_stitch_segment_ids": log_only_segment_ids,
+        "log_only_mask_bboxes": log_only_bboxes,
         "include_train_xyxys": include_train_xyxys,
         "stitch_val_dataloader_idx": stitch_val_dataloader_idx,
         "stitch_pred_shape": stitch_pred_shape,

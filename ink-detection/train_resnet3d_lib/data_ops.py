@@ -204,27 +204,7 @@ def read_image_mask(
         fragment_mask = cv2.flip(fragment_mask, 0)
 
     def _assert_bottom_right_pad_compatible(a_name, a_hw, b_name, b_hw, multiple):
-        a_h, a_w = [int(x) for x in a_hw]
-        b_h, b_w = [int(x) for x in b_hw]
-
-        def _check_dim(dim_name, a_dim, b_dim):
-            small = min(a_dim, b_dim)
-            big = max(a_dim, b_dim)
-            padded = ((small + multiple - 1) // multiple) * multiple
-            allowed = {small, padded}
-            if small % multiple == 0:
-                allowed.add(small + multiple)  # supports the legacy "always pad one block" variant
-
-            if big not in allowed:
-                raise ValueError(
-                    f"{fragment_id}: {a_name} {a_hw} vs {b_name} {b_hw} mismatch. "
-                    f"Only bottom/right padding to a multiple of {multiple} is allowed "
-                    f"(see inference_resnet3d.py). Got {dim_name}={a_dim} vs {b_dim}."
-                )
-
-        _check_dim("height", a_h, b_h)
-        _check_dim("width", a_w, b_w)
-
+        _assert_bottom_right_pad_compatible_global(fragment_id, a_name, a_hw, b_name, b_hw, multiple)
     if "frag" not in fragment_id:
         pad_multiple = 256
         _assert_bottom_right_pad_compatible("image", images.shape[:2], "label", mask.shape[:2], pad_multiple)
@@ -263,6 +243,106 @@ def read_image_mask(
     if images.shape[0] != mask.shape[0] or images.shape[1] != mask.shape[1]:
         raise ValueError(f"{fragment_id}: label shape {mask.shape} does not match image shape {images.shape[:2]}")
     return images, mask, fragment_mask
+
+
+def _assert_bottom_right_pad_compatible_global(fragment_id, a_name, a_hw, b_name, b_hw, multiple):
+    a_h, a_w = [int(x) for x in a_hw]
+    b_h, b_w = [int(x) for x in b_hw]
+
+    def _check_dim(dim_name, a_dim, b_dim):
+        small = min(a_dim, b_dim)
+        big = max(a_dim, b_dim)
+        padded = ((small + multiple - 1) // multiple) * multiple
+        allowed = {small, padded}
+        if small % multiple == 0:
+            allowed.add(small + multiple)  # supports the legacy "always pad one block" variant
+
+        if big not in allowed:
+            raise ValueError(
+                f"{fragment_id}: {a_name} {a_hw} vs {b_name} {b_hw} mismatch. "
+                f"Only bottom/right padding to a multiple of {multiple} is allowed "
+                f"(see inference_resnet3d.py). Got {dim_name}={a_dim} vs {b_dim}."
+            )
+
+    _check_dim("height", a_h, b_h)
+    _check_dim("width", a_w, b_w)
+
+
+def read_image_fragment_mask(
+    fragment_id,
+    *,
+    layer_range=None,
+    reverse_layers=False,
+    mask_suffix="",
+    images=None,
+):
+    if images is None:
+        images = read_image_layers(
+            fragment_id,
+            layer_range=layer_range,
+        )
+
+    if reverse_layers or fragment_id in REVERSE_LAYER_FRAGMENT_IDS_FALLBACK:
+        images = images[:, :, ::-1]
+
+    mask_base = f"train_scrolls/{fragment_id}/{fragment_id}_mask{mask_suffix}"
+    fragment_mask = _read_gray(f"{mask_base}.png")
+    if fragment_mask is None:
+        fragment_mask = _read_gray(f"{mask_base}.tiff")
+    if fragment_mask is None:
+        fragment_mask = _read_gray(f"{mask_base}.tif")
+    if fragment_mask is None:
+        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
+    if fragment_id == '20230827161846':
+        fragment_mask = cv2.flip(fragment_mask, 0)
+
+    if "frag" not in fragment_id:
+        pad_multiple = 256
+        _assert_bottom_right_pad_compatible_global(
+            fragment_id, "image", images.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple
+        )
+
+    target_h = min(images.shape[0], fragment_mask.shape[0])
+    target_w = min(images.shape[1], fragment_mask.shape[1])
+    if target_h <= 0 or target_w <= 0:
+        raise ValueError(f"{fragment_id}: empty shapes after alignment (image={images.shape}, mask={fragment_mask.shape})")
+
+    images = images[:target_h, :target_w]
+    fragment_mask = fragment_mask[:target_h, :target_w]
+
+    return images, fragment_mask
+
+
+def extract_patches_infer(image, fragment_mask, *, include_xyxys=True):
+    images = []
+    xyxys = []
+
+    stride = CFG.stride
+    x1_list = list(range(0, image.shape[1] - CFG.tile_size + 1, stride))
+    y1_list = list(range(0, image.shape[0] - CFG.tile_size + 1, stride))
+    windows_dict = {}
+
+    for a in y1_list:
+        for b in x1_list:
+            if np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
+                continue
+
+            for yi in range(0, CFG.tile_size, CFG.size):
+                for xi in range(0, CFG.tile_size, CFG.size):
+                    y1 = a + yi
+                    x1 = b + xi
+                    y2 = y1 + CFG.size
+                    x2 = x1 + CFG.size
+                    if (y1, y2, x1, x2) in windows_dict:
+                        continue
+
+                    windows_dict[(y1, y2, x1, x2)] = True
+                    images.append(image[y1:y2, x1:x2])
+                    if include_xyxys:
+                        xyxys.append([x1, y1, x2, y2])
+                    assert image[y1:y2, x1:x2].shape == (CFG.size, CFG.size, CFG.in_chans)
+
+    return images, xyxys
 
 
 def build_group_mappings(fragment_ids, segments_metadata, group_key="base_path"):
@@ -331,6 +411,18 @@ def _downsample_bool_mask_any(mask: np.ndarray, ds: int) -> np.ndarray:
         mask_bool = np.pad(mask_bool, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
     mask_bool = mask_bool.reshape(ds_h, ds, ds_w, ds)
     return mask_bool.any(axis=(1, 3))
+
+
+def _mask_bbox_downsample(mask: np.ndarray, ds: int) -> tuple[int, int, int, int] | None:
+    mask_ds = _downsample_bool_mask_any(mask, int(ds))
+    if not mask_ds.any():
+        return None
+    ys, xs = np.where(mask_ds)
+    y0 = int(ys.min())
+    y1 = int(ys.max()) + 1
+    x0 = int(xs.min())
+    x1 = int(xs.max()) + 1
+    return (y0, y1, x0, x1)
 
 
 def _mask_border(mask_bool: np.ndarray) -> np.ndarray:

@@ -74,6 +74,10 @@ class CFG:
     stitch_downsample = 1
     stitch_train = False
     stitch_train_every_n_epochs = 1
+    stitch_use_roi = True
+    stitch_log_only_segments = []
+    stitch_log_only_every_n_epochs = 10
+    stitch_log_only_downsample = 8
     cv_fold = None
     train_label_suffix = ""
     train_mask_suffix = ""
@@ -91,6 +95,37 @@ class CFG:
     # objective_cv = 'binary'  # 'binary', 'multiclass', 'regression'
     metric_direction = 'maximize'  # maximize, 'minimize'
     # metrics = 'dice_coef'
+
+    # ============== eval metrics cfg (validation-only) =============
+    # Threshold for confusion-based metrics (precision/recall/F-beta/MCC/IoU/Dice).
+    eval_threshold = 0.5
+    # Beta for F-beta; ScrollPrize/Vesuvius often uses F0.5 (precision-weighted).
+    eval_fbeta = 0.5
+    # Histogram bins for approximate AUPRC/AUROC and best-F-beta threshold search.
+    eval_num_bins = 1000
+    # Extra "stitched segment" metrics (expensive, but more faithful for topology/document metrics).
+    eval_stitch_metrics = True
+    eval_betti_connectivity = 2  # 1=4-neighborhood, 2=8-neighborhood
+    eval_drd_block_size = 8
+    eval_boundary_k = 3
+    eval_boundary_tols = [1.0]
+    eval_skeleton_radius = [1]
+    eval_component_iou_thr = 0.5
+    eval_component_worst_q = 0.1
+    eval_component_worst_k = 8
+    eval_component_min_area = 0
+    eval_component_ssim = True
+    eval_component_ssim_pad = 2
+    eval_pr_num_bins = 200
+    eval_threshold_grid_min = 0.05
+    eval_threshold_grid_max = 0.95
+    eval_threshold_grid_steps = 19
+    eval_threshold_grid = None
+    eval_ssim_mode = "prob"  # "prob" | "dist"
+    eval_persistence = False
+    eval_persistence_downsample = 4
+    eval_save_skeleton_images = True
+    eval_skeleton_images_dir = "metrics_skeletons"
 
     # ============== fixed =============
     pretrained = True
@@ -322,6 +357,31 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("weight_decay", "weight_decay"),
         ("exclude_weight_decay_bias_norm", "exclude_weight_decay_bias_norm"),
         ("max_grad_norm", "max_grad_norm"),
+        ("eval_threshold", "eval_threshold"),
+        ("eval_fbeta", "eval_fbeta"),
+        ("eval_num_bins", "eval_num_bins"),
+        ("eval_stitch_metrics", "eval_stitch_metrics"),
+        ("eval_betti_connectivity", "eval_betti_connectivity"),
+        ("eval_drd_block_size", "eval_drd_block_size"),
+        ("eval_boundary_k", "eval_boundary_k"),
+        ("eval_boundary_tols", "eval_boundary_tols"),
+        ("eval_skeleton_radius", "eval_skeleton_radius"),
+        ("eval_component_iou_thr", "eval_component_iou_thr"),
+        ("eval_component_worst_q", "eval_component_worst_q"),
+        ("eval_component_worst_k", "eval_component_worst_k"),
+        ("eval_component_min_area", "eval_component_min_area"),
+        ("eval_component_ssim", "eval_component_ssim"),
+        ("eval_component_ssim_pad", "eval_component_ssim_pad"),
+        ("eval_pr_num_bins", "eval_pr_num_bins"),
+        ("eval_threshold_grid_min", "eval_threshold_grid_min"),
+        ("eval_threshold_grid_max", "eval_threshold_grid_max"),
+        ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
+        ("eval_threshold_grid", "eval_threshold_grid"),
+        ("eval_ssim_mode", "eval_ssim_mode"),
+        ("eval_persistence", "eval_persistence"),
+        ("eval_persistence_downsample", "eval_persistence_downsample"),
+        ("eval_save_skeleton_images", "eval_save_skeleton_images"),
+        ("eval_skeleton_images_dir", "eval_skeleton_images_dir"),
         ("pretrained", "pretrained"),
         ("num_workers", "num_workers"),
         ("layer_read_workers", "layer_read_workers"),
@@ -340,6 +400,25 @@ def apply_metadata_hyperparameters(cfg, metadata):
     cfg.save_every_epoch = bool(training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)))
     cfg.stitch_all_val = bool(training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)))
     cfg.stitch_train = bool(training_cfg.get("stitch_train", getattr(cfg, "stitch_train", False)))
+    cfg.stitch_log_only_segments = list(
+        training_cfg.get("stitch_log_only_segments", getattr(cfg, "stitch_log_only_segments", [])) or []
+    )
+    cfg.stitch_log_only_every_n_epochs = int(
+        training_cfg.get(
+            "stitch_log_only_every_n_epochs",
+            getattr(cfg, "stitch_log_only_every_n_epochs", 10) or 10,
+        )
+    )
+    cfg.stitch_log_only_every_n_epochs = max(1, int(cfg.stitch_log_only_every_n_epochs))
+    cfg.stitch_log_only_downsample = int(
+        training_cfg.get(
+            "stitch_log_only_downsample",
+            getattr(cfg, "stitch_log_only_downsample", getattr(cfg, "stitch_downsample", 1)),
+        )
+        or 1
+    )
+    cfg.stitch_log_only_downsample = max(1, int(cfg.stitch_log_only_downsample))
+    cfg.stitch_use_roi = bool(training_cfg.get("stitch_use_roi", getattr(cfg, "stitch_use_roi", True)))
     cfg.stitch_train_every_n_epochs = int(
         training_cfg.get("stitch_train_every_n_epochs", getattr(cfg, "stitch_train_every_n_epochs", 1) or 1)
     )

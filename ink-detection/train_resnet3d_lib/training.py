@@ -150,6 +150,11 @@ def init_wandb_logger(args, base_config):
     # not the last logged value.
     try:
         run = wandb_logger.experiment
+        # Lightning logs optimizer step as `trainer/global_step`. Use it as the
+        # default x-axis for every metric so train/val/metrics stay aligned.
+        run.define_metric("trainer/global_step")
+        run.define_metric("*", step_metric="trainer/global_step", step_sync=True)
+
         run.define_metric("val/worst_group_loss", summary="min")
         run.define_metric("val/avg_loss", summary="min")
         run.define_metric("val/worst_group_dice", summary="max")
@@ -161,6 +166,48 @@ def init_wandb_logger(args, base_config):
         run.define_metric("train/total_loss_ema", summary="min")
         run.define_metric("train/dice_ema", summary="max")
         run.define_metric("train/worst_group_loss_ema", summary="min")
+
+        # Evaluation metrics (logged under metrics/val/*).
+        run.define_metric("metrics/val/auprc", summary="max")
+        run.define_metric("metrics/val/auroc", summary="max")
+        run.define_metric("metrics/val/best_f_beta", summary="max")
+        run.define_metric("metrics/val/f_beta", summary="max")
+        run.define_metric("metrics/val/dice", summary="max")
+        run.define_metric("metrics/val/iou", summary="max")
+        run.define_metric("metrics/val/mcc", summary="max")
+        run.define_metric("metrics/val/balanced_accuracy", summary="max")
+        run.define_metric("metrics/val/brier", summary="min")
+
+        run.define_metric("metrics/val_stitch/drd", summary="min")
+        run.define_metric("metrics/val_stitch/mpm", summary="min")
+        run.define_metric("metrics/val_stitch/nrm", summary="min")
+        run.define_metric("metrics/val_stitch/voi", summary="min")
+        run.define_metric("metrics/val_stitch/psnr", summary="max")
+        run.define_metric("metrics/val_stitch/betti/l1_betti_err", summary="min")
+        run.define_metric("metrics/val_stitch/abs_euler_err", summary="min")
+        run.define_metric("metrics/val_stitch/boundary/hd95", summary="min")
+        run.define_metric("metrics/val_stitch/skeleton/cldice", summary="max")
+        run.define_metric("metrics/val_stitch/components/mean_iou", summary="max")
+        run.define_metric("metrics/val_stitch/components/worst_k_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/worst_q_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/dice_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/dice_worst_k_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/dice_worst_q_mean", summary="max")
+        run.define_metric("metrics/val_stitch/pq/pq", summary="max")
+        run.define_metric("metrics/val_stitch/components/pr_auprc_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/pr_auroc_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/pr_auprc_worst_k_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/pr_auroc_worst_k_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/pr_auprc_worst_q_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/pr_auroc_worst_q_mean", summary="max")
+        run.define_metric("metrics/val_stitch/stability/dice_mean", summary="max")
+        run.define_metric("metrics/val_stitch/stability/fbeta_mean", summary="max")
+        run.define_metric("metrics/val_stitch/pfm", summary="max")
+        run.define_metric("metrics/val_stitch/components/ssim_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/ssim_worst_k_mean", summary="max")
+        run.define_metric("metrics/val_stitch/components/ssim_worst_q_mean", summary="max")
+        run.define_metric("metrics/val_stitch/pr/auprc", summary="max")
+        run.define_metric("metrics/val_stitch/pr/auroc", summary="max")
     except Exception:
         pass
 
@@ -317,6 +364,14 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
         run_dir = osp.join(CFG.outputs_path, "runs", f"{slugify(run_slug)}_{run_id}")
     log(f"run_dir={run_dir}")
 
+    cv_fold = getattr(CFG, "cv_fold", None)
+    if cv_fold is not None:
+        fold_tag = f"fold{cv_fold}"
+        tags = list(wandb_info.get("tags") or [])
+        if fold_tag not in tags:
+            tags.append(fold_tag)
+        wandb_info["tags"] = tags
+
     try:
         if wandb_info.get("group") is not None:
             wandb_logger.experiment.group = str(wandb_info["group"])
@@ -386,11 +441,24 @@ def build_model(run_state, data_state, wandb_logger):
         stitch_all_val_segment_ids=data_state["val_stitch_segment_ids"],
         stitch_train_shapes=data_state["train_stitch_shapes"],
         stitch_train_segment_ids=data_state["train_stitch_segment_ids"],
+        stitch_use_roi=bool(getattr(CFG, "stitch_use_roi", False)),
+        stitch_val_bboxes=data_state.get("val_mask_bboxes"),
+        stitch_train_bboxes=data_state.get("train_mask_bboxes"),
+        stitch_log_only_shapes=data_state.get("log_only_stitch_shapes"),
+        stitch_log_only_segment_ids=data_state.get("log_only_stitch_segment_ids"),
+        stitch_log_only_bboxes=data_state.get("log_only_mask_bboxes"),
+        stitch_log_only_downsample=int(getattr(CFG, "stitch_log_only_downsample", getattr(CFG, "stitch_downsample", 1))),
+        stitch_log_only_every_n_epochs=int(getattr(CFG, "stitch_log_only_every_n_epochs", 10)),
         stitch_train=bool(getattr(CFG, "stitch_train", False)),
         stitch_train_every_n_epochs=int(getattr(CFG, "stitch_train_every_n_epochs", 1)),
     )
     if data_state["train_stitch_loaders"]:
         model.set_train_stitch_loaders(data_state["train_stitch_loaders"], data_state["train_stitch_segment_ids"])
+    if data_state.get("log_only_stitch_loaders"):
+        model.set_log_only_stitch_loaders(
+            data_state.get("log_only_stitch_loaders"),
+            data_state.get("log_only_stitch_segment_ids"),
+        )
     if data_state["include_train_xyxys"]:
         model.set_stitch_borders(
             train_borders=data_state["train_mask_borders"],
@@ -419,6 +487,7 @@ def build_trainer(args, wandb_logger):
         accelerator=args.accelerator,
         devices=args.devices,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
+        log_every_n_steps=10,
         logger=wandb_logger,
         default_root_dir=CFG.outputs_path,
         accumulate_grad_batches=CFG.accumulate_grad_batches,
