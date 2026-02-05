@@ -108,10 +108,6 @@ Herculaneum scrolls scanned via synchrotron micro‑CT. These are the core targe
               <img src="/img/overview/scroll1-actual-new.webp" className="w-[100%]" />
               <figcaption className="mt-[-6px]">PHerc. Paris. 4 (Scroll 1)</figcaption>
             </div>
-            <div className="sm:w-[45%] mb-2">
-              <img src="/img/overview/scroll2-small-actual.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. Paris. 3 (Scroll 2)</figcaption>
-            </div>
             <div className="sm:w-[35.5%] mb-2 mr-2">
               <img src="/img/overview/PHerc332.webp" className="w-[100%]" />
               <figcaption className="mt-[-6px]">PHerc. 332 (Scroll 3)</figcaption>
@@ -202,6 +198,11 @@ Detached fragments with exposed ink on their surfaces. These are especially usef
 * GitHub Issues: [Vesuvius Challenge repository](https://github.com/scrollprize/villa)
 * Community Forum: [Scroll Prize Discord](https://discord.gg/V4fJhvtaQn)
 
-## License
+## Licenses
 
-[CC‑BY‑NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (unless otherwise noted for specific assets)
+- [CC‑BY‑NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (unless otherwise noted for specific assets)
+- Scrolls 1-4 and Fragments 1-6 are from the EduceLab-Scrolls Dataset, copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge, with the following additional terms:
+  - I agree all publications and presentations resulting from any use of the EduceLab-Scrolls Dataset must cite use of the EduceLab-Scrolls Dataset as follows.
+  - In any published abstract, I will cite "EduceLab-Scrolls" as the source of the data in the abstract.
+  - In any published manuscripts using data from EduceLab-Scrolls, I will reference the following paper: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
+  - I will include language similar to the following in the methods section of my manuscripts in order to accurately acknowledge the data source: "Data used in the preparation of this article were obtained from the EduceLab-Scrolls dataset [above citation]."
