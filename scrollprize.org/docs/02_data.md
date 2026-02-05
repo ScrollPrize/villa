@@ -96,7 +96,7 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 
 Herculaneum scrolls scanned via synchrotron micro‑CT. These are the core targets for “virtual unwrapping” and reading.
 
-➡️ **Browse the auto‑generated scroll list:** [Scrolls](data_scrolls)
+➡️ **Browse the scroll list:** [Scrolls](data_scrolls)
 
 <div>
   <table>
@@ -139,7 +139,7 @@ Herculaneum scrolls scanned via synchrotron micro‑CT. These are the core targe
 
 Detached fragments with exposed ink on their surfaces. These are especially useful for building and validating ML approaches (e.g., ink detection), because they provide ground truth signals.
 
-➡️ **Browse the auto‑generated fragment list:** [Fragments](data_fragments)
+➡️ **Browse the fragment list:** [Fragments](data_fragments)
 
 <div>
   <table>
