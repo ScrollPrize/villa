@@ -196,7 +196,7 @@ Detached fragments with exposed ink on their surfaces. These are especially usef
 ## Support
 
 * GitHub Issues: [Vesuvius Challenge repository](https://github.com/scrollprize/villa)
-* Community Forum: [Scroll Prize Discord](https://discord.gg/V4fJhvtaQn)
+* Community Forum: [Discord](https://discord.gg/V4fJhvtaQn)
 
 ## Licenses
 
