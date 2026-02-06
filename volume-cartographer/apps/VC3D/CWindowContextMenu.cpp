@@ -1274,6 +1274,7 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     job.pass2JsonPath = pass2JsonFile->fileName();
     job.directoryPrefix = copyOut ? QStringLiteral("neighbor_out_") : QStringLiteral("neighbor_in_");
     job.copyOut = copyOut;
+    job.pass2OmpThreads = dlg.pass2OmpThreads();
     job.baselineEntries = snapshotDirectoryEntries(outputDirPath);
     job.pass1JsonFile = std::move(pass1JsonFile);
     job.pass2JsonFile = std::move(pass2JsonFile);
@@ -2058,7 +2059,7 @@ void CWindow::launchNeighborCopySecondPass()
         if (!startNeighborCopyPass(_neighborCopyJob->pass2JsonPath,
                                    resumeSurface,
                                    QStringLiteral("local"),
-                                   12)) {
+                                   std::max(1, _neighborCopyJob->pass2OmpThreads))) {
             _cmdRunner->setOmpThreads(-1);
             QMessageBox::warning(this, tr("Error"), tr("Failed to launch the second neighbor copy pass."));
             _neighborCopyJob.reset();

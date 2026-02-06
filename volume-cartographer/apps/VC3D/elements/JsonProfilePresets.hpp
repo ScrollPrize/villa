@@ -82,12 +82,21 @@ inline QString robustTracerParams_w_SpaceLineGrowJson()
         "}\n");
 }
 
+inline QString defaultCopyTracerParamsJson()
+{
+    return QStringLiteral(
+        "{\n"
+        "  \"reference_ray_weight\": 0.5\n"
+        "}\n");
+}
+
 template <typename TrFn>
 inline QVector<JsonProfileEditor::Profile> tracerParamProfiles(TrFn&& trFn)
 {
     QVector<JsonProfileEditor::Profile> profiles;
     profiles.push_back({QStringLiteral("custom"), trFn("Custom"), QString(), true});
     profiles.push_back({QStringLiteral("default"), trFn("Default"), QString(), false});
+    profiles.push_back({QStringLiteral("default_copy"), trFn("Default (Copy)"), defaultCopyTracerParamsJson(), false});
     profiles.push_back({QStringLiteral("robust"), trFn("Robust"), robustTracerParamsJson(), false});
     profiles.push_back({QStringLiteral("robust_2"), trFn("Robust 2"), robustTracerParams2Json(), false});
     profiles.push_back({QStringLiteral("robust_3"), trFn("Robust with Spaceline (Copy)"), robustTracerParams_w_SpaceLineCopyJson(), false});
