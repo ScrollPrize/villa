@@ -3097,7 +3097,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         trace_data.space_line_compute = std::make_unique<lineLossDistance>(loss_settings.space_line_threshold,
                                                                            loss_settings.space_line_invert);
         trace_data.space_line_volume = std::make_unique<Chunked3d<uint8_t, lineLossDistance>>(
-            *trace_data.space_line_compute, ds, cache);
+            *trace_data.space_line_compute, ds, cache, cache_root);
         std::cout << "Space-line loss EDT enabled (threshold=" << loss_settings.space_line_threshold
                   << ", steps=" << loss_settings.space_line_steps
                   << ", invert=" << loss_settings.space_line_invert << ")" << std::endl;
