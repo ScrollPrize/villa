@@ -585,11 +585,64 @@ int main(int argc, char *argv[])
                 ? static_cast<int>(std::ceil(neighbor_min_clearance / neighbor_step))
                 : 0);
         const bool neighbor_fill = params.value("neighbor_fill", true);
+        const int neighbor_spike_window = std::max(1, params.value("neighbor_spike_window", 2));
 
         const bool cast_out = (neighbor_dir == "out");
         if (!(cast_out || neighbor_dir == "in")) {
             std::cerr << "WARNING: neighbor_dir must be 'in' or 'out'; defaulting to 'out'" << std::endl;
         }
+
+        auto tri_orientation_ok = [&](const cv::Vec3f& a0, const cv::Vec3f& b0, const cv::Vec3f& c0,
+                                      const cv::Vec3f& a1, const cv::Vec3f& b1, const cv::Vec3f& c1) -> bool {
+            const cv::Vec3f ref = (b0 - a0).cross(c0 - a0);
+            const float ref_len = cv::norm(ref);
+            if (ref_len <= 1e-6f) {
+                return true; // Degenerate in source: no reliable orientation
+            }
+
+            const cv::Vec3f cand = (b1 - a1).cross(c1 - a1);
+            const float cand_len = cv::norm(cand);
+            if (cand_len <= 1e-8f) {
+                return false;
+            }
+
+            const float dot = ref.dot(cand);
+            const float tol = 1e-6f * ref_len * cand_len;
+            return dot >= -tol;
+        };
+
+        cv::Mat_<cv::Vec3f> ray_dirs(rows, cols);
+        ray_dirs.setTo(invalid_marker);
+        cv::Mat_<uchar> ray_dir_valid(rows, cols);
+        ray_dir_valid.setTo(0);
+
+        // Precompute one normalized cast direction per vertex.
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (!src_valid(r, c)) {
+                    continue;
+                }
+
+                cv::Vec3f n = src_surface->gridNormal(r, c);
+                if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
+                    continue;
+                }
+                if (!cast_out) {
+                    n *= -1.f; // cast "in"
+                }
+                const float nlen = cv::norm(n);
+                if (!std::isfinite(nlen) || nlen <= 1e-6f) {
+                    continue;
+                }
+                ray_dirs(r, c) = n * (1.0f / nlen);
+                ray_dir_valid(r, c) = 1;
+            }
+        }
+
+        auto has_ray_dir = [&](int rr, int cc) -> bool {
+            return ray_dir_valid(rr, cc) != 0;
+        };
 
         // Cast a ray per valid vertex
         const int max_steps = (neighbor_max_distance > 0.0)
@@ -605,16 +658,10 @@ int main(int argc, char *argv[])
                     continue;
                 }
 
-                // Compute grid normal at this grid location
-                cv::Vec3f n = src_surface->gridNormal(r, c);
-                if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
+                const cv::Vec3f n = ray_dirs(r, c);
+                if (!has_ray_dir(r, c)) {
                     continue; // leave invalid
                 }
-                if (!cast_out) {
-                    n *= -1.f; // cast "in"
-                }
-                // Normalize direction defensively
-                cv::normalize(n, n);
 
                 // March along the ray until threshold is hit or max distance reached
                 bool clearance_met = (required_clearance_steps == 0);
@@ -655,6 +702,139 @@ int main(int argc, char *argv[])
                     }
                 }
             }
+        }
+
+        auto endpoint_from_dist = [&](const cv::Mat_<float>& dist_map,
+                                      int rr,
+                                      int cc,
+                                      cv::Vec3f& out,
+                                      int override_r = -1,
+                                      int override_c = -1,
+                                      float override_t = -1.0f) -> bool {
+            if (!src_valid(rr, cc)) {
+                return false;
+            }
+            const float t = (rr == override_r && cc == override_c) ? override_t : dist_map(rr, cc);
+            if (!(t > 0.0f) || !std::isfinite(t)) {
+                return false;
+            }
+            if (!has_ray_dir(rr, cc)) {
+                return false;
+            }
+            const cv::Vec3f& dir = ray_dirs(rr, cc);
+            const cv::Vec3f start = src_points(rr, cc);
+            out = start + dir * t;
+            return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+        };
+
+        auto quad_folded = [&](const cv::Mat_<float>& dist_map,
+                               int tl_r,
+                               int tl_c,
+                               int override_r = -1,
+                               int override_c = -1,
+                               float override_t = -1.0f) -> bool {
+            if (tl_r < 0 || tl_c < 0 || tl_r + 1 >= rows || tl_c + 1 >= cols) {
+                return false;
+            }
+            if (!src_valid(tl_r, tl_c) || !src_valid(tl_r + 1, tl_c) ||
+                !src_valid(tl_r, tl_c + 1) || !src_valid(tl_r + 1, tl_c + 1)) {
+                return false;
+            }
+
+            cv::Vec3f p00, p10, p01, p11;
+            if (!endpoint_from_dist(dist_map, tl_r, tl_c, p00, override_r, override_c, override_t) ||
+                !endpoint_from_dist(dist_map, tl_r + 1, tl_c, p10, override_r, override_c, override_t) ||
+                !endpoint_from_dist(dist_map, tl_r, tl_c + 1, p01, override_r, override_c, override_t) ||
+                !endpoint_from_dist(dist_map, tl_r + 1, tl_c + 1, p11, override_r, override_c, override_t)) {
+                return false;
+            }
+
+            const cv::Vec3f s00 = src_points(tl_r, tl_c);
+            const cv::Vec3f s10 = src_points(tl_r + 1, tl_c);
+            const cv::Vec3f s01 = src_points(tl_r, tl_c + 1);
+            const cv::Vec3f s11 = src_points(tl_r + 1, tl_c + 1);
+
+            if (!tri_orientation_ok(s00, s10, s01, p00, p10, p01)) {
+                return true;
+            }
+            if (!tri_orientation_ok(s10, s11, s01, p10, p11, p01)) {
+                return true;
+            }
+            return false;
+        };
+
+        auto vertex_folded = [&](const cv::Mat_<float>& dist_map, int rr, int cc, float test_dist) -> bool {
+            if (!src_valid(rr, cc)) {
+                return false;
+            }
+            if (!(test_dist > 0.0f) || !std::isfinite(test_dist)) {
+                return true;
+            }
+
+            if (quad_folded(dist_map, rr - 1, cc - 1, rr, cc, test_dist)) return true;
+            if (quad_folded(dist_map, rr - 1, cc    , rr, cc, test_dist)) return true;
+            if (quad_folded(dist_map, rr,     cc - 1, rr, cc, test_dist)) return true;
+            if (quad_folded(dist_map, rr,     cc    , rr, cc, test_dist)) return true;
+            return false;
+        };
+
+        // Ray-space fold prevention:
+        // iteratively shorten ray distances that would invert local quad orientation.
+        // This keeps rays from crossing before mesh reconstruction.
+        int fold_corrections = 0;
+        const int max_fold_iters = std::max(1, neighbor_spike_window * 4);
+        for (int iter = 0; iter < max_fold_iters; ++iter) {
+            bool changed = false;
+            cv::Mat_<float> next_dist = hit_dist.clone();
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    const float curr = hit_dist(r, c);
+                    if (!(curr > 0.0f) || !std::isfinite(curr)) {
+                        continue;
+                    }
+                    if (!vertex_folded(hit_dist, r, c, curr)) {
+                        continue;
+                    }
+
+                    float lo = 0.0f;
+                    float hi = curr;
+                    for (int step = 0; step < 16; ++step) {
+                        const float mid = 0.5f * (lo + hi);
+                        if (mid <= 0.0f) {
+                            hi = mid;
+                            continue;
+                        }
+                        if (vertex_folded(hit_dist, r, c, mid)) {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    }
+
+                    const float min_keep_dist = static_cast<float>(neighbor_step * 0.5);
+                    if (lo > min_keep_dist && !vertex_folded(hit_dist, r, c, lo)) {
+                        if (std::abs(lo - curr) > 1e-4f) {
+                            next_dist(r, c) = lo;
+                            changed = true;
+                            ++fold_corrections;
+                        }
+                    } else {
+                        next_dist(r, c) = -1.0f;
+                        changed = true;
+                        ++fold_corrections;
+                    }
+                }
+            }
+
+            hit_dist = std::move(next_dist);
+            if (!changed) {
+                break;
+            }
+        }
+
+        if (fold_corrections > 0) {
+            std::cout << "gen_neighbor: adjusted " << fold_corrections
+                      << " ray hits to prevent ray intersections" << std::endl;
         }
 
         // Smooth hit distances with a 9x9 sliding window (median of valid distances).
@@ -701,32 +881,92 @@ int main(int argc, char *argv[])
         }
 
         // Reconstruct points along each vertex normal using the smoothed distances.
+        auto compute_candidate = [&](int rr, int cc, cv::Vec3f& out) -> bool {
+            if (!src_valid(rr, cc)) {
+                return false;
+            }
+            const float t = smooth_dist(rr, cc);
+            if (!(t > 0.0f) || !std::isfinite(t)) {
+                return false;
+            }
+
+            if (!has_ray_dir(rr, cc)) {
+                return false;
+            }
+            const cv::Vec3f& n = ray_dirs(rr, cc);
+
+            const cv::Vec3f start = src_points(rr, cc);
+            out = start + n * t;
+            return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+        };
+
+        auto quad_orientation_ok = [&](int tl_r, int tl_c, int cr, int cc, const cv::Vec3f& cp) -> bool {
+            if (tl_r < 0 || tl_c < 0 || tl_r + 1 >= rows || tl_c + 1 >= cols) {
+                return true;
+            }
+
+            if (!src_valid(tl_r, tl_c) || !src_valid(tl_r + 1, tl_c) ||
+                !src_valid(tl_r, tl_c + 1) || !src_valid(tl_r + 1, tl_c + 1)) {
+                return true;
+            }
+
+            cv::Vec3f p00, p10, p01, p11;
+            bool v00 = compute_candidate(tl_r, tl_c, p00);
+            bool v10 = compute_candidate(tl_r + 1, tl_c, p10);
+            bool v01 = compute_candidate(tl_r, tl_c + 1, p01);
+            bool v11 = compute_candidate(tl_r + 1, tl_c + 1, p11);
+
+            if (cr == tl_r && cc == tl_c) {
+                p00 = cp;
+                v00 = true;
+            } else if (cr == tl_r + 1 && cc == tl_c) {
+                p10 = cp;
+                v10 = true;
+            } else if (cr == tl_r && cc == tl_c + 1) {
+                p01 = cp;
+                v01 = true;
+            } else if (cr == tl_r + 1 && cc == tl_c + 1) {
+                p11 = cp;
+                v11 = true;
+            }
+
+            if (!(v00 && v10 && v01 && v11)) {
+                return true;
+            }
+
+            const cv::Vec3f s00 = src_points(tl_r, tl_c);
+            const cv::Vec3f s10 = src_points(tl_r + 1, tl_c);
+            const cv::Vec3f s01 = src_points(tl_r, tl_c + 1);
+            const cv::Vec3f s11 = src_points(tl_r + 1, tl_c + 1);
+
+            if (!tri_orientation_ok(s00, s10, s01, p00, p10, p01)) {
+                return false;
+            }
+            if (!tri_orientation_ok(s10, s11, s01, p10, p11, p01)) {
+                return false;
+            }
+            return true;
+        };
+
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
-                if (!src_valid(r, c)) {
-                    continue;
-                }
-                const float t = smooth_dist(r, c);
-                if (t <= 0.0f) {
+                cv::Vec3f cand;
+                if (!compute_candidate(r, c, cand)) {
                     continue;
                 }
 
-                cv::Vec3f n = src_surface->gridNormal(r, c);
-                if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
-                    continue;
-                }
-                if (!cast_out) {
-                    n *= -1.f;
-                }
-                const float nlen = cv::norm(n);
-                if (nlen <= 1e-6f) {
-                    continue;
-                }
-                n *= (1.0f / nlen);
+                bool ok = true;
+                ok = ok && quad_orientation_ok(r - 1, c - 1, r, c, cand);
+                ok = ok && quad_orientation_ok(r - 1, c, r, c, cand);
+                ok = ok && quad_orientation_ok(r, c - 1, r, c, cand);
+                ok = ok && quad_orientation_ok(r, c, r, c, cand);
 
-                const cv::Vec3f start = src_points(r, c);
-                new_points(r, c) = start + n * t;
+                if (!ok) {
+                    continue;
+                }
+
+                new_points(r, c) = cand;
             }
         }
 

@@ -1134,6 +1134,19 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     spResumeMaxIters_->setToolTip(tr("Maximum Ceres iterations per resume-local solve during pass 2."));
     pass2Form->addRow(tr("Max iterations:"), spResumeMaxIters_);
 
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int savedPass2OmpThreads = std::max(
+        1,
+        settings.value(
+            vc3d::settings::neighbor_copy::PASS2_OMP_THREADS,
+            vc3d::settings::neighbor_copy::PASS2_OMP_THREADS_DEFAULT).toInt());
+
+    spPass2OmpThreads_ = new QSpinBox(this);
+    spPass2OmpThreads_->setRange(1, 256);
+    spPass2OmpThreads_->setValue(savedPass2OmpThreads);
+    spPass2OmpThreads_->setToolTip(tr("Sets OMP_NUM_THREADS for pass 2 resume-local optimization."));
+    pass2Form->addRow(tr("OMP threads:"), spPass2OmpThreads_);
+
     chkResumeDenseQr_ = new QCheckBox(tr("Use dense QR solver"), this);
     chkResumeDenseQr_->setToolTip(tr("Switch resume-local solves in pass 2 to the dense QR linear solver."));
     pass2Form->addRow(tr("Dense QR:"), chkResumeDenseQr_);
@@ -1148,7 +1161,6 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     const auto profiles = vc3d::json_profiles::tracerParamProfiles(
         [this](const char* text) { return tr(text); });
 
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const QString savedProfile = settings.value(
         vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
         QStringLiteral("default")).toString();
@@ -1180,13 +1192,14 @@ void NeighborCopyDialog::accept()
         return;
     }
 
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     if (pass2TracerParams_) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_PROFILE,
                           pass2TracerParams_->profile());
         settings.setValue(vc3d::settings::neighbor_copy::PASS2_PARAMS_TEXT,
                           pass2TracerParams_->customText());
     }
+    settings.setValue(vc3d::settings::neighbor_copy::PASS2_OMP_THREADS, pass2OmpThreads());
 
     QDialog::accept();
 }
@@ -1257,6 +1270,14 @@ int NeighborCopyDialog::resumeLocalOptRadius() const
 int NeighborCopyDialog::resumeLocalMaxIters() const
 {
     return spResumeMaxIters_ ? spResumeMaxIters_->value() : 1000;
+}
+
+int NeighborCopyDialog::pass2OmpThreads() const
+{
+    if (!spPass2OmpThreads_) {
+        return vc3d::settings::neighbor_copy::PASS2_OMP_THREADS_DEFAULT;
+    }
+    return std::max(1, spPass2OmpThreads_->value());
 }
 
 bool NeighborCopyDialog::resumeLocalDenseQr() const
