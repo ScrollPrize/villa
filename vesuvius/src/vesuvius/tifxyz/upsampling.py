@@ -470,6 +470,63 @@ def interpolate_at_points(
     return x_interp, y_interp, z_interp, valid
 
 
+def upsample_zyx_grid(
+    zyx_grid: NDArray[np.float32],
+    upsample_factor_y: int,
+    upsample_factor_x: int,
+    method: Literal["linear", "bspline", "catmull_rom"] = "catmull_rom",
+) -> Tuple[NDArray[np.float32], NDArray[np.bool_]]:
+    """Upsample a ZYX grid using interpolate_at_points.
+
+    Parameters
+    ----------
+    zyx_grid : NDArray[np.float32]
+        (H, W, 3) array of ZYX coordinates.
+    upsample_factor_y : int
+        Upsample factor in row dimension.
+    upsample_factor_x : int
+        Upsample factor in col dimension.
+    method : str
+        Interpolation method: "catmull_rom" (default), "linear", or "bspline".
+
+    Returns
+    -------
+    Tuple[NDArray[np.float32], NDArray[np.bool_]]
+        zyx_upsampled: (H_up, W_up, 3) upsampled coordinates.
+        valid: (H_up, W_up) validity mask.
+    """
+    h, w = zyx_grid.shape[:2]
+
+    # Extract x, y, z grids (zyx_grid has order z, y, x)
+    z_grid = zyx_grid[:, :, 0].astype(np.float32)
+    y_grid = zyx_grid[:, :, 1].astype(np.float32)
+    x_grid = zyx_grid[:, :, 2].astype(np.float32)
+    mask = np.ones((h, w), dtype=bool)
+
+    scale = (1.0, 1.0)
+
+    n_rows = h * upsample_factor_y
+    n_cols = w * upsample_factor_x
+
+    dense_rows = np.linspace(0, h - 1, n_rows)
+    dense_cols = np.linspace(0, w - 1, n_cols)
+    query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
+
+    x_up, y_up, z_up, valid = interpolate_at_points(
+        x_grid,
+        y_grid,
+        z_grid,
+        mask,
+        query_row,
+        query_col,
+        scale=scale,
+        method=method,
+    )
+
+    zyx_upsampled = np.stack([z_up, y_up, x_up], axis=-1)
+    return zyx_upsampled, valid
+
+
 def compute_grid_bounds(
     x: NDArray[np.float32],
     y: NDArray[np.float32],
