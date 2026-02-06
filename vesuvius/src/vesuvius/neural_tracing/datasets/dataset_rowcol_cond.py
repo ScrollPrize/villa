@@ -43,7 +43,7 @@ class EdtSegDataset(Dataset):
 
         config.setdefault('use_sdt', False)
         config.setdefault('dilation_radius', 1)  # voxels
-        config.setdefault('cond_percent', 0.5)
+        config.setdefault('cond_percent', [0.5, 0.5])
         config.setdefault('use_extrapolation', True)
         config.setdefault('extrapolation_method', 'linear_edge')
         config.setdefault('force_recompute_patches', False)
@@ -146,9 +146,20 @@ class EdtSegDataset(Dataset):
                 ))
 
         self.patches = patches
+        self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
 
     def __len__(self):
         return len(self.patches)
+
+    def _parse_cond_percent(self):
+        spec = self.config['cond_percent']
+        if not isinstance(spec, (list, tuple)) or len(spec) != 2:
+            raise ValueError("cond_percent must be [min, max], e.g. [0.1, 0.5]")
+
+        low, high = float(spec[0]), float(spec[1])
+        if not (0.0 < low <= high < 1.0):
+            raise ValueError("cond_percent values must satisfy 0 < min <= max < 1")
+        return low, high
 
     def __getitem__(self, idx):
 
@@ -206,7 +217,7 @@ class EdtSegDataset(Dataset):
         h_up, w_up = x_full.shape  # update dimensions after crop
 
         # split into cond and mask on the upsampled grid
-        conditioning_percent = self.config['cond_percent']
+        conditioning_percent = random.uniform(self._cond_percent_min, self._cond_percent_max)
         if h_up < 2 and w_up < 2:
             return self[np.random.randint(len(self))]
 
