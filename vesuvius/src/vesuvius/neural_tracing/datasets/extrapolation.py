@@ -95,6 +95,8 @@ def _extrapolate_rbf(
     zyx_cond: np.ndarray,
     uv_query: np.ndarray,
     downsample_factor: int = 40,
+    fallback_method: str = 'linear_rowcol',
+    singular_smoothing: float = 1e-4,
     **kwargs,
 ) -> np.ndarray:
     """
@@ -105,6 +107,8 @@ def _extrapolate_rbf(
         zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
         uv_query: (M, 2) flattened UV coordinates to extrapolate to
         downsample_factor: downsample conditioning points for efficiency
+        fallback_method: fallback method if RBF system remains singular
+        singular_smoothing: smoothing floor used for singular retry
 
     Returns:
         (M, 3) extrapolated ZYX coordinates
@@ -115,17 +119,49 @@ def _extrapolate_rbf(
     uv_cond_ds = uv_cond[::downsample_factor]
     zyx_cond_ds = zyx_cond[::downsample_factor]
 
-    # Fit RBF interpolator
-    rbf = RBFInterpolator(
+    smoothing = kwargs.get('smoothing', 0.0)
+    rbf_kwargs = dict(
         y=torch.from_numpy(uv_cond_ds).float(),   # input: (N, 2) UV
         d=torch.from_numpy(zyx_cond_ds).float(),  # output: (N, 3) ZYX
         kernel='thin_plate_spline',
-        smoothing=kwargs.get('smoothing', 0.0),
     )
 
-    # Extrapolate
-    zyx_extrapolated = rbf(torch.from_numpy(uv_query).float()).numpy()
-    return zyx_extrapolated
+    try:
+        rbf = RBFInterpolator(
+            smoothing=smoothing,
+            **rbf_kwargs,
+        )
+        return rbf(torch.from_numpy(uv_query).float()).numpy()
+    except ValueError as exc:
+        # Degenerate UV geometry can make the RBF system singular for some crops.
+        if "Singular matrix" not in str(exc):
+            raise
+
+        try:
+            rbf = RBFInterpolator(
+                smoothing=max(float(smoothing), float(singular_smoothing)),
+                **rbf_kwargs,
+            )
+            return rbf(torch.from_numpy(uv_query).float()).numpy()
+        except ValueError as retry_exc:
+            if "Singular matrix" not in str(retry_exc):
+                raise
+
+    # Last-resort fallback for singular systems; this avoids killing dataloader workers.
+    if fallback_method == 'rbf':
+        fallback_method = 'linear_rowcol'
+
+    fallback_fn = _EXTRAPOLATION_METHODS.get(fallback_method)
+    if fallback_fn is None:
+        available = list(_EXTRAPOLATION_METHODS.keys())
+        raise ValueError(f"Unknown fallback extrapolation method '{fallback_method}'. Available: {available}")
+
+    return fallback_fn(
+        uv_cond=uv_cond,
+        zyx_cond=zyx_cond,
+        uv_query=uv_query,
+        cond_direction=kwargs.get('cond_direction'),
+    )
 
 
 @register_method('linear_edge')

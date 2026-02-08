@@ -46,6 +46,8 @@ class EdtSegDataset(Dataset):
         config.setdefault('cond_percent', [0.5, 0.5])
         config.setdefault('use_extrapolation', True)
         config.setdefault('extrapolation_method', 'linear_edge')
+        config.setdefault('supervise_conditioning', False)
+        config.setdefault('cond_supervision_weight', 0.1)
         config.setdefault('force_recompute_patches', False)
         config.setdefault('use_heatmap_targets', False)
         config.setdefault('heatmap_step_size', 10)
@@ -353,38 +355,44 @@ class EdtSegDataset(Dataset):
         if not valid_directions:
             return self[np.random.randint(len(self))]
 
-        r_split_up = int(round(h_up * conditioning_percent))
-        c_split_up = int(round(w_up * conditioning_percent))
+        r_cond_up = int(round(h_up * conditioning_percent))
+        c_cond_up = int(round(w_up * conditioning_percent))
         if h_up >= 2:
-            r_split_up = min(max(r_split_up, 1), h_up - 1)
+            r_cond_up = min(max(r_cond_up, 1), h_up - 1)
         if w_up >= 2:
-            c_split_up = min(max(c_split_up, 1), w_up - 1)
+            c_cond_up = min(max(c_cond_up, 1), w_up - 1)
+
+        # Split boundaries measured from top/left in the upsampled frame.
+        r_split_up_top = r_cond_up
+        c_split_up_left = c_cond_up
 
         cond_direction = random.choice(valid_directions)
 
         if cond_direction == "left":
             # conditioning is left, mask the right
-            x_cond, y_cond, z_cond = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
-            x_mask, y_mask, z_mask = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
+            x_cond, y_cond, z_cond = x_full[:, :c_split_up_left], y_full[:, :c_split_up_left], z_full[:, :c_split_up_left]
+            x_mask, y_mask, z_mask = x_full[:, c_split_up_left:], y_full[:, c_split_up_left:], z_full[:, c_split_up_left:]
             cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = 0, c_split_up
+            mask_row_off, mask_col_off = 0, c_split_up_left
         elif cond_direction == "right":
             # conditioning is right, mask the left
-            x_cond, y_cond, z_cond = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
-            x_mask, y_mask, z_mask = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
-            cond_row_off, cond_col_off = 0, c_split_up
+            c_split_up_left = w_up - c_cond_up
+            x_cond, y_cond, z_cond = x_full[:, c_split_up_left:], y_full[:, c_split_up_left:], z_full[:, c_split_up_left:]
+            x_mask, y_mask, z_mask = x_full[:, :c_split_up_left], y_full[:, :c_split_up_left], z_full[:, :c_split_up_left]
+            cond_row_off, cond_col_off = 0, c_split_up_left
             mask_row_off, mask_col_off = 0, 0
         elif cond_direction == "up":
             # conditioning is up, mask the bottom
-            x_cond, y_cond, z_cond = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
-            x_mask, y_mask, z_mask = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
+            x_cond, y_cond, z_cond = x_full[:r_split_up_top, :], y_full[:r_split_up_top, :], z_full[:r_split_up_top, :]
+            x_mask, y_mask, z_mask = x_full[r_split_up_top:, :], y_full[r_split_up_top:, :], z_full[r_split_up_top:, :]
             cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = r_split_up, 0
+            mask_row_off, mask_col_off = r_split_up_top, 0
         elif cond_direction == "down":
             # conditioning is down, mask the top
-            x_cond, y_cond, z_cond = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
-            x_mask, y_mask, z_mask = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
-            cond_row_off, cond_col_off = r_split_up, 0
+            r_split_up_top = h_up - r_cond_up
+            x_cond, y_cond, z_cond = x_full[r_split_up_top:, :], y_full[r_split_up_top:, :], z_full[r_split_up_top:, :]
+            x_mask, y_mask, z_mask = x_full[:r_split_up_top, :], y_full[:r_split_up_top, :], z_full[:r_split_up_top, :]
+            cond_row_off, cond_col_off = r_split_up_top, 0
             mask_row_off, mask_col_off = 0, 0
 
         cond_h, cond_w = x_cond.shape
@@ -406,6 +414,7 @@ class EdtSegDataset(Dataset):
 
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
+        cond_zyxs_unperturbed = cond_zyxs.copy()
         cond_zyxs = self._maybe_perturb_conditioning_surface(cond_zyxs)
 
         # use world_bbox directly as crop position, this is the crop returned by find_patches
@@ -512,8 +521,18 @@ class EdtSegDataset(Dataset):
         use_heatmap = self.config['use_heatmap_targets']
         if use_heatmap:
             effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
-            r_split_s = r_min + round((r_max - r_min + 1) * conditioning_percent)
-            c_split_s = c_min + round((c_max - c_min + 1) * conditioning_percent)
+            h_s_full = r_max - r_min + 1
+            w_s_full = c_max - c_min + 1
+            r_cond_s = min(max(int(round(h_s_full * conditioning_percent)), 1), h_s_full - 1)
+            c_cond_s = min(max(int(round(w_s_full * conditioning_percent)), 1), w_s_full - 1)
+            if cond_direction == "down":
+                r_split_s = r_min + (h_s_full - r_cond_s)
+            else:
+                r_split_s = r_min + r_cond_s
+            if cond_direction == "right":
+                c_split_s = c_min + (w_s_full - c_cond_s)
+            else:
+                c_split_s = c_min + c_cond_s
             heatmap_tensor = compute_heatmap_targets(
                 cond_direction=cond_direction,
                 r_split=r_split_s, c_split=c_split_s,
@@ -601,10 +620,36 @@ class EdtSegDataset(Dataset):
 
         use_extrapolation = self.config['use_extrapolation']
         if use_extrapolation:
-           
+            sample_coords_local = extrap_coords_local
+            target_coords_local = gt_coords_local
+            point_weights_local = np.ones(sample_coords_local.shape[0], dtype=np.float32)
+
+            if self.config.get('supervise_conditioning', False):
+                cond_sample_coords_local = (cond_zyxs - min_corner).reshape(-1, 3).astype(np.float32)
+                cond_target_coords_local = (cond_zyxs_unperturbed - min_corner).reshape(-1, 3).astype(np.float32)
+                cond_weight = max(0.0, float(self.config.get('cond_supervision_weight', 0.1)))
+
+                cond_in_bounds = (
+                    (cond_sample_coords_local[:, 0] >= 0) & (cond_sample_coords_local[:, 0] < crop_size[0]) &
+                    (cond_sample_coords_local[:, 1] >= 0) & (cond_sample_coords_local[:, 1] < crop_size[1]) &
+                    (cond_sample_coords_local[:, 2] >= 0) & (cond_sample_coords_local[:, 2] < crop_size[2]) &
+                    (cond_target_coords_local[:, 0] >= 0) & (cond_target_coords_local[:, 0] < crop_size[0]) &
+                    (cond_target_coords_local[:, 1] >= 0) & (cond_target_coords_local[:, 1] < crop_size[1]) &
+                    (cond_target_coords_local[:, 2] >= 0) & (cond_target_coords_local[:, 2] < crop_size[2])
+                )
+                cond_sample_coords_local = cond_sample_coords_local[cond_in_bounds]
+                cond_target_coords_local = cond_target_coords_local[cond_in_bounds]
+
+                if cond_sample_coords_local.shape[0] > 0:
+                    sample_coords_local = np.concatenate([sample_coords_local, cond_sample_coords_local], axis=0)
+                    target_coords_local = np.concatenate([target_coords_local, cond_target_coords_local], axis=0)
+                    cond_weights = np.full(cond_sample_coords_local.shape[0], cond_weight, dtype=np.float32)
+                    point_weights_local = np.concatenate([point_weights_local, cond_weights], axis=0)
+
             extrap_surf = torch.from_numpy(extrap_surface).to(torch.float32)
-            extrap_coords = torch.from_numpy(extrap_coords_local).to(torch.float32)
-            gt_coords = torch.from_numpy(gt_coords_local).to(torch.float32)
+            extrap_coords = torch.from_numpy(sample_coords_local).to(torch.float32)
+            gt_coords = torch.from_numpy(target_coords_local).to(torch.float32)
+            point_weights = torch.from_numpy(point_weights_local).to(torch.float32)
             n_points = len(extrap_coords)
 
         use_sdt = self.config['use_sdt']
@@ -694,6 +739,7 @@ class EdtSegDataset(Dataset):
             result["extrap_surface"] = extrap_surf     # extrapolated surface voxelization
             result["extrap_coords"] = extrap_coords    # (N, 3) coords for sampling predicted field
             result["gt_displacement"] = gt_disp        # (N, 3) ground truth displacement
+            result["point_weights"] = point_weights    # (N,) per-point supervision weights
 
         if use_sdt:
             result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation
