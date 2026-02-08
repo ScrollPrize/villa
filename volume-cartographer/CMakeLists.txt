@@ -15,159 +15,31 @@ project(VC3D VERSION ${VC_VERSION})
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR}/bin)
 set(LIBRARY_OUTPUT_PATH ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
-
-option(VC_USE_OPENMP "Enable OpenMP support" ON)
-option(VC_USE_VALGRIND "Enable Valgrind support" off)
-
-find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
-endif()
-
-# Use modern C++ for everything and generate compile_commands database.
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 
-
-# Choose what to install
-option(VC_INSTALL_APPS      "Install VC core programs"    on)
-option(VC_INSTALL_LIBS      "Install VC libraries"        on)
-option(VC_INSTALL_UTILS     "Install VC utility programs" on)
-
-# Some helpful constants to be used in subprojects.
-include(VCConstants)
-
-# Enable/disable PaStiX from the build (OFF by default)
-option(VC_WITH_PASTIX "Build with PaStiX support" OFF)
-
-# Look for external dependencies.
-include(VCFindDependencies)
-
-
-set(CMAKE_CXX_FLAGS "  -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1  " )
-set(CMAKE_EXE_LINKER_FLAGS " ")
-include_directories(core/include)
-
-if(NOT CMAKE_BUILD_TYPE)
-    message(STATUS "Setting build type to 'Release' as none was specified.")
-    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
-endif()
-
-# Set LTO type and linker based on compiler
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    set(VC_LTO_FLAGS "-flto=thin")
-    #set(VC_LTO_FLAGS "-fno-lto")
-    set(VC_LINKER_FLAGS "-fuse-ld=lld")
-    message(STATUS "Using Clang: thin LTO with lld linker")
-else()
-    set(VC_LTO_FLAGS "-flto=auto")
-    set(VC_LINKER_FLAGS "")
-    message(STATUS "Using ${CMAKE_CXX_COMPILER_ID}: auto LTO with default linker")
-endif()
-
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}  -g")
-elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O1")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 ${VC_LTO_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
-elseif(CMAKE_BUILD_TYPE STREQUAL "ReleaseUnsafe")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 ${VC_LTO_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
-elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 ${VC_LTO_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
-elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os ${VC_LTO_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS}")
-endif()
-
-
-option(VC_ENABLE_ASAN "Enable AddressSanitizer for memory error detection" OFF)
-option(VC_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
-option(VC_ENABLE_TSAN "Enable ThreadSanitizer for data race detection" OFF)
-option(VC_ENABLE_LSAN "Enable LeakSanitizer for memory leak detection (standalone)" OFF)
-
-if(VC_ENABLE_ASAN AND VC_ENABLE_TSAN)
-    message(FATAL_ERROR "AddressSanitizer and ThreadSanitizer cannot be used together")
-endif()
-
-if(VC_ENABLE_LSAN AND VC_ENABLE_ASAN)
-    message(WARNING "LeakSanitizer is already included with AddressSanitizer. Disabling standalone LeakSanitizer.")
-    set(VC_ENABLE_LSAN OFF)
-endif()
-
-if(VC_ENABLE_LSAN AND VC_ENABLE_TSAN)
-    message(FATAL_ERROR "LeakSanitizer and ThreadSanitizer cannot be used together")
-endif()
-
-if(VC_ENABLE_ASAN)
-    message(STATUS "AddressSanitizer enabled")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer  -Og")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer -Og")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
-
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DADDRESS_SANITIZER")
-else()
-    message(STATUS "Addressanitizer disabled")
-endif()
-
-if(VC_ENABLE_UBSAN)
-    message(STATUS "UndefinedBehaviorSanitizer enabled")
-    set(UBSAN_FLAGS "-fsanitize=undefined -fno-sanitize-recover=all")
-    set(UBSAN_FLAGS "${UBSAN_FLAGS} -fsanitize=float-divide-by-zero")
-    set(UBSAN_FLAGS "${UBSAN_FLAGS} -fsanitize=float-cast-overflow")
-    set(UBSAN_FLAGS "${UBSAN_FLAGS} -fsanitize=nullability")
-
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${UBSAN_FLAGS} -fno-omit-frame-pointer  -Og")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${UBSAN_FLAGS} -fno-omit-frame-pointer  -Og")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${UBSAN_FLAGS}")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${UBSAN_FLAGS}")
-else()
-    message(STATUS "UndefinedBehaviorSanitizer disabled")
-endif()
-
-if(VC_ENABLE_TSAN)
-    message(STATUS "ThreadSanitizer enabled")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread -fno-omit-frame-pointer  -Og")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=thread -fno-omit-frame-pointer  -Og")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=thread")
-
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-else()
-    message(STATUS "ThreadSanitizer disabled")
-endif()
-
-if(VC_ENABLE_LSAN)
-    message(STATUS "LeakSanitizer enabled")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=leak -fno-omit-frame-pointer  -Og")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=leak -fno-omit-frame-pointer  -Og")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=leak")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=leak")
-else()
-    message(STATUS "LeakSanitizer disabled ")
-endif()
-
-if(VC_USE_VALGRIND)
-    message(STATUS "Valgrind support enabled")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-lto -march=x86-64 -mtune=generic -mno-avx -mno-avx2 -mno-avx512f -mno-fma -mno-bmi -mno-bmi2 -Og -g -fno-omit-frame-pointer " )
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64 -mtune=generic -mno-avx -mno-avx2 -mno-avx512f -mno-avx512cd -mno-avx512bw -mno-avx512dq -mno-avx512vl -mno-fma")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=x86-64 -mtune=generic -mno-avx -mno-avx2 -mno-avx512f -mno-avx512cd -mno-avx512bw -mno-avx512dq -mno-avx512vl -mno-fma")
-
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fno-lto ")
-else()
-    message(STATUS "Valgrind support disabled")
-endif()
-
+# ---- Options -----------------------------------------------------------------
+option(VC_USE_OPENMP        "Enable OpenMP support"                              ON)
+option(VC_USE_VALGRIND      "Enable Valgrind support"                            OFF)
+option(VC_USE_PCH           "Enable precompiled headers (faster incremental builds, but disables ccache)" OFF)
+option(VC_INSTALL_APPS      "Install VC core programs"                           ON)
+option(VC_INSTALL_LIBS      "Install VC libraries"                               ON)
+option(VC_INSTALL_UTILS     "Install VC utility programs"                        ON)
+option(VC_WITH_PASTIX       "Build with PaStiX support"                          OFF)
 option(VC_DEVELOPER_WARNINGS "For developers: Enable extensive compiler warnings" OFF)
+option(VC_ENABLE_ASAN       "Enable AddressSanitizer for memory error detection" OFF)
+option(VC_ENABLE_UBSAN      "Enable UndefinedBehaviorSanitizer"                  OFF)
+option(VC_ENABLE_TSAN       "Enable ThreadSanitizer for data race detection"     OFF)
+option(VC_ENABLE_LSAN       "Enable LeakSanitizer for memory leak detection (standalone)" OFF)
 mark_as_advanced(VC_DEVELOPER_WARNINGS)
-if(VC_DEVELOPER_WARNINGS)
-    include(VCWarnings)
-endif()
+
+# ---- Modules -----------------------------------------------------------------
+include(VCToolchain)
+include(VCConstants)
+include(VCFindDependencies)
+include(VCCompilerFlags)
+include(VCSanitizers)
+
+include_directories(core/include)
 
 add_subdirectory(misc)
 add_subdirectory(libs/OpenABF)
@@ -177,4 +49,3 @@ add_subdirectory(apps)
 include(VCPackageConfig)
 include(VCInstall)
 include(Packing)
-
