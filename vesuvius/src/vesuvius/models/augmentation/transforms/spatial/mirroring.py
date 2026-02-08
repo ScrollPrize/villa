@@ -104,10 +104,6 @@ class MirrorTransform(BasicTransform):
                     normals[axis] = -normals[axis]
                 data_dict[key] = normals
 
-        # Handle keypoints
-        if data_dict.get('keypoints') is not None:
-            data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
-
         # Handle vector_keys
         vector_keys = set(data_dict.get('vector_keys', []) or [])
         for key in vector_keys:
