@@ -223,7 +223,22 @@ class NetworkFromConfig(nn.Module):
                     features.append(min(feats, max_features))
                 self.features_per_stage = features
             
-            self.n_blocks_per_stage = get_n_blocks_per_stage(self.num_stages)
+            manual_n_blocks = model_config.get("n_blocks_per_stage", None)
+            if manual_n_blocks is None:
+                self.n_blocks_per_stage = get_n_blocks_per_stage(self.num_stages)
+            else:
+                if isinstance(manual_n_blocks, int):
+                    manual_n_blocks = [manual_n_blocks] * self.num_stages
+                elif isinstance(manual_n_blocks, tuple):
+                    manual_n_blocks = list(manual_n_blocks)
+
+                if len(manual_n_blocks) != self.num_stages:
+                    raise ValueError(
+                        f"n_blocks_per_stage must have {self.num_stages} entries to match features_per_stage. "
+                        f"Got {len(manual_n_blocks)} entries: {manual_n_blocks}"
+                    )
+                self.n_blocks_per_stage = manual_n_blocks
+                print(f"Using provided n_blocks_per_stage: {self.n_blocks_per_stage}")
             self.n_conv_per_stage_decoder = [1] * (self.num_stages - 1)
             self.strides = pool_op_kernel_sizes
             self.kernel_sizes = conv_kernel_sizes
