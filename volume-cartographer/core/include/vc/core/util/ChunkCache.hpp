@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cstdint>
 #include <mutex>
@@ -48,6 +49,8 @@ public:
         uint64_t misses = 0;
         uint64_t evictions = 0;
         uint64_t bytesRead = 0;
+        uint64_t reReads = 0;        // chunks loaded again after eviction
+        uint64_t reReadBytes = 0;    // bytes wasted on re-reads
     };
     Stats stats() const;
     void resetStats();
@@ -114,6 +117,12 @@ private:
     std::atomic<uint64_t> _misses{0};
     std::atomic<uint64_t> _evictions{0};
     std::atomic<uint64_t> _bytesRead{0};
+    std::atomic<uint64_t> _reReads{0};
+    std::atomic<uint64_t> _reReadBytes{0};
+
+    // Track which chunks have been evicted (persists across evictions)
+    std::unordered_set<ChunkKey, ChunkKeyHash> _everLoaded;
+    // Protected by _evictionMutex (reused since loads are already serialized)
 };
 
 extern template class ChunkCache<uint8_t>;

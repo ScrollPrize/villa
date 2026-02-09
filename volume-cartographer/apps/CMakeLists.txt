@@ -11,7 +11,7 @@ add_executable(vc_render_video src/vc_render_video.cpp)
 target_link_libraries(vc_render_video z5 opencv_core vc_core opencv_videoio)
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
-target_link_libraries(vc_render_tifxyz vc_core Boost::program_options tiff)
+target_link_libraries(vc_render_tifxyz vc_core Boost::program_options TIFF::TIFF)
 
 add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)
@@ -44,7 +44,7 @@ add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
 add_executable(vc_fill_quadmesh src/vc_fill_quadmesh.cpp)
-target_link_libraries(vc_fill_quadmesh vc_core vc_tracer)
+target_link_libraries(vc_fill_quadmesh vc_core vc_tracer Ceres::ceres)
 
 add_executable(vc_tiffxyz_upscale_grounding src/vc_tiffxyz_upscale_grounding.cpp)
 target_link_libraries(vc_tiffxyz_upscale_grounding vc_core vc_tracer)
@@ -96,6 +96,7 @@ target_link_libraries(vc_visualize vc_core Boost::program_options)
 
 add_executable(vc_ced2d src/vc_ced2d.cpp)
 target_link_libraries(vc_ced2d
+    vc_core
     z5
     opencv_core
     opencv_imgcodecs
@@ -147,7 +148,46 @@ add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
-target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options tiff)
+target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
+
+# Precompiled headers for CLI apps (reuse vc_core's PCH)
+if(VC_USE_PCH)
+    foreach(_app
+        vc_render_video
+        vc_render_tifxyz
+        vc_objrefine
+        vc_grow_seg_from_seed
+        vc_seg_add_overlap
+        vc_grow_seg_from_segments
+        vc_tifxyz2obj
+        vc_obj2tifxyz
+        vc_obj2tifxyz_legacy
+        vc_flatten
+        vc_tifxyz_inp_mask
+        vc_tifxyz_winding
+        vc_fill_quadmesh
+        vc_tiffxyz_upscale_grounding
+        vc_calc_surface_metrics
+        vc_tifxyz_gengt
+        vc_diffuse_winding
+        vc_render_bench
+        vc_create_segment_mask
+        vc_surface_diff
+        vc_visualize
+        vc_ced2d
+        vc_transform_geom
+        vc_gen_normalgrids
+        vc_ngrids
+        vc_tifxyz2rgb
+        vc_rgb2tifxyz
+        vc_telea_inpaint
+        vc_thinning
+        vc_tifxyz
+        vc_zarr_to_tiff
+    )
+        target_precompile_headers(${_app} REUSE_FROM vc_core)
+    endforeach()
+endif()
 
 # Install targets
 if(VC_INSTALL_APPS)

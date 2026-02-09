@@ -298,6 +298,7 @@ public:
     int resumeLocalOptStep() const;
     int resumeLocalOptRadius() const;
     int resumeLocalMaxIters() const;
+    int pass2OmpThreads() const;
     bool resumeLocalDenseQr() const;
     std::optional<QJsonObject> pass2TracerParamsJson(QString* error) const;
 
@@ -319,6 +320,7 @@ private:
     QSpinBox* spResumeStep_{nullptr};
     QSpinBox* spResumeRadius_{nullptr};
     QSpinBox* spResumeMaxIters_{nullptr};
+    QSpinBox* spPass2OmpThreads_{nullptr};
     QCheckBox* chkResumeDenseQr_{nullptr};
     JsonProfileEditor* pass2TracerParams_{nullptr};
 

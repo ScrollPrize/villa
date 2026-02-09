@@ -81,7 +81,7 @@
   <widget class="QDockWidget" name="dockWidgetDrawing">
    <property name="minimumSize">
     <size>
-     <width>352</width>
+     <width>150</width>
      <height>400</height>
     </size>
    </property>
@@ -111,7 +111,7 @@
   <widget class="QDockWidget" name="dockWidgetDistanceTransform">
    <property name="minimumSize">
     <size>
-     <width>352</width>
+     <width>150</width>
      <height>400</height>
     </size>
    </property>
@@ -141,7 +141,7 @@
   <widget class="QDockWidget" name="dockWidgetVolumes">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>64</height>
     </size>
    </property>
@@ -465,8 +465,8 @@
   <widget class="QDockWidget" name="dockWidgetSegmentation">
    <property name="minimumSize">
     <size>
-     <width>352</width>
-     <height>548</height>
+     <width>0</width>
+     <height>0</height>
     </size>
    </property>
    <property name="allowedAreas">
@@ -560,7 +560,7 @@
   <widget class="QDockWidget" name="dockWidgetComposite">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>40</height>
     </size>
    </property>
@@ -1165,7 +1165,7 @@
   <widget class="QDockWidget" name="dockWidgetPreprocessing">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>40</height>
     </size>
    </property>
@@ -1273,7 +1273,7 @@
   <widget class="QDockWidget" name="dockWidgetPostprocessing">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>40</height>
     </size>
    </property>
@@ -1406,7 +1406,7 @@
   <widget class="QDockWidget" name="dockWidgetView">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>40</height>
     </size>
    </property>
@@ -1793,7 +1793,7 @@
   <widget class="QDockWidget" name="dockWidgetNormalVis">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>40</height>
     </size>
    </property>
@@ -1942,7 +1942,7 @@
   <widget class="QDockWidget" name="dockWidgetOverlay">
    <property name="minimumSize">
     <size>
-     <width>250</width>
+     <width>150</width>
      <height>40</height>
     </size>
    </property>
@@ -2090,7 +2090,7 @@
    <widget class="QDockWidget" name="dockWidgetRenderSettings">
      <property name="minimumSize">
       <size>
-       <width>250</width>
+       <width>150</width>
        <height>40</height>
       </size>
      </property>

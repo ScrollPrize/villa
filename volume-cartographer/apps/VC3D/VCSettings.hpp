@@ -183,6 +183,8 @@ namespace export_ {  // underscore because 'export' is reserved keyword
 namespace neighbor_copy {
     constexpr auto PASS2_PARAMS_PROFILE = "neighbor_copy/pass2_params_profile";
     constexpr auto PASS2_PARAMS_TEXT = "neighbor_copy/pass2_params_text";
+    constexpr auto PASS2_OMP_THREADS = "neighbor_copy/pass2_omp_threads";
+    constexpr int PASS2_OMP_THREADS_DEFAULT = 1;
     constexpr auto RESUME_LOCAL_OMP_THREADS = "neighbor_copy/resume_local_omp_threads";
     constexpr int RESUME_LOCAL_OMP_THREADS_DEFAULT = 1;
 }

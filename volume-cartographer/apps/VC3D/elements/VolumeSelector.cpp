@@ -1,5 +1,6 @@
 #include "elements/VolumeSelector.hpp"
 
+#include <QAbstractItemView>
 #include <QHBoxLayout>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -21,6 +22,19 @@ VolumeSelector::VolumeSelector(QWidget* parent)
     layout->addWidget(_label);
     layout->addWidget(_combo, 1);
     layout->addWidget(_browseButton);
+
+    // Allow the selector to shrink arbitrarily; long items should elide instead of enforcing a wide minimum.
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    setMinimumWidth(0);
+    _label->setMinimumWidth(0);
+
+    _combo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    _combo->setMinimumWidth(0);
+    _combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    _combo->setMinimumContentsLength(0);
+    if (auto* v = _combo->view()) {
+        v->setTextElideMode(Qt::ElideRight);
+    }
 
     connect(_browseButton, &QToolButton::clicked, this, [this]() {
         if (!_combo) {
