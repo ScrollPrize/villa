@@ -106,5 +106,10 @@ python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1
 # try local exp to get robust params for final scale from scratch
 time python $SRC/fit.py $SRC/direct_robust.json $SRC/grow_z_args.json
 
-# looks very reasonable now
+# current very nice:
 time python $SRC/fit.py $SRC/direct_robust_exp.json $SRC/direct_fit_args.json
+time python $SRC/fit.py $SRC/direct_robust_exp.json $SRC/direct_fit_args.json
+
+ffmpeg -framerate 10 -pattern_type glob -i 'res_growz2/grids/res_grid_stage0_grow00*.jpg' -vf "crop=in_w/2:in_h/2:in_w/4:in_h/4" -c:v libx264 -pix_fmt yuv420p grow_direct_tuned.mkv
+
+# current best res -

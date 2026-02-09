@@ -2,7 +2,7 @@
 	"base": {
 		"dir_v": 10.0,
 		"dir_conn": 1.0,
-		"step": 0.1,
+		"step": 1.0,
 		"smooth_x": 0.0,
 		"smooth_y": 0.01,
 		"gradmag": 1.0,
@@ -28,7 +28,7 @@
 				"steps": 0
 			},
 			"local_opt": {
-				"steps": 2000,
+				"steps": 500,
 				"lr": [0.1, 0.01, 0.001],
 				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 				"min_scaledown": 0,
