@@ -63,3 +63,23 @@ void readMultiSlice(
     const cv::Mat_<cv::Vec3f>& stepDirs,
     const std::vector<float>& offsets
 );
+
+// Single-threaded per-tile multi-slice sampler (called from within OMP thread).
+// Same trilinear math as readMultiSlice but no internal OMP parallelism.
+void sampleTileSlices(
+    std::vector<cv::Mat_<uint8_t>>& out,
+    z5::Dataset* ds,
+    ChunkCache<uint8_t>* cache,
+    const cv::Mat_<cv::Vec3f>& basePoints,
+    const cv::Mat_<cv::Vec3f>& stepDirs,
+    const std::vector<float>& offsets
+);
+
+void sampleTileSlices(
+    std::vector<cv::Mat_<uint16_t>>& out,
+    z5::Dataset* ds,
+    ChunkCache<uint16_t>* cache,
+    const cv::Mat_<cv::Vec3f>& basePoints,
+    const cv::Mat_<cv::Vec3f>& stepDirs,
+    const std::vector<float>& offsets
+);

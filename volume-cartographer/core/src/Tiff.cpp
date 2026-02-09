@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
+#include <map>
 #include <stdexcept>
 #include <tiffio.h>
 
@@ -256,4 +258,78 @@ void TiffWriter::close() {
         TIFFClose(_tiff);
         _tiff = nullptr;
     }
+}
+
+// ============================================================================
+// mergeTiffParts implementation
+// ============================================================================
+
+bool mergeTiffParts(const std::string& outputPath, int numParts)
+{
+    std::filesystem::path outDir(outputPath);
+    if (!std::filesystem::is_directory(outDir)) outDir = outDir.parent_path();
+    if (outDir.empty()) outDir = ".";
+
+    std::map<std::filesystem::path, std::vector<std::filesystem::path>> groups;
+    for (auto& entry : std::filesystem::directory_iterator(outDir)) {
+        std::string fname = entry.path().filename().string();
+        auto pos = fname.find(".part");
+        if (pos == std::string::npos) continue;
+        auto dotTif = fname.find(".tif", pos);
+        if (dotTif == std::string::npos) continue;
+        groups[outDir / (fname.substr(0, pos) + ".tif")].push_back(entry.path());
+    }
+    if (groups.empty()) {
+        std::cerr << "No .partN.tif files found in " << outDir << "\n";
+        return false;
+    }
+
+    std::cout << "Merging " << groups.size() << " TIFF(s) from " << numParts << " parts..." << std::endl;
+    for (auto& [finalPath, partFiles] : groups) {
+        std::sort(partFiles.begin(), partFiles.end());
+        TIFF* first = TIFFOpen(partFiles[0].c_str(), "r");
+        if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; continue; }
+        uint32_t w, h, tw, th; uint16_t bps, spp, sf, comp;
+        TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w);
+        TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h);
+        TIFFGetField(first, TIFFTAG_TILEWIDTH, &tw);
+        TIFFGetField(first, TIFFTAG_TILELENGTH, &th);
+        TIFFGetField(first, TIFFTAG_BITSPERSAMPLE, &bps);
+        TIFFGetField(first, TIFFTAG_SAMPLESPERPIXEL, &spp);
+        TIFFGetField(first, TIFFTAG_SAMPLEFORMAT, &sf);
+        TIFFGetField(first, TIFFTAG_COMPRESSION, &comp);
+        TIFFClose(first);
+
+        TIFF* out = TIFFOpen(finalPath.c_str(), "w");
+        if (!out) { std::cerr << "Cannot create " << finalPath << "\n"; continue; }
+        TIFFSetField(out, TIFFTAG_IMAGEWIDTH, w); TIFFSetField(out, TIFFTAG_IMAGELENGTH, h);
+        TIFFSetField(out, TIFFTAG_TILEWIDTH, tw); TIFFSetField(out, TIFFTAG_TILELENGTH, th);
+        TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, bps); TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, spp);
+        TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, sf); TIFFSetField(out, TIFFTAG_COMPRESSION, comp);
+        TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+
+        tmsize_t tileBytes = TIFFTileSize(out);
+        std::vector<uint8_t> buf(tileBytes, 0), zero(tileBytes, 0);
+        uint32_t tilesX = (w + tw - 1) / tw, tilesY = (h + th - 1) / th;
+        size_t merged = 0;
+        for (uint32_t ty = 0; ty < tilesY; ty++)
+            for (uint32_t tx = 0; tx < tilesX; tx++) {
+                bool found = false;
+                for (auto& pf : partFiles) {
+                    TIFF* pt = TIFFOpen(pf.c_str(), "r");
+                    if (!pt) continue;
+                    tmsize_t r = TIFFReadEncodedTile(pt, TIFFComputeTile(pt, tx*tw, ty*th, 0, 0), buf.data(), tileBytes);
+                    TIFFClose(pt);
+                    if (r > 0 && buf != zero) { found = true; break; }
+                }
+                TIFFWriteEncodedTile(out, TIFFComputeTile(out, tx*tw, ty*th, 0, 0),
+                                     found ? buf.data() : zero.data(), tileBytes);
+                if (found) merged++;
+            }
+        TIFFWriteDirectory(out); TIFFClose(out);
+        for (auto& pf : partFiles) std::filesystem::remove(pf);
+        std::cout << "  " << finalPath.filename().string() << ": " << merged << " tiles from " << partFiles.size() << " parts\n";
+    }
+    std::cout << "Merge complete.\n";
+    return true;
 }

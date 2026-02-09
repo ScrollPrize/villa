@@ -2,6 +2,7 @@
 
 #include <opencv2/core.hpp>
 #include <filesystem>
+#include <string>
 #include <vector>
 #include <cstdint>
 #include <tiffio.h>
@@ -73,3 +74,9 @@ private:
     std::vector<uint8_t> _tileBuf;  // Reusable tile buffer
     std::filesystem::path _path;     // For error messages
 };
+
+// Merge partial .partN.tif files into final TIFFs.
+// Scans outputPath (or its parent directory) for .partN.tif files,
+// merges them tile-by-tile, and removes the part files.
+// Returns true on success, false if no part files found or on error.
+bool mergeTiffParts(const std::string& outputPath, int numParts);
