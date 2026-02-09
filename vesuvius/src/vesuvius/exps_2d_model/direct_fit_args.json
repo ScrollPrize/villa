@@ -8,5 +8,8 @@
 		"winding-step": 10.0,
 		"init-size-frac": 0.15,
 		"init-size-frac-h": 2.0,
-		"unet-z": 6000.0	}
+		"unet-z": 6000.0,
+		"grad-mag-blur-sigma" : 4.0,
+		"dir-blur-sigma" : 2.0
+		}
 }

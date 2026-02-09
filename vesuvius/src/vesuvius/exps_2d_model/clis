@@ -105,3 +105,6 @@ python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1
 
 # try local exp to get robust params for final scale from scratch
 time python $SRC/fit.py $SRC/direct_robust.json $SRC/grow_z_args.json
+
+# looks very reasonable now
+time python $SRC/fit.py $SRC/direct_robust_exp.json $SRC/direct_fit_args.json
