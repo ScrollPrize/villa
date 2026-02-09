@@ -25,7 +25,7 @@ def _require_consumed_dict(*, where: str, cfg: dict) -> None:
 @dataclass(frozen=True)
 class OptSettings:
 	steps: int
-	lr: float
+	lr: float | list[float]
 	params: list[str]
 	min_scaledown: int
 	opt_window: int
@@ -88,7 +88,16 @@ def _parse_opt_settings(
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
 	steps = max(0, int(opt_cfg.get("steps", 0)))
-	lr = float(opt_cfg.get("lr", 1e-3))
+	lr_raw = opt_cfg.get("lr", 1e-3)
+	if isinstance(lr_raw, list):
+		if not lr_raw:
+			raise ValueError(f"stages_json: stage '{stage_name}' opt.lr: must be a number or a non-empty list")
+		try:
+			lr: float | list[float] = [float(v) for v in lr_raw]
+		except Exception as e:
+			raise ValueError(f"stages_json: stage '{stage_name}' opt.lr: invalid list") from e
+	else:
+		lr = float(lr_raw)
 	params = opt_cfg.get("params", [])
 	if not isinstance(params, list):
 		params = []
@@ -127,6 +136,29 @@ def _parse_opt_settings(
 		w_fac=w_fac,
 		eff=eff,
 	)
+
+
+
+def _lr_last(lr: float | list[float]) -> float:
+	if isinstance(lr, list):
+		return float(lr[-1])
+	return float(lr)
+
+
+def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
+	"""Return learning rate for a scalespace param at index `scale_i` (0=highest res).
+
+	If `lr` is a list, the last element applies to highest-res (scale_i=0), then backwards.
+	If length doesn't match, missing rates fall back to the first element.
+	"""
+	if not isinstance(lr, list):
+		return float(lr)
+	if not lr:
+		return 0.0
+	idx = -1 - int(scale_i)
+	if -len(lr) <= idx < 0:
+		return float(lr[idx])
+	return float(lr[0])
 
 
 def load_stages_cfg(cfg: dict) -> list[Stage]:
@@ -312,7 +344,7 @@ def optimize(
 				raise ValueError("grow z index out of range")
 			z_keep = torch.zeros(n, 1, 1, 1, device=data.cos.device, dtype=torch.float32)
 			z_keep[ins_z, 0, 0, 0] = 1.0
-		params: list[torch.nn.Parameter] = []
+		param_groups: list[dict] = []
 		for name in opt_cfg.params:
 			group = all_params.get(name, [])
 			if name in {"mesh_ms", "conn_offset_ms"}:
@@ -326,20 +358,26 @@ def optimize(
 					if int(p0.shape[1]) != 1:
 						m = m.expand(int(m.shape[0]), int(p0.shape[1]), int(p0.shape[2]), int(p0.shape[3]))
 					hooks.append(p0.register_hook(lambda g, mm=m: g * mm))
-					params.append(p0)
+					param_groups.append({"params": [p0], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=0)})
 				else:
 					k0 = max(0, int(opt_cfg.min_scaledown))
-					params.extend(group[k0:])
+					for pi, p in enumerate(group):
+						if pi < k0:
+							continue
+						param_groups.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
 			else:
-				params.extend(group)
-		if not params:
+				lr_last = _lr_last(opt_cfg.lr)
+				for p in group:
+					param_groups.append({"params": [p], "lr": lr_last})
+		if not param_groups:
 			return
 		if z_keep is not None:
-			for p in params:
-				if p.ndim >= 1 and int(p.shape[0]) == int(z_keep.shape[0]):
-					m = z_keep.to(dtype=p.dtype).view(int(p.shape[0]), *([1] * (int(p.ndim) - 1)))
-					hooks.append(p.register_hook(lambda g, mm=m: g * mm))
-		opt = torch.optim.Adam(params, lr=opt_cfg.lr)
+			for g in param_groups:
+				for p in g.get("params", []):
+					if p.ndim >= 1 and int(p.shape[0]) == int(z_keep.shape[0]):
+						m = z_keep.to(dtype=p.dtype).view(int(p.shape[0]), *([1] * (int(p.ndim) - 1)))
+						hooks.append(p.register_hook(lambda g, mm=m: g * mm))
+		opt = torch.optim.Adam(param_groups)
 		mean_pos_xy = None
 		if _need_term("mean_pos", opt_cfg.eff) != 0.0:
 			with torch.no_grad():

@@ -8,6 +8,7 @@ import torch
 import cv2
 
 import fit_data
+import opt_loss_data
 import opt_loss_dir
 import opt_loss_geom
 import opt_loss_gradmag
@@ -462,8 +463,26 @@ def save(
 	angle_lm, _angle_mask = opt_loss_geom.angle_symmetry_loss_map(res=res)
 	y_straight_lm, _y_straight_mask = opt_loss_geom.y_straight_loss_map(res=res)
 	gradmag_lm, _gradmag_mask = opt_loss_gradmag.gradmag_period_loss_map(res=res)
+	data_lm, _data_mask = opt_loss_data.data_loss_map(res=res)
+	data_plain_lm, _data_plain_mask = opt_loss_data.data_plain_loss_map(res=res)
+	data_grad_lm, _data_grad_mask = opt_loss_data.data_grad_loss_map(res=res)
 
 	loss_maps = {
+		"data": {
+			"fn": lambda: data_lm,
+			"suffix": "data",
+			"reduce": True,
+		},
+		"data_plain": {
+			"fn": lambda: data_plain_lm,
+			"suffix": "data_plain",
+			"reduce": True,
+		},
+		"data_grad": {
+			"fn": lambda: data_grad_lm,
+			"suffix": "data_grad",
+			"reduce": True,
+		},
 		"dir_v": {
 			"fn": lambda: dir_lm_v,
 			"suffix": "dir_v",
