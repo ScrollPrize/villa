@@ -59,6 +59,14 @@ def merge_cfgs(paths: list[str]) -> dict:
 	return merged
 
 
+def add_args(p: argparse.ArgumentParser) -> None:
+	p.add_argument(
+		"cfg",
+		nargs="*",
+		help="Optional json config file(s) merged in order; any non-flag *.json is treated as config.",
+	)
+
+
 def apply_defaults_from_cfg_args(p: argparse.ArgumentParser, cfg: dict) -> None:
 	args_cfg = cfg.get("args", {})
 	if args_cfg is None:
@@ -85,3 +93,11 @@ def apply_defaults_from_cfg_args(p: argparse.ArgumentParser, cfg: dict) -> None:
 		defaults[dest] = _coerce_action_default(a=a, v=v)
 
 	p.set_defaults(**defaults)
+
+
+def parse_args(p: argparse.ArgumentParser, argv: list[str] | None) -> argparse.Namespace:
+	cfg_paths, argv_rest = split_cfg_argv(argv)
+	cfg_paths = [str(x) for x in cfg_paths]
+	cfg = merge_cfgs(cfg_paths) if cfg_paths else {}
+	apply_defaults_from_cfg_args(p, cfg)
+	return p.parse_args(argv_rest)
