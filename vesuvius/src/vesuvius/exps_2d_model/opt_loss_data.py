@@ -56,7 +56,7 @@ def data_grad_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	loss_x = (lx * wx).sum() / wsum_x if float(wsum_x.detach().cpu()) > 0.0 else lx.mean()
 	loss_y = (ly * wy).sum() / wsum_y if float(wsum_y.detach().cpu()) > 0.0 else ly.mean()
 	base = 0.5 * (loss_x + loss_y)
-	lm = base.view(int(pred.shape[0]), 1, 1, 1)
+	lm = base.expand(int(pred.shape[0]), 1, 1, 1)
 	mask = torch.ones_like(lm)
 	return lm, mask
 
