@@ -74,11 +74,13 @@ class BasicTransform(abc.ABC):
             if data_dict.get('geols_labels') is not None:
                 data_dict['geols_labels'] = self._apply_to_dist_map(data_dict['geols_labels'], **params)
 
-            if data_dict.get('keypoints') is not None:
-                data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
+            # Keypoints/bboxes should only be transformed by spatial transforms.
+            if getattr(self, '_is_spatial', False):
+                if data_dict.get('keypoints') is not None:
+                    data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
 
-            if data_dict.get('bbox') is not None:
-                data_dict['bbox'] = self._apply_to_bbox(data_dict['bbox'], **params)
+                if data_dict.get('bbox') is not None:
+                    data_dict['bbox'] = self._apply_to_bbox(data_dict['bbox'], **params)
 
             # Dynamic handling for any other keys (e.g., custom targets like 'ink', 'normals')
             # Skip 'ignore_masks' as it shouldn't be transformed

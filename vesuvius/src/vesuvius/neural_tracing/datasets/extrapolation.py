@@ -95,6 +95,8 @@ def _extrapolate_rbf(
     zyx_cond: np.ndarray,
     uv_query: np.ndarray,
     downsample_factor: int = 40,
+    fallback_method: str = 'linear_rowcol',
+    singular_smoothing: float = 1e-4,
     **kwargs,
 ) -> np.ndarray:
     """
@@ -105,6 +107,8 @@ def _extrapolate_rbf(
         zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
         uv_query: (M, 2) flattened UV coordinates to extrapolate to
         downsample_factor: downsample conditioning points for efficiency
+        fallback_method: fallback method if RBF system remains singular
+        singular_smoothing: smoothing floor used for singular retry
 
     Returns:
         (M, 3) extrapolated ZYX coordinates
@@ -115,16 +119,49 @@ def _extrapolate_rbf(
     uv_cond_ds = uv_cond[::downsample_factor]
     zyx_cond_ds = zyx_cond[::downsample_factor]
 
-    # Fit RBF interpolator
-    rbf = RBFInterpolator(
+    smoothing = kwargs.get('smoothing', 0.0)
+    rbf_kwargs = dict(
         y=torch.from_numpy(uv_cond_ds).float(),   # input: (N, 2) UV
         d=torch.from_numpy(zyx_cond_ds).float(),  # output: (N, 3) ZYX
-        kernel='thin_plate_spline'
+        kernel='thin_plate_spline',
     )
 
-    # Extrapolate
-    zyx_extrapolated = rbf(torch.from_numpy(uv_query).float()).numpy()
-    return zyx_extrapolated
+    try:
+        rbf = RBFInterpolator(
+            smoothing=smoothing,
+            **rbf_kwargs,
+        )
+        return rbf(torch.from_numpy(uv_query).float()).numpy()
+    except ValueError as exc:
+        # Degenerate UV geometry can make the RBF system singular for some crops.
+        if "Singular matrix" not in str(exc):
+            raise
+
+        try:
+            rbf = RBFInterpolator(
+                smoothing=max(float(smoothing), float(singular_smoothing)),
+                **rbf_kwargs,
+            )
+            return rbf(torch.from_numpy(uv_query).float()).numpy()
+        except ValueError as retry_exc:
+            if "Singular matrix" not in str(retry_exc):
+                raise
+
+    # Last-resort fallback for singular systems; this avoids killing dataloader workers.
+    if fallback_method == 'rbf':
+        fallback_method = 'linear_rowcol'
+
+    fallback_fn = _EXTRAPOLATION_METHODS.get(fallback_method)
+    if fallback_fn is None:
+        available = list(_EXTRAPOLATION_METHODS.keys())
+        raise ValueError(f"Unknown fallback extrapolation method '{fallback_method}'. Available: {available}")
+
+    return fallback_fn(
+        uv_cond=uv_cond,
+        zyx_cond=zyx_cond,
+        uv_query=uv_query,
+        cond_direction=kwargs.get('cond_direction'),
+    )
 
 
 @register_method('linear_edge')
@@ -537,6 +574,185 @@ def _extrapolate_bspline(
         zyx_extrapolated[:, dim] = bisplev(u_query, v_query, tck, grid=False)
 
     return zyx_extrapolated
+
+
+def generate_extended_uv(
+    uv_cond: np.ndarray,
+    growth_direction: str,
+    extension_size: int,
+) -> np.ndarray:
+    """
+    Generate UV coordinates extending beyond the boundary of the conditioning region.
+
+    Args:
+        uv_cond: (H, W, 2) UV coordinates of the conditioning region (the full segment)
+        growth_direction: "up", "down", "left", or "right" - direction to extend
+        extension_size: number of rows/columns to extend
+
+    Returns:
+        (H_e, W_e, 2) UV coordinates for the extension region only
+            - up/down: (extension_size, W, 2)
+            - left/right: (H, extension_size, 2)
+    """
+    H, W = uv_cond.shape[:2]
+
+    # Get the row/col values from the conditioning UV grid
+    rows = uv_cond[:, 0, 0]  # (H,) - row values along first column
+    cols = uv_cond[0, :, 1]  # (W,) - col values along first row
+
+    if growth_direction == 'up':
+        # Extend above: rows -1, -2, ..., -extension_size (prepend)
+        # Compute row step from existing grid
+        row_step = rows[1] - rows[0] if H > 1 else 1.0
+        new_rows = rows[0] - row_step * np.arange(extension_size, 0, -1)  # ascending order
+        # Create extended UV grid
+        extrap_uv = np.zeros((extension_size, W, 2), dtype=uv_cond.dtype)
+        extrap_uv[:, :, 0] = new_rows[:, None]  # broadcast rows
+        extrap_uv[:, :, 1] = cols[None, :]  # broadcast cols
+
+    elif growth_direction == 'down':
+        # Extend below: rows H, H+1, ..., H+extension_size-1 (append)
+        row_step = rows[-1] - rows[-2] if H > 1 else 1.0
+        new_rows = rows[-1] + row_step * np.arange(1, extension_size + 1)
+        extrap_uv = np.zeros((extension_size, W, 2), dtype=uv_cond.dtype)
+        extrap_uv[:, :, 0] = new_rows[:, None]
+        extrap_uv[:, :, 1] = cols[None, :]
+
+    elif growth_direction == 'left':
+        # Extend left: cols -1, -2, ..., -extension_size (prepend)
+        col_step = cols[1] - cols[0] if W > 1 else 1.0
+        new_cols = cols[0] - col_step * np.arange(extension_size, 0, -1)  # ascending order
+        extrap_uv = np.zeros((H, extension_size, 2), dtype=uv_cond.dtype)
+        extrap_uv[:, :, 0] = rows[:, None]
+        extrap_uv[:, :, 1] = new_cols[None, :]
+
+    elif growth_direction == 'right':
+        # Extend right: cols W, W+1, ..., W+extension_size-1 (append)
+        col_step = cols[-1] - cols[-2] if W > 1 else 1.0
+        new_cols = cols[-1] + col_step * np.arange(1, extension_size + 1)
+        extrap_uv = np.zeros((H, extension_size, 2), dtype=uv_cond.dtype)
+        extrap_uv[:, :, 0] = rows[:, None]
+        extrap_uv[:, :, 1] = new_cols[None, :]
+
+    else:
+        raise ValueError(f"Unknown growth_direction: {growth_direction}. "
+                         f"Expected 'up', 'down', 'left', or 'right'.")
+
+    return extrap_uv
+
+
+def compute_boundary_extrapolation(
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    growth_direction: str,
+    extension_size: int,
+    method: str = 'linear_edge',
+    **method_kwargs,
+) -> dict:
+    """
+    Extrapolate beyond the segment boundary to generate an extended grid.
+
+    This function is designed for use with `split_segment_by_growth_direction`
+    when `at_boundary=True`, where the entire segment becomes the conditioning
+    region and we want to predict new points beyond the edge.
+
+    Args:
+        uv_cond: (H, W, 2) UV coordinates of conditioning region (the full segment)
+        zyx_cond: (H, W, 3) ZYX world coordinates of conditioning region
+        growth_direction: "up", "down", "left", or "right" - direction to extend
+        extension_size: number of rows/columns to extend beyond the boundary
+        method: extrapolation method ('linear_edge', 'linear_rowcol', 'rbf', etc.)
+        **method_kwargs: additional kwargs passed to the extrapolation method
+
+    Returns:
+        dict with:
+            - extended_uv: (H_ext, W_ext, 2) full UV grid (cond + extrapolated)
+            - extended_zyx: (H_ext, W_ext, 3) full ZYX grid (cond + extrapolated)
+            - extension_mask: (H_ext, W_ext) bool, True for extrapolated points
+            - extrap_uv: (H_e, W_e, 2) just the extension region UV
+            - extrap_zyx: (H_e, W_e, 3) just the extension region ZYX
+
+    Raises:
+        ValueError: if method is unknown or growth_direction is invalid
+    """
+    if method not in _EXTRAPOLATION_METHODS:
+        available = list(_EXTRAPOLATION_METHODS.keys())
+        raise ValueError(f"Unknown extrapolation method '{method}'. Available: {available}")
+
+    H, W = uv_cond.shape[:2]
+
+    # Generate extended UV coordinates
+    extrap_uv = generate_extended_uv(uv_cond, growth_direction, extension_size)
+    H_e, W_e = extrap_uv.shape[:2]
+
+    # Flatten for extrapolation
+    uv_cond_flat = uv_cond.reshape(-1, 2)
+    zyx_cond_flat = zyx_cond.reshape(-1, 3)
+    uv_query_flat = extrap_uv.reshape(-1, 2)
+
+    # Map growth_direction to cond_direction for the extrapolation method
+    # growth_direction is where we want to GO, cond_direction is where conditioning IS
+    cond_direction_map = {
+        'up': 'down',     # extending upward means conditioning is below
+        'down': 'up',     # extending downward means conditioning is above
+        'left': 'right',  # extending left means conditioning is to the right
+        'right': 'left',  # extending right means conditioning is to the left
+    }
+    cond_direction = cond_direction_map[growth_direction]
+
+    # Run extrapolation method
+    extrapolate_fn = _EXTRAPOLATION_METHODS[method]
+    zyx_extrapolated_flat = extrapolate_fn(
+        uv_cond=uv_cond_flat,
+        zyx_cond=zyx_cond_flat,
+        uv_query=uv_query_flat,
+        cond_direction=cond_direction,
+        **method_kwargs,
+    )
+
+    # Reshape extrapolated ZYX back to grid form
+    extrap_zyx = zyx_extrapolated_flat.reshape(H_e, W_e, 3)
+
+    # Concatenate conditioning and extrapolated grids based on direction
+    if growth_direction == 'up':
+        # extrap goes above cond: [extrap, cond] along axis 0
+        extended_uv = np.concatenate([extrap_uv, uv_cond], axis=0)
+        extended_zyx = np.concatenate([extrap_zyx, zyx_cond], axis=0)
+        # Mask: first extension_size rows are extrapolated
+        extension_mask = np.zeros((H_e + H, W), dtype=bool)
+        extension_mask[:H_e, :] = True
+
+    elif growth_direction == 'down':
+        # extrap goes below cond: [cond, extrap] along axis 0
+        extended_uv = np.concatenate([uv_cond, extrap_uv], axis=0)
+        extended_zyx = np.concatenate([zyx_cond, extrap_zyx], axis=0)
+        # Mask: last extension_size rows are extrapolated
+        extension_mask = np.zeros((H + H_e, W), dtype=bool)
+        extension_mask[H:, :] = True
+
+    elif growth_direction == 'left':
+        # extrap goes left of cond: [extrap, cond] along axis 1
+        extended_uv = np.concatenate([extrap_uv, uv_cond], axis=1)
+        extended_zyx = np.concatenate([extrap_zyx, zyx_cond], axis=1)
+        # Mask: first extension_size cols are extrapolated
+        extension_mask = np.zeros((H, W_e + W), dtype=bool)
+        extension_mask[:, :W_e] = True
+
+    elif growth_direction == 'right':
+        # extrap goes right of cond: [cond, extrap] along axis 1
+        extended_uv = np.concatenate([uv_cond, extrap_uv], axis=1)
+        extended_zyx = np.concatenate([zyx_cond, extrap_zyx], axis=1)
+        # Mask: last extension_size cols are extrapolated
+        extension_mask = np.zeros((H, W + W_e), dtype=bool)
+        extension_mask[:, W:] = True
+
+    return {
+        'extended_uv': extended_uv,
+        'extended_zyx': extended_zyx,
+        'extension_mask': extension_mask,
+        'extrap_uv': extrap_uv,
+        'extrap_zyx': extrap_zyx,
+    }
 
 
 def compute_extrapolation(

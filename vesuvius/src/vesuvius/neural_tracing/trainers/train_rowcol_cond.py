@@ -44,23 +44,29 @@ def collate_with_padding(batch):
     # Pad variable-length data
     coords_list = [b['extrap_coords'] for b in batch]
     disp_list = [b['gt_displacement'] for b in batch]
+    weight_list = [
+        b['point_weights'] if 'point_weights' in b else torch.ones(len(b['extrap_coords']), dtype=torch.float32)
+        for b in batch
+    ]
     max_points = max(len(c) for c in coords_list)
 
     B = len(batch)
     padded_coords = torch.zeros(B, max_points, 3)
     padded_disp = torch.zeros(B, max_points, 3)
     valid_mask = torch.zeros(B, max_points)
+    padded_point_weights = torch.zeros(B, max_points)
 
-    for i, (c, d) in enumerate(zip(coords_list, disp_list)):
+    for i, (c, d, w) in enumerate(zip(coords_list, disp_list, weight_list)):
         n = len(c)
         padded_coords[i, :n] = c
         padded_disp[i, :n] = d
         valid_mask[i, :n] = 1.0
+        padded_point_weights[i, :n] = w
 
     result = {
         'vol': vol, 'cond': cond, 'extrap_surface': extrap_surface,
         'extrap_coords': padded_coords, 'gt_displacement': padded_disp,
-        'valid_mask': valid_mask
+        'valid_mask': valid_mask, 'point_weights': padded_point_weights
     }
 
     # Optional SDT
@@ -99,6 +105,7 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
     extrap_coords = batch['extrap_coords']       # [B, N, 3]
     gt_displacement = batch['gt_displacement']   # [B, N, 3]
     valid_mask = batch['valid_mask']             # [B, N]
+    point_weights = batch['point_weights'] if 'point_weights' in batch else torch.ones_like(valid_mask)  # [B, N]
 
     sdt_target = batch['sdt'].unsqueeze(1) if use_sdt and 'sdt' in batch else None  # [B, 1, D, H, W]
     heatmap_target = batch['heatmap_target'].unsqueeze(1) if use_heatmap and 'heatmap_target' in batch else None  # [B, 1, D, H, W]
@@ -109,7 +116,7 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
         seg_target = batch['segmentation'].unsqueeze(1)  # [B, 1, D, H, W]
         seg_skel = batch['segmentation_skel'].unsqueeze(1)  # [B, 1, D, H, W]
 
-    return inputs, extrap_coords, gt_displacement, valid_mask, sdt_target, heatmap_target, seg_target, seg_skel
+    return inputs, extrap_coords, gt_displacement, valid_mask, point_weights, sdt_target, heatmap_target, seg_target, seg_skel
 
 
 def rasterize_sparse_to_slice(coords, values, valid_mask, slice_idx, shape, tol=1.5, axis='z'):
@@ -334,7 +341,7 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
         # Normalize volume for overlay
         vol_norm = (vol_slice - vol_slice.min()) / (vol_slice.max() - vol_slice.min() + 1e-8)
 
-        # Row 0: Volume, Cond, Extrap, Pred Disp Mag, GT Disp Mag
+        # Row 0: Volume, Cond, Extrap, dense pred disp mag, sparse GT disp mag at extrap coords
         ax0[0].imshow(vol_slice, cmap='gray', extent=extent)
         ax0[0].set_title(f'Volume ({slice_label})')
         ax0[0].set_ylabel(ylabel)
@@ -348,14 +355,14 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
         ax0[2].set_yticks([])
 
         ax0[3].imshow(disp_slice, cmap='hot', vmin=0, vmax=disp_vmax, extent=extent)
-        ax0[3].set_title('Pred Disp Mag')
+        ax0[3].set_title('Pred Disp Mag (dense)')
         ax0[3].set_yticks([])
 
         ax0[4].imshow(gt_raster, cmap='hot', vmin=0, vmax=gt_vmax, extent=extent)
-        ax0[4].set_title('GT Disp Mag')
+        ax0[4].set_title('GT Disp Mag @ Extrap')
         ax0[4].set_yticks([])
 
-        # Row 1: dz, dy, dx, Overlay, Pred @ Extrap
+        # Row 1: dz, dy, dx, Overlay, sparse pred disp mag sampled at extrap coords
         ax1[0].imshow(disp_comps[0], cmap='RdBu', vmin=-disp_vmax_comp, vmax=disp_vmax_comp, extent=extent)
         ax1[0].set_title('dz (pred)')
         ax1[0].set_xlabel(xlabel)
@@ -384,7 +391,7 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
         ax1[3].set_yticks([])
 
         ax1[4].imshow(pred_sampled_raster, cmap='hot', vmin=0, vmax=gt_vmax, extent=extent)
-        ax1[4].set_title('Pred @ Extrap')
+        ax1[4].set_title('Pred Disp Mag @ Extrap')
         ax1[4].set_xlabel(xlabel)
         ax1[4].set_yticks([])
 
@@ -576,6 +583,8 @@ def train(config_path):
     config.setdefault('use_segmentation', False)
     config.setdefault('lambda_segmentation', 1.0)
     config.setdefault('segmentation_loss', {})
+    config.setdefault('supervise_conditioning', False)
+    config.setdefault('cond_supervision_weight', 0.1)
     config.setdefault('lambda_cond_disp', 0.0)
     config.setdefault('displacement_loss_type', 'vector_l2')
     config.setdefault('displacement_huber_beta', 5.0)
@@ -645,6 +654,12 @@ def train(config_path):
     lambda_segmentation = config.get('lambda_segmentation', 1.0)
     lambda_cond_disp = config.get('lambda_cond_disp', 0.0)
     lambda_smooth = config.get('lambda_smooth', 0.0)
+    if config.get('supervise_conditioning', False) and lambda_cond_disp > 0.0:
+        raise ValueError(
+            "supervise_conditioning=True adds nonzero conditioning displacement targets, "
+            "which conflicts with lambda_cond_disp > 0 (zero-displacement penalty on conditioning voxels). "
+            "Set lambda_cond_disp to 0 when supervise_conditioning is enabled."
+        )
     mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
     disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
     disp_huber_beta = config.get('displacement_huber_beta', 5.0)
@@ -796,6 +811,9 @@ def train(config_path):
             accelerator.print(f"Lambda segmentation: {lambda_segmentation}")
         if lambda_cond_disp > 0.0:
             accelerator.print(f"Lambda cond disp: {lambda_cond_disp}")
+        accelerator.print(f"Supervise conditioning: {config.get('supervise_conditioning', False)}")
+        if config.get('supervise_conditioning', False):
+            accelerator.print(f"Cond supervision weight: {config.get('cond_supervision_weight', 0.1)}")
         accelerator.print(f"Optimizer: AdamW (lr={config.get('learning_rate', 1e-3)})")
         accelerator.print(f"Scheduler: diffusers_cosine_warmup (warmup={config.get('warmup_steps', 5000)})")
         accelerator.print(f"Train samples: {num_train}, Val samples: {num_val}")
@@ -825,7 +843,7 @@ def train(config_path):
         if config['verbose']:
             print(f"got batch, keys: {batch.keys()}")
 
-        inputs, extrap_coords, gt_displacement, valid_mask, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
+        inputs, extrap_coords, gt_displacement, valid_mask, point_weights, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
             batch, use_sdt, use_heatmap, use_segmentation
         )
 
@@ -838,7 +856,8 @@ def train(config_path):
 
             # Displacement loss
             surf_loss = surface_sampled_loss(disp_pred, extrap_coords, gt_displacement, valid_mask,
-                                             loss_type=disp_loss_type, beta=disp_huber_beta)
+                                             loss_type=disp_loss_type, beta=disp_huber_beta,
+                                             sample_weights=point_weights)
             total_loss = surf_loss
 
             wandb_log['surf_loss'] = surf_loss.detach().item()
@@ -931,7 +950,7 @@ def train(config_path):
                     val_iterator = iter(val_dataloader)
                     val_batch = next(val_iterator)
 
-                val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
+                val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_point_weights, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
                     val_batch, use_sdt, use_heatmap, use_segmentation
                 )
 
@@ -939,7 +958,8 @@ def train(config_path):
                 val_disp_pred = val_output['displacement']
 
                 val_surf_loss = surface_sampled_loss(val_disp_pred, val_extrap_coords, val_gt_displacement, val_valid_mask,
-                                                     loss_type=disp_loss_type, beta=disp_huber_beta)
+                                                     loss_type=disp_loss_type, beta=disp_huber_beta,
+                                                     sample_weights=val_point_weights)
                 val_total_loss = val_surf_loss
 
                 wandb_log['val_surf_loss'] = val_surf_loss.item()

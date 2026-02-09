@@ -34,14 +34,6 @@ class Rot90Transform(BasicTransform):
         self.num_rot_per_combination = num_rot_per_combination
         self.allowed_axes = allowed_axes
 
-    def apply(self, data_dict, **params):
-        # Apply base transform (image, segmentation, etc.)
-        data_dict = super().apply(data_dict, **params)
-        # Also transform padding_mask with the same rotation
-        if data_dict.get('padding_mask') is not None:
-            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
-        return data_dict
-
     def get_parameters(self, **data_dict) -> dict:
         n_axes_combinations = round(sample_scalar(self.num_axis_combinations))
         axis_combinations = []
@@ -54,10 +46,18 @@ class Rot90Transform(BasicTransform):
             # +1 because we skip channel dimension
             axis_combinations.append([a + 1 for a in axes])
 
-        return {
+        params = {
             'num_rot_per_combination': num_rot_per_combination,
             'axis_combinations': axis_combinations
         }
+        crop_shape = data_dict.get('crop_shape')
+        if crop_shape is None:
+            image = data_dict.get('image')
+            if image is not None:
+                crop_shape = tuple(int(s) for s in image.shape[1:])
+        if crop_shape is not None:
+            params['crop_shape'] = tuple(int(s) for s in crop_shape)
+        return params
 
     def _maybe_rot90(
         self,
@@ -120,9 +120,10 @@ class Rot90Transform(BasicTransform):
             a, b = axes[0] - 1, axes[1] - 1
             k = n_rot % 4
             if k == 1:
-                # 90° rotation: new_a = old_b, new_b = shape[a] - 1 - old_a
-                new_a = keypoints[:, b].clone()
-                new_b = crop_shape[a] - 1 - keypoints[:, a]
+                # torch.rot90(..., k=1, dims=(a,b)):
+                # new_a = shape[b] - 1 - old_b, new_b = old_a
+                new_a = crop_shape[b] - 1 - keypoints[:, b]
+                new_b = keypoints[:, a].clone()
                 keypoints[:, a] = new_a
                 keypoints[:, b] = new_b
             elif k == 2:
@@ -130,9 +131,10 @@ class Rot90Transform(BasicTransform):
                 keypoints[:, a] = crop_shape[a] - 1 - keypoints[:, a]
                 keypoints[:, b] = crop_shape[b] - 1 - keypoints[:, b]
             elif k == 3:
-                # 270° rotation: new_a = shape[b] - 1 - old_b, new_b = old_a
-                new_a = crop_shape[b] - 1 - keypoints[:, b]
-                new_b = keypoints[:, a].clone()
+                # torch.rot90(..., k=3, dims=(a,b)):
+                # new_a = old_b, new_b = shape[a] - 1 - old_a
+                new_a = keypoints[:, b].clone()
+                new_b = crop_shape[a] - 1 - keypoints[:, a]
                 keypoints[:, a] = new_a
                 keypoints[:, b] = new_b
         return keypoints
@@ -152,9 +154,10 @@ class Rot90Transform(BasicTransform):
             a, b = axes[0] - 1, axes[1] - 1
             k = n_rot % 4
             if k == 1:
-                # 90° rotation: (va, vb) -> (vb, -va)
-                new_a = vectors[:, b].clone()
-                new_b = -vectors[:, a]
+                # Matches torch.rot90 k=1 coordinate mapping
+                # (va, vb) -> (-vb, va)
+                new_a = -vectors[:, b]
+                new_b = vectors[:, a].clone()
                 vectors[:, a] = new_a
                 vectors[:, b] = new_b
             elif k == 2:
@@ -162,9 +165,10 @@ class Rot90Transform(BasicTransform):
                 vectors[:, a] = -vectors[:, a]
                 vectors[:, b] = -vectors[:, b]
             elif k == 3:
-                # 270° rotation: (va, vb) -> (-vb, va)
-                new_a = -vectors[:, b]
-                new_b = vectors[:, a].clone()
+                # Matches torch.rot90 k=3 coordinate mapping
+                # (va, vb) -> (vb, -va)
+                new_a = vectors[:, b].clone()
+                new_b = -vectors[:, a]
                 vectors[:, a] = new_a
                 vectors[:, b] = new_b
         return vectors
@@ -173,14 +177,14 @@ class Rot90Transform(BasicTransform):
         """Override to handle keypoints and vector_keys."""
         data_dict = super().apply(data_dict, **params)
 
-        # Handle keypoints
-        if data_dict.get('keypoints') is not None:
-            data_dict['keypoints'] = self._apply_to_keypoints(data_dict['keypoints'], **params)
-
         # Handle vector_keys
         vector_keys = set(data_dict.get('vector_keys', []) or [])
         for key in vector_keys:
             if data_dict.get(key) is not None:
                 data_dict[key] = self._apply_to_vectors(data_dict[key], **params)
+
+        # Transform padding_mask with the same rotation
+        if data_dict.get('padding_mask') is not None:
+            data_dict['padding_mask'] = self._apply_to_image(data_dict['padding_mask'], **params)
 
         return data_dict
