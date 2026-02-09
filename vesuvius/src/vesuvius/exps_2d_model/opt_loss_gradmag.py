@@ -75,7 +75,6 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	# corresponds to ~2x the intended per-period integral, so target half.
 	lm = (integ - 0.5) * (integ - 0.5)
 
-
 	mc_lr = res.mask_conn
 	mc_strip_lr = mc_lr.reshape(n, 1, hm, wm * 3)
 	mc_strip_hr = F.interpolate(mc_strip_lr, size=(he, int(we * 3)), mode="nearest")
