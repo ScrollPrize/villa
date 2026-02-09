@@ -40,6 +40,8 @@ class FitResult:
 	_w_img: int
 	_mesh_step_px: int
 	_winding_step_px: int
+	_subsample_mesh: int
+	_subsample_winding: int
 
 	@property
 	def xy_lr(self) -> torch.Tensor:
@@ -104,6 +106,14 @@ class FitResult:
 	@property
 	def winding_step_px(self) -> int:
 		return int(self._winding_step_px)
+
+	@property
+	def subsample_mesh(self) -> int:
+		return int(self._subsample_mesh)
+
+	@property
+	def subsample_winding(self) -> int:
+		return int(self._subsample_winding)
 
 
 
@@ -210,6 +220,8 @@ class Model2D(nn.Module):
 			_w_img=int(self.init.w_img),
 			_mesh_step_px=int(self.init.mesh_step_px),
 			_winding_step_px=int(self.init.winding_step_px),
+			_subsample_mesh=int(self.subsample_mesh),
+			_subsample_winding=int(self.subsample_winding),
 		)
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
