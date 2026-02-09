@@ -228,6 +228,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Scroll Sleuth](https://github.com/Paul-G2/ScrollSleuth) by Paul Geiger. A web app that supports visual ink-searching in segment volumes via multiple display modes and segmentation tools.
 
+- [Scroll Slab Viewer](https://github.com/Paul-G2/ScrollSlabViewer) by Paul Geiger. A 3D viewer tailored for the [Kaggle Surface Detection challenge](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
+
 ## Ink Detection
 
 ### 🏆 3D Ink Detection
