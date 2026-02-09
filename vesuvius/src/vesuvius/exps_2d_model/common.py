@@ -259,8 +259,8 @@ def unet_infer_tiled(
 	#
 	# Semantics:
 	# - A hard border of width `b` at each side has weight 0 (never used).
-	# - Inside the remaining interval, we apply the original linear ramp with
-	#   overlap `ov`, so the cross-fade width is controlled only by `ov`.
+	# - The linear cross-fade happens within the *usable* overlap after removing
+	#   the border on both sides: ov_eff = max(0, overlap - 2*border).
 	def _blend_ramp(length: int, ov: int, b: int) -> torch.Tensor:
 		ramp = torch.zeros(length, device=device, dtype=dtype)
 		if length <= 0:
@@ -313,8 +313,9 @@ def unet_infer_tiled(
 			# Build weight mask for the actual patch size so that border/ramps
 			# are always aligned with the true patch edges, even for truncated
 			# tiles at the image boundary.
-			ramp_y = _blend_ramp(ph, overlap, border)
-			ramp_x = _blend_ramp(pw, overlap, border)
+			ov_eff = max(0, int(overlap) - 2 * int(border))
+			ramp_y = _blend_ramp(ph, ov_eff, border)
+			ramp_x = _blend_ramp(pw, ov_eff, border)
 			w_patch = (ramp_y.view(-1, 1) * ramp_x.view(1, -1)).unsqueeze(0).unsqueeze(0)
 	
 			with torch.no_grad():
