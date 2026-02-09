@@ -365,6 +365,10 @@ def save(
 	grid_path = out_grids / f"res_grid_{postfix}.jpg"
 	cv2.imwrite(str(grid_path), np.flip(grid_vis, -1))
 
+	# Also dump the (optionally blurred) grad_mag tensor.
+	mag_np = data.grad_mag[z_i, 0].detach().cpu().numpy().astype("float32")
+	tifffile.imwrite(str(out_vis / f"res_grad_mag_{postfix}.tif"), mag_np, compression="lzw")
+
 	def _save_img_loss_vis(*, iters: int | None = None, postfix2: str | None = None) -> None:
 		it_label = "default" if iters is None else f"it{int(iters)}"
 		p2 = str(postfix2) if postfix2 is not None else f"{postfix}_{it_label}"

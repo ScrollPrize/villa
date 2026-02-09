@@ -139,6 +139,34 @@ def _read_tif_float(path: Path, device: torch.device) -> torch.Tensor:
 	return t.to(device=device)
 
 
+def _gaussian_blur_nchw(*, x: torch.Tensor, sigma: float, kernel_size: int = 21) -> torch.Tensor:
+	if x.ndim != 4:
+		raise ValueError("gaussian_blur: x must be (N,C,H,W)")
+	if float(sigma) <= 0.0:
+		return x
+	ks = int(kernel_size)
+	if ks <= 1:
+		return x
+	if (ks % 2) == 0:
+		ks += 1
+	device = x.device
+	dtype = x.dtype
+	r = ks // 2
+	idx = torch.arange(-r, r + 1, device=device, dtype=dtype)
+	k = torch.exp(-(idx * idx) / (2.0 * float(sigma) * float(sigma)))
+	k = k / (k.sum() + 1e-12)
+	kx = k.view(1, 1, 1, ks)
+	ky = k.view(1, 1, ks, 1)
+	n, c, _h, _w = (int(v) for v in x.shape)
+	pad = (r, r, 0, 0)
+	y = F.pad(x, pad, mode="reflect")
+	y = F.conv2d(y, kx.expand(c, 1, 1, ks), groups=c)
+	pad = (0, 0, r, r)
+	y = F.pad(y, pad, mode="reflect")
+	y = F.conv2d(y, ky.expand(c, 1, ks, 1), groups=c)
+	return y
+
+
 def load(
 	path: str,
 	device: torch.device,
@@ -155,6 +183,7 @@ def load(
 	unet_group: str | None = None,
 	unet_out_dir_base: str | None = None,
 	grad_mag_blur_sigma: float = 0.0,
+	dir_blur_sigma: float = 0.0,
 ) -> FitData:
 	p = Path(path)
 	s = str(p)
@@ -298,10 +327,9 @@ def load(
 		dir1_t = F.interpolate(dir1_t, scale_factor=scale, mode="bilinear", align_corners=True)
 
 	if float(grad_mag_blur_sigma) > 0.0:
-		k = int(round(6.0 * float(grad_mag_blur_sigma)))
-		k = max(3, k | 1)
-		mag_t = mag_t.unsqueeze(0)
-		mag_t = torch.nn.functional.gaussian_blur(mag_t, kernel_size=[k, k], sigma=[float(grad_mag_blur_sigma), float(grad_mag_blur_sigma)])
-		mag_t = mag_t.squeeze(0)
+		mag_t = _gaussian_blur_nchw(x=mag_t, sigma=float(grad_mag_blur_sigma))
+	if float(dir_blur_sigma) > 0.0:
+		dir0_t = _gaussian_blur_nchw(x=dir0_t, sigma=float(dir_blur_sigma))
+		dir1_t = _gaussian_blur_nchw(x=dir1_t, sigma=float(dir_blur_sigma))
 
 	return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t, downscale=float(downscale) if downscale is not None else 1.0)
