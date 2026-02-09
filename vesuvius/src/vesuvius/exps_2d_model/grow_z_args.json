@@ -6,9 +6,10 @@
 		"out-dir": "res_growz",
 		"mesh-step": 10.0,
 		"winding-step": 10.0,
+		"z-step": 10.0,
 		"init-size-frac": 0.15,
 		"init-size-frac-h": 2.0,
 		"unet-z": 6000.0,
-		"model-input": "res_fit2_nice/model_snapshots/model_stage0_010000.pt"
+		"model-input": "direct_global_snapped.pt"
 	}
 }

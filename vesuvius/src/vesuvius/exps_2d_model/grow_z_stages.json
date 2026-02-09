@@ -1,20 +1,19 @@
 {
 	"base": {
-		"dir_v": 1.0,
-		"dir_conn": 100.0,
-		"step": 10.0,
+		"dir_v": 10.0,
+		"dir_conn": 1.0,
+		"step": 0.1,
 		"smooth_x": 0.0,
 		"smooth_y": 0.01,
-		"contr": 0.1,
-		"gradmag": 10.0,
+		"gradmag": 1.0,
 		"mean_pos": 0.0,
-		"meshoff_sy": 0.0,
+		"meshoff_sy": 0.001,
 		"conn_sy_l": 0.0,
 		"conn_sy_r": 0.0,
 		"angle": 0.001,
 		"y_straight": 0.0,
-		"data": 4.0,
-		"data_plain": 2.0,
+		"data": 0.4,
+		"data_plain": 0.2,
 		"data_grad": 0.0
 	},
 	"stages": [
@@ -29,8 +28,8 @@
 				"steps": 0
 			},
 			"local_opt": {
-				"steps": 10000,
-				"lr": 0.001,
+				"steps": 2000,
+				"lr": [0.1, 0.01, 0.001],
 				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 				"min_scaledown": 0,
 				"w_fac": {
