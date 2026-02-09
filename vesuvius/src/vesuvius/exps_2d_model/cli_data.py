@@ -22,6 +22,7 @@ class DataConfig:
 	device: str
 	downscale: float
 	crop: tuple[int, int, int, int] | None
+	grad_mag_blur_sigma: float
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -38,6 +39,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--device", default="cuda")
 	g.add_argument("--downscale", type=float, default=4.0)
 	g.add_argument("--crop", type=int, nargs=4, default=None)
+	g.add_argument("--grad-mag-blur-sigma", type=float, default=0.0)
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
@@ -56,6 +58,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		device=str(args.device),
 		downscale=float(args.downscale),
 		crop=tuple(int(v) for v in args.crop) if args.crop is not None else None,
+		grad_mag_blur_sigma=float(getattr(args, "grad_mag_blur_sigma", 0.0) or 0.0),
 	)
 
 
@@ -75,4 +78,5 @@ def load_fit_data(cfg: DataConfig, *, z_size: int = 1, out_dir_base: str | None 
 		unet_border=cfg.unet_border,
 		unet_group=cfg.unet_group,
 		unet_out_dir_base=out_dir_base,
+		grad_mag_blur_sigma=float(cfg.grad_mag_blur_sigma),
 	)

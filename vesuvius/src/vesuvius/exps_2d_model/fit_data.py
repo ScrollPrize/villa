@@ -154,6 +154,7 @@ def load(
 	unet_border: int = 0,
 	unet_group: str | None = None,
 	unet_out_dir_base: str | None = None,
+	grad_mag_blur_sigma: float = 0.0,
 ) -> FitData:
 	p = Path(path)
 	s = str(p)
@@ -295,5 +296,12 @@ def load(
 		mag_t = F.interpolate(mag_t, scale_factor=scale, mode="bilinear", align_corners=True)
 		dir0_t = F.interpolate(dir0_t, scale_factor=scale, mode="bilinear", align_corners=True)
 		dir1_t = F.interpolate(dir1_t, scale_factor=scale, mode="bilinear", align_corners=True)
+
+	if float(grad_mag_blur_sigma) > 0.0:
+		k = int(round(6.0 * float(grad_mag_blur_sigma)))
+		k = max(3, k | 1)
+		mag_t = mag_t.unsqueeze(0)
+		mag_t = torch.nn.functional.gaussian_blur(mag_t, kernel_size=[k, k], sigma=[float(grad_mag_blur_sigma), float(grad_mag_blur_sigma)])
+		mag_t = mag_t.squeeze(0)
 
 	return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t, downscale=float(downscale) if downscale is not None else 1.0)
