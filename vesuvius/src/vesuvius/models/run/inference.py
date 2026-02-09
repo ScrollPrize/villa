@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import zarr
 import os
-import json
 import multiprocessing
 import threading
 import fsspec
@@ -17,8 +16,10 @@ from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.data.utils import open_zarr
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
+from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.utils.k8s import get_tqdm_kwargs
+
 
 class Inferer():
     def __init__(self,
@@ -48,7 +49,8 @@ class Inferer():
                  resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
-                 hf_token: str = None
+                 hf_token: str = None,
+                 model_type: str = 'auto',
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -79,8 +81,15 @@ class Inferer():
         self.compressor_name = compressor_name
         self.compression_level = compression_level
         self.hf_token = hf_token
+        self.model_type = model_type
         self.model_patch_size = None
         self.num_classes = None
+
+        valid_model_types = {'auto', 'nnunet', 'train_py', 'resnet'}
+        if self.model_type not in valid_model_types:
+            raise ValueError(
+                f"Invalid model_type '{self.model_type}'. Must be one of {sorted(valid_model_types)}."
+            )
         
         # Store normalization info from model checkpoint
         self.model_normalization_scheme = None
@@ -149,17 +158,55 @@ class Inferer():
                     print(f"Loading train.py checkpoint from HuggingFace: {checkpoint_path}")
                 model_info = self._load_train_py_model(checkpoint_path)
         else:
-            # Check if this is a train.py checkpoint (single .pth file)
             model_path = Path(self.model_path)
             is_train_py_checkpoint = model_path.is_file() and model_path.suffix == '.pth'
-            
-            if is_train_py_checkpoint:
-                # Load train.py checkpoint
+
+            model_info = None
+            if self.model_type == 'resnet':
+                model_info = try_load_external_resnet34_model(
+                    model_path=model_path,
+                    device=self.device,
+                    patch_size=self.patch_size,
+                    verbose=self.verbose,
+                )
+                if model_info is not None:
+                    self.model_normalization_scheme = model_info.get('normalization_scheme', 'none')
+                else:
+                    raise ValueError(
+                        "model_type='resnet' but no compatible external model could be loaded from "
+                        f"path: {self.model_path}"
+                    )
+            elif self.model_type == 'train_py':
+                if not is_train_py_checkpoint:
+                    raise ValueError(
+                        f"model_type='train_py' requires a .pth checkpoint file, got: {self.model_path}"
+                    )
                 if self.verbose:
                     print(f"Loading train.py checkpoint from: {self.model_path}")
                 model_info = self._load_train_py_model(model_path)
+            elif self.model_type == 'nnunet':
+                if self.verbose:
+                    print(f"Loading nnUNet model from local path: {self.model_path}")
+                model_info = load_model_for_inference(
+                    model_folder=self.model_path,
+                    device_str=str(self.device),
+                    verbose=self.verbose
+                )
+            elif is_train_py_checkpoint:
+                # Auto mode: prefer train.py for plain .pth checkpoints
+                if self.verbose:
+                    print(f"Loading train.py checkpoint from: {self.model_path}")
+                try:
+                    model_info = self._load_train_py_model(model_path)
+                except ValueError as e:
+                    if "No model configuration found in checkpoint" not in str(e):
+                        raise
+                    raise ValueError(
+                        f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
+                        "rerun with --model-type resnet."
+                    ) from e
             else:
-                # Load from local path using nnUNet loader
+                # Auto mode: fallback to nnUNet loader
                 if self.verbose:
                     print(f"Loading nnUNet model from local path: {self.model_path}")
                 model_info = load_model_for_inference(
@@ -735,7 +782,8 @@ def main():
     import sys
     
     parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the nnUNet model folder')
+    parser.add_argument('--model_path', type=str, required=True,
+                      help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
     parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
@@ -752,6 +800,8 @@ def main():
     parser.add_argument('--normalization', type=str, default='instance_zscore',
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, none)')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                      help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
@@ -774,6 +824,9 @@ def main():
     
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
+    parser.add_argument('--model-type', type=str, default='auto',
+                      choices=['auto', 'nnunet', 'train_py', 'resnet'],
+                      help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     
     args = parser.parse_args()
     
@@ -814,6 +867,7 @@ def main():
         save_softmax=args.save_softmax,
         normalization_scheme=args.normalization,
         device=args.device,
+        num_dataloader_workers=args.num_workers,
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
         # Pass Volume-specific parameters to VCDataset
@@ -825,7 +879,8 @@ def main():
         compressor_name=args.zarr_compressor,
         compression_level=args.zarr_compression_level,
         # Pass Hugging Face parameters
-        hf_token=args.hf_token
+        hf_token=args.hf_token,
+        model_type=args.model_type
     )
 
     try:
