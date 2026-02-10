@@ -27,7 +27,6 @@ jobs:
               return;
             }
 
-            // Fetch PR details (includes changed_files and author)
             const prResp = await github.rest.pulls.get({
               owner,
               repo,
@@ -40,13 +39,11 @@ jobs:
 
             core.info(`PR #${prNumber}: changed_files=${changedFiles}, author=${author}`);
 
-            // Draft PRs can't be merged anyway; avoid noisy failures.
             if (pr.draft) {
               core.info("Draft PR detected — skipping gate.");
               return;
             }
 
-            // Fetch all reviews (chronological order per GitHub API docs)
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner,
               repo,
@@ -54,16 +51,14 @@ jobs:
               per_page: 100,
             });
 
-            // Keep only the latest review state per reviewer (exclude PR author)
             const latestStateByUser = new Map();
             for (const r of reviews) {
               const login = r.user?.login;
               if (!login) continue;
-              if (login === author) continue; // don't count self-approval
-              latestStateByUser.set(login, r.state); // last one wins
+              if (login === author) continue;
+              latestStateByUser.set(login, r.state);
             }
 
-            // Count approvals (based on each reviewer's latest state)
             let approvals = 0;
             for (const state of latestStateByUser.values()) {
               if (state === "APPROVED") approvals += 1;
