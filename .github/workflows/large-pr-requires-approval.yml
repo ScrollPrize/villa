@@ -1,0 +1,80 @@
+name: Large PR review gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block large PRs unless approved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const threshold = 20;
+
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) {
+              core.setFailed("Could not determine PR number from event payload.");
+              return;
+            }
+
+            // Fetch PR details (includes changed_files and author)
+            const prResp = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            const pr = prResp.data;
+            const changedFiles = pr.changed_files ?? 0;
+            const author = pr.user?.login;
+
+            core.info(`PR #${prNumber}: changed_files=${changedFiles}, author=${author}`);
+
+            // Draft PRs can't be merged anyway; avoid noisy failures.
+            if (pr.draft) {
+              core.info("Draft PR detected — skipping gate.");
+              return;
+            }
+
+            // Fetch all reviews (chronological order per GitHub API docs)
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            // Keep only the latest review state per reviewer (exclude PR author)
+            const latestStateByUser = new Map();
+            for (const r of reviews) {
+              const login = r.user?.login;
+              if (!login) continue;
+              if (login === author) continue; // don't count self-approval
+              latestStateByUser.set(login, r.state); // last one wins
+            }
+
+            // Count approvals (based on each reviewer's latest state)
+            let approvals = 0;
+            for (const state of latestStateByUser.values()) {
+              if (state === "APPROVED") approvals += 1;
+            }
+
+            core.info(`Approvals (excluding author): ${approvals}`);
+
+            if (changedFiles > threshold && approvals < 1) {
+              core.setFailed(
+                `This PR changes ${changedFiles} files (> ${threshold}). Add at least 1 approving review to merge.`
+              );
+            } else {
+              core.info("Gate passed.");
+            }
