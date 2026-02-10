@@ -107,6 +107,13 @@ notebooks = [
     "nest-asyncio>=1.6.0",
 ]
 
+# Blending and finalization (minimal dependencies for vesuvius.blend_logits and vesuvius.finalize_outputs)
+blending = [
+    "scipy>=1.13.1",       # For scipy.ndimage.gaussian_filter in blending.py
+    "tqdm>=4.67.1",        # Progress bars
+    "nest-asyncio>=1.6.0", # Required by vesuvius.utils.catalog (imported via __init__)
+]
+
 tests = ["pytest>=8.4.2"]
 
 # Convenience alias to install everything
