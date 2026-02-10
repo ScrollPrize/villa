@@ -1,5 +1,7 @@
 import numpy as np
 import os
+from dataclasses import dataclass
+from typing import Optional
 from tqdm.auto import tqdm
 import argparse
 import zarr
@@ -12,6 +14,125 @@ from functools import partial
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+
+
+@dataclass
+class FinalizeConfig:
+    """Bundle all finalization parameters."""
+    mode: str = "binary"           # "binary" or "multiclass"
+    threshold: bool = False
+    is_multi_task: bool = False
+    target_info: Optional[dict] = None
+
+
+def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
+    """
+    Apply softmax + mode logic to normalized logits, producing uint8 output.
+
+    Pure function (no I/O).
+
+    Args:
+        logits_np: float32 array (C, Z, Y, X) of normalized logits
+        num_classes: number of classes (C dimension)
+        config: FinalizeConfig with mode/threshold/multi-task settings
+
+    Returns:
+        (output_uint8, is_empty) — finalized uint8 array or (None, True) for empty chunks
+    """
+    # Check if this is an empty chunk (all values are the same)
+    first_value = logits_np.flat[0]
+    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
+
+    if is_empty:
+        return None, True
+
+    mode = config.mode
+    threshold = config.threshold
+    is_multi_task = config.is_multi_task
+    target_info = config.target_info
+
+    if mode == "binary":
+        if is_multi_task and target_info:
+            target_results = []
+            for target_name, info in sorted(target_info.items(), key=lambda x: x[1]['start_channel']):
+                start_ch = info['start_channel']
+                end_ch = info['end_channel']
+                target_logits = logits_np[start_ch:end_ch]
+                exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
+                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+                if threshold:
+                    binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
+                    target_results.append(binary_mask)
+                else:
+                    fg_prob = softmax[1]
+                    target_results.append(fg_prob)
+            output_data = np.stack(target_results, axis=0)
+        else:
+            exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+            softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+            if threshold:
+                binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
+                output_data = binary_mask[np.newaxis, ...]
+            else:
+                fg_prob = softmax[1:2]
+                output_data = fg_prob
+    else:  # multiclass
+        exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+        softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
+        argmax = argmax[np.newaxis, ...]
+        if threshold:
+            output_data = argmax
+        else:
+            output_data = np.concatenate([softmax, argmax], axis=0)
+
+    output_np = output_data
+
+    # Scale to uint8 range [0, 255]
+    min_val = output_np.min()
+    max_val = output_np.max()
+    if min_val < max_val:
+        output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+    else:
+        return None, True
+
+    # Final check: if the processed data is homogeneous, don't write it
+    first_processed_value = output_np.flat[0]
+    if np.all(output_np == first_processed_value):
+        return None, True
+
+    return output_np, False
+
+
+def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
+    """
+    Compute the output shape for finalized data based on mode/threshold.
+
+    Args:
+        spatial_shape: (Z, Y, X) spatial dimensions
+        num_classes: number of input classes
+        config: FinalizeConfig with mode/threshold/multi-task settings
+
+    Returns:
+        Output shape tuple (C_out, Z, Y, X)
+    """
+    mode = config.mode
+    threshold = config.threshold
+    is_multi_task = config.is_multi_task
+    target_info = config.target_info
+
+    if mode == "binary":
+        if is_multi_task and target_info:
+            num_targets = len(target_info)
+            return (num_targets, *spatial_shape)
+        else:
+            return (1, *spatial_shape)
+    else:  # multiclass
+        if threshold:
+            return (1, *spatial_shape)
+        else:
+            return (num_classes + 1, *spatial_shape)
+
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
@@ -49,102 +170,23 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         storage_options={'anon': False} if output_path.startswith('s3://') else None
     )
     
-    input_slice = (slice(None),) + spatial_slices 
+    input_slice = (slice(None),) + spatial_slices
     logits_np = input_store[input_slice]
-    
-    # Check if this is an empty chunk (all values are the same, indicating no meaningful data)
-    # This handles empty patches that have been filled with any constant value
-    first_value = logits_np.flat[0]  # Get the first value
-    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
-    
+
+    config = FinalizeConfig(
+        mode=mode,
+        threshold=threshold,
+        is_multi_task=is_multi_task,
+        target_info=target_info,
+    )
+    output_np, is_empty = apply_finalization(logits_np, num_classes, config)
+
     if is_empty:
-        # For empty/homogeneous patches, don't write anything to the output store
-        # This ensures write_empty_chunks=False works correctly
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-    
-    if mode == "binary":
-        if is_multi_task and target_info:
-            # For multi-task binary, process each target separately
-            target_results = []
-            
-            # Process each target - sort by start_channel to maintain correct order
-            for target_name, info in sorted(target_info.items(), key=lambda x: x[1]['start_channel']):
-                start_ch = info['start_channel']
-                end_ch = info['end_channel']
-                
-                # Extract channels for this target
-                target_logits = logits_np[start_ch:end_ch]
-                
-                # Compute softmax for this target
-                exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
-                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-                
-                if threshold:
-                    # Create binary mask
-                    binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
-                    target_results.append(binary_mask)
-                else:
-                    # Extract foreground probability
-                    fg_prob = softmax[1]
-                    target_results.append(fg_prob)
-            
-            # Stack results from all targets
-            output_data = np.stack(target_results, axis=0)
-        else:
-            # Single task binary - existing logic
-            # For binary case, we just need a softmax over dim 0 (channels)
-            # Compute softmax: exp(x) / sum(exp(x))
-            exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
-            softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-            
-            if threshold:
-                # Create binary mask using argmax (class 1 is foreground)
-                # Simply check if foreground probability > background probability
-                binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
-                output_data = binary_mask[np.newaxis, ...]  # Add channel dim
-            else:
-                # Extract foreground probability (channel 1)
-                fg_prob = softmax[1:2]  
-                output_data = fg_prob
-            
-    else:  # multiclass 
-        # Apply softmax over channel dimension
-        exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True)) 
-        softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-        
-        # Compute argmax
-        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
-        argmax = argmax[np.newaxis, ...]  # Add channel dim
-        
-        if threshold: 
-            # If threshold is provided for multiclass, only save the argmax
-            output_data = argmax
-        else:
-            # Concatenate softmax and argmax
-            output_data = np.concatenate([softmax, argmax], axis=0)
-    
-    # output_data is already numpy
-    output_np = output_data
-    
-    # Scale to uint8 range [0, 255]
-    min_val = output_np.min()
-    max_val = output_np.max()
-    if min_val < max_val: 
-        output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-    else:
-        # All values are the same after processing - this is effectively an empty chunk
-        # Don't write anything to respect write_empty_chunks=False
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-    
-    # Final check: if the processed data is homogeneous, don't write it
-    first_processed_value = output_np.flat[0]
-    if np.all(output_np == first_processed_value):
-        # Processed chunk is homogeneous (e.g., all 0s or all 255s), skip writing
         return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
 
     output_slice = (slice(None),) + spatial_slices
     output_store[output_slice] = output_np
-    return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_data.shape)}
+    return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_np.shape)}
 
 
 def finalize_logits(

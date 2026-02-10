@@ -381,12 +381,17 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
 _worker_state = {}
 
 
-def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3):
+def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3,
+                 finalize_config=None):
     """Initialize per-worker process state with cached zarr stores.
 
     Called once when each worker process starts. Zarr stores (and their
     underlying S3/HTTP connections) are reused across all chunks the worker
     processes, avoiding repeated metadata reads and connection setup.
+
+    Args:
+        finalize_config: Optional FinalizeConfig. When set, chunks are finalized
+            (softmax + uint8) inline instead of writing float16 blended logits.
     """
     numcodecs.blosc.use_threads = False
     storage_opts = {'anon': False} if is_s3 else None
@@ -398,6 +403,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         'is_s3': is_s3,
         'logits_stores': {},
         'output_store': open_zarr(output_path, mode='r+', storage_options=storage_opts),
+        'finalize_config': finalize_config,
     })
 
 
@@ -517,7 +523,22 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         np.divide(chunk_logits, chunk_weights[np.newaxis, :, :, :] + epsilon,
                   out=normalized, where=chunk_weights[np.newaxis, :, :, :] > 0)
 
-        output_store[output_slice] = normalized.astype(np.float16)
+        finalize_config = _worker_state.get('finalize_config')
+        if finalize_config is not None:
+            from vesuvius.models.run.finalize_outputs import apply_finalization
+            result, is_empty = apply_finalization(normalized, num_classes, finalize_config)
+            if not is_empty:
+                # Finalized output may have different channel count than blended logits;
+                # write using slices that match the finalized shape.
+                finalized_slice = (
+                    slice(None),
+                    slice(z_start, z_end),
+                    slice(y_start, y_end),
+                    slice(x_start, x_end)
+                )
+                output_store[finalized_slice] = result
+        else:
+            output_store[output_slice] = normalized.astype(np.float16)
 
     return {
         'chunk': chunk_info,
@@ -570,7 +591,8 @@ def merge_inference_outputs(
         compression_level: int = 1,  # Compression level (0-9, 0=none)
         verbose: bool = True,
         num_parts: int = 1,  # Number of parts to split processing into
-        global_part_id: int = 0):  # Part ID for this process (0-indexed)
+        global_part_id: int = 0,  # Part ID for this process (0-indexed)
+        finalize_config=None):  # Optional FinalizeConfig — fuse finalization when set
     """
     Args:
         parent_dir: Directory containing logits_part_X.zarr and coordinates_part_X.zarr.
@@ -584,6 +606,8 @@ def merge_inference_outputs(
         verbose: Print progress messages.
         num_parts: Number of parts to split the blending process into.
         global_part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning.
+        finalize_config: Optional FinalizeConfig. When provided, softmax + uint8 quantization
+            is applied inline after blending (fused mode), skipping the intermediate float16 array.
     """
 
     tqdm_kwargs = get_tqdm_kwargs()
@@ -679,7 +703,21 @@ def merge_inference_outputs(
     print(f"  Original Volume Shape (Z,Y,X): {original_volume_shape}")
 
     # --- 3. Prepare Output Stores ---
-    output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
+    # When fused mode is active, populate finalize_config with multi-task metadata
+    # from the logits zarr attrs and use the finalized shape/dtype.
+    if finalize_config is not None:
+        if hasattr(part0_logits_store, 'attrs'):
+            finalize_config.is_multi_task = part0_logits_store.attrs.get('is_multi_task', False)
+            finalize_config.target_info = part0_logits_store.attrs.get('target_info', None)
+
+        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
+        output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
+        output_dtype = np.uint8
+        print(f"Fused blend+finalize mode: {finalize_config.mode}, threshold={finalize_config.threshold}")
+        print(f"  Finalized output shape: {output_shape}")
+    else:
+        output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
+        output_dtype = np.float16
 
     # we use the patch size as the default chunk size throughout the pipeline
     # so that the chunk size is consistent , to avoid partial chunk read/writes
@@ -687,8 +725,8 @@ def merge_inference_outputs(
     if chunk_size is None or any(c == 0 for c in (chunk_size if chunk_size else [0, 0, 0])):
 
         output_chunks = (
-            1,  
-            patch_size[0],  # z 
+            1,
+            patch_size[0],  # z
             patch_size[1],  # y
             patch_size[2]   # x
         )
@@ -699,7 +737,7 @@ def merge_inference_outputs(
         if verbose:
             print(f"  Using specified chunk_size {chunk_size}")
 
-    
+
     if compression_level > 0:
         compressor = numcodecs.Blosc(
             cname='zstd',
@@ -723,7 +761,7 @@ def merge_inference_outputs(
             shape=output_shape,
             chunks=output_chunks,
             compressor=compressor,
-            dtype=np.float16,
+            dtype=output_dtype,
             fill_value=0,
             write_empty_chunks=False
         )
@@ -822,7 +860,7 @@ def merge_inference_outputs(
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_worker,
-        initargs=(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3)
+        initargs=(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3, finalize_config)
     ) as executor:
         future_to_chunk = {
             executor.submit(
@@ -892,6 +930,12 @@ def merge_inference_outputs(
         output_zarr.attrs['original_volume_shape'] = original_volume_shape
         output_zarr.attrs['sigma_scale'] = sigma_scale
 
+        # Add finalization metadata when in fused mode
+        if finalize_config is not None:
+            output_zarr.attrs['processing_mode'] = finalize_config.mode
+            output_zarr.attrs['threshold_applied'] = finalize_config.threshold
+            output_zarr.attrs['fused_blend_finalize'] = True
+
     print(f"\n--- Merging Finished ---")
     print(f"Final merged output saved to: {output_path}")
 
@@ -955,6 +999,77 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
+
+def blend_and_finalize_main():
+    """Entry point for vesuvius.blend_and_finalize — fused blend + finalize in one pass."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description='Blend partial inference outputs and finalize (softmax + uint8) in a single pass.')
+    parser.add_argument('parent_dir', type=str,
+                        help='Directory containing the partial inference results (logits_part_X.zarr, coordinates_part_X.zarr)')
+    parser.add_argument('output_path', type=str,
+                        help='Path for the final output Zarr file (uint8, finalized).')
+    # Blending args
+    parser.add_argument('--sigma_scale', type=float, default=8.0,
+                        help='Sigma scale for Gaussian map (patch_size / sigma_scale). Default: 8.0')
+    parser.add_argument('--chunk_size', type=str, default=None,
+                        help='Spatial chunk size (Z,Y,X) for output Zarr. Comma-separated.')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Number of worker processes. Default: CPU_COUNT // 2')
+    parser.add_argument('--compression_level', type=int, default=1, choices=range(10),
+                        help='Compression level (0-9, 0=none). Default: 1')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Disable verbose progress messages.')
+    parser.add_argument('--num_parts', type=int, default=1,
+                        help='Number of parts to split the blending process into. Default: 1')
+    parser.add_argument('--part_id', type=int, default=0,
+                        help='Part ID for this process (0-indexed). Default: 0')
+    # Finalization args
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
+                        help='Finalization mode. Default: binary')
+    parser.add_argument('--threshold', action='store_true',
+                        help='Apply argmax and only save class predictions (no probabilities).')
+
+    args = parser.parse_args()
+
+    if args.part_id < 0 or args.part_id >= args.num_parts:
+        parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}.")
+
+    chunks = None
+    if args.chunk_size:
+        try:
+            chunks = tuple(map(int, args.chunk_size.split(',')))
+            if len(chunks) != 3:
+                raise ValueError()
+        except ValueError:
+            parser.error("Invalid chunk_size format. Expected 3 comma-separated integers (Z,Y,X).")
+
+    from vesuvius.models.run.finalize_outputs import FinalizeConfig
+    finalize_config = FinalizeConfig(mode=args.mode, threshold=args.threshold)
+
+    try:
+        merge_inference_outputs(
+            parent_dir=args.parent_dir,
+            output_path=args.output_path,
+            sigma_scale=args.sigma_scale,
+            chunk_size=chunks,
+            num_workers=args.num_workers,
+            compression_level=args.compression_level,
+            verbose=not args.quiet,
+            num_parts=args.num_parts,
+            global_part_id=args.part_id,
+            finalize_config=finalize_config,
+        )
+        return 0
+    except Exception as e:
+        print(f"\n--- Blend and Finalize Failed ---")
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
 
 if __name__ == '__main__':
     import sys
