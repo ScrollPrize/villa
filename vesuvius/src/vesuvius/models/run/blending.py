@@ -517,7 +517,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         np.divide(chunk_logits, chunk_weights[np.newaxis, :, :, :] + epsilon,
                   out=normalized, where=chunk_weights[np.newaxis, :, :, :] > 0)
 
-        output_store[output_slice] = normalized
+        output_store[output_slice] = normalized.astype(np.float16)
 
     return {
         'chunk': chunk_info,
@@ -723,7 +723,7 @@ def merge_inference_outputs(
             shape=output_shape,
             chunks=output_chunks,
             compressor=compressor,
-            dtype=np.float32,
+            dtype=np.float16,
             fill_value=0,
             write_empty_chunks=False
         )
