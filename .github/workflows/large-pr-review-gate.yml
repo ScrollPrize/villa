@@ -2,7 +2,7 @@ name: Large PR review gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   pull_request_review:
     types: [submitted, edited, dismissed]
 
@@ -10,18 +10,25 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gate:
+    name: Gate
     runs-on: ubuntu-latest
     steps:
       - name: Block large PRs unless approved
         uses: actions/github-script@v7
+        env:
+          LARGE_PR_FILE_THRESHOLD: "20"
         with:
           script: |
-            const threshold = 20;
+            const threshold = Number(process.env.LARGE_PR_FILE_THRESHOLD || "20");
 
             const { owner, repo } = context.repo;
-            const prNumber = context.payload.pull_request?.number;
+            const prNumber = context.payload.pull_request?.number ?? context.issue.number;
             if (!prNumber) {
               core.setFailed("Could not determine PR number from event payload.");
               return;
@@ -37,7 +44,7 @@ jobs:
             const changedFiles = pr.changed_files ?? 0;
             const author = pr.user?.login;
 
-            core.info(`PR #${prNumber}: changed_files=${changedFiles}, author=${author}`);
+            core.info(`PR #${prNumber}: changed_files=${changedFiles}, threshold=${threshold}, author=${author}`);
 
             if (pr.draft) {
               core.info("Draft PR detected — skipping gate.");
@@ -51,11 +58,21 @@ jobs:
               per_page: 100,
             });
 
+            // Sort defensively so "last review wins" is stable even if API ordering changes.
+            reviews.sort((a, b) => {
+              const aTime = new Date(a.submitted_at ?? 0).getTime();
+              const bTime = new Date(b.submitted_at ?? 0).getTime();
+              if (aTime !== bTime) return aTime - bTime;
+              return (a.id ?? 0) - (b.id ?? 0);
+            });
+
             const latestStateByUser = new Map();
+            const decisionStates = new Set(["APPROVED", "CHANGES_REQUESTED", "DISMISSED"]);
             for (const r of reviews) {
               const login = r.user?.login;
               if (!login) continue;
               if (login === author) continue;
+              if (!decisionStates.has(r.state)) continue;
               latestStateByUser.set(login, r.state);
             }
 
