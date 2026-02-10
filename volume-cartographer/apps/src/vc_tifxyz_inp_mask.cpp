@@ -1,9 +1,9 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <iostream>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 

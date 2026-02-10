@@ -15,7 +15,6 @@
 
 #include <filesystem>
 
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"

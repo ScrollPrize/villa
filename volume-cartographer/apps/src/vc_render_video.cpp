@@ -21,7 +21,6 @@
 #include <filesystem>
 #include <omp.h>
 
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 
 using shape = z5::types::ShapeType;

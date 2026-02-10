@@ -19,7 +19,6 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/Slicing.hpp"
 
 namespace po = boost::program_options;
