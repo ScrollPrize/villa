@@ -89,9 +89,23 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
-    [[nodiscard]] bool autoApproveEdits() const { return _autoApproveEdits; }
+    [[nodiscard]] bool autoApproveEdits() const { return _autoApprovalEnabled; }
+    [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
+    [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
+    [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
+    [[nodiscard]] float autoApprovalMaxDistance() const { return _autoApprovalMaxDistance; }
+
     [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
     void setAutoApproveEdits(bool enabled);
+    void setAutoApprovalEnabled(bool enabled);
+    void setAutoApprovalRadius(float radius);
+    void setAutoApprovalThreshold(float threshold);
+    void setAutoApprovalMaxDistance(float distance);
+    std::vector<std::pair<int, int>> filterVerticesForAutoApproval(
+        const std::vector<SegmentationEditManager::VertexEdit>& edits,
+        const std::optional<std::pair<int, int>>& dragCenter) const;
+
+    void performAutoApproval(const std::vector<std::pair<int, int>>& vertices);
     void setApprovalMaskBrushRadius(float radiusSteps);
     void setApprovalBrushDepth(float depth);
     void setApprovalBrushColor(const QColor& color);
@@ -360,7 +374,11 @@ private:
     uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
-    bool _autoApproveEdits{true};
+    bool _autoApprovalEnabled{true};
+    float _autoApprovalRadius{0.5f};
+    float _autoApprovalThreshold{0.0f};
+    float _autoApprovalMaxDistance{0.0f};
+
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
     float _approvalBrushDepth{15.0f};       // Cylinder depth
     QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting

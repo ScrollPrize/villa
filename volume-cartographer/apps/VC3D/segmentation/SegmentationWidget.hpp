@@ -113,6 +113,11 @@ public:
     [[nodiscard]] bool editApprovedMask() const;
     [[nodiscard]] bool editUnapprovedMask() const;
     [[nodiscard]] bool autoApproveEdits() const;
+    [[nodiscard]] bool autoApprovalEnabled() const;
+    [[nodiscard]] float autoApprovalRadius() const;
+    [[nodiscard]] float autoApprovalThreshold() const;
+    [[nodiscard]] float autoApprovalMaxDistance() const;
+
     [[nodiscard]] float approvalBrushRadius() const;
     [[nodiscard]] float approvalBrushDepth() const;
     [[nodiscard]] int approvalMaskOpacity() const;
@@ -123,6 +128,11 @@ public:
     void setEditApprovedMask(bool enabled);
     void setEditUnapprovedMask(bool enabled);
     void setAutoApproveEdits(bool enabled);
+    void setAutoApprovalEnabled(bool enabled);
+    void setAutoApprovalRadius(float radius);
+    void setAutoApprovalThreshold(float threshold);
+    void setAutoApprovalMaxDistance(float distance);
+
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
     void setApprovalMaskOpacity(int opacity);
@@ -182,6 +192,11 @@ signals:
     void editApprovedMaskChanged(bool enabled);
     void editUnapprovedMaskChanged(bool enabled);
     void autoApproveEditsChanged(bool enabled);
+    void autoApprovalEnabledChanged(bool enabled);
+    void autoApprovalRadiusChanged(float radius);
+    void autoApprovalThresholdChanged(float threshold);
+    void autoApprovalMaxDistanceChanged(float distance);
+
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
     void approvalMaskOpacityChanged(int opacity);

@@ -280,6 +280,13 @@ namespace segmentation {
     constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
     constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
 
+    // Auto-approval settings
+    constexpr auto AUTO_APPROVAL_ENABLED = "auto_approval_enabled";
+    constexpr auto AUTO_APPROVAL_RADIUS = "auto_approval_radius";
+    constexpr auto AUTO_APPROVAL_THRESHOLD = "auto_approval_threshold";
+    constexpr auto AUTO_APPROVAL_MAX_DISTANCE = "auto_approval_max_distance";
+
+
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;
     constexpr int CORRECTIONS_Z_MIN_DEFAULT = 0;

@@ -170,21 +170,12 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
 
     // Auto-approve edited regions before applyPreview() clears them
     auto* overlay = _module.overlay();
-    if (_module.autoApproveEdits() && overlay && overlay->hasApprovalMaskData()) {
+    if (_module.autoApprovalEnabled() && overlay && overlay->hasApprovalMaskData()) {
         const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
-            std::vector<std::pair<int, int>> gridPositions;
-            gridPositions.reserve(editedVerts.size());
-            for (const auto& edit : editedVerts) {
-                gridPositions.emplace_back(edit.row, edit.col);
-            }
-            constexpr uint8_t kApproved = 255;
-            constexpr float kRadius = 1.0f;
-            constexpr bool kIsAutoApproval = true;
-            const QColor brushColor = _module.approvalBrushColor();
-            overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
-            overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-            qCInfo(lcSegModule) << "Auto-approved" << gridPositions.size() << "line tool edited vertices";
+            // Line tool has no single drag center - use nullopt
+            const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, std::nullopt);
+            _module.performAutoApproval(filteredVerts);
         }
     }
 
