@@ -340,6 +340,12 @@ def save(
 
 	h_img, w_img = data.size
 	res = model(data)
+	with torch.no_grad():
+		xy0 = res.xy_lr.detach()
+		mean_xy = xy0.mean(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
+		min_xy = xy0.amin(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
+		max_xy = xy0.amax(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
+		print(f"vis xy_lr: mean_xy={mean_xy} min_xy={min_xy} max_xy={max_xy}")
 	# z support: visualize the currently optimized z-slice (grow fw/bw), fallback z=0.
 	z_i = int(getattr(model, "_last_grow_insert_z", 0) or 0)
 	z_i = max(0, min(z_i, int(data.cos.shape[0]) - 1))
