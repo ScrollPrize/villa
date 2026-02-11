@@ -508,7 +508,6 @@ def parse_args():
         help="Load checkpoint config/settings but skip model forward inference.",
     )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--napari", action="store_true", help="Launch napari viewer for visualization")
     parser.add_argument("--iterations", type=int, default=1,
         help="Number of grow iterations.")
     parser.add_argument(
@@ -1102,7 +1101,6 @@ def run_inference(args, bbox_crops, crop_size, model_state):
         )
         valid_items.append((bbox_idx, crop, inputs, extrap_local))
 
-    pred_pts_world_all = []
     pred_samples = []
     use_tta = getattr(args, 'tta', False)
 
@@ -1119,7 +1117,6 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             pred_world = pred_local + crop["min_corner"][None, :]
             bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
             pred_world = pred_world[bbox_mask]
-            pred_pts_world_all.append(pred_world)
             if pred_uv is not None and len(pred_uv) == bbox_mask.shape[0]:
                 pred_samples.append((pred_uv[bbox_mask], pred_world))
 
@@ -1141,7 +1138,6 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             pred_world = pred_local.detach().cpu().numpy() + crop["min_corner"][None, :]
             bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
             pred_world = pred_world[bbox_mask]
-            pred_pts_world_all.append(pred_world)
             if extrap_uv is not None and len(extrap_uv) == bbox_mask.shape[0]:
                 pred_samples.append((extrap_uv[bbox_mask], pred_world))
 
@@ -1169,14 +1165,13 @@ def run_inference(args, bbox_crops, crop_size, model_state):
                 pred_world = pred_local.detach().cpu().numpy() + crop["min_corner"][None, :]
                 bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
                 pred_world = pred_world[bbox_mask]
-                pred_pts_world_all.append(pred_world)
                 if extrap_uv is not None and len(extrap_uv) == bbox_mask.shape[0]:
                     pred_samples.append((extrap_uv[bbox_mask], pred_world))
 
                 out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
                 _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
 
-    return pred_pts_world_all, pred_samples
+    return pred_samples
 
 
 def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
@@ -1253,32 +1248,6 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
         }
     )
     print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
-
-
-def visualize_napari(args, cond_zyxs, edge, window_zyxs, valid, bbox_pts,
-                     extrap_coords_world, extrap_result, pred_pts_world_all):
-    import napari
-    viewer = napari.Viewer()
-
-    cond_pts = cond_zyxs.reshape(-1, 3)
-    edge_pts = edge.reshape(-1, 3)
-    full_seg_pts = window_zyxs[valid]
-
-    pt_size = 1
-
-    viewer.add_points(cond_pts, name='cond_pts', size=pt_size, face_color="red")
-    viewer.add_points(edge_pts, name='edge_pts', size=pt_size, face_color="cyan")
-    viewer.add_points(bbox_pts, name='bboxes', size=pt_size, face_color='yellow')
-    if len(full_seg_pts) > 0:
-        viewer.add_points(full_seg_pts, name='full_seg_pts', size=pt_size, face_color='white')
-
-    if extrap_result is not None:
-        viewer.add_points(extrap_coords_world, name='extrap_pts', size=pt_size, face_color='magenta')
-    if pred_pts_world_all:
-        pred_pts_world = np.concatenate(pred_pts_world_all, axis=0)
-        viewer.add_points(pred_pts_world, name='pred_pts', size=pt_size, face_color='blue')
-
-    napari.run()
 
 
 def reassemble_predictions_to_grid(pred_samples):
@@ -1488,50 +1457,30 @@ def main():
         )
 
     all_pred_samples = []
-    all_pred_pts_world = []
     bboxes = []
-    edge = np.zeros((0, 3), dtype=np.float32)
-    extrap_coords_world = None
-    extrap_result = None
 
     for iteration in range(growth_iterations):
         print(f"[iteration {iteration + 1}/{growth_iterations}]")
         cond_zyxs = current_grid
         valid = current_valid
         uv_cond = _build_uv_grid(current_uv_offset, cond_zyxs.shape[:2])
-        window_zyxs = cond_zyxs
 
         # Outside path uses the grow-direction inner edge for bbox extraction.
-        bboxes, edge = get_cond_edge_bboxes(
+        bboxes, _ = get_cond_edge_bboxes(
             cond_zyxs, cond_direction, crop_size, outer_edge=False,
             overlap_frac=args.bbox_overlap_frac,
         )
 
         # --- build bbox crops + run inference ---
-        pred_pts_world_all = []
         pred_samples = []
         bbox_crops = build_bbox_crop_data(
             args, bboxes, cond_zyxs, valid, uv_cond, cond_direction, crop_size, tgt_segment,
             args.volume_scale, extrapolation_settings,
         )
 
-        iter_extrap_pts_world = []
-        for crop in bbox_crops:
-            extrap_local = crop.get("extrap_pts_local", None)
-            if extrap_local is None or len(extrap_local) == 0:
-                continue
-            iter_extrap_pts_world.append(extrap_local + crop["min_corner"][None, :])
-        if iter_extrap_pts_world:
-            extrap_coords_world = np.concatenate(iter_extrap_pts_world, axis=0)
-            extrap_result = {"bbox_count": len(iter_extrap_pts_world)}
-        else:
-            extrap_coords_world = None
-            extrap_result = None
-
         if run_model_inference and model_state is not None:
-            pred_pts_world_all, pred_samples = run_inference(args, bbox_crops, crop_size, model_state)
+            pred_samples = run_inference(args, bbox_crops, crop_size, model_state)
 
-        all_pred_pts_world.extend(pred_pts_world_all)
         if not pred_samples:
             print("No predicted samples this iteration; stopping iterative growth.")
             break
@@ -1552,40 +1501,12 @@ def main():
         current_uv_offset = merged_uv_offset
         print(f"  kept {n_kept_axis} new {'rows' if cond_direction in ['up', 'down'] else 'cols'}")
 
-    cond_zyxs = current_grid
-    window_zyxs = current_grid
-    valid = current_valid
     pred_samples = all_pred_samples
-    pred_pts_world_all = all_pred_pts_world
 
     if tifxyz_uuid is not None and pred_samples:
         save_tifxyz_output(
             args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
             tifxyz_voxel_size_um, checkpoint_path, cond_direction, args.volume_scale,
-        )
-
-    bbox_pts = []
-    for z0, z1, y0, y1, x0, x1 in bboxes:
-        verts = [
-            [z0, y0, x0], [z0, y0, x1], [z0, y1, x1], [z0, y1, x0],
-            [z1, y0, x0], [z1, y0, x1], [z1, y1, x1], [z1, y1, x0],
-        ]
-        edges = [
-            (0, 1), (1, 2), (2, 3), (3, 0),  # bottom face
-            (4, 5), (5, 6), (6, 7), (7, 4),  # top face
-            (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
-        ]
-        for a, b in edges:
-            p0 = np.asarray(verts[a], dtype=np.float32)
-            p1 = np.asarray(verts[b], dtype=np.float32)
-            length = float(np.linalg.norm(p1 - p0))
-            n = max(2, int(np.ceil(length)) + 1)
-            bbox_pts.extend(np.linspace(p0, p1, n))
-
-    if args.napari:
-        visualize_napari(
-            args, cond_zyxs, edge, window_zyxs, valid, bbox_pts,
-            extrap_coords_world, extrap_result, pred_pts_world_all,
         )
 
 
