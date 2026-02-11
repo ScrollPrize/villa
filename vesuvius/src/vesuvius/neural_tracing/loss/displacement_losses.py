@@ -8,6 +8,36 @@ import torch
 import torch.nn.functional as F
 
 
+def _sample_pred_field(pred_field, extrap_coords):
+    """Sample predicted field at query coordinates.
+
+    Args:
+        pred_field: (B, 3, D, H, W)
+        extrap_coords: (B, N, 3) in (z, y, x) voxel coords
+
+    Returns:
+        sampled: (B, N, 3)
+    """
+    B, _, D, H, W = pred_field.shape
+
+    # Normalize coords to [-1, 1] for grid_sample
+    coords_normalized = extrap_coords.clone()
+    d_denom = max(D - 1, 1)
+    h_denom = max(H - 1, 1)
+    w_denom = max(W - 1, 1)
+    coords_normalized[..., 0] = 2 * coords_normalized[..., 0] / d_denom - 1  # z
+    coords_normalized[..., 1] = 2 * coords_normalized[..., 1] / h_denom - 1  # y
+    coords_normalized[..., 2] = 2 * coords_normalized[..., 2] / w_denom - 1  # x
+
+    # grid_sample expects (B, N, 1, 1, 3) for 3D, with order (x, y, z)
+    grid = coords_normalized[..., [2, 1, 0]].view(B, -1, 1, 1, 3)
+
+    # Sample predicted field at surface locations
+    sampled = F.grid_sample(pred_field, grid, mode='bilinear', align_corners=True)
+    sampled = sampled.view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
+    return sampled
+
+
 def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
                          loss_type='vector_l2', beta=5.0, sample_weights=None):
     """
@@ -28,20 +58,7 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
     Returns:
         Loss between sampled predictions and ground truth
     """
-    B, C, D, H, W = pred_field.shape
-
-    # Normalize coords to [-1, 1] for grid_sample
-    coords_normalized = extrap_coords.clone()
-    coords_normalized[..., 0] = 2 * coords_normalized[..., 0] / (D - 1) - 1  # z
-    coords_normalized[..., 1] = 2 * coords_normalized[..., 1] / (H - 1) - 1  # y
-    coords_normalized[..., 2] = 2 * coords_normalized[..., 2] / (W - 1) - 1  # x
-
-    # grid_sample expects (B, N, 1, 1, 3) for 3D, with order (x, y, z)
-    grid = coords_normalized[..., [2, 1, 0]].view(B, -1, 1, 1, 3)
-
-    # Sample predicted field at surface locations
-    sampled = F.grid_sample(pred_field, grid, mode='bilinear', align_corners=True)
-    sampled = sampled.view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
+    sampled = _sample_pred_field(pred_field, extrap_coords)
 
     # Compute loss based on loss_type
     error = sampled - gt_displacement  # (B, N, 3)
@@ -68,6 +85,56 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
     masked_diff = diff * effective_mask
     loss = masked_diff.sum() / effective_mask.sum().clamp(min=1)
 
+    return loss
+
+
+def surface_sampled_normal_loss(
+    pred_field,
+    extrap_coords,
+    gt_displacement,
+    point_normals,
+    valid_mask,
+    loss_type='normal_huber',
+    beta=5.0,
+    sample_weights=None,
+):
+    """Supervise only displacement component along per-point normals.
+
+    Args:
+        pred_field: (B, 3, D, H, W) predicted dense displacement field
+        extrap_coords: (B, N, 3) sample coords in (z, y, x)
+        gt_displacement: (B, N, 3) target displacement vectors
+        point_normals: (B, N, 3) per-point unit normals (z, y, x order)
+        valid_mask: (B, N) binary mask for valid (non-padded) points
+        loss_type: one of {'normal_l2', 'normal_huber', 'normal_l1'}
+        beta: huber transition point
+        sample_weights: optional (B, N) per-point weights
+    """
+    sampled = _sample_pred_field(pred_field, extrap_coords)  # (B, N, 3)
+
+    normals = point_normals
+    normals = normals / normals.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    pred_n = (sampled * normals).sum(dim=-1)  # (B, N)
+    gt_n = (gt_displacement * normals).sum(dim=-1)  # (B, N)
+    err_n = pred_n - gt_n
+
+    if loss_type == 'normal_l2':
+        diff = err_n ** 2
+    elif loss_type == 'normal_l1':
+        diff = err_n.abs()
+    elif loss_type == 'normal_huber':
+        diff = F.smooth_l1_loss(err_n, torch.zeros_like(err_n), beta=beta, reduction='none')
+    else:
+        raise ValueError(f"Unknown normal loss_type: {loss_type}")
+
+    if sample_weights is None:
+        effective_mask = valid_mask
+    else:
+        effective_mask = valid_mask * sample_weights
+
+    masked_diff = diff * effective_mask
+    loss = masked_diff.sum() / effective_mask.sum().clamp(min=1)
     return loss
 
 

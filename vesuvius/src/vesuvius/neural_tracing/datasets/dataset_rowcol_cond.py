@@ -58,6 +58,7 @@ class EdtSegDataset(Dataset):
         # other wrap conditioning: provide other wraps from same segment as context
         config.setdefault('use_other_wrap_cond', False)
         config.setdefault('other_wrap_prob', 0.5)  # probability of including other wraps when available
+        config.setdefault('sample_mode', 'wrap')  # 'wrap' = each wrap is a sample, 'chunk' = random wrap per chunk
 
         config.setdefault('overlap_fraction', 0.0)
         config.setdefault('min_span_ratio', 1.0)
@@ -65,11 +66,17 @@ class EdtSegDataset(Dataset):
         config.setdefault('edge_touch_min_count', 10)
         config.setdefault('edge_touch_pad', 0)
         config.setdefault('min_points_per_wrap', 100)
+        # Point-count thresholds in patch finding depend on tifxyz point density,
+        # which changes with volume_scale after retargeting. Keep scale=1 behavior
+        # as the default reference and scale counts quadratically for other scales.
+        config.setdefault('scale_normalize_patch_counts', True)
+        config.setdefault('patch_count_reference_scale', 0)
         config.setdefault('bbox_pad_2d', 0)
         config.setdefault('require_all_valid_in_bbox', True)
         config.setdefault('skip_chunk_if_any_invalid', False)
         config.setdefault('min_cond_span', 0.3)
         config.setdefault('inner_bbox_fraction', 0.7)
+        config.setdefault('filter_oob_extrap_points', True)
         cond_local_perturb = dict(config.get('cond_local_perturb') or {})
         cond_local_perturb.setdefault('enabled', True)
         cond_local_perturb.setdefault('probability', 0.35)
@@ -79,7 +86,24 @@ class EdtSegDataset(Dataset):
         cond_local_perturb.setdefault('amplitude_range', [0.25, 1.25])
         cond_local_perturb.setdefault('radius_sigma_mult', 2.5)
         cond_local_perturb.setdefault('max_total_displacement', 6.0)
+        cond_local_perturb.setdefault('apply_without_augmentation', False)
         config['cond_local_perturb'] = cond_local_perturb
+        config.setdefault('rbf_downsample_factor', 4)
+        config.setdefault('rbf_edge_downsample_factor', 8)
+        config.setdefault('rbf_max_points', None)
+        config.setdefault('rbf_edge_band_frac', 0.10)
+        config.setdefault('rbf_edge_band_cells', None)
+        config.setdefault('rbf_edge_min_points', 128)
+        config.setdefault('debug_extrapolation_oob', False)
+        config.setdefault('debug_extrapolation_oob_every', 100)
+        config.setdefault('displacement_supervision', 'vector')
+        self.displacement_supervision = str(config.get('displacement_supervision', 'vector')).lower()
+        if self.displacement_supervision not in {'vector', 'normal_scalar'}:
+            raise ValueError(
+                "displacement_supervision must be 'vector' or 'normal_scalar', "
+                f"got {self.displacement_supervision!r}"
+            )
+        self._needs_point_normals = self.displacement_supervision == 'normal_scalar'
 
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -117,6 +141,29 @@ class EdtSegDataset(Dataset):
                 seg_scaled.volume = volume
                 scaled_segments.append(seg_scaled)
 
+            ref_scale = int(config.get('patch_count_reference_scale', 0))
+            if config.get('scale_normalize_patch_counts', True):
+                count_scale = float(2 ** (volume_scale - ref_scale))
+                count_scale_sq = count_scale * count_scale
+            else:
+                count_scale_sq = 1.0
+
+            min_points_per_wrap = max(1, int(round(
+                float(config.get('min_points_per_wrap', 100)) * count_scale_sq
+            )))
+            edge_touch_min_count = max(1, int(round(
+                float(config.get('edge_touch_min_count', 10)) * count_scale_sq
+            )))
+
+            if config.get('verbose', False):
+                print(
+                    "  [DEBUG PATCH COUNTS] "
+                    f"volume_scale={volume_scale}, ref_scale={ref_scale}, "
+                    f"count_scale_sq={count_scale_sq:.3f}, "
+                    f"min_points_per_wrap={min_points_per_wrap}, "
+                    f"edge_touch_min_count={edge_touch_min_count}"
+                )
+
             cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
             chunk_results = find_world_chunk_patches(
                 segments=scaled_segments,
@@ -124,9 +171,9 @@ class EdtSegDataset(Dataset):
                 overlap_fraction=config.get('overlap_fraction', 0.0),
                 min_span_ratio=config.get('min_span_ratio', 1.0),
                 edge_touch_frac=config.get('edge_touch_frac', 0.1),
-                edge_touch_min_count=config.get('edge_touch_min_count', 10),
+                edge_touch_min_count=edge_touch_min_count,
                 edge_touch_pad=config.get('edge_touch_pad', 0),
-                min_points_per_wrap=config.get('min_points_per_wrap', 100),
+                min_points_per_wrap=min_points_per_wrap,
                 bbox_pad_2d=config.get('bbox_pad_2d', 0),
                 require_all_valid_in_bbox=config.get('require_all_valid_in_bbox', True),
                 skip_chunk_if_any_invalid=config.get('skip_chunk_if_any_invalid', False),
@@ -158,10 +205,33 @@ class EdtSegDataset(Dataset):
                 ))
 
         self.patches = patches
+        self.sample_mode = str(config.get('sample_mode', 'wrap')).lower()
+        if self.sample_mode not in {'wrap', 'chunk'}:
+            raise ValueError(f"sample_mode must be 'wrap' or 'chunk', got {self.sample_mode!r}")
+        self.sample_index = self._build_sample_index()
         self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
 
+        if config.get('verbose', False):
+            total_wraps = sum(len(p.wraps) for p in self.patches)
+            print(
+                f"RowCol dataset built: chunks={len(self.patches)}, "
+                f"wraps={total_wraps}, sample_mode={self.sample_mode}, "
+                f"samples={len(self.sample_index)}"
+            )
+
     def __len__(self):
-        return len(self.patches)
+        return len(self.sample_index)
+
+    def _build_sample_index(self):
+        if self.sample_mode == 'chunk':
+            return [(patch_idx, None) for patch_idx in range(len(self.patches))]
+
+        # wrap mode: each (chunk, wrap) pair is a unique dataset sample
+        sample_index = []
+        for patch_idx, patch in enumerate(self.patches):
+            for wrap_idx in range(len(patch.wraps)):
+                sample_index.append((patch_idx, wrap_idx))
+        return sample_index
 
     def _parse_cond_percent(self):
         spec = self.config['cond_percent']
@@ -172,6 +242,52 @@ class EdtSegDataset(Dataset):
         if not (0.0 < low <= high < 1.0):
             raise ValueError("cond_percent values must satisfy 0 < min <= max < 1")
         return low, high
+
+    @staticmethod
+    def _coords_in_bounds(coords_zyx: torch.Tensor, shape_zyx) -> torch.Tensor:
+        d, h, w = (int(shape_zyx[0]), int(shape_zyx[1]), int(shape_zyx[2]))
+        return (
+            (coords_zyx[:, 0] >= 0) & (coords_zyx[:, 0] <= d - 1) &
+            (coords_zyx[:, 1] >= 0) & (coords_zyx[:, 1] <= h - 1) &
+            (coords_zyx[:, 2] >= 0) & (coords_zyx[:, 2] <= w - 1)
+        )
+
+    @staticmethod
+    def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
+        """Upsample (x, y, z) sampled grids in one cv2 call."""
+        h_s, w_s = x_s.shape
+        h_up = int(round(h_s / scale_y))
+        w_up = int(round(w_s / scale_x))
+        xyz_s = np.stack([x_s, y_s, z_s], axis=-1)
+        xyz_up = cv2.resize(xyz_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
+        return xyz_up[..., 0], xyz_up[..., 1], xyz_up[..., 2]
+
+    @staticmethod
+    def _trim_to_world_bbox(x_full, y_full, z_full, world_bbox):
+        """Keep the minimal row/col slab that intersects the world bbox."""
+        z_min, z_max, y_min, y_max, x_min, x_max = world_bbox
+        in_bounds = (
+            (z_full >= z_min) & (z_full < z_max) &
+            (y_full >= y_min) & (y_full < y_max) &
+            (x_full >= x_min) & (x_full < x_max)
+        )
+        if not in_bounds.any():
+            return None
+
+        valid_rows = np.any(in_bounds, axis=1)
+        valid_cols = np.any(in_bounds, axis=0)
+        row_idx = np.flatnonzero(valid_rows)
+        col_idx = np.flatnonzero(valid_cols)
+        if row_idx.size == 0 or col_idx.size == 0:
+            return None
+
+        r0, r1 = int(row_idx[0]), int(row_idx[-1])
+        c0, c1 = int(col_idx[0]), int(col_idx[-1])
+        return (
+            x_full[r0:r1 + 1, c0:c1 + 1],
+            y_full[r0:r1 + 1, c0:c1 + 1],
+            z_full[r0:r1 + 1, c0:c1 + 1],
+        )
 
     @staticmethod
     def _compute_surface_normals(surface_zyxs: np.ndarray) -> np.ndarray:
@@ -201,7 +317,8 @@ class EdtSegDataset(Dataset):
     def _maybe_perturb_conditioning_surface(self, cond_zyxs: np.ndarray) -> np.ndarray:
         """Apply local normal-direction pushes with Gaussian falloff on small regions."""
         cfg = self.config.get('cond_local_perturb', {})
-        if not self.apply_augmentation or not cfg.get('enabled', True):
+        apply_without_aug = bool(cfg.get('apply_without_augmentation', False))
+        if (not self.apply_augmentation and not apply_without_aug) or not cfg.get('enabled', True):
             return cond_zyxs
         if random.random() >= float(cfg.get('probability', 0.35)):
             return cond_zyxs
@@ -288,13 +405,13 @@ class EdtSegDataset(Dataset):
         return perturbed.astype(cond_zyxs.dtype, copy=False)
 
     def __getitem__(self, idx):
-
-        patch = self.patches[idx]
+        patch_idx, wrap_idx = self.sample_index[idx]
+        patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
-        # select one wrap randomly for conditioning/masked split
-        wrap = random.choice(patch.wraps)
+        # in wrap mode, use the indexed wrap; in chunk mode, choose randomly (legacy behavior)
+        wrap = patch.wraps[wrap_idx] if wrap_idx is not None else random.choice(patch.wraps)
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
@@ -317,29 +434,11 @@ class EdtSegDataset(Dataset):
 
         # upsampling here instead of in the tifxyz module because of the annoyances with 
         # handling coords in dif scales
-        h_s, w_s = x_full_s.shape
-        h_up = int(round(h_s / scale_y))
-        w_up = int(round(w_s / scale_x))
-        x_full = cv2.resize(x_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
-        y_full = cv2.resize(y_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
-        z_full = cv2.resize(z_full_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
-
-        z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
-        in_bounds = (
-            (z_full >= z_min) & (z_full < z_max) &
-            (y_full >= y_min) & (y_full < y_max) &
-            (x_full >= x_min) & (x_full < x_max)
-        )
-
-        valid_rows = np.any(in_bounds, axis=1)
-        valid_cols = np.any(in_bounds, axis=0)
-        if not valid_rows.any() or not valid_cols.any():
+        x_full, y_full, z_full = self._upsample_world_triplet(x_full_s, y_full_s, z_full_s, scale_y, scale_x)
+        trimmed = self._trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
+        if trimmed is None:
             return self[np.random.randint(len(self))]
-        r0, r1 = np.where(valid_rows)[0][[0, -1]]
-        c0, c1 = np.where(valid_cols)[0][[0, -1]]
-        x_full = x_full[r0:r1+1, c0:c1+1]
-        y_full = y_full[r0:r1+1, c0:c1+1]
-        z_full = z_full[r0:r1+1, c0:c1+1]
+        x_full, y_full, z_full = trimmed
         h_up, w_up = x_full.shape  # update dimensions after crop
 
         # split into cond and mask on the upsampled grid
@@ -424,6 +523,12 @@ class EdtSegDataset(Dataset):
 
         # if we're extrapolating, compute it with the extrapolation module
         if self.config['use_extrapolation']:
+            method_name = self.config['extrapolation_method']
+            rbf_downsample = int(self.config.get('rbf_downsample_factor', 2))
+            edge_downsample_cfg = self.config.get('rbf_edge_downsample_factor', None)
+            edge_downsample = rbf_downsample if edge_downsample_cfg is None else int(edge_downsample_cfg)
+            selected_downsample = edge_downsample if method_name == 'rbf_edge_only' else rbf_downsample
+
             extrap_result = compute_extrapolation(
                 uv_cond=uv_cond,
                 zyx_cond=cond_zyxs,
@@ -431,17 +536,26 @@ class EdtSegDataset(Dataset):
                 zyx_mask=masked_zyxs,
                 min_corner=min_corner,
                 crop_size=crop_size,
-                method=self.config['extrapolation_method'],
+                method=method_name,
+                downsample_factor=selected_downsample,
+                rbf_max_points=self.config.get('rbf_max_points'),
+                edge_band_frac=float(self.config.get('rbf_edge_band_frac', 0.10)),
+                edge_band_cells=self.config.get('rbf_edge_band_cells'),
+                edge_min_points=int(self.config.get('rbf_edge_min_points', 128)),
                 cond_direction=cond_direction,
                 degrade_prob=self.config.get('extrap_degrade_prob', 0.0),
                 degrade_curvature_range=self.config.get('extrap_degrade_curvature_range', (0.001, 0.01)),
                 degrade_gradient_range=self.config.get('extrap_degrade_gradient_range', (0.05, 0.2)),
+                debug_no_in_bounds=bool(self.config.get('debug_extrapolation_oob', False)),
+                debug_no_in_bounds_every=int(self.config.get('debug_extrapolation_oob_every', 100)),
+                return_gt_normals=self._needs_point_normals,
             )
             if extrap_result is None:
                 return self[np.random.randint(len(self))]
             extrap_surface = extrap_result['extrap_surface']
             extrap_coords_local = extrap_result['extrap_coords_local']
             gt_coords_local = extrap_result['gt_coords_local']
+            gt_normals_local = extrap_result.get('gt_normals_local')
 
         volume = patch.volume
         if isinstance(volume, zarr.Group):
@@ -478,8 +592,7 @@ class EdtSegDataset(Dataset):
         masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
 
         # make sure we actually have some conditioning
-        cond_nz = np.nonzero(cond_segmentation)
-        if len(cond_nz[0]) == 0:
+        if not cond_segmentation.any():
             return self[np.random.randint(len(self))]
 
         cond_segmentation_raw = cond_segmentation.copy()
@@ -580,29 +693,13 @@ class EdtSegDataset(Dataset):
                     if not ovalid_s.all():
                         continue
 
-                    oh_s, ow_s = ox_s.shape
-                    oh_up = int(round(oh_s / o_scale_y))
-                    ow_up = int(round(ow_s / o_scale_x))
-                    ox_full = cv2.resize(ox_s, (ow_up, oh_up), interpolation=cv2.INTER_LINEAR)
-                    oy_full = cv2.resize(oy_s, (ow_up, oh_up), interpolation=cv2.INTER_LINEAR)
-                    oz_full = cv2.resize(oz_s, (ow_up, oh_up), interpolation=cv2.INTER_LINEAR)
-
-                    in_bounds = (
-                        (oz_full >= z_min_w) & (oz_full < z_max_w) &
-                        (oy_full >= y_min_w) & (oy_full < y_max_w) &
-                        (ox_full >= x_min_w) & (ox_full < x_max_w)
+                    ox_full, oy_full, oz_full = self._upsample_world_triplet(ox_s, oy_s, oz_s, o_scale_y, o_scale_x)
+                    trimmed = self._trim_to_world_bbox(
+                        ox_full, oy_full, oz_full, (z_min_w, z_max_w, y_min_w, y_max_w, x_min_w, x_max_w)
                     )
-                    if not in_bounds.any():
+                    if trimmed is None:
                         continue
-                    valid_rows = np.any(in_bounds, axis=1)
-                    valid_cols = np.any(in_bounds, axis=0)
-                    if not valid_rows.any() or not valid_cols.any():
-                        continue
-                    r0, r1 = np.where(valid_rows)[0][[0, -1]]
-                    c0, c1 = np.where(valid_cols)[0][[0, -1]]
-                    ox_full = ox_full[r0:r1+1, c0:c1+1]
-                    oy_full = oy_full[r0:r1+1, c0:c1+1]
-                    oz_full = oz_full[r0:r1+1, c0:c1+1]
+                    ox_full, oy_full, oz_full = trimmed
 
                     other_zyxs = np.stack([oz_full, oy_full, ox_full], axis=-1)
                     other_zyxs_local = (other_zyxs - min_corner).astype(np.float64)
@@ -623,11 +720,20 @@ class EdtSegDataset(Dataset):
             sample_coords_local = extrap_coords_local
             target_coords_local = gt_coords_local
             point_weights_local = np.ones(sample_coords_local.shape[0], dtype=np.float32)
+            point_normals_local = None
+            if self._needs_point_normals:
+                if gt_normals_local is None:
+                    raise ValueError("Expected gt_normals_local for normal_scalar supervision, got None")
+                point_normals_local = gt_normals_local.astype(np.float32, copy=False)
 
             if self.config.get('supervise_conditioning', False):
                 cond_sample_coords_local = (cond_zyxs - min_corner).reshape(-1, 3).astype(np.float32)
                 cond_target_coords_local = (cond_zyxs_unperturbed - min_corner).reshape(-1, 3).astype(np.float32)
                 cond_weight = max(0.0, float(self.config.get('cond_supervision_weight', 0.1)))
+                cond_normals_local = None
+                if self._needs_point_normals:
+                    cond_normals_grid = self._compute_surface_normals(cond_zyxs_unperturbed)
+                    cond_normals_local = cond_normals_grid.reshape(-1, 3).astype(np.float32)
 
                 cond_in_bounds = (
                     (cond_sample_coords_local[:, 0] >= 0) & (cond_sample_coords_local[:, 0] < crop_size[0]) &
@@ -639,17 +745,24 @@ class EdtSegDataset(Dataset):
                 )
                 cond_sample_coords_local = cond_sample_coords_local[cond_in_bounds]
                 cond_target_coords_local = cond_target_coords_local[cond_in_bounds]
+                if cond_normals_local is not None:
+                    cond_normals_local = cond_normals_local[cond_in_bounds]
 
                 if cond_sample_coords_local.shape[0] > 0:
                     sample_coords_local = np.concatenate([sample_coords_local, cond_sample_coords_local], axis=0)
                     target_coords_local = np.concatenate([target_coords_local, cond_target_coords_local], axis=0)
                     cond_weights = np.full(cond_sample_coords_local.shape[0], cond_weight, dtype=np.float32)
                     point_weights_local = np.concatenate([point_weights_local, cond_weights], axis=0)
+                    if point_normals_local is not None and cond_normals_local is not None:
+                        point_normals_local = np.concatenate([point_normals_local, cond_normals_local], axis=0)
 
             extrap_surf = torch.from_numpy(extrap_surface).to(torch.float32)
             extrap_coords = torch.from_numpy(sample_coords_local).to(torch.float32)
             gt_coords = torch.from_numpy(target_coords_local).to(torch.float32)
             point_weights = torch.from_numpy(point_weights_local).to(torch.float32)
+            point_normals = None
+            if point_normals_local is not None:
+                point_normals = torch.from_numpy(point_normals_local).to(torch.float32)
             n_points = len(extrap_coords)
 
         use_sdt = self.config['use_sdt']
@@ -685,6 +798,9 @@ class EdtSegDataset(Dataset):
                 # stack both coordinate sets together - they get the same keypoint transform
                 # we will split them after augmentation and compute displacement from the difference
                 aug_kwargs['keypoints'] = torch.cat([extrap_coords, gt_coords], dim=0)
+                if point_normals is not None:
+                    aug_kwargs['point_normals'] = point_normals
+                    aug_kwargs['vector_keys'] = ['point_normals']
             if use_heatmap:
                 aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
                 aug_kwargs['regression_keys'] = ['heatmap_target']
@@ -715,6 +831,8 @@ class EdtSegDataset(Dataset):
                 all_coords = augmented['keypoints']
                 extrap_coords = all_coords[:n_points]
                 gt_coords = all_coords[n_points:]
+                if point_normals is not None:
+                    point_normals = augmented['point_normals']
                 # compute displacement AFTER augmentation 
                 # both coordinate sets received the same spatial transform, so their
                 # difference (displacement) is now in the post-augmentation coordinate system
@@ -725,6 +843,17 @@ class EdtSegDataset(Dataset):
             # No augmentation - compute displacement directly from coordinates
             if use_extrapolation:
                 gt_disp = gt_coords - extrap_coords
+
+        if use_extrapolation and self.config.get('filter_oob_extrap_points', True):
+            in_bounds = self._coords_in_bounds(extrap_coords, vol_crop.shape)
+            if not torch.all(in_bounds):
+                extrap_coords = extrap_coords[in_bounds]
+                gt_disp = gt_disp[in_bounds]
+                point_weights = point_weights[in_bounds]
+                if point_normals is not None:
+                    point_normals = point_normals[in_bounds]
+            if extrap_coords.shape[0] == 0:
+                return self[np.random.randint(len(self))]
 
         result = {
             "vol": vol_crop,                 # raw volume crop
@@ -740,6 +869,8 @@ class EdtSegDataset(Dataset):
             result["extrap_coords"] = extrap_coords    # (N, 3) coords for sampling predicted field
             result["gt_displacement"] = gt_disp        # (N, 3) ground truth displacement
             result["point_weights"] = point_weights    # (N,) per-point supervision weights
+            if point_normals is not None:
+                result["point_normals"] = point_normals  # (N, 3) normals for normal-scalar supervision
 
         if use_sdt:
             result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation
