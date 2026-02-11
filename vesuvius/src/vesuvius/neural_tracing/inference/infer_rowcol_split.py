@@ -4,17 +4,16 @@ import tifffile
 
 import vesuvius.tifxyz as tifxyz
 import numpy as np
-import random
 import json
 import os
 from pathlib import Path
 from datetime import datetime
 import torch
 import torch.nn.functional as F
-from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid, voxelize_surface_grid_masked
 from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHODS, apply_degradation
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
-from vesuvius.neural_tracing.models import load_checkpoint
+from vesuvius.neural_tracing.models import load_checkpoint, resolve_checkpoint_path
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
 import edt
 from tqdm import tqdm
@@ -235,6 +234,9 @@ def _points_to_voxels(points_local, crop_size):
         vox[coords[:, 0], coords[:, 1], coords[:, 2]] = 1.0
     return vox
 
+def _valid_surface_mask(zyx_grid):
+    return np.isfinite(zyx_grid).all(axis=-1) & ~(zyx_grid == -1).all(axis=-1)
+
 def _apply_edt_dilation(vox, dilation_radius):
     dist = edt.edt(1 - vox, parallel=1)
     return (dist <= dilation_radius).astype(np.float32)
@@ -256,9 +258,12 @@ def _sample_displacement_field(pred_field, coords_local):
     _, _, D, H, W = pred_field.shape
     # Ensure grid dtype matches pred_field for AMP compatibility.
     coords_norm = coords_local.to(dtype=pred_field.dtype).clone()
-    coords_norm[:, 0] = 2 * coords_norm[:, 0] / (D - 1) - 1
-    coords_norm[:, 1] = 2 * coords_norm[:, 1] / (H - 1) - 1
-    coords_norm[:, 2] = 2 * coords_norm[:, 2] / (W - 1) - 1
+    d_denom = max(D - 1, 1)
+    h_denom = max(H - 1, 1)
+    w_denom = max(W - 1, 1)
+    coords_norm[:, 0] = 2 * coords_norm[:, 0] / d_denom - 1
+    coords_norm[:, 1] = 2 * coords_norm[:, 1] / h_denom - 1
+    coords_norm[:, 2] = 2 * coords_norm[:, 2] / w_denom - 1
 
     grid = coords_norm[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
     sampled = F.grid_sample(pred_field, grid, mode='bilinear', align_corners=True)
@@ -426,40 +431,36 @@ def _save_crop_tiff(out_dir, name, array):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Row/col split inference for neural tracing")
-    parser.add_argument("--segments-path", type=str, required=True)
+    parser.add_argument(
+        "--tifxyz-path",
+        type=str,
+        required=True,
+        help="Path to a single tifxyz segment directory (contains x.tif/y.tif/z.tif/meta.json).",
+    )
     parser.add_argument("--volume-path", type=str, required=True)
     parser.add_argument("--volume-scale", type=int, default=1)
     parser.add_argument("--cond-pct", type=float, default=0.50)
-    parser.add_argument("--segment-idx", type=int, default=0)
     parser.add_argument("--crop-size", type=int, nargs=3, default=[128, 128, 128])
-    parser.add_argument("--no-full-resolution", dest="full_resolution", action="store_false")
     parser.add_argument("--window-pad", type=int, default=10)
-    parser.add_argument("--no-extrapolation", dest="use_extrapolation", action="store_false")
-    parser.add_argument("--no-extrapolate-outside", dest="extrapolate_outside", action="store_false")
-    parser.add_argument("--no-visualize-full-seg", dest="visualize_full_seg", action="store_false")
-    parser.add_argument("--extrapolation-method", type=str, default="linear_edge")
-    parser.add_argument("--extrap-degrade-prob", type=float, default=0.0)
-    parser.add_argument("--no-edge-on-outer", dest="edge_on_outer", action="store_false")
-    parser.add_argument("--no-debug-outside", dest="debug_outside", action="store_false")
-    parser.add_argument("--no-build-bbox-crops", dest="build_bbox_crops", action="store_false")
-    parser.add_argument("--no-save-bbox-crops", dest="save_bbox_crops", action="store_false")
+    parser.add_argument("--extrapolation-method", type=str, default=None)
     parser.add_argument(
         "--grow-direction",
         type=str,
-        default="random",
-        choices=VALID_DIRECTIONS + ["random"],
-        help="Direction to grow/extrapolate toward; use 'random' to pick automatically.",
+        required=True,
+        choices=VALID_DIRECTIONS,
+        help="Direction to grow/extrapolate toward.",
     )
     parser.add_argument("--bbox-crops-out-dir", type=str, default="/tmp/rowcol_bbox_crops")
-    parser.add_argument("--no-normalize-volume-crops", dest="normalize_volume_crops", action="store_false")
-    parser.add_argument("--no-run-model-inference", dest="run_model_inference", action="store_false")
-    parser.add_argument("--no-save-pred-crops", dest="save_pred_crops", action="store_false")
-    parser.add_argument("--no-save-full-tifxyz", dest="save_full_tifxyz", action="store_false")
     parser.add_argument("--tifxyz-out-dir", type=str, default=None)
     parser.add_argument("--tifxyz-step-size", type=int, default=None)
     parser.add_argument("--tifxyz-voxel-size-um", type=float, default=None)
     parser.add_argument("--config-path", type=str, default=None)
     parser.add_argument("--checkpoint-path", type=str, default=None)
+    parser.add_argument(
+        "--skip-inference",
+        action="store_true",
+        help="Load checkpoint config/settings but skip model forward inference.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--napari", action="store_true", help="Launch napari viewer for visualization")
     parser.add_argument("--iterations", type=int, default=1,
@@ -473,11 +474,6 @@ def parse_args():
 
 def load_model(args):
     checkpoint_path = args.checkpoint_path
-    if checkpoint_path is None and os.path.exists(args.config_path):
-        with open(args.config_path, 'r') as f:
-            cfg = json.load(f)
-        checkpoint_path = cfg.get("load_ckpt", None)
-
     if checkpoint_path is None:
         raise RuntimeError("checkpoint_path not set; provide a trained rowcol_cond checkpoint.")
 
@@ -495,11 +491,9 @@ def load_model(args):
         amp_enabled = True
         amp_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
-    tifxyz_uuid = None
-    if args.save_full_tifxyz:
-        ckpt_name = os.path.splitext(os.path.basename(str(checkpoint_path)))[0]
-        timestamp = datetime.now().strftime("%H%M%S")
-        tifxyz_uuid = f"displacement_tifxyz_{ckpt_name}_{timestamp}"
+    ckpt_name = os.path.splitext(os.path.basename(str(checkpoint_path)))[0]
+    timestamp = datetime.now().strftime("%H%M%S")
+    tifxyz_uuid = f"displacement_tifxyz_{ckpt_name}_{timestamp}"
 
     return {
         "model": model,
@@ -511,6 +505,68 @@ def load_model(args):
         "amp_enabled": amp_enabled,
         "amp_dtype": amp_dtype,
         "tifxyz_uuid": tifxyz_uuid,
+    }
+
+
+def load_checkpoint_config(checkpoint_path):
+    if checkpoint_path is None:
+        raise RuntimeError("checkpoint_path not set; provide a trained rowcol_cond checkpoint.")
+    resolved_path = resolve_checkpoint_path(checkpoint_path)
+    checkpoint = torch.load(resolved_path, map_location='cpu', weights_only=False)
+    model_config = checkpoint.get("config")
+    if model_config is None:
+        raise RuntimeError(f"'config' not found in checkpoint: {resolved_path}")
+    return model_config, str(resolved_path)
+
+def _load_optional_json(path):
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        return {}
+    with open(path, 'r') as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+def _resolve_extrapolation_settings(args, runtime_config):
+    cfg = runtime_config or {}
+
+    method = args.extrapolation_method
+    if method is None:
+        method = str(cfg.get("extrapolation_method", "linear_edge"))
+
+    degrade_prob = float(cfg.get("extrap_degrade_prob", 0.0))
+
+    def _pair_from_cfg(key, default_pair):
+        val = cfg.get(key, default_pair)
+        if isinstance(val, (list, tuple)) and len(val) == 2:
+            return (float(val[0]), float(val[1]))
+        return (float(default_pair[0]), float(default_pair[1]))
+
+    degrade_curvature_range = _pair_from_cfg("extrap_degrade_curvature_range", (0.001, 0.01))
+    degrade_gradient_range = _pair_from_cfg("extrap_degrade_gradient_range", (0.05, 0.2))
+
+    method_kwargs = {}
+    if method in {"rbf", "rbf_edge_only"}:
+        rbf_downsample = int(cfg.get("rbf_downsample_factor", 2))
+        edge_downsample_cfg = cfg.get("rbf_edge_downsample_factor", None)
+        edge_downsample = rbf_downsample if edge_downsample_cfg is None else int(edge_downsample_cfg)
+        method_kwargs["downsample_factor"] = edge_downsample if method == "rbf_edge_only" else rbf_downsample
+        method_kwargs["rbf_max_points"] = cfg.get("rbf_max_points")
+
+    if method == "rbf_edge_only":
+        method_kwargs["edge_band_frac"] = float(cfg.get("rbf_edge_band_frac", 0.10))
+        method_kwargs["edge_band_cells"] = cfg.get("rbf_edge_band_cells")
+        method_kwargs["edge_min_points"] = int(cfg.get("rbf_edge_min_points", 128))
+
+    # Keep args aligned with resolved settings for existing debug prints/metadata.
+    args.extrapolation_method = method
+
+    return {
+        "method": method,
+        "degrade_prob": float(degrade_prob),
+        "degrade_curvature_range": degrade_curvature_range,
+        "degrade_gradient_range": degrade_gradient_range,
+        "method_kwargs": method_kwargs,
     }
 
 
@@ -538,14 +594,16 @@ def resolve_tifxyz_params(args, model_config, volume_scale):
 
 
 def setup_segment(args, volume):
-    dataset_segments = list(tifxyz.load_folder(args.segments_path))
+    tifxyz_path = Path(args.tifxyz_path)
+    if not tifxyz_path.exists():
+        raise FileNotFoundError(f"tifxyz path not found: {tifxyz_path}")
+    if not tifxyz_path.is_dir():
+        raise NotADirectoryError(f"tifxyz path must be a directory: {tifxyz_path}")
+
+    tgt_segment = tifxyz.read_tifxyz(tifxyz_path)
     retarget_factor = 2 ** args.volume_scale
-    scaled_segments = []
-    for seg in dataset_segments:
-        seg_scaled = seg.retarget(retarget_factor)
-        seg_scaled.volume = volume
-        scaled_segments.append(seg_scaled)
-    tgt_segment = scaled_segments[args.segment_idx]
+    tgt_segment = tgt_segment.retarget(retarget_factor)
+    tgt_segment.volume = volume
 
     tgt_segment.use_stored_resolution()
     x_s, y_s, z_s, valid_s = tgt_segment[:]
@@ -562,16 +620,12 @@ def setup_segment(args, volume):
     if not valid_dirs:
         raise RuntimeError("Segment too small to define a split direction.")
     _OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up"}
-    grow_direction = args.grow_direction
-    if grow_direction != "random":
-        cond_direction = _OPPOSITE[grow_direction]
-        if cond_direction not in valid_dirs:
-            raise RuntimeError(
-                f"Requested grow_direction '{grow_direction}' (cond_direction='{cond_direction}') "
-                f"not available for this segment. Valid options: {valid_dirs}"
-            )
-    else:
-        cond_direction = random.choice(valid_dirs)
+    cond_direction = _OPPOSITE[args.grow_direction]
+    if cond_direction not in valid_dirs:
+        raise RuntimeError(
+            f"Requested grow_direction '{args.grow_direction}' (cond_direction='{cond_direction}') "
+            f"not available for this segment. Valid options: {valid_dirs}"
+        )
 
     return tgt_segment, stored_zyxs, valid_s, cond_direction, h_s, w_s
 
@@ -587,7 +641,7 @@ def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_
         cond_edge_strip = stored_zyxs[r_edge_s:r_edge_s + 1, :]
 
     bboxes, _ = get_cond_edge_bboxes(
-        cond_edge_strip, cond_direction, crop_size, outer_edge=args.edge_on_outer
+        cond_edge_strip, cond_direction, crop_size, outer_edge=True
     )
 
     r0_s, r1_s, c0_s, c1_s = get_window_bounds_from_bboxes(
@@ -599,82 +653,53 @@ def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_
     if win_h < 2 or win_w < 2:
         raise RuntimeError("Window too small after edge-based bounds.")
 
-    if args.extrapolate_outside:
-        outside_dir = cond_direction
-        r_edge_outside, c_edge_outside = _edge_index_from_valid(valid_s, outside_dir)
+    outside_dir = cond_direction
+    r_edge_outside, c_edge_outside = _edge_index_from_valid(valid_s, outside_dir)
 
-        cond_h = win_h
-        cond_w = win_w
-        if cond_direction in ["left", "right"]:
-            c0_s, c1_s = _place_window_on_edge(
-                c_edge_outside, cond_w, cond_w, outside_dir, w_s - 1
-            )
-            r0_s, r1_s = _clamp_window(r0_s, cond_h, 0, h_s - 1)
-        else:
-            r0_s, r1_s = _place_window_on_edge(
-                r_edge_outside, cond_h, cond_h, outside_dir, h_s - 1
-            )
-            c0_s, c1_s = _clamp_window(c0_s, cond_w, 0, w_s - 1)
-        r_split_s = None
-        c_split_s = None
-    else:
-        cond_h = int(round(win_h * args.cond_pct))
-        cond_w = int(round(win_w * args.cond_pct))
-        cond_h = max(1, min(win_h - 1, cond_h))
-        cond_w = max(1, min(win_w - 1, cond_w))
-        mask_h = win_h - cond_h
-        mask_w = win_w - cond_w
-
-        if cond_direction in ["left", "right"]:
-            c0_s, c1_s = _place_window_on_edge(c_edge_s, win_w, cond_w, cond_direction, w_s - 1)
-            r0_s, r1_s = _clamp_window(r0_s, win_h, 0, h_s - 1)
-            r_split_rel = cond_h
-            c_split_rel = cond_w if cond_direction == "left" else mask_w
-        else:
-            r0_s, r1_s = _place_window_on_edge(r_edge_s, win_h, cond_h, cond_direction, h_s - 1)
-            c0_s, c1_s = _clamp_window(c0_s, win_w, 0, w_s - 1)
-            r_split_rel = cond_h if cond_direction == "up" else mask_h
-            c_split_rel = cond_w
-
-        r_split_s = r0_s + r_split_rel
-        c_split_s = c0_s + c_split_rel
-
-    return r0_s, r1_s, c0_s, c1_s, r_split_s, c_split_s
-
-
-def run_extrapolation(args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, cond_direction, crop_size):
-    if args.extrapolate_outside:
-        edge_pts = _get_cond_edge(
-            cond_zyxs, cond_direction, outer_edge=not args.edge_on_outer
-        ).reshape(-1, 3)
-        edge_valid = ~(edge_pts == -1).all(axis=1)
-        if edge_valid.any():
-            edge_pts = edge_pts[edge_valid]
-        else:
-            edge_pts = cond_zyxs.reshape(-1, 3)
-            edge_pts = edge_pts[~(edge_pts == -1).all(axis=1)]
-            if edge_pts.size == 0:
-                return None, None
-        crop_size_extrap = tuple(int(v) for v in crop_size)
-        if valid is not None and valid.any():
-            cond_pts_bounds = window_zyxs[valid]
-        else:
-            cond_pts_bounds = window_zyxs.reshape(-1, 3)
-        cond_bounds = (
-            float(np.min(cond_pts_bounds[:, 0])),
-            float(np.max(cond_pts_bounds[:, 0])),
-            float(np.min(cond_pts_bounds[:, 1])),
-            float(np.max(cond_pts_bounds[:, 1])),
-            float(np.min(cond_pts_bounds[:, 2])),
-            float(np.max(cond_pts_bounds[:, 2])),
+    cond_h = win_h
+    cond_w = win_w
+    if cond_direction in ["left", "right"]:
+        c0_s, c1_s = _place_window_on_edge(
+            c_edge_outside, cond_w, cond_w, outside_dir, w_s - 1
         )
-        zyx_min = _min_corner_from_edge(
-            edge_pts, cond_bounds, crop_size_extrap, args.cond_pct, cond_direction
-        )
+        r0_s, r1_s = _clamp_window(r0_s, cond_h, 0, h_s - 1)
     else:
-        zyx_min = np.floor(window_zyxs.reshape(-1, 3).min(axis=0)).astype(np.int64)
-        zyx_max = np.ceil(window_zyxs.reshape(-1, 3).max(axis=0)).astype(np.int64)
-        crop_size_extrap = tuple((zyx_max - zyx_min + 1).tolist())
+        r0_s, r1_s = _place_window_on_edge(
+            r_edge_outside, cond_h, cond_h, outside_dir, h_s - 1
+        )
+        c0_s, c1_s = _clamp_window(c0_s, cond_w, 0, w_s - 1)
+    return r0_s, r1_s, c0_s, c1_s
+
+
+def run_extrapolation(args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, cond_direction, crop_size,
+                      extrapolation_settings):
+    edge_pts = _get_cond_edge(
+        cond_zyxs, cond_direction, outer_edge=False
+    ).reshape(-1, 3)
+    edge_valid = ~(edge_pts == -1).all(axis=1)
+    if edge_valid.any():
+        edge_pts = edge_pts[edge_valid]
+    else:
+        edge_pts = cond_zyxs.reshape(-1, 3)
+        edge_pts = edge_pts[~(edge_pts == -1).all(axis=1)]
+        if edge_pts.size == 0:
+            return None, None
+    crop_size_extrap = tuple(int(v) for v in crop_size)
+    if valid is not None and valid.any():
+        cond_pts_bounds = window_zyxs[valid]
+    else:
+        cond_pts_bounds = window_zyxs.reshape(-1, 3)
+    cond_bounds = (
+        float(np.min(cond_pts_bounds[:, 0])),
+        float(np.max(cond_pts_bounds[:, 0])),
+        float(np.min(cond_pts_bounds[:, 1])),
+        float(np.max(cond_pts_bounds[:, 1])),
+        float(np.min(cond_pts_bounds[:, 2])),
+        float(np.max(cond_pts_bounds[:, 2])),
+    )
+    zyx_min = _min_corner_from_edge(
+        edge_pts, cond_bounds, crop_size_extrap, args.cond_pct, cond_direction
+    )
 
     # Filter conditioning data to valid points only to avoid -1 sentinel
     # values poisoning gradient computation in linear_edge extrapolation.
@@ -692,30 +717,21 @@ def run_extrapolation(args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, con
         uv_query=uv_mask,
         min_corner=zyx_min,
         crop_size=crop_size_extrap,
-        method=args.extrapolation_method,
+        method=extrapolation_settings["method"],
         cond_direction=cond_direction,
-        degrade_prob=args.extrap_degrade_prob,
+        degrade_prob=extrapolation_settings["degrade_prob"],
+        degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
+        degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
         skip_bounds_check=True,
+        **extrapolation_settings["method_kwargs"],
     )
-
-    if args.extrapolate_outside and args.debug_outside:
-        print(f"[outside] grow_direction={args.grow_direction} cond_direction={cond_direction} edge_on_outer={args.edge_on_outer} cond_pct={args.cond_pct}")
-        if extrap_result is None:
-            print("[outside] extrap_result=None")
-        else:
-            coords = extrap_result["extrap_coords_local"]
-            if coords.size == 0 or np.any(~np.isfinite(coords)):
-                print(f"[outside] extrap_coords_local invalid size={coords.shape} finite={np.all(np.isfinite(coords))}")
-            else:
-                mins = coords.min(axis=0)
-                maxs = coords.max(axis=0)
-                print(f"[outside] extrap_coords_local mins={mins} maxs={maxs}")
 
     return extrap_result, zyx_min
 
 
-def build_bbox_crop_data(args, bboxes, cond_zyxs, crop_size, tgt_segment, volume_scale,
-                         use_extrapolation, extrap_result, extrap_coords_world, extrap_uv_full,
+def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, crop_size, tgt_segment, volume_scale,
+                         extrap_result, extrap_coords_world, extrap_uv_full,
+                         extrap_grid_world,
                          use_dilation, dilation_radius):
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
     cond_pts_world = cond_zyxs.reshape(-1, 3)
@@ -723,7 +739,7 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, crop_size, tgt_segment, volume
     cond_pts_world = cond_pts_world[cond_valid_mask]
     extrap_pts_world = None
     extrap_uv_world = None
-    if use_extrapolation and extrap_result is not None:
+    if extrap_result is not None:
         extrap_pts_world = extrap_coords_world
         extrap_uv_world = extrap_uv_full
 
@@ -731,8 +747,7 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, crop_size, tgt_segment, volume
     for bbox_idx, bbox in enumerate(bboxes):
         min_corner = _bbox_to_min_corner(bbox)
         vol_crop = _crop_volume_from_min_corner(volume_for_crops, min_corner, crop_size)
-        if args.normalize_volume_crops:
-            vol_crop = normalize_zscore(vol_crop)
+        vol_crop = normalize_zscore(vol_crop)
 
         cond_world_in = cond_pts_world[_filter_points_in_bbox_mask(cond_pts_world, bbox)]
         cond_local = _points_world_to_local(cond_world_in, min_corner, crop_size)
@@ -753,8 +768,20 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, crop_size, tgt_segment, volume
             else:
                 extrap_local = np.zeros((0, 3), dtype=np.float32)
 
-        cond_vox = _points_to_voxels(cond_local, crop_size)
-        extrap_vox = _points_to_voxels(extrap_local, crop_size) if extrap_local is not None else None
+        cond_grid_local = cond_zyxs.astype(np.float64, copy=False) - min_corner[None, None, :]
+        if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
+            cond_grid_valid = np.asarray(cond_valid, dtype=bool)
+        else:
+            cond_grid_valid = _valid_surface_mask(cond_zyxs)
+        cond_vox = voxelize_surface_grid_masked(cond_grid_local, crop_size, cond_grid_valid)
+
+        extrap_vox = None
+        if extrap_grid_world is not None:
+            extrap_grid_local = extrap_grid_world.astype(np.float64, copy=False) - min_corner[None, None, :]
+            extrap_grid_valid = np.isfinite(extrap_grid_world).all(axis=-1)
+            extrap_vox = voxelize_surface_grid_masked(extrap_grid_local, crop_size, extrap_grid_valid)
+        elif extrap_local is not None:
+            extrap_vox = _points_to_voxels(extrap_local, crop_size)
 
         if use_dilation:
             cond_vox = _apply_edt_dilation(cond_vox, dilation_radius)
@@ -772,12 +799,11 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, crop_size, tgt_segment, volume
             "extrap_vox": extrap_vox,
         })
 
-        if args.save_bbox_crops:
-            out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-            _save_crop_tiff(out_dir, "volume.tif", vol_crop)
-            _save_crop_tiff(out_dir, "cond.tif", cond_vox)
-            if extrap_vox is not None:
-                _save_crop_tiff(out_dir, "extrap.tif", extrap_vox)
+        out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
+        _save_crop_tiff(out_dir, "volume.tif", vol_crop)
+        _save_crop_tiff(out_dir, "cond.tif", cond_vox)
+        if extrap_vox is not None:
+            _save_crop_tiff(out_dir, "extrap.tif", extrap_vox)
 
     return bbox_crops
 
@@ -902,9 +928,8 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             if extrap_uv is not None and len(extrap_uv) == bbox_mask.shape[0]:
                 pred_samples.append((extrap_uv[bbox_mask], pred_world))
 
-            if args.save_bbox_crops and args.save_pred_crops:
-                out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-                _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
+            out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
+            _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
     else:
         # Standard batched path.
         n_batches = (len(valid_items) + batch_size - 1) // batch_size
@@ -944,21 +969,16 @@ def run_inference(args, bbox_crops, crop_size, model_state):
                 if extrap_uv is not None and len(extrap_uv) == bbox_mask.shape[0]:
                     pred_samples.append((extrap_uv[bbox_mask], pred_world))
 
-                if args.save_bbox_crops and args.save_pred_crops:
-                    out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-                    _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
+                out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
+                _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
 
     return pred_pts_world_all, pred_samples
 
 
 def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
                        tifxyz_voxel_size_um, checkpoint_path, cond_direction, volume_scale):
-    if args.full_resolution:
-        tgt_segment.use_full_resolution()
-        full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
-    else:
-        tgt_segment.use_stored_resolution()
-        full_zyxs = tgt_segment.get_zyxs(stored_resolution=True)
+    tgt_segment.use_full_resolution()
+    full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
 
     full_pred_zyxs = full_zyxs.copy()
     h_full, w_full = full_pred_zyxs.shape[:2]
@@ -1007,15 +1027,8 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
         full_pred_zyxs_out = full_pred_zyxs
 
     # Downsample grid to the correct tifxyz density (step_size spacing in full-res UV).
-    if args.full_resolution:
-        current_step_y = int(round(2 ** volume_scale))
-        current_step_x = int(round(2 ** volume_scale))
-    else:
-        scale_y, scale_x = tgt_segment._scale
-        base_step_y = int(round(1.0 / scale_y)) if scale_y != 0 else 1
-        base_step_x = int(round(1.0 / scale_x)) if scale_x != 0 else 1
-        current_step_y = int(round(base_step_y * (2 ** volume_scale)))
-        current_step_x = int(round(base_step_x * (2 ** volume_scale)))
+    current_step_y = int(round(2 ** volume_scale))
+    current_step_x = int(round(2 ** volume_scale))
 
     stride_y = int(round(float(tifxyz_step_size) / max(1, current_step_y)))
     stride_x = int(round(float(tifxyz_step_size) / max(1, current_step_x)))
@@ -1031,35 +1044,30 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
         source=str(checkpoint_path),
         additional_metadata={
             "cond_direction": cond_direction,
-            "edge_on_outer": args.edge_on_outer,
             "extrapolation_method": args.extrapolation_method,
         }
     )
     print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
 
 
-def visualize_napari(args, cond_zyxs, masked_zyxs, edge, window_zyxs, valid, bbox_pts,
-                     extrap_coords_world, extrap_result, pred_pts_world_all,
-                     use_extrapolation):
+def visualize_napari(args, cond_zyxs, edge, window_zyxs, valid, bbox_pts,
+                     extrap_coords_world, extrap_result, pred_pts_world_all):
     import napari
     viewer = napari.Viewer()
 
     cond_pts = cond_zyxs.reshape(-1, 3)
-    mask_pts = None if args.extrapolate_outside else masked_zyxs.reshape(-1, 3)
     edge_pts = edge.reshape(-1, 3)
-    full_seg_pts = window_zyxs[valid] if args.visualize_full_seg else None
+    full_seg_pts = window_zyxs[valid]
 
-    pt_size = 1 if args.full_resolution else 3
+    pt_size = 1
 
     viewer.add_points(cond_pts, name='cond_pts', size=pt_size, face_color="red")
-    if mask_pts is not None:
-        viewer.add_points(mask_pts, name='mask_pts', size=pt_size, face_color="green")
     viewer.add_points(edge_pts, name='edge_pts', size=pt_size, face_color="cyan")
     viewer.add_points(bbox_pts, name='bboxes', size=pt_size, face_color='yellow')
-    if full_seg_pts is not None and len(full_seg_pts) > 0:
+    if len(full_seg_pts) > 0:
         viewer.add_points(full_seg_pts, name='full_seg_pts', size=pt_size, face_color='white')
 
-    if use_extrapolation and extrap_result is not None:
+    if extrap_result is not None:
         viewer.add_points(extrap_coords_world, name='extrap_pts', size=pt_size, face_color='magenta')
     if pred_pts_world_all:
         pred_pts_world = np.concatenate(pred_pts_world_all, axis=0)
@@ -1235,6 +1243,8 @@ def prepare_next_iteration_cond(
 def main():
     args = parse_args()
     crop_size = tuple(args.crop_size)
+    has_checkpoint = args.checkpoint_path is not None
+    run_model_inference = has_checkpoint and not args.skip_inference
 
     model_state = None
     model_config = None
@@ -1243,25 +1253,32 @@ def main():
     dilation_radius = 1.0
     checkpoint_path = args.checkpoint_path
 
-    if args.run_model_inference:
-        model_state = load_model(args)
-        model_config = model_state["model_config"]
-        checkpoint_path = model_state["checkpoint_path"]
-        use_dilation = model_state["use_dilation"]
-        dilation_radius = model_state["dilation_radius"]
-        tifxyz_uuid = model_state["tifxyz_uuid"]
+    if has_checkpoint:
+        if run_model_inference:
+            model_state = load_model(args)
+            model_config = model_state["model_config"]
+            checkpoint_path = model_state["checkpoint_path"]
+            use_dilation = model_state["use_dilation"]
+            dilation_radius = model_state["dilation_radius"]
+            tifxyz_uuid = model_state["tifxyz_uuid"]
+        else:
+            model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
+            use_dilation = bool(model_config.get('use_dilation', False))
+            dilation_radius = float(model_config.get('dilation_radius', 1.0))
 
-    tifxyz_step_size = None
-    tifxyz_voxel_size_um = None
-    if args.save_full_tifxyz:
-        tifxyz_step_size, tifxyz_voxel_size_um = resolve_tifxyz_params(
-            args, model_config, args.volume_scale
-        )
+    file_config = _load_optional_json(args.config_path)
+    runtime_config = dict(model_config) if model_config is not None else {}
+    runtime_config.update(file_config)
+    extrapolation_settings = _resolve_extrapolation_settings(args, runtime_config)
+
+    tifxyz_step_size, tifxyz_voxel_size_um = resolve_tifxyz_params(
+        args, model_config, args.volume_scale
+    )
 
     volume = zarr.open_group(args.volume_path, mode='r')
     tgt_segment, stored_zyxs, valid_s, cond_direction, h_s, w_s = setup_segment(args, volume)
 
-    r0_s, r1_s, c0_s, c1_s, r_split_s, c_split_s = compute_window_and_split(
+    r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
         args, stored_zyxs, valid_s, cond_direction, h_s, w_s, crop_size
     )
 
@@ -1272,85 +1289,50 @@ def main():
     c0_full = max(0, int(np.floor(c0_s / scale_x)))
     c1_full = min(full_w, int(np.ceil((c1_s + 1) / scale_x)))
 
-    if args.full_resolution:
-        if not args.extrapolate_outside:
-            r_split_full = int(round(r_split_s / scale_y))
-            c_split_full = int(round(c_split_s / scale_x))
-
-            r0_full = max(0, min(r0_full, max(0, r_split_full - 1)))
-            r1_full = min(full_h, max(r1_full, min(full_h, r_split_full + 1)))
-            c0_full = max(0, min(c0_full, max(0, c_split_full - 1)))
-            c1_full = min(full_w, max(c1_full, min(full_w, c_split_full + 1)))
-
-        tgt_segment.use_full_resolution()
-        x, y, z, valid = tgt_segment[r0_full:r1_full, c0_full:c1_full]
-    else:
-        if not args.extrapolate_outside:
-            r_split_full = r_split_s
-            c_split_full = c_split_s
-        x, y, z, valid = tgt_segment[r0_s:r1_s + 1, c0_s:c1_s + 1]
-        r0_full, c0_full = r0_s, c0_s
+    tgt_segment.use_full_resolution()
+    x, y, z, valid = tgt_segment[r0_full:r1_full, c0_full:c1_full]
 
     window_zyxs = np.stack([z, y, x], axis=-1)
-    if args.extrapolate_outside:
-        cond_zyxs = window_zyxs
-        masked_zyxs = None
-        r0_uv = r0_full
-        r1_uv = r0_full + window_zyxs.shape[0] - 1
-        c0_uv = c0_full
-        c1_uv = c0_full + window_zyxs.shape[1] - 1
+    cond_zyxs = window_zyxs
+    r0_uv = r0_full
+    r1_uv = r0_full + window_zyxs.shape[0] - 1
+    c0_uv = c0_full
+    c1_uv = c0_full + window_zyxs.shape[1] - 1
 
-        r_coords = np.arange(r0_uv, r1_uv + 1)
-        c_coords = np.arange(c0_uv, c1_uv + 1)
-        uv_cond = np.stack(np.meshgrid(r_coords, c_coords, indexing='ij'), axis=-1)
+    r_coords = np.arange(r0_uv, r1_uv + 1)
+    c_coords = np.arange(c0_uv, c1_uv + 1)
+    uv_cond = np.stack(np.meshgrid(r_coords, c_coords, indexing='ij'), axis=-1)
 
-        if cond_direction in ["left", "right"]:
-            cond_w = window_zyxs.shape[1]
-            win_w_total = max(cond_w + 1, int(round(cond_w / args.cond_pct)))
-            mask_w = win_w_total - cond_w
-            if mask_w <= 0:
-                uv_mask = np.zeros((0, 0, 2), dtype=uv_cond.dtype)
-            else:
-                if cond_direction == "right":   # grow left → mask on left
-                    mask_c0 = c0_uv - mask_w
-                    mask_c1 = c0_uv - 1
-                else:                           # grow right → mask on right
-                    mask_c0 = c1_uv + 1
-                    mask_c1 = c1_uv + mask_w
-                mask_cols = np.arange(mask_c0, mask_c1 + 1)
-                uv_mask = np.stack(np.meshgrid(r_coords, mask_cols, indexing='ij'), axis=-1)
+    if cond_direction in ["left", "right"]:
+        cond_w = window_zyxs.shape[1]
+        win_w_total = max(cond_w + 1, int(round(cond_w / args.cond_pct)))
+        mask_w = win_w_total - cond_w
+        if mask_w <= 0:
+            uv_mask = np.zeros((0, 0, 2), dtype=uv_cond.dtype)
         else:
-            cond_h = window_zyxs.shape[0]
-            win_h_total = max(cond_h + 1, int(round(cond_h / args.cond_pct)))
-            mask_h = win_h_total - cond_h
-            if mask_h <= 0:
-                uv_mask = np.zeros((0, 0, 2), dtype=uv_cond.dtype)
-            else:
-                if cond_direction == "down":    # grow up → mask above
-                    mask_r0 = r0_uv - mask_h
-                    mask_r1 = r0_uv - 1
-                else:                           # grow down → mask below
-                    mask_r0 = r1_uv + 1
-                    mask_r1 = r1_uv + mask_h
-                mask_rows = np.arange(mask_r0, mask_r1 + 1)
-                uv_mask = np.stack(np.meshgrid(mask_rows, c_coords, indexing='ij'), axis=-1)
-        if args.debug_outside:
-            print(f"[outside] grow_direction={args.grow_direction} cond_direction={cond_direction} edge_on_outer={args.edge_on_outer} cond_pct={args.cond_pct}")
-            print(f"[outside] uv_cond shape={uv_cond.shape} rows=({uv_cond[...,0].min()},{uv_cond[...,0].max()}) cols=({uv_cond[...,1].min()},{uv_cond[...,1].max()})")
-            if uv_mask.size == 0:
-                print("[outside] uv_mask shape=EMPTY")
-            else:
-                print(f"[outside] uv_mask shape={uv_mask.shape} rows=({uv_mask[...,0].min()},{uv_mask[...,0].max()}) cols=({uv_mask[...,1].min()},{uv_mask[...,1].max()})")
+            if cond_direction == "right":   # grow left -> mask on left
+                mask_c0 = c0_uv - mask_w
+                mask_c1 = c0_uv - 1
+            else:                           # grow right -> mask on right
+                mask_c0 = c1_uv + 1
+                mask_c1 = c1_uv + mask_w
+            mask_cols = np.arange(mask_c0, mask_c1 + 1)
+            uv_mask = np.stack(np.meshgrid(r_coords, mask_cols, indexing='ij'), axis=-1)
     else:
-        r_split_rel = r_split_full - r0_full
-        c_split_rel = c_split_full - c0_full
-        cond_zyxs, masked_zyxs, uv_cond, uv_mask = split_grid(
-            window_zyxs, (r0_full, c0_full), cond_direction, r_split_rel, c_split_rel
-        )
-
-    uv_mask_flat = None
-    if uv_mask is not None and uv_mask.size > 0:
-        uv_mask_flat = uv_mask.reshape(-1, 2)
+        cond_h = window_zyxs.shape[0]
+        win_h_total = max(cond_h + 1, int(round(cond_h / args.cond_pct)))
+        mask_h = win_h_total - cond_h
+        if mask_h <= 0:
+            uv_mask = np.zeros((0, 0, 2), dtype=uv_cond.dtype)
+        else:
+            if cond_direction == "down":    # grow up -> mask above
+                mask_r0 = r0_uv - mask_h
+                mask_r1 = r0_uv - 1
+            else:                           # grow down -> mask below
+                mask_r0 = r1_uv + 1
+                mask_r1 = r1_uv + mask_h
+            mask_rows = np.arange(mask_r0, mask_r1 + 1)
+            uv_mask = np.stack(np.meshgrid(mask_rows, c_coords, indexing='ij'), axis=-1)
 
     # Save references to the original segment data for merging across iterations
     orig_window_zyxs = window_zyxs.copy()
@@ -1366,35 +1348,34 @@ def main():
         extrap_result = None
         extrap_uv_full = None
         extrap_coords_world = None
-        if args.use_extrapolation:
-            extrap_result, zyx_min = run_extrapolation(
-                args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, cond_direction, crop_size
-            )
-            if extrap_result is not None:
-                _uv_mask_flat = uv_mask.reshape(-1, 2) if uv_mask is not None and uv_mask.size > 0 else None
-                extrap_coords_world = extrap_result["extrap_coords_local"] + zyx_min
-                if _uv_mask_flat is not None and _uv_mask_flat.shape[0] == extrap_coords_world.shape[0]:
-                    extrap_uv_full = _uv_mask_flat
+        extrap_grid_world = None
+        extrap_result, zyx_min = run_extrapolation(
+            args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, cond_direction, crop_size,
+            extrapolation_settings,
+        )
+        if extrap_result is not None:
+            _uv_mask_flat = uv_mask.reshape(-1, 2) if uv_mask is not None and uv_mask.size > 0 else None
+            extrap_coords_world = extrap_result["extrap_coords_local"] + zyx_min
+            if _uv_mask_flat is not None and _uv_mask_flat.shape[0] == extrap_coords_world.shape[0]:
+                extrap_uv_full = _uv_mask_flat
+                extrap_grid_world = extrap_coords_world.reshape(uv_mask.shape[:2] + (3,))
 
-        # Outside path: bboxes must be on the grow-direction (inner) edge so they
-        # overlap with extrapolation points.  Inside path: honour the flag as-is.
-        _outer = (not args.edge_on_outer) if args.extrapolate_outside else args.edge_on_outer
+        # Outside path uses the grow-direction inner edge for bbox extraction.
         bboxes, edge = get_cond_edge_bboxes(
-            cond_zyxs, cond_direction, crop_size, outer_edge=_outer
+            cond_zyxs, cond_direction, crop_size, outer_edge=False
         )
 
         # --- build bbox crops + run inference ---
-        bbox_crops = []
         pred_pts_world_all = []
         pred_samples = []
-        if args.build_bbox_crops:
-            bbox_crops = build_bbox_crop_data(
-                args, bboxes, cond_zyxs, crop_size, tgt_segment, args.volume_scale,
-                args.use_extrapolation, extrap_result, extrap_coords_world, extrap_uv_full,
-                use_dilation, dilation_radius,
-            )
+        bbox_crops = build_bbox_crop_data(
+            args, bboxes, cond_zyxs, valid, crop_size, tgt_segment, args.volume_scale,
+            extrap_result, extrap_coords_world, extrap_uv_full,
+            extrap_grid_world,
+            use_dilation, dilation_radius,
+        )
 
-        if args.run_model_inference and args.build_bbox_crops and model_state is not None:
+        if run_model_inference and model_state is not None:
             pred_pts_world_all, pred_samples = run_inference(args, bbox_crops, crop_size, model_state)
 
         # --- iteration bookkeeping ---
@@ -1419,7 +1400,6 @@ def main():
             window_zyxs = merged_cond
             uv_cond = new_uv_cond
             uv_mask = new_uv_mask
-            uv_mask_flat = uv_mask.reshape(-1, 2) if uv_mask.size > 0 else None
         else:
             all_pred_samples.extend(pred_samples)
             all_pred_pts_world.extend(pred_pts_world_all)
@@ -1427,7 +1407,7 @@ def main():
     pred_samples = all_pred_samples
     pred_pts_world_all = all_pred_pts_world
 
-    if args.save_full_tifxyz and tifxyz_uuid is not None and pred_samples:
+    if tifxyz_uuid is not None and pred_samples:
         save_tifxyz_output(
             args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
             tifxyz_voxel_size_um, checkpoint_path, cond_direction, args.volume_scale,
@@ -1453,9 +1433,8 @@ def main():
 
     if args.napari:
         visualize_napari(
-            args, cond_zyxs, masked_zyxs, edge, window_zyxs, valid, bbox_pts,
+            args, cond_zyxs, edge, window_zyxs, valid, bbox_pts,
             extrap_coords_world, extrap_result, pred_pts_world_all,
-            args.use_extrapolation,
         )
 
 
