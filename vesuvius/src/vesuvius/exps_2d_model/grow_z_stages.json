@@ -2,7 +2,7 @@
 	"base": {
 		"dir_v": 10.0,
 		"dir_conn": 1.0,
-		"step": 10.0,
+		"step": 100.0,
 		"smooth_x": 0.0,
 		"smooth_y": 0.01,
 		"gradmag": 1.0,
@@ -18,6 +18,20 @@
 		"z_straight": 0.1
 	},
 	"stages": [
+		{
+			"name": "pre",
+			"global_opt": {
+				"steps": 5000,
+				"lr": [0.1, 0.01, 0.001],
+				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+				"min_scaledown": 0,
+				"w_fac": {
+				}
+			},
+			"local_opt": {
+				"steps": 0
+			}
+		},
 		{
 			"name": "grow_only",
 			"grow": {
