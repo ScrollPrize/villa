@@ -516,17 +516,9 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Within each outer iteration, run N refinement forward passes. "
-            "Each pass reuses the same conditioning and feeds sampled predictions "
-            "back as the next extrapolation before the final prediction is used."
-        ),
-    )
-    parser.add_argument(
-        "--refine-accumulate",
-        action="store_true",
-        help=(
-            "With --refine, average displacement predictions across refinement passes "
-            "and sample from the averaged displacement field."
+            "Within each outer iteration, run N+1 staged refinement forward passes. "
+            "Each stage predicts full displacement but only applies 1/(N+1) of it "
+            "before feeding coordinates back into the next stage."
         ),
     )
     parser.add_argument(
@@ -1007,8 +999,9 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
 
 
 def _run_refine_on_crop(args, crop, crop_size, model_state):
-    refine_steps = int(args.refine) if args.refine is not None else 1
-    refine_accumulate = bool(getattr(args, "refine_accumulate", False))
+    refine_extra_steps = int(args.refine) if args.refine is not None else 0
+    refine_parts = refine_extra_steps + 1
+    refine_fraction = 1.0 / float(refine_parts)
     use_tta = bool(getattr(args, "tta", False))
     model = model_state["model"]
     amp_enabled = model_state["amp_enabled"]
@@ -1026,9 +1019,6 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
         if len(current_uv) != current_coords.shape[0]:
             current_uv = None
 
-    initial_coords = current_coords.copy()
-    initial_uv = None if current_uv is None else current_uv.copy()
-
     cond_vox = crop["cond_vox"]
     other_wraps_vox = None
     if expected_in_channels > 3:
@@ -1038,11 +1028,9 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
     if initial_extrap_vox is None:
         initial_extrap_vox = _points_to_voxels(current_coords, crop_size)
 
-    disp_accum = None
-    disp_last = None
     n_forward = 0
 
-    for refine_idx in range(refine_steps):
+    for refine_idx in range(refine_parts):
         if current_coords.shape[0] == 0:
             break
 
@@ -1060,47 +1048,29 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
         else:
             disp_single = _forward_model_displacement(model, inputs, amp_enabled, amp_dtype)
 
-        disp_last = disp_single
         n_forward += 1
-        if refine_accumulate:
-            disp_accum = disp_single if disp_accum is None else (disp_accum + disp_single)
+        # Apply a fixed fraction of each stage's full displacement prediction.
+        coords_t = torch.from_numpy(current_coords).float().to(args.device)
+        disp_sampled = _sample_displacement_field(disp_single, coords_t)
+        next_coords = (coords_t + disp_sampled * refine_fraction).detach().cpu().numpy().astype(np.float32)
 
-        # Build next extrapolation from sampled displacement.
-        if refine_idx < refine_steps - 1:
-            coords_t = torch.from_numpy(current_coords).float().to(args.device)
-            disp_sampled = _sample_displacement_field(disp_single, coords_t)
-            next_coords = (coords_t + disp_sampled).detach().cpu().numpy().astype(np.float32)
-
-            in_bounds = _in_bounds_mask(next_coords, crop_size)
-            if not in_bounds.any():
-                current_coords = np.zeros((0, 3), dtype=np.float32)
-                if current_uv is not None:
-                    current_uv = current_uv[:0]
-                break
-
-            current_coords = next_coords[in_bounds]
+        in_bounds = _in_bounds_mask(next_coords, crop_size)
+        if not in_bounds.any():
+            current_coords = np.zeros((0, 3), dtype=np.float32)
             if current_uv is not None:
-                current_uv = current_uv[in_bounds]
+                current_uv = current_uv[:0]
+            break
 
-    if n_forward == 0 or disp_last is None:
-        return np.zeros((0, 3), dtype=np.float32), None if initial_uv is None else initial_uv[:0]
+        current_coords = next_coords[in_bounds]
+        if current_uv is not None:
+            current_uv = current_uv[in_bounds]
 
-    if refine_accumulate and disp_accum is not None:
-        disp_for_sampling = disp_accum / float(n_forward)
-        sample_coords = initial_coords
-        sample_uv = initial_uv
-    else:
-        disp_for_sampling = disp_last
-        sample_coords = current_coords
-        sample_uv = current_uv
+    if n_forward == 0:
+        return np.zeros((0, 3), dtype=np.float32), None if current_uv is None else current_uv[:0]
 
-    if sample_coords is None or sample_coords.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32), None if sample_uv is None else sample_uv[:0]
-
-    sample_coords_t = torch.from_numpy(sample_coords).float().to(args.device)
-    disp_sampled = _sample_displacement_field(disp_for_sampling, sample_coords_t)
-    pred_local = (sample_coords_t + disp_sampled).detach().cpu().numpy().astype(np.float32)
-    return pred_local, sample_uv
+    if current_coords is None or current_coords.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32), None if current_uv is None else current_uv[:0]
+    return current_coords.astype(np.float32, copy=False), current_uv
 
 
 def run_inference(args, bbox_crops, crop_size, model_state):
@@ -1140,8 +1110,6 @@ def run_inference(args, bbox_crops, crop_size, model_state):
         desc = "inference (refine)"
         if use_tta:
             desc = "inference (refine+TTA)"
-        if getattr(args, "refine_accumulate", False):
-            desc = desc[:-1] + "+accum)"
 
         for bbox_idx, crop, _, _ in tqdm(valid_items, desc=desc):
             pred_local, pred_uv = _run_refine_on_crop(args, crop, crop_size, model_state)
@@ -1281,8 +1249,7 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
         additional_metadata={
             "cond_direction": cond_direction,
             "extrapolation_method": args.extrapolation_method,
-            "refine_steps": args.refine,
-            "refine_accumulate": bool(args.refine_accumulate),
+            "refine_steps": None if args.refine is None else int(args.refine) + 1,
         }
     )
     print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
@@ -1456,13 +1423,14 @@ def main():
         raise ValueError("--bbox-overlap-frac must be in [0, 1).")
     if args.refine is not None and args.refine < 1:
         raise ValueError("--refine must be >= 1 when provided.")
-    if args.refine_accumulate and args.refine is None:
-        raise ValueError("--refine-accumulate requires --refine.")
 
     refine_mode = args.refine is not None
     growth_iterations = args.iterations
     if refine_mode:
-        print(f"--refine={args.refine} enabled; refinement runs inside each outer iteration.")
+        print(
+            f"--refine={args.refine} enabled; running {int(args.refine) + 1} "
+            "fractional refinement stages inside each outer iteration."
+        )
 
     crop_size = tuple(args.crop_size)
     has_checkpoint = args.checkpoint_path is not None
