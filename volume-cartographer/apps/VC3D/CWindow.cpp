@@ -858,7 +858,9 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
         _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
             if (viewer && viewer->surfName() == "segmentation") {
-                viewer->setCompositeEnabled(!viewer->isCompositeEnabled());
+                auto s = viewer->compositeRenderSettings();
+                s.enabled = !s.enabled;
+                viewer->setCompositeRenderSettings(s);
             }
         });
     });
@@ -2476,12 +2478,13 @@ void CWindow::CreateWidgets(void)
     // Connect composite view controls
     connect(ui.chkCompositeEnabled, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeEnabled(checked);
+            auto s = viewer->compositeRenderSettings();
+            s.enabled = checked;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        // Find the segmentation viewer and update its composite method
         std::string method = "max";
         switch (index) {
             case 0: method = "max"; break;
@@ -2492,7 +2495,9 @@ void CWindow::CreateWidgets(void)
         }
 
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeMethod(method);
+            auto s = viewer->compositeRenderSettings();
+            s.params.method = method;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
@@ -2509,130 +2514,144 @@ void CWindow::CreateWidgets(void)
     // Connect Layers In Front controls
     connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeLayersInFront(value);
+            auto s = viewer->compositeRenderSettings();
+            s.layersFront = value;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Layers Behind controls
     connect(ui.spinLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeLayersBehind(value);
+            auto s = viewer->compositeRenderSettings();
+            s.layersBehind = value;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Alpha Min controls
     connect(ui.spinAlphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeAlphaMin(value);
+            auto s = viewer->compositeRenderSettings();
+            s.params.alphaMin = value / 255.0f;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Alpha Max controls
     connect(ui.spinAlphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeAlphaMax(value);
+            auto s = viewer->compositeRenderSettings();
+            s.params.alphaMax = value / 255.0f;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Alpha Threshold controls
     connect(ui.spinAlphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (!_viewerManager) {
-            return;
-        }
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeAlphaThreshold(value);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.alphaCutoff = value / 10000.0f;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Material controls
     connect(ui.spinMaterial, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (!_viewerManager) {
-            return;
-        }
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeMaterial(value);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.alphaOpacity = value / 255.0f;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Reverse Direction control
     connect(ui.chkReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) {
-            return;
-        }
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "segmentation") {
-                viewer->setCompositeReverseDirection(checked);
-                break;
-            }
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.reverseDirection = checked;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Beer-Lambert Extinction control
     connect(ui.spinBLExtinction, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeBLExtinction(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.blExtinction = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Beer-Lambert Emission control
     connect(ui.spinBLEmission, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeBLEmission(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.blEmission = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Beer-Lambert Ambient control
     connect(ui.spinBLAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setCompositeBLAmbient(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.blAmbient = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Lighting Enable control
     connect(ui.chkLightingEnabled, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setLightingEnabled(checked);
+            auto s = viewer->compositeRenderSettings();
+            s.params.lightingEnabled = checked;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Light Azimuth control
     connect(ui.spinLightAzimuth, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setLightAzimuth(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.lightAzimuth = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Light Elevation control
     connect(ui.spinLightElevation, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setLightElevation(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.lightElevation = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Light Diffuse control
     connect(ui.spinLightDiffuse, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setLightDiffuse(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.lightDiffuse = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Light Ambient control
     connect(ui.spinLightAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setLightAmbient(static_cast<float>(value));
+            auto s = viewer->compositeRenderSettings();
+            s.params.lightAmbient = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     // Connect Volume Gradients checkbox
     connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setUseVolumeGradients(checked);
+            auto s = viewer->compositeRenderSettings();
+            s.useVolumeGradients = checked;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
@@ -2643,7 +2662,9 @@ void CWindow::CreateWidgets(void)
             return;
         }
         _viewerManager->forEachViewer([value](CVolumeViewer* viewer) {
-            viewer->setIsoCutoff(value);
+            auto s = viewer->compositeRenderSettings();
+            s.params.isoCutoff = static_cast<uint8_t>(std::clamp(value, 0, 255));
+            viewer->setCompositeRenderSettings(s);
         });
     });
 
@@ -2721,7 +2742,9 @@ void CWindow::CreateWidgets(void)
         if (!_viewerManager) return;
         for (auto* viewer : _viewerManager->viewers()) {
             if (viewer->surfName() == "xy plane") {
-                viewer->setPlaneCompositeEnabled(checked);
+                auto s = viewer->compositeRenderSettings();
+                s.planeEnabled = checked;
+                viewer->setCompositeRenderSettings(s);
             }
         }
     });
@@ -2730,7 +2753,9 @@ void CWindow::CreateWidgets(void)
         if (!_viewerManager) return;
         for (auto* viewer : _viewerManager->viewers()) {
             if (viewer->surfName() == "seg xz") {
-                viewer->setPlaneCompositeEnabled(checked);
+                auto s = viewer->compositeRenderSettings();
+                s.planeEnabled = checked;
+                viewer->setCompositeRenderSettings(s);
             }
         }
     });
@@ -2739,7 +2764,9 @@ void CWindow::CreateWidgets(void)
         if (!_viewerManager) return;
         for (auto* viewer : _viewerManager->viewers()) {
             if (viewer->surfName() == "seg yz") {
-                viewer->setPlaneCompositeEnabled(checked);
+                auto s = viewer->compositeRenderSettings();
+                s.planeEnabled = checked;
+                viewer->setCompositeRenderSettings(s);
             }
         }
     });
@@ -2753,7 +2780,10 @@ void CWindow::CreateWidgets(void)
         int behind = ui.spinPlaneLayersBehind->value();
         for (auto* viewer : _viewerManager->viewers()) {
             if (isPlaneViewer(viewer->surfName())) {
-                viewer->setPlaneCompositeLayers(value, behind);
+                auto s = viewer->compositeRenderSettings();
+                s.planeLayersFront = std::max(0, value);
+                s.planeLayersBehind = std::max(0, behind);
+                viewer->setCompositeRenderSettings(s);
             }
         }
     });
@@ -2763,7 +2793,10 @@ void CWindow::CreateWidgets(void)
         int front = ui.spinPlaneLayersFront->value();
         for (auto* viewer : _viewerManager->viewers()) {
             if (isPlaneViewer(viewer->surfName())) {
-                viewer->setPlaneCompositeLayers(front, value);
+                auto s = viewer->compositeRenderSettings();
+                s.planeLayersFront = std::max(0, front);
+                s.planeLayersBehind = std::max(0, value);
+                viewer->setCompositeRenderSettings(s);
             }
         }
     });
@@ -2771,13 +2804,17 @@ void CWindow::CreateWidgets(void)
     // Connect Postprocessing controls
     connect(ui.chkStretchValuesPost, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setPostStretchValues(checked);
+            auto s = viewer->compositeRenderSettings();
+            s.postStretchValues = checked;
+            viewer->setCompositeRenderSettings(s);
         }
     });
 
     connect(ui.chkRemoveSmallComponents, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setPostRemoveSmallComponents(checked);
+            auto s = viewer->compositeRenderSettings();
+            s.postRemoveSmallComponents = checked;
+            viewer->setCompositeRenderSettings(s);
         }
         // Enable/disable the min component size spinbox based on checkbox state
         ui.spinMinComponentSize->setEnabled(checked);
@@ -2786,7 +2823,9 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.spinMinComponentSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (auto* viewer = segmentationViewer()) {
-            viewer->setPostMinComponentSize(value);
+            auto s = viewer->compositeRenderSettings();
+            s.postMinComponentSize = std::clamp(value, 1, 100000);
+            viewer->setCompositeRenderSettings(s);
         }
     });
 

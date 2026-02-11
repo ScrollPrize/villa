@@ -6,6 +6,7 @@
 #include <xtensor/generators/xbuilder.hpp>
 
 #include "z5/dataset.hxx"
+#include "z5/multiarray/xtensor_access.hxx"
 
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 
 // ============================================================================
@@ -577,28 +579,6 @@ void readCompositeFast(
         getNormal, numLayers, zStep, zStart, &params);
 }
 
-void readCompositeFastConstantNormal(
-    cv::Mat_<uint8_t>& out,
-    z5::Dataset* ds,
-    const cv::Mat_<cv::Vec3f>& baseCoords,
-    const cv::Vec3f& normal,
-    float zStep,
-    int zStart, int zEnd,
-    const CompositeParams& params,
-    ChunkCache<uint8_t>& cache)
-{
-    CacheParams<uint8_t> p(ds);
-
-    const int numLayers = zEnd - zStart + 1;
-
-    auto getNormal = [&](int, int) -> cv::Vec3f {
-        return normal;
-    };
-
-    readVolumeImpl<uint8_t, SampleMode::Nearest>(out, ds, cache, p, baseCoords,
-        getNormal, numLayers, zStep, zStart, &params);
-}
-
 
 // ============================================================================
 // readMultiSlice — bulk multi-slice trilinear sampling
@@ -1053,5 +1033,121 @@ void sampleTileSlices(
     const std::vector<float>& offsets)
 {
     sampleTileSlicesImpl(out, ds, *cache, basePoints, stepDirs, offsets);
+}
+
+
+cv::Mat_<cv::Vec3f> computeVolumeGradientsNative(
+    z5::Dataset* ds,
+    const cv::Mat_<cv::Vec3f>& rawPoints,
+    float dsScale)
+{
+    const int h = rawPoints.rows;
+    const int w = rawPoints.cols;
+    cv::Mat_<cv::Vec3f> gradients(h, w, cv::Vec3f(0, 0, 1));
+
+    if (h == 0 || w == 0) return gradients;
+
+    const auto volShape = ds->shape();
+    const int volZ = static_cast<int>(volShape[0]);
+    const int volY = static_cast<int>(volShape[1]);
+    const int volX = static_cast<int>(volShape[2]);
+
+    // Step 1: Find bounding box of all valid coordinates
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float minZ = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const cv::Vec3f& c = rawPoints(y, x);
+            if (c[0] == -1.f) continue;
+
+            const float cx = c[0] * dsScale;
+            const float cy = c[1] * dsScale;
+            const float cz = c[2] * dsScale;
+
+            minX = std::min(minX, cx);
+            minY = std::min(minY, cy);
+            minZ = std::min(minZ, cz);
+            maxX = std::max(maxX, cx);
+            maxY = std::max(maxY, cy);
+            maxZ = std::max(maxZ, cz);
+        }
+    }
+
+    if (minX > maxX) return gradients;
+
+    const int pad = 2;
+    const int bboxX0 = std::max(0, static_cast<int>(std::floor(minX)) - pad);
+    const int bboxY0 = std::max(0, static_cast<int>(std::floor(minY)) - pad);
+    const int bboxZ0 = std::max(0, static_cast<int>(std::floor(minZ)) - pad);
+    const int bboxX1 = std::min(volX, static_cast<int>(std::ceil(maxX)) + pad + 1);
+    const int bboxY1 = std::min(volY, static_cast<int>(std::ceil(maxY)) + pad + 1);
+    const int bboxZ1 = std::min(volZ, static_cast<int>(std::ceil(maxZ)) + pad + 1);
+
+    const size_t localW = static_cast<size_t>(bboxX1 - bboxX0);
+    const size_t localH = static_cast<size_t>(bboxY1 - bboxY0);
+    const size_t localD = static_cast<size_t>(bboxZ1 - bboxZ0);
+
+    if (localW == 0 || localH == 0 || localD == 0) return gradients;
+
+    // Step 2: Batch read the volume data for the bounding box
+    xt::xarray<uint8_t> localVolume = xt::empty<uint8_t>({localD, localH, localW});
+    z5::types::ShapeType off = {static_cast<size_t>(bboxZ0), static_cast<size_t>(bboxY0), static_cast<size_t>(bboxX0)};
+    z5::multiarray::readSubarray<uint8_t>(*ds, localVolume, off.begin());
+
+    auto sampleLocal = [&](float gx, float gy, float gz) -> float {
+        const int lx = static_cast<int>(std::round(gx)) - bboxX0;
+        const int ly = static_cast<int>(std::round(gy)) - bboxY0;
+        const int lz = static_cast<int>(std::round(gz)) - bboxZ0;
+
+        if (lx < 0 || ly < 0 || lz < 0 ||
+            lx >= static_cast<int>(localW) ||
+            ly >= static_cast<int>(localH) ||
+            lz >= static_cast<int>(localD)) {
+            return 0.0f;
+        }
+        return static_cast<float>(localVolume(static_cast<size_t>(lz), static_cast<size_t>(ly), static_cast<size_t>(lx)));
+    };
+
+    // Step 3: Compute gradients in parallel at each raw grid point
+    #pragma omp parallel for collapse(2)
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const cv::Vec3f& c = rawPoints(y, x);
+
+            if (c[0] == -1.f) {
+                gradients(y, x) = cv::Vec3f(0, 0, 1);
+                continue;
+            }
+
+            const float cx = c[0] * dsScale;
+            const float cy = c[1] * dsScale;
+            const float cz = c[2] * dsScale;
+
+            const float v_xp = sampleLocal(cx + 1, cy, cz);
+            const float v_xm = sampleLocal(cx - 1, cy, cz);
+            const float v_yp = sampleLocal(cx, cy + 1, cz);
+            const float v_ym = sampleLocal(cx, cy - 1, cz);
+            const float v_zp = sampleLocal(cx, cy, cz + 1);
+            const float v_zm = sampleLocal(cx, cy, cz - 1);
+
+            float gx = (v_xp - v_xm) / 2.0f;
+            float gy = (v_yp - v_ym) / 2.0f;
+            float gz = (v_zp - v_zm) / 2.0f;
+
+            float len = std::sqrt(gx*gx + gy*gy + gz*gz);
+            if (len > 1e-6f) {
+                gradients(y, x) = cv::Vec3f(-gx/len, -gy/len, -gz/len);
+            } else {
+                gradients(y, x) = cv::Vec3f(0, 0, 1);
+            }
+        }
+    }
+
+    return gradients;
 }
 

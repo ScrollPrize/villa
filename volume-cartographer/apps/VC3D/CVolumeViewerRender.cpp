@@ -4,8 +4,6 @@
 
 #include "VolumeViewerCmaps.hpp"
 
-#include "z5/multiarray/xtensor_access.hxx"
-
 #include <QGraphicsView>
 #include <QGraphicsScene>
 #include <QDebug>
@@ -33,135 +31,6 @@
 
 #define COLOR_FOCUS QColor(50, 255, 215)
 
-namespace {
-
-// Compute volume gradients at native surface resolution (the raw point grid)
-// Returns normalized gradient vectors at each raw grid point
-// dsScale converts from world coordinates to dataset coordinates
-cv::Mat_<cv::Vec3f> computeVolumeGradientsNative(
-    z5::Dataset* ds,
-    const cv::Mat_<cv::Vec3f>& rawPoints,
-    float dsScale)
-{
-    const int h = rawPoints.rows;
-    const int w = rawPoints.cols;
-    cv::Mat_<cv::Vec3f> gradients(h, w, cv::Vec3f(0, 0, 1));
-
-    if (h == 0 || w == 0) return gradients;
-
-    const auto volShape = ds->shape();
-    const int volZ = static_cast<int>(volShape[0]);
-    const int volY = static_cast<int>(volShape[1]);
-    const int volX = static_cast<int>(volShape[2]);
-
-    // Step 1: Find bounding box of all valid coordinates
-    float minX = std::numeric_limits<float>::max();
-    float minY = std::numeric_limits<float>::max();
-    float minZ = std::numeric_limits<float>::max();
-    float maxX = std::numeric_limits<float>::lowest();
-    float maxY = std::numeric_limits<float>::lowest();
-    float maxZ = std::numeric_limits<float>::lowest();
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            const cv::Vec3f& c = rawPoints(y, x);
-            // Skip invalid points (marked as -1, -1, -1)
-            if (c[0] == -1.f) continue;
-
-            const float cx = c[0] * dsScale;
-            const float cy = c[1] * dsScale;
-            const float cz = c[2] * dsScale;
-
-            minX = std::min(minX, cx);
-            minY = std::min(minY, cy);
-            minZ = std::min(minZ, cz);
-            maxX = std::max(maxX, cx);
-            maxY = std::max(maxY, cy);
-            maxZ = std::max(maxZ, cz);
-        }
-    }
-
-    if (minX > maxX) return gradients;  // No valid points
-
-    // Add padding for gradient computation (need ±1 voxel)
-    const int pad = 2;
-    const int bboxX0 = std::max(0, static_cast<int>(std::floor(minX)) - pad);
-    const int bboxY0 = std::max(0, static_cast<int>(std::floor(minY)) - pad);
-    const int bboxZ0 = std::max(0, static_cast<int>(std::floor(minZ)) - pad);
-    const int bboxX1 = std::min(volX, static_cast<int>(std::ceil(maxX)) + pad + 1);
-    const int bboxY1 = std::min(volY, static_cast<int>(std::ceil(maxY)) + pad + 1);
-    const int bboxZ1 = std::min(volZ, static_cast<int>(std::ceil(maxZ)) + pad + 1);
-
-    const size_t localW = static_cast<size_t>(bboxX1 - bboxX0);
-    const size_t localH = static_cast<size_t>(bboxY1 - bboxY0);
-    const size_t localD = static_cast<size_t>(bboxZ1 - bboxZ0);
-
-    if (localW == 0 || localH == 0 || localD == 0) return gradients;
-
-    // Step 2: Batch read the volume data for the bounding box
-    xt::xarray<uint8_t> localVolume = xt::empty<uint8_t>({localD, localH, localW});
-    z5::types::ShapeType off = {static_cast<size_t>(bboxZ0), static_cast<size_t>(bboxY0), static_cast<size_t>(bboxX0)};
-    z5::multiarray::readSubarray<uint8_t>(*ds, localVolume, off.begin());
-
-    // Helper lambda to sample from local volume with bounds checking
-    auto sampleLocal = [&](float gx, float gy, float gz) -> float {
-        const int lx = static_cast<int>(std::round(gx)) - bboxX0;
-        const int ly = static_cast<int>(std::round(gy)) - bboxY0;
-        const int lz = static_cast<int>(std::round(gz)) - bboxZ0;
-
-        if (lx < 0 || ly < 0 || lz < 0 ||
-            lx >= static_cast<int>(localW) ||
-            ly >= static_cast<int>(localH) ||
-            lz >= static_cast<int>(localD)) {
-            return 0.0f;
-        }
-        return static_cast<float>(localVolume(static_cast<size_t>(lz), static_cast<size_t>(ly), static_cast<size_t>(lx)));
-    };
-
-    // Step 3: Compute gradients in parallel at each raw grid point
-    #pragma omp parallel for collapse(2)
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            const cv::Vec3f& c = rawPoints(y, x);
-
-            // Skip invalid points
-            if (c[0] == -1.f) {
-                gradients(y, x) = cv::Vec3f(0, 0, 1);
-                continue;
-            }
-
-            // Scale coordinates to dataset space
-            const float cx = c[0] * dsScale;
-            const float cy = c[1] * dsScale;
-            const float cz = c[2] * dsScale;
-
-            // Sample at ±1 voxel in each direction for central differences
-            const float v_xp = sampleLocal(cx + 1, cy, cz);
-            const float v_xm = sampleLocal(cx - 1, cy, cz);
-            const float v_yp = sampleLocal(cx, cy + 1, cz);
-            const float v_ym = sampleLocal(cx, cy - 1, cz);
-            const float v_zp = sampleLocal(cx, cy, cz + 1);
-            const float v_zm = sampleLocal(cx, cy, cz - 1);
-
-            // Central differences for gradient
-            float gx = (v_xp - v_xm) / 2.0f;
-            float gy = (v_yp - v_ym) / 2.0f;
-            float gz = (v_zp - v_zm) / 2.0f;
-
-            // Normalize to get unit normal (negative gradient points toward surface)
-            float len = std::sqrt(gx*gx + gy*gy + gz*gz);
-            if (len > 1e-6f) {
-                gradients(y, x) = cv::Vec3f(-gx/len, -gy/len, -gz/len);
-            } else {
-                gradients(y, x) = cv::Vec3f(0, 0, 1);
-            }
-        }
-    }
-
-    return gradients;
-}
-
-}  // anonymous namespace
 
 void CVolumeViewer::renderVisible(bool force)
 {
@@ -235,193 +104,34 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite(const cv::Rect &roi) {
     _ptr = ptr;
     _vis_center = roi_c;
 
-    // Check if we can reuse cached normals
-    // Cache key: roi size, scale, ptr position, and surface instance
-    // Note: z_off is NOT part of the cache key - normals don't depend on z_off,
-    // and we apply the z offset ourselves after retrieving cached values
-    bool cacheValid = (!_cachedNormals.empty() &&
-                       _cachedNormalsSize == roi.size() &&
-                       std::abs(_cachedNormalsScale - _scale) < 1e-6f &&
-                       cv::norm(_cachedNormalsPtr - ptr) < 1e-6f &&
-                       _cachedNormalsSurf.lock() == surf);
-
     cv::Mat_<cv::Vec3f> base_coords;
     cv::Mat_<cv::Vec3f> normals;
+    getCachedSurfaceCoords(base_coords, normals, roi, ptr, surf);
 
-    if (cacheValid) {
-        // Reuse cached coordinates and normals
-        // Cached coords are at z_off=0, so apply current z_off if needed
-        if (std::abs(_z_off - _cachedNormalsZOff) < 1e-6f) {
-            // Same z_off, use cached coords directly
-            base_coords = _cachedBaseCoords;
-        } else {
-            // Different z_off - apply offset along normals using work buffer
-            const int h = _cachedBaseCoords.rows;
-            const int w = _cachedBaseCoords.cols;
+    cv::Mat_<cv::Vec3f> lightingNormals = getVolumeGradientNormals(normals, roi, surf);
 
-            // Reuse work buffer if size matches, otherwise reallocate
-            if (_coordsWorkBuffer.rows != h || _coordsWorkBuffer.cols != w) {
-                _coordsWorkBuffer.create(h, w);
-            }
+    int z_start = _compositeSettings.reverseDirection ? -_compositeSettings.layersBehind : -_compositeSettings.layersFront;
+    int z_end = _compositeSettings.reverseDirection ? _compositeSettings.layersFront : _compositeSettings.layersBehind;
 
-            const float z_delta = _z_off - _cachedNormalsZOff;
-            #pragma omp parallel for collapse(2)
-            for (int j = 0; j < h; ++j) {
-                for (int i = 0; i < w; ++i) {
-                    const cv::Vec3f& src = _cachedBaseCoords(j, i);
-                    const cv::Vec3f& n = _cachedNormals(j, i);
-                    if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
-                        _coordsWorkBuffer(j, i) = src + n * z_delta;
-                    } else {
-                        _coordsWorkBuffer(j, i) = src;
-                    }
-                }
-            }
-            base_coords = _coordsWorkBuffer;
-        }
-        normals = _cachedNormals;
-    } else {
-        // Generate coordinates and normals for base layer
-        surf->gen(&base_coords, &normals, roi.size(), ptr, _scale,
-                  {static_cast<float>(-roi.width / 2), static_cast<float>(-roi.height / 2), _z_off});
-
-        // Cache for next render - gen() returns freshly allocated data, so we can
-        // just copy the cv::Mat header (shallow copy) since we own the data
-        _cachedBaseCoords = base_coords;
-        _cachedNormals = normals;
-        _cachedNormalsSize = roi.size();
-        _cachedNormalsScale = _scale;
-        _cachedNormalsPtr = ptr;
-        _cachedNormalsZOff = _z_off;
-        _cachedNormalsSurf = surf;
-    }
-
-    // Compute volume gradients if enabled (for PBR lighting from volume data)
-    // Gradients are computed once at native surface resolution (raw point grid),
-    // then warped to view resolution using the same transform as gen() uses for coords
-    cv::Mat_<cv::Vec3f> lightingNormals = normals;  // Default to mesh normals
-    if (_use_volume_gradients && _lighting_enabled) {
-        auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
-        if (quadSurf) {
-            // Compute native gradients once per surface
-            if (_cachedNativeVolumeGradients.empty() || _cachedGradientsSurf.lock() != surf) {
-                const cv::Mat_<cv::Vec3f>* rawPts = quadSurf->rawPointsPtr();
-                _cachedNativeVolumeGradients = computeVolumeGradientsNative(
-                    volume->zarrDataset(_ds_sd_idx),
-                    *rawPts,
-                    _ds_scale
-                );
-                _cachedGradientsSurf = surf;
-            }
-
-            // Warp native gradients to view coords using same transform as gen()
-            const cv::Vec2f surfScale = quadSurf->scale();
-            const cv::Vec3f center = quadSurf->center();
-
-            // Same calculation as gen(): ul = internal_loc(offset/scale + _center, ptr, _scale)
-            const cv::Vec3f offset = {static_cast<float>(-roi.width / 2), static_cast<float>(-roi.height / 2), _z_off};
-            const cv::Vec3f nominalOffset = offset / _scale + center;
-            const cv::Vec3f ul = ptr + cv::Vec3f(nominalOffset[0] * surfScale[0], nominalOffset[1] * surfScale[1], nominalOffset[2]);
-
-            const double sx = static_cast<double>(surfScale[0]) / static_cast<double>(_scale);
-            const double sy = static_cast<double>(surfScale[1]) / static_cast<double>(_scale);
-            const double ox = static_cast<double>(ul[0]);
-            const double oy = static_cast<double>(ul[1]);
-
-            // Map from raw grid coords to view coords
-            std::array<cv::Point2f, 3> srcf = {
-                cv::Point2f(static_cast<float>(ox), static_cast<float>(oy)),
-                cv::Point2f(static_cast<float>(ox + roi.width * sx), static_cast<float>(oy)),
-                cv::Point2f(static_cast<float>(ox), static_cast<float>(oy + roi.height * sy))
-            };
-            std::array<cv::Point2f, 3> dstf = {
-                cv::Point2f(0.f, 0.f),
-                cv::Point2f(static_cast<float>(roi.width), 0.f),
-                cv::Point2f(0.f, static_cast<float>(roi.height))
-            };
-
-            cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
-            cv::warpAffine(_cachedNativeVolumeGradients, lightingNormals, A, roi.size(),
-                           cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-        }
-    }
-
-    // Determine the z range based on front and behind layers
-    int z_start = _composite_reverse_direction ? -_composite_layers_behind : -_composite_layers_front;
-    int z_end = _composite_reverse_direction ? _composite_layers_front : _composite_layers_behind;
-
-    // Setup compositing parameters
-    CompositeParams params;
-    params.method = _composite_method;
-    params.alphaMin = _composite_alpha_min / 255.0f;
-    params.alphaMax = _composite_alpha_max / 255.0f;
-    params.alphaOpacity = _composite_material / 255.0f;
-    params.alphaCutoff = _composite_alpha_threshold / 10000.0f;
-    params.blExtinction = _composite_bl_extinction;
-    params.blEmission = _composite_bl_emission;
-    params.blAmbient = _composite_bl_ambient;
-    params.lightingEnabled = _lighting_enabled;
-    params.lightAzimuth = _light_azimuth;
-    params.lightElevation = _light_elevation;
-    params.lightDiffuse = _light_diffuse;
-    params.lightAmbient = _light_ambient;
-    params.isoCutoff = static_cast<uint8_t>(_iso_cutoff);
-
-    // Always use fast path (nearest neighbor, no mutex, specialized cache)
     readCompositeFast(
         img,
         volume->zarrDataset(_ds_sd_idx),
         base_coords * _ds_scale,
         lightingNormals,
-        _ds_scale,  // z step per layer (in dataset coordinates)
+        _ds_scale,
         z_start, z_end,
-        params,
+        _compositeSettings.params,
         *cache
     );
 
-    // Apply postprocessing
-    if (!img.empty()) {
-        // Stretch values to full range
-        if (_postStretchValues) {
-            double minVal, maxVal;
-            cv::minMaxLoc(img, &minVal, &maxVal);
-            if (maxVal > minVal) {
-                img.convertTo(img, CV_8U, 255.0 / (maxVal - minVal), -minVal * 255.0 / (maxVal - minVal));
-            }
-        }
-
-        // Remove small connected components
-        if (_postRemoveSmallComponents && _postMinComponentSize > 1) {
-            // Create binary mask of non-zero pixels
-            cv::Mat_<uint8_t> binary;
-            cv::threshold(img, binary, 0, 255, cv::THRESH_BINARY);
-
-            // Find connected components
-            cv::Mat labels, stats, centroids;
-            int numComponents = cv::connectedComponentsWithStats(binary, labels, stats, centroids, 8, CV_32S);
-
-            // Create mask of components to keep (those >= min size)
-            cv::Mat_<uint8_t> keepMask = cv::Mat_<uint8_t>::zeros(img.size());
-            for (int i = 1; i < numComponents; i++) {  // Start from 1 to skip background
-                int area = stats.at<int>(i, cv::CC_STAT_AREA);
-                if (area >= _postMinComponentSize) {
-                    keepMask.setTo(255, labels == i);
-                }
-            }
-
-            // Apply mask to original image
-            cv::Mat_<uint8_t> filtered;
-            img.copyTo(filtered, keepMask);
-            img = filtered;
-        }
-    }
+    postprocessComposite(img, _compositeSettings);
 
     return img;
 }
 
 cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(std::shared_ptr<QuadSurface> surface, cv::Size outputSize)
 {
-    if (!surface || !_composite_enabled || !volume) {
+    if (!surface || !_compositeSettings.enabled || !volume) {
         return cv::Mat_<uint8_t>();
     }
 
@@ -440,9 +150,6 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(std::shared_ptr<QuadS
     cv::Size rawPointsSize = surface->rawPointsPtr()->size();
     float surfScale = surface->_scale[0];
 
-    std::cout << "[renderCompositeForSurface] outputSize: " << outputSize.width << "x" << outputSize.height
-              << ", rawPointsSize: " << rawPointsSize.width << "x" << rawPointsSize.height
-              << ", surface->_scale: " << surface->_scale[0] << "x" << surface->_scale[1] << std::endl;
 
     _surf_weak = surface;
     _scale = surfScale;  // Use surface's scale so gen() samples 1:1 from raw points
@@ -450,8 +157,6 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(std::shared_ptr<QuadS
 
     recalcScales();
 
-    std::cout << "[renderCompositeForSurface] after recalcScales: _scale=" << _scale
-              << ", _ds_scale=" << _ds_scale << ", _ds_sd_idx=" << _ds_sd_idx << std::endl;
 
     _ptr = surface->pointer();
     // Use raw points size for the ROI so we cover the whole surface
@@ -462,12 +167,8 @@ cv::Mat_<uint8_t> CVolumeViewer::renderCompositeForSurface(std::shared_ptr<QuadS
 
     cv::Mat_<uint8_t> result = render_composite(roi);
 
-    std::cout << "[renderCompositeForSurface] result size: " << result.cols << "x" << result.rows << std::endl;
-
     // Resize to requested output size if different
     if (result.size() != outputSize) {
-        std::cout << "[renderCompositeForSurface] resizing from " << result.cols << "x" << result.rows
-                  << " to " << outputSize.width << "x" << outputSize.height << std::endl;
         cv::resize(result, result, outputSize, 0, 0, cv::INTER_LINEAR);
     }
 
@@ -499,10 +200,8 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     _overlayImageValid = false;
     _overlayImage = QImage();
 
-    const QRect roiRect(roi.x, roi.y, roi.width, roi.height);
-
-    const bool useComposite = (_surf_name == "segmentation" && _composite_enabled &&
-                               (_composite_layers_front > 0 || _composite_layers_behind > 0));
+    const bool useComposite = (_surf_name == "segmentation" && _compositeSettings.enabled &&
+                               (_compositeSettings.layersFront > 0 || _compositeSettings.layersBehind > 0));
 
     cv::Mat baseColor;
 
@@ -510,29 +209,16 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 
     // Check if this is a plane surface that should use plane composite rendering
     PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    const bool usePlaneComposite = (plane != nullptr && _plane_composite_enabled &&
-                                    (_plane_composite_layers_front > 0 || _plane_composite_layers_behind > 0));
+    const bool usePlaneComposite = (plane != nullptr && _compositeSettings.planeEnabled &&
+                                    (_compositeSettings.planeLayersFront > 0 || _compositeSettings.planeLayersBehind > 0));
 
     if (useComposite) {
         baseGray = render_composite(roi);
     } else if (usePlaneComposite) {
-        // Plane composite: generate coords first, then composite along plane normal
-        surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
+        generateViewCoords(coords, roi, surf);
         baseGray = render_composite_plane(roi, coords, plane->normal(cv::Vec3f(0, 0, 0)));
     } else {
-        if (plane) {
-            surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
-
-        } else {
-            cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
-            _ptr = surf->pointer();
-            cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
-            surf->move(_ptr, diff / _scale);
-            _vis_center = roi_c;
-
-            surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
-        }
-
+        generateViewCoords(coords, roi, surf);
         if (!baseDataset) {
             return cv::Mat();
         }
@@ -544,8 +230,8 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
     }
 
     // Apply ISO cutoff - zero out values below threshold
-    if (_iso_cutoff > 0 && !baseGray.empty()) {
-        cv::threshold(baseGray, baseGray, _iso_cutoff - 1, 0, cv::THRESH_TOZERO);
+    if (_compositeSettings.params.isoCutoff > 0) {
+        cv::threshold(baseGray, baseGray, _compositeSettings.params.isoCutoff - 1, 0, cv::THRESH_TOZERO);
     }
 
     cv::Mat baseProcessed;
@@ -587,16 +273,7 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 
     if (_overlayVolume && _overlayOpacity > 0.0f) {
         if (coords.empty()) {
-            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-                surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale, {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
-            } else {
-                cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
-                _ptr = surf->pointer();
-                cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
-                surf->move(_ptr, diff / _scale);
-                _vis_center = roi_c;
-                surf->gen(&coords, nullptr, roi.size(), _ptr, _scale, {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
-            }
+            generateViewCoords(coords, roi, surf);
         }
 
         if (!coords.empty()) {
@@ -840,28 +517,123 @@ void CVolumeViewer::setSurfaceOverlapThreshold(float threshold)
     }
 }
 
-void CVolumeViewer::setPlaneCompositeEnabled(bool enabled)
+void CVolumeViewer::getCachedSurfaceCoords(
+    cv::Mat_<cv::Vec3f>& base_coords, cv::Mat_<cv::Vec3f>& normals,
+    const cv::Rect& roi, const cv::Vec3f& ptr, const std::shared_ptr<Surface>& surf)
 {
-    if (_plane_composite_enabled == enabled) {
-        return;
-    }
-    _plane_composite_enabled = enabled;
-    if (volume) {
-        renderVisible(true);
+    // Cache key: roi size, scale, ptr position, and surface instance
+    // z_off is NOT part of the cache key — normals don't depend on z_off,
+    // and we apply the z offset ourselves after retrieving cached values
+    bool cacheValid = (!_cachedNormals.empty() &&
+                       _cachedNormalsSize == roi.size() &&
+                       std::abs(_cachedNormalsScale - _scale) < 1e-6f &&
+                       cv::norm(_cachedNormalsPtr - ptr) < 1e-6f &&
+                       _cachedNormalsSurf.lock() == surf);
+
+    if (cacheValid) {
+        if (std::abs(_z_off - _cachedNormalsZOff) < 1e-6f) {
+            base_coords = _cachedBaseCoords;
+        } else {
+            const int h = _cachedBaseCoords.rows;
+            const int w = _cachedBaseCoords.cols;
+            if (_coordsWorkBuffer.rows != h || _coordsWorkBuffer.cols != w) {
+                _coordsWorkBuffer.create(h, w);
+            }
+            const float z_delta = _z_off - _cachedNormalsZOff;
+            #pragma omp parallel for collapse(2)
+            for (int j = 0; j < h; ++j) {
+                for (int i = 0; i < w; ++i) {
+                    const cv::Vec3f& src = _cachedBaseCoords(j, i);
+                    const cv::Vec3f& n = _cachedNormals(j, i);
+                    if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+                        _coordsWorkBuffer(j, i) = src + n * z_delta;
+                    } else {
+                        _coordsWorkBuffer(j, i) = src;
+                    }
+                }
+            }
+            base_coords = _coordsWorkBuffer;
+        }
+        normals = _cachedNormals;
+    } else {
+        surf->gen(&base_coords, &normals, roi.size(), ptr, _scale,
+                  {static_cast<float>(-roi.width / 2), static_cast<float>(-roi.height / 2), _z_off});
+        _cachedBaseCoords = base_coords;
+        _cachedNormals = normals;
+        _cachedNormalsSize = roi.size();
+        _cachedNormalsScale = _scale;
+        _cachedNormalsPtr = ptr;
+        _cachedNormalsZOff = _z_off;
+        _cachedNormalsSurf = surf;
     }
 }
 
-void CVolumeViewer::setPlaneCompositeLayers(int front, int behind)
+cv::Mat_<cv::Vec3f> CVolumeViewer::getVolumeGradientNormals(
+    const cv::Mat_<cv::Vec3f>& meshNormals, const cv::Rect& roi,
+    const std::shared_ptr<Surface>& surf)
 {
-    front = std::max(0, front);
-    behind = std::max(0, behind);
-    if (_plane_composite_layers_front == front && _plane_composite_layers_behind == behind) {
-        return;
+    if (!_compositeSettings.useVolumeGradients || !_compositeSettings.params.lightingEnabled) {
+        return meshNormals;
     }
-    _plane_composite_layers_front = front;
-    _plane_composite_layers_behind = behind;
-    if (volume && _plane_composite_enabled) {
-        renderVisible(true);
+
+    auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
+    if (!quadSurf) {
+        return meshNormals;
+    }
+
+    // Compute native gradients once per surface
+    if (_cachedNativeVolumeGradients.empty() || _cachedGradientsSurf.lock() != surf) {
+        const cv::Mat_<cv::Vec3f>* rawPts = quadSurf->rawPointsPtr();
+        _cachedNativeVolumeGradients = computeVolumeGradientsNative(
+            volume->zarrDataset(_ds_sd_idx), *rawPts, _ds_scale);
+        _cachedGradientsSurf = surf;
+    }
+
+    // Warp native gradients to view coords using same transform as gen()
+    const cv::Vec2f surfScale = quadSurf->scale();
+    const cv::Vec3f center = quadSurf->center();
+    const cv::Vec3f offset = {static_cast<float>(-roi.width / 2), static_cast<float>(-roi.height / 2), _z_off};
+    const cv::Vec3f nominalOffset = offset / _scale + center;
+    const cv::Vec3f ul = _ptr + cv::Vec3f(nominalOffset[0] * surfScale[0], nominalOffset[1] * surfScale[1], nominalOffset[2]);
+
+    const double sx = static_cast<double>(surfScale[0]) / static_cast<double>(_scale);
+    const double sy = static_cast<double>(surfScale[1]) / static_cast<double>(_scale);
+    const double ox = static_cast<double>(ul[0]);
+    const double oy = static_cast<double>(ul[1]);
+
+    std::array<cv::Point2f, 3> srcf = {
+        cv::Point2f(static_cast<float>(ox), static_cast<float>(oy)),
+        cv::Point2f(static_cast<float>(ox + roi.width * sx), static_cast<float>(oy)),
+        cv::Point2f(static_cast<float>(ox), static_cast<float>(oy + roi.height * sy))
+    };
+    std::array<cv::Point2f, 3> dstf = {
+        cv::Point2f(0.f, 0.f),
+        cv::Point2f(static_cast<float>(roi.width), 0.f),
+        cv::Point2f(0.f, static_cast<float>(roi.height))
+    };
+
+    cv::Mat_<cv::Vec3f> lightingNormals;
+    cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
+    cv::warpAffine(_cachedNativeVolumeGradients, lightingNormals, A, roi.size(),
+                   cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+    return lightingNormals;
+}
+
+void CVolumeViewer::generateViewCoords(
+    cv::Mat_<cv::Vec3f>& coords, const cv::Rect& roi,
+    const std::shared_ptr<Surface>& surf)
+{
+    if (dynamic_cast<PlaneSurface*>(surf.get())) {
+        surf->gen(&coords, nullptr, roi.size(), cv::Vec3f(0, 0, 0), _scale,
+                  {static_cast<float>(roi.x), static_cast<float>(roi.y), _z_off});
+    } else {
+        cv::Vec2f roi_c = {roi.x + roi.width / 2.0f, roi.y + roi.height / 2.0f};
+        _ptr = surf->pointer();
+        cv::Vec3f diff = {roi_c[0], roi_c[1], 0};
+        surf->move(_ptr, diff / _scale);
+        _vis_center = roi_c;
+        surf->gen(&coords, nullptr, roi.size(), _ptr, _scale,
+                  {-roi.width / 2.0f, -roi.height / 2.0f, _z_off});
     }
 }
 
@@ -875,35 +647,20 @@ cv::Mat_<uint8_t> CVolumeViewer::render_composite_plane(const cv::Rect &roi, con
 
     // Determine z range based on front and behind layers
     // For planes, "front" means along the positive normal direction
-    int z_start = _composite_reverse_direction ? -_plane_composite_layers_behind : -_plane_composite_layers_front;
-    int z_end = _composite_reverse_direction ? _plane_composite_layers_front : _plane_composite_layers_behind;
+    int z_start = _compositeSettings.reverseDirection ? -_compositeSettings.planeLayersBehind : -_compositeSettings.planeLayersFront;
+    int z_end = _compositeSettings.reverseDirection ? _compositeSettings.planeLayersFront : _compositeSettings.planeLayersBehind;
 
-    // Setup compositing parameters (reuse the same parameters as segmentation composite)
-    CompositeParams params;
-    params.method = _composite_method;
-    params.alphaMin = _composite_alpha_min / 255.0f;
-    params.alphaMax = _composite_alpha_max / 255.0f;
-    params.alphaOpacity = _composite_material / 255.0f;
-    params.alphaCutoff = _composite_alpha_threshold / 10000.0f;
-    params.blExtinction = _composite_bl_extinction;
-    params.blEmission = _composite_bl_emission;
-    params.blAmbient = _composite_bl_ambient;
-    params.lightingEnabled = _lighting_enabled;
-    params.lightAzimuth = _light_azimuth;
-    params.lightElevation = _light_elevation;
-    params.lightDiffuse = _light_diffuse;
-    params.lightAmbient = _light_ambient;
-    params.isoCutoff = static_cast<uint8_t>(_iso_cutoff);
+    // Build a constant-normal mat and use the standard composite path
+    cv::Mat_<cv::Vec3f> normals(coords.size(), planeNormal);
 
-    // Always use fast path with constant normal (nearest neighbor, no mutex)
-    readCompositeFastConstantNormal(
+    readCompositeFast(
         img,
         volume->zarrDataset(_ds_sd_idx),
         coords * _ds_scale,
-        planeNormal,  // Single constant normal for all pixels
-        _ds_scale,    // z step per layer (in dataset coordinates)
+        normals,
+        _ds_scale,
         z_start, z_end,
-        params,
+        _compositeSettings.params,
         *cache
     );
 

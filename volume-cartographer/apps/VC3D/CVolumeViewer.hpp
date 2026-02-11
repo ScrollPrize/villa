@@ -58,43 +58,19 @@ public:
     std::string surfName() const { return _surf_name; };
     void recalcScales();
     
-    // Composite view methods
-    void setCompositeEnabled(bool enabled);
-    void setCompositeLayersInFront(int layers);
-    void setCompositeLayersBehind(int layers);
-    void setCompositeMethod(const std::string& method);
-    void setCompositeAlphaMin(int value);
-    void setCompositeAlphaMax(int value);
-    void setCompositeAlphaThreshold(int value);
-    void setCompositeMaterial(int value);
-    void setCompositeReverseDirection(bool reverse);
-    void setCompositeBLExtinction(float value);
-    void setCompositeBLEmission(float value);
-    void setCompositeBLAmbient(float value);
-    void setLightingEnabled(bool enabled);
-    void setLightAzimuth(float degrees);
-    void setLightElevation(float degrees);
-    void setLightDiffuse(float value);
-    void setLightAmbient(float value);
-    void setUseVolumeGradients(bool enabled);
-    void setIsoCutoff(int value);
+    // Composite rendering settings (single struct replaces ~25 individual setters)
+    void setCompositeRenderSettings(const CompositeRenderSettings& settings);
+    const CompositeRenderSettings& compositeRenderSettings() const { return _compositeSettings; }
+
+    bool isCompositeEnabled() const { return _compositeSettings.enabled; }
+    bool isPlaneCompositeEnabled() const { return _compositeSettings.planeEnabled; }
+    int planeCompositeLayersFront() const { return _compositeSettings.planeLayersFront; }
+    int planeCompositeLayersBehind() const { return _compositeSettings.planeLayersBehind; }
+    bool postStretchValues() const { return _compositeSettings.postStretchValues; }
+    bool postRemoveSmallComponents() const { return _compositeSettings.postRemoveSmallComponents; }
+    int postMinComponentSize() const { return _compositeSettings.postMinComponentSize; }
+
     void setResetViewOnSurfaceChange(bool reset);
-
-    // Plane composite view methods (for XY/XZ/YZ plane viewers)
-    void setPlaneCompositeEnabled(bool enabled);
-    void setPlaneCompositeLayers(int front, int behind);
-    bool isPlaneCompositeEnabled() const { return _plane_composite_enabled; }
-    int planeCompositeLayersFront() const { return _plane_composite_layers_front; }
-    int planeCompositeLayersBehind() const { return _plane_composite_layers_behind; }
-
-    // Postprocessing settings
-    void setPostStretchValues(bool enabled);
-    bool postStretchValues() const { return _postStretchValues; }
-    void setPostRemoveSmallComponents(bool enabled);
-    bool postRemoveSmallComponents() const { return _postRemoveSmallComponents; }
-    void setPostMinComponentSize(int size);
-    int postMinComponentSize() const { return _postMinComponentSize; }
-    bool isCompositeEnabled() const { return _composite_enabled; }
     std::shared_ptr<Volume> currentVolume() const { return volume; }
     ChunkCache<uint8_t>* chunkCachePtr() const { return cache; }
     int datasetScaleIndex() const { return _ds_sd_idx; }
@@ -273,6 +249,17 @@ signals:
 protected:
     QPointF volumeToScene(const cv::Vec3f& vol_point);
 
+    // Rendering helpers (extracted from render_composite / render_area)
+    void getCachedSurfaceCoords(
+        cv::Mat_<cv::Vec3f>& base_coords, cv::Mat_<cv::Vec3f>& normals,
+        const cv::Rect& roi, const cv::Vec3f& ptr, const std::shared_ptr<Surface>& surf);
+    cv::Mat_<cv::Vec3f> getVolumeGradientNormals(
+        const cv::Mat_<cv::Vec3f>& meshNormals, const cv::Rect& roi,
+        const std::shared_ptr<Surface>& surf);
+    void generateViewCoords(
+        cv::Mat_<cv::Vec3f>& coords, const cv::Rect& roi,
+        const std::shared_ptr<Surface>& surf);
+
 protected:
     // widget components
     QGraphicsScene* fScene;
@@ -302,34 +289,8 @@ protected:
     float _z_off = 0.0;  // Offset along surface normal (perpendicular to surface)
     QPointF _lastScenePos;  // Last known scene position for grid coordinate lookups
 
-    // Composite view settings (for segmentation/QuadSurface)
-    bool _composite_enabled = false;
-    int _composite_layers = 7;
-    int _composite_layers_front = 8;
-    int _composite_layers_behind = 0;
-    std::string _composite_method = "max";
-    int _composite_alpha_min = 170;
-    int _composite_alpha_max = 220;
-    int _composite_alpha_threshold = 9950;
-    int _composite_material = 230;
-    bool _composite_reverse_direction = false;
-    float _composite_bl_extinction = 1.5f;
-    float _composite_bl_emission = 1.5f;
-    float _composite_bl_ambient = 0.1f;
-    bool _lighting_enabled = false;
-    float _light_azimuth = 45.0f;
-    float _light_elevation = 45.0f;
-    float _light_diffuse = 0.7f;
-    float _light_ambient = 0.3f;
-    bool _use_volume_gradients = false;
-    int _iso_cutoff = 0;
-
-    // Plane composite view settings (for XY/XZ/YZ plane viewers)
-    // These share the same composite method/parameters as segmentation,
-    // but have separate layer counts and enable flag
-    bool _plane_composite_enabled = false;
-    int _plane_composite_layers_front = 4;
-    int _plane_composite_layers_behind = 4;
+    // Consolidated composite rendering settings
+    CompositeRenderSettings _compositeSettings;
     
     QGraphicsItem *_center_marker = nullptr;
     QGraphicsItem *_cursor = nullptr;
@@ -419,11 +380,6 @@ protected:
     bool _surfaceOverlayEnabled{false};
     std::map<std::string, cv::Vec3b> _surfaceOverlays;  // name -> BGR color
     float _surfaceOverlapThreshold{5.0f};
-
-    // Postprocessing settings
-    bool _postStretchValues{false};
-    bool _postRemoveSmallComponents{false};
-    int _postMinComponentSize{50};
 
     bool _dirtyWhileMinimized = false;
 
