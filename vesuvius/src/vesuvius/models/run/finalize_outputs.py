@@ -73,28 +73,27 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
             # Single-channel logits: interpret channel as foreground logit.
             logits = logits_np[0].astype(np.float32)
             if threshold:
-                output_data = (logits > 0).astype(np.float32)[np.newaxis, ...]
+                output_data = (logits > 0).astype(np.float32)
             else:
                 probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -20, 20)))
-                output_data = probs[np.newaxis, ...]
+                output_data = probs
         else:
             exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
             softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
             if threshold:
                 binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
-                output_data = binary_mask[np.newaxis, ...]
+                output_data = binary_mask
             else:
-                fg_prob = softmax[1:2]
+                fg_prob = softmax[1]
                 output_data = fg_prob
     else:  # multiclass
         exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
         softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
         argmax = np.argmax(logits_np, axis=0).astype(np.float32)
-        argmax = argmax[np.newaxis, ...]
         if threshold:
             output_data = argmax
         else:
-            output_data = np.concatenate([softmax, argmax], axis=0)
+            output_data = np.concatenate([softmax, argmax[np.newaxis, ...]], axis=0)
 
     output_np = output_data
 
@@ -127,7 +126,7 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
         config: FinalizeConfig with mode/threshold/multi-task settings
 
     Returns:
-        Output shape tuple (C_out, Z, Y, X)
+        Output shape tuple: (Z, Y, X) for single-channel, (C_out, Z, Y, X) for multi-channel
     """
     mode = config.mode
     threshold = config.threshold
@@ -139,10 +138,10 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
             num_targets = len(target_info)
             return (num_targets, *spatial_shape)
         else:
-            return (1, *spatial_shape)
+            return spatial_shape
     else:  # multiclass
         if threshold:
-            return (1, *spatial_shape)
+            return spatial_shape
         else:
             return (num_classes + 1, *spatial_shape)
 
@@ -166,9 +165,11 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     chunk_idx = chunk_info['indices']
     
+    has_channel_dim = len(output_chunks) > len(spatial_shape)
+    spatial_chunks = output_chunks[1:] if has_channel_dim else output_chunks
     spatial_slices = tuple(
         slice(idx * chunk, min((idx + 1) * chunk, shape_dim))
-        for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
+        for idx, chunk, shape_dim in zip(chunk_idx, spatial_chunks, spatial_shape)
     )
     
     input_store = open_zarr(
@@ -197,7 +198,7 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     if is_empty:
         return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
 
-    output_slice = (slice(None),) + spatial_slices
+    output_slice = (slice(None),) + spatial_slices if has_channel_dim else spatial_slices
     output_store[output_slice] = output_np
     return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_np.shape)}
 
@@ -313,32 +314,31 @@ def finalize_logits(
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
         else:
             if num_classes == 1:
-                output_shape = (1, *spatial_shape)
+                output_shape = spatial_shape
                 if threshold:
-                    print("Output will have 1 channel: [binary_mask_from_logit]")
+                    print("Output shape: (Z, Y, X) [binary_mask_from_logit]")
                 else:
-                    print("Output will have 1 channel: [sigmoid_fg]")
+                    print("Output shape: (Z, Y, X) [sigmoid_fg]")
             else:
                 if threshold:
-                    # If thresholding, only output argmax channel for binary
-                    output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
-                    print("Output will have 1 channel: [binary_mask]")
+                    output_shape = spatial_shape
+                    print("Output shape: (Z, Y, X) [binary_mask]")
                 else:
-                     # Just softmax of FG class
-                    output_shape = (1, *spatial_shape)
-                    print("Output will have 1 channel: [softmax_fg]")
+                    output_shape = spatial_shape
+                    print("Output shape: (Z, Y, X) [softmax_fg]")
     else:  # multiclass
         if threshold:
-            # If threshold is provided for multiclass, only save the argmax
-            output_shape = (1, *spatial_shape)
-            print("Output will have 1 channel: [argmax]")
+            output_shape = spatial_shape
+            print("Output shape: (Z, Y, X) [argmax]")
         else:
             # For multiclass, we'll output num_classes channels (all softmax values)
             # Plus 1 channel for the argmax
             output_shape = (num_classes + 1, *spatial_shape)
             print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
 
-    output_chunks = (1, *output_chunks)  # Chunk each channel separately
+    # Only prepend channel chunk dim when output has a channel dimension
+    if len(output_shape) > len(spatial_shape):
+        output_chunks = (1, *output_chunks)  # Chunk each channel separately
 
     # --- Create or Open Output Array ---
     if part_id == 0:
@@ -376,9 +376,13 @@ def finalize_logits(
 
     def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
-        # Skip first dimension (channels)
-        spatial_shape = shape[1:]
-        spatial_chunks = chunks[1:]
+        # Skip first dimension (channels) if present
+        if len(shape) == 4:
+            spatial_shape = shape[1:]
+            spatial_chunks = chunks[1:]
+        else:
+            spatial_shape = shape
+            spatial_chunks = chunks
         
         # Generate all combinations of chunk indices
         from itertools import product
@@ -395,7 +399,8 @@ def finalize_logits(
         return chunks_info
 
     # --- Calculate Z-range for this part ---
-    all_chunk_infos = get_chunk_indices(input_shape, output_chunks)
+    all_chunk_infos = get_chunk_indices(output_shape, output_chunks)
+    z_chunk_size = output_chunks[1] if len(output_shape) == 4 else output_chunks[0]
 
     if num_parts > 1:
         total_z = spatial_shape[0]  # Z dimension
@@ -408,8 +413,8 @@ def finalize_logits(
         for chunk_info in all_chunk_infos:
             z_idx, y_idx, x_idx = chunk_info['indices']
             # Calculate actual Z coordinates for this chunk
-            chunk_z_start = z_idx * output_chunks[1]  # output_chunks[1] is Z chunk size
-            chunk_z_end = min(chunk_z_start + output_chunks[1], spatial_shape[0])
+            chunk_z_start = z_idx * z_chunk_size
+            chunk_z_end = min(chunk_z_start + z_chunk_size, spatial_shape[0])
 
             # Check if chunk intersects with our Z-range
             if chunk_z_end > z_start and chunk_z_start < z_end:

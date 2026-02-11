@@ -530,12 +530,15 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             if not is_empty:
                 # Finalized output may have different channel count than blended logits;
                 # write using slices that match the finalized shape.
-                finalized_slice = (
-                    slice(None),
+                spatial_slices = (
                     slice(z_start, z_end),
                     slice(y_start, y_end),
                     slice(x_start, x_end)
                 )
+                if result.ndim > 3:
+                    finalized_slice = (slice(None),) + spatial_slices
+                else:
+                    finalized_slice = spatial_slices
                 output_store[finalized_slice] = result
         else:
             output_store[output_slice] = normalized.astype(np.float16)
@@ -722,20 +725,20 @@ def merge_inference_outputs(
     # we use the patch size as the default chunk size throughout the pipeline
     # so that the chunk size is consistent , to avoid partial chunk read/writes
     # given that we write the logits with aligned chunk/patch size, we continue that here
+    has_channel_dim = len(output_shape) > 3
     if chunk_size is None or any(c == 0 for c in (chunk_size if chunk_size else [0, 0, 0])):
-
-        output_chunks = (
-            1,
-            patch_size[0],  # z
-            patch_size[1],  # y
-            patch_size[2]   # x
-        )
+        spatial_chunks = (patch_size[0], patch_size[1], patch_size[2])
         if verbose:
-            print(f"  Using chunk_size {output_chunks[1:]} based directly on patch_size")
+            print(f"  Using chunk_size {spatial_chunks} based directly on patch_size")
     else:
-        output_chunks = (1, *chunk_size)
+        spatial_chunks = chunk_size
         if verbose:
-            print(f"  Using specified chunk_size {chunk_size}")
+            print(f"  Using specified chunk_size {spatial_chunks}")
+
+    if has_channel_dim:
+        output_chunks = (1, *spatial_chunks)
+    else:
+        output_chunks = spatial_chunks
 
 
     if compression_level > 0:
@@ -788,7 +791,7 @@ def merge_inference_outputs(
     # --- 6. Calculate Processing Chunks ---
     chunks = calculate_chunks(
         original_volume_shape,
-        output_chunks=output_chunks[1:],  # Skip the class dimension from output_chunks
+        output_chunks=output_chunks[1:] if has_channel_dim else output_chunks,
         z_range=z_range
     )
 
