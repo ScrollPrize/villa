@@ -1,10 +1,8 @@
 #include "CVolumeViewer.hpp"
-#include "vc/ui/UDataManipulateUtils.hpp"
 
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
-#include <QGraphicsView>
 #include <QGraphicsScene>
 #include <QGraphicsItem>
 #include <QPainterPath>
@@ -13,16 +11,11 @@
 #include "CSurfaceCollection.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 
-#include <omp.h>
-
-#include <iostream>
-#include <optional>
-#include <cstdlib>
+#include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -33,30 +26,121 @@
 #define COLOR_SEG_XY QColor(255, 140, 0)
 #define COLOR_APPROVED QColor(0, 200, 0)
 
-#include <algorithm>
-#include <cmath>
+static const QColor kIntersectionPalette[] = {
+    // Vibrant saturated colors
+    QColor(80, 180, 255),   // sky blue
+    QColor(180, 80, 220),   // violet
+    QColor(80, 220, 200),   // aqua/teal
+    QColor(220, 80, 180),   // magenta
+    QColor(80, 130, 255),   // medium blue
+    QColor(160, 80, 255),   // purple
+    QColor(80, 255, 220),   // cyan
+    QColor(255, 80, 200),   // hot pink
+    QColor(120, 220, 80),   // lime green
+    QColor(80, 180, 120),   // spring green
 
-// Helper to compare intersection lines for caching
-static bool intersectionLinesEqual(const std::vector<IntersectionLine>& a,
-                                   const std::vector<IntersectionLine>& b)
+    // Lighter/pastel variants
+    QColor(150, 200, 255),  // light sky blue
+    QColor(200, 150, 230),  // light violet
+    QColor(150, 230, 210),  // light aqua
+    QColor(230, 150, 200),  // light magenta
+    QColor(150, 170, 255),  // light blue
+    QColor(190, 150, 255),  // light purple
+    QColor(150, 255, 230),  // light cyan
+    QColor(255, 150, 210),  // light pink
+    QColor(180, 240, 150),  // light lime
+    QColor(150, 230, 170),  // light spring green
+
+    // Deeper/darker variants
+    QColor(50, 120, 200),   // deep blue
+    QColor(140, 50, 180),   // deep violet
+    QColor(50, 180, 160),   // deep teal
+    QColor(180, 50, 140),   // deep magenta
+    QColor(50, 90, 200),    // navy blue
+    QColor(120, 50, 200),   // deep purple
+    QColor(50, 200, 180),   // deep cyan
+    QColor(200, 50, 160),   // deep pink
+    QColor(80, 160, 60),    // forest green
+    QColor(50, 140, 100),   // deep sea green
+
+    // Extra variations with different saturation
+    QColor(100, 160, 220),  // muted blue
+    QColor(160, 100, 200),  // muted violet
+    QColor(100, 200, 180),  // muted teal
+    QColor(200, 100, 170),  // muted magenta
+    QColor(120, 180, 240),  // soft blue
+    QColor(180, 120, 220),  // soft purple
+    QColor(120, 220, 200),  // soft cyan
+    QColor(220, 120, 190),  // soft pink
+    QColor(140, 200, 100),  // soft lime
+    QColor(100, 180, 130),  // muted green
+};
+
+struct LineStyle {
+    QColor color;
+    float width;
+    int z;
+    bool operator==(const LineStyle& o) const {
+        return color == o.color && width == o.width && z == o.z;
+    }
+};
+
+struct LineStyleHash {
+    size_t operator()(const LineStyle& s) const {
+        return std::hash<int>()(s.color.rgba()) ^
+               std::hash<int>()(static_cast<int>(s.width * 100)) ^
+               std::hash<int>()(s.z);
+    }
+};
+
+// Compute per-segment style adjustments from the approval mask.
+// Returns true if the style was modified (segment is in an approved region).
+static bool applyApprovalStyle(
+    const SurfacePatchIndex::TriangleSegment& seg,
+    const QuadSurface& surface,
+    const SegmentationOverlayController& overlay,
+    const QColor& baseColor,
+    float baseWidth,
+    int baseZ,
+    QColor& outColor,
+    float& outWidth,
+    int& outZ)
 {
-    if (a.size() != b.size()) {
+    const cv::Vec2f grid0 = surface.ptrToGrid(seg.surfaceParams[0]);
+    const cv::Vec2f grid1 = surface.ptrToGrid(seg.surfaceParams[1]);
+
+    int status0 = 0, status1 = 0;
+    const float intensity0 = overlay.queryApprovalBilinear(grid0[1], grid0[0], &status0);
+    const float intensity1 = overlay.queryApprovalBilinear(grid1[1], grid1[0], &status1);
+
+    const int approvalState = std::max(status0, status1);
+    const float approvalIntensity = std::max(intensity0, intensity1);
+
+    if (approvalState <= 0 || approvalIntensity <= 0.0f) {
         return false;
     }
-    constexpr float epsilon = 1e-4f;
-    for (size_t i = 0; i < a.size(); ++i) {
-        for (int j = 0; j < 2; ++j) {
-            const auto& wa = a[i].world[j];
-            const auto& wb = b[i].world[j];
-            if (std::abs(wa[0] - wb[0]) > epsilon ||
-                std::abs(wa[1] - wb[1]) > epsilon ||
-                std::abs(wa[2] - wb[2]) > epsilon) {
-                return false;
-            }
-        }
+
+    // Query actual color from the mask at the midpoint of the line segment
+    const int queryRow = static_cast<int>(std::round((grid0[1] + grid1[1]) * 0.5f));
+    const int queryCol = static_cast<int>(std::round((grid0[0] + grid1[0]) * 0.5f));
+    QColor approvalColor = overlay.queryApprovalColor(queryRow, queryCol);
+    if (!approvalColor.isValid()) {
+        approvalColor = COLOR_APPROVED;
     }
+
+    const float opacityFactor = static_cast<float>(overlay.approvalMaskOpacity()) / 100.0f;
+    const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f) * opacityFactor;
+    outColor = QColor(
+        static_cast<int>(baseColor.red()   * (1.0f - blendFactor) + approvalColor.red()   * blendFactor),
+        static_cast<int>(baseColor.green() * (1.0f - blendFactor) + approvalColor.green() * blendFactor),
+        static_cast<int>(baseColor.blue()  * (1.0f - blendFactor) + approvalColor.blue()  * blendFactor),
+        approvalColor.alpha()
+    );
+    outWidth = baseWidth + 12.0f * blendFactor;
+    outZ = baseZ + 5;
     return true;
 }
+
 
 void CVolumeViewer::renderIntersections()
 {
@@ -140,25 +224,6 @@ void CVolumeViewer::renderIntersections()
                               static_cast<int>(viewRect.y()/_scale),
                               static_cast<int>(viewRect.width()/_scale),
                               static_cast<int>(viewRect.height()/_scale)};
-        // Enlarge the sampled region so nearby intersections outside the viewport still get clipped.
-        const int dominantSpan = std::max(plane_roi.width, plane_roi.height);
-        const int planeRoiPadding = 8;
-        plane_roi.x -= planeRoiPadding;
-        plane_roi.y -= planeRoiPadding;
-        plane_roi.width += planeRoiPadding * 2;
-        plane_roi.height += planeRoiPadding * 2;
-
-        cv::Vec3f corner = plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.x), static_cast<float>(plane_roi.y), 0.0});
-        Rect3D view_bbox = {corner, corner};
-        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.br().x), static_cast<float>(plane_roi.y), 0}));
-        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.x), static_cast<float>(plane_roi.br().y), 0}));
-        view_bbox = expand_rect(view_bbox, plane->coord(cv::Vec3f(0,0,0), {static_cast<float>(plane_roi.br().x), static_cast<float>(plane_roi.br().y), 0}));
-        const cv::Vec3f bboxExtent = view_bbox.high - view_bbox.low;
-        const float maxExtent = std::max(std::abs(bboxExtent[0]),
-                              std::max(std::abs(bboxExtent[1]), std::abs(bboxExtent[2])));
-        const float viewPadding = std::max(64.0f, maxExtent * 0.25f);
-        view_bbox.low -= cv::Vec3f(viewPadding, viewPadding, viewPadding);
-        view_bbox.high += cv::Vec3f(viewPadding, viewPadding, viewPadding);
 
         using IntersectionCandidate = std::pair<std::string, SurfacePatchIndex::SurfacePtr>;
         std::vector<IntersectionCandidate> intersectCandidates;
@@ -193,64 +258,27 @@ void CVolumeViewer::renderIntersections()
 
         const float clipTolerance = std::max(_intersectionThickness, 1e-4f);
 
-        // Use member buffers to preserve capacity across frames
-        patchIndex->queryTriangles(view_bbox, targetSurfaces, _triangleCandidates);
-
-        // Clear and rebuild surface mapping (reuses allocated vectors)
-        for (auto& [surf, indices] : _trianglesBySurface) {
-            indices.clear();
-        }
-        for (size_t idx = 0; idx < _triangleCandidates.size(); ++idx) {
-            const auto& surface = _triangleCandidates[idx].surface;
-            if (surface) {
-                _trianglesBySurface[surface].push_back(idx);
-            }
-        }
+        // Single call: builds bbox, queries R-tree, groups by surface, clips in parallel
+        auto intersectionMap = patchIndex->computePlaneIntersections(
+            *plane, plane_roi, targetSurfaces, clipTolerance,
+            &_triangleCandidates, &_trianglesBySurface);
 
         for (const auto& candidate : intersectCandidates) {
             const auto& key = candidate.first;
             const auto& segmentation = candidate.second;
 
-            const auto trianglesIt = _trianglesBySurface.find(segmentation);
-            if (trianglesIt == _trianglesBySurface.end()) {
+            const auto mapIt = intersectionMap.find(segmentation);
+            if (mapIt == intersectionMap.end() || mapIt->second.empty()) {
                 removeItemsForKey(key);
                 continue;
             }
-
-            const auto& candidateIndices = trianglesIt->second;
-            const size_t numCandidates = candidateIndices.size();
-
-            // Parallel triangle clipping - each thread writes to its own slot
-            std::vector<std::optional<IntersectionLine>> clipResults(numCandidates);
-
-            #pragma omp parallel for schedule(dynamic, 64)
-            for (size_t k = 0; k < numCandidates; ++k) {
-                const auto& triCandidate = _triangleCandidates[candidateIndices[k]];
-                auto segment = SurfacePatchIndex::clipTriangleToPlane(triCandidate, *plane, clipTolerance);
-                if (segment) {
-                    IntersectionLine line;
-                    line.world[0] = segment->world[0];
-                    line.world[1] = segment->world[1];
-                    line.surfaceParams[0] = segment->surfaceParams[0];
-                    line.surfaceParams[1] = segment->surfaceParams[1];
-                    clipResults[k] = std::move(line);
-                }
-            }
-
-            // Collect non-null results
-            std::vector<IntersectionLine> intersectionLines;
-            intersectionLines.reserve(numCandidates);
-            for (auto& result : clipResults) {
-                if (result) {
-                    intersectionLines.push_back(std::move(*result));
-                }
-            }
+            const auto& intersectionLines = mapIt->second;
 
             // Check if intersection lines match cached - if so, skip expensive recreation
             auto cachedIt = _cachedIntersectionLines.find(key);
             const bool hasCache = cachedIt != _cachedIntersectionLines.end();
             const bool hasExistingItems = _intersect_items.count(key) && !_intersect_items[key].empty();
-            if (hasCache && hasExistingItems && intersectionLinesEqual(intersectionLines, cachedIt->second)) {
+            if (hasCache && hasExistingItems && SurfacePatchIndex::segmentsEqual(intersectionLines, cachedIt->second)) {
                 // Lines unchanged - just update opacity and visibility on existing items and continue
                 for (auto* item : _intersect_items[key]) {
                     item->setVisible(true);
@@ -262,59 +290,10 @@ void CVolumeViewer::renderIntersections()
             // Update cache
             _cachedIntersectionLines[key] = intersectionLines;
 
+            // Determine base style for this surface
             QColor col;
             float width = 3;
             int z_value = 5;
-
-            static const QColor palette[] = {
-                // Vibrant saturated colors
-                QColor(80, 180, 255),   // sky blue
-                QColor(180, 80, 220),   // violet
-                QColor(80, 220, 200),   // aqua/teal
-                QColor(220, 80, 180),   // magenta
-                QColor(80, 130, 255),   // medium blue
-                QColor(160, 80, 255),   // purple
-                QColor(80, 255, 220),   // cyan
-                QColor(255, 80, 200),   // hot pink
-                QColor(120, 220, 80),   // lime green
-                QColor(80, 180, 120),   // spring green
-
-                // Lighter/pastel variants
-                QColor(150, 200, 255),  // light sky blue
-                QColor(200, 150, 230),  // light violet
-                QColor(150, 230, 210),  // light aqua
-                QColor(230, 150, 200),  // light magenta
-                QColor(150, 170, 255),  // light blue
-                QColor(190, 150, 255),  // light purple
-                QColor(150, 255, 230),  // light cyan
-                QColor(255, 150, 210),  // light pink
-                QColor(180, 240, 150),  // light lime
-                QColor(150, 230, 170),  // light spring green
-
-                // Deeper/darker variants
-                QColor(50, 120, 200),   // deep blue
-                QColor(140, 50, 180),   // deep violet
-                QColor(50, 180, 160),   // deep teal
-                QColor(180, 50, 140),   // deep magenta
-                QColor(50, 90, 200),    // navy blue
-                QColor(120, 50, 200),   // deep purple
-                QColor(50, 200, 180),   // deep cyan
-                QColor(200, 50, 160),   // deep pink
-                QColor(80, 160, 60),    // forest green
-                QColor(50, 140, 100),   // deep sea green
-
-                // Extra variations with different saturation
-                QColor(100, 160, 220),  // muted blue
-                QColor(160, 100, 200),  // muted violet
-                QColor(100, 200, 180),  // muted teal
-                QColor(200, 100, 170),  // muted magenta
-                QColor(120, 180, 240),  // soft blue
-                QColor(180, 120, 220),  // soft purple
-                QColor(120, 220, 200),  // soft cyan
-                QColor(220, 120, 190),  // soft pink
-                QColor(140, 200, 100),  // soft lime
-                QColor(100, 180, 130),  // muted green
-            };
 
             // Persistent color assignment: once a surface gets a color, it keeps it (up to 500 surfaces)
             size_t colorIndex;
@@ -325,10 +304,9 @@ void CVolumeViewer::renderIntersections()
                 colorIndex = _nextColorIndex++;
                 _surfaceColorAssignments[key] = colorIndex;
             } else {
-                // Over 500 surfaces - fall back to hash-based assignment
                 colorIndex = std::hash<std::string>{}(key);
             }
-            col = palette[colorIndex % std::size(palette)];
+            col = kIntersectionPalette[colorIndex % std::size(kIntersectionPalette)];
 
             const bool isActiveSegmentation =
                 activeSegSurface && segmentation == activeSegSurface;
@@ -353,80 +331,20 @@ void CVolumeViewer::renderIntersections()
             }
             const bool checkApproval = segOverlay && segOverlay->hasApprovalMaskData();
 
-            // Cache surface properties for coordinate conversion (constant for all lines from this surface)
-            float approvalOffsetX = 0.0f;
-            float approvalOffsetY = 0.0f;
-            if (checkApproval) {
-                const cv::Vec3f center = segmentation->center();
-                const cv::Vec2f scale = segmentation->scale();
-                approvalOffsetX = center[0] * scale[0];
-                approvalOffsetY = center[1] * scale[1];
-            }
-
             // Batch lines by style (color/width/z) to reduce QGraphicsItem count
-            struct LineStyle {
-                QColor color;
-                float width;
-                int z;
-                bool operator==(const LineStyle& o) const {
-                    return color == o.color && width == o.width && z == o.z;
-                }
-            };
-            struct LineStyleHash {
-                size_t operator()(const LineStyle& s) const {
-                    return std::hash<int>()(s.color.rgba()) ^
-                           std::hash<int>()(static_cast<int>(s.width * 100)) ^
-                           std::hash<int>()(s.z);
-                }
-            };
             std::unordered_map<LineStyle, QPainterPath, LineStyleHash> batchedPaths;
 
             for (const auto& line : intersectionLines) {
-                // Determine color and width based on approval status
                 QColor lineColor = col;
                 float lineWidth = width;
                 int lineZ = z_value;
 
                 if (checkApproval) {
-                    const float absCol0 = line.surfaceParams[0][0] + approvalOffsetX;
-                    const float absRow0 = line.surfaceParams[0][1] + approvalOffsetY;
-                    const float absCol1 = line.surfaceParams[1][0] + approvalOffsetX;
-                    const float absRow1 = line.surfaceParams[1][1] + approvalOffsetY;
-
-                    int status0 = 0, status1 = 0;
-                    const float intensity0 = segOverlay->queryApprovalBilinear(absRow0, absCol0, &status0);
-                    const float intensity1 = segOverlay->queryApprovalBilinear(absRow1, absCol1, &status1);
-
-                    const int approvalState = std::max(status0, status1);
-                    const float approvalIntensity = std::max(intensity0, intensity1);
-
-                    // Status: 0 = not approved, 1 = saved approved, 2 = pending approved
-                    // Use actual mask color for approved regions (unapprovals are applied immediately)
-                    if (approvalState > 0 && approvalIntensity > 0.0f) {
-                        // Query actual color from the mask at the midpoint of the line segment
-                        const int queryRow = static_cast<int>(std::round((absRow0 + absRow1) * 0.5f));
-                        const int queryCol = static_cast<int>(std::round((absCol0 + absCol1) * 0.5f));
-                        QColor approvalColor = segOverlay->queryApprovalColor(queryRow, queryCol);
-                        if (!approvalColor.isValid()) {
-                            approvalColor = COLOR_APPROVED;  // Fallback to default green
-                        }
-
-                        const float opacityFactor = static_cast<float>(segOverlay->approvalMaskOpacity()) / 100.0f;
-                        const float blendFactor = std::min(1.0f, approvalIntensity * 2.0f) * opacityFactor;
-                        lineColor = QColor(
-                            static_cast<int>(col.red() * (1.0f - blendFactor) + approvalColor.red() * blendFactor),
-                            static_cast<int>(col.green() * (1.0f - blendFactor) + approvalColor.green() * blendFactor),
-                            static_cast<int>(col.blue() * (1.0f - blendFactor) + approvalColor.blue() * blendFactor),
-                            approvalColor.alpha()
-                        );
-
-                        const float extraWidth = 12.0f * blendFactor;
-                        lineWidth = width + extraWidth;
-                        lineZ = z_value + 5;
-                    }
+                    applyApprovalStyle(line, *segmentation, *segOverlay,
+                                       col, width, z_value,
+                                       lineColor, lineWidth, lineZ);
                 }
 
-                // Add line to batched path for this style
                 LineStyle style{lineColor, lineWidth, lineZ};
                 QPainterPath& path = batchedPaths[style];
                 cv::Vec3f p0 = plane->project(line.world[0], 1.0, _scale);

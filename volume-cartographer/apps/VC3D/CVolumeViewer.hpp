@@ -339,7 +339,7 @@ protected:
     std::set<std::string> _intersect_tgts = {"visible_segmentation"};
     std::unordered_map<std::string, SurfacePatchIndex::SurfacePtr> _cachedIntersectSurfaces;
     std::unordered_map<std::string,std::vector<QGraphicsItem*>> _intersect_items;
-    std::unordered_map<std::string, std::vector<IntersectionLine>> _cachedIntersectionLines;
+    std::unordered_map<std::string, std::vector<SurfacePatchIndex::TriangleSegment>> _cachedIntersectionLines;
     float _cachedIntersectionScale = 0.0f;  // Scale used when caching intersection lines
     // Reusable buffers to avoid per-frame allocations
     std::vector<SurfacePatchIndex::TriangleCandidate> _triangleCandidates;

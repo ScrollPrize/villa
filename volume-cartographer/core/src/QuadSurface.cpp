@@ -189,9 +189,9 @@ bool QuadSurface::valid(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 }
 
 
-cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset)
+cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) const
 {
-    ensureLoaded();
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
     cv::Rect bounds = {0,0,_points->cols-2,_points->rows-2};
@@ -225,6 +225,12 @@ cv::Vec2f QuadSurface::scale() const
 cv::Vec3f QuadSurface::center() const
 {
     return _center;
+}
+
+cv::Vec2f QuadSurface::ptrToGrid(const cv::Vec3f& ptr) const
+{
+    return {ptr[0] + _center[0] * _scale[0],
+            ptr[1] + _center[1] * _scale[1]};
 }
 
 cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
@@ -394,9 +400,9 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                       cv::Size size,
                       const cv::Vec3f& ptr,
                       float scale,
-                      const cv::Vec3f& offset)
+                      const cv::Vec3f& offset) const
 {
-    ensureLoaded();
+    const_cast<QuadSurface*>(this)->ensureLoaded();
     const bool need_normals = (normals != nullptr) || offset[2] || ptr[2];
 
     const cv::Vec3f ul = internal_loc(offset/scale + _center, ptr, _scale);

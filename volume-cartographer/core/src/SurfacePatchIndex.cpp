@@ -1649,3 +1649,120 @@ void SurfacePatchIndex::setGeneration(const SurfacePtr& surface, uint64_t gen)
     }
     impl_->surfaceGenerations[surface.get()] = gen;
 }
+
+bool SurfacePatchIndex::segmentsEqual(const std::vector<TriangleSegment>& a,
+                                      const std::vector<TriangleSegment>& b,
+                                      float epsilon)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        for (int j = 0; j < 2; ++j) {
+            const auto& wa = a[i].world[j];
+            const auto& wb = b[i].world[j];
+            if (std::abs(wa[0] - wb[0]) > epsilon ||
+                std::abs(wa[1] - wb[1]) > epsilon ||
+                std::abs(wa[2] - wb[2]) > epsilon) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>>
+SurfacePatchIndex::computePlaneIntersections(
+    const PlaneSurface& plane,
+    const cv::Rect& planeRoi,
+    const std::unordered_set<SurfacePtr>& targets,
+    float clipTolerance,
+    std::vector<TriangleCandidate>* triangleBuf,
+    std::unordered_map<SurfacePtr, std::vector<size_t>>* surfaceBuf) const
+{
+    std::unordered_map<SurfacePtr, std::vector<TriangleSegment>> result;
+    if (empty() || targets.empty()) {
+        return result;
+    }
+
+    // Build 3D bounding box from the plane ROI with padding
+    constexpr int kPadding = 8;
+    cv::Rect roi = planeRoi;
+    roi.x -= kPadding;
+    roi.y -= kPadding;
+    roi.width += kPadding * 2;
+    roi.height += kPadding * 2;
+
+    cv::Vec3f corner = plane.coord(
+        cv::Vec3f(0, 0, 0),
+        {static_cast<float>(roi.x), static_cast<float>(roi.y), 0.0f});
+    Rect3D viewBbox = {corner, corner};
+    viewBbox = expand_rect(
+        viewBbox,
+        plane.coord(cv::Vec3f(0, 0, 0),
+                    {static_cast<float>(roi.br().x), static_cast<float>(roi.y), 0.0f}));
+    viewBbox = expand_rect(
+        viewBbox,
+        plane.coord(cv::Vec3f(0, 0, 0),
+                    {static_cast<float>(roi.x), static_cast<float>(roi.br().y), 0.0f}));
+    viewBbox = expand_rect(
+        viewBbox,
+        plane.coord(cv::Vec3f(0, 0, 0),
+                    {static_cast<float>(roi.br().x), static_cast<float>(roi.br().y), 0.0f}));
+
+    // Pad the bbox by 25% of the max extent (minimum 64 units)
+    const cv::Vec3f extent = viewBbox.high - viewBbox.low;
+    const float maxExtent = std::max(
+        std::abs(extent[0]), std::max(std::abs(extent[1]), std::abs(extent[2])));
+    const float padding = std::max(64.0f, maxExtent * 0.25f);
+    viewBbox.low -= cv::Vec3f(padding, padding, padding);
+    viewBbox.high += cv::Vec3f(padding, padding, padding);
+
+    // Query triangles from R-tree
+    std::vector<TriangleCandidate> localTriBuf;
+    auto& triangles = triangleBuf ? *triangleBuf : localTriBuf;
+    queryTriangles(viewBbox, targets, triangles);
+
+    // Group triangles by surface
+    std::unordered_map<SurfacePtr, std::vector<size_t>> localSurfBuf;
+    auto& bySurface = surfaceBuf ? *surfaceBuf : localSurfBuf;
+    for (auto& [surf, indices] : bySurface) {
+        indices.clear();
+    }
+    for (size_t idx = 0; idx < triangles.size(); ++idx) {
+        const auto& surface = triangles[idx].surface;
+        if (surface) {
+            bySurface[surface].push_back(idx);
+        }
+    }
+
+    // Clip triangles per surface in parallel
+    for (const auto& target : targets) {
+        const auto it = bySurface.find(target);
+        if (it == bySurface.end()) {
+            continue;
+        }
+        const auto& indices = it->second;
+        const size_t n = indices.size();
+
+        std::vector<std::optional<TriangleSegment>> clipResults(n);
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (size_t k = 0; k < n; ++k) {
+            clipResults[k] =
+                clipTriangleToPlane(triangles[indices[k]], plane, clipTolerance);
+        }
+
+        std::vector<TriangleSegment> segments;
+        segments.reserve(n);
+        for (auto& r : clipResults) {
+            if (r) {
+                segments.push_back(std::move(*r));
+            }
+        }
+        if (!segments.empty()) {
+            result[target] = std::move(segments);
+        }
+    }
+
+    return result;
+}
