@@ -123,20 +123,35 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 def main(argv: list[str] | None = None) -> int:
 	parser = _build_parser()
 	args = cli_json.parse_args(parser, argv)
-	cfg = ExportConfig(
-		input=str(args.input),
-		output=str(args.output),
-		prefix=str(args.prefix),
-		downscale=float(args.downscale),
-		offset_x=float(args.offset[0]),
-		offset_y=float(args.offset[1]),
-		offset_z=int(round(float(args.offset[2]))),
-	)
+	base = {
+		"input": str(args.input),
+		"output": str(args.output),
+		"prefix": str(args.prefix),
+		"downscale": float(args.downscale),
+		"offset_x": float(args.offset[0]),
+		"offset_y": float(args.offset[1]),
+		"offset_z": int(round(float(args.offset[2]))),
+	}
+	cfg = ExportConfig(**base)
 	dev = torch.device(cfg.device)
 
 	st = torch.load(cfg.input, map_location=dev)
 	if not isinstance(st, dict):
 		raise ValueError("expected a state_dict checkpoint")
+	model_params = st.get("_model_params_", None)
+	if not isinstance(model_params, dict):
+		model_params = None
+
+	if model_params is not None:
+		c6 = model_params.get("crop_xyzwhd", None)
+		if isinstance(c6, (list, tuple)) and len(c6) == 6:
+			x0c, y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
+			base["offset_x"] = float(base["offset_x"]) + float(x0c)
+			base["offset_y"] = float(base["offset_y"]) + float(y0c)
+			base["z0"] = int(z0c)
+		if "z_step_vx" in model_params:
+			base["z_step"] = max(1, int(model_params["z_step_vx"]))
+		cfg = ExportConfig(**base)
 
 	mesh_uv = _mesh_coarse_from_state_dict(st).to(device=dev, dtype=torch.float32)
 	xy = _apply_global_transform_from_state_dict(uv=mesh_uv, st=st)
@@ -168,8 +183,31 @@ def main(argv: list[str] | None = None) -> int:
 	for wi in range(wm):
 		x = xy_lr[idx_z_a, :, wi, 0]
 		y = xy_lr[idx_z_a, :, wi, 1] - 256
+		z_use = z_grid
+		mask = None
+		if model_params is not None:
+			c6 = model_params.get("crop_xyzwhd", None)
+			if isinstance(c6, (list, tuple)) and len(c6) == 6:
+				_x0c, _y0c, wc, hc, _z0c, _d = (int(v) for v in c6)
+				x0 = float(cfg.offset_x)
+				y0 = float(cfg.offset_y)
+				x1 = x0 + float(max(0, int(wc) - 1))
+				y1 = y0 + float(max(0, int(hc) - 1))
+				v = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+				mask = (v.astype(np.uint8) * 255)
+				if np.any(~v):
+					x = x.copy()
+					y = y.copy()
+					z_use = z_grid.copy()
+					x[~v] = -1.0
+					y[~v] = -1.0
+					z_use[~v] = -1.0
 		out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
-		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_grid, scale=meta_scale)
+		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale)
+		if model_params is not None:
+			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+		if mask is not None:
+			tifffile.imwrite(str(out_dir / "mask.tif"), mask, compression="lzw")
 
 	return 0
 

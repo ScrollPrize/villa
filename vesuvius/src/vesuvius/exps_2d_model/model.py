@@ -29,6 +29,8 @@ class ModelParams:
 	subsample_mesh: int
 	subsample_winding: int
 	z_step_vx: int
+	# 3D crop in source voxel/pixel space: (x, y, w, h, z0, d).
+	crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,7 @@ class Model2D(nn.Module):
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
 		z_step_vx: int = 1,
+		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
 	) -> None:
 		super().__init__()
 		self.init = init
@@ -176,6 +179,7 @@ class Model2D(nn.Module):
 			subsample_mesh=int(subsample_mesh),
 			subsample_winding=int(subsample_winding),
 			z_step_vx=max(1, int(z_step_vx)),
+			crop_xyzwhd=None if crop_xyzwhd is None else tuple(int(v) for v in crop_xyzwhd),
 		)
 		self.subsample_mesh = int(self.params.subsample_mesh)
 		self.subsample_winding = int(self.params.subsample_winding)
@@ -269,6 +273,7 @@ class Model2D(nn.Module):
 
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
 		st = dict(state_dict)
+		st.pop("_model_params_", None)
 		# Back-compat renames.
 		for k in list(st.keys()):
 			if k.startswith("mesh_offset_ms."):
@@ -612,6 +617,7 @@ class Model2D(nn.Module):
 		init_size_frac_v: float | None = None,
 		z_size: int = 1,
 		z_step_vx: int = 1,
+		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
 		*,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
@@ -633,6 +639,7 @@ class Model2D(nn.Module):
 			subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding,
 			z_step_vx=max(1, int(z_step_vx)),
+			crop_xyzwhd=crop_xyzwhd,
 		)
 
 	def _build_base_grid(self, *, gh0: int, gw0: int) -> torch.Tensor:
