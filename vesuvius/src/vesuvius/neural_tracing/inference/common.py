@@ -3,7 +3,6 @@ import os
 
 import numpy as np
 
-from vesuvius.neural_tracing.inference.displacement_tta import _aggregate_uv_points_geomedian
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
 
 
@@ -86,7 +85,7 @@ def _validate_named_method(merge_method, valid_methods, method_label):
 def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overlap_merge_method="mean"):
     """Merge list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
     overlap_merge_method = _validate_named_method(
-        overlap_merge_method, ("mean", "vector_geomedian"), "overlap merge method"
+        overlap_merge_method, ("mean",), "overlap merge method"
     )
 
     non_empty_samples = []
@@ -125,30 +124,18 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overla
     if not non_empty_samples:
         return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool), (uv_r_min, uv_c_min)
 
-    if overlap_merge_method == "mean":
-        grid_acc = np.zeros((h, w, 3), dtype=np.float64)
-        grid_count = np.zeros((h, w), dtype=np.int32)
+    grid_acc = np.zeros((h, w, 3), dtype=np.float64)
+    grid_count = np.zeros((h, w), dtype=np.int32)
 
-        for uv, pts in non_empty_samples:
-            rows = uv[:, 0].astype(np.int64) - uv_r_min
-            cols = uv[:, 1].astype(np.int64) - uv_c_min
-            np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
-            np.add.at(grid_count, (rows, cols), 1)
+    for uv, pts in non_empty_samples:
+        rows = uv[:, 0].astype(np.int64) - uv_r_min
+        cols = uv[:, 1].astype(np.int64) - uv_c_min
+        np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
+        np.add.at(grid_count, (rows, cols), 1)
 
-        grid_valid = grid_count > 0
-        grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
-        grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
-    elif overlap_merge_method == "vector_geomedian":
-        rows_all = np.concatenate(
-            [uv[:, 0].astype(np.int64) - uv_r_min for uv, _ in non_empty_samples], axis=0
-        )
-        cols_all = np.concatenate(
-            [uv[:, 1].astype(np.int64) - uv_c_min for uv, _ in non_empty_samples], axis=0
-        )
-        pts_all = np.concatenate([pts.astype(np.float64) for _, pts in non_empty_samples], axis=0)
-        grid_zyxs, grid_valid = _aggregate_uv_points_geomedian(rows_all, cols_all, pts_all, h, w)
-    else:
-        raise RuntimeError(f"Unhandled overlap merge method '{overlap_merge_method}'")
+    grid_valid = grid_count > 0
+    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
+    grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
 
     return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 

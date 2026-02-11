@@ -20,7 +20,6 @@ from vesuvius.neural_tracing.inference.displacement_tta import (
 from vesuvius.neural_tracing.inference.common import (
     _aggregate_pred_samples_to_uv_grid,
     _resolve_extrapolation_settings,
-    _validate_named_method,
     resolve_tifxyz_params,
     save_tifxyz_output,
 )
@@ -81,16 +80,6 @@ def parse_args():
         type=float,
         default=0.15,
         help="Fractional overlap between consecutive edge bboxes (default 0.15 = 15%%).",
-    )
-    parser.add_argument(
-        "--bbox-overlap-merge-method",
-        type=str,
-        default="mean",
-        choices=("mean", "vector_geomedian"),
-        help=(
-            "How to merge overlapping bbox point predictions at identical UV coordinates "
-            "(default: mean)."
-        ),
     )
     parser.add_argument("--extrapolation-method", type=str, default=None)
     parser.add_argument(
@@ -818,9 +807,6 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
 
     return bbox_crops
 
-_UV_OVERLAP_MERGE_METHODS = ("mean", "vector_geomedian")
-
-
 def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
     
     with torch.no_grad():
@@ -1156,11 +1142,6 @@ def main():
         raise ValueError("--tta-outlier-drop-thresh must be > 0 when provided.")
     if args.tta_outlier_drop_min_keep < 1:
         raise ValueError("--tta-outlier-drop-min-keep must be >= 1.")
-    args.bbox_overlap_merge_method = _validate_named_method(
-        args.bbox_overlap_merge_method,
-        _UV_OVERLAP_MERGE_METHODS,
-        "overlap merge method",
-    )
 
     refine_mode = args.refine is not None
     growth_iterations = args.iterations
@@ -1256,7 +1237,6 @@ def main():
 
         pred_grid, pred_valid, pred_offset = _aggregate_pred_samples_to_uv_grid(
             pred_samples,
-            overlap_merge_method=args.bbox_overlap_merge_method,
         )
         merged_cond, merged_valid, merged_uv_offset, kept, n_kept_axis = prepare_next_iteration_cond(
             current_grid, current_valid, current_uv_offset,
@@ -1281,7 +1261,6 @@ def main():
             args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
             tifxyz_voxel_size_um, checkpoint_path, cond_direction, grow_direction,
             args.volume_scale,
-            overlap_merge_method=args.bbox_overlap_merge_method,
         )
 
 
