@@ -24,24 +24,28 @@ _DIRECTION_SPECS = {
         "inner_edge_idx": -1,
         "outer_edge_idx": 0,
         "growth_sign": 1,
+        "opposite": "right",
     },
     "right": {
         "axis": "col",
         "inner_edge_idx": 0,
         "outer_edge_idx": -1,
         "growth_sign": -1,
+        "opposite": "left",
     },
     "up": {
         "axis": "row",
         "inner_edge_idx": -1,
         "outer_edge_idx": 0,
         "growth_sign": 1,
+        "opposite": "down",
     },
     "down": {
         "axis": "row",
         "inner_edge_idx": 0,
         "outer_edge_idx": -1,
         "growth_sign": -1,
+        "opposite": "up",
     },
 }
 
@@ -643,8 +647,7 @@ def setup_segment(args, volume):
         valid_dirs.extend(["up", "down"])
     if not valid_dirs:
         raise RuntimeError("Segment too small to define a split direction.")
-    _OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up"}
-    cond_direction = _OPPOSITE[args.grow_direction]
+    cond_direction = _get_direction_spec(args.grow_direction)["opposite"]
     if cond_direction not in valid_dirs:
         raise RuntimeError(
             f"Requested grow_direction '{args.grow_direction}' (cond_direction='{cond_direction}') "
