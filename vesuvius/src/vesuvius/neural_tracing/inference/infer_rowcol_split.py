@@ -159,7 +159,18 @@ def parse_args():
         ),
     )
     parser.set_defaults(tta=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.iter_keep_voxels is not None and args.iter_keep_voxels < 1:
+        parser.error("--iter-keep-voxels must be >= 1 when provided.")
+    if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
+        parser.error("--bbox-overlap-frac must be in [0, 1).")
+    if args.refine is not None and args.refine < 1:
+        parser.error("--refine must be >= 1 when provided.")
+    if args.tta_outlier_drop_thresh is not None and args.tta_outlier_drop_thresh <= 0:
+        parser.error("--tta-outlier-drop-thresh must be > 0 when provided.")
+    if args.tta_outlier_drop_min_keep < 1:
+        parser.error("--tta-outlier-drop-min-keep must be >= 1.")
+    return args
 
 
 def _get_growth_context(grow_direction):
@@ -1066,19 +1077,6 @@ def prepare_next_iteration_cond(
     return merged_cond, merged_valid, (new_r0, new_c0), kept_pred_samples, int(n_keep)
 
 
-def _validate_args(args):
-    if args.iter_keep_voxels is not None and args.iter_keep_voxels < 1:
-        raise ValueError("--iter-keep-voxels must be >= 1 when provided.")
-    if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
-        raise ValueError("--bbox-overlap-frac must be in [0, 1).")
-    if args.refine is not None and args.refine < 1:
-        raise ValueError("--refine must be >= 1 when provided.")
-    if args.tta_outlier_drop_thresh is not None and args.tta_outlier_drop_thresh <= 0:
-        raise ValueError("--tta-outlier-drop-thresh must be > 0 when provided.")
-    if args.tta_outlier_drop_min_keep < 1:
-        raise ValueError("--tta-outlier-drop-min-keep must be >= 1.")
-
-
 def _load_runtime_state(args):
     has_checkpoint = args.checkpoint_path is not None
     run_model_inference = has_checkpoint and not args.skip_inference
@@ -1159,9 +1157,11 @@ def _run_growth_iterations(
         print(f"[iteration {iteration + 1}/{growth_iterations}]")
         cond_zyxs = current_grid
         valid = current_valid
+
+        
         uv_cond = _build_uv_grid(current_uv_offset, cond_zyxs.shape[:2])
 
-        # Outside path uses the grow-direction inner edge for bbox extraction.
+        
         bboxes, _ = get_cond_edge_bboxes(
             cond_zyxs, cond_direction, crop_size,
             overlap_frac=args.bbox_overlap_frac,
@@ -1204,7 +1204,6 @@ def _run_growth_iterations(
 
 def main():
     args = parse_args()
-    _validate_args(args)
 
     refine_mode = args.refine is not None
     growth_iterations = args.iterations
