@@ -462,6 +462,16 @@ def parse_args():
         default=0.15,
         help="Fractional overlap between consecutive edge bboxes (default 0.15 = 15%%).",
     )
+    parser.add_argument(
+        "--bbox-overlap-merge-method",
+        type=str,
+        default="mean",
+        choices=("mean", "vector_geomedian"),
+        help=(
+            "How to merge overlapping bbox point predictions at identical UV coordinates "
+            "(default: mean)."
+        ),
+    )
     parser.add_argument("--extrapolation-method", type=str, default=None)
     parser.add_argument(
         "--grow-direction",
@@ -511,18 +521,19 @@ def parse_args():
     parser.add_argument(
         "--tta-merge-method",
         type=str,
-        default="median",
+        default="vector_geomedian",
         choices=_TTA_MERGE_METHODS,
-        help="How to merge mirrored TTA displacement predictions (default: median).",
+        help="How to merge mirrored TTA displacement predictions (default: vector_geomedian).",
     )
     parser.add_argument(
         "--tta-outlier-drop-thresh",
         type=float,
-        default=None,
+        default=1.25,
         help=(
             "Optional robust threshold multiplier for dropping outlier TTA flip variants "
             "before merge. Uses per-variant distance to the TTA median field and drops "
-            "variants above median + thresh * spread (MAD, with std fallback)."
+            "variants above median + thresh * spread (MAD, with std fallback). "
+            "(default: 1.25)"
         ),
     )
     parser.add_argument(
@@ -881,6 +892,75 @@ _TTA_FLIP_COMBOS = [
 # dim -1 (W/X) -> channel 2, dim -2 (H/Y) -> channel 1, dim -3 (D/Z) -> channel 0
 _FLIP_DIM_TO_CHANNEL = {-1: 2, -2: 1, -3: 0}
 _TTA_MERGE_METHODS = ("median", "mean", "trimmed_mean", "vector_medoid", "vector_geomedian")
+_UV_OVERLAP_MERGE_METHODS = ("mean", "vector_geomedian")
+
+
+def _validate_uv_overlap_merge_method(merge_method):
+    method = str(merge_method).strip().lower()
+    if method not in _UV_OVERLAP_MERGE_METHODS:
+        raise ValueError(
+            f"Unknown overlap merge method '{merge_method}'. "
+            f"Supported methods: {list(_UV_OVERLAP_MERGE_METHODS)}"
+        )
+    return method
+
+
+def _vector_geomedian_numpy(points, max_iters=8, eps=1e-6, tol=1e-4):
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2:
+        raise RuntimeError(f"Expected points with shape [N, C], got {pts.shape}.")
+    if pts.shape[0] == 0:
+        raise RuntimeError("Cannot compute geometric median of an empty point set.")
+    if pts.shape[0] == 1:
+        return pts[0]
+
+    x = np.median(pts, axis=0)
+    for _ in range(int(max_iters)):
+        diff = pts - x[None, :]
+        dist = np.linalg.norm(diff, axis=1)
+        dist = np.maximum(dist, float(eps))
+        w = 1.0 / dist
+        denom = np.maximum(w.sum(), float(eps))
+        x_new = (w[:, None] * pts).sum(axis=0) / denom
+        step = np.linalg.norm(x_new - x)
+        x = x_new
+        if float(step) < float(tol):
+            break
+    return x
+
+
+def _aggregate_uv_points_geomedian(rows, cols, pts, h, w):
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    pts = np.asarray(pts, dtype=np.float64)
+    if rows.size == 0:
+        return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool)
+
+    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
+    grid_valid = np.zeros((h, w), dtype=bool)
+
+    linear = rows * int(w) + cols
+    order = np.argsort(linear, kind="mergesort")
+    linear_sorted = linear[order]
+    pts_sorted = pts[order]
+
+    unique_linear, starts, counts = np.unique(
+        linear_sorted, return_index=True, return_counts=True
+    )
+
+    for linear_idx, start, count in zip(unique_linear, starts, counts):
+        rr = int(linear_idx // int(w))
+        cc = int(linear_idx % int(w))
+        group_pts = pts_sorted[start:start + count]
+        merged = (
+            group_pts[0]
+            if int(count) == 1
+            else _vector_geomedian_numpy(group_pts)
+        )
+        grid_zyxs[rr, cc] = merged.astype(np.float32, copy=False)
+        grid_valid[rr, cc] = True
+
+    return grid_zyxs, grid_valid
 
 
 def _validate_tta_merge_method(merge_method):
@@ -1025,8 +1105,8 @@ def _run_model_tta(
     inputs,
     amp_enabled,
     amp_dtype,
-    merge_method="median",
-    outlier_drop_thresh=None,
+    merge_method="vector_geomedian",
+    outlier_drop_thresh=1.25,
     outlier_drop_min_keep=4,
 ):
     """Run mirroring-based TTA on a batch, returning merged displacement.
@@ -1154,8 +1234,8 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
                 inputs,
                 amp_enabled,
                 amp_dtype,
-                merge_method=getattr(args, "tta_merge_method", "median"),
-                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", None),
+                merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
+                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
                 outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
             )
         else:
@@ -1263,8 +1343,8 @@ def run_inference(args, bbox_crops, crop_size, model_state):
                 inputs_dev,
                 amp_enabled,
                 amp_dtype,
-                merge_method=getattr(args, "tta_merge_method", "median"),
-                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", None),
+                merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
+                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
                 outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
             )
 
@@ -1306,11 +1386,21 @@ def run_inference(args, bbox_crops, crop_size, model_state):
     return pred_samples
 
 
-def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None):
-    """Average list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
+def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overlap_merge_method="mean"):
+    """Merge list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
+    overlap_merge_method = _validate_uv_overlap_merge_method(overlap_merge_method)
+
+    non_empty_samples = []
+    for uv, pts in pred_samples:
+        uv_arr = np.asarray(uv)
+        pts_arr = np.asarray(pts)
+        if uv_arr.size == 0 or pts_arr.size == 0:
+            continue
+        non_empty_samples.append((uv_arr, pts_arr))
+
     pred_bounds = None
-    if pred_samples:
-        all_uv = np.concatenate([uv for uv, _ in pred_samples], axis=0)
+    if non_empty_samples:
+        all_uv = np.concatenate([uv for uv, _ in non_empty_samples], axis=0)
         pred_bounds = (
             int(all_uv[:, 0].min()),
             int(all_uv[:, 1].min()),
@@ -1333,23 +1423,40 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None):
 
     h = uv_r_max - uv_r_min + 1
     w = uv_c_max - uv_c_min + 1
-    grid_acc = np.zeros((h, w, 3), dtype=np.float64)
-    grid_count = np.zeros((h, w), dtype=np.int32)
+    if not non_empty_samples:
+        return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool), (uv_r_min, uv_c_min)
 
-    for uv, pts in pred_samples:
-        rows = uv[:, 0].astype(np.int64) - uv_r_min
-        cols = uv[:, 1].astype(np.int64) - uv_c_min
-        np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
-        np.add.at(grid_count, (rows, cols), 1)
+    if overlap_merge_method == "mean":
+        grid_acc = np.zeros((h, w, 3), dtype=np.float64)
+        grid_count = np.zeros((h, w), dtype=np.int32)
 
-    grid_valid = grid_count > 0
-    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
-    grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
+        for uv, pts in non_empty_samples:
+            rows = uv[:, 0].astype(np.int64) - uv_r_min
+            cols = uv[:, 1].astype(np.int64) - uv_c_min
+            np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
+            np.add.at(grid_count, (rows, cols), 1)
+
+        grid_valid = grid_count > 0
+        grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
+        grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
+    elif overlap_merge_method == "vector_geomedian":
+        rows_all = np.concatenate(
+            [uv[:, 0].astype(np.int64) - uv_r_min for uv, _ in non_empty_samples], axis=0
+        )
+        cols_all = np.concatenate(
+            [uv[:, 1].astype(np.int64) - uv_c_min for uv, _ in non_empty_samples], axis=0
+        )
+        pts_all = np.concatenate([pts.astype(np.float64) for _, pts in non_empty_samples], axis=0)
+        grid_zyxs, grid_valid = _aggregate_uv_points_geomedian(rows_all, cols_all, pts_all, h, w)
+    else:
+        raise RuntimeError(f"Unhandled overlap merge method '{overlap_merge_method}'")
+
     return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 
 
 def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
-                       tifxyz_voxel_size_um, checkpoint_path, grow_direction, volume_scale):
+                       tifxyz_voxel_size_um, checkpoint_path, grow_direction, volume_scale,
+                       overlap_merge_method="mean"):
     cond_direction = _cond_direction_from_grow(grow_direction)
     tgt_segment.use_full_resolution()
     full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
@@ -1358,6 +1465,7 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
     pred_grid, pred_valid, (uv_r_min, uv_c_min) = _aggregate_pred_samples_to_uv_grid(
         pred_samples,
         base_uv_bounds=(0, 0, h_full - 1, w_full - 1),
+        overlap_merge_method=overlap_merge_method,
     )
     full_pred_zyxs = np.full_like(pred_grid, -1.0, dtype=np.float32)
     r_off = -uv_r_min
@@ -1401,8 +1509,11 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
     print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
 
 
-def reassemble_predictions_to_grid(pred_samples):
-    return _aggregate_pred_samples_to_uv_grid(pred_samples)
+def reassemble_predictions_to_grid(pred_samples, overlap_merge_method="mean"):
+    return _aggregate_pred_samples_to_uv_grid(
+        pred_samples,
+        overlap_merge_method=overlap_merge_method,
+    )
 
 
 def _build_uv_grid(uv_offset, shape_hw):
@@ -1517,6 +1628,9 @@ def main():
         raise ValueError("--tta-outlier-drop-thresh must be > 0 when provided.")
     if args.tta_outlier_drop_min_keep < 1:
         raise ValueError("--tta-outlier-drop-min-keep must be >= 1.")
+    args.bbox_overlap_merge_method = _validate_uv_overlap_merge_method(
+        args.bbox_overlap_merge_method
+    )
 
     refine_mode = args.refine is not None
     growth_iterations = args.iterations
@@ -1610,7 +1724,10 @@ def main():
             print("No predicted samples this iteration; stopping iterative growth.")
             break
 
-        pred_grid, pred_valid, pred_offset = reassemble_predictions_to_grid(pred_samples)
+        pred_grid, pred_valid, pred_offset = reassemble_predictions_to_grid(
+            pred_samples,
+            overlap_merge_method=args.bbox_overlap_merge_method,
+        )
         merged_cond, merged_valid, merged_uv_offset, kept, n_kept_axis = prepare_next_iteration_cond(
             current_grid, current_valid, current_uv_offset,
             pred_grid, pred_valid, pred_offset,
@@ -1633,6 +1750,7 @@ def main():
         save_tifxyz_output(
             args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
             tifxyz_voxel_size_um, checkpoint_path, grow_direction, args.volume_scale,
+            overlap_merge_method=args.bbox_overlap_merge_method,
         )
 
 
