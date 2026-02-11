@@ -933,16 +933,18 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
     if initial_extrap_vox is None:
         initial_extrap_vox = _points_to_voxels(current_coords, crop_size)
 
+    current_coords_t = torch.from_numpy(current_coords).float().to(args.device)
     n_forward = 0
 
     for refine_idx in range(refine_parts):
-        if current_coords.shape[0] == 0:
+        if current_coords_t.shape[0] == 0:
             break
 
         if refine_idx == 0:
             extrap_vox = initial_extrap_vox
         else:
-            extrap_vox = _points_to_voxels(current_coords, crop_size)
+            current_coords_np = current_coords_t.detach().cpu().numpy()
+            extrap_vox = _points_to_voxels(current_coords_np, crop_size)
 
         inputs = _build_model_inputs(
             crop["volume"], cond_vox, extrap_vox, other_wraps_vox=other_wraps_vox
@@ -964,21 +966,20 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
 
         n_forward += 1
         # Apply a fixed fraction of each stage's full displacement prediction.
-        coords_t = torch.from_numpy(current_coords).float().to(args.device)
-        disp_sampled = _sample_displacement_field(disp_single, coords_t)
-        next_coords = (coords_t + disp_sampled * refine_fraction).detach().cpu().numpy().astype(np.float32)
-        finite_mask = np.isfinite(next_coords).all(axis=1)
-        if not finite_mask.all():
-            next_coords[~finite_mask] = current_coords[~finite_mask]
+        disp_sampled = _sample_displacement_field(disp_single, current_coords_t)
+        next_coords_t = current_coords_t + disp_sampled * refine_fraction
+        finite_mask = torch.isfinite(next_coords_t).all(dim=1)
+        if not bool(finite_mask.all()):
+            next_coords_t = torch.where(finite_mask[:, None], next_coords_t, current_coords_t)
 
-        current_coords = next_coords
+        current_coords_t = next_coords_t
 
     if n_forward == 0:
         return np.zeros((0, 3), dtype=np.float32), None if current_uv is None else current_uv[:0]
 
-    if current_coords is None or current_coords.shape[0] == 0:
+    if current_coords_t is None or current_coords_t.shape[0] == 0:
         return np.zeros((0, 3), dtype=np.float32), None if current_uv is None else current_uv[:0]
-    return current_coords.astype(np.float32, copy=False), current_uv
+    return current_coords_t.detach().cpu().numpy().astype(np.float32, copy=False), current_uv
 
 
 def _finalize_crop_prediction(args, bbox_idx, crop, pred_local, pred_uv, crop_size):
@@ -1056,12 +1057,14 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             if pred_sample is not None:
                 pred_samples.append(pred_sample)
     elif use_tta:
-        # TTA path: process bboxes sequentially, but batch TTA flips inside run_model_tta.
-        for bbox_idx, crop, inputs, extrap_local in tqdm(valid_items, desc="inference (TTA)"):
-            inputs_dev = inputs.to(args.device)
-            disp_single = run_model_tta(
+        # TTA path: batch crops together, then run TTA once per batch.
+        n_batches = (len(valid_items) + batch_size - 1) // batch_size
+        for batch_start in tqdm(range(0, len(valid_items), batch_size), total=n_batches, desc="inference (TTA)"):
+            batch = valid_items[batch_start:batch_start + batch_size]
+            batch_inputs = torch.cat([item[2] for item in batch], dim=0).to(args.device)
+            disp_pred = run_model_tta(
                 model,
-                inputs_dev,
+                batch_inputs,
                 amp_enabled,
                 amp_dtype,
                 get_displacement_result=_get_displacement_result,
@@ -1070,16 +1073,18 @@ def run_inference(args, bbox_crops, crop_size, model_state):
                 outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
             )
 
-            extrap_coords = torch.from_numpy(extrap_local).float().to(args.device)
-            extrap_uv = crop.get("extrap_uv", None)
+            for i, (bbox_idx, crop, _, extrap_local) in enumerate(batch):
+                disp_single = disp_pred[i:i + 1]  # [1, 3, D, H, W]
+                extrap_coords = torch.from_numpy(extrap_local).float().to(args.device)
+                extrap_uv = crop.get("extrap_uv", None)
 
-            disp_sampled = _sample_displacement_field(disp_single, extrap_coords)
-            pred_local = extrap_coords + disp_sampled
-            pred_sample = _finalize_crop_prediction(
-                args, bbox_idx, crop, pred_local, extrap_uv, crop_size
-            )
-            if pred_sample is not None:
-                pred_samples.append(pred_sample)
+                disp_sampled = _sample_displacement_field(disp_single, extrap_coords)
+                pred_local = extrap_coords + disp_sampled
+                pred_sample = _finalize_crop_prediction(
+                    args, bbox_idx, crop, pred_local, extrap_uv, crop_size
+                )
+                if pred_sample is not None:
+                    pred_samples.append(pred_sample)
     else:
         # Standard batched path.
         n_batches = (len(valid_items) + batch_size - 1) // batch_size
