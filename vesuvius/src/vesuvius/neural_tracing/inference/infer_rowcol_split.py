@@ -286,18 +286,6 @@ def _points_to_voxels(points_local, crop_size):
         vox[coords[:, 0], coords[:, 1], coords[:, 2]] = 1.0
     return vox
 
-def _clip_coords_to_bounds(coords, size):
-    arr = np.asarray(coords, dtype=np.float32)
-    if arr.size == 0:
-        return arr.reshape(0, 3)
-
-    clipped = arr.copy()
-    max_vals = np.asarray(size, dtype=np.float32) - 1.0
-    np.clip(clipped[:, 0], 0.0, max_vals[0], out=clipped[:, 0])
-    np.clip(clipped[:, 1], 0.0, max_vals[1], out=clipped[:, 1])
-    np.clip(clipped[:, 2], 0.0, max_vals[2], out=clipped[:, 2])
-    return clipped
-
 def _valid_surface_mask(zyx_grid):
     return np.isfinite(zyx_grid).all(axis=-1) & ~(zyx_grid == -1).all(axis=-1)
 
@@ -812,11 +800,23 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
                 if extrap_result is not None:
                     extrap_local_full = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float64)
                     uv_query_flat = uv_query.reshape(-1, 2)
-                    extrap_local = _clip_coords_to_bounds(extrap_local_full, crop_size_extrap)
-                    extrap_uv = uv_query_flat
+                    extrap_in_bounds = _in_bounds_mask(extrap_local_full, crop_size_extrap)
 
-                    extrap_grid_local = extrap_local.reshape(uv_query.shape[:2] + (3,))
-                    extrap_vox = voxelize_surface_grid(extrap_grid_local, crop_size_extrap)
+                    if extrap_in_bounds.any():
+                        extrap_local = extrap_local_full[extrap_in_bounds].astype(np.float32)
+                        extrap_uv = uv_query_flat[extrap_in_bounds]
+
+                    extrap_grid_local = extrap_local_full.reshape(uv_query.shape[:2] + (3,))
+                    extrap_grid_valid = _in_bounds_mask(
+                        extrap_grid_local.reshape(-1, 3),
+                        crop_size_extrap,
+                    ).reshape(uv_query.shape[:2])
+                    if extrap_grid_valid.any():
+                        extrap_vox = voxelize_surface_grid_masked(
+                            extrap_grid_local,
+                            crop_size_extrap,
+                            extrap_grid_valid,
+                        )
 
         if extrap_vox is None and len(extrap_local) > 0:
             extrap_vox = _points_to_voxels(extrap_local, crop_size)
@@ -970,11 +970,17 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
         coords_t = torch.from_numpy(current_coords).float().to(args.device)
         disp_sampled = _sample_displacement_field(disp_single, coords_t)
         next_coords = (coords_t + disp_sampled * refine_fraction).detach().cpu().numpy().astype(np.float32)
-        finite_mask = np.isfinite(next_coords).all(axis=1)
-        if not finite_mask.all():
-            next_coords[~finite_mask] = current_coords[~finite_mask]
 
-        current_coords = _clip_coords_to_bounds(next_coords, crop_size)
+        in_bounds = _in_bounds_mask(next_coords, crop_size)
+        if not in_bounds.any():
+            current_coords = np.zeros((0, 3), dtype=np.float32)
+            if current_uv is not None:
+                current_uv = current_uv[:0]
+            break
+
+        current_coords = next_coords[in_bounds]
+        if current_uv is not None:
+            current_uv = current_uv[in_bounds]
 
     if n_forward == 0:
         return np.zeros((0, 3), dtype=np.float32), None if current_uv is None else current_uv[:0]
@@ -990,14 +996,15 @@ def _finalize_crop_prediction(args, bbox_idx, crop, pred_local, pred_uv, crop_si
     else:
         pred_local_np = np.asarray(pred_local)
 
-    pred_local_np = _clip_coords_to_bounds(pred_local_np, crop_size)
     pred_world = pred_local_np + crop["min_corner"][None, :]
+    bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
+    pred_world = pred_world[bbox_mask]
 
     pred_sample = None
     if pred_uv is not None:
         pred_uv = np.asarray(pred_uv)
-        if len(pred_uv) == pred_world.shape[0]:
-            pred_sample = (pred_uv, pred_world)
+        if len(pred_uv) == bbox_mask.shape[0]:
+            pred_sample = (pred_uv[bbox_mask], pred_world)
 
     out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
     _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local_np, crop_size))
