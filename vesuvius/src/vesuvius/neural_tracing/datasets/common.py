@@ -115,6 +115,69 @@ def voxelize_surface_grid(
 
     return volume
 
+@njit
+def voxelize_surface_grid_masked(
+    zyx_grid: np.ndarray,
+    crop_size: tuple,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Voxelize a 2D grid of 3D points while honoring a per-cell validity mask.
+
+    Behavior:
+    - Draw all valid points.
+    - Draw row/col edges only when both endpoints are valid.
+
+    Args:
+        zyx_grid: (H, W, 3) array of ZYX coordinates in local crop space
+        crop_size: (D, H, W) shape of output volume
+        valid_mask: (H, W) bool/0-1 mask; True means the grid cell is valid
+
+    Returns:
+        (D, H, W) binary volume with masked surface rasterization
+    """
+    volume = np.zeros(crop_size, dtype=np.float32)
+    n_rows, n_cols = zyx_grid.shape[0], zyx_grid.shape[1]
+
+    # Draw valid points so isolated valid cells are still represented.
+    for r in range(n_rows):
+        for c in range(n_cols):
+            if not valid_mask[r, c]:
+                continue
+            z = int(round(zyx_grid[r, c, 0]))
+            y = int(round(zyx_grid[r, c, 1]))
+            x = int(round(zyx_grid[r, c, 2]))
+            if 0 <= z < volume.shape[0] and 0 <= y < volume.shape[1] and 0 <= x < volume.shape[2]:
+                volume[z, y, x] = 1.0
+
+    # Draw horizontal lines between adjacent valid columns.
+    for r in range(n_rows):
+        for c in range(n_cols - 1):
+            if not (valid_mask[r, c] and valid_mask[r, c + 1]):
+                continue
+            z0 = int(round(zyx_grid[r, c, 0]))
+            y0 = int(round(zyx_grid[r, c, 1]))
+            x0 = int(round(zyx_grid[r, c, 2]))
+            z1 = int(round(zyx_grid[r, c + 1, 0]))
+            y1 = int(round(zyx_grid[r, c + 1, 1]))
+            x1 = int(round(zyx_grid[r, c + 1, 2]))
+            _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
+
+    # Draw vertical lines between adjacent valid rows.
+    for r in range(n_rows - 1):
+        for c in range(n_cols):
+            if not (valid_mask[r, c] and valid_mask[r + 1, c]):
+                continue
+            z0 = int(round(zyx_grid[r, c, 0]))
+            y0 = int(round(zyx_grid[r, c, 1]))
+            x0 = int(round(zyx_grid[r, c, 2]))
+            z1 = int(round(zyx_grid[r + 1, c, 0]))
+            y1 = int(round(zyx_grid[r + 1, c, 1]))
+            x1 = int(round(zyx_grid[r + 1, c, 2]))
+            _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
+
+    return volume
+
 @dataclass
 class Patch:
     """A single patch from the hierarchical tiling method."""
