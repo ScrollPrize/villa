@@ -18,6 +18,7 @@ import cli_json
 class ExportConfig:
 	input: str
 	output: str
+	prefix: str = "winding_"
 	device: str = "cpu"
 	downscale: float = 4.0
 	offset_x: float = 0.0
@@ -38,6 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	g = p.add_argument_group("io")
 	g.add_argument("--input", required=True, help="Model checkpoint (.pt) produced by fit")
 	g.add_argument("--output", required=True, help="Output directory (will contain one tifxyz dir per winding)")
+	g.add_argument("--prefix", default="winding_", help="Output tifxyz directory prefix (default: winding_)")
 	g.add_argument("--downscale", type=float, default=4.0, help="Fit-time downscale; x/y are multiplied by this")
 	g.add_argument(
 		"--offset",
@@ -124,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
 	cfg = ExportConfig(
 		input=str(args.input),
 		output=str(args.output),
+		prefix=str(args.prefix),
 		downscale=float(args.downscale),
 		offset_x=float(args.offset[0]),
 		offset_y=float(args.offset[1]),
@@ -165,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
 	for wi in range(wm):
 		x = xy_lr[idx_z_a, :, wi, 0]
 		y = xy_lr[idx_z_a, :, wi, 1] - 256
-		out_dir = out_base / f"winding_{wi:04d}.tifxyz"
+		out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
 		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_grid, scale=meta_scale)
 
 	return 0
