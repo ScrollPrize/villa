@@ -43,7 +43,7 @@ class CFG:
     # backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
     backbone = 'resnet3d'
-    in_chans = 30  # 65
+    in_chans = 62  # 65
     encoder_depth = 5
     norm = "batch"  # "batch" | "group"
     group_norm_groups = 32
@@ -83,6 +83,8 @@ class CFG:
     train_mask_suffix = ""
     val_label_suffix = "_val"
     val_mask_suffix = "_val"
+    data_backend = "zarr"  # "zarr" (default) | "tiff"
+    dataset_root = "train_scrolls"
 
     # ============== group DRO cfg =============
     objective = "erm"  # "erm" | "group_dro"
@@ -260,7 +262,7 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
     blur_cfg = augmentation_cfg.get("blur", {})
     coarse_dropout_cfg = augmentation_cfg.get("coarse_dropout", {})
 
-    blur_types = set(blur_cfg.get("types", ["GaussianBlur", "MotionBlur"]))
+    blur_types = set(blur_cfg.get("types", ["GaussNoise", "GaussianBlur", "MotionBlur"]))
     blur_transforms = []
     if "GaussNoise" in blur_types:
         gauss_noise_std_range = (
@@ -386,6 +388,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("num_workers", "num_workers"),
         ("layer_read_workers", "layer_read_workers"),
         ("seed", "seed"),
+        ("dataset_root", "dataset_root"),
     ]:
         if k in train_hp:
             setattr(cfg, attr, train_hp[k])
@@ -400,6 +403,10 @@ def apply_metadata_hyperparameters(cfg, metadata):
     cfg.save_every_epoch = bool(training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)))
     cfg.stitch_all_val = bool(training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)))
     cfg.stitch_train = bool(training_cfg.get("stitch_train", getattr(cfg, "stitch_train", False)))
+    cfg.data_backend = str(training_cfg.get("data_backend", getattr(cfg, "data_backend", "zarr"))).lower().strip()
+    if cfg.data_backend not in {"zarr", "tiff"}:
+        raise ValueError(f"training.data_backend must be 'zarr' or 'tiff', got {cfg.data_backend!r}")
+    cfg.dataset_root = str(training_cfg.get("dataset_root", getattr(cfg, "dataset_root", "train_scrolls")))
     cfg.stitch_log_only_segments = list(
         training_cfg.get("stitch_log_only_segments", getattr(cfg, "stitch_log_only_segments", [])) or []
     )

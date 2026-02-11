@@ -15,3 +15,5 @@ opencv-python-headless
 Pillow
 scipy
 tqdm
+zarr<3
+numcodecs

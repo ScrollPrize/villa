@@ -123,6 +123,7 @@
       },
       "blur": {
         "types": [
+          "GaussNoise",
           "GaussianBlur",
           "MotionBlur"
         ],

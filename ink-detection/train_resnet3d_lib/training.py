@@ -57,6 +57,8 @@ def parse_args():
     parser.add_argument("--check_val_every_n_epoch", type=int, default=1)
     parser.add_argument("--save_every_epoch", action="store_true")
     parser.add_argument("--accumulate_grad_batches", type=int, default=None)
+    parser.add_argument("--data_backend", type=str, default=None, help="Data backend: zarr (default) or tiff")
+    parser.add_argument("--dataset_root", type=str, default=None, help="Root directory for segment data")
     return parser.parse_args()
 
 
@@ -66,7 +68,8 @@ def log_startup(args):
         "args "
         f"metadata_json={args.metadata_json!r} valid_id={args.valid_id!r} outputs_path={args.outputs_path!r} "
         f"devices={args.devices} accelerator={args.accelerator!r} precision={args.precision!r} "
-        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} resume_from_ckpt={args.resume_from_ckpt!r}"
+        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} resume_from_ckpt={args.resume_from_ckpt!r} "
+        f"data_backend={args.data_backend!r} dataset_root={args.dataset_root!r}"
     )
     try:
         log(
@@ -331,6 +334,12 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
         CFG.save_every_epoch = True
     if args.accumulate_grad_batches is not None:
         CFG.accumulate_grad_batches = int(args.accumulate_grad_batches)
+    if args.data_backend is not None:
+        CFG.data_backend = str(args.data_backend).lower().strip()
+    if getattr(CFG, "data_backend", "zarr") not in {"zarr", "tiff"}:
+        raise ValueError(f"--data_backend must be 'zarr' or 'tiff', got {CFG.data_backend!r}")
+    if args.dataset_root is not None:
+        CFG.dataset_root = str(args.dataset_root)
 
     if args.outputs_path is not None:
         CFG.outputs_path = str(args.outputs_path)

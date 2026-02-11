@@ -1462,8 +1462,11 @@ def compute_stitched_metrics(
     else:
         cache_hit = False
         t0 = time.perf_counter()
-        label_base = osp.join("train_scrolls", seg, f"{seg}_inklabels{label_suffix}")
-        mask_base = osp.join("train_scrolls", seg, f"{seg}_mask{mask_suffix}")
+        from train_resnet3d_lib.config import CFG
+
+        dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
+        label_base = osp.join(dataset_root, seg, f"{seg}_inklabels{label_suffix}")
+        mask_base = osp.join(dataset_root, seg, f"{seg}_mask{mask_suffix}")
         gt_gray = _read_gray_any(label_base)
         valid_gray = _read_gray_any(mask_base)
 
