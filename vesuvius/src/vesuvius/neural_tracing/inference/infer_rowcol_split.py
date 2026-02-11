@@ -70,33 +70,6 @@ def _get_cond_edge(cond_zyxs, cond_direction, outer_edge=False):
         return cond_zyxs[-1, :, :] if outer_edge else cond_zyxs[0, :, :]
     raise ValueError(f"Unknown cond_direction '{cond_direction}'")
 
-def split_grid(zyxs, uv_offset, cond_direction, r_split, c_split):
-    h, w = zyxs.shape[:2]
-    r_split = int(np.clip(r_split, 0, h))
-    c_split = int(np.clip(c_split, 0, w))
-
-    uv_full = np.stack(np.meshgrid(
-        np.arange(h) + uv_offset[0],
-        np.arange(w) + uv_offset[1],
-        indexing='ij'
-    ), axis=-1)
-
-    if cond_direction in ("left", "right"):
-        a_zyxs = zyxs[:, :c_split]
-        b_zyxs = zyxs[:, c_split:]
-        a_uv = uv_full[:, :c_split]
-        b_uv = uv_full[:, c_split:]
-    else:
-        a_zyxs = zyxs[:r_split, :]
-        b_zyxs = zyxs[r_split:, :]
-        a_uv = uv_full[:r_split, :]
-        b_uv = uv_full[r_split:, :]
-
-    if cond_direction in ("left", "up"):
-        return a_zyxs, b_zyxs, a_uv, b_uv
-    else:
-        return b_zyxs, a_zyxs, b_uv, a_uv
-
 def _bbox_from_center(center, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
     # Align to voxel indices so inclusive bounds match a crop of size crop_size.
@@ -346,44 +319,6 @@ def get_window_bounds_from_bboxes(zyxs, valid, bboxes, pad=2):
     c_min = max(0, c_min - pad)
     c_max = min(w - 1, c_max + pad)
     return r_min, r_max, c_min, c_max
-
-def _min_corner_from_edge(edge_pts, cond_bounds, crop_size, cond_pct, cond_direction):
-    z_size, y_size, x_size = crop_size
-    z_min, z_max, y_min, y_max, x_min, x_max = cond_bounds
-
-    def _axis_start(axis_min, axis_max, size):
-        extent = axis_max - axis_min
-        if extent >= (size - 1):
-            return axis_min
-        center = (axis_min + axis_max) / 2
-        start = center - (size - 1) / 2
-        start = min(start, axis_min)
-        start = max(start, axis_max - (size - 1))
-        return start
-
-    z0 = _axis_start(z_min, z_max, z_size)
-    y0 = _axis_start(y_min, y_max, y_size)
-    x0 = _axis_start(x_min, x_max, x_size)
-
-    edge_center = np.median(edge_pts, axis=0)
-    zc, yc, xc = edge_center
-
-    if cond_direction in ["left", "right"]:
-        cond_size = max(1, min(x_size - 1, int(round(x_size * cond_pct))))
-        mask_size = x_size - cond_size
-        if cond_direction == "left":
-            x0 = xc - (cond_size - 1)
-        else:
-            x0 = xc - (mask_size - 1)
-    else:
-        cond_size = max(1, min(y_size - 1, int(round(y_size * cond_pct))))
-        mask_size = y_size - cond_size
-        if cond_direction == "up":
-            y0 = yc - (cond_size - 1)
-        else:
-            y0 = yc - (mask_size - 1)
-
-    return np.floor([z0, y0, x0]).astype(np.int64)
 
 def compute_extrapolation_infer(
     uv_cond,
@@ -733,64 +668,6 @@ def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_
     return r0_s, r1_s, c0_s, c1_s
 
 
-def run_extrapolation(args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, cond_direction, crop_size,
-                      extrapolation_settings):
-    edge_pts = _get_cond_edge(
-        cond_zyxs, cond_direction, outer_edge=False
-    ).reshape(-1, 3)
-    edge_valid = ~(edge_pts == -1).all(axis=1)
-    if edge_valid.any():
-        edge_pts = edge_pts[edge_valid]
-    else:
-        edge_pts = cond_zyxs.reshape(-1, 3)
-        edge_pts = edge_pts[~(edge_pts == -1).all(axis=1)]
-        if edge_pts.size == 0:
-            return None, None
-    crop_size_extrap = tuple(int(v) for v in crop_size)
-    if valid is not None and valid.any():
-        cond_pts_bounds = window_zyxs[valid]
-    else:
-        cond_pts_bounds = window_zyxs.reshape(-1, 3)
-    cond_bounds = (
-        float(np.min(cond_pts_bounds[:, 0])),
-        float(np.max(cond_pts_bounds[:, 0])),
-        float(np.min(cond_pts_bounds[:, 1])),
-        float(np.max(cond_pts_bounds[:, 1])),
-        float(np.min(cond_pts_bounds[:, 2])),
-        float(np.max(cond_pts_bounds[:, 2])),
-    )
-    zyx_min = _min_corner_from_edge(
-        edge_pts, cond_bounds, crop_size_extrap, args.cond_pct, cond_direction
-    )
-
-    # Filter conditioning data to valid points only to avoid -1 sentinel
-    # values poisoning gradient computation in linear_edge extrapolation.
-    if valid is not None and valid.any():
-        valid_flat = valid.ravel()
-        uv_for_extrap = uv_cond.reshape(-1, 2)[valid_flat]
-        zyx_for_extrap = cond_zyxs.reshape(-1, 3)[valid_flat]
-    else:
-        uv_for_extrap = uv_cond
-        zyx_for_extrap = cond_zyxs
-
-    extrap_result = compute_extrapolation_infer(
-        uv_cond=uv_for_extrap,
-        zyx_cond=zyx_for_extrap,
-        uv_query=uv_mask,
-        min_corner=zyx_min,
-        crop_size=crop_size_extrap,
-        method=extrapolation_settings["method"],
-        cond_direction=cond_direction,
-        degrade_prob=extrapolation_settings["degrade_prob"],
-        degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
-        degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
-        skip_bounds_check=True,
-        **extrapolation_settings["method_kwargs"],
-    )
-
-    return extrap_result, zyx_min
-
-
 def _build_uv_query_from_cond_points(uv_cond_pts, cond_direction, cond_pct):
     if uv_cond_pts is None or len(uv_cond_pts) == 0:
         return np.zeros((0, 0, 2), dtype=np.float64)
@@ -938,23 +815,21 @@ _TTA_FLIP_COMBOS = [
 _FLIP_DIM_TO_CHANNEL = {-1: 2, -2: 1, -3: 0}
 
 
-def _extract_displacement_output(output):
-    if isinstance(output, dict):
-        disp = output.get("displacement", None)
-        if disp is None:
-            raise RuntimeError("Model output missing 'displacement' head.")
-        return disp
-    return output
-
-
-def _forward_model_displacement(model, model_inputs, amp_enabled, amp_dtype):
+def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
     with torch.no_grad():
         if amp_enabled:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 output = model(model_inputs)
         else:
             output = model(model_inputs)
-    return _extract_displacement_output(output)
+    if not isinstance(output, dict):
+        raise RuntimeError(
+            f"Model output must be a dict with a 'displacement' head, got {type(output).__name__}."
+        )
+    disp = output.get("displacement", None)
+    if disp is None:
+        raise RuntimeError("Model output missing 'displacement' head.")
+    return disp
 
 
 def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
@@ -978,7 +853,7 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
             x = x.flip(d)
 
         # Forward pass
-        disp = _forward_model_displacement(model, x, amp_enabled, amp_dtype)
+        disp = _get_displacement_result(model, x, amp_enabled, amp_dtype)
 
         # Un-flip the displacement output
         for d in reversed(flip_dims):
@@ -1045,7 +920,7 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
         if use_tta:
             disp_single = _run_model_tta(model, inputs, amp_enabled, amp_dtype)
         else:
-            disp_single = _forward_model_displacement(model, inputs, amp_enabled, amp_dtype)
+            disp_single = _get_displacement_result(model, inputs, amp_enabled, amp_dtype)
 
         n_forward += 1
         # Apply a fixed fraction of each stage's full displacement prediction.
@@ -1124,9 +999,7 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local, crop_size))
     elif use_tta:
         # TTA path: process one crop at a time to avoid 8x memory blowup.
-        for item_idx, (bbox_idx, crop, inputs, extrap_local) in enumerate(
-            tqdm(valid_items, desc="inference (TTA)")
-        ):
+        for bbox_idx, crop, inputs, extrap_local in tqdm(valid_items, desc="inference (TTA)"):
             inputs_dev = inputs.to(args.device)
             disp_single = _run_model_tta(model, inputs_dev, amp_enabled, amp_dtype)
 
@@ -1151,7 +1024,7 @@ def run_inference(args, bbox_crops, crop_size, model_state):
 
             # Stack inputs along batch dim and run a single forward pass.
             batch_inputs = torch.cat([item[2] for item in batch], dim=0).to(args.device)
-            disp_pred = _forward_model_displacement(model, batch_inputs, amp_enabled, amp_dtype)
+            disp_pred = _get_displacement_result(model, batch_inputs, amp_enabled, amp_dtype)
 
             # Sample displacement per-crop from the batched output.
             for i, (bbox_idx, crop, _, extrap_local) in enumerate(batch):
@@ -1457,7 +1330,6 @@ def main():
         )
 
     all_pred_samples = []
-    bboxes = []
 
     for iteration in range(growth_iterations):
         print(f"[iteration {iteration + 1}/{growth_iterations}]")
