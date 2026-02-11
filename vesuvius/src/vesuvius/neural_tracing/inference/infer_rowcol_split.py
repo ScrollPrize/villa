@@ -1158,31 +1158,55 @@ def _run_growth_iterations(
         cond_zyxs = current_grid
         valid = current_valid
 
-        
+        # create global (row, col) coordinates for each point in the current window, offset during expansion to keep coordinates correctly aligned
         uv_cond = _build_uv_grid(current_uv_offset, cond_zyxs.shape[:2])
 
-        
+        # at the edge indicated by the growth direction, beginning at the center point, walk the edge in one direction and greedily add points until 
+        # we have enough to create a crop_size bbox, with overlap. then, walk the edge in the opposite direction and do the same, until each point in the edge
+        # has been assigned to at least one bbox. bboxes are centered on the edge points , but do not perfectly split the ratio of cond:extrap because
+        # the bboxes are axis-aligned and the surface may curve in 3d despite the obvious 2d straightness
         bboxes, _ = get_cond_edge_bboxes(
             cond_zyxs, cond_direction, crop_size,
             overlap_frac=args.bbox_overlap_frac,
         )
 
         pred_samples = []
+        # for each bbox: 
+        # - crop the volume, and zscore normalize it
+        # - convert the current conditioning points into crop-local coords, and voxelize them into a binary mask
+        # - using the conditioning coordinates that fall within this crop, extrapolate new points beyond the current edge (extrapolation also returns new row, col indices)
+        # - voxelize the extrapolated points into a binary mask
+        # - pack it all into a dict for the inference call
         bbox_crops = build_bbox_crop_data(
             args, bboxes, cond_zyxs, valid, uv_cond, grow_direction, crop_size, tgt_segment,
             args.volume_scale, extrapolation_settings,
         )
 
+        # we pass the bbox crop data to the model , and optionally apply TTA or fractional refinement
+        # the model predicts a dense 3d displacement field which says at each voxel the (dz, dy, dx) displacement to reach the intended surface
+        # we sample the predicted displacement field at the extrapolated points to get the correct z, y, x coordinates 
+        # and return the predicted (row, col, z, y, x) for each crops extrapolated grid
         if run_model_inference and model_state is not None:
             pred_samples = run_inference(args, bbox_crops, crop_size, model_state)
 
         if not pred_samples:
             print("No predicted samples this iteration; stopping iterative growth.")
             break
-
+        
+        # aggregate predicted samples from all bboxes into one dense UV-indexed grid -- each sample is (uv=row,col, pts=z,y,x) 
+        # we build a canvas covering all uvs and place points into uv cells, overlaps are averaged together
+        # at this point we are aggregating predictions only, we have not yet merged into the full grid
         pred_grid, pred_valid, pred_offset = _aggregate_pred_samples_to_uv_grid(
             pred_samples,
         )
+
+        # now we combine the prediction grid with the current full grid. 
+        # we keep only predicted points that lie beyond the current boundary in the growth direction
+        # we optionally choose to keep only the first rows or cols , determined by the --iter-keep-voxels argument
+        # then we create a new (row, col, z, y, x) grid large enough to hold both the current grid and the kept prediction grid
+        # we copy the current valid grid into the new grid, and copy the prediction grid (or the band determined by the --iter-keep-voxels argument / keep_mask) 
+        # according to its uv offset
+
         merged_cond, merged_valid, merged_uv_offset, kept, n_kept_axis = prepare_next_iteration_cond(
             current_grid, current_valid, current_uv_offset,
             pred_grid, pred_valid, pred_offset,
