@@ -275,18 +275,14 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
     second_side = np.arange(center_idx + 1, n_edge, dtype=np.int64)
 
     bboxes = []
-    for chunk in _chunk_ordered_indices(first_side):
-        pts = edge[chunk]
-        zc = (pts[:, 0].min() + pts[:, 0].max()) / 2
-        yc = (pts[:, 1].min() + pts[:, 1].max()) / 2
-        xc = (pts[:, 2].min() + pts[:, 2].max()) / 2
-        bboxes.append(_bbox_from_center((zc, yc, xc), crop_size))
-    for chunk in _chunk_ordered_indices(second_side):
-        pts = edge[chunk]
-        zc = (pts[:, 0].min() + pts[:, 0].max()) / 2
-        yc = (pts[:, 1].min() + pts[:, 1].max()) / 2
-        xc = (pts[:, 2].min() + pts[:, 2].max()) / 2
-        bboxes.append(_bbox_from_center((zc, yc, xc), crop_size))
+    def _append_side_bboxes(ordered_indices):
+        for chunk in _chunk_ordered_indices(ordered_indices):
+            pts = edge[chunk]
+            center = (pts.min(axis=0) + pts.max(axis=0)) / 2
+            bboxes.append(_bbox_from_center(center, crop_size))
+
+    _append_side_bboxes(first_side)
+    _append_side_bboxes(second_side)
 
     return bboxes, edge
 
@@ -361,21 +357,6 @@ def _in_bounds_mask(coords, size):
         (coords[:, 1] >= 0) & (coords[:, 1] < size[1]) &
         (coords[:, 2] >= 0) & (coords[:, 2] < size[2])
     )
-
-def _filter_points_in_bbox_mask(points, bbox):
-    z_min, z_max, y_min, y_max, x_min, x_max = bbox
-    z, y, x = points[:, 0], points[:, 1], points[:, 2]
-    return (
-        (z >= z_min) & (z <= z_max) &
-        (y >= y_min) & (y <= y_max) &
-        (x >= x_min) & (x <= x_max)
-    )
-
-def _points_world_to_local(points, min_corner, crop_size):
-    if points is None or len(points) == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    local = points - min_corner[None, :]
-    return local[_in_bounds_mask(local, crop_size)].astype(np.float32)
 
 def _points_to_voxels(points_local, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
@@ -496,16 +477,10 @@ def compute_extrapolation_infer(
         **method_kwargs,
     )
 
-    z_extrap = zyx_extrapolated[:, 0]
-    y_extrap = zyx_extrapolated[:, 1]
-    x_extrap = zyx_extrapolated[:, 2]
-
-    z_extrap_local = z_extrap - min_corner[0]
-    y_extrap_local = y_extrap - min_corner[1]
-    x_extrap_local = x_extrap - min_corner[2]
+    min_corner_arr = np.asarray(min_corner, dtype=zyx_extrapolated.dtype)
+    zyx_extrap_local_full = zyx_extrapolated - min_corner_arr[None, :]
 
     if degrade_prob > 0.0 and cond_direction is not None:
-        zyx_extrap_local_full = np.stack([z_extrap_local, y_extrap_local, x_extrap_local], axis=-1)
         uv_shape = uv_query.shape[:2]
         zyx_extrap_local_full, _ = apply_degradation(
             zyx_extrap_local_full,
@@ -515,16 +490,11 @@ def compute_extrapolation_infer(
             curvature_range=degrade_curvature_range,
             gradient_range=degrade_gradient_range,
         )
-        z_extrap_local = zyx_extrap_local_full[:, 0]
-        y_extrap_local = zyx_extrap_local_full[:, 1]
-        x_extrap_local = zyx_extrap_local_full[:, 2]
-
-    zyx_extrap_local_full = np.stack([z_extrap_local, y_extrap_local, x_extrap_local], axis=-1)
     extrap_coords_local = zyx_extrap_local_full
     extrap_surface = None
     if not skip_bounds_check:
         in_bounds = _in_bounds_mask(zyx_extrap_local_full, crop_size)
-        if in_bounds.sum() == 0:
+        if not in_bounds.any():
             return None
 
         extrap_coords_local = zyx_extrap_local_full[in_bounds]
@@ -718,9 +688,6 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
                          volume_scale, extrapolation_settings):
     cond_direction, _ = _get_growth_context(grow_direction)
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
-    cond_pts_world = cond_zyxs.reshape(-1, 3)
-    cond_valid_mask = ~(cond_pts_world == -1).all(axis=1)
-    cond_pts_world = cond_pts_world[cond_valid_mask]
     crop_size_extrap = tuple(int(v) for v in crop_size)
     if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
         cond_valid_base = np.asarray(cond_valid, dtype=bool)
@@ -732,9 +699,6 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
         min_corner, bbox_bounds_array = _bbox_to_min_corner_and_bounds_array(bbox)
         vol_crop = _crop_volume_from_min_corner(volume_for_crops, min_corner, crop_size)
         vol_crop = normalize_zscore(vol_crop)
-
-        cond_world_in = cond_pts_world[_filter_points_in_bbox_mask(cond_pts_world, bbox)]
-        cond_local = _points_world_to_local(cond_world_in, min_corner, crop_size)
 
         extrap_local = np.zeros((0, 3), dtype=np.float32)
         extrap_uv = None
@@ -791,7 +755,6 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
             "bbox": bbox,
             "min_corner": min_corner,
             "volume": vol_crop,
-            "cond_pts_local": cond_local,
             "extrap_pts_local": extrap_local,
             "extrap_uv": extrap_uv,
             "cond_vox": cond_vox,
@@ -820,14 +783,32 @@ def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
     return disp
 
 
+def _predict_displacement(args, model_state, model_inputs, use_tta=None):
+    model = model_state["model"]
+    amp_enabled = model_state["amp_enabled"]
+    amp_dtype = model_state["amp_dtype"]
+    if use_tta is None:
+        use_tta = bool(getattr(args, "tta", True))
+
+    if use_tta:
+        return run_model_tta(
+            model,
+            model_inputs,
+            amp_enabled,
+            amp_dtype,
+            get_displacement_result=_get_displacement_result,
+            merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
+            outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
+            outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
+        )
+
+    return _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype)
+
+
 def _run_refine_on_crop(args, crop, crop_size, model_state):
     refine_extra_steps = int(args.refine) if args.refine is not None else 0
     refine_parts = refine_extra_steps + 1
     refine_fraction = 1.0 / float(refine_parts)
-    use_tta = bool(getattr(args, "tta", True))
-    model = model_state["model"]
-    amp_enabled = model_state["amp_enabled"]
-    amp_dtype = model_state["amp_dtype"]
     expected_in_channels = model_state["expected_in_channels"]
 
     current_coords = crop.get("extrap_pts_local", None)
@@ -867,19 +848,7 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
             crop["volume"], cond_vox, extrap_vox, other_wraps_vox=other_wraps_vox
         ).to(args.device)
 
-        if use_tta:
-            disp_single = run_model_tta(
-                model,
-                inputs,
-                amp_enabled,
-                amp_dtype,
-                get_displacement_result=_get_displacement_result,
-                merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
-                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
-                outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
-            )
-        else:
-            disp_single = _get_displacement_result(model, inputs, amp_enabled, amp_dtype)
+        disp_single = _predict_displacement(args, model_state, inputs)
 
         n_forward += 1
         # Apply a fixed fraction of each stage's full displacement prediction.
@@ -927,9 +896,6 @@ def _finalize_crop_prediction(args, bbox_idx, crop, pred_local, pred_uv, crop_si
 
 
 def run_inference(args, bbox_crops, crop_size, model_state):
-    model = model_state["model"]
-    amp_enabled = model_state["amp_enabled"]
-    amp_dtype = model_state["amp_dtype"]
     expected_in_channels = model_state["expected_in_channels"]
     batch_size = args.batch_size
     refine_mode = args.refine is not None
@@ -973,46 +939,16 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             )
             if pred_sample is not None:
                 pred_samples.append(pred_sample)
-    elif use_tta:
-        # TTA path: batch crops together, then run TTA once per batch.
+    else:
+        desc = "inference (TTA)" if use_tta else "inference"
         n_batches = (len(valid_items) + batch_size - 1) // batch_size
-        for batch_start in tqdm(range(0, len(valid_items), batch_size), total=n_batches, desc="inference (TTA)"):
+        for batch_start in tqdm(range(0, len(valid_items), batch_size), total=n_batches, desc=desc):
             batch = valid_items[batch_start:batch_start + batch_size]
             batch_inputs = torch.cat([item[2] for item in batch], dim=0).to(args.device)
-            disp_pred = run_model_tta(
-                model,
-                batch_inputs,
-                amp_enabled,
-                amp_dtype,
-                get_displacement_result=_get_displacement_result,
-                merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
-                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
-                outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
+            disp_pred = _predict_displacement(
+                args, model_state, batch_inputs, use_tta=use_tta
             )
 
-            for i, (bbox_idx, crop, _, extrap_local) in enumerate(batch):
-                disp_single = disp_pred[i:i + 1]  # [1, 3, D, H, W]
-                extrap_coords = torch.from_numpy(extrap_local).float().to(args.device)
-                extrap_uv = crop.get("extrap_uv", None)
-
-                disp_sampled = _sample_displacement_field(disp_single, extrap_coords)
-                pred_local = extrap_coords + disp_sampled
-                pred_sample = _finalize_crop_prediction(
-                    args, bbox_idx, crop, pred_local, extrap_uv, crop_size
-                )
-                if pred_sample is not None:
-                    pred_samples.append(pred_sample)
-    else:
-        # Standard batched path.
-        n_batches = (len(valid_items) + batch_size - 1) // batch_size
-        for batch_start in tqdm(range(0, len(valid_items), batch_size), total=n_batches, desc="inference"):
-            batch = valid_items[batch_start:batch_start + batch_size]
-
-            # Stack inputs along batch dim and run a single forward pass.
-            batch_inputs = torch.cat([item[2] for item in batch], dim=0).to(args.device)
-            disp_pred = _get_displacement_result(model, batch_inputs, amp_enabled, amp_dtype)
-
-            # Sample displacement per-crop from the batched output.
             for i, (bbox_idx, crop, _, extrap_local) in enumerate(batch):
                 disp_single = disp_pred[i:i+1]  # [1, 3, D, H, W]
 
@@ -1130,8 +1066,7 @@ def prepare_next_iteration_cond(
     return merged_cond, merged_valid, (new_r0, new_c0), kept_pred_samples, int(n_keep)
 
 
-def main():
-    args = parse_args()
+def _validate_args(args):
     if args.iter_keep_voxels is not None and args.iter_keep_voxels < 1:
         raise ValueError("--iter-keep-voxels must be >= 1 when provided.")
     if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
@@ -1143,15 +1078,8 @@ def main():
     if args.tta_outlier_drop_min_keep < 1:
         raise ValueError("--tta-outlier-drop-min-keep must be >= 1.")
 
-    refine_mode = args.refine is not None
-    growth_iterations = args.iterations
-    if refine_mode:
-        print(
-            f"--refine={args.refine} enabled; running {int(args.refine) + 1} "
-            "fractional refinement stages inside each outer iteration."
-        )
 
-    crop_size = tuple(args.crop_size)
+def _load_runtime_state(args):
     has_checkpoint = args.checkpoint_path is not None
     run_model_inference = has_checkpoint and not args.skip_inference
 
@@ -1174,33 +1102,51 @@ def main():
     runtime_config.update(file_config)
     extrapolation_settings = _resolve_extrapolation_settings(args, runtime_config)
 
-    tifxyz_step_size, tifxyz_voxel_size_um = resolve_tifxyz_params(
-        args, model_config, args.volume_scale
-    )
+    return {
+        "run_model_inference": run_model_inference,
+        "model_state": model_state,
+        "model_config": model_config,
+        "checkpoint_path": checkpoint_path,
+        "tifxyz_uuid": tifxyz_uuid,
+        "extrapolation_settings": extrapolation_settings,
+    }
 
-    volume = zarr.open_group(args.volume_path, mode='r')
-    tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
-    cond_direction, growth_spec = _get_growth_context(grow_direction)
 
-    r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
-        args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
-    )
-
+def _stored_to_full_bounds(tgt_segment, stored_bounds):
+    r0_s, r1_s, c0_s, c1_s = stored_bounds
     scale_y, scale_x = tgt_segment._scale
     full_h, full_w = tgt_segment.full_resolution_shape
     r0_full = max(0, int(np.floor(r0_s / scale_y)))
     r1_full = min(full_h, int(np.ceil((r1_s + 1) / scale_y)))
     c0_full = max(0, int(np.floor(c0_s / scale_x)))
     c1_full = min(full_w, int(np.ceil((c1_s + 1) / scale_x)))
+    return r0_full, r1_full, c0_full, c1_full
 
+
+def _initialize_window_state(tgt_segment, full_bounds):
+    r0_full, r1_full, c0_full, c1_full = full_bounds
     tgt_segment.use_full_resolution()
     x, y, z, valid = tgt_segment[r0_full:r1_full, c0_full:c1_full]
 
     window_zyxs = np.stack([z, y, x], axis=-1)
-    current_grid = window_zyxs.copy()
-    current_valid = valid.copy()
-    current_uv_offset = (r0_full, c0_full)
+    return window_zyxs.copy(), valid.copy(), (r0_full, c0_full)
 
+
+def _run_growth_iterations(
+    args,
+    growth_iterations,
+    crop_size,
+    tgt_segment,
+    grow_direction,
+    cond_direction,
+    growth_spec,
+    current_grid,
+    current_valid,
+    current_uv_offset,
+    run_model_inference,
+    model_state,
+    extrapolation_settings,
+):
     if growth_iterations > 1 and args.iter_keep_voxels is None:
         print(
             "iter-keep-voxels not set; each iteration will keep all newly predicted "
@@ -1221,7 +1167,6 @@ def main():
             overlap_frac=args.bbox_overlap_frac,
         )
 
-        # --- build bbox crops + run inference ---
         pred_samples = []
         bbox_crops = build_bbox_crop_data(
             args, bboxes, cond_zyxs, valid, uv_cond, grow_direction, crop_size, tgt_segment,
@@ -1254,7 +1199,61 @@ def main():
         axis_label = "rows" if growth_spec["axis"] == "row" else "cols"
         print(f"  kept {n_kept_axis} new {axis_label}")
 
-    pred_samples = all_pred_samples
+    return all_pred_samples
+
+
+def main():
+    args = parse_args()
+    _validate_args(args)
+
+    refine_mode = args.refine is not None
+    growth_iterations = args.iterations
+    if refine_mode:
+        print(
+            f"--refine={args.refine} enabled; running {int(args.refine) + 1} "
+            "fractional refinement stages inside each outer iteration."
+        )
+
+    crop_size = tuple(args.crop_size)
+    runtime_state = _load_runtime_state(args)
+    run_model_inference = runtime_state["run_model_inference"]
+    model_state = runtime_state["model_state"]
+    model_config = runtime_state["model_config"]
+    checkpoint_path = runtime_state["checkpoint_path"]
+    tifxyz_uuid = runtime_state["tifxyz_uuid"]
+    extrapolation_settings = runtime_state["extrapolation_settings"]
+
+    tifxyz_step_size, tifxyz_voxel_size_um = resolve_tifxyz_params(
+        args, model_config, args.volume_scale
+    )
+
+    volume = zarr.open_group(args.volume_path, mode='r')
+    tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
+    cond_direction, growth_spec = _get_growth_context(grow_direction)
+
+    r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
+        args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
+    )
+
+    full_bounds = _stored_to_full_bounds(tgt_segment, (r0_s, r1_s, c0_s, c1_s))
+    current_grid, current_valid, current_uv_offset = _initialize_window_state(
+        tgt_segment, full_bounds
+    )
+    pred_samples = _run_growth_iterations(
+        args,
+        growth_iterations,
+        crop_size,
+        tgt_segment,
+        grow_direction,
+        cond_direction,
+        growth_spec,
+        current_grid,
+        current_valid,
+        current_uv_offset,
+        run_model_inference,
+        model_state,
+        extrapolation_settings,
+    )
 
     if tifxyz_uuid is not None and pred_samples:
         save_tifxyz_output(
