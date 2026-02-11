@@ -74,6 +74,7 @@ public:
         QString text;
         QFont font{};
         OverlayStyle style{};
+        bool outlined{false};
     };
 
     enum class PathRenderMode {
@@ -188,7 +189,8 @@ protected:
         void addText(const QPointF& position,
                      const QString& text,
                      const QFont& font,
-                     OverlayStyle style);
+                     OverlayStyle style,
+                     bool outlined = false);
 
         void addPath(const PathPrimitive& path);
 
