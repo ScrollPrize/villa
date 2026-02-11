@@ -507,7 +507,33 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8,
         help="Number of crops to process in a single batched forward pass.")
     parser.add_argument("--tta", action="store_true",
-        help="Enable mirroring-based test-time augmentation (8 flip combos, averaged).")
+        help="Enable mirroring-based test-time augmentation (8 flip combos, merged).")
+    parser.add_argument(
+        "--tta-merge-method",
+        type=str,
+        default="median",
+        choices=_TTA_MERGE_METHODS,
+        help="How to merge mirrored TTA displacement predictions (default: median).",
+    )
+    parser.add_argument(
+        "--tta-outlier-drop-thresh",
+        type=float,
+        default=None,
+        help=(
+            "Optional robust threshold multiplier for dropping outlier TTA flip variants "
+            "before merge. Uses per-variant distance to the TTA median field and drops "
+            "variants above median + thresh * spread (MAD, with std fallback)."
+        ),
+    )
+    parser.add_argument(
+        "--tta-outlier-drop-min-keep",
+        type=int,
+        default=4,
+        help=(
+            "Minimum number of TTA variants to keep when --tta-outlier-drop-thresh is set "
+            "(default: 4)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -691,7 +717,8 @@ def compute_window_and_split(args, stored_zyxs, valid_s, grow_direction, h_s, w_
     if win_h < 2 or win_w < 2:
         raise RuntimeError("Window too small after edge-based bounds.")
 
-    outside_dir = cond_direction
+    # Anchor to the growth side so right/down don't re-center toward the conditioning side.
+    outside_dir = grow_direction
     r_edge_outside, c_edge_outside = _edge_index_from_valid(valid_s, outside_dir)
 
     cond_h = win_h
@@ -853,6 +880,127 @@ _TTA_FLIP_COMBOS = [
 # Mapping from flip dim to displacement channel that must be negated:
 # dim -1 (W/X) -> channel 2, dim -2 (H/Y) -> channel 1, dim -3 (D/Z) -> channel 0
 _FLIP_DIM_TO_CHANNEL = {-1: 2, -2: 1, -3: 0}
+_TTA_MERGE_METHODS = ("median", "mean", "trimmed_mean", "vector_medoid", "vector_geomedian")
+
+
+def _validate_tta_merge_method(merge_method):
+    method = str(merge_method).strip().lower()
+    if method not in _TTA_MERGE_METHODS:
+        raise ValueError(
+            f"Unknown --tta-merge-method '{merge_method}'. "
+            f"Supported methods: {list(_TTA_MERGE_METHODS)}"
+        )
+    return method
+
+
+def _merge_tta_vector_medoid(disp_stack):
+    # Robust vector-consistent merge: pick the TTA vector minimizing total L2
+    # distance to all other TTA vectors at each voxel.
+    n_tta, batch_size, channels, depth, height, width = disp_stack.shape
+    vec = disp_stack.permute(0, 1, 3, 4, 5, 2).reshape(n_tta, -1, channels)
+    vec32 = vec.float()
+    n_locations = vec.shape[1]
+    score = torch.zeros((n_tta, n_locations), dtype=vec32.dtype, device=vec32.device)
+
+    for i in range(n_tta):
+        diff = vec32 - vec32[i:i + 1]
+        score[i] = (diff * diff).sum(dim=-1).sum(dim=0)
+
+    medoid_idx = score.argmin(dim=0)
+    vec_by_location = vec.permute(1, 0, 2)
+    loc_idx = torch.arange(n_locations, device=vec.device)
+    merged_vec = vec_by_location[loc_idx, medoid_idx]
+    merged = merged_vec.reshape(batch_size, depth, height, width, channels).permute(0, 4, 1, 2, 3)
+    return merged
+
+
+def _merge_tta_vector_geomedian(disp_stack, max_iters=8, eps=1e-6, tol=1e-4):
+    # Robust vector-consistent merge via Weiszfeld iterations.
+    n_tta, batch_size, channels, depth, height, width = disp_stack.shape
+    vec = disp_stack.permute(0, 1, 3, 4, 5, 2).reshape(n_tta, -1, channels)
+    vec32 = vec.float()
+    x = torch.median(vec32, dim=0).values
+
+    for _ in range(int(max_iters)):
+        dist = torch.linalg.norm(vec32 - x.unsqueeze(0), dim=-1).clamp_min(eps)
+        w = 1.0 / dist
+        x_new = (w.unsqueeze(-1) * vec32).sum(dim=0) / w.sum(dim=0).clamp_min(eps).unsqueeze(-1)
+        step = torch.linalg.norm(x_new - x, dim=-1).mean()
+        x = x_new
+        if float(step.item()) < tol:
+            break
+
+    merged = x.reshape(batch_size, depth, height, width, channels).permute(0, 4, 1, 2, 3)
+    return merged.to(dtype=disp_stack.dtype)
+
+
+def _merge_tta_displacements(disp_stack, merge_method):
+    if disp_stack.ndim != 6:
+        raise RuntimeError(
+            f"Expected stacked TTA displacement [T, B, C, D, H, W], got {tuple(disp_stack.shape)}"
+        )
+    method = _validate_tta_merge_method(merge_method)
+
+    if method == "mean":
+        return disp_stack.mean(dim=0)
+    if method == "median":
+        return torch.median(disp_stack, dim=0).values
+    if method == "trimmed_mean":
+        if disp_stack.shape[0] <= 2:
+            return disp_stack.mean(dim=0)
+        sorted_disp, _ = torch.sort(disp_stack, dim=0)
+        return sorted_disp[1:-1].mean(dim=0)
+    if method == "vector_medoid":
+        return _merge_tta_vector_medoid(disp_stack)
+    if method == "vector_geomedian":
+        return _merge_tta_vector_geomedian(disp_stack)
+    raise RuntimeError(f"Unhandled TTA merge method '{method}'")
+
+
+def _drop_tta_outlier_variants(disp_stack, thresh, min_keep=4):
+    """Drop whole TTA variants whose global vector error is far from consensus."""
+    if thresh is None:
+        return disp_stack
+    if disp_stack.ndim != 6:
+        raise RuntimeError(
+            f"Expected stacked TTA displacement [T, B, C, D, H, W], got {tuple(disp_stack.shape)}"
+        )
+
+    thresh = float(thresh)
+    if thresh <= 0:
+        return disp_stack
+
+    n_tta = int(disp_stack.shape[0])
+    if n_tta <= 2:
+        return disp_stack
+
+    min_keep = max(1, min(int(min_keep), n_tta))
+
+    center = torch.median(disp_stack, dim=0).values
+    diff = disp_stack.float() - center.unsqueeze(0).float()
+    l2 = torch.linalg.norm(diff, dim=2)
+    scores = l2.mean(dim=(1, 2, 3, 4))
+
+    med = torch.median(scores)
+    mad = torch.median(torch.abs(scores - med))
+
+    spread = mad
+    if float(spread.item()) <= 1e-12:
+        spread = scores.std(unbiased=False)
+    if float(spread.item()) <= 1e-12:
+        return disp_stack
+
+    cutoff = med + thresh * spread
+    keep_mask = scores <= cutoff
+
+    if int(keep_mask.sum().item()) < min_keep:
+        keep_mask = torch.zeros_like(keep_mask)
+        keep_idx = torch.topk(scores, k=min_keep, largest=False).indices
+        keep_mask[keep_idx] = True
+
+    if bool(keep_mask.all()):
+        return disp_stack
+    return disp_stack[keep_mask]
 
 
 def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
@@ -872,20 +1020,32 @@ def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
     return disp
 
 
-def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
-    """Run mirroring-based TTA on a batch, returning averaged displacement.
+def _run_model_tta(
+    model,
+    inputs,
+    amp_enabled,
+    amp_dtype,
+    merge_method="median",
+    outlier_drop_thresh=None,
+    outlier_drop_min_keep=4,
+):
+    """Run mirroring-based TTA on a batch, returning merged displacement.
 
     Args:
         model: The model to run inference with.
         inputs: Input tensor of shape [B, C, D, H, W].
         amp_enabled: Whether to use automatic mixed precision.
         amp_dtype: The dtype for AMP.
+        merge_method: Method used to merge un-flipped TTA predictions.
+        outlier_drop_thresh: Optional threshold for dropping outlier flip variants.
+        outlier_drop_min_keep: Minimum number of variants kept when outlier dropping.
 
     Returns:
-        Averaged displacement tensor of shape [B, 3, D, H, W].
+        Merged displacement tensor of shape [B, 3, D, H, W].
     """
     if inputs.ndim != 5:
         raise RuntimeError(f"Expected inputs with shape [B, C, D, H, W], got {tuple(inputs.shape)}")
+    merge_method = _validate_tta_merge_method(merge_method)
 
     batch_size = int(inputs.shape[0])
     if batch_size <= 0:
@@ -909,7 +1069,7 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
             f"Unexpected TTA output batch size {disp_all.shape[0]} (expected {expected_batch})."
         )
 
-    accum = None
+    aligned_displacements = []
 
     for tta_idx, flip_dims in enumerate(_TTA_FLIP_COMBOS):
         start = tta_idx * batch_size
@@ -932,12 +1092,15 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
                 sign[:, ch] = -1
             disp = disp * sign
 
-        if accum is None:
-            accum = disp
-        else:
-            accum = accum + disp
+        aligned_displacements.append(disp)
 
-    return accum / float(n_tta)
+    disp_stack = torch.stack(aligned_displacements, dim=0)
+    disp_stack = _drop_tta_outlier_variants(
+        disp_stack,
+        thresh=outlier_drop_thresh,
+        min_keep=outlier_drop_min_keep,
+    )
+    return _merge_tta_displacements(disp_stack, merge_method)
 
 
 def _run_refine_on_crop(args, crop, crop_size, model_state):
@@ -986,7 +1149,15 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
         ).to(args.device)
 
         if use_tta:
-            disp_single = _run_model_tta(model, inputs, amp_enabled, amp_dtype)
+            disp_single = _run_model_tta(
+                model,
+                inputs,
+                amp_enabled,
+                amp_dtype,
+                merge_method=getattr(args, "tta_merge_method", "median"),
+                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", None),
+                outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
+            )
         else:
             disp_single = _get_displacement_result(model, inputs, amp_enabled, amp_dtype)
 
@@ -1087,7 +1258,15 @@ def run_inference(args, bbox_crops, crop_size, model_state):
         # TTA path: process bboxes sequentially, but batch TTA flips inside _run_model_tta.
         for bbox_idx, crop, inputs, extrap_local in tqdm(valid_items, desc="inference (TTA)"):
             inputs_dev = inputs.to(args.device)
-            disp_single = _run_model_tta(model, inputs_dev, amp_enabled, amp_dtype)
+            disp_single = _run_model_tta(
+                model,
+                inputs_dev,
+                amp_enabled,
+                amp_dtype,
+                merge_method=getattr(args, "tta_merge_method", "median"),
+                outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", None),
+                outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
+            )
 
             extrap_coords = torch.from_numpy(extrap_local).float().to(args.device)
             extrap_uv = crop.get("extrap_uv", None)
@@ -1334,6 +1513,10 @@ def main():
         raise ValueError("--bbox-overlap-frac must be in [0, 1).")
     if args.refine is not None and args.refine < 1:
         raise ValueError("--refine must be >= 1 when provided.")
+    if args.tta_outlier_drop_thresh is not None and args.tta_outlier_drop_thresh <= 0:
+        raise ValueError("--tta-outlier-drop-thresh must be > 0 when provided.")
+    if args.tta_outlier_drop_min_keep < 1:
+        raise ValueError("--tta-outlier-drop-min-keep must be >= 1.")
 
     refine_mode = args.refine is not None
     growth_iterations = args.iterations
