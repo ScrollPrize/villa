@@ -19,35 +19,6 @@
 	},
 	"stages": [
 		{
-			"name": "incstep1",
-			"global_opt": {
-				"steps": 1000,
-				"lr": [0.1, 0.01, 0.001],
-				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
-				"min_scaledown": 0,
-				"w_fac": {
-					"step": 0.1
-				}
-			},
-			"local_opt": {
-				"steps": 0
-			}
-		},
-		{
-			"name": "incstep2",
-			"global_opt": {
-				"steps": 1000,
-				"lr": [0.1, 0.01, 0.001],
-				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
-				"min_scaledown": 0,
-				"w_fac": {
-				}
-			},
-			"local_opt": {
-				"steps": 0
-			}
-		},
-		{
 			"name": "grow_only",
 			"grow": {
 				"directions": ["fw"],
