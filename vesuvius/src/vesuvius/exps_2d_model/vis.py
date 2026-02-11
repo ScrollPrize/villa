@@ -553,7 +553,6 @@ def save(
 
 	for _k, spec in loss_maps.items():
 		mt0 = spec["fn"]().detach()
-		print(f"loss_map {spec['suffix']}: shape={tuple(mt0.shape)}")
 		m = mt0.cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
 			m = m[:, 0]

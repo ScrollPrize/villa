@@ -491,10 +491,6 @@ def optimize(
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
 			if model._last_grow_insert_z is not None:
-				print(
-					"dbg grow_z: before data_grow"
-					+ f" data.N={int(data.cos.shape[0])} model.z_size={int(model.z_size)} insert_z={int(model._last_grow_insert_z)}"
-				)
 				if int(data.cos.shape[0]) != int(model.z_size):
 					if data_cfg is None:
 						raise ValueError("grow fw/bw requires passing data_cfg")
@@ -507,10 +503,6 @@ def optimize(
 						new_z_size=int(model.z_size),
 						insert_z=int(model._last_grow_insert_z),
 						out_dir_base=data_out_dir_base,
-					)
-					print(
-						"dbg grow_z: after data_grow"
-						+ f" data.N={int(data.cos.shape[0])} model.z_size={int(model.z_size)} unet_z0={int(data_z0)}"
 					)
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
