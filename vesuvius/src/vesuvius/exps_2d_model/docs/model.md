@@ -213,6 +213,41 @@ Initialization rules:
 
 ## Current data contract (FitData)
 
+## Crop & scaling semantics (critical)
+
+This codebase uses two pixel/voxel coordinate spaces:
+
+- **Full-res** coordinates: the native coordinates of the input volume (OME-Zarr) or raw images.
+- **Model pixel** coordinates: the coordinates used by the fit model tensors & loss evaluation.
+
+### 1) ModelParams carries the crop (full-res) and scale-down
+
+Checkpoints embed a `_model_params_` dict. The corresponding runtime type is [`ModelParams`](../model.py:25).
+
+- `crop_fullres_xyzwhd = (x, y, w, h, z0, d)` is stored in **full-res** coordinates.
+- `scaledown` is the factor from **full-res → model pixel** coordinates.
+- `crop_xyzwhd` is a derived property (computed as `crop_fullres_xyzwhd / scaledown`), i.e. the crop in **model pixel** coordinates.
+
+### 2) Model tensors are always relative to the (scaled) crop
+
+All model-space XY tensors (`mesh_ms.*`, `amp`, `bias`, `xy_lr`, `xy_hr`, `xy_conn`) are defined in **model pixel coordinates** and are **relative to the scaled crop**.
+
+That means:
+
+- The top-left of the scaled crop is `(0, 0)`.
+- Valid XY ranges are approximately `x in [0, crop_w-1]`, `y in [0, crop_h-1]` in model pixel space.
+
+This is why visualization uses `data.size` (which is the scaled crop size) to map model XY to pixels.
+
+### 3) Export / downstream mapping back to full-res
+
+Whenever coordinates need to be interpreted in full-res space (e.g. tifxyz export), the mapping is:
+
+- `x_fullres = (x_model * scaledown) + crop_fullres_x0`
+- `y_fullres = (y_model * scaledown) + crop_fullres_y0`
+
+Z indices are derived from `crop_fullres_xyzwhd` and `z_step_vx`.
+
 - Model init uses the supervision container [`fit_data.FitData`](fit_data.py:10) (not raw tensors).
 - Current loader behavior:
 	- expects a directory with 4 float tif channels: `*_cos.tif`, `*_mag.tif`, `*_dir0.tif`, `*_dir1.tif`
