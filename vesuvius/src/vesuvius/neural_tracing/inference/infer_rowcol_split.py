@@ -56,6 +56,13 @@ def _get_direction_spec(cond_direction):
         raise ValueError(f"Unknown cond_direction '{cond_direction}'")
     return spec
 
+def _cond_direction_from_grow(grow_direction):
+    return _get_direction_spec(grow_direction)["opposite"]
+
+def _get_growth_spec(grow_direction):
+    # Growth semantics are encoded by the opposite conditioning side.
+    return _get_direction_spec(_cond_direction_from_grow(grow_direction))
+
 def _clamp_window(start, size, min_val, max_val):
     size = int(size)
     start = int(start)
@@ -647,18 +654,20 @@ def setup_segment(args, volume):
         valid_dirs.extend(["up", "down"])
     if not valid_dirs:
         raise RuntimeError("Segment too small to define a split direction.")
-    cond_direction = _get_direction_spec(args.grow_direction)["opposite"]
+    grow_direction = args.grow_direction
+    cond_direction = _cond_direction_from_grow(grow_direction)
     if cond_direction not in valid_dirs:
         raise RuntimeError(
             f"Requested grow_direction '{args.grow_direction}' (cond_direction='{cond_direction}') "
             f"not available for this segment. Valid options: {valid_dirs}"
         )
 
-    return tgt_segment, stored_zyxs, valid_s, cond_direction, h_s, w_s
+    return tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s
 
 
-def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_s, crop_size):
-    direction = _get_direction_spec(cond_direction)
+def compute_window_and_split(args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size):
+    direction = _get_growth_spec(grow_direction)
+    cond_direction = _cond_direction_from_grow(grow_direction)
     r_edge_s, c_edge_s = _edge_index_from_valid(valid_s, cond_direction)
     if r_edge_s is None and c_edge_s is None:
         raise RuntimeError("No valid edge found for segment.")
@@ -700,11 +709,11 @@ def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_
     return r0_s, r1_s, c0_s, c1_s
 
 
-def _build_uv_query_from_cond_points(uv_cond_pts, cond_direction, cond_pct):
+def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
     if uv_cond_pts is None or len(uv_cond_pts) == 0:
         return np.zeros((0, 0, 2), dtype=np.float64)
 
-    direction = _get_direction_spec(cond_direction)
+    direction = _get_growth_spec(grow_direction)
     uv_cond_pts = np.asarray(uv_cond_pts)
     r_min = int(np.floor(uv_cond_pts[:, 0].min()))
     r_max = int(np.ceil(uv_cond_pts[:, 0].max()))
@@ -736,8 +745,9 @@ def _build_uv_query_from_cond_points(uv_cond_pts, cond_direction, cond_pct):
     return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
 
 
-def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, cond_direction, crop_size, tgt_segment,
+def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_direction, crop_size, tgt_segment,
                          volume_scale, extrapolation_settings):
+    cond_direction = _cond_direction_from_grow(grow_direction)
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
     cond_pts_world = cond_zyxs.reshape(-1, 3)
     cond_valid_mask = ~(cond_pts_world == -1).all(axis=1)
@@ -770,7 +780,7 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, cond_dire
         if cond_grid_valid.any():
             uv_for_extrap = uv_cond[cond_grid_valid]
             zyx_for_extrap = cond_zyxs[cond_grid_valid]
-            uv_query = _build_uv_query_from_cond_points(uv_for_extrap, cond_direction, args.cond_pct)
+            uv_query = _build_uv_query_from_cond_points(uv_for_extrap, grow_direction, args.cond_pct)
 
             if uv_query.size > 0:
                 extrap_result = compute_extrapolation_infer(
@@ -1135,7 +1145,8 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None):
 
 
 def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
-                       tifxyz_voxel_size_um, checkpoint_path, cond_direction, volume_scale):
+                       tifxyz_voxel_size_um, checkpoint_path, grow_direction, volume_scale):
+    cond_direction = _cond_direction_from_grow(grow_direction)
     tgt_segment.use_full_resolution()
     full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
 
@@ -1177,6 +1188,7 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
         voxel_size_um=tifxyz_voxel_size_um,
         source=str(checkpoint_path),
         additional_metadata={
+            "grow_direction": grow_direction,
             "cond_direction": cond_direction,
             "extrapolation_method": args.extrapolation_method,
             "refine_steps": None if args.refine is None else int(args.refine) + 1,
@@ -1200,10 +1212,10 @@ def _build_uv_grid(uv_offset, shape_hw):
 def prepare_next_iteration_cond(
     full_grid_zyxs, full_valid, full_uv_offset,
     pred_grid_zyxs, pred_grid_valid, pred_uv_offset,
-    cond_direction, keep_voxels=None,
+    grow_direction, keep_voxels=None,
 ):
     """Append new prediction band outside current boundary, returning next full grid state."""
-    direction = _get_direction_spec(cond_direction)
+    direction = _get_growth_spec(grow_direction)
     keep_voxels = None if keep_voxels is None else int(keep_voxels)
     if keep_voxels is not None and keep_voxels < 1:
         keep_voxels = 1
@@ -1334,10 +1346,11 @@ def main():
     )
 
     volume = zarr.open_group(args.volume_path, mode='r')
-    tgt_segment, stored_zyxs, valid_s, cond_direction, h_s, w_s = setup_segment(args, volume)
+    tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
+    cond_direction = _cond_direction_from_grow(grow_direction)
 
     r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
-        args, stored_zyxs, valid_s, cond_direction, h_s, w_s, crop_size
+        args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
     )
 
     scale_y, scale_x = tgt_segment._scale
@@ -1378,7 +1391,7 @@ def main():
         # --- build bbox crops + run inference ---
         pred_samples = []
         bbox_crops = build_bbox_crop_data(
-            args, bboxes, cond_zyxs, valid, uv_cond, cond_direction, crop_size, tgt_segment,
+            args, bboxes, cond_zyxs, valid, uv_cond, grow_direction, crop_size, tgt_segment,
             args.volume_scale, extrapolation_settings,
         )
 
@@ -1393,7 +1406,7 @@ def main():
         merged_cond, merged_valid, merged_uv_offset, kept, n_kept_axis = prepare_next_iteration_cond(
             current_grid, current_valid, current_uv_offset,
             pred_grid, pred_valid, pred_offset,
-            cond_direction, args.iter_keep_voxels,
+            grow_direction, args.iter_keep_voxels,
         )
         if not kept:
             print("No new rows/cols beyond current boundary; stopping iterative growth.")
@@ -1403,7 +1416,7 @@ def main():
         current_grid = merged_cond
         current_valid = merged_valid
         current_uv_offset = merged_uv_offset
-        axis_label = "rows" if _DIRECTION_SPECS[cond_direction]["axis"] == "row" else "cols"
+        axis_label = "rows" if _get_growth_spec(grow_direction)["axis"] == "row" else "cols"
         print(f"  kept {n_kept_axis} new {axis_label}")
 
     pred_samples = all_pred_samples
@@ -1411,7 +1424,7 @@ def main():
     if tifxyz_uuid is not None and pred_samples:
         save_tifxyz_output(
             args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
-            tifxyz_voxel_size_um, checkpoint_path, cond_direction, args.volume_scale,
+            tifxyz_voxel_size_um, checkpoint_path, grow_direction, args.volume_scale,
         )
 
 
