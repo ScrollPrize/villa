@@ -211,6 +211,25 @@ def y_straight_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torc
 	return lm, mask
 
 
+def z_straight_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Return (lm, mask) for second-difference straightness along z (depth) in pixel xy."""
+	xy = res.xy_lr
+	if int(xy.shape[0]) < 3:
+		base = torch.zeros((), device=xy.device, dtype=xy.dtype)
+		mask0 = torch.zeros((), device=xy.device, dtype=xy.dtype)
+		return base, mask0
+
+	prev = xy[:-2, :, :, :]
+	mid = xy[1:-1, :, :, :]
+	next = xy[2:, :, :, :]
+	d = mid - 0.5 * (prev + next)
+	lm = (d * d).sum(dim=-1).unsqueeze(1)
+
+	m = res.mask_lr
+	mask = torch.minimum(torch.minimum(m[:-2, :, :, :], m[1:-1, :, :, :]), m[2:, :, :, :])
+	return lm, mask
+
+
 def mean_pos_loss_map(*, res: fit_model.FitResult, target_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (lm, mask) penalizing mean(xy_lr) deviating from `target_xy`.
 
@@ -271,6 +290,11 @@ def angle_symmetry_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 
 def y_straight_loss(*, res: fit_model.FitResult) -> torch.Tensor:
 	lm, mask = y_straight_loss_map(res=res)
+	return _full_mean(lm)
+
+
+def z_straight_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+	lm, mask = z_straight_loss_map(res=res)
 	return _full_mean(lm)
 
 

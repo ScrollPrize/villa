@@ -182,6 +182,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 			"conn_sy_r": 0.0,
 			"angle": 0.0,
 			"y_straight": 0.0,
+			"z_straight": 0.0,
 	}
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
@@ -296,6 +297,7 @@ def optimize(
 			"conn_sy_r": lambda: opt_loss_geom.conn_y_smooth_r_loss_map(res=res),
 			"angle": lambda: opt_loss_geom.angle_symmetry_loss_map(res=res),
 			"y_straight": lambda: opt_loss_geom.y_straight_loss_map(res=res),
+			"z_straight": lambda: opt_loss_geom.z_straight_loss_map(res=res),
 			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
 		}
 		if mean_pos_xy is not None:
@@ -401,6 +403,7 @@ def optimize(
 			"conn_sy_r": {"loss": opt_loss_geom.conn_y_smooth_r_loss},
 			"angle": {"loss": opt_loss_geom.angle_symmetry_loss},
 			"y_straight": {"loss": opt_loss_geom.y_straight_loss},
+			"z_straight": {"loss": opt_loss_geom.z_straight_loss},
 		}
 		with torch.no_grad():
 			res0 = model(data)
