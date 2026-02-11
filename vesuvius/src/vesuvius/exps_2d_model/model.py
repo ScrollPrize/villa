@@ -23,6 +23,15 @@ class ModelInit:
 
 
 @dataclass(frozen=True)
+class ModelParams:
+	mesh_step_px: int
+	winding_step_px: int
+	subsample_mesh: int
+	subsample_winding: int
+	z_step_vx: int
+
+
+@dataclass(frozen=True)
 class FitResult:
 	_xy_lr: torch.Tensor
 	_xy_hr: torch.Tensor
@@ -38,10 +47,7 @@ class FitResult:
 	_mask_conn: torch.Tensor
 	_h_img: int
 	_w_img: int
-	_mesh_step_px: int
-	_winding_step_px: int
-	_subsample_mesh: int
-	_subsample_winding: int
+	_params: ModelParams
 
 	@property
 	def xy_lr(self) -> torch.Tensor:
@@ -100,20 +106,28 @@ class FitResult:
 		return int(self._w_img)
 
 	@property
+	def params(self) -> ModelParams:
+		return self._params
+
+	@property
 	def mesh_step_px(self) -> int:
-		return int(self._mesh_step_px)
+		return int(self._params.mesh_step_px)
 
 	@property
 	def winding_step_px(self) -> int:
-		return int(self._winding_step_px)
+		return int(self._params.winding_step_px)
 
 	@property
 	def subsample_mesh(self) -> int:
-		return int(self._subsample_mesh)
+		return int(self._params.subsample_mesh)
 
 	@property
 	def subsample_winding(self) -> int:
-		return int(self._subsample_winding)
+		return int(self._params.subsample_winding)
+
+	@property
+	def z_step_vx(self) -> int:
+		return int(self._params.z_step_vx)
 
 
 
@@ -126,6 +140,7 @@ class Model2D(nn.Module):
 		z_size: int = 1,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
+		z_step_vx: int = 1,
 	) -> None:
 		super().__init__()
 		self.init = init
@@ -155,8 +170,15 @@ class Model2D(nn.Module):
 		self.const_mask_lr: torch.Tensor | None = None
 		self._last_grow_insert_lr: tuple[int, int, int, int] | None = None
 		self._last_grow_insert_z: int | None = None
-		self.subsample_winding = int(subsample_winding)
-		self.subsample_mesh = int(subsample_mesh)
+		self.params = ModelParams(
+			mesh_step_px=int(self.init.mesh_step_px),
+			winding_step_px=int(self.init.winding_step_px),
+			subsample_mesh=int(subsample_mesh),
+			subsample_winding=int(subsample_winding),
+			z_step_vx=max(1, int(z_step_vx)),
+		)
+		self.subsample_mesh = int(self.params.subsample_mesh)
+		self.subsample_winding = int(self.params.subsample_winding)
 
 	def xy_img_validity_mask(self, *, xy: torch.Tensor) -> torch.Tensor:
 		"""Return a binary mask for pixel xy image positions.
@@ -218,10 +240,7 @@ class Model2D(nn.Module):
 			_mask_conn=mask_conn,
 			_h_img=int(self.init.h_img),
 			_w_img=int(self.init.w_img),
-			_mesh_step_px=int(self.init.mesh_step_px),
-			_winding_step_px=int(self.init.winding_step_px),
-			_subsample_mesh=int(self.subsample_mesh),
-			_subsample_winding=int(self.subsample_winding),
+			_params=self.params,
 		)
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -575,8 +594,8 @@ class Model2D(nn.Module):
 		return torch.stack([x[:, 0], y[:, 0]], dim=-1)
 
 	def _grid_xy_subsampled_from_lr(self, *, xy_lr: torch.Tensor) -> torch.Tensor:
-		h = max(2, (self.mesh_h - 1) * self.subsample_mesh + 1)
-		w = max(2, (self.mesh_w - 1) * self.subsample_winding + 1)
+		h = max(2, (self.mesh_h - 1) * int(self.params.subsample_mesh) + 1)
+		w = max(2, (self.mesh_w - 1) * int(self.params.subsample_winding) + 1)
 		xy_nchw = xy_lr.permute(0, 3, 1, 2).contiguous()
 		xy_nchw = F.interpolate(xy_nchw, size=(h, w), mode="bilinear", align_corners=True)
 		return xy_nchw.permute(0, 2, 3, 1).contiguous()
@@ -592,6 +611,7 @@ class Model2D(nn.Module):
 		init_size_frac_h: float | None = None,
 		init_size_frac_v: float | None = None,
 		z_size: int = 1,
+		z_step_vx: int = 1,
 		*,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
@@ -612,6 +632,7 @@ class Model2D(nn.Module):
 			z_size=max(1, int(z_size)),
 			subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding,
+			z_step_vx=max(1, int(z_step_vx)),
 		)
 
 	def _build_base_grid(self, *, gh0: int, gw0: int) -> torch.Tensor:

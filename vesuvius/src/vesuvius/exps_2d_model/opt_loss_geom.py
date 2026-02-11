@@ -219,10 +219,13 @@ def z_straight_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torc
 		mask0 = torch.zeros((), device=xy.device, dtype=xy.dtype)
 		return base, mask0
 
+	z_step_px = float(res.params.z_step_vx)
+	z_step_px = max(1e-6, z_step_px)
+
 	prev = xy[:-2, :, :, :]
 	mid = xy[1:-1, :, :, :]
 	next = xy[2:, :, :, :]
-	d = mid - 0.5 * (prev + next)
+	d = (mid - 0.5 * (prev + next)) / z_step_px
 	lm = (d * d).sum(dim=-1).unsqueeze(1)
 
 	m = res.mask_lr
