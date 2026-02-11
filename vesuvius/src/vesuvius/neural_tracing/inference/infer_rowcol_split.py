@@ -109,38 +109,67 @@ def _bbox_from_center(center, crop_size):
         int(min_corner[2]), int(max_corner[2]),
     )
 
-def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, outer_edge=False):
+def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, outer_edge=False, overlap_frac=0.15):
     edge = _get_cond_edge(cond_zyxs, cond_direction, outer_edge=outer_edge)
 
     edge_valid = ~(edge == -1).all(axis=1)
     if not edge_valid.any():
         return [], edge
     edge = edge[edge_valid]
-    z_edge, y_edge, x_edge = edge[:, 0], edge[:, 1], edge[:, 2]
+    n_edge = edge.shape[0]
+    if n_edge == 0:
+        return [], edge
+
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+
+    overlap_frac = float(overlap_frac)
+    overlap_frac = max(0.0, min(overlap_frac, 0.99))
+
+    def _chunk_ordered_indices(ordered_indices):
+        chunks = []
+        if len(ordered_indices) == 0:
+            return chunks
+        start = 0
+        while start < len(ordered_indices):
+            end = start + 1
+            while end < len(ordered_indices):
+                candidate = ordered_indices[start:end + 1]
+                pts = edge[candidate]
+                spans = pts.max(axis=0) - pts.min(axis=0)
+                if (
+                    spans[0] <= (crop_size_arr[0] - 1) and
+                    spans[1] <= (crop_size_arr[1] - 1) and
+                    spans[2] <= (crop_size_arr[2] - 1)
+                ):
+                    end += 1
+                    continue
+                break
+            chunk = ordered_indices[start:end]
+            chunks.append(chunk)
+            chunk_len = len(chunk)
+            overlap_count = int(round(chunk_len * overlap_frac))
+            step = max(1, chunk_len - overlap_count)
+            start += step
+        return chunks
+
+    center_idx = n_edge // 2
+    # Center-out and two-sided: walk one side first (toward smaller indices), then the other side.
+    first_side = np.arange(center_idx, -1, -1, dtype=np.int64)
+    second_side = np.arange(center_idx + 1, n_edge, dtype=np.int64)
 
     bboxes = []
-    group_start = 0
-
-    for i in range(1, len(z_edge) + 1):
-        if i < len(z_edge):
-            # Look ahead: check if adding point i still fits within crop_size (inclusive bounds)
-            z_span = z_edge[group_start:i + 1].max() - z_edge[group_start:i + 1].min()
-            y_span = y_edge[group_start:i + 1].max() - y_edge[group_start:i + 1].min()
-            x_span = x_edge[group_start:i + 1].max() - x_edge[group_start:i + 1].min()
-            if (
-                z_span <= (crop_size[0] - 1) and
-                y_span <= (crop_size[1] - 1) and
-                x_span <= (crop_size[2] - 1)
-            ):
-                continue
-
-        # Emit bbox for group_start:i (aligned to voxel indices)
-        zc = (z_edge[group_start:i].min() + z_edge[group_start:i].max()) / 2
-        yc = (y_edge[group_start:i].min() + y_edge[group_start:i].max()) / 2
-        xc = (x_edge[group_start:i].min() + x_edge[group_start:i].max()) / 2
+    for chunk in _chunk_ordered_indices(first_side):
+        pts = edge[chunk]
+        zc = (pts[:, 0].min() + pts[:, 0].max()) / 2
+        yc = (pts[:, 1].min() + pts[:, 1].max()) / 2
+        xc = (pts[:, 2].min() + pts[:, 2].max()) / 2
         bboxes.append(_bbox_from_center((zc, yc, xc), crop_size))
-        group_start = i
-
+    for chunk in _chunk_ordered_indices(second_side):
+        pts = edge[chunk]
+        zc = (pts[:, 0].min() + pts[:, 0].max()) / 2
+        yc = (pts[:, 1].min() + pts[:, 1].max()) / 2
+        xc = (pts[:, 2].min() + pts[:, 2].max()) / 2
+        bboxes.append(_bbox_from_center((zc, yc, xc), crop_size))
 
     return bboxes, edge
 
@@ -247,6 +276,10 @@ def _points_to_voxels(points_local, crop_size):
 
 def _valid_surface_mask(zyx_grid):
     return np.isfinite(zyx_grid).all(axis=-1) & ~(zyx_grid == -1).all(axis=-1)
+
+def _grid_in_bounds_mask(zyx_grid_local, crop_size):
+    flat = zyx_grid_local.reshape(-1, 3)
+    return _in_bounds_mask(flat, crop_size).reshape(zyx_grid_local.shape[:2])
 
 def _build_model_inputs(vol_crop, cond_vox, extrap_vox, other_wraps_vox=None):
     vol_t = torch.from_numpy(vol_crop).float().unsqueeze(0).unsqueeze(0)
@@ -449,6 +482,12 @@ def parse_args():
     parser.add_argument("--cond-pct", type=float, default=0.50)
     parser.add_argument("--crop-size", type=int, nargs=3, default=[128, 128, 128])
     parser.add_argument("--window-pad", type=int, default=10)
+    parser.add_argument(
+        "--bbox-overlap-frac",
+        type=float,
+        default=0.15,
+        help="Fractional overlap between consecutive edge bboxes (default 0.15 = 15%%).",
+    )
     parser.add_argument("--extrapolation-method", type=str, default=None)
     parser.add_argument(
         "--grow-direction",
@@ -471,7 +510,35 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--napari", action="store_true", help="Launch napari viewer for visualization")
     parser.add_argument("--iterations", type=int, default=1,
-        help="Number of grow iterations. Each keeps the first half of predictions as new conditioning.")
+        help="Number of grow iterations.")
+    parser.add_argument(
+        "--refine",
+        type=int,
+        default=None,
+        help=(
+            "Within each outer iteration, run N refinement forward passes. "
+            "Each pass reuses the same conditioning and feeds sampled predictions "
+            "back as the next extrapolation before the final prediction is used."
+        ),
+    )
+    parser.add_argument(
+        "--refine-accumulate",
+        action="store_true",
+        help=(
+            "With --refine, average displacement predictions across refinement passes "
+            "and sample from the averaged displacement field."
+        ),
+    )
+    parser.add_argument(
+        "--iter-keep-voxels",
+        type=int,
+        default=None,
+        help=(
+            "For iterations>1, number of newly predicted rows/cols to keep per iteration "
+            "in the growth direction. If omitted, keeps all newly predicted rows/cols "
+            "outside the current boundary."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=8,
         help="Number of crops to process in a single batched forward pass.")
     parser.add_argument("--tta", action="store_true",
@@ -644,7 +711,8 @@ def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_
         cond_edge_strip = stored_zyxs[r_edge_s:r_edge_s + 1, :]
 
     bboxes, _ = get_cond_edge_bboxes(
-        cond_edge_strip, cond_direction, crop_size, outer_edge=True
+        cond_edge_strip, cond_direction, crop_size, outer_edge=True,
+        overlap_frac=args.bbox_overlap_frac,
     )
 
     r0_s, r1_s, c0_s, c1_s = get_window_bounds_from_bboxes(
@@ -732,18 +800,52 @@ def run_extrapolation(args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, con
     return extrap_result, zyx_min
 
 
-def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, crop_size, tgt_segment, volume_scale,
-                         extrap_result, extrap_coords_world, extrap_uv_full,
-                         extrap_grid_world):
+def _build_uv_query_from_cond_points(uv_cond_pts, cond_direction, cond_pct):
+    if uv_cond_pts is None or len(uv_cond_pts) == 0:
+        return np.zeros((0, 0, 2), dtype=np.float64)
+
+    uv_cond_pts = np.asarray(uv_cond_pts)
+    r_min = int(np.floor(uv_cond_pts[:, 0].min()))
+    r_max = int(np.ceil(uv_cond_pts[:, 0].max()))
+    c_min = int(np.floor(uv_cond_pts[:, 1].min()))
+    c_max = int(np.ceil(uv_cond_pts[:, 1].max()))
+
+    def _mask_span(cond_span):
+        cond_span = int(max(1, cond_span))
+        if cond_pct <= 0:
+            return cond_span
+        total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
+        return max(1, total_span - cond_span)
+
+    if cond_direction in ["left", "right"]:
+        rows = np.arange(r_min, r_max + 1, dtype=np.int64)
+        mask_w = _mask_span(c_max - c_min + 1)
+        if cond_direction == "left":   # grow right
+            cols = np.arange(c_max + 1, c_max + mask_w + 1, dtype=np.int64)
+        else:                          # grow left
+            cols = np.arange(c_min - mask_w, c_min, dtype=np.int64)
+        return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
+
+    cols = np.arange(c_min, c_max + 1, dtype=np.int64)
+    mask_h = _mask_span(r_max - r_min + 1)
+    if cond_direction == "up":         # grow down
+        rows = np.arange(r_max + 1, r_max + mask_h + 1, dtype=np.int64)
+    else:                              # grow up
+        rows = np.arange(r_min - mask_h, r_min, dtype=np.int64)
+    return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
+
+
+def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, cond_direction, crop_size, tgt_segment,
+                         volume_scale, extrapolation_settings):
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
     cond_pts_world = cond_zyxs.reshape(-1, 3)
     cond_valid_mask = ~(cond_pts_world == -1).all(axis=1)
     cond_pts_world = cond_pts_world[cond_valid_mask]
-    extrap_pts_world = None
-    extrap_uv_world = None
-    if extrap_result is not None:
-        extrap_pts_world = extrap_coords_world
-        extrap_uv_world = extrap_uv_full
+    crop_size_extrap = tuple(int(v) for v in crop_size)
+    if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
+        cond_valid_base = np.asarray(cond_valid, dtype=bool)
+    else:
+        cond_valid_base = _valid_surface_mask(cond_zyxs)
 
     bbox_crops = []
     for bbox_idx, bbox in enumerate(bboxes):
@@ -754,35 +856,58 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, crop_size, tgt_seg
         cond_world_in = cond_pts_world[_filter_points_in_bbox_mask(cond_pts_world, bbox)]
         cond_local = _points_world_to_local(cond_world_in, min_corner, crop_size)
 
-        extrap_local = None
+        extrap_local = np.zeros((0, 3), dtype=np.float32)
         extrap_uv = None
-        if extrap_pts_world is not None:
-            extrap_mask = _filter_points_in_bbox_mask(extrap_pts_world, bbox)
-            extrap_world_in = extrap_pts_world[extrap_mask]
-            extrap_uv_in = extrap_uv_world[extrap_mask] if extrap_uv_world is not None else None
-            # Convert to local and apply the same in-bounds filter to both
-            if extrap_world_in is not None and len(extrap_world_in) > 0:
-                local = extrap_world_in - min_corner[None, :]
-                bounds_mask = _in_bounds_mask(local, crop_size)
-                extrap_local = local[bounds_mask].astype(np.float32)
-                if extrap_uv_in is not None:
-                    extrap_uv = extrap_uv_in[bounds_mask]
-            else:
-                extrap_local = np.zeros((0, 3), dtype=np.float32)
 
         cond_grid_local = cond_zyxs.astype(np.float64, copy=False) - min_corner[None, None, :]
-        if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
-            cond_grid_valid = np.asarray(cond_valid, dtype=bool)
-        else:
-            cond_grid_valid = _valid_surface_mask(cond_zyxs)
+        # Copy so per-bbox masking does not mutate the shared conditioning mask.
+        cond_grid_valid = cond_valid_base.copy()
+        cond_grid_valid &= _grid_in_bounds_mask(cond_grid_local, crop_size)
         cond_vox = voxelize_surface_grid_masked(cond_grid_local, crop_size, cond_grid_valid)
 
         extrap_vox = None
-        if extrap_grid_world is not None:
-            extrap_grid_local = extrap_grid_world.astype(np.float64, copy=False) - min_corner[None, None, :]
-            extrap_grid_valid = np.isfinite(extrap_grid_world).all(axis=-1)
-            extrap_vox = voxelize_surface_grid_masked(extrap_grid_local, crop_size, extrap_grid_valid)
-        elif extrap_local is not None:
+        if cond_grid_valid.any():
+            uv_for_extrap = uv_cond[cond_grid_valid]
+            zyx_for_extrap = cond_zyxs[cond_grid_valid]
+            uv_query = _build_uv_query_from_cond_points(uv_for_extrap, cond_direction, args.cond_pct)
+
+            if uv_query.size > 0:
+                extrap_result = compute_extrapolation_infer(
+                    uv_cond=uv_for_extrap,
+                    zyx_cond=zyx_for_extrap,
+                    uv_query=uv_query,
+                    min_corner=min_corner,
+                    crop_size=crop_size_extrap,
+                    method=extrapolation_settings["method"],
+                    cond_direction=cond_direction,
+                    degrade_prob=extrapolation_settings["degrade_prob"],
+                    degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
+                    degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
+                    skip_bounds_check=True,
+                    **extrapolation_settings["method_kwargs"],
+                )
+                if extrap_result is not None:
+                    extrap_local_full = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float64)
+                    uv_query_flat = uv_query.reshape(-1, 2)
+                    extrap_in_bounds = _in_bounds_mask(extrap_local_full, crop_size_extrap)
+
+                    if extrap_in_bounds.any():
+                        extrap_local = extrap_local_full[extrap_in_bounds].astype(np.float32)
+                        extrap_uv = uv_query_flat[extrap_in_bounds]
+
+                    extrap_grid_local = extrap_local_full.reshape(uv_query.shape[:2] + (3,))
+                    extrap_grid_valid = _in_bounds_mask(
+                        extrap_grid_local.reshape(-1, 3),
+                        crop_size_extrap,
+                    ).reshape(uv_query.shape[:2])
+                    if extrap_grid_valid.any():
+                        extrap_vox = voxelize_surface_grid_masked(
+                            extrap_grid_local,
+                            crop_size_extrap,
+                            extrap_grid_valid,
+                        )
+
+        if extrap_vox is None and len(extrap_local) > 0:
             extrap_vox = _points_to_voxels(extrap_local, crop_size)
 
         bbox_crops.append({
@@ -822,6 +947,25 @@ _TTA_FLIP_COMBOS = [
 _FLIP_DIM_TO_CHANNEL = {-1: 2, -2: 1, -3: 0}
 
 
+def _extract_displacement_output(output):
+    if isinstance(output, dict):
+        disp = output.get("displacement", None)
+        if disp is None:
+            raise RuntimeError("Model output missing 'displacement' head.")
+        return disp
+    return output
+
+
+def _forward_model_displacement(model, model_inputs, amp_enabled, amp_dtype):
+    with torch.no_grad():
+        if amp_enabled:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                output = model(model_inputs)
+        else:
+            output = model(model_inputs)
+    return _extract_displacement_output(output)
+
+
 def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
     """Run mirroring-based TTA on a single sample, returning averaged displacement.
 
@@ -843,19 +987,7 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
             x = x.flip(d)
 
         # Forward pass
-        with torch.no_grad():
-            if amp_enabled:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    output = model(x)
-            else:
-                output = model(x)
-
-        if isinstance(output, dict):
-            disp = output.get("displacement", None)
-            if disp is None:
-                raise RuntimeError("Model output missing 'displacement' head.")
-        else:
-            disp = output
+        disp = _forward_model_displacement(model, x, amp_enabled, amp_dtype)
 
         # Un-flip the displacement output
         for d in reversed(flip_dims):
@@ -874,12 +1006,110 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
     return accum / len(_TTA_FLIP_COMBOS)
 
 
+def _run_refine_on_crop(args, crop, crop_size, model_state):
+    refine_steps = int(args.refine) if args.refine is not None else 1
+    refine_accumulate = bool(getattr(args, "refine_accumulate", False))
+    use_tta = bool(getattr(args, "tta", False))
+    model = model_state["model"]
+    amp_enabled = model_state["amp_enabled"]
+    amp_dtype = model_state["amp_dtype"]
+    expected_in_channels = model_state["expected_in_channels"]
+
+    current_coords = crop.get("extrap_pts_local", None)
+    if current_coords is None or len(current_coords) == 0:
+        return np.zeros((0, 3), dtype=np.float32), None
+
+    current_coords = np.asarray(current_coords, dtype=np.float32)
+    current_uv = crop.get("extrap_uv", None)
+    if current_uv is not None:
+        current_uv = np.asarray(current_uv, dtype=np.float64)
+        if len(current_uv) != current_coords.shape[0]:
+            current_uv = None
+
+    initial_coords = current_coords.copy()
+    initial_uv = None if current_uv is None else current_uv.copy()
+
+    cond_vox = crop["cond_vox"]
+    other_wraps_vox = None
+    if expected_in_channels > 3:
+        other_wraps_vox = np.zeros(crop_size, dtype=np.float32)
+
+    initial_extrap_vox = crop.get("extrap_vox", None)
+    if initial_extrap_vox is None:
+        initial_extrap_vox = _points_to_voxels(current_coords, crop_size)
+
+    disp_accum = None
+    disp_last = None
+    n_forward = 0
+
+    for refine_idx in range(refine_steps):
+        if current_coords.shape[0] == 0:
+            break
+
+        if refine_idx == 0:
+            extrap_vox = initial_extrap_vox
+        else:
+            extrap_vox = _points_to_voxels(current_coords, crop_size)
+
+        inputs = _build_model_inputs(
+            crop["volume"], cond_vox, extrap_vox, other_wraps_vox=other_wraps_vox
+        ).to(args.device)
+
+        if use_tta:
+            disp_single = _run_model_tta(model, inputs, amp_enabled, amp_dtype)
+        else:
+            disp_single = _forward_model_displacement(model, inputs, amp_enabled, amp_dtype)
+
+        disp_last = disp_single
+        n_forward += 1
+        if refine_accumulate:
+            disp_accum = disp_single if disp_accum is None else (disp_accum + disp_single)
+
+        # Build next extrapolation from sampled displacement.
+        if refine_idx < refine_steps - 1:
+            coords_t = torch.from_numpy(current_coords).float().to(args.device)
+            disp_sampled = _sample_displacement_field(disp_single, coords_t)
+            next_coords = (coords_t + disp_sampled).detach().cpu().numpy().astype(np.float32)
+
+            in_bounds = _in_bounds_mask(next_coords, crop_size)
+            if not in_bounds.any():
+                current_coords = np.zeros((0, 3), dtype=np.float32)
+                if current_uv is not None:
+                    current_uv = current_uv[:0]
+                break
+
+            current_coords = next_coords[in_bounds]
+            if current_uv is not None:
+                current_uv = current_uv[in_bounds]
+
+    if n_forward == 0 or disp_last is None:
+        return np.zeros((0, 3), dtype=np.float32), None if initial_uv is None else initial_uv[:0]
+
+    if refine_accumulate and disp_accum is not None:
+        disp_for_sampling = disp_accum / float(n_forward)
+        sample_coords = initial_coords
+        sample_uv = initial_uv
+    else:
+        disp_for_sampling = disp_last
+        sample_coords = current_coords
+        sample_uv = current_uv
+
+    if sample_coords is None or sample_coords.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32), None if sample_uv is None else sample_uv[:0]
+
+    sample_coords_t = torch.from_numpy(sample_coords).float().to(args.device)
+    disp_sampled = _sample_displacement_field(disp_for_sampling, sample_coords_t)
+    pred_local = (sample_coords_t + disp_sampled).detach().cpu().numpy().astype(np.float32)
+    return pred_local, sample_uv
+
+
 def run_inference(args, bbox_crops, crop_size, model_state):
     model = model_state["model"]
     amp_enabled = model_state["amp_enabled"]
     amp_dtype = model_state["amp_dtype"]
     expected_in_channels = model_state["expected_in_channels"]
     batch_size = args.batch_size
+    refine_mode = args.refine is not None
 
     # Collect crops that have valid extrapolation points.
     valid_items = []
@@ -906,7 +1136,28 @@ def run_inference(args, bbox_crops, crop_size, model_state):
     pred_samples = []
     use_tta = getattr(args, 'tta', False)
 
-    if use_tta:
+    if refine_mode:
+        desc = "inference (refine)"
+        if use_tta:
+            desc = "inference (refine+TTA)"
+        if getattr(args, "refine_accumulate", False):
+            desc = desc[:-1] + "+accum)"
+
+        for bbox_idx, crop, _, _ in tqdm(valid_items, desc=desc):
+            pred_local, pred_uv = _run_refine_on_crop(args, crop, crop_size, model_state)
+            if pred_local is None or len(pred_local) == 0:
+                continue
+
+            pred_world = pred_local + crop["min_corner"][None, :]
+            bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
+            pred_world = pred_world[bbox_mask]
+            pred_pts_world_all.append(pred_world)
+            if pred_uv is not None and len(pred_uv) == bbox_mask.shape[0]:
+                pred_samples.append((pred_uv[bbox_mask], pred_world))
+
+            out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
+            _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local, crop_size))
+    elif use_tta:
         # TTA path: process one crop at a time to avoid 8x memory blowup.
         for item_idx, (bbox_idx, crop, inputs, extrap_local) in enumerate(
             tqdm(valid_items, desc="inference (TTA)")
@@ -936,20 +1187,7 @@ def run_inference(args, bbox_crops, crop_size, model_state):
 
             # Stack inputs along batch dim and run a single forward pass.
             batch_inputs = torch.cat([item[2] for item in batch], dim=0).to(args.device)
-
-            with torch.no_grad():
-                if amp_enabled:
-                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                        output = model(batch_inputs)
-                else:
-                    output = model(batch_inputs)
-
-            if isinstance(output, dict):
-                disp_pred = output.get("displacement", None)
-                if disp_pred is None:
-                    raise RuntimeError("Model output missing 'displacement' head.")
-            else:
-                disp_pred = output
+            disp_pred = _forward_model_displacement(model, batch_inputs, amp_enabled, amp_dtype)
 
             # Sample displacement per-crop from the batched output.
             for i, (bbox_idx, crop, _, extrap_local) in enumerate(batch):
@@ -1043,6 +1281,8 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
         additional_metadata={
             "cond_direction": cond_direction,
             "extrapolation_method": args.extrapolation_method,
+            "refine_steps": args.refine,
+            "refine_accumulate": bool(args.refine_accumulate),
         }
     )
     print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
@@ -1104,142 +1344,126 @@ def reassemble_predictions_to_grid(pred_samples):
     return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 
 
-def prepare_next_iteration_cond(
-    pred_grid_zyxs, pred_grid_valid, pred_uv_offset,
-    orig_window_zyxs, orig_valid, orig_uv_offset,
-    bboxes, cond_direction, cond_pct,
-):
-    """Slice first half of predictions + original segment points in bboxes -> merged conditioning grid."""
-    ph, pw = pred_grid_zyxs.shape[:2]
-    pred_r0, pred_c0 = pred_uv_offset
+def _build_uv_grid(uv_offset, shape_hw):
+    r0, c0 = uv_offset
+    h, w = shape_hw
+    rows = np.arange(r0, r0 + h, dtype=np.int64)
+    cols = np.arange(c0, c0 + w, dtype=np.int64)
+    return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
 
-    # 1. Slice first half of prediction grid in the growth direction
-    if cond_direction == "left":    # growing right -> keep left half
-        kept = pred_grid_zyxs[:, :pw // 2]
-        kept_valid = pred_grid_valid[:, :pw // 2]
-        kept_r0, kept_c0 = pred_r0, pred_c0
-    elif cond_direction == "right":  # growing left -> keep right half
-        half = pw // 2
-        kept = pred_grid_zyxs[:, half:]
-        kept_valid = pred_grid_valid[:, half:]
-        kept_r0, kept_c0 = pred_r0, pred_c0 + half
-    elif cond_direction == "up":     # growing down -> keep top half
-        kept = pred_grid_zyxs[:ph // 2, :]
-        kept_valid = pred_grid_valid[:ph // 2, :]
-        kept_r0, kept_c0 = pred_r0, pred_c0
-    elif cond_direction == "down":   # growing up -> keep bottom half
-        half = ph // 2
-        kept = pred_grid_zyxs[half:, :]
-        kept_valid = pred_grid_valid[half:, :]
-        kept_r0, kept_c0 = pred_r0 + half, pred_c0
+
+def prepare_next_iteration_cond(
+    full_grid_zyxs, full_valid, full_uv_offset,
+    pred_grid_zyxs, pred_grid_valid, pred_uv_offset,
+    cond_direction, keep_voxels=None,
+):
+    """Append new prediction band outside current boundary, returning next full grid state."""
+    keep_voxels = None if keep_voxels is None else int(keep_voxels)
+    if keep_voxels is not None and keep_voxels < 1:
+        keep_voxels = 1
+
+    if pred_grid_zyxs.size == 0 or not pred_grid_valid.any():
+        return full_grid_zyxs, full_valid, full_uv_offset, [], 0
+
+    fh, fw = full_grid_zyxs.shape[:2]
+    full_r0, full_c0 = full_uv_offset
+    full_r1 = full_r0 + fh - 1
+    full_c1 = full_c0 + fw - 1
+
+    pred_r0, pred_c0 = pred_uv_offset
+    pred_rows, pred_cols = np.where(pred_grid_valid)
+    if pred_rows.size == 0:
+        return full_grid_zyxs, full_valid, full_uv_offset, [], 0
+
+    pred_rows_abs = pred_rows.astype(np.int64) + pred_r0
+    pred_cols_abs = pred_cols.astype(np.int64) + pred_c0
+    pred_pts = pred_grid_zyxs[pred_rows, pred_cols].astype(np.float32)
+
+    axis = None
+    if cond_direction == "left":    # growing right -> keep cols right of current boundary
+        growth_mask = pred_cols_abs > full_c1
+        ordered_axis_vals = np.sort(np.unique(pred_cols_abs[growth_mask]))
+        axis = "col"
+    elif cond_direction == "right":  # growing left -> keep cols left of current boundary
+        growth_mask = pred_cols_abs < full_c0
+        ordered_axis_vals = np.sort(np.unique(pred_cols_abs[growth_mask]))[::-1]
+        axis = "col"
+    elif cond_direction == "up":     # growing down -> keep rows below current boundary
+        growth_mask = pred_rows_abs > full_r1
+        ordered_axis_vals = np.sort(np.unique(pred_rows_abs[growth_mask]))
+        axis = "row"
+    elif cond_direction == "down":   # growing up -> keep rows above current boundary
+        growth_mask = pred_rows_abs < full_r0
+        ordered_axis_vals = np.sort(np.unique(pred_rows_abs[growth_mask]))[::-1]
+        axis = "row"
     else:
         raise ValueError(f"Unknown cond_direction '{cond_direction}'")
 
-    kh, kw = kept.shape[:2]
+    if ordered_axis_vals.size == 0:
+        return full_grid_zyxs, full_valid, full_uv_offset, [], 0
 
-    # Build kept_pred_samples from the kept half
-    kept_pred_samples = []
-    if kept_valid.any():
-        kept_rows, kept_cols = np.where(kept_valid)
-        kept_uv = np.stack([kept_rows + kept_r0, kept_cols + kept_c0], axis=-1).astype(np.float64)
-        kept_pts = kept[kept_valid]
-        kept_pred_samples.append((kept_uv, kept_pts))
+    n_keep = ordered_axis_vals.size if keep_voxels is None else min(ordered_axis_vals.size, keep_voxels)
+    kept_axis_vals = ordered_axis_vals[:n_keep]
 
-    # 2. Find original segment grid cells that are valid AND inside bbox union
-    orig_h, orig_w = orig_window_zyxs.shape[:2]
-    orig_r0, orig_c0 = orig_uv_offset
-    orig_in_bbox = np.zeros((orig_h, orig_w), dtype=bool)
-    if bboxes:
-        for bbox in bboxes:
-            z_min, z_max, y_min, y_max, x_min, x_max = bbox
-            z = orig_window_zyxs[..., 0]
-            y = orig_window_zyxs[..., 1]
-            x = orig_window_zyxs[..., 2]
-            mask = (
-                orig_valid &
-                (z >= z_min) & (z <= z_max) &
-                (y >= y_min) & (y <= y_max) &
-                (x >= x_min) & (x <= x_max)
-            )
-            orig_in_bbox |= mask
-
-    # 3. Build merged UV-space grid covering union of kept prediction + qualifying original
-    # Determine UV extents
-    kept_r1 = kept_r0 + kh - 1
-    kept_c1 = kept_c0 + kw - 1
-
-    merge_r0, merge_c0 = kept_r0, kept_c0
-    merge_r1, merge_c1 = kept_r1, kept_c1
-
-    if orig_in_bbox.any():
-        orig_rows, orig_cols = np.where(orig_in_bbox)
-        orig_uv_rows = orig_rows + orig_r0
-        orig_uv_cols = orig_cols + orig_c0
-        merge_r0 = min(merge_r0, int(orig_uv_rows.min()))
-        merge_c0 = min(merge_c0, int(orig_uv_cols.min()))
-        merge_r1 = max(merge_r1, int(orig_uv_rows.max()))
-        merge_c1 = max(merge_c1, int(orig_uv_cols.max()))
-
-    mh = merge_r1 - merge_r0 + 1
-    mw = merge_c1 - merge_c0 + 1
-
-    merged_cond = np.full((mh, mw, 3), -1.0, dtype=np.float32)
-    merged_valid = np.zeros((mh, mw), dtype=bool)
-
-    # Fill with original segment values first (where they qualify)
-    if orig_in_bbox.any():
-        orig_rows, orig_cols = np.where(orig_in_bbox)
-        mr = orig_rows + orig_r0 - merge_r0
-        mc = orig_cols + orig_c0 - merge_c0
-        merged_cond[mr, mc] = orig_window_zyxs[orig_rows, orig_cols]
-        merged_valid[mr, mc] = True
-
-    # Overwrite with prediction values where they exist
-    if kept_valid.any():
-        kr, kc = np.where(kept_valid)
-        mr = kr + (kept_r0 - merge_r0)
-        mc = kc + (kept_c0 - merge_c0)
-        merged_cond[mr, mc] = kept[kr, kc]
-        merged_valid[mr, mc] = True
-
-    # 4. Build uv_cond meshgrid for the merged region
-    r_coords = np.arange(merge_r0, merge_r1 + 1)
-    c_coords = np.arange(merge_c0, merge_c1 + 1)
-    new_uv_cond = np.stack(np.meshgrid(r_coords, c_coords, indexing='ij'), axis=-1)
-
-    # 5. Build uv_mask: extends from far edge of kept prediction half, sized by cond_pct
-    if cond_direction == "left":    # growing right -> mask on right of kept
-        mask_w = max(1, int(round(mw / cond_pct)) - mw) if cond_pct > 0 else mw
-        mask_c0 = merge_c1 + 1
-        mask_c1 = merge_c1 + mask_w
-        mask_cols = np.arange(mask_c0, mask_c1 + 1)
-        new_uv_mask = np.stack(np.meshgrid(r_coords, mask_cols, indexing='ij'), axis=-1)
-    elif cond_direction == "right":  # growing left -> mask on left of kept
-        mask_w = max(1, int(round(mw / cond_pct)) - mw) if cond_pct > 0 else mw
-        mask_c1 = merge_c0 - 1
-        mask_c0 = merge_c0 - mask_w
-        mask_cols = np.arange(mask_c0, mask_c1 + 1)
-        new_uv_mask = np.stack(np.meshgrid(r_coords, mask_cols, indexing='ij'), axis=-1)
-    elif cond_direction == "up":     # growing down -> mask below kept
-        mask_h = max(1, int(round(mh / cond_pct)) - mh) if cond_pct > 0 else mh
-        mask_r0 = merge_r1 + 1
-        mask_r1 = merge_r1 + mask_h
-        mask_rows = np.arange(mask_r0, mask_r1 + 1)
-        new_uv_mask = np.stack(np.meshgrid(mask_rows, c_coords, indexing='ij'), axis=-1)
-    elif cond_direction == "down":   # growing up -> mask above kept
-        mask_h = max(1, int(round(mh / cond_pct)) - mh) if cond_pct > 0 else mh
-        mask_r1 = merge_r0 - 1
-        mask_r0 = merge_r0 - mask_h
-        mask_rows = np.arange(mask_r0, mask_r1 + 1)
-        new_uv_mask = np.stack(np.meshgrid(mask_rows, c_coords, indexing='ij'), axis=-1)
+    if axis == "row":
+        keep_mask = growth_mask & np.isin(pred_rows_abs, kept_axis_vals)
     else:
-        new_uv_mask = np.zeros((0, 0, 2), dtype=new_uv_cond.dtype)
+        keep_mask = growth_mask & np.isin(pred_cols_abs, kept_axis_vals)
 
-    return merged_cond, merged_valid, new_uv_cond, new_uv_mask, kept_pred_samples
+    if not keep_mask.any():
+        return full_grid_zyxs, full_valid, full_uv_offset, [], 0
+
+    kept_rows_abs = pred_rows_abs[keep_mask]
+    kept_cols_abs = pred_cols_abs[keep_mask]
+    kept_pts = pred_pts[keep_mask]
+
+    new_r0 = min(full_r0, int(kept_rows_abs.min()))
+    new_c0 = min(full_c0, int(kept_cols_abs.min()))
+    new_r1 = max(full_r1, int(kept_rows_abs.max()))
+    new_c1 = max(full_c1, int(kept_cols_abs.max()))
+
+    nh = new_r1 - new_r0 + 1
+    nw = new_c1 - new_c0 + 1
+    merged_cond = np.full((nh, nw, 3), -1.0, dtype=np.float32)
+    merged_valid = np.zeros((nh, nw), dtype=bool)
+
+    # Copy current full grid.
+    full_rows, full_cols = np.where(full_valid)
+    if full_rows.size > 0:
+        full_rows_abs = full_rows.astype(np.int64) + full_r0
+        full_cols_abs = full_cols.astype(np.int64) + full_c0
+        mr = full_rows_abs - new_r0
+        mc = full_cols_abs - new_c0
+        merged_cond[mr, mc] = full_grid_zyxs[full_rows, full_cols]
+        merged_valid[mr, mc] = True
+
+    # Add newly selected prediction band.
+    mr = kept_rows_abs - new_r0
+    mc = kept_cols_abs - new_c0
+    merged_cond[mr, mc] = kept_pts
+    merged_valid[mr, mc] = True
+
+    kept_uv = np.stack([kept_rows_abs, kept_cols_abs], axis=-1).astype(np.float64)
+    kept_pred_samples = [(kept_uv, kept_pts)]
+    return merged_cond, merged_valid, (new_r0, new_c0), kept_pred_samples, int(n_keep)
 
 
 def main():
     args = parse_args()
+    if args.iter_keep_voxels is not None and args.iter_keep_voxels < 1:
+        raise ValueError("--iter-keep-voxels must be >= 1 when provided.")
+    if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
+        raise ValueError("--bbox-overlap-frac must be in [0, 1).")
+    if args.refine is not None and args.refine < 1:
+        raise ValueError("--refine must be >= 1 when provided.")
+    if args.refine_accumulate and args.refine is None:
+        raise ValueError("--refine-accumulate requires --refine.")
+
+    refine_mode = args.refine is not None
+    growth_iterations = args.iterations
+    if refine_mode:
+        print(f"--refine={args.refine} enabled; refinement runs inside each outer iteration.")
+
     crop_size = tuple(args.crop_size)
     has_checkpoint = args.checkpoint_path is not None
     run_model_inference = has_checkpoint and not args.skip_inference
@@ -1285,116 +1509,84 @@ def main():
     x, y, z, valid = tgt_segment[r0_full:r1_full, c0_full:c1_full]
 
     window_zyxs = np.stack([z, y, x], axis=-1)
-    cond_zyxs = window_zyxs
-    r0_uv = r0_full
-    r1_uv = r0_full + window_zyxs.shape[0] - 1
-    c0_uv = c0_full
-    c1_uv = c0_full + window_zyxs.shape[1] - 1
+    current_grid = window_zyxs.copy()
+    current_valid = valid.copy()
+    current_uv_offset = (r0_full, c0_full)
 
-    r_coords = np.arange(r0_uv, r1_uv + 1)
-    c_coords = np.arange(c0_uv, c1_uv + 1)
-    uv_cond = np.stack(np.meshgrid(r_coords, c_coords, indexing='ij'), axis=-1)
+    if growth_iterations > 1 and args.iter_keep_voxels is None:
+        print(
+            "iter-keep-voxels not set; each iteration will keep all newly predicted "
+            "rows/cols beyond the current boundary."
+        )
 
-    if cond_direction in ["left", "right"]:
-        cond_w = window_zyxs.shape[1]
-        win_w_total = max(cond_w + 1, int(round(cond_w / args.cond_pct)))
-        mask_w = win_w_total - cond_w
-        if mask_w <= 0:
-            uv_mask = np.zeros((0, 0, 2), dtype=uv_cond.dtype)
-        else:
-            if cond_direction == "right":   # grow left -> mask on left
-                mask_c0 = c0_uv - mask_w
-                mask_c1 = c0_uv - 1
-            else:                           # grow right -> mask on right
-                mask_c0 = c1_uv + 1
-                mask_c1 = c1_uv + mask_w
-            mask_cols = np.arange(mask_c0, mask_c1 + 1)
-            uv_mask = np.stack(np.meshgrid(r_coords, mask_cols, indexing='ij'), axis=-1)
-    else:
-        cond_h = window_zyxs.shape[0]
-        win_h_total = max(cond_h + 1, int(round(cond_h / args.cond_pct)))
-        mask_h = win_h_total - cond_h
-        if mask_h <= 0:
-            uv_mask = np.zeros((0, 0, 2), dtype=uv_cond.dtype)
-        else:
-            if cond_direction == "down":    # grow up -> mask above
-                mask_r0 = r0_uv - mask_h
-                mask_r1 = r0_uv - 1
-            else:                           # grow down -> mask below
-                mask_r0 = r1_uv + 1
-                mask_r1 = r1_uv + mask_h
-            mask_rows = np.arange(mask_r0, mask_r1 + 1)
-            uv_mask = np.stack(np.meshgrid(mask_rows, c_coords, indexing='ij'), axis=-1)
-
-    # Save references to the original segment data for merging across iterations
-    orig_window_zyxs = window_zyxs.copy()
-    orig_valid = valid.copy()
-    orig_uv_offset = (r0_full, c0_full)
     all_pred_samples = []
     all_pred_pts_world = []
+    bboxes = []
+    edge = np.zeros((0, 3), dtype=np.float32)
+    extrap_coords_world = None
+    extrap_result = None
 
-    for iteration in range(args.iterations):
-        print(f"[iteration {iteration + 1}/{args.iterations}]")
-
-        # --- extrapolation ---
-        extrap_result = None
-        extrap_uv_full = None
-        extrap_coords_world = None
-        extrap_grid_world = None
-        extrap_result, zyx_min = run_extrapolation(
-            args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, cond_direction, crop_size,
-            extrapolation_settings,
-        )
-        if extrap_result is not None:
-            _uv_mask_flat = uv_mask.reshape(-1, 2) if uv_mask is not None and uv_mask.size > 0 else None
-            extrap_coords_world = extrap_result["extrap_coords_local"] + zyx_min
-            if _uv_mask_flat is not None and _uv_mask_flat.shape[0] == extrap_coords_world.shape[0]:
-                extrap_uv_full = _uv_mask_flat
-                extrap_grid_world = extrap_coords_world.reshape(uv_mask.shape[:2] + (3,))
+    for iteration in range(growth_iterations):
+        print(f"[iteration {iteration + 1}/{growth_iterations}]")
+        cond_zyxs = current_grid
+        valid = current_valid
+        uv_cond = _build_uv_grid(current_uv_offset, cond_zyxs.shape[:2])
+        window_zyxs = cond_zyxs
 
         # Outside path uses the grow-direction inner edge for bbox extraction.
         bboxes, edge = get_cond_edge_bboxes(
-            cond_zyxs, cond_direction, crop_size, outer_edge=False
+            cond_zyxs, cond_direction, crop_size, outer_edge=False,
+            overlap_frac=args.bbox_overlap_frac,
         )
 
         # --- build bbox crops + run inference ---
         pred_pts_world_all = []
         pred_samples = []
         bbox_crops = build_bbox_crop_data(
-            args, bboxes, cond_zyxs, valid, crop_size, tgt_segment, args.volume_scale,
-            extrap_result, extrap_coords_world, extrap_uv_full,
-            extrap_grid_world,
+            args, bboxes, cond_zyxs, valid, uv_cond, cond_direction, crop_size, tgt_segment,
+            args.volume_scale, extrapolation_settings,
         )
+
+        iter_extrap_pts_world = []
+        for crop in bbox_crops:
+            extrap_local = crop.get("extrap_pts_local", None)
+            if extrap_local is None or len(extrap_local) == 0:
+                continue
+            iter_extrap_pts_world.append(extrap_local + crop["min_corner"][None, :])
+        if iter_extrap_pts_world:
+            extrap_coords_world = np.concatenate(iter_extrap_pts_world, axis=0)
+            extrap_result = {"bbox_count": len(iter_extrap_pts_world)}
+        else:
+            extrap_coords_world = None
+            extrap_result = None
 
         if run_model_inference and model_state is not None:
             pred_pts_world_all, pred_samples = run_inference(args, bbox_crops, crop_size, model_state)
 
-        # --- iteration bookkeeping ---
-        if iteration < args.iterations - 1 and pred_samples:
-            grid, valid_grid, offset = reassemble_predictions_to_grid(pred_samples)
-            if grid.shape[0] < 2 or grid.shape[1] < 2:
-                all_pred_samples.extend(pred_samples)
-                all_pred_pts_world.extend(pred_pts_world_all)
-                break
+        all_pred_pts_world.extend(pred_pts_world_all)
+        if not pred_samples:
+            print("No predicted samples this iteration; stopping iterative growth.")
+            break
 
-            merged_cond, merged_valid, new_uv_cond, new_uv_mask, kept = \
-                prepare_next_iteration_cond(
-                    grid, valid_grid, offset,
-                    orig_window_zyxs, orig_valid, orig_uv_offset,
-                    bboxes, cond_direction, args.cond_pct,
-                )
-            all_pred_samples.extend(kept)
-            all_pred_pts_world.extend(pred_pts_world_all)
+        pred_grid, pred_valid, pred_offset = reassemble_predictions_to_grid(pred_samples)
+        merged_cond, merged_valid, merged_uv_offset, kept, n_kept_axis = prepare_next_iteration_cond(
+            current_grid, current_valid, current_uv_offset,
+            pred_grid, pred_valid, pred_offset,
+            cond_direction, args.iter_keep_voxels,
+        )
+        if not kept:
+            print("No new rows/cols beyond current boundary; stopping iterative growth.")
+            break
 
-            cond_zyxs = merged_cond
-            valid = merged_valid
-            window_zyxs = merged_cond
-            uv_cond = new_uv_cond
-            uv_mask = new_uv_mask
-        else:
-            all_pred_samples.extend(pred_samples)
-            all_pred_pts_world.extend(pred_pts_world_all)
+        all_pred_samples.extend(kept)
+        current_grid = merged_cond
+        current_valid = merged_valid
+        current_uv_offset = merged_uv_offset
+        print(f"  kept {n_kept_axis} new {'rows' if cond_direction in ['up', 'down'] else 'cols'}")
 
+    cond_zyxs = current_grid
+    window_zyxs = current_grid
+    valid = current_valid
     pred_samples = all_pred_samples
     pred_pts_world_all = all_pred_pts_world
 
