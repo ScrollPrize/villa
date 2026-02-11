@@ -13,13 +13,13 @@ import fit_data
 
 @dataclass(frozen=True)
 class ModelInit:
-	h_img: int
-	w_img: int
 	init_size_frac: float
 	init_size_frac_h: float | None
 	init_size_frac_v: float | None
 	mesh_step_px: int
 	winding_step_px: int
+	mesh_h: int
+	mesh_w: int
 
 
 @dataclass(frozen=True)
@@ -152,13 +152,17 @@ class Model2D(nn.Module):
 		# FIXME need better init ...
 		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
+		self.params = ModelParams(
+			mesh_step_px=int(self.init.mesh_step_px),
+			winding_step_px=int(self.init.winding_step_px),
+			subsample_mesh=int(subsample_mesh),
+			subsample_winding=int(subsample_winding),
+			z_step_vx=max(1, int(z_step_vx)),
+			crop_xyzwhd=None if crop_xyzwhd is None else tuple(int(v) for v in crop_xyzwhd),
+		)
 
-		fh = float(init.init_size_frac if init.init_size_frac_h is None else init.init_size_frac_h) * float(int(init.h_img))
-		fw = float(init.init_size_frac if init.init_size_frac_v is None else init.init_size_frac_v) * float(int(init.w_img))
-		h = max(2, int(round(fh)))
-		w = max(2, int(round(fw)))
-		self.mesh_h = max(2, (h + int(init.mesh_step_px) - 1) // int(init.mesh_step_px) + 1)
-		self.mesh_w = max(2, (w + int(init.winding_step_px) - 1) // int(init.winding_step_px) + 1)
+		self.mesh_h = max(2, int(init.mesh_h))
+		self.mesh_w = max(2, int(init.mesh_w))
 		offset_scales = 5
 		self.mesh_ms = nn.ParameterList(
 			self._build_mesh_ms(offset_scales=offset_scales, device=device, gh0=self.mesh_h, gw0=self.mesh_w)
@@ -173,14 +177,6 @@ class Model2D(nn.Module):
 		self.const_mask_lr: torch.Tensor | None = None
 		self._last_grow_insert_lr: tuple[int, int, int, int] | None = None
 		self._last_grow_insert_z: int | None = None
-		self.params = ModelParams(
-			mesh_step_px=int(self.init.mesh_step_px),
-			winding_step_px=int(self.init.winding_step_px),
-			subsample_mesh=int(subsample_mesh),
-			subsample_winding=int(subsample_winding),
-			z_step_vx=max(1, int(z_step_vx)),
-			crop_xyzwhd=None if crop_xyzwhd is None else tuple(int(v) for v in crop_xyzwhd),
-		)
 		self.subsample_mesh = int(self.params.subsample_mesh)
 		self.subsample_winding = int(self.params.subsample_winding)
 
@@ -192,12 +188,17 @@ class Model2D(nn.Module):
 	"""
 		if xy.ndim < 1 or int(xy.shape[-1]) != 2:
 			raise ValueError("xy must have last dim == 2")
-		h = float(max(1, int(self.init.h_img) - 1))
-		w = float(max(1, int(self.init.w_img) - 1))
+		if self.params.crop_xyzwhd is None:
+			raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd")
+		cx, cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
+		h = float(max(1, int(ch) - 1))
+		w = float(max(1, int(cw) - 1))
 		flat = xy.reshape(-1, 2)
 		x = flat[:, 0]
 		y = flat[:, 1]
-		inside = (x >= 0.0) & (x <= w) & (y >= 0.0) & (y <= h)
+		x0 = float(int(cx))
+		y0 = float(int(cy))
+		inside = (x >= x0) & (x <= x0 + w) & (y >= y0) & (y <= y0 + h)
 		return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
 
 	def forward(self, data: fit_data.FitData) -> FitResult:
@@ -229,6 +230,9 @@ class Model2D(nn.Module):
 		if mask_conn.shape[3] >= 1:
 			mask_conn[:, :, :, 0, 0] = 0.0
 			mask_conn[:, :, :, -1, 2] = 0.0
+		if self.params.crop_xyzwhd is None:
+			raise ValueError("model.params.crop_xyzwhd must be set")
+		_cx, _cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
@@ -242,8 +246,8 @@ class Model2D(nn.Module):
 			_mask_hr=mask_hr,
 			_mask_lr=mask_lr,
 			_mask_conn=mask_conn,
-			_h_img=int(self.init.h_img),
-			_w_img=int(self.init.w_img),
+			_h_img=int(ch),
+			_w_img=int(cw),
 			_params=self.params,
 		)
 
@@ -251,8 +255,11 @@ class Model2D(nn.Module):
 		u = self.winding_scale * u
 		c = torch.cos(self.theta)
 		s = torch.sin(self.theta)
-		xc = 0.5 * float(max(1, int(self.init.w_img) - 1))
-		yc = 0.5 * float(max(1, int(self.init.h_img) - 1))
+		if self.params.crop_xyzwhd is None:
+			raise ValueError("_apply_global_transform requires params.crop_xyzwhd")
+		cx, cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
+		xc = float(int(cx)) + 0.5 * float(max(1, int(cw) - 1))
+		yc = float(int(cy)) + 0.5 * float(max(1, int(ch) - 1))
 		x = xc + c * (u - xc) - s * (v - yc)
 		y = yc + s * (u - xc) + c * (v - yc)
 		return x, y
@@ -623,14 +630,22 @@ class Model2D(nn.Module):
 		subsample_winding: int = 4,
 	) -> "Model2D":
 		h_img, w_img = data.size
+		step_h = int(mesh_step_px)
+		step_w = int(winding_step_px)
+		fh = float(init_size_frac if init_size_frac_h is None else init_size_frac_h)
+		fw = float(init_size_frac if init_size_frac_v is None else init_size_frac_v)
+		h = max(2, int(round(float(fh) * float(int(h_img)))))
+		w = max(2, int(round(float(fw) * float(int(w_img)))))
+		mesh_h = max(2, (h + step_h - 1) // step_h + 1)
+		mesh_w = max(2, (w + step_w - 1) // step_w + 1)
 		init = ModelInit(
-			h_img=int(h_img),
-			w_img=int(w_img),
 			init_size_frac=float(init_size_frac),
 			init_size_frac_h=None if init_size_frac_h is None else float(init_size_frac_h),
 			init_size_frac_v=None if init_size_frac_v is None else float(init_size_frac_v),
 			mesh_step_px=int(mesh_step_px),
 			winding_step_px=int(winding_step_px),
+			mesh_h=int(mesh_h),
+			mesh_w=int(mesh_w),
 		)
 		return cls(
 			init=init,
@@ -645,14 +660,17 @@ class Model2D(nn.Module):
 	def _build_base_grid(self, *, gh0: int, gw0: int) -> torch.Tensor:
 		# Model domain is initialized to a configurable fraction of the image extent.
 		# Internal coordinates are stored in pixel units.
-		w = float(max(1, int(self.init.w_img) - 1))
-		h = float(max(1, int(self.init.h_img) - 1))
+		if self.params.crop_xyzwhd is None:
+			raise ValueError("_build_base_grid requires params.crop_xyzwhd")
+		cx, cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
+		w = float(max(1, int(cw) - 1))
+		h = float(max(1, int(ch) - 1))
 		fh = float(self.init.init_size_frac if self.init.init_size_frac_h is None else self.init.init_size_frac_h)
 		fw = float(self.init.init_size_frac if self.init.init_size_frac_v is None else self.init.init_size_frac_v)
-		u0 = 0.5 * (1.0 - fw) * w
-		u1 = 0.5 * (1.0 + fw) * w
-		v0 = 0.5 * (1.0 - fh) * h
-		v1 = 0.5 * (1.0 + fh) * h
+		u0 = float(int(cx)) + 0.5 * (1.0 - fw) * w
+		u1 = float(int(cx)) + 0.5 * (1.0 + fw) * w
+		v0 = float(int(cy)) + 0.5 * (1.0 - fh) * h
+		v1 = float(int(cy)) + 0.5 * (1.0 + fh) * h
 		u = torch.linspace(u0, u1, int(gw0), dtype=torch.float32)
 		v = torch.linspace(v0, v1, int(gh0), dtype=torch.float32)
 		vv, uu = torch.meshgrid(v, u, indexing="ij")
