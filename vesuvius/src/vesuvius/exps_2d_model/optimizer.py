@@ -271,15 +271,22 @@ def optimize(
 ) -> fit_data.FitData:
 	data_z0 = data_cfg.unet_z if data_cfg is not None else None
 	def _masked_mean_per_z(*, lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-		if lm.ndim != 4 or mask.ndim != 4:
-			raise ValueError("loss map must be (N,1,H,W)")
-		if int(lm.shape[0]) != int(mask.shape[0]):
-			raise ValueError("loss map batch mismatch")
+		"""Return per-batch masked mean for arbitrary-shaped loss maps.
+
+		- If lm is scalar, returns (1,).
+		- Otherwise treats dim0 as batch and averages over remaining dims.
+		- mask is broadcast to lm.
+		"""
+		if lm.ndim == 0:
+			return lm.view(1)
+		if int(lm.shape[0]) == 0:
+			return lm.new_zeros((0,))
 		m = mask.to(dtype=lm.dtype)
+		mm = m.expand_as(lm)
 		n = int(lm.shape[0])
-		wsum = m.view(n, -1).sum(dim=1)
-		lsum = (lm * m).view(n, -1).sum(dim=1)
-		fallback = lm.view(n, -1).mean(dim=1)
+		wsum = mm.reshape(n, -1).sum(dim=1)
+		lsum = (lm * mm).reshape(n, -1).sum(dim=1)
+		fallback = lm.reshape(n, -1).mean(dim=1)
 		return torch.where(wsum > 0.0, lsum / wsum, fallback)
 
 	def _print_losses_per_z(*, label: str, res, eff: dict[str, float], mean_pos_xy: torch.Tensor | None) -> None:
@@ -320,8 +327,9 @@ def optimize(
 			out[name] = [float(x) for x in _masked_mean_per_z(lm=lm, mask=mask).detach().cpu().tolist()]
 		if not out:
 			return
-		msg = {k: [round(float(x), 6) for x in v] for k, v in out.items()}
-		print(f"{label} losses_per_z: {msg}")
+		for k in sorted(out.keys()):
+			vs = [round(float(x), 6) for x in out[k]]
+			print(f"{label} losses_per_z {k}: {vs}")
 	def _run_opt(*, si: int, label: str, opt_cfg: OptSettings) -> None:
 		if opt_cfg.steps <= 0:
 			return
@@ -467,9 +475,9 @@ def optimize(
 		snap_int = 0
 
 	for si, stage in enumerate(stages):
-		if stage.global_opt.steps > 0:
-			_run_opt(si=si, label=f"stage{si}", opt_cfg=stage.global_opt)
 		if stage.grow is None:
+			if stage.global_opt.steps > 0:
+				_run_opt(si=si, label=f"stage{si}", opt_cfg=stage.global_opt)
 			continue
 		grow = stage.grow
 		directions = grow.get("directions", [])
@@ -506,6 +514,8 @@ def optimize(
 					)
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
+			if stage.global_opt.steps > 0:
+				_run_opt(si=si, label=f"{stage_g}_global", opt_cfg=stage.global_opt)
 			if not local_opts or all(int(o.steps) <= 0 for o in local_opts):
 				continue
 			ins = model._last_grow_insert_lr
