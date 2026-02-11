@@ -18,6 +18,39 @@ from vesuvius.neural_tracing.tifxyz import save_tifxyz
 from tqdm import tqdm
 
 VALID_DIRECTIONS = ["left", "right", "down", "up"]
+_DIRECTION_SPECS = {
+    "left": {
+        "axis": "col",
+        "inner_edge_idx": -1,
+        "outer_edge_idx": 0,
+        "growth_sign": 1,
+    },
+    "right": {
+        "axis": "col",
+        "inner_edge_idx": 0,
+        "outer_edge_idx": -1,
+        "growth_sign": -1,
+    },
+    "up": {
+        "axis": "row",
+        "inner_edge_idx": -1,
+        "outer_edge_idx": 0,
+        "growth_sign": 1,
+    },
+    "down": {
+        "axis": "row",
+        "inner_edge_idx": 0,
+        "outer_edge_idx": -1,
+        "growth_sign": -1,
+    },
+}
+
+
+def _get_direction_spec(cond_direction):
+    spec = _DIRECTION_SPECS.get(cond_direction)
+    if spec is None:
+        raise ValueError(f"Unknown cond_direction '{cond_direction}'")
+    return spec
 
 def _clamp_window(start, size, min_val, max_val):
     size = int(size)
@@ -29,27 +62,26 @@ def _clamp_window(start, size, min_val, max_val):
     return start, end
 
 def _edge_index_from_valid(valid, cond_direction):
+    spec = _DIRECTION_SPECS.get(cond_direction)
+    if spec is None:
+        return None, None
+
     valid_rows = np.any(valid, axis=1)
     valid_cols = np.any(valid, axis=0)
     if not valid_rows.any() or not valid_cols.any():
         return None, None
+    if spec["axis"] == "col":
+        c_idx = np.where(valid_cols)[0]
+        return None, int(c_idx[spec["inner_edge_idx"]])
     r_idx = np.where(valid_rows)[0]
-    c_idx = np.where(valid_cols)[0]
-    if cond_direction == "left":   # cond on left, extrap right -> edge is rightmost
-        return None, int(c_idx[-1])
-    if cond_direction == "right":  # cond on right, extrap left -> edge is leftmost
-        return None, int(c_idx[0])
-    if cond_direction == "up":     # cond on top, extrap down -> edge is bottommost
-        return int(r_idx[-1]), None
-    if cond_direction == "down":   # cond on bottom, extrap up -> edge is topmost
-        return int(r_idx[0]), None
-    return None, None
+    return int(r_idx[spec["inner_edge_idx"]]), None
 
 def _place_window_on_edge(edge_idx, window_size, cond_size, cond_direction, max_idx, clamp=True):
     # Keep window size fixed; place edge at split determined by cond_size.
-    if cond_direction in ("left", "up"):
+    spec = _DIRECTION_SPECS.get(cond_direction)
+    if spec is not None and spec["growth_sign"] > 0:
         start = edge_idx - (cond_size - 1)
-    elif cond_direction in ("right", "down"):
+    elif spec is not None:
         mask_size = window_size - cond_size
         start = edge_idx - mask_size
     else:
@@ -60,15 +92,11 @@ def _place_window_on_edge(edge_idx, window_size, cond_size, cond_direction, max_
     return int(start), int(end)
 
 def _get_cond_edge(cond_zyxs, cond_direction, outer_edge=False):
-    if cond_direction == "left":
-        return cond_zyxs[:, 0, :] if outer_edge else cond_zyxs[:, -1, :]
-    if cond_direction == "right":
-        return cond_zyxs[:, -1, :] if outer_edge else cond_zyxs[:, 0, :]
-    if cond_direction == "up":
-        return cond_zyxs[0, :, :] if outer_edge else cond_zyxs[-1, :, :]
-    if cond_direction == "down":
-        return cond_zyxs[-1, :, :] if outer_edge else cond_zyxs[0, :, :]
-    raise ValueError(f"Unknown cond_direction '{cond_direction}'")
+    spec = _get_direction_spec(cond_direction)
+    edge_idx = spec["outer_edge_idx"] if outer_edge else spec["inner_edge_idx"]
+    if spec["axis"] == "col":
+        return cond_zyxs[:, edge_idx, :]
+    return cond_zyxs[edge_idx, :, :]
 
 def _bbox_from_center(center, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
@@ -627,11 +655,12 @@ def setup_segment(args, volume):
 
 
 def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_s, crop_size):
+    direction = _get_direction_spec(cond_direction)
     r_edge_s, c_edge_s = _edge_index_from_valid(valid_s, cond_direction)
     if r_edge_s is None and c_edge_s is None:
         raise RuntimeError("No valid edge found for segment.")
 
-    if cond_direction in ["left", "right"]:
+    if direction["axis"] == "col":
         cond_edge_strip = stored_zyxs[:, c_edge_s:c_edge_s + 1]
     else:
         cond_edge_strip = stored_zyxs[r_edge_s:r_edge_s + 1, :]
@@ -655,7 +684,7 @@ def compute_window_and_split(args, stored_zyxs, valid_s, cond_direction, h_s, w_
 
     cond_h = win_h
     cond_w = win_w
-    if cond_direction in ["left", "right"]:
+    if direction["axis"] == "col":
         c0_s, c1_s = _place_window_on_edge(
             c_edge_outside, cond_w, cond_w, outside_dir, w_s - 1
         )
@@ -672,6 +701,7 @@ def _build_uv_query_from_cond_points(uv_cond_pts, cond_direction, cond_pct):
     if uv_cond_pts is None or len(uv_cond_pts) == 0:
         return np.zeros((0, 0, 2), dtype=np.float64)
 
+    direction = _get_direction_spec(cond_direction)
     uv_cond_pts = np.asarray(uv_cond_pts)
     r_min = int(np.floor(uv_cond_pts[:, 0].min()))
     r_max = int(np.ceil(uv_cond_pts[:, 0].max()))
@@ -685,20 +715,20 @@ def _build_uv_query_from_cond_points(uv_cond_pts, cond_direction, cond_pct):
         total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
         return max(1, total_span - cond_span)
 
-    if cond_direction in ["left", "right"]:
+    if direction["axis"] == "col":
         rows = np.arange(r_min, r_max + 1, dtype=np.int64)
         mask_w = _mask_span(c_max - c_min + 1)
-        if cond_direction == "left":   # grow right
+        if direction["growth_sign"] > 0:
             cols = np.arange(c_max + 1, c_max + mask_w + 1, dtype=np.int64)
-        else:                          # grow left
+        else:
             cols = np.arange(c_min - mask_w, c_min, dtype=np.int64)
         return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
 
     cols = np.arange(c_min, c_max + 1, dtype=np.int64)
     mask_h = _mask_span(r_max - r_min + 1)
-    if cond_direction == "up":         # grow down
+    if direction["growth_sign"] > 0:
         rows = np.arange(r_max + 1, r_max + mask_h + 1, dtype=np.int64)
-    else:                              # grow up
+    else:
         rows = np.arange(r_min - mask_h, r_min, dtype=np.int64)
     return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
 
@@ -947,6 +977,27 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
     return current_coords.astype(np.float32, copy=False), current_uv
 
 
+def _finalize_crop_prediction(args, bbox_idx, crop, pred_local, pred_uv, crop_size):
+    if torch.is_tensor(pred_local):
+        pred_local_np = pred_local.detach().cpu().numpy()
+    else:
+        pred_local_np = np.asarray(pred_local)
+
+    pred_world = pred_local_np + crop["min_corner"][None, :]
+    bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
+    pred_world = pred_world[bbox_mask]
+
+    pred_sample = None
+    if pred_uv is not None:
+        pred_uv = np.asarray(pred_uv)
+        if len(pred_uv) == bbox_mask.shape[0]:
+            pred_sample = (pred_uv[bbox_mask], pred_world)
+
+    out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
+    _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local_np, crop_size))
+    return pred_sample
+
+
 def run_inference(args, bbox_crops, crop_size, model_state):
     model = model_state["model"]
     amp_enabled = model_state["amp_enabled"]
@@ -989,14 +1040,11 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             if pred_local is None or len(pred_local) == 0:
                 continue
 
-            pred_world = pred_local + crop["min_corner"][None, :]
-            bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
-            pred_world = pred_world[bbox_mask]
-            if pred_uv is not None and len(pred_uv) == bbox_mask.shape[0]:
-                pred_samples.append((pred_uv[bbox_mask], pred_world))
-
-            out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-            _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local, crop_size))
+            pred_sample = _finalize_crop_prediction(
+                args, bbox_idx, crop, pred_local, pred_uv, crop_size
+            )
+            if pred_sample is not None:
+                pred_samples.append(pred_sample)
     elif use_tta:
         # TTA path: process one crop at a time to avoid 8x memory blowup.
         for bbox_idx, crop, inputs, extrap_local in tqdm(valid_items, desc="inference (TTA)"):
@@ -1008,14 +1056,11 @@ def run_inference(args, bbox_crops, crop_size, model_state):
 
             disp_sampled = _sample_displacement_field(disp_single, extrap_coords)
             pred_local = extrap_coords + disp_sampled
-            pred_world = pred_local.detach().cpu().numpy() + crop["min_corner"][None, :]
-            bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
-            pred_world = pred_world[bbox_mask]
-            if extrap_uv is not None and len(extrap_uv) == bbox_mask.shape[0]:
-                pred_samples.append((extrap_uv[bbox_mask], pred_world))
-
-            out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-            _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
+            pred_sample = _finalize_crop_prediction(
+                args, bbox_idx, crop, pred_local, extrap_uv, crop_size
+            )
+            if pred_sample is not None:
+                pred_samples.append(pred_sample)
     else:
         # Standard batched path.
         n_batches = (len(valid_items) + batch_size - 1) // batch_size
@@ -1035,16 +1080,55 @@ def run_inference(args, bbox_crops, crop_size, model_state):
 
                 disp_sampled = _sample_displacement_field(disp_single, extrap_coords)
                 pred_local = extrap_coords + disp_sampled
-                pred_world = pred_local.detach().cpu().numpy() + crop["min_corner"][None, :]
-                bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
-                pred_world = pred_world[bbox_mask]
-                if extrap_uv is not None and len(extrap_uv) == bbox_mask.shape[0]:
-                    pred_samples.append((extrap_uv[bbox_mask], pred_world))
-
-                out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-                _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local.detach().cpu().numpy(), crop_size))
+                pred_sample = _finalize_crop_prediction(
+                    args, bbox_idx, crop, pred_local, extrap_uv, crop_size
+                )
+                if pred_sample is not None:
+                    pred_samples.append(pred_sample)
 
     return pred_samples
+
+
+def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None):
+    """Average list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
+    pred_bounds = None
+    if pred_samples:
+        all_uv = np.concatenate([uv for uv, _ in pred_samples], axis=0)
+        pred_bounds = (
+            int(all_uv[:, 0].min()),
+            int(all_uv[:, 1].min()),
+            int(all_uv[:, 0].max()),
+            int(all_uv[:, 1].max()),
+        )
+
+    if base_uv_bounds is None and pred_bounds is None:
+        return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=bool), (0, 0)
+
+    if base_uv_bounds is None:
+        uv_r_min, uv_c_min, uv_r_max, uv_c_max = pred_bounds
+    else:
+        uv_r_min, uv_c_min, uv_r_max, uv_c_max = (int(v) for v in base_uv_bounds)
+        if pred_bounds is not None:
+            uv_r_min = min(uv_r_min, pred_bounds[0])
+            uv_c_min = min(uv_c_min, pred_bounds[1])
+            uv_r_max = max(uv_r_max, pred_bounds[2])
+            uv_c_max = max(uv_c_max, pred_bounds[3])
+
+    h = uv_r_max - uv_r_min + 1
+    w = uv_c_max - uv_c_min + 1
+    grid_acc = np.zeros((h, w, 3), dtype=np.float64)
+    grid_count = np.zeros((h, w), dtype=np.int32)
+
+    for uv, pts in pred_samples:
+        rows = uv[:, 0].astype(np.int64) - uv_r_min
+        cols = uv[:, 1].astype(np.int64) - uv_c_min
+        np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
+        np.add.at(grid_count, (rows, cols), 1)
+
+    grid_valid = grid_count > 0
+    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
+    grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
+    return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 
 
 def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
@@ -1052,41 +1136,16 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
     tgt_segment.use_full_resolution()
     full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
 
-    full_pred_zyxs = full_zyxs.copy()
-    h_full, w_full = full_pred_zyxs.shape[:2]
-
-    # Compute UV extent across original grid and all prediction UVs
-    uv_r_min, uv_c_min = 0, 0
-    uv_r_max, uv_c_max = h_full - 1, w_full - 1
-    for uv, _ in pred_samples:
-        uv_r_min = min(uv_r_min, int(uv[:, 0].min()))
-        uv_c_min = min(uv_c_min, int(uv[:, 1].min()))
-        uv_r_max = max(uv_r_max, int(uv[:, 0].max()))
-        uv_c_max = max(uv_c_max, int(uv[:, 1].max()))
-
-    # Allocate extended grid filled with -1.0
-    ext_h = uv_r_max - uv_r_min + 1
-    ext_w = uv_c_max - uv_c_min + 1
-    extended = np.full((ext_h, ext_w, 3), -1.0, dtype=np.float32)
-
-    # Place original data at offset
+    h_full, w_full = full_zyxs.shape[:2]
+    pred_grid, pred_valid, (uv_r_min, uv_c_min) = _aggregate_pred_samples_to_uv_grid(
+        pred_samples,
+        base_uv_bounds=(0, 0, h_full - 1, w_full - 1),
+    )
+    full_pred_zyxs = np.full_like(pred_grid, -1.0, dtype=np.float32)
     r_off = -uv_r_min
     c_off = -uv_c_min
-    extended[r_off:r_off + h_full, c_off:c_off + w_full] = full_pred_zyxs
-
-    # Accumulate predictions and average overlapping points
-    pred_acc = np.zeros((ext_h, ext_w, 3), dtype=np.float64)
-    pred_count = np.zeros((ext_h, ext_w), dtype=np.int32)
-    for uv, pred_world in pred_samples:
-        rows = uv[:, 0].astype(np.int64) - uv_r_min
-        cols = uv[:, 1].astype(np.int64) - uv_c_min
-        np.add.at(pred_acc, (rows, cols), pred_world)
-        np.add.at(pred_count, (rows, cols), 1)
-
-    has_pred = pred_count > 0
-    extended[has_pred] = (pred_acc[has_pred] / pred_count[has_pred, np.newaxis]).astype(np.float32)
-
-    full_pred_zyxs = extended
+    full_pred_zyxs[r_off:r_off + h_full, c_off:c_off + w_full] = full_zyxs
+    full_pred_zyxs[pred_valid] = pred_grid[pred_valid]
 
     scale_factor = 2 ** volume_scale
     if scale_factor != 1:
@@ -1124,33 +1183,7 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
 
 
 def reassemble_predictions_to_grid(pred_samples):
-    """Reassemble list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
-    if not pred_samples:
-        return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=bool), (0, 0)
-
-    all_uv = np.concatenate([uv for uv, _ in pred_samples], axis=0)
-    uv_r_min = int(all_uv[:, 0].min())
-    uv_c_min = int(all_uv[:, 1].min())
-    uv_r_max = int(all_uv[:, 0].max())
-    uv_c_max = int(all_uv[:, 1].max())
-
-    h = uv_r_max - uv_r_min + 1
-    w = uv_c_max - uv_c_min + 1
-
-    grid_acc = np.zeros((h, w, 3), dtype=np.float64)
-    grid_count = np.zeros((h, w), dtype=np.int32)
-
-    for uv, pts in pred_samples:
-        rows = uv[:, 0].astype(np.int64) - uv_r_min
-        cols = uv[:, 1].astype(np.int64) - uv_c_min
-        np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
-        np.add.at(grid_count, (rows, cols), 1)
-
-    grid_valid = grid_count > 0
-    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
-    grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
-
-    return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
+    return _aggregate_pred_samples_to_uv_grid(pred_samples)
 
 
 def _build_uv_grid(uv_offset, shape_hw):
@@ -1167,6 +1200,7 @@ def prepare_next_iteration_cond(
     cond_direction, keep_voxels=None,
 ):
     """Append new prediction band outside current boundary, returning next full grid state."""
+    direction = _get_direction_spec(cond_direction)
     keep_voxels = None if keep_voxels is None else int(keep_voxels)
     if keep_voxels is not None and keep_voxels < 1:
         keep_voxels = 1
@@ -1188,25 +1222,20 @@ def prepare_next_iteration_cond(
     pred_cols_abs = pred_cols.astype(np.int64) + pred_c0
     pred_pts = pred_grid_zyxs[pred_rows, pred_cols].astype(np.float32)
 
-    axis = None
-    if cond_direction == "left":    # growing right -> keep cols right of current boundary
-        growth_mask = pred_cols_abs > full_c1
-        ordered_axis_vals = np.sort(np.unique(pred_cols_abs[growth_mask]))
-        axis = "col"
-    elif cond_direction == "right":  # growing left -> keep cols left of current boundary
-        growth_mask = pred_cols_abs < full_c0
-        ordered_axis_vals = np.sort(np.unique(pred_cols_abs[growth_mask]))[::-1]
-        axis = "col"
-    elif cond_direction == "up":     # growing down -> keep rows below current boundary
-        growth_mask = pred_rows_abs > full_r1
-        ordered_axis_vals = np.sort(np.unique(pred_rows_abs[growth_mask]))
-        axis = "row"
-    elif cond_direction == "down":   # growing up -> keep rows above current boundary
-        growth_mask = pred_rows_abs < full_r0
-        ordered_axis_vals = np.sort(np.unique(pred_rows_abs[growth_mask]))[::-1]
-        axis = "row"
+    if direction["axis"] == "row":
+        axis_vals = pred_rows_abs
+        boundary = full_r1 if direction["growth_sign"] > 0 else full_r0
     else:
-        raise ValueError(f"Unknown cond_direction '{cond_direction}'")
+        axis_vals = pred_cols_abs
+        boundary = full_c1 if direction["growth_sign"] > 0 else full_c0
+
+    if direction["growth_sign"] > 0:
+        growth_mask = axis_vals > boundary
+    else:
+        growth_mask = axis_vals < boundary
+    ordered_axis_vals = np.sort(np.unique(axis_vals[growth_mask]))
+    if direction["growth_sign"] < 0:
+        ordered_axis_vals = ordered_axis_vals[::-1]
 
     if ordered_axis_vals.size == 0:
         return full_grid_zyxs, full_valid, full_uv_offset, [], 0
@@ -1214,7 +1243,7 @@ def prepare_next_iteration_cond(
     n_keep = ordered_axis_vals.size if keep_voxels is None else min(ordered_axis_vals.size, keep_voxels)
     kept_axis_vals = ordered_axis_vals[:n_keep]
 
-    if axis == "row":
+    if direction["axis"] == "row":
         keep_mask = growth_mask & np.isin(pred_rows_abs, kept_axis_vals)
     else:
         keep_mask = growth_mask & np.isin(pred_cols_abs, kept_axis_vals)
@@ -1371,7 +1400,8 @@ def main():
         current_grid = merged_cond
         current_valid = merged_valid
         current_uv_offset = merged_uv_offset
-        print(f"  kept {n_kept_axis} new {'rows' if cond_direction in ['up', 'down'] else 'cols'}")
+        axis_label = "rows" if _DIRECTION_SPECS[cond_direction]["axis"] == "row" else "cols"
+        print(f"  kept {n_kept_axis} new {axis_label}")
 
     pred_samples = all_pred_samples
 
