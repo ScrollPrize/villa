@@ -137,7 +137,6 @@ def inverse_map_autograd(
 		if len(loss_hist) >= 11:
 			imp10 = loss_hist[-11] - loss_hist[-1]
 			if imp10 < (0.001 * loss_hist[-1]):
-				print(f"inv_map: early_stop imp10={imp10:.6g} loss={loss_hist[-1]:.6g}")
 				break
 
 	# Jacobian usability mask (finite-diff is fine here; only for visualization gating).
