@@ -171,6 +171,8 @@ def train(config_path):
     config.setdefault('eval_perturbed_val', False)
     config.setdefault('log_perturbed_val_images', False)
     config.setdefault('val_batches_per_log', 25)
+    config.setdefault('wandb_resume', False)
+    config.setdefault('wandb_resume_mode', 'allow')
 
     # Build targets dict based on config
     targets = {
@@ -210,12 +212,32 @@ def train(config_path):
         dynamo_plugin=dynamo_plugin
     )
 
+    preloaded_ckpt = None
+    wandb_resume = bool(config.get('wandb_resume', False))
+    wandb_run_id = config.get('wandb_run_id')
+    if wandb_resume and wandb_run_id is None and 'load_ckpt' in config:
+        preloaded_ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
+        wandb_run_id = preloaded_ckpt.get('wandb_run_id')
+        if wandb_run_id is None:
+            ckpt_config = preloaded_ckpt.get('config', {})
+            if isinstance(ckpt_config, dict):
+                wandb_run_id = ckpt_config.get('wandb_run_id')
+        if wandb_run_id is not None:
+            config['wandb_run_id'] = wandb_run_id
+
     if 'wandb_project' in config and accelerator.is_main_process:
-        wandb.init(
-            project=config['wandb_project'],
-            entity=config.get('wandb_entity', None),
-            config=config
-        )
+        wandb_kwargs = {
+            'project': config['wandb_project'],
+            'entity': config.get('wandb_entity', None),
+            'config': config,
+        }
+        if wandb_resume:
+            wandb_kwargs['resume'] = config.get('wandb_resume_mode', 'allow')
+            if wandb_run_id is not None:
+                wandb_kwargs['id'] = wandb_run_id
+        wandb.init(**wandb_kwargs)
+        if wandb.run is not None:
+            config['wandb_run_id'] = wandb.run.id
 
     # Setup SDT loss if enabled
     sdt_loss_fn = None
@@ -413,7 +435,9 @@ def train(config_path):
     start_iteration = 0
     if 'load_ckpt' in config:
         print(f'Loading checkpoint {config["load_ckpt"]}')
-        ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
+        ckpt = preloaded_ckpt if preloaded_ckpt is not None else torch.load(
+            config['load_ckpt'], map_location='cpu', weights_only=False
+        )
         state_dict = ckpt['model']
         # Handle compiled model state dict
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
@@ -433,6 +457,13 @@ def train(config_path):
                 print('Loaded optimizer state (momentum preserved)')
             else:
                 print('Skipping optimizer state load (optimizer type changed)')
+
+            if wandb_resume:
+                if 'lr_scheduler' in ckpt:
+                    lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+                    print('Loaded lr scheduler state (resume enabled)')
+                else:
+                    print('Resume enabled but checkpoint missing lr_scheduler state; using fresh scheduler')
 
     if val_pert_dataloader is not None:
         model, optimizer, train_dataloader, val_dataloader, val_pert_dataloader, lr_scheduler = accelerator.prepare(
@@ -513,6 +544,7 @@ def train(config_path):
             # Forward pass
             output = model(inputs)
             disp_pred = output['displacement']  # [B, 3, D, H, W]
+            grad_norm = None
 
             # Displacement loss
             if disp_supervision == 'normal_scalar':
@@ -584,13 +616,15 @@ def train(config_path):
 
             accelerator.backward(total_loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
-        wandb_log['lr'] = optimizer.param_groups[0]['lr']
+        wandb_log['current_lr'] = optimizer.param_groups[0]['lr']
+        if grad_norm is not None:
+            wandb_log['grad_norm'] = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
 
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
@@ -849,6 +883,7 @@ def train(config_path):
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'config': config,
                 'step': iteration,
+                'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
             }, f'{out_dir}/ckpt_{iteration:06}.pth')
 
         if wandb.run is not None and accelerator.is_main_process:
@@ -863,6 +898,7 @@ def train(config_path):
             'lr_scheduler': lr_scheduler.state_dict(),
             'config': config,
             'step': config['num_iterations'],
+            'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
         }, f'{out_dir}/ckpt_final.pth')
 
 
