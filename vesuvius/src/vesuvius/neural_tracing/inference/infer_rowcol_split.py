@@ -50,18 +50,17 @@ _DIRECTION_SPECS = {
 }
 
 
-def _get_direction_spec(cond_direction):
-    spec = _DIRECTION_SPECS.get(cond_direction)
+def _get_direction_spec(direction):
+    spec = _DIRECTION_SPECS.get(direction)
     if spec is None:
-        raise ValueError(f"Unknown cond_direction '{cond_direction}'")
+        raise ValueError(f"Unknown direction '{direction}'")
     return spec
 
-def _cond_direction_from_grow(grow_direction):
-    return _get_direction_spec(grow_direction)["opposite"]
-
-def _get_growth_spec(grow_direction):
+def _get_growth_context(grow_direction):
     # Growth semantics are encoded by the opposite conditioning side.
-    return _get_direction_spec(_cond_direction_from_grow(grow_direction))
+    cond_direction = _get_direction_spec(grow_direction)["opposite"]
+    growth_spec = _get_direction_spec(cond_direction)
+    return cond_direction, growth_spec
 
 def _clamp_window(start, size, min_val, max_val):
     size = int(size)
@@ -213,20 +212,17 @@ def _resolve_segment_volume(segment, volume_scale=None):
             return volume[str(nearest)]
     return volume
 
-def _bbox_to_min_corner(bbox):
-    z_min, _, y_min, _, x_min, _ = bbox
-    return np.floor([z_min, y_min, x_min]).astype(np.int64)
-
-
-def _bbox_to_bounds_array(bbox):
+def _bbox_to_min_corner_and_bounds_array(bbox):
     z_min, z_max, y_min, y_max, x_min, x_max = bbox
-    return np.asarray(
+    min_corner = np.floor([z_min, y_min, x_min]).astype(np.int64)
+    bounds_array = np.asarray(
         [
             [z_min, y_min, x_min],
             [z_max, y_max, x_max],
         ],
         dtype=np.int32,
     )
+    return min_corner, bounds_array
 
 
 def _crop_volume_from_min_corner(volume, min_corner, crop_size):
@@ -692,7 +688,7 @@ def setup_segment(args, volume):
     if not valid_dirs:
         raise RuntimeError("Segment too small to define a split direction.")
     grow_direction = args.grow_direction
-    cond_direction = _cond_direction_from_grow(grow_direction)
+    cond_direction, _ = _get_growth_context(grow_direction)
     if cond_direction not in valid_dirs:
         raise RuntimeError(
             f"Requested grow_direction '{args.grow_direction}' (cond_direction='{cond_direction}') "
@@ -703,8 +699,7 @@ def setup_segment(args, volume):
 
 
 def compute_window_and_split(args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size):
-    direction = _get_growth_spec(grow_direction)
-    cond_direction = _cond_direction_from_grow(grow_direction)
+    cond_direction, direction = _get_growth_context(grow_direction)
     r_edge_s, c_edge_s = _edge_index_from_valid(valid_s, cond_direction)
     if r_edge_s is None and c_edge_s is None:
         raise RuntimeError("No valid edge found for segment.")
@@ -751,7 +746,7 @@ def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
     if uv_cond_pts is None or len(uv_cond_pts) == 0:
         return np.zeros((0, 0, 2), dtype=np.float64)
 
-    direction = _get_growth_spec(grow_direction)
+    _, direction = _get_growth_context(grow_direction)
     uv_cond_pts = np.asarray(uv_cond_pts)
     r_min = int(np.floor(uv_cond_pts[:, 0].min()))
     r_max = int(np.ceil(uv_cond_pts[:, 0].max()))
@@ -785,7 +780,7 @@ def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
 
 def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_direction, crop_size, tgt_segment,
                          volume_scale, extrapolation_settings):
-    cond_direction = _cond_direction_from_grow(grow_direction)
+    cond_direction, _ = _get_growth_context(grow_direction)
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
     cond_pts_world = cond_zyxs.reshape(-1, 3)
     cond_valid_mask = ~(cond_pts_world == -1).all(axis=1)
@@ -798,7 +793,7 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
 
     bbox_crops = []
     for bbox_idx, bbox in enumerate(bboxes):
-        min_corner = _bbox_to_min_corner(bbox)
+        min_corner, bbox_bounds_array = _bbox_to_min_corner_and_bounds_array(bbox)
         vol_crop = _crop_volume_from_min_corner(volume_for_crops, min_corner, crop_size)
         vol_crop = normalize_zscore(vol_crop)
 
@@ -868,7 +863,7 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
         })
 
         out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-        _save_crop_tiff(out_dir, "bbox_coords.tif", _bbox_to_bounds_array(bbox))
+        _save_crop_tiff(out_dir, "bbox_coords.tif", bbox_bounds_array)
         _save_crop_tiff(out_dir, "volume.tif", vol_crop)
         _save_crop_tiff(out_dir, "cond.tif", cond_vox)
         if extrap_vox is not None:
@@ -895,12 +890,12 @@ _TTA_MERGE_METHODS = ("median", "mean", "trimmed_mean", "vector_medoid", "vector
 _UV_OVERLAP_MERGE_METHODS = ("mean", "vector_geomedian")
 
 
-def _validate_uv_overlap_merge_method(merge_method):
+def _validate_named_method(merge_method, valid_methods, method_label):
     method = str(merge_method).strip().lower()
-    if method not in _UV_OVERLAP_MERGE_METHODS:
+    if method not in valid_methods:
         raise ValueError(
-            f"Unknown overlap merge method '{merge_method}'. "
-            f"Supported methods: {list(_UV_OVERLAP_MERGE_METHODS)}"
+            f"Unknown {method_label} '{merge_method}'. "
+            f"Supported methods: {list(valid_methods)}"
         )
     return method
 
@@ -963,21 +958,27 @@ def _aggregate_uv_points_geomedian(rows, cols, pts, h, w):
     return grid_zyxs, grid_valid
 
 
-def _validate_tta_merge_method(merge_method):
-    method = str(merge_method).strip().lower()
-    if method not in _TTA_MERGE_METHODS:
-        raise ValueError(
-            f"Unknown --tta-merge-method '{merge_method}'. "
-            f"Supported methods: {list(_TTA_MERGE_METHODS)}"
+def _flatten_tta_disp_vectors(disp_stack):
+    if disp_stack.ndim != 6:
+        raise RuntimeError(
+            f"Expected stacked TTA displacement [T, B, C, D, H, W], got {tuple(disp_stack.shape)}"
         )
-    return method
+    _, batch_size, channels, depth, height, width = disp_stack.shape
+    vectors = disp_stack.permute(0, 1, 3, 4, 5, 2).reshape(disp_stack.shape[0], -1, channels)
+    return vectors, (batch_size, channels, depth, height, width)
+
+
+def _unflatten_tta_disp_vectors(vectors, disp_shape, out_dtype):
+    batch_size, channels, depth, height, width = disp_shape
+    merged = vectors.reshape(batch_size, depth, height, width, channels).permute(0, 4, 1, 2, 3)
+    return merged.to(dtype=out_dtype)
 
 
 def _merge_tta_vector_medoid(disp_stack):
     # Robust vector-consistent merge: pick the TTA vector minimizing total L2
     # distance to all other TTA vectors at each voxel.
-    n_tta, batch_size, channels, depth, height, width = disp_stack.shape
-    vec = disp_stack.permute(0, 1, 3, 4, 5, 2).reshape(n_tta, -1, channels)
+    vec, disp_shape = _flatten_tta_disp_vectors(disp_stack)
+    n_tta = vec.shape[0]
     vec32 = vec.float()
     n_locations = vec.shape[1]
     score = torch.zeros((n_tta, n_locations), dtype=vec32.dtype, device=vec32.device)
@@ -990,14 +991,12 @@ def _merge_tta_vector_medoid(disp_stack):
     vec_by_location = vec.permute(1, 0, 2)
     loc_idx = torch.arange(n_locations, device=vec.device)
     merged_vec = vec_by_location[loc_idx, medoid_idx]
-    merged = merged_vec.reshape(batch_size, depth, height, width, channels).permute(0, 4, 1, 2, 3)
-    return merged
+    return _unflatten_tta_disp_vectors(merged_vec, disp_shape, disp_stack.dtype)
 
 
 def _merge_tta_vector_geomedian(disp_stack, max_iters=8, eps=1e-6, tol=1e-4):
     # Robust vector-consistent merge via Weiszfeld iterations.
-    n_tta, batch_size, channels, depth, height, width = disp_stack.shape
-    vec = disp_stack.permute(0, 1, 3, 4, 5, 2).reshape(n_tta, -1, channels)
+    vec, disp_shape = _flatten_tta_disp_vectors(disp_stack)
     vec32 = vec.float()
     x = torch.median(vec32, dim=0).values
 
@@ -1010,16 +1009,11 @@ def _merge_tta_vector_geomedian(disp_stack, max_iters=8, eps=1e-6, tol=1e-4):
         if float(step.item()) < tol:
             break
 
-    merged = x.reshape(batch_size, depth, height, width, channels).permute(0, 4, 1, 2, 3)
-    return merged.to(dtype=disp_stack.dtype)
+    return _unflatten_tta_disp_vectors(x, disp_shape, disp_stack.dtype)
 
 
 def _merge_tta_displacements(disp_stack, merge_method):
-    if disp_stack.ndim != 6:
-        raise RuntimeError(
-            f"Expected stacked TTA displacement [T, B, C, D, H, W], got {tuple(disp_stack.shape)}"
-        )
-    method = _validate_tta_merge_method(merge_method)
+    method = _validate_named_method(merge_method, _TTA_MERGE_METHODS, "--tta-merge-method")
 
     if method == "mean":
         return disp_stack.mean(dim=0)
@@ -1125,7 +1119,7 @@ def _run_model_tta(
     """
     if inputs.ndim != 5:
         raise RuntimeError(f"Expected inputs with shape [B, C, D, H, W], got {tuple(inputs.shape)}")
-    merge_method = _validate_tta_merge_method(merge_method)
+    merge_method = _validate_named_method(merge_method, _TTA_MERGE_METHODS, "--tta-merge-method")
 
     batch_size = int(inputs.shape[0])
     if batch_size <= 0:
@@ -1388,7 +1382,9 @@ def run_inference(args, bbox_crops, crop_size, model_state):
 
 def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overlap_merge_method="mean"):
     """Merge list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
-    overlap_merge_method = _validate_uv_overlap_merge_method(overlap_merge_method)
+    overlap_merge_method = _validate_named_method(
+        overlap_merge_method, _UV_OVERLAP_MERGE_METHODS, "overlap merge method"
+    )
 
     non_empty_samples = []
     for uv, pts in pred_samples:
@@ -1457,7 +1453,7 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overla
 def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
                        tifxyz_voxel_size_um, checkpoint_path, grow_direction, volume_scale,
                        overlap_merge_method="mean"):
-    cond_direction = _cond_direction_from_grow(grow_direction)
+    cond_direction, _ = _get_growth_context(grow_direction)
     tgt_segment.use_full_resolution()
     full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
 
@@ -1509,13 +1505,6 @@ def save_tifxyz_output(args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step
     print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
 
 
-def reassemble_predictions_to_grid(pred_samples, overlap_merge_method="mean"):
-    return _aggregate_pred_samples_to_uv_grid(
-        pred_samples,
-        overlap_merge_method=overlap_merge_method,
-    )
-
-
 def _build_uv_grid(uv_offset, shape_hw):
     r0, c0 = uv_offset
     h, w = shape_hw
@@ -1530,7 +1519,7 @@ def prepare_next_iteration_cond(
     grow_direction, keep_voxels=None,
 ):
     """Append new prediction band outside current boundary, returning next full grid state."""
-    direction = _get_growth_spec(grow_direction)
+    _, direction = _get_growth_context(grow_direction)
     keep_voxels = None if keep_voxels is None else int(keep_voxels)
     if keep_voxels is not None and keep_voxels < 1:
         keep_voxels = 1
@@ -1628,8 +1617,10 @@ def main():
         raise ValueError("--tta-outlier-drop-thresh must be > 0 when provided.")
     if args.tta_outlier_drop_min_keep < 1:
         raise ValueError("--tta-outlier-drop-min-keep must be >= 1.")
-    args.bbox_overlap_merge_method = _validate_uv_overlap_merge_method(
-        args.bbox_overlap_merge_method
+    args.bbox_overlap_merge_method = _validate_named_method(
+        args.bbox_overlap_merge_method,
+        _UV_OVERLAP_MERGE_METHODS,
+        "overlap merge method",
     )
 
     refine_mode = args.refine is not None
@@ -1669,7 +1660,7 @@ def main():
 
     volume = zarr.open_group(args.volume_path, mode='r')
     tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
-    cond_direction = _cond_direction_from_grow(grow_direction)
+    cond_direction, growth_spec = _get_growth_context(grow_direction)
 
     r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
         args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
@@ -1724,7 +1715,7 @@ def main():
             print("No predicted samples this iteration; stopping iterative growth.")
             break
 
-        pred_grid, pred_valid, pred_offset = reassemble_predictions_to_grid(
+        pred_grid, pred_valid, pred_offset = _aggregate_pred_samples_to_uv_grid(
             pred_samples,
             overlap_merge_method=args.bbox_overlap_merge_method,
         )
@@ -1741,7 +1732,7 @@ def main():
         current_grid = merged_cond
         current_valid = merged_valid
         current_uv_offset = merged_uv_offset
-        axis_label = "rows" if _get_growth_spec(grow_direction)["axis"] == "row" else "cols"
+        axis_label = "rows" if growth_spec["axis"] == "row" else "cols"
         print(f"  kept {n_kept_axis} new {axis_label}")
 
     pred_samples = all_pred_samples
