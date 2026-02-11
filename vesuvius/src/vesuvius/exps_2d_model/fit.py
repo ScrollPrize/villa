@@ -76,12 +76,15 @@ def main(argv: list[str] | None = None) -> int:
 				subsample_winding_use = int(model_params_in["subsample_winding"])
 			if int(z_step_use) == 1 and ("z_step_vx" in model_params_in):
 				z_step_use = max(1, int(model_params_in["z_step_vx"]))
-			c6 = model_params_in.get("crop_xyzwhd", None)
+			c6 = model_params_in.get("crop_fullres_xyzwhd", None)
 			if isinstance(c6, (list, tuple)) and len(c6) == 6:
-				x, y, w, h, z0, _d = (int(v) for v in c6)
-				crop_use = data_cfg.crop if data_cfg.crop is not None else (x, y, w, h)
-				unet_z_use = data_cfg.unet_z if data_cfg.unet_z is not None else int(z0)
-				data_cfg = replace(data_cfg, crop=crop_use, unet_z=unet_z_use, z_step=int(z_step_use))
+				x, y, w, h, z0, d = (int(v) for v in c6)
+				if data_cfg.crop is None:
+					data_cfg = replace(data_cfg, crop=(x, y, w, h))
+				if data_cfg.unet_z is None:
+					data_cfg = replace(data_cfg, unet_z=int(z0))
+				z_size_use = max(1, int(d))
+				data_cfg = replace(data_cfg, z_step=int(z_step_use))
 
 	if model_params_in is not None:
 		print("model_params_in:\n" + json.dumps(model_params_in, indent=2, sort_keys=True))
