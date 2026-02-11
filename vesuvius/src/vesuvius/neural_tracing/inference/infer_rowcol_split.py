@@ -13,7 +13,11 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid, voxelize_surface_grid_masked
 from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHODS, apply_degradation
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
-from vesuvius.neural_tracing.inference.displacement_tta import TTA_MERGE_METHODS, run_model_tta
+from vesuvius.neural_tracing.inference.displacement_tta import (
+    TTA_MERGE_METHODS,
+    _aggregate_uv_points_geomedian,
+    run_model_tta,
+)
 from vesuvius.neural_tracing.models import load_checkpoint, resolve_checkpoint_path
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
 from tqdm import tqdm
@@ -509,8 +513,12 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=8,
         help="Number of crops to process in a single batched forward pass.")
-    parser.add_argument("--tta", action="store_true",
-        help="Enable mirroring-based test-time augmentation (8 flip combos, merged).")
+    parser.add_argument(
+        "--no-tta",
+        dest="tta",
+        action="store_false",
+        help="Disable mirroring-based test-time augmentation (enabled by default).",
+    )
     parser.add_argument(
         "--tta-merge-method",
         type=str,
@@ -538,6 +546,7 @@ def parse_args():
             "(default: 4)."
         ),
     )
+    parser.set_defaults(tta=True)
     return parser.parse_args()
 
 
@@ -881,78 +890,16 @@ def _validate_named_method(merge_method, valid_methods, method_label):
     return method
 
 
-def _vector_geomedian_numpy(points, max_iters=8, eps=1e-6, tol=1e-4):
-    pts = np.asarray(points, dtype=np.float64)
-    if pts.ndim != 2:
-        raise RuntimeError(f"Expected points with shape [N, C], got {pts.shape}.")
-    if pts.shape[0] == 0:
-        raise RuntimeError("Cannot compute geometric median of an empty point set.")
-    if pts.shape[0] == 1:
-        return pts[0]
-
-    x = np.median(pts, axis=0)
-    for _ in range(int(max_iters)):
-        diff = pts - x[None, :]
-        dist = np.linalg.norm(diff, axis=1)
-        dist = np.maximum(dist, float(eps))
-        w = 1.0 / dist
-        denom = np.maximum(w.sum(), float(eps))
-        x_new = (w[:, None] * pts).sum(axis=0) / denom
-        step = np.linalg.norm(x_new - x)
-        x = x_new
-        if float(step) < float(tol):
-            break
-    return x
-
-
-def _aggregate_uv_points_geomedian(rows, cols, pts, h, w):
-    rows = np.asarray(rows, dtype=np.int64)
-    cols = np.asarray(cols, dtype=np.int64)
-    pts = np.asarray(pts, dtype=np.float64)
-    if rows.size == 0:
-        return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool)
-
-    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
-    grid_valid = np.zeros((h, w), dtype=bool)
-
-    linear = rows * int(w) + cols
-    order = np.argsort(linear, kind="mergesort")
-    linear_sorted = linear[order]
-    pts_sorted = pts[order]
-
-    unique_linear, starts, counts = np.unique(
-        linear_sorted, return_index=True, return_counts=True
-    )
-
-    for linear_idx, start, count in zip(unique_linear, starts, counts):
-        rr = int(linear_idx // int(w))
-        cc = int(linear_idx % int(w))
-        group_pts = pts_sorted[start:start + count]
-        merged = (
-            group_pts[0]
-            if int(count) == 1
-            else _vector_geomedian_numpy(group_pts)
-        )
-        grid_zyxs[rr, cc] = merged.astype(np.float32, copy=False)
-        grid_valid[rr, cc] = True
-
-    return grid_zyxs, grid_valid
-
-
 def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
+    
     with torch.no_grad():
         if amp_enabled:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 output = model(model_inputs)
         else:
             output = model(model_inputs)
-    if not isinstance(output, dict):
-        raise RuntimeError(
-            f"Model output must be a dict with a 'displacement' head, got {type(output).__name__}."
-        )
     disp = output.get("displacement", None)
-    if disp is None:
-        raise RuntimeError("Model output missing 'displacement' head.")
+
     return disp
 
 
@@ -960,7 +907,7 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
     refine_extra_steps = int(args.refine) if args.refine is not None else 0
     refine_parts = refine_extra_steps + 1
     refine_fraction = 1.0 / float(refine_parts)
-    use_tta = bool(getattr(args, "tta", False))
+    use_tta = bool(getattr(args, "tta", True))
     model = model_state["model"]
     amp_enabled = model_state["amp_enabled"]
     amp_dtype = model_state["amp_dtype"]
@@ -1091,7 +1038,7 @@ def run_inference(args, bbox_crops, crop_size, model_state):
         valid_items.append((bbox_idx, crop, inputs, extrap_local))
 
     pred_samples = []
-    use_tta = getattr(args, 'tta', False)
+    use_tta = bool(getattr(args, "tta", True))
 
     if refine_mode:
         desc = "inference (refine)"

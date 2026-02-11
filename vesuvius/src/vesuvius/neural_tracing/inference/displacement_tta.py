@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 
@@ -26,6 +27,68 @@ def _validate_tta_merge_method(merge_method):
             f"Supported methods: {list(TTA_MERGE_METHODS)}"
         )
     return method
+
+
+def _compute_vector_geomedian(points, max_iters=8, eps=1e-6, tol=1e-4):
+    as_torch = torch.is_tensor(points)
+    pts_in = points if as_torch else torch.as_tensor(points)
+    if pts_in.ndim != 2:
+        raise RuntimeError(f"Expected points with shape [N, C], got {tuple(pts_in.shape)}.")
+    if int(pts_in.shape[0]) == 0:
+        raise RuntimeError("Cannot compute geometric median of an empty point set.")
+
+    pts = pts_in.to(dtype=torch.float64)
+    if int(pts.shape[0]) == 1:
+        out = pts[0]
+    else:
+        x = torch.median(pts, dim=0).values
+        for _ in range(int(max_iters)):
+            dist = torch.linalg.norm(pts - x.unsqueeze(0), dim=1).clamp_min(float(eps))
+            w = 1.0 / dist
+            x_new = (w.unsqueeze(-1) * pts).sum(dim=0) / w.sum().clamp_min(float(eps))
+            step = torch.linalg.norm(x_new - x)
+            x = x_new
+            if float(step.item()) < float(tol):
+                break
+        out = x
+
+    if as_torch:
+        return out.to(dtype=pts_in.dtype, device=pts_in.device)
+    return out.cpu().numpy()
+
+
+def _aggregate_uv_points_geomedian(rows, cols, pts, h, w):
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    pts = np.asarray(pts, dtype=np.float64)
+    if rows.size == 0:
+        return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool)
+
+    grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
+    grid_valid = np.zeros((h, w), dtype=bool)
+
+    linear = rows * int(w) + cols
+    order = np.argsort(linear, kind="mergesort")
+    linear_sorted = linear[order]
+    pts_sorted = pts[order]
+
+    unique_linear, starts, counts = np.unique(
+        linear_sorted, return_index=True, return_counts=True
+    )
+
+    for linear_idx, start, count in zip(unique_linear, starts, counts):
+        rr = int(linear_idx // int(w))
+        cc = int(linear_idx % int(w))
+        group_pts = pts_sorted[start:start + count]
+        merged = (
+            group_pts[0]
+            if int(count) == 1
+            else _compute_vector_geomedian(group_pts)
+        )
+        grid_zyxs[rr, cc] = merged.astype(np.float32, copy=False)
+        grid_valid[rr, cc] = True
+
+    return grid_zyxs, grid_valid
 
 
 def _flatten_tta_disp_vectors(disp_stack):
