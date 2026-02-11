@@ -145,9 +145,7 @@ def main(argv: list[str] | None = None) -> int:
 	if model_params is not None:
 		c6 = model_params.get("crop_xyzwhd", None)
 		if isinstance(c6, (list, tuple)) and len(c6) == 6:
-			x0c, y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
-			base["offset_x"] = float(base["offset_x"]) + float(x0c)
-			base["offset_y"] = float(base["offset_y"]) + float(y0c)
+			_x0c, _y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
 			base["z0"] = int(z0c)
 		if "z_step_vx" in model_params:
 			base["z_step"] = max(1, int(model_params["z_step_vx"]))

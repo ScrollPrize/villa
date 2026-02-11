@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
 			subsample_mesh=int(subsample_mesh_use),
 			subsample_winding=int(subsample_winding_use),
 			z_step_vx=int(z_step_use),
+			scaledown=float(data_cfg.downscale),
 			crop_xyzwhd=crop_xyzwhd,
 		)
 	else:
@@ -129,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
 			init_size_frac_v=model_cfg.init_size_frac_v,
 			z_size=int(z_size_use),
 			z_step_vx=int(z_step_use),
+			scaledown=float(data_cfg.downscale),
 			device=device,
 			subsample_mesh=int(subsample_mesh_use),
 			subsample_winding=int(subsample_winding_use),
@@ -141,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
 			print("state_dict: unexpected keys:", sorted(unexp))
 		if miss:
 			print("state_dict: missing keys:", sorted(miss))
+		with torch.no_grad():
+			xy0 = mdl.mesh_coarse().detach()
+			mean_xy = xy0.mean(dim=(0, 2, 3)).to(dtype=torch.float32).cpu().numpy().tolist()
+			min_xy = xy0.amin(dim=(0, 2, 3)).to(dtype=torch.float32).cpu().numpy().tolist()
+			max_xy = xy0.amax(dim=(0, 2, 3)).to(dtype=torch.float32).cpu().numpy().tolist()
+			print(f"loaded mesh_coarse: mean_xy={mean_xy} min_xy={min_xy} max_xy={max_xy}")
 	print("model_init:", mdl.init)
 	print("mesh:", mdl.mesh_h, mdl.mesh_w)
 
