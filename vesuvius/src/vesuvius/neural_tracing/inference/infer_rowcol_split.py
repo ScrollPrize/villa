@@ -15,10 +15,10 @@ from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHOD
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
-    _aggregate_uv_points_geomedian,
     run_model_tta,
 )
 from vesuvius.neural_tracing.inference.common import (
+    _aggregate_pred_samples_to_uv_grid,
     _resolve_extrapolation_settings,
     _validate_named_method,
     resolve_tifxyz_params,
@@ -1044,76 +1044,6 @@ def run_inference(args, bbox_crops, crop_size, model_state):
     return pred_samples
 
 
-def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overlap_merge_method="mean"):
-    """Merge list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
-    overlap_merge_method = _validate_named_method(
-        overlap_merge_method, _UV_OVERLAP_MERGE_METHODS, "overlap merge method"
-    )
-
-    non_empty_samples = []
-    for uv, pts in pred_samples:
-        uv_arr = np.asarray(uv)
-        pts_arr = np.asarray(pts)
-        if uv_arr.size == 0 or pts_arr.size == 0:
-            continue
-        non_empty_samples.append((uv_arr, pts_arr))
-
-    pred_bounds = None
-    if non_empty_samples:
-        all_uv = np.concatenate([uv for uv, _ in non_empty_samples], axis=0)
-        pred_bounds = (
-            int(all_uv[:, 0].min()),
-            int(all_uv[:, 1].min()),
-            int(all_uv[:, 0].max()),
-            int(all_uv[:, 1].max()),
-        )
-
-    if base_uv_bounds is None and pred_bounds is None:
-        return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=bool), (0, 0)
-
-    if base_uv_bounds is None:
-        uv_r_min, uv_c_min, uv_r_max, uv_c_max = pred_bounds
-    else:
-        uv_r_min, uv_c_min, uv_r_max, uv_c_max = (int(v) for v in base_uv_bounds)
-        if pred_bounds is not None:
-            uv_r_min = min(uv_r_min, pred_bounds[0])
-            uv_c_min = min(uv_c_min, pred_bounds[1])
-            uv_r_max = max(uv_r_max, pred_bounds[2])
-            uv_c_max = max(uv_c_max, pred_bounds[3])
-
-    h = uv_r_max - uv_r_min + 1
-    w = uv_c_max - uv_c_min + 1
-    if not non_empty_samples:
-        return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool), (uv_r_min, uv_c_min)
-
-    if overlap_merge_method == "mean":
-        grid_acc = np.zeros((h, w, 3), dtype=np.float64)
-        grid_count = np.zeros((h, w), dtype=np.int32)
-
-        for uv, pts in non_empty_samples:
-            rows = uv[:, 0].astype(np.int64) - uv_r_min
-            cols = uv[:, 1].astype(np.int64) - uv_c_min
-            np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
-            np.add.at(grid_count, (rows, cols), 1)
-
-        grid_valid = grid_count > 0
-        grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
-        grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
-    elif overlap_merge_method == "vector_geomedian":
-        rows_all = np.concatenate(
-            [uv[:, 0].astype(np.int64) - uv_r_min for uv, _ in non_empty_samples], axis=0
-        )
-        cols_all = np.concatenate(
-            [uv[:, 1].astype(np.int64) - uv_c_min for uv, _ in non_empty_samples], axis=0
-        )
-        pts_all = np.concatenate([pts.astype(np.float64) for _, pts in non_empty_samples], axis=0)
-        grid_zyxs, grid_valid = _aggregate_uv_points_geomedian(rows_all, cols_all, pts_all, h, w)
-    else:
-        raise RuntimeError(f"Unhandled overlap merge method '{overlap_merge_method}'")
-
-    return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
-
-
 def _build_uv_grid(uv_offset, shape_hw):
     r0, c0 = uv_offset
     h, w = shape_hw
@@ -1350,7 +1280,7 @@ def main():
         save_tifxyz_output(
             args, tgt_segment, pred_samples, tifxyz_uuid, tifxyz_step_size,
             tifxyz_voxel_size_um, checkpoint_path, cond_direction, grow_direction,
-            args.volume_scale, _aggregate_pred_samples_to_uv_grid,
+            args.volume_scale,
             overlap_merge_method=args.bbox_overlap_merge_method,
         )
 
