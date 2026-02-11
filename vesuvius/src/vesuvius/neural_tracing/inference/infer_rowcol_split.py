@@ -238,6 +238,8 @@ def _bbox_from_center(center, crop_size):
     )
 
 def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15):
+    # Build center-out crop anchors along the conditioning edge. Each chunk grows
+    # while its XYZ span still fits in one crop-sized bbox.
     edge = _get_cond_edge(cond_zyxs, cond_direction)
 
     edge_valid = ~(edge == -1).all(axis=1)
@@ -276,6 +278,7 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
             chunks.append(chunk)
             chunk_len = len(chunk)
             overlap_count = int(round(chunk_len * overlap_frac))
+            # Slide by (chunk - overlap) so adjacent bboxes share context.
             step = max(1, chunk_len - overlap_count)
             start += step
         return chunks
@@ -402,6 +405,7 @@ def _sample_displacement_field(pred_field, coords_local):
         return torch.zeros((0, 3), device=pred_field.device, dtype=pred_field.dtype)
 
     _, _, D, H, W = pred_field.shape
+    # grid_sample uses normalized coordinates in [-1, 1].
     # Ensure grid dtype matches pred_field for AMP compatibility.
     coords_norm = coords_local.to(dtype=pred_field.dtype).clone()
     d_denom = max(D - 1, 1)
@@ -411,6 +415,7 @@ def _sample_displacement_field(pred_field, coords_local):
     coords_norm[:, 1] = 2 * coords_norm[:, 1] / h_denom - 1
     coords_norm[:, 2] = 2 * coords_norm[:, 2] / w_denom - 1
 
+    # coords_local is (z, y, x); grid_sample expects (x, y, z).
     grid = coords_norm[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
     sampled = F.grid_sample(pred_field, grid, mode='bilinear', align_corners=True)
     sampled = sampled.view(1, 3, -1).permute(0, 2, 1)[0]
@@ -672,6 +677,8 @@ def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
 
     def _mask_span(cond_span):
         cond_span = int(max(1, cond_span))
+        # cond_pct is conditioning fraction of the combined (cond + extrap) span.
+        # Rearranging gives extrap span to query beyond the current boundary.
         if cond_pct <= 0:
             return cond_span
         total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
@@ -1013,6 +1020,7 @@ def prepare_next_iteration_cond(
     pred_cols_abs = pred_cols.astype(np.int64) + pred_c0
     pred_pts = pred_grid_zyxs[pred_rows, pred_cols].astype(np.float32)
 
+    # Keep only predictions outside the current boundary, in the growth direction.
     if direction["axis"] == "row":
         axis_vals = pred_rows_abs
         boundary = full_r1 if direction["growth_sign"] > 0 else full_r0
@@ -1031,6 +1039,7 @@ def prepare_next_iteration_cond(
     if ordered_axis_vals.size == 0:
         return full_grid_zyxs, full_valid, full_uv_offset, [], 0
 
+    # keep_voxels limits how many newly grown rows/cols are admitted this round.
     n_keep = ordered_axis_vals.size if keep_voxels is None else min(ordered_axis_vals.size, keep_voxels)
     kept_axis_vals = ordered_axis_vals[:n_keep]
 
@@ -1051,6 +1060,7 @@ def prepare_next_iteration_cond(
     new_r1 = max(full_r1, int(kept_rows_abs.max()))
     new_c1 = max(full_c1, int(kept_cols_abs.max()))
 
+    # Rebuild a contiguous UV canvas and return its new top-left offset.
     nh = new_r1 - new_r0 + 1
     nw = new_c1 - new_c0 + 1
     merged_cond = np.full((nh, nw, 3), -1.0, dtype=np.float32)
@@ -1153,6 +1163,8 @@ def _run_growth_iterations(
 
     all_pred_samples = []
 
+    # Per iteration: build UVs -> choose edge bboxes -> infer displaced points ->
+    # aggregate in UV space -> keep outward band -> update conditioning state.
     for iteration in range(growth_iterations):
         print(f"[iteration {iteration + 1}/{growth_iterations}]")
         cond_zyxs = current_grid
