@@ -1,43 +1,46 @@
 {
-    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v16",
-    "load_ckpt":"/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v15/ckpt_012000.pth",
+    "out_dir": "/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v24",
+    "load_ckpt":"/mnt/raid_nvme/datasets/results/neural_tracer/rowcol_cond_v24/ckpt_138000.pth",
     "seed": 10,
     "batch_size": 6,
     "num_workers": 12,
     "wandb_entity": "vesuvius-challenge",
     "wandb_project": "neural-tracing",
-    "load_weights_only": true,
+    "wandb_resume": true,
+    "wandb_resume_mode": "allow",
+    "wandb_run_id": "89mngx8y",
+    "load_weights_only": false,
 
     "datasets": [
         {
-            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0139.zarr",
+            "volume_path": "/home/sean/Documents/nt-data/neural_tracer_122225/volumes/0139.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0139"
+            "segments_path": "/home/sean/Documents/nt-data/neural_tracer_122225/segments/PHerc0139"
         },
         {
-            "volume_path": "/mnt/raid_nvme/volpkgs/PHerc172.volpkg/volumes/s5_rewindowed.zarr",
+            "volume_path": "/home/sean/Documents/nt-data/neural_tracer_122225/volumes/0172.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0172"
+            "segments_path": "/home/sean/Documents/nt-data/neural_tracer_122225/segments/PHerc0172"
         },
         {
-            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/0332.zarr",
+            "volume_path": "/home/sean/Documents/nt-data/neural_tracer_122225/volumes/0332.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc0332"
+            "segments_path": "/home/sean/Documents/nt-data/neural_tracer_122225/segments/PHerc0332"
         },
         {
-            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1451.zarr",
+            "volume_path": "/home/sean/Documents/nt-data/neural_tracer_122225/volumes/1451.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1451"
+            "segments_path": "/home/sean/Documents/nt-data/neural_tracer_122225/segments/PHerc1451"
         },
         {
-            "volume_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/volumes/1667.zarr",
+            "volume_path": "/home/sean/Documents/nt-data/neural_tracer_122225/volumes/1667.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHerc1667"
+            "segments_path": "/home/sean/Documents/nt-data/neural_tracer_122225/segments/PHerc1667"
         },
         {
-            "volume_path": "/mnt/raid_nvme/volpkgs/PHercParis4.volpkg/volumes/Scroll1_8um_uint8.zarr",
+            "volume_path": "/home/sean/Documents/nt-data/neural_tracer_122225/volumes/Paris4.zarr",
             "volume_scale": 1,
-            "segments_path": "/mnt/raid_nvme/datasets/neural-tracer-data_2025-11-10_still-paper-43/segments/PHercParis4"
+            "segments_path": "/home/sean/Documents/nt-data/neural_tracer_122225/segments/PHercParis4"
         }
     ],
 
@@ -46,38 +49,59 @@
     "crop_size": 128,
     "chunk_pad": 20.0,
     "force_recompute_patches": false,
+    "overlap_fraction": 0.25,
+    "sample_mode": "wrap",
     "val_fraction": 0.05,
     "use_extrapolation": true,
     "extrapolation_method": "rbf",
+    "rbf_downsample_factor": 4,
     "cond_percent": [0.10, 0.50],
+    "supervise_conditioning": true,
+    "cond_supervision_weight": 0.15,
+    "eval_perturbed_val": true,
+    "log_perturbed_val_images": false,
+
+    "cond_local_perturb": {
+        "enabled": true,
+        "probability": 0.75,
+        "apply_without_augmentation": false,
+        "num_blobs": [1, 6],
+        "points_affected": 250,
+        "amplitude_range": [1.0, 4.0],
+        "max_total_displacement": 6.0,
+        "radius_sigma_mult": 2.5
+  },
 
     "use_other_wrap_cond": false,
 
     "lambda_smooth": 0.0,
-    "displacement_loss_type": "vector_l2",
+    "displacement_loss_type": "vector_huber",
     "displacement_huber_beta": 5.0,
-    "lambda_cond_disp": 0.0,
+    "lambda_cond_disp": 0.00,
+    
 
     "use_dilation": false,
     "dilation_radius": 1,
 
-    "num_iterations": 250000,
+    "num_iterations": 500000,
     "log_frequency": 350,
     "ckpt_frequency": 1000,
 
+    "warmup_steps": 1000,
+    "grad_clip": 5,
     "learning_rate": 0.001,
     "weight_decay": 1e-4,
-    "warmup_steps": 1000,
-    "grad_clip": 7,
+
 
     "mixed_precision": "bf16",
     "compile_model": true,
 
-    "in_channels": 4,
+    "in_channels": 3,
     "model_type": "unet",
 
     "model_config": {
         "autoconfigure": true
+
     },
 
     "augmentation": {
