@@ -171,6 +171,7 @@ class Model2D(nn.Module):
 		self.init = init
 		self.device = device
 		self.z_size = max(1, int(z_size))
+		self.global_transform_enabled = True
 		# FIXME need better init ...
 		self.theta = nn.Parameter(torch.zeros((), device=device, dtype=torch.float32)-0.5)
 		self.winding_scale = nn.Parameter(torch.ones((), device=device, dtype=torch.float32))
@@ -202,6 +203,19 @@ class Model2D(nn.Module):
 		self._last_grow_insert_z: int | None = None
 		self.subsample_mesh = int(self.params.subsample_mesh)
 		self.subsample_winding = int(self.params.subsample_winding)
+
+	def bake_global_transform_into_mesh(self) -> None:
+		"""Bake current global transform into mesh & disable it."""
+		with torch.no_grad():
+			uv = self.mesh_coarse()
+			u = uv[:, 0:1]
+			v = uv[:, 1:2]
+			x, y = self._apply_global_transform(u, v)
+			flat = torch.cat([x, y], dim=1)
+			self.mesh_ms = self._construct_param_pyramid_from_flat(flat, n_scales=len(self.mesh_ms))
+			self.theta.data.zero_()
+			self.winding_scale.data.fill_(1.0)
+			self.global_transform_enabled = False
 
 	def xy_img_validity_mask(self, *, xy: torch.Tensor) -> torch.Tensor:
 		"""Return a binary mask for pixel xy image positions.
@@ -273,6 +287,8 @@ class Model2D(nn.Module):
 		)
 
 	def _apply_global_transform(self, u: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		if not bool(self.global_transform_enabled):
+			return u, v
 		u = self.winding_scale * u
 		c = torch.cos(self.theta)
 		s = torch.sin(self.theta)
@@ -291,9 +307,7 @@ class Model2D(nn.Module):
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
 		amp = [self.amp]
 		bias = [self.bias]
-		return {
-			"theta": [self.theta],
-			"winding_scale": [self.winding_scale],
+		out = {
 			"mesh_ms": list(self.mesh_ms),
 			"conn_offset_ms": list(self.conn_offset_ms),
 			"amp": amp,
@@ -301,6 +315,10 @@ class Model2D(nn.Module):
 			"amp_ms": amp,
 			"bias_ms": bias,
 		}
+		if bool(self.global_transform_enabled):
+			out["theta"] = [self.theta]
+			out["winding_scale"] = [self.winding_scale]
+		return out
 
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
 		st = dict(state_dict)

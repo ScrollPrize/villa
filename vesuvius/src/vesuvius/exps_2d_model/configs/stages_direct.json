@@ -19,6 +19,15 @@
 	},
 	"stages": [
 		{
+			"name": "global_only",
+			"global_opt": {
+				"steps": 1000,
+				"lr": 0.001,
+				"params": ["theta", "winding_scale"],
+				"min_scaledown": 0
+			}
+		},
+		{
 			"name": "global",
 			"steps": 5000,
 			"lr": [0.1, 0.01, 0.001],

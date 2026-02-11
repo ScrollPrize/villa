@@ -333,6 +333,11 @@ def optimize(
 	def _run_opt(*, si: int, label: str, opt_cfg: OptSettings) -> None:
 		if opt_cfg.steps <= 0:
 			return
+		# If the stage does not optimize any global transform params, bake the current
+		# global transform into the mesh and disable it.
+		if not ("theta" in opt_cfg.params or "winding_scale" in opt_cfg.params):
+			if hasattr(model, "global_transform_enabled") and bool(model.global_transform_enabled):
+				model.bake_global_transform_into_mesh()
 
 		all_params = model.opt_params()
 		hooks: list[torch.utils.hooks.RemovableHandle] = []
@@ -356,6 +361,9 @@ def optimize(
 			z_keep[ins_z, 0, 0, 0] = 1.0
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
+			if name in {"theta", "winding_scale"}:
+				if hasattr(model, "global_transform_enabled") and not bool(model.global_transform_enabled):
+					raise ValueError(f"opt params include '{name}' but global transform is disabled")
 			group = all_params.get(name, [])
 			if name in {"mesh_ms", "conn_offset_ms"}:
 				if cm_lr is not None:
