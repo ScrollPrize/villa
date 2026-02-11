@@ -10,6 +10,8 @@ import model
 import optimizer
 import torch
 import vis
+from dataclasses import asdict
+from dataclasses import replace
 
 import cli_json
 
@@ -46,20 +48,59 @@ def main(argv: list[str] | None = None) -> int:
 	print("opt:", opt_cfg)
 	print("vis:", vis_cfg)
 
-	data = cli_data.load_fit_data(data_cfg, z_size=model_cfg.z_size, out_dir_base=vis_cfg.out_dir)
+	model_params_in: dict | None = None
+	z_size_use = int(model_cfg.z_size)
+	mesh_step_use = int(model_cfg.mesh_step_px)
+	winding_step_use = int(model_cfg.winding_step_px)
+	subsample_mesh_use = int(model_cfg.subsample_mesh)
+	subsample_winding_use = int(model_cfg.subsample_winding)
+	z_step_use = int(data_cfg.z_step)
+	if model_cfg.model_input is not None:
+		st_in = torch.load(model_cfg.model_input, map_location="cpu")
+		if isinstance(st_in, dict) and isinstance(st_in.get("_model_params_", None), dict):
+			model_params_in = st_in["_model_params_"]
+		if isinstance(st_in, dict) and ("amp" in st_in) and hasattr(st_in["amp"], "shape"):
+			try:
+				z_size_use = max(1, int(st_in["amp"].shape[0]))
+			except Exception:
+				pass
+		if model_params_in is not None:
+			if "mesh_step_px" in model_params_in:
+				mesh_step_use = int(model_params_in["mesh_step_px"])
+			if "winding_step_px" in model_params_in:
+				winding_step_use = int(model_params_in["winding_step_px"])
+			if "subsample_mesh" in model_params_in:
+				subsample_mesh_use = int(model_params_in["subsample_mesh"])
+			if "subsample_winding" in model_params_in:
+				subsample_winding_use = int(model_params_in["subsample_winding"])
+			if int(z_step_use) == 1 and ("z_step_vx" in model_params_in):
+				z_step_use = max(1, int(model_params_in["z_step_vx"]))
+			c6 = model_params_in.get("crop_xyzwhd", None)
+			if isinstance(c6, (list, tuple)) and len(c6) == 6:
+				x, y, w, h, z0, _d = (int(v) for v in c6)
+				crop_use = data_cfg.crop if data_cfg.crop is not None else (x, y, w, h)
+				unet_z_use = data_cfg.unet_z if data_cfg.unet_z is not None else int(z0)
+				data_cfg = replace(data_cfg, crop=crop_use, unet_z=unet_z_use, z_step=int(z_step_use))
+
+	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
 	device = data.cos.device
+	crop_xyzwhd = None
+	if data_cfg.crop is not None and data_cfg.unet_z is not None:
+		x, y, w, h = (int(v) for v in data_cfg.crop)
+		crop_xyzwhd = (x, y, w, h, int(data_cfg.unet_z), int(z_size_use))
 	mdl = model.Model2D.from_fit_data(
 		data=data,
-		mesh_step_px=model_cfg.mesh_step_px,
-		winding_step_px=model_cfg.winding_step_px,
+		mesh_step_px=int(mesh_step_use),
+		winding_step_px=int(winding_step_use),
 		init_size_frac=model_cfg.init_size_frac,
 		init_size_frac_h=model_cfg.init_size_frac_h,
 		init_size_frac_v=model_cfg.init_size_frac_v,
-		z_size=model_cfg.z_size,
-		z_step_vx=data_cfg.z_step,
+		z_size=int(z_size_use),
+		z_step_vx=int(z_step_use),
 		device=device,
-		subsample_mesh=model_cfg.subsample_mesh,
-		subsample_winding=model_cfg.subsample_winding,
+		subsample_mesh=int(subsample_mesh_use),
+		subsample_winding=int(subsample_winding_use),
+		crop_xyzwhd=crop_xyzwhd,
 	)
 	if model_cfg.model_input is not None:
 		st = torch.load(model_cfg.model_input, map_location=device)
@@ -80,12 +121,16 @@ def main(argv: list[str] | None = None) -> int:
 		out_snap = out / "model_snapshots"
 		out_snap.mkdir(parents=True, exist_ok=True)
 		p = out_snap / f"model_{stage}_{step:06d}.pt"
-		torch.save(mdl.state_dict(), str(p))
+		st = dict(mdl.state_dict())
+		st["_model_params_"] = asdict(mdl.params)
+		torch.save(st, str(p))
 
 	def _save_model_output_final() -> None:
 		if model_cfg.model_output is None:
 			return
-		torch.save(mdl.state_dict(), str(model_cfg.model_output))
+		st = dict(mdl.state_dict())
+		st["_model_params_"] = asdict(mdl.params)
+		torch.save(st, str(model_cfg.model_output))
 
 	_save_model_snapshot(stage="init", step=0)
 	def _snapshot(*, stage: str, step: int, loss: float, data) -> None:

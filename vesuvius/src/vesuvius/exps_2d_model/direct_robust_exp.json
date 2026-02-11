@@ -2,7 +2,7 @@
 	"base": {
 		"dir_v": 10.0,
 		"dir_conn": 1.0,
-		"step": 0.1,
+		"step": 100.0,
 		"smooth_x": 0.0,
 		"smooth_y": 0.01,
 		"gradmag": 1.0,
@@ -14,7 +14,8 @@
 		"y_straight": 0.0,
 		"data": 0.4,
 		"data_plain": 0.2,
-		"data_grad": 0.0
+		"data_grad": 0.0,
+		"z_straight": 10.0
 	},
 	"stages": [
 		{
@@ -25,9 +26,7 @@
 			"min_scaledown": 0,
 			"w_fac": {
 				"data": 0.0,
-				"data_plain": 0.0,
-				"dir_conn": 1.0,
-				"gradmag": 1.0
+				"data_plain": 0.0
 			}
 		},
 		{

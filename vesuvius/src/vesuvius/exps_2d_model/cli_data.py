@@ -8,6 +8,16 @@ import torch
 import fit_data
 
 
+def _load_model_params_from_checkpoint(path: str) -> dict | None:
+	st = torch.load(path, map_location="cpu")
+	if not isinstance(st, dict):
+		return None
+	mp = st.get("_model_params_", None)
+	if not isinstance(mp, dict):
+		return None
+	return mp
+
+
 @dataclass(frozen=True)
 class DataConfig:
 	input: str
@@ -47,19 +57,36 @@ def add_args(p: argparse.ArgumentParser) -> None:
 def from_args(args: argparse.Namespace) -> DataConfig:
 	if args.input in (None, ""):
 		raise ValueError("missing --input (can be provided via JSON config args)")
+	crop = tuple(int(v) for v in args.crop) if args.crop is not None else None
+	unet_z = None if args.unet_z is None else int(args.unet_z)
+	z_step = max(1, int(args.z_step))
+	if (crop is None or unet_z is None or int(args.z_step) == 1) and args.unet_checkpoint is not None:
+		mp = _load_model_params_from_checkpoint(str(args.unet_checkpoint))
+		if mp is not None:
+			c6 = mp.get("crop_xyzwhd", None)
+			if isinstance(c6, (list, tuple)) and len(c6) == 6:
+				x, y, w, h, z0, d = (int(v) for v in c6)
+				if crop is None:
+					crop = (x, y, w, h)
+				if unet_z is None:
+					unet_z = int(z0)
+				if args.z_size is None:
+					args.z_size = int(d)
+			if int(args.z_step) == 1 and ("z_step_vx" in mp):
+				z_step = max(1, int(mp["z_step_vx"]))
 	return DataConfig(
 		input=str(args.input),
 		unet_checkpoint=None if args.unet_checkpoint in (None, "") else str(args.unet_checkpoint),
 		unet_layer=None if args.unet_layer is None else int(args.unet_layer),
-		unet_z=None if args.unet_z is None else int(args.unet_z),
-		z_step=max(1, int(args.z_step)),
+		unet_z=unet_z,
+		z_step=z_step,
 		unet_tile_size=int(args.unet_tile_size),
 		unet_overlap=int(args.unet_overlap),
 		unet_border=int(args.unet_border),
 		unet_group=None if args.unet_group in (None, "") else str(args.unet_group),
 		device=str(args.device),
 		downscale=float(args.downscale),
-		crop=tuple(int(v) for v in args.crop) if args.crop is not None else None,
+		crop=crop,
 		grad_mag_blur_sigma=float(getattr(args, "grad_mag_blur_sigma", 0.0) or 0.0),
 		dir_blur_sigma=float(getattr(args, "dir_blur_sigma", 0.0) or 0.0),
 	)
