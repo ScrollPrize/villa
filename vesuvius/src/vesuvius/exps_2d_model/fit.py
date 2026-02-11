@@ -12,6 +12,7 @@ import torch
 import vis
 from dataclasses import asdict
 from dataclasses import replace
+import json
 
 import cli_json
 
@@ -82,26 +83,57 @@ def main(argv: list[str] | None = None) -> int:
 				unet_z_use = data_cfg.unet_z if data_cfg.unet_z is not None else int(z0)
 				data_cfg = replace(data_cfg, crop=crop_use, unet_z=unet_z_use, z_step=int(z_step_use))
 
+	if model_params_in is not None:
+		print("model_params_in:\n" + json.dumps(model_params_in, indent=2, sort_keys=True))
+
 	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
 	device = data.cos.device
 	crop_xyzwhd = None
 	if data_cfg.crop is not None and data_cfg.unet_z is not None:
 		x, y, w, h = (int(v) for v in data_cfg.crop)
 		crop_xyzwhd = (x, y, w, h, int(data_cfg.unet_z), int(z_size_use))
-	mdl = model.Model2D.from_fit_data(
-		data=data,
-		mesh_step_px=int(mesh_step_use),
-		winding_step_px=int(winding_step_use),
-		init_size_frac=model_cfg.init_size_frac,
-		init_size_frac_h=model_cfg.init_size_frac_h,
-		init_size_frac_v=model_cfg.init_size_frac_v,
-		z_size=int(z_size_use),
-		z_step_vx=int(z_step_use),
-		device=device,
-		subsample_mesh=int(subsample_mesh_use),
-		subsample_winding=int(subsample_winding_use),
-		crop_xyzwhd=crop_xyzwhd,
-	)
+
+	if model_cfg.model_input is not None and model_params_in is not None:
+		# Derive model init size from checkpoint tensor shapes (ignore init_size_frac unless creating a new model).
+		st_cpu = torch.load(model_cfg.model_input, map_location="cpu")
+		mesh0 = st_cpu.get("mesh_ms.0", None) if isinstance(st_cpu, dict) else None
+		if mesh0 is None or not hasattr(mesh0, "shape"):
+			raise ValueError("model_input missing mesh_ms.0")
+		gh = int(mesh0.shape[2])
+		gw = int(mesh0.shape[3])
+		init = model.ModelInit(
+			init_size_frac=1.0,
+			init_size_frac_h=None,
+			init_size_frac_v=None,
+			mesh_step_px=int(mesh_step_use),
+			winding_step_px=int(winding_step_use),
+			mesh_h=int(gh),
+			mesh_w=int(gw),
+		)
+		mdl = model.Model2D(
+			init=init,
+			device=device,
+			z_size=int(z_size_use),
+			subsample_mesh=int(subsample_mesh_use),
+			subsample_winding=int(subsample_winding_use),
+			z_step_vx=int(z_step_use),
+			crop_xyzwhd=crop_xyzwhd,
+		)
+	else:
+		mdl = model.Model2D.from_fit_data(
+			data=data,
+			mesh_step_px=int(mesh_step_use),
+			winding_step_px=int(winding_step_use),
+			init_size_frac=model_cfg.init_size_frac,
+			init_size_frac_h=model_cfg.init_size_frac_h,
+			init_size_frac_v=model_cfg.init_size_frac_v,
+			z_size=int(z_size_use),
+			z_step_vx=int(z_step_use),
+			device=device,
+			subsample_mesh=int(subsample_mesh_use),
+			subsample_winding=int(subsample_winding_use),
+			crop_xyzwhd=crop_xyzwhd,
+		)
 	if model_cfg.model_input is not None:
 		st = torch.load(model_cfg.model_input, map_location=device)
 		miss, unexp = mdl.load_state_dict_compat(st, strict=False)
