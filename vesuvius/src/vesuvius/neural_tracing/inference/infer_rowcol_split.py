@@ -800,23 +800,20 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_dire
                 if extrap_result is not None:
                     extrap_local_full = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float64)
                     uv_query_flat = uv_query.reshape(-1, 2)
-                    extrap_in_bounds = _in_bounds_mask(extrap_local_full, crop_size_extrap)
-
-                    if extrap_in_bounds.any():
-                        extrap_local = extrap_local_full[extrap_in_bounds].astype(np.float32)
-                        extrap_uv = uv_query_flat[extrap_in_bounds]
+                    extrap_local = extrap_local_full.astype(np.float32, copy=False)
+                    extrap_uv = uv_query_flat
 
                     extrap_grid_local = extrap_local_full.reshape(uv_query.shape[:2] + (3,))
-                    extrap_grid_valid = _in_bounds_mask(
-                        extrap_grid_local.reshape(-1, 3),
-                        crop_size_extrap,
-                    ).reshape(uv_query.shape[:2])
-                    if extrap_grid_valid.any():
-                        extrap_vox = voxelize_surface_grid_masked(
-                            extrap_grid_local,
-                            crop_size_extrap,
-                            extrap_grid_valid,
-                        )
+                    if np.isfinite(extrap_grid_local).all():
+                        extrap_vox = voxelize_surface_grid(extrap_grid_local, crop_size_extrap)
+                    else:
+                        extrap_grid_valid = np.isfinite(extrap_grid_local).all(axis=-1)
+                        if extrap_grid_valid.any():
+                            extrap_vox = voxelize_surface_grid_masked(
+                                extrap_grid_local,
+                                crop_size_extrap,
+                                extrap_grid_valid,
+                            )
 
         if extrap_vox is None and len(extrap_local) > 0:
             extrap_vox = _points_to_voxels(extrap_local, crop_size)
@@ -876,43 +873,71 @@ def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
 
 
 def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
-    """Run mirroring-based TTA on a single sample, returning averaged displacement.
+    """Run mirroring-based TTA on a batch, returning averaged displacement.
 
     Args:
         model: The model to run inference with.
-        inputs: Input tensor of shape [1, C, D, H, W].
+        inputs: Input tensor of shape [B, C, D, H, W].
         amp_enabled: Whether to use automatic mixed precision.
         amp_dtype: The dtype for AMP.
 
     Returns:
-        Averaged displacement tensor of shape [1, 3, D, H, W].
+        Averaged displacement tensor of shape [B, 3, D, H, W].
     """
-    accum = None
+    if inputs.ndim != 5:
+        raise RuntimeError(f"Expected inputs with shape [B, C, D, H, W], got {tuple(inputs.shape)}")
 
+    batch_size = int(inputs.shape[0])
+    if batch_size <= 0:
+        raise RuntimeError("TTA received an empty batch.")
+
+    # Stack all mirrored variants along the batch dimension and run one forward pass.
+    tta_inputs = []
     for flip_dims in _TTA_FLIP_COMBOS:
-        # Flip input
         x = inputs
         for d in flip_dims:
             x = x.flip(d)
+        tta_inputs.append(x)
 
-        # Forward pass
-        disp = _get_displacement_result(model, x, amp_enabled, amp_dtype)
+    tta_inputs = torch.cat(tta_inputs, dim=0)
+    disp_all = _get_displacement_result(model, tta_inputs, amp_enabled, amp_dtype)
 
-        # Un-flip the displacement output
+    n_tta = len(_TTA_FLIP_COMBOS)
+    expected_batch = batch_size * n_tta
+    if disp_all.shape[0] != expected_batch:
+        raise RuntimeError(
+            f"Unexpected TTA output batch size {disp_all.shape[0]} (expected {expected_batch})."
+        )
+
+    accum = None
+
+    for tta_idx, flip_dims in enumerate(_TTA_FLIP_COMBOS):
+        start = tta_idx * batch_size
+        end = start + batch_size
+        disp = disp_all[start:end]
+
+        # Un-flip displacement outputs back to the original orientation.
         for d in reversed(flip_dims):
             disp = disp.flip(d)
 
-        # Negate displacement channels corresponding to flipped spatial axes
-        for d in flip_dims:
-            ch = _FLIP_DIM_TO_CHANNEL[d]
-            disp[:, ch] = -disp[:, ch]
+        # Negate displacement components along flipped spatial axes.
+        if flip_dims:
+            sign = torch.ones((1, disp.shape[1], 1, 1, 1), device=disp.device, dtype=disp.dtype)
+            for d in flip_dims:
+                ch = _FLIP_DIM_TO_CHANNEL[d]
+                if ch >= disp.shape[1]:
+                    raise RuntimeError(
+                        f"TTA channel index {ch} out of bounds for displacement with {disp.shape[1]} channels."
+                    )
+                sign[:, ch] = -1
+            disp = disp * sign
 
         if accum is None:
             accum = disp
         else:
             accum = accum + disp
 
-    return accum / len(_TTA_FLIP_COMBOS)
+    return accum / float(n_tta)
 
 
 def _run_refine_on_crop(args, crop, crop_size, model_state):
@@ -970,17 +995,11 @@ def _run_refine_on_crop(args, crop, crop_size, model_state):
         coords_t = torch.from_numpy(current_coords).float().to(args.device)
         disp_sampled = _sample_displacement_field(disp_single, coords_t)
         next_coords = (coords_t + disp_sampled * refine_fraction).detach().cpu().numpy().astype(np.float32)
+        finite_mask = np.isfinite(next_coords).all(axis=1)
+        if not finite_mask.all():
+            next_coords[~finite_mask] = current_coords[~finite_mask]
 
-        in_bounds = _in_bounds_mask(next_coords, crop_size)
-        if not in_bounds.any():
-            current_coords = np.zeros((0, 3), dtype=np.float32)
-            if current_uv is not None:
-                current_uv = current_uv[:0]
-            break
-
-        current_coords = next_coords[in_bounds]
-        if current_uv is not None:
-            current_uv = current_uv[in_bounds]
+        current_coords = next_coords
 
     if n_forward == 0:
         return np.zeros((0, 3), dtype=np.float32), None if current_uv is None else current_uv[:0]
@@ -997,17 +1016,23 @@ def _finalize_crop_prediction(args, bbox_idx, crop, pred_local, pred_uv, crop_si
         pred_local_np = np.asarray(pred_local)
 
     pred_world = pred_local_np + crop["min_corner"][None, :]
-    bbox_mask = _filter_points_in_bbox_mask(pred_world, crop["bbox"])
-    pred_world = pred_world[bbox_mask]
+    pred_finite = np.isfinite(pred_world).all(axis=1)
+    if not pred_finite.any():
+        pred_world = np.zeros((0, 3), dtype=np.float32)
+    elif not pred_finite.all():
+        pred_world = pred_world[pred_finite]
 
     pred_sample = None
     if pred_uv is not None:
         pred_uv = np.asarray(pred_uv)
-        if len(pred_uv) == bbox_mask.shape[0]:
-            pred_sample = (pred_uv[bbox_mask], pred_world)
+        if len(pred_uv) == pred_finite.shape[0]:
+            pred_uv_keep = pred_uv[pred_finite]
+            if pred_uv_keep.shape[0] == pred_world.shape[0] and pred_world.shape[0] > 0:
+                pred_sample = (pred_uv_keep, pred_world)
 
     out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
-    _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local_np, crop_size))
+    pred_local_finite = pred_local_np[np.isfinite(pred_local_np).all(axis=1)]
+    _save_crop_tiff(out_dir, "pred.tif", _points_to_voxels(pred_local_finite, crop_size))
     return pred_sample
 
 
@@ -1059,7 +1084,7 @@ def run_inference(args, bbox_crops, crop_size, model_state):
             if pred_sample is not None:
                 pred_samples.append(pred_sample)
     elif use_tta:
-        # TTA path: process one crop at a time to avoid 8x memory blowup.
+        # TTA path: process bboxes sequentially, but batch TTA flips inside _run_model_tta.
         for bbox_idx, crop, inputs, extrap_local in tqdm(valid_items, desc="inference (TTA)"):
             inputs_dev = inputs.to(args.device)
             disp_single = _run_model_tta(model, inputs_dev, amp_enabled, amp_dtype)
