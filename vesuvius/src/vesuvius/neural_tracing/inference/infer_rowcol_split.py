@@ -15,7 +15,6 @@ from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHOD
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.models import load_checkpoint, resolve_checkpoint_path
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
-import edt
 from tqdm import tqdm
 
 VALID_DIRECTIONS = ["left", "right", "down", "up"]
@@ -177,6 +176,18 @@ def _bbox_to_min_corner(bbox):
     z_min, _, y_min, _, x_min, _ = bbox
     return np.floor([z_min, y_min, x_min]).astype(np.int64)
 
+
+def _bbox_to_bounds_array(bbox):
+    z_min, z_max, y_min, y_max, x_min, x_max = bbox
+    return np.asarray(
+        [
+            [z_min, y_min, x_min],
+            [z_max, y_max, x_max],
+        ],
+        dtype=np.int32,
+    )
+
+
 def _crop_volume_from_min_corner(volume, min_corner, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
     max_corner = min_corner + crop_size_arr
@@ -236,10 +247,6 @@ def _points_to_voxels(points_local, crop_size):
 
 def _valid_surface_mask(zyx_grid):
     return np.isfinite(zyx_grid).all(axis=-1) & ~(zyx_grid == -1).all(axis=-1)
-
-def _apply_edt_dilation(vox, dilation_radius):
-    dist = edt.edt(1 - vox, parallel=1)
-    return (dist <= dilation_radius).astype(np.float32)
 
 def _build_model_inputs(vol_crop, cond_vox, extrap_vox, other_wraps_vox=None):
     vol_t = torch.from_numpy(vol_crop).float().unsqueeze(0).unsqueeze(0)
@@ -482,8 +489,6 @@ def load_model(args):
     model.eval()
 
     expected_in_channels = int(model_config.get("in_channels", 3))
-    use_dilation = bool(model_config.get('use_dilation', False))
-    dilation_radius = float(model_config.get('dilation_radius', 1.0))
     mixed_precision = str(model_config.get("mixed_precision", "no")).lower()
     amp_enabled = False
     amp_dtype = torch.float16
@@ -500,8 +505,6 @@ def load_model(args):
         "model_config": model_config,
         "checkpoint_path": checkpoint_path,
         "expected_in_channels": expected_in_channels,
-        "use_dilation": use_dilation,
-        "dilation_radius": dilation_radius,
         "amp_enabled": amp_enabled,
         "amp_dtype": amp_dtype,
         "tifxyz_uuid": tifxyz_uuid,
@@ -532,7 +535,7 @@ def _resolve_extrapolation_settings(args, runtime_config):
 
     method = args.extrapolation_method
     if method is None:
-        method = str(cfg.get("extrapolation_method", "linear_edge"))
+        method = str(cfg.get("extrapolation_method", "rbf"))
 
     degrade_prob = float(cfg.get("extrap_degrade_prob", 0.0))
 
@@ -731,8 +734,7 @@ def run_extrapolation(args, cond_zyxs, window_zyxs, valid, uv_cond, uv_mask, con
 
 def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, crop_size, tgt_segment, volume_scale,
                          extrap_result, extrap_coords_world, extrap_uv_full,
-                         extrap_grid_world,
-                         use_dilation, dilation_radius):
+                         extrap_grid_world):
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
     cond_pts_world = cond_zyxs.reshape(-1, 3)
     cond_valid_mask = ~(cond_pts_world == -1).all(axis=1)
@@ -783,11 +785,6 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, crop_size, tgt_seg
         elif extrap_local is not None:
             extrap_vox = _points_to_voxels(extrap_local, crop_size)
 
-        if use_dilation:
-            cond_vox = _apply_edt_dilation(cond_vox, dilation_radius)
-            if extrap_vox is not None:
-                extrap_vox = _apply_edt_dilation(extrap_vox, dilation_radius)
-
         bbox_crops.append({
             "bbox": bbox,
             "min_corner": min_corner,
@@ -800,6 +797,7 @@ def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, crop_size, tgt_seg
         })
 
         out_dir = Path(args.bbox_crops_out_dir) / f"bbox_{bbox_idx:04d}"
+        _save_crop_tiff(out_dir, "bbox_coords.tif", _bbox_to_bounds_array(bbox))
         _save_crop_tiff(out_dir, "volume.tif", vol_crop)
         _save_crop_tiff(out_dir, "cond.tif", cond_vox)
         if extrap_vox is not None:
@@ -1249,8 +1247,6 @@ def main():
     model_state = None
     model_config = None
     tifxyz_uuid = None
-    use_dilation = False
-    dilation_radius = 1.0
     checkpoint_path = args.checkpoint_path
 
     if has_checkpoint:
@@ -1258,13 +1254,9 @@ def main():
             model_state = load_model(args)
             model_config = model_state["model_config"]
             checkpoint_path = model_state["checkpoint_path"]
-            use_dilation = model_state["use_dilation"]
-            dilation_radius = model_state["dilation_radius"]
             tifxyz_uuid = model_state["tifxyz_uuid"]
         else:
             model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
-            use_dilation = bool(model_config.get('use_dilation', False))
-            dilation_radius = float(model_config.get('dilation_radius', 1.0))
 
     file_config = _load_optional_json(args.config_path)
     runtime_config = dict(model_config) if model_config is not None else {}
@@ -1372,7 +1364,6 @@ def main():
             args, bboxes, cond_zyxs, valid, crop_size, tgt_segment, args.volume_scale,
             extrap_result, extrap_coords_world, extrap_uv_full,
             extrap_grid_world,
-            use_dilation, dilation_radius,
         )
 
         if run_model_inference and model_state is not None:
