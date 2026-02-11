@@ -220,6 +220,11 @@ def unet_infer_tiled(
 	if image.ndim != 4:
 		raise ValueError(f"expected image of shape (N,C,H,W), got {tuple(image.shape)}")
 
+	n, c, h0, w0 = image.shape
+	pad0 = max(0, int(border))
+	if pad0 > 0:
+		image = torch.nn.functional.pad(image, (pad0, pad0, pad0, pad0), mode="reflect")
+
 	n, c, h, w = image.shape
 	if n > 1:
 		# Process batch element-wise to keep tiling/simple.
@@ -328,4 +333,6 @@ def unet_infer_tiled(
 	eps = torch.finfo(dtype).eps if torch.is_floating_point(wsum) else 1e-6
 	wsafe = torch.clamp(wsum, min=eps)
 	out = acc / wsafe
+	if pad0 > 0:
+		return out[:, :, pad0 : pad0 + h0, pad0 : pad0 + w0]
 	return out

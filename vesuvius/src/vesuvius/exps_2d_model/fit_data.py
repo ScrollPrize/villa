@@ -224,17 +224,7 @@ def load(
 		if xywh is None:
 			raise ValueError("non-directory input requires --crop x y w h")
 		x, y, w_c, h_c = (int(v) for v in xywh)
-		ov = max(0, int(unet_overlap))
-		b = max(0, int(unet_border))
-		pad = ov + b
-		# Expanded crop for tiling/blending, then trimmed back to target crop.
-		# Include `border` in the padding so the final crop is unaffected by
-		# tile-edge discard regions.
-		xe = x - pad
-		ye = y - pad
-		we = w_c + 2 * pad
-		he = h_c + 2 * pad
-		expanded_crop = (xe, ye, we, he)
+		crop = (x, y, w_c, h_c)
 
 		z0 = unet_z
 		if z0 is None:
@@ -249,7 +239,7 @@ def load(
 				raw_i = tiled_infer._load_omezarr_z_uint8_norm(
 					path=str(p),
 					z=zv,
-					crop=expanded_crop,
+					crop=crop,
 					device=device,
 				)
 			else:
@@ -290,14 +280,6 @@ def load(
 			tifffile.imwrite(str(prefix) + "_mag.tif", pred_np[1], compression="lzw")
 			tifffile.imwrite(str(prefix) + "_dir0.tif", pred_np[2], compression="lzw")
 			tifffile.imwrite(str(prefix) + "_dir1.tif", pred_np[3], compression="lzw")
-
-		# Trim expanded crop back to requested target crop.
-		_, _, ph, pw = pred.shape
-		x0t = max(0, min(pad, pw))
-		y0t = max(0, min(pad, ph))
-		x1t = max(x0t, min(x0t + w_c, pw))
-		y1t = max(y0t, min(y0t + h_c, ph))
-		pred = pred[:, :, y0t:y1t, x0t:x1t]
 
 		cos_t = pred[:, 0:1]
 		mag_t = pred[:, 1:2]
