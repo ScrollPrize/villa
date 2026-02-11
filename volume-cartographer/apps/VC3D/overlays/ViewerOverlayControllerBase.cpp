@@ -2,6 +2,7 @@
 
 #include "../CVolumeViewer.hpp"
 #include "../ViewerManager.hpp"
+#include "../elements/COutlinedTextItem.hpp"
 
 #include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
@@ -9,6 +10,7 @@
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
+#include <QGraphicsTextItem>
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
@@ -148,13 +150,15 @@ void ViewerOverlayControllerBase::OverlayBuilder::addRect(const QRectF& rect,
 void ViewerOverlayControllerBase::OverlayBuilder::addText(const QPointF& position,
                                                           const QString& text,
                                                           const QFont& font,
-                                                          OverlayStyle style)
+                                                          OverlayStyle style,
+                                                          bool outlined)
 {
     TextPrimitive prim;
     prim.position = position;
     prim.text = text;
     prim.font = font;
     prim.style = style;
+    prim.outlined = outlined;
     _primitives.emplace_back(std::move(prim));
 }
 
@@ -486,6 +490,8 @@ void applyStyle(QGraphicsItem* item, const ViewerOverlayControllerBase::OverlayS
     } else if (auto* ellipseItem = qgraphicsitem_cast<QGraphicsEllipseItem*>(item)) {
         ellipseItem->setPen(pen);
         ellipseItem->setBrush(QBrush(style.brushColor));
+    } else if (auto* outlinedTextItem = qgraphicsitem_cast<QGraphicsTextItem*>(item)) {
+        outlinedTextItem->setDefaultTextColor(style.penColor);
     } else if (auto* textItem = qgraphicsitem_cast<QGraphicsSimpleTextItem*>(item)) {
         textItem->setBrush(QBrush(style.penColor));
         textItem->setPen(pen);
@@ -629,10 +635,19 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                     addItem(item, style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
                     flushPointGroups();
-                    auto* item = new QGraphicsSimpleTextItem(prim.text);
-                    item->setFont(prim.font);
-                    item->setPos(prim.position);
-                    addItem(item, prim.style);
+                    if (prim.outlined) {
+                        auto* item = new COutlinedTextItem();
+                        item->setPlainText(prim.text);
+                        item->setFont(prim.font);
+                        item->setDefaultTextColor(prim.style.penColor);
+                        item->setPos(prim.position);
+                        addItem(item, prim.style);
+                    } else {
+                        auto* item = new QGraphicsSimpleTextItem(prim.text);
+                        item->setFont(prim.font);
+                        item->setPos(prim.position);
+                        addItem(item, prim.style);
+                    }
                 } else if constexpr (std::is_same_v<T, PathPrimitive>) {
                     flushPointGroups();
                     if (prim.points.empty()) {

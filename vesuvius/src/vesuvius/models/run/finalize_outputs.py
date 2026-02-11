@@ -51,6 +51,8 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     is_multi_task = config.is_multi_task
     target_info = config.target_info
 
+    single_channel_binary = mode == "binary" and (not is_multi_task or not target_info) and num_classes == 1
+
     if mode == "binary":
         if is_multi_task and target_info:
             target_results = []
@@ -67,6 +69,14 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                     fg_prob = softmax[1]
                     target_results.append(fg_prob)
             output_data = np.stack(target_results, axis=0)
+        elif num_classes == 1:
+            # Single-channel logits: interpret channel as foreground logit.
+            logits = logits_np[0].astype(np.float32)
+            if threshold:
+                output_data = (logits > 0).astype(np.float32)[np.newaxis, ...]
+            else:
+                probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -20, 20)))
+                output_data = probs[np.newaxis, ...]
         else:
             exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
             softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
@@ -88,18 +98,21 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
 
     output_np = output_data
 
-    # Scale to uint8 range [0, 255]
-    min_val = output_np.min()
-    max_val = output_np.max()
-    if min_val < max_val:
-        output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+    if single_channel_binary:
+        output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
     else:
-        return None, True
+        # Scale to uint8 range [0, 255]
+        min_val = output_np.min()
+        max_val = output_np.max()
+        if min_val < max_val:
+            output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        else:
+            return None, True
 
-    # Final check: if the processed data is homogeneous, don't write it
-    first_processed_value = output_np.flat[0]
-    if np.all(output_np == first_processed_value):
-        return None, True
+        # Final check: if the processed data is homogeneous, don't write it
+        first_processed_value = output_np.flat[0]
+        if np.all(output_np == first_processed_value):
+            return None, True
 
     return output_np, False
 
@@ -268,8 +281,10 @@ def finalize_logits(
             expected_channels = sum(info['out_channels'] for info in target_info.values())
             if num_classes != expected_channels:
                 raise ValueError(f"Multi-task binary mode expects {expected_channels} total channels, but input has {num_classes} channels.")
-        elif num_classes != 2:
-            raise ValueError(f"Binary mode expects 2 channels, but input has {num_classes} channels.")
+        elif num_classes not in (1, 2):
+            raise ValueError(f"Binary mode expects 1 or 2 channels, but input has {num_classes} channels.")
+        elif num_classes == 1:
+            print("Detected single-channel binary logits. Using sigmoid finalization (or logit>0 with --threshold).")
     elif mode == "multiclass" and num_classes < 2:
         raise ValueError(f"Multiclass mode expects at least 2 channels, but input has {num_classes} channels.")
     
@@ -297,14 +312,21 @@ def finalize_logits(
             else:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
         else:
-            if threshold:
-                # If thresholding, only output argmax channel for binary
-                output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
-                print("Output will have 1 channel: [binary_mask]")
-            else:
-                 # Just softmax of FG class
+            if num_classes == 1:
                 output_shape = (1, *spatial_shape)
-                print("Output will have 1 channel: [softmax_fg]")
+                if threshold:
+                    print("Output will have 1 channel: [binary_mask_from_logit]")
+                else:
+                    print("Output will have 1 channel: [sigmoid_fg]")
+            else:
+                if threshold:
+                    # If thresholding, only output argmax channel for binary
+                    output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
+                    print("Output will have 1 channel: [binary_mask]")
+                else:
+                     # Just softmax of FG class
+                    output_shape = (1, *spatial_shape)
+                    print("Output will have 1 channel: [softmax_fg]")
     else:  # multiclass
         if threshold:
             # If threshold is provided for multiclass, only save the argmax

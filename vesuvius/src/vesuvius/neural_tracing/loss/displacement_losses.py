@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 
 def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
-                         loss_type='vector_l2', beta=5.0):
+                         loss_type='vector_l2', beta=5.0, sample_weights=None):
     """
     Sample predicted displacement field at extrapolated surface coords.
 
@@ -18,6 +18,7 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
         extrap_coords: (B, N, 3) surface point coords in [0, shape) range (z, y, x)
         gt_displacement: (B, N, 3) ground truth displacement (dz, dy, dx)
         valid_mask: (B, N) binary mask for valid (non-padded) points
+        sample_weights: optional (B, N) per-point loss weights
         loss_type: Loss formulation:
             - 'vector_l2': Squared Euclidean distance (default)
             - 'vector_huber': Huber loss on Euclidean distance
@@ -59,8 +60,13 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-    masked_diff = diff * valid_mask
-    loss = masked_diff.sum() / valid_mask.sum().clamp(min=1)
+    if sample_weights is None:
+        effective_mask = valid_mask
+    else:
+        effective_mask = valid_mask * sample_weights
+
+    masked_diff = diff * effective_mask
+    loss = masked_diff.sum() / effective_mask.sum().clamp(min=1)
 
     return loss
 

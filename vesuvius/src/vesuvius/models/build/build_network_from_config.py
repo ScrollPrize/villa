@@ -194,6 +194,10 @@ class NetworkFromConfig(nn.Module):
                     min_feature_map_size=4,
                     max_numpool=999999
                 )
+            # Convert tuples from get_pool_and_conv_props to mutable lists so we can
+            # trim/extend and selectively override with user-provided settings.
+            pool_op_kernel_sizes = [list(k) for k in pool_op_kernel_sizes]
+            conv_kernel_sizes = [list(k) for k in conv_kernel_sizes]
 
             self.num_pool_per_axis = num_pool_per_axis
             self.must_be_divisible_by = must_div
@@ -223,11 +227,73 @@ class NetworkFromConfig(nn.Module):
                     features.append(min(feats, max_features))
                 self.features_per_stage = features
             
-            self.n_blocks_per_stage = get_n_blocks_per_stage(self.num_stages)
-            self.n_conv_per_stage_decoder = [1] * (self.num_stages - 1)
-            self.strides = pool_op_kernel_sizes
-            self.kernel_sizes = conv_kernel_sizes
-            self.pool_op_kernel_sizes = pool_op_kernel_sizes
+            manual_n_blocks = model_config.get("n_blocks_per_stage", None)
+            if manual_n_blocks is None:
+                self.n_blocks_per_stage = get_n_blocks_per_stage(self.num_stages)
+            else:
+                if isinstance(manual_n_blocks, int):
+                    manual_n_blocks = [manual_n_blocks] * self.num_stages
+                elif isinstance(manual_n_blocks, tuple):
+                    manual_n_blocks = list(manual_n_blocks)
+
+                if len(manual_n_blocks) != self.num_stages:
+                    raise ValueError(
+                        f"n_blocks_per_stage must have {self.num_stages} entries to match features_per_stage. "
+                        f"Got {len(manual_n_blocks)} entries: {manual_n_blocks}"
+                    )
+                self.n_blocks_per_stage = manual_n_blocks
+                print(f"Using provided n_blocks_per_stage: {self.n_blocks_per_stage}")
+            # Respect user-provided architecture details in autoconfigure mode and
+            # only fill missing parts from auto-derived defaults.
+            self.n_conv_per_stage_decoder = model_config.get(
+                "n_conv_per_stage_decoder",
+                [1] * (self.num_stages - 1)
+            )
+            self.strides = model_config.get("strides", pool_op_kernel_sizes)
+            self.kernel_sizes = model_config.get("kernel_sizes", conv_kernel_sizes)
+            self.pool_op_kernel_sizes = model_config.get("pool_op_kernel_sizes", pool_op_kernel_sizes)
+
+            # Validate stage-wise list lengths in autoconfigure mode.
+            if len(self.kernel_sizes) != self.num_stages:
+                raise ValueError(
+                    f"kernel_sizes must have {self.num_stages} entries, got {len(self.kernel_sizes)}."
+                )
+            if len(self.strides) != self.num_stages:
+                raise ValueError(
+                    f"strides must have {self.num_stages} entries, got {len(self.strides)}."
+                )
+            if len(self.pool_op_kernel_sizes) != self.num_stages:
+                raise ValueError(
+                    f"pool_op_kernel_sizes must have {self.num_stages} entries, got {len(self.pool_op_kernel_sizes)}."
+                )
+            if len(self.n_conv_per_stage_decoder) != (self.num_stages - 1):
+                raise ValueError(
+                    f"n_conv_per_stage_decoder must have {self.num_stages - 1} entries, "
+                    f"got {len(self.n_conv_per_stage_decoder)}."
+                )
+
+            # Check dimensionality for user-provided or auto-filled stage settings.
+            for i in range(len(self.kernel_sizes)):
+                if len(self.kernel_sizes[i]) != self.op_dims:
+                    raise ValueError(
+                        f"Kernel size at stage {i} has {len(self.kernel_sizes[i])} dimensions "
+                        f"but patch size indicates {self.op_dims}D operations. "
+                        f"Kernel: {self.kernel_sizes[i]}, Expected dimensions: {self.op_dims}"
+                    )
+            for i in range(len(self.strides)):
+                if len(self.strides[i]) != self.op_dims:
+                    raise ValueError(
+                        f"Stride at stage {i} has {len(self.strides[i])} dimensions "
+                        f"but patch size indicates {self.op_dims}D operations. "
+                        f"Stride: {self.strides[i]}, Expected dimensions: {self.op_dims}"
+                    )
+            for i in range(len(self.pool_op_kernel_sizes)):
+                if len(self.pool_op_kernel_sizes[i]) != self.op_dims:
+                    raise ValueError(
+                        f"Pool kernel size at stage {i} has {len(self.pool_op_kernel_sizes[i])} dimensions "
+                        f"but patch size indicates {self.op_dims}D operations. "
+                        f"Pool kernel: {self.pool_op_kernel_sizes[i]}, Expected dimensions: {self.op_dims}"
+                    )
         else:
             print("--- Configuring network from config file ---")
             self.basic_encoder_block = model_config.get("basic_encoder_block", "BasicBlockD")

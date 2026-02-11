@@ -7,7 +7,6 @@ add_library(vc_core
         src/Segmentation.cpp
         src/Volume.cpp
         src/VolumePkg.cpp
-        src/ChunkedTensor.cpp
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
         src/Logging.cpp
@@ -124,7 +123,7 @@ if(VC_USE_PCH)
     target_precompile_headers(vc_ui REUSE_FROM vc_core)
 endif()
 
-add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp)
+add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp src/ChunkedTensor.cpp)
 target_link_libraries(vc_tracer PUBLIC vc_core vc_ui Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 if(VC_USE_PCH)

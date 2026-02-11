@@ -108,6 +108,15 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::editUnapprovedMaskChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApproveEditsChanged,
             this, &SegmentationWidget::autoApproveEditsChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalEnabledChanged,
+            this, &SegmentationWidget::autoApprovalEnabledChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalRadiusChanged,
+            this, &SegmentationWidget::autoApprovalRadiusChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalThresholdChanged,
+            this, &SegmentationWidget::autoApprovalThresholdChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalMaxDistanceChanged,
+            this, &SegmentationWidget::autoApprovalMaxDistanceChanged);
+
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushRadiusChanged,
             this, &SegmentationWidget::approvalBrushRadiusChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushDepthChanged,
@@ -254,6 +263,11 @@ bool SegmentationWidget::showApprovalMask() const { return _approvalMaskPanel->s
 bool SegmentationWidget::editApprovedMask() const { return _approvalMaskPanel->editApprovedMask(); }
 bool SegmentationWidget::editUnapprovedMask() const { return _approvalMaskPanel->editUnapprovedMask(); }
 bool SegmentationWidget::autoApproveEdits() const { return _approvalMaskPanel->autoApproveEdits(); }
+bool SegmentationWidget::autoApprovalEnabled() const { return _approvalMaskPanel->autoApprovalEnabled(); }
+float SegmentationWidget::autoApprovalRadius() const { return _approvalMaskPanel->autoApprovalRadius(); }
+float SegmentationWidget::autoApprovalThreshold() const { return _approvalMaskPanel->autoApprovalThreshold(); }
+float SegmentationWidget::autoApprovalMaxDistance() const { return _approvalMaskPanel->autoApprovalMaxDistance(); }
+
 float SegmentationWidget::approvalBrushRadius() const { return _approvalMaskPanel->approvalBrushRadius(); }
 float SegmentationWidget::approvalBrushDepth() const { return _approvalMaskPanel->approvalBrushDepth(); }
 int SegmentationWidget::approvalMaskOpacity() const { return _approvalMaskPanel->approvalMaskOpacity(); }
@@ -263,6 +277,11 @@ void SegmentationWidget::setShowApprovalMask(bool enabled) { _approvalMaskPanel-
 void SegmentationWidget::setEditApprovedMask(bool enabled) { _approvalMaskPanel->setEditApprovedMask(enabled); }
 void SegmentationWidget::setEditUnapprovedMask(bool enabled) { _approvalMaskPanel->setEditUnapprovedMask(enabled); }
 void SegmentationWidget::setAutoApproveEdits(bool enabled) { _approvalMaskPanel->setAutoApproveEdits(enabled); }
+void SegmentationWidget::setAutoApprovalEnabled(bool enabled) { _approvalMaskPanel->setAutoApprovalEnabled(enabled); }
+void SegmentationWidget::setAutoApprovalRadius(float radius) { _approvalMaskPanel->setAutoApprovalRadius(radius); }
+void SegmentationWidget::setAutoApprovalThreshold(float threshold) { _approvalMaskPanel->setAutoApprovalThreshold(threshold); }
+void SegmentationWidget::setAutoApprovalMaxDistance(float distance) { _approvalMaskPanel->setAutoApprovalMaxDistance(distance); }
+
 void SegmentationWidget::setApprovalBrushRadius(float radius) { _approvalMaskPanel->setApprovalBrushRadius(radius); }
 void SegmentationWidget::setApprovalBrushDepth(float depth) { _approvalMaskPanel->setApprovalBrushDepth(depth); }
 void SegmentationWidget::setApprovalMaskOpacity(int opacity) { _approvalMaskPanel->setApprovalMaskOpacity(opacity); }

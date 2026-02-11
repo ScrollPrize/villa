@@ -57,6 +57,46 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     _chkAutoApproveEdits->setToolTip(tr("Automatically add edited surface regions to the approval mask."));
     approvalLayout->addWidget(_chkAutoApproveEdits);
 
+    // Auto-approval settings row: radius, threshold, max distance
+    auto* autoApprovalRow = new QHBoxLayout();
+    autoApprovalRow->setSpacing(8);
+
+    auto* autoRadiusLabel = new QLabel(tr("Overpaint:"), approvalParent);
+    _spinAutoApprovalRadius = new QDoubleSpinBox(approvalParent);
+    _spinAutoApprovalRadius->setDecimals(1);
+    _spinAutoApprovalRadius->setRange(0.0, 10.0);
+    _spinAutoApprovalRadius->setSingleStep(0.1);
+    _spinAutoApprovalRadius->setToolTip(tr("Overpainting radius in grid steps around edited vertices.\n"
+                                           "0 = only exact edited vertices\n"
+                                           "0.5 = small overpainting (default)\n"
+                                           ">1 = larger overpainting region"));
+    autoApprovalRow->addWidget(autoRadiusLabel);
+    autoApprovalRow->addWidget(_spinAutoApprovalRadius);
+
+    auto* autoThresholdLabel = new QLabel(tr("Min Change:"), approvalParent);
+    _spinAutoApprovalThreshold = new QDoubleSpinBox(approvalParent);
+    _spinAutoApprovalThreshold->setDecimals(1);
+    _spinAutoApprovalThreshold->setRange(0.0, 10.0);
+    _spinAutoApprovalThreshold->setSingleStep(0.1);
+    _spinAutoApprovalThreshold->setToolTip(tr("Minimum vertex displacement (world units) to auto-approve.\n"
+                                              "0 = approve all edited vertices\n"
+                                              ">0 = skip vertices that moved less than this amount"));
+    autoApprovalRow->addWidget(autoThresholdLabel);
+    autoApprovalRow->addWidget(_spinAutoApprovalThreshold);
+
+    auto* autoMaxDistLabel = new QLabel(tr("Max Dist:"), approvalParent);
+    _spinAutoApprovalMaxDistance = new QDoubleSpinBox(approvalParent);
+    _spinAutoApprovalMaxDistance->setDecimals(0);
+    _spinAutoApprovalMaxDistance->setRange(0.0, 500.0);
+    _spinAutoApprovalMaxDistance->setSingleStep(1.0);
+    _spinAutoApprovalMaxDistance->setToolTip(tr("Maximum grid distance from drag center to auto-approve.\n"
+                                               "0 = unlimited (approve all edited vertices)\n"
+                                               ">0 = skip vertices farther than this from drag center"));
+    autoApprovalRow->addWidget(autoMaxDistLabel);
+    autoApprovalRow->addWidget(_spinAutoApprovalMaxDistance);
+    autoApprovalRow->addStretch(1);
+    approvalLayout->addLayout(autoApprovalRow);
+
     // Cylinder brush controls: radius and depth
     auto* approvalBrushRow = new QHBoxLayout();
     approvalBrushRow->setSpacing(8);
@@ -147,7 +187,19 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     });
 
     connect(_chkAutoApproveEdits, &QCheckBox::toggled, this, [this](bool enabled) {
-        setAutoApproveEdits(enabled);
+        setAutoApprovalEnabled(enabled);
+    });
+
+    connect(_spinAutoApprovalRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setAutoApprovalRadius(static_cast<float>(value));
+    });
+
+    connect(_spinAutoApprovalThreshold, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setAutoApprovalThreshold(static_cast<float>(value));
+    });
+
+    connect(_spinAutoApprovalMaxDistance, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setAutoApprovalMaxDistance(static_cast<float>(value));
     });
 
     connect(_spinApprovalBrushRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
@@ -251,20 +303,79 @@ void SegmentationApprovalMaskPanel::setEditUnapprovedMask(bool enabled)
 
 void SegmentationApprovalMaskPanel::setAutoApproveEdits(bool enabled)
 {
-    if (_autoApproveEdits == enabled) {
+    setAutoApprovalEnabled(enabled);
+}
+
+void SegmentationApprovalMaskPanel::setAutoApprovalEnabled(bool enabled)
+{
+    if (_autoApprovalEnabled == enabled) {
         return;
     }
-    _autoApproveEdits = enabled;
+    _autoApprovalEnabled = enabled;
     qInfo() << "SegmentationWidget: Auto-approve edits changed to:" << enabled;
     if (!_restoringSettings) {
-        writeSetting(QStringLiteral("approval_auto_approve_edits"), _autoApproveEdits);
-        emit autoApproveEditsChanged(_autoApproveEdits);
+        writeSetting(QStringLiteral("auto_approval_enabled"), _autoApprovalEnabled);
+        emit autoApprovalEnabledChanged(_autoApprovalEnabled);
+        emit autoApproveEditsChanged(_autoApprovalEnabled);
     }
     if (_chkAutoApproveEdits) {
         const QSignalBlocker blocker(_chkAutoApproveEdits);
-        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+        _chkAutoApproveEdits->setChecked(_autoApprovalEnabled);
     }
 }
+
+void SegmentationApprovalMaskPanel::setAutoApprovalRadius(float radius)
+{
+    const float sanitized = std::clamp(radius, 0.0f, 10.0f);
+    if (std::abs(_autoApprovalRadius - sanitized) < 1e-4f) {
+        return;
+    }
+    _autoApprovalRadius = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("auto_approval_radius"), _autoApprovalRadius);
+        emit autoApprovalRadiusChanged(_autoApprovalRadius);
+    }
+    if (_spinAutoApprovalRadius) {
+        const QSignalBlocker blocker(_spinAutoApprovalRadius);
+        _spinAutoApprovalRadius->setValue(static_cast<double>(_autoApprovalRadius));
+    }
+}
+
+void SegmentationApprovalMaskPanel::setAutoApprovalThreshold(float threshold)
+{
+    const float sanitized = std::clamp(threshold, 0.0f, 10.0f);
+    if (std::abs(_autoApprovalThreshold - sanitized) < 1e-4f) {
+        return;
+    }
+    _autoApprovalThreshold = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("auto_approval_threshold"), _autoApprovalThreshold);
+        emit autoApprovalThresholdChanged(_autoApprovalThreshold);
+    }
+    if (_spinAutoApprovalThreshold) {
+        const QSignalBlocker blocker(_spinAutoApprovalThreshold);
+        _spinAutoApprovalThreshold->setValue(static_cast<double>(_autoApprovalThreshold));
+    }
+}
+
+void SegmentationApprovalMaskPanel::setAutoApprovalMaxDistance(float distance)
+{
+    const float sanitized = std::clamp(distance, 0.0f, 500.0f);
+    if (std::abs(_autoApprovalMaxDistance - sanitized) < 1e-4f) {
+        return;
+    }
+    _autoApprovalMaxDistance = sanitized;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("auto_approval_max_distance"), _autoApprovalMaxDistance);
+        emit autoApprovalMaxDistanceChanged(_autoApprovalMaxDistance);
+    }
+    if (_spinAutoApprovalMaxDistance) {
+        const QSignalBlocker blocker(_spinAutoApprovalMaxDistance);
+        _spinAutoApprovalMaxDistance->setValue(static_cast<double>(_autoApprovalMaxDistance));
+    }
+}
+
+
 
 void SegmentationApprovalMaskPanel::setApprovalBrushRadius(float radius)
 {
@@ -354,7 +465,20 @@ void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
         _approvalBrushColor = QColor::fromString(colorName);
     }
     _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
-    _autoApproveEdits = settings.value(segmentation::APPROVAL_AUTO_APPROVE_EDITS, _autoApproveEdits).toBool();
+
+    // Auto-approval settings — fall back to legacy key if new key not found
+    if (settings.contains(segmentation::AUTO_APPROVAL_ENABLED)) {
+        _autoApprovalEnabled = settings.value(segmentation::AUTO_APPROVAL_ENABLED, _autoApprovalEnabled).toBool();
+    } else {
+        _autoApprovalEnabled = settings.value(segmentation::APPROVAL_AUTO_APPROVE_EDITS, _autoApprovalEnabled).toBool();
+    }
+    _autoApprovalRadius = settings.value(segmentation::AUTO_APPROVAL_RADIUS, _autoApprovalRadius).toFloat();
+    _autoApprovalRadius = std::clamp(_autoApprovalRadius, 0.0f, 10.0f);
+    _autoApprovalThreshold = settings.value(segmentation::AUTO_APPROVAL_THRESHOLD, _autoApprovalThreshold).toFloat();
+    _autoApprovalThreshold = std::clamp(_autoApprovalThreshold, 0.0f, 10.0f);
+    _autoApprovalMaxDistance = settings.value(segmentation::AUTO_APPROVAL_MAX_DISTANCE, _autoApprovalMaxDistance).toFloat();
+    _autoApprovalMaxDistance = std::clamp(_autoApprovalMaxDistance, 0.0f, 500.0f);
+
     // Don't restore edit states - user must explicitly enable editing each session
 
     _restoringSettings = false;
@@ -378,7 +502,19 @@ void SegmentationApprovalMaskPanel::syncUiState()
     }
     if (_chkAutoApproveEdits) {
         const QSignalBlocker blocker(_chkAutoApproveEdits);
-        _chkAutoApproveEdits->setChecked(_autoApproveEdits);
+        _chkAutoApproveEdits->setChecked(_autoApprovalEnabled);
+    }
+    if (_spinAutoApprovalRadius) {
+        const QSignalBlocker blocker(_spinAutoApprovalRadius);
+        _spinAutoApprovalRadius->setValue(static_cast<double>(_autoApprovalRadius));
+    }
+    if (_spinAutoApprovalThreshold) {
+        const QSignalBlocker blocker(_spinAutoApprovalThreshold);
+        _spinAutoApprovalThreshold->setValue(static_cast<double>(_autoApprovalThreshold));
+    }
+    if (_spinAutoApprovalMaxDistance) {
+        const QSignalBlocker blocker(_spinAutoApprovalMaxDistance);
+        _spinAutoApprovalMaxDistance->setValue(static_cast<double>(_autoApprovalMaxDistance));
     }
     if (_sliderApprovalMaskOpacity) {
         const QSignalBlocker blocker(_sliderApprovalMaskOpacity);

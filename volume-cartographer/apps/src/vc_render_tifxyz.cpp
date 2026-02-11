@@ -3,7 +3,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/ABFFlattening.hpp"
 

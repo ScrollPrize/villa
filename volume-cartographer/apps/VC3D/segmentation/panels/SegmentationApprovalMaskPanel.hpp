@@ -26,7 +26,12 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
-    [[nodiscard]] bool autoApproveEdits() const { return _autoApproveEdits; }
+    [[nodiscard]] bool autoApproveEdits() const { return _autoApprovalEnabled; }
+    [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
+    [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
+    [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
+    [[nodiscard]] float autoApprovalMaxDistance() const { return _autoApprovalMaxDistance; }
+
     [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
@@ -37,6 +42,11 @@ public:
     void setEditApprovedMask(bool enabled);
     void setEditUnapprovedMask(bool enabled);
     void setAutoApproveEdits(bool enabled);
+    void setAutoApprovalEnabled(bool enabled);
+    void setAutoApprovalRadius(float radius);
+    void setAutoApprovalThreshold(float threshold);
+    void setAutoApprovalMaxDistance(float distance);
+
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
     void setApprovalMaskOpacity(int opacity);
@@ -50,6 +60,11 @@ signals:
     void editApprovedMaskChanged(bool enabled);
     void editUnapprovedMaskChanged(bool enabled);
     void autoApproveEditsChanged(bool enabled);
+    void autoApprovalEnabledChanged(bool enabled);
+    void autoApprovalRadiusChanged(float radius);
+    void autoApprovalThresholdChanged(float threshold);
+    void autoApprovalMaxDistanceChanged(float distance);
+
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
     void approvalMaskOpacityChanged(int opacity);
@@ -64,6 +79,10 @@ private:
     QCheckBox* _chkEditApprovedMask{nullptr};
     QCheckBox* _chkEditUnapprovedMask{nullptr};
     QCheckBox* _chkAutoApproveEdits{nullptr};
+    QDoubleSpinBox* _spinAutoApprovalRadius{nullptr};
+    QDoubleSpinBox* _spinAutoApprovalThreshold{nullptr};
+    QDoubleSpinBox* _spinAutoApprovalMaxDistance{nullptr};
+
     QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
     QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
     QSlider* _sliderApprovalMaskOpacity{nullptr};
@@ -74,7 +93,11 @@ private:
     bool _showApprovalMask{false};
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
-    bool _autoApproveEdits{true};
+    bool _autoApprovalEnabled{true};
+    float _autoApprovalRadius{0.5f};
+    float _autoApprovalThreshold{0.0f};
+    float _autoApprovalMaxDistance{0.0f};
+
     float _approvalBrushRadius{50.0f};
     float _approvalBrushDepth{15.0f};
     int _approvalMaskOpacity{50};

@@ -43,9 +43,11 @@ class EdtSegDataset(Dataset):
 
         config.setdefault('use_sdt', False)
         config.setdefault('dilation_radius', 1)  # voxels
-        config.setdefault('cond_percent', 0.5)
+        config.setdefault('cond_percent', [0.5, 0.5])
         config.setdefault('use_extrapolation', True)
         config.setdefault('extrapolation_method', 'linear_edge')
+        config.setdefault('supervise_conditioning', False)
+        config.setdefault('cond_supervision_weight', 0.1)
         config.setdefault('force_recompute_patches', False)
         config.setdefault('use_heatmap_targets', False)
         config.setdefault('heatmap_step_size', 10)
@@ -68,6 +70,16 @@ class EdtSegDataset(Dataset):
         config.setdefault('skip_chunk_if_any_invalid', False)
         config.setdefault('min_cond_span', 0.3)
         config.setdefault('inner_bbox_fraction', 0.7)
+        cond_local_perturb = dict(config.get('cond_local_perturb') or {})
+        cond_local_perturb.setdefault('enabled', True)
+        cond_local_perturb.setdefault('probability', 0.35)
+        cond_local_perturb.setdefault('num_blobs', [1, 3])
+        cond_local_perturb.setdefault('points_affected', 10)
+        cond_local_perturb.setdefault('sigma_fraction_range', [0.04, 0.10])
+        cond_local_perturb.setdefault('amplitude_range', [0.25, 1.25])
+        cond_local_perturb.setdefault('radius_sigma_mult', 2.5)
+        cond_local_perturb.setdefault('max_total_displacement', 6.0)
+        config['cond_local_perturb'] = cond_local_perturb
 
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -146,9 +158,134 @@ class EdtSegDataset(Dataset):
                 ))
 
         self.patches = patches
+        self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
 
     def __len__(self):
         return len(self.patches)
+
+    def _parse_cond_percent(self):
+        spec = self.config['cond_percent']
+        if not isinstance(spec, (list, tuple)) or len(spec) != 2:
+            raise ValueError("cond_percent must be [min, max], e.g. [0.1, 0.5]")
+
+        low, high = float(spec[0]), float(spec[1])
+        if not (0.0 < low <= high < 1.0):
+            raise ValueError("cond_percent values must satisfy 0 < min <= max < 1")
+        return low, high
+
+    @staticmethod
+    def _compute_surface_normals(surface_zyxs: np.ndarray) -> np.ndarray:
+        """Estimate per-point unit normals from local row/col tangents."""
+        h, w, _ = surface_zyxs.shape
+        if h < 2 or w < 2:
+            return np.zeros_like(surface_zyxs, dtype=np.float32)
+
+        surface = surface_zyxs.astype(np.float32, copy=False)
+        row_tangent = np.empty_like(surface)
+        col_tangent = np.empty_like(surface)
+
+        row_tangent[1:-1] = surface[2:] - surface[:-2]
+        row_tangent[0] = surface[1] - surface[0]
+        row_tangent[-1] = surface[-1] - surface[-2]
+
+        col_tangent[:, 1:-1] = surface[:, 2:] - surface[:, :-2]
+        col_tangent[:, 0] = surface[:, 1] - surface[:, 0]
+        col_tangent[:, -1] = surface[:, -1] - surface[:, -2]
+
+        normals = np.cross(col_tangent, row_tangent)
+        norms = np.linalg.norm(normals, axis=-1, keepdims=True)
+        normals = normals / np.maximum(norms, 1e-6)
+        normals[norms[..., 0] <= 1e-6] = 0.0
+        return normals.astype(np.float32, copy=False)
+
+    def _maybe_perturb_conditioning_surface(self, cond_zyxs: np.ndarray) -> np.ndarray:
+        """Apply local normal-direction pushes with Gaussian falloff on small regions."""
+        cfg = self.config.get('cond_local_perturb', {})
+        if not self.apply_augmentation or not cfg.get('enabled', True):
+            return cond_zyxs
+        if random.random() >= float(cfg.get('probability', 0.35)):
+            return cond_zyxs
+
+        cond_h, cond_w, _ = cond_zyxs.shape
+        if cond_h < 2 or cond_w < 2:
+            return cond_zyxs
+
+        normals = self._compute_surface_normals(cond_zyxs)
+        valid_normal_idx = np.argwhere(np.linalg.norm(normals, axis=-1) > 1e-6)
+        if len(valid_normal_idx) == 0:
+            return cond_zyxs
+
+        blob_cfg = cfg.get('num_blobs', [1, 3])
+        if isinstance(blob_cfg, (list, tuple)) and len(blob_cfg) == 2:
+            min_blobs = max(1, int(blob_cfg[0]))
+            max_blobs = max(min_blobs, int(blob_cfg[1]))
+        else:
+            min_blobs = max_blobs = 1
+        n_blobs = random.randint(min_blobs, max_blobs)
+
+        sigma_cfg = cfg.get('sigma_fraction_range', [0.04, 0.10])
+        if isinstance(sigma_cfg, (list, tuple)) and len(sigma_cfg) == 2:
+            sigma_lo_frac = max(0.01, float(sigma_cfg[0]))
+            sigma_hi_frac = max(sigma_lo_frac, float(sigma_cfg[1]))
+        else:
+            sigma_lo_frac, sigma_hi_frac = 0.04, 0.10
+        sigma_scale = float(min(cond_h, cond_w))
+        sigma_lo = max(0.3, sigma_lo_frac * sigma_scale)
+        sigma_hi = max(sigma_lo, sigma_hi_frac * sigma_scale)
+
+        amp_cfg = cfg.get('amplitude_range', [0.25, 1.25])
+        if isinstance(amp_cfg, (list, tuple)) and len(amp_cfg) == 2:
+            amp_lo = max(0.0, float(amp_cfg[0]))
+            amp_hi = max(amp_lo, float(amp_cfg[1]))
+        else:
+            amp_lo, amp_hi = 0.25, 1.25
+
+        radius_sigma_mult = max(0.5, float(cfg.get('radius_sigma_mult', 2.5)))
+        max_total_disp = max(0.0, float(cfg.get('max_total_displacement', 1.5)))
+        if max_total_disp <= 0.0:
+            return cond_zyxs
+
+        rr, cc = np.meshgrid(np.arange(cond_h), np.arange(cond_w), indexing='ij')
+        disp_along_normal = np.zeros((cond_h, cond_w), dtype=np.float32)
+        points_affected = int(cfg.get('points_affected', 10))
+        use_k_neighborhood = points_affected > 0
+
+        for _ in range(n_blobs):
+            seed_r, seed_c = valid_normal_idx[np.random.randint(len(valid_normal_idx))]
+
+            dr = rr - float(seed_r)
+            dc = cc - float(seed_c)
+            dist2 = dr * dr + dc * dc
+
+            if use_k_neighborhood:
+                flat_dist2 = dist2.reshape(-1)
+                k = min(points_affected, flat_dist2.size)
+                if k <= 0:
+                    continue
+                kth_idx = np.argpartition(flat_dist2, k - 1)[k - 1]
+                radius2 = float(flat_dist2[kth_idx])
+                local_mask = dist2 <= radius2
+                sigma = max(0.3, np.sqrt(max(radius2, 1e-6)) / max(radius_sigma_mult, 1e-3))
+            else:
+                sigma = random.uniform(sigma_lo, sigma_hi)
+                radius2 = (radius_sigma_mult * sigma) ** 2
+                local_mask = dist2 <= radius2
+
+            if not np.any(local_mask):
+                continue
+
+            amp = random.uniform(amp_lo, amp_hi)
+            signed_amp = amp if random.random() < 0.5 else -amp
+            falloff = np.exp(-0.5 * dist2 / max(sigma * sigma, 1e-6))
+            disp_along_normal[local_mask] += (signed_amp * falloff[local_mask]).astype(np.float32)
+
+        if not np.any(disp_along_normal):
+            return cond_zyxs
+
+        disp_along_normal = np.clip(disp_along_normal, -max_total_disp, max_total_disp)
+        perturbed = cond_zyxs.astype(np.float32, copy=True)
+        perturbed += normals * disp_along_normal[..., None]
+        return perturbed.astype(cond_zyxs.dtype, copy=False)
 
     def __getitem__(self, idx):
 
@@ -206,7 +343,7 @@ class EdtSegDataset(Dataset):
         h_up, w_up = x_full.shape  # update dimensions after crop
 
         # split into cond and mask on the upsampled grid
-        conditioning_percent = self.config['cond_percent']
+        conditioning_percent = random.uniform(self._cond_percent_min, self._cond_percent_max)
         if h_up < 2 and w_up < 2:
             return self[np.random.randint(len(self))]
 
@@ -218,38 +355,44 @@ class EdtSegDataset(Dataset):
         if not valid_directions:
             return self[np.random.randint(len(self))]
 
-        r_split_up = int(round(h_up * conditioning_percent))
-        c_split_up = int(round(w_up * conditioning_percent))
+        r_cond_up = int(round(h_up * conditioning_percent))
+        c_cond_up = int(round(w_up * conditioning_percent))
         if h_up >= 2:
-            r_split_up = min(max(r_split_up, 1), h_up - 1)
+            r_cond_up = min(max(r_cond_up, 1), h_up - 1)
         if w_up >= 2:
-            c_split_up = min(max(c_split_up, 1), w_up - 1)
+            c_cond_up = min(max(c_cond_up, 1), w_up - 1)
+
+        # Split boundaries measured from top/left in the upsampled frame.
+        r_split_up_top = r_cond_up
+        c_split_up_left = c_cond_up
 
         cond_direction = random.choice(valid_directions)
 
         if cond_direction == "left":
             # conditioning is left, mask the right
-            x_cond, y_cond, z_cond = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
-            x_mask, y_mask, z_mask = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
+            x_cond, y_cond, z_cond = x_full[:, :c_split_up_left], y_full[:, :c_split_up_left], z_full[:, :c_split_up_left]
+            x_mask, y_mask, z_mask = x_full[:, c_split_up_left:], y_full[:, c_split_up_left:], z_full[:, c_split_up_left:]
             cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = 0, c_split_up
+            mask_row_off, mask_col_off = 0, c_split_up_left
         elif cond_direction == "right":
             # conditioning is right, mask the left
-            x_cond, y_cond, z_cond = x_full[:, c_split_up:], y_full[:, c_split_up:], z_full[:, c_split_up:]
-            x_mask, y_mask, z_mask = x_full[:, :c_split_up], y_full[:, :c_split_up], z_full[:, :c_split_up]
-            cond_row_off, cond_col_off = 0, c_split_up
+            c_split_up_left = w_up - c_cond_up
+            x_cond, y_cond, z_cond = x_full[:, c_split_up_left:], y_full[:, c_split_up_left:], z_full[:, c_split_up_left:]
+            x_mask, y_mask, z_mask = x_full[:, :c_split_up_left], y_full[:, :c_split_up_left], z_full[:, :c_split_up_left]
+            cond_row_off, cond_col_off = 0, c_split_up_left
             mask_row_off, mask_col_off = 0, 0
         elif cond_direction == "up":
             # conditioning is up, mask the bottom
-            x_cond, y_cond, z_cond = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
-            x_mask, y_mask, z_mask = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
+            x_cond, y_cond, z_cond = x_full[:r_split_up_top, :], y_full[:r_split_up_top, :], z_full[:r_split_up_top, :]
+            x_mask, y_mask, z_mask = x_full[r_split_up_top:, :], y_full[r_split_up_top:, :], z_full[r_split_up_top:, :]
             cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = r_split_up, 0
+            mask_row_off, mask_col_off = r_split_up_top, 0
         elif cond_direction == "down":
             # conditioning is down, mask the top
-            x_cond, y_cond, z_cond = x_full[r_split_up:, :], y_full[r_split_up:, :], z_full[r_split_up:, :]
-            x_mask, y_mask, z_mask = x_full[:r_split_up, :], y_full[:r_split_up, :], z_full[:r_split_up, :]
-            cond_row_off, cond_col_off = r_split_up, 0
+            r_split_up_top = h_up - r_cond_up
+            x_cond, y_cond, z_cond = x_full[r_split_up_top:, :], y_full[r_split_up_top:, :], z_full[r_split_up_top:, :]
+            x_mask, y_mask, z_mask = x_full[:r_split_up_top, :], y_full[:r_split_up_top, :], z_full[:r_split_up_top, :]
+            cond_row_off, cond_col_off = r_split_up_top, 0
             mask_row_off, mask_col_off = 0, 0
 
         cond_h, cond_w = x_cond.shape
@@ -271,6 +414,8 @@ class EdtSegDataset(Dataset):
 
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
+        cond_zyxs_unperturbed = cond_zyxs.copy()
+        cond_zyxs = self._maybe_perturb_conditioning_surface(cond_zyxs)
 
         # use world_bbox directly as crop position, this is the crop returned by find_patches
         z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
@@ -376,8 +521,18 @@ class EdtSegDataset(Dataset):
         use_heatmap = self.config['use_heatmap_targets']
         if use_heatmap:
             effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
-            r_split_s = r_min + round((r_max - r_min + 1) * conditioning_percent)
-            c_split_s = c_min + round((c_max - c_min + 1) * conditioning_percent)
+            h_s_full = r_max - r_min + 1
+            w_s_full = c_max - c_min + 1
+            r_cond_s = min(max(int(round(h_s_full * conditioning_percent)), 1), h_s_full - 1)
+            c_cond_s = min(max(int(round(w_s_full * conditioning_percent)), 1), w_s_full - 1)
+            if cond_direction == "down":
+                r_split_s = r_min + (h_s_full - r_cond_s)
+            else:
+                r_split_s = r_min + r_cond_s
+            if cond_direction == "right":
+                c_split_s = c_min + (w_s_full - c_cond_s)
+            else:
+                c_split_s = c_min + c_cond_s
             heatmap_tensor = compute_heatmap_targets(
                 cond_direction=cond_direction,
                 r_split=r_split_s, c_split=c_split_s,
@@ -465,10 +620,36 @@ class EdtSegDataset(Dataset):
 
         use_extrapolation = self.config['use_extrapolation']
         if use_extrapolation:
-           
+            sample_coords_local = extrap_coords_local
+            target_coords_local = gt_coords_local
+            point_weights_local = np.ones(sample_coords_local.shape[0], dtype=np.float32)
+
+            if self.config.get('supervise_conditioning', False):
+                cond_sample_coords_local = (cond_zyxs - min_corner).reshape(-1, 3).astype(np.float32)
+                cond_target_coords_local = (cond_zyxs_unperturbed - min_corner).reshape(-1, 3).astype(np.float32)
+                cond_weight = max(0.0, float(self.config.get('cond_supervision_weight', 0.1)))
+
+                cond_in_bounds = (
+                    (cond_sample_coords_local[:, 0] >= 0) & (cond_sample_coords_local[:, 0] < crop_size[0]) &
+                    (cond_sample_coords_local[:, 1] >= 0) & (cond_sample_coords_local[:, 1] < crop_size[1]) &
+                    (cond_sample_coords_local[:, 2] >= 0) & (cond_sample_coords_local[:, 2] < crop_size[2]) &
+                    (cond_target_coords_local[:, 0] >= 0) & (cond_target_coords_local[:, 0] < crop_size[0]) &
+                    (cond_target_coords_local[:, 1] >= 0) & (cond_target_coords_local[:, 1] < crop_size[1]) &
+                    (cond_target_coords_local[:, 2] >= 0) & (cond_target_coords_local[:, 2] < crop_size[2])
+                )
+                cond_sample_coords_local = cond_sample_coords_local[cond_in_bounds]
+                cond_target_coords_local = cond_target_coords_local[cond_in_bounds]
+
+                if cond_sample_coords_local.shape[0] > 0:
+                    sample_coords_local = np.concatenate([sample_coords_local, cond_sample_coords_local], axis=0)
+                    target_coords_local = np.concatenate([target_coords_local, cond_target_coords_local], axis=0)
+                    cond_weights = np.full(cond_sample_coords_local.shape[0], cond_weight, dtype=np.float32)
+                    point_weights_local = np.concatenate([point_weights_local, cond_weights], axis=0)
+
             extrap_surf = torch.from_numpy(extrap_surface).to(torch.float32)
-            extrap_coords = torch.from_numpy(extrap_coords_local).to(torch.float32)
-            gt_coords = torch.from_numpy(gt_coords_local).to(torch.float32)
+            extrap_coords = torch.from_numpy(sample_coords_local).to(torch.float32)
+            gt_coords = torch.from_numpy(target_coords_local).to(torch.float32)
+            point_weights = torch.from_numpy(point_weights_local).to(torch.float32)
             n_points = len(extrap_coords)
 
         use_sdt = self.config['use_sdt']
@@ -558,6 +739,7 @@ class EdtSegDataset(Dataset):
             result["extrap_surface"] = extrap_surf     # extrapolated surface voxelization
             result["extrap_coords"] = extrap_coords    # (N, 3) coords for sampling predicted field
             result["gt_displacement"] = gt_disp        # (N, 3) ground truth displacement
+            result["point_weights"] = point_weights    # (N,) per-point supervision weights
 
         if use_sdt:
             result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation

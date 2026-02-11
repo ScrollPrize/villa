@@ -46,6 +46,20 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
 
+DirectionField::DirectionField(std::string dir,
+                               std::unique_ptr<Chunked3dVec3fFromUint8> field,
+                               std::unique_ptr<Chunked3dFloatFromUint8> weight_dataset,
+                               float weight)
+    : direction(std::move(dir))
+    , field_ptr(std::move(field))
+    , weight_ptr(std::move(weight_dataset))
+    , weight(weight)
+{
+}
+DirectionField::~DirectionField() = default;
+DirectionField::DirectionField(DirectionField&&) noexcept = default;
+DirectionField& DirectionField::operator=(DirectionField&&) noexcept = default;
+
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2
 #define LOSS_NORMALSNAP 4

@@ -532,21 +532,16 @@ void SegmentationPushPullTool::stopAll()
         _module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
-        if (_module.autoApproveEdits() && _overlay && _overlay->hasApprovalMaskData()) {
+        if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
             const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
-                std::vector<std::pair<int, int>> gridPositions;
-                gridPositions.reserve(editedVerts.size());
-                for (const auto& edit : editedVerts) {
-                    gridPositions.emplace_back(edit.row, edit.col);
+                // Get drag center from the cached row/col if available
+                std::optional<std::pair<int, int>> dragCenter;
+                if (_cachedRow >= 0 && _cachedCol >= 0) {
+                    dragCenter = std::make_pair(_cachedRow, _cachedCol);
                 }
-                constexpr uint8_t kApproved = 255;
-                constexpr float kRadius = 1.0f;
-                constexpr bool kIsAutoApproval = true;
-                const QColor brushColor = _module.approvalBrushColor();
-                _overlay->paintApprovalMaskDirect(gridPositions, kRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
-                _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-                qCInfo(lcSegPushPull) << "Auto-approved" << gridPositions.size() << "push/pull edited vertices";
+                const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, dragCenter);
+                _module.performAutoApproval(filteredVerts);
             }
         }
 

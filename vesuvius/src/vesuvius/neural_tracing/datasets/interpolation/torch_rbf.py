@@ -9,6 +9,7 @@ import math
 from itertools import combinations_with_replacement
 from .radial_fn import SCALE_INVARIANT, RADIAL_FUNCS, MIN_DEGREE
 
+torch.backends.cuda.matmul.allow_tf32 = False
 
 class RBFInterpolator(torch.nn.Module):
     """
@@ -456,19 +457,18 @@ def solve(y, d, smoothing, kernel, epsilon, powers, precision):
     try:
         coeffs = torch.linalg.solve(lhs, rhs)
     except RuntimeError:  # singular matrix
-        if coeffs is None:
-            msg = "Singular matrix."
-            nmonos = powers.shape[0]
-            if nmonos > 0:
-                pmat = polynomial_matrix((y - shift) / scale, powers)
-                rank = torch.linalg.matrix_rank(pmat)
-                if rank < nmonos:
-                    msg = (
-                        "Singular matrix. The matrix of monomials evaluated at "
-                        "the data point coordinates does not have full column "
-                        f"rank ({rank}/{nmonos})."
-                    )
+        msg = "Singular matrix."
+        nmonos = powers.shape[0]
+        if nmonos > 0:
+            pmat = polynomial_matrix((y - shift) / scale, powers)
+            rank = torch.linalg.matrix_rank(pmat)
+            if rank < nmonos:
+                msg = (
+                    "Singular matrix. The matrix of monomials evaluated at "
+                    "the data point coordinates does not have full column "
+                    f"rank ({rank}/{nmonos})."
+                )
 
-            raise ValueError(msg)
+        raise ValueError(msg)
 
     return shift, scale, coeffs

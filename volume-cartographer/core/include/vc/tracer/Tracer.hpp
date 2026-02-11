@@ -11,13 +11,10 @@ struct DirectionField
     DirectionField(std::string dir,
                    std::unique_ptr<Chunked3dVec3fFromUint8> field,
                    std::unique_ptr<Chunked3dFloatFromUint8> weight_dataset,
-                   float weight = 1.0f)
-        : direction(std::move(dir))
-        , field_ptr(std::move(field))
-        , weight_ptr(std::move(weight_dataset))
-        , weight(weight)
-    {
-    }
+                   float weight = 1.0f);
+    ~DirectionField();
+    DirectionField(DirectionField&&) noexcept;
+    DirectionField& operator=(DirectionField&&) noexcept;
 
     std::string direction;
     std::unique_ptr<Chunked3dVec3fFromUint8> field_ptr;
