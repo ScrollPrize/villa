@@ -4,7 +4,7 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
-#include "vc/core/util/ABFFlattening.hpp"
+#include "vc/flattening/ABFFlattening.hpp"
 
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>

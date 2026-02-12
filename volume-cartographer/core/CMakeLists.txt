@@ -21,7 +21,6 @@ add_library(vc_core
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/ABFFlattening.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
@@ -36,7 +35,6 @@ target_link_libraries(vc_core
         z5
         OpenMP::OpenMP_CXX
         TIFF::TIFF
-        OpenABF
         #${CURL_LIBRARIES}
         #${OPENSSL_LIBRARIES}
         #${ZLIB_LIBRARIES}
@@ -97,9 +95,6 @@ target_precompile_headers(vc_core PRIVATE
     <opencv2/core/mat.hpp>
     <opencv2/imgproc.hpp>
     <opencv2/imgcodecs.hpp>
-    # Eigen (used by Ceres)
-    <Eigen/Core>
-    <Eigen/Dense>
     # Boost (used by CLI apps)
     <boost/program_options.hpp>
     # z5/xtensor (zarr volume access - heavy templates)
@@ -123,6 +118,9 @@ if(VC_USE_PCH)
     target_precompile_headers(vc_ui REUSE_FROM vc_core)
 endif()
 
+add_library(vc_flattening src/ABFFlattening.cpp)
+target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
+
 add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp src/ChunkedTensor.cpp)
 target_link_libraries(vc_tracer PUBLIC vc_core vc_ui Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
@@ -133,6 +131,16 @@ endif()
 if(VC_INSTALL_LIBS)
     install(
             TARGETS vc_core
+            COMPONENT "Libraries"
+            EXPORT "${targets_export_name}"
+            ARCHIVE DESTINATION "lib"
+            LIBRARY DESTINATION "lib"
+            INCLUDES DESTINATION "${include_install_dir}"
+            RUNTIME DESTINATION "bin"
+    )
+
+    install(
+            TARGETS vc_flattening
             COMPONENT "Libraries"
             EXPORT "${targets_export_name}"
             ARCHIVE DESTINATION "lib"

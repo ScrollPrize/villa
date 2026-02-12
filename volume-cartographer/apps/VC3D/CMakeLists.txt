@@ -143,6 +143,7 @@ target_link_libraries(VC3D
     vc_core
     vc_ui
     vc_tracer
+    vc_flattening
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets

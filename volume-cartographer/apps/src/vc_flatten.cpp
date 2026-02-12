@@ -11,7 +11,7 @@
  */
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/ABFFlattening.hpp"
+#include "vc/flattening/ABFFlattening.hpp"
 
 #include <boost/program_options.hpp>
 #include <filesystem>
