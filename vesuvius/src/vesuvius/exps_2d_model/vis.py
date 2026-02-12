@@ -421,6 +421,9 @@ def save(
 
 		for _k, spec in loss_maps.items():
 			mt = spec["fn"]().detach()
+			mask = spec.get("mask", None)
+			if mask is not None:
+				mt = mt * mask.to(dtype=mt.dtype)
 			if mt.ndim == 4 and int(mt.shape[0]) > 1:
 				mt = mt[z_i:z_i + 1]
 			if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
@@ -465,31 +468,34 @@ def save(
 	dir_lm_conn_l = dir_lm_conn_l * dir_mask_conn_l + 0.5 * inv_conn_l
 	dir_lm_conn_r = dir_lm_conn_r * dir_mask_conn_r + 0.5 * inv_conn_r
 
-	smooth_x_lm, _smooth_x_mask = opt_loss_geom.smooth_x_loss_map(res=res)
-	smooth_y_lm, _smooth_y_mask = opt_loss_geom.smooth_y_loss_map(res=res)
-	meshoff_sy_lm, _meshoff_sy_mask = opt_loss_geom.meshoff_smooth_y_loss_map(res=res)
-	conn_sy_l_lm, _conn_sy_l_mask = opt_loss_geom.conn_y_smooth_l_loss_map(res=res)
-	conn_sy_r_lm, _conn_sy_r_mask = opt_loss_geom.conn_y_smooth_r_loss_map(res=res)
-	angle_lm, _angle_mask = opt_loss_geom.angle_symmetry_loss_map(res=res)
-	y_straight_lm, _y_straight_mask = opt_loss_geom.y_straight_loss_map(res=res)
-	gradmag_lm, _gradmag_mask = opt_loss_gradmag.gradmag_period_loss_map(res=res)
-	data_lm, _data_mask = opt_loss_data.data_loss_map(res=res)
-	data_plain_lm, _data_plain_mask = opt_loss_data.data_plain_loss_map(res=res)
-	data_grad_lm, _data_grad_mask = opt_loss_data.data_grad_loss_map(res=res)
+	smooth_x_lm, smooth_x_mask = opt_loss_geom.smooth_x_loss_map(res=res)
+	smooth_y_lm, smooth_y_mask = opt_loss_geom.smooth_y_loss_map(res=res)
+	meshoff_sy_lm, meshoff_sy_mask = opt_loss_geom.meshoff_smooth_y_loss_map(res=res)
+	conn_sy_l_lm, conn_sy_l_mask = opt_loss_geom.conn_y_smooth_l_loss_map(res=res)
+	conn_sy_r_lm, conn_sy_r_mask = opt_loss_geom.conn_y_smooth_r_loss_map(res=res)
+	angle_lm, angle_mask = opt_loss_geom.angle_symmetry_loss_map(res=res)
+	y_straight_lm, y_straight_mask = opt_loss_geom.y_straight_loss_map(res=res)
+	gradmag_lm, gradmag_mask = opt_loss_gradmag.gradmag_period_loss_map(res=res)
+	data_lm, data_mask = opt_loss_data.data_loss_map(res=res)
+	data_plain_lm, data_plain_mask = opt_loss_data.data_plain_loss_map(res=res)
+	data_grad_lm, data_grad_mask = opt_loss_data.data_grad_loss_map(res=res)
 
 	loss_maps = {
 		"data": {
 			"fn": lambda: data_lm,
+			"mask": data_mask,
 			"suffix": "data",
 			"reduce": True,
 		},
 		"data_plain": {
 			"fn": lambda: data_plain_lm,
+			"mask": data_plain_mask,
 			"suffix": "data_plain",
 			"reduce": True,
 		},
 		"data_grad": {
 			"fn": lambda: data_grad_lm,
+			"mask": data_grad_mask,
 			"suffix": "data_grad",
 			"reduce": True,
 		},
@@ -515,41 +521,49 @@ def save(
 		},
 		"gradmag": {
 			"fn": lambda: gradmag_lm,
+			"mask": gradmag_mask,
 			"suffix": "gradmag",
 			"reduce": True,
 		},
 		"smooth_x": {
 			"fn": lambda: smooth_x_lm,
+			"mask": smooth_x_mask,
 			"suffix": "smooth_x",
 			"reduce": True,
 		},
 		"smooth_y": {
 			"fn": lambda: smooth_y_lm,
+			"mask": smooth_y_mask,
 			"suffix": "smooth_y",
 			"reduce": True,
 		},
 		"meshoff_sy": {
 			"fn": lambda: meshoff_sy_lm,
+			"mask": meshoff_sy_mask,
 			"suffix": "meshoff_sy",
 			"reduce": True,
 		},
 		"conn_sy_l": {
 			"fn": lambda: conn_sy_l_lm,
+			"mask": conn_sy_l_mask,
 			"suffix": "conn_sy_l",
 			"reduce": True,
 		},
 		"conn_sy_r": {
 			"fn": lambda: conn_sy_r_lm,
+			"mask": conn_sy_r_mask,
 			"suffix": "conn_sy_r",
 			"reduce": True,
 		},
 		"angle": {
 			"fn": lambda: angle_lm,
+			"mask": angle_mask,
 			"suffix": "angle",
 			"reduce": True,
 		},
 		"y_straight": {
 			"fn": lambda: y_straight_lm,
+			"mask": y_straight_mask,
 			"suffix": "y_straight",
 			"reduce": True,
 		},
@@ -559,6 +573,9 @@ def save(
 
 	for _k, spec in loss_maps.items():
 		mt0 = spec["fn"]().detach()
+		mask = spec.get("mask", None)
+		if mask is not None:
+			mt0 = mt0 * mask.to(dtype=mt0.dtype)
 		m = mt0.cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
 			m = m[:, 0]
@@ -568,7 +585,11 @@ def save(
 	# One horizontally-concatenated float tif for quick inspection.
 	loss_2d: list[tuple[str, np.ndarray]] = []
 	for _k, spec in loss_maps.items():
-		m = spec["fn"]().detach().cpu()
+		m = spec["fn"]().detach()
+		mask = spec.get("mask", None)
+		if mask is not None:
+			m = m * mask.to(dtype=m.dtype)
+		m = m.cpu()
 		if m.ndim == 4:
 			m2 = m[0, 0].numpy().astype("float32")
 		elif m.ndim == 2:
