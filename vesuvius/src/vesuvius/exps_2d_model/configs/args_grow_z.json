@@ -6,6 +6,7 @@
 		"grad-mag-blur-sigma" : 4.0,
 		"dir-blur-sigma" : 2.0,
 		"z-step": 10.0,
-		"model-input": "log/2026-02-11_res_direct/model_snapshots/model_final_000000.pt"
+		"model-input": "res_direct/model_snapshots/model_final_000000.pt",
+		"__model-input": "log/2026-02-11_res_direct/model_snapshots/model_final_000000.pt"
 	}
 }

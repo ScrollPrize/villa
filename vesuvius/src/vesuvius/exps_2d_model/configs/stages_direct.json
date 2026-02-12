@@ -44,6 +44,17 @@
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 			"min_scaledown": 0,
+			"masks": [
+				{
+					"label": "cw_pie",
+					"type": "central_winding_pie_ema",
+					"ramp_start_it": 0,
+					"start_size_segs": 4,
+					"ramp_stop_it": 4000,
+					"blur_sigma": 7.0,
+					"losses": ["gradmag"]
+				}
+			],
 			"w_fac": {
 				"data": 1.0,
 				"data_plain": 1.0
