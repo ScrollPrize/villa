@@ -1,6 +1,7 @@
 // vc_transform_geom.cpp
 // Small utility to apply an affine (and optional scale-segmentation) to
-// either OBJ or TIFXYZ geometry, writing the transformed result.
+// OBJ geometry, a single TIFXYZ mesh, or a directory of TIFXYZ subfolders,
+// writing the transformed result.
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -119,6 +120,51 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     return 0;
 }
 
+static int run_tifxyz_batch(const std::filesystem::path& inRoot,
+                            const std::filesystem::path& outRoot,
+                            const AffineTransform* A,
+                            bool invert,
+                            double scale_seg)
+{
+    if (std::filesystem::exists(outRoot)) {
+        std::cerr << "output directory already exists: " << outRoot << std::endl;
+        return 1;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(outRoot, ec);
+    if (ec) {
+        std::cerr << "failed to create output directory: " << outRoot << std::endl;
+        return 1;
+    }
+
+    int found = 0;
+    int ok = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(inRoot)) {
+        if (!entry.is_directory()) continue;
+        const auto& sub = entry.path();
+        if (!is_tifxyz_dir(sub)) continue;
+
+        found++;
+        const auto out = outRoot / sub.filename();
+        const int rc = run_tifxyz(sub, out, A, invert, scale_seg);
+        if (rc == 0) {
+            ok++;
+            std::cout << "[ok] " << sub.filename() << std::endl;
+        } else {
+            std::cerr << "[fail] " << sub.filename() << " (exit " << rc << ")" << std::endl;
+        }
+    }
+
+    if (found == 0) {
+        std::cerr << "No tifxyz subfolders found under: " << inRoot << std::endl;
+        return 1;
+    }
+
+    std::cout << "Processed " << ok << "/" << found << " tifxyz folders." << std::endl;
+    return ok == found ? 0 : 1;
+}
+
 static bool starts_with(const std::string& s, const char* pfx) {
     return s.rfind(pfx, 0) == 0;
 }
@@ -183,8 +229,8 @@ int main(int argc, char** argv) {
         po::options_description desc("Options");
         desc.add_options()
             ("help,h", "Show help")
-            ("input,i",  po::value<std::string>()->required(), "Input path: OBJ file or TIFXYZ dir")
-            ("output,o", po::value<std::string>()->required(), "Output: OBJ file or TIFXYZ dir (must not exist)")
+            ("input,i",  po::value<std::string>()->required(), "Input path: OBJ file, TIFXYZ dir, or dir containing TIFXYZ subfolders")
+            ("output,o", po::value<std::string>()->required(), "Output path (required): OBJ file, TIFXYZ dir, or output root for batch")
             ("affine,a", po::value<std::string>(), "Affine JSON with 'transformation_matrix'")
             ("invert",   po::bool_switch()->default_value(false), "Invert the affine")
             ("scale-segmentation", po::value<double>()->default_value(1.0), "Pre-scale applied to coordinates (uniform)")
@@ -209,12 +255,17 @@ int main(int argc, char** argv) {
             A = std::make_unique<AffineTransform>(load_affine_json(vm["affine"].as<std::string>()));
         }
 
-        // Determine input type and route
+        // Determine input type and route:
+        // 1) single TIFXYZ dir, 2) batch TIFXYZ root dir, 3) OBJ file.
         if (is_tifxyz_dir(inPath)) {
             if (std::filesystem::exists(outPath)) {
                 std::cerr << "output directory already exists: " << outPath << std::endl; return 1;
             }
             return run_tifxyz(inPath, outPath, A.get(), invert, scale_seg);
+        }
+
+        if (std::filesystem::is_directory(inPath)) {
+            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_seg);
         }
 
         if (inPath.extension() == ".obj") {
@@ -224,7 +275,7 @@ int main(int argc, char** argv) {
             return run_obj(inPath, outPath, A.get(), invert, scale_seg);
         }
 
-        std::cerr << "Unknown input type. Provide a .obj file or a TIFXYZ directory (containing x.tif,y.tif,z.tif)." << std::endl;
+        std::cerr << "Unknown input type. Provide a .obj file, a TIFXYZ directory, or a directory containing TIFXYZ subfolders." << std::endl;
         return 1;
     } catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << std::endl; return 1;
