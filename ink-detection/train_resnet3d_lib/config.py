@@ -1,5 +1,4 @@
 import os
-import os.path as osp
 
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "109951162777600")
 
@@ -26,12 +25,6 @@ def log(msg):
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
-
-    # comp_dir_path = './'
-    comp_dir_path = './'
-    comp_folder_name = './'
-    # comp_dataset_path = f'{comp_dir_path}datasets/{comp_folder_name}/'
-    comp_dataset_path = f'./'
 
     exp_name = 'pretraining_all'
 
@@ -94,10 +87,6 @@ class CFG:
     save_every_epoch = False
     accumulate_grad_batches = 1
 
-    # objective_cv = 'binary'  # 'binary', 'multiclass', 'regression'
-    metric_direction = 'maximize'  # maximize, 'minimize'
-    # metrics = 'dice_coef'
-
     # ============== eval metrics cfg (validation-only) =============
     # Threshold for confusion-based metrics (precision/recall/F-beta/MCC/IoU/Dice).
     eval_threshold = 0.5
@@ -131,7 +120,6 @@ class CFG:
 
     # ============== fixed =============
     pretrained = True
-    inf_weight = 'best'  # 'best'
 
     min_lr = 1e-6
     weight_decay = 1e-6
@@ -144,13 +132,9 @@ class CFG:
 
     seed = 130697
 
-    # ============== set dataset path =============
-    print('set dataset path')
-
     outputs_path = f'./outputs/{comp_name}/{exp_name}/'
 
     submission_dir = outputs_path + 'submissions/'
-    submission_path = submission_dir + f'submission_{exp_name}.csv'
 
     model_dir = outputs_path + \
         f'{comp_name}-models/'
@@ -158,7 +142,6 @@ class CFG:
     figures_dir = outputs_path + 'figures/'
 
     log_dir = outputs_path + 'logs/'
-    log_path = log_dir + f'{exp_name}.txt'
 
     # ============== augmentation =============
     train_aug_list = []
@@ -191,13 +174,6 @@ def cfg_init(cfg, mode='train'):
 
     if mode == 'train':
         make_dirs(cfg)
-
-DEFAULT_FRAGMENT_IDS = [
-    '20231210121321', '20231106155350', '20231005123336', '20230820203112', '20230620230619',
-    '20230826170124', '20230702185753', '20230522215721', '20230531193658', '20230520175435',
-    '20230903193206', '20230902141231', '20231007101615', '20230929220924', 'recto', 'verso',
-    '20231016151000', '20231012184423', '20231031143850'
-]
 
 REVERSE_LAYER_FRAGMENT_IDS_FALLBACK = {
     '20230701020044', 'verso', '20230901184804', '20230901234823', '20230531193658', '20231007101615',
@@ -325,10 +301,21 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
 
 
 def apply_metadata_hyperparameters(cfg, metadata):
-    hp = metadata.get("training_hyperparameters", {})
-    model_hp = hp.get("model", {})
-    train_hp = hp.get("training", {})
-    training_cfg = metadata.get("training", {}) or {}
+    if not isinstance(metadata, dict):
+        raise TypeError(f"metadata must be an object, got {type(metadata).__name__}")
+    if "training_hyperparameters" not in metadata or not isinstance(metadata["training_hyperparameters"], dict):
+        raise KeyError("metadata missing required object: 'training_hyperparameters'")
+    if "training" not in metadata or not isinstance(metadata["training"], dict):
+        raise KeyError("metadata missing required object: 'training'")
+
+    hp = metadata["training_hyperparameters"]
+    if "model" not in hp or not isinstance(hp["model"], dict):
+        raise KeyError("metadata.training_hyperparameters missing required object: 'model'")
+    if "training" not in hp or not isinstance(hp["training"], dict):
+        raise KeyError("metadata.training_hyperparameters missing required object: 'training'")
+    model_hp = hp["model"]
+    train_hp = hp["training"]
+    training_cfg = metadata["training"]
 
     for k in ["model_name", "backbone", "encoder_depth", "target_size", "in_chans", "norm", "group_norm_groups"]:
         if k in model_hp:

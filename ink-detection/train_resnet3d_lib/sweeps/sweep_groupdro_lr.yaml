@@ -15,11 +15,15 @@ parameters:
   training.sampler:
     value: group_balanced
 
-  group_dro.robust_step_size:
-    values: [0.01, 0.05, 0.1, 0.2]
+  training_hyperparameters.training.lr:
+    values: [3e-5, 1e-4]
 
-  training_hyperparameters.training.weight_decay:
-    values: [0.000001, 0.0001, 0.1, 1.0]
+  training.stitch_all_val:
+    value: true
+  training.stitch_train:
+    value: true
+  training.stitch_downsample:
+    value: 8
 
 command:
   - ${env}
@@ -29,9 +33,5 @@ command:
   - metadata.json
   - --outputs_path
   - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls
-  - --stitch_all_val
-  - --stitch_train
-  - --stitch_downsample
-  - "8"
   - --wandb_tags
-  - ink-2um,group_dro,ablation_weight_decay_step_size
+  - ink-2um,group_dro,ablation_lr

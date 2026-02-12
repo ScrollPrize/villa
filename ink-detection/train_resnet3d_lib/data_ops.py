@@ -16,9 +16,17 @@ import PIL.Image
 import zarr
 
 
+def _require_dict(value, *, name):
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be a dict, got {type(value).__name__}")
+    return value
+
+
 def _read_gray(path):
     if not osp.exists(path):
         return None
+
+    errors = []
 
     # OpenCV can emit noisy libpng warnings (e.g. "chunk data is too large") for some PNGs.
     # Prefer PIL for PNGs to keep logs clean; fall back to OpenCV if PIL fails.
@@ -26,21 +34,24 @@ def _read_gray(path):
         try:
             with PIL.Image.open(path) as im:
                 return np.array(im.convert("L"))
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            errors.append(f"PIL[png]: {exc}")
 
     try:
         img = cv2.imread(path, 0)
+    except cv2.error as exc:
+        errors.append(f"cv2: {exc}")
+    else:
         if img is not None:
             return img
-    except cv2.error:
-        pass
+        errors.append("cv2: returned None")
 
     try:
         with PIL.Image.open(path) as im:
             return np.array(im.convert("L"))
-    except Exception as e:
-        raise RuntimeError(f"Could not read image: {path}. Error: {e}") from e
+    except (OSError, ValueError) as exc:
+        errors.append(f"PIL[fallback]: {exc}")
+        raise RuntimeError(f"Could not read image: {path}. Attempts: {' | '.join(errors)}") from exc
 
 
 def read_image_layers(
@@ -338,16 +349,6 @@ def _compute_selected_layer_indices(fragment_id, layer_range=None):
     return [int(i) for i in idxs]
 
 
-def _expand_relative_path_candidates(path: str, dataset_root: str) -> list[str]:
-    path = str(path)
-    if osp.isabs(path):
-        return [path]
-    out = [path]
-    if dataset_root:
-        out.append(osp.join(dataset_root, path))
-    return out
-
-
 def _looks_like_zarr_store(path: str) -> bool:
     if not osp.exists(path):
         return False
@@ -366,63 +367,33 @@ def _looks_like_zarr_store(path: str) -> bool:
 
 def resolve_segment_zarr_path(fragment_id, seg_meta):
     fragment_id = str(fragment_id)
-    seg_meta = seg_meta or {}
+    seg_meta = _require_dict(seg_meta, name=f"segments[{fragment_id!r}]")
     dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
+    if "original_path" not in seg_meta:
+        raise KeyError(f"segments[{fragment_id!r}] missing required key: 'original_path'")
 
-    segment_roots = [osp.join(dataset_root, fragment_id)]
-    original_path = seg_meta.get("original_path")
-    if original_path:
-        segment_roots.extend(_expand_relative_path_candidates(str(original_path), dataset_root))
+    original_path = str(seg_meta["original_path"]).strip()
+    if not original_path:
+        raise ValueError(f"segments[{fragment_id!r}].original_path must be a non-empty string")
 
-    zarr_candidate_paths = []
-    explicit_keys = (
-        "zarr_path",
-        "volume_zarr",
-        "surface_volume_zarr",
-        "layers_zarr",
-        "zarr",
-        "volume_path",
-    )
-    for key in explicit_keys:
-        val = seg_meta.get(key)
-        if not val:
-            continue
-        for candidate in _expand_relative_path_candidates(str(val), dataset_root):
-            zarr_candidate_paths.append(candidate)
-            for root in segment_roots:
-                zarr_candidate_paths.append(osp.join(root, str(val)))
-
-    implicit_names = ("layers.zarr", "surface_volume.zarr", "volume.zarr", "layers")
-    for root in segment_roots:
-        for name in implicit_names:
-            zarr_candidate_paths.append(osp.join(root, name))
-
-    seen = set()
-    ordered = []
-    for candidate in zarr_candidate_paths:
-        c = osp.normpath(candidate)
-        if c in seen:
-            continue
-        seen.add(c)
-        ordered.append(c)
-
-    for candidate in ordered:
-        if _looks_like_zarr_store(candidate):
-            return candidate
+    candidate = original_path if osp.isabs(original_path) else osp.join(dataset_root, original_path)
+    candidate = osp.normpath(candidate)
+    if _looks_like_zarr_store(candidate):
+        return candidate
 
     raise FileNotFoundError(
         f"Could not resolve zarr volume path for segment={fragment_id}. "
-        f"Tried: {ordered[:12]}{' ...' if len(ordered) > 12 else ''}"
+        f"Expected zarr store at segments[{fragment_id!r}].original_path -> {candidate!r}."
     )
 
 
 def _ensure_zarr_v2():
     ver = str(getattr(zarr, "__version__", "") or "")
-    try:
-        major = int(ver.split(".")[0])
-    except Exception:
-        major = None
-    if major is not None and major >= 3:
+    major_str = ver.split(".", 1)[0].strip()
+    if not major_str.isdigit():
+        raise RuntimeError(f"Could not parse zarr version {ver!r}; expected major version integer.")
+    major = int(major_str)
+    if major >= 3:
         raise RuntimeError(
             f"zarr backend requires zarr v2, found version {ver!r}. "
             "Install a v2 release (e.g., `zarr<3`)."
@@ -441,7 +412,7 @@ class ZarrSegmentVolume:
         _ensure_zarr_v2()
 
         self.fragment_id = str(fragment_id)
-        self.seg_meta = seg_meta or {}
+        self.seg_meta = _require_dict(seg_meta, name=f"segments[{self.fragment_id!r}]")
         self.path = resolve_segment_zarr_path(self.fragment_id, self.seg_meta)
         self.is_frag = "frag" in self.fragment_id
         self.flip_vertical = self.fragment_id == "20230827161846"
@@ -485,14 +456,11 @@ class ZarrSegmentVolume:
         if hasattr(root, "shape"):
             return root
 
-        # Group-like store: prefer OME-Zarr's "0"; otherwise, use the only array key.
+        # Group-like store: training expects the canonical OME-Zarr base scale at key "0".
         if "0" in root:
             return root["0"]
-        array_keys = list(root.array_keys()) if hasattr(root, "array_keys") else []
-        if len(array_keys) == 1:
-            return root[array_keys[0]]
         raise ValueError(
-            f"Expected a 3D zarr array at {path}, got group with array keys={array_keys}"
+            f"Expected a 3D zarr array or group key '0' at {path}; got group without key '0'."
         )
 
     def _inspect_volume(self):
@@ -859,12 +827,20 @@ def extract_patches_infer(image, fragment_mask, *, include_xyxys=True):
 
 
 def build_group_mappings(fragment_ids, segments_metadata, group_key="base_path"):
+    segments_metadata = _require_dict(segments_metadata, name="segments_metadata")
     fragment_to_group_name = {}
     for fragment_id in fragment_ids:
-        seg_meta = (segments_metadata or {}).get(fragment_id, {}) or {}
-        group_name = seg_meta.get(group_key)
-        if group_name is None:
-            group_name = seg_meta.get("base_path", fragment_id)
+        if fragment_id not in segments_metadata:
+            raise KeyError(f"segments_metadata missing segment id: {fragment_id!r}")
+        seg_meta = _require_dict(segments_metadata[fragment_id], name=f"segments_metadata[{fragment_id!r}]")
+        if group_key in seg_meta:
+            group_name = seg_meta[group_key]
+        elif "base_path" in seg_meta:
+            group_name = seg_meta["base_path"]
+        else:
+            raise KeyError(
+                f"segment {fragment_id!r} missing group key {group_key!r} and fallback 'base_path'"
+            )
         fragment_to_group_name[fragment_id] = str(group_name)
 
     group_names = sorted(set(fragment_to_group_name.values()))
@@ -1092,12 +1068,16 @@ class CustomDatasetTest(Dataset):
 
 
 def _flatten_segment_patch_index(xyxys_by_segment, groups_by_segment=None):
+    xyxys_by_segment = _require_dict(xyxys_by_segment, name="xyxys_by_segment")
+    if groups_by_segment is not None:
+        groups_by_segment = _require_dict(groups_by_segment, name="groups_by_segment")
+
     segment_ids = []
     seg_indices = []
     xy_chunks = []
     group_chunks = []
 
-    for segment_id, xyxys in (xyxys_by_segment or {}).items():
+    for segment_id, xyxys in xyxys_by_segment.items():
         xy = np.asarray(xyxys, dtype=np.int64)
         if xy.ndim != 2 or xy.shape[1] != 4:
             raise ValueError(
@@ -1111,7 +1091,10 @@ def _flatten_segment_patch_index(xyxys_by_segment, groups_by_segment=None):
         xy_chunks.append(xy)
         seg_indices.append(np.full((xy.shape[0],), seg_idx, dtype=np.int32))
         if groups_by_segment is not None:
-            group_id = int(groups_by_segment.get(str(segment_id), 0))
+            seg_id_key = str(segment_id)
+            if seg_id_key not in groups_by_segment:
+                raise KeyError(f"groups_by_segment missing segment id: {seg_id_key!r}")
+            group_id = int(groups_by_segment[seg_id_key])
             group_chunks.append(np.full((xy.shape[0],), group_id, dtype=np.int64))
 
     if len(segment_ids) == 0:
@@ -1157,8 +1140,8 @@ class LazyZarrTrainDataset(Dataset):
         cfg,
         transform=None,
     ):
-        self.volumes = dict(volumes_by_segment or {})
-        self.masks = dict(masks_by_segment or {})
+        self.volumes = dict(_require_dict(volumes_by_segment, name="volumes_by_segment"))
+        self.masks = dict(_require_dict(masks_by_segment, name="masks_by_segment"))
         self.cfg = cfg
         self.transform = transform
         self.rotate = CFG.rotate
@@ -1199,8 +1182,8 @@ class LazyZarrXyLabelDataset(Dataset):
         cfg,
         transform=None,
     ):
-        self.volumes = dict(volumes_by_segment or {})
-        self.masks = dict(masks_by_segment or {})
+        self.volumes = dict(_require_dict(volumes_by_segment, name="volumes_by_segment"))
+        self.masks = dict(_require_dict(masks_by_segment, name="masks_by_segment"))
         self.cfg = cfg
         self.transform = transform
         (
@@ -1236,7 +1219,7 @@ class LazyZarrXyOnlyDataset(Dataset):
         cfg,
         transform=None,
     ):
-        self.volumes = dict(volumes_by_segment or {})
+        self.volumes = dict(_require_dict(volumes_by_segment, name="volumes_by_segment"))
         self.cfg = cfg
         self.transform = transform
         (

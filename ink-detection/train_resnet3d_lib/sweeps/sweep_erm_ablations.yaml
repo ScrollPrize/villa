@@ -11,9 +11,16 @@ parameters:
   training.objective:
     value: erm
   training.sampler:
-    value: group_balanced
+    value: shuffle
   training.loss_mode:
-    value: batch
+    values: [batch, per_sample]
+
+  training.stitch_all_val:
+    value: true
+  training.stitch_train:
+    value: true
+  training.stitch_downsample:
+    value: 8
 
 command:
   - ${env}
@@ -23,9 +30,5 @@ command:
   - metadata.json
   - --outputs_path
   - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls
-  - --stitch_all_val
-  - --stitch_train
-  - --stitch_downsample
-  - "8"
   - --wandb_tags
-  - ink-2um,group_dro,erm_group_balanced
+  - ink-2um,group_dro,ablations

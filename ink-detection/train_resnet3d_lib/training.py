@@ -23,9 +23,8 @@ from train_resnet3d_lib.config import (
     apply_metadata_hyperparameters,
     cfg_init,
     slugify,
-    DEFAULT_FRAGMENT_IDS,
 )
-from train_resnet3d_lib.datasetes_builder import build_datasets
+from train_resnet3d_lib.datasets_builder import build_datasets
 from train_resnet3d_lib.model import RegressionPLModel
 from train_resnet3d_lib.checkpointing import resolve_checkpoint_path, load_state_dict_from_checkpoint
 
@@ -47,18 +46,10 @@ def parse_args():
     parser.add_argument("--wandb_tags", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--outputs_path", type=str, default=None)
-    parser.add_argument("--stitch_all_val", action="store_true")
-    parser.add_argument("--stitch_train", action="store_true")
-    parser.add_argument("--stitch_train_every_n_epochs", type=int, default=None)
-    parser.add_argument("--stitch_downsample", type=int, default=None)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--check_val_every_n_epoch", type=int, default=1)
-    parser.add_argument("--save_every_epoch", action="store_true")
-    parser.add_argument("--accumulate_grad_batches", type=int, default=None)
-    parser.add_argument("--data_backend", type=str, default=None, help="Data backend: zarr (default) or tiff")
-    parser.add_argument("--dataset_root", type=str, default=None, help="Root directory for segment data")
     return parser.parse_args()
 
 
@@ -68,36 +59,47 @@ def log_startup(args):
         "args "
         f"metadata_json={args.metadata_json!r} valid_id={args.valid_id!r} outputs_path={args.outputs_path!r} "
         f"devices={args.devices} accelerator={args.accelerator!r} precision={args.precision!r} "
-        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} resume_from_ckpt={args.resume_from_ckpt!r} "
-        f"data_backend={args.data_backend!r} dataset_root={args.dataset_root!r}"
+        f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} resume_from_ckpt={args.resume_from_ckpt!r}"
     )
-    try:
-        log(
-            f"torch cuda_available={torch.cuda.is_available()} cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES')!r} "
-            f"device_count={torch.cuda.device_count() if torch.cuda.is_available() else 0}"
-        )
-    except Exception:
-        pass
+    cuda_available = bool(torch.cuda.is_available())
+    device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    log(
+        f"torch cuda_available={cuda_available} cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES')!r} "
+        f"device_count={device_count}"
+    )
+
+
+def _warn(message, exc=None):
+    if exc is None:
+        log(f"WARNING: {message}")
+        return
+    log(f"WARNING: {message}: {type(exc).__name__}: {exc}")
 
 
 def load_base_config(args):
-    base_config = {}
-    if args.metadata_json:
-        metadata_path = args.metadata_json
-        if not osp.isabs(metadata_path):
-            if not osp.exists(metadata_path):
-                metadata_path = osp.join(osp.dirname(__file__), metadata_path)
-        log(f"loading metadata_json={metadata_path}")
-        base_config = load_metadata_json(metadata_path)
+    if not args.metadata_json:
+        raise ValueError("--metadata_json is required")
 
-    base_config = base_config or {}
-    base_config.setdefault("training", {})
-    base_config["training"].setdefault("objective", getattr(CFG, "objective", "erm"))
-    base_config["training"].setdefault("sampler", getattr(CFG, "sampler", "shuffle"))
-    base_config["training"].setdefault("loss_mode", getattr(CFG, "loss_mode", "batch"))
-    base_config["training"].setdefault("save_every_epoch", getattr(CFG, "save_every_epoch", False))
-    base_config.setdefault("group_dro", {})
-    base_config["group_dro"].setdefault("group_key", "base_path")
+    metadata_path = args.metadata_json
+    if not osp.isabs(metadata_path):
+        if not osp.exists(metadata_path):
+            metadata_path = osp.join(osp.dirname(__file__), metadata_path)
+    log(f"loading metadata_json={metadata_path}")
+    base_config = load_metadata_json(metadata_path)
+
+    if not isinstance(base_config, dict):
+        raise TypeError(f"metadata_json root must be an object, got {type(base_config).__name__}")
+    if "training" not in base_config or not isinstance(base_config["training"], dict):
+        raise KeyError("metadata_json must define an object at key 'training'")
+    if "group_dro" not in base_config or not isinstance(base_config["group_dro"], dict):
+        raise KeyError("metadata_json must define an object at key 'group_dro'")
+
+    required_training_keys = ("objective", "sampler", "loss_mode", "save_every_epoch")
+    for key in required_training_keys:
+        if key not in base_config["training"]:
+            raise KeyError(f"metadata_json.training missing required key: {key!r}")
+    if "group_key" not in base_config["group_dro"]:
+        raise KeyError("metadata_json.group_dro missing required key: 'group_key'")
     return base_config
 
 
@@ -136,9 +138,10 @@ def init_wandb_logger(args, base_config):
 
     try:
         wandb_logger_sig = inspect.signature(WandbLogger.__init__)
+    except (TypeError, ValueError) as exc:
+        _warn("could not inspect WandbLogger signature; keeping kwargs as-is", exc)
+    else:
         wandb_logger_kwargs = {k: v for k, v in wandb_logger_kwargs.items() if k in wandb_logger_sig.parameters}
-    except Exception:
-        wandb_logger_kwargs = {}
 
     log(
         "wandb init "
@@ -146,73 +149,81 @@ def init_wandb_logger(args, base_config):
         f"mode={os.environ.get('WANDB_MODE')!r}"
     )
     wandb_t0 = time.time()
-    wandb_logger = WandbLogger(project=wandb_project, name=args.run_name, **wandb_logger_kwargs)
+    try:
+        wandb_logger = WandbLogger(project=wandb_project, name=args.run_name, **wandb_logger_kwargs)
+    except Exception as exc:
+        _warn("wandb init failed; training will continue with logger disabled", exc)
+        return None, {
+            "group": wandb_group,
+            "tags": wandb_tags,
+            "project": wandb_project,
+            "entity": wandb_entity,
+        }
     log(f"wandb ready in {time.time() - wandb_t0:.1f}s")
 
     # Sweep selection: ensure W&B summarizes robust metrics by the best value over training,
     # not the last logged value.
     try:
         run = wandb_logger.experiment
-        # Lightning logs optimizer step as `trainer/global_step`. Use it as the
-        # default x-axis for every metric so train/val/metrics stay aligned.
         run.define_metric("trainer/global_step")
         run.define_metric("*", step_metric="trainer/global_step", step_sync=True)
 
-        run.define_metric("val/worst_group_loss", summary="min")
-        run.define_metric("val/avg_loss", summary="min")
-        run.define_metric("val/worst_group_dice", summary="max")
-        run.define_metric("val/avg_dice", summary="max")
-        run.define_metric("val/worst_group_loss_ema", summary="min")
-        run.define_metric("val/avg_loss_ema", summary="min")
-        run.define_metric("val/worst_group_dice_ema", summary="max")
-        run.define_metric("val/avg_dice_ema", summary="max")
-        run.define_metric("train/total_loss_ema", summary="min")
-        run.define_metric("train/dice_ema", summary="max")
-        run.define_metric("train/worst_group_loss_ema", summary="min")
-
-        # Evaluation metrics (logged under metrics/val/*).
-        run.define_metric("metrics/val/auprc", summary="max")
-        run.define_metric("metrics/val/auroc", summary="max")
-        run.define_metric("metrics/val/best_f_beta", summary="max")
-        run.define_metric("metrics/val/f_beta", summary="max")
-        run.define_metric("metrics/val/dice", summary="max")
-        run.define_metric("metrics/val/iou", summary="max")
-        run.define_metric("metrics/val/mcc", summary="max")
-        run.define_metric("metrics/val/balanced_accuracy", summary="max")
-        run.define_metric("metrics/val/brier", summary="min")
-
-        run.define_metric("metrics/val_stitch/drd", summary="min")
-        run.define_metric("metrics/val_stitch/mpm", summary="min")
-        run.define_metric("metrics/val_stitch/nrm", summary="min")
-        run.define_metric("metrics/val_stitch/voi", summary="min")
-        run.define_metric("metrics/val_stitch/psnr", summary="max")
-        run.define_metric("metrics/val_stitch/betti/l1_betti_err", summary="min")
-        run.define_metric("metrics/val_stitch/abs_euler_err", summary="min")
-        run.define_metric("metrics/val_stitch/boundary/hd95", summary="min")
-        run.define_metric("metrics/val_stitch/skeleton/cldice", summary="max")
-        run.define_metric("metrics/val_stitch/components/mean_iou", summary="max")
-        run.define_metric("metrics/val_stitch/components/worst_k_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/worst_q_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/dice_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/dice_worst_k_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/dice_worst_q_mean", summary="max")
-        run.define_metric("metrics/val_stitch/pq/pq", summary="max")
-        run.define_metric("metrics/val_stitch/components/pr_auprc_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/pr_auroc_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/pr_auprc_worst_k_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/pr_auroc_worst_k_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/pr_auprc_worst_q_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/pr_auroc_worst_q_mean", summary="max")
-        run.define_metric("metrics/val_stitch/stability/dice_mean", summary="max")
-        run.define_metric("metrics/val_stitch/stability/fbeta_mean", summary="max")
-        run.define_metric("metrics/val_stitch/pfm", summary="max")
-        run.define_metric("metrics/val_stitch/components/ssim_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/ssim_worst_k_mean", summary="max")
-        run.define_metric("metrics/val_stitch/components/ssim_worst_q_mean", summary="max")
-        run.define_metric("metrics/val_stitch/pr/auprc", summary="max")
-        run.define_metric("metrics/val_stitch/pr/auroc", summary="max")
-    except Exception:
-        pass
+        metric_summaries = {
+            "val/worst_group_loss": "min",
+            "val/avg_loss": "min",
+            "val/worst_group_dice": "max",
+            "val/avg_dice": "max",
+            "val/worst_group_loss_ema": "min",
+            "val/avg_loss_ema": "min",
+            "val/worst_group_dice_ema": "max",
+            "val/avg_dice_ema": "max",
+            "train/total_loss_ema": "min",
+            "train/dice_ema": "max",
+            "train/worst_group_loss_ema": "min",
+            "metrics/val/auprc": "max",
+            "metrics/val/auroc": "max",
+            "metrics/val/best_f_beta": "max",
+            "metrics/val/f_beta": "max",
+            "metrics/val/dice": "max",
+            "metrics/val/iou": "max",
+            "metrics/val/mcc": "max",
+            "metrics/val/balanced_accuracy": "max",
+            "metrics/val/brier": "min",
+            "metrics/val_stitch/drd": "min",
+            "metrics/val_stitch/mpm": "min",
+            "metrics/val_stitch/nrm": "min",
+            "metrics/val_stitch/voi": "min",
+            "metrics/val_stitch/psnr": "max",
+            "metrics/val_stitch/betti/l1_betti_err": "min",
+            "metrics/val_stitch/abs_euler_err": "min",
+            "metrics/val_stitch/boundary/hd95": "min",
+            "metrics/val_stitch/skeleton/cldice": "max",
+            "metrics/val_stitch/components/mean_iou": "max",
+            "metrics/val_stitch/components/worst_k_mean": "max",
+            "metrics/val_stitch/components/worst_q_mean": "max",
+            "metrics/val_stitch/components/dice_mean": "max",
+            "metrics/val_stitch/components/dice_worst_k_mean": "max",
+            "metrics/val_stitch/components/dice_worst_q_mean": "max",
+            "metrics/val_stitch/pq/pq": "max",
+            "metrics/val_stitch/components/pr_auprc_mean": "max",
+            "metrics/val_stitch/components/pr_auroc_mean": "max",
+            "metrics/val_stitch/components/pr_auprc_worst_k_mean": "max",
+            "metrics/val_stitch/components/pr_auroc_worst_k_mean": "max",
+            "metrics/val_stitch/components/pr_auprc_worst_q_mean": "max",
+            "metrics/val_stitch/components/pr_auroc_worst_q_mean": "max",
+            "metrics/val_stitch/stability/dice_mean": "max",
+            "metrics/val_stitch/stability/fbeta_mean": "max",
+            "metrics/val_stitch/pfm": "max",
+            "metrics/val_stitch/components/ssim_mean": "max",
+            "metrics/val_stitch/components/ssim_worst_k_mean": "max",
+            "metrics/val_stitch/components/ssim_worst_q_mean": "max",
+            "metrics/val_stitch/pr/auprc": "max",
+            "metrics/val_stitch/pr/auroc": "max",
+        }
+        for metric_name, summary_mode in metric_summaries.items():
+            run.define_metric(metric_name, summary=summary_mode)
+    except Exception as exc:
+        _warn("wandb metric definitions failed; continuing", exc)
 
     wandb_info = {
         "group": wandb_group,
@@ -224,37 +235,40 @@ def init_wandb_logger(args, base_config):
 
 
 def merge_config(base_config, wandb_logger, args):
-    try:
-        wandb_overrides = unflatten_dict(dict(wandb_logger.experiment.config))
-    except Exception:
-        wandb_overrides = {}
+    wandb_overrides = {}
+    if wandb_logger is not None:
+        try:
+            wandb_overrides = unflatten_dict(dict(wandb_logger.experiment.config))
+        except Exception as exc:
+            _warn("failed to parse wandb config overrides; proceeding with metadata/base config only", exc)
 
     merged_config = json.loads(json.dumps(base_config))
     deep_merge_dict(merged_config, wandb_overrides)
 
     apply_metadata_hyperparameters(CFG, merged_config)
-    try:
-        log("cfg " + json.dumps(merged_config, sort_keys=True, default=str))
-    except Exception:
-        log(f"cfg {merged_config}")
-    try:
-        log("args_json " + json.dumps(vars(args), sort_keys=True, default=str))
-    except Exception:
-        log("args_json (failed to serialize)")
+    log("cfg " + json.dumps(merged_config, sort_keys=True, default=str))
+    log("args_json " + json.dumps(vars(args), sort_keys=True, default=str))
 
-    try:
-        wandb_logger.experiment.config.update(merged_config, allow_val_change=True)
-    except Exception:
-        pass
+    if wandb_logger is not None:
+        try:
+            wandb_logger.experiment.config.update(merged_config, allow_val_change=True)
+        except Exception as exc:
+            _warn("failed to sync merged config back to wandb", exc)
 
     return merged_config
 
 
 def prepare_run(args, merged_config, wandb_logger, wandb_info):
-    segments_metadata = merged_config.get("segments", {}) or {}
-    fragment_ids = list(segments_metadata.keys()) or DEFAULT_FRAGMENT_IDS
+    if "segments" not in merged_config or not isinstance(merged_config["segments"], dict):
+        raise KeyError("metadata_json must define an object at key 'segments'")
+    segments_metadata = merged_config["segments"]
+    if not segments_metadata:
+        raise ValueError("metadata_json must define at least one segment under key 'segments'")
+    fragment_ids = list(segments_metadata.keys())
 
-    training_cfg = merged_config.get("training", {}) or {}
+    if "training" not in merged_config or not isinstance(merged_config["training"], dict):
+        raise KeyError("metadata_json must define an object at key 'training'")
+    training_cfg = merged_config["training"]
     train_fragment_ids = training_cfg.get("train_segments")
     val_fragment_ids = training_cfg.get("val_segments")
     if train_fragment_ids is None:
@@ -277,7 +291,9 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
         if missing_val:
             raise ValueError(f"training.val_segments contains unknown segment ids: {missing_val}")
 
-    group_dro_cfg = merged_config.get("group_dro", {}) or {}
+    if "group_dro" not in merged_config or not isinstance(merged_config["group_dro"], dict):
+        raise KeyError("metadata_json must define an object at key 'group_dro'")
+    group_dro_cfg = merged_config["group_dro"]
     group_key = group_dro_cfg.get("group_key", "base_path")
 
     init_ckpt_path = resolve_checkpoint_path(
@@ -330,27 +346,8 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
     if CFG.valid_id not in val_fragment_ids and val_fragment_ids:
         CFG.valid_id = val_fragment_ids[0]
 
-    if args.save_every_epoch:
-        CFG.save_every_epoch = True
-    if args.accumulate_grad_batches is not None:
-        CFG.accumulate_grad_batches = int(args.accumulate_grad_batches)
-    if args.data_backend is not None:
-        CFG.data_backend = str(args.data_backend).lower().strip()
-    if getattr(CFG, "data_backend", "zarr") not in {"zarr", "tiff"}:
-        raise ValueError(f"--data_backend must be 'zarr' or 'tiff', got {CFG.data_backend!r}")
-    if args.dataset_root is not None:
-        CFG.dataset_root = str(args.dataset_root)
-
     if args.outputs_path is not None:
         CFG.outputs_path = str(args.outputs_path)
-    if args.stitch_all_val:
-        CFG.stitch_all_val = True
-    if args.stitch_train:
-        CFG.stitch_train = True
-    if args.stitch_train_every_n_epochs is not None:
-        CFG.stitch_train_every_n_epochs = max(1, int(args.stitch_train_every_n_epochs))
-    if args.stitch_downsample is not None:
-        CFG.stitch_downsample = max(1, int(args.stitch_downsample))
 
     run_slug = args.run_name or f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_stitch={CFG.valid_id}"
     if args.run_name is None and getattr(CFG, "cv_fold", None) is not None:
@@ -381,15 +378,16 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
             tags.append(fold_tag)
         wandb_info["tags"] = tags
 
-    try:
-        if wandb_info.get("group") is not None:
-            wandb_logger.experiment.group = str(wandb_info["group"])
-        if wandb_info.get("tags"):
-            wandb_logger.experiment.tags = wandb_info["tags"]
-        if args.run_name is None:
-            wandb_logger.experiment.name = f"{run_slug}_{run_id}"
-    except Exception:
-        pass
+    if wandb_logger is not None:
+        try:
+            if wandb_info.get("group") is not None:
+                wandb_logger.experiment.group = str(wandb_info["group"])
+            if wandb_info.get("tags"):
+                wandb_logger.experiment.tags = wandb_info["tags"]
+            if args.run_name is None:
+                wandb_logger.experiment.name = f"{run_slug}_{run_id}"
+        except Exception as exc:
+            _warn("failed to apply wandb run metadata (group/tags/name)", exc)
 
     CFG.outputs_path = run_dir
     CFG.model_dir = osp.join(run_dir, "checkpoints")
@@ -477,27 +475,26 @@ def build_model(run_state, data_state, wandb_logger):
         log(f"loading init weights from {run_state['init_ckpt_path']}")
         state_dict = load_state_dict_from_checkpoint(run_state["init_ckpt_path"])
         incompat = model.load_state_dict(state_dict, strict=False)
+        missing = len(incompat.missing_keys)
+        unexpected = len(incompat.unexpected_keys)
+        log(f"loaded init weights (missing_keys={missing}, unexpected_keys={unexpected})")
+    if wandb_logger is not None:
         try:
-            missing = len(incompat.missing_keys)
-            unexpected = len(incompat.unexpected_keys)
-            log(f"loaded init weights (missing_keys={missing}, unexpected_keys={unexpected})")
-        except Exception:
-            log("loaded init weights")
-    try:
-        wandb_logger.watch(model, log="all", log_freq=100)
-    except Exception:
-        pass
+            wandb_logger.watch(model, log="all", log_freq=100)
+        except Exception as exc:
+            _warn("wandb watch failed; continuing without parameter/gradient watching", exc)
     return model
 
 
 def build_trainer(args, wandb_logger):
+    trainer_logger = wandb_logger if wandb_logger is not None else False
     return pl.Trainer(
         max_epochs=CFG.epochs,
         accelerator=args.accelerator,
         devices=args.devices,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         log_every_n_steps=10,
-        logger=wandb_logger,
+        logger=trainer_logger,
         default_root_dir=CFG.outputs_path,
         accumulate_grad_batches=CFG.accumulate_grad_batches,
         precision=args.precision,
@@ -539,7 +536,8 @@ def fit(trainer, model, data_state, run_state):
         val_dataloaders=data_state["val_loaders"],
         ckpt_path=run_state["resume_ckpt_path"],
     )
-    wandb.finish()
+    if wandb.run is not None:
+        wandb.finish()
 
 
 def run(args):

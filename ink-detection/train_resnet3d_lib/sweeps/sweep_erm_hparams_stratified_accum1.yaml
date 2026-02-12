@@ -13,7 +13,7 @@ parameters:
   training.loss_mode:
     value: batch
   training.sampler:
-    value: group_balanced
+    value: group_stratified
   training.cv_fold:
     value: 0
 
@@ -31,6 +31,13 @@ parameters:
     min: 1e-8
     max: 1e-2
 
+  training.stitch_all_val:
+    value: true
+  training.stitch_train:
+    value: true
+  training.stitch_downsample:
+    value: 1
+
 command:
   - ${env}
   - ${interpreter}
@@ -39,9 +46,5 @@ command:
   - metadata.json
   - --outputs_path
   - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/train_scrolls
-  - --stitch_all_val
-  - --stitch_train
-  - --stitch_downsample
-  - "1"
   - --wandb_tags
-  - ink-2um,erm,hparam_sweep,group_balanced,accum1,fold0
+  - ink-2um,erm,hparam_sweep,group_stratified,accum1,fold0

@@ -13,7 +13,7 @@ from pytorch_lightning.loggers import WandbLogger
 
 from metrics import StreamingBinarySegmentationMetrics
 
-from group_dro import GroupDROComputer
+from train_resnet3d_lib.group_dro import GroupDROComputer
 from warmup_scheduler import GradualWarmupScheduler
 from models.resnetall import generate_model
 # from models.i3dallnl import InceptionI3d
@@ -143,10 +143,9 @@ class StitchManager:
             ds_h = (h + ds - 1) // ds
             ds_w = (w + ds - 1) // ds
             if self.use_roi and bbox is not None:
-                try:
-                    y0, y1, x0, x1 = [int(v) for v in bbox]
-                except Exception:
-                    y0, y1, x0, x1 = 0, 0, 0, 0
+                if len(bbox) != 4:
+                    raise ValueError(f"stitch ROI bbox must be [y0, y1, x0, x1], got {bbox!r}")
+                y0, y1, x0, x1 = [int(v) for v in bbox]
                 y0 = max(0, min(y0, ds_h))
                 y1 = max(0, min(y1, ds_h))
                 x0 = max(0, min(x0, ds_w))
@@ -661,136 +660,121 @@ class StitchManager:
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             if isinstance(model.logger, WandbLogger):
-                step = None
-                try:
-                    step = int(getattr(model.trainer, "global_step", 0))
-                except Exception:
-                    step = None
-                if step is None:
-                    model.logger.log_image(key="masks", images=images, caption=captions)
-                else:
-                    model.logger.log_image(key="masks", images=images, caption=captions, step=step)
+                step = int(getattr(model.trainer, "global_step", 0))
+                model.logger.log_image(key="masks", images=images, caption=captions, step=step)
                 if log_only_images:
-                    if step is None:
-                        model.logger.log_image(key="masks_log_only", images=log_only_images, caption=log_only_captions)
-                    else:
-                        model.logger.log_image(
-                            key="masks_log_only",
-                            images=log_only_images,
-                            caption=log_only_captions,
-                            step=step,
-                        )
+                    model.logger.log_image(
+                        key="masks_log_only",
+                        images=log_only_images,
+                        caption=log_only_captions,
+                        step=step,
+                    )
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             if bool(getattr(CFG, "eval_stitch_metrics", True)) and segment_to_val:
-                try:
-                    from metrics.textseg_metrics import compute_stitched_metrics
-                except Exception as e:
-                    compute_stitched_metrics = None
-                    log(f"WARNING: stitch metrics disabled (failed import metrics.textseg_metrics): {e}")
+                from metrics.textseg_metrics import compute_stitched_metrics
 
-                if compute_stitched_metrics is not None:
-                    label_suffix = str(getattr(CFG, "val_label_suffix", "_val"))
-                    mask_suffix = str(getattr(CFG, "val_mask_suffix", "_val"))
-                    threshold = float(getattr(CFG, "eval_threshold", 0.5))
-                    fbeta = float(getattr(CFG, "eval_fbeta", 0.5))
-                    betti_connectivity = int(getattr(CFG, "eval_betti_connectivity", 2))
-                    drd_block_size = int(getattr(CFG, "eval_drd_block_size", 8))
-                    boundary_k = int(getattr(CFG, "eval_boundary_k", 3))
-                    component_iou_thr = float(getattr(CFG, "eval_component_iou_thr", 0.5))
-                    component_worst_q = getattr(CFG, "eval_component_worst_q", 0.1)
-                    if isinstance(component_worst_q, str) and component_worst_q.strip().lower() in {"", "none", "null"}:
-                        component_worst_q = None
-                    if component_worst_q is not None:
-                        component_worst_q = float(component_worst_q)
-                    component_worst_k = getattr(CFG, "eval_component_worst_k", None)
-                    if isinstance(component_worst_k, str) and component_worst_k.strip().lower() in {"", "none", "null"}:
-                        component_worst_k = None
-                    if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
-                        component_worst_k = int(component_worst_k)
-                    component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
-                    component_ssim = bool(getattr(CFG, "eval_component_ssim", False))
-                    component_ssim_pad = int(getattr(CFG, "eval_component_ssim_pad", 2))
-                    pr_num_bins = int(getattr(CFG, "eval_pr_num_bins", 200))
-                    ssim_mode = str(getattr(CFG, "eval_ssim_mode", "prob"))
-                    compute_persistence = bool(getattr(CFG, "eval_persistence", False))
-                    persistence_downsample = int(getattr(CFG, "eval_persistence_downsample", 4) or 1)
-                    save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
-                    skeleton_images_dir = str(getattr(CFG, "eval_skeleton_images_dir", "metrics_skeletons"))
-                    output_dir = osp.join(str(getattr(CFG, "figures_dir", ".")), skeleton_images_dir)
-                    component_output_dir = osp.join(
-                        str(getattr(CFG, "figures_dir", ".")),
-                        "metrics_components",
+                label_suffix = str(getattr(CFG, "val_label_suffix", "_val"))
+                mask_suffix = str(getattr(CFG, "val_mask_suffix", "_val"))
+                threshold = float(getattr(CFG, "eval_threshold", 0.5))
+                fbeta = float(getattr(CFG, "eval_fbeta", 0.5))
+                betti_connectivity = int(getattr(CFG, "eval_betti_connectivity", 2))
+                drd_block_size = int(getattr(CFG, "eval_drd_block_size", 8))
+                boundary_k = int(getattr(CFG, "eval_boundary_k", 3))
+                component_iou_thr = float(getattr(CFG, "eval_component_iou_thr", 0.5))
+                component_worst_q = getattr(CFG, "eval_component_worst_q", 0.1)
+                if isinstance(component_worst_q, str) and component_worst_q.strip().lower() in {"", "none", "null"}:
+                    component_worst_q = None
+                if component_worst_q is not None:
+                    component_worst_q = float(component_worst_q)
+                component_worst_k = getattr(CFG, "eval_component_worst_k", None)
+                if isinstance(component_worst_k, str) and component_worst_k.strip().lower() in {"", "none", "null"}:
+                    component_worst_k = None
+                if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
+                    component_worst_k = int(component_worst_k)
+                component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
+                component_ssim = bool(getattr(CFG, "eval_component_ssim", False))
+                component_ssim_pad = int(getattr(CFG, "eval_component_ssim_pad", 2))
+                pr_num_bins = int(getattr(CFG, "eval_pr_num_bins", 200))
+                ssim_mode = str(getattr(CFG, "eval_ssim_mode", "prob"))
+                compute_persistence = bool(getattr(CFG, "eval_persistence", False))
+                persistence_downsample = int(getattr(CFG, "eval_persistence_downsample", 4) or 1)
+                save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
+                skeleton_images_dir = str(getattr(CFG, "eval_skeleton_images_dir", "metrics_skeletons"))
+                output_dir = osp.join(str(getattr(CFG, "figures_dir", ".")), skeleton_images_dir)
+                component_output_dir = osp.join(
+                    str(getattr(CFG, "figures_dir", ".")),
+                    "metrics_components",
+                )
+
+                def _parse_list(value, cast_fn):
+                    if value is None:
+                        return None
+                    if isinstance(value, str):
+                        parts = [p.strip() for p in value.replace(";", ",").split(",")]
+                        return [cast_fn(p) for p in parts if p]
+                    if isinstance(value, (list, tuple, np.ndarray)):
+                        return [cast_fn(v) for v in value]
+                    return [cast_fn(value)]
+
+                boundary_tols = _parse_list(getattr(CFG, "eval_boundary_tols", None), float)
+                skeleton_radius = _parse_list(getattr(CFG, "eval_skeleton_radius", None), int)
+
+                threshold_grid = _parse_list(getattr(CFG, "eval_threshold_grid", None), float)
+                if threshold_grid is None:
+                    tmin = float(getattr(CFG, "eval_threshold_grid_min", 0.05))
+                    tmax = float(getattr(CFG, "eval_threshold_grid_max", 0.95))
+                    steps = int(getattr(CFG, "eval_threshold_grid_steps", 19))
+                    if steps >= 2:
+                        threshold_grid = np.linspace(tmin, tmax, steps).tolist()
+
+                multi = len(segment_to_val) > 1
+                for segment_id, (pred_prob, pred_has) in segment_to_val.items():
+                    meta = segment_to_val_meta.get(str(segment_id), {})
+                    roi_offset = meta.get("offset", (0, 0))
+                    cache_max = int(max(1, len(segment_to_val))) if segment_to_val else 1
+                    metrics = compute_stitched_metrics(
+                        fragment_id=segment_id,
+                        pred_prob=pred_prob,
+                        pred_has=pred_has,
+                        label_suffix=label_suffix,
+                        mask_suffix=mask_suffix,
+                        downsample=self.downsample,
+                        roi_offset=roi_offset,
+                        threshold=threshold,
+                        fbeta=fbeta,
+                        betti_connectivity=betti_connectivity,
+                        drd_block_size=drd_block_size,
+                        boundary_k=boundary_k,
+                        boundary_tols=boundary_tols,
+                        skeleton_radius=skeleton_radius,
+                        component_iou_thr=component_iou_thr,
+                        component_worst_q=component_worst_q,
+                        component_worst_k=component_worst_k,
+                        component_min_area=component_min_area,
+                        component_ssim=component_ssim,
+                        component_ssim_pad=component_ssim_pad,
+                        pr_num_bins=pr_num_bins,
+                        threshold_grid=threshold_grid,
+                        ssim_mode=ssim_mode,
+                        compute_persistence=compute_persistence,
+                        persistence_downsample=persistence_downsample,
+                        output_dir=output_dir,
+                        component_output_dir=component_output_dir,
+                        save_skeleton_images=save_skeleton_images,
+                        gt_cache_max=cache_max,
                     )
 
-                    def _parse_list(value, cast_fn):
-                        if value is None:
-                            return None
-                        if isinstance(value, str):
-                            parts = [p.strip() for p in value.replace(";", ",").split(",")]
-                            return [cast_fn(p) for p in parts if p]
-                        if isinstance(value, (list, tuple, np.ndarray)):
-                            return [cast_fn(v) for v in value]
-                        return [cast_fn(value)]
-
-                    boundary_tols = _parse_list(getattr(CFG, "eval_boundary_tols", None), float)
-                    skeleton_radius = _parse_list(getattr(CFG, "eval_skeleton_radius", None), int)
-
-                    threshold_grid = _parse_list(getattr(CFG, "eval_threshold_grid", None), float)
-                    if threshold_grid is None:
-                        tmin = float(getattr(CFG, "eval_threshold_grid_min", 0.05))
-                        tmax = float(getattr(CFG, "eval_threshold_grid_max", 0.95))
-                        steps = int(getattr(CFG, "eval_threshold_grid_steps", 19))
-                        if steps >= 2:
-                            threshold_grid = np.linspace(tmin, tmax, steps).tolist()
-
-                    multi = len(segment_to_val) > 1
-                    for segment_id, (pred_prob, pred_has) in segment_to_val.items():
-                        try:
-                            meta = segment_to_val_meta.get(str(segment_id), {})
-                            roi_offset = meta.get("offset", (0, 0))
-                            cache_max = int(max(1, len(segment_to_val))) if segment_to_val else 1
-                            metrics = compute_stitched_metrics(
-                                fragment_id=segment_id,
-                                pred_prob=pred_prob,
-                                pred_has=pred_has,
-                                label_suffix=label_suffix,
-                                mask_suffix=mask_suffix,
-                                downsample=self.downsample,
-                                roi_offset=roi_offset,
-                                threshold=threshold,
-                                fbeta=fbeta,
-                                betti_connectivity=betti_connectivity,
-                                drd_block_size=drd_block_size,
-                                boundary_k=boundary_k,
-                                boundary_tols=boundary_tols,
-                                skeleton_radius=skeleton_radius,
-                                component_iou_thr=component_iou_thr,
-                                component_worst_q=component_worst_q,
-                                component_worst_k=component_worst_k,
-                                component_min_area=component_min_area,
-                                component_ssim=component_ssim,
-                                component_ssim_pad=component_ssim_pad,
-                                pr_num_bins=pr_num_bins,
-                                threshold_grid=threshold_grid,
-                                ssim_mode=ssim_mode,
-                                compute_persistence=compute_persistence,
-                                persistence_downsample=persistence_downsample,
-                                output_dir=output_dir,
-                                component_output_dir=component_output_dir,
-                                save_skeleton_images=save_skeleton_images,
-                                gt_cache_max=cache_max,
-                            )
-                        except Exception as e:
-                            log(f"WARNING: failed stitch metrics for segment={segment_id!r}: {e}")
-                            continue
-
-                        base_key = "metrics/val_stitch"
-                        if multi:
-                            safe_segment_id = str(segment_id).replace("/", "_")
-                            base_key = f"{base_key}/{safe_segment_id}"
-                        for k, v in (metrics or {}).items():
-                            model.log(f"{base_key}/{k}", v, on_epoch=True, prog_bar=False)
+                    base_key = "metrics/val_stitch"
+                    if multi:
+                        safe_segment_id = str(segment_id).replace("/", "_")
+                        base_key = f"{base_key}/{safe_segment_id}"
+                    if not isinstance(metrics, dict):
+                        raise TypeError(
+                            f"compute_stitched_metrics must return a dict, got {type(metrics).__name__}"
+                        )
+                    for k, v in metrics.items():
+                        model.log(f"{base_key}/{k}", v, on_epoch=True, prog_bar=False)
 
         # reset stitch buffers
         for pred_buf, count_buf in self.buffers.values():
@@ -1048,9 +1032,9 @@ class RegressionPLModel(pl.LightningModule):
 
     def _update_ema_metric(self, name, value):
         decay = float(self._ema_decay)
-        try:
+        if torch.is_tensor(value):
             val = float(value.detach().cpu().item())
-        except Exception:
+        else:
             val = float(value)
         prev = self._ema_metrics.get(name)
         if prev is None:
@@ -1159,8 +1143,8 @@ class RegressionPLModel(pl.LightningModule):
             raise ValueError(f"Unknown training.objective: {self.hparams.objective!r}")
 
         self._update_train_stats(per_sample_loss, per_sample_dice, g)
-        if torch.isnan(loss):
-            print("Loss nan encountered")
+        if torch.isnan(loss).any():
+            raise FloatingPointError("NaN loss encountered during training_step")
         self.log("train/total_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss}
 

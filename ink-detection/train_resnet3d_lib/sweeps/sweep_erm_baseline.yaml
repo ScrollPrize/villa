@@ -1,10 +1,10 @@
 program: train_resnet3d.py
-project: ink-2um-experiments
+project: ink-group-dro
 entity: vesuvius-challenge
-method: random
+method: grid
 
 metric:
-  name: val/worst_group_loss_ema.min
+  name: val/worst_group_loss.min
   goal: minimize
 
 parameters:
@@ -14,37 +14,28 @@ parameters:
     value: batch
   training.sampler:
     value: shuffle
-  training.cv_fold:
-    value: 0
-
 
   training_hyperparameters.training.accumulate_grad_batches:
-    value: 4
-
-  training_hyperparameters.training.epochs:
-    value: 60
+    value: 1
 
   training_hyperparameters.training.lr:
-    distribution: log_uniform_values
-    min: 2e-5
-    max: 1.5e-3
+    value: 1e-5
 
   training_hyperparameters.training.weight_decay:
-    distribution: log_uniform_values
-    min: 1e-8
-    max: 1e-2
+    value: 1e-6
+
+  training.stitch_all_val:
+    value: true
+  training.stitch_train:
+    value: true
+  training.stitch_downsample:
+    value: 8
 
 command:
   - ${env}
   - ${interpreter}
   - ${program}
   - --metadata_json
-  - metadata.json
+  - metadata-no500p2a.json
   - --outputs_path
   - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/train_scrolls
-  - --stitch_all_val
-  - --stitch_train
-  - --stitch_downsample
-  - "1"
-  - --wandb_tags
-  - ink-2um,erm,hparam_sweep,shuffle,accum4,fold0

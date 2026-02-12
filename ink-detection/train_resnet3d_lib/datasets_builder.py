@@ -32,6 +32,15 @@ from train_resnet3d_lib.data_ops import (
 )
 
 
+def _segment_meta(segments_metadata, fragment_id):
+    if fragment_id not in segments_metadata:
+        raise KeyError(f"segments metadata missing fragment id: {fragment_id!r}")
+    seg_meta = segments_metadata[fragment_id]
+    if not isinstance(seg_meta, dict):
+        raise TypeError(f"segments[{fragment_id!r}] must be an object, got {type(seg_meta).__name__}")
+    return seg_meta
+
+
 def build_group_metadata(fragment_ids, segments_metadata, group_key):
     group_names, _group_name_to_idx, fragment_to_group_idx = build_group_mappings(
         fragment_ids,
@@ -237,51 +246,7 @@ def build_train_loader(train_images, train_masks, train_groups, group_names, *, 
         groups=train_groups,
         transform=train_transform,
     )
-
-    group_array = torch.as_tensor(train_groups, dtype=torch.long)
-    group_counts = torch.bincount(group_array, minlength=len(group_names)).float()
-    train_group_counts = [int(x) for x in group_counts.tolist()]
-    log(f"train group counts {dict(zip(group_names, train_group_counts))}")
-
-    if CFG.sampler == "shuffle":
-        train_sampler = None
-        train_shuffle = True
-        train_batch_sampler = None
-    elif CFG.sampler == "group_balanced":
-        group_weights = len(train_dataset) / group_counts.clamp_min(1)
-        weights = group_weights[group_array]
-        train_sampler = WeightedRandomSampler(weights, len(train_dataset), replacement=True)
-        train_shuffle = False
-        train_batch_sampler = None
-    elif CFG.sampler == "group_stratified":
-        train_sampler = None
-        train_shuffle = False
-        train_batch_sampler = GroupStratifiedBatchSampler(
-            train_groups,
-            batch_size=CFG.train_batch_size,
-            seed=getattr(CFG, "seed", 0),
-            drop_last=True,
-        )
-
-    if train_batch_sampler is not None:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=train_batch_sampler,
-            num_workers=CFG.num_workers,
-            pin_memory=True,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=CFG.train_batch_size,
-            shuffle=train_shuffle,
-            sampler=train_sampler,
-            num_workers=CFG.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-
-    return train_loader, train_group_counts
+    return _build_train_loader_from_dataset(train_dataset, train_groups, group_names)
 
 
 def _build_train_loader_from_dataset(train_dataset, train_groups, group_names):
@@ -387,22 +352,11 @@ def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stit
     if not bool(getattr(CFG, "stitch_train", False)):
         return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
 
-    if bool(getattr(CFG, "stitch_all_val", False)):
-        requested_ids = [str(fid) for fid in train_fragment_ids if str(fid) in train_stitch_candidates]
-    else:
-        requested_ids = []
-        if stitch_segment_id is not None and str(stitch_segment_id) in train_stitch_candidates:
-            requested_ids = [str(stitch_segment_id)]
-        else:
-            for fid in train_fragment_ids:
-                if str(fid) in train_stitch_candidates:
-                    requested_ids = [str(fid)]
-                    break
-        if not requested_ids:
-            log(
-                "WARNING: stitch_train is enabled but no train segments had stitch candidates. "
-                "No train visualization stitch will be produced."
-            )
+    requested_ids = _resolve_requested_train_stitch_ids(
+        train_fragment_ids,
+        train_stitch_candidates.keys(),
+        stitch_segment_id,
+    )
 
     for segment_id in requested_ids:
         entry = train_stitch_candidates.get(str(segment_id))
@@ -522,7 +476,7 @@ def build_log_only_stitch_loaders(
     log_only_bboxes = {}
 
     for fragment_id in log_only_segments:
-        seg_meta = segments_metadata.get(fragment_id, {}) or {}
+        seg_meta = _segment_meta(segments_metadata, fragment_id)
         layers = layers_cache.get(fragment_id)
         if layers is None:
             layers = read_image_layers(
@@ -584,7 +538,7 @@ def build_log_only_stitch_loaders_lazy(
 
     for fragment_id in log_only_segments:
         sid = str(fragment_id)
-        seg_meta = segments_metadata.get(fragment_id, {}) or {}
+        seg_meta = _segment_meta(segments_metadata, fragment_id)
         volume = volume_cache.get(sid)
         if volume is None:
             volume = ZarrSegmentVolume(
@@ -691,7 +645,7 @@ def build_datasets(run_state):
 
         for fragment_id in train_fragment_ids:
             sid = str(fragment_id)
-            seg_meta = segments_metadata.get(fragment_id, {}) or {}
+            seg_meta = _segment_meta(segments_metadata, fragment_id)
             group_idx = int(fragment_to_group_idx[fragment_id])
             group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
 
@@ -740,7 +694,7 @@ def build_datasets(run_state):
 
         for fragment_id in val_fragment_ids:
             sid = str(fragment_id)
-            seg_meta = segments_metadata.get(fragment_id, {}) or {}
+            seg_meta = _segment_meta(segments_metadata, fragment_id)
             group_idx = int(fragment_to_group_idx[fragment_id])
             group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
 
@@ -917,7 +871,7 @@ def build_datasets(run_state):
     include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
 
     for fragment_id in train_fragment_ids:
-        seg_meta = segments_metadata.get(fragment_id, {}) or {}
+        seg_meta = _segment_meta(segments_metadata, fragment_id)
         group_idx = fragment_to_group_idx[fragment_id]
         group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
 
@@ -945,7 +899,7 @@ def build_datasets(run_state):
         train_groups.extend([group_idx] * len(result["images"]))
 
     for fragment_id in val_fragment_ids:
-        seg_meta = segments_metadata.get(fragment_id, {}) or {}
+        seg_meta = _segment_meta(segments_metadata, fragment_id)
         group_idx = fragment_to_group_idx[fragment_id]
         group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
 
