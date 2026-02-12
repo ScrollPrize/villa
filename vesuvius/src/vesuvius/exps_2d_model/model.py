@@ -54,6 +54,26 @@ class ModelParams:
 		)
 
 
+def xy_img_validity_mask(*, params: ModelParams, xy: torch.Tensor) -> torch.Tensor:
+	"""Return a binary mask for pixel xy image positions.
+
+	`xy` must encode (x,y) in the last dimension (..,2) in model pixel coords.
+	Output has shape `xy.shape[:-1]`.
+	"""
+	if xy.ndim < 1 or int(xy.shape[-1]) != 2:
+		raise ValueError("xy must have last dim == 2")
+	if params.crop_xyzwhd is None:
+		raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd")
+	_cx, _cy, cw, ch, _z0, _d = params.crop_xyzwhd
+	h = float(max(1, int(ch) - 1))
+	w = float(max(1, int(cw) - 1))
+	flat = xy.reshape(-1, 2)
+	x = flat[:, 0]
+	y = flat[:, 1]
+	inside = (x >= 0.0) & (x <= w) & (y >= 0.0) & (y <= h)
+	return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
+
+
 @dataclass(frozen=True)
 class FitResult:
 	_xy_lr: torch.Tensor
@@ -218,23 +238,7 @@ class Model2D(nn.Module):
 			self.global_transform_enabled = False
 
 	def xy_img_validity_mask(self, *, xy: torch.Tensor) -> torch.Tensor:
-		"""Return a binary mask for pixel xy image positions.
-
-	`xy` must encode (x,y) in the last dimension (..,2) in pixel coords.
-	Output has shape `xy.shape[:-1]`.
-	"""
-		if xy.ndim < 1 or int(xy.shape[-1]) != 2:
-			raise ValueError("xy must have last dim == 2")
-		if self.params.crop_xyzwhd is None:
-			raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd")
-		_cx, _cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
-		h = float(max(1, int(ch) - 1))
-		w = float(max(1, int(cw) - 1))
-		flat = xy.reshape(-1, 2)
-		x = flat[:, 0]
-		y = flat[:, 1]
-		inside = (x >= 0.0) & (x <= w) & (y >= 0.0) & (y <= h)
-		return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
+		return xy_img_validity_mask(params=self.params, xy=xy)
 
 	def forward(self, data: fit_data.FitData) -> FitResult:
 		if int(data.cos.shape[0]) != int(self.z_size):

@@ -85,6 +85,14 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	mag_lc = res.data.grid_sample_px(xy_px=xy_lc_strip).grad_mag.reshape(n, 1, he, we, strip_samples)
 	mag_cr = res.data.grid_sample_px(xy_px=xy_cr_strip).grad_mag.reshape(n, 1, he, we, strip_samples)
 
+	# Validity mask for the strip samples (not just endpoints).
+	mask_lc_strip = fit_model.xy_img_validity_mask(params=res.params, xy=xy_lc_strip).reshape(n, he, we, strip_samples).unsqueeze(1)
+	mask_cr_strip = fit_model.xy_img_validity_mask(params=res.params, xy=xy_cr_strip).reshape(n, he, we, strip_samples).unsqueeze(1)
+	mask_lc_strip = mask_lc_strip.amin(dim=-1)
+	mask_cr_strip = mask_cr_strip.amin(dim=-1)
+
+	# (dbg dump removed)
+
 	eps = 1e-12
 	len_lc = torch.sqrt(((center - left) * (center - left)).sum(dim=-1) + eps) * float(res.data.downscale)
 	len_cr = torch.sqrt(((right - center) * (right - center)).sum(dim=-1) + eps) * float(res.data.downscale)
@@ -111,6 +119,8 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	mask_lc = torch.minimum(mc_lc_hr[..., 0], mc_lc_hr[..., 1])
 	mask_cr = torch.minimum(mc_cr_hr[..., 0], mc_cr_hr[..., 1])
 	mask = torch.minimum(mask_lc, mask_cr)
+	mask = torch.minimum(mask, mask_lc_strip)
+	mask = torch.minimum(mask, mask_cr_strip)
 	return lm, mask
 
 
