@@ -180,26 +180,56 @@ def init_wandb_logger(args, base_config):
             "train/total_loss_ema": "min",
             "train/dice_ema": "max",
             "train/worst_group_loss_ema": "min",
-            "metrics/val/best_f_beta": "max",
-            "metrics/val/f_beta": "max",
             "metrics/val/dice": "max",
-            "metrics/val/mcc": "max",
-            "metrics/val/balanced_accuracy": "max",
-            "metrics/val_stitch/drd": "min",
-            "metrics/val_stitch/mpm": "min",
-            "metrics/val_stitch/voi": "min",
-            "metrics/val_stitch/psnr": "max",
-            "metrics/val_stitch/betti/l1_betti_err": "min",
-            "metrics/val_stitch/abs_euler_err": "min",
-            "metrics/val_stitch/boundary/hd95": "min",
-            "metrics/val_stitch/skeleton/cldice": "max",
-            "metrics/val_stitch/skeleton/chamfer": "min",
-            "metrics/val_stitch/components/dice_mean": "max",
-            "metrics/val_stitch/components/dice_worst_k_mean": "max",
-            "metrics/val_stitch/components/dice_worst_q_mean": "max",
-            "metrics/val_stitch/stability/dice_mean": "max",
-            "metrics/val_stitch/stability/fbeta_mean": "max",
-            "metrics/val_stitch/pfm": "max",
+            "metrics/val_stitch/segments/*/dice_hard": "max",
+            "metrics/val_stitch/segments/*/dice_soft": "max",
+            "metrics/val_stitch/segments/*/drd": "min",
+            "metrics/val_stitch/segments/*/mpm": "min",
+            "metrics/val_stitch/segments/*/voi": "min",
+            "metrics/val_stitch/segments/*/betti/l1_betti_err": "min",
+            "metrics/val_stitch/segments/*/abs_euler_err": "min",
+            "metrics/val_stitch/segments/*/boundary/hd95": "min",
+            "metrics/val_stitch/segments/*/skeleton/cldice": "max",
+            "metrics/val_stitch/segments/*/skeleton/chamfer": "min",
+            "metrics/val_stitch/global/components/dice_hard_mean": "max",
+            "metrics/val_stitch/global/components/dice_hard_worst_k_mean": "max",
+            "metrics/val_stitch/global/components/dice_hard_worst_q_mean": "max",
+            "metrics/val_stitch/global/components/dice_soft_mean": "max",
+            "metrics/val_stitch/global/components/dice_soft_worst_k_mean": "max",
+            "metrics/val_stitch/global/components/dice_soft_worst_q_mean": "max",
+            "metrics/val_stitch/global/components/pfm_mean": "max",
+            "metrics/val_stitch/global/components/pfm_worst_k_mean": "max",
+            "metrics/val_stitch/global/components/pfm_worst_q_mean": "max",
+            "metrics/val_stitch/global/components/voi_mean": "min",
+            "metrics/val_stitch/global/components/voi_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/voi_worst_q_mean": "min",
+            "metrics/val_stitch/global/components/mpm_mean": "min",
+            "metrics/val_stitch/global/components/mpm_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/mpm_worst_q_mean": "min",
+            "metrics/val_stitch/global/components/drd_mean": "min",
+            "metrics/val_stitch/global/components/drd_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/drd_worst_q_mean": "min",
+            "metrics/val_stitch/global/components/betti_l1_mean": "min",
+            "metrics/val_stitch/global/components/betti_l1_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/betti_l1_worst_q_mean": "min",
+            "metrics/val_stitch/global/components/abs_euler_err_mean": "min",
+            "metrics/val_stitch/global/components/abs_euler_err_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/abs_euler_err_worst_q_mean": "min",
+            "metrics/val_stitch/global/components/boundary_hd95_mean": "min",
+            "metrics/val_stitch/global/components/boundary_hd95_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/boundary_hd95_worst_q_mean": "min",
+            "metrics/val_stitch/global/components/skeleton_cldice_mean": "max",
+            "metrics/val_stitch/global/components/skeleton_cldice_worst_k_mean": "max",
+            "metrics/val_stitch/global/components/skeleton_cldice_worst_q_mean": "max",
+            "metrics/val_stitch/global/components/skeleton_chamfer_mean": "min",
+            "metrics/val_stitch/global/components/skeleton_chamfer_worst_k_mean": "min",
+            "metrics/val_stitch/global/components/skeleton_chamfer_worst_q_mean": "min",
+            "metrics/val_stitch/segments/*/stability/dice_hard_mean": "max",
+            "metrics/val_stitch/segments/*/stability/dice_soft_mean": "max",
+            "metrics/val_stitch/segments/*/stability/pfm_mean": "max",
+            "metrics/val_stitch/segments/*/stability/voi_mean": "min",
+            "metrics/val_stitch/segments/*/stability/betti_l1_mean": "min",
+            "metrics/val_stitch/segments/*/pfm": "max",
         }
         for metric_name, summary_mode in metric_summaries.items():
             run.define_metric(metric_name, summary=summary_mode)
@@ -258,10 +288,11 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
         val_fragment_ids = fragment_ids
     train_fragment_ids = list(train_fragment_ids)
     val_fragment_ids = list(val_fragment_ids)
+    stitch_target = "all" if bool(getattr(CFG, "stitch_all_val", False)) else str(CFG.valid_id)
     log(
         "segments "
         f"train={len(train_fragment_ids)} val={len(val_fragment_ids)} "
-        f"valid_id={CFG.valid_id!r}"
+        f"stitch_target={stitch_target!r}"
     )
 
     if segments_metadata:
@@ -330,7 +361,15 @@ def prepare_run(args, merged_config, wandb_logger, wandb_info):
     if args.outputs_path is not None:
         CFG.outputs_path = str(args.outputs_path)
 
-    run_slug = args.run_name or f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_stitch={CFG.valid_id}"
+    if args.run_name is None:
+        lr_tag = f"{float(CFG.lr):.2e}"
+        wd_tag = f"{float(CFG.weight_decay):.2e}"
+        run_slug = (
+            f"{CFG.objective}_{CFG.sampler}_{CFG.loss_mode}_"
+            f"lr={lr_tag}_wd={wd_tag}"
+        )
+    else:
+        run_slug = args.run_name
     if args.run_name is None and getattr(CFG, "cv_fold", None) is not None:
         run_slug = f"{run_slug}_fold={CFG.cv_fold}"
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"

@@ -10,7 +10,7 @@ def parse_args():
 
 
 def main():
-    args = tr.parse_args()
+    args = parse_args()
     tr.log_startup(args)
     base_config = tr.load_base_config(args)
     wandb_logger, wandb_info = tr.init_wandb_logger(args, base_config)

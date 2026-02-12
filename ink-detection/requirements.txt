@@ -11,7 +11,7 @@ timesformer-pytorch
 typed-argument-parser
 numpy==1.26.4
 PyYAML
-opencv-python-headless
+opencv-contrib-python-headless
 Pillow
 scipy
 tqdm

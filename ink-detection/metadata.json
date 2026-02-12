@@ -109,7 +109,28 @@
       "num_workers": 12,
       "layer_read_workers": 12,
       "seed": 130697,
+      "eval_threshold": 0.5,
+      "eval_stitch_metrics": true,
+      "eval_drd_block_size": 8,
+      "eval_boundary_k": 3,
+      "eval_boundary_tols": [
+        1.0
+      ],
+      "eval_skeleton_radius": [
+        1
+      ],
+      "eval_component_worst_q": 0.2,
+      "eval_component_worst_k": 2,
       "eval_component_min_area": 0,
+      "eval_component_pad": 5,
+      "eval_stitch_full_region_metrics": false,
+      "eval_save_component_debug_images": false,
+      "eval_component_debug_max_items": 24,
+      "eval_threshold_grid_min": 0.4,
+      "eval_threshold_grid_max": 0.7,
+      "eval_threshold_grid_steps": 5,
+      "eval_threshold_grid": null,
+      "eval_save_skeleton_images": true,
       "stitch_log_only_downsample": 8
     },
     "augmentation": {

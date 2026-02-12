@@ -20,12 +20,6 @@ from models.resnetall import generate_model
 from train_resnet3d_lib.config import CFG, log
 
 
-# from resnetall import generate_model
-def init_weights(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m, mode='fan_out', nonlinearity='relu')
-
-
 def _pick_group_norm_groups(num_channels: int, desired_groups: int) -> int:
     num_channels = int(num_channels)
     desired_groups = int(desired_groups)
@@ -339,7 +333,6 @@ class StitchManager:
                 return False
 
         t0 = time.perf_counter()
-        from train_resnet3d_lib.config import log
         log(f"train stitch pass start epoch={epoch}")
 
         for segment_id in self.train_segment_ids:
@@ -425,7 +418,6 @@ class StitchManager:
                 return False
 
         t0 = time.perf_counter()
-        from train_resnet3d_lib.config import log
         log(f"log-only stitch pass start epoch={epoch}")
 
         for segment_id in self.log_only_segment_ids:
@@ -672,34 +664,47 @@ class StitchManager:
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             if bool(getattr(CFG, "eval_stitch_metrics", True)) and segment_to_val:
-                from metrics.textseg_metrics import compute_stitched_metrics
+                from metrics.stitched_metrics import (
+                    compute_stitched_metrics,
+                    summarize_component_rows,
+                    write_global_component_manifest,
+                )
 
                 label_suffix = str(getattr(CFG, "val_label_suffix", "_val"))
                 mask_suffix = str(getattr(CFG, "val_mask_suffix", "_val"))
                 threshold = float(getattr(CFG, "eval_threshold", 0.5))
-                fbeta = float(getattr(CFG, "eval_fbeta", 0.5))
-                betti_connectivity = int(getattr(CFG, "eval_betti_connectivity", 2))
+                betti_connectivity = 2
                 drd_block_size = int(getattr(CFG, "eval_drd_block_size", 8))
                 boundary_k = int(getattr(CFG, "eval_boundary_k", 3))
-                component_worst_q = getattr(CFG, "eval_component_worst_q", 0.1)
+                component_worst_q = getattr(CFG, "eval_component_worst_q", 0.2)
                 if isinstance(component_worst_q, str) and component_worst_q.strip().lower() in {"", "none", "null"}:
                     component_worst_q = None
                 if component_worst_q is not None:
                     component_worst_q = float(component_worst_q)
-                component_worst_k = getattr(CFG, "eval_component_worst_k", None)
+                component_worst_k = getattr(CFG, "eval_component_worst_k", 2)
                 if isinstance(component_worst_k, str) and component_worst_k.strip().lower() in {"", "none", "null"}:
                     component_worst_k = None
                 if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
                     component_worst_k = int(component_worst_k)
                 component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
-                component_pad = int(getattr(CFG, "eval_component_pad", 2))
+                component_pad = int(getattr(CFG, "eval_component_pad", 5))
+                enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
                 save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
-                skeleton_images_dir = str(getattr(CFG, "eval_skeleton_images_dir", "metrics_skeletons"))
-                output_dir = osp.join(str(getattr(CFG, "figures_dir", ".")), skeleton_images_dir)
+                save_component_debug_images = bool(getattr(CFG, "eval_save_component_debug_images", False))
+                component_debug_max_items = getattr(CFG, "eval_component_debug_max_items", None)
+                if isinstance(component_debug_max_items, str) and component_debug_max_items.strip().lower() in {
+                    "",
+                    "none",
+                    "null",
+                }:
+                    component_debug_max_items = None
+                if component_debug_max_items is not None:
+                    component_debug_max_items = int(component_debug_max_items)
                 component_output_dir = osp.join(
                     str(getattr(CFG, "figures_dir", ".")),
                     "metrics_components",
                 )
+                output_dir = component_output_dir
 
                 def _parse_list(value, cast_fn):
                     if value is None:
@@ -722,7 +727,7 @@ class StitchManager:
                     if steps >= 2:
                         threshold_grid = np.linspace(tmin, tmax, steps).tolist()
 
-                multi = len(segment_to_val) > 1
+                global_component_rows = []
                 for segment_id, (pred_prob, pred_has) in segment_to_val.items():
                     meta = segment_to_val_meta.get(str(segment_id), {})
                     roi_offset = meta.get("offset", (0, 0))
@@ -736,7 +741,6 @@ class StitchManager:
                         downsample=self.downsample,
                         roi_offset=roi_offset,
                         threshold=threshold,
-                        fbeta=fbeta,
                         betti_connectivity=betti_connectivity,
                         drd_block_size=drd_block_size,
                         boundary_k=boundary_k,
@@ -746,23 +750,64 @@ class StitchManager:
                         component_worst_k=component_worst_k,
                         component_min_area=component_min_area,
                         component_pad=component_pad,
+                        enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
                         output_dir=output_dir,
                         component_output_dir=component_output_dir,
                         save_skeleton_images=save_skeleton_images,
+                        save_component_debug_images=save_component_debug_images,
+                        component_debug_max_items=component_debug_max_items,
                         gt_cache_max=cache_max,
+                        component_rows_collector=global_component_rows,
                     )
 
-                    base_key = "metrics/val_stitch"
-                    if multi:
-                        safe_segment_id = str(segment_id).replace("/", "_")
-                        base_key = f"{base_key}/{safe_segment_id}"
+                    safe_segment_id = str(segment_id).replace("/", "_")
+                    base_key = f"metrics/val_stitch/segments/{safe_segment_id}"
                     if not isinstance(metrics, dict):
                         raise TypeError(
                             f"compute_stitched_metrics must return a dict, got {type(metrics).__name__}"
                         )
                     for k, v in metrics.items():
                         model.log(f"{base_key}/{k}", v, on_epoch=True, prog_bar=False)
+
+                if global_component_rows:
+                    global_stats, global_rankings = summarize_component_rows(
+                        global_component_rows,
+                        worst_q=component_worst_q,
+                        worst_k=component_worst_k,
+                        id_key="global_component_id",
+                    )
+                    for metric_name, stats in global_stats.items():
+                        for stat_name, stat_val in stats.items():
+                            model.log(
+                                f"metrics/val_stitch/global/components/{metric_name}_{stat_name}",
+                                float(stat_val),
+                                on_epoch=True,
+                                prog_bar=False,
+                            )
+                    manifest_path = None
+                    if component_output_dir:
+                        manifest_path = write_global_component_manifest(
+                            component_rows=global_component_rows,
+                            component_output_dir=component_output_dir,
+                            downsample=self.downsample,
+                            worst_k=component_worst_k,
+                            worst_q=component_worst_q,
+                            rankings=global_rankings,
+                        )
+                    if isinstance(model.logger, WandbLogger):
+                        run = model.logger.experiment
+                        if manifest_path is not None:
+                            run.summary["metrics/val_stitch/global/components_manifest_path"] = str(manifest_path)
+                        for metric_name, ranking in global_rankings.items():
+                            k_ids = ranking["worst_k_component_ids"]
+                            q_ids = ranking["worst_q_component_ids"]
+                            run.summary[
+                                f"metrics/val_stitch/global/components/{metric_name}_worst_k_component_ids"
+                            ] = ",".join(str(v) for v in k_ids)
+                            run.summary[
+                                f"metrics/val_stitch/global/components/{metric_name}_worst_q_component_ids"
+                            ] = ",".join(str(v) for v in q_ids)
 
         # reset stitch buffers
         for pred_buf, count_buf in self.buffers.values():
@@ -856,8 +901,6 @@ class RegressionPLModel(pl.LightningModule):
 
         # Evaluation-only metrics (kept separate from the optimization objective).
         self._eval_threshold = float(getattr(CFG, "eval_threshold", 0.5))
-        self._eval_fbeta = float(getattr(CFG, "eval_fbeta", 0.5))
-        self._eval_num_bins = int(getattr(CFG, "eval_num_bins", 1000))
         self._val_eval_metrics = None
 
         self.loss_func1 = smp.losses.DiceLoss(mode="binary")
@@ -947,9 +990,6 @@ class RegressionPLModel(pl.LightningModule):
             offset=offset,
         )
 
-    def _run_train_stitch_pass(self):
-        return self._stitcher.run_train_stitch_pass(self)
-
     def on_train_epoch_start(self):
         device = self.device
         self._train_loss_sum = torch.tensor(0.0, device=device)
@@ -1014,9 +1054,6 @@ class RegressionPLModel(pl.LightningModule):
         group_denom = group_count + (group_count == 0).float()
         group_avg = (group_map @ values.view(-1)) / group_denom
         return group_avg, group_count
-
-    def compute_batch_loss(self, logits, targets):
-        return 0.5 * self.loss_func1(logits, targets) + 0.5 * self.loss_func2(logits, targets)
 
     def _update_ema_metric(self, name, value):
         decay = float(self._ema_decay)
@@ -1191,8 +1228,6 @@ class RegressionPLModel(pl.LightningModule):
 
         self._val_eval_metrics = StreamingBinarySegmentationMetrics(
             threshold=self._eval_threshold,
-            beta=self._eval_fbeta,
-            num_bins=self._eval_num_bins,
             device=device,
         )
 
@@ -1262,9 +1297,6 @@ class RegressionPLModel(pl.LightningModule):
             eval_metrics = self._val_eval_metrics.compute()
             for k, v in eval_metrics.items():
                 self.log(f"metrics/val/{k}", v, on_epoch=True, prog_bar=False)
-            # Helpful context in W&B charts, even if constant per run.
-            self.log("metrics/val/threshold", float(self._eval_threshold), on_epoch=True, prog_bar=False)
-            self.log("metrics/val/beta", float(self._eval_fbeta), on_epoch=True, prog_bar=False)
 
         for group_idx, group_name in enumerate(self.group_names):
             safe_group_name = str(group_name).replace("/", "_")
@@ -1397,7 +1429,3 @@ def get_scheduler(cfg, optimizer):
         optimizer, multiplier=1.0, total_epoch=1, after_scheduler=scheduler_cosine)
 
     return scheduler
-
-
-def scheduler_step(scheduler, avg_val_loss, epoch):
-    scheduler.step(epoch)

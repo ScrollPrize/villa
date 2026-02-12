@@ -1,15 +1,13 @@
-from train_resnet3d_lib.config import CFG, REVERSE_LAYER_FRAGMENT_IDS_FALLBACK
+from train_resnet3d_lib.config import CFG
 
 import os.path as osp
 
 import numpy as np
 import random
 import cv2
-import torch
 import torch.nn.functional as F
 
 import albumentations as A
-from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset
 from scipy import ndimage
 import PIL.Image
@@ -109,8 +107,6 @@ def read_image_layers(
             image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
             image = cv2.resize(image, (image.shape[1] // 2, image.shape[0] // 2), interpolation=cv2.INTER_AREA)
             np.clip(image, 0, 200, out=image)
-            if fragment_id == '20230827161846':
-                image = cv2.flip(image, 0)
             images_list.append(image)
 
         images = np.stack(images_list, axis=2)
@@ -135,8 +131,6 @@ def read_image_layers(
 
     images = np.zeros((out_h, out_w, len(idxs)), dtype=first.dtype)
     np.clip(first, 0, 200, out=first)
-    if fragment_id == '20230827161846':
-        first = cv2.flip(first, 0)
     images[:base_h, :base_w, 0] = first
 
     def _load_and_write(task):
@@ -155,8 +149,6 @@ def read_image_layers(
                 f"{fragment_id}: layer {i:02} has shape {img.shape} but expected {(base_h, base_w)}"
             )
         np.clip(img, 0, 200, out=img)
-        if fragment_id == '20230827161846':
-            img = cv2.flip(img, 0)
         images[:base_h, :base_w, chan] = img
         return None
 
@@ -193,7 +185,7 @@ def read_image_mask(
             layer_range=layer_range,
         )
 
-    if reverse_layers or fragment_id in REVERSE_LAYER_FRAGMENT_IDS_FALLBACK:
+    if reverse_layers:
         images = images[:, :, ::-1]
 
     dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
@@ -214,8 +206,6 @@ def read_image_mask(
         fragment_mask = _read_gray(f"{mask_base}.tif")
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
-    if fragment_id == '20230827161846':
-        fragment_mask = cv2.flip(fragment_mask, 0)
 
     def _assert_bottom_right_pad_compatible(a_name, a_hw, b_name, b_hw, multiple):
         _assert_bottom_right_pad_compatible_global(fragment_id, a_name, a_hw, b_name, b_hw, multiple)
@@ -296,7 +286,7 @@ def read_image_fragment_mask(
             layer_range=layer_range,
         )
 
-    if reverse_layers or fragment_id in REVERSE_LAYER_FRAGMENT_IDS_FALLBACK:
+    if reverse_layers:
         images = images[:, :, ::-1]
 
     dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
@@ -308,8 +298,6 @@ def read_image_fragment_mask(
         fragment_mask = _read_gray(f"{mask_base}.tif")
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
-    if fragment_id == '20230827161846':
-        fragment_mask = cv2.flip(fragment_mask, 0)
 
     if "frag" not in fragment_id:
         pad_multiple = 256
@@ -415,10 +403,9 @@ class ZarrSegmentVolume:
         self.seg_meta = _require_dict(seg_meta, name=f"segments[{self.fragment_id!r}]")
         self.path = resolve_segment_zarr_path(self.fragment_id, self.seg_meta)
         self.is_frag = "frag" in self.fragment_id
-        self.flip_vertical = self.fragment_id == "20230827161846"
 
         idxs = _compute_selected_layer_indices(self.fragment_id, layer_range=layer_range)
-        if reverse_layers or self.fragment_id in REVERSE_LAYER_FRAGMENT_IDS_FALLBACK:
+        if reverse_layers:
             idxs = list(reversed(idxs))
         self._requested_layer_indices = [int(i) for i in idxs]
 
@@ -521,10 +508,6 @@ class ZarrSegmentVolume:
     def shape(self):
         return (int(self._out_h), int(self._out_w), int(CFG.in_chans))
 
-    @property
-    def base_shape(self):
-        return (int(self._base_h), int(self._base_w))
-
     def _ensure_zarr_array(self):
         if self._zarr_array is None:
             self._zarr_array = self._open_zarr_array(self.path)
@@ -570,13 +553,7 @@ class ZarrSegmentVolume:
         return out
 
     def _read_nonfrag_patch(self, y1, y2, x1, x2):
-        if not self.flip_vertical:
-            return self._read_nonfrag_patch_unflipped(y1, y2, x1, x2)
-
-        src_y1 = int(self._base_h) - int(y2)
-        src_y2 = int(self._base_h) - int(y1)
-        patch = self._read_nonfrag_patch_unflipped(src_y1, src_y2, x1, x2)
-        return np.flipud(patch)
+        return self._read_nonfrag_patch_unflipped(y1, y2, x1, x2)
 
     def _read_frag_patch_unflipped(self, y1, y2, x1, x2):
         # "frag" segments are resized by 2x downsampling after padding.
@@ -594,13 +571,7 @@ class ZarrSegmentVolume:
         return out
 
     def _read_frag_patch(self, y1, y2, x1, x2):
-        if not self.flip_vertical:
-            return self._read_frag_patch_unflipped(y1, y2, x1, x2)
-
-        src_y1 = int(self._out_h) - int(y2)
-        src_y2 = int(self._out_h) - int(y1)
-        patch = self._read_frag_patch_unflipped(src_y1, src_y2, x1, x2)
-        return np.flipud(patch)
+        return self._read_frag_patch_unflipped(y1, y2, x1, x2)
 
     def read_patch(self, y1, y2, x1, x2):
         y1 = int(y1)
@@ -657,8 +628,6 @@ def read_label_and_fragment_mask_for_shape(
         fragment_mask = _read_gray(f"{mask_base}.tif")
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
-    if str(fragment_id) == "20230827161846":
-        fragment_mask = cv2.flip(fragment_mask, 0)
 
     if not bool(is_frag):
         pad_multiple = 256
@@ -736,8 +705,6 @@ def read_fragment_mask_for_shape(
         fragment_mask = _read_gray(f"{mask_base}.tif")
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
-    if str(fragment_id) == "20230827161846":
-        fragment_mask = cv2.flip(fragment_mask, 0)
 
     if "frag" not in str(fragment_id):
         pad_multiple = 256
@@ -1010,18 +977,6 @@ class CustomDataset(Dataset):
 
     def __len__(self):
         return len(self.images)
-
-    def cubeTranslate(self, y):
-        x = np.random.uniform(0, 1, 4).reshape(2, 2)
-        x[x < .4] = 0
-        x[x > .633] = 2
-        x[(x > .4) & (x < .633)] = 1
-        mask = cv2.resize(x, (x.shape[1] * 64, x.shape[0] * 64), interpolation=cv2.INTER_AREA)
-
-        x = np.zeros((self.cfg.size, self.cfg.size, self.cfg.in_chans)).astype(np.uint8)
-        for i in range(3):
-            x = np.where(np.repeat((mask == 0).reshape(self.cfg.size, self.cfg.size, 1), self.cfg.in_chans, axis=2), y[:, :, i:self.cfg.in_chans + i], x)
-        return x
 
     def __getitem__(self, idx):
         group_id = 0

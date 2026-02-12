@@ -62,7 +62,7 @@ class CFG:
     onecycle_final_div_factor = 1e2
     cosine_warmup_pct = 0.15
     # ============== fold =============
-    valid_id = '20230820203112'
+    valid_id = None
     stitch_all_val = False
     stitch_downsample = 1
     stitch_train = False
@@ -88,29 +88,26 @@ class CFG:
     accumulate_grad_batches = 1
 
     # ============== eval metrics cfg (validation-only) =============
-    # Threshold for confusion-based metrics (F-beta, Dice, etc.).
+    # Threshold for confusion-based metrics.
     eval_threshold = 0.5
-    # Beta for F-beta; ScrollPrize/Vesuvius often uses F0.5 (precision-weighted).
-    eval_fbeta = 0.5
-    # Histogram bins for approximate best-F-beta threshold search.
-    eval_num_bins = 1000
     # Extra "stitched segment" metrics (expensive, but more faithful for topology/document metrics).
     eval_stitch_metrics = True
-    eval_betti_connectivity = 2  # 1=4-neighborhood, 2=8-neighborhood
     eval_drd_block_size = 8
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
     eval_skeleton_radius = [1]
-    eval_component_worst_q = 0.1
-    eval_component_worst_k = 8
+    eval_component_worst_q = 0.2
+    eval_component_worst_k = 2
     eval_component_min_area = 0
-    eval_component_pad = 2
+    eval_component_pad = 5
+    eval_stitch_full_region_metrics = False
+    eval_save_component_debug_images = False
+    eval_component_debug_max_items = 24
     eval_threshold_grid_min = 0.40
     eval_threshold_grid_max = 0.70
     eval_threshold_grid_steps = 5
     eval_threshold_grid = None
     eval_save_skeleton_images = True
-    eval_skeleton_images_dir = "metrics_skeletons"
 
     # ============== fixed =============
     pretrained = True
@@ -168,13 +165,6 @@ def cfg_init(cfg, mode='train'):
 
     if mode == 'train':
         make_dirs(cfg)
-
-REVERSE_LAYER_FRAGMENT_IDS_FALLBACK = {
-    '20230701020044', 'verso', '20230901184804', '20230901234823', '20230531193658', '20231007101615',
-    '20231005123333', '20231011144857', '20230522215721', '20230919113918', '20230625171244',
-    '20231022170900', '20231012173610', '20231016151000'
-}
-
 
 def load_metadata_json(path):
     with open(path, "r") as f:
@@ -341,10 +331,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("exclude_weight_decay_bias_norm", "exclude_weight_decay_bias_norm"),
         ("max_grad_norm", "max_grad_norm"),
         ("eval_threshold", "eval_threshold"),
-        ("eval_fbeta", "eval_fbeta"),
-        ("eval_num_bins", "eval_num_bins"),
         ("eval_stitch_metrics", "eval_stitch_metrics"),
-        ("eval_betti_connectivity", "eval_betti_connectivity"),
         ("eval_drd_block_size", "eval_drd_block_size"),
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
@@ -353,12 +340,14 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_component_worst_k", "eval_component_worst_k"),
         ("eval_component_min_area", "eval_component_min_area"),
         ("eval_component_pad", "eval_component_pad"),
+        ("eval_stitch_full_region_metrics", "eval_stitch_full_region_metrics"),
+        ("eval_save_component_debug_images", "eval_save_component_debug_images"),
+        ("eval_component_debug_max_items", "eval_component_debug_max_items"),
         ("eval_threshold_grid_min", "eval_threshold_grid_min"),
         ("eval_threshold_grid_max", "eval_threshold_grid_max"),
         ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
         ("eval_threshold_grid", "eval_threshold_grid"),
         ("eval_save_skeleton_images", "eval_save_skeleton_images"),
-        ("eval_skeleton_images_dir", "eval_skeleton_images_dir"),
         ("pretrained", "pretrained"),
         ("num_workers", "num_workers"),
         ("layer_read_workers", "layer_read_workers"),
