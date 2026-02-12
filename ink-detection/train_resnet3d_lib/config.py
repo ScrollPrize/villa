@@ -88,11 +88,11 @@ class CFG:
     accumulate_grad_batches = 1
 
     # ============== eval metrics cfg (validation-only) =============
-    # Threshold for confusion-based metrics (precision/recall/F-beta/MCC/IoU/Dice).
+    # Threshold for confusion-based metrics (F-beta, Dice, etc.).
     eval_threshold = 0.5
     # Beta for F-beta; ScrollPrize/Vesuvius often uses F0.5 (precision-weighted).
     eval_fbeta = 0.5
-    # Histogram bins for approximate AUPRC/AUROC and best-F-beta threshold search.
+    # Histogram bins for approximate best-F-beta threshold search.
     eval_num_bins = 1000
     # Extra "stitched segment" metrics (expensive, but more faithful for topology/document metrics).
     eval_stitch_metrics = True
@@ -101,20 +101,14 @@ class CFG:
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
     eval_skeleton_radius = [1]
-    eval_component_iou_thr = 0.5
     eval_component_worst_q = 0.1
     eval_component_worst_k = 8
     eval_component_min_area = 0
-    eval_component_ssim = True
-    eval_component_ssim_pad = 2
-    eval_pr_num_bins = 200
-    eval_threshold_grid_min = 0.05
-    eval_threshold_grid_max = 0.95
-    eval_threshold_grid_steps = 19
+    eval_component_pad = 2
+    eval_threshold_grid_min = 0.40
+    eval_threshold_grid_max = 0.70
+    eval_threshold_grid_steps = 5
     eval_threshold_grid = None
-    eval_ssim_mode = "prob"  # "prob" | "dist"
-    eval_persistence = False
-    eval_persistence_downsample = 4
     eval_save_skeleton_images = True
     eval_skeleton_images_dir = "metrics_skeletons"
 
@@ -355,20 +349,14 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
         ("eval_skeleton_radius", "eval_skeleton_radius"),
-        ("eval_component_iou_thr", "eval_component_iou_thr"),
         ("eval_component_worst_q", "eval_component_worst_q"),
         ("eval_component_worst_k", "eval_component_worst_k"),
         ("eval_component_min_area", "eval_component_min_area"),
-        ("eval_component_ssim", "eval_component_ssim"),
-        ("eval_component_ssim_pad", "eval_component_ssim_pad"),
-        ("eval_pr_num_bins", "eval_pr_num_bins"),
+        ("eval_component_pad", "eval_component_pad"),
         ("eval_threshold_grid_min", "eval_threshold_grid_min"),
         ("eval_threshold_grid_max", "eval_threshold_grid_max"),
         ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
         ("eval_threshold_grid", "eval_threshold_grid"),
-        ("eval_ssim_mode", "eval_ssim_mode"),
-        ("eval_persistence", "eval_persistence"),
-        ("eval_persistence_downsample", "eval_persistence_downsample"),
         ("eval_save_skeleton_images", "eval_save_skeleton_images"),
         ("eval_skeleton_images_dir", "eval_skeleton_images_dir"),
         ("pretrained", "pretrained"),

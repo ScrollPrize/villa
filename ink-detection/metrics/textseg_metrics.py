@@ -167,20 +167,8 @@ def dice_from_confusion(c: Confusion) -> float:
     return _safe_div(2.0 * c.tp, 2.0 * c.tp + c.fp + c.fn)
 
 
-def iou_from_confusion(c: Confusion) -> float:
-    return _safe_div(c.tp, c.tp + c.fp + c.fn)
-
-
 def accuracy_from_confusion(c: Confusion) -> float:
     return _safe_div(c.tp + c.tn, c.tp + c.fp + c.fn + c.tn)
-
-
-def precision_from_confusion(c: Confusion) -> float:
-    return _safe_div(c.tp, c.tp + c.fp)
-
-
-def recall_from_confusion(c: Confusion) -> float:
-    return _safe_div(c.tp, c.tp + c.fn)
 
 
 def fbeta_from_confusion(c: Confusion, *, beta: float) -> float:
@@ -286,13 +274,6 @@ def psnr(pred: np.ndarray, gt: np.ndarray, *, C: float = 255.0) -> float:
     if mse <= 0:
         return float("inf")
     return float(10.0 * math.log10((C * C) / mse))
-
-
-def nrm(pred: np.ndarray, gt: np.ndarray) -> float:
-    c = confusion_counts(pred, gt)
-    nr_fn = _safe_div(c.fn, c.fn + c.tp)
-    nr_fp = _safe_div(c.fp, c.fp + c.tn)
-    return float(0.5 * (nr_fn + nr_fp))
 
 
 def _boundary_mask(mask: np.ndarray, *, k: int = 3) -> np.ndarray:
@@ -470,34 +451,6 @@ def hausdorff_metrics(
     return {"hd": hd, "hd95": hd95, "assd": assd}
 
 
-def boundary_iou(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    tau: float = 1.0,
-    boundary_k: int = 3,
-) -> float:
-    """Boundary IoU using a tau-width band around each boundary."""
-    from scipy.ndimage import distance_transform_edt
-
-    pred = _as_bool_2d(pred)
-    gt = _as_bool_2d(gt)
-    pb = _boundary_mask(pred, k=boundary_k)
-    gb = _boundary_mask(gt, k=boundary_k)
-    if pb.sum() == 0 and gb.sum() == 0:
-        return 1.0
-    if pb.sum() == 0 or gb.sum() == 0:
-        return 0.0
-
-    dt_to_pb = distance_transform_edt((~pb).astype(np.uint8))
-    dt_to_gb = distance_transform_edt((~gb).astype(np.uint8))
-    pb_band = dt_to_pb <= float(tau)
-    gb_band = dt_to_gb <= float(tau)
-    inter = np.logical_and(pb_band, gb_band).sum()
-    union = np.logical_or(pb_band, gb_band).sum()
-    return _safe_div(inter, union)
-
-
 def skeletonize_binary(mask: np.ndarray) -> np.ndarray:
     mask = _as_bool_2d(mask)
     if not mask.any():
@@ -658,6 +611,29 @@ def skeleton_tube_metrics(
     return {"tube_precision": float(prec), "tube_recall": float(rec), "tube_f1": float(f1)}
 
 
+def skeleton_chamfer(skel_pred: np.ndarray, skel_gt: np.ndarray) -> Dict[str, float]:
+    from scipy.ndimage import distance_transform_edt
+
+    skel_pred = _as_bool_2d(skel_pred)
+    skel_gt = _as_bool_2d(skel_gt)
+
+    if skel_pred.sum() == 0 and skel_gt.sum() == 0:
+        return {"chamfer": 0.0, "pred_to_gt": 0.0, "gt_to_pred": 0.0}
+    if skel_pred.sum() == 0 or skel_gt.sum() == 0:
+        diag = float(math.hypot(skel_pred.shape[0], skel_pred.shape[1]))
+        return {"chamfer": diag, "pred_to_gt": diag, "gt_to_pred": diag}
+
+    dt_to_gt = distance_transform_edt((~skel_gt).astype(np.uint8))
+    dt_to_pred = distance_transform_edt((~skel_pred).astype(np.uint8))
+    pred_to_gt = float(dt_to_gt[skel_pred].mean())
+    gt_to_pred = float(dt_to_pred[skel_gt].mean())
+    return {
+        "chamfer": float(0.5 * (pred_to_gt + gt_to_pred)),
+        "pred_to_gt": pred_to_gt,
+        "gt_to_pred": gt_to_pred,
+    }
+
+
 def _label_components(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[np.ndarray, int]:
     from scipy.ndimage import label as cc_label
 
@@ -665,80 +641,6 @@ def _label_components(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[np.nd
     struct = _cc_structure(connectivity)
     lab, n = cc_label(mask, structure=struct)
     return lab, int(n)
-
-
-def component_iou_stats(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    connectivity: int = 2,
-    worst_q: Optional[float] = 0.1,
-    worst_k: Optional[int] = None,
-    pred_lab: Optional[np.ndarray] = None,
-    n_pred: Optional[int] = None,
-    gt_lab: Optional[np.ndarray] = None,
-    n_gt: Optional[int] = None,
-) -> Dict[str, float]:
-    pred = _as_bool_2d(pred)
-    gt = _as_bool_2d(gt)
-    if pred_lab is None or n_pred is None:
-        pred_lab, n_pred = _label_components(pred, connectivity=connectivity)
-    if gt_lab is None or n_gt is None:
-        gt_lab, n_gt = _label_components(gt, connectivity=connectivity)
-
-    if n_gt == 0:
-        return {
-            "n_gt": 0.0,
-            "n_pred": float(n_pred),
-            "mean_iou": float("nan"),
-            "median_iou": float("nan"),
-            "worst_k_mean": float("nan"),
-            "worst_q_mean": float("nan"),
-            "min_iou": float("nan"),
-        }
-
-    if n_pred == 0:
-        ious = np.zeros(n_gt, dtype=np.float64)
-    else:
-        ious = np.zeros(n_gt, dtype=np.float64)
-        pred_sizes = np.array([(pred_lab == (i + 1)).sum() for i in range(n_pred)], dtype=np.float64)
-        for gi in range(n_gt):
-            g_mask = (gt_lab == (gi + 1))
-            g_size = g_mask.sum()
-            if g_size == 0:
-                continue
-            best = 0.0
-            for pj in range(n_pred):
-                if pred_sizes[pj] == 0:
-                    continue
-                inter = np.logical_and(g_mask, pred_lab == (pj + 1)).sum()
-                if inter == 0:
-                    continue
-                union = g_size + pred_sizes[pj] - inter
-                best = max(best, float(inter) / float(union))
-            ious[gi] = best
-
-    ious_sorted = np.sort(ious)
-    worst_k_mean = float("nan")
-    worst_q_mean = float("nan")
-    if ious_sorted.size:
-        if worst_k is not None:
-            k = max(1, min(int(worst_k), int(len(ious_sorted))))
-            worst_k_mean = float(ious_sorted[:k].mean())
-        if worst_q is not None:
-            q = float(worst_q)
-            q = min(max(q, 0.0), 1.0)
-            kq = max(1, int(round(len(ious_sorted) * q)))
-            worst_q_mean = float(ious_sorted[:kq].mean())
-    return {
-        "n_gt": float(n_gt),
-        "n_pred": float(n_pred),
-        "mean_iou": float(ious.mean()),
-        "median_iou": float(np.median(ious)),
-        "worst_k_mean": worst_k_mean,
-        "worst_q_mean": worst_q_mean,
-        "min_iou": float(ious.min()) if ious.size else float("nan"),
-    }
 
 
 def component_dice_stats(
@@ -821,457 +723,6 @@ def component_dice_stats(
     }
 
 
-def panoptic_quality(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    connectivity: int = 2,
-    iou_thr: float = 0.5,
-    pred_lab: Optional[np.ndarray] = None,
-    n_pred: Optional[int] = None,
-    gt_lab: Optional[np.ndarray] = None,
-    n_gt: Optional[int] = None,
-) -> Dict[str, float]:
-    pred = _as_bool_2d(pred)
-    gt = _as_bool_2d(gt)
-    if pred_lab is None or n_pred is None:
-        pred_lab, n_pred = _label_components(pred, connectivity=connectivity)
-    if gt_lab is None or n_gt is None:
-        gt_lab, n_gt = _label_components(gt, connectivity=connectivity)
-
-    if n_gt == 0 and n_pred == 0:
-        return {"pq": 1.0, "sq": 1.0, "rq": 1.0, "tp": 0.0, "fp": 0.0, "fn": 0.0}
-    if n_gt == 0:
-        return {"pq": 0.0, "sq": 0.0, "rq": 0.0, "tp": 0.0, "fp": float(n_pred), "fn": 0.0}
-    if n_pred == 0:
-        return {"pq": 0.0, "sq": 0.0, "rq": 0.0, "tp": 0.0, "fp": 0.0, "fn": float(n_gt)}
-
-    pred_sizes = np.array([(pred_lab == (i + 1)).sum() for i in range(n_pred)], dtype=np.float64)
-    gt_sizes = np.array([(gt_lab == (i + 1)).sum() for i in range(n_gt)], dtype=np.float64)
-
-    pairs = []
-    for gi in range(n_gt):
-        g_mask = (gt_lab == (gi + 1))
-        g_size = gt_sizes[gi]
-        for pj in range(n_pred):
-            p_size = pred_sizes[pj]
-            inter = np.logical_and(g_mask, pred_lab == (pj + 1)).sum()
-            if inter == 0:
-                continue
-            union = g_size + p_size - inter
-            iou = float(inter) / float(union)
-            if iou >= float(iou_thr):
-                pairs.append((iou, gi, pj))
-    pairs.sort(reverse=True)
-
-    matched_gt = set()
-    matched_pred = set()
-    sum_iou = 0.0
-    for iou, gi, pj in pairs:
-        if gi in matched_gt or pj in matched_pred:
-            continue
-        matched_gt.add(gi)
-        matched_pred.add(pj)
-        sum_iou += float(iou)
-
-    tp = float(len(matched_gt))
-    fp = float(n_pred) - tp
-    fn = float(n_gt) - tp
-    denom = tp + 0.5 * fp + 0.5 * fn
-    pq = _safe_div(sum_iou, denom) if denom > 0 else 0.0
-    sq = _safe_div(sum_iou, tp) if tp > 0 else 0.0
-    rq = _safe_div(tp, denom) if denom > 0 else 0.0
-    return {"pq": pq, "sq": sq, "rq": rq, "tp": tp, "fp": fp, "fn": fn}
-
-
-def component_ssim_stats(
-    pred_prob: np.ndarray,
-    gt_bin: np.ndarray,
-    *,
-    connectivity: int = 2,
-    pad: int = 2,
-    ssim_mode: str = "prob",
-    worst_q: Optional[float] = 0.1,
-    worst_k: Optional[int] = None,
-    gt_lab: Optional[np.ndarray] = None,
-    n_gt: Optional[int] = None,
-) -> Dict[str, float]:
-    pred_prob = np.asarray(pred_prob, dtype=np.float32)
-    gt_bin = _as_bool_2d(gt_bin)
-    if gt_lab is None or n_gt is None:
-        gt_lab, n_gt = _label_components(gt_bin, connectivity=connectivity)
-    if n_gt == 0:
-        return {
-            "n_gt": 0.0,
-            "mean": float("nan"),
-            "median": float("nan"),
-            "worst_k_mean": float("nan"),
-            "worst_q_mean": float("nan"),
-            "min": float("nan"),
-        }
-
-    pad = max(0, int(pad))
-    vals = []
-    for gi in range(1, n_gt + 1):
-        mask = gt_lab == gi
-        if not mask.any():
-            continue
-        ys, xs = np.where(mask)
-        y0 = max(0, int(ys.min()) - pad)
-        y1 = min(gt_bin.shape[0], int(ys.max()) + 1 + pad)
-        x0 = max(0, int(xs.min()) - pad)
-        x1 = min(gt_bin.shape[1], int(xs.max()) + 1 + pad)
-
-        crop_pred = pred_prob[y0:y1, x0:x1]
-        crop_gt = gt_bin[y0:y1, x0:x1]
-
-        if str(ssim_mode).lower() == "dist":
-            from scipy.ndimage import distance_transform_edt
-
-            pred_bin = crop_pred >= 0.5
-            pred_img = distance_transform_edt(~pred_bin.astype(np.uint8)).astype(np.float32)
-            gt_img = distance_transform_edt(~crop_gt.astype(np.uint8)).astype(np.float32)
-            if pred_img.max() > 0:
-                pred_img = pred_img / float(pred_img.max())
-            if gt_img.max() > 0:
-                gt_img = gt_img / float(gt_img.max())
-        else:
-            pred_img = crop_pred.astype(np.float32)
-            gt_img = crop_gt.astype(np.float32)
-
-        vals.append(_gaussian_ssim(pred_img, gt_img, sigma=1.5, data_range=1.0))
-
-    if not vals:
-        return {
-            "n_gt": float(n_gt),
-            "mean": float("nan"),
-            "median": float("nan"),
-            "worst_k_mean": float("nan"),
-            "worst_q_mean": float("nan"),
-            "min": float("nan"),
-        }
-
-    vals = np.asarray(vals, dtype=np.float64)
-    vals_sorted = np.sort(vals)
-    worst_k_mean = float("nan")
-    worst_q_mean = float("nan")
-    if vals_sorted.size:
-        if worst_k is not None:
-            k = max(1, min(int(worst_k), int(len(vals_sorted))))
-            worst_k_mean = float(vals_sorted[:k].mean())
-        if worst_q is not None:
-            q = float(worst_q)
-            q = min(max(q, 0.0), 1.0)
-            kq = max(1, int(round(len(vals_sorted) * q)))
-            worst_q_mean = float(vals_sorted[:kq].mean())
-    return {
-        "n_gt": float(n_gt),
-        "mean": float(vals.mean()),
-        "median": float(np.median(vals)),
-        "worst_k_mean": worst_k_mean,
-        "worst_q_mean": worst_q_mean,
-        "min": float(vals_sorted.min()),
-    }
-
-
-def _hist_pr_roc(
-    pred_prob: np.ndarray,
-    gt_bin: np.ndarray,
-    *,
-    num_bins: int,
-    mask: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
-    pred_prob = np.asarray(pred_prob, dtype=np.float32)
-    gt_bin = _as_bool_2d(gt_bin)
-    num_bins = max(2, int(num_bins))
-
-    if mask is not None:
-        mask = _as_bool_2d(mask)
-        pred_prob = pred_prob[mask]
-        gt_bin = gt_bin[mask]
-
-    if pred_prob.size == 0:
-        return {"auprc": float("nan"), "auroc": float("nan")}
-
-    idx = np.clip((pred_prob * float(num_bins)).astype(np.int64), 0, num_bins - 1)
-    pos_hist = np.bincount(idx[gt_bin], minlength=num_bins).astype(np.float64)
-    neg_hist = np.bincount(idx[~gt_bin], minlength=num_bins).astype(np.float64)
-
-    tp = np.cumsum(pos_hist[::-1])
-    fp = np.cumsum(neg_hist[::-1])
-    total_pos = pos_hist.sum()
-    total_neg = neg_hist.sum()
-
-    if total_pos <= 0:
-        return {"auprc": float("nan"), "auroc": float("nan")}
-
-    precision = tp / np.maximum(tp + fp, 1.0)
-    recall = tp / np.maximum(total_pos, 1.0)
-
-    # AP (step integration over recall).
-    recall0 = np.concatenate([[0.0], recall])
-    prec0 = np.concatenate([[1.0], precision])
-    ap = float(np.sum(np.maximum(recall0[1:] - recall0[:-1], 0.0) * prec0[1:]))
-
-    if total_neg <= 0:
-        auroc = float("nan")
-    else:
-        fpr = fp / np.maximum(total_neg, 1.0)
-        auroc = float(np.trapz(recall, fpr))
-
-    return {"auprc": ap, "auroc": auroc}
-
-
-def component_pr_stats(
-    pred_prob: np.ndarray,
-    gt_bin: np.ndarray,
-    *,
-    connectivity: int = 2,
-    pad: int = 2,
-    num_bins: int = 200,
-    worst_q: Optional[float] = 0.1,
-    worst_k: Optional[int] = None,
-    gt_lab: Optional[np.ndarray] = None,
-    n_gt: Optional[int] = None,
-    eval_mask: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
-    pred_prob = np.asarray(pred_prob, dtype=np.float32)
-    gt_bin = _as_bool_2d(gt_bin)
-    if gt_lab is None or n_gt is None:
-        gt_lab, n_gt = _label_components(gt_bin, connectivity=connectivity)
-    if n_gt == 0:
-        return {
-            "n_gt": 0.0,
-            "auprc_mean": float("nan"),
-            "auprc_worst_k_mean": float("nan"),
-            "auprc_worst_q_mean": float("nan"),
-            "auroc_mean": float("nan"),
-            "auroc_worst_k_mean": float("nan"),
-            "auroc_worst_q_mean": float("nan"),
-        }
-
-    pad = max(0, int(pad))
-    auprc_vals = []
-    auroc_vals = []
-    for gi in range(1, n_gt + 1):
-        mask = gt_lab == gi
-        if not mask.any():
-            continue
-        ys, xs = np.where(mask)
-        y0 = max(0, int(ys.min()) - pad)
-        y1 = min(gt_bin.shape[0], int(ys.max()) + 1 + pad)
-        x0 = max(0, int(xs.min()) - pad)
-        x1 = min(gt_bin.shape[1], int(xs.max()) + 1 + pad)
-
-        crop_pred = pred_prob[y0:y1, x0:x1]
-        crop_gt = gt_bin[y0:y1, x0:x1]
-        crop_mask = None
-        if eval_mask is not None:
-            crop_mask = eval_mask[y0:y1, x0:x1]
-        stats = _hist_pr_roc(crop_pred, crop_gt, num_bins=num_bins, mask=crop_mask)
-        auprc_vals.append(stats["auprc"])
-        auroc_vals.append(stats["auroc"])
-
-    if not auprc_vals:
-        return {
-            "n_gt": float(n_gt),
-            "auprc_mean": float("nan"),
-            "auprc_worst_k_mean": float("nan"),
-            "auprc_worst_q_mean": float("nan"),
-            "auroc_mean": float("nan"),
-            "auroc_worst_k_mean": float("nan"),
-            "auroc_worst_q_mean": float("nan"),
-        }
-
-    auprc_vals = np.asarray(auprc_vals, dtype=np.float64)
-    auroc_vals = np.asarray(auroc_vals, dtype=np.float64)
-
-    def _worst_mean(vals: np.ndarray) -> Tuple[float, float]:
-        vals_sorted = np.sort(vals)
-        worst_k_mean = float("nan")
-        worst_q_mean = float("nan")
-        if vals_sorted.size:
-            if worst_k is not None:
-                k = max(1, min(int(worst_k), int(len(vals_sorted))))
-                worst_k_mean = float(vals_sorted[:k].mean())
-            if worst_q is not None:
-                q = float(worst_q)
-                q = min(max(q, 0.0), 1.0)
-                kq = max(1, int(round(len(vals_sorted) * q)))
-                worst_q_mean = float(vals_sorted[:kq].mean())
-        return worst_k_mean, worst_q_mean
-
-    auprc_wk, auprc_wq = _worst_mean(auprc_vals)
-    auroc_wk, auroc_wq = _worst_mean(auroc_vals)
-    return {
-        "n_gt": float(n_gt),
-        "auprc_mean": float(auprc_vals.mean()),
-        "auprc_worst_k_mean": auprc_wk,
-        "auprc_worst_q_mean": auprc_wq,
-        "auroc_mean": float(auroc_vals.mean()),
-        "auroc_worst_k_mean": auroc_wk,
-        "auroc_worst_q_mean": auroc_wq,
-    }
-
-
-def component_diagnostics(
-    pred_prob: np.ndarray,
-    gt_bin: np.ndarray,
-    *,
-    pred_lab: np.ndarray,
-    n_pred: int,
-    gt_lab: np.ndarray,
-    n_gt: int,
-    connectivity: int = 2,
-    pad: int = 0,
-    num_bins: int = 200,
-    eval_mask: Optional[np.ndarray] = None,
-    worst_q: Optional[float] = 0.1,
-    worst_k: Optional[int] = None,
-    ssim_mode: str = "prob",
-    offset: Optional[Tuple[int, int]] = None,
-) -> list[dict]:
-    pred_prob = np.asarray(pred_prob, dtype=np.float32)
-    gt_bin = _as_bool_2d(gt_bin)
-    if n_gt <= 0:
-        return []
-
-    pad = max(0, int(pad))
-    pred_sizes = np.array([(pred_lab == (i + 1)).sum() for i in range(n_pred)], dtype=np.float64)
-
-    rows = []
-    iou_vals = []
-    dice_vals = []
-    ssim_vals = []
-    auprc_vals = []
-    auroc_vals = []
-
-    off_y, off_x = (0, 0)
-    if offset is not None:
-        off_y, off_x = [int(v) for v in offset]
-
-    eps = 1e-7
-    for gi in range(1, n_gt + 1):
-        g_mask = (gt_lab == gi)
-        if not g_mask.any():
-            continue
-        ys, xs = np.where(g_mask)
-        y0 = int(ys.min())
-        y1 = int(ys.max()) + 1
-        x0 = int(xs.min())
-        x1 = int(xs.max()) + 1
-
-        g_size = float(g_mask.sum())
-        best_iou = 0.0
-        best_pred_id = 0
-        if n_pred > 0:
-            cand_preds = np.unique(pred_lab[g_mask])
-            cand_preds = cand_preds[cand_preds > 0]
-            for pj in cand_preds:
-                p_idx = int(pj) - 1
-                p_size = pred_sizes[p_idx] if p_idx >= 0 else 0.0
-                if p_size <= 0:
-                    continue
-                inter = np.logical_and(g_mask, pred_lab == int(pj)).sum()
-                if inter == 0:
-                    continue
-                union = g_size + float(p_size) - float(inter)
-                iou = float(inter) / float(union)
-                if iou > best_iou:
-                    best_iou = float(iou)
-                    best_pred_id = int(pj)
-
-        y0p = max(0, y0 - pad)
-        y1p = min(gt_bin.shape[0], y1 + pad)
-        x0p = max(0, x0 - pad)
-        x1p = min(gt_bin.shape[1], x1 + pad)
-
-        crop_pred = pred_prob[y0p:y1p, x0p:x1p]
-        crop_gt = gt_bin[y0p:y1p, x0p:x1p].astype(np.float32)
-        inter = float((crop_pred * crop_gt).sum())
-        denom = float(crop_pred.sum() + crop_gt.sum())
-        dice = (2.0 * inter + eps) / (denom + eps)
-
-        if str(ssim_mode).lower() == "dist":
-            from scipy.ndimage import distance_transform_edt
-
-            pred_bin = crop_pred >= 0.5
-            pred_img = distance_transform_edt(~pred_bin.astype(np.uint8)).astype(np.float32)
-            gt_img = distance_transform_edt(~crop_gt.astype(np.uint8)).astype(np.float32)
-            if pred_img.max() > 0:
-                pred_img = pred_img / float(pred_img.max())
-            if gt_img.max() > 0:
-                gt_img = gt_img / float(gt_img.max())
-        else:
-            pred_img = crop_pred.astype(np.float32)
-            gt_img = crop_gt.astype(np.float32)
-        ssim_val = _gaussian_ssim(pred_img, gt_img, sigma=1.5, data_range=1.0)
-
-        crop_mask = None
-        if eval_mask is not None:
-            crop_mask = eval_mask[y0p:y1p, x0p:x1p]
-        pr_stats = _hist_pr_roc(crop_pred, crop_gt, num_bins=num_bins, mask=crop_mask)
-        auprc = float(pr_stats["auprc"])
-        auroc = float(pr_stats["auroc"])
-
-        row = {
-            "gt_id": int(gi),
-            "gt_area": float(g_size),
-            "y0": int(y0 + off_y),
-            "y1": int(y1 + off_y),
-            "x0": int(x0 + off_x),
-            "x1": int(x1 + off_x),
-            "best_iou": float(best_iou),
-            "best_pred_id": int(best_pred_id),
-            "dice": float(dice),
-            "ssim": float(ssim_val),
-            "auprc": float(auprc),
-            "auroc": float(auroc),
-        }
-        rows.append(row)
-        iou_vals.append(best_iou)
-        dice_vals.append(dice)
-        ssim_vals.append(ssim_val)
-        auprc_vals.append(auprc)
-        auroc_vals.append(auroc)
-
-    def _worst_flags(vals):
-        flags = {"wk": set(), "wq": set()}
-        if not rows:
-            return flags
-        vals = np.asarray(vals, dtype=np.float64)
-        vals = np.nan_to_num(vals, nan=1.0, posinf=1.0, neginf=1.0)
-        order = np.argsort(vals)
-        if worst_k is not None:
-            k = max(1, min(int(worst_k), int(len(order))))
-            flags["wk"] = set(int(i) for i in order[:k])
-        if worst_q is not None:
-            q = float(worst_q)
-            q = min(max(q, 0.0), 1.0)
-            kq = max(1, int(round(len(order) * q)))
-            flags["wq"] = set(int(i) for i in order[:kq])
-        return flags
-
-    iou_flags = _worst_flags(iou_vals)
-    dice_flags = _worst_flags(dice_vals)
-    ssim_flags = _worst_flags(ssim_vals)
-    auprc_flags = _worst_flags(auprc_vals)
-    auroc_flags = _worst_flags(auroc_vals)
-
-    for idx, row in enumerate(rows):
-        row["worst_k_iou"] = int(idx in iou_flags["wk"])
-        row["worst_q_iou"] = int(idx in iou_flags["wq"])
-        row["worst_k_dice"] = int(idx in dice_flags["wk"])
-        row["worst_q_dice"] = int(idx in dice_flags["wq"])
-        row["worst_k_ssim"] = int(idx in ssim_flags["wk"])
-        row["worst_q_ssim"] = int(idx in ssim_flags["wq"])
-        row["worst_k_auprc"] = int(idx in auprc_flags["wk"])
-        row["worst_q_auprc"] = int(idx in auprc_flags["wq"])
-        row["worst_k_auroc"] = int(idx in auroc_flags["wk"])
-        row["worst_q_auroc"] = int(idx in auroc_flags["wq"])
-    return rows
-
-
 def threshold_stability(
     pred_prob: np.ndarray,
     gt: np.ndarray,
@@ -1294,94 +745,6 @@ def threshold_stability(
     }
 
 
-def _gaussian_ssim(pred: np.ndarray, gt: np.ndarray, *, sigma: float = 1.5, data_range: float = 1.0) -> float:
-    from scipy.ndimage import gaussian_filter
-
-    pred = np.asarray(pred, dtype=np.float64)
-    gt = np.asarray(gt, dtype=np.float64)
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
-
-    mu1 = gaussian_filter(pred, sigma=sigma)
-    mu2 = gaussian_filter(gt, sigma=sigma)
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = gaussian_filter(pred * pred, sigma=sigma) - mu1_sq
-    sigma2_sq = gaussian_filter(gt * gt, sigma=sigma) - mu2_sq
-    sigma12 = gaussian_filter(pred * gt, sigma=sigma) - mu1_mu2
-
-    num = (2.0 * mu1_mu2 + c1) * (2.0 * sigma12 + c2)
-    den = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
-    ssim_map = num / (den + EPS)
-    return float(np.mean(ssim_map))
-
-
-def persistence_distances(
-    pred_prob: np.ndarray,
-    gt_bin: np.ndarray,
-    *,
-    dims: Tuple[int, ...] = (0, 1),
-    invert: bool = True,
-    downsample: int = 1,
-) -> Dict[str, float]:
-    try:
-        import gudhi as gd
-        from gudhi.hera import bottleneck_distance
-        from gudhi.wasserstein import wasserstein_distance
-    except Exception:
-        return {
-            "pd_available": 0.0,
-            "bottleneck_d0": float("nan"),
-            "bottleneck_d1": float("nan"),
-            "wasserstein_d0": float("nan"),
-            "wasserstein_d1": float("nan"),
-        }
-
-    def _diagram(img: np.ndarray, *, invert_flag: bool) -> Dict[int, np.ndarray]:
-        f = (1.0 - img) if invert_flag else img
-        cc = gd.CubicalComplex(top_dimensional_cells=f.astype(np.float64))
-        cc.persistence()
-        return {d: cc.persistence_intervals_in_dimension(d) for d in dims}
-
-    def _downsample_mean(img: np.ndarray, factor: int) -> np.ndarray:
-        factor = max(1, int(factor))
-        if factor == 1:
-            return img
-        h, w = img.shape
-        h2 = (h // factor) * factor
-        w2 = (w // factor) * factor
-        if h2 <= 0 or w2 <= 0:
-            return img[: max(1, h), : max(1, w)]
-        img = img[:h2, :w2]
-        img = img.reshape(h2 // factor, factor, w2 // factor, factor).mean(axis=(1, 3))
-        return img
-
-    pred_prob = np.asarray(pred_prob, dtype=np.float64)
-    gt_prob = np.asarray(gt_bin, dtype=np.float64)
-    ds = max(1, int(downsample))
-    if ds > 1:
-        pred_prob = _downsample_mean(pred_prob, ds)
-        gt_prob = _downsample_mean(gt_prob, ds)
-    pred_dgms = _diagram(pred_prob, invert_flag=invert)
-    gt_dgms = _diagram(gt_prob, invert_flag=invert)
-
-    out = {"pd_available": 1.0}
-    for d in dims:
-        dgm_p = pred_dgms.get(d, np.zeros((0, 2), dtype=np.float64))
-        dgm_g = gt_dgms.get(d, np.zeros((0, 2), dtype=np.float64))
-        try:
-            out[f"bottleneck_d{d}"] = float(bottleneck_distance(dgm_p, dgm_g))
-        except Exception:
-            out[f"bottleneck_d{d}"] = float("nan")
-        try:
-            out[f"wasserstein_d{d}"] = float(wasserstein_distance(dgm_p, dgm_g, order=1, internal_p=2))
-        except Exception:
-            out[f"wasserstein_d{d}"] = float("nan")
-    return out
-
-
 def compute_stitched_metrics(
     *,
     fragment_id: str,
@@ -1398,17 +761,11 @@ def compute_stitched_metrics(
     boundary_k: int = 3,
     boundary_tols: Optional[np.ndarray] = None,
     skeleton_radius: Optional[np.ndarray] = None,
-    component_iou_thr: float = 0.5,
     component_worst_q: Optional[float] = 0.1,
     component_worst_k: Optional[int] = 8,
     component_min_area: int = 0,
-    component_ssim: bool = False,
-    component_ssim_pad: int = 2,
-    pr_num_bins: int = 200,
+    component_pad: int = 2,
     threshold_grid: Optional[np.ndarray] = None,
-    ssim_mode: str = "prob",
-    compute_persistence: bool = False,
-    persistence_downsample: int = 1,
     output_dir: Optional[str] = None,
     component_output_dir: Optional[str] = None,
     save_skeleton_images: bool = True,
@@ -1455,6 +812,10 @@ def compute_stitched_metrics(
         eval_mask = cache["eval_mask"]
         gt_lab = cache["gt_lab"]
         n_gt = cache["n_gt"]
+        gt_beta0 = int(cache["gt_beta0"])
+        gt_beta1 = int(cache["gt_beta1"])
+        gt_euler = int(cache["gt_euler"])
+        skel_gt = cache["skel_gt"]
         y0, y1, x0, x1 = cache["crop"]
         pred_full_shape = tuple(cache.get("full_shape", pred_full_shape))
         pred_prob = pred_prob[y0:y1, x0:x1]
@@ -1494,6 +855,9 @@ def compute_stitched_metrics(
         gt_bin[~eval_mask] = False
 
         gt_lab, n_gt = _label_components(gt_bin, connectivity=betti_connectivity)
+        gt_beta0, gt_beta1 = betti_numbers_2d(gt_bin, connectivity=betti_connectivity)
+        gt_euler = int(gt_beta0 - gt_beta1)
+        skel_gt = skeletonize_binary(gt_bin)
         _gt_cache_put(
             cache_key,
             {
@@ -1501,6 +865,10 @@ def compute_stitched_metrics(
                 "eval_mask": eval_mask,
                 "gt_lab": gt_lab,
                 "n_gt": n_gt,
+                "gt_beta0": int(gt_beta0),
+                "gt_beta1": int(gt_beta1),
+                "gt_euler": int(gt_euler),
+                "skel_gt": skel_gt,
                 "crop": (int(y0), int(y1), int(x0), int(x1)),
                 "full_shape": pred_full_shape,
             },
@@ -1540,14 +908,10 @@ def compute_stitched_metrics(
     t0 = time.perf_counter()
     out: Dict[str, float] = {
         "dice": dice_from_confusion(c),
-        "iou": iou_from_confusion(c),
         "accuracy": accuracy_from_confusion(c),
-        "precision": precision_from_confusion(c),
-        "recall": recall_from_confusion(c),
         "f_beta": fbeta_from_confusion(c, beta=float(fbeta)),
         "voi": voi_from_confusion(c),
         "psnr": psnr(pred_bin, gt_bin),
-        "nrm": nrm(pred_bin, gt_bin),
         "mpm": mpm(pred_bin, gt_bin, boundary_k=boundary_k),
         "drd": drd(pred_bin, gt_bin, block_size=drd_block_size),
         "eval_pixels": float(eval_mask.sum()),
@@ -1557,29 +921,33 @@ def compute_stitched_metrics(
     _timeit("base_metrics", t0)
 
     t0 = time.perf_counter()
-    out.update({f"betti/{k}": v for k, v in betti_error(pred_bin, gt_bin, connectivity=betti_connectivity).items()})
-    out["euler_pred"] = float(euler_characteristic(pred_bin, connectivity=betti_connectivity))
-    out["euler_gt"] = float(euler_characteristic(gt_bin, connectivity=betti_connectivity))
+    pred_beta0, pred_beta1 = betti_numbers_2d(pred_bin_comp, connectivity=betti_connectivity)
+    out["betti/beta0_pred"] = float(pred_beta0)
+    out["betti/beta1_pred"] = float(pred_beta1)
+    out["betti/beta0_gt"] = float(gt_beta0)
+    out["betti/beta1_gt"] = float(gt_beta1)
+    out["betti/abs_beta0_err"] = float(abs(pred_beta0 - gt_beta0))
+    out["betti/abs_beta1_err"] = float(abs(pred_beta1 - gt_beta1))
+    out["betti/l1_betti_err"] = float(abs(pred_beta0 - gt_beta0) + abs(pred_beta1 - gt_beta1))
+    out["euler_pred"] = float(pred_beta0 - pred_beta1)
+    out["euler_gt"] = float(gt_euler)
     out["abs_euler_err"] = float(abs(out["euler_pred"] - out["euler_gt"]))
     _timeit("betti_euler", t0)
 
-    # Boundary metrics.
+    # Boundary metrics on filtered prediction to reduce tiny-component noise effects.
     t0 = time.perf_counter()
     if boundary_tols is None:
         boundary_tols = np.asarray([1.0], dtype=np.float32)
     for tau in boundary_tols:
         tau_f = float(tau)
         tau_key = str(tau_f).replace(".", "p")
-        bf = boundary_precision_recall_f1(pred_bin, gt_bin, tau=tau_f, boundary_k=boundary_k)
+        bf = boundary_precision_recall_f1(pred_bin_comp, gt_bin, tau=tau_f, boundary_k=boundary_k)
         out[f"boundary/bf1_tau{tau_key}"] = float(bf["b_f1"])
-        out[f"boundary/bprec_tau{tau_key}"] = float(bf["b_precision"])
-        out[f"boundary/brec_tau{tau_key}"] = float(bf["b_recall"])
-        out[f"boundary/nsd_tau{tau_key}"] = float(nsd_surface_dice(pred_bin, gt_bin, tau=tau_f, boundary_k=boundary_k))
-        out[f"boundary/biou_tau{tau_key}"] = float(boundary_iou(pred_bin, gt_bin, tau=tau_f, boundary_k=boundary_k))
-    _timeit("boundary_bf_nsdbiou", t0)
+        out[f"boundary/nsd_tau{tau_key}"] = float(nsd_surface_dice(pred_bin_comp, gt_bin, tau=tau_f, boundary_k=boundary_k))
+    _timeit("boundary_bf_nsd", t0)
 
     t0 = time.perf_counter()
-    hd = hausdorff_metrics(pred_bin, gt_bin, boundary_k=boundary_k)
+    hd = hausdorff_metrics(pred_bin_comp, gt_bin, boundary_k=boundary_k)
     out["boundary/hd"] = float(hd["hd"])
     out["boundary/hd95"] = float(hd["hd95"])
     out["boundary/assd"] = float(hd["assd"])
@@ -1587,13 +955,16 @@ def compute_stitched_metrics(
 
     # Skeleton / topology metrics.
     t0 = time.perf_counter()
-    skel_pred = skeletonize_binary(pred_bin)
-    skel_gt = skeletonize_binary(gt_bin)
-    out["skeleton/recall"] = float(skeleton_recall(pred_bin, gt_bin, skel_gt=skel_gt))
+    skel_pred = skeletonize_binary(pred_bin_comp)
+    out["skeleton/recall"] = float(skeleton_recall(pred_bin_comp, gt_bin, skel_gt=skel_gt))
     out["skeleton/cldice"] = float(
-        cldice(pred_bin, gt_bin, skel_pred=skel_pred, skel_gt=skel_gt)
+        cldice(pred_bin_comp, gt_bin, skel_pred=skel_pred, skel_gt=skel_gt)
     )
-    out["pfm"] = float(pseudo_fmeasure(pred_bin, gt_bin, skel_gt=skel_gt))
+    out["pfm"] = float(pseudo_fmeasure(pred_bin_comp, gt_bin, skel_gt=skel_gt))
+    chamfer = skeleton_chamfer(skel_pred, skel_gt)
+    out["skeleton/chamfer"] = float(chamfer["chamfer"])
+    out["skeleton/chamfer_pred_to_gt"] = float(chamfer["pred_to_gt"])
+    out["skeleton/chamfer_gt_to_pred"] = float(chamfer["gt_to_pred"])
     _timeit("skeleton_base", t0)
     if skeleton_radius is None:
         skeleton_radius = np.asarray([1], dtype=np.int64)
@@ -1602,155 +973,59 @@ def compute_stitched_metrics(
         r_i = int(r)
         r_key = str(r_i)
         tube = skeleton_tube_metrics(
-            pred_bin,
+            pred_bin_comp,
             gt_bin,
             radius=r_i,
             skel_gt=skel_gt,
         )
         out[f"skeleton/tube_f1_r{r_key}"] = float(tube["tube_f1"])
-        out[f"skeleton/tube_precision_r{r_key}"] = float(tube["tube_precision"])
-        out[f"skeleton/tube_recall_r{r_key}"] = float(tube["tube_recall"])
         _timeit(f"skeleton_tube_r{r_key}", t0)
 
-    # Component-level metrics.
-    t0 = time.perf_counter()
-    comp_stats = component_iou_stats(
-        pred_bin_comp,
-        gt_bin,
-        connectivity=betti_connectivity,
-        worst_q=component_worst_q,
-        worst_k=component_worst_k,
-        pred_lab=pred_lab,
-        n_pred=n_pred,
-        gt_lab=gt_lab,
-        n_gt=n_gt,
-    )
-    out.update({f"components/{k}": float(v) for k, v in comp_stats.items()})
-    _timeit("components_iou", t0)
-
+    # Component-level dice summaries.
     t0 = time.perf_counter()
     dice_stats = component_dice_stats(
         pred_prob_comp,
         gt_bin,
         connectivity=betti_connectivity,
-        pad=component_ssim_pad,
+        pad=component_pad,
         worst_q=component_worst_q,
         worst_k=component_worst_k,
         gt_lab=gt_lab,
         n_gt=n_gt,
     )
     out.update({f"components/dice_{k}": float(v) for k, v in dice_stats.items()})
+    out["components/n_pred"] = float(n_pred)
     _timeit("components_dice", t0)
-
-    t0 = time.perf_counter()
-    pq = panoptic_quality(
-        pred_bin_comp,
-        gt_bin,
-        connectivity=betti_connectivity,
-        iou_thr=component_iou_thr,
-        pred_lab=pred_lab,
-        n_pred=n_pred,
-        gt_lab=gt_lab,
-        n_gt=n_gt,
-    )
-    out.update({f"pq/{k}": float(v) for k, v in pq.items()})
-    _timeit("components_pq", t0)
-    if component_ssim:
-        t0 = time.perf_counter()
-        ssim_stats = component_ssim_stats(
-            pred_prob_comp,
-            gt_bin,
-            connectivity=betti_connectivity,
-            pad=component_ssim_pad,
-            ssim_mode=ssim_mode,
-            worst_q=component_worst_q,
-            worst_k=component_worst_k,
-            gt_lab=gt_lab,
-            n_gt=n_gt,
-        )
-        out.update({f"components/ssim_{k}": float(v) for k, v in ssim_stats.items()})
-        _timeit("components_ssim", t0)
-
-    t0 = time.perf_counter()
-    comp_pr = component_pr_stats(
-        pred_prob_comp,
-        gt_bin,
-        connectivity=betti_connectivity,
-        pad=component_ssim_pad,
-        num_bins=pr_num_bins,
-        worst_q=component_worst_q,
-        worst_k=component_worst_k,
-        gt_lab=gt_lab,
-        n_gt=n_gt,
-        eval_mask=eval_mask,
-    )
-    out.update({f"components/pr_{k}": float(v) for k, v in comp_pr.items()})
-    _timeit("components_pr", t0)
 
     if component_output_dir:
         t0 = time.perf_counter()
-        try:
-            os.makedirs(component_output_dir, exist_ok=True)
-            rows = component_diagnostics(
-                pred_prob_comp,
-                gt_bin,
-                pred_lab=pred_lab,
-                n_pred=n_pred,
-                gt_lab=gt_lab,
-                n_gt=n_gt,
-                connectivity=betti_connectivity,
-                pad=component_ssim_pad,
-                num_bins=pr_num_bins,
-                eval_mask=eval_mask,
-                worst_q=component_worst_q,
-                worst_k=component_worst_k,
-                ssim_mode=ssim_mode,
-                offset=(int(roi_key[0]) + int(y0), int(roi_key[1]) + int(x0)),
-            )
-            safe_seg = str(fragment_id).replace("/", "_")
-            if rows:
-                import csv
+        os.makedirs(component_output_dir, exist_ok=True)
+        safe_seg = str(fragment_id).replace("/", "_")
+        gt_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}_gt_labels.png")
+        pred_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}_pred_labels.png")
+        meta_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}_meta.json")
+        if not (osp.exists(gt_path) and osp.exists(pred_path) and osp.exists(meta_path)):
+            from PIL import Image
+            import json as _json
 
-                out_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}.csv")
-                cols = list(rows[0].keys())
-                with open(out_path, "w", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=cols)
-                    writer.writeheader()
-                    writer.writerows(rows)
-
-            gt_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}_gt_labels.png")
-            pred_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}_pred_labels.png")
-            meta_path = osp.join(component_output_dir, f"components_{safe_seg}_ds{int(ds)}_meta.json")
-            if not (osp.exists(gt_path) and osp.exists(pred_path) and osp.exists(meta_path)):
-                from PIL import Image
-                import json as _json
-
-                gt_u16 = gt_lab.astype(np.uint16, copy=False)
-                pred_u16 = pred_lab.astype(np.uint16, copy=False)
-                Image.fromarray(gt_u16, mode="I;16").save(gt_path)
-                Image.fromarray(pred_u16, mode="I;16").save(pred_path)
-                off_y, off_x = roi_key
-                crop_off_y, crop_off_x = int(y0), int(x0)
-                meta = {
-                    "segment_id": str(fragment_id),
-                    "downsample": int(ds),
-                    "roi_offset": [int(off_y), int(off_x)],
-                    "crop_offset": [int(crop_off_y), int(crop_off_x)],
-                    "full_offset": [int(off_y + crop_off_y), int(off_x + crop_off_x)],
-                    "full_shape": [int(pred_full_shape[0]), int(pred_full_shape[1])],
-                    "crop_shape": [int(gt_lab.shape[0]), int(gt_lab.shape[1])],
-                }
-                with open(meta_path, "w") as f:
-                    _json.dump(meta, f)
-        except Exception:
-            pass
+            gt_u16 = gt_lab.astype(np.uint16, copy=False)
+            pred_u16 = pred_lab.astype(np.uint16, copy=False)
+            Image.fromarray(gt_u16, mode="I;16").save(gt_path)
+            Image.fromarray(pred_u16, mode="I;16").save(pred_path)
+            off_y, off_x = roi_key
+            crop_off_y, crop_off_x = int(y0), int(x0)
+            meta = {
+                "segment_id": str(fragment_id),
+                "downsample": int(ds),
+                "roi_offset": [int(off_y), int(off_x)],
+                "crop_offset": [int(crop_off_y), int(crop_off_x)],
+                "full_offset": [int(off_y + crop_off_y), int(off_x + crop_off_x)],
+                "full_shape": [int(pred_full_shape[0]), int(pred_full_shape[1])],
+                "crop_shape": [int(gt_lab.shape[0]), int(gt_lab.shape[1])],
+            }
+            with open(meta_path, "w") as f:
+                _json.dump(meta, f)
         _timeit("components_dump", t0)
-
-    t0 = time.perf_counter()
-    pr_stats = _hist_pr_roc(pred_prob, gt_bin, num_bins=pr_num_bins, mask=eval_mask)
-    out["pr/auprc"] = float(pr_stats["auprc"])
-    out["pr/auroc"] = float(pr_stats["auroc"])
-    _timeit("pr_hist", t0)
 
     # Threshold stability.
     if threshold_grid is not None and len(threshold_grid):
@@ -1762,12 +1037,6 @@ def compute_stitched_metrics(
             thresholds=tgrid,
             metric_fn=lambda p, g, m=eval_mask: dice_from_confusion(confusion_counts(p, g, mask=m)),
         )
-        iou_stab = threshold_stability(
-            pred_prob,
-            gt_bin,
-            thresholds=tgrid,
-            metric_fn=lambda p, g, m=eval_mask: iou_from_confusion(confusion_counts(p, g, mask=m)),
-        )
         fbeta_stab = threshold_stability(
             pred_prob,
             gt_bin,
@@ -1775,47 +1044,25 @@ def compute_stitched_metrics(
             metric_fn=lambda p, g, m=eval_mask: fbeta_from_confusion(confusion_counts(p, g, mask=m), beta=float(fbeta)),
         )
         out.update({f"stability/dice_{k}": float(v) for k, v in dice_stab.items()})
-        out.update({f"stability/iou_{k}": float(v) for k, v in iou_stab.items()})
         out.update({f"stability/fbeta_{k}": float(v) for k, v in fbeta_stab.items()})
         _timeit("threshold_stability", t0)
 
     # Save skeleton images locally (optional).
     if output_dir is not None and save_skeleton_images:
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            safe_seg = str(fragment_id).replace("/", "_")
-            thr_tag = str(float(threshold)).replace(".", "p")
-            pred_path = osp.join(output_dir, f"{safe_seg}_pred_thr{thr_tag}.png")
-            gt_path = osp.join(output_dir, f"{safe_seg}_gt.png")
-            if (not osp.exists(pred_path)) or (not osp.exists(gt_path)):
-                from PIL import Image
+        os.makedirs(output_dir, exist_ok=True)
+        safe_seg = str(fragment_id).replace("/", "_")
+        thr_tag = str(float(threshold)).replace(".", "p")
+        pred_path = osp.join(output_dir, f"{safe_seg}_pred_thr{thr_tag}.png")
+        gt_path = osp.join(output_dir, f"{safe_seg}_gt.png")
+        if (not osp.exists(pred_path)) or (not osp.exists(gt_path)):
+            from PIL import Image
 
-                pred_img = (skel_pred.astype(np.uint8) * 255)
-                gt_img = (skel_gt.astype(np.uint8) * 255)
-                Image.fromarray(pred_img).save(pred_path)
-                Image.fromarray(gt_img).save(gt_path)
-        except Exception:
-            pass
+            pred_img = (skel_pred.astype(np.uint8) * 255)
+            gt_img = (skel_gt.astype(np.uint8) * 255)
+            Image.fromarray(pred_img).save(pred_path)
+            Image.fromarray(gt_img).save(gt_path)
 
-    # Persistent homology distances (optional).
-    if compute_persistence:
-        t0 = time.perf_counter()
-        out.update(
-            {
-                f"ph/{k}": float(v)
-                for k, v in persistence_distances(
-                    pred_prob,
-                    gt_bin,
-                    downsample=persistence_downsample,
-                ).items()
-            }
-        )
-        _timeit("persistence", t0)
-
-    try:
-        from train_resnet3d_lib.config import log as _log
-    except Exception:
-        _log = None
+    from train_resnet3d_lib.config import log as _log
     total = sum(timings.values())
     parts = sorted(timings.items(), key=lambda kv: kv[1], reverse=True)
     msg = (
@@ -1823,19 +1070,13 @@ def compute_stitched_metrics(
         f"total={total:.3f}s "
         + ", ".join([f"{k}={v:.3f}s" for k, v in parts])
     )
-    if _log is None:
-        print(msg, flush=True)
-    else:
-        _log(msg)
+    _log(msg)
 
     return out
 
 
 # Metrics implementation notes:
-# Implemented: confusion-based, boundary metrics (BF1/NSD/HD/HD95/ASSD/Boundary-IoU),
-# skeleton metrics (clDice, skeleton recall, tubed skeleton F1, p-FM) via scikit-image,
-# component stats + PQ (worst-k and worst-q summaries),
-# component-level SSIM (optional), DIBCO metrics (NRM/MPM/DRD/PSNR), Betti/Euler,
-# threshold stability, SSIM, persistence distances (Gudhi optional).
-# Next: consider component-wise boundary/skeleton summaries if needed, add exact DIBCO weights
-# for DRD/MPM if you provide the official evaluator, and optionally add chamfer/DTW metrics.
+# Implemented: confusion-based metrics, boundary metrics (BF1/NSD/HD/HD95/ASSD),
+# skeleton metrics (clDice, skeleton recall, tube F1, p-FM, chamfer),
+# component-level dice summaries, DIBCO metrics (MPM/DRD/PSNR), Betti/Euler,
+# and threshold stability summaries.

@@ -681,7 +681,6 @@ class StitchManager:
                 betti_connectivity = int(getattr(CFG, "eval_betti_connectivity", 2))
                 drd_block_size = int(getattr(CFG, "eval_drd_block_size", 8))
                 boundary_k = int(getattr(CFG, "eval_boundary_k", 3))
-                component_iou_thr = float(getattr(CFG, "eval_component_iou_thr", 0.5))
                 component_worst_q = getattr(CFG, "eval_component_worst_q", 0.1)
                 if isinstance(component_worst_q, str) and component_worst_q.strip().lower() in {"", "none", "null"}:
                     component_worst_q = None
@@ -693,12 +692,7 @@ class StitchManager:
                 if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
                     component_worst_k = int(component_worst_k)
                 component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
-                component_ssim = bool(getattr(CFG, "eval_component_ssim", False))
-                component_ssim_pad = int(getattr(CFG, "eval_component_ssim_pad", 2))
-                pr_num_bins = int(getattr(CFG, "eval_pr_num_bins", 200))
-                ssim_mode = str(getattr(CFG, "eval_ssim_mode", "prob"))
-                compute_persistence = bool(getattr(CFG, "eval_persistence", False))
-                persistence_downsample = int(getattr(CFG, "eval_persistence_downsample", 4) or 1)
+                component_pad = int(getattr(CFG, "eval_component_pad", 2))
                 save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
                 skeleton_images_dir = str(getattr(CFG, "eval_skeleton_images_dir", "metrics_skeletons"))
                 output_dir = osp.join(str(getattr(CFG, "figures_dir", ".")), skeleton_images_dir)
@@ -722,9 +716,9 @@ class StitchManager:
 
                 threshold_grid = _parse_list(getattr(CFG, "eval_threshold_grid", None), float)
                 if threshold_grid is None:
-                    tmin = float(getattr(CFG, "eval_threshold_grid_min", 0.05))
-                    tmax = float(getattr(CFG, "eval_threshold_grid_max", 0.95))
-                    steps = int(getattr(CFG, "eval_threshold_grid_steps", 19))
+                    tmin = float(getattr(CFG, "eval_threshold_grid_min", 0.40))
+                    tmax = float(getattr(CFG, "eval_threshold_grid_max", 0.70))
+                    steps = int(getattr(CFG, "eval_threshold_grid_steps", 5))
                     if steps >= 2:
                         threshold_grid = np.linspace(tmin, tmax, steps).tolist()
 
@@ -748,17 +742,11 @@ class StitchManager:
                         boundary_k=boundary_k,
                         boundary_tols=boundary_tols,
                         skeleton_radius=skeleton_radius,
-                        component_iou_thr=component_iou_thr,
                         component_worst_q=component_worst_q,
                         component_worst_k=component_worst_k,
                         component_min_area=component_min_area,
-                        component_ssim=component_ssim,
-                        component_ssim_pad=component_ssim_pad,
-                        pr_num_bins=pr_num_bins,
+                        component_pad=component_pad,
                         threshold_grid=threshold_grid,
-                        ssim_mode=ssim_mode,
-                        compute_persistence=compute_persistence,
-                        persistence_downsample=persistence_downsample,
                         output_dir=output_dir,
                         component_output_dir=component_output_dir,
                         save_skeleton_images=save_skeleton_images,

@@ -32,10 +32,6 @@ def confusion_counts(preds: torch.Tensor, targets: torch.Tensor) -> ConfusionCou
     return ConfusionCounts(tp=tp, fp=fp, tn=tn, fn=fn)
 
 
-def precision_from_counts(c: ConfusionCounts) -> torch.Tensor:
-    return _safe_div(c.tp, c.tp + c.fp)
-
-
 def recall_from_counts(c: ConfusionCounts) -> torch.Tensor:
     return _safe_div(c.tp, c.tp + c.fn)
 
@@ -47,11 +43,6 @@ def specificity_from_counts(c: ConfusionCounts) -> torch.Tensor:
 def dice_from_counts(c: ConfusionCounts) -> torch.Tensor:
     # Dice/F1: 2TP / (2TP + FP + FN)
     return _safe_div(2.0 * c.tp, 2.0 * c.tp + c.fp + c.fn)
-
-
-def iou_from_counts(c: ConfusionCounts) -> torch.Tensor:
-    # Jaccard/IoU: TP / (TP + FP + FN)
-    return _safe_div(c.tp, c.tp + c.fp + c.fn)
 
 
 def fbeta_from_counts(c: ConfusionCounts, *, beta: float) -> torch.Tensor:
@@ -79,7 +70,7 @@ class StreamingBinarySegmentationMetrics:
 
     Notes:
     - Confusion-based metrics are computed at a fixed threshold.
-    - AUPRC/AUROC + best-F_beta are approximated via a fixed-width probability histogram.
+    - best-F_beta is approximated via a fixed-width probability histogram.
     """
 
     def __init__(
@@ -124,9 +115,6 @@ class StreamingBinarySegmentationMetrics:
         self._pos_hist = torch.zeros(self.num_bins, device=dev, dtype=torch.float64)
         self._neg_hist = torch.zeros(self.num_bins, device=dev, dtype=torch.float64)
 
-        self._brier_sum = torch.zeros((), device=dev, dtype=torch.float64)
-        self._numel = torch.zeros((), device=dev, dtype=torch.float64)
-
     def update(
         self,
         *,
@@ -169,11 +157,7 @@ class StreamingBinarySegmentationMetrics:
         self._counts.tn += batch_counts.tn
         self._counts.fn += batch_counts.fn
 
-        # Proper scoring rules (threshold-free).
-        self._brier_sum += torch.sum((probs - targets_f) ** 2, dtype=torch.float64)
-        self._numel += float(targets_f.numel())
-
-        # Histogram for approximate PR/ROC curves.
+        # Histogram for approximate best-F_beta threshold sweep.
         # Bin index in [0, num_bins-1] for probs in [0, 1].
         idx = torch.clamp((probs * float(self.num_bins)).to(dtype=torch.int64), min=0, max=self.num_bins - 1)
 
@@ -186,7 +170,6 @@ class StreamingBinarySegmentationMetrics:
 
     def _curves(self) -> Dict[str, torch.Tensor]:
         total_pos = self._pos_hist.sum()
-        total_neg = self._neg_hist.sum()
 
         # Curves are computed for thresholds descending from ~1 -> 0.
         tp = torch.cumsum(self._pos_hist.flip(0), dim=0)
@@ -198,70 +181,35 @@ class StreamingBinarySegmentationMetrics:
         else:
             recall = tp / total_pos
 
-        if float(total_neg.item()) <= 0.0:
-            fpr = torch.zeros_like(fp)
-        else:
-            fpr = fp / total_neg
-
-        precision = _safe_div(tp, tp + fp)
-
         # Threshold values that correspond to the cumulative curve points.
         thresholds = torch.arange(self.num_bins - 1, -1, -1, device=tp.device, dtype=torch.float64) / float(self.num_bins)
 
         return {
             "tp": tp,
             "fp": fp,
-            "precision": precision,
             "recall": recall,
-            "fpr": fpr,
             "thresholds": thresholds,
             "total_pos": total_pos,
-            "total_neg": total_neg,
         }
 
     def compute(self) -> Dict[str, torch.Tensor]:
         c = self._counts
 
-        precision = precision_from_counts(c)
         recall = recall_from_counts(c)
         specificity = specificity_from_counts(c)
 
         metrics: Dict[str, torch.Tensor] = {
-            "precision": precision,
-            "recall": recall,
             "specificity": specificity,
             "dice": dice_from_counts(c),
-            "iou": iou_from_counts(c),
             "f_beta": fbeta_from_counts(c, beta=self.beta),
             "mcc": mcc_from_counts(c),
             "balanced_accuracy": 0.5 * (recall + specificity),
-            "brier": _safe_div(self._brier_sum, self._numel),
         }
 
         curves = self._curves()
         tp = curves["tp"]
         fp = curves["fp"]
         total_pos = curves["total_pos"]
-        precision_curve = curves["precision"]
-        recall_curve = curves["recall"]
-
-        # Approximate average precision (area under precision-recall curve).
-        if float(total_pos.item()) <= 0.0:
-            metrics["auprc"] = torch.tensor(float("nan"), device=self.device, dtype=torch.float64)
-        else:
-            # Step integration in recall (AP-style).
-            recall0 = torch.cat([torch.zeros(1, device=recall_curve.device, dtype=recall_curve.dtype), recall_curve])
-            prec0 = torch.cat([torch.ones(1, device=precision_curve.device, dtype=precision_curve.dtype), precision_curve])
-            metrics["auprc"] = torch.sum((recall0[1:] - recall0[:-1]).clamp_min(0.0) * prec0[1:])
-
-        # ROC AUC (trapezoid over TPR vs FPR).
-        fpr = curves["fpr"]
-        if float(curves["total_neg"].item()) <= 0.0 or float(total_pos.item()) <= 0.0:
-            metrics["auroc"] = torch.tensor(float("nan"), device=self.device, dtype=torch.float64)
-        else:
-            fpr0 = torch.cat([torch.zeros(1, device=fpr.device, dtype=fpr.dtype), fpr])
-            tpr0 = torch.cat([torch.zeros(1, device=recall_curve.device, dtype=recall_curve.dtype), recall_curve])
-            metrics["auroc"] = torch.trapz(tpr0, fpr0)
 
         # Best F_beta over histogram thresholds (approx).
         if float(total_pos.item()) <= 0.0:
