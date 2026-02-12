@@ -11,7 +11,7 @@ add_executable(vc_render_video src/vc_render_video.cpp)
 target_link_libraries(vc_render_video z5 opencv_core vc_core opencv_videoio)
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
-target_link_libraries(vc_render_tifxyz vc_core Boost::program_options TIFF::TIFF)
+target_link_libraries(vc_render_tifxyz vc_core vc_flattening Boost::program_options TIFF::TIFF)
 
 add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)
@@ -35,7 +35,7 @@ add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 
 add_executable(vc_flatten src/vc_flatten.cpp)
-target_link_libraries(vc_flatten vc_core Boost::program_options)
+target_link_libraries(vc_flatten vc_core vc_flattening Boost::program_options)
 
 add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
 target_link_libraries(vc_tifxyz_inp_mask vc_core)
