@@ -321,6 +321,7 @@ def save(
 	*,
 	model,
 	data: fit_data.FitData,
+	res=None,
 	postfix: str,
 	out_dir: str,
 	scale: int,
@@ -339,7 +340,8 @@ def save(
 	out_vis.mkdir(parents=True, exist_ok=True)
 
 	h_img, w_img = data.size
-	res = model(data)
+	if res is None:
+		res = model(data)
 	with torch.no_grad():
 		xy0 = res.xy_lr.detach()
 		mean_xy = xy0.mean(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
@@ -374,6 +376,40 @@ def save(
 	# Also dump the (optionally blurred) grad_mag tensor.
 	mag_np = data.grad_mag[z_i, 0].detach().cpu().numpy().astype("float32")
 	tifffile.imwrite(str(out_vis / f"res_grad_mag_{postfix}.tif"), mag_np, compression="lzw")
+
+	# Dump stage img masks (if present) for debugging.
+	if res.stage_img_masks is not None:
+		for lbl, m in res.stage_img_masks.items():
+			m0 = m
+			if m0.ndim == 4 and int(m0.shape[0]) > 1:
+				m0 = m0[z_i:z_i + 1]
+			if m0.ndim == 4 and int(m0.shape[1]) == 1:
+				m_np = m0[0, 0].detach().cpu().numpy().astype("float32")
+				out_path = out_vis / f"res_stage_img_mask_{str(lbl)}_{postfix}.tif"
+				tifffile.imwrite(str(out_path), m_np, compression="lzw")
+
+				# Overlay mask on top of the grid visualization.
+				grid_ov = grid_vis.copy()
+				h_vis, w_vis = int(grid_ov.shape[0]), int(grid_ov.shape[1])
+				w_im = w_vis
+				h_im = h_vis
+				x_off = 0
+				y_off = 0
+				if bg is not None:
+					w_im = max(1, w_vis // 2)
+					h_im = max(1, h_vis // 2)
+					x_off = (w_vis - w_im) // 2
+					y_off = (h_vis - h_im) // 2
+				m_rs = cv2.resize(m_np, (w_im, h_im), interpolation=cv2.INTER_LINEAR)
+				m_rs = np.clip(m_rs, 0.0, 1.0)
+				alpha = (m_rs * 0.6).astype("float32")
+				roi = grid_ov[y_off:y_off + h_im, x_off:x_off + w_im, :].astype("float32")
+				col = np.zeros((h_im, w_im, 3), dtype="float32")
+				col[:, :, 2] = 255.0
+				roi = roi * (1.0 - alpha[:, :, None]) + col * alpha[:, :, None]
+				grid_ov[y_off:y_off + h_im, x_off:x_off + w_im, :] = np.clip(roi, 0.0, 255.0).astype("uint8")
+				out_path_ov = out_vis / f"res_stage_img_mask_overlay_{str(lbl)}_{postfix}.jpg"
+				cv2.imwrite(str(out_path_ov), np.flip(grid_ov, -1))
 
 	def _save_img_loss_vis(*, iters: int | None = None, postfix2: str | None = None) -> None:
 		it_label = "default" if iters is None else f"it{int(iters)}"
@@ -576,7 +612,7 @@ def save(
 		mask = spec.get("mask", None)
 		if mask is not None:
 			mt0 = mt0 * mask.to(dtype=mt0.dtype)
-		m = mt0.cpu()
+		m = mt0.detach().cpu()
 		if bool(spec["reduce"]) and m.ndim == 4:
 			m = m[:, 0]
 		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
@@ -589,11 +625,11 @@ def save(
 		mask = spec.get("mask", None)
 		if mask is not None:
 			m = m * mask.to(dtype=m.dtype)
-		m = m.cpu()
+		m = m.detach().cpu()
 		if m.ndim == 4:
-			m2 = m[0, 0].numpy().astype("float32")
+			m2 = m[0, 0].detach().numpy().astype("float32")
 		elif m.ndim == 2:
-			m2 = m.numpy().astype("float32")
+			m2 = m.detach().numpy().astype("float32")
 		else:
 			continue
 		name = str(spec["suffix"])

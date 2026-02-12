@@ -11,7 +11,7 @@ def data_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tens
 	tgt = res.target_mod
 	d = pred - tgt
 	lm = d * d
-	mask = res.mask_hr
+	mask = fit_model.xy_img_mask(res=res, xy=res.xy_hr, loss_name="data").unsqueeze(1)
 	return lm * mask, mask
 
 
@@ -21,7 +21,7 @@ def data_plain_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torc
 	tgt = res.target_plain
 	d = pred - tgt
 	lm = d * d
-	mask = res.mask_hr
+	mask = fit_model.xy_img_mask(res=res, xy=res.xy_hr, loss_name="data_plain").unsqueeze(1)
 	return lm * mask, mask
 
 

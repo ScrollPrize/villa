@@ -13,6 +13,7 @@ import opt_loss_geom
 import opt_loss_gradmag
 import opt_loss_mod
 import opt_loss_step
+import mask_schedule
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -38,6 +39,7 @@ class OptSettings:
 class Stage:
 	name: str
 	grow: dict | None
+	masks: list[dict] | None
 	global_opt: OptSettings
 	local_opt: list[OptSettings] | None
 
@@ -205,6 +207,11 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 		s = dict(s)
 		name = str(s.pop("name", ""))
 		grow = s.pop("grow", None)
+		masks = s.pop("masks", None)
+		if masks is not None and not isinstance(masks, list):
+			raise ValueError(f"stages_json: stage '{name}' field 'masks' must be a list or null")
+		if isinstance(masks, list):
+			masks = [m for m in masks if isinstance(m, dict)]
 		if grow is not None and not isinstance(grow, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'grow' must be an object or null")
 		if isinstance(grow, dict):
@@ -247,7 +254,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 					_parse_opt_settings(stage_name=name, opt_cfg=opt_cfg, base=lambda_global, prev_eff=prev_eff)
 				)
 
-		out.append(Stage(name=name, grow=grow, global_opt=global_opt, local_opt=local_opt))
+		out.append(Stage(name=name, grow=grow, masks=masks, global_opt=global_opt, local_opt=local_opt))
 	return out
 
 
@@ -330,7 +337,7 @@ def optimize(
 		for k in sorted(out.keys()):
 			vs = [round(float(x), 6) for x in out[k]]
 			print(f"{label} losses_per_z {k}: {vs}")
-	def _run_opt(*, si: int, label: str, opt_cfg: OptSettings) -> None:
+	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings) -> None:
 		if opt_cfg.steps <= 0:
 			return
 		# If the stage does not optimize any global transform params, bake the current
@@ -423,6 +430,14 @@ def optimize(
 		}
 		with torch.no_grad():
 			res0 = model(data)
+			if stage.masks is not None:
+				model.update_ema(xy_lr=res0.xy_lr, xy_conn=res0.xy_conn)
+				stage_img_masks, stage_img_masks_losses = mask_schedule.build_stage_img_masks(
+					model=model,
+					it=0,
+					masks=stage.masks,
+				)
+				res0 = replace(res0, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
 			loss0 = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals0: dict[str, float] = {}
 			for name, t in terms.items():
@@ -441,10 +456,19 @@ def optimize(
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
 			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
-		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data)
+		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
 
 		for step in range(opt_cfg.steps):
 			res = model(data)
+			model.update_ema(xy_lr=res.xy_lr, xy_conn=res.xy_conn)
+			if stage.masks is not None:
+				with torch.no_grad():
+					stage_img_masks, stage_img_masks_losses = mask_schedule.build_stage_img_masks(
+						model=model,
+						it=int(step),
+						masks=stage.masks,
+					)
+				res = replace(res, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
 			for name, t in terms.items():
@@ -470,9 +494,9 @@ def optimize(
 				print(f"{label} step {step1}/{opt_cfg.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
-				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data)
+				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)
 
-		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data)
+		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data, res=model(data))
 		with torch.no_grad():
 			_print_losses_per_z(label=f"{label} step {opt_cfg.steps}/{opt_cfg.steps}", res=model(data), eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		for h in hooks:
@@ -485,7 +509,7 @@ def optimize(
 	for si, stage in enumerate(stages):
 		if stage.grow is None:
 			if stage.global_opt.steps > 0:
-				_run_opt(si=si, label=f"stage{si}", opt_cfg=stage.global_opt)
+				_run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt)
 			continue
 		grow = stage.grow
 		directions = grow.get("directions", [])
@@ -515,7 +539,7 @@ def optimize(
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
 			if stage.global_opt.steps > 0:
-				_run_opt(si=si, label=f"{stage_g}_global", opt_cfg=stage.global_opt)
+				_run_opt(si=si, label=f"{stage_g}_global", stage=stage, opt_cfg=stage.global_opt)
 			if not local_opts or all(int(o.steps) <= 0 for o in local_opts):
 				continue
 			ins = model._last_grow_insert_lr
@@ -523,7 +547,7 @@ def optimize(
 				if model._last_grow_insert_z is not None:
 					model.const_mask_lr = None
 					for li, opt_cfg in enumerate(local_opts):
-						_run_opt(si=si, label=f"{stage_g}_local{li}", opt_cfg=opt_cfg)
+						_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg)
 					continue
 				raise RuntimeError("grow: missing insertion rect")
 			py0, px0, ho, wo = ins
@@ -543,6 +567,6 @@ def optimize(
 			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
 			model.const_mask_lr = cm
 			for li, opt_cfg in enumerate(local_opts):
-				_run_opt(si=si, label=f"{stage_g}_local{li}", opt_cfg=opt_cfg)
-		model.const_mask_lr = None
+				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg)
+	model.const_mask_lr = None
 	return data

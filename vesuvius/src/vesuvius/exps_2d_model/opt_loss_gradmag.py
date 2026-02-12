@@ -86,8 +86,8 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	mag_cr = res.data.grid_sample_px(xy_px=xy_cr_strip).grad_mag.reshape(n, 1, he, we, strip_samples)
 
 	# Validity mask for the strip samples (not just endpoints).
-	mask_lc_strip = fit_model.xy_img_validity_mask(params=res.params, xy=xy_lc_strip).reshape(n, he, we, strip_samples).unsqueeze(1)
-	mask_cr_strip = fit_model.xy_img_validity_mask(params=res.params, xy=xy_cr_strip).reshape(n, he, we, strip_samples).unsqueeze(1)
+	mask_lc_strip = fit_model.xy_img_mask(res=res, xy=xy_lc_strip, loss_name="gradmag").reshape(n, he, we, strip_samples).unsqueeze(1)
+	mask_cr_strip = fit_model.xy_img_mask(res=res, xy=xy_cr_strip, loss_name="gradmag").reshape(n, he, we, strip_samples).unsqueeze(1)
 	mask_lc_strip = mask_lc_strip.amin(dim=-1)
 	mask_cr_strip = mask_cr_strip.amin(dim=-1)
 

@@ -74,6 +74,48 @@ def xy_img_validity_mask(*, params: ModelParams, xy: torch.Tensor) -> torch.Tens
 	return inside.to(dtype=torch.float32).reshape(xy.shape[:-1])
 
 
+@torch.no_grad()
+def xy_img_mask(*, res: "FitResult", xy: torch.Tensor, loss_name: str) -> torch.Tensor:
+	"""Return image-space mask at `xy` for `loss_name`.
+
+	Mask is the base xy validity mask multiplied by any stage-scheduled image masks
+	configured to apply to `loss_name`.
+
+	- `xy`: (...,2) in model pixel coords
+	- returns: xy.shape[:-1] float mask in [0,1]
+	"""
+	base = xy_img_validity_mask(params=res.params, xy=xy)
+	masks = res.stage_img_masks
+	losses = res.stage_img_masks_losses
+	if not masks or not losses:
+		return base
+	name = str(loss_name)
+	if xy.ndim < 1 or int(xy.shape[-1]) != 2:
+		raise ValueError("xy must have last dim == 2")
+	if res.h_img <= 0 or res.w_img <= 0:
+		raise ValueError("invalid image size")
+
+	out = base
+	for lbl, m_img in masks.items():
+		ls = losses.get(lbl, [])
+		if name not in ls:
+			continue
+		if m_img.ndim != 4 or int(m_img.shape[1]) != 1:
+			raise ValueError("stage img mask must be (N,1,H,W)")
+		if int(m_img.shape[0]) != int(xy.shape[0]):
+			raise ValueError("stage img mask batch must match xy batch")
+		grid = xy.detach().to(dtype=torch.float32)
+		grid = grid.reshape(int(grid.shape[0]), -1, 1, 2)
+		hd = float(max(1, int(res.h_img) - 1))
+		wd = float(max(1, int(res.w_img) - 1))
+		grid[..., 0] = (grid[..., 0] / wd) * 2.0 - 1.0
+		grid[..., 1] = (grid[..., 1] / hd) * 2.0 - 1.0
+		s = F.grid_sample(m_img.to(dtype=torch.float32), grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+		s = s.reshape(int(xy.shape[0]), *[int(v) for v in xy.shape[1:-1]])
+		out = out * s
+	return out
+
+
 @dataclass(frozen=True)
 class FitResult:
 	_xy_lr: torch.Tensor
@@ -91,6 +133,8 @@ class FitResult:
 	_h_img: int
 	_w_img: int
 	_params: ModelParams
+	_stage_img_masks: dict[str, torch.Tensor] | None = None
+	_stage_img_masks_losses: dict[str, list[str]] | None = None
 
 	@property
 	def xy_lr(self) -> torch.Tensor:
@@ -103,6 +147,14 @@ class FitResult:
 	@property
 	def xy_conn(self) -> torch.Tensor:
 		return self._xy_conn
+
+	@property
+	def stage_img_masks(self) -> dict[str, torch.Tensor] | None:
+		return self._stage_img_masks
+
+	@property
+	def stage_img_masks_losses(self) -> dict[str, list[str]] | None:
+		return self._stage_img_masks_losses
 
 	@property
 	def data(self) -> fit_data.FitData:
@@ -223,6 +275,9 @@ class Model2D(nn.Module):
 		self._last_grow_insert_z: int | None = None
 		self.subsample_mesh = int(self.params.subsample_mesh)
 		self.subsample_winding = int(self.params.subsample_winding)
+		self._ema_decay = 0.99
+		self.register_buffer("xy_ema", torch.zeros((0, 0, 0, 0), device=device, dtype=torch.float32))
+		self.register_buffer("xy_conn_ema", torch.zeros((0, 0, 0, 0, 0), device=device, dtype=torch.float32))
 
 	def bake_global_transform_into_mesh(self) -> None:
 		"""Bake current global transform into mesh & disable it."""
@@ -239,6 +294,24 @@ class Model2D(nn.Module):
 
 	def xy_img_validity_mask(self, *, xy: torch.Tensor) -> torch.Tensor:
 		return xy_img_validity_mask(params=self.params, xy=xy)
+
+	@torch.no_grad()
+	def update_ema(self, *, xy_lr: torch.Tensor, xy_conn: torch.Tensor) -> None:
+		"""Update LR EMA tensors used by downstream mask scheduling.
+
+		Inputs are expected to match `FitResult.xy_lr` and `FitResult.xy_conn`.
+		"""
+		d = float(self._ema_decay)
+		x = xy_lr.detach().to(dtype=torch.float32)
+		xc = xy_conn.detach().to(dtype=torch.float32)
+		if self.xy_ema.numel() == 0 or tuple(self.xy_ema.shape) != tuple(x.shape):
+			self.xy_ema = x.clone()
+		else:
+			self.xy_ema.mul_(d).add_(x, alpha=(1.0 - d))
+		if self.xy_conn_ema.numel() == 0 or tuple(self.xy_conn_ema.shape) != tuple(xc.shape):
+			self.xy_conn_ema = xc.clone()
+		else:
+			self.xy_conn_ema.mul_(d).add_(xc, alpha=(1.0 - d))
 
 	def forward(self, data: fit_data.FitData) -> FitResult:
 		if int(data.cos.shape[0]) != int(self.z_size):
@@ -327,6 +400,9 @@ class Model2D(nn.Module):
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
 		st = dict(state_dict)
 		st.pop("_model_params_", None)
+		# EMA buffers are runtime-only; allow loading checkpoints with/without them.
+		st.pop("xy_ema", None)
+		st.pop("xy_conn_ema", None)
 		# Back-compat renames.
 		for k in list(st.keys()):
 			if k.startswith("mesh_offset_ms."):
