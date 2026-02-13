@@ -261,44 +261,44 @@ def _full_mean(lm: torch.Tensor) -> torch.Tensor:
 	return lm.mean()
 
 
-def smooth_x_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def smooth_x_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = smooth_x_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def smooth_y_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def smooth_y_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = smooth_y_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def meshoff_smooth_y_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def meshoff_smooth_y_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = meshoff_smooth_y_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def conn_y_smooth_l_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def conn_y_smooth_l_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = conn_y_smooth_l_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def conn_y_smooth_r_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def conn_y_smooth_r_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = conn_y_smooth_r_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def angle_symmetry_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def angle_symmetry_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = angle_symmetry_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def y_straight_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def y_straight_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = y_straight_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
-def z_straight_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def z_straight_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = z_straight_loss_map(res=res)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)
 
 
 def angle_symmetry_loss_uv(*, res: fit_model.FitResult) -> torch.Tensor:
@@ -307,6 +307,6 @@ def angle_symmetry_loss_uv(*, res: fit_model.FitResult) -> torch.Tensor:
 	return _full_mean(lm)
 
 
-def mean_pos_loss(*, res: fit_model.FitResult, target_xy: torch.Tensor) -> torch.Tensor:
+def mean_pos_loss(*, res: fit_model.FitResult, target_xy: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = mean_pos_loss_map(res=res, target_xy=target_xy)
-	return _full_mean(lm)
+	return _full_mean(lm), (lm,), (mask,)

@@ -80,18 +80,19 @@ def dir_conn_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	lm_conn_l_lr = _dir_lm(x0=left, x1=mid) * mask_conn_l_lr
 	lm_conn_r_lr = _dir_lm(x0=mid, x1=right) * mask_conn_r_lr
 	return lm_conn_l_lr, lm_conn_r_lr, mask_conn_l_lr, mask_conn_r_lr
-def dir_v_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def dir_v_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Vertical direction loss vs (dir0, dir1) encodings."""
 	lm_v_lr, mask_v_lr = dir_v_loss_maps(res=res)
 	wsum_v = mask_v_lr.sum()
-	return lm_v_lr.sum() / wsum_v if float(wsum_v.detach().cpu()) > 0.0 else lm_v_lr.mean()
+	loss = lm_v_lr.sum() / wsum_v if float(wsum_v.detach().cpu()) > 0.0 else lm_v_lr.mean()
+	return loss, (lm_v_lr,), (mask_v_lr,)
 
 
-def dir_conn_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def dir_conn_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Connection direction loss vs (dir0, dir1) encodings."""
 	lm_l, lm_r, mask_l, mask_r = dir_conn_loss_maps(res=res)
 	wsum_l = mask_l.sum()
 	wsum_r = mask_r.sum()
 	ll = lm_l.sum() / wsum_l if float(wsum_l.detach().cpu()) > 0.0 else lm_l.mean()
 	lr = lm_r.sum() / wsum_r if float(wsum_r.detach().cpu()) > 0.0 else lm_r.mean()
-	return 0.5 * (ll + lr)
+	return 0.5 * (ll + lr), (lm_l, lm_r), (mask_l, mask_r)

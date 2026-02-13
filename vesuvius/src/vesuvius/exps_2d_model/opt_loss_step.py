@@ -21,7 +21,8 @@ def step_loss_maps(*, res: fit_model.FitResult) -> torch.Tensor:
 	return rel * rel
 
 
-def step_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def step_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Penalize vertical mesh edge lengths deviating from the configured step size (relative)."""
 	step_v = step_loss_maps(res=res)
-	return step_v.mean()
+	mask = torch.ones_like(step_v)
+	return step_v.mean(), (step_v,), (mask,)

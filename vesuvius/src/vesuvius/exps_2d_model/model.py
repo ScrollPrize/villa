@@ -104,7 +104,7 @@ def xy_img_mask(*, res: "FitResult", xy: torch.Tensor, loss_name: str) -> torch.
 			raise ValueError("stage img mask must be (N,1,H,W)")
 		if int(m_img.shape[0]) != int(xy.shape[0]):
 			raise ValueError("stage img mask batch must match xy batch")
-		grid = xy.detach().to(dtype=torch.float32)
+		grid = xy.detach().to(dtype=torch.float32).clone()
 		grid = grid.reshape(int(grid.shape[0]), -1, 1, 2)
 		hd = float(max(1, int(res.h_img) - 1))
 		wd = float(max(1, int(res.w_img) - 1))
@@ -135,6 +135,7 @@ class FitResult:
 	_params: ModelParams
 	_stage_img_masks: dict[str, torch.Tensor] | None = None
 	_stage_img_masks_losses: dict[str, list[str]] | None = None
+	_vis_loss_maps: dict[str, torch.Tensor] | None = None
 
 	@property
 	def xy_lr(self) -> torch.Tensor:
@@ -155,6 +156,10 @@ class FitResult:
 	@property
 	def stage_img_masks_losses(self) -> dict[str, list[str]] | None:
 		return self._stage_img_masks_losses
+
+	@property
+	def vis_loss_maps(self) -> dict[str, torch.Tensor] | None:
+		return self._vis_loss_maps
 
 	@property
 	def data(self) -> fit_data.FitData:

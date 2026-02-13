@@ -48,11 +48,13 @@
 				{
 					"label": "cw_pie",
 					"type": "central_winding_pie_ema",
-					"ramp_start_it": 0,
-					"start_size_segs": 4,
-					"ramp_stop_it": 4000,
-					"blur_sigma": 7.0,
-					"losses": ["gradmag"]
+					"ramp_start_it": 500,
+					"center_off" : [0,5],
+					"start_size_segs": 2,
+					"ramp_stop_it": 4500,
+					"blur_sigma": 3.0,
+					"__losses": [],
+					"losses": ["data","data_plain","data_grad"]
 				}
 			],
 			"w_fac": {

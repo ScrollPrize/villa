@@ -176,11 +176,12 @@ def main(argv: list[str] | None = None) -> int:
 		torch.save(st, str(model_cfg.model_output))
 
 	_save_model_snapshot(stage="init", step=0)
-	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
+	def _snapshot(*, stage: str, step: int, loss: float, data, res=None, vis_losses=None) -> None:
 		vis.save(
 			model=mdl,
 			data=data,
 			res=res,
+			vis_losses=vis_losses,
 			postfix=f"{stage}_{step:06d}",
 			out_dir=vis_cfg.out_dir,
 			scale=vis_cfg.scale,
