@@ -17,7 +17,7 @@ from vesuvius.neural_tracing.inference.common import (
     _resolve_settings,
     _RuntimeProfiler,
     _save_merged_surface_tifxyz,
-    _select_agg_extrap_uv_for_sampling,
+    _select_extrap_uvs_for_sampling,
     _serialize_args,
     _show_napari,
 )
@@ -235,15 +235,15 @@ def _build_bbox_crops(
     grow_direction,
     crop_size,
     cond_pct,
-    one_map,
+    extrap_uv_to_zyx,
 ):
     cond_valid_base = np.asarray(cond_valid, dtype=bool)
     cond_zyxs64 = np.asarray(cond_zyxs, dtype=np.float64)
     crop_size = tuple(int(v) for v in crop_size)
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
-    one_map = one_map if isinstance(one_map, dict) else {}
-    one_map_get = one_map.get
+    extrap_uv_to_zyx = extrap_uv_to_zyx if isinstance(extrap_uv_to_zyx, dict) else {}
+    extrap_uv_to_zyx_get = extrap_uv_to_zyx.get
 
     bbox_crops = []
 
@@ -268,7 +268,7 @@ def _build_bbox_crops(
         extrap_world_list = []
         for uv in uv_query_flat:
             uv_key = (int(uv[0]), int(uv[1]))
-            pt = one_map_get(uv_key)
+            pt = extrap_uv_to_zyx_get(uv_key)
             if pt is None:
                 continue
             pt_arr = np.asarray(pt)
@@ -297,8 +297,8 @@ def _build_bbox_crops(
                 "cond_vox": cond_vox,
                 "extrap_vox": extrap_vox,
                 "extrap_uv": extrap_uv.astype(np.int64, copy=False),
-                "cond_world_zyx": cond_world,
-                "extrap_world_zyx": extrap_world,
+                "cond_world": cond_world,
+                "extrap_world": extrap_world,
                 "n_cond": int(cond_uv.shape[0]),
                 "n_query": int(uv_query_flat.shape[0]),
                 "n_extrap": int(extrap_uv.shape[0]),
@@ -307,23 +307,7 @@ def _build_bbox_crops(
 
     return bbox_crops
 
-
-def _build_bbox_results_from_crops(bbox_crops):
-    bbox_results = []
-    for crop in bbox_crops:
-        extrap_world = crop["extrap_world_zyx"]
-        bbox_results.append(
-            {
-                "bbox_idx": crop["bbox_idx"],
-                "bbox": crop["bbox"],
-                "cond_world": crop["cond_world_zyx"],
-                "extrap_world": extrap_world,
-            }
-        )
-    return bbox_results
-
-
-def _run_bbox_displacement_inference(args, bbox_crops, model_state, verbose=True):
+def _run_inference(args, bbox_crops, model_state, verbose=True):
     expected_in_channels = int(model_state["expected_in_channels"])
     if expected_in_channels != 3:
         raise RuntimeError(
@@ -378,7 +362,7 @@ def _run_bbox_displacement_inference(args, bbox_crops, model_state, verbose=True
     return per_crop_fields
 
 
-def _stack_displacements_to_global(per_crop_fields):
+def _stack_displacement_results(per_crop_fields):
     if len(per_crop_fields) == 0:
         return None
 
@@ -450,16 +434,16 @@ def _empty_stack_samples():
     }
 
 
-def _sample_stacked_displacement_on_agg_extrap(
+def _sample_displacement_for_extrap_uvs(
     stacked_displacement,
-    one_map,
+    extrap_uv_to_zyx,
     grow_direction,
     max_lines=None,
 ):
-    if stacked_displacement is None or not one_map:
+    if stacked_displacement is None or not extrap_uv_to_zyx:
         return _empty_stack_samples()
 
-    sampled_uv = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=max_lines)
+    sampled_uv = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
@@ -468,7 +452,7 @@ def _sample_stacked_displacement_on_agg_extrap(
     min_corner = np.asarray(stacked_displacement["min_corner"], dtype=np.int64)
     shape = np.asarray(stacked_displacement["shape"], dtype=np.int64)
 
-    sampled_world = _lookup_sampled_world_from_one_map(sampled_uv, one_map)
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx)
     coords_local = sampled_world.astype(np.float64, copy=False) - min_corner[None, :].astype(np.float64)
     in_bounds = (
         (coords_local[:, 0] >= 0.0) & (coords_local[:, 0] <= float(shape[0] - 1)) &
@@ -503,22 +487,22 @@ def _sample_stacked_displacement_on_agg_extrap(
     }
 
 
-def _lookup_sampled_world_from_one_map(sampled_uv, one_map):
+def _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx):
     return np.asarray(
-        [one_map[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
+        [extrap_uv_to_zyx[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
         dtype=np.float32,
     )
 
 
-def _sample_agg_extrap_direct(one_map, grow_direction, max_lines=None):
-    if not one_map:
+def _sample_extrap_no_disp(extrap_uv_to_zyx, grow_direction, max_lines=None):
+    if not extrap_uv_to_zyx:
         return _empty_stack_samples()
 
-    sampled_uv = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=max_lines)
+    sampled_uv = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
-    sampled_world = _lookup_sampled_world_from_one_map(sampled_uv, one_map)
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx)
     keep = np.isfinite(sampled_world).all(axis=1)
     if not keep.any():
         return _empty_stack_samples()
@@ -583,11 +567,39 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
     return sampled_disp_np, sampled_count_np, valid_mask_np
 
 
-def _apply_displacement(samples, verbose=True):
+def _apply_displacement(samples, verbose=True, skip_inference=False):
     world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
     displacement = np.asarray(samples.get("displacement", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
     uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
     stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
+
+    if skip_inference:
+        n = int(min(uv.shape[0], world.shape[0], stack_count.shape[0]))
+        if n == 0:
+            if verbose:
+                print("== Applied Displacement ==")
+                print("Extrap-only mode: no extrapolated points selected to merge.")
+            return {
+                "uv": np.zeros((0, 2), dtype=np.int64),
+                "world": np.zeros((0, 3), dtype=np.float32),
+                "displacement": np.zeros((0, 3), dtype=np.float32),
+                "world_displaced": np.zeros((0, 3), dtype=np.float32),
+                "stack_count": np.zeros((0,), dtype=np.uint32),
+            }
+        uv = uv[:n].astype(np.int64, copy=False)
+        world = world[:n].astype(np.float32, copy=False)
+        stack_count = stack_count[:n].astype(np.uint32, copy=False)
+        if verbose:
+            print("== Applied Displacement ==")
+            print("Extrap-only mode: bypassed displacement sampling; merging extrapolated points directly.")
+            print(f"n points: {n}")
+        return {
+            "uv": uv,
+            "world": world,
+            "displacement": np.zeros((n, 3), dtype=np.float32),
+            "world_displaced": world,
+            "stack_count": stack_count,
+        }
 
     if world.shape[0] == 0 or displacement.shape[0] == 0:
         if verbose:
@@ -625,40 +637,6 @@ def _apply_displacement(samples, verbose=True):
         "world": world,
         "displacement": displacement,
         "world_displaced": world_displaced.astype(np.float32, copy=False),
-        "stack_count": stack_count,
-    }
-
-
-def _use_extrap_points_directly(samples, verbose=True):
-    uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
-    world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
-    stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
-
-    n = int(min(uv.shape[0], world.shape[0], stack_count.shape[0]))
-    if n == 0:
-        if verbose:
-            print("== Applied Displacement ==")
-            print("Extrap-only mode: no extrapolated points selected to merge.")
-        return {
-            "uv": np.zeros((0, 2), dtype=np.int64),
-            "world": np.zeros((0, 3), dtype=np.float32),
-            "displacement": np.zeros((0, 3), dtype=np.float32),
-            "world_displaced": np.zeros((0, 3), dtype=np.float32),
-            "stack_count": np.zeros((0,), dtype=np.uint32),
-        }
-
-    uv = uv[:n].astype(np.int64, copy=False)
-    world = world[:n].astype(np.float32, copy=False)
-    stack_count = stack_count[:n].astype(np.uint32, copy=False)
-    if verbose:
-        print("== Applied Displacement ==")
-        print("Extrap-only mode: bypassed displacement sampling; merging extrapolated points directly.")
-        print(f"n points: {n}")
-    return {
-        "uv": uv,
-        "world": world,
-        "displacement": np.zeros((n, 3), dtype=np.float32),
-        "world_displaced": world,
         "stack_count": stack_count,
     }
 
@@ -919,7 +897,7 @@ def main():
         "uv_query_flat": np.zeros((0, 2), dtype=np.float64),
         "extrap_coords_world": np.zeros((0, 3), dtype=np.float32),
     }
-    one_map = {}
+    extrap_uv_to_zyx = {}
     stacked_displacement = None
     displaced = {
         "uv": np.zeros((0, 2), dtype=np.int64),
@@ -988,7 +966,7 @@ def main():
             one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
             one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
             one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
-            one_map = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
+            extrap_uv_to_zyx = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
 
         with profiler.section("iter_build_bbox_crops"):
             bbox_crops = _build_bbox_crops(
@@ -1001,35 +979,35 @@ def main():
                 grow_direction=grow_direction,
                 crop_size=crop_size,
                 cond_pct=args.cond_pct,
-                one_map=one_map,
+                extrap_uv_to_zyx=extrap_uv_to_zyx,
             )
         _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
-        bbox_results = _build_bbox_results_from_crops(bbox_crops)
+        bbox_results = bbox_crops
 
         stacked_displacement = None
         if run_model_inference and model_state is not None:
             with profiler.section("iter_displacement_inference"):
-                per_crop_fields = _run_bbox_displacement_inference(
+                per_crop_fields = _run_inference(
                     args,
                     bbox_crops,
                     model_state,
                     verbose=args.verbose,
                 )
             with profiler.section("iter_stack_displacements"):
-                stacked_displacement = _stack_displacements_to_global(per_crop_fields)
+                stacked_displacement = _stack_displacement_results(per_crop_fields)
         _print_stacked_displacement_debug(stacked_displacement, verbose=args.verbose)
         if extrap_only_mode:
-            with profiler.section("iter_sample_agg_extrap_direct"):
-                agg_samples = _sample_agg_extrap_direct(
-                    one_map,
+            with profiler.section("iter_sample_extrap_no_disp"):
+                agg_samples = _sample_extrap_no_disp(
+                    extrap_uv_to_zyx,
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
                 )
         else:
             with profiler.section("iter_sample_stacked_displacement"):
-                agg_samples = _sample_stacked_displacement_on_agg_extrap(
+                agg_samples = _sample_displacement_for_extrap_uvs(
                     stacked_displacement,
-                    one_map,
+                    extrap_uv_to_zyx,
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
                 )
@@ -1037,20 +1015,20 @@ def main():
         _print_iteration_summary(
             bbox_results,
             one_shot,
-            one_map,
+            extrap_uv_to_zyx,
             grow_direction,
             verbose=args.verbose,
         )
         _print_agg_extrap_sampling_debug(
             agg_samples,
-            one_map,
+            extrap_uv_to_zyx,
             grow_direction,
             max_lines=args.agg_extrap_lines,
             verbose=args.verbose,
         )
         if extrap_only_mode:
             with profiler.section("iter_apply_samples_direct"):
-                displaced = _use_extrap_points_directly(agg_samples, verbose=args.verbose)
+                displaced = _apply_displacement(agg_samples, verbose=args.verbose, skip_inference=True)
         else:
             with profiler.section("iter_apply_displacement"):
                 displaced = _apply_displacement(agg_samples, verbose=args.verbose)
@@ -1117,7 +1095,7 @@ def main():
                 current_valid,
                 bbox_results,
                 one_shot,
-                one_map,
+                extrap_uv_to_zyx,
                 disp_bbox=disp_bbox,
                 displaced=displaced,
                 merged=merged,

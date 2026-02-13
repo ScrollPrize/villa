@@ -291,11 +291,11 @@ def _agg_extrap_axis_metadata(grow_direction):
     return axis_idx, axis_name, near_to_far_desc
 
 
-def _finite_uv_from_one_map(one_map):
-    if not one_map:
+def _finite_uvs_from_extrap_map(extrap_uv_to_zyx):
+    if not extrap_uv_to_zyx:
         return np.zeros((0, 2), dtype=np.int64)
     finite_uv = []
-    for uv_key, pt in one_map.items():
+    for uv_key, pt in extrap_uv_to_zyx.items():
         if pt is None:
             continue
         pt_arr = np.asarray(pt)
@@ -306,8 +306,8 @@ def _finite_uv_from_one_map(one_map):
     return np.asarray(finite_uv, dtype=np.int64).reshape(-1, 2)
 
 
-def _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None):
-    uv_ordered = _finite_uv_from_one_map(one_map)
+def _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=None):
+    uv_ordered = _finite_uvs_from_extrap_map(extrap_uv_to_zyx)
     if uv_ordered.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int64)
 
@@ -332,10 +332,10 @@ def _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None):
     return uv_ordered[keep]
 
 
-def _print_agg_extrap_sampling_debug(samples, one_map, grow_direction, max_lines=None, verbose=True):
+def _print_agg_extrap_sampling_debug(samples, extrap_uv_to_zyx, grow_direction, max_lines=None, verbose=True):
     if not verbose:
         return
-    all_uv = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None)
+    all_uv = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=None)
     sampled_uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
     axis_idx, axis_name, _ = _agg_extrap_axis_metadata(grow_direction)
     total_uv = int(all_uv.shape[0])
@@ -466,8 +466,8 @@ def _print_bbox_crop_debug_table(bbox_crops, verbose=True):
     )
 
 
-def _agg_extrap_line_summary(one_map, grow_direction):
-    uv_ordered = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None)
+def _agg_extrap_line_summary(extrap_uv_to_zyx, grow_direction):
+    uv_ordered = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=None)
     axis_idx, axis_name, _ = _agg_extrap_axis_metadata(grow_direction)
     if uv_ordered.shape[0] == 0:
         return {
@@ -492,14 +492,14 @@ def _agg_extrap_line_summary(one_map, grow_direction):
     }
 
 
-def _print_iteration_summary(bbox_results, one_shot, one_map, grow_direction, verbose=True):
+def _print_iteration_summary(bbox_results, one_shot, extrap_uv_to_zyx, grow_direction, verbose=True):
     if not verbose:
         return
-    agg_summary = _agg_extrap_line_summary(one_map, grow_direction)
+    agg_summary = _agg_extrap_line_summary(extrap_uv_to_zyx, grow_direction)
     print("== Extrapolation Summary ==")
     print(f"bboxes: {len(bbox_results)}")
     print(f"one-shot edge-input uv count: {len(one_shot.get('edge_uv', []))}")
-    print(f"one-shot extrap uv count (aggregated): {len(one_map)}")
+    print(f"one-shot extrap uv count (aggregated): {len(extrap_uv_to_zyx)}")
     print("== Aggregated Extrapolation ==")
     print(f"axis: {agg_summary['axis_name']}")
     print(f"available lines (near->far): {agg_summary['line_count']}")
@@ -515,7 +515,7 @@ def _show_napari(
     cond_valid,
     bbox_results,
     one_shot,
-    one_map,
+    extrap_uv_to_zyx,
     disp_bbox=None,
     displaced=None,
     merged=None,
@@ -663,8 +663,8 @@ def _show_napari(
             opacity=0.9,
         )
 
-    if one_map:
-        one_pts = np.asarray(list(one_map.values()), dtype=np.float32)
+    if extrap_uv_to_zyx:
+        one_pts = np.asarray(list(extrap_uv_to_zyx.values()), dtype=np.float32)
         one_pts = _downsample_points(one_pts)
         viewer.add_points(
             one_pts,
