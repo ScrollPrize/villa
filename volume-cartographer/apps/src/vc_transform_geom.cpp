@@ -1,5 +1,5 @@
 // vc_transform_geom.cpp
-// Small utility to apply an affine (and optional scale-segmentation) to
+// Small utility to apply an affine and optional uniform scales before/after
 // OBJ geometry, a single TIFXYZ mesh, or a directory of TIFXYZ subfolders,
 // writing the transformed result.
 
@@ -121,7 +121,8 @@ static int run_tifxyz(const std::filesystem::path& inDir,
                       const std::filesystem::path& outDir,
                       const AffineTransform* A,
                       bool invert,
-                      double scale_seg)
+                      double scale_before_affine,
+                      double scale_after_affine)
 {
     std::unique_ptr<AffineTransform> AA;
     if (A) {
@@ -142,8 +143,9 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         for (int i = 0; i < P->cols; ++i) {
             cv::Vec3f& p = (*P)(j,i);
             if (p[0] == -1) continue; // keep invalids
-            cv::Vec3f q = p * static_cast<float>(scale_seg);
+            cv::Vec3f q = p * static_cast<float>(scale_before_affine);
             if (AA) q = apply_affine_point(q, *AA);
+            q *= static_cast<float>(scale_after_affine);
             p = q;
         }
     }
@@ -164,7 +166,8 @@ static int run_tifxyz_batch(const std::filesystem::path& inRoot,
                             const std::filesystem::path& outRoot,
                             const AffineTransform* A,
                             bool invert,
-                            double scale_seg)
+                            double scale_before_affine,
+                            double scale_after_affine)
 {
     if (std::filesystem::exists(outRoot)) {
         std::cerr << "output directory already exists: " << outRoot << std::endl;
@@ -187,7 +190,7 @@ static int run_tifxyz_batch(const std::filesystem::path& inRoot,
 
         found++;
         const auto out = outRoot / sub.filename();
-        const int rc = run_tifxyz(sub, out, A, invert, scale_seg);
+        const int rc = run_tifxyz(sub, out, A, invert, scale_before_affine, scale_after_affine);
         if (rc == 0) {
             ok++;
             std::cout << "[ok] " << sub.filename() << std::endl;
@@ -213,7 +216,8 @@ static int run_obj(const std::filesystem::path& inFile,
                    const std::filesystem::path& outFile,
                    const AffineTransform* A,
                    bool invert,
-                   double scale_seg)
+                   double scale_before_affine,
+                   double scale_after_affine)
 {
     std::unique_ptr<AffineTransform> AA;
     if (A) {
@@ -244,8 +248,9 @@ static int run_obj(const std::filesystem::path& inFile,
             char c; ss >> c; // 'v'
             double x, y, z; ss >> x >> y >> z;
             cv::Vec3f p = {static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
-            p *= static_cast<float>(scale_seg);
+            p *= static_cast<float>(scale_before_affine);
             if (AA) p = apply_affine_point(p, *AA);
+            p *= static_cast<float>(scale_after_affine);
             out << std::setprecision(9) << "v " << p[0] << " " << p[1] << " " << p[2] << "\n";
         } else if (starts_with(line, "vn ")) {
             std::istringstream ss(line);
@@ -253,7 +258,7 @@ static int run_obj(const std::filesystem::path& inFile,
             double nx, ny, nz; ss >> nx >> ny >> nz;
             cv::Vec3f n = {static_cast<float>(nx), static_cast<float>(ny), static_cast<float>(nz)};
             if (AA) n = transform_normal(n, *AA);
-            // scale_seg is uniform -> no effect on normalized normals
+            // uniform scaling before/after affine has no effect on normalized normals
             out << std::setprecision(9) << "vn " << n[0] << " " << n[1] << " " << n[2] << "\n";
         } else {
             out << line << "\n";
@@ -271,7 +276,9 @@ int main(int argc, char** argv) {
             ("output,o", po::value<std::string>()->required(), "Output path (required): OBJ file, TIFXYZ dir, or output root for batch")
             ("affine,a", po::value<std::string>(), "Affine JSON with 'transformation_matrix'")
             ("invert",   po::bool_switch()->default_value(false), "Invert the affine")
-            ("scale-segmentation", po::value<double>()->default_value(1.0), "Pre-scale applied to coordinates (uniform)")
+            ("scale-before-affine", po::value<double>()->default_value(1.0), "Uniform scale applied before affine")
+            ("scale-after-affine", po::value<double>()->default_value(1.0), "Uniform scale applied after affine")
+            ("scale-segmentation", po::value<double>(), "[Deprecated] Alias for --scale-before-affine")
         ;
 
         po::variables_map vm;
@@ -285,8 +292,19 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path inPath(vm["input"].as<std::string>());
         const std::filesystem::path outPath(vm["output"].as<std::string>());
-        const double scale_seg = vm["scale-segmentation"].as<double>();
+        double scale_before_affine = vm["scale-before-affine"].as<double>();
+        const double scale_after_affine = vm["scale-after-affine"].as<double>();
         const bool invert = vm["invert"].as<bool>();
+
+        if (vm.count("scale-segmentation")) {
+            const double legacy_scale = vm["scale-segmentation"].as<double>();
+            if (!vm["scale-before-affine"].defaulted() && scale_before_affine != legacy_scale) {
+                std::cerr << "Conflicting values for --scale-before-affine and deprecated --scale-segmentation" << std::endl;
+                return 1;
+            }
+            scale_before_affine = legacy_scale;
+            std::cerr << "Warning: --scale-segmentation is deprecated; use --scale-before-affine" << std::endl;
+        }
 
         std::unique_ptr<AffineTransform> A;
         if (vm.count("affine")) {
@@ -299,18 +317,18 @@ int main(int argc, char** argv) {
             if (std::filesystem::exists(outPath)) {
                 std::cerr << "output directory already exists: " << outPath << std::endl; return 1;
             }
-            return run_tifxyz(inPath, outPath, A.get(), invert, scale_seg);
+            return run_tifxyz(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine);
         }
 
         if (std::filesystem::is_directory(inPath)) {
-            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_seg);
+            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine);
         }
 
         if (inPath.extension() == ".obj") {
             if (outPath.extension() != ".obj") {
                 std::cerr << "output should have .obj extension for OBJ input" << std::endl; return 1;
             }
-            return run_obj(inPath, outPath, A.get(), invert, scale_seg);
+            return run_obj(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine);
         }
 
         std::cerr << "Unknown input type. Provide a .obj file, a TIFXYZ directory, or a directory containing TIFXYZ subfolders." << std::endl;
