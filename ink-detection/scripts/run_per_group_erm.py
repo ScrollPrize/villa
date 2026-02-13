@@ -39,8 +39,10 @@ def main():
     parser.add_argument("--dry_run", action="store_true")
     args, passthrough = parser.parse_known_args()
 
+    project_root = Path(__file__).resolve().parent.parent
+
     if args.metadata_json is None:
-        metadata_path = (Path(__file__).resolve().parent / "metadata.json").resolve()
+        metadata_path = (project_root / "metadata.json").resolve()
     else:
         metadata_path = Path(args.metadata_json).expanduser().resolve()
     base_metadata = load_json(metadata_path)
@@ -75,7 +77,7 @@ def main():
     else:
         group_names = [s.strip() for s in str(args.groups).split(",") if s.strip()]
 
-    train_script = (Path(__file__).resolve().parent / "train_resnet3d.py").resolve()
+    train_script = (project_root / "train_resnet3d.py").resolve()
 
     tmp_dir_ctx = tempfile.TemporaryDirectory(prefix="per_group_erm_")
     tmp_dir = Path(tmp_dir_ctx.name)

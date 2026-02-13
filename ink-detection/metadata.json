@@ -159,6 +159,7 @@
     }
   },
   "training": {
+    "data_backend": "tiff",
     "objective": "erm",
     "sampler": "shuffle",
     "loss_mode": "batch",

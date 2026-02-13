@@ -353,25 +353,19 @@ def _looks_like_zarr_store(path: str) -> bool:
     return False
 
 
-def resolve_segment_zarr_path(fragment_id, seg_meta):
+def resolve_segment_zarr_path(fragment_id):
     fragment_id = str(fragment_id)
-    seg_meta = _require_dict(seg_meta, name=f"segments[{fragment_id!r}]")
     dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-    if "original_path" not in seg_meta:
-        raise KeyError(f"segments[{fragment_id!r}] missing required key: 'original_path'")
+    if not fragment_id:
+        raise ValueError("segment id must be a non-empty string")
 
-    original_path = str(seg_meta["original_path"]).strip()
-    if not original_path:
-        raise ValueError(f"segments[{fragment_id!r}].original_path must be a non-empty string")
-
-    candidate = original_path if osp.isabs(original_path) else osp.join(dataset_root, original_path)
-    candidate = osp.normpath(candidate)
+    candidate = osp.normpath(osp.join(dataset_root, f"{fragment_id}.zarr"))
     if _looks_like_zarr_store(candidate):
         return candidate
 
     raise FileNotFoundError(
         f"Could not resolve zarr volume path for segment={fragment_id}. "
-        f"Expected zarr store at segments[{fragment_id!r}].original_path -> {candidate!r}."
+        f"Expected zarr store at {candidate!r}."
     )
 
 
@@ -400,8 +394,8 @@ class ZarrSegmentVolume:
         _ensure_zarr_v2()
 
         self.fragment_id = str(fragment_id)
-        self.seg_meta = _require_dict(seg_meta, name=f"segments[{self.fragment_id!r}]")
-        self.path = resolve_segment_zarr_path(self.fragment_id, self.seg_meta)
+        _require_dict(seg_meta, name=f"segments[{self.fragment_id!r}]")
+        self.path = resolve_segment_zarr_path(self.fragment_id)
         self.is_frag = "frag" in self.fragment_id
 
         idxs = _compute_selected_layer_indices(self.fragment_id, layer_range=layer_range)
