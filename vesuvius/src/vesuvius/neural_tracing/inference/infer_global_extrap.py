@@ -2,6 +2,8 @@ import argparse
 import colorsys
 import os
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -167,6 +169,11 @@ def parse_args():
         help="Point size for all Napari point layers (default: 1).",
     )
     parser.add_argument("--napari", action="store_true", help="Visualize bbox/full-edge conditioning and extrapolation.")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable runtime profiling logs for major pipeline stages.",
+    )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -1320,10 +1327,68 @@ def _show_napari(
     napari.run()
 
 
+class _RuntimeProfiler:
+    def __init__(self, enabled=False, device=None):
+        self.enabled = bool(enabled)
+        self._totals = {}
+        self._counts = {}
+        self._order = []
+        self._device = None
+        self._use_cuda_sync = False
+        if self.enabled and device is not None:
+            self._device = torch.device(device)
+            self._use_cuda_sync = self._device.type == "cuda" and torch.cuda.is_available()
+
+    def _sync_cuda(self):
+        if self._use_cuda_sync:
+            torch.cuda.synchronize(self._device)
+
+    def sync(self):
+        if not self.enabled:
+            return
+        self._sync_cuda()
+
+    @contextmanager
+    def section(self, name):
+        if not self.enabled:
+            yield
+            return
+        self._sync_cuda()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync_cuda()
+            elapsed = time.perf_counter() - start
+            if name not in self._totals:
+                self._totals[name] = 0.0
+                self._counts[name] = 0
+                self._order.append(name)
+            self._totals[name] += elapsed
+            self._counts[name] += 1
+
+    def print_summary(self, total_runtime_s=None):
+        if not self.enabled:
+            return
+        print("== Performance Profile ==")
+        for name in self._order:
+            total_s = float(self._totals.get(name, 0.0))
+            count = int(self._counts.get(name, 0))
+            avg_s = total_s / max(count, 1)
+            print(f"{name}: {total_s:.3f}s ({count}x, avg {avg_s:.3f}s)")
+        if total_runtime_s is not None:
+            print(f"total_runtime: {float(total_runtime_s):.3f}s")
+
+
 def main():
     args = parse_args()
     call_args = _serialize_args(args)
     crop_size = tuple(int(v) for v in args.crop_size)
+    profiler = _RuntimeProfiler(enabled=args.profile, device=args.device)
+    run_start = None
+    if args.profile:
+        profiler.sync()
+        run_start = time.perf_counter()
 
     extrap_only_mode = bool(args.extrap_only)
     run_model_inference = (
@@ -1335,7 +1400,8 @@ def main():
     model_config = None
     checkpoint_path = None
     if run_model_inference:
-        model_state = load_model(args)
+        with profiler.section("load_model"):
+            model_state = load_model(args)
         model_config = model_state["model_config"]
         checkpoint_path = model_state["checkpoint_path"]
         expected_in_channels = int(model_state["expected_in_channels"])
@@ -1350,38 +1416,45 @@ def main():
             if args.verbose:
                 print("--agg-extrap-min-stack-count is ignored in --extrap-only mode.")
         if args.checkpoint_path is not None:
-            model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
+            with profiler.section("load_checkpoint_config"):
+                model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
     elif args.skip_inference:
         if args.verbose:
             print("Skipping displacement inference (--skip-inference set).")
         if args.checkpoint_path is not None:
-            model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
+            with profiler.section("load_checkpoint_config"):
+                model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
     else:
         if args.verbose:
             print("Skipping displacement inference (no --checkpoint-path provided).")
         if args.checkpoint_path is not None:
-            model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
+            with profiler.section("load_checkpoint_config"):
+                model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
 
-    extrapolation_settings = _resolve_settings(args, model_config=model_config)
+    with profiler.section("resolve_settings"):
+        extrapolation_settings = _resolve_settings(args, model_config=model_config)
 
-    volume = zarr.open_group(args.volume_path, mode="r")
-    tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
+    with profiler.section("setup_segment"):
+        volume = zarr.open_group(args.volume_path, mode="r")
+        tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
     cond_direction, _ = _get_growth_context(grow_direction)
 
     if int(args.iterations) > 1:
-        tgt_segment.use_full_resolution()
-        base_x, base_y, base_z, base_valid = tgt_segment[:]
-        current_zyxs = np.stack([base_z, base_y, base_x], axis=-1).copy()
-        current_valid = np.asarray(base_valid, dtype=bool).copy()
-        current_uv_offset = (0, 0)
+        with profiler.section("initialize_full_surface"):
+            tgt_segment.use_full_resolution()
+            base_x, base_y, base_z, base_valid = tgt_segment[:]
+            current_zyxs = np.stack([base_z, base_y, base_x], axis=-1).copy()
+            current_valid = np.asarray(base_valid, dtype=bool).copy()
+            current_uv_offset = (0, 0)
         if args.verbose:
             print("Using full input surface as initial conditioning for iterative growth.")
     else:
-        r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
-            args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
-        )
-        full_bounds = _stored_to_full_bounds(tgt_segment, (r0_s, r1_s, c0_s, c1_s))
-        current_zyxs, current_valid, current_uv_offset = _initialize_window_state(tgt_segment, full_bounds)
+        with profiler.section("initialize_window"):
+            r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
+                args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
+            )
+            full_bounds = _stored_to_full_bounds(tgt_segment, (r0_s, r1_s, c0_s, c1_s))
+            current_zyxs, current_valid, current_uv_offset = _initialize_window_state(tgt_segment, full_bounds)
 
     bbox_results = []
     one_shot = {
@@ -1416,12 +1489,13 @@ def main():
         cond_uv_offset = current_uv_offset
         uv_cond = _build_uv_grid(cond_uv_offset, cond_zyxs.shape[:2])
 
-        bboxes, _ = get_cond_edge_bboxes(
-            cond_zyxs,
-            cond_direction,
-            crop_size,
-            overlap_frac=args.bbox_overlap_frac,
-        )
+        with profiler.section("iter_get_edge_bboxes"):
+            bboxes, _ = get_cond_edge_bboxes(
+                cond_zyxs,
+                cond_direction,
+                crop_size,
+                overlap_frac=args.bbox_overlap_frac,
+            )
         if len(bboxes) == 0:
             if args.verbose:
                 print("No edge bboxes available at current boundary; stopping iterative growth.")
@@ -1429,22 +1503,23 @@ def main():
                 iteration_pbar.set_postfix_str("stopped: no edge bboxes", refresh=True)
             break
 
-        one_shot = compute_edge_one_shot_extrapolation(
-            cond_zyxs=cond_zyxs,
-            cond_valid=cond_valid,
-            uv_cond=uv_cond,
-            grow_direction=grow_direction,
-            edge_input_rowscols=args.edge_input_rowscols,
-            cond_pct=args.cond_pct,
-            method=extrapolation_settings["method"],
-            min_corner=np.zeros(3, dtype=np.float64),
-            crop_size=crop_size,
-            degrade_prob=extrapolation_settings["degrade_prob"],
-            degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
-            degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
-            skip_bounds_check=True,
-            **extrapolation_settings["method_kwargs"],
-        )
+        with profiler.section("iter_one_shot_extrapolation"):
+            one_shot = compute_edge_one_shot_extrapolation(
+                cond_zyxs=cond_zyxs,
+                cond_valid=cond_valid,
+                uv_cond=uv_cond,
+                grow_direction=grow_direction,
+                edge_input_rowscols=args.edge_input_rowscols,
+                cond_pct=args.cond_pct,
+                method=extrapolation_settings["method"],
+                min_corner=np.zeros(3, dtype=np.float64),
+                crop_size=crop_size,
+                degrade_prob=extrapolation_settings["degrade_prob"],
+                degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
+                degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
+                skip_bounds_check=True,
+                **extrapolation_settings["method_kwargs"],
+            )
         if one_shot is None:
             one_shot = {
                 "edge_uv": np.zeros((0, 2), dtype=np.float64),
@@ -1453,49 +1528,55 @@ def main():
                 "extrap_coords_world": np.zeros((0, 3), dtype=np.float32),
             }
 
-        one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
-        one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
-        one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
-        one_map = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
+        with profiler.section("iter_aggregate_extrapolation"):
+            one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
+            one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
+            one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
+            one_map = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
 
-        bbox_crops = _build_bbox_crops(
-            bboxes=bboxes,
-            tgt_segment=tgt_segment,
-            volume_scale=args.volume_scale,
-            cond_zyxs=cond_zyxs,
-            cond_valid=cond_valid,
-            uv_cond=uv_cond,
-            grow_direction=grow_direction,
-            crop_size=crop_size,
-            cond_pct=args.cond_pct,
-            one_map=one_map,
-        )
+        with profiler.section("iter_build_bbox_crops"):
+            bbox_crops = _build_bbox_crops(
+                bboxes=bboxes,
+                tgt_segment=tgt_segment,
+                volume_scale=args.volume_scale,
+                cond_zyxs=cond_zyxs,
+                cond_valid=cond_valid,
+                uv_cond=uv_cond,
+                grow_direction=grow_direction,
+                crop_size=crop_size,
+                cond_pct=args.cond_pct,
+                one_map=one_map,
+            )
         _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
         bbox_results = _build_bbox_results_from_crops(bbox_crops)
 
         stacked_displacement = None
         if run_model_inference and model_state is not None:
-            per_crop_fields = _run_bbox_displacement_inference(
-                args,
-                bbox_crops,
-                model_state,
-                verbose=args.verbose,
-            )
-            stacked_displacement = _stack_displacements_to_global(per_crop_fields)
+            with profiler.section("iter_displacement_inference"):
+                per_crop_fields = _run_bbox_displacement_inference(
+                    args,
+                    bbox_crops,
+                    model_state,
+                    verbose=args.verbose,
+                )
+            with profiler.section("iter_stack_displacements"):
+                stacked_displacement = _stack_displacements_to_global(per_crop_fields)
         _print_stacked_displacement_debug(stacked_displacement, verbose=args.verbose)
         if extrap_only_mode:
-            agg_samples = _sample_agg_extrap_direct(
-                one_map,
-                grow_direction,
-                max_lines=args.agg_extrap_lines,
-            )
+            with profiler.section("iter_sample_agg_extrap_direct"):
+                agg_samples = _sample_agg_extrap_direct(
+                    one_map,
+                    grow_direction,
+                    max_lines=args.agg_extrap_lines,
+                )
         else:
-            agg_samples = _sample_stacked_displacement_on_agg_extrap(
-                stacked_displacement,
-                one_map,
-                grow_direction,
-                max_lines=args.agg_extrap_lines,
-            )
+            with profiler.section("iter_sample_stacked_displacement"):
+                agg_samples = _sample_stacked_displacement_on_agg_extrap(
+                    stacked_displacement,
+                    one_map,
+                    grow_direction,
+                    max_lines=args.agg_extrap_lines,
+                )
 
         _print_iteration_summary(
             bbox_results,
@@ -1517,24 +1598,28 @@ def main():
                 "n_after_stack_count": int(np.asarray(agg_samples.get("uv", np.zeros((0, 2), dtype=np.int64))).shape[0]),
             }
         else:
-            agg_samples, sample_filter_stats = _filter_samples_min_stack_count(
-                agg_samples,
-                min_stack_count=args.agg_extrap_min_stack_count,
-            )
+            with profiler.section("iter_filter_samples"):
+                agg_samples, sample_filter_stats = _filter_samples_min_stack_count(
+                    agg_samples,
+                    min_stack_count=args.agg_extrap_min_stack_count,
+                )
         _print_sample_filter_debug(sample_filter_stats, verbose=args.verbose)
         if extrap_only_mode:
-            displaced = _use_extrap_points_directly(agg_samples, verbose=args.verbose)
+            with profiler.section("iter_apply_samples_direct"):
+                displaced = _use_extrap_points_directly(agg_samples, verbose=args.verbose)
         else:
-            displaced = _apply_displacement_and_print_stats(agg_samples, verbose=args.verbose)
+            with profiler.section("iter_apply_displacement"):
+                displaced = _apply_displacement_and_print_stats(agg_samples, verbose=args.verbose)
 
         prev_boundary = _boundary_axis_value(cond_valid, cond_uv_offset, grow_direction)
-        merged_iter = _merge_displaced_points_into_full_surface(
-            cond_zyxs,
-            cond_valid,
-            cond_uv_offset,
-            displaced,
-            verbose=args.verbose,
-        )
+        with profiler.section("iter_merge_surface"):
+            merged_iter = _merge_displaced_points_into_full_surface(
+                cond_zyxs,
+                cond_valid,
+                cond_uv_offset,
+                displaced,
+                verbose=args.verbose,
+            )
         next_boundary = _boundary_axis_value(
             merged_iter["merged_valid"],
             merged_iter["uv_offset"],
@@ -1562,36 +1647,48 @@ def main():
 
     # Merge the full iteratively grown surface onto the full input canvas so
     # output preserves all existing input points and includes all growth steps.
-    grown_uv, grown_pts = _surface_to_uv_samples(current_zyxs, current_valid, current_uv_offset)
-    tgt_segment.use_full_resolution()
-    base_x, base_y, base_z, base_valid = tgt_segment[:]
-    base_zyxs = np.stack([base_z, base_y, base_x], axis=-1)
-    merged = _merge_displaced_points_into_full_surface(
-        base_zyxs,
-        base_valid,
-        (0, 0),
-        {
-            "uv": grown_uv,
-            "world_displaced": grown_pts,
-        },
-        verbose=args.verbose,
-    )
-    _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args)
+    with profiler.section("final_merge_full_surface"):
+        grown_uv, grown_pts = _surface_to_uv_samples(current_zyxs, current_valid, current_uv_offset)
+        tgt_segment.use_full_resolution()
+        base_x, base_y, base_z, base_valid = tgt_segment[:]
+        base_zyxs = np.stack([base_z, base_y, base_x], axis=-1)
+        merged = _merge_displaced_points_into_full_surface(
+            base_zyxs,
+            base_valid,
+            (0, 0),
+            {
+                "uv": grown_uv,
+                "world_displaced": grown_pts,
+            },
+            verbose=args.verbose,
+        )
+    with profiler.section("save_tifxyz"):
+        _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args)
 
     if args.napari:
         disp_bbox = None if stacked_displacement is None else stacked_displacement["bbox"]
-        _show_napari(
-            current_zyxs,
-            current_valid,
-            bbox_results,
-            one_shot,
-            one_map,
-            disp_bbox=disp_bbox,
-            displaced=displaced,
-            merged=merged,
-            downsample=args.napari_downsample,
-            point_size=args.napari_point_size,
+        with profiler.section("napari"):
+            _show_napari(
+                current_zyxs,
+                current_valid,
+                bbox_results,
+                one_shot,
+                one_map,
+                disp_bbox=disp_bbox,
+                displaced=displaced,
+                merged=merged,
+                downsample=args.napari_downsample,
+                point_size=args.napari_point_size,
+            )
+
+    if args.profile:
+        profiler.sync()
+        total_runtime_s = (
+            time.perf_counter() - run_start
+            if run_start is not None
+            else None
         )
+        profiler.print_summary(total_runtime_s=total_runtime_s)
 
 
 if __name__ == "__main__":
