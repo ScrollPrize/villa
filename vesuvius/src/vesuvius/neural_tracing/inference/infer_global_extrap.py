@@ -557,10 +557,7 @@ def _sample_stacked_displacement_on_agg_extrap(
     min_corner = np.asarray(stacked_displacement["min_corner"], dtype=np.int64)
     shape = np.asarray(stacked_displacement["shape"], dtype=np.int64)
 
-    sampled_world = np.asarray(
-        [one_map[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
-        dtype=np.float32,
-    )
+    sampled_world = _lookup_sampled_world_from_one_map(sampled_uv, one_map)
     coords_local = sampled_world.astype(np.float64, copy=False) - min_corner[None, :].astype(np.float64)
     in_bounds = (
         (coords_local[:, 0] >= 0.0) & (coords_local[:, 0] <= float(shape[0] - 1)) &
@@ -595,6 +592,13 @@ def _sample_stacked_displacement_on_agg_extrap(
     }
 
 
+def _lookup_sampled_world_from_one_map(sampled_uv, one_map):
+    return np.asarray(
+        [one_map[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
+        dtype=np.float32,
+    )
+
+
 def _sample_agg_extrap_direct(one_map, grow_direction, max_lines=None):
     if not one_map:
         return _empty_stack_samples()
@@ -603,10 +607,7 @@ def _sample_agg_extrap_direct(one_map, grow_direction, max_lines=None):
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
-    sampled_world = np.asarray(
-        [one_map[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
-        dtype=np.float32,
-    )
+    sampled_world = _lookup_sampled_world_from_one_map(sampled_uv, one_map)
     keep = np.isfinite(sampled_world).all(axis=1)
     if not keep.any():
         return _empty_stack_samples()
@@ -645,24 +646,16 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
     coords_t[:, 2] = 2.0 * coords_t[:, 2] / float(w_denom) - 1.0
     grid = coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
 
-    sampled_disp_weighted = F.grid_sample(
-        disp_weighted_t,
+    sample_inputs = torch.cat([disp_weighted_t, valid_t, count_t], dim=1)
+    sampled_all = F.grid_sample(
+        sample_inputs,
         grid,
         mode="bilinear",
         align_corners=True,
-    ).view(3, -1).permute(1, 0)
-    sampled_valid_weight = F.grid_sample(
-        valid_t,
-        grid,
-        mode="bilinear",
-        align_corners=True,
-    ).view(-1)
-    sampled_count = F.grid_sample(
-        count_t,
-        grid,
-        mode="bilinear",
-        align_corners=True,
-    ).view(-1)
+    ).view(5, -1)
+    sampled_disp_weighted = sampled_all[:3].permute(1, 0)
+    sampled_valid_weight = sampled_all[3]
+    sampled_count = sampled_all[4]
 
     eps = 1e-6
     valid_mask = sampled_valid_weight > eps
