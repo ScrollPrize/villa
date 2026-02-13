@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -122,6 +123,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 
 def main(argv: list[str] | None = None) -> int:
 	parser = _build_parser()
+	raw_argv = list(sys.argv[1:] if argv is None else argv)
+	offset_explicit = "--offset" in raw_argv
 	args = cli_json.parse_args(parser, argv)
 	base = {
 		"input": str(args.input),
@@ -143,13 +146,72 @@ def main(argv: list[str] | None = None) -> int:
 		model_params = None
 
 	if model_params is not None:
-		c6 = model_params.get("crop_xyzwhd", None)
-		if isinstance(c6, (list, tuple)) and len(c6) == 6:
-			_x0c, _y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
+		c6_full = model_params.get("crop_fullres_xyzwhd", None)
+		c6_model = model_params.get("crop_xyzwhd", None)
+		c6 = None
+		crop_key = "none"
+		if isinstance(c6_full, (list, tuple)) and len(c6_full) == 6:
+			c6 = c6_full
+			crop_key = "crop_fullres_xyzwhd"
+		elif isinstance(c6_model, (list, tuple)) and len(c6_model) == 6:
+			c6 = c6_model
+			crop_key = "crop_xyzwhd"
+		if c6 is not None:
+			x0c, y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
+			if not bool(offset_explicit):
+				if crop_key == "crop_fullres_xyzwhd":
+					base["offset_x"] = float(x0c)
+					base["offset_y"] = float(y0c)
+				else:
+					ds = float(base["downscale"])
+					if ds <= 0.0:
+						ds = 1.0
+					base["offset_x"] = float(x0c) * ds
+					base["offset_y"] = float(y0c) * ds
+				base["offset_z"] = 0
 			base["z0"] = int(z0c)
 		if "z_step_vx" in model_params:
 			base["z_step"] = max(1, int(model_params["z_step_vx"]))
 		cfg = ExportConfig(**base)
+
+	crop_bounds_fullres: tuple[float, float, float, float] | None = None
+	if model_params is not None:
+		c6_full = model_params.get("crop_fullres_xyzwhd", None)
+		c6_model = model_params.get("crop_xyzwhd", None)
+		if isinstance(c6_full, (list, tuple)) and len(c6_full) == 6:
+			x0c, y0c, wc, hc, _z0c, _d = (int(v) for v in c6_full)
+			x0 = float(x0c)
+			y0 = float(y0c)
+			x1 = x0 + float(max(0, int(wc) - 1))
+			y1 = y0 + float(max(0, int(hc) - 1))
+			crop_bounds_fullres = (x0, y0, x1, y1)
+		elif isinstance(c6_model, (list, tuple)) and len(c6_model) == 6:
+			x0c, y0c, wc, hc, _z0c, _d = (int(v) for v in c6_model)
+			ds = float(cfg.downscale)
+			if ds <= 0.0:
+				ds = 1.0
+			x0 = float(x0c) * ds
+			y0 = float(y0c) * ds
+			x1 = x0 + float(max(0, int(wc) - 1)) * ds
+			y1 = y0 + float(max(0, int(hc) - 1)) * ds
+			crop_bounds_fullres = (x0, y0, x1, y1)
+
+	offset_src = "cli --offset" if bool(offset_explicit) else "model crop"
+	crop_dbg = None if model_params is None else {
+		"crop_fullres_xyzwhd": model_params.get("crop_fullres_xyzwhd", None),
+		"crop_xyzwhd": model_params.get("crop_xyzwhd", None),
+	}
+	print(
+		"[fit2tifxyz] using offsets",
+		{
+			"source": offset_src,
+			"offset_x": float(cfg.offset_x),
+			"offset_y": float(cfg.offset_y),
+			"offset_z": int(cfg.offset_z),
+			"downscale": float(cfg.downscale),
+			"crop_from_checkpoint": crop_dbg,
+		},
+	)
 
 	mesh_uv = _mesh_coarse_from_state_dict(st).to(device=dev, dtype=torch.float32)
 	xy = _apply_global_transform_from_state_dict(uv=mesh_uv, st=st)
@@ -180,26 +242,20 @@ def main(argv: list[str] | None = None) -> int:
 	meta_scale = float(cfg.scale) * float(cfg.downscale)
 	for wi in range(wm):
 		x = xy_lr[idx_z_a, :, wi, 0]
-		y = xy_lr[idx_z_a, :, wi, 1] - 256
+		y = xy_lr[idx_z_a, :, wi, 1]
 		z_use = z_grid
 		mask = None
-		if model_params is not None:
-			c6 = model_params.get("crop_xyzwhd", None)
-			if isinstance(c6, (list, tuple)) and len(c6) == 6:
-				_x0c, _y0c, wc, hc, _z0c, _d = (int(v) for v in c6)
-				x0 = float(cfg.offset_x)
-				y0 = float(cfg.offset_y)
-				x1 = x0 + float(max(0, int(wc) - 1))
-				y1 = y0 + float(max(0, int(hc) - 1))
-				v = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
-				mask = (v.astype(np.uint8) * 255)
-				if np.any(~v):
-					x = x.copy()
-					y = y.copy()
-					z_use = z_grid.copy()
-					x[~v] = -1.0
-					y[~v] = -1.0
-					z_use[~v] = -1.0
+		if crop_bounds_fullres is not None:
+			x0, y0, x1, y1 = crop_bounds_fullres
+			v = np.isfinite(x) & np.isfinite(y) & (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+			mask = (v.astype(np.uint8) * 255)
+			if np.any(~v):
+				x = x.copy()
+				y = y.copy()
+				z_use = z_grid.copy()
+				x[~v] = -1.0
+				y[~v] = -1.0
+				z_use[~v] = -1.0
 		out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
 		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale)
 		if model_params is not None:

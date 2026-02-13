@@ -88,6 +88,14 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	# Validity mask for the strip samples (not just endpoints).
 	mask_lc_strip = fit_model.xy_img_mask(res=res, xy=xy_lc_strip, loss_name="gradmag").reshape(n, he, we, strip_samples).unsqueeze(1)
 	mask_cr_strip = fit_model.xy_img_mask(res=res, xy=xy_cr_strip, loss_name="gradmag").reshape(n, he, we, strip_samples).unsqueeze(1)
+	mask_lc_strip_mean_z = mask_lc_strip.mean(dim=(1, 2, 3, 4)).detach().cpu()
+	mask_cr_strip_mean_z = mask_cr_strip.mean(dim=(1, 2, 3, 4)).detach().cpu()
+	# print("[gradmag] img-valid mask mean per-z lc:", [float(v) for v in mask_lc_strip_mean_z])
+	# print("[gradmag] img-valid mask mean per-z cr:", [float(v) for v in mask_cr_strip_mean_z])
+	if bool((mask_lc_strip_mean_z <= 0.0).any()):
+		print("[gradmag][warn] lc image-valid mask is zero for at least one z slice")
+	if bool((mask_cr_strip_mean_z <= 0.0).any()):
+		print("[gradmag][warn] cr image-valid mask is zero for at least one z slice")
 	mask_lc_strip = mask_lc_strip.amin(dim=-1)
 	mask_cr_strip = mask_cr_strip.amin(dim=-1)
 
@@ -121,6 +129,10 @@ def gradmag_period_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, 
 	mask = torch.minimum(mask_lc, mask_cr)
 	mask = torch.minimum(mask, mask_lc_strip)
 	mask = torch.minimum(mask, mask_cr_strip)
+	mask_mean_z = mask.mean(dim=(1, 2, 3)).detach().cpu()
+	# print("[gradmag] final mask mean per-z:", [float(v) for v in mask_mean_z])
+	if bool((mask_mean_z <= 0.0).any()):
+		print("[gradmag][warn] final mask is zero for at least one z slice")
 	return lm, mask
 
 
@@ -128,6 +140,7 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 	wsum = mask.sum()
 	if float(wsum) > 0.0:
 		return (lm * mask).sum() / wsum
+	print("warning zero mask!")
 	return lm.mean()
 
 

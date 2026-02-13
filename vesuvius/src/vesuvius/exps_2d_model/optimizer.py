@@ -349,7 +349,7 @@ def optimize(
 		for k in sorted(out.keys()):
 			vs = [round(float(x), 6) for x in out[k]]
 			print(f"{label} losses_per_z {k}: {vs}")
-	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings) -> None:
+	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, keep_only_grown_z: bool = False) -> None:
 		if opt_cfg.steps <= 0:
 			return
 		# If the stage does not optimize any global transform params, bake the current
@@ -369,7 +369,7 @@ def optimize(
 				raise ValueError("const_mask_lr batch must match data batch")
 			keep_lr = (1.0 - cm_lr)
 
-		ins_z = model._last_grow_insert_z
+		ins_z = model._last_grow_insert_z if bool(keep_only_grown_z) else None
 		z_keep = None
 		if ins_z is not None:
 			ins_z = int(ins_z)
@@ -557,7 +557,7 @@ def optimize(
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
 			if stage.global_opt.steps > 0:
-				_run_opt(si=si, label=f"{stage_g}_global", stage=stage, opt_cfg=stage.global_opt)
+				_run_opt(si=si, label=f"{stage_g}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
 			if not local_opts or all(int(o.steps) <= 0 for o in local_opts):
 				continue
 			ins = model._last_grow_insert_lr
@@ -565,7 +565,7 @@ def optimize(
 				if model._last_grow_insert_z is not None:
 					model.const_mask_lr = None
 					for li, opt_cfg in enumerate(local_opts):
-						_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg)
+						_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=True)
 					continue
 				raise RuntimeError("grow: missing insertion rect")
 			py0, px0, ho, wo = ins
@@ -585,6 +585,6 @@ def optimize(
 			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
 			model.const_mask_lr = cm
 			for li, opt_cfg in enumerate(local_opts):
-				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg)
+				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=True)
 	model.const_mask_lr = None
 	return data

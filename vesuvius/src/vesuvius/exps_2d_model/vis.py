@@ -447,11 +447,22 @@ def save(
 
 		for _k, lm, mask in loss_maps:
 			mt = lm.detach()
-			if mask is not None:
-				mt = mt * mask.to(dtype=mt.dtype)
-			if mt.ndim == 4 and int(mt.shape[0]) > 1:
-				mt = mt[z_i:z_i + 1]
-			if mt.ndim == 4 and int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
+			mk = mask.detach() if mask is not None else None
+			if mt.ndim != 4:
+				continue
+			if int(mt.shape[0]) != int(uv_img.shape[0]):
+				if int(uv_img.shape[0]) == 1 and int(mt.shape[0]) > z_i:
+					mt = mt[z_i:z_i + 1]
+					if mk is not None and mk.ndim == 4 and int(mk.shape[0]) > z_i:
+						mk = mk[z_i:z_i + 1]
+				else:
+					continue
+			if mk is not None:
+				if mk.ndim == 4 and int(mk.shape[0]) == int(mt.shape[0]):
+					mt = mt * mk.to(dtype=mt.dtype)
+				elif mk.ndim == 2 and int(mt.shape[0]) == 1:
+					mt = mt * mk[None, None].to(dtype=mt.dtype)
+			if int(mt.shape[2]) > 1 and int(mt.shape[3]) > 1:
 				uv_m = _scale_uv_for_src(uv_lr=uv_img, src=mt)
 				im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_m, uv_mask=uv_mask, fill=0.5)
 				img_loss_layers.append(im[0, 0].detach().cpu().numpy().astype("float32"))
