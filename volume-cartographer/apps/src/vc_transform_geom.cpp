@@ -11,6 +11,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -29,9 +30,20 @@ struct AffineTransform {
 
 static AffineTransform load_affine_json(const std::string& filename) {
     AffineTransform t;
+    const std::filesystem::path p(filename);
+    if (!std::filesystem::exists(p))
+        throw std::runtime_error("affine path does not exist: " + filename);
+    if (!std::filesystem::is_regular_file(p))
+        throw std::runtime_error("affine path is not a regular file: " + filename);
+
     std::ifstream f(filename);
     if (!f.is_open()) throw std::runtime_error("cannot open affine file: " + filename);
-    json j; f >> j;
+    json j;
+    try {
+        f >> j;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("failed to parse affine file '" + filename + "': " + e.what());
+    }
     if (!j.contains("transformation_matrix")) return t; // identity
     auto mat = j["transformation_matrix"];
     if (mat.size() != 3 && mat.size() != 4) throw std::runtime_error("affine must be 3x4 or 4x4");
@@ -45,6 +57,33 @@ static AffineTransform load_affine_json(const std::string& filename) {
             throw std::runtime_error("bottom row must be [0,0,0,1]");
     }
     return t;
+}
+
+
+
+static bool invert_affine_in_place(AffineTransform& T) {
+    cv::Mat A(3, 3, CV_64F), Ainv;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            A.at<double>(r, c) = T.M(r, c);
+
+    if (cv::invert(A, Ainv, cv::DECOMP_LU) < 1e-12) return false;
+
+    cv::Matx33d Ai;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            Ai(r, c) = Ainv.at<double>(r, c);
+
+    cv::Vec3d t(T.M(0,3), T.M(1,3), T.M(2,3));
+    cv::Vec3d ti = -(Ai * t);
+
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) T.M(r, c) = Ai(r, c);
+        T.M(r, 3) = ti(r);
+    }
+    T.M(3,0) = T.M(3,1) = T.M(3,2) = 0.0;
+    T.M(3,3) = 1.0;
+    return true;
 }
 
 static inline cv::Vec3f apply_affine_point(const cv::Vec3f& p, const AffineTransform& A) {
@@ -87,10 +126,8 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
-        if (invert) {
-            cv::Mat inv = cv::Mat(AA->M).inv();
-            if (inv.empty()) { std::cerr << "non-invertible affine" << std::endl; return 2; }
-            inv.copyTo(AA->M);
+        if (invert && !invert_affine_in_place(*AA)) {
+            std::cerr << "non-invertible affine" << std::endl; return 2;
         }
     }
 
@@ -110,6 +147,9 @@ static int run_tifxyz(const std::filesystem::path& inDir,
             p = q;
         }
     }
+
+    // QuadSurface exposes points directly, but not a writable raw normal grid API.
+    // Keep TIFXYZ point transforms here and leave normal recomputation to downstream tools.
 
     try {
         std::filesystem::path out = outDir;
@@ -178,10 +218,8 @@ static int run_obj(const std::filesystem::path& inFile,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
-        if (invert) {
-            cv::Mat inv = cv::Mat(AA->M).inv();
-            if (inv.empty()) { std::cerr << "non-invertible affine" << std::endl; return 2; }
-            inv.copyTo(AA->M);
+        if (invert && !invert_affine_in_place(*AA)) {
+            std::cerr << "non-invertible affine" << std::endl; return 2;
         }
     }
 
