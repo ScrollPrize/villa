@@ -278,6 +278,7 @@ int main(int argc, char** argv) {
             ("invert",   po::bool_switch()->default_value(false), "Invert the affine")
             ("scale-before-affine", po::value<double>()->default_value(1.0), "Uniform scale applied before affine")
             ("scale-after-affine", po::value<double>()->default_value(1.0), "Uniform scale applied after affine")
+            ("scale-segmentation", po::value<double>(), "[Deprecated] Alias for --scale-before-affine")
         ;
 
         po::variables_map vm;
@@ -291,9 +292,19 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path inPath(vm["input"].as<std::string>());
         const std::filesystem::path outPath(vm["output"].as<std::string>());
-        const double scale_before_affine = vm["scale-before-affine"].as<double>();
+        double scale_before_affine = vm["scale-before-affine"].as<double>();
         const double scale_after_affine = vm["scale-after-affine"].as<double>();
         const bool invert = vm["invert"].as<bool>();
+
+        if (vm.count("scale-segmentation")) {
+            const double legacy_scale = vm["scale-segmentation"].as<double>();
+            if (!vm["scale-before-affine"].defaulted() && scale_before_affine != legacy_scale) {
+                std::cerr << "Conflicting values for --scale-before-affine and deprecated --scale-segmentation" << std::endl;
+                return 1;
+            }
+            scale_before_affine = legacy_scale;
+            std::cerr << "Warning: --scale-segmentation is deprecated; use --scale-before-affine" << std::endl;
+        }
 
         std::unique_ptr<AffineTransform> A;
         if (vm.count("affine")) {
