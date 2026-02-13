@@ -148,16 +148,8 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         }
     }
 
-    if (AA) {
-        cv::Mat_<cv::Vec3f>* N = surf->rawNormalsPtr();
-        for (int j = 0; j < N->rows; ++j) {
-            for (int i = 0; i < N->cols; ++i) {
-                cv::Vec3f& n = (*N)(j,i);
-                if (std::isnan(n[0])) continue;
-                n = transform_normal(n, *AA);
-            }
-        }
-    }
+    // QuadSurface exposes points directly, but not a writable raw normal grid API.
+    // Keep TIFXYZ point transforms here and leave normal recomputation to downstream tools.
 
     try {
         std::filesystem::path out = outDir;
