@@ -83,6 +83,15 @@ def parse_args():
     )
     parser.add_argument("--extrapolation-method", type=str, default=None)
     parser.add_argument(
+        "--rbf-downsample-factor",
+        type=int,
+        default=None,
+        help=(
+            "Override RBF downsample factor for extrapolation. "
+            "When set, takes precedence over checkpoint/config rbf_downsample_factor."
+        ),
+    )
+    parser.add_argument(
         "--grow-direction",
         type=str,
         required=True,
@@ -164,6 +173,8 @@ def parse_args():
         parser.error("--iter-keep-voxels must be >= 1 when provided.")
     if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
         parser.error("--bbox-overlap-frac must be in [0, 1).")
+    if args.rbf_downsample_factor is not None and args.rbf_downsample_factor < 1:
+        parser.error("--rbf-downsample-factor must be >= 1 when provided.")
     if args.refine is not None and args.refine < 1:
         parser.error("--refine must be >= 1 when provided.")
     if args.tta_outlier_drop_thresh is not None and args.tta_outlier_drop_thresh <= 0:
