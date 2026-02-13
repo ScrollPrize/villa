@@ -44,6 +44,18 @@ class Stage:
 	local_opt: list[OptSettings] | None
 
 
+@dataclass(frozen=True)
+class VisLossCollection:
+	loss_maps: dict[str, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]]
+
+	def add_or_update(self, *, name: str, maps: tuple[torch.Tensor, ...], masks: tuple[torch.Tensor, ...]) -> "VisLossCollection":
+		if len(maps) == 0:
+			return self
+		loss_maps = dict(self.loss_maps)
+		loss_maps[name] = (maps, masks)
+		return VisLossCollection(loss_maps=loss_maps)
+
+
 def _stage_to_modifiers(
 	base: dict[str, float],
 	prev_eff: dict[str, float] | None,
@@ -403,6 +415,10 @@ def optimize(
 						m = z_keep.to(dtype=p.dtype).view(int(p.shape[0]), *([1] * (int(p.ndim) - 1)))
 						hooks.append(p.register_hook(lambda g, mm=m: g * mm))
 		opt = torch.optim.Adam(param_groups)
+
+		def _loss3(*, loss_fn, res) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+			lv, lms, masks = loss_fn(res=res)
+			return lv, tuple(lms), tuple(masks)
 		mean_pos_xy = None
 		if _need_term("mean_pos", opt_cfg.eff) != 0.0:
 			with torch.no_grad():
@@ -440,12 +456,13 @@ def optimize(
 				res0 = replace(res0, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
 			loss0 = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals0: dict[str, float] = {}
+			vis_losses0 = VisLossCollection(loss_maps={})
 			for name, t in terms.items():
 				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
-				loss_fn = t["loss"]
-				lv = loss_fn(res=res0)
+				lv, lms, masks = _loss3(loss_fn=t["loss"], res=res0)
+				vis_losses0 = vis_losses0.add_or_update(name=name, maps=lms, masks=masks)
 				term_vals0[name] = float(lv.detach().cpu())
 				loss0 = loss0 + w * lv
 			param_vals0: dict[str, float] = {}
@@ -456,7 +473,7 @@ def optimize(
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
 			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
-		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
+		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0, vis_losses=vis_losses0)
 
 		for step in range(opt_cfg.steps):
 			res = model(data)
@@ -471,12 +488,13 @@ def optimize(
 				res = replace(res, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
+			vis_losses = VisLossCollection(loss_maps={})
 			for name, t in terms.items():
 				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
-				loss_fn = t["loss"]
-				lv = loss_fn(res=res)
+				lv, lms, masks = _loss3(loss_fn=t["loss"], res=res)
+				vis_losses = vis_losses.add_or_update(name=name, maps=lms, masks=masks)
 				term_vals[name] = float(lv.detach().cpu())
 				loss = loss + w * lv
 			opt.zero_grad(set_to_none=True)
@@ -494,11 +512,11 @@ def optimize(
 				print(f"{label} step {step1}/{opt_cfg.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
-				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)
+				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 
-		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data, res=model(data))
+		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 		with torch.no_grad():
-			_print_losses_per_z(label=f"{label} step {opt_cfg.steps}/{opt_cfg.steps}", res=model(data), eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+			_print_losses_per_z(label=f"{label} step {opt_cfg.steps}/{opt_cfg.steps}", res=res, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		for h in hooks:
 			h.remove()
 

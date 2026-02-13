@@ -8,11 +8,6 @@ import torch
 import cv2
 
 import fit_data
-import opt_loss_data
-import opt_loss_dir
-import opt_loss_geom
-import opt_loss_gradmag
-import opt_loss_step
 import inv_map
 
 
@@ -322,6 +317,7 @@ def save(
 	model,
 	data: fit_data.FitData,
 	res=None,
+	vis_losses=None,
 	postfix: str,
 	out_dir: str,
 	scale: int,
@@ -341,14 +337,8 @@ def save(
 
 	h_img, w_img = data.size
 	if res is None:
+		print("FIXME - save without res is deprecated!")
 		res = model(data)
-	with torch.no_grad():
-		xy0 = res.xy_lr.detach()
-		mean_xy = xy0.mean(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
-		min_xy = xy0.amin(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
-		max_xy = xy0.amax(dim=(0, 1, 2)).to(dtype=torch.float32).cpu().numpy().tolist()
-		print(f"vis xy_lr: mean_xy={mean_xy} min_xy={min_xy} max_xy={max_xy}")
-	# z support: visualize the currently optimized z-slice (grow fw/bw), fallback z=0.
 	z_i = int(getattr(model, "_last_grow_insert_z", 0) or 0)
 	z_i = max(0, min(z_i, int(data.cos.shape[0]) - 1))
 	bg = data.cos[z_i:z_i + 1]
@@ -455,9 +445,8 @@ def save(
 		img_loss_layers.append(tgt_mod_img[0, 0].detach().cpu().numpy().astype("float32"))
 		img_loss_names.append("target_mod")
 
-		for _k, spec in loss_maps.items():
-			mt = spec["fn"]().detach()
-			mask = spec.get("mask", None)
+		for _k, lm, mask in loss_maps:
+			mt = lm.detach()
 			if mask is not None:
 				mt = mt * mask.to(dtype=mt.dtype)
 			if mt.ndim == 4 and int(mt.shape[0]) > 1:
@@ -466,7 +455,7 @@ def save(
 				uv_m = _scale_uv_for_src(uv_lr=uv_img, src=mt)
 				im = inv_map.warp_nchw_from_uv(src=mt, uv=uv_m, uv_mask=uv_mask, fill=0.5)
 				img_loss_layers.append(im[0, 0].detach().cpu().numpy().astype("float32"))
-				img_loss_names.append(str(spec["suffix"]))
+				img_loss_names.append(str(_k))
 
 		if not img_loss_layers:
 			return
@@ -481,148 +470,30 @@ def save(
 					extratags=[(285, "s", 0, page_name, False)],
 				)
 		return
-	# with torch.no_grad():
-	# 	xy = res.xy_conn[0].detach().cpu().numpy()
-	# 	gh, gw = xy.shape[0], xy.shape[1]
-	# 	print(f"xy_conn dbg: grid={gh}x{gw}")
-	# 	for iy in range(gh):
-	# 		for ix in range(gw):
-	# 			l = xy[iy, ix, 0]
-	# 			p = xy[iy, ix, 1]
-	# 			r = xy[iy, ix, 2]
-	# 			dl = float(((p[0] - l[0]) ** 2 + (p[1] - l[1]) ** 2) ** 0.5)
-	# 			dr = float(((r[0] - p[0]) ** 2 + (r[1] - p[1]) ** 2) ** 0.5)
-	# 			print(
-	# 				f"({iy:02d},{ix:02d}) p=({p[0]:.2f},{p[1]:.2f}) "
-	# 				f"l=({l[0]:.2f},{l[1]:.2f}) dl={dl:.2f} "
-	# 				f"r=({r[0]:.2f},{r[1]:.2f}) dr={dr:.2f}"
-	# 			)
-	dir_lm_v, _dir_mask_v = opt_loss_dir.dir_v_loss_maps(res=res)
-	dir_lm_conn_l, dir_lm_conn_r, dir_mask_conn_l, dir_mask_conn_r = opt_loss_dir.dir_conn_loss_maps(res=res)
-	inv_conn_l = (1.0 - dir_mask_conn_l).to(dtype=dir_lm_conn_l.dtype)
-	inv_conn_r = (1.0 - dir_mask_conn_r).to(dtype=dir_lm_conn_r.dtype)
-	dir_lm_conn_l = dir_lm_conn_l * dir_mask_conn_l + 0.5 * inv_conn_l
-	dir_lm_conn_r = dir_lm_conn_r * dir_mask_conn_r + 0.5 * inv_conn_r
-
-	smooth_x_lm, smooth_x_mask = opt_loss_geom.smooth_x_loss_map(res=res)
-	smooth_y_lm, smooth_y_mask = opt_loss_geom.smooth_y_loss_map(res=res)
-	meshoff_sy_lm, meshoff_sy_mask = opt_loss_geom.meshoff_smooth_y_loss_map(res=res)
-	conn_sy_l_lm, conn_sy_l_mask = opt_loss_geom.conn_y_smooth_l_loss_map(res=res)
-	conn_sy_r_lm, conn_sy_r_mask = opt_loss_geom.conn_y_smooth_r_loss_map(res=res)
-	angle_lm, angle_mask = opt_loss_geom.angle_symmetry_loss_map(res=res)
-	y_straight_lm, y_straight_mask = opt_loss_geom.y_straight_loss_map(res=res)
-	gradmag_lm, gradmag_mask = opt_loss_gradmag.gradmag_period_loss_map(res=res)
-	data_lm, data_mask = opt_loss_data.data_loss_map(res=res)
-	data_plain_lm, data_plain_mask = opt_loss_data.data_plain_loss_map(res=res)
-	data_grad_lm, data_grad_mask = opt_loss_data.data_grad_loss_map(res=res)
-
-	loss_maps = {
-		"data": {
-			"fn": lambda: data_lm,
-			"mask": data_mask,
-			"suffix": "data",
-			"reduce": True,
-		},
-		"data_plain": {
-			"fn": lambda: data_plain_lm,
-			"mask": data_plain_mask,
-			"suffix": "data_plain",
-			"reduce": True,
-		},
-		"data_grad": {
-			"fn": lambda: data_grad_lm,
-			"mask": data_grad_mask,
-			"suffix": "data_grad",
-			"reduce": True,
-		},
-		"dir_v": {
-			"fn": lambda: dir_lm_v,
-			"suffix": "dir_v",
-			"reduce": True,
-		},
-		"dir_conn_l": {
-			"fn": lambda: dir_lm_conn_l,
-			"suffix": "dir_conn_l",
-			"reduce": True,
-		},
-		"dir_conn_r": {
-			"fn": lambda: dir_lm_conn_r,
-			"suffix": "dir_conn_r",
-			"reduce": True,
-		},
-		"step_v": {
-			"fn": lambda: opt_loss_step.step_loss_maps(res=res),
-			"suffix": "step_v",
-			"reduce": True,
-		},
-		"gradmag": {
-			"fn": lambda: gradmag_lm,
-			"mask": gradmag_mask,
-			"suffix": "gradmag",
-			"reduce": True,
-		},
-		"smooth_x": {
-			"fn": lambda: smooth_x_lm,
-			"mask": smooth_x_mask,
-			"suffix": "smooth_x",
-			"reduce": True,
-		},
-		"smooth_y": {
-			"fn": lambda: smooth_y_lm,
-			"mask": smooth_y_mask,
-			"suffix": "smooth_y",
-			"reduce": True,
-		},
-		"meshoff_sy": {
-			"fn": lambda: meshoff_sy_lm,
-			"mask": meshoff_sy_mask,
-			"suffix": "meshoff_sy",
-			"reduce": True,
-		},
-		"conn_sy_l": {
-			"fn": lambda: conn_sy_l_lm,
-			"mask": conn_sy_l_mask,
-			"suffix": "conn_sy_l",
-			"reduce": True,
-		},
-		"conn_sy_r": {
-			"fn": lambda: conn_sy_r_lm,
-			"mask": conn_sy_r_mask,
-			"suffix": "conn_sy_r",
-			"reduce": True,
-		},
-		"angle": {
-			"fn": lambda: angle_lm,
-			"mask": angle_mask,
-			"suffix": "angle",
-			"reduce": True,
-		},
-		"y_straight": {
-			"fn": lambda: y_straight_lm,
-			"mask": y_straight_mask,
-			"suffix": "y_straight",
-			"reduce": True,
-		},
-	}
+	loss_maps: list[tuple[str, torch.Tensor, torch.Tensor | None]] = []
+	if vis_losses is not None:
+		for name, (lms, masks) in vis_losses.loss_maps.items():
+			for i, lm in enumerate(lms):
+				mask = masks[i] if i < len(masks) else None
+				suffix = str(name) if len(lms) == 1 else f"{name}_{i}"
+				loss_maps.append((suffix, lm, mask))
 
 	_save_img_loss_vis()
 
-	for _k, spec in loss_maps.items():
-		mt0 = spec["fn"]().detach()
-		mask = spec.get("mask", None)
+	for _k, lm, mask in loss_maps:
+		mt0 = lm.detach()
 		if mask is not None:
 			mt0 = mt0 * mask.to(dtype=mt0.dtype)
 		m = mt0.detach().cpu()
-		if bool(spec["reduce"]) and m.ndim == 4:
+		if m.ndim == 4:
 			m = m[:, 0]
-		out_path = out_loss / f"res_loss_{spec['suffix']}_{postfix}.tif"
+		out_path = out_loss / f"res_loss_{_k}_{postfix}.tif"
 		tifffile.imwrite(str(out_path), m.numpy().astype("float32"), compression="lzw")
 
 	# One horizontally-concatenated float tif for quick inspection.
 	loss_2d: list[tuple[str, np.ndarray]] = []
-	for _k, spec in loss_maps.items():
-		m = spec["fn"]().detach()
-		mask = spec.get("mask", None)
+	for _k, lm, mask in loss_maps:
+		m = lm.detach()
 		if mask is not None:
 			m = m * mask.to(dtype=m.dtype)
 		m = m.detach().cpu()
@@ -632,9 +503,10 @@ def save(
 			m2 = m.detach().numpy().astype("float32")
 		else:
 			continue
-		name = str(spec["suffix"])
-		loss_2d.append((name, m2))
+		loss_2d.append((str(_k), m2))
 	# Float tif with a top label band (label pixels are visual-only floats in [0,1]).
+	if not loss_2d:
+		loss_2d = [("none", np.zeros((1, 1), dtype="float32"))]
 	concat_f = _loss_concat_vis(loss_maps_2d=loss_2d, border_px=6, label_px=16)
 	concat_f = np.repeat(np.repeat(concat_f, 8, axis=0), 8, axis=1)
 	label_h = max(1, 16 // 2)
@@ -660,7 +532,8 @@ def save(
 		x += int(m.shape[1])
 		if border > 0 and i + 1 < len(loss_2d):
 			x += border
-	concat_f[0:label_h * s, :] = lab_u8.astype("float32") / 255.0
+	label_rows = min(int(label_h * s), int(concat_f.shape[0]))
+	concat_f[0:label_rows, :] = (lab_u8.astype("float32") / 255.0)[0:label_rows, :]
 	concat_path = out_vis / f"res_loss_concat_{postfix}.tif"
 	tifffile.imwrite(str(concat_path), concat_f.astype("float32"), compression="lzw")
 

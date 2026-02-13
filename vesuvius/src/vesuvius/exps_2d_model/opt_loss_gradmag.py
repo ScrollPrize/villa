@@ -131,6 +131,6 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 	return lm.mean()
 
 
-def gradmag_period_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def gradmag_period_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = gradmag_period_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _masked_mean(lm, mask), (lm,), (mask,)

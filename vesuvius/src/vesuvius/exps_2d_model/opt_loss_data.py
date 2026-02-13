@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 import model as fit_model
+
+
+def _pool_h3(*, lm: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	lm_p = F.max_pool2d(lm, kernel_size=(1, 3), stride=1, padding=(0, 1))
+	mask_p = -F.max_pool2d(-mask, kernel_size=(1, 3), stride=1, padding=(0, 1))
+	return lm_p, mask_p
 
 
 def data_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
@@ -12,6 +19,7 @@ def data_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tens
 	d = pred - tgt
 	lm = d * d
 	mask = fit_model.xy_img_mask(res=res, xy=res.xy_hr, loss_name="data").unsqueeze(1)
+	lm, mask = _pool_h3(lm=lm, mask=mask)
 	return lm, mask
 
 
@@ -22,6 +30,7 @@ def data_plain_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torc
 	d = pred - tgt
 	lm = d * d
 	mask = fit_model.xy_img_mask(res=res, xy=res.xy_hr, loss_name="data_plain").unsqueeze(1)
+	lm, mask = _pool_h3(lm=lm, mask=mask)
 	return lm, mask
 
 
@@ -58,6 +67,7 @@ def data_grad_loss_map(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	base = 0.5 * (loss_x + loss_y)
 	lm = base.expand(int(pred.shape[0]), 1, 1, 1)
 	mask = torch.ones_like(lm)
+	lm, mask = _pool_h3(lm=lm, mask=mask)
 	return lm, mask
 
 
@@ -68,16 +78,16 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 	return lm.mean()
 
 
-def data_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def data_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = data_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _masked_mean(lm, mask), (lm,), (mask,)
 
 
-def data_plain_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def data_plain_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = data_plain_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _masked_mean(lm, mask), (lm,), (mask,)
 
 
-def data_grad_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def data_grad_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = data_grad_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _masked_mean(lm, mask), (lm,), (mask,)

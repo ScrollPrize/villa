@@ -29,12 +29,13 @@ def _masked_mean(lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 	return lm.mean()
 
 
-def mod_smooth_y_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def mod_smooth_y_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	lm, mask = mod_smooth_y_loss_map(res=res)
-	return _masked_mean(lm, mask)
+	return _masked_mean(lm, mask), (lm,), (mask,)
 
 
-def contr_loss(*, res: fit_model.FitResult) -> torch.Tensor:
+def contr_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	amp = res.amp_lr
 	bias = res.bias_lr
-	return ((amp - 1.0) * (amp - 1.0) + bias * bias).mean()
+	loss = ((amp - 1.0) * (amp - 1.0) + bias * bias).mean()
+	return loss, tuple(), tuple()
