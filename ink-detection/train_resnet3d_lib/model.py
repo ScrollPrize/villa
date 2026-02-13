@@ -1,5 +1,6 @@
 import time
 import os.path as osp
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 
 import numpy as np
@@ -129,6 +130,8 @@ class StitchManager:
         self.val_bboxes = dict(stitch_val_bboxes or {})
         self.train_bboxes = dict(stitch_train_bboxes or {})
         self.log_only_bboxes = dict(stitch_log_only_bboxes or {})
+        self._wandb_media_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wandb_media")
+        self._wandb_media_future = None
 
         def _resolve_roi(shape, bbox, ds):
             h = int(shape[0])
@@ -238,6 +241,55 @@ class StitchManager:
                 self.log_only_segment_ids.append(seg_id)
 
         self.enabled = len(self.buffers) > 0
+
+    def _poll_wandb_media_job(self):
+        if self._wandb_media_future is None:
+            return
+        if not self._wandb_media_future.done():
+            return
+        exc = self._wandb_media_future.exception()
+        self._wandb_media_future = None
+        if exc is not None:
+            raise RuntimeError("asynchronous wandb media logging failed") from exc
+
+    def _submit_wandb_media_job(self, *, logger, step, images, captions, log_only_images, log_only_captions):
+        self._poll_wandb_media_job()
+        if self._wandb_media_future is not None:
+            log(
+                f"skip wandb media step={int(step)} reason=previous_media_job_pending "
+                f"masks={len(images)} masks_log_only={len(log_only_images)}"
+            )
+            return
+
+        images_payload = list(images)
+        captions_payload = list(captions)
+        log_only_images_payload = list(log_only_images)
+        log_only_captions_payload = list(log_only_captions)
+
+        def _job():
+            t0 = time.perf_counter()
+            if images_payload:
+                logger.log_image(key="masks", images=images_payload, caption=captions_payload, step=step)
+            if log_only_images_payload:
+                logger.log_image(
+                    key="masks_log_only",
+                    images=log_only_images_payload,
+                    caption=log_only_captions_payload,
+                    step=step,
+                )
+            log(
+                f"wandb media done step={int(step)} "
+                f"masks={len(images_payload)} masks_log_only={len(log_only_images_payload)} "
+                f"elapsed={time.perf_counter() - t0:.2f}s"
+            )
+
+        self._wandb_media_future = self._wandb_media_executor.submit(_job)
+
+    def shutdown(self):
+        if self._wandb_media_future is not None:
+            self._wandb_media_future.result()
+            self._wandb_media_future = None
+        self._wandb_media_executor.shutdown(wait=True)
 
     def set_borders(self, *, train_borders=None, val_borders=None):
         if train_borders is not None:
@@ -474,6 +526,7 @@ class StitchManager:
     def on_validation_epoch_end(self, model):
         if not self.enabled or not self.buffers:
             return
+        self._poll_wandb_media_job()
 
         sanity_checking = bool(model.trainer is not None and getattr(model.trainer, "sanity_checking", False))
         is_global_zero = bool(model.trainer is None or model.trainer.is_global_zero)
@@ -653,17 +706,28 @@ class StitchManager:
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             if isinstance(model.logger, WandbLogger):
                 step = int(getattr(model.trainer, "global_step", 0))
-                model.logger.log_image(key="masks", images=images, caption=captions, step=step)
-                if log_only_images:
-                    model.logger.log_image(
-                        key="masks_log_only",
-                        images=log_only_images,
-                        caption=log_only_captions,
-                        step=step,
-                    )
+                self._submit_wandb_media_job(
+                    logger=model.logger,
+                    step=step,
+                    images=images,
+                    captions=captions,
+                    log_only_images=log_only_images,
+                    log_only_captions=log_only_captions,
+                )
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
-            if bool(getattr(CFG, "eval_stitch_metrics", True)) and segment_to_val:
+            should_run_stitch_metrics = bool(getattr(CFG, "eval_stitch_metrics", True)) and bool(segment_to_val)
+            if should_run_stitch_metrics:
+                stitch_every_n_epochs = max(1, int(getattr(CFG, "eval_stitch_every_n_epochs", 1)))
+                current_epoch = int(getattr(getattr(model, "trainer", None), "current_epoch", 0))
+                if ((current_epoch + 1) % stitch_every_n_epochs) != 0:
+                    should_run_stitch_metrics = False
+                    log(
+                        f"skip stitched metrics epoch={current_epoch} "
+                        f"eval_stitch_every_n_epochs={stitch_every_n_epochs}"
+                    )
+
+            if should_run_stitch_metrics:
                 from metrics.stitched_metrics import (
                     compute_stitched_metrics,
                     summarize_component_rows,
@@ -688,8 +752,10 @@ class StitchManager:
                     component_worst_k = int(component_worst_k)
                 component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
                 component_pad = int(getattr(CFG, "eval_component_pad", 5))
+                skeleton_thinning_type = str(getattr(CFG, "eval_skeleton_thinning_type", "zhang_suen"))
                 enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
                 save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
+                save_stitched_inputs = bool(getattr(CFG, "eval_save_stitched_inputs", False))
                 save_component_debug_images = bool(getattr(CFG, "eval_save_component_debug_images", False))
                 component_debug_max_items = getattr(CFG, "eval_component_debug_max_items", None)
                 if isinstance(component_debug_max_items, str) and component_debug_max_items.strip().lower() in {
@@ -705,6 +771,12 @@ class StitchManager:
                     "metrics_components",
                 )
                 output_dir = component_output_dir
+                stitched_inputs_output_dir = osp.join(
+                    str(getattr(CFG, "figures_dir", ".")),
+                    "metrics_stitched_inputs",
+                )
+                if not save_stitched_inputs:
+                    stitched_inputs_output_dir = None
 
                 def _parse_list(value, cast_fn):
                     if value is None:
@@ -750,15 +822,18 @@ class StitchManager:
                         component_worst_k=component_worst_k,
                         component_min_area=component_min_area,
                         component_pad=component_pad,
+                        skeleton_thinning_type=skeleton_thinning_type,
                         enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
                         output_dir=output_dir,
                         component_output_dir=component_output_dir,
+                        stitched_inputs_output_dir=stitched_inputs_output_dir,
                         save_skeleton_images=save_skeleton_images,
                         save_component_debug_images=save_component_debug_images,
                         component_debug_max_items=component_debug_max_items,
                         gt_cache_max=cache_max,
                         component_rows_collector=global_component_rows,
+                        eval_epoch=int(current_epoch + 1),
                     )
 
                     safe_segment_id = str(segment_id).replace("/", "_")
@@ -767,8 +842,12 @@ class StitchManager:
                         raise TypeError(
                             f"compute_stitched_metrics must return a dict, got {type(metrics).__name__}"
                         )
+
+                    from train_resnet3d_lib.val_stitch_wandb import rewrite_val_stitch_metric_key
+
                     for k, v in metrics.items():
-                        model.log(f"{base_key}/{k}", v, on_epoch=True, prog_bar=False)
+                        metric_key = rewrite_val_stitch_metric_key(str(k))
+                        model.log(f"{base_key}/{metric_key}", v, on_epoch=True, prog_bar=False)
 
                 if global_component_rows:
                     global_stats, global_rankings = summarize_component_rows(
@@ -780,7 +859,7 @@ class StitchManager:
                     for metric_name, stats in global_stats.items():
                         for stat_name, stat_val in stats.items():
                             model.log(
-                                f"metrics/val_stitch/global/components/{metric_name}_{stat_name}",
+                                f"metrics/val_stitch/global/components/{metric_name}/{stat_name}",
                                 float(stat_val),
                                 on_epoch=True,
                                 prog_bar=False,
@@ -798,15 +877,17 @@ class StitchManager:
                     if isinstance(model.logger, WandbLogger):
                         run = model.logger.experiment
                         if manifest_path is not None:
-                            run.summary["metrics/val_stitch/global/components_manifest_path"] = str(manifest_path)
+                            run.summary["metrics/val_stitch/global/diagnostics/components/manifest_path"] = str(
+                                manifest_path
+                            )
                         for metric_name, ranking in global_rankings.items():
                             k_ids = ranking["worst_k_component_ids"]
                             q_ids = ranking["worst_q_component_ids"]
                             run.summary[
-                                f"metrics/val_stitch/global/components/{metric_name}_worst_k_component_ids"
+                                f"metrics/val_stitch/global/diagnostics/components/{metric_name}/worst_k_component_ids"
                             ] = ",".join(str(v) for v in k_ids)
                             run.summary[
-                                f"metrics/val_stitch/global/components/{metric_name}_worst_q_component_ids"
+                                f"metrics/val_stitch/global/diagnostics/components/{metric_name}/worst_q_component_ids"
                             ] = ",".join(str(v) for v in q_ids)
 
         # reset stitch buffers
@@ -1306,6 +1387,9 @@ class RegressionPLModel(pl.LightningModule):
             self.log(f"val/group_{group_idx}_{safe_group_name}/dice_loss", group_dice_loss[group_idx], on_epoch=True)
             self.log(f"val/group_{group_idx}_{safe_group_name}/count", group_count[group_idx], on_epoch=True)
         self._stitcher.on_validation_epoch_end(self)
+
+    def on_fit_end(self):
+        self._stitcher.shutdown()
 
     def configure_optimizers(self):
         if bool(getattr(CFG, "exclude_weight_decay_bias_norm", False)) and float(getattr(CFG, "weight_decay", 0.0) or 0.0) > 0:

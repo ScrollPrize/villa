@@ -168,6 +168,8 @@ def init_wandb_logger(args, base_config):
         run.define_metric("trainer/global_step")
         run.define_metric("*", step_metric="trainer/global_step", step_sync=True)
 
+        from train_resnet3d_lib.val_stitch_wandb import WANDB_VAL_STITCH_METRIC_SUMMARIES
+
         metric_summaries = {
             "val/worst_group_loss": "min",
             "val/avg_loss": "min",
@@ -181,66 +183,11 @@ def init_wandb_logger(args, base_config):
             "train/dice_ema": "max",
             "train/worst_group_loss_ema": "min",
             "metrics/val/dice": "max",
-            "metrics/val_stitch/segments/*/dice_hard": "max",
-            "metrics/val_stitch/segments/*/dice_soft": "max",
-            "metrics/val_stitch/segments/*/drd": "min",
-            "metrics/val_stitch/segments/*/mpm": "min",
-            "metrics/val_stitch/segments/*/voi": "min",
-            "metrics/val_stitch/segments/*/betti/l1_betti_err": "min",
-            "metrics/val_stitch/segments/*/abs_euler_err": "min",
-            "metrics/val_stitch/segments/*/boundary/hd95": "min",
-            "metrics/val_stitch/segments/*/skeleton/cldice": "max",
-            "metrics/val_stitch/segments/*/skeleton/chamfer": "min",
-            "metrics/val_stitch/global/components/dice_hard_mean": "max",
-            "metrics/val_stitch/global/components/dice_hard_worst_k_mean": "max",
-            "metrics/val_stitch/global/components/dice_hard_worst_q_mean": "max",
-            "metrics/val_stitch/global/components/dice_soft_mean": "max",
-            "metrics/val_stitch/global/components/dice_soft_worst_k_mean": "max",
-            "metrics/val_stitch/global/components/dice_soft_worst_q_mean": "max",
-            "metrics/val_stitch/global/components/pfm_mean": "max",
-            "metrics/val_stitch/global/components/pfm_worst_k_mean": "max",
-            "metrics/val_stitch/global/components/pfm_worst_q_mean": "max",
-            "metrics/val_stitch/global/components/pfm_nonempty_mean": "max",
-            "metrics/val_stitch/global/components/pfm_nonempty_worst_k_mean": "max",
-            "metrics/val_stitch/global/components/pfm_nonempty_worst_q_mean": "max",
-            "metrics/val_stitch/global/components/pfm_weighted_mean": "max",
-            "metrics/val_stitch/global/components/pfm_weighted_worst_k_mean": "max",
-            "metrics/val_stitch/global/components/pfm_weighted_worst_q_mean": "max",
-            "metrics/val_stitch/global/components/voi_mean": "min",
-            "metrics/val_stitch/global/components/voi_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/voi_worst_q_mean": "min",
-            "metrics/val_stitch/global/components/mpm_mean": "min",
-            "metrics/val_stitch/global/components/mpm_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/mpm_worst_q_mean": "min",
-            "metrics/val_stitch/global/components/drd_mean": "min",
-            "metrics/val_stitch/global/components/drd_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/drd_worst_q_mean": "min",
-            "metrics/val_stitch/global/components/betti_l1_mean": "min",
-            "metrics/val_stitch/global/components/betti_l1_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/betti_l1_worst_q_mean": "min",
-            "metrics/val_stitch/global/components/abs_euler_err_mean": "min",
-            "metrics/val_stitch/global/components/abs_euler_err_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/abs_euler_err_worst_q_mean": "min",
-            "metrics/val_stitch/global/components/boundary_hd95_mean": "min",
-            "metrics/val_stitch/global/components/boundary_hd95_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/boundary_hd95_worst_q_mean": "min",
-            "metrics/val_stitch/global/components/skeleton_cldice_mean": "max",
-            "metrics/val_stitch/global/components/skeleton_cldice_worst_k_mean": "max",
-            "metrics/val_stitch/global/components/skeleton_cldice_worst_q_mean": "max",
-            "metrics/val_stitch/global/components/skeleton_chamfer_mean": "min",
-            "metrics/val_stitch/global/components/skeleton_chamfer_worst_k_mean": "min",
-            "metrics/val_stitch/global/components/skeleton_chamfer_worst_q_mean": "min",
-            "metrics/val_stitch/segments/*/stability/dice_hard_mean": "max",
-            "metrics/val_stitch/segments/*/stability/dice_soft_mean": "max",
-            "metrics/val_stitch/segments/*/stability/pfm_mean": "max",
-            "metrics/val_stitch/segments/*/stability/pfm_nonempty_mean": "max",
-            "metrics/val_stitch/segments/*/stability/pfm_weighted_mean": "max",
-            "metrics/val_stitch/segments/*/stability/voi_mean": "min",
-            "metrics/val_stitch/segments/*/stability/betti_l1_mean": "min",
-            "metrics/val_stitch/segments/*/pfm": "max",
-            "metrics/val_stitch/segments/*/pfm_nonempty": "max",
-            "metrics/val_stitch/segments/*/pfm_weighted": "max",
         }
+        overlap = set(metric_summaries) & set(WANDB_VAL_STITCH_METRIC_SUMMARIES)
+        if overlap:
+            raise ValueError(f"wandb metric summary keys overlap: {sorted(overlap)!r}")
+        metric_summaries.update(WANDB_VAL_STITCH_METRIC_SUMMARIES)
         for metric_name, summary_mode in metric_summaries.items():
             run.define_metric(metric_name, summary=summary_mode)
     except Exception as exc:

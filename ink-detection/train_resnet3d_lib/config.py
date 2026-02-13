@@ -92,15 +92,18 @@ class CFG:
     eval_threshold = 0.5
     # Extra "stitched segment" metrics (expensive, but more faithful for topology/document metrics).
     eval_stitch_metrics = True
+    eval_stitch_every_n_epochs = 1
     eval_drd_block_size = 8
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
     eval_skeleton_radius = [1]
     eval_component_worst_q = 0.2
     eval_component_worst_k = 2
-    eval_component_min_area = 0
+    eval_component_min_area = 64
     eval_component_pad = 5
+    eval_skeleton_thinning_type = "guo_hall"
     eval_stitch_full_region_metrics = False
+    eval_save_stitched_inputs = True
     eval_save_component_debug_images = False
     eval_component_debug_max_items = 24
     eval_threshold_grid_min = 0.40
@@ -138,6 +141,11 @@ class CFG:
     train_aug_list = []
     valid_aug_list = []
     rotate = A.Compose([A.Rotate(5, p=1)])
+    fourth_augment_p = 0.6
+    fourth_augment_min_crop_ratio = 0.9
+    fourth_augment_max_crop_ratio = 1.0
+    fourth_augment_cutout_max_count = 2
+    fourth_augment_cutout_p = 0.6
 
 
 def set_seed(seed=None, cudnn_deterministic=True):
@@ -212,9 +220,54 @@ def unflatten_dict(flat, *, sep="."):
 def rebuild_augmentations(cfg, augmentation_cfg=None):
     if augmentation_cfg is None:
         augmentation_cfg = {}
+    if not isinstance(augmentation_cfg, dict):
+        raise TypeError(
+            f"metadata.training_hyperparameters.augmentation must be an object, got {type(augmentation_cfg).__name__}"
+        )
+    if "fourth_augment" not in augmentation_cfg or not isinstance(augmentation_cfg["fourth_augment"], dict):
+        raise KeyError(
+            "metadata.training_hyperparameters.augmentation missing required object: 'fourth_augment'"
+        )
 
     size = cfg.size
     in_chans = cfg.in_chans
+    fourth_augment_cfg = augmentation_cfg["fourth_augment"]
+    required_fourth_augment_keys = (
+        "p",
+        "min_crop_ratio",
+        "max_crop_ratio",
+        "cutout_max_count",
+        "cutout_p",
+    )
+    missing_fourth_augment_keys = [k for k in required_fourth_augment_keys if k not in fourth_augment_cfg]
+    if missing_fourth_augment_keys:
+        raise KeyError(
+            "metadata.training_hyperparameters.augmentation.fourth_augment missing required keys: "
+            f"{missing_fourth_augment_keys}"
+        )
+
+    cfg.fourth_augment_p = float(fourth_augment_cfg["p"])
+    cfg.fourth_augment_min_crop_ratio = float(fourth_augment_cfg["min_crop_ratio"])
+    cfg.fourth_augment_max_crop_ratio = float(fourth_augment_cfg["max_crop_ratio"])
+    cfg.fourth_augment_cutout_max_count = int(fourth_augment_cfg["cutout_max_count"])
+    cfg.fourth_augment_cutout_p = float(fourth_augment_cfg["cutout_p"])
+
+    if not (0.0 <= cfg.fourth_augment_p <= 1.0):
+        raise ValueError(f"augmentation.fourth_augment.p must be in [0,1], got {cfg.fourth_augment_p}")
+    if not (0.0 < cfg.fourth_augment_min_crop_ratio <= cfg.fourth_augment_max_crop_ratio <= 1.0):
+        raise ValueError(
+            "augmentation.fourth_augment ratios must satisfy 0 < min_crop_ratio <= max_crop_ratio <= 1, "
+            f"got min={cfg.fourth_augment_min_crop_ratio}, max={cfg.fourth_augment_max_crop_ratio}"
+        )
+    if cfg.fourth_augment_cutout_max_count < 0:
+        raise ValueError(
+            "augmentation.fourth_augment.cutout_max_count must be >= 0, "
+            f"got {cfg.fourth_augment_cutout_max_count}"
+        )
+    if not (0.0 <= cfg.fourth_augment_cutout_p <= 1.0):
+        raise ValueError(
+            f"augmentation.fourth_augment.cutout_p must be in [0,1], got {cfg.fourth_augment_cutout_p}"
+        )
 
     hflip_p = float(augmentation_cfg.get("horizontal_flip", 0.5))
     vflip_p = float(augmentation_cfg.get("vertical_flip", 0.5))
@@ -297,18 +350,45 @@ def apply_metadata_hyperparameters(cfg, metadata):
         raise KeyError("metadata.training_hyperparameters missing required object: 'model'")
     if "training" not in hp or not isinstance(hp["training"], dict):
         raise KeyError("metadata.training_hyperparameters missing required object: 'training'")
+    if "augmentation" not in hp or not isinstance(hp["augmentation"], dict):
+        raise KeyError("metadata.training_hyperparameters missing required object: 'augmentation'")
     model_hp = hp["model"]
     train_hp = hp["training"]
     training_cfg = metadata["training"]
+    required_model_keys = ["model_name", "backbone", "encoder_depth", "target_size", "in_chans", "norm", "group_norm_groups"]
+    missing_model_keys = [k for k in required_model_keys if k not in model_hp]
+    if missing_model_keys:
+        raise KeyError(f"metadata.training_hyperparameters.model missing required keys: {missing_model_keys}")
 
-    for k in ["model_name", "backbone", "encoder_depth", "target_size", "in_chans", "norm", "group_norm_groups"]:
-        if k in model_hp:
-            if k == "norm":
-                setattr(cfg, "norm", str(model_hp[k]).lower())
-            elif k == "group_norm_groups":
-                setattr(cfg, "group_norm_groups", int(model_hp[k]))
-            else:
-                setattr(cfg, k, model_hp[k])
+    required_training_keys = [
+        "size",
+        "tile_size",
+        "stride",
+        "train_batch_size",
+        "valid_batch_size",
+        "use_amp",
+        "epochs",
+        "scheduler",
+        "lr",
+        "min_lr",
+        "weight_decay",
+        "num_workers",
+        "layer_read_workers",
+        "seed",
+    ]
+    missing_training_keys = [k for k in required_training_keys if k not in train_hp]
+    if missing_training_keys:
+        raise KeyError(f"metadata.training_hyperparameters.training missing required keys: {missing_training_keys}")
+
+    for k in required_model_keys:
+        if k == "norm":
+            setattr(cfg, "norm", str(model_hp[k]).lower())
+        elif k == "group_norm_groups":
+            setattr(cfg, "group_norm_groups", int(model_hp[k]))
+        elif k in {"encoder_depth", "target_size", "in_chans"}:
+            setattr(cfg, k, int(model_hp[k]))
+        else:
+            setattr(cfg, k, model_hp[k])
 
     for k, attr in [
         ("size", "size"),
@@ -332,6 +412,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("max_grad_norm", "max_grad_norm"),
         ("eval_threshold", "eval_threshold"),
         ("eval_stitch_metrics", "eval_stitch_metrics"),
+        ("eval_stitch_every_n_epochs", "eval_stitch_every_n_epochs"),
         ("eval_drd_block_size", "eval_drd_block_size"),
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
@@ -340,7 +421,9 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_component_worst_k", "eval_component_worst_k"),
         ("eval_component_min_area", "eval_component_min_area"),
         ("eval_component_pad", "eval_component_pad"),
+        ("eval_skeleton_thinning_type", "eval_skeleton_thinning_type"),
         ("eval_stitch_full_region_metrics", "eval_stitch_full_region_metrics"),
+        ("eval_save_stitched_inputs", "eval_save_stitched_inputs"),
         ("eval_save_component_debug_images", "eval_save_component_debug_images"),
         ("eval_component_debug_max_items", "eval_component_debug_max_items"),
         ("eval_threshold_grid_min", "eval_threshold_grid_min"),
@@ -357,8 +440,40 @@ def apply_metadata_hyperparameters(cfg, metadata):
         if k in train_hp:
             setattr(cfg, attr, train_hp[k])
 
-    if getattr(cfg, "stride", None) is None:
-        cfg.stride = cfg.tile_size // 8
+    numeric_constraints = [
+        ("size", "training_hyperparameters.training.size", 1),
+        ("tile_size", "training_hyperparameters.training.tile_size", 1),
+        ("stride", "training_hyperparameters.training.stride", 1),
+        ("in_chans", "training_hyperparameters.model.in_chans", 1),
+        ("train_batch_size", "training_hyperparameters.training.train_batch_size", 1),
+        ("valid_batch_size", "training_hyperparameters.training.valid_batch_size", 1),
+        ("epochs", "training_hyperparameters.training.epochs", 1),
+        ("num_workers", "training_hyperparameters.training.num_workers", 0),
+        ("layer_read_workers", "training_hyperparameters.training.layer_read_workers", 1),
+        ("group_norm_groups", "training_hyperparameters.model.group_norm_groups", 1),
+    ]
+    for attr, meta_key, min_value in numeric_constraints:
+        value = int(getattr(cfg, attr))
+        setattr(cfg, attr, value)
+        if value < min_value:
+            constraint = ">= 0" if min_value == 0 else "> 0"
+            raise ValueError(f"{meta_key} must be {constraint}, got {value}")
+    cfg.seed = int(cfg.seed)
+
+    if cfg.norm not in {"batch", "group"}:
+        raise ValueError(f"training_hyperparameters.model.norm must be 'batch' or 'group', got {cfg.norm!r}")
+    cfg.eval_stitch_every_n_epochs = int(getattr(cfg, "eval_stitch_every_n_epochs", 1))
+    if cfg.eval_stitch_every_n_epochs < 1:
+        raise ValueError(
+            "training_hyperparameters.training.eval_stitch_every_n_epochs must be >= 1, "
+            f"got {cfg.eval_stitch_every_n_epochs}"
+        )
+    cfg.eval_skeleton_thinning_type = str(getattr(cfg, "eval_skeleton_thinning_type", "zhang_suen")).strip().lower()
+    if cfg.eval_skeleton_thinning_type not in {"zhang_suen", "guo_hall"}:
+        raise ValueError(
+            "training_hyperparameters.training.eval_skeleton_thinning_type must be "
+            f"'zhang_suen' or 'guo_hall', got {cfg.eval_skeleton_thinning_type!r}"
+        )
 
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()
@@ -444,5 +559,5 @@ def apply_metadata_hyperparameters(cfg, metadata):
         if "val_mask_suffix" not in training_cfg:
             cfg.val_mask_suffix = f"_val_{cfg.cv_fold}"
 
-    rebuild_augmentations(cfg, hp.get("augmentation"))
+    rebuild_augmentations(cfg, hp["augmentation"])
     return cfg

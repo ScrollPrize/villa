@@ -41,6 +41,34 @@ def _segment_meta(segments_metadata, fragment_id):
     return seg_meta
 
 
+def _segment_layer_range(seg_meta, fragment_id):
+    if "layer_range" not in seg_meta:
+        raise KeyError(f"segments[{fragment_id!r}] missing required key: 'layer_range'")
+    layer_range = seg_meta["layer_range"]
+    if not isinstance(layer_range, (list, tuple)) or len(layer_range) != 2:
+        raise TypeError(
+            f"segments[{fragment_id!r}].layer_range must be [start_idx, end_idx], got {layer_range!r}"
+        )
+    start_idx = int(layer_range[0])
+    end_idx = int(layer_range[1])
+    if end_idx <= start_idx:
+        raise ValueError(
+            f"segments[{fragment_id!r}].layer_range must satisfy end_idx > start_idx, got {layer_range!r}"
+        )
+    return start_idx, end_idx
+
+
+def _segment_reverse_layers(seg_meta, fragment_id):
+    if "reverse_layers" not in seg_meta:
+        raise KeyError(f"segments[{fragment_id!r}] missing required key: 'reverse_layers'")
+    reverse_layers = seg_meta["reverse_layers"]
+    if not isinstance(reverse_layers, bool):
+        raise TypeError(
+            f"segments[{fragment_id!r}].reverse_layers must be boolean, got {type(reverse_layers).__name__}"
+        )
+    return reverse_layers
+
+
 def build_group_metadata(fragment_ids, segments_metadata, group_key):
     group_names, _group_name_to_idx, fragment_to_group_idx = build_group_mappings(
         fragment_ids,
@@ -64,16 +92,18 @@ def load_train_segment(
 ):
     t0 = time.time()
     log(f"load train segment={fragment_id} group={group_name}")
+    layer_range = _segment_layer_range(seg_meta, fragment_id)
+    reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
     layers = read_image_layers(
         fragment_id,
-        layer_range=seg_meta.get("layer_range"),
+        layer_range=layer_range,
     )
     if fragment_id in overlap_segments:
         layers_cache[fragment_id] = layers
 
     image, mask, fragment_mask = read_image_mask(
         fragment_id,
-        reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+        reverse_layers=reverse_layers,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
         images=layers,
@@ -142,18 +172,20 @@ def load_val_segment(
 ):
     t0 = time.time()
     log(f"load val segment={fragment_id} group={group_name}")
+    layer_range = _segment_layer_range(seg_meta, fragment_id)
+    reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
     layers = layers_cache.get(fragment_id)
     if layers is None:
         layers = read_image_layers(
             fragment_id,
-            layer_range=seg_meta.get("layer_range"),
+            layer_range=layer_range,
         )
     else:
         log(f"reuse layers cache for val segment={fragment_id}")
 
     image_val, mask_val, fragment_mask_val = read_image_mask(
         fragment_id,
-        reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+        reverse_layers=reverse_layers,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
         images=layers,
@@ -477,18 +509,20 @@ def build_log_only_stitch_loaders(
 
     for fragment_id in log_only_segments:
         seg_meta = _segment_meta(segments_metadata, fragment_id)
+        layer_range = _segment_layer_range(seg_meta, fragment_id)
+        reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
         layers = layers_cache.get(fragment_id)
         if layers is None:
             layers = read_image_layers(
                 fragment_id,
-                layer_range=seg_meta.get("layer_range"),
+                layer_range=layer_range,
             )
         else:
             log(f"reuse layers cache for log-only segment={fragment_id}")
 
         image, fragment_mask = read_image_fragment_mask(
             fragment_id,
-            reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+            reverse_layers=reverse_layers,
             mask_suffix=mask_suffix,
             images=layers,
         )
@@ -539,13 +573,15 @@ def build_log_only_stitch_loaders_lazy(
     for fragment_id in log_only_segments:
         sid = str(fragment_id)
         seg_meta = _segment_meta(segments_metadata, fragment_id)
+        layer_range = _segment_layer_range(seg_meta, fragment_id)
+        reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
         volume = volume_cache.get(sid)
         if volume is None:
             volume = ZarrSegmentVolume(
                 sid,
                 seg_meta,
-                layer_range=seg_meta.get("layer_range"),
-                reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+                layer_range=layer_range,
+                reverse_layers=reverse_layers,
             )
             volume_cache[sid] = volume
         else:
@@ -646,6 +682,8 @@ def build_datasets(run_state):
         for fragment_id in train_fragment_ids:
             sid = str(fragment_id)
             seg_meta = _segment_meta(segments_metadata, fragment_id)
+            layer_range = _segment_layer_range(seg_meta, fragment_id)
+            reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
             group_idx = int(fragment_to_group_idx[fragment_id])
             group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
 
@@ -656,8 +694,8 @@ def build_datasets(run_state):
                 volume = ZarrSegmentVolume(
                     sid,
                     seg_meta,
-                    layer_range=seg_meta.get("layer_range"),
-                    reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+                    layer_range=layer_range,
+                    reverse_layers=reverse_layers,
                 )
                 volume_cache[sid] = volume
             else:
@@ -695,6 +733,8 @@ def build_datasets(run_state):
         for fragment_id in val_fragment_ids:
             sid = str(fragment_id)
             seg_meta = _segment_meta(segments_metadata, fragment_id)
+            layer_range = _segment_layer_range(seg_meta, fragment_id)
+            reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
             group_idx = int(fragment_to_group_idx[fragment_id])
             group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
 
@@ -705,8 +745,8 @@ def build_datasets(run_state):
                 volume = ZarrSegmentVolume(
                     sid,
                     seg_meta,
-                    layer_range=seg_meta.get("layer_range"),
-                    reverse_layers=bool(seg_meta.get("reverse_layers", False)),
+                    layer_range=layer_range,
+                    reverse_layers=reverse_layers,
                 )
                 volume_cache[sid] = volume
             else:

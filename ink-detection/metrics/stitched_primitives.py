@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -381,7 +382,23 @@ def hausdorff_metrics(
     return {"hd": hd, "hd95": hd95, "assd": assd}
 
 
-def skeletonize_binary(mask: np.ndarray) -> np.ndarray:
+def _resolve_thinning_type(thinning_type: str) -> int:
+    thinning_type_str = str(thinning_type).strip().lower()
+    if thinning_type_str in {"zhang_suen", "zhangsuen", "zhang-suen"}:
+        import cv2
+
+        return int(cv2.ximgproc.THINNING_ZHANGSUEN)
+    if thinning_type_str in {"guo_hall", "guohall", "guo-hall"}:
+        import cv2
+
+        return int(cv2.ximgproc.THINNING_GUOHALL)
+    raise ValueError(
+        "thinning_type must be one of {'zhang_suen', 'guo_hall'}, "
+        f"got {thinning_type!r}"
+    )
+
+
+def skeletonize_binary(mask: np.ndarray, *, thinning_type: str = "zhang_suen") -> np.ndarray:
     mask = _as_bool_2d(mask)
     if not mask.any():
         return np.zeros_like(mask, dtype=bool)
@@ -392,8 +409,9 @@ def skeletonize_binary(mask: np.ndarray) -> np.ndarray:
             "cv2.ximgproc.thinning is required for skeleton metrics. "
             "Install OpenCV contrib (opencv-contrib-python)."
         )
+    thinning_type_cv2 = _resolve_thinning_type(thinning_type)
     mask_u8 = (mask.astype(np.uint8) * 255)
-    skel_u8 = cv2.ximgproc.thinning(mask_u8, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+    skel_u8 = cv2.ximgproc.thinning(mask_u8, thinningType=thinning_type_cv2)
     return skel_u8 > 0
 
 
@@ -684,26 +702,54 @@ def _local_metrics_from_binary(
     gt_beta1: Optional[int] = None,
     skel_gt: Optional[np.ndarray] = None,
     skel_pred: Optional[np.ndarray] = None,
+    gt_lab: Optional[np.ndarray] = None,
+    pred_lab: Optional[np.ndarray] = None,
     pfm_weight_recall: Optional[np.ndarray] = None,
     pfm_weight_recall_sum: Optional[float] = None,
     pfm_weight_precision: Optional[np.ndarray] = None,
+    timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     pred_bin = _as_bool_2d(pred_bin)
     gt_bin = _as_bool_2d(gt_bin)
     if pred_bin.shape != gt_bin.shape:
         raise ValueError(f"pred_bin/gt_bin shape mismatch: {pred_bin.shape} vs {gt_bin.shape}")
 
+    t0 = time.perf_counter()
     c = confusion_counts(pred_bin, gt_bin)
-    gt_lab, _ = _label_components(gt_bin, connectivity=connectivity)
-    pred_lab, _ = _label_components(pred_bin, connectivity=connectivity)
-    voi_split, voi_merge = voi_split_merge_from_labels(gt_lab, pred_lab)
+    if timings is not None:
+        timings["confusion_counts"] = timings.get("confusion_counts", 0.0) + (time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    if gt_lab is None:
+        gt_lab_i, _ = _label_components(gt_bin, connectivity=connectivity)
+    else:
+        gt_lab_i = _as_int_labels_2d(gt_lab)
+        if gt_lab_i.shape != gt_bin.shape:
+            raise ValueError(f"gt_lab/gt_bin shape mismatch: {gt_lab_i.shape} vs {gt_bin.shape}")
+    if pred_lab is None:
+        pred_lab_i, _ = _label_components(pred_bin, connectivity=connectivity)
+    else:
+        pred_lab_i = _as_int_labels_2d(pred_lab)
+        if pred_lab_i.shape != pred_bin.shape:
+            raise ValueError(f"pred_lab/pred_bin shape mismatch: {pred_lab_i.shape} vs {pred_bin.shape}")
+    if timings is not None:
+        timings["label_components"] = timings.get("label_components", 0.0) + (time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    voi_split, voi_merge = voi_split_merge_from_labels(gt_lab_i, pred_lab_i)
+    if timings is not None:
+        timings["voi"] = timings.get("voi", 0.0) + (time.perf_counter() - t0)
     voi_total = float(voi_split + voi_merge)
     if gt_beta0 is None or gt_beta1 is None:
+        t0 = time.perf_counter()
         gt_beta0_i, gt_beta1_i = betti_numbers_2d(gt_bin, connectivity=connectivity)
+        if timings is not None:
+            timings["betti_gt"] = timings.get("betti_gt", 0.0) + (time.perf_counter() - t0)
     else:
         gt_beta0_i = int(gt_beta0)
         gt_beta1_i = int(gt_beta1)
+    t0 = time.perf_counter()
     pred_beta0_i, pred_beta1_i = betti_numbers_2d(pred_bin, connectivity=connectivity)
+    if timings is not None:
+        timings["betti_pred"] = timings.get("betti_pred", 0.0) + (time.perf_counter() - t0)
     abs_beta0_err = float(abs(pred_beta0_i - gt_beta0_i))
     abs_beta1_err = float(abs(pred_beta1_i - gt_beta1_i))
     betti_l1 = float(abs_beta0_err + abs_beta1_err)
@@ -711,16 +757,35 @@ def _local_metrics_from_binary(
     euler_gt = float(gt_beta0_i - gt_beta1_i)
     abs_euler_err = float(abs(euler_pred - euler_gt))
 
+    t0 = time.perf_counter()
     hd = hausdorff_metrics(pred_bin, gt_bin, boundary_k=boundary_k)
+    if timings is not None:
+        timings["boundary_hausdorff"] = timings.get("boundary_hausdorff", 0.0) + (time.perf_counter() - t0)
     if skel_gt is None:
+        t0 = time.perf_counter()
         skel_gt = skeletonize_binary(gt_bin)
+        if timings is not None:
+            timings["skeletonize_gt"] = timings.get("skeletonize_gt", 0.0) + (time.perf_counter() - t0)
     if skel_pred is None:
+        t0 = time.perf_counter()
         skel_pred = skeletonize_binary(pred_bin)
+        if timings is not None:
+            timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
+    t0 = time.perf_counter()
     chamfer = skeleton_chamfer(skel_pred, skel_gt)
+    if timings is not None:
+        timings["skeleton_chamfer"] = timings.get("skeleton_chamfer", 0.0) + (time.perf_counter() - t0)
+    t0 = time.perf_counter()
     pfm, pfm_nonempty = pseudo_fmeasure_values(pred_bin, gt_bin, skel_gt=skel_gt)
+    if timings is not None:
+        timings["pfm"] = timings.get("pfm", 0.0) + (time.perf_counter() - t0)
     if pfm_weight_recall is None and pfm_weight_recall_sum is None and pfm_weight_precision is None:
+        t0 = time.perf_counter()
         pfm_weighted = weighted_pseudo_fmeasure(pred_bin, gt_bin, connectivity=connectivity)
+        if timings is not None:
+            timings["pfm_weighted"] = timings.get("pfm_weighted", 0.0) + (time.perf_counter() - t0)
     elif pfm_weight_recall is not None and pfm_weight_recall_sum is not None and pfm_weight_precision is not None:
+        t0 = time.perf_counter()
         pfm_weighted = weighted_pseudo_fmeasure_from_weights(
             pred_bin,
             gt_bin,
@@ -728,18 +793,34 @@ def _local_metrics_from_binary(
             recall_weights_sum=float(pfm_weight_recall_sum),
             precision_weights=pfm_weight_precision,
         )
+        if timings is not None:
+            timings["pfm_weighted"] = timings.get("pfm_weighted", 0.0) + (time.perf_counter() - t0)
     else:
         raise ValueError(
             "pfm weighted inputs must be provided together: "
             "pfm_weight_recall, pfm_weight_recall_sum, pfm_weight_precision"
         )
 
+    t0 = time.perf_counter()
+    mpm_val = float(mpm(pred_bin, gt_bin, boundary_k=boundary_k))
+    if timings is not None:
+        timings["mpm"] = timings.get("mpm", 0.0) + (time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    drd_val = float(drd(pred_bin, gt_bin, block_size=drd_block_size))
+    if timings is not None:
+        timings["drd"] = timings.get("drd", 0.0) + (time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    skel_recall_val = float(skeleton_recall(pred_bin, gt_bin, skel_gt=skel_gt))
+    skel_cldice_val = float(cldice(pred_bin, gt_bin, skel_pred=skel_pred, skel_gt=skel_gt))
+    if timings is not None:
+        timings["skeleton_overlap"] = timings.get("skeleton_overlap", 0.0) + (time.perf_counter() - t0)
+
     return {
         "dice": float(dice_from_confusion(c)),
         "accuracy": float(accuracy_from_confusion(c)),
         "voi": voi_total,
-        "mpm": float(mpm(pred_bin, gt_bin, boundary_k=boundary_k)),
-        "drd": float(drd(pred_bin, gt_bin, block_size=drd_block_size)),
+        "mpm": mpm_val,
+        "drd": drd_val,
         "betti_beta0_pred": float(pred_beta0_i),
         "betti_beta1_pred": float(pred_beta1_i),
         "betti_beta0_gt": float(gt_beta0_i),
@@ -753,8 +834,8 @@ def _local_metrics_from_binary(
         "boundary_hd": float(hd["hd"]),
         "boundary_hd95": float(hd["hd95"]),
         "boundary_assd": float(hd["assd"]),
-        "skeleton_recall": float(skeleton_recall(pred_bin, gt_bin, skel_gt=skel_gt)),
-        "skeleton_cldice": float(cldice(pred_bin, gt_bin, skel_pred=skel_pred, skel_gt=skel_gt)),
+        "skeleton_recall": skel_recall_val,
+        "skeleton_cldice": skel_cldice_val,
         "pfm": float(pfm),
         "pfm_nonempty": float(pfm_nonempty),
         "pfm_weighted": float(pfm_weighted),

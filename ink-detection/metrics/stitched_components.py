@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import os.path as osp
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -25,6 +26,7 @@ def _build_gt_component_templates(
     *,
     connectivity: int,
     pad: int,
+    skeleton_thinning_type: str = "zhang_suen",
 ) -> List[Dict[str, Any]]:
     gt_bin = _as_bool_2d(gt_bin)
     gt_lab = np.asarray(gt_lab)
@@ -44,8 +46,9 @@ def _build_gt_component_templates(
         x0 = max(0, int(xs.min()) - pad)
         x1 = min(gt_bin.shape[1], int(xs.max()) + 1 + pad)
         crop_gt = gt_bin[y0:y1, x0:x1]
+        crop_gt_lab, _ = _label_components(crop_gt, connectivity=connectivity)
         gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
-        gt_skel = skeletonize_binary(crop_gt)
+        gt_skel = skeletonize_binary(crop_gt, thinning_type=skeleton_thinning_type)
         pfm_weight_recall = _pseudo_recall_weights(crop_gt).astype(np.float32, copy=False)
         pfm_weight_recall_sum = float(pfm_weight_recall.sum(dtype=np.float64))
         if crop_gt.any() and pfm_weight_recall_sum <= 0.0:
@@ -59,6 +62,7 @@ def _build_gt_component_templates(
                 "bbox": [int(y0), int(y1), int(x0), int(x1)],
                 "gt_beta0": int(gt_beta0),
                 "gt_beta1": int(gt_beta1),
+                "gt_lab": crop_gt_lab,
                 "gt_skel": gt_skel,
                 "pfm_weight_recall": pfm_weight_recall,
                 "pfm_weight_recall_sum": float(pfm_weight_recall_sum),
@@ -217,6 +221,8 @@ def component_metrics_by_gt_bbox(
     gt_lab: Optional[np.ndarray] = None,
     n_gt: Optional[int] = None,
     gt_component_templates: Optional[List[Dict[str, Any]]] = None,
+    skeleton_thinning_type: str = "zhang_suen",
+    timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, float]], Dict[str, Dict[str, Any]]]:
     pred_prob = np.asarray(pred_prob, dtype=np.float32)
     pred_bin = _as_bool_2d(pred_bin)
@@ -234,6 +240,7 @@ def component_metrics_by_gt_bbox(
             int(n_gt),
             connectivity=connectivity,
             pad=pad,
+            skeleton_thinning_type=skeleton_thinning_type,
         )
 
     rows: List[Dict[str, Any]] = []
@@ -245,8 +252,23 @@ def component_metrics_by_gt_bbox(
         crop_pred_prob = pred_prob[y0:y1, x0:x1]
         crop_pred_bin = pred_bin[y0:y1, x0:x1]
         crop_gt = gt_bin[y0:y1, x0:x1]
+        crop_gt_lab = template["gt_lab"]
+        if crop_gt_lab.shape != crop_gt.shape:
+            raise ValueError(
+                f"template gt_lab shape mismatch for component {gi}: "
+                f"{crop_gt_lab.shape} vs {crop_gt.shape}"
+            )
 
-        crop_pred_skel = skeletonize_binary(crop_pred_bin)
+        t0 = time.perf_counter()
+        crop_pred_skel = skeletonize_binary(crop_pred_bin, thinning_type=skeleton_thinning_type)
+        if timings is not None:
+            timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        crop_pred_lab, _ = _label_components(crop_pred_bin, connectivity=connectivity)
+        if timings is not None:
+            timings["label_pred"] = timings.get("label_pred", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        local_metric_timings: Dict[str, float] = {}
         local_metrics = _local_metrics_from_binary(
             crop_pred_bin,
             crop_gt,
@@ -257,12 +279,22 @@ def component_metrics_by_gt_bbox(
             gt_beta1=int(template["gt_beta1"]),
             skel_gt=template["gt_skel"],
             skel_pred=crop_pred_skel,
+            gt_lab=crop_gt_lab,
+            pred_lab=crop_pred_lab,
             pfm_weight_recall=template["pfm_weight_recall"],
             pfm_weight_recall_sum=float(template["pfm_weight_recall_sum"]),
             pfm_weight_precision=template["pfm_weight_precision"],
+            timings=local_metric_timings,
         )
+        if timings is not None:
+            timings["local_metrics"] = timings.get("local_metrics", 0.0) + (time.perf_counter() - t0)
+            for key, value in local_metric_timings.items():
+                timings[f"local_metrics/{key}"] = timings.get(f"local_metrics/{key}", 0.0) + float(value)
+        t0 = time.perf_counter()
         dice_hard = float(local_metrics["dice"])
         dice_soft = float(soft_dice_from_prob(crop_pred_prob, crop_gt))
+        if timings is not None:
+            timings["soft_dice"] = timings.get("soft_dice", 0.0) + (time.perf_counter() - t0)
 
         row = {
             "component_id": int(gi),

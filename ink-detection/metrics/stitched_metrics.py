@@ -253,7 +253,12 @@ def _component_metric_means_for_stability(
         crop_gt = gt_bin[y0:y1, x0:x1]
 
         c = confusion_counts(crop_pred_bin, crop_gt)
-        crop_gt_lab, _ = _label_components(crop_gt, connectivity=connectivity)
+        crop_gt_lab = template["gt_lab"]
+        if crop_gt_lab.shape != crop_gt.shape:
+            raise ValueError(
+                f"template gt_lab shape mismatch for component {template['component_id']}: "
+                f"{crop_gt_lab.shape} vs {crop_gt.shape}"
+            )
         crop_pred_lab, _ = _label_components(crop_pred_bin, connectivity=connectivity)
         dice_hard_vals.append(float(dice_from_confusion(c)))
         dice_soft_vals.append(float(soft_dice_from_prob(crop_pred_prob, crop_gt)))
@@ -345,8 +350,10 @@ def _compute_full_region_metrics(
     gt_beta0: int,
     gt_beta1: int,
     skel_gt: np.ndarray,
+    skeleton_thinning_type: str,
+    timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict[str, float], np.ndarray]:
-    skel_pred = skeletonize_binary(pred_bin_clean)
+    skel_pred = skeletonize_binary(pred_bin_clean, thinning_type=skeleton_thinning_type)
     full_metrics = _local_metrics_from_binary(
         pred_bin_clean,
         gt_bin,
@@ -357,6 +364,7 @@ def _compute_full_region_metrics(
         gt_beta1=int(gt_beta1),
         skel_gt=skel_gt,
         skel_pred=skel_pred,
+        timings=timings,
     )
     out: Dict[str, float] = {
         "dice_hard": float(full_metrics["dice"]),
@@ -576,6 +584,7 @@ def _compute_threshold_stability_metrics(
     component_min_area: int,
     gt_bin: np.ndarray,
     gt_component_templates: List[Dict[str, Any]],
+    timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     tgrid = np.asarray(threshold_grid, dtype=np.float32)
     dice_hard_vals: List[float] = []
@@ -586,6 +595,7 @@ def _compute_threshold_stability_metrics(
     pfm_weighted_vals: List[float] = []
     betti_l1_vals: List[float] = []
     for t in tgrid:
+        t0 = time.perf_counter()
         pred_bin_t, pred_prob_t = _postprocess_prediction(
             pred_prob,
             eval_mask=eval_mask,
@@ -594,6 +604,9 @@ def _compute_threshold_stability_metrics(
             component_min_area=component_min_area,
             return_labels=False,
         )
+        if timings is not None:
+            timings["postprocess"] = timings.get("postprocess", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
         component_means_t = _component_metric_means_for_stability(
             pred_prob_t,
             pred_bin_t,
@@ -601,6 +614,8 @@ def _compute_threshold_stability_metrics(
             gt_component_templates=gt_component_templates,
             connectivity=betti_connectivity,
         )
+        if timings is not None:
+            timings["component_means"] = timings.get("component_means", 0.0) + (time.perf_counter() - t0)
         dice_hard_vals.append(float(component_means_t["dice_hard"]))
         dice_soft_vals.append(float(component_means_t["dice_soft"]))
         voi_vals.append(float(component_means_t["voi"]))
@@ -637,6 +652,7 @@ def _save_skeleton_images(
     skel_gt: np.ndarray,
     pred_bin_clean: np.ndarray,
     skel_pred: Optional[np.ndarray],
+    skeleton_thinning_type: str,
 ) -> Optional[np.ndarray]:
     os.makedirs(output_dir, exist_ok=True)
     safe_seg = str(fragment_id).replace("/", "_")
@@ -647,12 +663,105 @@ def _save_skeleton_images(
         from PIL import Image
 
         if skel_pred is None:
-            skel_pred = skeletonize_binary(pred_bin_clean)
+            skel_pred = skeletonize_binary(pred_bin_clean, thinning_type=skeleton_thinning_type)
         pred_img = (skel_pred.astype(np.uint8) * 255)
         gt_img = (skel_gt.astype(np.uint8) * 255)
         Image.fromarray(pred_img).save(pred_path)
         Image.fromarray(gt_img).save(gt_path)
     return skel_pred
+
+
+def _save_stitched_eval_inputs(
+    *,
+    stitched_inputs_output_dir: str,
+    fragment_id: str,
+    downsample: int,
+    eval_epoch: Optional[int],
+    threshold: float,
+    component_min_area: int,
+    pred_prob: np.ndarray,
+    pred_bin_threshold: np.ndarray,
+    pred_bin_postprocess: np.ndarray,
+    gt_bin: np.ndarray,
+    eval_mask: np.ndarray,
+    roi_offset: Tuple[int, int],
+    crop_offset: Tuple[int, int],
+    full_offset: Tuple[int, int],
+    full_shape: Tuple[int, int],
+) -> None:
+    import json as _json
+    from PIL import Image
+
+    safe_seg = str(fragment_id).replace("/", "_")
+    thr_tag = str(float(threshold)).replace(".", "p")
+    crop_h, crop_w = [int(v) for v in pred_prob.shape]
+    full_off_y, full_off_x = [int(v) for v in full_offset]
+    crop_key = f"fulloff_y{full_off_y}_x{full_off_x}_h{crop_h}_w{crop_w}"
+    segment_dir = osp.join(stitched_inputs_output_dir, safe_seg, f"ds{int(downsample)}", crop_key)
+    epoch_tag = "epoch_unknown" if eval_epoch is None else f"epoch_{int(eval_epoch):04d}"
+    epoch_dir = osp.join(segment_dir, epoch_tag)
+    threshold_dir = osp.join(epoch_dir, "thresholds", f"thr_{thr_tag}")
+    os.makedirs(segment_dir, exist_ok=True)
+    os.makedirs(epoch_dir, exist_ok=True)
+    os.makedirs(threshold_dir, exist_ok=True)
+
+    pred_prob_path = osp.join(epoch_dir, "pred_prob_eval_crop.png")
+    gt_path = osp.join(segment_dir, "gt_eval_crop.png")
+    eval_mask_path = osp.join(epoch_dir, "eval_mask_crop.png")
+    meta_path = osp.join(segment_dir, "eval_crop_meta.json")
+    epoch_meta_path = osp.join(epoch_dir, "epoch_meta.json")
+    pred_bin_threshold_path = osp.join(threshold_dir, "pred_bin_threshold_eval_crop.png")
+    pred_bin_postprocess_path = osp.join(threshold_dir, "pred_bin_postprocess_eval_crop.png")
+    postprocess_meta_path = osp.join(threshold_dir, "postprocess_meta.json")
+
+    pred_prob_u8 = (np.clip(pred_prob, 0.0, 1.0) * 255.0).astype(np.uint8)
+    pred_bin_threshold_u8 = (pred_bin_threshold.astype(np.uint8) * 255)
+    pred_bin_postprocess_u8 = (pred_bin_postprocess.astype(np.uint8) * 255)
+    gt_u8 = (gt_bin.astype(np.uint8) * 255)
+    eval_mask_u8 = (eval_mask.astype(np.uint8) * 255)
+    if not osp.exists(pred_prob_path):
+        Image.fromarray(pred_prob_u8).save(pred_prob_path)
+    if not osp.exists(eval_mask_path):
+        Image.fromarray(eval_mask_u8).save(eval_mask_path)
+    if not osp.exists(gt_path):
+        Image.fromarray(gt_u8).save(gt_path)
+
+    off_y, off_x = [int(v) for v in roi_offset]
+    crop_off_y, crop_off_x = [int(v) for v in crop_offset]
+    if not osp.exists(meta_path):
+        meta = {
+            "segment_id": str(fragment_id),
+            "downsample": int(downsample),
+            "roi_offset": [off_y, off_x],
+            "crop_offset": [crop_off_y, crop_off_x],
+            "full_offset": [full_off_y, full_off_x],
+            "full_shape": [int(full_shape[0]), int(full_shape[1])],
+            "crop_shape": [int(pred_prob.shape[0]), int(pred_prob.shape[1])],
+        }
+        with open(meta_path, "w") as f:
+            _json.dump(meta, f, indent=2)
+    if not osp.exists(epoch_meta_path):
+        epoch_meta = {
+            "segment_id": str(fragment_id),
+            "downsample": int(downsample),
+            "epoch": None if eval_epoch is None else int(eval_epoch),
+            "crop_shape": [int(pred_prob.shape[0]), int(pred_prob.shape[1])],
+        }
+        with open(epoch_meta_path, "w") as f:
+            _json.dump(epoch_meta, f, indent=2)
+    if (
+        (not osp.exists(pred_bin_threshold_path))
+        or (not osp.exists(pred_bin_postprocess_path))
+        or (not osp.exists(postprocess_meta_path))
+    ):
+        Image.fromarray(pred_bin_threshold_u8).save(pred_bin_threshold_path)
+        Image.fromarray(pred_bin_postprocess_u8).save(pred_bin_postprocess_path)
+        postprocess_meta = {
+            "threshold": float(threshold),
+            "component_min_area": int(component_min_area),
+        }
+        with open(postprocess_meta_path, "w") as f:
+            _json.dump(postprocess_meta, f, indent=2)
 
 
 def _log_timing(*, segment_id: str, downsample: int, cache_hit: bool, timings: Dict[str, float]) -> None:
@@ -702,15 +811,18 @@ def compute_stitched_metrics(
     component_worst_k: Optional[int] = 2,
     component_min_area: int = 0,
     component_pad: int = 5,
+    skeleton_thinning_type: str = "zhang_suen",
     enable_full_region_metrics: bool = False,
     threshold_grid: Optional[np.ndarray] = None,
     output_dir: Optional[str] = None,
     component_output_dir: Optional[str] = None,
+    stitched_inputs_output_dir: Optional[str] = None,
     save_skeleton_images: bool = True,
     save_component_debug_images: bool = False,
     component_debug_max_items: Optional[int] = None,
     gt_cache_max: Optional[int] = None,
     component_rows_collector: Optional[List[Dict[str, Any]]] = None,
+    eval_epoch: Optional[int] = None,
 ) -> Dict[str, float]:
     seg = str(fragment_id)
     pred_prob = np.asarray(pred_prob, dtype=np.float32)
@@ -743,6 +855,7 @@ def compute_stitched_metrics(
         tuple(pred_prob.shape),
         str(pred_has_digest),
         int(betti_connectivity),
+        str(skeleton_thinning_type),
     )
     cache = _gt_cache_get(cache_key)
     if cache is not None:
@@ -802,7 +915,7 @@ def compute_stitched_metrics(
         gt_lab, n_gt = _label_components(gt_bin, connectivity=betti_connectivity)
         gt_beta0 = int(n_gt)
         gt_beta1 = _count_holes_2d(gt_bin, connectivity=betti_connectivity)
-        skel_gt = skeletonize_binary(gt_bin)
+        skel_gt = skeletonize_binary(gt_bin, thinning_type=skeleton_thinning_type)
         cache_entry = {
             "gt_bin": gt_bin,
             "eval_mask": eval_mask,
@@ -842,12 +955,14 @@ def compute_stitched_metrics(
         return_labels=True,
     )
     _timeit("postprocess_and_confusion", t0)
+    pred_bin_threshold = np.logical_and(pred_prob >= float(threshold), eval_mask)
 
     skel_pred: Optional[np.ndarray] = None
 
     out: Dict[str, float] = {}
     if enable_full_region_metrics:
         t0 = time.perf_counter()
+        full_region_timings: Dict[str, float] = {}
         full_region_out, skel_pred = _compute_full_region_metrics(
             pred_bin_clean=pred_bin_clean,
             pred_prob_clean=pred_prob_clean,
@@ -860,9 +975,13 @@ def compute_stitched_metrics(
             gt_beta0=int(gt_beta0),
             gt_beta1=int(gt_beta1),
             skel_gt=skel_gt,
+            skeleton_thinning_type=skeleton_thinning_type,
+            timings=full_region_timings,
         )
         out.update(full_region_out)
         _timeit("full_region_metrics", t0)
+        for key, value in full_region_timings.items():
+            timings[f"full_region_metrics/{key}"] = timings.get(f"full_region_metrics/{key}", 0.0) + float(value)
 
     t0 = time.perf_counter()
     gt_component_templates = cache_entry["gt_component_templates"]
@@ -873,9 +992,11 @@ def compute_stitched_metrics(
             int(n_gt),
             connectivity=betti_connectivity,
             pad=pad_i,
+            skeleton_thinning_type=skeleton_thinning_type,
         )
         cache_entry["gt_component_templates"] = gt_component_templates
         cache_entry["gt_component_pad"] = int(pad_i)
+    component_metric_timings: Dict[str, float] = {}
     component_rows, component_metric_stats, component_metric_rankings = component_metrics_by_gt_bbox(
         pred_prob_clean,
         pred_bin_clean,
@@ -890,6 +1011,8 @@ def compute_stitched_metrics(
         gt_lab=gt_lab,
         n_gt=n_gt,
         gt_component_templates=gt_component_templates,
+        skeleton_thinning_type=skeleton_thinning_type,
+        timings=component_metric_timings,
     )
     for metric_name, stats in component_metric_stats.items():
         out.update({f"components/{metric_name}_{k}": float(v) for k, v in stats.items()})
@@ -915,11 +1038,34 @@ def compute_stitched_metrics(
         for out_key, comp_metric in alias_map.items():
             out[out_key] = float(out[f"components/{comp_metric}_mean"])
     _timeit("components_metrics", t0)
+    for key, value in component_metric_timings.items():
+        timings[f"components_metrics/{key}"] = timings.get(f"components_metrics/{key}", 0.0) + float(value)
 
     off_y, off_x = [int(v) for v in roi_key]
     crop_off_y, crop_off_x = int(y0), int(x0)
     full_off_y = int(off_y + crop_off_y)
     full_off_x = int(off_x + crop_off_x)
+
+    if stitched_inputs_output_dir:
+        t0 = time.perf_counter()
+        _save_stitched_eval_inputs(
+            stitched_inputs_output_dir=stitched_inputs_output_dir,
+            fragment_id=fragment_id,
+            downsample=ds,
+            eval_epoch=eval_epoch,
+            threshold=float(threshold),
+            component_min_area=component_min_area,
+            pred_prob=pred_prob,
+            pred_bin_threshold=pred_bin_threshold,
+            pred_bin_postprocess=pred_bin_clean,
+            gt_bin=gt_bin,
+            eval_mask=eval_mask,
+            roi_offset=(off_y, off_x),
+            crop_offset=(crop_off_y, crop_off_x),
+            full_offset=(full_off_y, full_off_x),
+            full_shape=pred_full_shape,
+        )
+        _timeit("stitched_inputs_dump", t0)
 
     components_manifest, rows_by_id = _build_components_manifest(
         component_rows=component_rows,
@@ -965,6 +1111,7 @@ def compute_stitched_metrics(
 
     if threshold_grid is not None and len(threshold_grid):
         t0 = time.perf_counter()
+        threshold_stability_timings: Dict[str, float] = {}
         out.update(
             _compute_threshold_stability_metrics(
                 threshold_grid=np.asarray(threshold_grid, dtype=np.float32),
@@ -974,9 +1121,12 @@ def compute_stitched_metrics(
                 component_min_area=component_min_area,
                 gt_bin=gt_bin,
                 gt_component_templates=gt_component_templates,
+                timings=threshold_stability_timings,
             )
         )
         _timeit("threshold_stability", t0)
+        for key, value in threshold_stability_timings.items():
+            timings[f"threshold_stability/{key}"] = timings.get(f"threshold_stability/{key}", 0.0) + float(value)
 
     if output_dir is not None and save_skeleton_images:
         skel_pred = _save_skeleton_images(
@@ -986,6 +1136,7 @@ def compute_stitched_metrics(
             skel_gt=skel_gt,
             pred_bin_clean=pred_bin_clean,
             skel_pred=skel_pred,
+            skeleton_thinning_type=skeleton_thinning_type,
         )
 
     _log_timing(segment_id=seg, downsample=ds, cache_hit=cache_hit, timings=timings)

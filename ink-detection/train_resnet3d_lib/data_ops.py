@@ -52,27 +52,25 @@ def _read_gray(path):
         raise RuntimeError(f"Could not read image: {path}. Attempts: {' | '.join(errors)}") from exc
 
 
-def read_image_layers(
-    fragment_id,
-    start_idx=15,
-    end_idx=45,
-    *,
-    layer_range=None,
-):
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-    layers_dir = osp.join(dataset_root, fragment_id, "layers")
-    layer_exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
+def _parse_layer_range(fragment_id, layer_range):
+    if layer_range is None:
+        raise KeyError(f"{fragment_id}: missing required segments metadata key 'layer_range'")
+    if not isinstance(layer_range, (list, tuple)) or len(layer_range) != 2:
+        raise TypeError(
+            f"{fragment_id}: layer_range must be a [start_idx, end_idx] pair, got {layer_range!r}"
+        )
 
-    def _iter_layer_paths(layer_idx):
-        # Support 00.tif, 000.tif, 0000.tif, etc.
-        for fmt in (f"{layer_idx:02}", f"{layer_idx:03}", f"{layer_idx:04}", str(layer_idx)):
-            for ext in layer_exts:
-                yield osp.join(layers_dir, f"{fmt}{ext}")
+    start_idx = int(layer_range[0])
+    end_idx = int(layer_range[1])
+    if end_idx <= start_idx:
+        raise ValueError(f"{fragment_id}: layer_range must satisfy end_idx > start_idx, got {layer_range!r}")
+    return start_idx, end_idx
 
-    if layer_range is not None:
-        start_idx, end_idx = layer_range
 
-    idxs = list(range(int(start_idx), int(end_idx)))
+def _compute_selected_layer_indices(fragment_id, layer_range):
+    start_idx, end_idx = _parse_layer_range(fragment_id, layer_range)
+
+    idxs = list(range(start_idx, end_idx))
     if len(idxs) < CFG.in_chans:
         raise ValueError(
             f"{fragment_id}: expected at least {CFG.in_chans} layers, got {len(idxs)} from range {start_idx}-{end_idx}"
@@ -84,6 +82,25 @@ def read_image_layers(
         raise ValueError(
             f"{fragment_id}: expected {CFG.in_chans} layers after cropping, got {len(idxs)} from range {start_idx}-{end_idx}"
         )
+    return [int(i) for i in idxs]
+
+
+def read_image_layers(
+    fragment_id,
+    *,
+    layer_range,
+):
+    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
+    layers_dir = osp.join(dataset_root, fragment_id, "layers")
+    layer_exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
+
+    def _iter_layer_paths(layer_idx):
+        # Support 00.tif, 000.tif, 0000.tif, etc.
+        for fmt in (f"{layer_idx:02}", f"{layer_idx:03}", f"{layer_idx:04}", str(layer_idx)):
+            for ext in layer_exts:
+                yield osp.join(layers_dir, f"{fmt}{ext}")
+
+    idxs = _compute_selected_layer_indices(fragment_id, layer_range)
 
     layer_read_workers = int(getattr(CFG, "layer_read_workers", 1) or 1)
     layer_read_workers = max(1, min(layer_read_workers, len(idxs)))
@@ -168,8 +185,6 @@ def read_image_layers(
 
 def read_image_mask(
     fragment_id,
-    start_idx=15,
-    end_idx=45,
     *,
     layer_range=None,
     reverse_layers=False,
@@ -180,8 +195,6 @@ def read_image_mask(
     if images is None:
         images = read_image_layers(
             fragment_id,
-            start_idx=start_idx,
-            end_idx=end_idx,
             layer_range=layer_range,
         )
 
@@ -316,27 +329,6 @@ def read_image_fragment_mask(
     return images, fragment_mask
 
 
-def _compute_selected_layer_indices(fragment_id, layer_range=None):
-    start_idx = 15
-    end_idx = 45
-    if layer_range is not None:
-        start_idx, end_idx = layer_range
-
-    idxs = list(range(int(start_idx), int(end_idx)))
-    if len(idxs) < CFG.in_chans:
-        raise ValueError(
-            f"{fragment_id}: expected at least {CFG.in_chans} layers, got {len(idxs)} from range {start_idx}-{end_idx}"
-        )
-    if len(idxs) > CFG.in_chans:
-        start = max(0, (len(idxs) - CFG.in_chans) // 2)
-        idxs = idxs[start:start + CFG.in_chans]
-    if len(idxs) != CFG.in_chans:
-        raise ValueError(
-            f"{fragment_id}: expected {CFG.in_chans} layers after cropping, got {len(idxs)} from range {start_idx}-{end_idx}"
-        )
-    return [int(i) for i in idxs]
-
-
 def _looks_like_zarr_store(path: str) -> bool:
     if not osp.exists(path):
         return False
@@ -388,7 +380,7 @@ class ZarrSegmentVolume:
         fragment_id,
         seg_meta,
         *,
-        layer_range=None,
+        layer_range,
         reverse_layers=False,
     ):
         _ensure_zarr_v2()
@@ -463,18 +455,13 @@ class ZarrSegmentVolume:
         if len(layer_indices) == 0:
             raise ValueError(f"{self.fragment_id}: no selected layers for zarr volume")
 
-        if max(layer_indices) >= int(n_layers):
-            # Support 1-based layer ranges mapped onto 0-based zarr depth.
-            if min(layer_indices) >= 1 and (max(layer_indices) - 1) < int(n_layers):
-                layer_indices = [int(i - 1) for i in layer_indices]
-            else:
-                raise ValueError(
-                    f"{self.fragment_id}: selected layer indices out of bounds for zarr depth={n_layers}. "
-                    f"indices={layer_indices[:5]}...{layer_indices[-5:]}"
-                )
-
-        if min(layer_indices) < 0:
-            raise ValueError(f"{self.fragment_id}: negative layer index in {layer_indices}")
+        min_idx = int(min(layer_indices))
+        max_idx = int(max(layer_indices))
+        if min_idx < 0 or max_idx >= int(n_layers):
+            raise ValueError(
+                f"{self.fragment_id}: selected layer indices out of bounds for zarr depth={n_layers}. "
+                f"expected 0-based indices in [0, {int(n_layers) - 1}], got min={min_idx}, max={max_idx}"
+            )
 
         li = np.asarray(layer_indices, dtype=np.int64)
         layer_read_mode = "fancy"
@@ -925,15 +912,33 @@ def _xy_to_bounds(xy):
     return x1, y1, x2, y2
 
 
-def _fourth_augment(image, in_chans):
+def _fourth_augment(image, cfg):
+    in_chans = int(cfg.in_chans)
+    if in_chans <= 0:
+        raise ValueError(f"in_chans must be > 0 for fourth augment, got {in_chans}")
+    if image.shape[-1] != in_chans:
+        raise ValueError(
+            f"fourth augment expected image with {in_chans} channels, got shape {tuple(image.shape)}"
+        )
+
+    min_crop_ratio = float(cfg.fourth_augment_min_crop_ratio)
+    max_crop_ratio = float(cfg.fourth_augment_max_crop_ratio)
+    if not (0.0 < min_crop_ratio <= max_crop_ratio <= 1.0):
+        raise ValueError(
+            "fourth augment crop ratios must satisfy 0 < min_crop_ratio <= max_crop_ratio <= 1, "
+            f"got min={min_crop_ratio}, max={max_crop_ratio}"
+        )
+
     image_tmp = np.zeros_like(image)
-    max_crop = min(62, int(in_chans))
-    min_crop = min(56, max_crop)
-    if min_crop <= 0:
-        return image
+    min_crop = max(1, int(np.ceil(in_chans * min_crop_ratio)))
+    max_crop = max(1, int(np.floor(in_chans * max_crop_ratio)))
+    if min_crop > max_crop:
+        raise ValueError(
+            f"invalid fourth augment crop window for in_chans={in_chans}: min_crop={min_crop}, max_crop={max_crop}"
+        )
     cropping_num = random.randint(min_crop, max_crop)
 
-    max_start = max(0, int(in_chans) - cropping_num)
+    max_start = max(0, in_chans - cropping_num)
     start_idx = random.randint(0, max_start)
     crop_indices = np.arange(start_idx, start_idx + cropping_num)
 
@@ -942,19 +947,28 @@ def _fourth_augment(image, in_chans):
     tmp = np.arange(start_paste_idx, start_paste_idx + cropping_num)
     np.random.shuffle(tmp)
 
-    cutout_idx = random.randint(0, 2)
+    cutout_max_count = int(cfg.fourth_augment_cutout_max_count)
+    if cutout_max_count < 0:
+        raise ValueError(f"fourth_augment_cutout_max_count must be >= 0, got {cutout_max_count}")
+    cutout_idx = random.randint(0, min(cutout_max_count, cropping_num))
     temporal_random_cutout_idx = tmp[:cutout_idx]
 
     image_tmp[..., start_paste_idx:start_paste_idx + cropping_num] = image[..., crop_indices]
 
-    if random.random() > 0.4:
+    cutout_p = float(cfg.fourth_augment_cutout_p)
+    if not (0.0 <= cutout_p <= 1.0):
+        raise ValueError(f"fourth_augment_cutout_p must be in [0, 1], got {cutout_p}")
+    if random.random() < cutout_p:
         image_tmp[..., temporal_random_cutout_idx] = 0
     return image_tmp
 
 
-def _maybe_fourth_augment(image, in_chans):
-    if random.random() > 0.4:
-        return _fourth_augment(image, in_chans)
+def _maybe_fourth_augment(image, cfg):
+    p = float(cfg.fourth_augment_p)
+    if not (0.0 <= p <= 1.0):
+        raise ValueError(f"fourth_augment_p must be in [0, 1], got {p}")
+    if random.random() < p:
+        return _fourth_augment(image, cfg)
     return image
 
 
@@ -993,7 +1007,7 @@ class CustomDataset(Dataset):
             # image=image.transpose(0,2,1)#(c,w,h)
             # image=image.transpose(2,1,0)#(h,w,c)
 
-            image = _maybe_fourth_augment(image, self.cfg.in_chans)
+            image = _maybe_fourth_augment(image, self.cfg)
             image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
             return image, label, group_id
 
@@ -1115,7 +1129,7 @@ class LazyZarrTrainDataset(Dataset):
 
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
         label = self.masks[segment_id][y1:y2, x1:x2, None]
-        image = _maybe_fourth_augment(image, self.cfg.in_chans)
+        image = _maybe_fourth_augment(image, self.cfg)
         image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
 
         return image, label, group_id
