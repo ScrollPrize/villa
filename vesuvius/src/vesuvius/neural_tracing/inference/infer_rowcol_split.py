@@ -255,6 +255,15 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
     overlap_frac = float(overlap_frac)
     overlap_frac = max(0.0, min(overlap_frac, 0.99))
 
+    def _indices_fit_single_bbox(indices):
+        pts = edge[indices]
+        spans = pts.max(axis=0) - pts.min(axis=0)
+        return (
+            spans[0] <= (crop_size_arr[0] - 1) and
+            spans[1] <= (crop_size_arr[1] - 1) and
+            spans[2] <= (crop_size_arr[2] - 1)
+        )
+
     def _chunk_ordered_indices(ordered_indices):
         chunks = []
         if len(ordered_indices) == 0:
@@ -264,18 +273,18 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
             end = start + 1
             while end < len(ordered_indices):
                 candidate = ordered_indices[start:end + 1]
-                pts = edge[candidate]
-                spans = pts.max(axis=0) - pts.min(axis=0)
-                if (
-                    spans[0] <= (crop_size_arr[0] - 1) and
-                    spans[1] <= (crop_size_arr[1] - 1) and
-                    spans[2] <= (crop_size_arr[2] - 1)
-                ):
+                if _indices_fit_single_bbox(candidate):
                     end += 1
                     continue
                 break
             chunk = ordered_indices[start:end]
+            if len(chunk) == 0:
+                break
             chunks.append(chunk)
+            # Once a chunk reaches the side endpoint, further starts only create
+            # nested tail chunks that heavily overlap and can quantize to duplicates.
+            if end >= len(ordered_indices):
+                break
             chunk_len = len(chunk)
             overlap_count = int(round(chunk_len * overlap_frac))
             # Slide by (chunk - overlap) so adjacent bboxes share context.
@@ -284,19 +293,32 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
         return chunks
 
     center_idx = n_edge // 2
-    # center-out and two-sided: walk one side first (toward smaller indices), then the other side.
     first_side = np.arange(center_idx, -1, -1, dtype=np.int64)
-    second_side = np.arange(center_idx + 1, n_edge, dtype=np.int64)
+
+    first_chunks = _chunk_ordered_indices(first_side)
+    seam_overlap_count = 0
+    if first_chunks:
+        seam_overlap_count = int(round(len(first_chunks[0]) * overlap_frac))
+        seam_overlap_count = max(0, min(seam_overlap_count, center_idx + 1))
+    second_start = max(0, center_idx + 1 - seam_overlap_count)
+    second_side = np.arange(second_start, n_edge, dtype=np.int64)
+    second_chunks = _chunk_ordered_indices(second_side)
 
     bboxes = []
-    def _append_side_bboxes(ordered_indices):
-        for chunk in _chunk_ordered_indices(ordered_indices):
+    seen_bboxes = set()
+
+    def _append_chunks(chunks):
+        for chunk in chunks:
             pts = edge[chunk]
             center = (pts.min(axis=0) + pts.max(axis=0)) / 2
-            bboxes.append(_bbox_from_center(center, crop_size))
+            bbox = _bbox_from_center(center, crop_size)
+            if bbox in seen_bboxes:
+                continue
+            seen_bboxes.add(bbox)
+            bboxes.append(bbox)
 
-    _append_side_bboxes(first_side)
-    _append_side_bboxes(second_side)
+    _append_chunks(first_chunks)
+    _append_chunks(second_chunks)
 
     return bboxes, edge
 
@@ -700,6 +722,137 @@ def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
     else:
         rows = np.arange(r_min - mask_h, r_min, dtype=np.int64)
     return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
+
+
+def _build_edge_input_mask(cond_valid, cond_direction, edge_input_rowscols):
+    cond_valid = np.asarray(cond_valid, dtype=bool)
+    if cond_valid.ndim != 2:
+        raise ValueError(f"cond_valid must be 2D, got shape {cond_valid.shape}")
+
+    n_axis = int(edge_input_rowscols)
+    if n_axis < 1:
+        raise ValueError("edge_input_rowscols must be >= 1")
+
+    spec = _get_direction_spec(cond_direction)
+    edge_mask = np.zeros_like(cond_valid, dtype=bool)
+
+    if spec["axis"] == "col":
+        valid_axis = np.any(cond_valid, axis=0)
+        axis_indices = np.where(valid_axis)[0]
+        if axis_indices.size == 0:
+            return edge_mask
+        keep = min(n_axis, axis_indices.size)
+        keep_axis = axis_indices[-keep:] if spec["edge_idx"] == -1 else axis_indices[:keep]
+        edge_mask[:, keep_axis] = True
+    else:
+        valid_axis = np.any(cond_valid, axis=1)
+        axis_indices = np.where(valid_axis)[0]
+        if axis_indices.size == 0:
+            return edge_mask
+        keep = min(n_axis, axis_indices.size)
+        keep_axis = axis_indices[-keep:] if spec["edge_idx"] == -1 else axis_indices[:keep]
+        edge_mask[keep_axis, :] = True
+
+    return cond_valid & edge_mask
+
+
+def compute_edge_one_shot_extrapolation(
+    cond_zyxs,
+    cond_valid,
+    uv_cond,
+    grow_direction,
+    edge_input_rowscols,
+    cond_pct,
+    method="rbf",
+    min_corner=None,
+    crop_size=None,
+    degrade_prob=0.0,
+    degrade_curvature_range=(0.001, 0.01),
+    degrade_gradient_range=(0.05, 0.2),
+    skip_bounds_check=True,
+    **method_kwargs,
+):
+    cond_zyxs = np.asarray(cond_zyxs)
+    uv_cond = np.asarray(uv_cond)
+    if cond_zyxs.shape[:2] != uv_cond.shape[:2]:
+        raise ValueError(
+            f"cond_zyxs and uv_cond must share HxW; got {cond_zyxs.shape[:2]} vs {uv_cond.shape[:2]}"
+        )
+
+    if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
+        cond_valid_base = np.asarray(cond_valid, dtype=bool)
+    else:
+        cond_valid_base = _valid_surface_mask(cond_zyxs)
+
+    if not cond_valid_base.any():
+        return None
+
+    cond_direction, _ = _get_growth_context(grow_direction)
+    edge_input_mask = _build_edge_input_mask(cond_valid_base, cond_direction, edge_input_rowscols)
+    if not edge_input_mask.any():
+        return None
+
+    uv_cond_full = uv_cond[cond_valid_base]
+    uv_query = _build_uv_query_from_cond_points(uv_cond_full, grow_direction, cond_pct)
+    if uv_query.size == 0:
+        return None
+
+    uv_edge = uv_cond[edge_input_mask]
+    zyx_edge = cond_zyxs[edge_input_mask]
+
+    min_corner_arr = (
+        np.asarray(min_corner, dtype=np.float64)
+        if min_corner is not None
+        else np.zeros(3, dtype=np.float64)
+    )
+    if min_corner_arr.shape != (3,):
+        raise ValueError(f"min_corner must have shape (3,), got {min_corner_arr.shape}")
+
+    if crop_size is None:
+        if not skip_bounds_check:
+            raise ValueError("crop_size is required when skip_bounds_check=False")
+        crop_size_use = (1, 1, 1)
+    else:
+        crop_size_use = tuple(int(v) for v in crop_size)
+
+    extrap_result = compute_extrapolation_infer(
+        uv_cond=uv_edge,
+        zyx_cond=zyx_edge,
+        uv_query=uv_query,
+        min_corner=min_corner_arr,
+        crop_size=crop_size_use,
+        method=method,
+        cond_direction=cond_direction,
+        degrade_prob=degrade_prob,
+        degrade_curvature_range=degrade_curvature_range,
+        degrade_gradient_range=degrade_gradient_range,
+        skip_bounds_check=skip_bounds_check,
+        **method_kwargs,
+    )
+    if extrap_result is None:
+        extrap_local = np.zeros((0, 3), dtype=np.float32)
+        extrap_surface = None
+    else:
+        extrap_local = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float32)
+        extrap_surface = extrap_result["extrap_surface"]
+
+    if extrap_local.size == 0:
+        extrap_world = np.zeros((0, 3), dtype=np.float32)
+    else:
+        extrap_world = extrap_local + min_corner_arr[None, :].astype(np.float32, copy=False)
+
+    return {
+        "cond_direction": cond_direction,
+        "edge_input_mask": edge_input_mask,
+        "edge_uv": uv_edge.astype(np.float64, copy=False),
+        "edge_zyx": zyx_edge.astype(np.float32, copy=False),
+        "uv_query": uv_query,
+        "uv_query_flat": uv_query.reshape(-1, 2),
+        "min_corner": min_corner_arr,
+        "extrap_coords_local": extrap_local,
+        "extrap_coords_world": extrap_world,
+        "extrap_surface": extrap_surface,
+    }
 
 
 def build_bbox_crop_data(args, bboxes, cond_zyxs, cond_valid, uv_cond, grow_direction, crop_size, tgt_segment,
