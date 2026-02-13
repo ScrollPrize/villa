@@ -105,9 +105,10 @@ target_link_libraries(vc_ced2d
     OpenMP::OpenMP_CXX
 )
 
-# Apply affine + scale to OBJ or TIFXYZ
+# Apply affine + scale to OBJ, single TIFXYZ, or batch TIFXYZ subfolders
 add_executable(vc_transform_geom src/vc_transform_geom.cpp)
 target_link_libraries(vc_transform_geom vc_core Boost::program_options)
+
 
 add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.cpp)
 target_link_libraries(vc_gen_normalgrids vc_core z5 Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)

@@ -1,6 +1,7 @@
 // vc_transform_geom.cpp
 // Small utility to apply an affine (and optional scale-segmentation) to
-// either OBJ or TIFXYZ geometry, writing the transformed result.
+// OBJ geometry, a single TIFXYZ mesh, or a directory of TIFXYZ subfolders,
+// writing the transformed result.
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -10,6 +11,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -28,9 +30,20 @@ struct AffineTransform {
 
 static AffineTransform load_affine_json(const std::string& filename) {
     AffineTransform t;
+    const std::filesystem::path p(filename);
+    if (!std::filesystem::exists(p))
+        throw std::runtime_error("affine path does not exist: " + filename);
+    if (!std::filesystem::is_regular_file(p))
+        throw std::runtime_error("affine path is not a regular file: " + filename);
+
     std::ifstream f(filename);
     if (!f.is_open()) throw std::runtime_error("cannot open affine file: " + filename);
-    json j; f >> j;
+    json j;
+    try {
+        f >> j;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("failed to parse affine file '" + filename + "': " + e.what());
+    }
     if (!j.contains("transformation_matrix")) return t; // identity
     auto mat = j["transformation_matrix"];
     if (mat.size() != 3 && mat.size() != 4) throw std::runtime_error("affine must be 3x4 or 4x4");
@@ -44,6 +57,33 @@ static AffineTransform load_affine_json(const std::string& filename) {
             throw std::runtime_error("bottom row must be [0,0,0,1]");
     }
     return t;
+}
+
+
+
+static bool invert_affine_in_place(AffineTransform& T) {
+    cv::Mat A(3, 3, CV_64F), Ainv;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            A.at<double>(r, c) = T.M(r, c);
+
+    if (cv::invert(A, Ainv, cv::DECOMP_LU) < 1e-12) return false;
+
+    cv::Matx33d Ai;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            Ai(r, c) = Ainv.at<double>(r, c);
+
+    cv::Vec3d t(T.M(0,3), T.M(1,3), T.M(2,3));
+    cv::Vec3d ti = -(Ai * t);
+
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) T.M(r, c) = Ai(r, c);
+        T.M(r, 3) = ti(r);
+    }
+    T.M(3,0) = T.M(3,1) = T.M(3,2) = 0.0;
+    T.M(3,3) = 1.0;
+    return true;
 }
 
 static inline cv::Vec3f apply_affine_point(const cv::Vec3f& p, const AffineTransform& A) {
@@ -86,10 +126,8 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
-        if (invert) {
-            cv::Mat inv = cv::Mat(AA->M).inv();
-            if (inv.empty()) { std::cerr << "non-invertible affine" << std::endl; return 2; }
-            inv.copyTo(AA->M);
+        if (invert && !invert_affine_in_place(*AA)) {
+            std::cerr << "non-invertible affine" << std::endl; return 2;
         }
     }
 
@@ -110,6 +148,17 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         }
     }
 
+    if (AA) {
+        cv::Mat_<cv::Vec3f>* N = surf->rawNormalsPtr();
+        for (int j = 0; j < N->rows; ++j) {
+            for (int i = 0; i < N->cols; ++i) {
+                cv::Vec3f& n = (*N)(j,i);
+                if (std::isnan(n[0])) continue;
+                n = transform_normal(n, *AA);
+            }
+        }
+    }
+
     try {
         std::filesystem::path out = outDir;
         surf->save(out);
@@ -117,6 +166,51 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         std::cerr << "failed to save tifxyz: " << e.what() << std::endl; return 4;
     }
     return 0;
+}
+
+static int run_tifxyz_batch(const std::filesystem::path& inRoot,
+                            const std::filesystem::path& outRoot,
+                            const AffineTransform* A,
+                            bool invert,
+                            double scale_seg)
+{
+    if (std::filesystem::exists(outRoot)) {
+        std::cerr << "output directory already exists: " << outRoot << std::endl;
+        return 1;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(outRoot, ec);
+    if (ec) {
+        std::cerr << "failed to create output directory: " << outRoot << std::endl;
+        return 1;
+    }
+
+    int found = 0;
+    int ok = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(inRoot)) {
+        if (!entry.is_directory()) continue;
+        const auto& sub = entry.path();
+        if (!is_tifxyz_dir(sub)) continue;
+
+        found++;
+        const auto out = outRoot / sub.filename();
+        const int rc = run_tifxyz(sub, out, A, invert, scale_seg);
+        if (rc == 0) {
+            ok++;
+            std::cout << "[ok] " << sub.filename() << std::endl;
+        } else {
+            std::cerr << "[fail] " << sub.filename() << " (exit " << rc << ")" << std::endl;
+        }
+    }
+
+    if (found == 0) {
+        std::cerr << "No tifxyz subfolders found under: " << inRoot << std::endl;
+        return 1;
+    }
+
+    std::cout << "Processed " << ok << "/" << found << " tifxyz folders." << std::endl;
+    return ok == found ? 0 : 1;
 }
 
 static bool starts_with(const std::string& s, const char* pfx) {
@@ -132,10 +226,8 @@ static int run_obj(const std::filesystem::path& inFile,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
-        if (invert) {
-            cv::Mat inv = cv::Mat(AA->M).inv();
-            if (inv.empty()) { std::cerr << "non-invertible affine" << std::endl; return 2; }
-            inv.copyTo(AA->M);
+        if (invert && !invert_affine_in_place(*AA)) {
+            std::cerr << "non-invertible affine" << std::endl; return 2;
         }
     }
 
@@ -183,8 +275,8 @@ int main(int argc, char** argv) {
         po::options_description desc("Options");
         desc.add_options()
             ("help,h", "Show help")
-            ("input,i",  po::value<std::string>()->required(), "Input path: OBJ file or TIFXYZ dir")
-            ("output,o", po::value<std::string>()->required(), "Output: OBJ file or TIFXYZ dir (must not exist)")
+            ("input,i",  po::value<std::string>()->required(), "Input path: OBJ file, TIFXYZ dir, or dir containing TIFXYZ subfolders")
+            ("output,o", po::value<std::string>()->required(), "Output path (required): OBJ file, TIFXYZ dir, or output root for batch")
             ("affine,a", po::value<std::string>(), "Affine JSON with 'transformation_matrix'")
             ("invert",   po::bool_switch()->default_value(false), "Invert the affine")
             ("scale-segmentation", po::value<double>()->default_value(1.0), "Pre-scale applied to coordinates (uniform)")
@@ -209,12 +301,17 @@ int main(int argc, char** argv) {
             A = std::make_unique<AffineTransform>(load_affine_json(vm["affine"].as<std::string>()));
         }
 
-        // Determine input type and route
+        // Determine input type and route:
+        // 1) single TIFXYZ dir, 2) batch TIFXYZ root dir, 3) OBJ file.
         if (is_tifxyz_dir(inPath)) {
             if (std::filesystem::exists(outPath)) {
                 std::cerr << "output directory already exists: " << outPath << std::endl; return 1;
             }
             return run_tifxyz(inPath, outPath, A.get(), invert, scale_seg);
+        }
+
+        if (std::filesystem::is_directory(inPath)) {
+            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_seg);
         }
 
         if (inPath.extension() == ".obj") {
@@ -224,7 +321,7 @@ int main(int argc, char** argv) {
             return run_obj(inPath, outPath, A.get(), invert, scale_seg);
         }
 
-        std::cerr << "Unknown input type. Provide a .obj file or a TIFXYZ directory (containing x.tif,y.tif,z.tif)." << std::endl;
+        std::cerr << "Unknown input type. Provide a .obj file, a TIFXYZ directory, or a directory containing TIFXYZ subfolders." << std::endl;
         return 1;
     } catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << std::endl; return 1;
