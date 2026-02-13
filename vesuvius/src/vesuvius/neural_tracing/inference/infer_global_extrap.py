@@ -7,7 +7,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import zarr
+from tqdm import tqdm
 
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.common import (
@@ -31,7 +33,6 @@ from vesuvius.neural_tracing.inference.infer_rowcol_split import (
     _resolve_segment_volume,
     _stored_to_full_bounds,
     compute_edge_one_shot_extrapolation,
-    compute_extrapolation_infer,
     compute_window_and_split,
     get_cond_edge_bboxes,
     load_model,
@@ -39,6 +40,18 @@ from vesuvius.neural_tracing.inference.infer_rowcol_split import (
     setup_segment,
 )
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
+
+
+def _parse_optional_tta_outlier_drop_thresh(value):
+    text = str(value).strip()
+    if text.lower() == "none":
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--tta-outlier-drop-thresh must be a positive float or 'none'."
+        ) from exc
 
 
 def parse_args():
@@ -79,6 +92,14 @@ def parse_args():
         action="store_true",
         help="Skip displacement model forward pass even if --checkpoint-path is provided.",
     )
+    parser.add_argument(
+        "--extrap-only",
+        action="store_true",
+        help=(
+            "Iterative extrapolation-only mode: skip model inference and stacked displacement "
+            "sampling, and directly merge selected aggregated extrapolation rows/cols each iteration."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
@@ -102,9 +123,9 @@ def parse_args():
     )
     parser.add_argument(
         "--tta-outlier-drop-thresh",
-        type=float,
+        type=_parse_optional_tta_outlier_drop_thresh,
         default=1.25,
-        help="Outlier threshold multiplier for dropping inconsistent TTA variants.",
+        help="Outlier threshold multiplier for dropping inconsistent TTA variants; use 'none' to disable.",
     )
     parser.add_argument(
         "--tta-outlier-drop-min-keep",
@@ -119,23 +140,19 @@ def parse_args():
         help="Number of edge rows/cols from conditioning region to use in one-shot extrapolation.",
     )
     parser.add_argument(
-        "--safe-band-lines",
+        "--agg-extrap-lines",
         type=int,
         default=None,
         help=(
-            "Optional number of contiguous safe-band rows/cols (near->far) to sample from the stacked "
-            "displacement. If unset, samples all safe-band lines."
+            "Optional number of near->far rows/cols to sample from one-shot aggregated extrapolation. "
+            "If unset, samples all available lines."
         ),
     )
     parser.add_argument(
-        "--safe-line-min-coverage",
-        type=float,
-        default=0.995,
-        help=(
-            "Minimum per-line coverage ratio in one-shot support (inside bbox-union coverage) "
-            "to accept a safe line "
-            "(default: 0.995)."
-        ),
+        "--agg-extrap-min-stack-count",
+        type=int,
+        default=1,
+        help="Minimum stacked-field support count required for an aggregated extrapolation sample (default: 1).",
     )
     parser.add_argument(
         "--napari-downsample",
@@ -150,6 +167,11 @@ def parse_args():
         help="Point size for all Napari point layers (default: 1).",
     )
     parser.add_argument("--napari", action="store_true", help="Visualize bbox/full-edge conditioning and extrapolation.")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging and tables.",
+    )
     parser.set_defaults(tta=True)
     args = parser.parse_args()
 
@@ -161,10 +183,10 @@ def parse_args():
         parser.error("--batch-size must be >= 1")
     if args.iterations < 1:
         parser.error("--iterations must be >= 1")
-    if args.safe_band_lines is not None and args.safe_band_lines < 1:
-        parser.error("--safe-band-lines must be >= 1 when provided")
-    if args.safe_line_min_coverage <= 0.0 or args.safe_line_min_coverage > 1.0:
-        parser.error("--safe-line-min-coverage must be in (0, 1].")
+    if args.agg_extrap_lines is not None and args.agg_extrap_lines < 1:
+        parser.error("--agg-extrap-lines must be >= 1 when provided")
+    if args.agg_extrap_min_stack_count < 1:
+        parser.error("--agg-extrap-min-stack-count must be >= 1")
     if args.napari_downsample < 1:
         parser.error("--napari-downsample must be >= 1")
     if args.napari_point_size <= 0:
@@ -232,22 +254,26 @@ def _build_bbox_crops(
     uv_cond,
     grow_direction,
     crop_size,
-    extrapolation_settings,
     cond_pct,
+    one_map,
 ):
-    cond_direction, _ = _get_growth_context(grow_direction)
     cond_valid_base = np.asarray(cond_valid, dtype=bool)
+    cond_zyxs64 = np.asarray(cond_zyxs, dtype=np.float64)
     crop_size = tuple(int(v) for v in crop_size)
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
+    one_map = one_map if isinstance(one_map, dict) else {}
+    one_map_get = one_map.get
 
     bbox_crops = []
 
     for bbox_idx, bbox in enumerate(bboxes):
         min_corner, _ = _bbox_to_min_corner_and_bounds_array(bbox)
+        min_corner32 = min_corner.astype(np.float32, copy=False)
         vol_crop = _crop_volume_from_min_corner(volume_for_crops, min_corner, crop_size)
         vol_crop = normalize_zscore(vol_crop)
 
-        cond_grid_local = cond_zyxs.astype(np.float64, copy=False) - min_corner[None, None, :]
+        cond_grid_local = cond_zyxs64 - min_corner[None, None, :]
         cond_grid_valid = cond_valid_base.copy()
         cond_grid_valid &= _grid_in_bounds_mask(cond_grid_local, crop_size)
 
@@ -258,36 +284,27 @@ def _build_bbox_crops(
         uv_query = _build_uv_query_from_cond_points(cond_uv, grow_direction, cond_pct)
         uv_query_flat = uv_query.reshape(-1, 2).astype(np.float64, copy=False)
 
-        extrap_local = np.zeros((0, 3), dtype=np.float32)
-        extrap_uv = np.zeros((0, 2), dtype=np.float64)
-        extrap_world = np.zeros((0, 3), dtype=np.float32)
-        if uv_query.size > 0 and len(cond_uv) > 0:
-            extrap_result = compute_extrapolation_infer(
-                uv_cond=cond_uv,
-                zyx_cond=cond_world,
-                uv_query=uv_query,
-                min_corner=min_corner,
-                crop_size=crop_size,
-                method=extrapolation_settings["method"],
-                cond_direction=cond_direction,
-                degrade_prob=extrapolation_settings["degrade_prob"],
-                degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
-                degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
-                skip_bounds_check=True,
-                **extrapolation_settings["method_kwargs"],
-            )
-            if extrap_result is not None:
-                extrap_local_full = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float32)
-                if extrap_local_full.shape[0] != uv_query_flat.shape[0]:
-                    raise ValueError(
-                        f"bbox {bbox_idx} extrapolation count mismatch: "
-                        f"{extrap_local_full.shape[0]} coords for {uv_query_flat.shape[0]} UV queries"
-                    )
-                extrap_world_full = extrap_local_full + min_corner[None, :].astype(np.float32)
-                extrap_valid = np.isfinite(extrap_world_full).all(axis=1)
-                extrap_local = extrap_local_full[extrap_valid].astype(np.float32, copy=False)
-                extrap_uv = uv_query_flat[extrap_valid].astype(np.float64, copy=False)
-                extrap_world = extrap_world_full[extrap_valid].astype(np.float32, copy=False)
+        extrap_uv_list = []
+        extrap_world_list = []
+        for uv in uv_query_flat:
+            uv_key = (int(uv[0]), int(uv[1]))
+            pt = one_map_get(uv_key)
+            if pt is None:
+                continue
+            pt_arr = np.asarray(pt)
+            if not np.isfinite(pt_arr).all():
+                continue
+            extrap_uv_list.append((float(uv_key[0]), float(uv_key[1])))
+            extrap_world_list.append(pt_arr.astype(np.float32, copy=False))
+
+        if extrap_world_list:
+            extrap_uv = np.asarray(extrap_uv_list, dtype=np.float64)
+            extrap_world = np.asarray(extrap_world_list, dtype=np.float32)
+            extrap_local = extrap_world - min_corner32[None, :]
+        else:
+            extrap_uv = np.zeros((0, 2), dtype=np.float64)
+            extrap_world = np.zeros((0, 3), dtype=np.float32)
+            extrap_local = np.zeros((0, 3), dtype=np.float32)
         extrap_vox = _points_to_voxels(extrap_local, crop_size)
 
         bbox_crops.append(
@@ -295,10 +312,11 @@ def _build_bbox_crops(
                 "bbox_idx": bbox_idx,
                 "bbox": bbox,
                 "min_corner": min_corner.astype(np.int64, copy=False),
-                "crop_size": np.asarray(crop_size, dtype=np.int64),
+                "crop_size": crop_size_arr.copy(),
                 "volume": vol_crop,
                 "cond_vox": cond_vox,
                 "extrap_vox": extrap_vox,
+                "extrap_uv": extrap_uv.astype(np.int64, copy=False),
                 "cond_world_zyx": cond_world,
                 "extrap_world_zyx": extrap_world,
                 "n_cond": int(cond_uv.shape[0]),
@@ -325,7 +343,7 @@ def _build_bbox_results_from_crops(bbox_crops):
     return bbox_results
 
 
-def _run_bbox_displacement_inference(args, bbox_crops, model_state):
+def _run_bbox_displacement_inference(args, bbox_crops, model_state, verbose=True):
     expected_in_channels = int(model_state["expected_in_channels"])
     if expected_in_channels != 3:
         raise RuntimeError(
@@ -374,7 +392,8 @@ def _run_bbox_displacement_inference(args, bbox_crops, model_state):
                 }
             )
         done = (batch_start // batch_size) + 1
-        print(f"{desc}: batch {done}/{n_batches}")
+        if verbose:
+            print(f"{desc}: batch {done}/{n_batches}")
 
     return per_crop_fields
 
@@ -417,8 +436,7 @@ def _stack_displacements_to_global(per_crop_fields):
             disp_block += disp
             count_block += 1
         else:
-            for ch in range(3):
-                disp_block[ch][finite_mask] += disp[ch][finite_mask]
+            disp_block[:, finite_mask] += disp[:, finite_mask]
             count_block[finite_mask] += 1
 
     disp_global = np.zeros_like(disp_sum, dtype=np.float32)
@@ -443,7 +461,9 @@ def _stack_displacements_to_global(per_crop_fields):
     }
 
 
-def _print_stacked_displacement_debug(stacked):
+def _print_stacked_displacement_debug(stacked, verbose=True):
+    if not verbose:
+        return
     if stacked is None:
         print("== Displacement Stack ==")
         print("No displacement stack available.")
@@ -461,122 +481,276 @@ def _print_stacked_displacement_debug(stacked):
     print(f"max overlap count: {max_overlap}")
 
 
-def _sample_stacked_displacement_on_safe_band(stacked_displacement, one_map, safe_band, max_lines=None):
-    if stacked_displacement is None or not one_map or not isinstance(safe_band, dict):
-        return {
-            "uv": np.zeros((0, 2), dtype=np.int64),
-            "world": np.zeros((0, 3), dtype=np.float32),
-            "displacement": np.zeros((0, 3), dtype=np.float32),
-            "stack_count": np.zeros((0,), dtype=np.uint32),
-        }
+def _empty_stack_samples():
+    return {
+        "uv": np.zeros((0, 2), dtype=np.int64),
+        "world": np.zeros((0, 3), dtype=np.float32),
+        "displacement": np.zeros((0, 3), dtype=np.float32),
+        "stack_count": np.zeros((0,), dtype=np.uint32),
+    }
 
-    safe_uv_ordered = _select_safe_uv_for_sampling(safe_band, max_lines=max_lines)
-    if safe_uv_ordered.shape[0] == 0:
-        return {
-            "uv": np.zeros((0, 2), dtype=np.int64),
-            "world": np.zeros((0, 3), dtype=np.float32),
-            "displacement": np.zeros((0, 3), dtype=np.float32),
-            "stack_count": np.zeros((0,), dtype=np.uint32),
-        }
+
+def _agg_extrap_axis_metadata(grow_direction):
+    axis_idx = 1 if grow_direction in {"left", "right"} else 0
+    axis_name = "col" if axis_idx == 1 else "row"
+    _, growth_spec = _get_growth_context(grow_direction)
+    near_to_far_desc = int(growth_spec["growth_sign"]) < 0
+    return axis_idx, axis_name, near_to_far_desc
+
+
+def _finite_uv_from_one_map(one_map):
+    if not one_map:
+        return np.zeros((0, 2), dtype=np.int64)
+    finite_uv = []
+    for uv_key, pt in one_map.items():
+        if pt is None:
+            continue
+        pt_arr = np.asarray(pt)
+        if pt_arr.shape == (3,) and np.isfinite(pt_arr).all():
+            finite_uv.append((int(uv_key[0]), int(uv_key[1])))
+    if len(finite_uv) == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.asarray(finite_uv, dtype=np.int64).reshape(-1, 2)
+
+
+def _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None):
+    uv_ordered = _finite_uv_from_one_map(one_map)
+    if uv_ordered.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    axis_idx, _, near_to_far_desc = _agg_extrap_axis_metadata(grow_direction)
+    if axis_idx == 1:
+        primary = -uv_ordered[:, 1] if near_to_far_desc else uv_ordered[:, 1]
+        secondary = uv_ordered[:, 0]
+    else:
+        primary = -uv_ordered[:, 0] if near_to_far_desc else uv_ordered[:, 0]
+        secondary = uv_ordered[:, 1]
+    order = np.lexsort((secondary, primary))
+    uv_ordered = uv_ordered[order]
+
+    if max_lines is None:
+        return uv_ordered
+
+    axis_values = np.unique(uv_ordered[:, axis_idx]).astype(np.int64)
+    axis_values = np.sort(axis_values)
+    if near_to_far_desc:
+        axis_values = axis_values[::-1]
+    selected_axis_values = axis_values[: int(max_lines)]
+    keep = np.isin(uv_ordered[:, axis_idx], selected_axis_values, assume_unique=False)
+    return uv_ordered[keep]
+
+
+def _sample_stacked_displacement_on_agg_extrap(
+    stacked_displacement,
+    one_map,
+    grow_direction,
+    max_lines=None,
+):
+    if stacked_displacement is None or not one_map:
+        return _empty_stack_samples()
+
+    sampled_uv = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=max_lines)
+    if sampled_uv.shape[0] == 0:
+        return _empty_stack_samples()
 
     disp = np.asarray(stacked_displacement["displacement"], dtype=np.float32)
     count = np.asarray(stacked_displacement["count"], dtype=np.uint32)
     min_corner = np.asarray(stacked_displacement["min_corner"], dtype=np.int64)
     shape = np.asarray(stacked_displacement["shape"], dtype=np.int64)
 
-    sampled_uv = []
-    sampled_world = []
-    sampled_disp = []
-    sampled_count = []
+    sampled_world = np.asarray(
+        [one_map[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
+        dtype=np.float32,
+    )
+    coords_local = sampled_world.astype(np.float64, copy=False) - min_corner[None, :].astype(np.float64)
+    in_bounds = (
+        (coords_local[:, 0] >= 0.0) & (coords_local[:, 0] <= float(shape[0] - 1)) &
+        (coords_local[:, 1] >= 0.0) & (coords_local[:, 1] <= float(shape[1] - 1)) &
+        (coords_local[:, 2] >= 0.0) & (coords_local[:, 2] <= float(shape[2] - 1))
+    )
+    if not in_bounds.any():
+        return _empty_stack_samples()
 
-    # Sample nearest stack voxel for each safe-band world point.
-    for uv_row, uv_col in safe_uv_ordered:
-        uv = (int(uv_row), int(uv_col))
-        pt = one_map.get(uv)
-        if pt is None or not np.isfinite(pt).all():
-            continue
+    sampled_uv = sampled_uv[in_bounds]
+    sampled_world = sampled_world[in_bounds]
+    coords_local = coords_local[in_bounds].astype(np.float32, copy=False)
 
-        idx = np.rint(np.asarray(pt, dtype=np.float64)).astype(np.int64) - min_corner
-        if np.any(idx < 0) or np.any(idx >= shape):
-            continue
+    sampled_disp, sampled_count, valid_mask = _sample_trilinear_displacement_stack(
+        disp,
+        count,
+        coords_local,
+    )
+    if not valid_mask.any():
+        return _empty_stack_samples()
 
-        z, y, x = int(idx[0]), int(idx[1]), int(idx[2])
-        c = count[z, y, x]
-        if c == 0:
-            continue
+    sampled_uv = sampled_uv[valid_mask]
+    sampled_world = sampled_world[valid_mask]
+    sampled_disp = sampled_disp[valid_mask]
+    sampled_count = sampled_count[valid_mask]
 
-        sampled_uv.append((int(uv[0]), int(uv[1])))
-        sampled_world.append(np.asarray(pt, dtype=np.float32))
-        sampled_disp.append(disp[:, z, y, x].astype(np.float32, copy=False))
-        sampled_count.append(int(c))
+    return {
+        "uv": sampled_uv.astype(np.int64, copy=False),
+        "world": sampled_world.astype(np.float32, copy=False),
+        "displacement": sampled_disp.astype(np.float32, copy=False),
+        "stack_count": sampled_count.astype(np.uint32, copy=False),
+    }
 
-    if len(sampled_uv) == 0:
+
+def _sample_agg_extrap_direct(one_map, grow_direction, max_lines=None):
+    if not one_map:
+        return _empty_stack_samples()
+
+    sampled_uv = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=max_lines)
+    if sampled_uv.shape[0] == 0:
+        return _empty_stack_samples()
+
+    sampled_world = np.asarray(
+        [one_map[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
+        dtype=np.float32,
+    )
+    keep = np.isfinite(sampled_world).all(axis=1)
+    if not keep.any():
+        return _empty_stack_samples()
+
+    sampled_uv = sampled_uv[keep].astype(np.int64, copy=False)
+    sampled_world = sampled_world[keep].astype(np.float32, copy=False)
+    n = int(sampled_world.shape[0])
+    return {
+        "uv": sampled_uv,
+        "world": sampled_world,
+        "displacement": np.zeros((n, 3), dtype=np.float32),
+        "stack_count": np.ones((n,), dtype=np.uint32),
+    }
+
+
+def _sample_trilinear_displacement_stack(disp, count, coords_local):
+    if coords_local is None or len(coords_local) == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.uint32),
+            np.zeros((0,), dtype=bool),
+        )
+
+    disp_t = torch.from_numpy(np.asarray(disp, dtype=np.float32)).unsqueeze(0)  # [1, 3, D, H, W]
+    count_t = torch.from_numpy(np.asarray(count, dtype=np.float32)).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+    valid_t = (count_t > 0).to(dtype=disp_t.dtype)
+    disp_weighted_t = disp_t * valid_t
+
+    coords_t = torch.from_numpy(np.asarray(coords_local, dtype=np.float32)).clone()
+    _, _, d, h, w = disp_t.shape
+    d_denom = max(int(d) - 1, 1)
+    h_denom = max(int(h) - 1, 1)
+    w_denom = max(int(w) - 1, 1)
+    coords_t[:, 0] = 2.0 * coords_t[:, 0] / float(d_denom) - 1.0
+    coords_t[:, 1] = 2.0 * coords_t[:, 1] / float(h_denom) - 1.0
+    coords_t[:, 2] = 2.0 * coords_t[:, 2] / float(w_denom) - 1.0
+    grid = coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+
+    sampled_disp_weighted = F.grid_sample(
+        disp_weighted_t,
+        grid,
+        mode="bilinear",
+        align_corners=True,
+    ).view(3, -1).permute(1, 0)
+    sampled_valid_weight = F.grid_sample(
+        valid_t,
+        grid,
+        mode="bilinear",
+        align_corners=True,
+    ).view(-1)
+    sampled_count = F.grid_sample(
+        count_t,
+        grid,
+        mode="bilinear",
+        align_corners=True,
+    ).view(-1)
+
+    eps = 1e-6
+    valid_mask = sampled_valid_weight > eps
+    sampled_disp = torch.zeros_like(sampled_disp_weighted)
+    if bool(valid_mask.any()):
+        sampled_disp[valid_mask] = (
+            sampled_disp_weighted[valid_mask] /
+            sampled_valid_weight[valid_mask].unsqueeze(-1)
+        )
+
+    sampled_disp_np = sampled_disp.cpu().numpy().astype(np.float32, copy=False)
+    sampled_count_np = np.rint(sampled_count.cpu().numpy()).astype(np.uint32, copy=False)
+    valid_mask_np = valid_mask.cpu().numpy().astype(bool, copy=False)
+    return sampled_disp_np, sampled_count_np, valid_mask_np
+
+
+def _print_agg_extrap_sampling_debug(samples, one_map, grow_direction, max_lines=None, verbose=True):
+    if not verbose:
+        return
+    all_uv = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None)
+    sampled_uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
+    axis_idx, axis_name, _ = _agg_extrap_axis_metadata(grow_direction)
+    total_uv = int(all_uv.shape[0])
+    total_lines = int(np.unique(all_uv[:, axis_idx]).shape[0]) if total_uv > 0 else 0
+    sampled = int(sampled_uv.shape[0])
+    sampled_lines = int(np.unique(sampled_uv[:, axis_idx]).shape[0]) if sampled > 0 else 0
+    stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
+    print("== Aggregated Extrapolation Stack Sampling ==")
+    print(f"sampled aggregated-extrap UVs: {sampled}/{total_uv}")
+    print(f"sampled {axis_name} lines (near->far): {sampled_lines}/{total_lines}")
+    if max_lines is not None:
+        print(f"line limit requested: {int(max_lines)}")
+    if stack_count.size > 0:
+        sc = stack_count.astype(np.float64, copy=False)
+        print(f"stack-count min/max/mean: {int(sc.min())}/{int(sc.max())}/{sc.mean():.2f}")
+
+
+def _filter_samples_min_stack_count(samples, min_stack_count=1):
+    uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
+    world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    displacement = np.asarray(samples.get("displacement", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
+
+    n_input = int(min(uv.shape[0], world.shape[0], displacement.shape[0], stack_count.shape[0]))
+    if n_input == 0:
         return {
             "uv": np.zeros((0, 2), dtype=np.int64),
             "world": np.zeros((0, 3), dtype=np.float32),
             "displacement": np.zeros((0, 3), dtype=np.float32),
             "stack_count": np.zeros((0,), dtype=np.uint32),
-        }
+        }, {"n_input": 0, "n_after_stack_count": 0}
 
+    uv = uv[:n_input]
+    world = world[:n_input]
+    displacement = displacement[:n_input]
+    stack_count = stack_count[:n_input]
+    min_stack_count = max(1, int(min_stack_count))
+    keep = stack_count >= np.uint32(min_stack_count)
+    n_after_stack_count = int(keep.sum())
     return {
-        "uv": np.asarray(sampled_uv, dtype=np.int64),
-        "world": np.asarray(sampled_world, dtype=np.float32),
-        "displacement": np.asarray(sampled_disp, dtype=np.float32),
-        "stack_count": np.asarray(sampled_count, dtype=np.uint32),
-    }
+        "uv": uv[keep].astype(np.int64, copy=False),
+        "world": world[keep].astype(np.float32, copy=False),
+        "displacement": displacement[keep].astype(np.float32, copy=False),
+        "stack_count": stack_count[keep].astype(np.uint32, copy=False),
+    }, {"n_input": n_input, "n_after_stack_count": n_after_stack_count}
 
 
-def _select_safe_uv_for_sampling(safe_band, max_lines=None):
-    if not isinstance(safe_band, dict):
-        return np.zeros((0, 2), dtype=np.int64)
-
-    safe_uv_ordered = np.asarray(
-        safe_band.get("safe_uv_ordered", np.zeros((0, 2), dtype=np.int64)),
-        dtype=np.int64,
-    )
-    if safe_uv_ordered.size == 0:
-        return np.zeros((0, 2), dtype=np.int64)
-    safe_uv_ordered = safe_uv_ordered.reshape(-1, 2)
-    if max_lines is None:
-        return safe_uv_ordered
-
-    safe_axis_values = safe_band.get("safe_axis_values_near_to_far", [])
-    axis_name = safe_band.get("axis_name")
-    if axis_name not in {"row", "col"} or len(safe_axis_values) == 0:
-        return safe_uv_ordered
-
-    selected_axis_values = set(int(v) for v in safe_axis_values[: int(max_lines)])
-    if axis_name == "col":
-        keep = np.array([int(uv[1]) in selected_axis_values for uv in safe_uv_ordered], dtype=bool)
-    else:
-        keep = np.array([int(uv[0]) in selected_axis_values for uv in safe_uv_ordered], dtype=bool)
-    return safe_uv_ordered[keep]
+def _print_sample_filter_debug(filter_stats, verbose=True):
+    if not verbose:
+        return
+    print("== Sample Filter ==")
+    n_input = int(filter_stats.get("n_input", 0))
+    n_after_stack_count = int(filter_stats.get("n_after_stack_count", 0))
+    print(f"input samples: {n_input}")
+    print(f"after min-stack-count: {n_after_stack_count}")
 
 
-def _print_safe_band_sampling_debug(samples, safe_band, max_lines=None):
-    if isinstance(safe_band, dict):
-        safe_uv_ordered = np.asarray(safe_band.get("safe_uv_ordered", np.zeros((0, 2), dtype=np.int64)))
-        safe_total = int(safe_uv_ordered.reshape(-1, 2).shape[0]) if safe_uv_ordered.size > 0 else 0
-    else:
-        safe_total = 0
-    safe_lines_total = int(safe_band.get("safe_lines", 0)) if isinstance(safe_band, dict) else 0
-    sampled = int(samples["uv"].shape[0])
-    print("== Safe Band Stack Sampling ==")
-    print(f"sampled safe-band UVs: {sampled}/{safe_total}")
-    if max_lines is not None:
-        used_lines = min(int(max_lines), safe_lines_total)
-        print(f"sampled safe-band lines (near->far): {used_lines}/{safe_lines_total}")
-
-
-def _apply_displacement_and_print_stats(samples):
+def _apply_displacement_and_print_stats(samples, verbose=True):
     world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
     displacement = np.asarray(samples.get("displacement", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
     uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
     stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
 
     if world.shape[0] == 0 or displacement.shape[0] == 0:
-        print("== Safe Band Applied Displacement ==")
-        print("No sampled points to apply displacement.")
+        if verbose:
+            print("== Applied Displacement ==")
+            print("No sampled points to apply displacement.")
         return {
             "uv": np.zeros((0, 2), dtype=np.int64),
             "world": np.zeros((0, 3), dtype=np.float32),
@@ -588,20 +762,21 @@ def _apply_displacement_and_print_stats(samples):
     world_displaced = world + displacement
     disp_norm = np.linalg.norm(displacement.astype(np.float64), axis=1)
 
-    print("== Safe Band Applied Displacement ==")
-    print(f"n points: {world.shape[0]}")
-    print(
-        "disp_norm min/max/mean/median: "
-        f"{disp_norm.min():.4f} / {disp_norm.max():.4f} / {disp_norm.mean():.4f} / {np.median(disp_norm):.4f}"
-    )
-
-    axis_names = ("z", "y", "x")
-    for axis_idx, axis_name in enumerate(axis_names):
-        vals = world_displaced[:, axis_idx].astype(np.float64, copy=False)
+    if verbose:
+        print("== Applied Displacement ==")
+        print(f"n points: {world.shape[0]}")
         print(
-            f"{axis_name} min/max/mean/median: "
-            f"{vals.min():.4f} / {vals.max():.4f} / {vals.mean():.4f} / {np.median(vals):.4f}"
+            "disp_norm min/max/mean/median: "
+            f"{disp_norm.min():.4f} / {disp_norm.max():.4f} / {disp_norm.mean():.4f} / {np.median(disp_norm):.4f}"
         )
+
+        axis_names = ("z", "y", "x")
+        for axis_idx, axis_name in enumerate(axis_names):
+            vals = world_displaced[:, axis_idx].astype(np.float64, copy=False)
+            print(
+                f"{axis_name} min/max/mean/median: "
+                f"{vals.min():.4f} / {vals.max():.4f} / {vals.mean():.4f} / {np.median(vals):.4f}"
+            )
 
     return {
         "uv": uv,
@@ -612,7 +787,41 @@ def _apply_displacement_and_print_stats(samples):
     }
 
 
-def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_offset, displaced):
+def _use_extrap_points_directly(samples, verbose=True):
+    uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
+    world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
+
+    n = int(min(uv.shape[0], world.shape[0], stack_count.shape[0]))
+    if n == 0:
+        if verbose:
+            print("== Applied Displacement ==")
+            print("Extrap-only mode: no extrapolated points selected to merge.")
+        return {
+            "uv": np.zeros((0, 2), dtype=np.int64),
+            "world": np.zeros((0, 3), dtype=np.float32),
+            "displacement": np.zeros((0, 3), dtype=np.float32),
+            "world_displaced": np.zeros((0, 3), dtype=np.float32),
+            "stack_count": np.zeros((0,), dtype=np.uint32),
+        }
+
+    uv = uv[:n].astype(np.int64, copy=False)
+    world = world[:n].astype(np.float32, copy=False)
+    stack_count = stack_count[:n].astype(np.uint32, copy=False)
+    if verbose:
+        print("== Applied Displacement ==")
+        print("Extrap-only mode: bypassed displacement sampling; merging extrapolated points directly.")
+        print(f"n points: {n}")
+    return {
+        "uv": uv,
+        "world": world,
+        "displacement": np.zeros((n, 3), dtype=np.float32),
+        "world_displaced": world,
+        "stack_count": stack_count,
+    }
+
+
+def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_offset, displaced, verbose=True):
     merged_zyxs = np.asarray(cond_zyxs, dtype=np.float32).copy()
     merged_valid = np.asarray(cond_valid, dtype=bool).copy()
 
@@ -620,8 +829,9 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     pts = np.asarray(displaced.get("world_displaced", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
 
     if uv.shape[0] == 0 or pts.shape[0] == 0:
-        print("== Merge Displaced Into Full Surface ==")
-        print("No displaced points to merge.")
+        if verbose:
+            print("== Merge Displaced Into Full Surface ==")
+            print("No displaced points to merge.")
         return {
             "merged_zyxs": merged_zyxs,
             "merged_valid": merged_valid,
@@ -637,7 +847,8 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     h, w = merged_valid.shape
 
     n = min(int(uv.shape[0]), int(pts.shape[0]))
-    uv_n = uv[:n]
+    uv_n = uv[:n].astype(np.int64, copy=False)
+    pts_n = pts[:n].astype(np.float32, copy=False)
     if uv_n.size > 0:
         min_r = min(r0, int(uv_n[:, 0].min()))
         max_r = max(r0 + h - 1, int(uv_n[:, 0].max()))
@@ -658,45 +869,56 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
             merged_valid = expanded_valid
             r0, c0 = min_r, min_c
             h, w = new_h, new_w
-            print("== Merge Displaced Into Full Surface ==")
-            print(
-                f"expanded UV canvas: shape ({cond_valid.shape[0]}, {cond_valid.shape[1]}) -> ({h}, {w}), "
-                f"offset ({int(cond_uv_offset[0])}, {int(cond_uv_offset[1])}) -> ({r0}, {c0})"
-            )
+            if verbose:
+                print("== Merge Displaced Into Full Surface ==")
+                print(
+                    f"expanded UV canvas: shape ({cond_valid.shape[0]}, {cond_valid.shape[1]}) -> ({h}, {w}), "
+                    f"offset ({int(cond_uv_offset[0])}, {int(cond_uv_offset[1])}) -> ({r0}, {c0})"
+                )
 
     n_written = 0
     n_new_valid = 0
     n_overwrite_existing = 0
-    n_out_of_bounds = 0
-    n_nonfinite = 0
+    if n > 0:
+        finite_mask = np.isfinite(pts_n).all(axis=1)
+        rr_all = uv_n[:, 0] - r0
+        cc_all = uv_n[:, 1] - c0
+        in_bounds_mask = (
+            finite_mask &
+            (rr_all >= 0) &
+            (rr_all < h) &
+            (cc_all >= 0) &
+            (cc_all < w)
+        )
+        n_nonfinite = int((~finite_mask).sum())
+        n_out_of_bounds = int((finite_mask & ~in_bounds_mask).sum())
+        write_indices = np.nonzero(in_bounds_mask)[0]
+    else:
+        rr_all = np.zeros((0,), dtype=np.int64)
+        cc_all = np.zeros((0,), dtype=np.int64)
+        n_nonfinite = 0
+        n_out_of_bounds = 0
+        write_indices = np.zeros((0,), dtype=np.int64)
 
-    for i in range(n):
-        pt = pts[i]
-        if not np.isfinite(pt).all():
-            n_nonfinite += 1
-            continue
-
-        rr = int(uv[i, 0]) - r0
-        cc = int(uv[i, 1]) - c0
-        if rr < 0 or rr >= h or cc < 0 or cc >= w:
-            n_out_of_bounds += 1
-            continue
-
+    for i in write_indices:
+        rr = int(rr_all[i])
+        cc = int(cc_all[i])
         if merged_valid[rr, cc]:
             n_overwrite_existing += 1
         else:
             n_new_valid += 1
 
-        merged_zyxs[rr, cc] = pt
+        merged_zyxs[rr, cc] = pts_n[i]
         merged_valid[rr, cc] = True
         n_written += 1
 
-    print("== Merge Displaced Into Full Surface ==")
-    print(f"written points: {n_written}")
-    print(f"new valid points: {n_new_valid}")
-    print(f"overwrote existing valid points: {n_overwrite_existing}")
-    print(f"skipped out-of-bounds points: {n_out_of_bounds}")
-    print(f"skipped nonfinite points: {n_nonfinite}")
+    if verbose:
+        print("== Merge Displaced Into Full Surface ==")
+        print(f"written points: {n_written}")
+        print(f"new valid points: {n_new_valid}")
+        print(f"overwrote existing valid points: {n_overwrite_existing}")
+        print(f"skipped out-of-bounds points: {n_out_of_bounds}")
+        print(f"skipped nonfinite points: {n_nonfinite}")
 
     return {
         "merged_zyxs": merged_zyxs,
@@ -762,7 +984,8 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
             "grow_direction": args.grow_direction,
             "extrapolation_method": args.extrapolation_method,
             "uv_offset_rc": [int(uv_offset[0]), int(uv_offset[1])],
-            "safe_band_lines": None if args.safe_band_lines is None else int(args.safe_band_lines),
+            "agg_extrap_lines": None if args.agg_extrap_lines is None else int(args.agg_extrap_lines),
+            "agg_extrap_min_stack_count": int(args.agg_extrap_min_stack_count),
             "run_argv": list(sys.argv[1:]),
             "run_args": _json_safe(call_args),
         },
@@ -815,7 +1038,9 @@ def _surface_to_uv_samples(grid, valid, uv_offset):
     return uv[keep], pts[keep]
 
 
-def _print_bbox_crop_debug_table(bbox_crops):
+def _print_bbox_crop_debug_table(bbox_crops, verbose=True):
+    if not verbose:
+        return
     if not bbox_crops:
         print("== BBox Crop Debug ==")
         print("No bbox crops.")
@@ -859,157 +1084,65 @@ def _grid_to_uv_world_dict(grid, valid, offset):
         return {}
     rows_abs = rows.astype(np.int64) + int(offset[0])
     cols_abs = cols.astype(np.int64) + int(offset[1])
-    pts = grid[rows, cols]
-    out = {}
-    for i in range(rows_abs.shape[0]):
-        if np.isfinite(pts[i]).all():
-            out[(int(rows_abs[i]), int(cols_abs[i]))] = pts[i].astype(np.float32, copy=False)
-    return out
-
-
-def _compute_safe_band(bbox_results, one_shot, one_map, grow_direction, min_line_coverage=1.0):
-    one_uv = np.asarray(one_shot.get("uv_query_flat", np.zeros((0, 2), dtype=np.float64)))
-    if one_uv.size == 0:
-        return {
-            "axis_name": None,
-            "total_lines": 0,
-            "safe_lines": 0,
-            "safe_axis_values_near_to_far": [],
-            "safe_uv_ordered": np.zeros((0, 2), dtype=np.int64),
-            "near_axis_value": None,
-            "farthest_safe_axis_value": None,
-            "first_unsafe_axis_value": None,
-            "first_unsafe_covered": 0,
-            "first_unsafe_total": 0,
-        }
-
-    one_uv_i = one_uv.astype(np.int64, copy=False)
-
-    bbox_bounds = []
-    for item in bbox_results:
-        z_min, z_max, y_min, y_max, x_min, x_max = item["bbox"]
-        bbox_bounds.append(
-            (
-                float(z_min), float(z_max),
-                float(y_min), float(y_max),
-                float(x_min), float(x_max),
-            )
-        )
-    bbox_bounds = tuple(bbox_bounds)
-
-    def _in_bbox_union(pt):
-        z, y, x = float(pt[0]), float(pt[1]), float(pt[2])
-        for z_min, z_max, y_min, y_max, x_min, x_max in bbox_bounds:
-            if (
-                z >= z_min and z <= z_max and
-                y >= y_min and y <= y_max and
-                x >= x_min and x <= x_max
-            ):
-                return True
-        return False
-
-    # UVs that have finite one-shot predictions inside the 3D union of bbox bounds.
-    uv_supported = set()
-    for uv_key, pt in one_map.items():
-        if np.isfinite(pt).all() and _in_bbox_union(pt):
-            uv_supported.add((int(uv_key[0]), int(uv_key[1])))
-
-    axis_idx = 1 if grow_direction in {"left", "right"} else 0
-    axis_name = "col" if axis_idx == 1 else "row"
-    near_to_far_desc = grow_direction in {"left", "up"}
-
-    line_orth_values = {}
-    for row, col in one_uv_i:
-        axis_val = int(col) if axis_idx == 1 else int(row)
-        orth_val = int(row) if axis_idx == 1 else int(col)
-        line_orth_values.setdefault(axis_val, set()).add(orth_val)
-
-    axis_values = sorted(line_orth_values.keys(), reverse=near_to_far_desc)
-    if len(axis_values) == 0:
-        return {
-            "axis_name": axis_name,
-            "total_lines": 0,
-            "safe_lines": 0,
-            "safe_axis_values_near_to_far": [],
-            "safe_uv_ordered": np.zeros((0, 2), dtype=np.int64),
-            "near_axis_value": None,
-            "farthest_safe_axis_value": None,
-            "first_unsafe_axis_value": None,
-            "first_unsafe_covered": 0,
-            "first_unsafe_total": 0,
-        }
-
-    safe_axis_values = []
-    first_unsafe_axis_value = None
-    first_unsafe_covered = 0
-    first_unsafe_total = 0
-
-    for axis_val in axis_values:
-        orth_values = line_orth_values[axis_val]
-        covered = 0
-        for orth_val in orth_values:
-            uv_key = (orth_val, axis_val) if axis_idx == 1 else (axis_val, orth_val)
-            if uv_key in uv_supported:
-                covered += 1
-        required = int(np.ceil(float(min_line_coverage) * float(len(orth_values))))
-        if covered >= max(1, required):
-            safe_axis_values.append(axis_val)
-        else:
-            first_unsafe_axis_value = axis_val
-            first_unsafe_covered = int(covered)
-            first_unsafe_total = int(len(orth_values))
-            break
-
-    safe_uv_set = set()
-    for axis_val in safe_axis_values:
-        for orth_val in line_orth_values[axis_val]:
-            uv_key = (orth_val, axis_val) if axis_idx == 1 else (axis_val, orth_val)
-            safe_uv_set.add(uv_key)
-    safe_uv_ordered = np.asarray(
-        [
-            (int(uv_key[0]), int(uv_key[1]))
-            for uv_key in one_map.keys()
-            if (int(uv_key[0]), int(uv_key[1])) in safe_uv_set
-        ],
-        dtype=np.int64,
-    )
-    if safe_uv_ordered.size == 0:
-        safe_uv_ordered = np.zeros((0, 2), dtype=np.int64)
-
+    pts = np.asarray(grid)[rows, cols]
+    finite_mask = np.isfinite(pts).all(axis=1)
+    if not finite_mask.any():
+        return {}
+    rows_abs = rows_abs[finite_mask]
+    cols_abs = cols_abs[finite_mask]
+    pts = pts[finite_mask].astype(np.float32, copy=False)
     return {
-        "axis_name": axis_name,
-        "total_lines": int(len(axis_values)),
-        "safe_lines": int(len(safe_axis_values)),
-        "safe_axis_values_near_to_far": [int(v) for v in safe_axis_values],
-        "safe_uv_ordered": safe_uv_ordered,
-        "near_axis_value": int(axis_values[0]),
-        "farthest_safe_axis_value": None if len(safe_axis_values) == 0 else int(safe_axis_values[-1]),
-        "first_unsafe_axis_value": None if first_unsafe_axis_value is None else int(first_unsafe_axis_value),
-        "first_unsafe_covered": first_unsafe_covered,
-        "first_unsafe_total": first_unsafe_total,
+        (int(rows_abs[i]), int(cols_abs[i])): pts[i]
+        for i in range(rows_abs.shape[0])
     }
 
 
-def _print_iteration_summary(bbox_results, one_shot, one_map, safe_band):
+def _agg_extrap_line_summary(one_map, grow_direction):
+    uv_ordered = _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None)
+    axis_idx, axis_name, _ = _agg_extrap_axis_metadata(grow_direction)
+    if uv_ordered.shape[0] == 0:
+        return {
+            "axis_name": axis_name,
+            "uv_count": 0,
+            "line_count": 0,
+            "near_axis_value": None,
+            "far_axis_value": None,
+        }
+
+    axis_values = []
+    seen = set()
+    for value in uv_ordered[:, axis_idx]:
+        int_value = int(value)
+        if int_value in seen:
+            continue
+        seen.add(int_value)
+        axis_values.append(int_value)
+
+    return {
+        "axis_name": axis_name,
+        "uv_count": int(uv_ordered.shape[0]),
+        "line_count": int(len(axis_values)),
+        "near_axis_value": axis_values[0] if axis_values else None,
+        "far_axis_value": axis_values[-1] if axis_values else None,
+    }
+
+
+def _print_iteration_summary(bbox_results, one_shot, one_map, grow_direction, verbose=True):
+    if not verbose:
+        return
+    agg_summary = _agg_extrap_line_summary(one_map, grow_direction)
     print("== Extrapolation Summary ==")
     print(f"bboxes: {len(bbox_results)}")
     print(f"one-shot edge-input uv count: {len(one_shot.get('edge_uv', []))}")
     print(f"one-shot extrap uv count (aggregated): {len(one_map)}")
-    print("== Safe Band ==")
-    print(f"safe axis: {safe_band.get('axis_name')}")
-    print(f"safe lines (near->far contiguous): {safe_band.get('safe_lines', 0)}/{safe_band.get('total_lines', 0)}")
-    safe_uv_ordered = np.asarray(safe_band.get("safe_uv_ordered", np.zeros((0, 2), dtype=np.int64)))
-    safe_uv_count = int(safe_uv_ordered.reshape(-1, 2).shape[0]) if safe_uv_ordered.size > 0 else 0
-    print(f"safe uv count: {safe_uv_count}")
-    near_axis = safe_band.get("near_axis_value")
-    far_axis = safe_band.get("farthest_safe_axis_value")
+    print("== Aggregated Extrapolation ==")
+    print(f"axis: {agg_summary['axis_name']}")
+    print(f"available lines (near->far): {agg_summary['line_count']}")
+    print(f"available uv count: {agg_summary['uv_count']}")
+    near_axis = agg_summary["near_axis_value"]
+    far_axis = agg_summary["far_axis_value"]
     if near_axis is not None:
-        print(f"safe axis range near->far: {near_axis} -> {far_axis}")
-    first_unsafe = safe_band.get("first_unsafe_axis_value")
-    if first_unsafe is not None:
-        covered = int(safe_band.get("first_unsafe_covered", 0))
-        total = int(safe_band.get("first_unsafe_total", 0))
-        print(f"first unsafe axis value: {first_unsafe} ({covered}/{total} covered)")
+        print(f"axis range near->far: {near_axis} -> {far_axis}")
 
 
 def _show_napari(
@@ -1018,7 +1151,6 @@ def _show_napari(
     bbox_results,
     one_shot,
     one_map,
-    safe_band,
     disp_bbox=None,
     displaced=None,
     merged=None,
@@ -1071,6 +1203,19 @@ def _show_napari(
     if cond_full.size > 0:
         viewer.add_points(cond_full, name="cond_full", size=point_size, face_color=[0.7, 0.7, 0.7], opacity=0.2)
 
+    sampled_agg = None
+    if isinstance(displaced, dict):
+        sampled_agg = np.asarray(displaced.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    sampled_agg = _downsample_points(sampled_agg if sampled_agg is not None else np.zeros((0, 3), dtype=np.float32))
+    if sampled_agg is not None and sampled_agg.size > 0:
+        viewer.add_points(
+            sampled_agg,
+            name="agg_extrap_sampled",
+            size=point_size,
+            face_color=[0.0, 1.0, 1.0],
+            opacity=0.8,
+        )
+
     displaced_band = None
     if isinstance(displaced, dict):
         displaced_band = np.asarray(displaced.get("world_displaced", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
@@ -1078,7 +1223,7 @@ def _show_napari(
     if displaced_band is not None and displaced_band.size > 0:
         viewer.add_points(
             displaced_band,
-            name="safe_band_displaced",
+            name="agg_extrap_displaced",
             size=point_size,
             face_color=[1.0, 0.0, 1.0],
             opacity=0.9,
@@ -1163,38 +1308,14 @@ def _show_napari(
             face_color=[1.0, 0.4, 0.0],
             opacity=0.6,
         )
-    safe_uv_ordered = (
-        np.asarray(safe_band.get("safe_uv_ordered", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
-        if isinstance(safe_band, dict)
-        else np.zeros((0, 2), dtype=np.int64)
-    )
-    safe_uv_ordered = safe_uv_ordered.reshape(-1, 2) if safe_uv_ordered.size > 0 else np.zeros((0, 2), dtype=np.int64)
-    if one_map and safe_uv_ordered.shape[0] > 0:
-        safe_pts = np.asarray(
-            [
-                one_map[(int(uv[0]), int(uv[1]))]
-                for uv in safe_uv_ordered
-                if (int(uv[0]), int(uv[1])) in one_map and np.isfinite(one_map[(int(uv[0]), int(uv[1]))]).all()
-            ],
-            dtype=np.float32,
-        )
-        safe_pts = _downsample_points(safe_pts)
-        if safe_pts.size > 0:
-            viewer.add_points(
-                safe_pts,
-                name="one_shot_safe_band",
-                size=point_size,
-                face_color=[0.0, 1.0, 1.0],
-                opacity=0.8,
-            )
 
     def _default_visible(layer_name):
         if layer_name in {
             "cond_full",
             "merged_full_surface",
-            "safe_band_displaced",
+            "agg_extrap_sampled",
+            "agg_extrap_displaced",
             "one_shot_edge_cond",
-            "one_shot_safe_band",
             "disp_stack_bbox",
         }:
             return True
@@ -1216,7 +1337,12 @@ def main():
     call_args = _serialize_args(args)
     crop_size = tuple(int(v) for v in args.crop_size)
 
-    run_model_inference = (args.checkpoint_path is not None) and (not args.skip_inference)
+    extrap_only_mode = bool(args.extrap_only)
+    run_model_inference = (
+        (args.checkpoint_path is not None)
+        and (not args.skip_inference)
+        and (not extrap_only_mode)
+    )
     model_state = None
     model_config = None
     checkpoint_path = None
@@ -1229,12 +1355,22 @@ def main():
             raise RuntimeError(
                 f"infer_global_extrap only supports 3-channel models; got in_channels={expected_in_channels}"
             )
+    elif extrap_only_mode:
+        if args.verbose:
+            print("Running extrap-only iterative mode (--extrap-only set): skipping inference and stack sampling.")
+        if args.agg_extrap_min_stack_count != 1:
+            if args.verbose:
+                print("--agg-extrap-min-stack-count is ignored in --extrap-only mode.")
+        if args.checkpoint_path is not None:
+            model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
     elif args.skip_inference:
-        print("Skipping displacement inference (--skip-inference set).")
+        if args.verbose:
+            print("Skipping displacement inference (--skip-inference set).")
         if args.checkpoint_path is not None:
             model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
     else:
-        print("Skipping displacement inference (no --checkpoint-path provided).")
+        if args.verbose:
+            print("Skipping displacement inference (no --checkpoint-path provided).")
         if args.checkpoint_path is not None:
             model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
 
@@ -1250,7 +1386,8 @@ def main():
         current_zyxs = np.stack([base_z, base_y, base_x], axis=-1).copy()
         current_valid = np.asarray(base_valid, dtype=bool).copy()
         current_uv_offset = (0, 0)
-        print("Using full input surface as initial conditioning for iterative growth.")
+        if args.verbose:
+            print("Using full input surface as initial conditioning for iterative growth.")
     else:
         r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
             args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
@@ -1266,13 +1403,6 @@ def main():
         "extrap_coords_world": np.zeros((0, 3), dtype=np.float32),
     }
     one_map = {}
-    safe_band = {
-        "axis_name": None,
-        "total_lines": 0,
-        "safe_lines": 0,
-        "safe_axis_values_near_to_far": [],
-        "safe_uv_ordered": np.zeros((0, 2), dtype=np.int64),
-    }
     stacked_displacement = None
     displaced = {
         "uv": np.zeros((0, 2), dtype=np.int64),
@@ -1282,8 +1412,17 @@ def main():
         "stack_count": np.zeros((0,), dtype=np.uint32),
     }
 
-    for iteration in range(int(args.iterations)):
-        print(f"[iteration {iteration + 1}/{int(args.iterations)}]")
+    n_iterations = int(args.iterations)
+    iteration_pbar = None
+    if args.verbose:
+        iteration_iter = range(n_iterations)
+    else:
+        iteration_pbar = tqdm(range(n_iterations), total=n_iterations, desc="iterations", unit="iter")
+        iteration_iter = iteration_pbar
+
+    for iteration in iteration_iter:
+        if args.verbose:
+            print(f"[iteration {iteration + 1}/{n_iterations}]")
         cond_zyxs = current_zyxs
         cond_valid = current_valid
         cond_uv_offset = current_uv_offset
@@ -1296,29 +1435,11 @@ def main():
             overlap_frac=args.bbox_overlap_frac,
         )
         if len(bboxes) == 0:
-            print("No edge bboxes available at current boundary; stopping iterative growth.")
+            if args.verbose:
+                print("No edge bboxes available at current boundary; stopping iterative growth.")
+            elif iteration_pbar is not None:
+                iteration_pbar.set_postfix_str("stopped: no edge bboxes", refresh=True)
             break
-
-        bbox_crops = _build_bbox_crops(
-            bboxes=bboxes,
-            tgt_segment=tgt_segment,
-            volume_scale=args.volume_scale,
-            cond_zyxs=cond_zyxs,
-            cond_valid=cond_valid,
-            uv_cond=uv_cond,
-            grow_direction=grow_direction,
-            crop_size=crop_size,
-            extrapolation_settings=extrapolation_settings,
-            cond_pct=args.cond_pct,
-        )
-        _print_bbox_crop_debug_table(bbox_crops)
-        bbox_results = _build_bbox_results_from_crops(bbox_crops)
-
-        stacked_displacement = None
-        if run_model_inference and model_state is not None:
-            per_crop_fields = _run_bbox_displacement_inference(args, bbox_crops, model_state)
-            stacked_displacement = _stack_displacements_to_global(per_crop_fields)
-        _print_stacked_displacement_debug(stacked_displacement)
 
         one_shot = compute_edge_one_shot_extrapolation(
             cond_zyxs=cond_zyxs,
@@ -1346,27 +1467,77 @@ def main():
 
         one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
         one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
-
         one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
-
         one_map = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
-        safe_band = _compute_safe_band(
+
+        bbox_crops = _build_bbox_crops(
+            bboxes=bboxes,
+            tgt_segment=tgt_segment,
+            volume_scale=args.volume_scale,
+            cond_zyxs=cond_zyxs,
+            cond_valid=cond_valid,
+            uv_cond=uv_cond,
+            grow_direction=grow_direction,
+            crop_size=crop_size,
+            cond_pct=args.cond_pct,
+            one_map=one_map,
+        )
+        _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
+        bbox_results = _build_bbox_results_from_crops(bbox_crops)
+
+        stacked_displacement = None
+        if run_model_inference and model_state is not None:
+            per_crop_fields = _run_bbox_displacement_inference(
+                args,
+                bbox_crops,
+                model_state,
+                verbose=args.verbose,
+            )
+            stacked_displacement = _stack_displacements_to_global(per_crop_fields)
+        _print_stacked_displacement_debug(stacked_displacement, verbose=args.verbose)
+        if extrap_only_mode:
+            agg_samples = _sample_agg_extrap_direct(
+                one_map,
+                grow_direction,
+                max_lines=args.agg_extrap_lines,
+            )
+        else:
+            agg_samples = _sample_stacked_displacement_on_agg_extrap(
+                stacked_displacement,
+                one_map,
+                grow_direction,
+                max_lines=args.agg_extrap_lines,
+            )
+
+        _print_iteration_summary(
             bbox_results,
             one_shot,
             one_map,
             grow_direction,
-            min_line_coverage=float(args.safe_line_min_coverage),
+            verbose=args.verbose,
         )
-        safe_stack_samples = _sample_stacked_displacement_on_safe_band(
-            stacked_displacement,
+        _print_agg_extrap_sampling_debug(
+            agg_samples,
             one_map,
-            safe_band,
-            max_lines=args.safe_band_lines,
+            grow_direction,
+            max_lines=args.agg_extrap_lines,
+            verbose=args.verbose,
         )
-
-        _print_iteration_summary(bbox_results, one_shot, one_map, safe_band)
-        _print_safe_band_sampling_debug(safe_stack_samples, safe_band, max_lines=args.safe_band_lines)
-        displaced = _apply_displacement_and_print_stats(safe_stack_samples)
+        if extrap_only_mode:
+            sample_filter_stats = {
+                "n_input": int(np.asarray(agg_samples.get("uv", np.zeros((0, 2), dtype=np.int64))).shape[0]),
+                "n_after_stack_count": int(np.asarray(agg_samples.get("uv", np.zeros((0, 2), dtype=np.int64))).shape[0]),
+            }
+        else:
+            agg_samples, sample_filter_stats = _filter_samples_min_stack_count(
+                agg_samples,
+                min_stack_count=args.agg_extrap_min_stack_count,
+            )
+        _print_sample_filter_debug(sample_filter_stats, verbose=args.verbose)
+        if extrap_only_mode:
+            displaced = _use_extrap_points_directly(agg_samples, verbose=args.verbose)
+        else:
+            displaced = _apply_displacement_and_print_stats(agg_samples, verbose=args.verbose)
 
         prev_boundary = _boundary_axis_value(cond_valid, cond_uv_offset, grow_direction)
         merged_iter = _merge_displaced_points_into_full_surface(
@@ -1374,6 +1545,7 @@ def main():
             cond_valid,
             cond_uv_offset,
             displaced,
+            verbose=args.verbose,
         )
         next_boundary = _boundary_axis_value(
             merged_iter["merged_valid"],
@@ -1385,11 +1557,20 @@ def main():
         current_uv_offset = merged_iter["uv_offset"]
 
         if int(merged_iter.get("n_new_valid", 0)) < 1:
-            print("No newly added valid points this iteration; stopping iterative growth.")
+            if args.verbose:
+                print("No newly added valid points this iteration; stopping iterative growth.")
+            elif iteration_pbar is not None:
+                iteration_pbar.set_postfix_str("stopped: no new valid points", refresh=True)
             break
         if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
-            print("Boundary did not advance this iteration; stopping iterative growth.")
+            if args.verbose:
+                print("Boundary did not advance this iteration; stopping iterative growth.")
+            elif iteration_pbar is not None:
+                iteration_pbar.set_postfix_str("stopped: boundary unchanged", refresh=True)
             break
+
+    if iteration_pbar is not None:
+        iteration_pbar.close()
 
     # Merge the full iteratively grown surface onto the full input canvas so
     # output preserves all existing input points and includes all growth steps.
@@ -1405,6 +1586,7 @@ def main():
             "uv": grown_uv,
             "world_displaced": grown_pts,
         },
+        verbose=args.verbose,
     )
     _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args)
 
@@ -1416,7 +1598,6 @@ def main():
             bbox_results,
             one_shot,
             one_map,
-            safe_band,
             disp_bbox=disp_bbox,
             displaced=displaced,
             merged=merged,

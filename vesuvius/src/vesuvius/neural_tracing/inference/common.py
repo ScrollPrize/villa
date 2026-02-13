@@ -31,6 +31,7 @@ def _resolve_extrapolation_settings(args, runtime_config):
         edge_downsample = rbf_downsample if edge_downsample_cfg is None else int(edge_downsample_cfg)
         method_kwargs["downsample_factor"] = edge_downsample if method == "rbf_edge_only" else rbf_downsample
         method_kwargs["rbf_max_points"] = cfg.get("rbf_max_points")
+        method_kwargs["precision"] = cfg.get("rbf_precision", "float64")
 
     if method == "rbf_edge_only":
         method_kwargs["edge_band_frac"] = float(cfg.get("rbf_edge_band_frac", 0.10))

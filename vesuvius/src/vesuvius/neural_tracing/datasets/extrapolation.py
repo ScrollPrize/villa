@@ -11,6 +11,29 @@ from typing import Callable, Optional
 from .common import voxelize_surface_grid
 
 
+def _resolve_torch_precision(value) -> torch.dtype:
+    if value is None:
+        return torch.float64
+    if isinstance(value, torch.dtype):
+        if value in (torch.float32, torch.float64):
+            return value
+        raise ValueError(f"Unsupported precision dtype: {value}")
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"float32", "fp32", "single", "f32"}:
+            return torch.float32
+        if token in {"float64", "fp64", "double", "f64"}:
+            return torch.float64
+    if value in (np.float32, np.dtype(np.float32)):
+        return torch.float32
+    if value in (np.float64, np.dtype(np.float64)):
+        return torch.float64
+    raise ValueError(
+        "Unsupported precision value for RBF extrapolation. "
+        "Use float32/fp32 or float64/fp64."
+    )
+
+
 def _compute_surface_normals_grid(surface_zyx: np.ndarray) -> np.ndarray:
     """Estimate per-point unit normals from local row/col tangents."""
     h, w, _ = surface_zyx.shape
@@ -143,6 +166,72 @@ def _run_fallback_method(
     )
 
 
+def _downsample_uv_cond_directional(
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    stride: int,
+    cond_direction: Optional[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Downsample conditioning points in a direction-aware way.
+
+    Why: `uv_cond[::stride]` is order-dependent. For row-major edge bands this
+    creates phase aliasing where small changes in edge-band width (e.g., 4->5)
+    radically change which columns are selected per row.
+    """
+    stride = max(1, int(stride))
+    if stride <= 1 or len(uv_cond) == 0:
+        return uv_cond, zyx_cond
+
+    uv = np.asarray(uv_cond)
+    zyx = np.asarray(zyx_cond)
+
+    keep_mask = np.zeros((uv.shape[0],), dtype=bool)
+
+    if cond_direction in {"left", "right"}:
+        # Horizontal growth: keep all rows, decimate columns from edge inward.
+        row_vals = np.unique(uv[:, 0])
+        for row in row_vals:
+            row_idx = np.where(uv[:, 0] == row)[0]
+            if row_idx.size == 0:
+                continue
+            cols = uv[row_idx, 1]
+            if cond_direction == "left":
+                # Conditioning edge is high-col side.
+                order = np.argsort(-cols, kind="stable")
+            else:
+                # Conditioning edge is low-col side.
+                order = np.argsort(cols, kind="stable")
+            row_idx_ordered = row_idx[order]
+            keep_mask[row_idx_ordered[::stride]] = True
+
+    elif cond_direction in {"up", "down"}:
+        # Vertical growth: keep all cols, decimate rows from edge inward.
+        col_vals = np.unique(uv[:, 1])
+        for col in col_vals:
+            col_idx = np.where(uv[:, 1] == col)[0]
+            if col_idx.size == 0:
+                continue
+            rows = uv[col_idx, 0]
+            if cond_direction == "up":
+                # Conditioning edge is high-row side.
+                order = np.argsort(-rows, kind="stable")
+            else:
+                # Conditioning edge is low-row side.
+                order = np.argsort(rows, kind="stable")
+            col_idx_ordered = col_idx[order]
+            keep_mask[col_idx_ordered[::stride]] = True
+
+    else:
+        # Unknown direction: preserve legacy behavior.
+        keep_mask[::stride] = True
+
+    if not keep_mask.any():
+        keep_mask[::stride] = True
+
+    return uv[keep_mask], zyx[keep_mask]
+
+
 def _infer_cond_direction(
     uv_cond: np.ndarray,
     uv_query: np.ndarray,
@@ -195,8 +284,13 @@ def _extrapolate_rbf(
 
     # Downsample for RBF fitting.
     stride = max(1, int(downsample_factor))
-    uv_cond_ds = uv_cond[::stride]
-    zyx_cond_ds = zyx_cond[::stride]
+    cond_direction = kwargs.get("cond_direction")
+    uv_cond_ds, zyx_cond_ds = _downsample_uv_cond_directional(
+        uv_cond,
+        zyx_cond,
+        stride,
+        cond_direction=cond_direction,
+    )
 
     # Optional cap on the number of control points to reduce solve cost on large crops.
     if rbf_max_points is not None:
@@ -206,15 +300,18 @@ def _extrapolate_rbf(
             uv_cond_ds = uv_cond_ds[keep_idx]
             zyx_cond_ds = zyx_cond_ds[keep_idx]
 
-    uv_cond_t = torch.from_numpy(uv_cond_ds).float()
-    zyx_cond_t = torch.from_numpy(zyx_cond_ds).float()
-    uv_query_t = torch.from_numpy(uv_query).float()
+    rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
+    np_precision = np.float64 if rbf_precision == torch.float64 else np.float32
+    uv_cond_t = torch.from_numpy(np.asarray(uv_cond_ds, dtype=np_precision))
+    zyx_cond_t = torch.from_numpy(np.asarray(zyx_cond_ds, dtype=np_precision))
+    uv_query_t = torch.from_numpy(np.asarray(uv_query, dtype=np_precision))
 
     smoothing = kwargs.get('smoothing', 0.0)
     rbf_kwargs = dict(
         y=uv_cond_t,   # input: (N, 2) UV
         d=zyx_cond_t,  # output: (N, 3) ZYX
         kernel='thin_plate_spline',
+        precision=rbf_precision,
     )
 
     try:
@@ -222,7 +319,7 @@ def _extrapolate_rbf(
             smoothing=smoothing,
             **rbf_kwargs,
         )
-        return rbf(uv_query_t).cpu().numpy()
+        return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
     except ValueError as exc:
         # Degenerate UV geometry can make the RBF system singular for some crops.
         if "Singular matrix" not in str(exc):
@@ -233,7 +330,7 @@ def _extrapolate_rbf(
                 smoothing=max(float(smoothing), float(singular_smoothing)),
                 **rbf_kwargs,
             )
-            return rbf(uv_query_t).cpu().numpy()
+            return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
         except ValueError as retry_exc:
             if "Singular matrix" not in str(retry_exc):
                 raise
