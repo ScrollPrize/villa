@@ -532,7 +532,6 @@ def _select_agg_extrap_uv_for_sampling(one_map, grow_direction, max_lines=None):
         return uv_ordered
 
     axis_values = np.unique(uv_ordered[:, axis_idx]).astype(np.int64)
-    axis_values = np.sort(axis_values)
     if near_to_far_desc:
         axis_values = axis_values[::-1]
     selected_axis_values = axis_values[: int(max_lines)]
@@ -1109,21 +1108,17 @@ def _agg_extrap_line_summary(one_map, grow_direction):
             "far_axis_value": None,
         }
 
-    axis_values = []
-    seen = set()
-    for value in uv_ordered[:, axis_idx]:
-        int_value = int(value)
-        if int_value in seen:
-            continue
-        seen.add(int_value)
-        axis_values.append(int_value)
+    axis_values = uv_ordered[:, axis_idx].astype(np.int64, copy=False)
+    keep = np.ones((axis_values.shape[0],), dtype=bool)
+    keep[1:] = axis_values[1:] != axis_values[:-1]
+    axis_values = axis_values[keep]
 
     return {
         "axis_name": axis_name,
         "uv_count": int(uv_ordered.shape[0]),
-        "line_count": int(len(axis_values)),
-        "near_axis_value": axis_values[0] if axis_values else None,
-        "far_axis_value": axis_values[-1] if axis_values else None,
+        "line_count": int(axis_values.shape[0]),
+        "near_axis_value": int(axis_values[0]) if axis_values.shape[0] > 0 else None,
+        "far_axis_value": int(axis_values[-1]) if axis_values.shape[0] > 0 else None,
     }
 
 
