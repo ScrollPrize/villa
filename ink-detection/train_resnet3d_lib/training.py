@@ -200,6 +200,12 @@ def init_wandb_logger(args, base_config):
             "metrics/val_stitch/global/components/pfm_mean": "max",
             "metrics/val_stitch/global/components/pfm_worst_k_mean": "max",
             "metrics/val_stitch/global/components/pfm_worst_q_mean": "max",
+            "metrics/val_stitch/global/components/pfm_nonempty_mean": "max",
+            "metrics/val_stitch/global/components/pfm_nonempty_worst_k_mean": "max",
+            "metrics/val_stitch/global/components/pfm_nonempty_worst_q_mean": "max",
+            "metrics/val_stitch/global/components/pfm_weighted_mean": "max",
+            "metrics/val_stitch/global/components/pfm_weighted_worst_k_mean": "max",
+            "metrics/val_stitch/global/components/pfm_weighted_worst_q_mean": "max",
             "metrics/val_stitch/global/components/voi_mean": "min",
             "metrics/val_stitch/global/components/voi_worst_k_mean": "min",
             "metrics/val_stitch/global/components/voi_worst_q_mean": "min",
@@ -227,9 +233,13 @@ def init_wandb_logger(args, base_config):
             "metrics/val_stitch/segments/*/stability/dice_hard_mean": "max",
             "metrics/val_stitch/segments/*/stability/dice_soft_mean": "max",
             "metrics/val_stitch/segments/*/stability/pfm_mean": "max",
+            "metrics/val_stitch/segments/*/stability/pfm_nonempty_mean": "max",
+            "metrics/val_stitch/segments/*/stability/pfm_weighted_mean": "max",
             "metrics/val_stitch/segments/*/stability/voi_mean": "min",
             "metrics/val_stitch/segments/*/stability/betti_l1_mean": "min",
             "metrics/val_stitch/segments/*/pfm": "max",
+            "metrics/val_stitch/segments/*/pfm_nonempty": "max",
+            "metrics/val_stitch/segments/*/pfm_weighted": "max",
         }
         for metric_name, summary_mode in metric_summaries.items():
             run.define_metric(metric_name, summary=summary_mode)

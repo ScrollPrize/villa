@@ -10,6 +10,8 @@ from .stitched_primitives import (
     _as_bool_2d,
     _label_components,
     _local_metrics_from_binary,
+    _pseudo_precision_weights,
+    _pseudo_recall_weights,
     betti_numbers_2d,
     skeletonize_binary,
     soft_dice_from_prob,
@@ -44,6 +46,13 @@ def _build_gt_component_templates(
         crop_gt = gt_bin[y0:y1, x0:x1]
         gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
         gt_skel = skeletonize_binary(crop_gt)
+        pfm_weight_recall = _pseudo_recall_weights(crop_gt).astype(np.float32, copy=False)
+        pfm_weight_recall_sum = float(pfm_weight_recall.sum(dtype=np.float64))
+        if crop_gt.any() and pfm_weight_recall_sum <= 0.0:
+            raise ValueError(f"invalid weighted pseudo-recall sum for component {gi}: {pfm_weight_recall_sum}")
+        pfm_weight_precision = _pseudo_precision_weights(crop_gt, connectivity=connectivity).astype(
+            np.float32, copy=False
+        )
         templates.append(
             {
                 "component_id": int(gi),
@@ -51,6 +60,9 @@ def _build_gt_component_templates(
                 "gt_beta0": int(gt_beta0),
                 "gt_beta1": int(gt_beta1),
                 "gt_skel": gt_skel,
+                "pfm_weight_recall": pfm_weight_recall,
+                "pfm_weight_recall_sum": float(pfm_weight_recall_sum),
+                "pfm_weight_precision": pfm_weight_precision,
             }
         )
     return templates
@@ -61,6 +73,8 @@ COMPONENT_METRIC_SPECS: Tuple[Tuple[str, bool], ...] = (
     ("dice_soft", True),
     ("accuracy", True),
     ("pfm", True),
+    ("pfm_nonempty", True),
+    ("pfm_weighted", True),
     ("skeleton_cldice", True),
     ("skeleton_recall", True),
     ("voi", False),
@@ -243,6 +257,9 @@ def component_metrics_by_gt_bbox(
             gt_beta1=int(template["gt_beta1"]),
             skel_gt=template["gt_skel"],
             skel_pred=crop_pred_skel,
+            pfm_weight_recall=template["pfm_weight_recall"],
+            pfm_weight_recall_sum=float(template["pfm_weight_recall_sum"]),
+            pfm_weight_precision=template["pfm_weight_precision"],
         )
         dice_hard = float(local_metrics["dice"])
         dice_soft = float(soft_dice_from_prob(crop_pred_prob, crop_gt))
@@ -257,6 +274,8 @@ def component_metrics_by_gt_bbox(
             "mpm": float(local_metrics["mpm"]),
             "drd": float(local_metrics["drd"]),
             "pfm": float(local_metrics["pfm"]),
+            "pfm_nonempty": float(local_metrics["pfm_nonempty"]),
+            "pfm_weighted": float(local_metrics["pfm_weighted"]),
             "betti_l1": float(local_metrics["betti_l1"]),
             "abs_euler_err": float(local_metrics["abs_euler_err"]),
             "boundary_hd95": float(local_metrics["boundary_hd95"]),

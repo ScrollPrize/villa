@@ -26,11 +26,12 @@ from .stitched_primitives import (
     confusion_counts,
     dice_from_confusion,
     nsd_surface_dice,
-    pseudo_fmeasure,
+    pseudo_fmeasure_values,
     skeletonize_binary,
     skeleton_tube_metrics,
     soft_dice_from_prob,
     voi_from_component_labels,
+    weighted_pseudo_fmeasure_from_weights,
 )
 
 
@@ -241,6 +242,8 @@ def _component_metric_means_for_stability(
     dice_soft_vals: List[float] = []
     voi_vals: List[float] = []
     pfm_vals: List[float] = []
+    pfm_nonempty_vals: List[float] = []
+    pfm_weighted_vals: List[float] = []
     betti_l1_vals: List[float] = []
 
     for template in gt_component_templates:
@@ -255,7 +258,20 @@ def _component_metric_means_for_stability(
         dice_hard_vals.append(float(dice_from_confusion(c)))
         dice_soft_vals.append(float(soft_dice_from_prob(crop_pred_prob, crop_gt)))
         voi_vals.append(float(voi_from_component_labels(crop_gt_lab, crop_pred_lab)))
-        pfm_vals.append(float(pseudo_fmeasure(crop_pred_bin, crop_gt, skel_gt=template["gt_skel"])))
+        pfm_i, pfm_nonempty_i = pseudo_fmeasure_values(crop_pred_bin, crop_gt, skel_gt=template["gt_skel"])
+        pfm_vals.append(float(pfm_i))
+        pfm_nonempty_vals.append(float(pfm_nonempty_i))
+        pfm_weighted_vals.append(
+            float(
+                weighted_pseudo_fmeasure_from_weights(
+                    crop_pred_bin,
+                    crop_gt,
+                    recall_weights=template["pfm_weight_recall"],
+                    recall_weights_sum=float(template["pfm_weight_recall_sum"]),
+                    precision_weights=template["pfm_weight_precision"],
+                )
+            )
+        )
 
         pred_beta0, pred_beta1 = betti_numbers_2d(crop_pred_bin, connectivity=connectivity)
         gt_beta0 = int(template["gt_beta0"])
@@ -266,11 +282,20 @@ def _component_metric_means_for_stability(
         arr = np.asarray(vals, dtype=np.float64)
         return float(arr.mean()) if arr.size else float("nan")
 
+    def _nanmean_or_nan(vals: List[float]) -> float:
+        arr = np.asarray(vals, dtype=np.float64)
+        if arr.size == 0:
+            return float("nan")
+        arr = arr[np.isfinite(arr)]
+        return float(arr.mean()) if arr.size else float("nan")
+
     return {
         "dice_hard": _mean_or_nan(dice_hard_vals),
         "dice_soft": _mean_or_nan(dice_soft_vals),
         "voi": _mean_or_nan(voi_vals),
         "pfm": _mean_or_nan(pfm_vals),
+        "pfm_nonempty": _nanmean_or_nan(pfm_nonempty_vals),
+        "pfm_weighted": _mean_or_nan(pfm_weighted_vals),
         "betti_l1": _mean_or_nan(betti_l1_vals),
     }
 
@@ -356,6 +381,8 @@ def _compute_full_region_metrics(
         "skeleton/recall": float(full_metrics["skeleton_recall"]),
         "skeleton/cldice": float(full_metrics["skeleton_cldice"]),
         "pfm": float(full_metrics["pfm"]),
+        "pfm_nonempty": float(full_metrics["pfm_nonempty"]),
+        "pfm_weighted": float(full_metrics["pfm_weighted"]),
         "skeleton/chamfer": float(full_metrics["skeleton_chamfer"]),
         "skeleton/chamfer_pred_to_gt": float(full_metrics["skeleton_chamfer_pred_to_gt"]),
         "skeleton/chamfer_gt_to_pred": float(full_metrics["skeleton_chamfer_gt_to_pred"]),
@@ -404,6 +431,8 @@ def _build_components_manifest(
             "mpm": float(row["mpm"]),
             "drd": float(row["drd"]),
             "pfm": float(row["pfm"]),
+            "pfm_nonempty": float(row["pfm_nonempty"]),
+            "pfm_weighted": float(row["pfm_weighted"]),
             "voi": float(row["voi"]),
             "betti_l1": float(row["betti_l1"]),
             "abs_euler_err": float(row["abs_euler_err"]),
@@ -553,6 +582,8 @@ def _compute_threshold_stability_metrics(
     dice_soft_vals: List[float] = []
     voi_vals: List[float] = []
     pfm_vals: List[float] = []
+    pfm_nonempty_vals: List[float] = []
+    pfm_weighted_vals: List[float] = []
     betti_l1_vals: List[float] = []
     for t in tgrid:
         pred_bin_t, pred_prob_t = _postprocess_prediction(
@@ -574,6 +605,8 @@ def _compute_threshold_stability_metrics(
         dice_soft_vals.append(float(component_means_t["dice_soft"]))
         voi_vals.append(float(component_means_t["voi"]))
         pfm_vals.append(float(component_means_t["pfm"]))
+        pfm_nonempty_vals.append(float(component_means_t["pfm_nonempty"]))
+        pfm_weighted_vals.append(float(component_means_t["pfm_weighted"]))
         betti_l1_vals.append(float(component_means_t["betti_l1"]))
 
     out: Dict[str, float] = {}
@@ -581,11 +614,17 @@ def _compute_threshold_stability_metrics(
     dice_soft_stab = _stability_stats(dice_soft_vals)
     voi_stab = _stability_stats(voi_vals)
     pfm_stab = _stability_stats(pfm_vals)
+    pfm_nonempty_arr = np.asarray(pfm_nonempty_vals, dtype=np.float64)
+    pfm_nonempty_arr = pfm_nonempty_arr[np.isfinite(pfm_nonempty_arr)]
+    pfm_nonempty_stab = _stability_stats(pfm_nonempty_arr.tolist())
+    pfm_weighted_stab = _stability_stats(pfm_weighted_vals)
     betti_l1_stab = _stability_stats(betti_l1_vals)
     out.update({f"stability/dice_hard_{k}": float(v) for k, v in dice_hard_stab.items()})
     out.update({f"stability/dice_soft_{k}": float(v) for k, v in dice_soft_stab.items()})
     out.update({f"stability/voi_{k}": float(v) for k, v in voi_stab.items()})
     out.update({f"stability/pfm_{k}": float(v) for k, v in pfm_stab.items()})
+    out.update({f"stability/pfm_nonempty_{k}": float(v) for k, v in pfm_nonempty_stab.items()})
+    out.update({f"stability/pfm_weighted_{k}": float(v) for k, v in pfm_weighted_stab.items()})
     out.update({f"stability/betti_l1_{k}": float(v) for k, v in betti_l1_stab.items()})
     return out
 
@@ -864,6 +903,8 @@ def compute_stitched_metrics(
             "mpm": "mpm",
             "drd": "drd",
             "pfm": "pfm",
+            "pfm_nonempty": "pfm_nonempty",
+            "pfm_weighted": "pfm_weighted",
             "betti/l1_betti_err": "betti_l1",
             "abs_euler_err": "abs_euler_err",
             "boundary/hd95": "boundary_hd95",
