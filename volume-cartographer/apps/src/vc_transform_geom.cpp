@@ -1,5 +1,5 @@
 // vc_transform_geom.cpp
-// Small utility to apply an affine (and optional scale-segmentation) to
+// Small utility to apply an affine plus optional pre/post uniform scales to
 // OBJ geometry, a single TIFXYZ mesh, or a directory of TIFXYZ subfolders,
 // writing the transformed result.
 
@@ -117,11 +117,22 @@ static bool is_tifxyz_dir(const std::filesystem::path& p) {
         && std::filesystem::exists(p/"z.tif");
 }
 
+static inline cv::Vec3f transform_point_pipeline(const cv::Vec3f& p,
+                                                 const AffineTransform* A,
+                                                 double scale_before,
+                                                 double scale_after) {
+    cv::Vec3f q = p * static_cast<float>(scale_before);
+    if (A) q = apply_affine_point(q, *A);
+    q *= static_cast<float>(scale_after);
+    return q;
+}
+
 static int run_tifxyz(const std::filesystem::path& inDir,
                       const std::filesystem::path& outDir,
                       const AffineTransform* A,
                       bool invert,
-                      double scale_seg)
+                      double scale_before,
+                      double scale_after)
 {
     std::unique_ptr<AffineTransform> AA;
     if (A) {
@@ -142,22 +153,12 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         for (int i = 0; i < P->cols; ++i) {
             cv::Vec3f& p = (*P)(j,i);
             if (p[0] == -1) continue; // keep invalids
-            cv::Vec3f q = p * static_cast<float>(scale_seg);
-            if (AA) q = apply_affine_point(q, *AA);
-            p = q;
+            p = transform_point_pipeline(p, AA.get(), scale_before, scale_after);
         }
     }
 
-    if (AA) {
-        cv::Mat_<cv::Vec3f>* N = surf->rawNormalsPtr();
-        for (int j = 0; j < N->rows; ++j) {
-            for (int i = 0; i < N->cols; ++i) {
-                cv::Vec3f& n = (*N)(j,i);
-                if (std::isnan(n[0])) continue;
-                n = transform_normal(n, *AA);
-            }
-        }
-    }
+    // QuadSurface exposes points directly, but not a writable raw normal grid API.
+    // Keep TIFXYZ point transforms here and leave normal recomputation to downstream tools.
 
     try {
         std::filesystem::path out = outDir;
@@ -172,7 +173,8 @@ static int run_tifxyz_batch(const std::filesystem::path& inRoot,
                             const std::filesystem::path& outRoot,
                             const AffineTransform* A,
                             bool invert,
-                            double scale_seg)
+                            double scale_before,
+                            double scale_after)
 {
     if (std::filesystem::exists(outRoot)) {
         std::cerr << "output directory already exists: " << outRoot << std::endl;
@@ -195,7 +197,7 @@ static int run_tifxyz_batch(const std::filesystem::path& inRoot,
 
         found++;
         const auto out = outRoot / sub.filename();
-        const int rc = run_tifxyz(sub, out, A, invert, scale_seg);
+        const int rc = run_tifxyz(sub, out, A, invert, scale_before, scale_after);
         if (rc == 0) {
             ok++;
             std::cout << "[ok] " << sub.filename() << std::endl;
@@ -221,7 +223,8 @@ static int run_obj(const std::filesystem::path& inFile,
                    const std::filesystem::path& outFile,
                    const AffineTransform* A,
                    bool invert,
-                   double scale_seg)
+                   double scale_before,
+                   double scale_after)
 {
     std::unique_ptr<AffineTransform> AA;
     if (A) {
@@ -252,8 +255,7 @@ static int run_obj(const std::filesystem::path& inFile,
             char c; ss >> c; // 'v'
             double x, y, z; ss >> x >> y >> z;
             cv::Vec3f p = {static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
-            p *= static_cast<float>(scale_seg);
-            if (AA) p = apply_affine_point(p, *AA);
+            p = transform_point_pipeline(p, AA.get(), scale_before, scale_after);
             out << std::setprecision(9) << "v " << p[0] << " " << p[1] << " " << p[2] << "\n";
         } else if (starts_with(line, "vn ")) {
             std::istringstream ss(line);
@@ -261,7 +263,7 @@ static int run_obj(const std::filesystem::path& inFile,
             double nx, ny, nz; ss >> nx >> ny >> nz;
             cv::Vec3f n = {static_cast<float>(nx), static_cast<float>(ny), static_cast<float>(nz)};
             if (AA) n = transform_normal(n, *AA);
-            // scale_seg is uniform -> no effect on normalized normals
+            // Uniform before/after scales do not affect normalized normals.
             out << std::setprecision(9) << "vn " << n[0] << " " << n[1] << " " << n[2] << "\n";
         } else {
             out << line << "\n";
@@ -279,7 +281,8 @@ int main(int argc, char** argv) {
             ("output,o", po::value<std::string>()->required(), "Output path (required): OBJ file, TIFXYZ dir, or output root for batch")
             ("affine,a", po::value<std::string>(), "Affine JSON with 'transformation_matrix'")
             ("invert",   po::bool_switch()->default_value(false), "Invert the affine")
-            ("scale-segmentation", po::value<double>()->default_value(1.0), "Pre-scale applied to coordinates (uniform)")
+            ("scale-before", po::value<double>()->default_value(1.0), "Uniform scale applied before affine")
+            ("scale-after", po::value<double>()->default_value(1.0), "Uniform scale applied after affine")
         ;
 
         po::variables_map vm;
@@ -293,7 +296,8 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path inPath(vm["input"].as<std::string>());
         const std::filesystem::path outPath(vm["output"].as<std::string>());
-        const double scale_seg = vm["scale-segmentation"].as<double>();
+        const double scale_before = vm["scale-before"].as<double>();
+        const double scale_after = vm["scale-after"].as<double>();
         const bool invert = vm["invert"].as<bool>();
 
         std::unique_ptr<AffineTransform> A;
@@ -307,18 +311,18 @@ int main(int argc, char** argv) {
             if (std::filesystem::exists(outPath)) {
                 std::cerr << "output directory already exists: " << outPath << std::endl; return 1;
             }
-            return run_tifxyz(inPath, outPath, A.get(), invert, scale_seg);
+            return run_tifxyz(inPath, outPath, A.get(), invert, scale_before, scale_after);
         }
 
         if (std::filesystem::is_directory(inPath)) {
-            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_seg);
+            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_before, scale_after);
         }
 
         if (inPath.extension() == ".obj") {
             if (outPath.extension() != ".obj") {
                 std::cerr << "output should have .obj extension for OBJ input" << std::endl; return 1;
             }
-            return run_obj(inPath, outPath, A.get(), invert, scale_seg);
+            return run_obj(inPath, outPath, A.get(), invert, scale_before, scale_after);
         }
 
         std::cerr << "Unknown input type. Provide a .obj file, a TIFXYZ directory, or a directory containing TIFXYZ subfolders." << std::endl;
