@@ -99,7 +99,7 @@ class CFG:
     eval_skeleton_radius = [1]
     eval_component_worst_q = 0.2
     eval_component_worst_k = 2
-    eval_component_min_area = 64
+    eval_component_min_area = 0
     eval_component_pad = 5
     eval_skeleton_thinning_type = "guo_hall"
     eval_stitch_full_region_metrics = False
@@ -111,6 +111,7 @@ class CFG:
     eval_threshold_grid_steps = 5
     eval_threshold_grid = None
     eval_save_skeleton_images = True
+    eval_wandb_media_downsample = 1
 
     # ============== fixed =============
     pretrained = True
@@ -431,6 +432,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
         ("eval_threshold_grid", "eval_threshold_grid"),
         ("eval_save_skeleton_images", "eval_save_skeleton_images"),
+        ("eval_wandb_media_downsample", "eval_wandb_media_downsample"),
         ("pretrained", "pretrained"),
         ("num_workers", "num_workers"),
         ("layer_read_workers", "layer_read_workers"),
@@ -467,6 +469,18 @@ def apply_metadata_hyperparameters(cfg, metadata):
         raise ValueError(
             "training_hyperparameters.training.eval_stitch_every_n_epochs must be >= 1, "
             f"got {cfg.eval_stitch_every_n_epochs}"
+        )
+    cfg.eval_wandb_media_downsample = int(getattr(cfg, "eval_wandb_media_downsample", 1))
+    if cfg.eval_wandb_media_downsample < 1:
+        raise ValueError(
+            "training_hyperparameters.training.eval_wandb_media_downsample must be >= 1, "
+            f"got {cfg.eval_wandb_media_downsample}"
+        )
+    cfg.eval_component_min_area = int(getattr(cfg, "eval_component_min_area", 0) or 0)
+    if cfg.eval_component_min_area < 0:
+        raise ValueError(
+            "training_hyperparameters.training.eval_component_min_area must be >= 0, "
+            f"got {cfg.eval_component_min_area}"
         )
     cfg.eval_skeleton_thinning_type = str(getattr(cfg, "eval_skeleton_thinning_type", "zhang_suen")).strip().lower()
     if cfg.eval_skeleton_thinning_type not in {"zhang_suen", "guo_hall"}:

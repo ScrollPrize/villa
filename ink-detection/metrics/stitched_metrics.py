@@ -222,6 +222,66 @@ def _stability_stats(values: List[float]) -> Dict[str, float]:
     }
 
 
+def _normalize_component_min_area(component_min_area: Any) -> int:
+    value = component_min_area
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "null", "0"}:
+            return 0
+        value = int(text)
+    area = int(value)
+    if area <= 0:
+        return 0
+    return area
+
+
+def _remove_small_components_by_area_fast(
+    mask: np.ndarray,
+    *,
+    min_area: int,
+    connectivity: int,
+    return_labels: bool = False,
+):
+    import cv2
+
+    mask_bool = _as_bool_2d(mask)
+    area_i = _normalize_component_min_area(min_area)
+    if area_i <= 0:
+        if return_labels:
+            lab, n = _label_components(mask_bool, connectivity=connectivity)
+            return mask_bool, lab, int(n)
+        return mask_bool
+
+    cc_conn = 4 if int(connectivity) == 1 else 8
+    n_all, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_bool.astype(np.uint8, copy=False),
+        connectivity=cc_conn,
+    )
+    if int(n_all) <= 1:
+        if return_labels:
+            pred_lab = np.zeros_like(labels)
+            return mask_bool, pred_lab, 0
+        return mask_bool
+    sizes = stats[1:, cv2.CC_STAT_AREA].astype(np.int64, copy=False)
+    keep = sizes >= int(area_i)
+    keep_table = np.zeros(int(n_all), dtype=bool)
+    keep_table[1:] = keep
+    mask_filtered = keep_table[labels]
+    if not return_labels:
+        return mask_filtered
+    kept_labels = np.flatnonzero(keep) + 1
+    n_pred = int(kept_labels.size)
+    if n_pred == 0:
+        pred_lab = np.zeros_like(labels)
+        return mask_filtered, pred_lab, 0
+    remap = np.zeros(int(n_all), dtype=labels.dtype)
+    remap[kept_labels] = np.arange(1, n_pred + 1, dtype=labels.dtype)
+    pred_lab = remap[labels]
+    return mask_filtered, pred_lab, n_pred
+
+
 def _component_metric_means_for_stability(
     pred_prob_clean: np.ndarray,
     pred_bin: np.ndarray,
@@ -320,19 +380,24 @@ def _postprocess_prediction(
         raise ValueError(f"pred_prob/eval_mask shape mismatch: {pred_prob.shape} vs {eval_mask.shape}")
 
     pred_bin = np.logical_and(pred_prob >= float(threshold), eval_mask)
-    if component_min_area and int(component_min_area) > 0:
-        lab, n_lab = _label_components(pred_bin, connectivity=connectivity)
-        if n_lab > 0:
-            sizes = np.bincount(lab.ravel())[1:].astype(np.int64)
-            keep = sizes >= int(component_min_area)
-            keep_table = np.zeros(n_lab + 1, dtype=bool)
-            keep_table[1:] = keep
-            pred_bin = keep_table[lab]
+    if return_labels:
+        pred_bin, pred_lab, n_pred = _remove_small_components_by_area_fast(
+            pred_bin,
+            min_area=int(component_min_area),
+            connectivity=connectivity,
+            return_labels=True,
+        )
+    else:
+        pred_bin = _remove_small_components_by_area_fast(
+            pred_bin,
+            min_area=int(component_min_area),
+            connectivity=connectivity,
+            return_labels=False,
+        )
 
     pred_prob_clean = pred_prob.copy()
     pred_prob_clean[~pred_bin] = 0.0
     if return_labels:
-        pred_lab, n_pred = _label_components(pred_bin, connectivity=connectivity)
         return pred_bin, pred_prob_clean, pred_lab, int(n_pred)
     return pred_bin, pred_prob_clean
 
@@ -585,8 +650,39 @@ def _compute_threshold_stability_metrics(
     gt_bin: np.ndarray,
     gt_component_templates: List[Dict[str, Any]],
     timings: Optional[Dict[str, float]] = None,
+    stitched_inputs_output_dir: Optional[str] = None,
+    fragment_id: Optional[str] = None,
+    downsample: Optional[int] = None,
+    eval_epoch: Optional[int] = None,
+    roi_offset: Optional[Tuple[int, int]] = None,
+    crop_offset: Optional[Tuple[int, int]] = None,
+    full_offset: Optional[Tuple[int, int]] = None,
+    full_shape: Optional[Tuple[int, int]] = None,
+    output_dir: Optional[str] = None,
+    skeleton_thinning_type: str,
+    skel_gt: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
+    if stitched_inputs_output_dir is not None:
+        if fragment_id is None:
+            raise ValueError("fragment_id is required when stitched_inputs_output_dir is set")
+        if downsample is None:
+            raise ValueError("downsample is required when stitched_inputs_output_dir is set")
+        if roi_offset is None:
+            raise ValueError("roi_offset is required when stitched_inputs_output_dir is set")
+        if crop_offset is None:
+            raise ValueError("crop_offset is required when stitched_inputs_output_dir is set")
+        if full_offset is None:
+            raise ValueError("full_offset is required when stitched_inputs_output_dir is set")
+        if full_shape is None:
+            raise ValueError("full_shape is required when stitched_inputs_output_dir is set")
+    if output_dir is not None:
+        if fragment_id is None:
+            raise ValueError("fragment_id is required when output_dir is set")
+        if skel_gt is None:
+            raise ValueError("skel_gt is required when output_dir is set")
+
     tgrid = np.asarray(threshold_grid, dtype=np.float32)
+    out: Dict[str, float] = {}
     dice_hard_vals: List[float] = []
     dice_soft_vals: List[float] = []
     voi_vals: List[float] = []
@@ -595,17 +691,55 @@ def _compute_threshold_stability_metrics(
     pfm_weighted_vals: List[float] = []
     betti_l1_vals: List[float] = []
     for t in tgrid:
+        t_f = float(t)
         t0 = time.perf_counter()
         pred_bin_t, pred_prob_t = _postprocess_prediction(
             pred_prob,
             eval_mask=eval_mask,
-            threshold=float(t),
+            threshold=t_f,
             connectivity=betti_connectivity,
             component_min_area=component_min_area,
             return_labels=False,
         )
         if timings is not None:
             timings["postprocess"] = timings.get("postprocess", 0.0) + (time.perf_counter() - t0)
+
+        if stitched_inputs_output_dir is not None:
+            t0 = time.perf_counter()
+            pred_bin_threshold_t = np.logical_and(pred_prob >= t_f, eval_mask)
+            _save_stitched_eval_inputs(
+                stitched_inputs_output_dir=stitched_inputs_output_dir,
+                fragment_id=str(fragment_id),
+                downsample=int(downsample),
+                eval_epoch=eval_epoch,
+                threshold=t_f,
+                component_min_area=component_min_area,
+                pred_prob=pred_prob,
+                pred_bin_threshold=pred_bin_threshold_t,
+                pred_bin_postprocess=pred_bin_t,
+                gt_bin=gt_bin,
+                eval_mask=eval_mask,
+                roi_offset=(int(roi_offset[0]), int(roi_offset[1])),
+                crop_offset=(int(crop_offset[0]), int(crop_offset[1])),
+                full_offset=(int(full_offset[0]), int(full_offset[1])),
+                full_shape=(int(full_shape[0]), int(full_shape[1])),
+            )
+            if timings is not None:
+                timings["save_inputs"] = timings.get("save_inputs", 0.0) + (time.perf_counter() - t0)
+        if output_dir is not None:
+            t0 = time.perf_counter()
+            _save_skeleton_images(
+                output_dir=output_dir,
+                fragment_id=str(fragment_id),
+                threshold=t_f,
+                skel_gt=skel_gt,
+                pred_bin_clean=pred_bin_t,
+                skel_pred=None,
+                skeleton_thinning_type=skeleton_thinning_type,
+            )
+            if timings is not None:
+                timings["save_skeletons"] = timings.get("save_skeletons", 0.0) + (time.perf_counter() - t0)
+
         t0 = time.perf_counter()
         component_means_t = _component_metric_means_for_stability(
             pred_prob_t,
@@ -616,6 +750,15 @@ def _compute_threshold_stability_metrics(
         )
         if timings is not None:
             timings["component_means"] = timings.get("component_means", 0.0) + (time.perf_counter() - t0)
+        thr_str = f"{t_f:.6f}".rstrip("0").rstrip(".")
+        if not thr_str:
+            thr_str = "0"
+        thr_tag = thr_str.replace(".", "p")
+        for metric_name in ("dice_hard", "dice_soft", "voi", "pfm", "pfm_nonempty", "pfm_weighted", "betti_l1"):
+            metric_key = f"thresholds/{metric_name}/thr_{thr_tag}"
+            if metric_key in out:
+                raise ValueError(f"duplicate threshold metric key: {metric_key}")
+            out[metric_key] = float(component_means_t[metric_name])
         dice_hard_vals.append(float(component_means_t["dice_hard"]))
         dice_soft_vals.append(float(component_means_t["dice_soft"]))
         voi_vals.append(float(component_means_t["voi"]))
@@ -624,7 +767,6 @@ def _compute_threshold_stability_metrics(
         pfm_weighted_vals.append(float(component_means_t["pfm_weighted"]))
         betti_l1_vals.append(float(component_means_t["betti_l1"]))
 
-    out: Dict[str, float] = {}
     dice_hard_stab = _stability_stats(dice_hard_vals)
     dice_soft_stab = _stability_stats(dice_soft_vals)
     voi_stab = _stability_stats(voi_vals)
@@ -809,7 +951,7 @@ def compute_stitched_metrics(
     skeleton_radius: Optional[np.ndarray] = None,
     component_worst_q: Optional[float] = 0.2,
     component_worst_k: Optional[int] = 2,
-    component_min_area: int = 0,
+    component_min_area: Optional[Any] = None,
     component_pad: int = 5,
     skeleton_thinning_type: str = "zhang_suen",
     enable_full_region_metrics: bool = False,
@@ -840,6 +982,7 @@ def compute_stitched_metrics(
 
     ds = max(1, int(downsample))
     pad_i = max(0, int(component_pad))
+    component_min_area_i = _normalize_component_min_area(component_min_area)
     roi_key = (0, 0)
     if roi_offset is not None:
         roi_key = (int(roi_offset[0]), int(roi_offset[1]))
@@ -951,7 +1094,7 @@ def compute_stitched_metrics(
         eval_mask=eval_mask,
         threshold=float(threshold),
         connectivity=betti_connectivity,
-        component_min_area=component_min_area,
+        component_min_area=component_min_area_i,
         return_labels=True,
     )
     _timeit("postprocess_and_confusion", t0)
@@ -1054,7 +1197,7 @@ def compute_stitched_metrics(
             downsample=ds,
             eval_epoch=eval_epoch,
             threshold=float(threshold),
-            component_min_area=component_min_area,
+            component_min_area=component_min_area_i,
             pred_prob=pred_prob,
             pred_bin_threshold=pred_bin_threshold,
             pred_bin_postprocess=pred_bin_clean,
@@ -1118,10 +1261,21 @@ def compute_stitched_metrics(
                 pred_prob=pred_prob,
                 eval_mask=eval_mask,
                 betti_connectivity=betti_connectivity,
-                component_min_area=component_min_area,
+                component_min_area=component_min_area_i,
                 gt_bin=gt_bin,
                 gt_component_templates=gt_component_templates,
                 timings=threshold_stability_timings,
+                stitched_inputs_output_dir=stitched_inputs_output_dir,
+                fragment_id=fragment_id,
+                downsample=ds,
+                eval_epoch=eval_epoch,
+                roi_offset=(off_y, off_x),
+                crop_offset=(crop_off_y, crop_off_x),
+                full_offset=(full_off_y, full_off_x),
+                full_shape=pred_full_shape,
+                output_dir=output_dir if save_skeleton_images else None,
+                skeleton_thinning_type=skeleton_thinning_type,
+                skel_gt=skel_gt,
             )
         )
         _timeit("threshold_stability", t0)

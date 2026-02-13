@@ -122,7 +122,7 @@
       ],
       "eval_component_worst_q": 0.2,
       "eval_component_worst_k": 2,
-      "eval_component_min_area": 64,
+      "eval_component_min_area": 65536,
       "eval_component_pad": 5,
       "eval_skeleton_thinning_type": "guo_hall",
       "eval_stitch_full_region_metrics": false,
@@ -134,7 +134,8 @@
       "eval_threshold_grid_steps": 5,
       "eval_threshold_grid": null,
       "eval_save_skeleton_images": true,
-      "stitch_log_only_downsample": 8
+      "stitch_log_only_downsample": 8,
+      "eval_wandb_media_downsample": 8
     },
     "augmentation": {
       "fourth_augment": {
@@ -178,7 +179,7 @@
     "stitch_all_val": true,
     "stitch_train": true,
     "stitch_train_every_n_epochs": 10,
-    "stitch_downsample": 8,
+    "stitch_downsample": 1,
     "train_segments": [
       "20250806145318",
       "l2_0_crop",

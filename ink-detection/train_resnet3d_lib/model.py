@@ -1,6 +1,5 @@
 import time
 import os.path as osp
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 
 import numpy as np
@@ -112,7 +111,6 @@ class StitchManager:
         self.buffers = {}
         self.segment_ids = {}
         self.buffer_meta = {}
-        self.train_buffers = {}
         self.train_buffer_meta = {}
         self.train_segment_ids = []
         self.train_loaders = []
@@ -122,7 +120,6 @@ class StitchManager:
         self.log_only_buffer_meta = {}
         self.log_only_segment_ids = []
         self.log_only_loaders = []
-        self.log_only_enabled = bool(stitch_log_only_shapes) and bool(stitch_log_only_segment_ids)
         self.log_only_every_n_epochs = max(1, int(stitch_log_only_every_n_epochs or 10))
         self.log_only_downsample = int(stitch_log_only_downsample or self.downsample)
         self.borders_by_split = {"train": {}, "val": {}}
@@ -130,8 +127,6 @@ class StitchManager:
         self.val_bboxes = dict(stitch_val_bboxes or {})
         self.train_bboxes = dict(stitch_train_bboxes or {})
         self.log_only_bboxes = dict(stitch_log_only_bboxes or {})
-        self._wandb_media_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wandb_media")
-        self._wandb_media_future = None
 
         def _resolve_roi(shape, bbox, ds):
             h = int(shape[0])
@@ -208,13 +203,10 @@ class StitchManager:
                 (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.downsample)
                 buf_h = max(1, int(y1 - y0))
                 buf_w = max(1, int(x1 - x0))
-                self.train_buffers[seg_id] = (
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
-                )
                 self.train_buffer_meta[seg_id] = {
                     "offset": (int(y0), int(x0)),
                     "full_shape": (int(ds_h), int(ds_w)),
+                    "buffer_shape": (int(buf_h), int(buf_w)),
                 }
                 self.train_segment_ids.append(seg_id)
 
@@ -241,55 +233,6 @@ class StitchManager:
                 self.log_only_segment_ids.append(seg_id)
 
         self.enabled = len(self.buffers) > 0
-
-    def _poll_wandb_media_job(self):
-        if self._wandb_media_future is None:
-            return
-        if not self._wandb_media_future.done():
-            return
-        exc = self._wandb_media_future.exception()
-        self._wandb_media_future = None
-        if exc is not None:
-            raise RuntimeError("asynchronous wandb media logging failed") from exc
-
-    def _submit_wandb_media_job(self, *, logger, step, images, captions, log_only_images, log_only_captions):
-        self._poll_wandb_media_job()
-        if self._wandb_media_future is not None:
-            log(
-                f"skip wandb media step={int(step)} reason=previous_media_job_pending "
-                f"masks={len(images)} masks_log_only={len(log_only_images)}"
-            )
-            return
-
-        images_payload = list(images)
-        captions_payload = list(captions)
-        log_only_images_payload = list(log_only_images)
-        log_only_captions_payload = list(log_only_captions)
-
-        def _job():
-            t0 = time.perf_counter()
-            if images_payload:
-                logger.log_image(key="masks", images=images_payload, caption=captions_payload, step=step)
-            if log_only_images_payload:
-                logger.log_image(
-                    key="masks_log_only",
-                    images=log_only_images_payload,
-                    caption=log_only_captions_payload,
-                    step=step,
-                )
-            log(
-                f"wandb media done step={int(step)} "
-                f"masks={len(images_payload)} masks_log_only={len(log_only_images_payload)} "
-                f"elapsed={time.perf_counter() - t0:.2f}s"
-            )
-
-        self._wandb_media_future = self._wandb_media_executor.submit(_job)
-
-    def shutdown(self):
-        if self._wandb_media_future is not None:
-            self._wandb_media_future.result()
-            self._wandb_media_future = None
-        self._wandb_media_executor.shutdown(wait=True)
 
     def set_borders(self, *, train_borders=None, val_borders=None):
         if train_borders is not None:
@@ -370,9 +313,9 @@ class StitchManager:
 
     def run_train_stitch_pass(self, model):
         if not self.train_enabled:
-            return False
+            return None
         if not self.train_loaders or not self.train_segment_ids:
-            return False
+            return None
         if len(self.train_loaders) != len(self.train_segment_ids):
             raise ValueError(
                 "train stitch loaders/segment_ids length mismatch "
@@ -382,17 +325,11 @@ class StitchManager:
         epoch = int(getattr(model, "current_epoch", 0))
         if self.train_every_n_epochs > 1:
             if ((epoch + 1) % self.train_every_n_epochs) != 0:
-                return False
+                return None
 
         t0 = time.perf_counter()
         log(f"train stitch pass start epoch={epoch}")
-
-        for segment_id in self.train_segment_ids:
-            if segment_id not in self.train_buffers:
-                raise ValueError(f"Missing train stitch buffers for segment_id={segment_id!r}")
-            pred_buf, count_buf = self.train_buffers[segment_id]
-            pred_buf.fill(0)
-            count_buf.fill(0)
+        segment_viz = {}
 
         was_training = model.training
         precision_context = nullcontext()
@@ -408,8 +345,18 @@ class StitchManager:
             model.eval()
             with torch.inference_mode(), precision_context:
                 for loader, segment_id in zip(self.train_loaders, self.train_segment_ids):
-                    pred_buf, count_buf = self.train_buffers[str(segment_id)]
-                    meta = self.train_buffer_meta.get(str(segment_id), {})
+                    segment_id = str(segment_id)
+                    meta = self.train_buffer_meta.get(segment_id)
+                    if meta is None:
+                        raise ValueError(f"Missing train stitch metadata for segment_id={segment_id!r}")
+                    buf_h, buf_w = [int(v) for v in meta.get("buffer_shape", (0, 0))]
+                    if buf_h <= 0 or buf_w <= 0:
+                        raise ValueError(
+                            f"Invalid train stitch buffer shape for segment_id={segment_id!r}: "
+                            f"{meta.get('buffer_shape')!r}"
+                        )
+                    pred_buf = np.zeros((buf_h, buf_w), dtype=np.float16)
+                    count_buf = np.zeros((buf_h, buf_w), dtype=np.uint16)
                     offset = meta.get("offset", (0, 0))
                     for batch in loader:
                         x, _y, xyxys, _g = batch
@@ -423,37 +370,43 @@ class StitchManager:
                             offset=offset,
                             ds_override=self.downsample,
                         )
+                    covered = count_buf > 0
+                    covered_px = int(covered.sum())
+                    total_px = int(covered.size)
+                    coverage = float(covered_px) / float(max(1, total_px))
+                    if covered_px > 0:
+                        stitched = np.divide(
+                            pred_buf.astype(np.float32),
+                            count_buf.astype(np.float32),
+                            out=np.zeros((buf_h, buf_w), dtype=np.float32),
+                            where=covered,
+                        )
+                        vals = stitched[covered]
+                        prob_mean = float(vals.mean()) if vals.size else float("nan")
+                        prob_max = float(vals.max()) if vals.size else float("nan")
+                    else:
+                        stitched = np.zeros((buf_h, buf_w), dtype=np.float32)
+                        prob_mean = float("nan")
+                        prob_max = float("nan")
+                    log(
+                        f"train stitch summary segment={segment_id} "
+                        f"coverage={coverage:.4f} covered_px={covered_px}/{total_px} "
+                        f"prob_mean={prob_mean:.4f} prob_max={prob_max:.4f}"
+                    )
+                    segment_viz[segment_id] = {
+                        "img_u8": (np.clip(stitched, 0.0, 1.0) * 255.0).astype(np.uint8),
+                        "has": covered,
+                        "meta": {
+                            "offset": tuple(meta.get("offset", (0, 0))),
+                            "full_shape": tuple(meta.get("full_shape", stitched.shape)),
+                        },
+                    }
         finally:
             if was_training:
                 model.train()
 
-        for segment_id in self.train_segment_ids:
-            pred_buf, count_buf = self.train_buffers[str(segment_id)]
-            covered = count_buf > 0
-            covered_px = int(covered.sum())
-            total_px = int(covered.size)
-            coverage = float(covered_px) / float(max(1, total_px))
-            if covered_px > 0:
-                stitched = np.divide(
-                    pred_buf,
-                    count_buf,
-                    out=np.zeros_like(pred_buf),
-                    where=covered,
-                )
-                vals = stitched[covered]
-                prob_mean = float(vals.mean()) if vals.size else float("nan")
-                prob_max = float(vals.max()) if vals.size else float("nan")
-            else:
-                prob_mean = float("nan")
-                prob_max = float("nan")
-            log(
-                f"train stitch summary segment={segment_id} "
-                f"coverage={coverage:.4f} covered_px={covered_px}/{total_px} "
-                f"prob_mean={prob_mean:.4f} prob_max={prob_max:.4f}"
-            )
-
         log(f"train stitch pass done epoch={epoch} elapsed={time.perf_counter() - t0:.1f}s")
-        return True
+        return segment_viz
 
     def run_log_only_stitch_pass(self, model):
         if not self.log_only_loaders or not self.log_only_segment_ids:
@@ -526,15 +479,15 @@ class StitchManager:
     def on_validation_epoch_end(self, model):
         if not self.enabled or not self.buffers:
             return
-        self._poll_wandb_media_job()
 
         sanity_checking = bool(model.trainer is not None and getattr(model.trainer, "sanity_checking", False))
         is_global_zero = bool(model.trainer is None or model.trainer.is_global_zero)
-        train_configured = bool(self.train_loaders) and bool(self.train_segment_ids) and bool(self.train_buffers)
+        train_configured = bool(self.train_loaders) and bool(self.train_segment_ids) and bool(self.train_buffer_meta)
         stitch_train_mode = bool(self.train_enabled and train_configured)
         log_only_configured = bool(self.log_only_loaders) and bool(self.log_only_segment_ids) and bool(self.log_only_buffers)
 
         did_run_train_stitch = False
+        train_segment_viz = {}
         did_run_log_only = False
         if stitch_train_mode and (not is_global_zero):
             # Only rank-0 runs the extra train visualization pass + logging.
@@ -543,7 +496,8 @@ class StitchManager:
                 count_buf.fill(0)
             return
         if stitch_train_mode and (not sanity_checking):
-            did_run_train_stitch = self.run_train_stitch_pass(model)
+            train_segment_viz = self.run_train_stitch_pass(model) or {}
+            did_run_train_stitch = bool(train_segment_viz)
             if not did_run_train_stitch:
                 # train stitching is enabled but only runs every N epochs; fall back to val-only logging.
                 stitch_train_mode = False
@@ -560,9 +514,6 @@ class StitchManager:
                 log_only_mode = False
 
         log_train_stitch = bool(stitch_train_mode and did_run_train_stitch)
-
-        images = []
-        captions = []
 
         segment_to_val = {}
         segment_to_val_meta = {}
@@ -595,125 +546,141 @@ class StitchManager:
             full_has[y0 : y0 + h, x0 : x0 + w] = has
             return full, full_has
 
-        if log_train_stitch:
-            segment_to_train = {}
-            segment_to_train_meta = {}
-            for segment_id in self.train_segment_ids:
-                pred_buf, count_buf = self.train_buffers[str(segment_id)]
-                stitched = np.divide(
-                    pred_buf,
-                    count_buf,
-                    out=np.zeros_like(pred_buf),
-                    where=count_buf != 0,
+        def _to_u8(img_float):
+            return (np.clip(img_float, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        def _add_borders_rgb(base_u8, segment_id):
+            rgb = np.repeat(base_u8[..., None], 3, axis=2)
+            train_border = self.borders_by_split.get("train", {}).get(str(segment_id))
+            val_border = self.borders_by_split.get("val", {}).get(str(segment_id))
+            if train_border is not None:
+                rgb[train_border.astype(bool)] = np.array([255, 0, 0], dtype=np.uint8)
+            if val_border is not None:
+                rgb[val_border.astype(bool)] = np.array([0, 0, 255], dtype=np.uint8)
+            return rgb
+
+        can_log_media = (
+            (not sanity_checking)
+            and (model.trainer is None or model.trainer.is_global_zero)
+            and isinstance(model.logger, WandbLogger)
+        )
+        media_step = int(getattr(model.trainer, "global_step", 0)) if can_log_media else None
+
+        if can_log_media:
+            wandb_media_downsample = int(getattr(CFG, "eval_wandb_media_downsample", 1))
+            if wandb_media_downsample < 1:
+                raise ValueError(
+                    "eval_wandb_media_downsample must be >= 1, "
+                    f"got {wandb_media_downsample}"
                 )
-                segment_id = str(segment_id)
-                segment_to_train[segment_id] = (np.clip(stitched, 0, 1), (count_buf != 0))
-                meta = self.train_buffer_meta.get(segment_id, {})
-                segment_to_train_meta[segment_id] = {
-                    "offset": meta.get("offset", (0, 0)),
-                    "full_shape": meta.get("full_shape", stitched.shape),
-                }
 
-            segment_ids = sorted(set(segment_to_val.keys()) | set(segment_to_train.keys()))
-            for segment_id in segment_ids:
-                base = None
-                if segment_id in segment_to_val:
-                    val_img, val_has = segment_to_val[segment_id]
-                    val_meta = segment_to_val_meta.get(segment_id, {})
-                    base, _ = _expand_to_full(val_img, val_has, val_meta)
-                    base = base.copy()
-                elif segment_id in segment_to_train:
-                    train_img, train_has = segment_to_train[segment_id]
-                    train_meta = segment_to_train_meta.get(segment_id, {})
-                    base, _ = _expand_to_full(train_img, train_has, train_meta)
-                    base = base.copy()
-                else:
-                    continue
+            def _downsample_for_wandb(img: np.ndarray, *, source_downsample: int) -> np.ndarray:
+                source_downsample = int(source_downsample)
+                if source_downsample < 1:
+                    raise ValueError(f"source_downsample must be >= 1, got {source_downsample}")
+                if source_downsample > 1 or wandb_media_downsample == 1:
+                    return img
+                return np.ascontiguousarray(img[::wandb_media_downsample, ::wandb_media_downsample])
 
-                if segment_id in segment_to_train and segment_id in segment_to_val:
-                    train_img, train_has = segment_to_train[segment_id]
-                    val_img, val_has = segment_to_val[segment_id]
-                    train_meta = segment_to_train_meta.get(segment_id, {})
-                    val_meta = segment_to_val_meta.get(segment_id, {})
-                    train_img, train_has = _expand_to_full(train_img, train_has, train_meta)
-                    val_img, val_has = _expand_to_full(val_img, val_has, val_meta)
-                    base[train_has] = train_img[train_has]
-                    base[val_has] = val_img[val_has]
+            masks_logged = 0
+            masks_log_only_logged = 0
+            t0 = time.perf_counter()
+            if log_train_stitch:
+                segment_ids = sorted(set(segment_to_val.keys()) | set(train_segment_viz.keys()))
+                for segment_id in segment_ids:
+                    val_base = None
+                    val_has = None
+                    if segment_id in segment_to_val:
+                        val_img, val_cov = segment_to_val[segment_id]
+                        val_meta = segment_to_val_meta.get(segment_id, {})
+                        val_base, val_has = _expand_to_full(val_img, val_cov, val_meta)
+                        val_base = _to_u8(val_base)
 
-                rgb = np.repeat(base[..., None], 3, axis=2)
-                train_border = self.borders_by_split.get("train", {}).get(str(segment_id))
-                val_border = self.borders_by_split.get("val", {}).get(str(segment_id))
-                if train_border is not None:
-                    rgb[train_border.astype(bool)] = np.array([1.0, 0.0, 0.0], dtype=rgb.dtype)
-                if val_border is not None:
-                    rgb[val_border.astype(bool)] = np.array([0.0, 0.0, 1.0], dtype=rgb.dtype)
+                    train_base = None
+                    train_has = None
+                    if segment_id in train_segment_viz:
+                        entry = train_segment_viz[segment_id]
+                        train_base, train_has = _expand_to_full(entry["img_u8"], entry["has"], entry["meta"])
 
-                images.append(rgb)
-                has_train = segment_id in segment_to_train and bool(segment_to_train[segment_id][1].any())
-                has_val = segment_id in segment_to_val and bool(segment_to_val[segment_id][1].any())
-                if has_train and has_val:
-                    split_tag = "train+val"
-                elif has_train:
-                    split_tag = "train"
-                elif has_val:
-                    split_tag = "val"
-                else:
-                    split_tag = "none"
-                captions.append(f"{segment_id} ({split_tag} ds={self.downsample})")
-        else:
-            want_color = bool(self.train_enabled)
-            for loader_idx, (pred_buf, count_buf) in self.buffers.items():
-                stitched = np.divide(
-                    pred_buf,
-                    count_buf,
-                    out=np.zeros_like(pred_buf),
-                    where=count_buf != 0,
-                )
-                segment_id = self.segment_ids.get(loader_idx, str(loader_idx))
-                segment_id = str(segment_id)
-                base = np.clip(stitched, 0, 1)
-                base, _ = _expand_to_full(base, count_buf != 0, segment_to_val_meta.get(segment_id, {}))
-                if want_color:
-                    rgb = np.repeat(base[..., None], 3, axis=2)
-                    train_border = self.borders_by_split.get("train", {}).get(str(segment_id))
-                    val_border = self.borders_by_split.get("val", {}).get(str(segment_id))
-                    if train_border is not None:
-                        rgb[train_border.astype(bool)] = np.array([1.0, 0.0, 0.0], dtype=rgb.dtype)
-                    if val_border is not None:
-                        rgb[val_border.astype(bool)] = np.array([0.0, 0.0, 1.0], dtype=rgb.dtype)
-                    images.append(rgb)
-                else:
-                    images.append(base)
-                captions.append(f"{segment_id} (val ds={self.downsample})")
+                    if val_base is None and train_base is None:
+                        continue
+                    if val_base is not None:
+                        base_u8 = val_base.copy()
+                    else:
+                        base_u8 = train_base.copy()
+                    if train_base is not None and train_has is not None:
+                        base_u8[train_has] = train_base[train_has]
+                    if val_base is not None and val_has is not None:
+                        base_u8[val_has] = val_base[val_has]
 
-        log_only_images = []
-        log_only_captions = []
-        if log_only_mode:
-            for segment_id in self.log_only_segment_ids:
-                pred_buf, count_buf = self.log_only_buffers[str(segment_id)]
-                stitched = np.divide(
-                    pred_buf,
-                    count_buf,
-                    out=np.zeros_like(pred_buf),
-                    where=count_buf != 0,
-                )
-                meta = self.log_only_buffer_meta.get(str(segment_id), {})
-                base = np.clip(stitched, 0, 1)
-                base, _ = _expand_to_full(base, count_buf != 0, meta)
-                log_only_images.append(base)
-                log_only_captions.append(f"{segment_id} (log-only ds={self.log_only_downsample})")
+                    image = _add_borders_rgb(base_u8, segment_id)
+                    has_train = bool(train_has is not None and train_has.any())
+                    has_val = bool(val_has is not None and val_has.any())
+                    if has_train and has_val:
+                        split_tag = "train+val"
+                    elif has_train:
+                        split_tag = "train"
+                    elif has_val:
+                        split_tag = "val"
+                    else:
+                        split_tag = "none"
+                    image = _downsample_for_wandb(image, source_downsample=int(self.downsample))
+                    model.logger.log_image(
+                        key="masks",
+                        images=[image],
+                        caption=[f"{segment_id} ({split_tag} ds={self.downsample})"],
+                    )
+                    masks_logged += 1
+            else:
+                want_color = bool(self.train_enabled)
+                for loader_idx, (pred_buf, count_buf) in self.buffers.items():
+                    stitched = np.divide(
+                        pred_buf,
+                        count_buf,
+                        out=np.zeros_like(pred_buf),
+                        where=count_buf != 0,
+                    )
+                    segment_id = str(self.segment_ids.get(loader_idx, str(loader_idx)))
+                    base = np.clip(stitched, 0, 1)
+                    base, _ = _expand_to_full(base, count_buf != 0, segment_to_val_meta.get(segment_id, {}))
+                    base_u8 = _to_u8(base)
+                    if want_color:
+                        image = _add_borders_rgb(base_u8, segment_id)
+                    else:
+                        image = base_u8
+                    image = _downsample_for_wandb(image, source_downsample=int(self.downsample))
+                    model.logger.log_image(
+                        key="masks",
+                        images=[image],
+                        caption=[f"{segment_id} (val ds={self.downsample})"],
+                    )
+                    masks_logged += 1
 
-        if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
-            if isinstance(model.logger, WandbLogger):
-                step = int(getattr(model.trainer, "global_step", 0))
-                self._submit_wandb_media_job(
-                    logger=model.logger,
-                    step=step,
-                    images=images,
-                    captions=captions,
-                    log_only_images=log_only_images,
-                    log_only_captions=log_only_captions,
-                )
+            if log_only_mode:
+                for segment_id in self.log_only_segment_ids:
+                    pred_buf, count_buf = self.log_only_buffers[str(segment_id)]
+                    stitched = np.divide(
+                        pred_buf,
+                        count_buf,
+                        out=np.zeros_like(pred_buf),
+                        where=count_buf != 0,
+                    )
+                    meta = self.log_only_buffer_meta.get(str(segment_id), {})
+                    base = np.clip(stitched, 0, 1)
+                    base, _ = _expand_to_full(base, count_buf != 0, meta)
+                    image = _downsample_for_wandb(_to_u8(base), source_downsample=int(self.log_only_downsample))
+                    model.logger.log_image(
+                        key="masks_log_only",
+                        images=[image],
+                        caption=[f"{segment_id} (log-only ds={self.log_only_downsample})"],
+                    )
+                    masks_log_only_logged += 1
+
+            log(
+                f"wandb media done step={int(media_step)} "
+                f"masks={masks_logged} masks_log_only={masks_log_only_logged} "
+                f"elapsed={time.perf_counter() - t0:.2f}s"
+            )
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
             should_run_stitch_metrics = bool(getattr(CFG, "eval_stitch_metrics", True)) and bool(segment_to_val)
@@ -894,10 +861,6 @@ class StitchManager:
         for pred_buf, count_buf in self.buffers.values():
             pred_buf.fill(0)
             count_buf.fill(0)
-        if log_train_stitch:
-            for pred_buf, count_buf in self.train_buffers.values():
-                pred_buf.fill(0)
-                count_buf.fill(0)
         if log_only_mode:
             for pred_buf, count_buf in self.log_only_buffers.values():
                 pred_buf.fill(0)
@@ -1387,9 +1350,6 @@ class RegressionPLModel(pl.LightningModule):
             self.log(f"val/group_{group_idx}_{safe_group_name}/dice_loss", group_dice_loss[group_idx], on_epoch=True)
             self.log(f"val/group_{group_idx}_{safe_group_name}/count", group_count[group_idx], on_epoch=True)
         self._stitcher.on_validation_epoch_end(self)
-
-    def on_fit_end(self):
-        self._stitcher.shutdown()
 
     def configure_optimizers(self):
         if bool(getattr(CFG, "exclude_weight_decay_bias_norm", False)) and float(getattr(CFG, "weight_decay", 0.0) or 0.0) > 0:

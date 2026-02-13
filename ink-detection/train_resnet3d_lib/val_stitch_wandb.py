@@ -88,4 +88,10 @@ def rewrite_val_stitch_metric_key(key: str) -> str:
                 stat_name = suffix[1:]
                 return f"stability/{metric_name}/{stat_name}"
         raise ValueError(f"unrecognized stability metric key: {key!r}")
+    if key.startswith("thresholds/"):
+        rest = key[len("thresholds/") :]
+        metric_name, sep, threshold_tag = rest.partition("/")
+        if not sep or not metric_name or not threshold_tag.startswith("thr_"):
+            raise ValueError(f"unrecognized thresholds metric key: {key!r}")
+        return key
     return f"summary/{key}"

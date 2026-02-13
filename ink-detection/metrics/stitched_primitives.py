@@ -28,7 +28,7 @@ def _as_int_labels_2d(x: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected 2D label array, got shape={x.shape}")
     if not np.issubdtype(x.dtype, np.integer):
         raise TypeError(f"expected integer label dtype, got {x.dtype}")
-    return x.astype(np.int64, copy=False)
+    return x
 
 
 @dataclass
@@ -668,8 +668,8 @@ def skeleton_chamfer(skel_pred: np.ndarray, skel_gt: np.ndarray) -> Dict[str, fl
     if skel_pred.sum() == 0 and skel_gt.sum() == 0:
         return {"chamfer": 0.0, "pred_to_gt": 0.0, "gt_to_pred": 0.0}
     if skel_pred.sum() == 0 or skel_gt.sum() == 0:
-        diag = float(math.hypot(skel_pred.shape[0], skel_pred.shape[1]))
-        return {"chamfer": diag, "pred_to_gt": diag, "gt_to_pred": diag}
+        inf = float("inf")
+        return {"chamfer": inf, "pred_to_gt": inf, "gt_to_pred": inf}
 
     dt_to_gt = distance_transform_edt((~skel_gt).astype(np.uint8))
     dt_to_pred = distance_transform_edt((~skel_pred).astype(np.uint8))
