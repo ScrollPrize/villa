@@ -43,7 +43,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--unet-layer", type=int, default=None)
 	g.add_argument("--unet-z", type=int, default=None)
 	g.add_argument("--z-step", type=int, default=1)
-	g.add_argument("--unet-tile-size", type=int, default=320)
+	g.add_argument("--unet-tile-size", type=int, default=2048)
 	g.add_argument("--unet-overlap", type=int, default=128)
 	g.add_argument("--unet-border", type=int, default=32)
 	g.add_argument("--unet-group", default=None)

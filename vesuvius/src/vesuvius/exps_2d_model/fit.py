@@ -126,6 +126,13 @@ def main(argv: list[str] | None = None) -> int:
 		z_size=int(z_size_use),
 	)
 	print("[point_constraints] points_xyz_winda_work", points_tensor_work)
+	points_all = torch.empty((0, 4), dtype=torch.float32)
+	idx_left = torch.empty((0, 3), dtype=torch.int64)
+	valid_left = torch.empty((0,), dtype=torch.bool)
+	min_dist_left = torch.empty((0,), dtype=torch.float32)
+	idx_right = torch.empty((0, 3), dtype=torch.int64)
+	valid_right = torch.empty((0,), dtype=torch.bool)
+	min_dist_right = torch.empty((0,), dtype=torch.float32)
 
 	device = torch.device(data_cfg.device)
 	crop_xyzwhd = None
@@ -182,7 +189,14 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			xy_lr0 = mdl._grid_xy()
 			xy_conn0 = mdl._xy_conn_px(xy_lr=xy_lr0)
-		point_constraints.print_closest_conn_segments(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+		points_all, idx_left, valid_left, min_dist_left, idx_right, valid_right, min_dist_right = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+		print("[point_constraints] points_xyz_winda_work_all", points_all)
+		print("[point_constraints] closest_conn_left[z,row,colL]", idx_left)
+		print("[point_constraints] closest_conn_left_valid", valid_left)
+		print("[point_constraints] closest_conn_left_min_dist_px", min_dist_left)
+		print("[point_constraints] closest_conn_right[z,row,colL]", idx_right)
+		print("[point_constraints] closest_conn_right_valid", valid_right)
+		print("[point_constraints] closest_conn_right_min_dist_px", min_dist_right)
 
 	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
 	device = data.cos.device
@@ -201,6 +215,22 @@ def main(argv: list[str] | None = None) -> int:
 			subsample_mesh=int(subsample_mesh_use),
 			subsample_winding=int(subsample_winding_use),
 			crop_xyzwhd=crop_xyzwhd,
+		)
+	if int(points_all.shape[0]) > 0:
+		with torch.no_grad():
+			xy_lr_corr = mdl._grid_xy()
+			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
+		vis.save_corr_points(
+			data=data,
+			xy_lr=xy_lr_corr,
+			xy_conn=xy_conn_corr,
+			points_xyz_winda=points_all,
+			idx_left=idx_left,
+			valid_left=valid_left,
+			idx_right=idx_right,
+			valid_right=valid_right,
+			out_dir=vis_cfg.out_dir,
+			scale=vis_cfg.scale,
 		)
 
 	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)

@@ -312,6 +312,121 @@ def _draw_grid_vis(
 		return bg
 
 
+def save_corr_points(
+	*,
+	data: fit_data.FitData,
+	xy_lr: torch.Tensor,
+	xy_conn: torch.Tensor,
+	points_xyz_winda: torch.Tensor,
+	idx_left: torch.Tensor,
+	valid_left: torch.Tensor,
+	idx_right: torch.Tensor,
+	valid_right: torch.Tensor,
+	out_dir: str,
+	scale: int,
+) -> None:
+	with torch.no_grad():
+		if int(points_xyz_winda.shape[0]) <= 0:
+			return
+		out = Path(out_dir)
+		out_corr = out / "corr_vis"
+		out_corr.mkdir(parents=True, exist_ok=True)
+		h_img, w_img = data.size
+		sf = max(1, int(scale))
+		h_vis = int(h_img * sf)
+		w_vis = int(w_img * sf)
+		rad = max(2, int(round((2.0 * float(sf)) / 3.0)))
+		seg_th = max(2, int(round(float(sf))))
+		conn_th = max(1, seg_th - 1)
+
+		n = int(xy_lr.shape[0])
+		z_pts = points_xyz_winda[:, 2].to(dtype=torch.float32)
+		z_idx = torch.round(z_pts).to(dtype=torch.int64).clamp(0, max(0, n - 1))
+		z_unique = torch.unique(z_idx, sorted=True)
+
+		for zt in z_unique.tolist():
+			z = int(zt)
+			bg = _draw_grid_vis(
+				scale=sf,
+				h_img=h_img,
+				w_img=w_img,
+				background=data.cos[z:z + 1],
+				xy_lr=xy_lr[z:z + 1],
+				xy_conn=xy_conn[z:z + 1],
+				mask_lr=None,
+				mask_conn=None,
+			)
+
+			x_off = 0
+			y_off = 0
+			w_im = w_vis
+			h_im = h_vis
+			if data.cos is not None:
+				w_im = max(1, w_vis // 2)
+				h_im = max(1, h_vis // 2)
+				x_off = (w_vis - w_im) // 2
+				y_off = (h_vis - h_im) // 2
+			wx = float(max(1, int(w_img) - 1))
+			hy = float(max(1, int(h_img) - 1))
+			sx = float(max(1, int(w_im) - 1)) / wx
+			sy = float(max(1, int(h_im) - 1)) / hy
+
+			xy_lr_z = xy_lr[z].to(dtype=torch.float32, device="cpu")
+			k_sel = torch.nonzero(z_idx == z, as_tuple=False).reshape(-1)
+			for kk in k_sel.tolist():
+				pt = points_xyz_winda[int(kk)].to(dtype=torch.float32, device="cpu")
+				px = int(round(float(x_off + pt[0].item() * sx)))
+				py = int(round(float(y_off + pt[1].item() * sy)))
+				vl = bool(valid_left[int(kk)].item()) if int(valid_left.numel()) > int(kk) else False
+				vr = bool(valid_right[int(kk)].item()) if int(valid_right.numel()) > int(kk) else False
+				is_partial = not (vl and vr)
+
+				l = idx_left[int(kk)].to(dtype=torch.int64, device="cpu")
+				r = idx_right[int(kk)].to(dtype=torch.int64, device="cpu")
+				r0l = int(l[1].item())
+				c0l = int(l[2].item())
+				r0r = int(r[1].item())
+				c0r = int(r[2].item())
+				if vl and r0l >= 0 and c0l >= 0 and (r0l + 1) < int(xy_lr_z.shape[0]) and c0l < int(xy_lr_z.shape[1]):
+					a0 = xy_lr_z[r0l, c0l]
+					a1 = xy_lr_z[r0l + 1, c0l]
+					a0p = (int(round(float(x_off + a0[0].item() * sx))), int(round(float(y_off + a0[1].item() * sy))))
+					a1p = (int(round(float(x_off + a1[0].item() * sx))), int(round(float(y_off + a1[1].item() * sy))))
+					cv2.line(bg, a0p, a1p, (0, 200, 255), seg_th)
+					ab = a1p[0] - a0p[0], a1p[1] - a0p[1]
+					ap = px - a0p[0], py - a0p[1]
+					den = float(ab[0] * ab[0] + ab[1] * ab[1])
+					t = 0.0 if den <= 1e-12 else max(0.0, min(1.0, float(ap[0] * ab[0] + ap[1] * ab[1]) / den))
+					cx = int(round(float(a0p[0] + t * ab[0])))
+					cy = int(round(float(a0p[1] + t * ab[1])))
+					cv2.line(bg, (px, py), (cx, cy), (0, 200, 255), conn_th)
+				if vr and r0r >= 0 and c0r >= 0 and (r0r + 1) < int(xy_lr_z.shape[0]) and c0r < int(xy_lr_z.shape[1]):
+					b0 = xy_lr_z[r0r, c0r]
+					b1 = xy_lr_z[r0r + 1, c0r]
+					b0p = (int(round(float(x_off + b0[0].item() * sx))), int(round(float(y_off + b0[1].item() * sy))))
+					b1p = (int(round(float(x_off + b1[0].item() * sx))), int(round(float(y_off + b1[1].item() * sy))))
+					cv2.line(bg, b0p, b1p, (255, 220, 0), seg_th)
+					ab = b1p[0] - b0p[0], b1p[1] - b0p[1]
+					ap = px - b0p[0], py - b0p[1]
+					den = float(ab[0] * ab[0] + ab[1] * ab[1])
+					t = 0.0 if den <= 1e-12 else max(0.0, min(1.0, float(ap[0] * ab[0] + ap[1] * ab[1]) / den))
+					cx = int(round(float(b0p[0] + t * ab[0])))
+					cy = int(round(float(b0p[1] + t * ab[1])))
+					cv2.line(bg, (px, py), (cx, cy), (255, 220, 0), conn_th)
+
+				if is_partial:
+					overlay = bg.copy()
+					cv2.circle(overlay, (px, py), rad, (255, 0, 255), -1)
+					bg = cv2.addWeighted(overlay, 0.35, bg, 0.65, 0.0)
+					cv2.circle(bg, (px, py), rad + 1, (200, 200, 200), 1)
+				else:
+					cv2.circle(bg, (px, py), rad, (255, 0, 255), -1)
+					cv2.circle(bg, (px, py), rad + 1, (255, 255, 255), 1)
+
+			out_path = out_corr / f"corr_grid_z{int(z):04d}.jpg"
+			cv2.imwrite(str(out_path), np.flip(bg, -1))
+
+
 def save(
 	*,
 	model,

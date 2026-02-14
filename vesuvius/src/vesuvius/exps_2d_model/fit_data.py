@@ -233,6 +233,9 @@ def load(
 		zst = max(1, int(z_step))
 		# Load raw 2D slice(s) as (N,1,H,W).
 		raws: list[torch.Tensor] = []
+		show_z_progress = int(zs) > 1
+		if show_z_progress:
+			print(f"[tiled_infer] loading z slices: 0/{int(zs)}", end="", flush=True)
 		for zi in range(zs):
 			zv = int(z0) + int(zi) * int(zst)
 			if is_omezarr:
@@ -246,6 +249,10 @@ def load(
 				# Non-OME-Zarr paths are single-slice only.
 				raise ValueError("z_size>1 requires OME-Zarr input")
 			raws.append(raw_i)
+			if show_z_progress:
+				print(f"\r[tiled_infer] loading z slices: {int(zi) + 1}/{int(zs)}", end="", flush=True)
+		if show_z_progress:
+			print("", flush=True)
 		raw = torch.cat(raws, dim=0)
 
 		mdl = load_unet(
@@ -259,6 +266,10 @@ def load(
 			max_channels=1024,
 		)
 		mdl.eval()
+		print(
+			f"[tiled_infer] device={str(device)} cuda_available={bool(torch.cuda.is_available())} "
+			f"raw_device={str(raw.device)} model_device={str(next(mdl.parameters()).device)}"
+		)
 		with torch.no_grad():
 			pred = unet_infer_tiled(
 				mdl,
