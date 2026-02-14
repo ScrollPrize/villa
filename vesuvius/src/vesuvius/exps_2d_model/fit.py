@@ -117,9 +117,17 @@ def main(argv: list[str] | None = None) -> int:
 
 	if model_params_in is not None:
 		print("model_params_in:\n" + json.dumps(model_params_in, indent=2, sort_keys=True))
+	points_tensor_work = point_constraints.to_working_coords(
+		points_xyz_winda=points_tensor,
+		downscale=float(data_cfg.downscale),
+		crop_xywh=data_cfg.crop,
+		z0=data_cfg.unet_z,
+		z_step=int(z_step_use),
+		z_size=int(z_size_use),
+	)
+	print("[point_constraints] points_xyz_winda_work", points_tensor_work)
 
-	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
-	device = data.cos.device
+	device = torch.device(data_cfg.device)
 	crop_xyzwhd = None
 	if data_cfg.crop is not None and data_cfg.unet_z is not None:
 		x, y, w, h = (int(v) for v in data_cfg.crop)
@@ -153,21 +161,7 @@ def main(argv: list[str] | None = None) -> int:
 			crop_xyzwhd=crop_xyzwhd,
 		)
 	else:
-		mdl = model.Model2D.from_fit_data(
-			data=data,
-			mesh_step_px=int(mesh_step_use),
-			winding_step_px=int(winding_step_use),
-			init_size_frac=model_cfg.init_size_frac,
-			init_size_frac_h=model_cfg.init_size_frac_h,
-			init_size_frac_v=model_cfg.init_size_frac_v,
-			z_size=int(z_size_use),
-			z_step_vx=int(z_step_use),
-			scaledown=float(data_cfg.downscale),
-			device=device,
-			subsample_mesh=int(subsample_mesh_use),
-			subsample_winding=int(subsample_winding_use),
-			crop_xyzwhd=crop_xyzwhd,
-		)
+		mdl = None
 	if model_cfg.model_input is not None:
 		st = torch.load(model_cfg.model_input, map_location=device)
 		miss, unexp = mdl.load_state_dict_compat(st, strict=False)
@@ -183,6 +177,31 @@ def main(argv: list[str] | None = None) -> int:
 			print(f"loaded mesh_coarse: mean_xy={mean_xy} min_xy={min_xy} max_xy={max_xy}")
 	print("model_init:", mdl.init)
 	print("mesh:", mdl.mesh_h, mdl.mesh_w)
+	if int(points_tensor_work.shape[0]) > 0:
+		print("[point_constraints] starting closest segment search")
+		with torch.no_grad():
+			xy_lr0 = mdl._grid_xy()
+			xy_conn0 = mdl._xy_conn_px(xy_lr=xy_lr0)
+		point_constraints.print_closest_conn_segments(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+
+	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
+	device = data.cos.device
+	if mdl is None:
+		mdl = model.Model2D.from_fit_data(
+			data=data,
+			mesh_step_px=int(mesh_step_use),
+			winding_step_px=int(winding_step_use),
+			init_size_frac=model_cfg.init_size_frac,
+			init_size_frac_h=model_cfg.init_size_frac_h,
+			init_size_frac_v=model_cfg.init_size_frac_v,
+			z_size=int(z_size_use),
+			z_step_vx=int(z_step_use),
+			scaledown=float(data_cfg.downscale),
+			device=device,
+			subsample_mesh=int(subsample_mesh_use),
+			subsample_winding=int(subsample_winding_use),
+			crop_xyzwhd=crop_xyzwhd,
+		)
 
 	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
 	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_init.tif")
