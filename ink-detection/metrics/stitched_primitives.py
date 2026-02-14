@@ -132,12 +132,12 @@ def soft_dice_from_prob(pred_prob: np.ndarray, gt_bin: np.ndarray, *, eps: float
     return float((2.0 * inter + eps) / (denom + eps))
 
 
-def _cc_structure(connectivity: int) -> np.ndarray:
+def _cc_connectivity_cv2(connectivity: int) -> int:
     connectivity = int(connectivity)
     if connectivity == 1:
-        return np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+        return 4
     if connectivity == 2:
-        return np.ones((3, 3), dtype=bool)
+        return 8
     raise ValueError(f"connectivity must be 1 (4-neighborhood) or 2 (8-neighborhood), got {connectivity}")
 
 
@@ -156,20 +156,21 @@ def betti_numbers_2d(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[int, i
     beta0: number of connected components in the foreground.
     beta1: number of holes (background components not touching the border).
     """
-    from scipy.ndimage import label as cc_label
+    import cv2
 
     mask = _as_bool_2d(mask)
     H, W = mask.shape
     if H == 0 or W == 0:
         return 0, 0
 
-    fg_struct = _cc_structure(connectivity)
-    bg_struct = _cc_structure(_dual_connectivity(connectivity))
-    fg_lab, fg_n = cc_label(mask, structure=fg_struct)
-    beta0 = int(fg_n)
+    fg_conn = _cc_connectivity_cv2(connectivity)
+    bg_conn = _cc_connectivity_cv2(_dual_connectivity(connectivity))
+    fg_n_all, _fg_lab = cv2.connectedComponents(mask.astype(np.uint8, copy=False), connectivity=fg_conn)
+    beta0 = int(max(0, int(fg_n_all) - 1))
 
-    bg_lab, bg_n = cc_label(~mask, structure=bg_struct)
-    if bg_n == 0:
+    bg_n_all, bg_lab = cv2.connectedComponents((~mask).astype(np.uint8, copy=False), connectivity=bg_conn)
+    bg_n = int(max(0, int(bg_n_all) - 1))
+    if bg_n <= 0:
         return beta0, 0
 
     border = np.zeros((H, W), dtype=bool)
@@ -185,16 +186,17 @@ def betti_numbers_2d(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[int, i
 
 
 def _count_holes_2d(mask: np.ndarray, *, connectivity: int = 2) -> int:
-    from scipy.ndimage import label as cc_label
+    import cv2
 
     mask = _as_bool_2d(mask)
     H, W = mask.shape
     if H == 0 or W == 0:
         return 0
 
-    bg_struct = _cc_structure(_dual_connectivity(connectivity))
-    bg_lab, bg_n = cc_label(~mask, structure=bg_struct)
-    if bg_n == 0:
+    bg_conn = _cc_connectivity_cv2(_dual_connectivity(connectivity))
+    bg_n_all, bg_lab = cv2.connectedComponents((~mask).astype(np.uint8, copy=False), connectivity=bg_conn)
+    bg_n = int(max(0, int(bg_n_all) - 1))
+    if bg_n <= 0:
         return 0
 
     border = np.zeros((H, W), dtype=bool)
@@ -683,11 +685,12 @@ def skeleton_chamfer(skel_pred: np.ndarray, skel_gt: np.ndarray) -> Dict[str, fl
 
 
 def _label_components(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[np.ndarray, int]:
-    from scipy.ndimage import label as cc_label
+    import cv2
 
     mask = _as_bool_2d(mask)
-    struct = _cc_structure(connectivity)
-    lab, n = cc_label(mask, structure=struct)
+    cc_conn = _cc_connectivity_cv2(connectivity)
+    n_all, lab = cv2.connectedComponents(mask.astype(np.uint8, copy=False), connectivity=cc_conn)
+    n = int(max(0, int(n_all) - 1))
     return lab, int(n)
 
 

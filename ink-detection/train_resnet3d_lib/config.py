@@ -110,7 +110,6 @@ class CFG:
     eval_threshold_grid_max = 0.70
     eval_threshold_grid_steps = 5
     eval_threshold_grid = None
-    eval_save_skeleton_images = True
     eval_wandb_media_downsample = 1
 
     # ============== fixed =============
@@ -431,7 +430,6 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_threshold_grid_max", "eval_threshold_grid_max"),
         ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
         ("eval_threshold_grid", "eval_threshold_grid"),
-        ("eval_save_skeleton_images", "eval_save_skeleton_images"),
         ("eval_wandb_media_downsample", "eval_wandb_media_downsample"),
         ("pretrained", "pretrained"),
         ("num_workers", "num_workers"),

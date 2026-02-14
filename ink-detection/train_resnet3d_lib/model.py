@@ -298,7 +298,7 @@ class StitchManager:
 
             pred_crop = pred_patch[..., py0:py1, px0:px1]
             pred_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += pred_crop.squeeze(0).squeeze(0).numpy()
-            count_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += 1.0
+            count_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += 1
 
     def accumulate_val(self, *, outputs, xyxys, dataloader_idx):
         if not self.enabled:
@@ -721,7 +721,6 @@ class StitchManager:
                 component_pad = int(getattr(CFG, "eval_component_pad", 5))
                 skeleton_thinning_type = str(getattr(CFG, "eval_skeleton_thinning_type", "zhang_suen"))
                 enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
-                save_skeleton_images = bool(getattr(CFG, "eval_save_skeleton_images", True))
                 save_stitched_inputs = bool(getattr(CFG, "eval_save_stitched_inputs", False))
                 save_component_debug_images = bool(getattr(CFG, "eval_save_component_debug_images", False))
                 component_debug_max_items = getattr(CFG, "eval_component_debug_max_items", None)
@@ -795,7 +794,6 @@ class StitchManager:
                         output_dir=output_dir,
                         component_output_dir=component_output_dir,
                         stitched_inputs_output_dir=stitched_inputs_output_dir,
-                        save_skeleton_images=save_skeleton_images,
                         save_component_debug_images=save_component_debug_images,
                         component_debug_max_items=component_debug_max_items,
                         gt_cache_max=cache_max,

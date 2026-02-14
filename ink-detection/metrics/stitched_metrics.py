@@ -149,21 +149,31 @@ def _load_ground_truth_masks(
     downsample: int,
     pred_shape: Tuple[int, int],
     roi_offset: Optional[Tuple[int, int]],
+    timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    t0 = time.perf_counter()
     label_base = osp.join(dataset_root, segment_id, f"{segment_id}_inklabels{label_suffix}")
     mask_base = osp.join(dataset_root, segment_id, f"{segment_id}_mask{mask_suffix}")
     gt_gray = _read_gray_any(label_base)
     valid_gray = _read_gray_any(mask_base)
+    if timings is not None:
+        timings["read_inputs"] = timings.get("read_inputs", 0.0) + (time.perf_counter() - t0)
 
+    t0 = time.perf_counter()
     gt_bin_full = (gt_gray.astype(np.float32) / 255.0) >= 0.5
     valid_full = valid_gray.astype(np.uint8) > 0
+    if timings is not None:
+        timings["binarize"] = timings.get("binarize", 0.0) + (time.perf_counter() - t0)
 
+    t0 = time.perf_counter()
     if roi_offset is not None and (int(roi_offset[0]) != 0 or int(roi_offset[1]) != 0):
         gt_bin = _downsample_bool_any_roi(gt_bin_full, ds=downsample, out_hw=pred_shape, offset=roi_offset)
         valid = _downsample_bool_any_roi(valid_full, ds=downsample, out_hw=pred_shape, offset=roi_offset)
     else:
         gt_bin = _downsample_bool_any(gt_bin_full, ds=downsample, out_hw=pred_shape)
         valid = _downsample_bool_any(valid_full, ds=downsample, out_hw=pred_shape)
+    if timings is not None:
+        timings["downsample"] = timings.get("downsample", 0.0) + (time.perf_counter() - t0)
     return gt_bin, valid
 
 
@@ -959,7 +969,6 @@ def compute_stitched_metrics(
     output_dir: Optional[str] = None,
     component_output_dir: Optional[str] = None,
     stitched_inputs_output_dir: Optional[str] = None,
-    save_skeleton_images: bool = True,
     save_component_debug_images: bool = False,
     component_debug_max_items: Optional[int] = None,
     gt_cache_max: Optional[int] = None,
@@ -1028,6 +1037,7 @@ def compute_stitched_metrics(
     else:
         cache_hit = False
         t0 = time.perf_counter()
+        load_gt_timings: Dict[str, float] = {}
         gt_bin_ds, valid = _load_ground_truth_masks(
             dataset_root=dataset_root,
             segment_id=seg,
@@ -1036,9 +1046,15 @@ def compute_stitched_metrics(
             downsample=ds,
             pred_shape=tuple(pred_prob.shape),
             roi_offset=roi_offset,
+            timings=load_gt_timings,
         )
+        t1 = time.perf_counter()
         eval_mask_full = np.logical_and(pred_has, valid)
+        load_gt_timings["eval_mask"] = load_gt_timings.get("eval_mask", 0.0) + (time.perf_counter() - t1)
         if not eval_mask_full.any():
+            _timeit("load_gt", t0)
+            for key, value in load_gt_timings.items():
+                timings[f"load_gt/{key}"] = timings.get(f"load_gt/{key}", 0.0) + float(value)
             _log_empty_eval_mask(
                 segment_id=seg,
                 downsample=ds,
@@ -1046,19 +1062,31 @@ def compute_stitched_metrics(
                 pred_has_count=int(pred_has.sum()),
             )
             return {}
+        t1 = time.perf_counter()
         pred_prob, gt_bin, eval_mask, crop = _prepare_eval_crop(
             pred_prob=pred_prob,
             pred_has=pred_has,
             gt_bin=gt_bin_ds,
             valid=valid,
         )
+        load_gt_timings["prepare_eval_crop"] = load_gt_timings.get("prepare_eval_crop", 0.0) + (
+            time.perf_counter() - t1
+        )
         y0, y1, x0, x1 = crop
         pred_has = pred_has[y0:y1, x0:x1]
 
+        t1 = time.perf_counter()
         gt_lab, n_gt = _label_components(gt_bin, connectivity=betti_connectivity)
+        load_gt_timings["gt_label_components"] = load_gt_timings.get("gt_label_components", 0.0) + (
+            time.perf_counter() - t1
+        )
         gt_beta0 = int(n_gt)
+        t1 = time.perf_counter()
         gt_beta1 = _count_holes_2d(gt_bin, connectivity=betti_connectivity)
+        load_gt_timings["gt_holes"] = load_gt_timings.get("gt_holes", 0.0) + (time.perf_counter() - t1)
+        t1 = time.perf_counter()
         skel_gt = skeletonize_binary(gt_bin, thinning_type=skeleton_thinning_type)
+        load_gt_timings["gt_skeleton"] = load_gt_timings.get("gt_skeleton", 0.0) + (time.perf_counter() - t1)
         cache_entry = {
             "gt_bin": gt_bin,
             "eval_mask": eval_mask,
@@ -1072,8 +1100,12 @@ def compute_stitched_metrics(
             "gt_component_templates": None,
             "gt_component_pad": None,
         }
+        t1 = time.perf_counter()
         _gt_cache_put(cache_key, cache_entry)
+        load_gt_timings["cache_put"] = load_gt_timings.get("cache_put", 0.0) + (time.perf_counter() - t1)
         _timeit("load_gt", t0)
+        for key, value in load_gt_timings.items():
+            timings[f"load_gt/{key}"] = timings.get(f"load_gt/{key}", 0.0) + float(value)
 
     if eval_mask.shape != pred_prob.shape:
         raise ValueError("internal error: cropped shapes mismatch")
@@ -1273,7 +1305,7 @@ def compute_stitched_metrics(
                 crop_offset=(crop_off_y, crop_off_x),
                 full_offset=(full_off_y, full_off_x),
                 full_shape=pred_full_shape,
-                output_dir=output_dir if save_skeleton_images else None,
+                output_dir=output_dir if stitched_inputs_output_dir is not None else None,
                 skeleton_thinning_type=skeleton_thinning_type,
                 skel_gt=skel_gt,
             )
@@ -1282,7 +1314,7 @@ def compute_stitched_metrics(
         for key, value in threshold_stability_timings.items():
             timings[f"threshold_stability/{key}"] = timings.get(f"threshold_stability/{key}", 0.0) + float(value)
 
-    if output_dir is not None and save_skeleton_images:
+    if output_dir is not None and stitched_inputs_output_dir is not None:
         skel_pred = _save_skeleton_images(
             output_dir=output_dir,
             fragment_id=fragment_id,
