@@ -1,0 +1,38 @@
+{
+	"args": {
+		"unet-checkpoint": "../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt",
+		"input": "../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/",
+		"out-dir": "res_corr",
+		"grad-mag-blur-sigma" : 4.0,
+		"dir-blur-sigma" : 2.0,
+		"model-input" : "res_growz/model_snapshots/model_final_000000.pt",
+		"points" : "../s5/2025-02-14_test_corr.json"
+	},
+	"base": {
+		"dir_v": 10.0,
+		"dir_conn": 1.0,
+		"step": 100.0,
+		"smooth_x": 0.0,
+		"smooth_y": 0.01,
+		"gradmag": 1.0,
+		"mean_pos": 0.0,
+		"meshoff_sy": 0.001,
+		"conn_sy_l": 0.0,
+		"conn_sy_r": 0.0,
+		"angle": 0.001,
+		"y_straight": 0.0,
+		"data": 0.4,
+		"data_plain": 0.2,
+		"data_grad": 0.0,
+		"z_straight": 10.0
+	},
+	"stages": [
+		{
+			"name": "snap",
+			"steps": 5000,
+			"lr": [0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+			"min_scaledown": 0
+		}
+	]
+}

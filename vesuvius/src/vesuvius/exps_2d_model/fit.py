@@ -8,6 +8,7 @@ import cli_opt
 import cli_vis
 import model
 import optimizer
+import point_constraints
 import torch
 import vis
 from dataclasses import asdict
@@ -26,23 +27,40 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_model.add_args(p)
 	cli_opt.add_args(p)
 	cli_vis.add_args(p)
+	point_constraints.add_args(p)
 	return p
 
 
 def main(argv: list[str] | None = None) -> int:
 	if argv is None:
 		argv = sys.argv[1:]
+
+	# Keep --points <file.json> out of generic cfg json-path detection.
+	argv_cfg_scan: list[str] = []
+	points_argv: list[str] = []
+	i = 0
+	while i < len(argv):
+		a = str(argv[i])
+		if a == "--points" and (i + 1) < len(argv):
+			points_argv.extend([a, str(argv[i + 1])])
+			i += 2
+			continue
+		argv_cfg_scan.append(a)
+		i += 1
 	parser = _build_parser()
-	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv)
+	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv_cfg_scan)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = cli_json.merge_cfgs(cfg_paths)
 	cli_json.apply_defaults_from_cfg_args(parser, cfg)
-	args = parser.parse_args(argv_rest)
+	args = parser.parse_args((argv_rest or []) + points_argv)
 
 	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)
 	opt_cfg = cli_opt.from_args(args)
 	vis_cfg = cli_vis.from_args(args)
+	points_cfg = point_constraints.from_args(args)
+	points_tensor = point_constraints.load_points_tensor(points_cfg)
+	point_constraints.print_points_tensor(points_tensor)
 
 	print("data:", data_cfg)
 	print("model:", model_cfg)
@@ -51,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	model_params_in: dict | None = None
 	z_size_use = int(model_cfg.z_size)
+	z_size_from_state = 0
 	mesh_step_use = int(model_cfg.mesh_step_px)
 	winding_step_use = int(model_cfg.winding_step_px)
 	subsample_mesh_use = int(model_cfg.subsample_mesh)
@@ -60,11 +79,17 @@ def main(argv: list[str] | None = None) -> int:
 		st_in = torch.load(model_cfg.model_input, map_location="cpu")
 		if isinstance(st_in, dict) and isinstance(st_in.get("_model_params_", None), dict):
 			model_params_in = st_in["_model_params_"]
-		if isinstance(st_in, dict) and ("amp" in st_in) and hasattr(st_in["amp"], "shape"):
-			try:
-				z_size_use = max(1, int(st_in["amp"].shape[0]))
-			except Exception:
-				pass
+		if isinstance(st_in, dict):
+			for k in ("amp", "bias", "mesh_ms.0", "conn_offset_ms.0"):
+				t = st_in.get(k, None)
+				if t is None or not hasattr(t, "shape"):
+					continue
+				try:
+					z_size_from_state = max(1, int(t.shape[0]))
+					z_size_use = int(z_size_from_state)
+					break
+				except Exception:
+					continue
 		if model_params_in is not None:
 			if "mesh_step_px" in model_params_in:
 				mesh_step_use = int(model_params_in["mesh_step_px"])
@@ -85,6 +110,10 @@ def main(argv: list[str] | None = None) -> int:
 					data_cfg = replace(data_cfg, unet_z=int(z0))
 				z_size_use = max(1, int(d))
 				data_cfg = replace(data_cfg, z_step=int(z_step_use))
+			elif "z_size" in model_params_in:
+				z_size_use = max(1, int(model_params_in["z_size"]))
+		if int(z_size_from_state) > 0:
+			z_size_use = max(int(z_size_use), int(z_size_from_state))
 
 	if model_params_in is not None:
 		print("model_params_in:\n" + json.dumps(model_params_in, indent=2, sort_keys=True))
