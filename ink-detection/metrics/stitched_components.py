@@ -219,6 +219,7 @@ def component_metrics_by_gt_bbox(
     worst_k: Optional[int] = 2,
     keep_pred_skeleton: bool = False,
     gt_lab: Optional[np.ndarray] = None,
+    pred_lab: np.ndarray,
     n_gt: Optional[int] = None,
     gt_component_templates: Optional[List[Dict[str, Any]]] = None,
     skeleton_thinning_type: str = "zhang_suen",
@@ -231,6 +232,11 @@ def component_metrics_by_gt_bbox(
         raise ValueError(f"pred_prob/gt_bin shape mismatch: {pred_prob.shape} vs {gt_bin.shape}")
     if pred_bin.shape != gt_bin.shape:
         raise ValueError(f"pred_bin/gt_bin shape mismatch: {pred_bin.shape} vs {gt_bin.shape}")
+    pred_lab_full = np.asarray(pred_lab)
+    if pred_lab_full.shape != pred_bin.shape:
+        raise ValueError(f"pred_lab/pred_bin shape mismatch: {pred_lab_full.shape} vs {pred_bin.shape}")
+    if not np.issubdtype(pred_lab_full.dtype, np.integer):
+        raise TypeError(f"pred_lab must have integer dtype, got {pred_lab_full.dtype}")
     if gt_component_templates is None:
         if gt_lab is None or n_gt is None:
             gt_lab, n_gt = _label_components(gt_bin, connectivity=connectivity)
@@ -264,7 +270,9 @@ def component_metrics_by_gt_bbox(
         if timings is not None:
             timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
         t0 = time.perf_counter()
-        crop_pred_lab, _ = _label_components(crop_pred_bin, connectivity=connectivity)
+        # Use cropped global predicted labels to avoid per-crop relabeling.
+        # This intentionally makes VOI follow the global partition restricted to the bbox.
+        crop_pred_lab = pred_lab_full[y0:y1, x0:x1]
         if timings is not None:
             timings["label_pred"] = timings.get("label_pred", 0.0) + (time.perf_counter() - t0)
         t0 = time.perf_counter()

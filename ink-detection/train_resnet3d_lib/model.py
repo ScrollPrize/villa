@@ -736,7 +736,6 @@ class StitchManager:
                     str(getattr(CFG, "figures_dir", ".")),
                     "metrics_components",
                 )
-                output_dir = component_output_dir
                 stitched_inputs_output_dir = osp.join(
                     str(getattr(CFG, "figures_dir", ".")),
                     "metrics_stitched_inputs",
@@ -791,7 +790,6 @@ class StitchManager:
                         skeleton_thinning_type=skeleton_thinning_type,
                         enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
-                        output_dir=output_dir,
                         component_output_dir=component_output_dir,
                         stitched_inputs_output_dir=stitched_inputs_output_dir,
                         save_component_debug_images=save_component_debug_images,
