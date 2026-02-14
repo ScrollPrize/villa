@@ -1,5 +1,7 @@
 import numpy as np
 import os
+from dataclasses import dataclass
+from typing import Optional
 from tqdm.auto import tqdm
 import argparse
 import zarr
@@ -12,6 +14,137 @@ from functools import partial
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+
+
+@dataclass
+class FinalizeConfig:
+    """Bundle all finalization parameters."""
+    mode: str = "binary"           # "binary" or "multiclass"
+    threshold: bool = False
+    is_multi_task: bool = False
+    target_info: Optional[dict] = None
+
+
+def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
+    """
+    Apply softmax + mode logic to normalized logits, producing uint8 output.
+
+    Pure function (no I/O).
+
+    Args:
+        logits_np: float32 array (C, Z, Y, X) of normalized logits
+        num_classes: number of classes (C dimension)
+        config: FinalizeConfig with mode/threshold/multi-task settings
+
+    Returns:
+        (output_uint8, is_empty) — finalized uint8 array or (None, True) for empty chunks
+    """
+    # Check if this is an empty chunk (all values are the same)
+    first_value = logits_np.flat[0]
+    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
+
+    if is_empty:
+        return None, True
+
+    mode = config.mode
+    threshold = config.threshold
+    is_multi_task = config.is_multi_task
+    target_info = config.target_info
+
+    single_channel_binary = mode == "binary" and (not is_multi_task or not target_info) and num_classes == 1
+
+    if mode == "binary":
+        if is_multi_task and target_info:
+            target_results = []
+            for target_name, info in sorted(target_info.items(), key=lambda x: x[1]['start_channel']):
+                start_ch = info['start_channel']
+                end_ch = info['end_channel']
+                target_logits = logits_np[start_ch:end_ch]
+                exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
+                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+                if threshold:
+                    binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
+                    target_results.append(binary_mask)
+                else:
+                    fg_prob = softmax[1]
+                    target_results.append(fg_prob)
+            output_data = np.stack(target_results, axis=0)
+        elif num_classes == 1:
+            # Single-channel logits: interpret channel as foreground logit.
+            logits = logits_np[0].astype(np.float32)
+            if threshold:
+                output_data = (logits > 0).astype(np.float32)
+            else:
+                probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -20, 20)))
+                output_data = probs
+        else:
+            exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+            softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+            if threshold:
+                binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
+                output_data = binary_mask
+            else:
+                fg_prob = softmax[1]
+                output_data = fg_prob
+    else:  # multiclass
+        exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+        softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
+        if threshold:
+            output_data = argmax
+        else:
+            output_data = np.concatenate([softmax, argmax[np.newaxis, ...]], axis=0)
+
+    output_np = output_data
+
+    if single_channel_binary:
+        output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
+    else:
+        # Scale to uint8 range [0, 255]
+        min_val = output_np.min()
+        max_val = output_np.max()
+        if min_val < max_val:
+            output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        else:
+            return None, True
+
+        # Final check: if the processed data is homogeneous, don't write it
+        first_processed_value = output_np.flat[0]
+        if np.all(output_np == first_processed_value):
+            return None, True
+
+    return output_np, False
+
+
+def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
+    """
+    Compute the output shape for finalized data based on mode/threshold.
+
+    Args:
+        spatial_shape: (Z, Y, X) spatial dimensions
+        num_classes: number of input classes
+        config: FinalizeConfig with mode/threshold/multi-task settings
+
+    Returns:
+        Output shape tuple: (Z, Y, X) for single-channel, (C_out, Z, Y, X) for multi-channel
+    """
+    mode = config.mode
+    threshold = config.threshold
+    is_multi_task = config.is_multi_task
+    target_info = config.target_info
+
+    if mode == "binary":
+        if is_multi_task and target_info:
+            num_targets = len(target_info)
+            return (num_targets, *spatial_shape)
+        else:
+            return spatial_shape
+    else:  # multiclass
+        if threshold:
+            return spatial_shape
+        else:
+            return (num_classes + 1, *spatial_shape)
+
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
@@ -32,9 +165,11 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     
     chunk_idx = chunk_info['indices']
     
+    has_channel_dim = len(output_chunks) > len(spatial_shape)
+    spatial_chunks = output_chunks[1:] if has_channel_dim else output_chunks
     spatial_slices = tuple(
         slice(idx * chunk, min((idx + 1) * chunk, shape_dim))
-        for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
+        for idx, chunk, shape_dim in zip(chunk_idx, spatial_chunks, spatial_shape)
     )
     
     input_store = open_zarr(
@@ -49,115 +184,23 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         storage_options={'anon': False} if output_path.startswith('s3://') else None
     )
     
-    input_slice = (slice(None),) + spatial_slices 
+    input_slice = (slice(None),) + spatial_slices
     logits_np = input_store[input_slice]
-    
-    # Check if this is an empty chunk (all values are the same, indicating no meaningful data)
-    # This handles empty patches that have been filled with any constant value
-    first_value = logits_np.flat[0]  # Get the first value
-    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
-    
+
+    config = FinalizeConfig(
+        mode=mode,
+        threshold=threshold,
+        is_multi_task=is_multi_task,
+        target_info=target_info,
+    )
+    output_np, is_empty = apply_finalization(logits_np, num_classes, config)
+
     if is_empty:
-        # For empty/homogeneous patches, don't write anything to the output store
-        # This ensures write_empty_chunks=False works correctly
         return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-    
-    single_channel_binary = mode == "binary" and (not is_multi_task or not target_info) and num_classes == 1
 
-    if mode == "binary":
-        if is_multi_task and target_info:
-            # For multi-task binary, process each target separately
-            target_results = []
-            
-            # Process each target - sort by start_channel to maintain correct order
-            for target_name, info in sorted(target_info.items(), key=lambda x: x[1]['start_channel']):
-                start_ch = info['start_channel']
-                end_ch = info['end_channel']
-                
-                # Extract channels for this target
-                target_logits = logits_np[start_ch:end_ch]
-                
-                # Compute softmax for this target
-                exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
-                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-                
-                if threshold:
-                    # Create binary mask
-                    binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
-                    target_results.append(binary_mask)
-                else:
-                    # Extract foreground probability
-                    fg_prob = softmax[1]
-                    target_results.append(fg_prob)
-            
-            # Stack results from all targets
-            output_data = np.stack(target_results, axis=0)
-        elif num_classes == 1:
-            # Single-channel logits: interpret channel as foreground logit.
-            logits = logits_np[0].astype(np.float32)
-            if threshold:
-                output_data = (logits > 0).astype(np.float32)[np.newaxis, ...]
-            else:
-                probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -20, 20)))
-                output_data = probs[np.newaxis, ...]
-        else:
-            # Single task binary - existing logic
-            # For binary case, we just need a softmax over dim 0 (channels)
-            # Compute softmax: exp(x) / sum(exp(x))
-            exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
-            softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-            
-            if threshold:
-                # Create binary mask using argmax (class 1 is foreground)
-                # Simply check if foreground probability > background probability
-                binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
-                output_data = binary_mask[np.newaxis, ...]  # Add channel dim
-            else:
-                # Extract foreground probability (channel 1)
-                fg_prob = softmax[1:2]  
-                output_data = fg_prob
-            
-    else:  # multiclass 
-        # Apply softmax over channel dimension
-        exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True)) 
-        softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-        
-        # Compute argmax
-        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
-        argmax = argmax[np.newaxis, ...]  # Add channel dim
-        
-        if threshold: 
-            # If threshold is provided for multiclass, only save the argmax
-            output_data = argmax
-        else:
-            # Concatenate softmax and argmax
-            output_data = np.concatenate([softmax, argmax], axis=0)
-    
-    # output_data is already numpy
-    output_np = output_data
-    
-    if single_channel_binary:
-        output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
-    else:
-        # Scale to uint8 range [0, 255]
-        min_val = output_np.min()
-        max_val = output_np.max()
-        if min_val < max_val:
-            output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-        else:
-            # All values are the same after processing - this is effectively an empty chunk
-            # Don't write anything to respect write_empty_chunks=False
-            return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-
-        # Final check: if the processed data is homogeneous, don't write it
-        first_processed_value = output_np.flat[0]
-        if np.all(output_np == first_processed_value):
-            # Processed chunk is homogeneous (e.g., all 0s or all 255s), skip writing
-            return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
-
-    output_slice = (slice(None),) + spatial_slices
+    output_slice = (slice(None),) + spatial_slices if has_channel_dim else spatial_slices
     output_store[output_slice] = output_np
-    return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_data.shape)}
+    return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_np.shape)}
 
 
 def finalize_logits(
@@ -271,32 +314,31 @@ def finalize_logits(
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
         else:
             if num_classes == 1:
-                output_shape = (1, *spatial_shape)
+                output_shape = spatial_shape
                 if threshold:
-                    print("Output will have 1 channel: [binary_mask_from_logit]")
+                    print("Output shape: (Z, Y, X) [binary_mask_from_logit]")
                 else:
-                    print("Output will have 1 channel: [sigmoid_fg]")
+                    print("Output shape: (Z, Y, X) [sigmoid_fg]")
             else:
                 if threshold:
-                    # If thresholding, only output argmax channel for binary
-                    output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
-                    print("Output will have 1 channel: [binary_mask]")
+                    output_shape = spatial_shape
+                    print("Output shape: (Z, Y, X) [binary_mask]")
                 else:
-                     # Just softmax of FG class
-                    output_shape = (1, *spatial_shape)
-                    print("Output will have 1 channel: [softmax_fg]")
+                    output_shape = spatial_shape
+                    print("Output shape: (Z, Y, X) [softmax_fg]")
     else:  # multiclass
         if threshold:
-            # If threshold is provided for multiclass, only save the argmax
-            output_shape = (1, *spatial_shape)
-            print("Output will have 1 channel: [argmax]")
+            output_shape = spatial_shape
+            print("Output shape: (Z, Y, X) [argmax]")
         else:
             # For multiclass, we'll output num_classes channels (all softmax values)
             # Plus 1 channel for the argmax
             output_shape = (num_classes + 1, *spatial_shape)
             print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
 
-    output_chunks = (1, *output_chunks)  # Chunk each channel separately
+    # Only prepend channel chunk dim when output has a channel dimension
+    if len(output_shape) > len(spatial_shape):
+        output_chunks = (1, *output_chunks)  # Chunk each channel separately
 
     # --- Create or Open Output Array ---
     if part_id == 0:
@@ -334,9 +376,13 @@ def finalize_logits(
 
     def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
-        # Skip first dimension (channels)
-        spatial_shape = shape[1:]
-        spatial_chunks = chunks[1:]
+        # Skip first dimension (channels) if present
+        if len(shape) == 4:
+            spatial_shape = shape[1:]
+            spatial_chunks = chunks[1:]
+        else:
+            spatial_shape = shape
+            spatial_chunks = chunks
         
         # Generate all combinations of chunk indices
         from itertools import product
@@ -353,7 +399,8 @@ def finalize_logits(
         return chunks_info
 
     # --- Calculate Z-range for this part ---
-    all_chunk_infos = get_chunk_indices(input_shape, output_chunks)
+    all_chunk_infos = get_chunk_indices(output_shape, output_chunks)
+    z_chunk_size = output_chunks[1] if len(output_shape) == 4 else output_chunks[0]
 
     if num_parts > 1:
         total_z = spatial_shape[0]  # Z dimension
@@ -366,8 +413,8 @@ def finalize_logits(
         for chunk_info in all_chunk_infos:
             z_idx, y_idx, x_idx = chunk_info['indices']
             # Calculate actual Z coordinates for this chunk
-            chunk_z_start = z_idx * output_chunks[1]  # output_chunks[1] is Z chunk size
-            chunk_z_end = min(chunk_z_start + output_chunks[1], spatial_shape[0])
+            chunk_z_start = z_idx * z_chunk_size
+            chunk_z_end = min(chunk_z_start + z_chunk_size, spatial_shape[0])
 
             # Check if chunk intersects with our Z-range
             if chunk_z_end > z_start and chunk_z_start < z_end:

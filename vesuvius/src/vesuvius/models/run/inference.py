@@ -619,8 +619,23 @@ class Inferer():
 
         coords_np = np.array(self.patch_start_coords_list, dtype=np.int32)
         coords_store[:] = coords_np
-        
-        if self.verbose: 
+
+        # Compute and store bounding box for efficient blending filtering
+        if len(coords_np) > 0:
+            pZ, pY, pX = self.patch_size
+            bbox = {
+                'z_min': int(coords_np[:, 0].min()),
+                'z_max': int(coords_np[:, 0].max()) + pZ,
+                'y_min': int(coords_np[:, 1].min()),
+                'y_max': int(coords_np[:, 1].max()) + pY,
+                'x_min': int(coords_np[:, 2].min()),
+                'x_max': int(coords_np[:, 2].max()) + pX
+            }
+            coords_store.attrs['bbox'] = bbox
+            if self.verbose:
+                print(f"Stored bounding box in coordinates .zattrs: {bbox}")
+
+        if self.verbose:
             print(f"Created output stores: {main_store_path} and {self.coords_store_path}")
         
         return self.output_store
