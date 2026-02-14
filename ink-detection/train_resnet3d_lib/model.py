@@ -625,8 +625,9 @@ class StitchManager:
                     else:
                         split_tag = "none"
                     image = _downsample_for_wandb(image, source_downsample=int(self.downsample))
+                    safe_segment_id = str(segment_id).replace("/", "_")
                     model.logger.log_image(
-                        key="masks",
+                        key=f"masks/{safe_segment_id}",
                         images=[image],
                         caption=[f"{segment_id} ({split_tag} ds={self.downsample})"],
                     )
@@ -649,8 +650,9 @@ class StitchManager:
                     else:
                         image = base_u8
                     image = _downsample_for_wandb(image, source_downsample=int(self.downsample))
+                    safe_segment_id = str(segment_id).replace("/", "_")
                     model.logger.log_image(
-                        key="masks",
+                        key=f"masks/{safe_segment_id}",
                         images=[image],
                         caption=[f"{segment_id} (val ds={self.downsample})"],
                     )
@@ -669,8 +671,9 @@ class StitchManager:
                     base = np.clip(stitched, 0, 1)
                     base, _ = _expand_to_full(base, count_buf != 0, meta)
                     image = _downsample_for_wandb(_to_u8(base), source_downsample=int(self.log_only_downsample))
+                    safe_segment_id = str(segment_id).replace("/", "_")
                     model.logger.log_image(
-                        key="masks_log_only",
+                        key=f"masks_log_only/{safe_segment_id}",
                         images=[image],
                         caption=[f"{segment_id} (log-only ds={self.log_only_downsample})"],
                     )
@@ -686,12 +689,20 @@ class StitchManager:
             should_run_stitch_metrics = bool(getattr(CFG, "eval_stitch_metrics", True)) and bool(segment_to_val)
             if should_run_stitch_metrics:
                 stitch_every_n_epochs = max(1, int(getattr(CFG, "eval_stitch_every_n_epochs", 1)))
+                stitch_plus_one = bool(getattr(CFG, "eval_stitch_every_n_epochs_plus_one", False))
                 current_epoch = int(getattr(getattr(model, "trainer", None), "current_epoch", 0))
-                if ((current_epoch + 1) % stitch_every_n_epochs) != 0:
+                eval_epoch = int(current_epoch + 1)
+                if stitch_plus_one and stitch_every_n_epochs > 1:
+                    mod = eval_epoch % stitch_every_n_epochs
+                    should_run_epoch = (eval_epoch >= stitch_every_n_epochs) and (mod == 0 or mod == 1)
+                else:
+                    should_run_epoch = (eval_epoch % stitch_every_n_epochs) == 0
+                if not should_run_epoch:
                     should_run_stitch_metrics = False
                     log(
                         f"skip stitched metrics epoch={current_epoch} "
-                        f"eval_stitch_every_n_epochs={stitch_every_n_epochs}"
+                        f"eval_stitch_every_n_epochs={stitch_every_n_epochs} "
+                        f"eval_stitch_every_n_epochs_plus_one={stitch_plus_one}"
                     )
 
             if should_run_stitch_metrics:

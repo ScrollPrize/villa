@@ -37,6 +37,14 @@ parameters:
     value: true
   training.stitch_downsample:
     value: 1
+  wandb.tags:
+    value:
+      - ink-2um
+      - erm
+      - hparam_sweep
+      - group_balanced
+      - accum1
+      - fold0
 
 command:
   - ${env}
@@ -46,5 +54,3 @@ command:
   - metadata.json
   - --outputs_path
   - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls
-  - --wandb_tags
-  - ink-2um,erm,hparam_sweep,group_balanced,accum1,fold0

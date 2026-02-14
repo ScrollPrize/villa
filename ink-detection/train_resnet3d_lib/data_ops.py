@@ -24,32 +24,20 @@ def _read_gray(path):
     if not osp.exists(path):
         return None
 
-    errors = []
-
-    # OpenCV can emit noisy libpng warnings (e.g. "chunk data is too large") for some PNGs.
-    # Prefer PIL for PNGs to keep logs clean; fall back to OpenCV if PIL fails.
     if path.lower().endswith(".png"):
         try:
             with PIL.Image.open(path) as im:
                 return np.array(im.convert("L"))
         except (OSError, ValueError) as exc:
-            errors.append(f"PIL[png]: {exc}")
+            raise RuntimeError(f"Could not read PNG image via PIL: {path}") from exc
 
     try:
         img = cv2.imread(path, 0)
     except cv2.error as exc:
-        errors.append(f"cv2: {exc}")
-    else:
-        if img is not None:
-            return img
-        errors.append("cv2: returned None")
-
-    try:
-        with PIL.Image.open(path) as im:
-            return np.array(im.convert("L"))
-    except (OSError, ValueError) as exc:
-        errors.append(f"PIL[fallback]: {exc}")
-        raise RuntimeError(f"Could not read image: {path}. Attempts: {' | '.join(errors)}") from exc
+        raise RuntimeError(f"Could not read image via OpenCV: {path}") from exc
+    if img is None:
+        raise RuntimeError(f"Could not read image via OpenCV (returned None): {path}")
+    return img
 
 
 def _parse_layer_range(fragment_id, layer_range):
@@ -269,10 +257,11 @@ def _assert_bottom_right_pad_compatible_global(fragment_id, a_name, a_hw, b_name
     def _check_dim(dim_name, a_dim, b_dim):
         small = min(a_dim, b_dim)
         big = max(a_dim, b_dim)
-        padded = ((small + multiple - 1) // multiple) * multiple
-        allowed = {small, padded}
+        ceil_to_multiple = ((small + multiple - 1) // multiple) * multiple
         if small % multiple == 0:
-            allowed.add(small + multiple)  # supports the legacy "always pad one block" variant
+            allowed = {small, small + multiple}
+        else:
+            allowed = {small, ceil_to_multiple}
 
         if big not in allowed:
             raise ValueError(
@@ -781,14 +770,9 @@ def build_group_mappings(fragment_ids, segments_metadata, group_key="base_path")
         if fragment_id not in segments_metadata:
             raise KeyError(f"segments_metadata missing segment id: {fragment_id!r}")
         seg_meta = _require_dict(segments_metadata[fragment_id], name=f"segments_metadata[{fragment_id!r}]")
-        if group_key in seg_meta:
-            group_name = seg_meta[group_key]
-        elif "base_path" in seg_meta:
-            group_name = seg_meta["base_path"]
-        else:
-            raise KeyError(
-                f"segment {fragment_id!r} missing group key {group_key!r} and fallback 'base_path'"
-            )
+        if group_key not in seg_meta:
+            raise KeyError(f"segment {fragment_id!r} missing required group key {group_key!r}")
+        group_name = seg_meta[group_key]
         fragment_to_group_name[fragment_id] = str(group_name)
 
     group_names = sorted(set(fragment_to_group_name.values()))

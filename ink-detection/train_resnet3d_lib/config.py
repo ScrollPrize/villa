@@ -1,4 +1,5 @@
 import os
+import os.path as osp
 
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "109951162777600")
 
@@ -15,7 +16,6 @@ import torch
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
 
 def log(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -93,6 +93,7 @@ class CFG:
     # Extra "stitched segment" metrics (expensive, but more faithful for topology/document metrics).
     eval_stitch_metrics = True
     eval_stitch_every_n_epochs = 1
+    eval_stitch_every_n_epochs_plus_one = False
     eval_drd_block_size = 8
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
@@ -215,6 +216,120 @@ def unflatten_dict(flat, *, sep="."):
         else:
             nested[key] = value
     return nested
+
+
+def parse_bool_strict(value, *, key):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        parsed_value = value.strip().lower()
+        if parsed_value in {"1", "true", "yes", "y"}:
+            return True
+        if parsed_value in {"0", "false", "no", "n"}:
+            return False
+        raise ValueError(f"{key} must be a boolean, got {value!r}")
+    if isinstance(value, int):
+        if value in {0, 1}:
+            return bool(value)
+        raise ValueError(f"{key} must be a boolean, got {value!r}")
+    raise ValueError(f"{key} must be a boolean, got {value!r}")
+
+
+def normalize_wandb_config(wandb_cfg, *, key_prefix="metadata_json.wandb"):
+    if not isinstance(wandb_cfg, dict):
+        raise TypeError(f"{key_prefix} must be an object, got {type(wandb_cfg).__name__}")
+
+    required_keys = ("enabled", "project", "entity")
+    missing_required_keys = [key for key in required_keys if key not in wandb_cfg]
+    if missing_required_keys:
+        raise KeyError(f"{key_prefix} missing required keys: {missing_required_keys!r}")
+
+    enabled = parse_bool_strict(wandb_cfg["enabled"], key=f"{key_prefix}.enabled")
+
+    project = wandb_cfg["project"]
+    if not isinstance(project, str) or not project.strip():
+        raise ValueError(f"{key_prefix}.project must be a non-empty string, got {project!r}")
+    project = project.strip()
+
+    entity = wandb_cfg["entity"]
+    if not isinstance(entity, str) or not entity.strip():
+        raise ValueError(f"{key_prefix}.entity must be a non-empty string, got {entity!r}")
+    entity = entity.strip()
+
+    group = wandb_cfg.get("group")
+    if group is None:
+        normalized_group = None
+    elif isinstance(group, str):
+        normalized_group = group.strip() or None
+    else:
+        raise TypeError(f"{key_prefix}.group must be null or a string, got {type(group).__name__}")
+
+    tags = wandb_cfg.get("tags", [])
+    if tags is None:
+        tags = []
+    if not isinstance(tags, list):
+        raise TypeError(f"{key_prefix}.tags must be a list of strings, got {type(tags).__name__}")
+    normalized_tags = []
+    for idx, tag in enumerate(tags):
+        if not isinstance(tag, str):
+            raise TypeError(f"{key_prefix}.tags[{idx}] must be a string, got {type(tag).__name__}")
+        tag_value = tag.strip()
+        if not tag_value:
+            raise ValueError(f"{key_prefix}.tags[{idx}] must be a non-empty string, got {tag!r}")
+        normalized_tags.append(tag_value)
+
+    return {
+        "enabled": enabled,
+        "project": project,
+        "entity": entity,
+        "group": normalized_group,
+        "tags": normalized_tags,
+    }
+
+
+def resolve_metadata_path(metadata_json, *, base_dir):
+    if not metadata_json:
+        raise ValueError("--metadata_json is required")
+    metadata_path = str(metadata_json)
+    if not osp.isabs(metadata_path):
+        if not osp.exists(metadata_path):
+            metadata_path = osp.join(base_dir, metadata_path)
+    return metadata_path
+
+
+def validate_base_config(base_config):
+    if not isinstance(base_config, dict):
+        raise TypeError(f"metadata_json root must be an object, got {type(base_config).__name__}")
+    if "training" not in base_config or not isinstance(base_config["training"], dict):
+        raise KeyError("metadata_json must define an object at key 'training'")
+    if "group_dro" not in base_config or not isinstance(base_config["group_dro"], dict):
+        raise KeyError("metadata_json must define an object at key 'group_dro'")
+    if "wandb" not in base_config or not isinstance(base_config["wandb"], dict):
+        raise KeyError("metadata_json must define an object at key 'wandb'")
+
+    required_training_keys = ("objective", "sampler", "loss_mode", "save_every_epoch")
+    for key in required_training_keys:
+        if key not in base_config["training"]:
+            raise KeyError(f"metadata_json.training missing required key: {key!r}")
+    if "group_key" not in base_config["group_dro"]:
+        raise KeyError("metadata_json.group_dro missing required key: 'group_key'")
+
+
+def load_and_validate_base_config(metadata_json, *, base_dir):
+    metadata_path = resolve_metadata_path(metadata_json, base_dir=base_dir)
+    log(f"loading metadata_json={metadata_path}")
+    base_config = load_metadata_json(metadata_path)
+    validate_base_config(base_config)
+    return base_config
+
+
+def merge_config_with_overrides(base_config, overrides):
+    merged_config = json.loads(json.dumps(base_config))
+    deep_merge_dict(merged_config, overrides or {})
+    if "wandb" not in merged_config:
+        raise KeyError("merged_config missing required object: 'wandb'")
+    merged_config["wandb"] = normalize_wandb_config(merged_config["wandb"], key_prefix="merged_config.wandb")
+    return merged_config
 
 
 def rebuild_augmentations(cfg, augmentation_cfg=None):
@@ -412,7 +527,6 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("max_grad_norm", "max_grad_norm"),
         ("eval_threshold", "eval_threshold"),
         ("eval_stitch_metrics", "eval_stitch_metrics"),
-        ("eval_stitch_every_n_epochs", "eval_stitch_every_n_epochs"),
         ("eval_drd_block_size", "eval_drd_block_size"),
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
@@ -462,30 +576,6 @@ def apply_metadata_hyperparameters(cfg, metadata):
 
     if cfg.norm not in {"batch", "group"}:
         raise ValueError(f"training_hyperparameters.model.norm must be 'batch' or 'group', got {cfg.norm!r}")
-    cfg.eval_stitch_every_n_epochs = int(getattr(cfg, "eval_stitch_every_n_epochs", 1))
-    if cfg.eval_stitch_every_n_epochs < 1:
-        raise ValueError(
-            "training_hyperparameters.training.eval_stitch_every_n_epochs must be >= 1, "
-            f"got {cfg.eval_stitch_every_n_epochs}"
-        )
-    cfg.eval_wandb_media_downsample = int(getattr(cfg, "eval_wandb_media_downsample", 1))
-    if cfg.eval_wandb_media_downsample < 1:
-        raise ValueError(
-            "training_hyperparameters.training.eval_wandb_media_downsample must be >= 1, "
-            f"got {cfg.eval_wandb_media_downsample}"
-        )
-    cfg.eval_component_min_area = int(getattr(cfg, "eval_component_min_area", 0) or 0)
-    if cfg.eval_component_min_area < 0:
-        raise ValueError(
-            "training_hyperparameters.training.eval_component_min_area must be >= 0, "
-            f"got {cfg.eval_component_min_area}"
-        )
-    cfg.eval_skeleton_thinning_type = str(getattr(cfg, "eval_skeleton_thinning_type", "zhang_suen")).strip().lower()
-    if cfg.eval_skeleton_thinning_type not in {"zhang_suen", "guo_hall"}:
-        raise ValueError(
-            "training_hyperparameters.training.eval_skeleton_thinning_type must be "
-            f"'zhang_suen' or 'guo_hall', got {cfg.eval_skeleton_thinning_type!r}"
-        )
 
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()
@@ -517,8 +607,31 @@ def apply_metadata_hyperparameters(cfg, metadata):
     )
     cfg.stitch_log_only_downsample = max(1, int(cfg.stitch_log_only_downsample))
     cfg.stitch_use_roi = bool(training_cfg.get("stitch_use_roi", getattr(cfg, "stitch_use_roi", True)))
-    cfg.stitch_train_every_n_epochs = int(
-        training_cfg.get("stitch_train_every_n_epochs", getattr(cfg, "stitch_train_every_n_epochs", 1) or 1)
+
+    stitching_schedule_cfg = training_cfg.get("stitching_schedule")
+    if stitching_schedule_cfg is None:
+        raise KeyError("metadata.training missing required object: 'stitching_schedule'")
+    if not isinstance(stitching_schedule_cfg, dict):
+        raise TypeError(
+            "metadata.training.stitching_schedule must be an object, "
+            f"got {type(stitching_schedule_cfg).__name__}"
+        )
+    required_schedule_keys = [
+        "train_every_n_epochs",
+        "eval_every_n_epochs",
+        "eval_every_n_epochs_plus_one",
+    ]
+    missing_schedule_keys = [k for k in required_schedule_keys if k not in stitching_schedule_cfg]
+    if missing_schedule_keys:
+        raise KeyError(
+            "metadata.training.stitching_schedule missing required keys: "
+            f"{missing_schedule_keys!r}"
+        )
+    cfg.stitch_train_every_n_epochs = int(stitching_schedule_cfg["train_every_n_epochs"])
+    cfg.eval_stitch_every_n_epochs = int(stitching_schedule_cfg["eval_every_n_epochs"])
+    cfg.eval_stitch_every_n_epochs_plus_one = parse_bool_strict(
+        stitching_schedule_cfg["eval_every_n_epochs_plus_one"],
+        key="metadata.training.stitching_schedule.eval_every_n_epochs_plus_one",
     )
     cfg.stitch_train_every_n_epochs = max(1, int(cfg.stitch_train_every_n_epochs))
     if "stitch_downsample" in training_cfg:
@@ -526,6 +639,30 @@ def apply_metadata_hyperparameters(cfg, metadata):
     else:
         cfg.stitch_downsample = 8 if cfg.stitch_all_val else int(getattr(cfg, "stitch_downsample", 1))
     cfg.stitch_downsample = max(1, int(cfg.stitch_downsample))
+
+    if cfg.eval_stitch_every_n_epochs < 1:
+        raise ValueError(
+            "metadata.training.stitching_schedule.eval_every_n_epochs must be >= 1, "
+            f"got {cfg.eval_stitch_every_n_epochs}"
+        )
+    cfg.eval_wandb_media_downsample = int(getattr(cfg, "eval_wandb_media_downsample", 1))
+    if cfg.eval_wandb_media_downsample < 1:
+        raise ValueError(
+            "training_hyperparameters.training.eval_wandb_media_downsample must be >= 1, "
+            f"got {cfg.eval_wandb_media_downsample}"
+        )
+    cfg.eval_component_min_area = int(getattr(cfg, "eval_component_min_area", 0) or 0)
+    if cfg.eval_component_min_area < 0:
+        raise ValueError(
+            "training_hyperparameters.training.eval_component_min_area must be >= 0, "
+            f"got {cfg.eval_component_min_area}"
+        )
+    cfg.eval_skeleton_thinning_type = str(getattr(cfg, "eval_skeleton_thinning_type", "zhang_suen")).strip().lower()
+    if cfg.eval_skeleton_thinning_type not in {"zhang_suen", "guo_hall"}:
+        raise ValueError(
+            "training_hyperparameters.training.eval_skeleton_thinning_type must be "
+            f"'zhang_suen' or 'guo_hall', got {cfg.eval_skeleton_thinning_type!r}"
+        )
 
     cv_fold = training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None))
     if isinstance(cv_fold, str) and cv_fold.strip().lower() in {"", "none", "null"}:
