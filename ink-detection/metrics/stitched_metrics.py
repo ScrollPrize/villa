@@ -293,6 +293,8 @@ _COMPONENT_ROW_EXTRA_MEAN_METRICS: Tuple[str, ...] = (
     "betti_beta1_pred",
     "betti_beta0_gt",
     "betti_beta1_gt",
+    "betti_match_err_dim0",
+    "betti_match_err_dim1",
 )
 
 
@@ -371,6 +373,8 @@ def _compute_full_region_metrics(
     skeleton_radius: Optional[np.ndarray],
     gt_beta0: int,
     gt_beta1: int,
+    gt_lab: np.ndarray,
+    pred_lab: np.ndarray,
     skel_gt: np.ndarray,
     skeleton_thinning_type: str,
     timings: Optional[Dict[str, float]] = None,
@@ -384,6 +388,8 @@ def _compute_full_region_metrics(
         boundary_k=boundary_k,
         gt_beta0=int(gt_beta0),
         gt_beta1=int(gt_beta1),
+        gt_lab=gt_lab,
+        pred_lab=pred_lab,
         skel_gt=skel_gt,
         skel_pred=skel_pred,
         timings=timings,
@@ -402,6 +408,9 @@ def _compute_full_region_metrics(
         "betti/abs_beta0_err": float(full_metrics["betti_abs_beta0_err"]),
         "betti/abs_beta1_err": float(full_metrics["betti_abs_beta1_err"]),
         "betti/l1_betti_err": float(full_metrics["betti_l1"]),
+        "betti/match_err": float(full_metrics["betti_match_err"]),
+        "betti/match_err_dim0": float(full_metrics["betti_match_err_dim0"]),
+        "betti/match_err_dim1": float(full_metrics["betti_match_err_dim1"]),
         "euler_pred": float(full_metrics["euler_pred"]),
         "euler_gt": float(full_metrics["euler_gt"]),
         "abs_euler_err": float(full_metrics["abs_euler_err"]),
@@ -476,6 +485,9 @@ def _build_components_manifest(
             "betti_beta1_pred": float(row["betti_beta1_pred"]),
             "betti_beta0_gt": float(row["betti_beta0_gt"]),
             "betti_beta1_gt": float(row["betti_beta1_gt"]),
+            "betti_match_err": float(row["betti_match_err"]),
+            "betti_match_err_dim0": float(row["betti_match_err_dim0"]),
+            "betti_match_err_dim1": float(row["betti_match_err_dim1"]),
         }
         components_manifest.append(entry)
         rows_by_id[entry["component_id"]] = row
@@ -512,16 +524,18 @@ def _write_component_outputs(
     os.makedirs(component_output_dir, exist_ok=True)
     safe_seg = str(fragment_id).replace("/", "_")
     thr_tag = _threshold_tag(float(threshold))
-    base_name = f"components_{safe_seg}_ds{int(downsample)}_thr_{thr_tag}"
+    base_name = f"components_{safe_seg}_ds{int(downsample)}"
+    threshold_base_name = f"{base_name}_thr_{thr_tag}"
     gt_path = osp.join(component_output_dir, f"{base_name}_gt_labels.png")
-    pred_path = osp.join(component_output_dir, f"{base_name}_pred_labels.png")
-    meta_path = osp.join(component_output_dir, f"{base_name}_meta.json")
-    manifest_path = osp.join(component_output_dir, f"{base_name}_manifest.json")
+    pred_path = osp.join(component_output_dir, f"{threshold_base_name}_pred_labels.png")
+    meta_path = osp.join(component_output_dir, f"{threshold_base_name}_meta.json")
+    manifest_path = osp.join(component_output_dir, f"{threshold_base_name}_manifest.json")
 
-    if not (osp.exists(gt_path) and osp.exists(pred_path) and osp.exists(meta_path)):
+    if not osp.exists(gt_path):
         gt_u16 = gt_lab.astype(np.uint16, copy=False)
-        pred_u16 = pred_lab.astype(np.uint16, copy=False)
         Image.fromarray(gt_u16, mode="I;16").save(gt_path)
+    if not (osp.exists(pred_path) and osp.exists(meta_path)):
+        pred_u16 = pred_lab.astype(np.uint16, copy=False)
         Image.fromarray(pred_u16, mode="I;16").save(pred_path)
 
     off_y, off_x = [int(v) for v in roi_offset]
@@ -572,7 +586,7 @@ def _write_component_outputs(
         max_items = max(1, int(component_debug_max_items))
         selected_component_ids = selected_component_ids[:max_items]
 
-    debug_dir = osp.join(component_output_dir, f"{base_name}_debug")
+    debug_dir = osp.join(component_output_dir, f"{threshold_base_name}_debug")
     os.makedirs(debug_dir, exist_ok=True)
     for component_id in selected_component_ids:
         if component_id not in rows_by_id:
@@ -698,8 +712,13 @@ def _save_stitched_eval_inputs(
 def _log_timing(*, segment_id: str, downsample: int, cache_hit: bool, timings: Dict[str, float]) -> None:
     from train_resnet3d_lib.config import log as _log
 
-    total = sum(timings.values())
-    parts = sorted(timings.items(), key=lambda kv: kv[1], reverse=True)
+    if "wall" in timings:
+        total = float(timings["wall"])
+    else:
+        total = sum(float(v) for k, v in timings.items() if "/" not in k)
+        if total <= 0.0:
+            total = sum(float(v) for v in timings.values())
+    parts = sorted(((k, v) for k, v in timings.items() if k != "wall"), key=lambda kv: kv[1], reverse=True)
     msg = (
         f"metrics timing segment={segment_id} ds={downsample} cache={'hit' if cache_hit else 'miss'} "
         f"total={total:.3f}s "
@@ -763,6 +782,7 @@ def compute_stitched_metrics(
     pred_full_shape = tuple(pred_prob.shape)
 
     timings: Dict[str, float] = {}
+    wall_t0 = time.perf_counter()
 
     def _timeit(name: str, t0: float) -> None:
         timings[name] = timings.get(name, 0.0) + (time.perf_counter() - t0)
@@ -1042,6 +1062,8 @@ def compute_stitched_metrics(
                 skeleton_radius=skeleton_radius,
                 gt_beta0=int(gt_beta0),
                 gt_beta1=int(gt_beta1),
+                gt_lab=gt_lab,
+                pred_lab=pred_lab_t,
                 skel_gt=skel_gt,
                 skeleton_thinning_type=skeleton_thinning_type,
                 timings=full_region_timings_t,
@@ -1124,6 +1146,7 @@ def compute_stitched_metrics(
         stab = _stability_stats(finite_vals)
         out.update({f"stability/{metric_base}_{k}": float(v) for k, v in stab.items()})
 
+    timings["wall"] = max(0.0, float(time.perf_counter() - wall_t0))
     _log_timing(segment_id=seg, downsample=ds, cache_hit=cache_hit, timings=timings)
 
     return out

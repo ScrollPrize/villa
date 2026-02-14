@@ -150,6 +150,42 @@ def _dual_connectivity(connectivity: int) -> int:
     raise ValueError(f"connectivity must be 1 (4-neighborhood) or 2 (8-neighborhood), got {connectivity}")
 
 
+def _hole_labels_2d(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[np.ndarray, int]:
+    import cv2
+
+    mask = _as_bool_2d(mask)
+    H, W = mask.shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.int32), 0
+
+    bg_conn = _cc_connectivity_cv2(_dual_connectivity(connectivity))
+    n_all, bg_lab = cv2.connectedComponents((~mask).astype(np.uint8, copy=False), connectivity=bg_conn)
+    n_all_i = int(n_all)
+    if n_all_i <= 1:
+        return np.zeros_like(bg_lab, dtype=np.int32), 0
+
+    border = np.zeros((H, W), dtype=bool)
+    border[0, :] = True
+    border[-1, :] = True
+    border[:, 0] = True
+    border[:, -1] = True
+    touching = np.unique(bg_lab[border])
+
+    is_hole = np.ones(n_all_i, dtype=bool)
+    is_hole[0] = False
+    is_hole[touching] = False
+
+    hole_ids = np.flatnonzero(is_hole).astype(np.int32, copy=False)
+    n_holes = int(hole_ids.size)
+    if n_holes <= 0:
+        return np.zeros_like(bg_lab, dtype=np.int32), 0
+
+    remap = np.zeros(n_all_i, dtype=np.int32)
+    remap[hole_ids] = np.arange(1, n_holes + 1, dtype=np.int32)
+    hole_lab = remap[bg_lab]
+    return hole_lab, n_holes
+
+
 def betti_numbers_2d(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[int, int]:
     """Compute (beta0, beta1) for a 2D binary foreground mask.
 
@@ -164,50 +200,86 @@ def betti_numbers_2d(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[int, i
         return 0, 0
 
     fg_conn = _cc_connectivity_cv2(connectivity)
-    bg_conn = _cc_connectivity_cv2(_dual_connectivity(connectivity))
     fg_n_all, _fg_lab = cv2.connectedComponents(mask.astype(np.uint8, copy=False), connectivity=fg_conn)
     beta0 = int(max(0, int(fg_n_all) - 1))
 
-    bg_n_all, bg_lab = cv2.connectedComponents((~mask).astype(np.uint8, copy=False), connectivity=bg_conn)
-    bg_n = int(max(0, int(bg_n_all) - 1))
-    if bg_n <= 0:
-        return beta0, 0
-
-    border = np.zeros((H, W), dtype=bool)
-    border[0, :] = True
-    border[-1, :] = True
-    border[:, 0] = True
-    border[:, -1] = True
-    touching = set(np.unique(bg_lab[border])) - {0}
-    all_bg = set(range(1, int(bg_n) + 1))
-    holes = all_bg - touching
-    beta1 = int(len(holes))
+    _hole_lab, beta1 = _hole_labels_2d(mask, connectivity=connectivity)
     return beta0, beta1
 
 
 def _count_holes_2d(mask: np.ndarray, *, connectivity: int = 2) -> int:
-    import cv2
+    _hole_lab, n_holes = _hole_labels_2d(mask, connectivity=connectivity)
+    return int(n_holes)
 
-    mask = _as_bool_2d(mask)
-    H, W = mask.shape
-    if H == 0 or W == 0:
+
+_BETTI_MATCHING_BACKEND = None
+
+
+def _get_betti_matching_backend():
+    global _BETTI_MATCHING_BACKEND
+    if _BETTI_MATCHING_BACKEND is not None:
+        return _BETTI_MATCHING_BACKEND
+
+    try:
+        import betti_matching as backend
+    except Exception:
+        try:
+            from topolosses.losses.betti_matching.src import betti_matching as backend
+        except Exception as exc:
+            raise ImportError(
+                "Strict Betti matching backend not available. Install `betti_matching` "
+                "or `topolosses` with its betti-matching extension."
+            ) from exc
+
+    _BETTI_MATCHING_BACKEND = backend
+    return _BETTI_MATCHING_BACKEND
+
+
+def _num_features_from_coordinates(coords) -> int:
+    arr = np.asarray(coords)
+    if arr.size == 0:
         return 0
+    if arr.ndim == 0:
+        return 1
+    return int(arr.shape[0])
 
-    bg_conn = _cc_connectivity_cv2(_dual_connectivity(connectivity))
-    bg_n_all, bg_lab = cv2.connectedComponents((~mask).astype(np.uint8, copy=False), connectivity=bg_conn)
-    bg_n = int(max(0, int(bg_n_all) - 1))
-    if bg_n <= 0:
-        return 0
 
-    border = np.zeros((H, W), dtype=bool)
-    border[0, :] = True
-    border[-1, :] = True
-    border[:, 0] = True
-    border[:, -1] = True
-    touching = set(np.unique(bg_lab[border])) - {0}
-    all_bg = set(range(1, int(bg_n) + 1))
-    holes = all_bg - touching
-    return int(len(holes))
+def betti_matching_error(
+    pred_bin: np.ndarray,
+    gt_bin: np.ndarray,
+) -> Dict[str, float]:
+    pred_bin_b = _as_bool_2d(pred_bin)
+    gt_bin_b = _as_bool_2d(gt_bin)
+    if pred_bin_b.shape != gt_bin_b.shape:
+        raise ValueError(f"pred_bin/gt_bin shape mismatch: {pred_bin_b.shape} vs {gt_bin_b.shape}")
+
+    backend = _get_betti_matching_backend()
+
+    # Betti-matching implementations use sublevel filtration; for segmentation we
+    # evaluate superlevel topology by inverting binary masks.
+    pred_super = np.ascontiguousarray(1.0 - pred_bin_b.astype(np.float64))
+    gt_super = np.ascontiguousarray(1.0 - gt_bin_b.astype(np.float64))
+
+    results = backend.compute_matching([pred_super], [gt_super])
+    if len(results) != 1:
+        raise ValueError(f"expected one matching result, got {len(results)}")
+    result = results[0]
+
+    dims = len(result.input1_unmatched_birth_coordinates)
+    err_by_dim = np.zeros((max(2, int(dims)),), dtype=np.float64)
+    pair_by_dim = np.zeros((max(2, int(dims)),), dtype=np.float64)
+    for dim in range(int(dims)):
+        n_pred_unmatched = _num_features_from_coordinates(result.input1_unmatched_birth_coordinates[dim])
+        n_gt_unmatched = _num_features_from_coordinates(result.input2_unmatched_birth_coordinates[dim])
+        n_matched = _num_features_from_coordinates(result.input1_matched_birth_coordinates[dim])
+        err_by_dim[dim] = float(n_pred_unmatched + n_gt_unmatched)
+        pair_by_dim[dim] = float(n_matched)
+
+    return {
+        "betti_match_err": float(err_by_dim[0] + err_by_dim[1]),
+        "betti_match_err_dim0": float(err_by_dim[0]),
+        "betti_match_err_dim1": float(err_by_dim[1]),
+    }
 
 
 def _boundary_mask(mask: np.ndarray, *, k: int = 3) -> np.ndarray:
@@ -761,6 +833,11 @@ def _local_metrics_from_binary(
     abs_euler_err = float(abs(euler_pred - euler_gt))
 
     t0 = time.perf_counter()
+    betti_match = betti_matching_error(pred_bin, gt_bin)
+    if timings is not None:
+        timings["betti_matching"] = timings.get("betti_matching", 0.0) + (time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
     hd = hausdorff_metrics(pred_bin, gt_bin, boundary_k=boundary_k)
     if timings is not None:
         timings["boundary_hausdorff"] = timings.get("boundary_hausdorff", 0.0) + (time.perf_counter() - t0)
@@ -831,6 +908,9 @@ def _local_metrics_from_binary(
         "betti_abs_beta0_err": abs_beta0_err,
         "betti_abs_beta1_err": abs_beta1_err,
         "betti_l1": betti_l1,
+        "betti_match_err": float(betti_match["betti_match_err"]),
+        "betti_match_err_dim0": float(betti_match["betti_match_err_dim0"]),
+        "betti_match_err_dim1": float(betti_match["betti_match_err_dim1"]),
         "euler_pred": euler_pred,
         "euler_gt": euler_gt,
         "abs_euler_err": abs_euler_err,
