@@ -656,6 +656,14 @@ class Model2D(nn.Module):
 		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
 		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
 		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
+		# Edge fallback for undefined horizontal neighbors:
+		# mirror the nearest inside conn vector (visual/search-only backup).
+		with torch.no_grad():
+			if wm > 1:
+				v_in_l = right_conn[:, :, :, 1] - xy_px[:, :, :, 1]
+				v_in_r = left_conn[:, :, :, -2] - xy_px[:, :, :, -2]
+				left_conn[:, :, :, 0] = (xy_px[:, :, :, 0] - v_in_l).detach()
+				right_conn[:, :, :, -1] = (xy_px[:, :, :, -1] - v_in_r).detach()
 		conn = torch.stack([left_conn, xy_px, right_conn], dim=1)
 		return conn.permute(0, 3, 4, 1, 2).contiguous()
 
