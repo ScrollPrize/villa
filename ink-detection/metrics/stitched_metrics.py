@@ -376,10 +376,14 @@ def _compute_full_region_metrics(
     gt_lab: np.ndarray,
     pred_lab: np.ndarray,
     skel_gt: np.ndarray,
-    skeleton_thinning_type: str,
+    skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict[str, float], np.ndarray]:
-    skel_pred = skeletonize_binary(pred_bin_clean, thinning_type=skeleton_thinning_type)
+    skel_pred = skeletonize_binary(
+        pred_bin_clean,
+        cc_labels=pred_lab,
+        skeleton_method=skeleton_method,
+    )
     full_metrics = _local_metrics_from_binary(
         pred_bin_clean,
         gt_bin,
@@ -392,6 +396,7 @@ def _compute_full_region_metrics(
         pred_lab=pred_lab,
         skel_gt=skel_gt,
         skel_pred=skel_pred,
+        skeleton_method=skeleton_method,
         timings=timings,
     )
     out: Dict[str, float] = {
@@ -761,7 +766,7 @@ def compute_stitched_metrics(
     component_worst_k: Optional[int] = 2,
     component_min_area: Optional[Any] = None,
     component_pad: int = 5,
-    skeleton_thinning_type: str = "zhang_suen",
+    skeleton_method: str = "guo_hall",
     enable_full_region_metrics: bool = False,
     threshold_grid: Optional[np.ndarray] = None,
     component_output_dir: Optional[str] = None,
@@ -805,7 +810,7 @@ def compute_stitched_metrics(
         tuple(pred_prob.shape),
         str(pred_has_digest),
         int(betti_connectivity),
-        str(skeleton_thinning_type),
+        str(skeleton_method),
     )
     cache = _gt_cache_get(cache_key)
     if cache is not None:
@@ -883,7 +888,11 @@ def compute_stitched_metrics(
         gt_beta1 = _count_holes_2d(gt_bin, connectivity=betti_connectivity)
         load_gt_timings["gt_holes"] = load_gt_timings.get("gt_holes", 0.0) + (time.perf_counter() - t1)
         t1 = time.perf_counter()
-        skel_gt = skeletonize_binary(gt_bin, thinning_type=skeleton_thinning_type)
+        skel_gt = skeletonize_binary(
+            gt_bin,
+            cc_labels=gt_lab,
+            skeleton_method=skeleton_method,
+        )
         load_gt_timings["gt_skeleton"] = load_gt_timings.get("gt_skeleton", 0.0) + (time.perf_counter() - t1)
         cache_entry = {
             "gt_bin": gt_bin,
@@ -928,7 +937,7 @@ def compute_stitched_metrics(
             int(n_gt),
             connectivity=betti_connectivity,
             pad=pad_i,
-            skeleton_thinning_type=skeleton_thinning_type,
+            skeleton_method=skeleton_method,
         )
         cache_entry["gt_component_templates"] = gt_component_templates
         cache_entry["gt_component_pad"] = int(pad_i)
@@ -1027,7 +1036,7 @@ def compute_stitched_metrics(
             pred_lab=pred_lab_t,
             n_gt=n_gt,
             gt_component_templates=gt_component_templates,
-            skeleton_thinning_type=skeleton_thinning_type,
+            skeleton_method=skeleton_method,
             timings=component_metric_timings_t,
         )
         threshold_grid_timings["component_metrics"] = threshold_grid_timings.get("component_metrics", 0.0) + (
@@ -1065,7 +1074,7 @@ def compute_stitched_metrics(
                 gt_lab=gt_lab,
                 pred_lab=pred_lab_t,
                 skel_gt=skel_gt,
-                skeleton_thinning_type=skeleton_thinning_type,
+                skeleton_method=skeleton_method,
                 timings=full_region_timings_t,
             )
             threshold_grid_timings["full_region_metrics"] = threshold_grid_timings.get("full_region_metrics", 0.0) + (

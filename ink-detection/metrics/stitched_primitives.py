@@ -5,14 +5,41 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+import edt
 import numpy as np
+from kimimaro.trace import trace
 
 
 EPS = 1e-8
 
+DEFAULT_TEASAR_PARAMS = {
+    "scale": 1.5,
+    "const": 300,
+    "pdrf_scale": 100000,
+    "pdrf_exponent": 4,
+    "soma_acceptance_threshold": 3500,
+    "soma_detection_threshold": 750,
+    "soma_invalidation_const": 300,
+    "soma_invalidation_scale": 2,
+}
+
 
 def _safe_div(n: float, d: float) -> float:
     return float(n) / float(d + EPS)
+
+
+def _normalize_skeleton_method(skeleton_method: str) -> str:
+    method = str(skeleton_method).strip().lower()
+    if method in {"zhang_suen", "zhangsuen", "zhang-suen"}:
+        return "zhang_suen"
+    if method in {"guo_hall", "guohall", "guo-hall"}:
+        return "guo_hall"
+    if method == "kimimaro":
+        return "kimimaro"
+    raise ValueError(
+        "skeleton_method must be one of {'zhang_suen', 'guo_hall', 'kimimaro'}, "
+        f"got {skeleton_method!r}"
+    )
 
 
 def _as_bool_2d(x: np.ndarray) -> np.ndarray:
@@ -456,37 +483,125 @@ def hausdorff_metrics(
     return {"hd": hd, "hd95": hd95, "assd": assd}
 
 
-def _resolve_thinning_type(thinning_type: str) -> int:
-    thinning_type_str = str(thinning_type).strip().lower()
-    if thinning_type_str in {"zhang_suen", "zhangsuen", "zhang-suen"}:
-        import cv2
-
-        return int(cv2.ximgproc.THINNING_ZHANGSUEN)
-    if thinning_type_str in {"guo_hall", "guohall", "guo-hall"}:
-        import cv2
-
-        return int(cv2.ximgproc.THINNING_GUOHALL)
-    raise ValueError(
-        "thinning_type must be one of {'zhang_suen', 'guo_hall'}, "
-        f"got {thinning_type!r}"
-    )
+def _draw_edge_2d(mask: np.ndarray, *, y0: float, x0: float, y1: float, x1: float) -> None:
+    steps = max(int(np.ceil(abs(y1 - y0))), int(np.ceil(abs(x1 - x0))), 1)
+    ys = np.rint(np.linspace(y0, y1, steps + 1)).astype(np.int64, copy=False)
+    xs = np.rint(np.linspace(x0, x1, steps + 1)).astype(np.int64, copy=False)
+    valid = (ys >= 0) & (ys < mask.shape[0]) & (xs >= 0) & (xs < mask.shape[1])
+    if valid.any():
+        mask[ys[valid], xs[valid]] = True
 
 
-def skeletonize_binary(mask: np.ndarray, *, thinning_type: str = "zhang_suen") -> np.ndarray:
+def _trace_skeleton_to_mask_2d(skel: object, *, out_shape: Tuple[int, int]) -> np.ndarray:
+    out = np.zeros(out_shape, dtype=bool)
+    vertices = np.asarray(skel.vertices, dtype=np.float64)
+    if vertices.ndim != 2 or vertices.shape[1] not in (2, 3):
+        raise ValueError(f"kimimaro skeleton vertices must have shape (N, 2) or (N, 3), got {vertices.shape}")
+    if vertices.shape[0] == 0:
+        return out
+
+    edges = np.asarray(skel.edges)
+    if edges.ndim != 2 or edges.shape[1] != 2:
+        raise ValueError(f"kimimaro skeleton edges must have shape (M, 2), got {edges.shape}")
+
+    if edges.shape[0] == 0:
+        y0 = int(np.rint(vertices[0, 0]))
+        x0 = int(np.rint(vertices[0, 1]))
+        if 0 <= y0 < out_shape[0] and 0 <= x0 < out_shape[1]:
+            out[y0, x0] = True
+        return out
+
+    n_vertices = int(vertices.shape[0])
+    for edge in edges:
+        vi0 = int(edge[0])
+        vi1 = int(edge[1])
+        if vi0 < 0 or vi0 >= n_vertices or vi1 < 0 or vi1 >= n_vertices:
+            raise ValueError(
+                f"kimimaro edge has invalid vertex index: {(vi0, vi1)} for n_vertices={n_vertices}"
+            )
+        y0 = float(vertices[vi0, 0])
+        x0 = float(vertices[vi0, 1])
+        y1 = float(vertices[vi1, 0])
+        x1 = float(vertices[vi1, 1])
+        _draw_edge_2d(out, y0=y0, x0=x0, y1=y1, x1=x1)
+
+    return out
+
+
+def _skeletonize_binary_opencv(mask: np.ndarray, *, thinning_type: str) -> np.ndarray:
+    import cv2
+
     mask = _as_bool_2d(mask)
     if not mask.any():
         return np.zeros_like(mask, dtype=bool)
-    import cv2
-
     if not hasattr(cv2, "ximgproc") or not hasattr(cv2.ximgproc, "thinning"):
         raise ImportError(
-            "cv2.ximgproc.thinning is required for skeleton metrics. "
-            "Install OpenCV contrib (opencv-contrib-python)."
+            "cv2.ximgproc.thinning is required for OpenCV skeleton methods. "
+            "Install opencv-contrib-python-headless."
         )
-    thinning_type_cv2 = _resolve_thinning_type(thinning_type)
-    mask_u8 = (mask.astype(np.uint8) * 255)
+    thinning_method = _normalize_skeleton_method(thinning_type)
+    if thinning_method == "zhang_suen":
+        thinning_type_cv2 = int(cv2.ximgproc.THINNING_ZHANGSUEN)
+    elif thinning_method == "guo_hall":
+        thinning_type_cv2 = int(cv2.ximgproc.THINNING_GUOHALL)
+    else:
+        raise ValueError(
+            "OpenCV thinning_type must be one of {'zhang_suen', 'guo_hall'}, "
+            f"got {thinning_type!r}"
+        )
+    mask_u8 = mask.astype(np.uint8, copy=False) * 255
     skel_u8 = cv2.ximgproc.thinning(mask_u8, thinningType=thinning_type_cv2)
     return skel_u8 > 0
+
+
+def skeletonize_binary(
+    mask: np.ndarray,
+    *,
+    cc_labels: Optional[np.ndarray] = None,
+    skeleton_method: str = "guo_hall",
+) -> np.ndarray:
+    mask = _as_bool_2d(mask)
+    if not mask.any():
+        return np.zeros_like(mask, dtype=bool)
+    method = _normalize_skeleton_method(skeleton_method)
+    if method in {"zhang_suen", "guo_hall"}:
+        return _skeletonize_binary_opencv(mask, thinning_type=method)
+
+    if cc_labels is None:
+        cc_labels_i, _ = _label_components(mask, connectivity=2)
+    else:
+        cc_labels_i = _as_int_labels_2d(cc_labels)
+        if cc_labels_i.shape != mask.shape:
+            raise ValueError(f"cc_labels/mask shape mismatch: {cc_labels_i.shape} vs {mask.shape}")
+        if np.any(cc_labels_i < 0):
+            raise ValueError("cc_labels must be non-negative")
+        if not np.array_equal(mask, cc_labels_i > 0):
+            raise ValueError("cc_labels foreground (labels > 0) must exactly match mask foreground")
+
+    skel_mask = np.zeros_like(mask, dtype=bool)
+    cc_ids = np.unique(cc_labels_i)
+    for cc_id in cc_ids:
+        cc_id_i = int(cc_id)
+        if cc_id_i == 0:
+            continue
+        component_mask = cc_labels_i == cc_id_i
+        if not component_mask.any():
+            raise ValueError(f"connected component id={cc_id_i} has no foreground pixels")
+
+        mask3 = np.asfortranarray(component_mask[..., None].astype(np.uint8, copy=False))
+        dbf = edt.edt(mask3, anisotropy=(1, 1, 1), black_border=True)
+        skel = trace(
+            mask3,
+            dbf,
+            anisotropy=(1, 1, 1),
+            manual_targets_before=[],
+            manual_targets_after=[],
+            root=None,
+            **DEFAULT_TEASAR_PARAMS,
+        )
+        skel_mask |= _trace_skeleton_to_mask_2d(skel, out_shape=mask.shape)
+
+    return skel_mask
 
 
 def skeleton_recall(pred: np.ndarray, gt: np.ndarray, *, skel_gt: Optional[np.ndarray] = None) -> float:
@@ -782,6 +897,7 @@ def _local_metrics_from_binary(
     pfm_weight_recall: Optional[np.ndarray] = None,
     pfm_weight_recall_sum: Optional[float] = None,
     pfm_weight_precision: Optional[np.ndarray] = None,
+    skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     pred_bin = _as_bool_2d(pred_bin)
@@ -843,12 +959,12 @@ def _local_metrics_from_binary(
         timings["boundary_hausdorff"] = timings.get("boundary_hausdorff", 0.0) + (time.perf_counter() - t0)
     if skel_gt is None:
         t0 = time.perf_counter()
-        skel_gt = skeletonize_binary(gt_bin)
+        skel_gt = skeletonize_binary(gt_bin, skeleton_method=skeleton_method)
         if timings is not None:
             timings["skeletonize_gt"] = timings.get("skeletonize_gt", 0.0) + (time.perf_counter() - t0)
     if skel_pred is None:
         t0 = time.perf_counter()
-        skel_pred = skeletonize_binary(pred_bin)
+        skel_pred = skeletonize_binary(pred_bin, skeleton_method=skeleton_method)
         if timings is not None:
             timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
     t0 = time.perf_counter()

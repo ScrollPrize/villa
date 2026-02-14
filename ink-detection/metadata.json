@@ -124,11 +124,11 @@
       "eval_skeleton_radius": [
         1
       ],
+      "eval_skeleton_thinning_type": "guo_hall",
       "eval_component_worst_q": 0.2,
       "eval_component_worst_k": 2,
       "eval_component_min_area": 4096,
       "eval_component_pad": 5,
-      "eval_skeleton_thinning_type": "guo_hall",
       "eval_stitch_full_region_metrics": false,
       "eval_save_stitched_inputs": true,
       "eval_save_component_debug_images": true,

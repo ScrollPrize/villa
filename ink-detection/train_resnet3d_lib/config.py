@@ -98,11 +98,11 @@ class CFG:
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
     eval_skeleton_radius = [1]
+    eval_skeleton_thinning_type = "guo_hall"
     eval_component_worst_q = 0.2
     eval_component_worst_k = 2
     eval_component_min_area = 0
     eval_component_pad = 5
-    eval_skeleton_thinning_type = "guo_hall"
     eval_stitch_full_region_metrics = False
     eval_save_stitched_inputs = True
     eval_save_component_debug_images = False
@@ -531,11 +531,11 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
         ("eval_skeleton_radius", "eval_skeleton_radius"),
+        ("eval_skeleton_thinning_type", "eval_skeleton_thinning_type"),
         ("eval_component_worst_q", "eval_component_worst_q"),
         ("eval_component_worst_k", "eval_component_worst_k"),
         ("eval_component_min_area", "eval_component_min_area"),
         ("eval_component_pad", "eval_component_pad"),
-        ("eval_skeleton_thinning_type", "eval_skeleton_thinning_type"),
         ("eval_stitch_full_region_metrics", "eval_stitch_full_region_metrics"),
         ("eval_save_stitched_inputs", "eval_save_stitched_inputs"),
         ("eval_save_component_debug_images", "eval_save_component_debug_images"),
@@ -657,13 +657,12 @@ def apply_metadata_hyperparameters(cfg, metadata):
             "training_hyperparameters.training.eval_component_min_area must be >= 0, "
             f"got {cfg.eval_component_min_area}"
         )
-    cfg.eval_skeleton_thinning_type = str(getattr(cfg, "eval_skeleton_thinning_type", "zhang_suen")).strip().lower()
-    if cfg.eval_skeleton_thinning_type not in {"zhang_suen", "guo_hall"}:
+    cfg.eval_skeleton_thinning_type = str(getattr(cfg, "eval_skeleton_thinning_type", "guo_hall")).strip().lower()
+    if cfg.eval_skeleton_thinning_type not in {"zhang_suen", "guo_hall", "kimimaro"}:
         raise ValueError(
             "training_hyperparameters.training.eval_skeleton_thinning_type must be "
-            f"'zhang_suen' or 'guo_hall', got {cfg.eval_skeleton_thinning_type!r}"
+            f"'zhang_suen', 'guo_hall', or 'kimimaro', got {cfg.eval_skeleton_thinning_type!r}"
         )
-
     cv_fold = training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None))
     if isinstance(cv_fold, str) and cv_fold.strip().lower() in {"", "none", "null"}:
         cv_fold = None

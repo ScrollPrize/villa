@@ -728,9 +728,9 @@ class StitchManager:
                     component_worst_k = None
                 if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
                     component_worst_k = int(component_worst_k)
+                skeleton_thinning_type = str(getattr(CFG, "eval_skeleton_thinning_type", "guo_hall"))
                 component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
                 component_pad = int(getattr(CFG, "eval_component_pad", 5))
-                skeleton_thinning_type = str(getattr(CFG, "eval_skeleton_thinning_type", "zhang_suen"))
                 enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
                 save_stitched_inputs = bool(getattr(CFG, "eval_save_stitched_inputs", False))
                 save_component_debug_images = bool(getattr(CFG, "eval_save_component_debug_images", False))
@@ -798,7 +798,7 @@ class StitchManager:
                         component_worst_k=component_worst_k,
                         component_min_area=component_min_area,
                         component_pad=component_pad,
-                        skeleton_thinning_type=skeleton_thinning_type,
+                        skeleton_method=skeleton_thinning_type,
                         enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
                         component_output_dir=component_output_dir,

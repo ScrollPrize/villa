@@ -18,3 +18,5 @@ tqdm
 zarr<3
 numcodecs
 topolosses
+kimimaro
+edt

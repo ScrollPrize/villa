@@ -26,7 +26,7 @@ def _build_gt_component_templates(
     *,
     connectivity: int,
     pad: int,
-    skeleton_thinning_type: str = "zhang_suen",
+    skeleton_method: str = "guo_hall",
 ) -> List[Dict[str, Any]]:
     gt_bin = _as_bool_2d(gt_bin)
     gt_lab = np.asarray(gt_lab)
@@ -48,7 +48,11 @@ def _build_gt_component_templates(
         crop_gt = gt_bin[y0:y1, x0:x1]
         crop_gt_lab, _ = _label_components(crop_gt, connectivity=connectivity)
         gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
-        gt_skel = skeletonize_binary(crop_gt, thinning_type=skeleton_thinning_type)
+        gt_skel = skeletonize_binary(
+            crop_gt,
+            cc_labels=crop_gt_lab,
+            skeleton_method=skeleton_method,
+        )
         pfm_weight_recall = _pseudo_recall_weights(crop_gt).astype(np.float32, copy=False)
         pfm_weight_recall_sum = float(pfm_weight_recall.sum(dtype=np.float64))
         if crop_gt.any() and pfm_weight_recall_sum <= 0.0:
@@ -223,7 +227,7 @@ def component_metrics_by_gt_bbox(
     pred_lab: np.ndarray,
     n_gt: Optional[int] = None,
     gt_component_templates: Optional[List[Dict[str, Any]]] = None,
-    skeleton_thinning_type: str = "zhang_suen",
+    skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, float]], Dict[str, Dict[str, Any]]]:
     pred_prob = np.asarray(pred_prob, dtype=np.float32)
@@ -247,7 +251,7 @@ def component_metrics_by_gt_bbox(
             int(n_gt),
             connectivity=connectivity,
             pad=pad,
-            skeleton_thinning_type=skeleton_thinning_type,
+            skeleton_method=skeleton_method,
         )
 
     rows: List[Dict[str, Any]] = []
@@ -267,15 +271,19 @@ def component_metrics_by_gt_bbox(
             )
 
         t0 = time.perf_counter()
-        crop_pred_skel = skeletonize_binary(crop_pred_bin, thinning_type=skeleton_thinning_type)
-        if timings is not None:
-            timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
-        t0 = time.perf_counter()
         # Use cropped global predicted labels to avoid per-crop relabeling.
         # This intentionally makes VOI follow the global partition restricted to the bbox.
         crop_pred_lab = pred_lab_full[y0:y1, x0:x1]
         if timings is not None:
             timings["label_pred"] = timings.get("label_pred", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        crop_pred_skel = skeletonize_binary(
+            crop_pred_bin,
+            cc_labels=crop_pred_lab,
+            skeleton_method=skeleton_method,
+        )
+        if timings is not None:
+            timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
         t0 = time.perf_counter()
         local_metric_timings: Dict[str, float] = {}
         local_metrics = _local_metrics_from_binary(
@@ -293,6 +301,7 @@ def component_metrics_by_gt_bbox(
             pfm_weight_recall=template["pfm_weight_recall"],
             pfm_weight_recall_sum=float(template["pfm_weight_recall_sum"]),
             pfm_weight_precision=template["pfm_weight_precision"],
+            skeleton_method=skeleton_method,
             timings=local_metric_timings,
         )
         if timings is not None:
