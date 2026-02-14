@@ -97,8 +97,8 @@ class CFG:
     eval_drd_block_size = 8
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
-    eval_skeleton_radius = [1]
     eval_skeleton_thinning_type = "guo_hall"
+    eval_enable_skeleton_metrics = True
     eval_component_worst_q = 0.2
     eval_component_worst_k = 2
     eval_component_min_area = 0
@@ -530,8 +530,8 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_drd_block_size", "eval_drd_block_size"),
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
-        ("eval_skeleton_radius", "eval_skeleton_radius"),
         ("eval_skeleton_thinning_type", "eval_skeleton_thinning_type"),
+        ("eval_enable_skeleton_metrics", "eval_enable_skeleton_metrics"),
         ("eval_component_worst_q", "eval_component_worst_q"),
         ("eval_component_worst_k", "eval_component_worst_k"),
         ("eval_component_min_area", "eval_component_min_area"),
@@ -663,6 +663,10 @@ def apply_metadata_hyperparameters(cfg, metadata):
             "training_hyperparameters.training.eval_skeleton_thinning_type must be "
             f"'zhang_suen', 'guo_hall', or 'kimimaro', got {cfg.eval_skeleton_thinning_type!r}"
         )
+    cfg.eval_enable_skeleton_metrics = parse_bool_strict(
+        getattr(cfg, "eval_enable_skeleton_metrics", True),
+        key="training_hyperparameters.training.eval_enable_skeleton_metrics",
+    )
     cv_fold = training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None))
     if isinstance(cv_fold, str) and cv_fold.strip().lower() in {"", "none", "null"}:
         cv_fold = None

@@ -225,7 +225,11 @@ def define_wandb_metric_summaries(wandb_logger, merged_config):
     run = wandb_logger.experiment
     run.define_metric("trainer/global_step")
 
-    from train_resnet3d_lib.val_stitch_wandb import WANDB_VAL_STITCH_METRIC_SUMMARIES
+    from train_resnet3d_lib.val_stitch_wandb import get_wandb_val_stitch_metric_summaries
+
+    val_stitch_metric_summaries = get_wandb_val_stitch_metric_summaries(
+        enable_skeleton_metrics=bool(getattr(CFG, "eval_enable_skeleton_metrics", True))
+    )
 
     metric_summaries = {
         "val/worst_group_loss": "min",
@@ -241,10 +245,10 @@ def define_wandb_metric_summaries(wandb_logger, merged_config):
         "train/worst_group_loss_ema": "min",
         "metrics/val/dice": "max",
     }
-    overlap = set(metric_summaries) & set(WANDB_VAL_STITCH_METRIC_SUMMARIES)
+    overlap = set(metric_summaries) & set(val_stitch_metric_summaries)
     if overlap:
         raise ValueError(f"wandb metric summary keys overlap: {sorted(overlap)!r}")
-    metric_summaries.update(WANDB_VAL_STITCH_METRIC_SUMMARIES)
+    metric_summaries.update(val_stitch_metric_summaries)
     if "segments" not in merged_config or not isinstance(merged_config["segments"], dict):
         raise KeyError("metadata_json must define an object at key 'segments'")
     metric_summaries = expand_wandb_metric_summary_keys(

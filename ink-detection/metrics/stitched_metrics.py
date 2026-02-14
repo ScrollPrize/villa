@@ -10,26 +10,27 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .stitched_components import (
-    COMPONENT_METRIC_SPECS,
     _build_gt_component_templates,
     component_metrics_by_gt_bbox,
     summarize_component_rows,
     write_global_component_manifest,
 )
+from .stitched_metric_specs import component_metric_specs
 from .stitched_primitives import (
     _as_bool_2d,
     _count_holes_2d,
     _label_components,
     _local_metrics_from_binary,
+    _pseudo_weight_maps,
     boundary_precision_recall_f1,
     nsd_surface_dice,
     skeletonize_binary,
-    skeleton_tube_metrics,
     soft_dice_from_prob,
 )
 
 
 __all__ = [
+    "component_metric_specs",
     "compute_stitched_metrics",
     "summarize_component_rows",
     "write_global_component_manifest",
@@ -286,18 +287,6 @@ def _remove_small_components_by_area(
     return mask_filtered, pred_lab, n_pred
 
 
-_COMPONENT_ROW_EXTRA_MEAN_METRICS: Tuple[str, ...] = (
-    "betti_abs_beta0_err",
-    "betti_abs_beta1_err",
-    "betti_beta0_pred",
-    "betti_beta1_pred",
-    "betti_beta0_gt",
-    "betti_beta1_gt",
-    "betti_match_err_dim0",
-    "betti_match_err_dim1",
-)
-
-
 def _postprocess_prediction(
     pred_prob: np.ndarray,
     *,
@@ -335,19 +324,8 @@ def _threshold_tag(threshold: float) -> str:
     return thr_str.replace(".", "p")
 
 
-def _finite_mean(values: List[float]) -> float:
-    arr = np.asarray(values, dtype=np.float64)
-    if arr.size == 0:
-        return float("nan")
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return float("nan")
-    return float(arr.mean())
-
-
 def _threshold_metric_values_from_component_stats(
     *,
-    component_rows: List[Dict[str, Any]],
     component_metric_stats: Dict[str, Dict[str, float]],
 ) -> Dict[str, float]:
     values: Dict[str, float] = {}
@@ -355,9 +333,6 @@ def _threshold_metric_values_from_component_stats(
         for stat_name, stat_value in stats.items():
             key = metric_name if stat_name == "mean" else f"{metric_name}_{stat_name}"
             values[key] = float(stat_value)
-    for metric_name in _COMPONENT_ROW_EXTRA_MEAN_METRICS:
-        metric_vals = [float(row[metric_name]) for row in component_rows]
-        values[metric_name] = _finite_mean(metric_vals)
     return values
 
 
@@ -370,20 +345,30 @@ def _compute_full_region_metrics(
     drd_block_size: int,
     boundary_k: int,
     boundary_tols: Optional[np.ndarray],
-    skeleton_radius: Optional[np.ndarray],
     gt_beta0: int,
     gt_beta1: int,
     gt_lab: np.ndarray,
     pred_lab: np.ndarray,
-    skel_gt: np.ndarray,
+    skel_gt: Optional[np.ndarray],
+    pfm_weight_recall: Optional[np.ndarray],
+    pfm_weight_precision: Optional[np.ndarray],
+    enable_skeleton_metrics: bool = True,
     skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
-) -> Tuple[Dict[str, float], np.ndarray]:
-    skel_pred = skeletonize_binary(
-        pred_bin_clean,
-        cc_labels=pred_lab,
-        skeleton_method=skeleton_method,
-    )
+) -> Dict[str, float]:
+    enable_skeleton_metrics = bool(enable_skeleton_metrics)
+    if enable_skeleton_metrics and skel_gt is None:
+        raise ValueError("skel_gt is required when enable_skeleton_metrics is True")
+    if (pfm_weight_recall is None) != (pfm_weight_precision is None):
+        pfm_weight_recall = None
+        pfm_weight_precision = None
+    pfm_weight_recall_sum_i: Optional[float] = None
+    if pfm_weight_recall is not None and pfm_weight_precision is not None:
+        pfm_weight_recall_sum_i = float(np.asarray(pfm_weight_recall, dtype=np.float64).sum())
+        if pfm_weight_recall_sum_i <= 0.0:
+            pfm_weight_recall = None
+            pfm_weight_precision = None
+            pfm_weight_recall_sum_i = None
     full_metrics = _local_metrics_from_binary(
         pred_bin_clean,
         gt_bin,
@@ -395,7 +380,10 @@ def _compute_full_region_metrics(
         gt_lab=gt_lab,
         pred_lab=pred_lab,
         skel_gt=skel_gt,
-        skel_pred=skel_pred,
+        pfm_weight_recall=pfm_weight_recall,
+        pfm_weight_recall_sum=pfm_weight_recall_sum_i,
+        pfm_weight_precision=pfm_weight_precision,
+        enable_skeleton_metrics=enable_skeleton_metrics,
         skeleton_method=skeleton_method,
         timings=timings,
     )
@@ -422,15 +410,16 @@ def _compute_full_region_metrics(
         "boundary/hd": float(full_metrics["boundary_hd"]),
         "boundary/hd95": float(full_metrics["boundary_hd95"]),
         "boundary/assd": float(full_metrics["boundary_assd"]),
-        "skeleton/recall": float(full_metrics["skeleton_recall"]),
-        "skeleton/cldice": float(full_metrics["skeleton_cldice"]),
-        "pfm": float(full_metrics["pfm"]),
-        "pfm_nonempty": float(full_metrics["pfm_nonempty"]),
         "pfm_weighted": float(full_metrics["pfm_weighted"]),
-        "skeleton/chamfer": float(full_metrics["skeleton_chamfer"]),
-        "skeleton/chamfer_pred_to_gt": float(full_metrics["skeleton_chamfer_pred_to_gt"]),
-        "skeleton/chamfer_gt_to_pred": float(full_metrics["skeleton_chamfer_gt_to_pred"]),
     }
+    if enable_skeleton_metrics:
+        out.update(
+            {
+                "skeleton/recall": float(full_metrics["skeleton_recall"]),
+                "pfm": float(full_metrics["pfm"]),
+                "pfm_nonempty": float(full_metrics["pfm_nonempty"]),
+            }
+        )
 
     tau_values = np.asarray([1.0], dtype=np.float32) if boundary_tols is None else np.asarray(boundary_tols)
     for tau in tau_values:
@@ -439,14 +428,7 @@ def _compute_full_region_metrics(
         bf = boundary_precision_recall_f1(pred_bin_clean, gt_bin, tau=tau_f, boundary_k=boundary_k)
         out[f"boundary/bf1_tau{tau_key}"] = float(bf["b_f1"])
         out[f"boundary/nsd_tau{tau_key}"] = float(nsd_surface_dice(pred_bin_clean, gt_bin, tau=tau_f, boundary_k=boundary_k))
-
-    radius_values = np.asarray([1], dtype=np.int64) if skeleton_radius is None else np.asarray(skeleton_radius)
-    for radius in radius_values:
-        r_i = int(radius)
-        r_key = str(r_i)
-        tube = skeleton_tube_metrics(pred_bin_clean, gt_bin, radius=r_i, skel_gt=skel_gt)
-        out[f"skeleton/tube_f1_r{r_key}"] = float(tube["tube_f1"])
-    return out, skel_pred
+    return out
 
 
 def _build_components_manifest(
@@ -454,6 +436,7 @@ def _build_components_manifest(
     component_rows: List[Dict[str, Any]],
     full_off_y: int,
     full_off_x: int,
+    enable_skeleton_metrics: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
     components_manifest: List[Dict[str, Any]] = []
     rows_by_id: Dict[int, Dict[str, Any]] = {}
@@ -474,16 +457,11 @@ def _build_components_manifest(
             "accuracy": float(row["accuracy"]),
             "mpm": float(row["mpm"]),
             "drd": float(row["drd"]),
-            "pfm": float(row["pfm"]),
-            "pfm_nonempty": float(row["pfm_nonempty"]),
             "pfm_weighted": float(row["pfm_weighted"]),
             "voi": float(row["voi"]),
             "betti_l1": float(row["betti_l1"]),
             "abs_euler_err": float(row["abs_euler_err"]),
             "boundary_hd95": float(row["boundary_hd95"]),
-            "skeleton_recall": float(row["skeleton_recall"]),
-            "skeleton_cldice": float(row["skeleton_cldice"]),
-            "skeleton_chamfer": float(row["skeleton_chamfer"]),
             "betti_abs_beta0_err": float(row["betti_abs_beta0_err"]),
             "betti_abs_beta1_err": float(row["betti_abs_beta1_err"]),
             "betti_beta0_pred": float(row["betti_beta0_pred"]),
@@ -494,6 +472,14 @@ def _build_components_manifest(
             "betti_match_err_dim0": float(row["betti_match_err_dim0"]),
             "betti_match_err_dim1": float(row["betti_match_err_dim1"]),
         }
+        if enable_skeleton_metrics:
+            entry.update(
+                {
+                    "pfm": float(row["pfm"]),
+                    "pfm_nonempty": float(row["pfm_nonempty"]),
+                    "skeleton_recall": float(row["skeleton_recall"]),
+                }
+            )
         components_manifest.append(entry)
         rows_by_id[entry["component_id"]] = row
     return components_manifest, rows_by_id
@@ -513,11 +499,11 @@ def _write_component_outputs(
     full_offset: Tuple[int, int],
     component_worst_k: Optional[int],
     component_worst_q: Optional[float],
+    metric_specs: Tuple[Tuple[str, bool], ...],
     components_manifest: List[Dict[str, Any]],
     component_metric_rankings: Dict[str, Dict[str, Any]],
     save_component_debug_images: bool,
     component_debug_max_items: Optional[int],
-    gt_component_templates: List[Dict[str, Any]],
     rows_by_id: Dict[int, Dict[str, Any]],
     pred_prob_clean: np.ndarray,
     pred_bin_clean: np.ndarray,
@@ -579,9 +565,8 @@ def _write_component_outputs(
     if not save_component_debug_images:
         return
 
-    template_by_id = {int(t["component_id"]): t for t in gt_component_templates}
     selected_component_ids: List[int] = []
-    for metric_name, _ in COMPONENT_METRIC_SPECS:
+    for metric_name, _ in metric_specs:
         selected_component_ids.extend(component_metric_rankings[metric_name]["worst_k_component_ids"])
         selected_component_ids.extend(component_metric_rankings[metric_name]["worst_q_component_ids"])
     selected_component_ids = sorted(set(int(v) for v in selected_component_ids))
@@ -596,18 +581,12 @@ def _write_component_outputs(
     for component_id in selected_component_ids:
         if component_id not in rows_by_id:
             raise KeyError(f"component_id={component_id} missing from component rows")
-        if component_id not in template_by_id:
-            raise KeyError(f"component_id={component_id} missing from GT templates")
         row = rows_by_id[component_id]
-        if "_pred_skel" not in row:
-            raise KeyError(f"component_id={component_id} missing cached pred skeleton")
         bbox = [int(v) for v in row["bbox"]]
         by0, by1, bx0, bx1 = bbox
         crop_pred_prob = pred_prob_clean[by0:by1, bx0:bx1]
         crop_pred_bin = pred_bin_clean[by0:by1, bx0:bx1]
         crop_gt = gt_bin[by0:by1, bx0:bx1]
-        skel_pred_comp = row["_pred_skel"]
-        skel_gt_comp = template_by_id[component_id]["gt_skel"]
 
         cid = f"{int(component_id):05d}"
         Image.fromarray((np.clip(crop_pred_prob, 0.0, 1.0) * 255.0).astype(np.uint8)).save(
@@ -615,10 +594,6 @@ def _write_component_outputs(
         )
         Image.fromarray((crop_pred_bin.astype(np.uint8) * 255)).save(osp.join(debug_dir, f"comp_{cid}_pred_bin.png"))
         Image.fromarray((crop_gt.astype(np.uint8) * 255)).save(osp.join(debug_dir, f"comp_{cid}_gt_bin.png"))
-        Image.fromarray((skel_pred_comp.astype(np.uint8) * 255)).save(
-            osp.join(debug_dir, f"comp_{cid}_pred_skeleton.png")
-        )
-        Image.fromarray((skel_gt_comp.astype(np.uint8) * 255)).save(osp.join(debug_dir, f"comp_{cid}_gt_skeleton.png"))
 
 
 def _save_stitched_eval_inputs(
@@ -638,6 +613,9 @@ def _save_stitched_eval_inputs(
     crop_offset: Tuple[int, int],
     full_offset: Tuple[int, int],
     full_shape: Tuple[int, int],
+    gt_skeleton: Optional[np.ndarray] = None,
+    pfm_weight_recall: Optional[np.ndarray] = None,
+    pfm_weight_precision: Optional[np.ndarray] = None,
 ) -> None:
     import json as _json
     from PIL import Image
@@ -675,6 +653,66 @@ def _save_stitched_eval_inputs(
         Image.fromarray(eval_mask_u8).save(eval_mask_path)
     if not osp.exists(gt_path):
         Image.fromarray(gt_u8).save(gt_path)
+
+    if gt_skeleton is not None:
+        skel_gt = _as_bool_2d(gt_skeleton)
+        if skel_gt.shape != gt_bin.shape:
+            raise ValueError(f"gt_skeleton/gt_bin shape mismatch: {skel_gt.shape} vs {gt_bin.shape}")
+        gt_skel_path = osp.join(segment_dir, "gt_skeleton_eval_crop.png")
+        if not osp.exists(gt_skel_path):
+            Image.fromarray((skel_gt.astype(np.uint8) * 255)).save(gt_skel_path)
+
+    if (pfm_weight_recall is None) != (pfm_weight_precision is None):
+        raise ValueError("pfm_weight_recall and pfm_weight_precision must be provided together")
+    if pfm_weight_recall is not None and pfm_weight_precision is not None:
+        gw = np.asarray(pfm_weight_recall, dtype=np.float32)
+        pw = np.asarray(pfm_weight_precision, dtype=np.float32)
+        if gw.shape != gt_bin.shape or pw.shape != gt_bin.shape:
+            raise ValueError(
+                "pfm weight shape mismatch: "
+                f"gw={gw.shape}, pw={pw.shape}, gt={gt_bin.shape}"
+            )
+        gw_vis_path = osp.join(segment_dir, "pfm_weight_recall_eval_crop.png")
+        pw_vis_path = osp.join(segment_dir, "pfm_weight_precision_eval_crop.png")
+        gwpw_meta_path = osp.join(segment_dir, "pfm_weights_eval_crop_meta.json")
+
+        if (
+            (not osp.exists(gw_vis_path))
+            or (not osp.exists(pw_vis_path))
+            or (not osp.exists(gwpw_meta_path))
+        ):
+            def _to_u8_heatmap(arr: np.ndarray) -> Tuple[np.ndarray, float, float]:
+                arr_f = np.asarray(arr, dtype=np.float32)
+                finite = np.isfinite(arr_f)
+                if not finite.any():
+                    return np.zeros(arr_f.shape, dtype=np.uint8), 0.0, 0.0
+                vals = arr_f[finite]
+                lo = float(vals.min())
+                hi = float(vals.max())
+                if hi <= lo:
+                    return np.zeros(arr_f.shape, dtype=np.uint8), lo, hi
+                norm = np.zeros(arr_f.shape, dtype=np.float32)
+                norm[finite] = (arr_f[finite] - lo) / (hi - lo)
+                return np.clip(norm * 255.0, 0.0, 255.0).astype(np.uint8), lo, hi
+
+            gw_u8, gw_min, gw_max = _to_u8_heatmap(gw)
+            pw_u8, pw_min, pw_max = _to_u8_heatmap(pw)
+
+            if not osp.exists(gw_vis_path):
+                Image.fromarray(gw_u8).save(gw_vis_path)
+            if not osp.exists(pw_vis_path):
+                Image.fromarray(pw_u8).save(pw_vis_path)
+            if not osp.exists(gwpw_meta_path):
+                gwpw_meta = {
+                    "gw_min": float(gw_min),
+                    "gw_max": float(gw_max),
+                    "pw_min": float(pw_min),
+                    "pw_max": float(pw_max),
+                    "gw_sum": float(gw.astype(np.float64).sum()),
+                    "pw_sum": float(pw.astype(np.float64).sum()),
+                }
+                with open(gwpw_meta_path, "w") as f:
+                    _json.dump(gwpw_meta, f, indent=2)
 
     off_y, off_x = [int(v) for v in roi_offset]
     crop_off_y, crop_off_x = [int(v) for v in crop_offset]
@@ -761,12 +799,12 @@ def compute_stitched_metrics(
     drd_block_size: int = 8,
     boundary_k: int = 3,
     boundary_tols: Optional[np.ndarray] = None,
-    skeleton_radius: Optional[np.ndarray] = None,
     component_worst_q: Optional[float] = 0.2,
     component_worst_k: Optional[int] = 2,
     component_min_area: Optional[Any] = None,
     component_pad: int = 5,
     skeleton_method: str = "guo_hall",
+    enable_skeleton_metrics: bool = True,
     enable_full_region_metrics: bool = False,
     threshold_grid: Optional[np.ndarray] = None,
     component_output_dir: Optional[str] = None,
@@ -795,6 +833,8 @@ def compute_stitched_metrics(
     ds = max(1, int(downsample))
     pad_i = max(0, int(component_pad))
     component_min_area_i = _normalize_component_min_area(component_min_area)
+    enable_skeleton_metrics = bool(enable_skeleton_metrics)
+    metric_specs = component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics)
     roi_key = (0, 0)
     if roi_offset is not None:
         roi_key = (int(roi_offset[0]), int(roi_offset[1]))
@@ -810,7 +850,8 @@ def compute_stitched_metrics(
         tuple(pred_prob.shape),
         str(pred_has_digest),
         int(betti_connectivity),
-        str(skeleton_method),
+        bool(enable_skeleton_metrics),
+        str(skeleton_method) if enable_skeleton_metrics else "__disabled__",
     )
     cache = _gt_cache_get(cache_key)
     if cache is not None:
@@ -822,7 +863,9 @@ def compute_stitched_metrics(
         n_gt = cache_entry["n_gt"]
         gt_beta0 = int(cache_entry["gt_beta0"])
         gt_beta1 = int(cache_entry["gt_beta1"])
-        skel_gt = cache_entry["skel_gt"]
+        skel_gt = cache_entry.get("skel_gt")
+        if enable_skeleton_metrics and skel_gt is None:
+            raise ValueError("cached entry missing skel_gt while enable_skeleton_metrics is True")
         y0, y1, x0, x1 = cache_entry["crop"]
         pred_full_shape = tuple(cache_entry.get("full_shape", pred_full_shape))
         pred_prob = pred_prob[y0:y1, x0:x1]
@@ -831,6 +874,10 @@ def compute_stitched_metrics(
             cache_entry["gt_component_templates"] = None
         if "gt_component_pad" not in cache_entry:
             cache_entry["gt_component_pad"] = None
+        if "pfm_weight_recall_full" not in cache_entry:
+            cache_entry["pfm_weight_recall_full"] = None
+        if "pfm_weight_precision_full" not in cache_entry:
+            cache_entry["pfm_weight_precision_full"] = None
         cached_component_pad = cache_entry["gt_component_pad"]
         if cached_component_pad is not None and int(cached_component_pad) != pad_i:
             raise ValueError(
@@ -887,13 +934,15 @@ def compute_stitched_metrics(
         t1 = time.perf_counter()
         gt_beta1 = _count_holes_2d(gt_bin, connectivity=betti_connectivity)
         load_gt_timings["gt_holes"] = load_gt_timings.get("gt_holes", 0.0) + (time.perf_counter() - t1)
-        t1 = time.perf_counter()
-        skel_gt = skeletonize_binary(
-            gt_bin,
-            cc_labels=gt_lab,
-            skeleton_method=skeleton_method,
-        )
-        load_gt_timings["gt_skeleton"] = load_gt_timings.get("gt_skeleton", 0.0) + (time.perf_counter() - t1)
+        skel_gt: Optional[np.ndarray] = None
+        if enable_skeleton_metrics:
+            t1 = time.perf_counter()
+            skel_gt = skeletonize_binary(
+                gt_bin,
+                cc_labels=gt_lab,
+                skeleton_method=skeleton_method,
+            )
+            load_gt_timings["gt_skeleton"] = load_gt_timings.get("gt_skeleton", 0.0) + (time.perf_counter() - t1)
         cache_entry = {
             "gt_bin": gt_bin,
             "eval_mask": eval_mask,
@@ -906,6 +955,8 @@ def compute_stitched_metrics(
             "full_shape": pred_full_shape,
             "gt_component_templates": None,
             "gt_component_pad": None,
+            "pfm_weight_recall_full": None,
+            "pfm_weight_precision_full": None,
         }
         t1 = time.perf_counter()
         _gt_cache_put(cache_key, cache_entry)
@@ -937,6 +988,7 @@ def compute_stitched_metrics(
             int(n_gt),
             connectivity=betti_connectivity,
             pad=pad_i,
+            enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
         )
         cache_entry["gt_component_templates"] = gt_component_templates
@@ -962,6 +1014,30 @@ def compute_stitched_metrics(
     threshold_grid_timings: Dict[str, float] = {}
     want_component_outputs = component_output_dir is not None
     want_component_rows = component_rows_collector is not None
+    need_full_gt_pfm_maps = bool(enable_full_region_metrics or stitched_inputs_output_dir)
+    pfm_weight_recall_full = cache_entry.get("pfm_weight_recall_full")
+    pfm_weight_precision_full = cache_entry.get("pfm_weight_precision_full")
+    if need_full_gt_pfm_maps:
+        if (pfm_weight_recall_full is None) != (pfm_weight_precision_full is None):
+            pfm_weight_recall_full = None
+            pfm_weight_precision_full = None
+            cache_entry["pfm_weight_recall_full"] = None
+            cache_entry["pfm_weight_precision_full"] = None
+        if pfm_weight_recall_full is None and pfm_weight_precision_full is None and bool(gt_bin.any()):
+            t_build = time.perf_counter()
+            gw_full, pw_full = _pseudo_weight_maps(gt_bin, connectivity=betti_connectivity)
+            gw_full_sum = float(gw_full.astype(np.float64).sum())
+            if gw_full_sum > 0.0:
+                pfm_weight_recall_full = gw_full.astype(np.float32, copy=False)
+                pfm_weight_precision_full = pw_full.astype(np.float32, copy=False)
+            else:
+                pfm_weight_recall_full = None
+                pfm_weight_precision_full = None
+            cache_entry["pfm_weight_recall_full"] = pfm_weight_recall_full
+            cache_entry["pfm_weight_precision_full"] = pfm_weight_precision_full
+            threshold_grid_timings["full_region_pfm_weight_cache_build"] = threshold_grid_timings.get(
+                "full_region_pfm_weight_cache_build", 0.0
+            ) + (time.perf_counter() - t_build)
 
     t0 = time.perf_counter()
     for thr in tgrid.tolist():
@@ -1014,6 +1090,9 @@ def compute_stitched_metrics(
                 crop_offset=(crop_off_y, crop_off_x),
                 full_offset=(full_off_y, full_off_x),
                 full_shape=pred_full_shape,
+                gt_skeleton=skel_gt if enable_skeleton_metrics else None,
+                pfm_weight_recall=pfm_weight_recall_full,
+                pfm_weight_precision=pfm_weight_precision_full,
             )
             threshold_grid_timings["save_inputs"] = threshold_grid_timings.get("save_inputs", 0.0) + (
                 time.perf_counter() - p0
@@ -1031,7 +1110,7 @@ def compute_stitched_metrics(
             pad=pad_i,
             worst_q=component_worst_q,
             worst_k=component_worst_k,
-            keep_pred_skeleton=bool(want_component_outputs and save_component_debug_images),
+            enable_skeleton_metrics=enable_skeleton_metrics,
             gt_lab=gt_lab,
             pred_lab=pred_lab_t,
             n_gt=n_gt,
@@ -1047,7 +1126,6 @@ def compute_stitched_metrics(
             threshold_grid_timings[agg_key] = threshold_grid_timings.get(agg_key, 0.0) + float(value)
 
         threshold_metric_values = _threshold_metric_values_from_component_stats(
-            component_rows=component_rows_t,
             component_metric_stats=component_metric_stats_t,
         )
         for metric_base, metric_value in threshold_metric_values.items():
@@ -1060,7 +1138,7 @@ def compute_stitched_metrics(
         if enable_full_region_metrics:
             p0 = time.perf_counter()
             full_region_timings_t: Dict[str, float] = {}
-            full_region_out_t, _ = _compute_full_region_metrics(
+            full_region_out_t = _compute_full_region_metrics(
                 pred_bin_clean=pred_bin_t,
                 pred_prob_clean=pred_prob_t,
                 gt_bin=gt_bin,
@@ -1068,12 +1146,14 @@ def compute_stitched_metrics(
                 drd_block_size=drd_block_size,
                 boundary_k=boundary_k,
                 boundary_tols=boundary_tols,
-                skeleton_radius=skeleton_radius,
                 gt_beta0=int(gt_beta0),
                 gt_beta1=int(gt_beta1),
                 gt_lab=gt_lab,
                 pred_lab=pred_lab_t,
                 skel_gt=skel_gt,
+                pfm_weight_recall=pfm_weight_recall_full,
+                pfm_weight_precision=pfm_weight_precision_full,
+                enable_skeleton_metrics=enable_skeleton_metrics,
                 skeleton_method=skeleton_method,
                 timings=full_region_timings_t,
             )
@@ -1098,6 +1178,7 @@ def compute_stitched_metrics(
                 component_rows=component_rows_t,
                 full_off_y=full_off_y,
                 full_off_x=full_off_x,
+                enable_skeleton_metrics=enable_skeleton_metrics,
             )
 
         if want_component_rows:
@@ -1133,11 +1214,11 @@ def compute_stitched_metrics(
                 full_offset=(full_off_y, full_off_x),
                 component_worst_k=component_worst_k,
                 component_worst_q=component_worst_q,
+                metric_specs=metric_specs,
                 components_manifest=components_manifest_t,
                 component_metric_rankings=component_metric_rankings_t,
                 save_component_debug_images=save_component_debug_images,
                 component_debug_max_items=component_debug_max_items,
-                gt_component_templates=gt_component_templates,
                 rows_by_id=rows_by_id_t,
                 pred_prob_clean=pred_prob_t,
                 pred_bin_clean=pred_bin_t,

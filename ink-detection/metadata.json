@@ -121,10 +121,8 @@
       "eval_boundary_tols": [
         1.0
       ],
-      "eval_skeleton_radius": [
-        1
-      ],
       "eval_skeleton_thinning_type": "guo_hall",
+      "eval_enable_skeleton_metrics": true,
       "eval_component_worst_q": 0.2,
       "eval_component_worst_k": 2,
       "eval_component_min_area": 4096,

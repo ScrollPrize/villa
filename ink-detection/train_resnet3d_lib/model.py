@@ -707,6 +707,7 @@ class StitchManager:
 
             if should_run_stitch_metrics:
                 from metrics.stitched_metrics import (
+                    component_metric_specs,
                     compute_stitched_metrics,
                     summarize_component_rows,
                     write_global_component_manifest,
@@ -729,6 +730,7 @@ class StitchManager:
                 if isinstance(component_worst_k, float) and float(component_worst_k).is_integer():
                     component_worst_k = int(component_worst_k)
                 skeleton_thinning_type = str(getattr(CFG, "eval_skeleton_thinning_type", "guo_hall"))
+                enable_skeleton_metrics = bool(getattr(CFG, "eval_enable_skeleton_metrics", True))
                 component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
                 component_pad = int(getattr(CFG, "eval_component_pad", 5))
                 enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
@@ -765,7 +767,6 @@ class StitchManager:
                     return [cast_fn(value)]
 
                 boundary_tols = _parse_list(getattr(CFG, "eval_boundary_tols", None), float)
-                skeleton_radius = _parse_list(getattr(CFG, "eval_skeleton_radius", None), int)
 
                 threshold_grid = _parse_list(getattr(CFG, "eval_threshold_grid", None), float)
                 if threshold_grid is None:
@@ -793,12 +794,12 @@ class StitchManager:
                         drd_block_size=drd_block_size,
                         boundary_k=boundary_k,
                         boundary_tols=boundary_tols,
-                        skeleton_radius=skeleton_radius,
                         component_worst_q=component_worst_q,
                         component_worst_k=component_worst_k,
                         component_min_area=component_min_area,
                         component_pad=component_pad,
                         skeleton_method=skeleton_thinning_type,
+                        enable_skeleton_metrics=enable_skeleton_metrics,
                         enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
                         component_output_dir=component_output_dir,
@@ -829,6 +830,9 @@ class StitchManager:
                         worst_q=component_worst_q,
                         worst_k=component_worst_k,
                         id_key="global_component_id",
+                        metric_specs=component_metric_specs(
+                            enable_skeleton_metrics=enable_skeleton_metrics
+                        ),
                     )
                     for metric_name, stats in global_stats.items():
                         for stat_name, stat_val in stats.items():

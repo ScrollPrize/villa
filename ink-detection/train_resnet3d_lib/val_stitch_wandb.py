@@ -2,68 +2,20 @@ from __future__ import annotations
 
 from typing import Dict
 
-WANDB_VAL_STITCH_METRIC_SUMMARIES: Dict[str, str] = {
-    "metrics/val_stitch/global/components/dice_hard/mean": "max",
-    "metrics/val_stitch/global/components/dice_hard/worst_k_mean": "max",
-    "metrics/val_stitch/global/components/dice_hard/worst_q_mean": "max",
-    "metrics/val_stitch/global/components/dice_soft/mean": "max",
-    "metrics/val_stitch/global/components/dice_soft/worst_k_mean": "max",
-    "metrics/val_stitch/global/components/dice_soft/worst_q_mean": "max",
-    "metrics/val_stitch/global/components/pfm/mean": "max",
-    "metrics/val_stitch/global/components/pfm/worst_k_mean": "max",
-    "metrics/val_stitch/global/components/pfm/worst_q_mean": "max",
-    "metrics/val_stitch/global/components/pfm_nonempty/mean": "max",
-    "metrics/val_stitch/global/components/pfm_nonempty/worst_k_mean": "max",
-    "metrics/val_stitch/global/components/pfm_nonempty/worst_q_mean": "max",
-    "metrics/val_stitch/global/components/pfm_weighted/mean": "max",
-    "metrics/val_stitch/global/components/pfm_weighted/worst_k_mean": "max",
-    "metrics/val_stitch/global/components/pfm_weighted/worst_q_mean": "max",
-    "metrics/val_stitch/global/components/voi/mean": "min",
-    "metrics/val_stitch/global/components/voi/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/voi/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/mpm/mean": "min",
-    "metrics/val_stitch/global/components/mpm/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/mpm/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/drd/mean": "min",
-    "metrics/val_stitch/global/components/drd/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/drd/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/betti_l1/mean": "min",
-    "metrics/val_stitch/global/components/betti_l1/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/betti_l1/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/betti_match_err/mean": "min",
-    "metrics/val_stitch/global/components/betti_match_err/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/betti_match_err/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/abs_euler_err/mean": "min",
-    "metrics/val_stitch/global/components/abs_euler_err/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/abs_euler_err/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/boundary_hd95/mean": "min",
-    "metrics/val_stitch/global/components/boundary_hd95/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/boundary_hd95/worst_q_mean": "min",
-    "metrics/val_stitch/global/components/skeleton_cldice/mean": "max",
-    "metrics/val_stitch/global/components/skeleton_cldice/worst_k_mean": "max",
-    "metrics/val_stitch/global/components/skeleton_cldice/worst_q_mean": "max",
-    "metrics/val_stitch/global/components/skeleton_chamfer/mean": "min",
-    "metrics/val_stitch/global/components/skeleton_chamfer/worst_k_mean": "min",
-    "metrics/val_stitch/global/components/skeleton_chamfer/worst_q_mean": "min",
-    "metrics/val_stitch/segments/*/stability/dice_hard/mean": "max",
-    "metrics/val_stitch/segments/*/stability/dice_soft/mean": "max",
-    "metrics/val_stitch/segments/*/stability/accuracy/mean": "max",
-    "metrics/val_stitch/segments/*/stability/pfm/mean": "max",
-    "metrics/val_stitch/segments/*/stability/pfm_nonempty/mean": "max",
-    "metrics/val_stitch/segments/*/stability/pfm_weighted/mean": "max",
-    "metrics/val_stitch/segments/*/stability/voi/mean": "min",
-    "metrics/val_stitch/segments/*/stability/mpm/mean": "min",
-    "metrics/val_stitch/segments/*/stability/drd/mean": "min",
-    "metrics/val_stitch/segments/*/stability/betti_l1/mean": "min",
-    "metrics/val_stitch/segments/*/stability/betti_match_err/mean": "min",
-    "metrics/val_stitch/segments/*/stability/betti_abs_beta0_err/mean": "min",
-    "metrics/val_stitch/segments/*/stability/betti_abs_beta1_err/mean": "min",
-    "metrics/val_stitch/segments/*/stability/abs_euler_err/mean": "min",
-    "metrics/val_stitch/segments/*/stability/boundary_hd95/mean": "min",
-    "metrics/val_stitch/segments/*/stability/skeleton_recall/mean": "max",
-    "metrics/val_stitch/segments/*/stability/skeleton_cldice/mean": "max",
-    "metrics/val_stitch/segments/*/stability/skeleton_chamfer/mean": "min",
-}
+from metrics.stitched_metric_specs import component_metric_specs, component_metric_supports_worst
+
+
+def get_wandb_val_stitch_metric_summaries(*, enable_skeleton_metrics: bool) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for metric_name, higher_is_better in component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics):
+        summary_mode = "max" if bool(higher_is_better) else "min"
+        stat_names = ("mean",)
+        if component_metric_supports_worst(metric_name=metric_name):
+            stat_names = ("mean", "worst_k_mean", "worst_q_mean")
+        for stat_name in stat_names:
+            out[f"metrics/val_stitch/global/components/{metric_name}/{stat_name}"] = summary_mode
+        out[f"metrics/val_stitch/segments/*/stability/{metric_name}/mean"] = summary_mode
+    return out
 
 
 def rewrite_val_stitch_metric_key(key: str) -> str:

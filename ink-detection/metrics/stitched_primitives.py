@@ -614,82 +614,106 @@ def skeleton_recall(pred: np.ndarray, gt: np.ndarray, *, skel_gt: Optional[np.nd
     return _safe_div(np.logical_and(skel_gt, pred).sum(), skel_gt.sum())
 
 
-def _pseudo_recall_weights(gt: np.ndarray) -> np.ndarray:
+def _pseudo_contour_mask(gt: np.ndarray) -> np.ndarray:
+    """Return a GT contour mask close to the DIBCO/TIP contour extraction setup."""
+    gt = _as_bool_2d(gt)
+    if not gt.any():
+        return np.zeros_like(gt, dtype=bool)
+    try:
+        import cv2
+
+        gt_u8 = gt.astype(np.uint8, copy=False) * 255
+        blurred = cv2.GaussianBlur(gt_u8, (0, 0), sigmaX=1.5, sigmaY=1.5, borderType=cv2.BORDER_REPLICATE)
+        canny = cv2.Canny(blurred, threshold1=int(round(0.2 * 255.0)), threshold2=int(round(0.3 * 255.0)))
+        contour = np.logical_and(canny > 0, gt)
+        if contour.any():
+            return contour
+    except Exception:
+        pass
+    return _boundary_mask(gt, k=3)
+
+
+def _pseudo_recall_normalizer(c_i: int) -> float:
+    """Normalization N(C_i) from Ntirogiannis et al. (TIP 2013, Eq. 6)."""
+    c_i = max(1, int(c_i))
+    if (c_i % 2) == 1:
+        n = ((float(c_i) - 1.0) / 2.0) ** 2
+    else:
+        half = float(c_i) / 2.0
+        n = half * (half - 1.0)
+    return float(max(1.0, n))
+
+
+def _pseudo_weight_maps(gt: np.ndarray, *, connectivity: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build DIBCO-style recall/precision weight maps (GW/PW)."""
     from scipy.ndimage import distance_transform_cdt, distance_transform_edt
 
     gt = _as_bool_2d(gt)
     gw = np.zeros(gt.shape, dtype=np.float64)
-    if not gt.any():
-        return gw
-
-    contour = _boundary_mask(gt, k=3)
-    d = distance_transform_cdt((~contour).astype(np.uint8), metric="chessboard").astype(np.float64)
-    d[~gt] = 0.0
-
-    # Approximate local stroke width from distance to background.
-    gsw = np.maximum(1.0, 2.0 * distance_transform_edt(gt).astype(np.float64))
-    gsw_i = np.maximum(1, np.rint(gsw).astype(np.int32))
-    odd = (gsw_i % 2) == 1
-
-    # Normalization used by weighted pseudo-recall (Ntirogiannis et al., TIP 2013).
-    nr = np.ones(gt.shape, dtype=np.float64)
-    nr_odd = ((gsw_i.astype(np.float64) - 1.0) / 2.0) ** 2
-    nr_even = (gsw_i.astype(np.float64) / 2.0) * ((gsw_i.astype(np.float64) / 2.0) - 1.0)
-    nr[odd] = np.maximum(1.0, nr_odd[odd])
-    nr[~odd] = np.maximum(1.0, nr_even[~odd])
-
-    thick = np.logical_and(gt, gsw > 2.0)
-    thin = np.logical_and(gt, ~thick)
-    gw[thick] = d[thick] / nr[thick]
-    gw[thin] = 1.0 / gsw[thin]
-    return gw
-
-
-def _pseudo_precision_weights(gt: np.ndarray, *, connectivity: int) -> np.ndarray:
-    from scipy.ndimage import distance_transform_cdt, distance_transform_edt
-
-    gt = _as_bool_2d(gt)
     pw = np.ones(gt.shape, dtype=np.float64)
     if not gt.any():
-        return pw
-
-    contour = _boundary_mask(gt, k=3)
-    d = distance_transform_cdt((~contour).astype(np.uint8), metric="chessboard").astype(np.float64)
+        return gw, pw
 
     gt_lab, n_gt = _label_components(gt, connectivity=connectivity)
     if n_gt <= 0:
-        return pw
+        return gw, pw
 
-    dt_fg = distance_transform_edt(gt).astype(np.float64)
-    avg_sw = np.ones(n_gt + 1, dtype=np.float64)
+    contour = _pseudo_contour_mask(gt)
+    d_cm = distance_transform_cdt((~contour).astype(np.uint8), metric="chessboard").astype(np.float64)
+
+    contour_labels = np.where(contour, gt_lab, 0).astype(np.int32, copy=False)
+    _d_edt, nearest_contour_inds = distance_transform_edt((~contour).astype(np.uint8), return_indices=True)
+    nearest_contour_label = contour_labels[nearest_contour_inds[0], nearest_contour_inds[1]]
+
+    c_by_label = np.ones(int(n_gt) + 1, dtype=np.float64)
+    n_by_label = np.ones(int(n_gt) + 1, dtype=np.float64)
+    sw_by_label = np.ones(int(n_gt) + 1, dtype=np.float64)
+
+    try:
+        skel_all = skeletonize_binary(gt)
+    except Exception:
+        skel_all = np.zeros_like(gt, dtype=bool)
+
     for label_id in range(1, int(n_gt) + 1):
-        vals = 2.0 * dt_fg[gt_lab == label_id]
-        if vals.size == 0:
-            raise ValueError(f"component {label_id} has no pixels in gt_lab")
-        avg_sw[label_id] = max(1.0, float(vals.mean()))
+        component = gt_lab == label_id
+        if not component.any():
+            continue
+        skel_component = np.logical_and(skel_all, component)
+        sw_samples = d_cm[skel_component]
+        if sw_samples.size == 0:
+            sw_samples = d_cm[component]
+        if sw_samples.size == 0:
+            continue
 
-    dist_to_fg, inds = distance_transform_edt((~gt).astype(np.uint8), return_indices=True)
-    nearest_gt_label = gt_lab[inds[0], inds[1]]
-    nearest_sw = avg_sw[nearest_gt_label]
+        c_i = max(1, int(math.ceil(float(sw_samples.max()))))
+        c_by_label[label_id] = float(c_i)
+        n_by_label[label_id] = _pseudo_recall_normalizer(c_i)
+        sw_by_label[label_id] = max(1.0, float(2.0 * sw_samples.mean()))
 
-    region = np.logical_and(~gt, np.logical_and(nearest_gt_label > 0, dist_to_fg <= nearest_sw))
-    pw[region] = 1.0 + (d[region] / np.maximum(1.0, nearest_sw[region]))
-    pw[region] = np.minimum(2.0, pw[region])
-    return pw
+    inside = gt
+    d_in = d_cm[inside]
+    labels_in = gt_lab[inside]
+    c_in = c_by_label[labels_in]
+    n_in = n_by_label[labels_in]
 
+    w_in = np.empty_like(d_in, dtype=np.float64)
+    on_contour = d_in <= 0.0
+    in_core = np.logical_and(d_in > 0.0, d_in < c_in)
+    in_plateau = np.logical_not(np.logical_or(on_contour, in_core))
 
-def pseudo_fmeasure(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    skel_gt: Optional[np.ndarray] = None,
-) -> float:
-    """Pseudo F-measure (p-FM) used in H-DIBCO.
+    w_in[on_contour] = 1.0
+    w_in[in_core] = d_in[in_core] / n_in[in_core]
+    w_in[in_plateau] = c_in[in_plateau] / n_in[in_plateau]
+    gw[inside] = w_in
 
-    Precision is standard; recall is computed on the GT skeleton.
-    """
-    pfm, _ = pseudo_fmeasure_values(pred, gt, skel_gt=skel_gt)
-    return float(pfm)
+    outside = np.logical_not(gt)
+    sw_map = sw_by_label[nearest_contour_label]
+    near = np.logical_and(outside, np.logical_and(nearest_contour_label > 0, d_cm <= sw_map))
+    if near.any():
+        pw[near] = 1.0 + (d_cm[near] / np.maximum(1.0, sw_map[near]))
+        pw[near] = np.minimum(2.0, pw[near])
+
+    return gw, pw
 
 
 def pseudo_fmeasure_values(
@@ -721,16 +745,6 @@ def pseudo_fmeasure_values(
     pre_recall = _safe_div(np.logical_and(pred, skel_gt).sum(), skel_count)
     pfm = _safe_div(2.0 * precision * pre_recall, precision + pre_recall)
     return float(pfm), float(pfm)
-
-
-def pseudo_fmeasure_nonempty(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    skel_gt: Optional[np.ndarray] = None,
-) -> float:
-    _, pfm_nonempty = pseudo_fmeasure_values(pred, gt, skel_gt=skel_gt)
-    return float(pfm_nonempty)
 
 
 def weighted_pseudo_fmeasure_from_weights(
@@ -775,8 +789,9 @@ def weighted_pseudo_fmeasure(
 ) -> float:
     """Weighted pseudo-FMeasure (Fps) from weighted pseudo-recall/precision.
 
-    This is a practical approximation of the local stroke-width weighting
-    scheme described by Ntirogiannis et al. (TIP 2013).
+    Uses the component-wise GW/PW weighting scheme described by
+    Ntirogiannis et al. (TIP 2013), with pragmatic fallbacks for
+    degenerate contour/skeleton cases.
     """
     pred = _as_bool_2d(pred)
     gt = _as_bool_2d(gt)
@@ -786,8 +801,7 @@ def weighted_pseudo_fmeasure(
     if not gt.any():
         return 1.0 if not pred.any() else 0.0
 
-    gw = _pseudo_recall_weights(gt)
-    pw = _pseudo_precision_weights(gt, connectivity=connectivity)
+    gw, pw = _pseudo_weight_maps(gt, connectivity=connectivity)
     return float(
         weighted_pseudo_fmeasure_from_weights(
             pred,
@@ -797,78 +811,6 @@ def weighted_pseudo_fmeasure(
             precision_weights=pw,
         )
     )
-
-
-def cldice(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    skel_pred: Optional[np.ndarray] = None,
-    skel_gt: Optional[np.ndarray] = None,
-) -> float:
-    pred = _as_bool_2d(pred)
-    gt = _as_bool_2d(gt)
-    if skel_pred is None:
-        skel_pred = skeletonize_binary(pred)
-    if skel_gt is None:
-        skel_gt = skeletonize_binary(gt)
-
-    tp = np.logical_and(skel_pred, gt).sum()
-    ts = np.logical_and(skel_gt, pred).sum()
-    tprec = _safe_div(tp, skel_pred.sum()) if skel_pred.sum() > 0 else 0.0
-    tsens = _safe_div(ts, skel_gt.sum()) if skel_gt.sum() > 0 else 0.0
-    return _safe_div(2.0 * tprec * tsens, tprec + tsens)
-
-
-def skeleton_tube_metrics(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    *,
-    radius: int = 1,
-    skel_gt: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
-    from scipy.ndimage import distance_transform_edt
-
-    pred = _as_bool_2d(pred)
-    gt = _as_bool_2d(gt)
-    if skel_gt is None:
-        skel_gt = skeletonize_binary(gt)
-    if skel_gt.sum() == 0:
-        return {"tube_precision": 0.0, "tube_recall": 0.0, "tube_f1": 0.0}
-
-    dt = distance_transform_edt((~skel_gt).astype(np.uint8))
-    tube = dt <= float(radius)
-
-    tp = np.logical_and(pred, tube).sum()
-    fp = np.logical_and(pred, ~tube).sum()
-    fn = np.logical_and(~pred, tube).sum()
-    prec = _safe_div(tp, tp + fp)
-    rec = _safe_div(tp, tp + fn)
-    f1 = _safe_div(2.0 * prec * rec, prec + rec)
-    return {"tube_precision": float(prec), "tube_recall": float(rec), "tube_f1": float(f1)}
-
-
-def skeleton_chamfer(skel_pred: np.ndarray, skel_gt: np.ndarray) -> Dict[str, float]:
-    from scipy.ndimage import distance_transform_edt
-
-    skel_pred = _as_bool_2d(skel_pred)
-    skel_gt = _as_bool_2d(skel_gt)
-
-    if skel_pred.sum() == 0 and skel_gt.sum() == 0:
-        return {"chamfer": 0.0, "pred_to_gt": 0.0, "gt_to_pred": 0.0}
-    if skel_pred.sum() == 0 or skel_gt.sum() == 0:
-        inf = float("inf")
-        return {"chamfer": inf, "pred_to_gt": inf, "gt_to_pred": inf}
-
-    dt_to_gt = distance_transform_edt((~skel_gt).astype(np.uint8))
-    dt_to_pred = distance_transform_edt((~skel_pred).astype(np.uint8))
-    pred_to_gt = float(dt_to_gt[skel_pred].mean())
-    gt_to_pred = float(dt_to_pred[skel_gt].mean())
-    return {
-        "chamfer": float(0.5 * (pred_to_gt + gt_to_pred)),
-        "pred_to_gt": pred_to_gt,
-        "gt_to_pred": gt_to_pred,
-    }
 
 
 def _label_components(mask: np.ndarray, *, connectivity: int = 2) -> Tuple[np.ndarray, int]:
@@ -891,12 +833,12 @@ def _local_metrics_from_binary(
     gt_beta0: Optional[int] = None,
     gt_beta1: Optional[int] = None,
     skel_gt: Optional[np.ndarray] = None,
-    skel_pred: Optional[np.ndarray] = None,
     gt_lab: Optional[np.ndarray] = None,
     pred_lab: Optional[np.ndarray] = None,
     pfm_weight_recall: Optional[np.ndarray] = None,
     pfm_weight_recall_sum: Optional[float] = None,
     pfm_weight_precision: Optional[np.ndarray] = None,
+    enable_skeleton_metrics: bool = True,
     skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
@@ -904,6 +846,9 @@ def _local_metrics_from_binary(
     gt_bin = _as_bool_2d(gt_bin)
     if pred_bin.shape != gt_bin.shape:
         raise ValueError(f"pred_bin/gt_bin shape mismatch: {pred_bin.shape} vs {gt_bin.shape}")
+    enable_skeleton_metrics = bool(enable_skeleton_metrics)
+    if (not enable_skeleton_metrics) and (skel_gt is not None):
+        raise ValueError("skel_gt must be None when enable_skeleton_metrics is False")
 
     t0 = time.perf_counter()
     c = confusion_counts(pred_bin, gt_bin)
@@ -957,24 +902,24 @@ def _local_metrics_from_binary(
     hd = hausdorff_metrics(pred_bin, gt_bin, boundary_k=boundary_k)
     if timings is not None:
         timings["boundary_hausdorff"] = timings.get("boundary_hausdorff", 0.0) + (time.perf_counter() - t0)
-    if skel_gt is None:
+
+    pfm: Optional[float] = None
+    pfm_nonempty: Optional[float] = None
+    skel_recall_val: Optional[float] = None
+    if enable_skeleton_metrics:
+        if skel_gt is None:
+            t0 = time.perf_counter()
+            skel_gt = skeletonize_binary(gt_bin, skeleton_method=skeleton_method)
+            if timings is not None:
+                timings["skeletonize_gt"] = timings.get("skeletonize_gt", 0.0) + (time.perf_counter() - t0)
+        else:
+            skel_gt = _as_bool_2d(skel_gt)
+            if skel_gt.shape != gt_bin.shape:
+                raise ValueError(f"skel_gt/gt_bin shape mismatch: {skel_gt.shape} vs {gt_bin.shape}")
         t0 = time.perf_counter()
-        skel_gt = skeletonize_binary(gt_bin, skeleton_method=skeleton_method)
+        pfm, pfm_nonempty = pseudo_fmeasure_values(pred_bin, gt_bin, skel_gt=skel_gt)
         if timings is not None:
-            timings["skeletonize_gt"] = timings.get("skeletonize_gt", 0.0) + (time.perf_counter() - t0)
-    if skel_pred is None:
-        t0 = time.perf_counter()
-        skel_pred = skeletonize_binary(pred_bin, skeleton_method=skeleton_method)
-        if timings is not None:
-            timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
-    t0 = time.perf_counter()
-    chamfer = skeleton_chamfer(skel_pred, skel_gt)
-    if timings is not None:
-        timings["skeleton_chamfer"] = timings.get("skeleton_chamfer", 0.0) + (time.perf_counter() - t0)
-    t0 = time.perf_counter()
-    pfm, pfm_nonempty = pseudo_fmeasure_values(pred_bin, gt_bin, skel_gt=skel_gt)
-    if timings is not None:
-        timings["pfm"] = timings.get("pfm", 0.0) + (time.perf_counter() - t0)
+            timings["pfm"] = timings.get("pfm", 0.0) + (time.perf_counter() - t0)
     if pfm_weight_recall is None and pfm_weight_recall_sum is None and pfm_weight_precision is None:
         t0 = time.perf_counter()
         pfm_weighted = weighted_pseudo_fmeasure(pred_bin, gt_bin, connectivity=connectivity)
@@ -1005,13 +950,15 @@ def _local_metrics_from_binary(
     drd_val = float(drd(pred_bin, gt_bin, block_size=drd_block_size))
     if timings is not None:
         timings["drd"] = timings.get("drd", 0.0) + (time.perf_counter() - t0)
-    t0 = time.perf_counter()
-    skel_recall_val = float(skeleton_recall(pred_bin, gt_bin, skel_gt=skel_gt))
-    skel_cldice_val = float(cldice(pred_bin, gt_bin, skel_pred=skel_pred, skel_gt=skel_gt))
-    if timings is not None:
-        timings["skeleton_overlap"] = timings.get("skeleton_overlap", 0.0) + (time.perf_counter() - t0)
+    if enable_skeleton_metrics:
+        if skel_gt is None:
+            raise ValueError("internal error: skel_gt is required when enable_skeleton_metrics is True")
+        t0 = time.perf_counter()
+        skel_recall_val = float(skeleton_recall(pred_bin, gt_bin, skel_gt=skel_gt))
+        if timings is not None:
+            timings["skeleton_recall"] = timings.get("skeleton_recall", 0.0) + (time.perf_counter() - t0)
 
-    return {
+    out = {
         "dice": float(dice_from_confusion(c)),
         "accuracy": float(accuracy_from_confusion(c)),
         "voi": voi_total,
@@ -1033,12 +980,18 @@ def _local_metrics_from_binary(
         "boundary_hd": float(hd["hd"]),
         "boundary_hd95": float(hd["hd95"]),
         "boundary_assd": float(hd["assd"]),
-        "skeleton_recall": skel_recall_val,
-        "skeleton_cldice": skel_cldice_val,
-        "pfm": float(pfm),
-        "pfm_nonempty": float(pfm_nonempty),
         "pfm_weighted": float(pfm_weighted),
-        "skeleton_chamfer": float(chamfer["chamfer"]),
-        "skeleton_chamfer_pred_to_gt": float(chamfer["pred_to_gt"]),
-        "skeleton_chamfer_gt_to_pred": float(chamfer["gt_to_pred"]),
     }
+    if enable_skeleton_metrics:
+        if pfm is None or pfm_nonempty is None:
+            raise ValueError("internal error: pfm metrics are required when enable_skeleton_metrics is True")
+        if skel_recall_val is None:
+            raise ValueError("internal error: skeleton_recall is required when enable_skeleton_metrics is True")
+        out.update(
+            {
+                "skeleton_recall": float(skel_recall_val),
+                "pfm": float(pfm),
+                "pfm_nonempty": float(pfm_nonempty),
+            }
+        )
+    return out

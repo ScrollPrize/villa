@@ -7,12 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .stitched_metric_specs import component_metric_specs, component_metric_supports_worst
 from .stitched_primitives import (
     _as_bool_2d,
     _label_components,
     _local_metrics_from_binary,
-    _pseudo_precision_weights,
-    _pseudo_recall_weights,
+    _pseudo_weight_maps,
     betti_numbers_2d,
     skeletonize_binary,
     soft_dice_from_prob,
@@ -26,6 +26,7 @@ def _build_gt_component_templates(
     *,
     connectivity: int,
     pad: int,
+    enable_skeleton_metrics: bool = True,
     skeleton_method: str = "guo_hall",
 ) -> List[Dict[str, Any]]:
     gt_bin = _as_bool_2d(gt_bin)
@@ -48,52 +49,38 @@ def _build_gt_component_templates(
         crop_gt = gt_bin[y0:y1, x0:x1]
         crop_gt_lab, _ = _label_components(crop_gt, connectivity=connectivity)
         gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
-        gt_skel = skeletonize_binary(
-            crop_gt,
-            cc_labels=crop_gt_lab,
-            skeleton_method=skeleton_method,
-        )
-        pfm_weight_recall = _pseudo_recall_weights(crop_gt).astype(np.float32, copy=False)
+        gt_skel: Optional[np.ndarray] = None
+        if enable_skeleton_metrics:
+            gt_skel = skeletonize_binary(
+                crop_gt,
+                cc_labels=crop_gt_lab,
+                skeleton_method=skeleton_method,
+            )
+        pfm_weight_recall, pfm_weight_precision = _pseudo_weight_maps(crop_gt, connectivity=connectivity)
+        pfm_weight_recall = pfm_weight_recall.astype(np.float32, copy=False)
         pfm_weight_recall_sum = float(pfm_weight_recall.sum(dtype=np.float64))
         if crop_gt.any() and pfm_weight_recall_sum <= 0.0:
             raise ValueError(f"invalid weighted pseudo-recall sum for component {gi}: {pfm_weight_recall_sum}")
-        pfm_weight_precision = _pseudo_precision_weights(crop_gt, connectivity=connectivity).astype(
-            np.float32, copy=False
-        )
-        templates.append(
-            {
-                "component_id": int(gi),
-                "bbox": [int(y0), int(y1), int(x0), int(x1)],
-                "gt_beta0": int(gt_beta0),
-                "gt_beta1": int(gt_beta1),
-                "gt_lab": crop_gt_lab,
-                "gt_skel": gt_skel,
-                "pfm_weight_recall": pfm_weight_recall,
-                "pfm_weight_recall_sum": float(pfm_weight_recall_sum),
-                "pfm_weight_precision": pfm_weight_precision,
-            }
-        )
+        pfm_weight_precision = pfm_weight_precision.astype(np.float32, copy=False)
+        template = {
+            "component_id": int(gi),
+            "bbox": [int(y0), int(y1), int(x0), int(x1)],
+            "gt_beta0": int(gt_beta0),
+            "gt_beta1": int(gt_beta1),
+            "gt_lab": crop_gt_lab,
+            "pfm_weight_recall": pfm_weight_recall,
+            "pfm_weight_recall_sum": float(pfm_weight_recall_sum),
+            "pfm_weight_precision": pfm_weight_precision,
+        }
+        if enable_skeleton_metrics:
+            if gt_skel is None:
+                raise ValueError("internal error: gt_skel is required when enable_skeleton_metrics is True")
+            template["gt_skel"] = gt_skel
+        templates.append(template)
     return templates
 
-
-COMPONENT_METRIC_SPECS: Tuple[Tuple[str, bool], ...] = (
-    ("dice_hard", True),
-    ("dice_soft", True),
-    ("accuracy", True),
-    ("pfm", True),
-    ("pfm_nonempty", True),
-    ("pfm_weighted", True),
-    ("skeleton_cldice", True),
-    ("skeleton_recall", True),
-    ("voi", False),
-    ("mpm", False),
-    ("drd", False),
-    ("betti_l1", False),
-    ("betti_match_err", False),
-    ("abs_euler_err", False),
-    ("boundary_hd95", False),
-    ("skeleton_chamfer", False),
-)
+# Full metric set.
+COMPONENT_METRIC_SPECS: Tuple[Tuple[str, bool], ...] = component_metric_specs(enable_skeleton_metrics=True)
 
 
 def _component_metric_summary(
@@ -103,18 +90,21 @@ def _component_metric_summary(
     higher_is_better: bool,
     worst_q: Optional[float],
     worst_k: Optional[int],
+    include_worst: bool,
     id_key: str = "component_id",
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
     if not rows:
+        stats = {
+            "n_gt": 0.0,
+            "mean": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+        }
+        if include_worst:
+            stats["worst_k_mean"] = float("nan")
+            stats["worst_q_mean"] = float("nan")
         return (
-            {
-                "n_gt": 0.0,
-                "mean": float("nan"),
-                "worst_k_mean": float("nan"),
-                "worst_q_mean": float("nan"),
-                "min": float("nan"),
-                "max": float("nan"),
-            },
+            stats,
             {
                 "sort_order": "asc" if higher_is_better else "desc",
                 "component_ids_sorted_worst_first": [],
@@ -133,7 +123,7 @@ def _component_metric_summary(
     worst_q_mean = float("nan")
     worst_k_ids: List[Any] = []
     worst_q_ids: List[Any] = []
-    if sorted_values.size:
+    if include_worst and sorted_values.size:
         if worst_k is not None:
             k = max(1, min(int(worst_k), int(len(sorted_values))))
             worst_k_mean = float(sorted_values[:k].mean())
@@ -144,15 +134,17 @@ def _component_metric_summary(
             worst_q_mean = float(sorted_values[:kq].mean())
             worst_q_ids = list(sorted_ids[:kq])
 
+    stats = {
+        "n_gt": float(len(rows)),
+        "mean": float(values.mean()),
+        "min": float(values.min()) if values.size else float("nan"),
+        "max": float(values.max()) if values.size else float("nan"),
+    }
+    if include_worst:
+        stats["worst_k_mean"] = worst_k_mean
+        stats["worst_q_mean"] = worst_q_mean
     return (
-        {
-            "n_gt": float(len(rows)),
-            "mean": float(values.mean()),
-            "worst_k_mean": worst_k_mean,
-            "worst_q_mean": worst_q_mean,
-            "min": float(values.min()) if values.size else float("nan"),
-            "max": float(values.max()) if values.size else float("nan"),
-        },
+        stats,
         {
             "sort_order": "asc" if higher_is_better else "desc",
             "component_ids_sorted_worst_first": list(sorted_ids),
@@ -168,16 +160,20 @@ def summarize_component_rows(
     worst_q: Optional[float],
     worst_k: Optional[int],
     id_key: str,
+    metric_specs: Optional[Tuple[Tuple[str, bool], ...]] = None,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, Any]]]:
+    metric_specs_i = COMPONENT_METRIC_SPECS if metric_specs is None else tuple(metric_specs)
     metric_stats: Dict[str, Dict[str, float]] = {}
     metric_rankings: Dict[str, Dict[str, Any]] = {}
-    for metric_name, higher_is_better in COMPONENT_METRIC_SPECS:
+    for metric_name, higher_is_better in metric_specs_i:
+        include_worst = component_metric_supports_worst(metric_name=metric_name)
         stats, rankings = _component_metric_summary(
             rows,
             key=metric_name,
             higher_is_better=higher_is_better,
             worst_q=worst_q,
             worst_k=worst_k,
+            include_worst=include_worst,
             id_key=id_key,
         )
         metric_stats[metric_name] = stats
@@ -222,7 +218,7 @@ def component_metrics_by_gt_bbox(
     pad: int = 0,
     worst_q: Optional[float] = 0.2,
     worst_k: Optional[int] = 2,
-    keep_pred_skeleton: bool = False,
+    enable_skeleton_metrics: bool = True,
     gt_lab: Optional[np.ndarray] = None,
     pred_lab: np.ndarray,
     n_gt: Optional[int] = None,
@@ -251,9 +247,11 @@ def component_metrics_by_gt_bbox(
             int(n_gt),
             connectivity=connectivity,
             pad=pad,
+            enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
         )
 
+    metric_specs = component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics)
     rows: List[Dict[str, Any]] = []
     for template in gt_component_templates:
         gi = int(template["component_id"])
@@ -277,15 +275,12 @@ def component_metrics_by_gt_bbox(
         if timings is not None:
             timings["label_pred"] = timings.get("label_pred", 0.0) + (time.perf_counter() - t0)
         t0 = time.perf_counter()
-        crop_pred_skel = skeletonize_binary(
-            crop_pred_bin,
-            cc_labels=crop_pred_lab,
-            skeleton_method=skeleton_method,
-        )
-        if timings is not None:
-            timings["skeletonize_pred"] = timings.get("skeletonize_pred", 0.0) + (time.perf_counter() - t0)
-        t0 = time.perf_counter()
         local_metric_timings: Dict[str, float] = {}
+        skel_gt: Optional[np.ndarray] = None
+        if enable_skeleton_metrics:
+            if "gt_skel" not in template:
+                raise KeyError(f"template for component {gi} is missing 'gt_skel'")
+            skel_gt = template["gt_skel"]
         local_metrics = _local_metrics_from_binary(
             crop_pred_bin,
             crop_gt,
@@ -294,13 +289,13 @@ def component_metrics_by_gt_bbox(
             boundary_k=boundary_k,
             gt_beta0=int(template["gt_beta0"]),
             gt_beta1=int(template["gt_beta1"]),
-            skel_gt=template["gt_skel"],
-            skel_pred=crop_pred_skel,
+            skel_gt=skel_gt,
             gt_lab=crop_gt_lab,
             pred_lab=crop_pred_lab,
             pfm_weight_recall=template["pfm_weight_recall"],
             pfm_weight_recall_sum=float(template["pfm_weight_recall_sum"]),
             pfm_weight_precision=template["pfm_weight_precision"],
+            enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
             timings=local_metric_timings,
         )
@@ -323,8 +318,6 @@ def component_metrics_by_gt_bbox(
             "voi": float(local_metrics["voi"]),
             "mpm": float(local_metrics["mpm"]),
             "drd": float(local_metrics["drd"]),
-            "pfm": float(local_metrics["pfm"]),
-            "pfm_nonempty": float(local_metrics["pfm_nonempty"]),
             "pfm_weighted": float(local_metrics["pfm_weighted"]),
             "betti_l1": float(local_metrics["betti_l1"]),
             "betti_match_err": float(local_metrics["betti_match_err"]),
@@ -332,9 +325,6 @@ def component_metrics_by_gt_bbox(
             "betti_match_err_dim1": float(local_metrics["betti_match_err_dim1"]),
             "abs_euler_err": float(local_metrics["abs_euler_err"]),
             "boundary_hd95": float(local_metrics["boundary_hd95"]),
-            "skeleton_recall": float(local_metrics["skeleton_recall"]),
-            "skeleton_cldice": float(local_metrics["skeleton_cldice"]),
-            "skeleton_chamfer": float(local_metrics["skeleton_chamfer"]),
             "betti_abs_beta0_err": float(local_metrics["betti_abs_beta0_err"]),
             "betti_abs_beta1_err": float(local_metrics["betti_abs_beta1_err"]),
             "betti_beta0_pred": float(local_metrics["betti_beta0_pred"]),
@@ -342,8 +332,14 @@ def component_metrics_by_gt_bbox(
             "betti_beta0_gt": float(local_metrics["betti_beta0_gt"]),
             "betti_beta1_gt": float(local_metrics["betti_beta1_gt"]),
         }
-        if keep_pred_skeleton:
-            row["_pred_skel"] = crop_pred_skel
+        if enable_skeleton_metrics:
+            row.update(
+                {
+                    "pfm": float(local_metrics["pfm"]),
+                    "pfm_nonempty": float(local_metrics["pfm_nonempty"]),
+                    "skeleton_recall": float(local_metrics["skeleton_recall"]),
+                }
+            )
         rows.append(row)
 
     metric_stats, metric_rankings = summarize_component_rows(
@@ -351,6 +347,7 @@ def component_metrics_by_gt_bbox(
         worst_q=worst_q,
         worst_k=worst_k,
         id_key="component_id",
+        metric_specs=metric_specs,
     )
 
     return rows, metric_stats, metric_rankings
