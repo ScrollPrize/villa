@@ -621,16 +621,19 @@ def _pseudo_contour_mask(gt: np.ndarray) -> np.ndarray:
         return np.zeros_like(gt, dtype=bool)
     try:
         import cv2
+    except Exception as exc:
+        raise ImportError(
+            "OpenCV is required for weighted pseudo-FMeasure contour extraction; "
+            "install opencv-contrib-python-headless."
+        ) from exc
 
-        gt_u8 = gt.astype(np.uint8, copy=False) * 255
-        blurred = cv2.GaussianBlur(gt_u8, (0, 0), sigmaX=1.5, sigmaY=1.5, borderType=cv2.BORDER_REPLICATE)
-        canny = cv2.Canny(blurred, threshold1=int(round(0.2 * 255.0)), threshold2=int(round(0.3 * 255.0)))
-        contour = np.logical_and(canny > 0, gt)
-        if contour.any():
-            return contour
-    except Exception:
-        pass
-    return _boundary_mask(gt, k=3)
+    gt_u8 = gt.astype(np.uint8, copy=False) * 255
+    blurred = cv2.GaussianBlur(gt_u8, (0, 0), sigmaX=1.5, sigmaY=1.5, borderType=cv2.BORDER_REPLICATE)
+    canny = cv2.Canny(blurred, threshold1=int(round(0.2 * 255.0)), threshold2=int(round(0.3 * 255.0)))
+    contour = np.logical_and(canny > 0, gt)
+    if not contour.any():
+        raise ValueError("weighted pseudo-FMeasure contour extraction produced an empty contour for non-empty GT")
+    return contour
 
 
 def _pseudo_recall_normalizer(c_i: int) -> float:
@@ -644,7 +647,13 @@ def _pseudo_recall_normalizer(c_i: int) -> float:
     return float(max(1.0, n))
 
 
-def _pseudo_weight_maps(gt: np.ndarray, *, connectivity: int) -> Tuple[np.ndarray, np.ndarray]:
+def _pseudo_weight_maps(
+    gt: np.ndarray,
+    *,
+    connectivity: int,
+    skel_gt: Optional[np.ndarray] = None,
+    contour_gt: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """Build DIBCO-style recall/precision weight maps (GW/PW)."""
     from scipy.ndimage import distance_transform_cdt, distance_transform_edt
 
@@ -658,7 +667,16 @@ def _pseudo_weight_maps(gt: np.ndarray, *, connectivity: int) -> Tuple[np.ndarra
     if n_gt <= 0:
         return gw, pw
 
-    contour = _pseudo_contour_mask(gt)
+    if contour_gt is None:
+        contour = _pseudo_contour_mask(gt)
+    else:
+        contour = _as_bool_2d(contour_gt)
+        if contour.shape != gt.shape:
+            raise ValueError(f"contour_gt/gt shape mismatch: {contour.shape} vs {gt.shape}")
+        if np.logical_and(contour, ~gt).any():
+            raise ValueError("contour_gt must be a subset of gt foreground")
+        if gt.any() and (not contour.any()):
+            raise ValueError("contour_gt is empty for non-empty GT")
     d_cm = distance_transform_cdt((~contour).astype(np.uint8), metric="chessboard").astype(np.float64)
 
     contour_labels = np.where(contour, gt_lab, 0).astype(np.int32, copy=False)
@@ -669,10 +687,17 @@ def _pseudo_weight_maps(gt: np.ndarray, *, connectivity: int) -> Tuple[np.ndarra
     n_by_label = np.ones(int(n_gt) + 1, dtype=np.float64)
     sw_by_label = np.ones(int(n_gt) + 1, dtype=np.float64)
 
-    try:
-        skel_all = skeletonize_binary(gt)
-    except Exception:
-        skel_all = np.zeros_like(gt, dtype=bool)
+    if skel_gt is None:
+        try:
+            skel_all = skeletonize_binary(gt)
+        except Exception as exc:
+            raise RuntimeError("failed to skeletonize GT while building weighted pseudo-FMeasure maps") from exc
+    else:
+        skel_all = _as_bool_2d(skel_gt)
+        if skel_all.shape != gt.shape:
+            raise ValueError(f"skel_gt/gt shape mismatch: {skel_all.shape} vs {gt.shape}")
+        if np.logical_and(skel_all, ~gt).any():
+            raise ValueError("skel_gt must be a subset of gt foreground")
 
     for label_id in range(1, int(n_gt) + 1):
         component = gt_lab == label_id
@@ -774,9 +799,10 @@ def weighted_pseudo_fmeasure_from_weights(
     bw = pred.astype(np.float64) * precision_weights
     bw_sum = float(bw.sum())
     if bw_sum <= 0.0:
-        pps = 1.0
-    else:
-        pps = float((gt.astype(np.float64) * bw).sum() / bw_sum)
+        raise ValueError(
+            "invalid weighted pseudo-precision denominator: predicted weighted foreground sum is non-positive"
+        )
+    pps = float((gt.astype(np.float64) * bw).sum() / bw_sum)
 
     return _safe_div(2.0 * rps * pps, rps + pps)
 
@@ -786,12 +812,14 @@ def weighted_pseudo_fmeasure(
     gt: np.ndarray,
     *,
     connectivity: int = 2,
+    skel_gt: Optional[np.ndarray] = None,
 ) -> float:
     """Weighted pseudo-FMeasure (Fps) from weighted pseudo-recall/precision.
 
     Uses the component-wise GW/PW weighting scheme described by
-    Ntirogiannis et al. (TIP 2013), with pragmatic fallbacks for
-    degenerate contour/skeleton cases.
+    Ntirogiannis et al. (TIP 2013), with strict fail-fast behavior when
+    contour/skeleton extraction or weighted precision denominators are invalid.
+    If `skel_gt` is provided, it is reused instead of recomputing GT skeletons.
     """
     pred = _as_bool_2d(pred)
     gt = _as_bool_2d(gt)
@@ -801,7 +829,7 @@ def weighted_pseudo_fmeasure(
     if not gt.any():
         return 1.0 if not pred.any() else 0.0
 
-    gw, pw = _pseudo_weight_maps(gt, connectivity=connectivity)
+    gw, pw = _pseudo_weight_maps(gt, connectivity=connectivity, skel_gt=skel_gt)
     return float(
         weighted_pseudo_fmeasure_from_weights(
             pred,
@@ -920,25 +948,37 @@ def _local_metrics_from_binary(
         pfm, pfm_nonempty = pseudo_fmeasure_values(pred_bin, gt_bin, skel_gt=skel_gt)
         if timings is not None:
             timings["pfm"] = timings.get("pfm", 0.0) + (time.perf_counter() - t0)
-    if pfm_weight_recall is None and pfm_weight_recall_sum is None and pfm_weight_precision is None:
-        t0 = time.perf_counter()
-        pfm_weighted = weighted_pseudo_fmeasure(pred_bin, gt_bin, connectivity=connectivity)
-        if timings is not None:
-            timings["pfm_weighted"] = timings.get("pfm_weighted", 0.0) + (time.perf_counter() - t0)
-    elif pfm_weight_recall is not None and pfm_weight_recall_sum is not None and pfm_weight_precision is not None:
-        t0 = time.perf_counter()
-        pfm_weighted = weighted_pseudo_fmeasure_from_weights(
-            pred_bin,
-            gt_bin,
-            recall_weights=pfm_weight_recall,
-            recall_weights_sum=float(pfm_weight_recall_sum),
-            precision_weights=pfm_weight_precision,
-        )
-        if timings is not None:
-            timings["pfm_weighted"] = timings.get("pfm_weighted", 0.0) + (time.perf_counter() - t0)
-    else:
+    pfm_weighted: Optional[float] = None
+    if enable_skeleton_metrics:
+        if pfm_weight_recall is None and pfm_weight_recall_sum is None and pfm_weight_precision is None:
+            t0 = time.perf_counter()
+            pfm_weighted = weighted_pseudo_fmeasure(
+                pred_bin,
+                gt_bin,
+                connectivity=connectivity,
+                skel_gt=skel_gt,
+            )
+            if timings is not None:
+                timings["pfm_weighted"] = timings.get("pfm_weighted", 0.0) + (time.perf_counter() - t0)
+        elif pfm_weight_recall is not None and pfm_weight_recall_sum is not None and pfm_weight_precision is not None:
+            t0 = time.perf_counter()
+            pfm_weighted = weighted_pseudo_fmeasure_from_weights(
+                pred_bin,
+                gt_bin,
+                recall_weights=pfm_weight_recall,
+                recall_weights_sum=float(pfm_weight_recall_sum),
+                precision_weights=pfm_weight_precision,
+            )
+            if timings is not None:
+                timings["pfm_weighted"] = timings.get("pfm_weighted", 0.0) + (time.perf_counter() - t0)
+        else:
+            raise ValueError(
+                "pfm weighted inputs must be provided together: "
+                "pfm_weight_recall, pfm_weight_recall_sum, pfm_weight_precision"
+            )
+    elif pfm_weight_recall is not None or pfm_weight_recall_sum is not None or pfm_weight_precision is not None:
         raise ValueError(
-            "pfm weighted inputs must be provided together: "
+            "pfm weighted inputs must be None when enable_skeleton_metrics is False: "
             "pfm_weight_recall, pfm_weight_recall_sum, pfm_weight_precision"
         )
 
@@ -980,18 +1020,20 @@ def _local_metrics_from_binary(
         "boundary_hd": float(hd["hd"]),
         "boundary_hd95": float(hd["hd95"]),
         "boundary_assd": float(hd["assd"]),
-        "pfm_weighted": float(pfm_weighted),
     }
     if enable_skeleton_metrics:
         if pfm is None or pfm_nonempty is None:
             raise ValueError("internal error: pfm metrics are required when enable_skeleton_metrics is True")
         if skel_recall_val is None:
             raise ValueError("internal error: skeleton_recall is required when enable_skeleton_metrics is True")
+        if pfm_weighted is None:
+            raise ValueError("internal error: pfm_weighted is required when enable_skeleton_metrics is True")
         out.update(
             {
                 "skeleton_recall": float(skel_recall_val),
                 "pfm": float(pfm),
                 "pfm_nonempty": float(pfm_nonempty),
+                "pfm_weighted": float(pfm_weighted),
             }
         )
     return out

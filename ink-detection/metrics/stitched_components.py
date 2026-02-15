@@ -28,6 +28,7 @@ def _build_gt_component_templates(
     pad: int,
     enable_skeleton_metrics: bool = True,
     skeleton_method: str = "guo_hall",
+    skel_gt_full: Optional[np.ndarray] = None,
 ) -> List[Dict[str, Any]]:
     gt_bin = _as_bool_2d(gt_bin)
     gt_lab = np.asarray(gt_lab)
@@ -36,6 +37,14 @@ def _build_gt_component_templates(
 
     pad = max(0, int(pad))
     templates: List[Dict[str, Any]] = []
+    skel_gt_full_i: Optional[np.ndarray] = None
+    if enable_skeleton_metrics and skel_gt_full is not None:
+        skel_gt_full_i = _as_bool_2d(skel_gt_full)
+        if skel_gt_full_i.shape != gt_bin.shape:
+            raise ValueError(f"skel_gt_full/gt_bin shape mismatch: {skel_gt_full_i.shape} vs {gt_bin.shape}")
+        if np.logical_and(skel_gt_full_i, ~gt_bin).any():
+            raise ValueError("skel_gt_full must be a subset of gt_bin foreground")
+
     for gi in range(1, int(n_gt) + 1):
         component_mask = gt_lab == gi
         if not component_mask.any():
@@ -51,31 +60,44 @@ def _build_gt_component_templates(
         gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
         gt_skel: Optional[np.ndarray] = None
         if enable_skeleton_metrics:
-            gt_skel = skeletonize_binary(
+            if skel_gt_full_i is not None:
+                gt_skel = skel_gt_full_i[y0:y1, x0:x1]
+            else:
+                gt_skel = skeletonize_binary(
+                    crop_gt,
+                    cc_labels=crop_gt_lab,
+                    skeleton_method=skeleton_method,
+                )
+        pfm_weight_recall: Optional[np.ndarray] = None
+        pfm_weight_recall_sum: Optional[float] = None
+        pfm_weight_precision: Optional[np.ndarray] = None
+        if enable_skeleton_metrics:
+            pfm_weight_recall, pfm_weight_precision = _pseudo_weight_maps(
                 crop_gt,
-                cc_labels=crop_gt_lab,
-                skeleton_method=skeleton_method,
+                connectivity=connectivity,
+                skel_gt=gt_skel,
             )
-        pfm_weight_recall, pfm_weight_precision = _pseudo_weight_maps(crop_gt, connectivity=connectivity)
-        pfm_weight_recall = pfm_weight_recall.astype(np.float32, copy=False)
-        pfm_weight_recall_sum = float(pfm_weight_recall.sum(dtype=np.float64))
-        if crop_gt.any() and pfm_weight_recall_sum <= 0.0:
-            raise ValueError(f"invalid weighted pseudo-recall sum for component {gi}: {pfm_weight_recall_sum}")
-        pfm_weight_precision = pfm_weight_precision.astype(np.float32, copy=False)
+            pfm_weight_recall = pfm_weight_recall.astype(np.float32, copy=False)
+            pfm_weight_recall_sum = float(pfm_weight_recall.sum(dtype=np.float64))
+            if crop_gt.any() and pfm_weight_recall_sum <= 0.0:
+                raise ValueError(f"invalid weighted pseudo-recall sum for component {gi}: {pfm_weight_recall_sum}")
+            pfm_weight_precision = pfm_weight_precision.astype(np.float32, copy=False)
         template = {
             "component_id": int(gi),
             "bbox": [int(y0), int(y1), int(x0), int(x1)],
             "gt_beta0": int(gt_beta0),
             "gt_beta1": int(gt_beta1),
             "gt_lab": crop_gt_lab,
-            "pfm_weight_recall": pfm_weight_recall,
-            "pfm_weight_recall_sum": float(pfm_weight_recall_sum),
-            "pfm_weight_precision": pfm_weight_precision,
         }
         if enable_skeleton_metrics:
             if gt_skel is None:
                 raise ValueError("internal error: gt_skel is required when enable_skeleton_metrics is True")
+            if pfm_weight_recall is None or pfm_weight_recall_sum is None or pfm_weight_precision is None:
+                raise ValueError("internal error: pfm weighted maps are required when enable_skeleton_metrics is True")
             template["gt_skel"] = gt_skel
+            template["pfm_weight_recall"] = pfm_weight_recall
+            template["pfm_weight_recall_sum"] = float(pfm_weight_recall_sum)
+            template["pfm_weight_precision"] = pfm_weight_precision
         templates.append(template)
     return templates
 
@@ -277,10 +299,22 @@ def component_metrics_by_gt_bbox(
         t0 = time.perf_counter()
         local_metric_timings: Dict[str, float] = {}
         skel_gt: Optional[np.ndarray] = None
+        pfm_weight_recall: Optional[np.ndarray] = None
+        pfm_weight_recall_sum: Optional[float] = None
+        pfm_weight_precision: Optional[np.ndarray] = None
         if enable_skeleton_metrics:
             if "gt_skel" not in template:
                 raise KeyError(f"template for component {gi} is missing 'gt_skel'")
             skel_gt = template["gt_skel"]
+            if "pfm_weight_recall" not in template:
+                raise KeyError(f"template for component {gi} is missing 'pfm_weight_recall'")
+            if "pfm_weight_recall_sum" not in template:
+                raise KeyError(f"template for component {gi} is missing 'pfm_weight_recall_sum'")
+            if "pfm_weight_precision" not in template:
+                raise KeyError(f"template for component {gi} is missing 'pfm_weight_precision'")
+            pfm_weight_recall = template["pfm_weight_recall"]
+            pfm_weight_recall_sum = float(template["pfm_weight_recall_sum"])
+            pfm_weight_precision = template["pfm_weight_precision"]
         local_metrics = _local_metrics_from_binary(
             crop_pred_bin,
             crop_gt,
@@ -292,9 +326,9 @@ def component_metrics_by_gt_bbox(
             skel_gt=skel_gt,
             gt_lab=crop_gt_lab,
             pred_lab=crop_pred_lab,
-            pfm_weight_recall=template["pfm_weight_recall"],
-            pfm_weight_recall_sum=float(template["pfm_weight_recall_sum"]),
-            pfm_weight_precision=template["pfm_weight_precision"],
+            pfm_weight_recall=pfm_weight_recall,
+            pfm_weight_recall_sum=pfm_weight_recall_sum,
+            pfm_weight_precision=pfm_weight_precision,
             enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
             timings=local_metric_timings,
@@ -318,7 +352,6 @@ def component_metrics_by_gt_bbox(
             "voi": float(local_metrics["voi"]),
             "mpm": float(local_metrics["mpm"]),
             "drd": float(local_metrics["drd"]),
-            "pfm_weighted": float(local_metrics["pfm_weighted"]),
             "betti_l1": float(local_metrics["betti_l1"]),
             "betti_match_err": float(local_metrics["betti_match_err"]),
             "betti_match_err_dim0": float(local_metrics["betti_match_err_dim0"]),
@@ -335,6 +368,7 @@ def component_metrics_by_gt_bbox(
         if enable_skeleton_metrics:
             row.update(
                 {
+                    "pfm_weighted": float(local_metrics["pfm_weighted"]),
                     "pfm": float(local_metrics["pfm"]),
                     "pfm_nonempty": float(local_metrics["pfm_nonempty"]),
                     "skeleton_recall": float(local_metrics["skeleton_recall"]),

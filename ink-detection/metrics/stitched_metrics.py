@@ -21,6 +21,7 @@ from .stitched_primitives import (
     _count_holes_2d,
     _label_components,
     _local_metrics_from_binary,
+    _pseudo_contour_mask,
     _pseudo_weight_maps,
     boundary_precision_recall_f1,
     nsd_surface_dice,
@@ -359,16 +360,23 @@ def _compute_full_region_metrics(
     enable_skeleton_metrics = bool(enable_skeleton_metrics)
     if enable_skeleton_metrics and skel_gt is None:
         raise ValueError("skel_gt is required when enable_skeleton_metrics is True")
-    if (pfm_weight_recall is None) != (pfm_weight_precision is None):
-        pfm_weight_recall = None
-        pfm_weight_precision = None
+    if (not enable_skeleton_metrics) and (skel_gt is not None):
+        raise ValueError("skel_gt must be None when enable_skeleton_metrics is False")
+
     pfm_weight_recall_sum_i: Optional[float] = None
-    if pfm_weight_recall is not None and pfm_weight_precision is not None:
-        pfm_weight_recall_sum_i = float(np.asarray(pfm_weight_recall, dtype=np.float64).sum())
-        if pfm_weight_recall_sum_i <= 0.0:
-            pfm_weight_recall = None
-            pfm_weight_precision = None
-            pfm_weight_recall_sum_i = None
+    if enable_skeleton_metrics:
+        if (pfm_weight_recall is None) != (pfm_weight_precision is None):
+            raise ValueError("pfm_weight_recall and pfm_weight_precision must be provided together")
+        if pfm_weight_recall is not None and pfm_weight_precision is not None:
+            pfm_weight_recall_sum_i = float(np.asarray(pfm_weight_recall, dtype=np.float64).sum())
+            if pfm_weight_recall_sum_i <= 0.0:
+                raise ValueError(
+                    "invalid weighted pseudo-recall map for full-region metrics: sum is non-positive"
+                )
+    elif (pfm_weight_recall is not None) or (pfm_weight_precision is not None):
+        raise ValueError(
+            "pfm_weight_recall and pfm_weight_precision must be None when enable_skeleton_metrics is False"
+        )
     full_metrics = _local_metrics_from_binary(
         pred_bin_clean,
         gt_bin,
@@ -410,7 +418,6 @@ def _compute_full_region_metrics(
         "boundary/hd": float(full_metrics["boundary_hd"]),
         "boundary/hd95": float(full_metrics["boundary_hd95"]),
         "boundary/assd": float(full_metrics["boundary_assd"]),
-        "pfm_weighted": float(full_metrics["pfm_weighted"]),
     }
     if enable_skeleton_metrics:
         out.update(
@@ -418,6 +425,7 @@ def _compute_full_region_metrics(
                 "skeleton/recall": float(full_metrics["skeleton_recall"]),
                 "pfm": float(full_metrics["pfm"]),
                 "pfm_nonempty": float(full_metrics["pfm_nonempty"]),
+                "pfm_weighted": float(full_metrics["pfm_weighted"]),
             }
         )
 
@@ -457,7 +465,6 @@ def _build_components_manifest(
             "accuracy": float(row["accuracy"]),
             "mpm": float(row["mpm"]),
             "drd": float(row["drd"]),
-            "pfm_weighted": float(row["pfm_weighted"]),
             "voi": float(row["voi"]),
             "betti_l1": float(row["betti_l1"]),
             "abs_euler_err": float(row["abs_euler_err"]),
@@ -475,6 +482,7 @@ def _build_components_manifest(
         if enable_skeleton_metrics:
             entry.update(
                 {
+                    "pfm_weighted": float(row["pfm_weighted"]),
                     "pfm": float(row["pfm"]),
                     "pfm_nonempty": float(row["pfm_nonempty"]),
                     "skeleton_recall": float(row["skeleton_recall"]),
@@ -613,6 +621,7 @@ def _save_stitched_eval_inputs(
     crop_offset: Tuple[int, int],
     full_offset: Tuple[int, int],
     full_shape: Tuple[int, int],
+    gt_contour: Optional[np.ndarray] = None,
     gt_skeleton: Optional[np.ndarray] = None,
     pfm_weight_recall: Optional[np.ndarray] = None,
     pfm_weight_precision: Optional[np.ndarray] = None,
@@ -661,6 +670,16 @@ def _save_stitched_eval_inputs(
         gt_skel_path = osp.join(segment_dir, "gt_skeleton_eval_crop.png")
         if not osp.exists(gt_skel_path):
             Image.fromarray((skel_gt.astype(np.uint8) * 255)).save(gt_skel_path)
+
+    if gt_contour is not None:
+        contour_gt = _as_bool_2d(gt_contour)
+        if contour_gt.shape != gt_bin.shape:
+            raise ValueError(f"gt_contour/gt_bin shape mismatch: {contour_gt.shape} vs {gt_bin.shape}")
+        if np.logical_and(contour_gt, ~gt_bin).any():
+            raise ValueError("gt_contour must be a subset of gt_bin foreground")
+        gt_contour_path = osp.join(segment_dir, "gt_contour_eval_crop.png")
+        if not osp.exists(gt_contour_path):
+            Image.fromarray((contour_gt.astype(np.uint8) * 255)).save(gt_contour_path)
 
     if (pfm_weight_recall is None) != (pfm_weight_precision is None):
         raise ValueError("pfm_weight_recall and pfm_weight_precision must be provided together")
@@ -878,6 +897,8 @@ def compute_stitched_metrics(
             cache_entry["pfm_weight_recall_full"] = None
         if "pfm_weight_precision_full" not in cache_entry:
             cache_entry["pfm_weight_precision_full"] = None
+        if "gt_contour_full" not in cache_entry:
+            cache_entry["gt_contour_full"] = None
         cached_component_pad = cache_entry["gt_component_pad"]
         if cached_component_pad is not None and int(cached_component_pad) != pad_i:
             raise ValueError(
@@ -957,6 +978,7 @@ def compute_stitched_metrics(
             "gt_component_pad": None,
             "pfm_weight_recall_full": None,
             "pfm_weight_precision_full": None,
+            "gt_contour_full": None,
         }
         t1 = time.perf_counter()
         _gt_cache_put(cache_key, cache_entry)
@@ -990,6 +1012,7 @@ def compute_stitched_metrics(
             pad=pad_i,
             enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
+            skel_gt_full=skel_gt,
         )
         cache_entry["gt_component_templates"] = gt_component_templates
         cache_entry["gt_component_pad"] = int(pad_i)
@@ -1014,9 +1037,11 @@ def compute_stitched_metrics(
     threshold_grid_timings: Dict[str, float] = {}
     want_component_outputs = component_output_dir is not None
     want_component_rows = component_rows_collector is not None
-    need_full_gt_pfm_maps = bool(enable_full_region_metrics or stitched_inputs_output_dir)
+    need_full_gt_pfm_maps = bool(enable_skeleton_metrics and (enable_full_region_metrics or stitched_inputs_output_dir))
     pfm_weight_recall_full = cache_entry.get("pfm_weight_recall_full")
     pfm_weight_precision_full = cache_entry.get("pfm_weight_precision_full")
+    need_full_gt_contour = bool(enable_skeleton_metrics and stitched_inputs_output_dir)
+    gt_contour_full = cache_entry.get("gt_contour_full")
     if need_full_gt_pfm_maps:
         if (pfm_weight_recall_full is None) != (pfm_weight_precision_full is None):
             pfm_weight_recall_full = None
@@ -1025,7 +1050,17 @@ def compute_stitched_metrics(
             cache_entry["pfm_weight_precision_full"] = None
         if pfm_weight_recall_full is None and pfm_weight_precision_full is None and bool(gt_bin.any()):
             t_build = time.perf_counter()
-            gw_full, pw_full = _pseudo_weight_maps(gt_bin, connectivity=betti_connectivity)
+            contour_for_maps: Optional[np.ndarray] = gt_contour_full
+            if contour_for_maps is None and need_full_gt_contour:
+                contour_for_maps = _pseudo_contour_mask(gt_bin)
+                gt_contour_full = contour_for_maps
+                cache_entry["gt_contour_full"] = gt_contour_full
+            gw_full, pw_full = _pseudo_weight_maps(
+                gt_bin,
+                connectivity=betti_connectivity,
+                skel_gt=skel_gt,
+                contour_gt=contour_for_maps,
+            )
             gw_full_sum = float(gw_full.astype(np.float64).sum())
             if gw_full_sum > 0.0:
                 pfm_weight_recall_full = gw_full.astype(np.float32, copy=False)
@@ -1038,6 +1073,13 @@ def compute_stitched_metrics(
             threshold_grid_timings["full_region_pfm_weight_cache_build"] = threshold_grid_timings.get(
                 "full_region_pfm_weight_cache_build", 0.0
             ) + (time.perf_counter() - t_build)
+    if need_full_gt_contour and bool(gt_bin.any()) and gt_contour_full is None:
+        t_build = time.perf_counter()
+        gt_contour_full = _pseudo_contour_mask(gt_bin)
+        cache_entry["gt_contour_full"] = gt_contour_full
+        threshold_grid_timings["full_region_contour_cache_build"] = threshold_grid_timings.get(
+            "full_region_contour_cache_build", 0.0
+        ) + (time.perf_counter() - t_build)
 
     t0 = time.perf_counter()
     for thr in tgrid.tolist():
@@ -1090,6 +1132,7 @@ def compute_stitched_metrics(
                 crop_offset=(crop_off_y, crop_off_x),
                 full_offset=(full_off_y, full_off_x),
                 full_shape=pred_full_shape,
+                gt_contour=gt_contour_full if enable_skeleton_metrics else None,
                 gt_skeleton=skel_gt if enable_skeleton_metrics else None,
                 pfm_weight_recall=pfm_weight_recall_full,
                 pfm_weight_precision=pfm_weight_precision_full,

@@ -363,6 +363,19 @@ def _ensure_zarr_v2():
         )
 
 
+def _from_uint16_to_uint8(arr: np.ndarray, *, fragment_id: str) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.dtype == np.uint8:
+        return arr
+    if arr.dtype == np.uint16:
+        # Match the common 16-bit -> 8-bit downscale convention used by OpenCV grayscale reads.
+        return (arr >> 8).astype(np.uint8, copy=False)
+    raise TypeError(
+        f"{fragment_id}: unsupported zarr dtype for 8-bit pipeline: {arr.dtype}. "
+        "Expected uint8 or uint16."
+    )
+
+
 class ZarrSegmentVolume:
     def __init__(
         self,
@@ -556,9 +569,8 @@ class ZarrSegmentVolume:
         else:
             patch = self._read_nonfrag_patch(y1, y2, x1, x2)
 
+        patch = _from_uint16_to_uint8(patch, fragment_id=self.fragment_id)
         np.clip(patch, 0, 200, out=patch)
-        if patch.dtype != np.uint8:
-            patch = patch.astype(np.uint8, copy=False)
 
         expected = (int(y2 - y1), int(x2 - x1), int(CFG.in_chans))
         if patch.shape != expected:

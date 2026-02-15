@@ -7,7 +7,6 @@ COMPONENT_METRIC_SPECS_BASE: Tuple[Tuple[str, bool], ...] = (
     ("dice_hard", True),
     ("dice_soft", True),
     ("accuracy", True),
-    ("pfm_weighted", True),
     ("voi", False),
     ("mpm", False),
     ("drd", False),
@@ -26,6 +25,7 @@ COMPONENT_METRIC_SPECS_BASE: Tuple[Tuple[str, bool], ...] = (
 )
 
 COMPONENT_METRIC_SPECS_SKELETON: Tuple[Tuple[str, bool], ...] = (
+    ("pfm_weighted", True),
     ("pfm", True),
     ("pfm_nonempty", True),
     ("skeleton_recall", True),
