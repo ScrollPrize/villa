@@ -127,6 +127,9 @@ class StitchManager:
         self.val_bboxes = dict(stitch_val_bboxes or {})
         self.train_bboxes = dict(stitch_train_bboxes or {})
         self.log_only_bboxes = dict(stitch_log_only_bboxes or {})
+        self._gaussian_cache = {}
+        self._gaussian_sigma_scale = 0.125
+        self._gaussian_min_weight = 1e-6
 
         def _resolve_roi(shape, bbox, ds):
             h = int(shape[0])
@@ -248,6 +251,36 @@ class StitchManager:
         self.log_only_loaders = list(loaders or [])
         self.log_only_segment_ids = [str(x) for x in (segment_ids or [])]
 
+    def _gaussian_weights(self, h: int, w: int) -> np.ndarray:
+        h = int(h)
+        w = int(w)
+        if h <= 0 or w <= 0:
+            raise ValueError(f"gaussian weight shape must be positive, got {(h, w)}")
+        key = (h, w)
+        weights = self._gaussian_cache.get(key)
+        if weights is not None:
+            return weights
+        sigma_scale = float(self._gaussian_sigma_scale)
+        if sigma_scale <= 0:
+            raise ValueError(f"gaussian sigma scale must be > 0, got {sigma_scale}")
+        sigma_y = max(float(h) * sigma_scale, 1.0)
+        sigma_x = max(float(w) * sigma_scale, 1.0)
+        y = np.arange(h, dtype=np.float32) - ((h - 1) / 2.0)
+        x = np.arange(w, dtype=np.float32) - ((w - 1) / 2.0)
+        wy = np.exp(-0.5 * (y / sigma_y) ** 2).astype(np.float32)
+        wx = np.exp(-0.5 * (x / sigma_x) ** 2).astype(np.float32)
+        weights = np.outer(wy, wx).astype(np.float32)
+        peak = float(weights.max())
+        if (not np.isfinite(peak)) or peak <= 0:
+            raise ValueError(f"invalid gaussian peak for shape {(h, w)}: {peak}")
+        weights /= peak
+        min_weight = float(self._gaussian_min_weight)
+        if min_weight <= 0:
+            raise ValueError(f"gaussian min weight must be > 0, got {min_weight}")
+        weights = np.clip(weights, min_weight, None, out=weights)
+        self._gaussian_cache[key] = weights
+        return weights
+
     def accumulate_to_buffers(self, *, outputs, xyxys, pred_buf, count_buf, offset=(0, 0), ds_override=None):
         ds = int(ds_override or self.downsample)
         y_preds = torch.sigmoid(outputs).to("cpu")
@@ -280,6 +313,7 @@ class StitchManager:
                     mode="bilinear",
                     align_corners=False,
                 )
+            patch_weights = self._gaussian_weights(target_h, target_w)
 
             if x2_ds <= 0 or y2_ds <= 0 or x1_ds >= buf_w or y1_ds >= buf_h:
                 continue
@@ -297,8 +331,11 @@ class StitchManager:
                 continue
 
             pred_crop = pred_patch[..., py0:py1, px0:px1]
-            pred_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += pred_crop.squeeze(0).squeeze(0).numpy()
-            count_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += 1
+            weight_crop = patch_weights[py0:py1, px0:px1]
+            pred_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += (
+                pred_crop.squeeze(0).squeeze(0).numpy() * weight_crop
+            )
+            count_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += weight_crop
 
     def accumulate_val(self, *, outputs, xyxys, dataloader_idx):
         if not self.enabled:
@@ -355,8 +392,8 @@ class StitchManager:
                             f"Invalid train stitch buffer shape for segment_id={segment_id!r}: "
                             f"{meta.get('buffer_shape')!r}"
                         )
-                    pred_buf = np.zeros((buf_h, buf_w), dtype=np.float16)
-                    count_buf = np.zeros((buf_h, buf_w), dtype=np.uint16)
+                    pred_buf = np.zeros((buf_h, buf_w), dtype=np.float32)
+                    count_buf = np.zeros((buf_h, buf_w), dtype=np.float32)
                     offset = meta.get("offset", (0, 0))
                     for batch in loader:
                         x, _y, xyxys, _g = batch
