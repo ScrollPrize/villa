@@ -5,6 +5,7 @@ import os.path as osp
 import numpy as np
 import random
 import cv2
+import torch
 import torch.nn.functional as F
 
 import albumentations as A
@@ -243,8 +244,8 @@ def read_image_mask(
     mask = mask[:target_h, :target_w]
     fragment_mask = fragment_mask[:target_h, :target_w]
 
-    mask = mask.astype('float32')
-    mask /= 255
+    if mask.dtype != np.uint8:
+        mask = np.clip(mask, 0, 255).astype(np.uint8, copy=False)
     if images.shape[0] != mask.shape[0] or images.shape[1] != mask.shape[1]:
         raise ValueError(f"{fragment_id}: label shape {mask.shape} does not match image shape {images.shape[:2]}")
     return images, mask, fragment_mask
@@ -663,8 +664,9 @@ def read_label_and_fragment_mask_for_shape(
             f"(image={(image_h, image_w)}, label={mask.shape}, mask={fragment_mask.shape})"
         )
 
-    mask = mask[:target_h, :target_w].astype("float32")
-    mask /= 255.0
+    mask = mask[:target_h, :target_w]
+    if mask.dtype != np.uint8:
+        mask = np.clip(mask, 0, 255).astype(np.uint8, copy=False)
     fragment_mask = fragment_mask[:target_h, :target_w]
     return mask, fragment_mask
 
@@ -709,6 +711,17 @@ def read_fragment_mask_for_shape(
     return fragment_mask[:target_h, :target_w]
 
 
+def _label_tile_is_empty(label_tile) -> bool:
+    tile = np.asarray(label_tile)
+    if tile.size == 0:
+        return True
+    if np.issubdtype(tile.dtype, np.floating):
+        return bool(np.all(tile < 0.01))
+    if np.issubdtype(tile.dtype, np.integer):
+        return bool(np.all(tile < 3))
+    return bool(np.all(tile.astype(np.float32, copy=False) < 0.01))
+
+
 def extract_patch_coordinates(
     mask,
     fragment_mask,
@@ -723,7 +736,9 @@ def extract_patch_coordinates(
 
     for a in y1_list:
         for b in x1_list:
-            if filter_empty_tile and mask is not None and np.all(mask[a:a + CFG.tile_size, b:b + CFG.tile_size] < 0.01):
+            if filter_empty_tile and mask is not None and _label_tile_is_empty(
+                mask[a:a + CFG.tile_size, b:b + CFG.tile_size]
+            ):
                 continue
             if np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
                 continue
@@ -741,6 +756,194 @@ def extract_patch_coordinates(
     if len(xyxys) == 0:
         return np.zeros((0, 4), dtype=np.int64)
     return np.asarray(xyxys, dtype=np.int64)
+
+
+def _component_bboxes(mask, *, connectivity=2):
+    mask_u8 = (np.asarray(mask) > 0).astype(np.uint8, copy=False)
+    if mask_u8.ndim != 2:
+        raise ValueError(f"expected 2D mask, got shape={tuple(mask_u8.shape)}")
+    if not bool(mask_u8.any()):
+        return np.zeros((0, 4), dtype=np.int32)
+
+    cc_conn = 4 if int(connectivity) == 1 else 8
+    n_all, _, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=cc_conn)
+    bboxes = []
+    for li in range(1, int(n_all)):
+        x = int(stats[li, cv2.CC_STAT_LEFT])
+        y = int(stats[li, cv2.CC_STAT_TOP])
+        w = int(stats[li, cv2.CC_STAT_WIDTH])
+        h = int(stats[li, cv2.CC_STAT_HEIGHT])
+        if w <= 0 or h <= 0:
+            continue
+        bboxes.append((y, y + h, x, x + w))
+    if len(bboxes) == 0:
+        return np.zeros((0, 4), dtype=np.int32)
+    bboxes.sort(key=lambda b: (int(b[0]), int(b[2]), int(b[1]), int(b[3])))
+    return np.asarray(bboxes, dtype=np.int32)
+
+
+def _build_mask_store_and_patch_index(
+    mask,
+    fragment_mask,
+    *,
+    filter_empty_tile,
+):
+    mask_u8 = np.asarray(mask)
+    if mask_u8.ndim != 2:
+        raise ValueError(f"expected 2D label mask, got shape={tuple(mask_u8.shape)}")
+    if mask_u8.dtype != np.uint8:
+        mask_u8 = np.clip(mask_u8, 0, 255).astype(np.uint8, copy=False)
+
+    fragment_mask = np.asarray(fragment_mask)
+    if fragment_mask.ndim != 2:
+        raise ValueError(f"expected 2D fragment mask, got shape={tuple(fragment_mask.shape)}")
+    if fragment_mask.shape != mask_u8.shape:
+        raise ValueError(
+            f"label/fragment mask shape mismatch: {tuple(mask_u8.shape)} vs {tuple(fragment_mask.shape)}"
+        )
+
+    bboxes = _component_bboxes(fragment_mask, connectivity=2)
+    if int(bboxes.shape[0]) == 0:
+        xyxys = extract_patch_coordinates(mask_u8, fragment_mask, filter_empty_tile=bool(filter_empty_tile))
+        bbox_idx = np.full((int(xyxys.shape[0]),), -1, dtype=np.int32)
+        return (
+            {"mode": "full", "shape": tuple(mask_u8.shape), "mask": mask_u8},
+            xyxys,
+            bbox_idx,
+        )
+
+    mask_crops = []
+    kept_bboxes = []
+    xy_chunks = []
+    bbox_chunks = []
+    seen_windows = set()
+    for y0, y1, x0, x1 in bboxes.tolist():
+        y0 = int(y0)
+        y1 = int(y1)
+        x0 = int(x0)
+        x1 = int(x1)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        mask_c = np.asarray(mask_u8[y0:y1, x0:x1], dtype=np.uint8).copy()
+        fragment_mask_c = fragment_mask[y0:y1, x0:x1]
+        xy_local = extract_patch_coordinates(mask_c, fragment_mask_c, filter_empty_tile=bool(filter_empty_tile))
+        if int(xy_local.shape[0]) == 0:
+            continue
+
+        xy_global_rows = []
+        for x1_l, y1_l, x2_l, y2_l in np.asarray(xy_local, dtype=np.int64).tolist():
+            gx1 = int(x1_l) + int(x0)
+            gy1 = int(y1_l) + int(y0)
+            gx2 = int(x2_l) + int(x0)
+            gy2 = int(y2_l) + int(y0)
+            key = (gx1, gy1, gx2, gy2)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            xy_global_rows.append([gx1, gy1, gx2, gy2])
+        if len(xy_global_rows) == 0:
+            continue
+
+        local_bbox_idx = int(len(mask_crops))
+        xy_global = np.asarray(xy_global_rows, dtype=np.int64)
+
+        mask_crops.append(mask_c)
+        kept_bboxes.append((int(y0), int(y1), int(x0), int(x1)))
+        xy_chunks.append(xy_global)
+        bbox_chunks.append(np.full((int(xy_global.shape[0]),), local_bbox_idx, dtype=np.int32))
+
+    if len(xy_chunks) == 0:
+        return (
+            {"mode": "full", "shape": tuple(mask_u8.shape), "mask": mask_u8},
+            np.zeros((0, 4), dtype=np.int64),
+            np.zeros((0,), dtype=np.int32),
+        )
+
+    xyxys = np.concatenate(xy_chunks, axis=0)
+    bbox_idx = np.concatenate(bbox_chunks, axis=0)
+    return (
+        {
+            "mode": "bboxes",
+            "shape": tuple(mask_u8.shape),
+            "bboxes": np.asarray(kept_bboxes, dtype=np.int32),
+            "mask_crops": mask_crops,
+        },
+        xyxys,
+        bbox_idx,
+    )
+
+
+def _mask_store_shape(mask_store):
+    if isinstance(mask_store, np.ndarray):
+        if mask_store.ndim < 2:
+            raise ValueError(f"expected at least 2D mask array, got shape={tuple(mask_store.shape)}")
+        return (int(mask_store.shape[0]), int(mask_store.shape[1]))
+    if isinstance(mask_store, dict):
+        shape = mask_store.get("shape")
+        if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+            raise ValueError("mask store missing valid 'shape'")
+        return int(shape[0]), int(shape[1])
+    raise TypeError(f"unsupported mask store type: {type(mask_store).__name__}")
+
+
+def _read_mask_patch(mask_store, *, y1, y2, x1, x2, bbox_index=None):
+    y1 = int(y1)
+    y2 = int(y2)
+    x1 = int(x1)
+    x2 = int(x2)
+    if y2 <= y1 or x2 <= x1:
+        raise ValueError(f"invalid patch coords: {(x1, y1, x2, y2)}")
+
+    if isinstance(mask_store, np.ndarray):
+        return np.asarray(mask_store[y1:y2, x1:x2])
+
+    if not isinstance(mask_store, dict):
+        raise TypeError(f"unsupported mask store type: {type(mask_store).__name__}")
+
+    mode = str(mask_store.get("mode", "full"))
+    if mode == "full":
+        if "mask" not in mask_store:
+            raise ValueError("mask store mode='full' is missing key 'mask'")
+        mask_arr = np.asarray(mask_store["mask"])
+        return np.asarray(mask_arr[y1:y2, x1:x2])
+
+    if mode != "bboxes":
+        raise ValueError(f"unsupported mask store mode: {mode!r}")
+
+    bboxes = np.asarray(mask_store.get("bboxes"))
+    mask_crops = list(mask_store.get("mask_crops", []))
+    if bboxes.ndim != 2 or bboxes.shape[1] != 4:
+        raise ValueError("mask store mode='bboxes' requires bboxes shape (N, 4)")
+    if int(bboxes.shape[0]) != int(len(mask_crops)):
+        raise ValueError("mask store mode='bboxes' requires matching bboxes and mask_crops lengths")
+
+    idx = None
+    if bbox_index is not None:
+        idx_i = int(bbox_index)
+        if idx_i >= 0:
+            idx = idx_i
+    if idx is None:
+        for i, bbox in enumerate(bboxes.tolist()):
+            by0, by1, bx0, bx1 = [int(v) for v in bbox]
+            if y1 >= by0 and y2 <= by1 and x1 >= bx0 and x2 <= bx1:
+                idx = int(i)
+                break
+    if idx is None:
+        raise ValueError(f"could not resolve bbox for patch coords {(x1, y1, x2, y2)}")
+    if idx < 0 or idx >= int(len(mask_crops)):
+        raise ValueError(f"bbox index out of range: {idx}")
+
+    by0, by1, bx0, bx1 = [int(v) for v in bboxes[idx].tolist()]
+    ly1 = int(y1 - by0)
+    ly2 = int(y2 - by0)
+    lx1 = int(x1 - bx0)
+    lx2 = int(x2 - bx0)
+    if ly1 < 0 or lx1 < 0 or ly2 > (by1 - by0) or lx2 > (bx1 - bx0):
+        raise ValueError(
+            f"patch {(x1, y1, x2, y2)} is out of bbox bounds {(bx0, by0, bx1, by1)}"
+        )
+    crop = np.asarray(mask_crops[idx])
+    return np.asarray(crop[ly1:ly2, lx1:lx2])
 
 
 def extract_patches_infer(image, fragment_mask, *, include_xyxys=True):
@@ -805,7 +1008,7 @@ def extract_patches(image, mask, fragment_mask, *, include_xyxys, filter_empty_t
 
     for a in y1_list:
         for b in x1_list:
-            if filter_empty_tile and np.all(mask[a:a + CFG.tile_size, b:b + CFG.tile_size] < 0.01):
+            if filter_empty_tile and _label_tile_is_empty(mask[a:a + CFG.tile_size, b:b + CFG.tile_size]):
                 continue
             if np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
                 continue
@@ -884,6 +1087,12 @@ def get_transforms(data, cfg):
 
 
 def _resize_label_for_loss(label, cfg):
+    if not torch.is_floating_point(label):
+        label = label.float()
+    else:
+        label = label.to(dtype=torch.float32)
+    if label.numel() > 0 and float(label.max().detach().item()) > 1.0:
+        label = label / 255.0
     return F.interpolate(label.unsqueeze(0), (cfg.size // 4, cfg.size // 4)).squeeze(0)
 
 
@@ -1026,15 +1235,25 @@ class CustomDatasetTest(Dataset):
         return image, xy
 
 
-def _flatten_segment_patch_index(xyxys_by_segment, groups_by_segment=None):
+def _flatten_segment_patch_index(
+    xyxys_by_segment,
+    groups_by_segment=None,
+    sample_bbox_indices_by_segment=None,
+):
     xyxys_by_segment = _require_dict(xyxys_by_segment, name="xyxys_by_segment")
     if groups_by_segment is not None:
         groups_by_segment = _require_dict(groups_by_segment, name="groups_by_segment")
+    if sample_bbox_indices_by_segment is not None:
+        sample_bbox_indices_by_segment = _require_dict(
+            sample_bbox_indices_by_segment,
+            name="sample_bbox_indices_by_segment",
+        )
 
     segment_ids = []
     seg_indices = []
     xy_chunks = []
     group_chunks = []
+    bbox_idx_chunks = []
 
     for segment_id, xyxys in xyxys_by_segment.items():
         xy = np.asarray(xyxys, dtype=np.int64)
@@ -1049,6 +1268,17 @@ def _flatten_segment_patch_index(xyxys_by_segment, groups_by_segment=None):
         segment_ids.append(str(segment_id))
         xy_chunks.append(xy)
         seg_indices.append(np.full((xy.shape[0],), seg_idx, dtype=np.int32))
+        if sample_bbox_indices_by_segment is not None:
+            seg_id_key = str(segment_id)
+            if seg_id_key not in sample_bbox_indices_by_segment:
+                raise KeyError(f"sample_bbox_indices_by_segment missing segment id: {seg_id_key!r}")
+            bbox_idx = np.asarray(sample_bbox_indices_by_segment[seg_id_key], dtype=np.int32).reshape(-1)
+            if bbox_idx.shape[0] != xy.shape[0]:
+                raise ValueError(
+                    f"{segment_id}: sample_bbox_indices length {bbox_idx.shape[0]} "
+                    f"does not match xyxys length {xy.shape[0]}"
+                )
+            bbox_idx_chunks.append(bbox_idx)
         if groups_by_segment is not None:
             seg_id_key = str(segment_id)
             if seg_id_key not in groups_by_segment:
@@ -1059,26 +1289,37 @@ def _flatten_segment_patch_index(xyxys_by_segment, groups_by_segment=None):
     if len(segment_ids) == 0:
         empty_xy = np.zeros((0, 4), dtype=np.int64)
         empty_seg = np.zeros((0,), dtype=np.int32)
+        empty_bbox_idx = np.zeros((0,), dtype=np.int32) if sample_bbox_indices_by_segment is not None else None
         if groups_by_segment is None:
-            return [], empty_seg, empty_xy, None
-        return [], empty_seg, empty_xy, np.zeros((0,), dtype=np.int64)
+            return [], empty_seg, empty_xy, None, empty_bbox_idx
+        return [], empty_seg, empty_xy, np.zeros((0,), dtype=np.int64), empty_bbox_idx
 
     flat_xy = np.concatenate(xy_chunks, axis=0)
     flat_seg = np.concatenate(seg_indices, axis=0)
+    flat_bbox_idx = None
+    if sample_bbox_indices_by_segment is not None:
+        flat_bbox_idx = np.concatenate(bbox_idx_chunks, axis=0)
     if groups_by_segment is None:
-        return segment_ids, flat_seg, flat_xy, None
+        return segment_ids, flat_seg, flat_xy, None, flat_bbox_idx
     flat_groups = np.concatenate(group_chunks, axis=0)
-    return segment_ids, flat_seg, flat_xy, flat_groups
+    return segment_ids, flat_seg, flat_xy, flat_groups, flat_bbox_idx
 
 
-def _init_flat_segment_index(xyxys_by_segment, groups_by_segment, dataset_name):
-    segment_ids, sample_segment_indices, sample_xyxys, sample_groups = _flatten_segment_patch_index(
+def _init_flat_segment_index(
+    xyxys_by_segment,
+    groups_by_segment,
+    dataset_name,
+    *,
+    sample_bbox_indices_by_segment=None,
+):
+    segment_ids, sample_segment_indices, sample_xyxys, sample_groups, sample_bbox_indices = _flatten_segment_patch_index(
         xyxys_by_segment,
         groups_by_segment,
+        sample_bbox_indices_by_segment=sample_bbox_indices_by_segment,
     )
     if sample_xyxys.shape[0] == 0:
         raise ValueError(f"{dataset_name} has no samples")
-    return segment_ids, sample_segment_indices, sample_xyxys, sample_groups
+    return segment_ids, sample_segment_indices, sample_xyxys, sample_groups, sample_bbox_indices
 
 
 def _validate_segment_data(segment_ids, volumes, masks=None):
@@ -1098,6 +1339,7 @@ class LazyZarrTrainDataset(Dataset):
         groups_by_segment,
         cfg,
         transform=None,
+        sample_bbox_indices_by_segment=None,
     ):
         self.volumes = dict(_require_dict(volumes_by_segment, name="volumes_by_segment"))
         self.masks = dict(_require_dict(masks_by_segment, name="masks_by_segment"))
@@ -1110,7 +1352,13 @@ class LazyZarrTrainDataset(Dataset):
             self.sample_segment_indices,
             self.sample_xyxys,
             self.sample_groups,
-        ) = _init_flat_segment_index(xyxys_by_segment, groups_by_segment, "LazyZarrTrainDataset")
+            self.sample_bbox_indices,
+        ) = _init_flat_segment_index(
+            xyxys_by_segment,
+            groups_by_segment,
+            "LazyZarrTrainDataset",
+            sample_bbox_indices_by_segment=sample_bbox_indices_by_segment,
+        )
         _validate_segment_data(self.segment_ids, self.volumes, self.masks)
 
     def __len__(self):
@@ -1122,9 +1370,10 @@ class LazyZarrTrainDataset(Dataset):
         segment_id = self.segment_ids[seg_idx]
         x1, y1, x2, y2 = _xy_to_bounds(self.sample_xyxys[idx])
         group_id = int(self.sample_groups[idx])
+        bbox_idx = int(self.sample_bbox_indices[idx]) if self.sample_bbox_indices is not None else None
 
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
-        label = self.masks[segment_id][y1:y2, x1:x2, None]
+        label = _read_mask_patch(self.masks[segment_id], y1=y1, y2=y2, x1=x1, x2=x2, bbox_index=bbox_idx)[..., None]
         image = _maybe_fourth_augment(image, self.cfg)
         image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
 
@@ -1140,6 +1389,7 @@ class LazyZarrXyLabelDataset(Dataset):
         groups_by_segment,
         cfg,
         transform=None,
+        sample_bbox_indices_by_segment=None,
     ):
         self.volumes = dict(_require_dict(volumes_by_segment, name="volumes_by_segment"))
         self.masks = dict(_require_dict(masks_by_segment, name="masks_by_segment"))
@@ -1150,7 +1400,13 @@ class LazyZarrXyLabelDataset(Dataset):
             self.sample_segment_indices,
             self.sample_xyxys,
             self.sample_groups,
-        ) = _init_flat_segment_index(xyxys_by_segment, groups_by_segment, "LazyZarrXyLabelDataset")
+            self.sample_bbox_indices,
+        ) = _init_flat_segment_index(
+            xyxys_by_segment,
+            groups_by_segment,
+            "LazyZarrXyLabelDataset",
+            sample_bbox_indices_by_segment=sample_bbox_indices_by_segment,
+        )
         _validate_segment_data(self.segment_ids, self.volumes, self.masks)
 
     def __len__(self):
@@ -1163,9 +1419,10 @@ class LazyZarrXyLabelDataset(Dataset):
         xy = self.sample_xyxys[idx]
         x1, y1, x2, y2 = _xy_to_bounds(xy)
         group_id = int(self.sample_groups[idx])
+        bbox_idx = int(self.sample_bbox_indices[idx]) if self.sample_bbox_indices is not None else None
 
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
-        label = self.masks[segment_id][y1:y2, x1:x2, None]
+        label = _read_mask_patch(self.masks[segment_id], y1=y1, y2=y2, x1=x1, x2=x2, bbox_index=bbox_idx)[..., None]
         image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
         return image, label, xy, group_id
 
@@ -1186,7 +1443,13 @@ class LazyZarrXyOnlyDataset(Dataset):
             self.sample_segment_indices,
             self.sample_xyxys,
             _,
-        ) = _init_flat_segment_index(xyxys_by_segment, groups_by_segment=None, dataset_name="LazyZarrXyOnlyDataset")
+            _,
+        ) = _init_flat_segment_index(
+            xyxys_by_segment,
+            groups_by_segment=None,
+            dataset_name="LazyZarrXyOnlyDataset",
+            sample_bbox_indices_by_segment=None,
+        )
         _validate_segment_data(self.segment_ids, self.volumes)
 
     def __len__(self):

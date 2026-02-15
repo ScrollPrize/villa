@@ -26,9 +26,11 @@ from train_resnet3d_lib.data_ops import (
     LazyZarrTrainDataset,
     LazyZarrXyLabelDataset,
     LazyZarrXyOnlyDataset,
+    _build_mask_store_and_patch_index,
     _mask_border,
     _downsample_bool_mask_any,
     _mask_bbox_downsample,
+    _mask_store_shape,
 )
 
 
@@ -333,6 +335,7 @@ def build_train_loader_lazy(
     train_volumes_by_segment,
     train_masks_by_segment,
     train_xyxys_by_segment,
+    train_sample_bbox_indices_by_segment,
     train_groups_by_segment,
     group_names,
     *,
@@ -345,6 +348,7 @@ def build_train_loader_lazy(
         train_groups_by_segment,
         CFG,
         transform=train_transform,
+        sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
     )
     train_groups = [int(x) for x in train_dataset.sample_groups.tolist()]
     return _build_train_loader_from_dataset(train_dataset, train_groups, group_names)
@@ -445,6 +449,7 @@ def build_train_stitch_loaders_lazy(
     train_volumes_by_segment,
     train_masks_by_segment,
     train_xyxys_by_segment,
+    train_sample_bbox_indices_by_segment,
     train_groups_by_segment,
     stitch_segment_id,
     *,
@@ -469,6 +474,9 @@ def build_train_stitch_loaders_lazy(
             continue
         if sid not in train_volumes_by_segment or sid not in train_masks_by_segment:
             continue
+        bbox_idx = train_sample_bbox_indices_by_segment.get(sid)
+        if bbox_idx is None:
+            bbox_idx = np.full((int(len(xy)),), -1, dtype=np.int32)
 
         dataset = LazyZarrXyLabelDataset(
             {sid: train_volumes_by_segment[sid]},
@@ -477,6 +485,7 @@ def build_train_stitch_loaders_lazy(
             {sid: int(train_groups_by_segment.get(sid, 0))},
             CFG,
             transform=valid_transform,
+            sample_bbox_indices_by_segment={sid: bbox_idx},
         )
         loader = DataLoader(
             dataset,
@@ -487,7 +496,7 @@ def build_train_stitch_loaders_lazy(
             drop_last=False,
         )
         train_stitch_loaders.append(loader)
-        train_stitch_shapes.append(tuple(train_masks_by_segment[sid].shape))
+        train_stitch_shapes.append(tuple(_mask_store_shape(train_masks_by_segment[sid])))
         train_stitch_segment_ids.append(sid)
 
     return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
@@ -665,6 +674,7 @@ def build_datasets(run_state):
         train_volumes_by_segment = {}
         train_masks_by_segment = {}
         train_xyxys_by_segment = {}
+        train_sample_bbox_indices_by_segment = {}
 
         val_loaders = []
         val_stitch_shapes = []
@@ -709,7 +719,11 @@ def build_datasets(run_state):
                 mask_suffix=train_mask_suffix,
                 is_frag=("frag" in sid),
             )
-            xyxys = extract_patch_coordinates(mask, fragment_mask, filter_empty_tile=True)
+            mask_store, xyxys, sample_bbox_indices = _build_mask_store_and_patch_index(
+                mask,
+                fragment_mask,
+                filter_empty_tile=True,
+            )
             patch_count = int(len(xyxys))
             train_patch_counts_by_segment[fragment_id] = patch_count
             log(
@@ -719,8 +733,9 @@ def build_datasets(run_state):
 
             if patch_count > 0:
                 train_volumes_by_segment[sid] = volume
-                train_masks_by_segment[sid] = mask
+                train_masks_by_segment[sid] = mask_store
                 train_xyxys_by_segment[sid] = xyxys
+                train_sample_bbox_indices_by_segment[sid] = sample_bbox_indices
 
             if include_train_xyxys:
                 train_mask_borders[sid] = _mask_border(
@@ -760,7 +775,11 @@ def build_datasets(run_state):
                 mask_suffix=val_mask_suffix,
                 is_frag=("frag" in sid),
             )
-            val_xyxys = extract_patch_coordinates(mask_val, fragment_mask_val, filter_empty_tile=False)
+            mask_store_val, val_xyxys, val_sample_bbox_indices = _build_mask_store_and_patch_index(
+                mask_val,
+                fragment_mask_val,
+                filter_empty_tile=False,
+            )
             patch_count = int(len(val_xyxys))
             val_patch_counts_by_segment[fragment_id] = patch_count
             log(
@@ -772,11 +791,12 @@ def build_datasets(run_state):
 
             val_dataset = LazyZarrXyLabelDataset(
                 {sid: volume},
-                {sid: mask_val},
+                {sid: mask_store_val},
                 {sid: val_xyxys},
                 {sid: group_idx},
                 CFG,
                 transform=valid_transform,
+                sample_bbox_indices_by_segment={sid: val_sample_bbox_indices},
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -787,7 +807,8 @@ def build_datasets(run_state):
                 drop_last=False,
             )
             val_loaders.append(val_loader)
-            val_stitch_shapes.append(tuple(mask_val.shape))
+            mask_val_shape = tuple(_mask_store_shape(mask_store_val))
+            val_stitch_shapes.append(mask_val_shape)
             val_stitch_segment_ids.append(fragment_id)
 
             if include_train_xyxys:
@@ -801,7 +822,7 @@ def build_datasets(run_state):
 
             if fragment_id == CFG.valid_id:
                 stitch_val_dataloader_idx = len(val_loaders) - 1
-                stitch_pred_shape = tuple(mask_val.shape)
+                stitch_pred_shape = mask_val_shape
                 stitch_segment_id = fragment_id
 
         summarize_patch_counts(
@@ -830,6 +851,7 @@ def build_datasets(run_state):
             train_volumes_by_segment,
             train_masks_by_segment,
             train_xyxys_by_segment,
+            train_sample_bbox_indices_by_segment,
             train_groups_by_segment,
             group_names,
             train_transform=train_transform,
@@ -841,6 +863,7 @@ def build_datasets(run_state):
             train_volumes_by_segment,
             train_masks_by_segment,
             train_xyxys_by_segment,
+            train_sample_bbox_indices_by_segment,
             train_groups_by_segment,
             stitch_segment_id,
             valid_transform=valid_transform,

@@ -119,6 +119,85 @@ def _crop_to_mask_bbox(
     return pred_c, gt_c, mask_c, (y0, y1, x0, x1)
 
 
+def _bboxes_overlap(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
+    ay0, ay1, ax0, ax1 = [int(v) for v in a]
+    by0, by1, bx0, bx1 = [int(v) for v in b]
+    return (ay0 < by1) and (ay1 > by0) and (ax0 < bx1) and (ax1 > bx0)
+
+
+def _bbox_union(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    ay0, ay1, ax0, ax1 = [int(v) for v in a]
+    by0, by1, bx0, bx1 = [int(v) for v in b]
+    return (
+        int(min(ay0, by0)),
+        int(max(ay1, by1)),
+        int(min(ax0, bx0)),
+        int(max(ax1, bx1)),
+    )
+
+
+def _merge_overlapping_bboxes(bboxes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+    merged = [(int(y0), int(y1), int(x0), int(x1)) for (y0, y1, x0, x1) in bboxes]
+    merged = [b for b in merged if (b[1] > b[0]) and (b[3] > b[2])]
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        out: List[Tuple[int, int, int, int]] = []
+        for bbox in merged:
+            placed = False
+            for i, existing in enumerate(out):
+                if _bboxes_overlap(bbox, existing):
+                    out[i] = _bbox_union(bbox, existing)
+                    changed = True
+                    placed = True
+                    break
+            if not placed:
+                out.append(bbox)
+        merged = out
+    merged.sort(key=lambda b: (b[0], b[2], b[1], b[3]))
+    return merged
+
+
+def _eval_mask_bboxes(
+    eval_mask: np.ndarray,
+    *,
+    connectivity: int = 2,
+    pad: int = 0,
+) -> List[Tuple[int, int, int, int]]:
+    """Split an eval mask into non-overlapping crop bboxes.
+
+    Returns a list of (y0, y1, x0, x1) in pred-space coordinates.
+    """
+    import cv2
+
+    eval_mask = _as_bool_2d(eval_mask)
+    if not eval_mask.any():
+        return []
+    H, W = eval_mask.shape
+    pad_i = max(0, int(pad))
+    cc_conn = 4 if int(connectivity) == 1 else 8
+    n_all, _, stats, _ = cv2.connectedComponentsWithStats(
+        eval_mask.astype(np.uint8, copy=False),
+        connectivity=cc_conn,
+    )
+    bboxes: List[Tuple[int, int, int, int]] = []
+    for li in range(1, int(n_all)):
+        x = int(stats[li, cv2.CC_STAT_LEFT])
+        y = int(stats[li, cv2.CC_STAT_TOP])
+        w = int(stats[li, cv2.CC_STAT_WIDTH])
+        h = int(stats[li, cv2.CC_STAT_HEIGHT])
+        if w <= 0 or h <= 0:
+            continue
+        y0 = max(0, y - pad_i)
+        y1 = min(H, y + h + pad_i)
+        x0 = max(0, x - pad_i)
+        x1 = min(W, x + w + pad_i)
+        bboxes.append((int(y0), int(y1), int(x0), int(x1)))
+    if not bboxes:
+        return []
+    return _merge_overlapping_bboxes(bboxes)
+
+
 def _bool_mask_digest(mask: np.ndarray) -> str:
     mask = _as_bool_2d(mask)
     packed = np.packbits(mask, axis=None)
@@ -238,7 +317,9 @@ def _normalize_component_min_area(component_min_area: Any) -> int:
             return 0
         value = int(text)
     area = int(value)
-    if area <= 0:
+    if area < 0:
+        raise ValueError(f"component_min_area must be >= 0, got {component_min_area!r}")
+    if area == 0:
         return 0
     return area
 
@@ -445,9 +526,8 @@ def _build_components_manifest(
     full_off_y: int,
     full_off_x: int,
     enable_skeleton_metrics: bool = True,
-) -> Tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+) -> List[Dict[str, Any]]:
     components_manifest: List[Dict[str, Any]] = []
-    rows_by_id: Dict[int, Dict[str, Any]] = {}
     for row in component_rows:
         bbox = [int(v) for v in row["bbox"]]
         bbox_full = [
@@ -489,119 +569,7 @@ def _build_components_manifest(
                 }
             )
         components_manifest.append(entry)
-        rows_by_id[entry["component_id"]] = row
-    return components_manifest, rows_by_id
-
-
-def _write_component_outputs(
-    *,
-    component_output_dir: str,
-    fragment_id: str,
-    downsample: int,
-    threshold: float,
-    gt_lab: np.ndarray,
-    pred_lab: np.ndarray,
-    pred_full_shape: Tuple[int, int],
-    roi_offset: Tuple[int, int],
-    crop_offset: Tuple[int, int],
-    full_offset: Tuple[int, int],
-    component_worst_k: Optional[int],
-    component_worst_q: Optional[float],
-    metric_specs: Tuple[Tuple[str, bool], ...],
-    components_manifest: List[Dict[str, Any]],
-    component_metric_rankings: Dict[str, Dict[str, Any]],
-    save_component_debug_images: bool,
-    component_debug_max_items: Optional[int],
-    rows_by_id: Dict[int, Dict[str, Any]],
-    pred_prob_clean: np.ndarray,
-    pred_bin_clean: np.ndarray,
-    gt_bin: np.ndarray,
-) -> None:
-    import json as _json
-    from PIL import Image
-
-    os.makedirs(component_output_dir, exist_ok=True)
-    safe_seg = str(fragment_id).replace("/", "_")
-    thr_tag = _threshold_tag(float(threshold))
-    base_name = f"components_{safe_seg}_ds{int(downsample)}"
-    threshold_base_name = f"{base_name}_thr_{thr_tag}"
-    gt_path = osp.join(component_output_dir, f"{base_name}_gt_labels.png")
-    pred_path = osp.join(component_output_dir, f"{threshold_base_name}_pred_labels.png")
-    meta_path = osp.join(component_output_dir, f"{threshold_base_name}_meta.json")
-    manifest_path = osp.join(component_output_dir, f"{threshold_base_name}_manifest.json")
-
-    if not osp.exists(gt_path):
-        gt_u16 = gt_lab.astype(np.uint16, copy=False)
-        Image.fromarray(gt_u16, mode="I;16").save(gt_path)
-    if not (osp.exists(pred_path) and osp.exists(meta_path)):
-        pred_u16 = pred_lab.astype(np.uint16, copy=False)
-        Image.fromarray(pred_u16, mode="I;16").save(pred_path)
-
-    off_y, off_x = [int(v) for v in roi_offset]
-    crop_off_y, crop_off_x = [int(v) for v in crop_offset]
-    full_off_y, full_off_x = [int(v) for v in full_offset]
-    meta = {
-        "segment_id": str(fragment_id),
-        "downsample": int(downsample),
-        "threshold": float(threshold),
-        "roi_offset": [off_y, off_x],
-        "crop_offset": [crop_off_y, crop_off_x],
-        "full_offset": [full_off_y, full_off_x],
-        "full_shape": [int(pred_full_shape[0]), int(pred_full_shape[1])],
-        "crop_shape": [int(gt_lab.shape[0]), int(gt_lab.shape[1])],
-    }
-    with open(meta_path, "w") as f:
-        _json.dump(meta, f, indent=2)
-
-    manifest = {
-        "segment_id": str(fragment_id),
-        "downsample": int(downsample),
-        "threshold": float(threshold),
-        "roi_offset": [off_y, off_x],
-        "crop_offset": [crop_off_y, crop_off_x],
-        "full_offset": [full_off_y, full_off_x],
-        "full_shape": [int(pred_full_shape[0]), int(pred_full_shape[1])],
-        "crop_shape": [int(gt_lab.shape[0]), int(gt_lab.shape[1])],
-        "worst_k": None if component_worst_k is None else int(component_worst_k),
-        "worst_q": None if component_worst_q is None else float(component_worst_q),
-        "components": components_manifest,
-        "rankings": component_metric_rankings,
-    }
-    with open(manifest_path, "w") as f:
-        _json.dump(manifest, f, indent=2)
-
-    if not save_component_debug_images:
-        return
-
-    selected_component_ids: List[int] = []
-    for metric_name, _ in metric_specs:
-        selected_component_ids.extend(component_metric_rankings[metric_name]["worst_k_component_ids"])
-        selected_component_ids.extend(component_metric_rankings[metric_name]["worst_q_component_ids"])
-    selected_component_ids = sorted(set(int(v) for v in selected_component_ids))
-    if not selected_component_ids:
-        raise ValueError("save_component_debug_images requires component_worst_k or component_worst_q to be set")
-    if component_debug_max_items is not None:
-        max_items = max(1, int(component_debug_max_items))
-        selected_component_ids = selected_component_ids[:max_items]
-
-    debug_dir = osp.join(component_output_dir, f"{threshold_base_name}_debug")
-    os.makedirs(debug_dir, exist_ok=True)
-    for component_id in selected_component_ids:
-        if component_id not in rows_by_id:
-            raise KeyError(f"component_id={component_id} missing from component rows")
-        row = rows_by_id[component_id]
-        bbox = [int(v) for v in row["bbox"]]
-        by0, by1, bx0, bx1 = bbox
-        crop_pred_prob = pred_prob_clean[by0:by1, bx0:bx1]
-        crop_pred_bin = pred_bin_clean[by0:by1, bx0:bx1]
-        crop_gt = gt_bin[by0:by1, bx0:bx1]
-
-        cid = f"{int(component_id):05d}"
-        Image.fromarray((np.clip(crop_pred_prob, 0.0, 1.0) * 255.0).astype(np.uint8)).save(
-            osp.join(debug_dir, f"comp_{cid}_pred_prob.png")
-        )
-        Image.fromarray((crop_pred_bin.astype(np.uint8) * 255)).save(osp.join(debug_dir, f"comp_{cid}_pred_bin.png"))
-        Image.fromarray((crop_gt.astype(np.uint8) * 255)).save(osp.join(debug_dir, f"comp_{cid}_gt_bin.png"))
+    return components_manifest
 
 
 def _save_stitched_eval_inputs(
@@ -826,10 +794,7 @@ def compute_stitched_metrics(
     enable_skeleton_metrics: bool = True,
     enable_full_region_metrics: bool = False,
     threshold_grid: Optional[np.ndarray] = None,
-    component_output_dir: Optional[str] = None,
     stitched_inputs_output_dir: Optional[str] = None,
-    save_component_debug_images: bool = False,
-    component_debug_max_items: Optional[int] = None,
     gt_cache_max: Optional[int] = None,
     component_rows_collector: Optional[List[Dict[str, Any]]] = None,
     eval_epoch: Optional[int] = None,
@@ -839,9 +804,16 @@ def compute_stitched_metrics(
     pred_has = _as_bool_2d(pred_has)
     if pred_prob.shape != pred_has.shape:
         raise ValueError(f"pred_prob/pred_has shape mismatch: {pred_prob.shape} vs {pred_has.shape}")
+    threshold_f = float(threshold)
+    if not np.isfinite(threshold_f):
+        raise ValueError(f"threshold must be finite, got {threshold!r}")
+    if threshold_f < 0.0 or threshold_f > 1.0:
+        raise ValueError(f"threshold must be in [0, 1], got {threshold_f}")
     if gt_cache_max is not None:
         _gt_cache_set_max(gt_cache_max)
     pred_full_shape = tuple(pred_prob.shape)
+    pred_prob_full = pred_prob
+    pred_has_full = pred_has
 
     timings: Dict[str, float] = {}
     wall_t0 = time.perf_counter()
@@ -853,12 +825,12 @@ def compute_stitched_metrics(
     pad_i = max(0, int(component_pad))
     component_min_area_i = _normalize_component_min_area(component_min_area)
     enable_skeleton_metrics = bool(enable_skeleton_metrics)
-    metric_specs = component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics)
     roi_key = (0, 0)
     if roi_offset is not None:
         roi_key = (int(roi_offset[0]), int(roi_offset[1]))
     dataset_root = _dataset_root_from_cfg()
     pred_has_digest = _bool_mask_digest(pred_has)
+    enable_multi_crops = bool(not enable_full_region_metrics)
     cache_key = (
         str(dataset_root),
         seg,
@@ -871,40 +843,45 @@ def compute_stitched_metrics(
         int(betti_connectivity),
         bool(enable_skeleton_metrics),
         str(skeleton_method) if enable_skeleton_metrics else "__disabled__",
+        int(pad_i),
+        bool(enable_multi_crops),
     )
     cache = _gt_cache_get(cache_key)
     if cache is not None:
         cache_hit = True
         cache_entry = cache
-        gt_bin = cache_entry["gt_bin"]
-        eval_mask = cache_entry["eval_mask"]
-        gt_lab = cache_entry["gt_lab"]
-        n_gt = cache_entry["n_gt"]
-        gt_beta0 = int(cache_entry["gt_beta0"])
-        gt_beta1 = int(cache_entry["gt_beta1"])
-        skel_gt = cache_entry.get("skel_gt")
-        if enable_skeleton_metrics and skel_gt is None:
-            raise ValueError("cached entry missing skel_gt while enable_skeleton_metrics is True")
-        y0, y1, x0, x1 = cache_entry["crop"]
-        pred_full_shape = tuple(cache_entry.get("full_shape", pred_full_shape))
-        pred_prob = pred_prob[y0:y1, x0:x1]
-        pred_has = pred_has[y0:y1, x0:x1]
-        if "gt_component_templates" not in cache_entry:
-            cache_entry["gt_component_templates"] = None
-        if "gt_component_pad" not in cache_entry:
-            cache_entry["gt_component_pad"] = None
-        if "pfm_weight_recall_full" not in cache_entry:
-            cache_entry["pfm_weight_recall_full"] = None
-        if "pfm_weight_precision_full" not in cache_entry:
-            cache_entry["pfm_weight_precision_full"] = None
-        if "gt_contour_full" not in cache_entry:
-            cache_entry["gt_contour_full"] = None
-        cached_component_pad = cache_entry["gt_component_pad"]
-        if cached_component_pad is not None and int(cached_component_pad) != pad_i:
-            raise ValueError(
-                f"component_pad changed for cached segment={seg}: "
-                f"cached={int(cached_component_pad)} current={int(pad_i)}"
-            )
+        if isinstance(cache_entry, dict) and str(cache_entry.get("mode", "")) == "multi":
+            pred_full_shape = tuple(cache_entry.get("full_shape", pred_full_shape))
+        else:
+            gt_bin = cache_entry["gt_bin"]
+            eval_mask = cache_entry["eval_mask"]
+            gt_lab = cache_entry["gt_lab"]
+            n_gt = cache_entry["n_gt"]
+            gt_beta0 = int(cache_entry["gt_beta0"])
+            gt_beta1 = int(cache_entry["gt_beta1"])
+            skel_gt = cache_entry.get("skel_gt")
+            if enable_skeleton_metrics and skel_gt is None:
+                raise ValueError("cached entry missing skel_gt while enable_skeleton_metrics is True")
+            y0, y1, x0, x1 = cache_entry["crop"]
+            pred_full_shape = tuple(cache_entry.get("full_shape", pred_full_shape))
+            pred_prob = pred_prob[y0:y1, x0:x1]
+            pred_has = pred_has[y0:y1, x0:x1]
+            if "gt_component_templates" not in cache_entry:
+                cache_entry["gt_component_templates"] = None
+            if "gt_component_pad" not in cache_entry:
+                cache_entry["gt_component_pad"] = None
+            if "pfm_weight_recall_full" not in cache_entry:
+                cache_entry["pfm_weight_recall_full"] = None
+            if "pfm_weight_precision_full" not in cache_entry:
+                cache_entry["pfm_weight_precision_full"] = None
+            if "gt_contour_full" not in cache_entry:
+                cache_entry["gt_contour_full"] = None
+            cached_component_pad = cache_entry["gt_component_pad"]
+            if cached_component_pad is not None and int(cached_component_pad) != pad_i:
+                raise ValueError(
+                    f"component_pad changed for cached segment={seg}: "
+                    f"cached={int(cached_component_pad)} current={int(pad_i)}"
+                )
     else:
         cache_hit = False
         t0 = time.perf_counter()
@@ -933,59 +910,451 @@ def compute_stitched_metrics(
                 pred_has_count=int(pred_has.sum()),
             )
             return {}
-        t1 = time.perf_counter()
-        pred_prob, gt_bin, eval_mask, crop = _prepare_eval_crop(
-            pred_prob=pred_prob,
-            pred_has=pred_has,
-            gt_bin=gt_bin_ds,
-            valid=valid,
-        )
-        load_gt_timings["prepare_eval_crop"] = load_gt_timings.get("prepare_eval_crop", 0.0) + (
-            time.perf_counter() - t1
-        )
-        y0, y1, x0, x1 = crop
-        pred_has = pred_has[y0:y1, x0:x1]
-
-        t1 = time.perf_counter()
-        gt_lab, n_gt = _label_components(gt_bin, connectivity=betti_connectivity)
-        load_gt_timings["gt_label_components"] = load_gt_timings.get("gt_label_components", 0.0) + (
-            time.perf_counter() - t1
-        )
-        gt_beta0 = int(n_gt)
-        t1 = time.perf_counter()
-        gt_beta1 = _count_holes_2d(gt_bin, connectivity=betti_connectivity)
-        load_gt_timings["gt_holes"] = load_gt_timings.get("gt_holes", 0.0) + (time.perf_counter() - t1)
-        skel_gt: Optional[np.ndarray] = None
-        if enable_skeleton_metrics:
-            t1 = time.perf_counter()
-            skel_gt = skeletonize_binary(
-                gt_bin,
-                cc_labels=gt_lab,
-                skeleton_method=skeleton_method,
+        crop_bboxes: Optional[List[Tuple[int, int, int, int]]] = None
+        if enable_multi_crops:
+            t_bboxes = time.perf_counter()
+            crop_bboxes = _eval_mask_bboxes(eval_mask_full, connectivity=betti_connectivity, pad=pad_i)
+            load_gt_timings["eval_mask_bboxes"] = load_gt_timings.get("eval_mask_bboxes", 0.0) + (
+                time.perf_counter() - t_bboxes
             )
-            load_gt_timings["gt_skeleton"] = load_gt_timings.get("gt_skeleton", 0.0) + (time.perf_counter() - t1)
-        cache_entry = {
-            "gt_bin": gt_bin,
-            "eval_mask": eval_mask,
-            "gt_lab": gt_lab,
-            "n_gt": n_gt,
-            "gt_beta0": int(gt_beta0),
-            "gt_beta1": int(gt_beta1),
-            "skel_gt": skel_gt,
-            "crop": (int(y0), int(y1), int(x0), int(x1)),
-            "full_shape": pred_full_shape,
-            "gt_component_templates": None,
-            "gt_component_pad": None,
-            "pfm_weight_recall_full": None,
-            "pfm_weight_precision_full": None,
-            "gt_contour_full": None,
-        }
-        t1 = time.perf_counter()
-        _gt_cache_put(cache_key, cache_entry)
-        load_gt_timings["cache_put"] = load_gt_timings.get("cache_put", 0.0) + (time.perf_counter() - t1)
-        _timeit("load_gt", t0)
-        for key, value in load_gt_timings.items():
-            timings[f"load_gt/{key}"] = timings.get(f"load_gt/{key}", 0.0) + float(value)
+        if crop_bboxes is not None and len(crop_bboxes) > 1:
+            t_build = time.perf_counter()
+            crop_entries: List[Dict[str, Any]] = []
+            component_id_offset = 0
+            for y0, y1, x0, x1 in crop_bboxes:
+                crop_eval = eval_mask_full[int(y0) : int(y1), int(x0) : int(x1)].copy()
+                crop_gt = gt_bin_ds[int(y0) : int(y1), int(x0) : int(x1)].copy()
+                if crop_eval.shape != crop_gt.shape:
+                    raise ValueError("internal error: multi-crop shapes mismatch")
+                crop_gt[~crop_eval] = False
+
+                gt_lab_c, n_gt_c = _label_components(crop_gt, connectivity=betti_connectivity)
+                gt_beta0_c = int(n_gt_c)
+                gt_beta1_c = _count_holes_2d(crop_gt, connectivity=betti_connectivity)
+                skel_gt_c: Optional[np.ndarray] = None
+                if enable_skeleton_metrics:
+                    skel_gt_c = skeletonize_binary(
+                        crop_gt,
+                        cc_labels=gt_lab_c,
+                        skeleton_method=skeleton_method,
+                    )
+
+                crop_entries.append(
+                    {
+                        "gt_bin": crop_gt,
+                        "eval_mask": crop_eval,
+                        "gt_lab": gt_lab_c,
+                        "n_gt": int(n_gt_c),
+                        "gt_beta0": int(gt_beta0_c),
+                        "gt_beta1": int(gt_beta1_c),
+                        "skel_gt": skel_gt_c,
+                        "crop": (int(y0), int(y1), int(x0), int(x1)),
+                        "component_id_offset": int(component_id_offset),
+                        "gt_component_templates": None,
+                        "gt_component_pad": None,
+                        "pfm_weight_recall_full": None,
+                        "pfm_weight_precision_full": None,
+                        "gt_contour_full": None,
+                    }
+                )
+                component_id_offset += int(n_gt_c)
+
+            load_gt_timings["multi_crop_build"] = load_gt_timings.get("multi_crop_build", 0.0) + (
+                time.perf_counter() - t_build
+            )
+            cache_entry = {
+                "mode": "multi",
+                "full_shape": pred_full_shape,
+                "crops": crop_entries,
+            }
+            t1 = time.perf_counter()
+            _gt_cache_put(cache_key, cache_entry)
+            load_gt_timings["cache_put"] = load_gt_timings.get("cache_put", 0.0) + (time.perf_counter() - t1)
+            _timeit("load_gt", t0)
+            for key, value in load_gt_timings.items():
+                timings[f"load_gt/{key}"] = timings.get(f"load_gt/{key}", 0.0) + float(value)
+        else:
+            t1 = time.perf_counter()
+            pred_prob, gt_bin, eval_mask, crop = _prepare_eval_crop(
+                pred_prob=pred_prob,
+                pred_has=pred_has,
+                gt_bin=gt_bin_ds,
+                valid=valid,
+            )
+            load_gt_timings["prepare_eval_crop"] = load_gt_timings.get("prepare_eval_crop", 0.0) + (
+                time.perf_counter() - t1
+            )
+            y0, y1, x0, x1 = crop
+            pred_has = pred_has[y0:y1, x0:x1]
+
+            t1 = time.perf_counter()
+            gt_lab, n_gt = _label_components(gt_bin, connectivity=betti_connectivity)
+            load_gt_timings["gt_label_components"] = load_gt_timings.get("gt_label_components", 0.0) + (
+                time.perf_counter() - t1
+            )
+            gt_beta0 = int(n_gt)
+            t1 = time.perf_counter()
+            gt_beta1 = _count_holes_2d(gt_bin, connectivity=betti_connectivity)
+            load_gt_timings["gt_holes"] = load_gt_timings.get("gt_holes", 0.0) + (time.perf_counter() - t1)
+            skel_gt: Optional[np.ndarray] = None
+            if enable_skeleton_metrics:
+                t1 = time.perf_counter()
+                skel_gt = skeletonize_binary(
+                    gt_bin,
+                    cc_labels=gt_lab,
+                    skeleton_method=skeleton_method,
+                )
+                load_gt_timings["gt_skeleton"] = load_gt_timings.get("gt_skeleton", 0.0) + (
+                    time.perf_counter() - t1
+                )
+            cache_entry = {
+                "gt_bin": gt_bin,
+                "eval_mask": eval_mask,
+                "gt_lab": gt_lab,
+                "n_gt": n_gt,
+                "gt_beta0": int(gt_beta0),
+                "gt_beta1": int(gt_beta1),
+                "skel_gt": skel_gt,
+                "crop": (int(y0), int(y1), int(x0), int(x1)),
+                "full_shape": pred_full_shape,
+                "gt_component_templates": None,
+                "gt_component_pad": None,
+                "pfm_weight_recall_full": None,
+                "pfm_weight_precision_full": None,
+                "gt_contour_full": None,
+            }
+            t1 = time.perf_counter()
+            _gt_cache_put(cache_key, cache_entry)
+            load_gt_timings["cache_put"] = load_gt_timings.get("cache_put", 0.0) + (time.perf_counter() - t1)
+            _timeit("load_gt", t0)
+            for key, value in load_gt_timings.items():
+                timings[f"load_gt/{key}"] = timings.get(f"load_gt/{key}", 0.0) + float(value)
+
+    if isinstance(cache_entry, dict) and str(cache_entry.get("mode", "")) == "multi":
+        crop_entries_raw = cache_entry.get("crops")
+        if not isinstance(crop_entries_raw, list) or not crop_entries_raw:
+            raise ValueError(f"cached multi-crop entry missing crops for segment={seg}")
+        crop_entries: List[Dict[str, Any]] = [c for c in crop_entries_raw if isinstance(c, dict)]
+
+        def _crop_sort_key(entry: Dict[str, Any]) -> Tuple[int, int, int, int]:
+            y0, y1, x0, x1 = [int(v) for v in entry.get("crop", (0, 0, 0, 0))]
+            return int(y0), int(x0), int(y1), int(x1)
+
+        crop_entries.sort(key=_crop_sort_key)
+
+        if enable_full_region_metrics:
+            raise ValueError("enable_full_region_metrics is not supported with multi-crop eval mask bboxes")
+
+        if any("component_id_offset" not in c for c in crop_entries):
+            offset = 0
+            for c in crop_entries:
+                c["component_id_offset"] = int(offset)
+                c["gt_component_templates"] = None
+                c["gt_component_pad"] = None
+                offset += int(c.get("n_gt", 0) or 0)
+
+        tgrid = np.asarray([threshold_f], dtype=np.float32)
+        if threshold_grid is not None and len(threshold_grid):
+            tgrid = np.asarray(threshold_grid, dtype=np.float32)
+        if tgrid.ndim != 1:
+            raise ValueError(f"threshold grid must be 1D, got shape {tgrid.shape}")
+        if tgrid.size == 0:
+            raise ValueError("threshold grid must contain at least one threshold")
+        if not np.isfinite(tgrid).all():
+            raise ValueError("threshold grid contains non-finite threshold values")
+        if np.any(tgrid < 0.0) or np.any(tgrid > 1.0):
+            raise ValueError(f"threshold grid values must be in [0, 1], got {tgrid.tolist()}")
+
+        out: Dict[str, float] = {}
+        threshold_metric_series: Dict[str, List[float]] = {}
+        threshold_grid_timings: Dict[str, float] = {}
+        want_component_rows = component_rows_collector is not None
+        need_full_gt_pfm_maps = bool(enable_skeleton_metrics and stitched_inputs_output_dir)
+        need_full_gt_contour = bool(enable_skeleton_metrics and stitched_inputs_output_dir)
+        metric_specs_i = component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics)
+
+        off_y, off_x = [int(v) for v in roi_key]
+        crop_states: List[Dict[str, Any]] = []
+        for crop_entry in crop_entries:
+            if "gt_component_templates" not in crop_entry:
+                crop_entry["gt_component_templates"] = None
+            if "gt_component_pad" not in crop_entry:
+                crop_entry["gt_component_pad"] = None
+            if "pfm_weight_recall_full" not in crop_entry:
+                crop_entry["pfm_weight_recall_full"] = None
+            if "pfm_weight_precision_full" not in crop_entry:
+                crop_entry["pfm_weight_precision_full"] = None
+            if "gt_contour_full" not in crop_entry:
+                crop_entry["gt_contour_full"] = None
+
+            cached_component_pad = crop_entry.get("gt_component_pad")
+            if cached_component_pad is not None and int(cached_component_pad) != pad_i:
+                raise ValueError(
+                    f"component_pad changed for cached segment={seg}: "
+                    f"cached={int(cached_component_pad)} current={int(pad_i)}"
+                )
+
+            gt_bin_c = crop_entry.get("gt_bin")
+            eval_mask_c = crop_entry.get("eval_mask")
+            gt_lab_c = crop_entry.get("gt_lab")
+            if gt_bin_c is None or eval_mask_c is None or gt_lab_c is None:
+                raise ValueError(f"cached multi-crop entry is missing gt_bin/eval_mask/gt_lab for segment={seg}")
+            gt_bin_c = _as_bool_2d(gt_bin_c)
+            eval_mask_c = _as_bool_2d(eval_mask_c)
+            if gt_bin_c.shape != eval_mask_c.shape:
+                raise ValueError("internal error: cached multi-crop shapes mismatch")
+            if not eval_mask_c.any():
+                continue
+            if np.logical_and(gt_bin_c, ~eval_mask_c).any():
+                gt_bin_c = gt_bin_c.copy()
+                gt_bin_c[~eval_mask_c] = False
+                crop_entry["gt_bin"] = gt_bin_c
+
+            skel_gt_c = crop_entry.get("skel_gt")
+            if enable_skeleton_metrics and skel_gt_c is None:
+                raise ValueError("cached entry missing skel_gt while enable_skeleton_metrics is True")
+
+            y0, y1, x0, x1 = [int(v) for v in crop_entry.get("crop", (0, 0, 0, 0))]
+            if y1 <= y0 or x1 <= x0:
+                raise ValueError(f"invalid cached crop bbox for segment={seg}: {(y0, y1, x0, x1)}")
+            pred_prob_c = np.asarray(pred_prob_full, dtype=np.float32)[y0:y1, x0:x1].copy()
+            if pred_prob_c.shape != eval_mask_c.shape:
+                raise ValueError("internal error: cached crop/pred_prob shapes mismatch")
+            pred_prob_c[~eval_mask_c] = 0.0
+
+            gt_component_templates_c = crop_entry.get("gt_component_templates")
+            if gt_component_templates_c is None:
+                t_templates = time.perf_counter()
+                gt_component_templates_c = _build_gt_component_templates(
+                    gt_bin_c,
+                    np.asarray(gt_lab_c),
+                    int(crop_entry.get("n_gt", 0) or 0),
+                    connectivity=betti_connectivity,
+                    pad=pad_i,
+                    component_id_offset=int(crop_entry.get("component_id_offset", 0) or 0),
+                    enable_skeleton_metrics=enable_skeleton_metrics,
+                    skeleton_method=skeleton_method,
+                    skel_gt_full=skel_gt_c,
+                )
+                crop_entry["gt_component_templates"] = gt_component_templates_c
+                crop_entry["gt_component_pad"] = int(pad_i)
+                _timeit("build_gt_component_templates", t_templates)
+
+            crop_off_y, crop_off_x = int(y0), int(x0)
+            full_off_y = int(off_y + crop_off_y)
+            full_off_x = int(off_x + crop_off_x)
+            crop_states.append(
+                {
+                    "crop_entry": crop_entry,
+                    "pred_prob": pred_prob_c,
+                    "gt_bin": gt_bin_c,
+                    "eval_mask": eval_mask_c,
+                    "crop_offset": (crop_off_y, crop_off_x),
+                    "full_offset": (full_off_y, full_off_x),
+                }
+            )
+
+        if not crop_states:
+            _log_empty_eval_mask(
+                segment_id=seg,
+                downsample=ds,
+                pred_shape=tuple(pred_prob_full.shape),
+                pred_has_count=int(pred_has_full.sum()),
+            )
+            return {}
+
+        for state in crop_states:
+            crop_entry = state["crop_entry"]
+            gt_bin_c = state["gt_bin"]
+            skel_gt_c = crop_entry.get("skel_gt")
+            pfm_weight_recall_full = crop_entry.get("pfm_weight_recall_full")
+            pfm_weight_precision_full = crop_entry.get("pfm_weight_precision_full")
+            gt_contour_full = crop_entry.get("gt_contour_full")
+
+            if need_full_gt_pfm_maps:
+                if (pfm_weight_recall_full is None) != (pfm_weight_precision_full is None):
+                    pfm_weight_recall_full = None
+                    pfm_weight_precision_full = None
+                    crop_entry["pfm_weight_recall_full"] = None
+                    crop_entry["pfm_weight_precision_full"] = None
+                if pfm_weight_recall_full is None and pfm_weight_precision_full is None and bool(gt_bin_c.any()):
+                    t_build = time.perf_counter()
+                    contour_for_maps: Optional[np.ndarray] = gt_contour_full
+                    if contour_for_maps is None and need_full_gt_contour:
+                        contour_for_maps = _pseudo_contour_mask(gt_bin_c)
+                        gt_contour_full = contour_for_maps
+                        crop_entry["gt_contour_full"] = gt_contour_full
+                    gw_full, pw_full = _pseudo_weight_maps(
+                        gt_bin_c,
+                        connectivity=betti_connectivity,
+                        skel_gt=skel_gt_c,
+                        contour_gt=contour_for_maps,
+                    )
+                    gw_full_sum = float(gw_full.astype(np.float64).sum())
+                    if gw_full_sum > 0.0:
+                        pfm_weight_recall_full = gw_full.astype(np.float32, copy=False)
+                        pfm_weight_precision_full = pw_full.astype(np.float32, copy=False)
+                    else:
+                        pfm_weight_recall_full = None
+                        pfm_weight_precision_full = None
+                    crop_entry["pfm_weight_recall_full"] = pfm_weight_recall_full
+                    crop_entry["pfm_weight_precision_full"] = pfm_weight_precision_full
+                    threshold_grid_timings["full_region_pfm_weight_cache_build"] = threshold_grid_timings.get(
+                        "full_region_pfm_weight_cache_build", 0.0
+                    ) + (time.perf_counter() - t_build)
+            if need_full_gt_contour and bool(gt_bin_c.any()) and gt_contour_full is None:
+                t_build = time.perf_counter()
+                gt_contour_full = _pseudo_contour_mask(gt_bin_c)
+                crop_entry["gt_contour_full"] = gt_contour_full
+                threshold_grid_timings["full_region_contour_cache_build"] = threshold_grid_timings.get(
+                    "full_region_contour_cache_build", 0.0
+                ) + (time.perf_counter() - t_build)
+
+        t0 = time.perf_counter()
+        for thr in tgrid.tolist():
+            thr_f = float(thr)
+            thr_tag = _threshold_tag(thr_f)
+
+            component_rows_all: List[Dict[str, Any]] = []
+            for state in crop_states:
+                crop_entry = state["crop_entry"]
+                gt_bin_c = state["gt_bin"]
+                eval_mask_c = state["eval_mask"]
+                pred_prob_c = state["pred_prob"]
+                crop_off_y, crop_off_x = state["crop_offset"]
+                full_off_y, full_off_x = state["full_offset"]
+
+                p0 = time.perf_counter()
+                pred_bin_t: np.ndarray
+                pred_prob_t: np.ndarray
+                pred_lab_t: np.ndarray
+                pred_bin_threshold_t: Optional[np.ndarray] = None
+                if stitched_inputs_output_dir:
+                    pred_bin_t, pred_prob_t, pred_lab_t, _, pred_bin_threshold_t = _postprocess_prediction(
+                        pred_prob_c,
+                        eval_mask=eval_mask_c,
+                        threshold=thr_f,
+                        connectivity=betti_connectivity,
+                        component_min_area=component_min_area_i,
+                        return_threshold_bin=True,
+                    )
+                else:
+                    pred_bin_t, pred_prob_t, pred_lab_t, _ = _postprocess_prediction(
+                        pred_prob_c,
+                        eval_mask=eval_mask_c,
+                        threshold=thr_f,
+                        connectivity=betti_connectivity,
+                        component_min_area=component_min_area_i,
+                    )
+                threshold_grid_timings["postprocess"] = threshold_grid_timings.get("postprocess", 0.0) + (
+                    time.perf_counter() - p0
+                )
+
+                if stitched_inputs_output_dir:
+                    if pred_bin_threshold_t is None:
+                        raise ValueError("internal error: threshold mask is required for stitched input outputs")
+                    p0 = time.perf_counter()
+                    _save_stitched_eval_inputs(
+                        stitched_inputs_output_dir=stitched_inputs_output_dir,
+                        fragment_id=fragment_id,
+                        downsample=ds,
+                        eval_epoch=eval_epoch,
+                        threshold=thr_f,
+                        component_min_area=component_min_area_i,
+                        pred_prob=pred_prob_c,
+                        pred_bin_threshold=pred_bin_threshold_t,
+                        pred_bin_postprocess=pred_bin_t,
+                        gt_bin=gt_bin_c,
+                        eval_mask=eval_mask_c,
+                        roi_offset=(off_y, off_x),
+                        crop_offset=(crop_off_y, crop_off_x),
+                        full_offset=(full_off_y, full_off_x),
+                        full_shape=pred_full_shape,
+                        gt_contour=crop_entry.get("gt_contour_full") if enable_skeleton_metrics else None,
+                        gt_skeleton=crop_entry.get("skel_gt") if enable_skeleton_metrics else None,
+                        pfm_weight_recall=crop_entry.get("pfm_weight_recall_full"),
+                        pfm_weight_precision=crop_entry.get("pfm_weight_precision_full"),
+                    )
+                    threshold_grid_timings["save_inputs"] = threshold_grid_timings.get("save_inputs", 0.0) + (
+                        time.perf_counter() - p0
+                    )
+
+                p0 = time.perf_counter()
+                component_metric_timings_t: Dict[str, float] = {}
+                component_rows_t, _, _ = component_metrics_by_gt_bbox(
+                    pred_prob_t,
+                    pred_bin_t,
+                    gt_bin_c,
+                    connectivity=betti_connectivity,
+                    drd_block_size=drd_block_size,
+                    boundary_k=boundary_k,
+                    pad=pad_i,
+                    worst_q=component_worst_q,
+                    worst_k=component_worst_k,
+                    enable_skeleton_metrics=enable_skeleton_metrics,
+                    gt_lab=np.asarray(crop_entry.get("gt_lab")),
+                    pred_lab=pred_lab_t,
+                    n_gt=int(crop_entry.get("n_gt", 0) or 0),
+                    gt_component_templates=crop_entry.get("gt_component_templates"),
+                    skeleton_method=skeleton_method,
+                    timings=component_metric_timings_t,
+                )
+                threshold_grid_timings["component_metrics"] = threshold_grid_timings.get("component_metrics", 0.0) + (
+                    time.perf_counter() - p0
+                )
+                for key, value in component_metric_timings_t.items():
+                    agg_key = f"component_metrics/{key}"
+                    threshold_grid_timings[agg_key] = threshold_grid_timings.get(agg_key, 0.0) + float(value)
+
+                component_rows_all.extend(component_rows_t)
+
+                if want_component_rows:
+                    components_manifest_c = _build_components_manifest(
+                        component_rows=component_rows_t,
+                        full_off_y=full_off_y,
+                        full_off_x=full_off_x,
+                        enable_skeleton_metrics=enable_skeleton_metrics,
+                    )
+                    for entry in components_manifest_c:
+                        global_entry = dict(entry)
+                        global_entry["segment_id"] = str(fragment_id)
+                        global_entry["downsample"] = int(ds)
+                        global_entry["threshold"] = float(thr_f)
+                        global_entry["threshold_tag"] = str(thr_tag)
+                        global_entry["global_component_id"] = (
+                            f"{global_entry['segment_id']}:{global_entry['threshold_tag']}:{int(global_entry['component_id'])}"
+                        )
+                        component_rows_collector.append(global_entry)
+
+            component_metric_stats_t, _ = summarize_component_rows(
+                component_rows_all,
+                worst_q=component_worst_q,
+                worst_k=component_worst_k,
+                id_key="component_id",
+                metric_specs=metric_specs_i,
+            )
+
+            threshold_metric_values = _threshold_metric_values_from_component_stats(
+                component_metric_stats=component_metric_stats_t,
+            )
+            for metric_base, metric_value in threshold_metric_values.items():
+                metric_key = f"thresholds/{metric_base}/thr_{thr_tag}"
+                if metric_key in out:
+                    raise ValueError(f"duplicate threshold metric key: {metric_key}")
+                out[metric_key] = float(metric_value)
+                threshold_metric_series.setdefault(metric_base, []).append(float(metric_value))
+        _timeit("threshold_stability", t0)
+        for key, value in threshold_grid_timings.items():
+            timings[f"threshold_stability/{key}"] = timings.get(f"threshold_stability/{key}", 0.0) + float(value)
+
+        for metric_base, metric_values in threshold_metric_series.items():
+            finite_vals = [float(v) for v in metric_values if np.isfinite(v)]
+            stab = _stability_stats(finite_vals)
+            out.update({f"stability/{metric_base}_{k}": float(v) for k, v in stab.items()})
+
+        timings["wall"] = max(0.0, float(time.perf_counter() - wall_t0))
+        _log_timing(segment_id=seg, downsample=ds, cache_hit=cache_hit, timings=timings)
+        return out
 
     if eval_mask.shape != pred_prob.shape:
         raise ValueError("internal error: cropped shapes mismatch")
@@ -1023,7 +1392,7 @@ def compute_stitched_metrics(
     full_off_y = int(off_y + crop_off_y)
     full_off_x = int(off_x + crop_off_x)
 
-    tgrid = np.asarray([float(threshold)], dtype=np.float32)
+    tgrid = np.asarray([threshold_f], dtype=np.float32)
     if threshold_grid is not None and len(threshold_grid):
         tgrid = np.asarray(threshold_grid, dtype=np.float32)
     if tgrid.ndim != 1:
@@ -1032,10 +1401,11 @@ def compute_stitched_metrics(
         raise ValueError("threshold grid must contain at least one threshold")
     if not np.isfinite(tgrid).all():
         raise ValueError("threshold grid contains non-finite threshold values")
+    if np.any(tgrid < 0.0) or np.any(tgrid > 1.0):
+        raise ValueError(f"threshold grid values must be in [0, 1], got {tgrid.tolist()}")
 
     threshold_metric_series: Dict[str, List[float]] = {}
     threshold_grid_timings: Dict[str, float] = {}
-    want_component_outputs = component_output_dir is not None
     want_component_rows = component_rows_collector is not None
     need_full_gt_pfm_maps = bool(enable_skeleton_metrics and (enable_full_region_metrics or stitched_inputs_output_dir))
     pfm_weight_recall_full = cache_entry.get("pfm_weight_recall_full")
@@ -1143,7 +1513,7 @@ def compute_stitched_metrics(
 
         p0 = time.perf_counter()
         component_metric_timings_t: Dict[str, float] = {}
-        component_rows_t, component_metric_stats_t, component_metric_rankings_t = component_metrics_by_gt_bbox(
+        component_rows_t, component_metric_stats_t, _component_metric_rankings_t = component_metrics_by_gt_bbox(
             pred_prob_t,
             pred_bin_t,
             gt_bin,
@@ -1215,9 +1585,8 @@ def compute_stitched_metrics(
                 threshold_metric_series.setdefault(metric_base, []).append(float(metric_value))
 
         components_manifest_t: Optional[List[Dict[str, Any]]] = None
-        rows_by_id_t: Optional[Dict[int, Dict[str, Any]]] = None
-        if want_component_outputs or want_component_rows:
-            components_manifest_t, rows_by_id_t = _build_components_manifest(
+        if want_component_rows:
+            components_manifest_t = _build_components_manifest(
                 component_rows=component_rows_t,
                 full_off_y=full_off_y,
                 full_off_x=full_off_x,
@@ -1237,39 +1606,6 @@ def compute_stitched_metrics(
                     f"{global_entry['segment_id']}:{global_entry['threshold_tag']}:{int(global_entry['component_id'])}"
                 )
                 component_rows_collector.append(global_entry)
-
-        if want_component_outputs:
-            if components_manifest_t is None:
-                raise ValueError("internal error: component manifest is required for component outputs")
-            if rows_by_id_t is None:
-                raise ValueError("internal error: component rows lookup is required for component outputs")
-            p0 = time.perf_counter()
-            _write_component_outputs(
-                component_output_dir=component_output_dir,
-                fragment_id=fragment_id,
-                downsample=ds,
-                threshold=thr_f,
-                gt_lab=gt_lab,
-                pred_lab=pred_lab_t,
-                pred_full_shape=pred_full_shape,
-                roi_offset=(off_y, off_x),
-                crop_offset=(crop_off_y, crop_off_x),
-                full_offset=(full_off_y, full_off_x),
-                component_worst_k=component_worst_k,
-                component_worst_q=component_worst_q,
-                metric_specs=metric_specs,
-                components_manifest=components_manifest_t,
-                component_metric_rankings=component_metric_rankings_t,
-                save_component_debug_images=save_component_debug_images,
-                component_debug_max_items=component_debug_max_items,
-                rows_by_id=rows_by_id_t,
-                pred_prob_clean=pred_prob_t,
-                pred_bin_clean=pred_bin_t,
-                gt_bin=gt_bin,
-            )
-            threshold_grid_timings["component_outputs"] = threshold_grid_timings.get("component_outputs", 0.0) + (
-                time.perf_counter() - p0
-            )
     _timeit("threshold_stability", t0)
     for key, value in threshold_grid_timings.items():
         timings[f"threshold_stability/{key}"] = timings.get(f"threshold_stability/{key}", 0.0) + float(value)

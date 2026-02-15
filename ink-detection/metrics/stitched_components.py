@@ -26,6 +26,7 @@ def _build_gt_component_templates(
     *,
     connectivity: int,
     pad: int,
+    component_id_offset: int = 0,
     enable_skeleton_metrics: bool = True,
     skeleton_method: str = "guo_hall",
     skel_gt_full: Optional[np.ndarray] = None,
@@ -83,7 +84,7 @@ def _build_gt_component_templates(
                 raise ValueError(f"invalid weighted pseudo-recall sum for component {gi}: {pfm_weight_recall_sum}")
             pfm_weight_precision = pfm_weight_precision.astype(np.float32, copy=False)
         template = {
-            "component_id": int(gi),
+            "component_id": int(gi) + int(component_id_offset),
             "bbox": [int(y0), int(y1), int(x0), int(x1)],
             "gt_beta0": int(gt_beta0),
             "gt_beta1": int(gt_beta1),
@@ -206,7 +207,7 @@ def summarize_component_rows(
 def write_global_component_manifest(
     *,
     component_rows: List[Dict[str, Any]],
-    component_output_dir: str,
+    output_dir: str,
     downsample: int,
     worst_k: Optional[int],
     worst_q: Optional[float],
@@ -214,8 +215,8 @@ def write_global_component_manifest(
 ) -> str:
     import json as _json
 
-    os.makedirs(component_output_dir, exist_ok=True)
-    out_path = osp.join(component_output_dir, f"components_global_ds{int(downsample)}_manifest.json")
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = osp.join(output_dir, f"components_global_ds{int(downsample)}_manifest.json")
     manifest = {
         "downsample": int(downsample),
         "worst_k": None if worst_k is None else int(worst_k),

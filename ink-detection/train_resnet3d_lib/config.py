@@ -52,6 +52,12 @@ class CFG:
     scheduler = "OneCycleLR"  # "OneCycleLR" | "cosine"
     epochs = 30  # 30
 
+    optimizer = "adamw"  # "adamw" | "sgd"
+    adamw_beta2 = 0.999
+    adamw_eps = 1e-8
+    sgd_momentum = 0.9
+    sgd_nesterov = False
+
     # adamW warmupあり
     warmup_factor = 10
     # lr = 1e-4 / warmup_factor
@@ -104,9 +110,7 @@ class CFG:
     eval_component_min_area = 0
     eval_component_pad = 5
     eval_stitch_full_region_metrics = False
-    eval_save_stitched_inputs = True
-    eval_save_component_debug_images = False
-    eval_component_debug_max_items = 24
+    eval_save_stitch_debug_images = True
     eval_threshold_grid_min = 0.40
     eval_threshold_grid_max = 0.70
     eval_threshold_grid_steps = 5
@@ -515,6 +519,11 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("accumulate_grad_batches", "accumulate_grad_batches"),
         ("epochs", "epochs"),
         ("scheduler", "scheduler"),
+        ("optimizer", "optimizer"),
+        ("adamw_beta2", "adamw_beta2"),
+        ("adamw_eps", "adamw_eps"),
+        ("sgd_momentum", "sgd_momentum"),
+        ("sgd_nesterov", "sgd_nesterov"),
         ("warmup_factor", "warmup_factor"),
         ("lr", "lr"),
         ("onecycle_pct_start", "onecycle_pct_start"),
@@ -537,9 +546,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_component_min_area", "eval_component_min_area"),
         ("eval_component_pad", "eval_component_pad"),
         ("eval_stitch_full_region_metrics", "eval_stitch_full_region_metrics"),
-        ("eval_save_stitched_inputs", "eval_save_stitched_inputs"),
-        ("eval_save_component_debug_images", "eval_save_component_debug_images"),
-        ("eval_component_debug_max_items", "eval_component_debug_max_items"),
+        ("eval_save_stitch_debug_images", "eval_save_stitch_debug_images"),
         ("eval_threshold_grid_min", "eval_threshold_grid_min"),
         ("eval_threshold_grid_max", "eval_threshold_grid_max"),
         ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
@@ -576,6 +583,40 @@ def apply_metadata_hyperparameters(cfg, metadata):
 
     if cfg.norm not in {"batch", "group"}:
         raise ValueError(f"training_hyperparameters.model.norm must be 'batch' or 'group', got {cfg.norm!r}")
+
+    cfg.optimizer = str(getattr(cfg, "optimizer", "adamw")).strip().lower()
+    if cfg.optimizer not in {"adamw", "sgd"}:
+        raise ValueError(
+            "training_hyperparameters.training.optimizer must be 'adamw' or 'sgd', "
+            f"got {cfg.optimizer!r}"
+        )
+    cfg.adamw_beta2 = float(getattr(cfg, "adamw_beta2", 0.999))
+    if not (0.0 < cfg.adamw_beta2 < 1.0):
+        raise ValueError(
+            "training_hyperparameters.training.adamw_beta2 must be in (0, 1), "
+            f"got {cfg.adamw_beta2}"
+        )
+    cfg.adamw_eps = float(getattr(cfg, "adamw_eps", 1e-8))
+    if cfg.adamw_eps <= 0:
+        raise ValueError(
+            "training_hyperparameters.training.adamw_eps must be > 0, "
+            f"got {cfg.adamw_eps}"
+        )
+    cfg.sgd_momentum = float(getattr(cfg, "sgd_momentum", 0.0) or 0.0)
+    if cfg.sgd_momentum < 0:
+        raise ValueError(
+            "training_hyperparameters.training.sgd_momentum must be >= 0, "
+            f"got {cfg.sgd_momentum}"
+        )
+    cfg.sgd_nesterov = parse_bool_strict(
+        getattr(cfg, "sgd_nesterov", False),
+        key="training_hyperparameters.training.sgd_nesterov",
+    )
+    if cfg.sgd_nesterov and cfg.sgd_momentum <= 0:
+        raise ValueError(
+            "training_hyperparameters.training.sgd_nesterov requires sgd_momentum > 0, "
+            f"got sgd_momentum={cfg.sgd_momentum}"
+        )
 
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()

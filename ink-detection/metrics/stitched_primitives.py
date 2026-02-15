@@ -360,7 +360,9 @@ def drd(pred: np.ndarray, gt: np.ndarray, *, block_size: int = 8) -> float:
     H, W = gt.shape
 
     # NUBN: number of non-uniform blocks in the GT.
-    bs = max(1, int(block_size))
+    bs = int(block_size)
+    if bs < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size!r}")
     hb = (H + bs - 1) // bs
     wb = (W + bs - 1) // bs
     pad_h = hb * bs - H
@@ -799,6 +801,8 @@ def weighted_pseudo_fmeasure_from_weights(
     bw = pred.astype(np.float64) * precision_weights
     bw_sum = float(bw.sum())
     if bw_sum <= 0.0:
+        if int(pred.sum()) == 0:
+            return 0.0
         raise ValueError(
             "invalid weighted pseudo-precision denominator: predicted weighted foreground sum is non-positive"
         )
@@ -817,8 +821,8 @@ def weighted_pseudo_fmeasure(
     """Weighted pseudo-FMeasure (Fps) from weighted pseudo-recall/precision.
 
     Uses the component-wise GW/PW weighting scheme described by
-    Ntirogiannis et al. (TIP 2013), with strict fail-fast behavior when
-    contour/skeleton extraction or weighted precision denominators are invalid.
+    Ntirogiannis et al. (TIP 2013). Empty predictions return 0.0 for weighted
+    pseudo-FMeasure; invalid contour/skeleton extraction still fail-fast.
     If `skel_gt` is provided, it is reused instead of recomputing GT skeletons.
     """
     pred = _as_bool_2d(pred)

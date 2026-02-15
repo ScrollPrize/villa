@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import segmentation_models_pytorch as smp
-from torch.optim import AdamW
+from torch.optim import AdamW, SGD
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 
@@ -771,26 +771,12 @@ class StitchManager:
                 component_min_area = int(getattr(CFG, "eval_component_min_area", 0) or 0)
                 component_pad = int(getattr(CFG, "eval_component_pad", 5))
                 enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
-                save_stitched_inputs = bool(getattr(CFG, "eval_save_stitched_inputs", False))
-                save_component_debug_images = bool(getattr(CFG, "eval_save_component_debug_images", False))
-                component_debug_max_items = getattr(CFG, "eval_component_debug_max_items", None)
-                if isinstance(component_debug_max_items, str) and component_debug_max_items.strip().lower() in {
-                    "",
-                    "none",
-                    "null",
-                }:
-                    component_debug_max_items = None
-                if component_debug_max_items is not None:
-                    component_debug_max_items = int(component_debug_max_items)
-                component_output_dir = osp.join(
-                    str(getattr(CFG, "figures_dir", ".")),
-                    "metrics_components",
-                )
+                save_stitch_debug_images = bool(getattr(CFG, "eval_save_stitch_debug_images", False))
                 stitched_inputs_output_dir = osp.join(
                     str(getattr(CFG, "figures_dir", ".")),
-                    "metrics_stitched_inputs",
+                    "metrics_stitched_debug",
                 )
-                if not save_stitched_inputs:
+                if not save_stitch_debug_images:
                     stitched_inputs_output_dir = None
 
                 def _parse_list(value, cast_fn):
@@ -866,10 +852,7 @@ class StitchManager:
                         enable_skeleton_metrics=enable_skeleton_metrics,
                         enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
-                        component_output_dir=component_output_dir,
                         stitched_inputs_output_dir=stitched_inputs_output_dir,
-                        save_component_debug_images=save_component_debug_images,
-                        component_debug_max_items=component_debug_max_items,
                         gt_cache_max=cache_max,
                         component_rows_collector=global_component_rows,
                         eval_epoch=int(current_epoch + 1),
@@ -941,10 +924,11 @@ class StitchManager:
                                 prog_bar=False,
                             )
                     manifest_path = None
-                    if component_output_dir:
+                    manifest_output_dir = stitched_inputs_output_dir
+                    if manifest_output_dir:
                         manifest_path = write_global_component_manifest(
                             component_rows=global_component_rows,
-                            component_output_dir=component_output_dir,
+                            output_dir=manifest_output_dir,
                             downsample=self.downsample,
                             worst_k=component_worst_k,
                             worst_q=component_worst_q,
@@ -1482,9 +1466,15 @@ class RegressionPLModel(pl.LightningModule):
         self._stitcher.on_validation_epoch_end(self)
 
     def configure_optimizers(self):
-        if bool(getattr(CFG, "exclude_weight_decay_bias_norm", False)) and float(getattr(CFG, "weight_decay", 0.0) or 0.0) > 0:
-            decay_params = []
-            no_decay_params = []
+        lr = float(CFG.lr)
+        weight_decay = float(getattr(CFG, "weight_decay", 0.0) or 0.0)
+        optimizer_name = str(getattr(CFG, "optimizer", "adamw")).strip().lower()
+
+        exclude_wd_bias_norm = bool(getattr(CFG, "exclude_weight_decay_bias_norm", False))
+        use_param_groups = exclude_wd_bias_norm and weight_decay > 0
+        decay_params = []
+        no_decay_params = []
+        if use_param_groups:
             for _, param in self.named_parameters():
                 if not param.requires_grad:
                     continue
@@ -1493,16 +1483,55 @@ class RegressionPLModel(pl.LightningModule):
                 else:
                     decay_params.append(param)
 
-            optimizer = AdamW(
-                [
-                    {"params": decay_params, "weight_decay": float(CFG.weight_decay)},
-                    {"params": no_decay_params, "weight_decay": 0.0},
-                ],
-                lr=CFG.lr,
-                weight_decay=0.0,
-            )
+        if optimizer_name == "adamw":
+            beta2 = float(getattr(CFG, "adamw_beta2", 0.999))
+            eps = float(getattr(CFG, "adamw_eps", 1e-8))
+            betas = (0.9, beta2)
+            if use_param_groups:
+                optimizer = AdamW(
+                    [
+                        {"params": decay_params, "weight_decay": weight_decay},
+                        {"params": no_decay_params, "weight_decay": 0.0},
+                    ],
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=0.0,
+                )
+            else:
+                optimizer = AdamW(
+                    self.parameters(),
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=weight_decay,
+                )
+        elif optimizer_name == "sgd":
+            momentum = float(getattr(CFG, "sgd_momentum", 0.0) or 0.0)
+            nesterov = bool(getattr(CFG, "sgd_nesterov", False))
+            if use_param_groups:
+                optimizer = SGD(
+                    [
+                        {"params": decay_params, "weight_decay": weight_decay},
+                        {"params": no_decay_params, "weight_decay": 0.0},
+                    ],
+                    lr=lr,
+                    momentum=momentum,
+                    nesterov=nesterov,
+                    weight_decay=0.0,
+                )
+            else:
+                optimizer = SGD(
+                    self.parameters(),
+                    lr=lr,
+                    momentum=momentum,
+                    nesterov=nesterov,
+                    weight_decay=weight_decay,
+                )
         else:
-            optimizer = AdamW(self.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+            raise ValueError(
+                f"Unsupported optimizer={CFG.optimizer!r}. Supported: 'adamw' | 'sgd'."
+            )
         scheduler_name = str(getattr(CFG, "scheduler", "OneCycleLR")).lower()
         steps_per_epoch = int(self.hparams.total_steps)
         epochs = int(CFG.epochs)
