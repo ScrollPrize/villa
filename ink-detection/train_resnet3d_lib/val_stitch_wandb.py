@@ -15,6 +15,7 @@ def get_wandb_val_stitch_metric_summaries(*, enable_skeleton_metrics: bool) -> D
         for stat_name in stat_names:
             out[f"metrics/val_stitch/global/components/{metric_name}/{stat_name}"] = summary_mode
         out[f"metrics/val_stitch/segments/*/stability/{metric_name}/mean"] = summary_mode
+        out[f"metrics/val_stitch/worst_group/stability/{metric_name}/mean"] = summary_mode
     return out
 
 

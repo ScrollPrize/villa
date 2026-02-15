@@ -31,6 +31,7 @@ def build_model(run_state, data_state, wandb_logger):
         total_steps=data_state["steps_per_epoch"],
         n_groups=len(data_state["group_names"]),
         group_names=data_state["group_names"],
+        stitch_group_idx_by_segment=data_state["group_idx_by_segment"],
         stitch_val_dataloader_idx=data_state["stitch_val_dataloader_idx"],
         stitch_pred_shape=data_state["stitch_pred_shape"],
         stitch_segment_id=data_state["stitch_segment_id"],

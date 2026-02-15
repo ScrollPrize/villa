@@ -635,6 +635,7 @@ def build_datasets(run_state):
         segments_metadata,
         group_key,
     )
+    group_idx_by_segment = {str(fragment_id): int(group_idx) for fragment_id, group_idx in fragment_to_group_idx.items()}
 
     train_transform = get_transforms(data="train", cfg=CFG)
     valid_transform = get_transforms(data="valid", cfg=CFG)
@@ -864,6 +865,7 @@ def build_datasets(run_state):
             "train_loader": train_loader,
             "val_loaders": val_loaders,
             "group_names": group_names,
+            "group_idx_by_segment": group_idx_by_segment,
             "train_group_counts": train_group_counts,
             "steps_per_epoch": steps_per_epoch,
             "train_stitch_loaders": train_stitch_loaders,
@@ -1025,6 +1027,7 @@ def build_datasets(run_state):
         "train_loader": train_loader,
         "val_loaders": val_loaders,
         "group_names": group_names,
+        "group_idx_by_segment": group_idx_by_segment,
         "train_group_counts": train_group_counts,
         "steps_per_epoch": steps_per_epoch,
         "train_stitch_loaders": train_stitch_loaders,

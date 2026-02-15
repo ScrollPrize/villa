@@ -813,9 +813,36 @@ class StitchManager:
                     if steps >= 2:
                         threshold_grid = np.linspace(tmin, tmax, steps).tolist()
 
+                from train_resnet3d_lib.val_stitch_wandb import rewrite_val_stitch_metric_key
+
+                stitch_group_idx_by_segment = getattr(model, "_stitch_group_idx_by_segment", None)
+                if not isinstance(stitch_group_idx_by_segment, dict):
+                    raise TypeError(
+                        "model._stitch_group_idx_by_segment must be a dict mapping segment id to group index"
+                    )
+                stability_metric_directions = {
+                    str(metric_name): bool(higher_is_better)
+                    for metric_name, higher_is_better in component_metric_specs(
+                        enable_skeleton_metrics=enable_skeleton_metrics
+                    )
+                }
+                group_stability_values = {
+                    metric_name: {int(group_idx): [] for group_idx in range(int(model.n_groups))}
+                    for metric_name in stability_metric_directions
+                }
+
                 global_component_rows = []
                 for segment_id, (pred_prob, pred_has) in segment_to_val.items():
-                    meta = segment_to_val_meta.get(str(segment_id), {})
+                    segment_id_key = str(segment_id)
+                    if segment_id_key not in stitch_group_idx_by_segment:
+                        raise KeyError(f"missing stitched group index for segment_id={segment_id_key!r}")
+                    segment_group_idx = int(stitch_group_idx_by_segment[segment_id_key])
+                    if segment_group_idx < 0 or segment_group_idx >= int(model.n_groups):
+                        raise ValueError(
+                            f"invalid stitched group index for segment_id={segment_id_key!r}: {segment_group_idx}"
+                        )
+
+                    meta = segment_to_val_meta.get(segment_id_key, {})
                     roi_offset = meta.get("offset", (0, 0))
                     cache_max = int(max(1, len(segment_to_val))) if segment_to_val else 1
                     metrics = compute_stitched_metrics(
@@ -848,18 +875,52 @@ class StitchManager:
                         eval_epoch=int(current_epoch + 1),
                     )
 
-                    safe_segment_id = str(segment_id).replace("/", "_")
+                    safe_segment_id = segment_id_key.replace("/", "_")
                     base_key = f"metrics/val_stitch/segments/{safe_segment_id}"
                     if not isinstance(metrics, dict):
                         raise TypeError(
                             f"compute_stitched_metrics must return a dict, got {type(metrics).__name__}"
                         )
 
-                    from train_resnet3d_lib.val_stitch_wandb import rewrite_val_stitch_metric_key
-
                     for k, v in metrics.items():
                         metric_key = rewrite_val_stitch_metric_key(str(k))
                         model.log(f"{base_key}/{metric_key}", v, on_epoch=True, prog_bar=False)
+                        prefix = "stability/"
+                        suffix = "/mean"
+                        if metric_key.startswith(prefix) and metric_key.endswith(suffix):
+                            metric_name = metric_key[len(prefix) : -len(suffix)]
+                            if metric_name in group_stability_values:
+                                group_stability_values[metric_name][segment_group_idx].append(float(v))
+
+                if len(model.group_names) != int(model.n_groups):
+                    raise ValueError(
+                        f"group_names length must match n_groups: {len(model.group_names)} vs {int(model.n_groups)}"
+                    )
+                for metric_name, higher_is_better in stability_metric_directions.items():
+                    present_group_means = []
+                    for group_idx in range(int(model.n_groups)):
+                        values = np.asarray(group_stability_values[metric_name][group_idx], dtype=np.float64)
+                        finite_values = values[np.isfinite(values)]
+                        if finite_values.size == 0:
+                            continue
+                        group_mean = float(finite_values.mean())
+                        present_group_means.append(group_mean)
+                        safe_group_name = str(model.group_names[group_idx]).replace("/", "_")
+                        model.log(
+                            f"metrics/val_stitch/groups/group_{group_idx}_{safe_group_name}/stability/{metric_name}/mean",
+                            group_mean,
+                            on_epoch=True,
+                            prog_bar=False,
+                        )
+                    if not present_group_means:
+                        continue
+                    worst_group_mean = min(present_group_means) if higher_is_better else max(present_group_means)
+                    model.log(
+                        f"metrics/val_stitch/worst_group/stability/{metric_name}/mean",
+                        float(worst_group_mean),
+                        on_epoch=True,
+                        prog_bar=False,
+                    )
 
                 if global_component_rows:
                     global_stats, global_rankings = summarize_component_rows(
@@ -933,6 +994,7 @@ class RegressionPLModel(pl.LightningModule):
         total_steps=780,
         n_groups=1,
         group_names=None,
+        stitch_group_idx_by_segment=None,
         stitch_val_dataloader_idx=None,
         stitch_pred_shape=None,
         stitch_segment_id=None,
@@ -964,6 +1026,26 @@ class RegressionPLModel(pl.LightningModule):
         if group_names is None:
             group_names = [str(i) for i in range(self.n_groups)]
         self.group_names = list(group_names)
+        if len(self.group_names) != self.n_groups:
+            raise ValueError(f"group_names length must be {self.n_groups}, got {len(self.group_names)}")
+        if stitch_group_idx_by_segment is None:
+            self._stitch_group_idx_by_segment = {}
+        else:
+            if not isinstance(stitch_group_idx_by_segment, dict):
+                raise TypeError(
+                    "stitch_group_idx_by_segment must be a dict mapping segment id to group index, "
+                    f"got {type(stitch_group_idx_by_segment).__name__}"
+                )
+            normalized_group_map = {}
+            for segment_id, group_idx in stitch_group_idx_by_segment.items():
+                segment_key = str(segment_id)
+                group_idx_i = int(group_idx)
+                if group_idx_i < 0 or group_idx_i >= self.n_groups:
+                    raise ValueError(
+                        f"stitch_group_idx_by_segment[{segment_key!r}]={group_idx_i} out of range [0, {self.n_groups})"
+                    )
+                normalized_group_map[segment_key] = group_idx_i
+            self._stitch_group_idx_by_segment = normalized_group_map
 
         self.group_dro = None
         if str(self.hparams.objective).lower() == "group_dro":
