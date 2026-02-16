@@ -278,13 +278,17 @@ def load(
 			db_cli = float(dir_blur_sigma)
 			tol = 1e-6
 			bad: list[str] = []
+			# CLI defaults mean "not explicitly set" for preprocessed volumes.
+			zs_cli_is_default = int(zs_cli) == 1
+			gmb_cli_is_default = abs(float(gmb_cli) - 0.0) <= tol
+			db_cli_is_default = abs(float(db_cli) - 0.0) <= tol
 			if abs(ds_meta - ds_cli) > tol:
 				bad.append(f"downscale(meta={ds_meta}, cli={ds_cli})")
-			if int(zs_meta) != int(zs_cli):
+			if (not zs_cli_is_default) and int(zs_meta) != int(zs_cli):
 				bad.append(f"z_step(meta={zs_meta}, cli={zs_cli})")
-			if abs(gmb_meta - gmb_cli) > tol:
+			if (not gmb_cli_is_default) and abs(gmb_meta - gmb_cli) > tol:
 				bad.append(f"grad_mag_blur_sigma(meta={gmb_meta}, cli={gmb_cli})")
-			if abs(db_meta - db_cli) > tol:
+			if (not db_cli_is_default) and abs(db_meta - db_cli) > tol:
 				bad.append(f"dir_blur_sigma(meta={db_meta}, cli={db_cli})")
 			if bad:
 				raise ValueError("preprocessed zarr preprocess_params mismatch vs fit args: " + ", ".join(bad))
