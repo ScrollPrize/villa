@@ -253,6 +253,15 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
 			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
+			_wobs0, winding_avg, winding_err = point_constraints.winding_observed_and_error(
+				points_xyz_winda=points_all,
+				collection_idx=points_collection_idx,
+				xy_conn=xy_conn_corr,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+			)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,
@@ -264,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
 			valid_right=valid_right,
 			winding_avg=winding_avg,
 			winding_err=winding_err,
+			postfix="init",
 			out_dir=vis_cfg.out_dir,
 			scale=vis_cfg.scale,
 		)
@@ -290,6 +300,38 @@ def main(argv: list[str] | None = None) -> int:
 
 	_save_model_snapshot(stage="init", step=0)
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None, vis_losses=None) -> None:
+		if int(points_all.shape[0]) > 0:
+			if res is not None:
+				xy_lr_corr = res.xy_lr
+				xy_conn_corr = res.xy_conn
+			else:
+				with torch.no_grad():
+					xy_lr_corr = mdl._grid_xy()
+					xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
+			_wobs, wavg, werr = point_constraints.winding_observed_and_error(
+				points_xyz_winda=points_all,
+				collection_idx=points_collection_idx,
+				xy_conn=xy_conn_corr,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+			)
+			vis.save_corr_points(
+				data=data,
+				xy_lr=xy_lr_corr,
+				xy_conn=xy_conn_corr,
+				points_xyz_winda=points_all,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+				winding_avg=wavg,
+				winding_err=werr,
+				postfix=f"{stage}_{step:06d}",
+				out_dir=vis_cfg.out_dir,
+				scale=vis_cfg.scale,
+			)
 		vis.save(
 			model=mdl,
 			data=data,
@@ -311,6 +353,34 @@ def main(argv: list[str] | None = None) -> int:
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,
 	)
+	if int(points_all.shape[0]) > 0:
+		with torch.no_grad():
+			xy_lr_corr = mdl._grid_xy()
+			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
+			_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
+				points_xyz_winda=points_all,
+				collection_idx=points_collection_idx,
+				xy_conn=xy_conn_corr,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+			)
+		vis.save_corr_points(
+			data=data,
+			xy_lr=xy_lr_corr,
+			xy_conn=xy_conn_corr,
+			points_xyz_winda=points_all,
+			idx_left=idx_left,
+			valid_left=valid_left,
+			idx_right=idx_right,
+			valid_right=valid_right,
+			winding_avg=wavgf,
+			winding_err=werrf,
+			postfix="final",
+			out_dir=vis_cfg.out_dir,
+			scale=vis_cfg.scale,
+		)
 	vis.save(model=mdl, data=data, postfix="final", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
 	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_final.tif")
 	_save_model_snapshot(stage="final", step=0)

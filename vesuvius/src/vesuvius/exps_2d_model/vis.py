@@ -324,6 +324,7 @@ def save_corr_points(
 	valid_right: torch.Tensor,
 	winding_avg: torch.Tensor,
 	winding_err: torch.Tensor,
+	postfix: str,
 	out_dir: str,
 	scale: int,
 ) -> None:
@@ -446,7 +447,7 @@ def save_corr_points(
 						lineType=cv2.LINE_8,
 					)
 
-			out_path = out_corr / f"corr_grid_z{int(z):04d}.jpg"
+			out_path = out_corr / f"corr_grid_{str(postfix)}_z{int(z):04d}.jpg"
 			cv2.imwrite(str(out_path), np.flip(bg, -1))
 
 
