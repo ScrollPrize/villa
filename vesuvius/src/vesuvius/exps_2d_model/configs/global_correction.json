@@ -6,7 +6,8 @@
 		"grad-mag-blur-sigma" : 4.0,
 		"dir-blur-sigma" : 2.0,
 		"model-input" : "res_growz/model_snapshots/model_final_000000.pt",
-		"points" : "../s5/2025-02-14_test_corr.json"
+		"points" : "../s5/2025-02-16_test_corr_withsteps.json",
+		"snapshot-interval" : 100
 	},
 	"base": {
 		"dir_v": 10.0,
@@ -25,11 +26,21 @@
 		"data_plain": 0.2,
 		"data_grad": 0.0,
 		"z_straight": 10.0,
-		"corr_winding": 10.0
+		"corr_winding": 0.01
 	},
 	"stages": [
 		{
 			"name": "snap",
+			"steps": 500,
+			"lr": [0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"corr_winding": 0.0
+				}
+		},
+		{
+			"name": "corr",
 			"steps": 5000,
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
