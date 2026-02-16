@@ -13,12 +13,28 @@ import cli_data
 
 
 @dataclass(frozen=True)
+class PointConstraintsData:
+	points_xyz_winda: torch.Tensor
+	collection_idx: torch.Tensor
+	idx_left: torch.Tensor
+	valid_left: torch.Tensor
+	idx_right: torch.Tensor
+	valid_right: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ConstraintsData:
+	points: PointConstraintsData | None = None
+
+
+@dataclass(frozen=True)
 class FitData:
 	cos: torch.Tensor
 	grad_mag: torch.Tensor
 	dir0: torch.Tensor
 	dir1: torch.Tensor
 	downscale: float = 1.0
+	constraints: ConstraintsData | None = None
 
 	def grid_sample_px(self, *, xy_px: torch.Tensor) -> "FitData":
 		"""Sample using pixel xy positions.
@@ -41,7 +57,14 @@ class FitData:
 		mag_t = F.grid_sample(self.grad_mag, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir0_t = F.grid_sample(self.dir0, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir1_t = F.grid_sample(self.dir1, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-		return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t, downscale=float(self.downscale))
+		return FitData(
+			cos=cos_t,
+			grad_mag=mag_t,
+			dir0=dir0_t,
+			dir1=dir1_t,
+			downscale=float(self.downscale),
+			constraints=self.constraints,
+		)
 
 	@property
 	def size(self) -> tuple[int, int]:
@@ -107,6 +130,7 @@ def grow_z_from_omezarr_unet(
 				dir0=torch.cat([d_new.dir0, data.dir0], dim=0),
 				dir1=torch.cat([d_new.dir1, data.dir1], dim=0),
 				downscale=float(data.downscale),
+				constraints=data.constraints,
 			),
 			int(unet_z0),
 		)
@@ -117,6 +141,7 @@ def grow_z_from_omezarr_unet(
 			dir0=torch.cat([data.dir0, d_new.dir0], dim=0),
 			dir1=torch.cat([data.dir1, d_new.dir1], dim=0),
 			downscale=float(data.downscale),
+			constraints=data.constraints,
 		),
 		int(unet_z0),
 	)
@@ -325,4 +350,11 @@ def load(
 		dir0_t = _gaussian_blur_nchw(x=dir0_t, sigma=float(dir_blur_sigma))
 		dir1_t = _gaussian_blur_nchw(x=dir1_t, sigma=float(dir_blur_sigma))
 
-	return FitData(cos=cos_t, grad_mag=mag_t, dir0=dir0_t, dir1=dir1_t, downscale=float(downscale) if downscale is not None else 1.0)
+	return FitData(
+		cos=cos_t,
+		grad_mag=mag_t,
+		dir0=dir0_t,
+		dir1=dir1_t,
+		downscale=float(downscale) if downscale is not None else 1.0,
+		constraints=None,
+	)

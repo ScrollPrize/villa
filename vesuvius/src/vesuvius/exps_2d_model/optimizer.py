@@ -13,6 +13,7 @@ import opt_loss_geom
 import opt_loss_gradmag
 import opt_loss_mod
 import opt_loss_step
+import opt_loss_corr
 import mask_schedule
 
 
@@ -197,6 +198,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 			"angle": 0.0,
 			"y_straight": 0.0,
 			"z_straight": 0.0,
+			"corr_winding": 0.0,
 	}
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
@@ -309,6 +311,7 @@ def optimize(
 		return torch.where(wsum > 0.0, lsum / wsum, fallback)
 
 	def _print_losses_per_z(*, label: str, res, eff: dict[str, float], mean_pos_xy: torch.Tensor | None) -> None:
+		pts_c = data.constraints.points if data.constraints is not None else None
 		term_to_maps = {
 			"data": lambda: opt_loss_data.data_loss_map(res=res),
 			"data_plain": lambda: opt_loss_data.data_plain_loss_map(res=res),
@@ -324,6 +327,7 @@ def optimize(
 			"angle": lambda: opt_loss_geom.angle_symmetry_loss_map(res=res),
 			"y_straight": lambda: opt_loss_geom.y_straight_loss_map(res=res),
 			"z_straight": lambda: opt_loss_geom.z_straight_loss_map(res=res),
+			"corr_winding": lambda: (lambda lv, lms, ms: (lms[0], ms[0]))(*opt_loss_corr.corr_winding_loss(res=res, pts_c=pts_c)),
 			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
 		}
 		if mean_pos_xy is not None:
@@ -424,6 +428,7 @@ def optimize(
 			with torch.no_grad():
 				res_init = model(data)
 				mean_pos_xy = res_init.xy_lr.mean(dim=(0, 1, 2))
+		pts_c = data.constraints.points if data.constraints is not None else None
 		terms = {
 			"dir_v": {"loss": opt_loss_dir.dir_v_loss},
 			"dir_conn": {"loss": opt_loss_dir.dir_conn_loss},
@@ -443,6 +448,7 @@ def optimize(
 			"angle": {"loss": opt_loss_geom.angle_symmetry_loss},
 			"y_straight": {"loss": opt_loss_geom.y_straight_loss},
 			"z_straight": {"loss": opt_loss_geom.z_straight_loss},
+			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=pts_c)},
 		}
 		with torch.no_grad():
 			res0 = model(data)

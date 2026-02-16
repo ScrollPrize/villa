@@ -6,6 +6,7 @@ import cli_data
 import cli_model
 import cli_opt
 import cli_vis
+import fit_data
 import model
 import optimizer
 import point_constraints
@@ -59,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 	opt_cfg = cli_opt.from_args(args)
 	vis_cfg = cli_vis.from_args(args)
 	points_cfg = point_constraints.from_args(args)
-	points_tensor = point_constraints.load_points_tensor(points_cfg)
+	points_tensor, points_collection_idx = point_constraints.load_points_tensor(points_cfg)
 	point_constraints.print_points_tensor(points_tensor)
 
 	print("data:", data_cfg)
@@ -133,6 +134,9 @@ def main(argv: list[str] | None = None) -> int:
 	idx_right = torch.empty((0, 3), dtype=torch.int64)
 	valid_right = torch.empty((0,), dtype=torch.bool)
 	min_dist_right = torch.empty((0,), dtype=torch.float32)
+	winding_obs = torch.empty((0,), dtype=torch.float32)
+	winding_avg = torch.empty((0,), dtype=torch.float32)
+	winding_err = torch.empty((0,), dtype=torch.float32)
 
 	device = torch.device(data_cfg.device)
 	crop_xyzwhd = None
@@ -197,8 +201,37 @@ def main(argv: list[str] | None = None) -> int:
 		print("[point_constraints] closest_conn_right[z,row,colL]", idx_right)
 		print("[point_constraints] closest_conn_right_valid", valid_right)
 		print("[point_constraints] closest_conn_right_min_dist_px", min_dist_right)
+		winding_obs, winding_avg, winding_err = point_constraints.winding_observed_and_error(
+			points_xyz_winda=points_all,
+			collection_idx=points_collection_idx,
+			xy_conn=xy_conn0,
+			idx_left=idx_left,
+			valid_left=valid_left,
+			idx_right=idx_right,
+			valid_right=valid_right,
+		)
+		print("[point_constraints] winding_observed", winding_obs)
+		print("[point_constraints] winding_collection_avg", winding_avg)
+		print("[point_constraints] winding_error_obs_minus_avg_plus_winda", winding_err)
 
 	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
+	data = fit_data.FitData(
+		cos=data.cos,
+		grad_mag=data.grad_mag,
+		dir0=data.dir0,
+		dir1=data.dir1,
+		downscale=float(data.downscale),
+		constraints=fit_data.ConstraintsData(
+			points=fit_data.PointConstraintsData(
+				points_xyz_winda=points_all,
+				collection_idx=points_collection_idx,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+			)
+		),
+	)
 	device = data.cos.device
 	if mdl is None:
 		mdl = model.Model2D.from_fit_data(
@@ -229,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
 			valid_left=valid_left,
 			idx_right=idx_right,
 			valid_right=valid_right,
+			winding_avg=winding_avg,
+			winding_err=winding_err,
 			out_dir=vis_cfg.out_dir,
 			scale=vis_cfg.scale,
 		)
