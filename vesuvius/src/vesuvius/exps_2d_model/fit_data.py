@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import tifffile
 import torch
 import torch.nn.functional as F
+import zarr
 
 import tiled_infer
 from common import load_unet, unet_infer_tiled
@@ -33,6 +35,7 @@ class FitData:
 	grad_mag: torch.Tensor
 	dir0: torch.Tensor
 	dir1: torch.Tensor
+	valid: torch.Tensor | None = None
 	downscale: float = 1.0
 	constraints: ConstraintsData | None = None
 
@@ -62,6 +65,7 @@ class FitData:
 			grad_mag=mag_t,
 			dir0=dir0_t,
 			dir1=dir1_t,
+			valid=None if self.valid is None else F.grid_sample(self.valid, grid, mode="bilinear", padding_mode="zeros", align_corners=True),
 			downscale=float(self.downscale),
 			constraints=self.constraints,
 		)
@@ -129,6 +133,7 @@ def grow_z_from_omezarr_unet(
 				grad_mag=torch.cat([d_new.grad_mag, data.grad_mag], dim=0),
 				dir0=torch.cat([d_new.dir0, data.dir0], dim=0),
 				dir1=torch.cat([d_new.dir1, data.dir1], dim=0),
+				valid=None if (d_new.valid is None or data.valid is None) else torch.cat([d_new.valid, data.valid], dim=0),
 				downscale=float(data.downscale),
 				constraints=data.constraints,
 			),
@@ -140,6 +145,7 @@ def grow_z_from_omezarr_unet(
 			grad_mag=torch.cat([data.grad_mag, d_new.grad_mag], dim=0),
 			dir0=torch.cat([data.dir0, d_new.dir0], dim=0),
 			dir1=torch.cat([data.dir1, d_new.dir1], dim=0),
+			valid=None if (data.valid is None or d_new.valid is None) else torch.cat([data.valid, d_new.valid], dim=0),
 			downscale=float(data.downscale),
 			constraints=data.constraints,
 		),
@@ -212,6 +218,7 @@ def load(
 ) -> FitData:
 	p = Path(path)
 	s = str(p)
+	skip_postprocess = False
 	is_omezarr = (
 		s.endswith(".zarr")
 		or s.endswith(".ome.zarr")
@@ -240,90 +247,233 @@ def load(
 		mag_t = _read_tif_float(mag_path, device=device)
 		dir0_t = _read_tif_float(dir0_path, device=device)
 		dir1_t = _read_tif_float(dir1_path, device=device)
+		valid_t = None
 	else:
-		# Non-directory input: run UNet inference and return predictions as FitData.
-		if unet_checkpoint is None:
-			raise ValueError("non-directory input requires --unet-checkpoint")
+		# Zarr input can be either raw OME-Zarr (run UNet) or preprocessed fit zarr.
+		if is_omezarr:
+			zsrc = zarr.open(str(p), mode="r")
+		else:
+			zsrc = None
+		if isinstance(zsrc, zarr.Array) and int(len(zsrc.shape)) == 4 and int(zsrc.shape[0]) >= 4 and ("preprocess_params" in dict(getattr(zsrc, "attrs", {}))):
+			params = dict(getattr(zsrc, "attrs", {}).get("preprocess_params", {}) or {})
+			channels = [str(v) for v in (params.get("channels", []) or [])]
+			if len(channels) <= 0:
+				channels = ["cos", "grad_mag", "dir0", "dir1"]
 
-		xywh = crop
-		if xywh is None:
-			raise ValueError("non-directory input requires --crop x y w h")
-		x, y, w_c, h_c = (int(v) for v in xywh)
-		crop = (x, y, w_c, h_c)
+			req_keys = ["downscale_xy", "z_step", "grad_mag_blur_sigma", "dir_blur_sigma", "grad_mag_encode_scale"]
+			missing = [k for k in req_keys if k not in params]
+			if missing:
+				raise ValueError(f"preprocessed zarr missing preprocess_params keys for fit-arg consistency: {missing}")
 
-		z0 = unet_z
-		if z0 is None:
-			raise ValueError("OME-Zarr inference requires --unet-z")
-		zs = max(1, int(z_size))
-		zst = max(1, int(z_step))
-		# Load raw 2D slice(s) as (N,1,H,W).
-		raws: list[torch.Tensor] = []
-		show_z_progress = int(zs) > 1
-		if show_z_progress:
-			print(f"[tiled_infer] loading z slices: 0/{int(zs)}", end="", flush=True)
-		for zi in range(zs):
-			zv = int(z0) + int(zi) * int(zst)
-			if is_omezarr:
-				raw_i = tiled_infer._load_omezarr_z_uint8_norm(
-					path=str(p),
-					z=zv,
-					crop=crop,
-					device=device,
+			ds_meta = float(params.get("downscale_xy", 1.0))
+			zs_meta = int(params.get("z_step", 1))
+			gmb_meta = float(params.get("grad_mag_blur_sigma", 0.0))
+			db_meta = float(params.get("dir_blur_sigma", 0.0))
+			gmag_enc = float(params.get("grad_mag_encode_scale"))
+			if gmag_enc <= 0.0:
+				raise ValueError(f"invalid preprocess_params.grad_mag_encode_scale: {gmag_enc}")
+			ds_cli = float(downscale)
+			zs_cli = max(1, int(z_step))
+			gmb_cli = float(grad_mag_blur_sigma)
+			db_cli = float(dir_blur_sigma)
+			tol = 1e-6
+			bad: list[str] = []
+			if abs(ds_meta - ds_cli) > tol:
+				bad.append(f"downscale(meta={ds_meta}, cli={ds_cli})")
+			if int(zs_meta) != int(zs_cli):
+				bad.append(f"z_step(meta={zs_meta}, cli={zs_cli})")
+			if abs(gmb_meta - gmb_cli) > tol:
+				bad.append(f"grad_mag_blur_sigma(meta={gmb_meta}, cli={gmb_cli})")
+			if abs(db_meta - db_cli) > tol:
+				bad.append(f"dir_blur_sigma(meta={db_meta}, cli={db_cli})")
+			if bad:
+				raise ValueError("preprocessed zarr preprocess_params mismatch vs fit args: " + ", ".join(bad))
+
+			ci = {name: i for i, name in enumerate(channels)}
+			need = ["cos", "grad_mag", "dir0", "dir1"]
+			miss_need = [k for k in need if k not in ci]
+			if miss_need:
+				raise ValueError(f"preprocessed zarr missing required channels: {miss_need}; available={channels}")
+
+			shape_czyx = tuple(int(v) for v in zsrc.shape)
+			if len(shape_czyx) != 4:
+				raise ValueError(f"preprocessed zarr must be CZYX (4D), got shape={shape_czyx}")
+			_, z_all, h_all, w_all = shape_czyx
+			output_full_scaled = bool(params.get("output_full_scaled", False))
+			z_step_eff_meta = int(params.get("z_step_eff", int(zs_meta) * int(max(1, int(ds_meta)))))
+			if z_step_eff_meta <= 0:
+				raise ValueError(f"invalid preprocess_params.z_step_eff: {z_step_eff_meta}")
+			if not output_full_scaled:
+				raise ValueError("preprocessed zarr requires preprocess_params.output_full_scaled=true")
+
+			def _ceil_div(a: int, b: int) -> int:
+				return (int(a) + int(b) - 1) // int(b)
+
+			x0 = 0
+			y0 = 0
+			cw = int(w_all)
+			ch = int(h_all)
+			if crop is not None:
+				x0i, y0i, wi, hi = (int(v) for v in crop)
+				ds_i = max(1, int(round(float(ds_meta))))
+				x0s = max(0, int(x0i))
+				y0s = max(0, int(y0i))
+				x1s = max(x0s, int(x0i) + max(0, int(wi)))
+				y1s = max(y0s, int(y0i) + max(0, int(hi)))
+				x0 = int(x0s) // int(ds_i)
+				y0 = int(y0s) // int(ds_i)
+				x1m = _ceil_div(int(x1s), int(ds_i))
+				y1m = _ceil_div(int(y1s), int(ds_i))
+				cw = max(1, min(int(x1m), int(w_all)) - int(x0))
+				ch = max(1, min(int(y1m), int(h_all)) - int(y0))
+			x1 = int(x0) + int(cw)
+			y1 = int(y0) + int(ch)
+
+			z0_raw = int(unet_z) if unet_z is not None else 0
+			zs = max(1, int(z_size))
+			zst = max(1, int(z_step))
+			z_req_raw = [int(z0_raw) + int(i) * int(zst) for i in range(int(zs))]
+			z_idx = [int(zz) // int(z_step_eff_meta) for zz in z_req_raw]
+			if any((zi < 0 or zi >= int(z_all)) for zi in z_idx):
+				raise ValueError(
+					"requested z range out of bounds for preprocessed zarr: "
+					f"z_req_raw={z_req_raw}, z_idx_loaded={z_idx}, z_max={int(z_all) - 1}, "
+					f"z_step_eff_meta={int(z_step_eff_meta)}"
 				)
-			else:
-				# Non-OME-Zarr paths are single-slice only.
-				raise ValueError("z_size>1 requires OME-Zarr input")
-			raws.append(raw_i)
-			if show_z_progress:
-				print(f"\r[tiled_infer] loading z slices: {int(zi) + 1}/{int(zs)}", end="", flush=True)
-		if show_z_progress:
-			print("", flush=True)
-		raw = torch.cat(raws, dim=0)
 
-		mdl = load_unet(
-			device=device,
-			weights=unet_checkpoint,
-			strict=True,
-			in_channels=1,
-			out_channels=4,
-			base_channels=32,
-			num_levels=6,
-			max_channels=1024,
-		)
-		mdl.eval()
-		print(
-			f"[tiled_infer] device={str(device)} cuda_available={bool(torch.cuda.is_available())} "
-			f"raw_device={str(raw.device)} model_device={str(next(mdl.parameters()).device)}"
-		)
-		with torch.no_grad():
-			pred = unet_infer_tiled(
-				mdl,
-				raw,
-				tile_size=int(unet_tile_size),
-				overlap=int(unet_overlap),
-				border=int(unet_border),
+			print(
+				"[fit_data] preprocessed zarr load "
+				f"shape_czyx={shape_czyx} "
+				f"z_req_raw={z_req_raw} "
+				f"z_idx_loaded={z_idx} "
+				f"z_step_eff_meta={int(z_step_eff_meta)} "
+				f"output_full_scaled={int(output_full_scaled)} "
+				f"crop_xywh=({int(x0)},{int(y0)},{int(cw)},{int(ch)})",
+				flush=True,
 			)
 
-		if unet_out_dir_base is not None:
-			out_p = Path(unet_out_dir_base) / "unet_pred"
-			out_p.mkdir(parents=True, exist_ok=True)
-			# Save the extracted slice/crop fed into the UNet.
-			raw_np = raw[0, 0].detach().cpu().numpy().astype("float32")
-			tifffile.imwrite(str(out_p / "raw.tif"), raw_np, compression="lzw")
-			prefix = out_p / "unet"
-			pred_np = pred[0].detach().cpu().numpy().astype("float32")
-			tifffile.imwrite(str(prefix) + "_cos.tif", pred_np[0], compression="lzw")
-			tifffile.imwrite(str(prefix) + "_mag.tif", pred_np[1], compression="lzw")
-			tifffile.imwrite(str(prefix) + "_dir0.tif", pred_np[2], compression="lzw")
-			tifffile.imwrite(str(prefix) + "_dir1.tif", pred_np[3], compression="lzw")
+			def _read_ch(name: str) -> np.ndarray:
+				ci0 = int(ci[name])
+				if int(zst) == 1:
+					z_a = int(z_idx[0])
+					z_b = int(z_idx[-1]) + 1
+					return np.asarray(zsrc[ci0, z_a:z_b, y0:y1, x0:x1])
+				return np.stack([np.asarray(zsrc[ci0, int(zi), y0:y1, x0:x1]) for zi in z_idx], axis=0)
 
-		cos_t = pred[:, 0:1]
-		mag_t = pred[:, 1:2]
-		dir0_t = pred[:, 2:3]
-		dir1_t = pred[:, 3:4]
+			cos_np = _read_ch("cos")
+			mag_np = _read_ch("grad_mag")
+			dir0_np = _read_ch("dir0")
+			dir1_np = _read_ch("dir1")
+			valid_np = _read_ch("valid") if "valid" in ci else None
 
-		# For UNet input, interpret downscale as post-prediction downscale.
-		crop = None
+			def _u8_to_t(a: np.ndarray) -> torch.Tensor:
+				t = torch.from_numpy(a.astype(np.float32) / 255.0).to(device=device, dtype=torch.float32)
+				return t.unsqueeze(1)
+
+			def _u8_to_t_scaled(a: np.ndarray, *, scale: float) -> torch.Tensor:
+				s = float(scale)
+				if s <= 0.0:
+					raise ValueError(f"invalid grad_mag decode scale: {s}")
+				t = torch.from_numpy(a.astype(np.float32) / s).to(device=device, dtype=torch.float32)
+				return t.unsqueeze(1)
+
+			def _u8_valid_to_t(a: np.ndarray) -> torch.Tensor:
+				t = torch.from_numpy((a > 0).astype(np.float32)).to(device=device, dtype=torch.float32)
+				return t.unsqueeze(1)
+
+			cos_t = _u8_to_t(cos_np)
+			mag_t = _u8_to_t_scaled(mag_np, scale=float(gmag_enc))
+			dir0_t = _u8_to_t(dir0_np)
+			dir1_t = _u8_to_t(dir1_np)
+			valid_t = None if valid_np is None else _u8_valid_to_t(valid_np)
+			crop = None
+			downscale = float(ds_meta)
+			skip_postprocess = True
+		else:
+			# Raw input path: run UNet inference and return predictions as FitData.
+			if unet_checkpoint is None:
+				raise ValueError("non-directory input requires --unet-checkpoint")
+
+			xywh = crop
+			if xywh is None:
+				raise ValueError("non-directory input requires --crop x y w h")
+			x, y, w_c, h_c = (int(v) for v in xywh)
+			crop = (x, y, w_c, h_c)
+
+			z0 = unet_z
+			if z0 is None:
+				raise ValueError("OME-Zarr inference requires --unet-z")
+			zs = max(1, int(z_size))
+			zst = max(1, int(z_step))
+			# Load raw 2D slice(s) as (N,1,H,W).
+			raws: list[torch.Tensor] = []
+			show_z_progress = int(zs) > 1
+			if show_z_progress:
+				print(f"[tiled_infer] loading z slices: 0/{int(zs)}", end="", flush=True)
+			for zi in range(zs):
+				zv = int(z0) + int(zi) * int(zst)
+				if is_omezarr:
+					raw_i = tiled_infer._load_omezarr_z_uint8_norm(
+						path=str(p),
+						z=zv,
+						crop=crop,
+						device=device,
+					)
+				else:
+					# Non-OME-Zarr paths are single-slice only.
+					raise ValueError("z_size>1 requires OME-Zarr input")
+				raws.append(raw_i)
+				if show_z_progress:
+					print(f"\r[tiled_infer] loading z slices: {int(zi) + 1}/{int(zs)}", end="", flush=True)
+			if show_z_progress:
+				print("", flush=True)
+			raw = torch.cat(raws, dim=0)
+
+			mdl = load_unet(
+				device=device,
+				weights=unet_checkpoint,
+				strict=True,
+				in_channels=1,
+				out_channels=4,
+				base_channels=32,
+				num_levels=6,
+				max_channels=1024,
+			)
+			mdl.eval()
+			print(
+				f"[tiled_infer] device={str(device)} cuda_available={bool(torch.cuda.is_available())} "
+				f"raw_device={str(raw.device)} model_device={str(next(mdl.parameters()).device)}"
+			)
+			with torch.no_grad():
+				pred = unet_infer_tiled(
+					mdl,
+					raw,
+					tile_size=int(unet_tile_size),
+					overlap=int(unet_overlap),
+					border=int(unet_border),
+				)
+
+			if unet_out_dir_base is not None:
+				out_p = Path(unet_out_dir_base) / "unet_pred"
+				out_p.mkdir(parents=True, exist_ok=True)
+				# Save the extracted slice/crop fed into the UNet.
+				raw_np = raw[0, 0].detach().cpu().numpy().astype("float32")
+				tifffile.imwrite(str(out_p / "raw.tif"), raw_np, compression="lzw")
+				prefix = out_p / "unet"
+				pred_np = pred[0].detach().cpu().numpy().astype("float32")
+				tifffile.imwrite(str(prefix) + "_cos.tif", pred_np[0], compression="lzw")
+				tifffile.imwrite(str(prefix) + "_mag.tif", pred_np[1], compression="lzw")
+				tifffile.imwrite(str(prefix) + "_dir0.tif", pred_np[2], compression="lzw")
+				tifffile.imwrite(str(prefix) + "_dir1.tif", pred_np[3], compression="lzw")
+
+			cos_t = pred[:, 0:1]
+			mag_t = pred[:, 1:2]
+			dir0_t = pred[:, 2:3]
+			dir1_t = pred[:, 3:4]
+			valid_t = None
+
+			# For UNet input, interpret downscale as post-prediction downscale.
+			crop = None
 
 	if crop is not None:
 		x, y, w_c, h_c = (int(v) for v in crop)
@@ -336,25 +486,32 @@ def load(
 		mag_t = mag_t[:, :, y0:y1, x0:x1]
 		dir0_t = dir0_t[:, :, y0:y1, x0:x1]
 		dir1_t = dir1_t[:, :, y0:y1, x0:x1]
+		if valid_t is not None:
+			valid_t = valid_t[:, :, y0:y1, x0:x1]
 
-	if downscale is not None and float(downscale) > 1.0:
+	if (not skip_postprocess) and downscale is not None and float(downscale) > 1.0:
 		scale = 1.0 / float(downscale)
 		cos_t = F.interpolate(cos_t, scale_factor=scale, mode="bilinear", align_corners=True)
 		mag_t = F.interpolate(mag_t, scale_factor=scale, mode="bilinear", align_corners=True)
 		dir0_t = F.interpolate(dir0_t, scale_factor=scale, mode="bilinear", align_corners=True)
 		dir1_t = F.interpolate(dir1_t, scale_factor=scale, mode="bilinear", align_corners=True)
+		if valid_t is not None:
+			valid_t = F.interpolate(valid_t, scale_factor=scale, mode="area")
 
-	if float(grad_mag_blur_sigma) > 0.0:
+	if (not skip_postprocess) and float(grad_mag_blur_sigma) > 0.0:
 		mag_t = _gaussian_blur_nchw(x=mag_t, sigma=float(grad_mag_blur_sigma))
-	if float(dir_blur_sigma) > 0.0:
+	if (not skip_postprocess) and float(dir_blur_sigma) > 0.0:
 		dir0_t = _gaussian_blur_nchw(x=dir0_t, sigma=float(dir_blur_sigma))
 		dir1_t = _gaussian_blur_nchw(x=dir1_t, sigma=float(dir_blur_sigma))
+	if valid_t is not None:
+		valid_t = (valid_t > 0.5).to(dtype=torch.float32)
 
 	return FitData(
 		cos=cos_t,
 		grad_mag=mag_t,
 		dir0=dir0_t,
 		dir1=dir1_t,
+		valid=valid_t,
 		downscale=float(downscale) if downscale is not None else 1.0,
 		constraints=None,
 	)

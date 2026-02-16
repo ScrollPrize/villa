@@ -134,19 +134,20 @@ def run(
 				sh = _shape_mul2(base_shape, int(first_filled_level) - int(lv))
 			else:
 				sh = _shape_div2(base_shape, int(lv) - int(first_filled_level))
-			arrs[lv] = g.create_dataset(
-				str(lv),
-				shape=sh,
-				chunks=(
-					min(int(sh[0]), max(1, int(chunk))),
-					min(int(sh[1]), max(1, int(chunk))),
-					min(int(sh[2]), max(1, int(chunk))),
-				),
-				dtype=np.uint8,
-				overwrite=True,
-				fill_value=0,
-				dimension_separator="/",
-			)
+			if lv >= int(first_filled_level):
+				arrs[lv] = g.create_dataset(
+					str(lv),
+					shape=sh,
+					chunks=(
+						min(int(sh[0]), max(1, int(chunk))),
+						min(int(sh[1]), max(1, int(chunk))),
+						min(int(sh[2]), max(1, int(chunk))),
+					),
+					dtype=np.uint8,
+					overwrite=True,
+					fill_value=0,
+					dimension_separator="/",
+				)
 
 		# Fill only lower levels (>= first_filled_level).
 		cur = base
