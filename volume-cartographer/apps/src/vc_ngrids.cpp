@@ -2134,7 +2134,8 @@ static void run_fit_normals(
     };
 
     const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<int64_t> next_report_elapsed_ns{10LL * 1000LL * 1000LL * 1000LL};
+    constexpr int64_t kProgressReportPeriodNs = 10LL * 1000LL * 1000LL * 1000LL;
+    std::atomic<int64_t> next_report_elapsed_ns{kProgressReportPeriodNs};
 
     auto report_progress = [&](int64_t processed, int64_t written) {
         const auto now = std::chrono::steady_clock::now();
@@ -2204,6 +2205,8 @@ static void run_fit_normals(
 
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
     constexpr int64_t kProgressFlushSamples = 256;
+    // Reporting reads merged per-thread snapshots at coarse wall-time intervals
+    // to avoid touching frequently-mutating counters every sample.
     #pragma omp parallel
     {
         const int tid = omp_get_thread_num();
@@ -2393,7 +2396,7 @@ static void run_fit_normals(
                                 flush_progress(true);
                                 const auto [processed_snapshot, written_snapshot] = merged_progress();
                                 report_progress(processed_snapshot, written_snapshot);
-                                next_report_elapsed_ns.store(elapsed_ns2 + 10LL * 1000LL * 1000LL * 1000LL, std::memory_order_relaxed);
+                                next_report_elapsed_ns.store(elapsed_ns2 + kProgressReportPeriodNs, std::memory_order_relaxed);
                             }
                         }
                     }
