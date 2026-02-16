@@ -115,3 +115,12 @@ time python $SRC/fit.py $SRC/grow_z_stages.json $SRC/grow_z_args.json
 ffmpeg -framerate 10 -pattern_type glob -i 'res_growz2/grids/res_grid_stage0_grow*500.jpg' -vf "crop=in_w/2:in_h/2:in_w/4:in_h/4" -c:v libx264 -pix_fmt yuv420p grow_direct_tuned.mkv
 
 python $SRC/fit2tifxyz.py --input log/res_growz3/model_snapshots/model_final_000000.pt --output surfs/ --offset 2000 2500 6000
+
+#preproc cos volume
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output s5_cos.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 2000 2500 6000 1600 1600 1000
+
+[hendrik@turbosheep volumes]$ sshfs staticsheep:/home/hendrik/business/aiconsulting/vesuviuschallenge/data/model2d_fullsize_exps/vis_fit_cos.ome.zarr vis_fit_cos.ome.zarr
+sshfs: bad mount point `vis_fit_cos.ome.zarr': No such file or directory
+[hendrik@turbosheep volumes]$ mkdir vis_fit_cos.ome.zarr
+[hendrik@turbosheep volumes]$ sshfs staticsheep:/home/hendrik/business/aiconsulting/vesuviuschallenge/data/model2d_fullsize_exps/vis_fit_cos.ome.zarr vis_fit_cos.ome.zarr
+[hendrik@turbosheep volumes]$
