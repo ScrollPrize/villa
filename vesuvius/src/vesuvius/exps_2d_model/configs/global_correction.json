@@ -24,7 +24,8 @@
 		"data": 0.4,
 		"data_plain": 0.2,
 		"data_grad": 0.0,
-		"z_straight": 10.0
+		"z_straight": 10.0,
+		"corr_winding": 1.0
 	},
 	"stages": [
 		{

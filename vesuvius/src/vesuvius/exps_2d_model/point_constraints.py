@@ -34,8 +34,9 @@ def from_args(args: argparse.Namespace) -> PointConstraintsConfig:
 	return PointConstraintsConfig(points=paths)
 
 
-def load_points_tensor(cfg: PointConstraintsConfig) -> torch.Tensor:
+def load_points_tensor(cfg: PointConstraintsConfig) -> tuple[torch.Tensor, torch.Tensor]:
 	rows: list[list[float]] = []
+	cids: list[int] = []
 	for pth in cfg.points:
 		obj = json.loads(Path(pth).read_text(encoding="utf-8"))
 		cols = obj.get("collections", {}) if isinstance(obj, dict) else {}
@@ -58,13 +59,20 @@ def load_points_tensor(cfg: PointConstraintsConfig) -> torch.Tensor:
 				pv = pd.get("p", None)
 				if not isinstance(pv, (list, tuple)) or len(pv) < 3:
 					continue
+				try:
+					cid_i = int(_cid)
+				except Exception:
+					cid_i = -1
 				rows.append([
 					float(pv[0]),
 					float(pv[1]),
 					float(pv[2]),
 					float(pd["wind_a"]),
 				])
-	return torch.tensor(rows, dtype=torch.float32) if rows else torch.empty((0, 4), dtype=torch.float32)
+				cids.append(cid_i)
+	pts = torch.tensor(rows, dtype=torch.float32) if rows else torch.empty((0, 4), dtype=torch.float32)
+	col_idx = torch.tensor(cids, dtype=torch.int64) if cids else torch.empty((0,), dtype=torch.int64)
+	return pts, col_idx
 
 
 def print_points_tensor(t: torch.Tensor) -> None:
@@ -223,3 +231,90 @@ def print_closest_conn_segments(*, points_xyz_winda: torch.Tensor, xy_conn: torc
 	print("[point_constraints] closest_conn_right[z,row,colL]", idx_r)
 	print("[point_constraints] closest_conn_right_valid", ok_r)
 	print("[point_constraints] closest_conn_right_min_dist_px", d_r)
+
+
+def winding_observed_and_error(
+	*,
+	points_xyz_winda: torch.Tensor,
+	collection_idx: torch.Tensor,
+	xy_conn: torch.Tensor,
+	idx_left: torch.Tensor,
+	valid_left: torch.Tensor,
+	idx_right: torch.Tensor,
+	valid_right: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Return per-point observed winding, per-point collection average, and winding error.
+
+	- observed winding uses both sides when valid:
+	  left estimate:  col_left - xfrac_left
+	  right estimate: col_right + xfrac_right
+	  observed = 0.5 * (left_est + right_est)
+	- points without both valid sides are ignored for collection averages.
+	- error = observed - (collection_avg + wind_a)
+	"""
+	if int(points_xyz_winda.shape[0]) <= 0:
+		empty = torch.empty((0,), dtype=torch.float32, device=xy_conn.device)
+		return empty, empty, empty
+	pts = points_xyz_winda.to(device=xy_conn.device, dtype=torch.float32)
+	col = collection_idx.to(device=xy_conn.device, dtype=torch.int64)
+	idx_l = idx_left.to(device=xy_conn.device, dtype=torch.int64)
+	idx_r = idx_right.to(device=xy_conn.device, dtype=torch.int64)
+	ok_l = valid_left.to(device=xy_conn.device, dtype=torch.bool)
+	ok_r = valid_right.to(device=xy_conn.device, dtype=torch.bool)
+
+	center = xy_conn[:, :, :, 1, :]
+	leftp = xy_conn[:, :, :, 0, :]
+	rightp = xy_conn[:, :, :, 2, :]
+	n, hm, wm = int(center.shape[0]), int(center.shape[1]), int(center.shape[2])
+
+	def _xfrac_for_side(*, side_pts: torch.Tensor, idx: torch.Tensor, ok: torch.Tensor) -> torch.Tensor:
+		xf = torch.full((int(pts.shape[0]),), float("nan"), dtype=torch.float32, device=xy_conn.device)
+		for i in range(int(pts.shape[0])):
+			if not bool(ok[i].item()):
+				continue
+			z = int(idx[i, 0].item())
+			r = int(idx[i, 1].item())
+			c = int(idx[i, 2].item())
+			if z < 0 or z >= n or r < 0 or (r + 1) >= hm or c < 0 or c >= wm:
+				continue
+			q = pts[i, 0:2]
+			p0 = center[z, r, c]
+			p1 = center[z, r + 1, c]
+			c0 = side_pts[z, r, c]
+			c1 = side_pts[z, r + 1, c]
+			s = p1 - p0
+			l2 = float((s * s).sum().item())
+			if l2 <= 1e-12:
+				continue
+			a = float(((q - p0) * s).sum().item()) / l2
+			a = max(0.0, min(1.0, a))
+			cp = p0 + s * a
+			v0 = c0 - p0
+			v1 = c1 - p1
+			v = v0 * (1.0 - a) + v1 * a
+			v2 = float((v * v).sum().item())
+			if v2 <= 1e-12:
+				continue
+			xf[i] = float(((q - cp) * v).sum().item()) / v2
+		return xf
+
+	xf_l = _xfrac_for_side(side_pts=leftp, idx=idx_l, ok=ok_l)
+	xf_r = _xfrac_for_side(side_pts=rightp, idx=idx_r, ok=ok_r)
+	w_left = idx_l[:, 2].to(dtype=torch.float32) - xf_l
+	w_right = idx_r[:, 2].to(dtype=torch.float32) + xf_r
+	both = ok_l & ok_r & torch.isfinite(w_left) & torch.isfinite(w_right)
+	obs = torch.full((int(pts.shape[0]),), float("nan"), dtype=torch.float32, device=xy_conn.device)
+	obs[both] = 0.5 * (w_left[both] + w_right[both])
+
+	avg = torch.full_like(obs, float("nan"))
+	if int(col.numel()) == int(obs.numel()) and int(obs.numel()) > 0:
+		uc = torch.unique(col)
+		for cid in uc.tolist():
+			m = (col == int(cid)) & both
+			if bool(m.any().item()):
+				v = obs[m]
+				mu = torch.nanmean(v)
+				avg[col == int(cid)] = mu
+
+	err = obs - (avg + pts[:, 3])
+	return obs, avg, err

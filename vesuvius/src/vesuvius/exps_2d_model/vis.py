@@ -322,6 +322,8 @@ def save_corr_points(
 	valid_left: torch.Tensor,
 	idx_right: torch.Tensor,
 	valid_right: torch.Tensor,
+	winding_avg: torch.Tensor,
+	winding_err: torch.Tensor,
 	out_dir: str,
 	scale: int,
 ) -> None:
@@ -422,6 +424,27 @@ def save_corr_points(
 				else:
 					cv2.circle(bg, (px, py), rad, (255, 0, 255), -1)
 					cv2.circle(bg, (px, py), rad + 1, (255, 255, 255), 1)
+
+				wa = float("nan")
+				we = float("nan")
+				if int(winding_avg.numel()) > int(kk):
+					wa = float(winding_avg[int(kk)].item())
+				if int(winding_err.numel()) > int(kk):
+					we = float(winding_err[int(kk)].item())
+				if np.isfinite(wa) or np.isfinite(we):
+					wa_s = "nan" if not np.isfinite(wa) else f"{wa:.2f}"
+					we_s = "nan" if not np.isfinite(we) else f"{we:+.2f}"
+					lbl = f"{wa_s}/{we_s}"
+					cv2.putText(
+						bg,
+						lbl,
+						(px + rad + 2, py - rad - 2),
+						cv2.FONT_HERSHEY_PLAIN,
+						0.45,
+						(255, 255, 255),
+						1,
+						lineType=cv2.LINE_8,
+					)
 
 			out_path = out_corr / f"corr_grid_z{int(z):04d}.jpg"
 			cv2.imwrite(str(out_path), np.flip(bg, -1))
