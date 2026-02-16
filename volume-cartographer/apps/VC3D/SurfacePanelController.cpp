@@ -1528,10 +1528,6 @@ void SurfacePanelController::applyFiltersInternal()
             _surfaces->setSurface(id, surf, true, false);
         }
 
-        if (restrictToCurrent && !id.empty()) {
-            show = show && (id == _currentSurfaceId);
-        }
-
         if (hasSurfaceIdFilter && !id.empty()) {
             show = show && QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
         }

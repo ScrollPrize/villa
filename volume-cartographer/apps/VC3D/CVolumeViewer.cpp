@@ -345,6 +345,30 @@ void CVolumeViewer::recalcScales()
         // Clamp to available scales
         _ds_sd_idx = std::min(_ds_sd_idx, (int)volume->numScales() - 1);
     }
+
+    // If requested level is missing, move to lower resolution (higher pyramid level).
+    // If no lower-resolution level exists, fall back to the closest available one.
+    if (volume && volume->numScales() > 0) {
+        _ds_sd_idx = std::max(0, std::min(_ds_sd_idx, (int)volume->numScales() - 1));
+
+        int chosen = _ds_sd_idx;
+        while (chosen < static_cast<int>(volume->numScales()) && !volume->zarrDataset(chosen)) {
+            ++chosen;
+        }
+
+        if (chosen >= static_cast<int>(volume->numScales())) {
+            chosen = _ds_sd_idx;
+            while (chosen >= 0 && !volume->zarrDataset(chosen)) {
+                --chosen;
+            }
+        }
+
+        if (chosen >= 0) {
+            _ds_sd_idx = chosen;
+        }
+
+    }
+
     _ds_scale = std::pow(2.0f, -_ds_sd_idx);
     /* ---------------------------------------------------------------- */
 

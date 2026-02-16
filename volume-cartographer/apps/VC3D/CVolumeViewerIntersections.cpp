@@ -145,8 +145,13 @@ static bool applyApprovalStyle(
 void CVolumeViewer::renderIntersections()
 {
     auto surf = _surf_weak.lock();
-    if (!volume || !volume->zarrDataset() || !surf)
+    if (!volume || !surf)
         return;
+
+    recalcScales();
+    if (!volume->zarrDataset(_ds_sd_idx)) {
+        return;
+    }
 
     // Refresh cached surface pointers if targets changed or if a surface object
     // was swapped out during an edit (common for segmentation updates).

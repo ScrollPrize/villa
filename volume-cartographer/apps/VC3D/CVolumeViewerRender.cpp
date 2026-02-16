@@ -50,8 +50,17 @@ void CVolumeViewer::renderVisible(bool force)
         }
     }
 
-    if (!volume || !volume->zarrDataset() || !surf)
+    if (!volume || !surf)
         return;
+
+    recalcScales();
+    if (!volume->zarrDataset(_ds_sd_idx)) {
+        // Avoid showing stale image from previous volume when selected scale is unavailable.
+        if (fBaseImageItem) {
+            fBaseImageItem->setPixmap(QPixmap());
+        }
+        return;
+    }
 
     QRectF bbox = fGraphicsView->mapToScene(fGraphicsView->viewport()->geometry()).boundingRect();
 
@@ -281,12 +290,28 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             float overlayScale = 1.0f;
             if (_overlayVolume->numScales() > 0) {
                 overlayIdx = std::min<int>(_ds_sd_idx, static_cast<int>(_overlayVolume->numScales()) - 1);
-                overlayScale = std::pow(2.0f, -overlayIdx);
+                int chosenIdx = overlayIdx;
+                while (chosenIdx < static_cast<int>(_overlayVolume->numScales()) && !_overlayVolume->zarrDataset(chosenIdx)) {
+                    ++chosenIdx;
+                }
+                if (chosenIdx >= static_cast<int>(_overlayVolume->numScales())) {
+                    chosenIdx = overlayIdx;
+                    while (chosenIdx >= 0 && !_overlayVolume->zarrDataset(chosenIdx)) {
+                        --chosenIdx;
+                    }
+                }
+
+                if (chosenIdx >= 0) {
+                    overlayIdx = chosenIdx;
+                    overlayScale = std::pow(2.0f, -overlayIdx);
+                }
             }
 
             cv::Mat_<uint8_t> overlayValues;
             z5::Dataset* overlayDataset = _overlayVolume->zarrDataset(overlayIdx);
-            readInterpolated3D(overlayValues, overlayDataset, coords * overlayScale, cache, /*nearest_neighbor=*/true);
+            if (overlayDataset) {
+                readInterpolated3D(overlayValues, overlayDataset, coords * overlayScale, cache, /*nearest_neighbor=*/true);
+            }
 
             if (!overlayValues.empty()) {
                 const int windowLow = static_cast<int>(std::clamp(_overlayWindowLow, 0.0f, 255.0f));
