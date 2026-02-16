@@ -9,6 +9,7 @@
 #include <array>
 #include <random>
 
+#include <unordered_map>
 #include <unordered_set>
 
 #include <boost/program_options.hpp>
@@ -1887,7 +1888,35 @@ static void run_fit_normals(
 
     std::vector<FitStats> stats = stats_of();
 
+    using NGridPtr = decltype(ngv.query_nearest(cv::Point3f(0.f, 0.f, 0.f), 0));
+    std::vector<std::unordered_map<uint64_t, NGridPtr>> nearest_grid_cache(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+
+    struct SegmentCandidate {
+        cv::Point3f dir_unit;
+        cv::Point3f delta_xyz;
+        double weight = 0.0;
+        float dist2 = 0.0f;
+        bool is_short_path = false;
+    };
+
+    auto plane_slice_key = [](int plane_idx, int slice_idx) -> uint64_t {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(plane_idx)) << 32) |
+               static_cast<uint64_t>(static_cast<uint32_t>(slice_idx));
+    };
+
+    auto query_nearest_cached = [&](int tid, int plane_idx, int slice_idx, const cv::Point3f& sample_point) -> NGridPtr {
+        auto& cache = nearest_grid_cache[static_cast<size_t>(tid)];
+        const uint64_t key = plane_slice_key(plane_idx, slice_idx);
+        const auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+        auto grid = ngv.query_nearest(point_for_slice_query(sample_point, plane_idx, slice_idx), plane_idx);
+        cache.emplace(key, grid);
+        return grid;
+    };
+
     auto gather_samples_for_radius = [&](
+        const std::array<std::vector<SegmentCandidate>, 3>& candidates,
+        std::array<size_t, 3>& candidate_cursor,
         const cv::Point3f& sample,
         float rad,
         int tid,
@@ -1895,7 +1924,32 @@ static void run_fit_normals(
         std::array<std::vector<double>, 3>& weights,
         std::array<std::vector<cv::Point3f>, 3>& deltas_xyz,
         int& used_segments_total,
-        int& used_segments_short_paths,
+        int& used_segments_short_paths) {
+
+        (void)sample;
+        (void)tid;
+
+        const float r2 = rad * rad;
+        for (int p = 0; p < 3; ++p) {
+            auto& cursor = candidate_cursor[p];
+            const auto& cand = candidates[p];
+            while (cursor < cand.size() && cand[cursor].dist2 <= r2) {
+                const auto& c = cand[cursor];
+                dirs_unit[p].push_back(c.dir_unit);
+                deltas_xyz[p].push_back(c.delta_xyz);
+                weights[p].push_back(c.weight);
+                ++used_segments_total;
+                if (c.is_short_path) ++used_segments_short_paths;
+                ++cursor;
+            }
+        }
+    };
+
+    auto gather_segment_candidates = [&](
+        const cv::Point3f& sample,
+        float max_rad,
+        int tid,
+        std::array<std::vector<SegmentCandidate>, 3>& candidates,
         double& t_ng_read_s,
         double& t_preproc_s) {
 
@@ -1905,8 +1959,7 @@ static void run_fit_normals(
         // A path with a single segment (2 points) is considered "short".
         constexpr int kShortPathMaxSegments = 1;
 
-        const float r2 = rad * rad;
-        const float sigma = rad / 2.0f;
+        const float sigma = max_rad / 2.0f;
         const float inv_two_sigma2 = 1.0f / (2.0f * sigma * sigma + 1e-12f);
         (void)inv_two_sigma2;
         const float sample_arr[3] = {sample.x, sample.y, sample.z};
@@ -1918,8 +1971,8 @@ static void run_fit_normals(
             const int s_axis = (pc.plane_idx == 0) ? 2 : (pc.plane_idx == 1) ? 1 : 0;
 
             const int s_center = static_cast<int>(sample_arr[s_axis]);
-            const int s_min = std::max(read_box.min[s_axis], static_cast<int>(std::floor(s_center - rad)));
-            const int s_max = std::min(read_box.max[s_axis], static_cast<int>(std::ceil(s_center + rad)) + 1);
+            const int s_min = std::max(read_box.min[s_axis], static_cast<int>(std::floor(s_center - max_rad)));
+            const int s_max = std::min(read_box.max[s_axis], static_cast<int>(std::ceil(s_center + max_rad)) + 1);
             int slice_start = align_down(s_min, sparse_volume);
             if (slice_start < s_min) slice_start += std::max(1, sparse_volume);
 
@@ -1927,8 +1980,8 @@ static void run_fit_normals(
                 // Shrink the 2D query rect based on distance in the slice axis:
                 // at offset ds from the center, the in-slice radius is sqrt(r^2 - ds^2).
                 const float ds = std::abs(static_cast<float>(slice) - sample_arr[s_axis]);
-                if (ds > rad) continue;
-                const float r_eff = std::sqrt(std::max(0.0f, rad * rad - ds * ds));
+                if (ds > max_rad) continue;
+                const float r_eff = std::sqrt(std::max(0.0f, max_rad * max_rad - ds * ds));
 
                 const int u0 = std::max(read_box.min[u_axis], static_cast<int>(std::floor(sample_arr[u_axis] - r_eff)));
                 const int v0 = std::max(read_box.min[v_axis], static_cast<int>(std::floor(sample_arr[v_axis] - r_eff)));
@@ -1939,7 +1992,7 @@ static void run_fit_normals(
                 const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
 
                 const auto t_read0 = std::chrono::steady_clock::now();
-                auto grid = ngv.query_nearest(point_for_slice_query(sample, pc.plane_idx, slice), pc.plane_idx);
+                auto grid = query_nearest_cached(tid, pc.plane_idx, slice, sample);
                 if (!grid) continue;
 
                 const auto paths = grid->get(query);
@@ -1974,34 +2027,41 @@ static void run_fit_normals(
 
                         if (!clip_segment_to_crop(a, b, read_box)) continue;
                         const float dist2 = dist_sq_point_segment_appx(sample, a, b);
-                        const bool reject = (dist2 > r2);
-                        stats[static_cast<size_t>(tid)].add_dist_test(reject);
-                        if (reject) continue;
 
                         const cv::Point3f d = b - a;
                         const float seglen2 = d.dot(d);
                         if (seglen2 <= 1e-6f) continue;
                         const float inv = 1.0f / std::sqrt(seglen2);
-                        dirs_unit[pc.plane_idx].emplace_back(d.x * inv, d.y * inv, d.z * inv);
+                        const cv::Point3f dir_unit(d.x * inv, d.y * inv, d.z * inv);
 
                         // Delta from sample point for first-order curvature term.
                         // Use the segment midpoint as the constraint location.
                         const cv::Point3f m = 0.5f * (a + b);
-                        deltas_xyz[pc.plane_idx].emplace_back(m.x - sample.x, m.y - sample.y, m.z - sample.z);
+                        const cv::Point3f delta_xyz(m.x - sample.x, m.y - sample.y, m.z - sample.z);
 
                     // Weights are proportional to path length:
                     // seg_count=1 -> 0.1, seg_count>=10 -> 1.0.
                     const double path_w = std::max(0.1, std::min(1.0, static_cast<double>(seg_count) / 10.0));
                     const double w = path_w; // switchable: path_w * std::exp(-static_cast<double>(dist2) * static_cast<double>(inv_two_sigma2))
-                    weights[pc.plane_idx].push_back(w);
-
-                        ++used_segments_total;
-                        if (is_short_path) ++used_segments_short_paths;
+                        candidates[pc.plane_idx].push_back(SegmentCandidate{dir_unit, delta_xyz, w, dist2, is_short_path});
                     }
                 }
                 const auto t_pp1 = std::chrono::steady_clock::now();
                 t_preproc_s += std::chrono::duration<double>(t_pp1 - t_pp0).count();
             }
+        }
+
+        for (int p = 0; p < 3; ++p) {
+            auto& c = candidates[p];
+            std::sort(c.begin(), c.end(), [](const SegmentCandidate& a, const SegmentCandidate& b) {
+                return a.dist2 < b.dist2;
+            });
+            size_t reject_count = 0;
+            for (const auto& seg : c) {
+                if (seg.dist2 > max_rad * max_rad) ++reject_count;
+            }
+            stats[static_cast<size_t>(tid)].dist_test_total += static_cast<uint64_t>(c.size());
+            stats[static_cast<size_t>(tid)].dist_test_reject += static_cast<uint64_t>(reject_count);
         }
     };
 
@@ -2016,6 +2076,8 @@ static void run_fit_normals(
         std::array<std::vector<cv::Point3f>, 3> dirs_unit;
         std::array<std::vector<double>, 3> weights;
         std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
+        std::array<std::vector<SegmentCandidate>, 3> candidates;
+        std::array<size_t, 3> candidate_cursor = {0, 0, 0};
     };
     std::vector<FitBuffers> fit_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
     for (auto& fb : fit_buffers) {
@@ -2023,6 +2085,7 @@ static void run_fit_normals(
             fb.dirs_unit[p].reserve(512);
             fb.weights[p].reserve(512);
             fb.deltas_xyz[p].reserve(512);
+            fb.candidates[p].reserve(2048);
         }
     }
 
@@ -2200,6 +2263,8 @@ static void run_fit_normals(
                 auto& dirs_unit = fb.dirs_unit;
                 auto& weights = fb.weights;
                 auto& deltas_xyz = fb.deltas_xyz;
+                auto& candidates = fb.candidates;
+                auto& candidate_cursor = fb.candidate_cursor;
 
                 double t_ng_read_s = 0.0;
                 double t_preproc_s = 0.0;
@@ -2208,20 +2273,28 @@ static void run_fit_normals(
                 int used_segments_total = 0;
                 int used_segments_short_paths = 0;
                 bool skip_fit_due_to_low_segments = false;
+                clear_fit_buffers(dirs_unit, weights, deltas_xyz);
+                for (int p = 0; p < 3; ++p) {
+                    candidates[p].clear();
+                    candidate_cursor[p] = 0;
+                }
+                gather_segment_candidates(sample,
+                                          static_cast<float>(kMaxRadius),
+                                          tid,
+                                          candidates,
+                                          t_ng_read_s,
+                                          t_preproc_s);
                 for (int rad = kMinRadius; rad <= kMaxRadius; rad *= 1.1) {
-                    clear_fit_buffers(dirs_unit, weights, deltas_xyz);
-                    used_segments_total = 0;
-                    used_segments_short_paths = 0;
-                    gather_samples_for_radius(sample,
+                    gather_samples_for_radius(candidates,
+                                              candidate_cursor,
+                                              sample,
                                               static_cast<float>(rad),
                                               tid,
                                               dirs_unit,
                                               weights,
                                               deltas_xyz,
                                               used_segments_total,
-                                              used_segments_short_paths,
-                                              t_ng_read_s,
-                                              t_preproc_s);
+                                              used_segments_short_paths);
                     used_rad = rad;
 
                     // If at the initial radius there are too few segments overall, skip this normal completely.
