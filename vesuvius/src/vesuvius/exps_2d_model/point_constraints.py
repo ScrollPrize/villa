@@ -312,7 +312,7 @@ def winding_observed_and_error(
 		for cid in uc.tolist():
 			m = (col == int(cid)) & both
 			if bool(m.any().item()):
-				v = obs[m]
+				v = obs[m] - pts[m, 3]
 				mu = torch.nanmean(v)
 				avg[col == int(cid)] = mu
 
