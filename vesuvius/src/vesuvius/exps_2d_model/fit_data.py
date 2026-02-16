@@ -87,12 +87,14 @@ def grow_z_from_omezarr_unet(
 	insert_z: int,
 	out_dir_base: str | None,
 ) -> tuple[FitData, int]:
-	"""Expand `data` along Z by running UNet inference for the missing slice(s).
+	"""Expand `data` along Z by loading the newly required slice(s).
 
 	Contract:
 	- Only supports growing by 1 slice.
 	- Only supports prepend (insert_z==0) or append (insert_z==old_N).
 	- Requires OME-Zarr input.
+	- For preprocessed zarr input: reloads the full target stack via [`load()`](fit_data.py:201).
+	- For raw OME-Zarr input: infers only the missing slice via UNet.
 	- Returns (expanded_data, new_unet_z0).
 	"""
 	old_n = int(data.cos.shape[0])
@@ -102,6 +104,47 @@ def grow_z_from_omezarr_unet(
 	ins = int(insert_z)
 	if ins not in (0, old_n):
 		raise ValueError("grow_z: only prepend/append supported")
+
+	# Preprocessed zarr path: reload full target stack with the same loader mapping.
+	try:
+		p_in = Path(str(cfg.input))
+		s_in = str(p_in)
+		is_omezarr_in = (
+			s_in.endswith(".zarr")
+			or s_in.endswith(".ome.zarr")
+			or (".zarr/" in s_in)
+			or (".ome.zarr/" in s_in)
+		)
+		if is_omezarr_in:
+			zsrc_in = zarr.open(str(p_in), mode="r")
+			if isinstance(zsrc_in, zarr.Array) and ("preprocess_params" in dict(getattr(zsrc_in, "attrs", {}))):
+				z0_new = int(unet_z0)
+				if ins == 0:
+					z0_new = int(unet_z0) - int(max(1, int(cfg.z_step)))
+				d_reload = load(
+					path=str(cfg.input),
+					device=data.cos.device,
+					downscale=float(cfg.downscale),
+					crop=cfg.crop,
+					unet_checkpoint=str(cfg.unet_checkpoint) if cfg.unet_checkpoint is not None else None,
+					unet_layer=cfg.unet_layer,
+					unet_z=int(z0_new),
+					z_size=int(new_n),
+					z_step=int(cfg.z_step),
+					unet_tile_size=int(cfg.unet_tile_size),
+					unet_overlap=int(cfg.unet_overlap),
+					unet_border=int(cfg.unet_border),
+					unet_group=cfg.unet_group,
+					unet_out_dir_base=out_dir_base,
+					grad_mag_blur_sigma=float(cfg.grad_mag_blur_sigma),
+					dir_blur_sigma=float(cfg.dir_blur_sigma),
+				)
+				if int(d_reload.cos.shape[0]) != int(new_n):
+					raise RuntimeError(f"grow_z: preprocessed reload returned N={int(d_reload.cos.shape[0])}, expected {int(new_n)}")
+				return d_reload, int(z0_new)
+	except Exception:
+		pass
+
 	if ins == 0:
 		unet_z0 = int(unet_z0) - int(max(1, int(cfg.z_step)))
 		z_inf = int(unet_z0)
@@ -335,8 +378,8 @@ def load(
 
 			z0_raw = int(unet_z) if unet_z is not None else 0
 			zs = max(1, int(z_size))
-			zst = max(1, int(z_step))
-			z_req_raw = [int(z0_raw) + int(i) * int(zst) for i in range(int(zs))]
+			# CLI coords are always full-res; preprocessed spacing along Z is z_step_eff.
+			z_req_raw = [int(z0_raw) + int(i) * int(z_step_eff_meta) for i in range(int(zs))]
 			z_idx = [int(zz) // int(z_step_eff_meta) for zz in z_req_raw]
 			if any((zi < 0 or zi >= int(z_all)) for zi in z_idx):
 				raise ValueError(
@@ -358,7 +401,7 @@ def load(
 
 			def _read_ch(name: str) -> np.ndarray:
 				ci0 = int(ci[name])
-				if int(zst) == 1:
+				if len(z_idx) <= 1 or all((int(z_idx[i]) == int(z_idx[0]) + i) for i in range(len(z_idx))):
 					z_a = int(z_idx[0])
 					z_b = int(z_idx[-1]) + 1
 					return np.asarray(zsrc[ci0, z_a:z_b, y0:y1, x0:x1])
@@ -509,6 +552,13 @@ def load(
 		dir1_t = _gaussian_blur_nchw(x=dir1_t, sigma=float(dir_blur_sigma))
 	if valid_t is not None:
 		valid_t = (valid_t > 0.5).to(dtype=torch.float32)
+
+	if unet_out_dir_base is not None:
+		dbg_dir = Path(unet_out_dir_base) / "dbg_cos_z"
+		dbg_dir.mkdir(parents=True, exist_ok=True)
+		cos_np_all = cos_t[:, 0].detach().cpu().numpy().astype("float32")
+		for zi in range(int(cos_np_all.shape[0])):
+			tifffile.imwrite(str(dbg_dir / f"z{zi:04d}.tif"), cos_np_all[zi], compression="lzw")
 
 	return FitData(
 		cos=cos_t,
