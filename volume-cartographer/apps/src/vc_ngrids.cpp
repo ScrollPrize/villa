@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <string>
@@ -1807,7 +1808,7 @@ static void run_fit_normals(
     // Stats: iterations-to-solved histogram and RMS histogram.
     // Note: we keep a coarse RMS bucket histogram for printing and a fine histogram for median estimation.
     constexpr int kFineRmsBins = 1000;
-    struct FitStats {
+    struct alignas(64) FitStats {
         // Iteration buckets: [0-4],[5-9],[10-19],[20-49],[50-99],[100-199],[200+]
         uint64_t iters_buckets[7] = {0, 0, 0, 0, 0, 0, 0};
 
@@ -1879,6 +1880,9 @@ static void run_fit_normals(
             ++dist_test_total;
             if (rejected) ++dist_test_reject;
         }
+
+        // Reduce adjacent-thread false sharing when stored in per-thread vectors.
+        char cacheline_pad[64] = {};
     };
 
     auto stats_of = [&]() -> std::vector<FitStats> {
@@ -2006,16 +2010,18 @@ static void run_fit_normals(
     };
 
     // Per-thread warm start for the solver.
-    struct WarmStart {
+    struct alignas(64) WarmStart {
         double n[3] = {0.0, 0.0, 0.0};
         bool has = false;
+        char cacheline_pad[64] = {};
     };
     std::vector<WarmStart> warm(static_cast<size_t>(std::max(1, omp_get_max_threads())));
 
-    struct FitBuffers {
+    struct alignas(64) FitBuffers {
         std::array<std::vector<cv::Point3f>, 3> dirs_unit;
         std::array<std::vector<double>, 3> weights;
         std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
+        char cacheline_pad[64] = {};
     };
     std::vector<FitBuffers> fit_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
     for (auto& fb : fit_buffers) {
@@ -2110,12 +2116,27 @@ static void run_fit_normals(
         const int q = static_cast<int>(std::lround(tc * 255.0));
         return static_cast<uint8_t>(std::max(0, std::min(255, q)));
     };
-    int64_t processed = 0;
-    int64_t written = 0;
-    const auto t0 = std::chrono::steady_clock::now();
-    auto t_last = t0;
+    struct alignas(64) ThreadProgress {
+        std::atomic<int64_t> processed{0};
+        std::atomic<int64_t> written{0};
+        char cacheline_pad[64] = {};
+    };
+    std::vector<ThreadProgress> thread_progress(static_cast<size_t>(nthreads));
 
-    auto report_progress = [&]() {
+    auto merged_progress = [&]() -> std::pair<int64_t, int64_t> {
+        int64_t processed = 0;
+        int64_t written = 0;
+        for (const auto& tp : thread_progress) {
+            processed += tp.processed.load(std::memory_order_relaxed);
+            written += tp.written.load(std::memory_order_relaxed);
+        }
+        return {processed, written};
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<int64_t> next_report_elapsed_ns{10LL * 1000LL * 1000LL * 1000LL};
+
+    auto report_progress = [&](int64_t processed, int64_t written) {
         const auto now = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(now - t0).count();
         const double rate = (elapsed > 1e-9) ? (static_cast<double>(processed) / elapsed) : 0.0;
@@ -2182,11 +2203,29 @@ static void run_fit_normals(
     }
 
     // Only compute normals inside crop, but write them into the full lattice when out_zarr is enabled.
-    #pragma omp parallel for collapse(2) schedule(dynamic,1)
-    for (int z = sz0; z < crop.max[2]; z += step) {
-        for (int y = sy0; y < crop.max[1]; y += step) {
-            for (int x = sx0; x < crop.max[0]; x += step) {
-                const int tid = omp_get_thread_num();
+    constexpr int64_t kProgressFlushSamples = 256;
+    #pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        int64_t pending_processed = 0;
+        int64_t pending_written = 0;
+
+        auto flush_progress = [&](bool force) {
+            if (!force && pending_processed < kProgressFlushSamples) return;
+            if (pending_processed > 0) {
+                thread_progress[static_cast<size_t>(tid)].processed.fetch_add(pending_processed, std::memory_order_relaxed);
+                pending_processed = 0;
+            }
+            if (pending_written > 0) {
+                thread_progress[static_cast<size_t>(tid)].written.fetch_add(pending_written, std::memory_order_relaxed);
+                pending_written = 0;
+            }
+        };
+
+        #pragma omp for collapse(2) schedule(dynamic,1) nowait
+        for (int z = sz0; z < crop.max[2]; z += step) {
+            for (int y = sy0; y < crop.max[1]; y += step) {
+                for (int x = sx0; x < crop.max[0]; x += step) {
                 ThreadOut* tout = nullptr;
                 if (out_ply_opt.has_value()) {
                     tout = &t_out[static_cast<size_t>(tid)];
@@ -2336,32 +2375,37 @@ static void run_fit_normals(
                 const double t_overhead_s = std::max(0.0, t_total_s - t_ng_read_s - t_preproc_s - t_solve_call_s);
                 stats[static_cast<size_t>(tid)].add_timing(t_ng_read_s, t_preproc_s, t_solve_s, t_solve_call_s, t_overhead_s);
 
-                #pragma omp atomic
-                processed += 1;
-                if (ok) {
-                    #pragma omp atomic
-                    written += 1;
-                }
+                ++pending_processed;
+                if (ok) ++pending_written;
+                flush_progress(false);
 
                 // Only one thread reports.
-                const auto now = std::chrono::steady_clock::now();
-                if (tid == 0 && now - t_last >= std::chrono::seconds(10)) {
-                    #pragma omp critical
-                    {
-                        const auto now2 = std::chrono::steady_clock::now();
-                        if (now2 - t_last >= std::chrono::seconds(10)) {
-                            report_progress();
-                            report_stats();
-                            t_last = now2;
+                if (tid == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const int64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count();
+                    if (elapsed_ns >= next_report_elapsed_ns.load(std::memory_order_relaxed)) {
+                        #pragma omp critical
+                        {
+                            const auto now2 = std::chrono::steady_clock::now();
+                            const int64_t elapsed_ns2 = std::chrono::duration_cast<std::chrono::nanoseconds>(now2 - t0).count();
+                            int64_t next_ns = next_report_elapsed_ns.load(std::memory_order_relaxed);
+                            if (elapsed_ns2 >= next_ns) {
+                                flush_progress(true);
+                                const auto [processed_snapshot, written_snapshot] = merged_progress();
+                                report_progress(processed_snapshot, written_snapshot);
+                                next_report_elapsed_ns.store(elapsed_ns2 + 10LL * 1000LL * 1000LL * 1000LL, std::memory_order_relaxed);
+                            }
                         }
                     }
                 }
             }
         }
+        flush_progress(true);
     }
 
     // Final report.
-    report_progress();
+    const auto [processed_final, written_final] = merged_progress();
+    report_progress(processed_final, written_final);
     report_stats();
 
     if (dbg_tif) {
