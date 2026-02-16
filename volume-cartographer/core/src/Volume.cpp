@@ -1,5 +1,8 @@
 #include "vc/core/types/Volume.hpp"
 
+#include <cmath>
+#include <limits>
+#include <optional>
 #include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 
@@ -113,38 +116,159 @@ void Volume::zarrOpen()
     z5::filesystem::handle::Group group(path_, z5::FileMode::FileMode::r);
     z5::readAttributes(group, zarrGroup_);
 
-    std::vector<std::string> groups;
-    zarrFile_->keys(groups);
-    std::sort(groups.begin(), groups.end());
+    auto isPowerOfTwoScale = [](double v) {
+        if (!(v > 0.0)) return false;
+        const double lv = std::log2(v);
+        const double rounded = std::round(lv);
+        return std::abs(lv - rounded) < 1e-6;
+    };
 
-    //FIXME hardcoded assumption that groups correspond to power-2 scaledowns ...
-    for(auto name : groups) {
+    auto scaleToLevel = [](double v) -> int {
+        return static_cast<int>(std::llround(std::log2(v)));
+    };
+
+    struct Candidate {
+        int level;
+        std::string path;
+    };
+    std::vector<Candidate> candidates;
+
+    bool usedOmeMultiscales = false;
+    if (zarrGroup_.contains("multiscales") && zarrGroup_["multiscales"].is_array() &&
+        !zarrGroup_["multiscales"].empty()) {
+        const auto& ms0 = zarrGroup_["multiscales"][0];
+        if (ms0.contains("datasets") && ms0["datasets"].is_array()) {
+            usedOmeMultiscales = true;
+            for (const auto& ds : ms0["datasets"]) {
+                if (!ds.contains("path") || !ds["path"].is_string()) {
+                    throw std::runtime_error("OME-Zarr dataset entry missing string 'path' in " + path_.string());
+                }
+                const std::string dsPath = ds["path"].get<std::string>();
+
+                if (!ds.contains("coordinateTransformations") || !ds["coordinateTransformations"].is_array()) {
+                    throw std::runtime_error("OME-Zarr dataset '" + dsPath + "' missing coordinateTransformations in " + path_.string());
+                }
+
+                std::optional<int> level;
+                for (const auto& tr : ds["coordinateTransformations"]) {
+                    if (!tr.is_object() || !tr.contains("type") || !tr["type"].is_string())
+                        continue;
+                    if (tr["type"].get<std::string>() != "scale")
+                        continue;
+                    if (!tr.contains("scale") || !tr["scale"].is_array() || tr["scale"].size() < 3) {
+                        throw std::runtime_error("OME-Zarr dataset '" + dsPath + "' has invalid scale transformation in " + path_.string());
+                    }
+
+                    const double sz = tr["scale"][0].get<double>();
+                    const double sy = tr["scale"][1].get<double>();
+                    const double sx = tr["scale"][2].get<double>();
+                    if (std::abs(sz - sy) > 1e-6 || std::abs(sz - sx) > 1e-6 || !isPowerOfTwoScale(sz)) {
+                        throw std::runtime_error(
+                            "unsupported OME-Zarr scale for dataset '" + dsPath +
+                            "' (expected isotropic power-of-two, got [" +
+                            std::to_string(sz) + "," + std::to_string(sy) + "," + std::to_string(sx) +
+                            "]) in " + path_.string());
+                    }
+                    level = scaleToLevel(sz);
+                    break;
+                }
+
+                if (!level.has_value()) {
+                    throw std::runtime_error("OME-Zarr dataset '" + dsPath + "' has no scale transformation in " + path_.string());
+                }
+                candidates.push_back({*level, dsPath});
+            }
+        }
+    }
+
+    if (!usedOmeMultiscales) {
+        std::vector<std::string> groups;
+        zarrFile_->keys(groups);
+        std::sort(groups.begin(), groups.end());
+        for (const auto& name : groups) {
+            try {
+                const int level = std::stoi(name);
+                if (level < 0) {
+                    continue;
+                }
+                candidates.push_back({level, name});
+            } catch (...) {
+                // Ignore non-numeric groups in legacy fallback mode.
+            }
+        }
+    }
+
+    if (candidates.empty()) {
+        throw std::runtime_error("no zarr datasets found in " + path_.string());
+    }
+
+    int maxLevel = -1;
+    for (const auto& c : candidates) {
+        maxLevel = std::max(maxLevel, c.level);
+    }
+    zarrDs_.clear();
+    zarrDs_.resize(static_cast<size_t>(maxLevel + 1));
+
+    for (const auto& c : candidates) {
+        if (c.level < 0) {
+            continue;
+        }
+
+        // Allow missing scales: ignore datasets declared in metadata but not physically present.
+        if (!std::filesystem::exists(path_ / c.path / ".zarray")) {
+            continue;
+        }
+
         // Read metadata first to discover the dimension separator
-        z5::filesystem::handle::Dataset tmp_handle(path_ / name, z5::FileMode::FileMode::r);
+        z5::filesystem::handle::Dataset tmp_handle(path_ / c.path, z5::FileMode::FileMode::r);
         z5::DatasetMetadata dsMeta;
         z5::filesystem::readMetadata(tmp_handle, dsMeta);
 
         // Re-create handle with correct delimiter so chunk keys resolve properly
-        z5::filesystem::handle::Dataset ds_handle(group, name, dsMeta.zarrDelimiter);
+        z5::filesystem::handle::Dataset ds_handle(group, c.path, dsMeta.zarrDelimiter);
 
-        zarrDs_.push_back(z5::filesystem::openDataset(ds_handle));
-        if (zarrDs_.back()->getDtype() != z5::types::Datatype::uint8 && zarrDs_.back()->getDtype() != z5::types::Datatype::uint16)
-            throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets incompatible type found in "+path_.string()+" / " +name);
+        auto ds = z5::filesystem::openDataset(ds_handle);
+        if (ds->getDtype() != z5::types::Datatype::uint8 && ds->getDtype() != z5::types::Datatype::uint16)
+            throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets incompatible type found in "+path_.string()+" / " +c.path);
 
-        // Verify level 0 shape matches meta.json dimensions
-        // zarr shape is [z, y, x] = [slices, height, width]
-        if (zarrDs_.size() == 1 && !skipShapeCheck) {
-            const auto& shape = zarrDs_[0]->shape();
-            if (static_cast<int>(shape[0]) != _slices ||
-                static_cast<int>(shape[1]) != _height ||
-                static_cast<int>(shape[2]) != _width) {
-                throw std::runtime_error(
-                    "zarr level 0 shape [z,y,x]=(" + std::to_string(shape[0]) + ", " +
-                    std::to_string(shape[1]) + ", " + std::to_string(shape[2]) +
-                    ") does not match meta.json dimensions (slices=" + std::to_string(_slices) +
-                    ", height=" + std::to_string(_height) + ", width=" + std::to_string(_width) +
-                    ") in " + path_.string());
+        zarrDs_[static_cast<size_t>(c.level)] = std::move(ds);
+    }
+
+    // Verify each existing level shape against meta.json dimensions and level downscale.
+    // zarr shape is [z, y, x] = [slices, height, width]
+    if (!skipShapeCheck) {
+        auto ceilDivPow2 = [](int v, int level) -> int {
+            const int64_t denom = int64_t{1} << level;
+            return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
+        };
+
+        bool hasAnyPhysicalScale = false;
+        for (size_t level = 0; level < zarrDs_.size(); ++level) {
+            const auto& ds = zarrDs_[level];
+            if (!ds) {
+                continue;
             }
+            hasAnyPhysicalScale = true;
+
+            const auto& shape = ds->shape();
+            const int expectedSlices = ceilDivPow2(_slices, static_cast<int>(level));
+            const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
+            const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
+
+            if (static_cast<int>(shape[0]) != expectedSlices ||
+                static_cast<int>(shape[1]) != expectedHeight ||
+                static_cast<int>(shape[2]) != expectedWidth) {
+                throw std::runtime_error(
+                    "zarr level " + std::to_string(level) + " shape [z,y,x]=("
+                    + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
+                    + ") does not match expected downscaled meta.json dimensions (slices=" + std::to_string(expectedSlices)
+                    + ", height=" + std::to_string(expectedHeight) + ", width=" + std::to_string(expectedWidth)
+                    + ") in " + path_.string());
+            }
+        }
+
+        if (!hasAnyPhysicalScale) {
+            throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
         }
     }
 }
@@ -169,7 +293,10 @@ double Volume::voxelSize() const
 }
 
 z5::Dataset *Volume::zarrDataset(int level) const {
-    if (level >= zarrDs_.size())
+    if (level < 0 || zarrDs_.empty())
+        return nullptr;
+
+    if (static_cast<size_t>(level) >= zarrDs_.size())
         return nullptr;
 
     return zarrDs_[level].get();
