@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.loss.displacement_losses import (
+    dense_displacement_loss,
     surface_sampled_loss,
     surface_sampled_normal_loss,
     smoothness_loss,
@@ -26,7 +27,10 @@ from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.models import make_model
-from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import make_visualization
+from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
+    make_dense_visualization,
+    make_visualization,
+)
 from accelerate.utils import TorchDynamoPlugin
 
 import multiprocessing
@@ -41,45 +45,57 @@ def seed_worker(worker_id):
 
 
 def collate_with_padding(batch):
-    """Collate batch with padding for variable-length point data."""
+    """Collate batch with optional sparse point padding and dense targets."""
     # Stack fixed-size tensors normally
     vol = torch.stack([b['vol'] for b in batch])
     cond = torch.stack([b['cond'] for b in batch])
-    extrap_surface = torch.stack([b['extrap_surface'] for b in batch])
-
-    # Pad variable-length data
-    coords_list = [b['extrap_coords'] for b in batch]
-    disp_list = [b['gt_displacement'] for b in batch]
-    weight_list = [
-        b['point_weights'] if 'point_weights' in b else torch.ones(len(b['extrap_coords']), dtype=torch.float32)
-        for b in batch
-    ]
-    max_points = max(len(c) for c in coords_list)
-
-    B = len(batch)
-    padded_coords = torch.zeros(B, max_points, 3)
-    padded_disp = torch.zeros(B, max_points, 3)
-    valid_mask = torch.zeros(B, max_points)
-    padded_point_weights = torch.zeros(B, max_points)
-    padded_point_normals = torch.zeros(B, max_points, 3)
-    has_point_normals = 'point_normals' in batch[0]
-
-    for i, (c, d, w) in enumerate(zip(coords_list, disp_list, weight_list)):
-        n = len(c)
-        padded_coords[i, :n] = c
-        padded_disp[i, :n] = d
-        valid_mask[i, :n] = 1.0
-        padded_point_weights[i, :n] = w
-        if has_point_normals:
-            padded_point_normals[i, :n] = batch[i]['point_normals']
-
     result = {
-        'vol': vol, 'cond': cond, 'extrap_surface': extrap_surface,
-        'extrap_coords': padded_coords, 'gt_displacement': padded_disp,
-        'valid_mask': valid_mask, 'point_weights': padded_point_weights
+        'vol': vol,
+        'cond': cond,
     }
-    if has_point_normals:
-        result['point_normals'] = padded_point_normals
+
+    has_extrap_surface = 'extrap_surface' in batch[0]
+    if has_extrap_surface:
+        result['extrap_surface'] = torch.stack([b['extrap_surface'] for b in batch])
+
+    has_sparse_supervision = 'extrap_coords' in batch[0] and 'gt_displacement' in batch[0]
+    if has_sparse_supervision:
+        coords_list = [b['extrap_coords'] for b in batch]
+        disp_list = [b['gt_displacement'] for b in batch]
+        weight_list = [
+            b['point_weights'] if 'point_weights' in b else torch.ones(len(b['extrap_coords']), dtype=torch.float32)
+            for b in batch
+        ]
+        max_points = max(len(c) for c in coords_list)
+
+        B = len(batch)
+        padded_coords = torch.zeros(B, max_points, 3)
+        padded_disp = torch.zeros(B, max_points, 3)
+        valid_mask = torch.zeros(B, max_points)
+        padded_point_weights = torch.zeros(B, max_points)
+        padded_point_normals = torch.zeros(B, max_points, 3)
+        has_point_normals = 'point_normals' in batch[0]
+
+        for i, (c, d, w) in enumerate(zip(coords_list, disp_list, weight_list)):
+            n = len(c)
+            padded_coords[i, :n] = c
+            padded_disp[i, :n] = d
+            valid_mask[i, :n] = 1.0
+            padded_point_weights[i, :n] = w
+            if has_point_normals:
+                padded_point_normals[i, :n] = batch[i]['point_normals']
+
+        result['extrap_coords'] = padded_coords
+        result['gt_displacement'] = padded_disp
+        result['valid_mask'] = valid_mask
+        result['point_weights'] = padded_point_weights
+        if has_point_normals:
+            result['point_normals'] = padded_point_normals
+
+    if 'dense_gt_displacement' in batch[0]:
+        result['dense_gt_displacement'] = torch.stack([b['dense_gt_displacement'] for b in batch])
+        if 'dense_loss_weight' in batch[0]:
+            result['dense_loss_weight'] = torch.stack([b['dense_loss_weight'] for b in batch])
 
     # Optional SDT
     if 'sdt' in batch[0]:
@@ -103,22 +119,29 @@ def collate_with_padding(batch):
 
 def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=False):
     """Prepare batch tensors for training."""
-    vol = batch['vol'].unsqueeze(1)                    # [B, 1, D, H, W]
-    cond = batch['cond'].unsqueeze(1)                  # [B, 1, D, H, W]
-    extrap_surf = batch['extrap_surface'].unsqueeze(1) # [B, 1, D, H, W]
+    vol = batch['vol'].unsqueeze(1)  # [B, 1, D, H, W]
+    cond = batch['cond'].unsqueeze(1)  # [B, 1, D, H, W]
 
-    input_list = [vol, cond, extrap_surf]
+    input_list = [vol, cond]
+    if 'extrap_surface' in batch:
+        extrap_surf = batch['extrap_surface'].unsqueeze(1)  # [B, 1, D, H, W]
+        input_list.append(extrap_surf)
     if 'other_wraps' in batch:
         other_wraps = batch['other_wraps'].unsqueeze(1)  # [B, 1, D, H, W]
         input_list.append(other_wraps)
 
-    inputs = torch.cat(input_list, dim=1)  # [B, 3 or 4, D, H, W]
+    inputs = torch.cat(input_list, dim=1)
 
-    extrap_coords = batch['extrap_coords']       # [B, N, 3]
-    gt_displacement = batch['gt_displacement']   # [B, N, 3]
-    valid_mask = batch['valid_mask']             # [B, N]
-    point_weights = batch['point_weights'] if 'point_weights' in batch else torch.ones_like(valid_mask)  # [B, N]
-    point_normals = batch.get('point_normals', None)  # [B, N, 3] or None
+    extrap_coords = batch.get('extrap_coords', None)
+    gt_displacement = batch.get('gt_displacement', None)
+    valid_mask = batch.get('valid_mask', None)
+    point_weights = None
+    if valid_mask is not None:
+        point_weights = batch['point_weights'] if 'point_weights' in batch else torch.ones_like(valid_mask)
+    point_normals = batch.get('point_normals', None)
+
+    dense_gt_displacement = batch.get('dense_gt_displacement', None)  # [B, 3, D, H, W]
+    dense_loss_weight = batch.get('dense_loss_weight', None)  # [B, 1, D, H, W]
 
     sdt_target = batch['sdt'].unsqueeze(1) if use_sdt and 'sdt' in batch else None  # [B, 1, D, H, W]
     heatmap_target = batch['heatmap_target'].unsqueeze(1) if use_heatmap and 'heatmap_target' in batch else None  # [B, 1, D, H, W]
@@ -129,7 +152,20 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
         seg_target = batch['segmentation'].unsqueeze(1)  # [B, 1, D, H, W]
         seg_skel = batch['segmentation_skel'].unsqueeze(1)  # [B, 1, D, H, W]
 
-    return inputs, extrap_coords, gt_displacement, valid_mask, point_weights, point_normals, sdt_target, heatmap_target, seg_target, seg_skel
+    return (
+        inputs,
+        extrap_coords,
+        gt_displacement,
+        valid_mask,
+        point_weights,
+        point_normals,
+        dense_gt_displacement,
+        dense_loss_weight,
+        sdt_target,
+        heatmap_target,
+        seg_target,
+        seg_skel,
+    )
 
 
 @click.command()
@@ -141,7 +177,17 @@ def train(config_path):
         config = json.load(f)
 
     # Defaults
-    config.setdefault('in_channels', 3)  # vol + cond + extrap_surface
+    config.setdefault('use_extrapolation', True)
+    config.setdefault('use_other_wrap_cond', False)
+    config.setdefault('use_dense_displacement', False)
+    default_in_channels = 2 + int(config.get('use_extrapolation', True)) + int(config.get('use_other_wrap_cond', False))
+    config.setdefault('in_channels', default_in_channels)
+    if int(config['in_channels']) != default_in_channels:
+        raise ValueError(
+            f"in_channels={config['in_channels']} does not match configured inputs "
+            f"(expected {default_in_channels} from use_extrapolation={config.get('use_extrapolation', True)}, "
+            f"use_other_wrap_cond={config.get('use_other_wrap_cond', False)})"
+        )
     config.setdefault('step_count', 1)  # Required by make_model
     config.setdefault('num_iterations', 250000)
     config.setdefault('log_frequency', 100)
@@ -265,14 +311,19 @@ def train(config_path):
             "Set lambda_cond_disp to 0 when supervise_conditioning is enabled."
         )
     mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
+    use_dense_displacement = bool(config.get('use_dense_displacement', False))
     disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
     if disp_supervision not in {'vector', 'normal_scalar'}:
         raise ValueError(
             "displacement_supervision must be 'vector' or 'normal_scalar', "
             f"got {disp_supervision!r}"
         )
+    if not config.get('use_extrapolation', True) and not use_dense_displacement:
+        raise ValueError("Need at least one displacement supervision path: use_extrapolation or use_dense_displacement")
     if disp_supervision == 'normal_scalar' and not config.get('use_extrapolation', True):
         raise ValueError("displacement_supervision='normal_scalar' requires use_extrapolation=True")
+    if disp_supervision == 'normal_scalar' and use_dense_displacement:
+        raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
     disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
     disp_huber_beta = config.get('displacement_huber_beta', 5.0)
     normal_loss_type = str(config.get('normal_loss_type', 'normal_huber')).lower()
@@ -315,6 +366,41 @@ def train(config_path):
             weight_dice=seg_loss_cfg.get('weight_dice', 1),
             weight_srec=seg_loss_cfg.get('weight_srec', 1),
             ignore_label=seg_loss_cfg.get('ignore_label', None),
+        )
+
+    def compute_displacement_loss(
+        disp_pred,
+        extrap_coords,
+        gt_displacement,
+        valid_mask,
+        point_weights,
+        point_normals,
+        dense_gt_displacement,
+        dense_loss_weight,
+    ):
+        if dense_gt_displacement is not None:
+            return dense_displacement_loss(
+                disp_pred,
+                dense_gt_displacement,
+                sample_weights=dense_loss_weight,
+                loss_type=disp_loss_type,
+                beta=disp_huber_beta,
+            )
+
+        if extrap_coords is None or gt_displacement is None or valid_mask is None:
+            raise ValueError("Sparse displacement supervision expected but sparse batch tensors are missing")
+
+        if disp_supervision == 'normal_scalar':
+            if point_normals is None:
+                raise ValueError("point_normals missing while displacement_supervision='normal_scalar'")
+            return surface_sampled_normal_loss(
+                disp_pred, extrap_coords, gt_displacement, point_normals, valid_mask,
+                loss_type=normal_loss_type, beta=normal_loss_beta, sample_weights=point_weights
+            )
+
+        return surface_sampled_loss(
+            disp_pred, extrap_coords, gt_displacement, valid_mask,
+            loss_type=disp_loss_type, beta=disp_huber_beta, sample_weights=point_weights
         )
 
     def make_generator(offset=0):
@@ -477,7 +563,9 @@ def train(config_path):
     if accelerator.is_main_process:
         accelerator.print("\n=== Displacement Field Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
-        if disp_supervision == 'normal_scalar':
+        if use_dense_displacement:
+            accelerator.print(f"Displacement supervision: dense ({disp_loss_type}, beta={disp_huber_beta})")
+        elif disp_supervision == 'normal_scalar':
             accelerator.print(f"Displacement supervision: {disp_supervision} ({normal_loss_type}, beta={normal_loss_beta})")
         else:
             accelerator.print(f"Displacement supervision: {disp_supervision} ({disp_loss_type}, beta={disp_huber_beta})")
@@ -534,7 +622,7 @@ def train(config_path):
         if config['verbose']:
             print(f"got batch, keys: {batch.keys()}")
 
-        inputs, extrap_coords, gt_displacement, valid_mask, point_weights, point_normals, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
+        inputs, extrap_coords, gt_displacement, valid_mask, point_weights, point_normals, dense_gt_displacement, dense_loss_weight, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
             batch, use_sdt, use_heatmap, use_segmentation
         )
 
@@ -546,19 +634,16 @@ def train(config_path):
             disp_pred = output['displacement']  # [B, 3, D, H, W]
             grad_norm = None
 
-            # Displacement loss
-            if disp_supervision == 'normal_scalar':
-                if point_normals is None:
-                    raise ValueError("point_normals missing from batch while displacement_supervision='normal_scalar'")
-                surf_loss = surface_sampled_normal_loss(
-                    disp_pred, extrap_coords, gt_displacement, point_normals, valid_mask,
-                    loss_type=normal_loss_type, beta=normal_loss_beta, sample_weights=point_weights
-                )
-            else:
-                surf_loss = surface_sampled_loss(
-                    disp_pred, extrap_coords, gt_displacement, valid_mask,
-                    loss_type=disp_loss_type, beta=disp_huber_beta, sample_weights=point_weights
-                )
+            surf_loss = compute_displacement_loss(
+                disp_pred,
+                extrap_coords,
+                gt_displacement,
+                valid_mask,
+                point_weights,
+                point_normals,
+                dense_gt_displacement,
+                dense_loss_weight,
+            )
             total_loss = surf_loss
 
             wandb_log['surf_loss'] = surf_loss.detach().item()
@@ -614,11 +699,21 @@ def train(config_path):
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
 
+            do_optimizer_step = True
             accelerator.backward(total_loss)
             if accelerator.sync_gradients:
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            lr_scheduler.step()
+                grad_norm_value = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
+                if not np.isfinite(grad_norm_value):
+                    do_optimizer_step = False
+                    if accelerator.is_main_process:
+                        accelerator.print(
+                            f"Warning: non-finite grad norm at iteration {iteration}; skipping optimizer step"
+                        )
+                    wandb_log['skipped_step_nonfinite_grad'] = 1.0
+            if do_optimizer_step:
+                optimizer.step()
+                lr_scheduler.step()
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
@@ -647,7 +742,7 @@ def train(config_path):
             with torch.no_grad():
                 model.eval()
 
-                val_batches_per_log = max(1, int(config.get('val_batches_per_log', 25)))
+                val_batches_per_log = max(1, int(config.get('val_batches_per_log', 10)))
                 val_metric_sums = {
                     'val_surf_loss': 0.0,
                     'val_loss': 0.0,
@@ -671,25 +766,23 @@ def train(config_path):
                         val_iterator = iter(val_dataloader)
                         val_batch = next(val_iterator)
 
-                    val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_point_weights, val_point_normals, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
+                    val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_point_weights, val_point_normals, val_dense_gt_displacement, val_dense_loss_weight, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
                         val_batch, use_sdt, use_heatmap, use_segmentation
                     )
 
                     val_output = model(val_inputs)
                     val_disp_pred = val_output['displacement']
 
-                    if disp_supervision == 'normal_scalar':
-                        if val_point_normals is None:
-                            raise ValueError("val point_normals missing while displacement_supervision='normal_scalar'")
-                        val_surf_loss = surface_sampled_normal_loss(
-                            val_disp_pred, val_extrap_coords, val_gt_displacement, val_point_normals, val_valid_mask,
-                            loss_type=normal_loss_type, beta=normal_loss_beta, sample_weights=val_point_weights
-                        )
-                    else:
-                        val_surf_loss = surface_sampled_loss(
-                            val_disp_pred, val_extrap_coords, val_gt_displacement, val_valid_mask,
-                            loss_type=disp_loss_type, beta=disp_huber_beta, sample_weights=val_point_weights
-                        )
+                    val_surf_loss = compute_displacement_loss(
+                        val_disp_pred,
+                        val_extrap_coords,
+                        val_gt_displacement,
+                        val_valid_mask,
+                        val_point_weights,
+                        val_point_normals,
+                        val_dense_gt_displacement,
+                        val_dense_loss_weight,
+                    )
                     val_total_loss = val_surf_loss
                     val_metric_sums['val_surf_loss'] += val_surf_loss.item()
 
@@ -746,12 +839,22 @@ def train(config_path):
                             'extrap_coords': val_extrap_coords,
                             'gt_displacement': val_gt_displacement,
                             'valid_mask': val_valid_mask,
+                            'dense_gt_displacement': val_dense_gt_displacement,
+                            'dense_loss_weight': val_dense_loss_weight,
                             'sdt_pred': val_sdt_pred,
                             'sdt_target': val_sdt_target,
                             'heatmap_pred': val_heatmap_pred,
                             'heatmap_target': val_heatmap_target,
                             'seg_pred': val_output.get('segmentation') if use_segmentation else None,
                             'seg_target': val_seg_target if use_segmentation else None,
+                            'can_visualize_sparse': (
+                                val_extrap_coords is not None and
+                                val_gt_displacement is not None and
+                                val_valid_mask is not None
+                            ),
+                            'can_visualize_dense': (
+                                val_dense_gt_displacement is not None
+                            ),
                         }
 
                 for key, value in val_metric_sums.items():
@@ -764,27 +867,53 @@ def train(config_path):
                 train_sdt_pred = output.get('sdt') if use_sdt else None
                 train_heatmap_pred = heatmap_pred if use_heatmap else None
                 train_seg_pred = output.get('segmentation') if use_segmentation else None
-                make_visualization(
-                    inputs, disp_pred, extrap_coords, gt_displacement, valid_mask,
-                    sdt_pred=train_sdt_pred, sdt_target=sdt_target,
-                    heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
-                    seg_pred=train_seg_pred, seg_target=seg_target if use_segmentation else None,
-                    save_path=train_img_path
+                train_can_visualize_sparse = (
+                    extrap_coords is not None and gt_displacement is not None and valid_mask is not None
                 )
-                make_visualization(
-                    first_val_vis['inputs'], first_val_vis['disp_pred'],
-                    first_val_vis['extrap_coords'], first_val_vis['gt_displacement'],
-                    first_val_vis['valid_mask'],
-                    sdt_pred=first_val_vis['sdt_pred'], sdt_target=first_val_vis['sdt_target'],
-                    heatmap_pred=first_val_vis['heatmap_pred'], heatmap_target=first_val_vis['heatmap_target'],
-                    seg_pred=first_val_vis['seg_pred'],
-                    seg_target=first_val_vis['seg_target'],
-                    save_path=val_img_path
-                )
+                train_can_visualize_dense = dense_gt_displacement is not None
+                if train_can_visualize_sparse and first_val_vis is not None and first_val_vis.get('can_visualize_sparse', False):
+                    make_visualization(
+                        inputs, disp_pred, extrap_coords, gt_displacement, valid_mask,
+                        sdt_pred=train_sdt_pred, sdt_target=sdt_target,
+                        heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
+                        seg_pred=train_seg_pred, seg_target=seg_target if use_segmentation else None,
+                        save_path=train_img_path
+                    )
+                    make_visualization(
+                        first_val_vis['inputs'], first_val_vis['disp_pred'],
+                        first_val_vis['extrap_coords'], first_val_vis['gt_displacement'],
+                        first_val_vis['valid_mask'],
+                        sdt_pred=first_val_vis['sdt_pred'], sdt_target=first_val_vis['sdt_target'],
+                        heatmap_pred=first_val_vis['heatmap_pred'], heatmap_target=first_val_vis['heatmap_target'],
+                        seg_pred=first_val_vis['seg_pred'],
+                        seg_target=first_val_vis['seg_target'],
+                        save_path=val_img_path
+                    )
 
-                if wandb.run is not None:
-                    wandb_log['train_image'] = wandb.Image(train_img_path)
-                    wandb_log['val_image'] = wandb.Image(val_img_path)
+                    if wandb.run is not None:
+                        wandb_log['train_image'] = wandb.Image(train_img_path)
+                        wandb_log['val_image'] = wandb.Image(val_img_path)
+                elif train_can_visualize_dense and first_val_vis is not None and first_val_vis.get('can_visualize_dense', False):
+                    make_dense_visualization(
+                        inputs, disp_pred, dense_gt_displacement, dense_loss_weight,
+                        sdt_pred=train_sdt_pred, sdt_target=sdt_target,
+                        heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
+                        seg_pred=train_seg_pred, seg_target=seg_target if use_segmentation else None,
+                        save_path=train_img_path
+                    )
+                    make_dense_visualization(
+                        first_val_vis['inputs'], first_val_vis['disp_pred'],
+                        first_val_vis['dense_gt_displacement'], first_val_vis['dense_loss_weight'],
+                        sdt_pred=first_val_vis['sdt_pred'], sdt_target=first_val_vis['sdt_target'],
+                        heatmap_pred=first_val_vis['heatmap_pred'], heatmap_target=first_val_vis['heatmap_target'],
+                        seg_pred=first_val_vis['seg_pred'],
+                        seg_target=first_val_vis['seg_target'],
+                        save_path=val_img_path
+                    )
+
+                    if wandb.run is not None:
+                        wandb_log['train_image'] = wandb.Image(train_img_path)
+                        wandb_log['val_image'] = wandb.Image(val_img_path)
 
                 if val_pert_dataloader is not None:
                     try:
@@ -793,25 +922,23 @@ def train(config_path):
                         val_pert_iterator = iter(val_pert_dataloader)
                         val_pert_batch = next(val_pert_iterator)
 
-                    val_pert_inputs, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask, val_pert_point_weights, val_pert_point_normals, val_pert_sdt_target, val_pert_heatmap_target, val_pert_seg_target, val_pert_seg_skel = prepare_batch(
+                    val_pert_inputs, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask, val_pert_point_weights, val_pert_point_normals, val_pert_dense_gt_displacement, val_pert_dense_loss_weight, val_pert_sdt_target, val_pert_heatmap_target, val_pert_seg_target, val_pert_seg_skel = prepare_batch(
                         val_pert_batch, use_sdt, use_heatmap, use_segmentation
                     )
 
                     val_pert_output = model(val_pert_inputs)
                     val_pert_disp_pred = val_pert_output['displacement']
 
-                    if disp_supervision == 'normal_scalar':
-                        if val_pert_point_normals is None:
-                            raise ValueError("val_pert point_normals missing while displacement_supervision='normal_scalar'")
-                        val_pert_surf_loss = surface_sampled_normal_loss(
-                            val_pert_disp_pred, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_point_normals, val_pert_valid_mask,
-                            loss_type=normal_loss_type, beta=normal_loss_beta, sample_weights=val_pert_point_weights
-                        )
-                    else:
-                        val_pert_surf_loss = surface_sampled_loss(
-                            val_pert_disp_pred, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask,
-                            loss_type=disp_loss_type, beta=disp_huber_beta, sample_weights=val_pert_point_weights
-                        )
+                    val_pert_surf_loss = compute_displacement_loss(
+                        val_pert_disp_pred,
+                        val_pert_extrap_coords,
+                        val_pert_gt_displacement,
+                        val_pert_valid_mask,
+                        val_pert_point_weights,
+                        val_pert_point_normals,
+                        val_pert_dense_gt_displacement,
+                        val_pert_dense_loss_weight,
+                    )
                     val_pert_total_loss = val_pert_surf_loss
                     wandb_log['val_pert_surf_loss'] = val_pert_surf_loss.item()
 
@@ -862,17 +989,34 @@ def train(config_path):
                     wandb_log['val_pert_loss'] = val_pert_total_loss.item()
 
                     if config.get('log_perturbed_val_images', False):
-                        val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
-                        make_visualization(
-                            val_pert_inputs, val_pert_disp_pred, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask,
-                            sdt_pred=val_pert_sdt_pred, sdt_target=val_pert_sdt_target,
-                            heatmap_pred=val_pert_heatmap_pred, heatmap_target=val_pert_heatmap_target,
-                            seg_pred=val_pert_output.get('segmentation') if use_segmentation else None,
-                            seg_target=val_pert_seg_target if use_segmentation else None,
-                            save_path=val_pert_img_path
-                        )
-                        if wandb.run is not None:
-                            wandb_log['val_pert_image'] = wandb.Image(val_pert_img_path)
+                        if (
+                            val_pert_extrap_coords is not None and
+                            val_pert_gt_displacement is not None and
+                            val_pert_valid_mask is not None
+                        ):
+                            val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
+                            make_visualization(
+                                val_pert_inputs, val_pert_disp_pred, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask,
+                                sdt_pred=val_pert_sdt_pred, sdt_target=val_pert_sdt_target,
+                                heatmap_pred=val_pert_heatmap_pred, heatmap_target=val_pert_heatmap_target,
+                                seg_pred=val_pert_output.get('segmentation') if use_segmentation else None,
+                                seg_target=val_pert_seg_target if use_segmentation else None,
+                                save_path=val_pert_img_path
+                            )
+                            if wandb.run is not None:
+                                wandb_log['val_pert_image'] = wandb.Image(val_pert_img_path)
+                        elif val_pert_dense_gt_displacement is not None:
+                            val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
+                            make_dense_visualization(
+                                val_pert_inputs, val_pert_disp_pred, val_pert_dense_gt_displacement, val_pert_dense_loss_weight,
+                                sdt_pred=val_pert_sdt_pred, sdt_target=val_pert_sdt_target,
+                                heatmap_pred=val_pert_heatmap_pred, heatmap_target=val_pert_heatmap_target,
+                                seg_pred=val_pert_output.get('segmentation') if use_segmentation else None,
+                                seg_target=val_pert_seg_target if use_segmentation else None,
+                                save_path=val_pert_img_path
+                            )
+                            if wandb.run is not None:
+                                wandb_log['val_pert_image'] = wandb.Image(val_pert_img_path)
 
                 model.train()
 

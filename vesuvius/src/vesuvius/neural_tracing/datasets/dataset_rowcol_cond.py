@@ -14,6 +14,7 @@ from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
 from vesuvius.neural_tracing.datasets.extrapolation import compute_extrapolation
 import cv2
+from scipy import ndimage
 
 import os
 os.environ['OMP_NUM_THREADS'] = '1' # this is set to 1 because by default the edt package uses omp to threads the edt call
@@ -45,6 +46,7 @@ class EdtSegDataset(Dataset):
         config.setdefault('dilation_radius', 1)  # voxels
         config.setdefault('cond_percent', [0.5, 0.5])
         config.setdefault('use_extrapolation', True)
+        config.setdefault('use_dense_displacement', False)
         config.setdefault('extrapolation_method', 'linear_edge')
         config.setdefault('supervise_conditioning', False)
         config.setdefault('cond_supervision_weight', 0.1)
@@ -103,6 +105,9 @@ class EdtSegDataset(Dataset):
                 "displacement_supervision must be 'vector' or 'normal_scalar', "
                 f"got {self.displacement_supervision!r}"
             )
+        self.use_dense_displacement = bool(config.get('use_dense_displacement', False))
+        if self.displacement_supervision == 'normal_scalar' and self.use_dense_displacement:
+            raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
         self._needs_point_normals = self.displacement_supervision == 'normal_scalar'
 
         aug_config = config.get('augmentation', {})
@@ -313,6 +318,34 @@ class EdtSegDataset(Dataset):
         normals = normals / np.maximum(norms, 1e-6)
         normals[norms[..., 0] <= 1e-6] = 0.0
         return normals.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _compute_dense_displacement_field(full_surface_mask: np.ndarray):
+        """Compute nearest-surface displacement vector for every voxel.
+
+        Args:
+            full_surface_mask: (D, H, W) binary/boolean mask of GT surface voxels.
+
+        Returns:
+            disp_field: (3, D, H, W) with components (dz, dy, dx)
+            weight_mask: (1, D, H, W) per-voxel supervision weights
+        """
+        surface = full_surface_mask > 0.5
+        if not surface.any():
+            return None, None
+
+        # Distance transform on inverse mask gives nearest foreground (surface) index per voxel.
+        _, nearest_idx = ndimage.distance_transform_edt(~surface, return_indices=True)
+        z_idx, y_idx, x_idx = nearest_idx
+        zz, yy, xx = np.indices(surface.shape, dtype=np.float32)
+
+        disp = np.stack([
+            z_idx.astype(np.float32) - zz,
+            y_idx.astype(np.float32) - yy,
+            x_idx.astype(np.float32) - xx,
+        ], axis=0)
+        weights = np.ones((1, *surface.shape), dtype=np.float32)
+        return disp.astype(np.float32, copy=False), weights
 
     def _maybe_perturb_conditioning_surface(self, cond_zyxs: np.ndarray) -> np.ndarray:
         """Apply local normal-direction pushes with Gaussian falloff on small regions."""
@@ -583,19 +616,24 @@ class EdtSegDataset(Dataset):
 
         # convert cond and masked coords to crop-local coords (float for line interpolation)
         cond_zyxs_local_float = (cond_zyxs - min_corner).astype(np.float64)
+        cond_zyxs_unperturbed_local_float = (cond_zyxs_unperturbed - min_corner).astype(np.float64)
         masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float64)
 
         crop_shape = target_shape
 
         # voxelize with line interpolation between adjacent grid points
         cond_segmentation = voxelize_surface_grid(cond_zyxs_local_float, crop_shape)
+        cond_segmentation_gt = voxelize_surface_grid(cond_zyxs_unperturbed_local_float, crop_shape)
         masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
 
         # make sure we actually have some conditioning
         if not cond_segmentation.any():
             return self[np.random.randint(len(self))]
+        if self.use_dense_displacement and not cond_segmentation_gt.any():
+            return self[np.random.randint(len(self))]
 
         cond_segmentation_raw = cond_segmentation.copy()
+        cond_segmentation_gt_raw = cond_segmentation_gt.copy()
 
         # add thickness to conditioning segmentation via dilation
         use_dilation = self.config.get('use_dilation', False)
@@ -606,6 +644,7 @@ class EdtSegDataset(Dataset):
 
         use_segmentation = self.config.get('use_segmentation', False)
         use_sdt = self.config['use_sdt']
+        use_dense_displacement = self.use_dense_displacement
         full_segmentation = None
         full_segmentation_raw = None
         if use_sdt:
@@ -710,6 +749,7 @@ class EdtSegDataset(Dataset):
         vol_crop = torch.from_numpy(vol_crop).to(torch.float32)
         masked_seg = torch.from_numpy(masked_segmentation).to(torch.float32)
         cond_seg = torch.from_numpy(cond_segmentation).to(torch.float32)
+        cond_seg_gt = torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32)
         other_wraps_tensor = torch.from_numpy(other_wraps_vox).to(torch.float32)
         if use_segmentation:
             full_seg = torch.from_numpy(seg_dilated).to(torch.float32)
@@ -772,6 +812,9 @@ class EdtSegDataset(Dataset):
         if self._augmentations is not None:
             seg_list = [masked_seg, cond_seg, other_wraps_tensor]
             seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
+            if use_dense_displacement:
+                seg_list.append(cond_seg_gt)
+                seg_keys.append('cond_seg_gt')
             if use_segmentation:
                 seg_list.append(full_seg)
                 seg_keys.append('full_seg')
@@ -815,6 +858,8 @@ class EdtSegDataset(Dataset):
                     cond_seg = augmented['segmentation'][i]
                 elif key == 'other_wraps':
                     other_wraps_tensor = augmented['segmentation'][i]
+                elif key == 'cond_seg_gt':
+                    cond_seg_gt = augmented['segmentation'][i]
                 elif key == 'full_seg':
                     full_seg = augmented['segmentation'][i]
                 elif key == 'seg_skel':
@@ -855,6 +900,20 @@ class EdtSegDataset(Dataset):
             if extrap_coords.shape[0] == 0:
                 return self[np.random.randint(len(self))]
 
+        dense_gt_disp = None
+        dense_loss_weight = None
+        if use_dense_displacement:
+            # Build dense GT from augmented surfaces so supervision is in the same frame
+            # as transformed inputs/labels.
+            full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
+            dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
+                full_dense_surface.numpy()
+            )
+            if dense_disp_np is None:
+                return self[np.random.randint(len(self))]
+            dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
+            dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
+
         result = {
             "vol": vol_crop,                 # raw volume crop
             "cond": cond_seg,                # conditioning segmentation
@@ -871,6 +930,10 @@ class EdtSegDataset(Dataset):
             result["point_weights"] = point_weights    # (N,) per-point supervision weights
             if point_normals is not None:
                 result["point_normals"] = point_normals  # (N, 3) normals for normal-scalar supervision
+
+        if use_dense_displacement:
+            result["dense_gt_displacement"] = dense_gt_disp  # (3, D, H, W)
+            result["dense_loss_weight"] = dense_loss_weight  # (1, D, H, W)
 
         if use_sdt:
             result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation
@@ -929,7 +992,7 @@ if __name__ == "__main__":
 
         # Save 3D volumes as tif
         for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'other_wraps', 'sdt', 'heatmap_target',
-                    'segmentation', 'segmentation_skel']:
+                    'segmentation', 'segmentation_skel', 'dense_gt_displacement', 'dense_loss_weight']:
             if key in sample:
                 subdir = out_dir / key
                 subdir.mkdir(exist_ok=True)

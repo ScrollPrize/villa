@@ -8,6 +8,11 @@ import torch
 import torch.nn.functional as F
 
 
+def _safe_vector_norm(x, dim, eps=1e-12):
+    """Stable vector norm with finite gradient at zero."""
+    return torch.sqrt((x ** 2).sum(dim=dim) + eps)
+
+
 def _sample_pred_field(pred_field, extrap_coords):
     """Sample predicted field at query coordinates.
 
@@ -68,7 +73,7 @@ def surface_sampled_loss(pred_field, extrap_coords, gt_displacement, valid_mask,
         diff = (error ** 2).sum(dim=-1)  # (B, N)
     elif loss_type == 'vector_huber':
         # Huber loss on Euclidean distance
-        dist = (error ** 2).sum(dim=-1).sqrt()  # (B, N)
+        dist = _safe_vector_norm(error, dim=-1)  # (B, N)
         diff = F.smooth_l1_loss(dist, torch.zeros_like(dist), beta=beta, reduction='none')
     elif loss_type == 'component_huber':
         # Legacy: per-component Huber, then sum
@@ -136,6 +141,53 @@ def surface_sampled_normal_loss(
     masked_diff = diff * effective_mask
     loss = masked_diff.sum() / effective_mask.sum().clamp(min=1)
     return loss
+
+
+def dense_displacement_loss(pred_field, gt_displacement, sample_weights=None,
+                            loss_type='vector_l2', beta=5.0):
+    """Voxelwise displacement supervision for dense targets.
+
+    Args:
+        pred_field: (B, 3, D, H, W) predicted dense displacement field
+        gt_displacement: (B, 3, D, H, W) dense GT displacement vectors
+        sample_weights: optional (B, 1, D, H, W) or (B, D, H, W) per-voxel weights
+        loss_type: one of {'vector_l2', 'vector_huber', 'component_huber'}
+        beta: Huber transition point
+    """
+    if pred_field.shape != gt_displacement.shape:
+        raise ValueError(
+            f"pred_field and gt_displacement must match shape, got "
+            f"{tuple(pred_field.shape)} vs {tuple(gt_displacement.shape)}"
+        )
+
+    error = pred_field - gt_displacement
+
+    if loss_type == 'vector_l2':
+        diff = (error ** 2).sum(dim=1)  # [B, D, H, W]
+    elif loss_type == 'vector_huber':
+        dist = _safe_vector_norm(error, dim=1)  # [B, D, H, W]
+        diff = F.smooth_l1_loss(dist, torch.zeros_like(dist), beta=beta, reduction='none')
+    elif loss_type == 'component_huber':
+        diff = F.smooth_l1_loss(pred_field, gt_displacement, beta=beta, reduction='none').sum(dim=1)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    if sample_weights is None:
+        effective_mask = torch.ones_like(diff)
+    else:
+        if sample_weights.ndim == 5:
+            effective_mask = sample_weights.squeeze(1)
+        elif sample_weights.ndim == 4:
+            effective_mask = sample_weights
+        else:
+            raise ValueError(
+                "sample_weights must have shape (B, 1, D, H, W) or (B, D, H, W), "
+                f"got {tuple(sample_weights.shape)}"
+            )
+        effective_mask = effective_mask.to(dtype=diff.dtype, device=diff.device)
+
+    masked_diff = diff * effective_mask
+    return masked_diff.sum() / effective_mask.sum().clamp(min=1)
 
 
 def smoothness_loss(pred_field):

@@ -442,3 +442,225 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
         plt.savefig(save_path, dpi=100, bbox_inches='tight')
     plt.close(fig)
 
+
+def make_dense_visualization(
+    inputs,
+    disp_pred,
+    dense_gt_displacement,
+    dense_loss_weight=None,
+    sdt_pred=None,
+    sdt_target=None,
+    heatmap_pred=None,
+    heatmap_target=None,
+    seg_pred=None,
+    seg_target=None,
+    save_path=None,
+):
+    """Create and save PNG visualization for dense displacement supervision."""
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    b = 0
+    D, H, W = inputs.shape[2], inputs.shape[3], inputs.shape[4]
+
+    vol_3d = inputs[b, 0].cpu().numpy()
+    cond_3d = inputs[b, 1].cpu().numpy()
+    aux_3d = inputs[b, 2].cpu().numpy() if inputs.shape[1] > 2 else None
+
+    pred_3d = disp_pred[b].cpu().numpy()
+    gt_3d = dense_gt_displacement[b].cpu().numpy()
+    pred_mag_3d = np.linalg.norm(pred_3d, axis=0)
+    gt_mag_3d = np.linalg.norm(gt_3d, axis=0)
+    gt_surface_3d = (gt_mag_3d < 0.5).astype(np.float32)
+    resid_mag_3d = np.linalg.norm(pred_3d - gt_3d, axis=0)
+
+    if dense_loss_weight is None:
+        weight_3d = np.ones((D, H, W), dtype=np.float32)
+    else:
+        w = dense_loss_weight[b].cpu().numpy()
+        weight_3d = w[0] if w.ndim == 4 else w
+    weight_3d = weight_3d.astype(np.float32, copy=False)
+    supervised_mask = weight_3d > 0
+
+    def _safe_percentile(arr, p, fallback=1.0):
+        if arr.size == 0:
+            return fallback
+        val = np.percentile(arr, p)
+        return float(val if np.isfinite(val) and val > 1e-8 else fallback)
+
+    def _weighted_mean(arr, wts):
+        den = float(wts.sum())
+        if den <= 1e-8:
+            return float(arr.mean())
+        return float((arr * wts).sum() / den)
+
+    pred_for_scale = pred_mag_3d[supervised_mask] if np.any(supervised_mask) else pred_mag_3d.reshape(-1)
+    gt_for_scale = gt_mag_3d[supervised_mask] if np.any(supervised_mask) else gt_mag_3d.reshape(-1)
+    resid_for_scale = resid_mag_3d[supervised_mask] if np.any(supervised_mask) else resid_mag_3d.reshape(-1)
+    disp_vmax = max(_safe_percentile(pred_for_scale, 99), _safe_percentile(gt_for_scale, 99))
+    resid_vmax = _safe_percentile(resid_for_scale, 99)
+
+    sdt_pred_3d = sdt_pred[b, 0].cpu().numpy() if sdt_pred is not None else None
+    sdt_gt_3d = sdt_target[b, 0].cpu().numpy() if sdt_target is not None else None
+    sdt_vmax = 1.0
+    if sdt_pred_3d is not None:
+        sdt_vmax = max(float(np.abs(sdt_pred_3d).max()), float(np.abs(sdt_gt_3d).max()) if sdt_gt_3d is not None else 0.0, 1e-6)
+    hm_pred_3d = torch.sigmoid(heatmap_pred[b, 0]).cpu().numpy() if heatmap_pred is not None else None
+    hm_gt_3d = heatmap_target[b, 0].cpu().numpy() if heatmap_target is not None else None
+    has_seg = seg_pred is not None and seg_target is not None
+    seg_pred_3d = seg_pred[b].argmax(dim=0).cpu().numpy() if seg_pred is not None else None
+    seg_gt_3d = seg_target[b, 0].cpu().numpy() if seg_target is not None else None
+
+    use_aux = aux_3d is not None
+    use_sdt = sdt_pred_3d is not None
+    use_hm = hm_pred_3d is not None
+    n_cols = 6 + int(use_aux) + int(use_sdt) + int(use_hm) + int(has_seg)
+
+    fig = plt.figure(figsize=(4 * n_cols + 4, 14))
+    gs = GridSpec(3, n_cols + 1, figure=fig, width_ratios=[1] * n_cols + [1.2], wspace=0.3)
+    axes = np.empty((3, n_cols), dtype=object)
+    for r in range(3):
+        for c in range(n_cols):
+            axes[r, c] = fig.add_subplot(gs[r, c])
+    ax_text = fig.add_subplot(gs[:, n_cols])
+    ax_text.axis('off')
+
+    z0, y0, x0 = D // 2, H // 2, W // 2
+    slices = [
+        ("z", z0, f"z={z0}", "x", "y", [-W / 2, W / 2, H / 2, -H / 2]),
+        ("y", y0, f"y={y0}", "x", "z", [-W / 2, W / 2, D / 2, -D / 2]),
+        ("x", x0, f"x={x0}", "y", "z", [-H / 2, H / 2, D / 2, -D / 2]),
+    ]
+
+    def _slice(arr, axis, idx):
+        if axis == "z":
+            return arr[idx]
+        if axis == "y":
+            return arr[:, idx, :]
+        return arr[:, :, idx]
+
+    for row, (axis, idx, label, xlabel, ylabel, extent) in enumerate(slices):
+        vol_slice = _slice(vol_3d, axis, idx)
+        cond_slice = _slice(cond_3d, axis, idx)
+        aux_slice = _slice(aux_3d, axis, idx) if use_aux else None
+        pred_slice = _slice(pred_mag_3d, axis, idx)
+        gt_surface_slice = _slice(gt_surface_3d, axis, idx)
+        gt_slice = _slice(gt_mag_3d, axis, idx)
+        resid_slice = _slice(resid_mag_3d, axis, idx)
+
+        col = 0
+        axes[row, col].imshow(vol_slice, cmap="gray", extent=extent)
+        axes[row, col].set_title(f"Volume ({label})")
+        axes[row, col].set_ylabel(ylabel)
+        col += 1
+
+        axes[row, col].imshow(cond_slice, cmap="gray", extent=extent)
+        axes[row, col].set_title("Conditioning")
+        axes[row, col].set_yticks([])
+        col += 1
+
+        if use_aux:
+            axes[row, col].imshow(aux_slice, cmap="gray", extent=extent)
+            axes[row, col].set_title("Input Ch2")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        axes[row, col].imshow(pred_slice, cmap="hot", vmin=0, vmax=disp_vmax, extent=extent)
+        axes[row, col].set_title("Pred Disp Mag")
+        axes[row, col].set_yticks([])
+        col += 1
+
+        axes[row, col].imshow(gt_surface_slice, cmap="gray", vmin=0, vmax=1, extent=extent)
+        axes[row, col].set_title("GT Surface (full)")
+        axes[row, col].set_yticks([])
+        col += 1
+
+        axes[row, col].imshow(gt_slice, cmap="hot", vmin=0, vmax=disp_vmax, extent=extent)
+        axes[row, col].set_title("GT Disp Mag")
+        axes[row, col].set_yticks([])
+        col += 1
+
+        axes[row, col].imshow(resid_slice, cmap="hot", vmin=0, vmax=resid_vmax, extent=extent)
+        axes[row, col].set_title("|Pred-GT|")
+        axes[row, col].set_yticks([])
+        col += 1
+
+        if use_sdt:
+            sdt_pred_slice = _slice(sdt_pred_3d, axis, idx)
+            axes[row, col].imshow(sdt_pred_slice, cmap="RdBu", vmin=-sdt_vmax, vmax=sdt_vmax, extent=extent)
+            axes[row, col].set_title("SDT Pred")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if use_hm:
+            hm_pred_slice = _slice(hm_pred_3d, axis, idx)
+            axes[row, col].imshow(hm_pred_slice, cmap="hot", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Heatmap Pred")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if has_seg:
+            seg_pred_slice = _slice(seg_pred_3d, axis, idx) > 0.5
+            seg_gt_slice = _slice(seg_gt_3d, axis, idx) > 0.5
+            overlay = np.zeros((*seg_pred_slice.shape, 3), dtype=np.float32)
+            overlay[..., 0] = seg_pred_slice.astype(np.float32)
+            overlay[..., 1] = seg_gt_slice.astype(np.float32)
+            axes[row, col].imshow(overlay, extent=extent)
+            axes[row, col].set_title("Seg Pred(R) GT(G)")
+            axes[row, col].set_yticks([])
+
+        for c in range(n_cols):
+            axes[row, c].set_xlabel(xlabel)
+
+    cond_mask = cond_3d > 0.5
+    cond_pred = pred_mag_3d[cond_mask]
+    cond_gt = gt_mag_3d[cond_mask]
+
+    gt_floor = 0.10
+    improvement_clip = 100.0
+    meaningful = (gt_mag_3d > gt_floor) & supervised_mask
+    if np.any(meaningful):
+        imp = (1.0 - resid_mag_3d[meaningful] / np.maximum(gt_mag_3d[meaningful], 1e-8)) * 100.0
+        imp = np.clip(imp[np.isfinite(imp)], -improvement_clip, improvement_clip)
+        improvement = float(np.median(imp)) if imp.size > 0 else 0.0
+        n_imp = int(imp.size)
+    else:
+        improvement = 0.0
+        n_imp = 0
+
+    w = weight_3d
+    stats_lines = [
+        "=" * 40,
+        "DENSE DISPLACEMENT STATS",
+        "=" * 40,
+        f"Supervised voxels: {int(supervised_mask.sum())}",
+        f"Total voxels:      {int(weight_3d.size)}",
+        "",
+        "--- Weighted means ---",
+        f"Pred |disp|: {_weighted_mean(pred_mag_3d, w):.4f}",
+        f"GT   |disp|: {_weighted_mean(gt_mag_3d, w):.4f}",
+        f"Resid|disp|: {_weighted_mean(resid_mag_3d, w):.4f}",
+        "",
+        "--- Improvement ---",
+        f"Median % improvement: {improvement:.1f}%",
+        f"  gt_mag > {gt_floor:.2f}, clipped to +/-{improvement_clip:.0f}% (n={n_imp})",
+        "",
+        "--- Conditioning voxels ---",
+        f"N cond voxels: {int(cond_mask.sum())}",
+        f"Pred |disp| @ cond mean: {float(cond_pred.mean()) if cond_pred.size > 0 else 0.0:.4f}",
+        f"GT   |disp| @ cond mean: {float(cond_gt.mean()) if cond_gt.size > 0 else 0.0:.4f}",
+        "=" * 40,
+    ]
+    ax_text.text(
+        0.05, 0.95, "\n".join(stats_lines),
+        transform=ax_text.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="gray"),
+    )
+
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)
