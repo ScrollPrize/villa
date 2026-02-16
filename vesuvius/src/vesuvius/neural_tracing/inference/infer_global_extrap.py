@@ -120,6 +120,16 @@ def parse_args():
         help="Number of iterative boundary growth passes to run.",
     )
     parser.add_argument(
+        "--refine",
+        type=int,
+        default=None,
+        help=(
+            "Within each outer iteration, run N+1 staged fractional displacement updates when "
+            "sampling the stacked displacement field. Each stage applies 1/(N+1) of the sampled "
+            "displacement before re-sampling at updated coordinates."
+        ),
+    )
+    parser.add_argument(
         "--no-tta",
         dest="tta",
         action="store_false",
@@ -195,6 +205,8 @@ def parse_args():
         parser.error("--batch-size must be >= 1")
     if args.iterations < 1:
         parser.error("--iterations must be >= 1")
+    if args.refine is not None and args.refine < 1:
+        parser.error("--refine must be >= 1 when provided")
     if args.agg_extrap_lines is not None and args.agg_extrap_lines < 1:
         parser.error("--agg-extrap-lines must be >= 1 when provided")
     if args.napari_downsample < 1:
@@ -309,10 +321,10 @@ def _build_bbox_crops(
 
 def _run_inference(args, bbox_crops, model_state, verbose=True):
     expected_in_channels = int(model_state["expected_in_channels"])
-    if expected_in_channels != 3:
+    if expected_in_channels not in (2, 3):
         raise RuntimeError(
-            f"Only 3-channel models are supported in infer_global_extrap. "
-            f"Checkpoint expects in_channels={expected_in_channels}."
+            "infer_global_extrap currently supports only 2- or 3-channel models; "
+            f"checkpoint expects in_channels={expected_in_channels}."
         )
 
     if len(bbox_crops) == 0:
@@ -326,10 +338,17 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
     n_batches = (len(bbox_crops) + batch_size - 1) // batch_size
     for batch_start in range(0, len(bbox_crops), batch_size):
         batch = bbox_crops[batch_start:batch_start + batch_size]
-        batch_inputs = [
-            _build_model_inputs(crop["volume"], crop["cond_vox"], crop["extrap_vox"])
-            for crop in batch
-        ]
+        batch_inputs = []
+        for crop in batch:
+            if expected_in_channels == 2:
+                # Dense-displacement checkpoints may be trained without extrapolation
+                # conditioning (vol + cond only).
+                vol_t = torch.from_numpy(crop["volume"]).float().unsqueeze(0).unsqueeze(0)
+                cond_t = torch.from_numpy(crop["cond_vox"]).float().unsqueeze(0).unsqueeze(0)
+                model_input = torch.cat([vol_t, cond_t], dim=1)
+            else:
+                model_input = _build_model_inputs(crop["volume"], crop["cond_vox"], crop["extrap_vox"])
+            batch_inputs.append(model_input)
         model_inputs = torch.cat(batch_inputs, dim=0).to(args.device)
         disp_pred = _predict_displacement(args, model_state, model_inputs, use_tta=use_tta)
         if disp_pred is None:
@@ -439,6 +458,7 @@ def _sample_displacement_for_extrap_uvs(
     extrap_uv_to_zyx,
     grow_direction,
     max_lines=None,
+    refine=None,
 ):
     if stacked_displacement is None or not extrap_uv_to_zyx:
         return _empty_stack_samples()
@@ -466,11 +486,19 @@ def _sample_displacement_for_extrap_uvs(
     sampled_world = sampled_world[in_bounds]
     coords_local = coords_local[in_bounds].astype(np.float32, copy=False)
 
-    sampled_disp, sampled_count, valid_mask = _sample_trilinear_displacement_stack(
-        disp,
-        count,
-        coords_local,
-    )
+    if refine is None:
+        sampled_disp, sampled_count, valid_mask = _sample_trilinear_displacement_stack(
+            disp,
+            count,
+            coords_local,
+        )
+    else:
+        sampled_disp, sampled_count, valid_mask = _sample_fractional_displacement_stack(
+            disp,
+            count,
+            coords_local,
+            refine_extra_steps=int(refine),
+        )
     if not valid_mask.any():
         return _empty_stack_samples()
 
@@ -485,6 +513,49 @@ def _sample_displacement_for_extrap_uvs(
         "displacement": sampled_disp.astype(np.float32, copy=False),
         "stack_count": sampled_count.astype(np.uint32, copy=False),
     }
+
+
+def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extra_steps):
+    coords_local = np.asarray(coords_local, dtype=np.float32)
+    if coords_local.ndim != 2 or coords_local.shape[1] != 3 or coords_local.shape[0] == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.uint32),
+            np.zeros((0,), dtype=bool),
+        )
+
+    refine_extra_steps = max(int(refine_extra_steps), 0)
+    refine_parts = refine_extra_steps + 1
+    refine_fraction = 1.0 / float(refine_parts)
+
+    start_coords = coords_local.copy()
+    current_coords = coords_local.copy()
+    best_count = np.zeros((coords_local.shape[0],), dtype=np.uint32)
+    ever_valid = np.zeros((coords_local.shape[0],), dtype=bool)
+
+    for _ in range(refine_parts):
+        stage_disp, stage_count, stage_valid = _sample_trilinear_displacement_stack(
+            disp,
+            count,
+            current_coords,
+        )
+        np.maximum(best_count, stage_count, out=best_count)
+        if not stage_valid.any():
+            continue
+        delta = stage_disp * refine_fraction
+        finite_delta = np.isfinite(delta).all(axis=1)
+        apply_mask = stage_valid & finite_delta
+        if not apply_mask.any():
+            continue
+        current_coords[apply_mask] = current_coords[apply_mask] + delta[apply_mask]
+        ever_valid |= apply_mask
+
+    sampled_disp = (current_coords - start_coords).astype(np.float32, copy=False)
+    finite_disp = np.isfinite(sampled_disp).all(axis=1)
+    if not bool(finite_disp.all()):
+        sampled_disp = np.where(finite_disp[:, None], sampled_disp, 0.0).astype(np.float32, copy=False)
+        ever_valid &= finite_disp
+    return sampled_disp, best_count, ever_valid
 
 
 def _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx):
@@ -838,9 +909,10 @@ def main():
         model_config = model_state["model_config"]
         checkpoint_path = model_state["checkpoint_path"]
         expected_in_channels = int(model_state["expected_in_channels"])
-        if expected_in_channels != 3:
+        if expected_in_channels not in (2, 3):
             raise RuntimeError(
-                f"infer_global_extrap only supports 3-channel models; got in_channels={expected_in_channels}"
+                "infer_global_extrap currently supports only 2- or 3-channel models; "
+                f"got in_channels={expected_in_channels}"
             )
     elif extrap_only_mode:
         if args.verbose:
@@ -1010,6 +1082,7 @@ def main():
                     extrap_uv_to_zyx,
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
+                    refine=args.refine,
                 )
 
         _print_iteration_summary(
