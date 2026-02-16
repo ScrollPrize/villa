@@ -253,24 +253,28 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
 			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-			_wobs0, winding_avg, winding_err = point_constraints.winding_observed_and_error(
+			pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
+				xy_conn=xy_conn_corr,
+			)
+			_wobs0, winding_avg, winding_err = point_constraints.winding_observed_and_error(
+				points_xyz_winda=pts_corr,
 				collection_idx=points_collection_idx,
 				xy_conn=xy_conn_corr,
-				idx_left=idx_left,
-				valid_left=valid_left,
-				idx_right=idx_right,
-				valid_right=valid_right,
+				idx_left=idx_l_corr,
+				valid_left=ok_l_corr,
+				idx_right=idx_r_corr,
+				valid_right=ok_r_corr,
 			)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,
 			xy_conn=xy_conn_corr,
-			points_xyz_winda=points_all,
-			idx_left=idx_left,
-			valid_left=valid_left,
-			idx_right=idx_right,
-			valid_right=valid_right,
+			points_xyz_winda=pts_corr,
+			idx_left=idx_l_corr,
+			valid_left=ok_l_corr,
+			idx_right=idx_r_corr,
+			valid_right=ok_r_corr,
 			winding_avg=winding_avg,
 			winding_err=winding_err,
 			postfix="init",
@@ -308,24 +312,28 @@ def main(argv: list[str] | None = None) -> int:
 				with torch.no_grad():
 					xy_lr_corr = mdl._grid_xy()
 					xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-			_wobs, wavg, werr = point_constraints.winding_observed_and_error(
+			pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
+				xy_conn=xy_conn_corr,
+			)
+			_wobs, wavg, werr = point_constraints.winding_observed_and_error(
+				points_xyz_winda=pts_corr,
 				collection_idx=points_collection_idx,
 				xy_conn=xy_conn_corr,
-				idx_left=idx_left,
-				valid_left=valid_left,
-				idx_right=idx_right,
-				valid_right=valid_right,
+				idx_left=idx_l_corr,
+				valid_left=ok_l_corr,
+				idx_right=idx_r_corr,
+				valid_right=ok_r_corr,
 			)
 			vis.save_corr_points(
 				data=data,
 				xy_lr=xy_lr_corr,
 				xy_conn=xy_conn_corr,
-				points_xyz_winda=points_all,
-				idx_left=idx_left,
-				valid_left=valid_left,
-				idx_right=idx_right,
-				valid_right=valid_right,
+				points_xyz_winda=pts_corr,
+				idx_left=idx_l_corr,
+				valid_left=ok_l_corr,
+				idx_right=idx_r_corr,
+				valid_right=ok_r_corr,
 				winding_avg=wavg,
 				winding_err=werr,
 				postfix=f"{stage}_{step:06d}",
@@ -357,24 +365,28 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
 			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-			_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
+			pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
+				xy_conn=xy_conn_corr,
+			)
+			_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
+				points_xyz_winda=pts_corr,
 				collection_idx=points_collection_idx,
 				xy_conn=xy_conn_corr,
-				idx_left=idx_left,
-				valid_left=valid_left,
-				idx_right=idx_right,
-				valid_right=valid_right,
+				idx_left=idx_l_corr,
+				valid_left=ok_l_corr,
+				idx_right=idx_r_corr,
+				valid_right=ok_r_corr,
 			)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,
 			xy_conn=xy_conn_corr,
-			points_xyz_winda=points_all,
-			idx_left=idx_left,
-			valid_left=valid_left,
-			idx_right=idx_right,
-			valid_right=valid_right,
+			points_xyz_winda=pts_corr,
+			idx_left=idx_l_corr,
+			valid_left=ok_l_corr,
+			idx_right=idx_r_corr,
+			valid_right=ok_r_corr,
 			winding_avg=wavgf,
 			winding_err=werrf,
 			postfix="final",

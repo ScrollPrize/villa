@@ -15,6 +15,7 @@ import opt_loss_mod
 import opt_loss_step
 import opt_loss_corr
 import mask_schedule
+import point_constraints
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -77,10 +78,7 @@ def _stage_to_modifiers(
 			for k, v in w_fac.items():
 				if v is None:
 					continue
-				if isinstance(v, dict) and "abs" in v:
-					eff[str(k)] = float(v["abs"])
-				else:
-					eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
+				eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
 
 	mods: dict[str, float] = {}
 	for name, val in eff.items():
@@ -214,7 +212,6 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 	_require_consumed_dict(where="top-level", cfg=cfg)
 
 	out: list[Stage] = []
-	prev_eff: dict[str, float] | None = None
 	for s in stages_cfg:
 		if not isinstance(s, dict):
 			raise ValueError("stages_json: each stage must be an object")
@@ -252,8 +249,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 		if local_opt_cfg is not None and not isinstance(local_opt_cfg, (dict, list)):
 			raise ValueError(f"stages_json: stage '{name}' field 'local_opt' must be an object, list, or null")
 
-		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=lambda_global, prev_eff=prev_eff)
-		prev_eff = global_opt.eff
+		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=lambda_global, prev_eff=None)
 		local_opt = None
 		if local_opt_cfg is not None:
 			if isinstance(local_opt_cfg, dict):
@@ -265,7 +261,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 				if not isinstance(opt_cfg, dict):
 					raise ValueError(f"stages_json: stage '{name}' field 'local_opt[{li}]' must be an object")
 				local_opt.append(
-					_parse_opt_settings(stage_name=name, opt_cfg=opt_cfg, base=lambda_global, prev_eff=prev_eff)
+					_parse_opt_settings(stage_name=name, opt_cfg=opt_cfg, base=lambda_global, prev_eff=None)
 				)
 
 		out.append(Stage(name=name, grow=grow, masks=masks, global_opt=global_opt, local_opt=local_opt))
@@ -311,7 +307,22 @@ def optimize(
 		return torch.where(wsum > 0.0, lsum / wsum, fallback)
 
 	def _print_losses_per_z(*, label: str, res, eff: dict[str, float], mean_pos_xy: torch.Tensor | None) -> None:
-		pts_c = data.constraints.points if data.constraints is not None else None
+		pts_c0 = data.constraints.points if data.constraints is not None else None
+		def _corr_pts_for_res() -> fit_data.PointConstraintsData | None:
+			if pts_c0 is None:
+				return None
+			pts_all, idx_left, valid_left, _d_l, idx_right, valid_right, _d_r = point_constraints.closest_conn_segment_indices(
+				points_xyz_winda=pts_c0.points_xyz_winda,
+				xy_conn=res.xy_conn,
+			)
+			return fit_data.PointConstraintsData(
+				points_xyz_winda=pts_all,
+				collection_idx=pts_c0.collection_idx,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+			)
 		term_to_maps = {
 			"data": lambda: opt_loss_data.data_loss_map(res=res),
 			"data_plain": lambda: opt_loss_data.data_plain_loss_map(res=res),
@@ -327,7 +338,7 @@ def optimize(
 			"angle": lambda: opt_loss_geom.angle_symmetry_loss_map(res=res),
 			"y_straight": lambda: opt_loss_geom.y_straight_loss_map(res=res),
 			"z_straight": lambda: opt_loss_geom.z_straight_loss_map(res=res),
-			"corr_winding": lambda: (lambda lv, lms, ms: (lms[0], ms[0]))(*opt_loss_corr.corr_winding_loss(res=res, pts_c=pts_c)),
+			"corr_winding": lambda: (lambda lv, lms, ms: (lms[0], ms[0]))(*opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res())),
 			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
 		}
 		if mean_pos_xy is not None:
@@ -428,7 +439,22 @@ def optimize(
 			with torch.no_grad():
 				res_init = model(data)
 				mean_pos_xy = res_init.xy_lr.mean(dim=(0, 1, 2))
-		pts_c = data.constraints.points if data.constraints is not None else None
+		pts_c0 = data.constraints.points if data.constraints is not None else None
+		def _corr_pts_for_res(res) -> fit_data.PointConstraintsData | None:
+			if pts_c0 is None:
+				return None
+			pts_all, idx_left, valid_left, _d_l, idx_right, valid_right, _d_r = point_constraints.closest_conn_segment_indices(
+				points_xyz_winda=pts_c0.points_xyz_winda,
+				xy_conn=res.xy_conn,
+			)
+			return fit_data.PointConstraintsData(
+				points_xyz_winda=pts_all,
+				collection_idx=pts_c0.collection_idx,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+			)
 		terms = {
 			"dir_v": {"loss": opt_loss_dir.dir_v_loss},
 			"dir_conn": {"loss": opt_loss_dir.dir_conn_loss},
@@ -448,7 +474,7 @@ def optimize(
 			"angle": {"loss": opt_loss_geom.angle_symmetry_loss},
 			"y_straight": {"loss": opt_loss_geom.y_straight_loss},
 			"z_straight": {"loss": opt_loss_geom.z_straight_loss},
-			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=pts_c)},
+			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res(res))},
 		}
 		with torch.no_grad():
 			res0 = model(data)

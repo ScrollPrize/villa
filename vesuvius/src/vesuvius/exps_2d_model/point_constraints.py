@@ -312,9 +312,31 @@ def winding_observed_and_error(
 		for cid in uc.tolist():
 			m = (col == int(cid)) & both
 			if bool(m.any().item()):
-				v = obs[m] - pts[m, 3]
-				mu = torch.nanmean(v)
-				avg[col == int(cid)] = mu
+				obs_m = obs[m]
+				wa_m = pts[m, 3]
+				avg_pos = torch.nanmean(obs_m - wa_m)
+				err_pos = obs_m - (avg_pos + wa_m)
+				mse_pos = torch.nanmean(err_pos * err_pos)
+				avg_neg = torch.nanmean(obs_m + wa_m)
+				err_neg = obs_m - (avg_neg - wa_m)
+				mse_neg = torch.nanmean(err_neg * err_neg)
+				use_neg = bool((mse_neg < mse_pos).item())
+				avg[col == int(cid)] = avg_neg if use_neg else avg_pos
 
-	err = obs - (avg + pts[:, 3])
+	err = torch.full_like(obs, float("nan"))
+	if int(col.numel()) == int(obs.numel()) and int(obs.numel()) > 0:
+		uc = torch.unique(col)
+		for cid in uc.tolist():
+			m = (col == int(cid)) & both
+			if not bool(m.any().item()):
+				continue
+			obs_m = obs[m]
+			wa_m = pts[m, 3]
+			avg_m = avg[m]
+			err_pos = obs_m - (avg_m + wa_m)
+			err_neg = obs_m - (avg_m - wa_m)
+			mse_pos = torch.nanmean(err_pos * err_pos)
+			mse_neg = torch.nanmean(err_neg * err_neg)
+			use_neg = bool((mse_neg < mse_pos).item())
+			err[m] = err_neg if use_neg else err_pos
 	return obs, avg, err
