@@ -236,7 +236,12 @@ def main(argv: list[str] | None = None) -> int:
 	n, hm, wm, _c2 = (int(v) for v in xy_lr.shape)
 	idx_z_a = np.asarray(idx_z, dtype=np.int64)
 
-	z_vals = np.asarray([cfg.z0 + int(cfg.offset_z) + zi * int(cfg.z_step) for zi in idx_z], dtype=np.float32)
+	# z coordinates are exported in full-resolution units.
+	# Model z_step is in fit-space; multiply by XY downscale for effective full-res z stride.
+	z_step_fullres = int(round(float(cfg.z_step) * float(cfg.downscale)))
+	if z_step_fullres <= 0:
+		raise ValueError(f"invalid effective full-res z-step: z_step={cfg.z_step}, downscale={cfg.downscale}, z_step_fullres={z_step_fullres}")
+	z_vals = np.asarray([cfg.z0 + int(cfg.offset_z) + zi * int(z_step_fullres) for zi in idx_z], dtype=np.float32)
 	z_grid = z_vals.reshape(-1, 1).repeat(hm, axis=1)
 
 	meta_scale = float(cfg.scale) * float(cfg.downscale)
