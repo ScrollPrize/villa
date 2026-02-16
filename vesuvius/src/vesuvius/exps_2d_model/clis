@@ -124,3 +124,6 @@ sshfs: bad mount point `vis_fit_cos.ome.zarr': No such file or directory
 [hendrik@turbosheep volumes]$ mkdir vis_fit_cos.ome.zarr
 [hendrik@turbosheep volumes]$ sshfs staticsheep:/home/hendrik/business/aiconsulting/vesuviuschallenge/data/model2d_fullsize_exps/vis_fit_cos.ome.zarr vis_fit_cos.ome.zarr
 [hendrik@turbosheep volumes]$
+
+[hendrik@staticsheep model2d_fullsize_exps]$ python $SRC/convert_fit_zarr_to_vc3d_omezarr.py --level 5 --input s5_cos.zarr/ --output vis_fit
+

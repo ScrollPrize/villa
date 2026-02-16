@@ -126,6 +126,9 @@ def run_preprocess(
 		"downscale_xy": int(downscale_xy),
 		"z_step": int(z_step_raw),
 		"z_step_eff": int(z_step_eff),
+		"grad_mag_blur_sigma": float(grad_mag_blur_sigma),
+		"grad_mag_encode_scale": float(1000.0),
+		"dir_blur_sigma": float(dir_blur_sigma),
 		"processed_z_slices": int(proc_z),
 		"crop_xyzwhd": [int(x0), int(y0), int(z0), int(nx), int(ny), int(nz)],
 		"output_full_scaled": True,
@@ -209,9 +212,14 @@ def run_preprocess(
 			if float(dir_blur_sigma) > 0.0:
 				dir0 = _gaussian_blur_nchw(x=dir0, sigma=float(dir_blur_sigma))
 				dir1 = _gaussian_blur_nchw(x=dir1, sigma=float(dir_blur_sigma))
+			gm_np = grad_mag[0, 0].detach().cpu().numpy().astype(np.float32)
+			print(
+				f"[preprocess_cos_omezarr][grad_mag] z={int(zz)} min={float(gm_np.min()):.6f} max={float(gm_np.max()):.6f} mean={float(gm_np.mean()):.6f}",
+				flush=True,
+			)
 
 			cos_u8 = np.clip(cos_np * 255.0, 0.0, 255.0).astype(np.uint8)
-			grad_mag_u8 = np.clip(grad_mag[0, 0].detach().cpu().numpy().astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
+			grad_mag_u8 = np.clip(grad_mag[0, 0].detach().cpu().numpy().astype(np.float32) * 1000.0, 0.0, 255.0).astype(np.uint8)
 			dir0_u8 = np.clip(dir0[0, 0].detach().cpu().numpy().astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
 			dir1_u8 = np.clip(dir1[0, 0].detach().cpu().numpy().astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
 			t_wr0 = time.time()
@@ -227,7 +235,7 @@ def run_preprocess(
 				arr[1, oi, ys:y1w, xs:x1w] = grad_mag_u8[:yh, :xw]
 				arr[2, oi, ys:y1w, xs:x1w] = dir0_u8[:yh, :xw]
 				arr[3, oi, ys:y1w, xs:x1w] = dir1_u8[:yh, :xw]
-				arr[4, oi, ys:y1w, xs:x1w] = 1
+				arr[4, oi, ys:y1w, xs:x1w] = 255
 			t_write_sum += float(time.time() - t_wr0)
 
 			done += 1

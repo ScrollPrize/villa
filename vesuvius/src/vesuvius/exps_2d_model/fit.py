@@ -186,8 +186,9 @@ def main(argv: list[str] | None = None) -> int:
 			min_xy = xy0.amin(dim=(0, 2, 3)).to(dtype=torch.float32).cpu().numpy().tolist()
 			max_xy = xy0.amax(dim=(0, 2, 3)).to(dtype=torch.float32).cpu().numpy().tolist()
 			print(f"loaded mesh_coarse: mean_xy={mean_xy} min_xy={min_xy} max_xy={max_xy}")
-	print("model_init:", mdl.init)
-	print("mesh:", mdl.mesh_h, mdl.mesh_w)
+	if mdl is not None:
+		print("model_init:", mdl.init)
+		print("mesh:", mdl.mesh_h, mdl.mesh_w)
 	if int(points_tensor_work.shape[0]) > 0:
 		print("[point_constraints] starting closest segment search")
 		with torch.no_grad():
@@ -249,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
 			subsample_winding=int(subsample_winding_use),
 			crop_xyzwhd=crop_xyzwhd,
 		)
+		print("model_init:", mdl.init)
+		print("mesh:", mdl.mesh_h, mdl.mesh_w)
 	if int(points_all.shape[0]) > 0:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
