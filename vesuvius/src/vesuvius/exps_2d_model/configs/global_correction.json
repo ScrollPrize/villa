@@ -30,18 +30,31 @@
 	},
 	"stages": [
 		{
-			"name": "snap",
+			"name": "init",
 			"steps": 500,
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 			"min_scaledown": 0,
 			"w_fac": {
+				"data": 0.0,
+				"data_plain": 0.0,
 				"corr_winding": 0.0
 				}
 		},
 		{
 			"name": "corr",
-			"steps": 5000,
+			"steps": 500,
+			"lr": [0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"data": 0.0,
+				"data_plain": 0.0
+				}
+		},
+		{
+			"name": "snap",
+			"steps": 500,
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 			"min_scaledown": 0

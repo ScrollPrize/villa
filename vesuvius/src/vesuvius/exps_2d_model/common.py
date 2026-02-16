@@ -259,12 +259,6 @@ def unet_infer_tiled(
 	stride = max(1, tile_size - overlap)
 	y_positions = _build_positions(h, tile_size, stride)
 	x_positions = _build_positions(w, tile_size, stride)
-	print(
-		f"[tiled_infer] image_nchw={tuple(int(v) for v in image.shape)} "
-		f"tile_size={int(tile_size)} overlap={int(overlap)} border={int(border)} "
-		f"stride={int(stride)} tiles={int(len(y_positions))}x{int(len(x_positions))}={int(len(y_positions)*len(x_positions))} "
-		f"device={str(image.device)}"
-	)
 	
 	# Per-dimension 1D blending ramp builder.
 	#
