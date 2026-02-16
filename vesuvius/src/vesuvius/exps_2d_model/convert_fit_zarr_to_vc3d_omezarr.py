@@ -34,6 +34,10 @@ def _shape_mul2(shape: tuple[int, int, int], n: int) -> tuple[int, int, int]:
 	return max(1, z * f), max(1, y * f), max(1, x * f)
 
 
+def _ceil_div(a: int, b: int) -> int:
+	return (int(a) + int(b) - 1) // int(b)
+
+
 def _print_progress(*, prefix: str, done: int, total: int, t0: float) -> None:
 	d = max(0, int(done))
 	t = max(1, int(total))
@@ -76,6 +80,18 @@ def _write_z_chunks(*, dst: zarr.Array, data: np.ndarray, chunk: int, label: str
 	print("", flush=True)
 
 
+def _write_z_chunks_at(*, dst: zarr.Array, data: np.ndarray, z0: int, y0: int, x0: int, chunk: int, label: str) -> None:
+	z = int(data.shape[0])
+	y = int(data.shape[1])
+	x = int(data.shape[2])
+	t0 = time.time()
+	for za in range(0, z, max(1, int(chunk))):
+		zb = min(z, za + max(1, int(chunk)))
+		dst[int(z0) + int(za) : int(z0) + int(zb), int(y0) : int(y0) + int(y), int(x0) : int(x0) + int(x)] = data[za:zb, :, :]
+		_print_progress(prefix=label, done=int(zb), total=int(z), t0=float(t0))
+	print("", flush=True)
+
+
 def _channels_from_src(*, c_in: int, params: dict) -> list[str]:
 	ch = params.get("channels", None)
 	if isinstance(ch, list) and all(isinstance(v, str) for v in ch) and len(ch) == int(c_in):
@@ -109,8 +125,31 @@ def run(
 	z_repeat = int(params.get("z_step", 1) or 1)
 	downscale_xy = int(params.get("downscale_xy", 1) or 1)
 	first_filled_level = _first_filled_level_from_downscale(downscale_xy=downscale_xy)
+	z_step_eff = int(params.get("z_step_eff", int(z_repeat) * int(max(1, int(downscale_xy)))))
+	if z_step_eff <= 0:
+		raise ValueError(f"invalid preprocess_params.z_step_eff: {z_step_eff}")
 
 	c_in, z0, y0, x0 = (int(v) for v in a.shape)
+	zs0 = 0
+	ys0 = 0
+	xs0 = 0
+	zs1 = int(z0)
+	ys1 = int(y0)
+	xs1 = int(x0)
+	crop_xyzwhd = params.get("crop_xyzwhd", None)
+	if isinstance(crop_xyzwhd, (list, tuple)) and len(crop_xyzwhd) == 6:
+		x0f, y0f, z0f, wf, hf, df = (int(v) for v in crop_xyzwhd)
+		if wf > 0 and hf > 0 and df > 0:
+			xs0 = max(0, int(x0f) // int(max(1, downscale_xy)))
+			ys0 = max(0, int(y0f) // int(max(1, downscale_xy)))
+			zs0 = max(0, int(z0f) // int(z_step_eff))
+			xs1 = min(int(x0), _ceil_div(int(x0f) + int(wf), int(max(1, downscale_xy))))
+			ys1 = min(int(y0), _ceil_div(int(y0f) + int(hf), int(max(1, downscale_xy))))
+			zs1 = min(int(z0), _ceil_div(int(z0f) + int(df), int(z_step_eff)))
+	if zs1 <= zs0 or ys1 <= ys0 or xs1 <= xs0:
+		raise ValueError(
+			f"empty crop selection for conversion: z=[{zs0},{zs1}) y=[{ys0},{ys1}) x=[{xs0},{xs1}) from input shape={(z0, y0, x0)}"
+		)
 	channels = _channels_from_src(c_in=int(c_in), params=params)
 	ch_n = int(len(channels))
 	t0 = time.time()
@@ -121,19 +160,21 @@ def run(
 
 		print(f"[convert_fit_zarr_to_vc3d_omezarr] loading channel={ch}", flush=True)
 		base = _load_channel_chunked(
-			src=a[ci],
+			src=a[ci, zs0:zs1, ys0:ys1, xs0:xs1],
 			chunk=max(1, int(chunk)),
 			label=f"[convert_fit_zarr_to_vc3d_omezarr] load {ch}",
 		)
 		base = _expand_z_repeat(base, z_repeat=z_repeat)
 		base_shape = tuple(int(v) for v in base.shape)
+		base_full_shape = (int(z0) * int(max(1, int(z_repeat))), int(y0), int(x0))
+		off_base = (int(zs0) * int(max(1, int(z_repeat))), int(ys0), int(xs0))
 
 		arrs: dict[int, zarr.Array] = {}
 		for lv in range(max(1, int(levels))):
 			if lv < int(first_filled_level):
-				sh = _shape_mul2(base_shape, int(first_filled_level) - int(lv))
+				sh = _shape_mul2(base_full_shape, int(first_filled_level) - int(lv))
 			else:
-				sh = _shape_div2(base_shape, int(lv) - int(first_filled_level))
+				sh = _shape_div2(base_full_shape, int(lv) - int(first_filled_level))
 			if lv >= int(first_filled_level):
 				arrs[lv] = g.create_dataset(
 					str(lv),
@@ -149,19 +190,32 @@ def run(
 					dimension_separator="/",
 				)
 
-		# Fill only lower levels (>= first_filled_level).
+		# Fill only lower levels (>= first_filled_level), writing crop into absolute position.
 		cur = base
-		_write_z_chunks(
+		oz, oy, ox = (int(off_base[0]), int(off_base[1]), int(off_base[2]))
+		_write_z_chunks_at(
 			dst=arrs[int(first_filled_level)],
 			data=cur,
+			z0=int(oz),
+			y0=int(oy),
+			x0=int(ox),
 			chunk=max(1, int(chunk)),
 			label=f"[convert_fit_zarr_to_vc3d_omezarr] write {ch}/L{int(first_filled_level)}",
 		)
 		for lv in range(int(first_filled_level) + 1, max(1, int(levels))):
-			cur = _down2(cur)
-			_write_z_chunks(
+			sz = int(oz) & 1
+			sy = int(oy) & 1
+			sx = int(ox) & 1
+			cur = cur[sz::2, sy::2, sx::2]
+			oz = int(oz) // 2
+			oy = int(oy) // 2
+			ox = int(ox) // 2
+			_write_z_chunks_at(
 				dst=arrs[lv],
 				data=cur,
+				z0=int(oz),
+				y0=int(oy),
+				x0=int(ox),
 				chunk=max(1, int(chunk)),
 				label=f"[convert_fit_zarr_to_vc3d_omezarr] write {ch}/L{int(lv)}",
 			)
@@ -203,13 +257,19 @@ def run(
 			"channel_index": int(ci),
 			"z_repeat": int(z_repeat),
 			"downscale_xy": int(downscale_xy),
+			"z_step_eff": int(z_step_eff),
+			"crop_scaled_zyx_start": [int(zs0), int(ys0), int(xs0)],
+			"crop_scaled_zyx_stop": [int(zs1), int(ys1), int(xs1)],
+			"crop_repeated_zyx_start": [int(off_base[0]), int(off_base[1]), int(off_base[2])],
+			"base_full_shape": [int(base_full_shape[0]), int(base_full_shape[1]), int(base_full_shape[2])],
 			"levels": int(levels),
 			"first_filled_level": int(first_filled_level),
 		}
 
 		print(
 			f"[convert_fit_zarr_to_vc3d_omezarr] channel={ch} "
-			f"input=(Z,Y,X)={(z0, y0, x0)} repeated_z={int(base_shape[0])} "
+			f"input=(Z,Y,X)={(z0, y0, x0)} crop_scaled=[z:{zs0}:{zs1},y:{ys0}:{ys1},x:{xs0}:{xs1}] repeated_z={int(base_shape[0])} "
+			f"base_full={(int(base_full_shape[0]), int(base_full_shape[1]), int(base_full_shape[2]))} "
 			f"out={str(out_path)} filled_levels={int(first_filled_level)}..{int(levels)-1}"
 		)
 
