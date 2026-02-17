@@ -1,14 +1,14 @@
 FROM ubuntu:noble
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt -y update
-RUN apt -y install software-properties-common
-RUN add-apt-repository -y universe
-RUN apt -y update
-RUN apt -y upgrade
-RUN apt -y full-upgrade
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends software-properties-common \
+ && add-apt-repository -y universe \
+ && apt-get update \
+ && rm -rf /var/lib/apt/lists/*
 
 # --- base toolchain & libs (avoiding xtensor-dev here) ---
-RUN apt -y install --no-install-recommends \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends --fix-missing \
     build-essential git cmake ninja-build pkg-config \
     qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
     libopencv-dev libopencv-contrib-dev \
@@ -16,7 +16,8 @@ RUN apt -y install --no-install-recommends \
     file curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils \
  && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends --fix-missing \
     flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -64,7 +65,8 @@ RUN mkdir -p pastix-install scotch-install
 # --- libigl: clone and pin to latest commit (as of 2025-10-02) ---
 # Latest on main: Aug 1, 2025 — ae8f959ea26d7059abad4c698aba8d6b7c3205e8
 ARG LIBIGL_COMMIT=ae8f959ea26d7059abad4c698aba8d6b7c3205e8
-RUN git clone https://github.com/libigl/libigl.git libigl \
+RUN rm -rf libigl \
+    && git clone https://github.com/libigl/libigl.git libigl \
      && cd libigl \
      && git fetch --depth 1 origin ${LIBIGL_COMMIT} \
      && git checkout -q ${LIBIGL_COMMIT} \
@@ -93,6 +95,8 @@ RUN make SCOTCH_HOME=/usr/local/scotch
 RUN make SCOTCH_HOME=/usr/local/scotch install
     
     # --- build libigl-based target (after overlay) ---
+WORKDIR /src/libs/flatboi
+RUN rm -rf build && mkdir -p build
 WORKDIR /src/libs/flatboi/build
 RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
       -DLIBIGL_WITH_PASTIX=ON \
