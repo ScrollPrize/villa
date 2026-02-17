@@ -8,10 +8,28 @@ function AtlasBrowserInner() {
   const scriptRef = useRef(null);
   const linkRef = useRef(null);
 
+  // react-helmet-async removes data-theme from <html> during SPA page transitions
+  // (its cleanup runs in a rAF after React commit, before new page's Helmet re-applies).
+  // Since this site forces dark mode (disableSwitch: true), use a MutationObserver to
+  // immediately restore it whenever it gets removed.
   useEffect(() => {
-    console.log('AtlasBrowser mounting...');
-    console.log('Container element:', containerRef.current);
+    const observer = new MutationObserver(() => {
+      if (!document.documentElement.getAttribute('data-theme')) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme'],
+    });
+    // Also restore immediately in case it's already missing
+    if (!document.documentElement.getAttribute('data-theme')) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+    return () => observer.disconnect();
+  }, []);
 
+  useEffect(() => {
     // Don't load if already loaded (prevents double loading on remount)
     if (scriptRef.current || linkRef.current) {
       console.log('Atlas already loaded, dispatching container-ready event...');
@@ -33,7 +51,7 @@ function AtlasBrowserInner() {
     // Dynamically load the atlas JS
     const script = document.createElement('script');
     script.type = 'module';
-    script.src = '/atlas/assets/index-BPwaJqtD.js';
+    script.src = '/atlas/assets/index-DP7DY9SI.js';
     script.onload = () => {
       console.log('JS loaded');
       setLoaded(true);
