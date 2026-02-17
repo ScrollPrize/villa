@@ -29,8 +29,8 @@ struct ABFConfig {
      */
     int downsampleFactor = 1;
 
-    /** If true, rotate output so highest Z values are at row 0 (default: true) */
-    bool rotateHighZToTop = true;
+    /** If true, rotate output so highest Z values are at row 0 (default: false) */
+    bool rotateHighZToTop = false;
 };
 
 /**

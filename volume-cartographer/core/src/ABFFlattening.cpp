@@ -473,6 +473,37 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     }
 
     const cv::Mat_<cv::Vec3f>* srcPoints = surface.rawPointsPtr();
+    if (!srcPoints || srcPoints->empty()) {
+        return nullptr;
+    }
+
+    // Track valid source bounds. Rasterized points are barycentric mixtures of source
+    // vertices, so they must remain within these limits (up to tiny numeric tolerance).
+    cv::Vec3f srcMin(std::numeric_limits<float>::max(),
+                     std::numeric_limits<float>::max(),
+                     std::numeric_limits<float>::max());
+    cv::Vec3f srcMax(std::numeric_limits<float>::lowest(),
+                     std::numeric_limits<float>::lowest(),
+                     std::numeric_limits<float>::lowest());
+    bool haveSrcBounds = false;
+    for (int row = 0; row < srcPoints->rows; ++row) {
+        for (int col = 0; col < srcPoints->cols; ++col) {
+            const cv::Vec3f& p = (*srcPoints)(row, col);
+            if (p[0] == -1.f || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+                continue;
+            }
+            haveSrcBounds = true;
+            srcMin[0] = std::min(srcMin[0], p[0]);
+            srcMin[1] = std::min(srcMin[1], p[1]);
+            srcMin[2] = std::min(srcMin[2], p[2]);
+            srcMax[0] = std::max(srcMax[0], p[0]);
+            srcMax[1] = std::max(srcMax[1], p[1]);
+            srcMax[2] = std::max(srcMax[2], p[2]);
+        }
+    }
+    if (!haveSrcBounds) {
+        return nullptr;
+    }
 
     // Step 2: Find UV bounds (parallelized)
     float uvMinX = std::numeric_limits<float>::max();
@@ -525,8 +556,19 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     const float rxInv = (gridW - 1) / std::max(uvRange[0], 1e-12f);
     const float ryInv = (gridH - 1) / std::max(uvRange[1], 1e-12f);
 
-    // For each valid quad in the source, triangulate and rasterize
-    #pragma omp parallel for collapse(2) schedule(dynamic, 64)
+    const float srcBoundsEps = 1e-3f;
+    const auto isPlausiblePos = [&](const cv::Vec3f& pos) -> bool {
+        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2])) {
+            return false;
+        }
+        return pos[0] >= srcMin[0] - srcBoundsEps && pos[0] <= srcMax[0] + srcBoundsEps &&
+               pos[1] >= srcMin[1] - srcBoundsEps && pos[1] <= srcMax[1] + srcBoundsEps &&
+               pos[2] >= srcMin[2] - srcBoundsEps && pos[2] <= srcMax[2] + srcBoundsEps;
+    };
+
+    // For each valid quad in the source, triangulate and rasterize.
+    // This loop intentionally stays single-threaded because triangles overlap at
+    // shared edges, and unsynchronized parallel writes can corrupt output pixels.
     for (int row = 0; row < srcPoints->rows - 1; ++row) {
         for (int col = 0; col < srcPoints->cols - 1; ++col) {
             const cv::Vec3f& p00 = (*srcPoints)(row, col);
@@ -541,6 +583,15 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
             const cv::Vec2f& uv01 = uvs(row, col + 1);
             const cv::Vec2f& uv10 = uvs(row + 1, col);
             const cv::Vec2f& uv11 = uvs(row + 1, col + 1);
+            if (uv00[0] == -1.f || uv01[0] == -1.f || uv10[0] == -1.f || uv11[0] == -1.f) {
+                continue;
+            }
+            if (!std::isfinite(uv00[0]) || !std::isfinite(uv00[1]) ||
+                !std::isfinite(uv01[0]) || !std::isfinite(uv01[1]) ||
+                !std::isfinite(uv10[0]) || !std::isfinite(uv10[1]) ||
+                !std::isfinite(uv11[0]) || !std::isfinite(uv11[1])) {
+                continue;
+            }
 
             // Transform UVs to grid coordinates (inlined for performance)
             cv::Vec2f guv00((uv00[0] - uvMin[0]) * rxInv, (uv00[1] - uvMin[1]) * ryInv);
@@ -565,7 +616,7 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
                             if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
                                 cv::Vec3f pos = bary[0] * p10 + bary[1] * p00 + bary[2] * p01;
-                                if ((*outPoints)(y, x)[0] == -1.f) {
+                                if (isPlausiblePos(pos) && (*outPoints)(y, x)[0] == -1.f) {
                                     (*outPoints)(y, x) = pos;
                                 }
                             }
@@ -591,7 +642,7 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
                             if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
                                 cv::Vec3f pos = bary[0] * p10 + bary[1] * p01 + bary[2] * p11;
-                                if ((*outPoints)(y, x)[0] == -1.f) {
+                                if (isPlausiblePos(pos) && (*outPoints)(y, x)[0] == -1.f) {
                                     (*outPoints)(y, x) = pos;
                                 }
                             }
