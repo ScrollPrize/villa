@@ -232,9 +232,34 @@ def _place_window_on_edge(edge_idx, window_size, cond_size, cond_direction, max_
 def _get_cond_edge(cond_zyxs, cond_direction):
     spec = _get_direction_spec(cond_direction)
     edge_idx = spec["edge_idx"]
+    # For non-rectangular inputs the fixed column/row may have no valid cells.
+    # Instead, find the per-row (col axis) or per-col (row axis) frontier.
+    invalid = (cond_zyxs == -1).all(axis=-1)  # (n_rows, n_cols)
+    valid = ~invalid
     if spec["axis"] == "col":
-        return cond_zyxs[:, edge_idx, :]
-    return cond_zyxs[edge_idx, :, :]
+        n_rows, n_cols = valid.shape
+        out = np.full((n_rows, 3), -1, dtype=cond_zyxs.dtype)
+        any_valid = valid.any(axis=1)
+        if edge_idx == 0 or (edge_idx == -1 and n_cols == 1):
+            # leftmost valid column per row (first True)
+            col_indices = np.argmax(valid, axis=1)
+        else:
+            # rightmost valid column per row (last True)
+            col_indices = n_cols - 1 - np.argmax(valid[:, ::-1], axis=1)
+        out[any_valid] = cond_zyxs[np.where(any_valid)[0], col_indices[any_valid], :]
+        return out
+    else:
+        n_rows, n_cols = valid.shape
+        out = np.full((n_cols, 3), -1, dtype=cond_zyxs.dtype)
+        any_valid = valid.any(axis=0)
+        if edge_idx == 0 or (edge_idx == -1 and n_rows == 1):
+            # topmost valid row per column (first True)
+            row_indices = np.argmax(valid, axis=0)
+        else:
+            # bottommost valid row per column (last True)
+            row_indices = n_rows - 1 - np.argmax(valid[::-1, :], axis=0)
+        out[any_valid] = cond_zyxs[row_indices[any_valid], np.where(any_valid)[0], :]
+        return out
 
 def _bbox_from_center(center, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
@@ -1284,14 +1309,26 @@ def _load_runtime_state(args):
     }
 
 
+def _scale_to_subsample_stride(scale):
+    scale = float(scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"Invalid tifxyz scale: {scale}")
+    return max(1, int(round(1.0 / scale)))
+
+
 def _stored_to_full_bounds(tgt_segment, stored_bounds):
     r0_s, r1_s, c0_s, c1_s = stored_bounds
     scale_y, scale_x = tgt_segment._scale
     full_h, full_w = tgt_segment.full_resolution_shape
-    r0_full = max(0, int(np.floor(r0_s / scale_y)))
-    r1_full = min(full_h, int(np.ceil((r1_s + 1) / scale_y)))
-    c0_full = max(0, int(np.floor(c0_s / scale_x)))
-    c1_full = min(full_w, int(np.ceil((c1_s + 1) / scale_x)))
+    sub_r = _scale_to_subsample_stride(scale_y)
+    sub_c = _scale_to_subsample_stride(scale_x)
+    # Convert stored grid indices to full-resolution UV indices using integer
+    # stride math to avoid float drift (e.g. 0.10000000149) dropping edge voxels.
+    r0_full = max(0, int(r0_s) * sub_r)
+    # Upper bound is exclusive. Map inclusive stored max directly, then +1.
+    r1_full = min(full_h, int(r1_s) * sub_r + 1)
+    c0_full = max(0, int(c0_s) * sub_c)
+    c1_full = min(full_w, int(c1_s) * sub_c + 1)
     return r0_full, r1_full, c0_full, c1_full
 
 

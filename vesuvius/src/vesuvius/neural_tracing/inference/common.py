@@ -363,7 +363,8 @@ def _print_sample_filter_debug(filter_stats, verbose=True):
     print(f"after min-stack-count: {n_after_stack_count}")
 
 
-def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args):
+def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args,
+                                 input_scale=None):
     merged_zyxs = np.asarray(merged.get("merged_zyxs"), dtype=np.float32)
     merged_valid = np.asarray(merged.get("merged_valid"), dtype=bool)
     if merged_zyxs.ndim != 3 or merged_zyxs.shape[-1] != 3:
@@ -389,8 +390,14 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
         args, model_config, args.volume_scale
     )
     current_step = int(round(2 ** int(args.volume_scale)))
-    stride_y = max(1, int(round(float(tifxyz_step_size) / max(1, current_step))))
-    stride_x = max(1, int(round(float(tifxyz_step_size) / max(1, current_step))))
+    if input_scale is not None:
+        # Stored-resolution input: stride accounts for the scale factor
+        stride_y = max(1, int(round(float(tifxyz_step_size) * input_scale[0] / max(1, current_step))))
+        stride_x = max(1, int(round(float(tifxyz_step_size) * input_scale[1] / max(1, current_step))))
+    else:
+        # Full-resolution input (legacy)
+        stride_y = max(1, int(round(float(tifxyz_step_size) / max(1, current_step))))
+        stride_x = stride_y
     if stride_y > 1 or stride_x > 1:
         merged_for_save = merged_for_save[::stride_y, ::stride_x]
 

@@ -28,16 +28,18 @@ from vesuvius.neural_tracing.inference.infer_rowcol_split import (
     _build_uv_grid,
     _build_uv_query_from_cond_points,
     _crop_volume_from_min_corner,
+    _edge_index_from_valid,
     _get_growth_context,
     _grid_in_bounds_mask,
     _initialize_window_state,
     _points_to_voxels,
     _predict_displacement,
     _resolve_segment_volume,
+    _scale_to_subsample_stride,
     _stored_to_full_bounds,
     compute_edge_one_shot_extrapolation,
-    compute_window_and_split,
     get_cond_edge_bboxes,
+    get_window_bounds_from_bboxes,
     load_model,
     load_checkpoint_config,
     setup_segment,
@@ -945,22 +947,29 @@ def main():
         tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
     cond_direction, _ = _get_growth_context(grow_direction)
 
-    if int(args.iterations) > 1:
-        with profiler.section("initialize_full_surface"):
-            tgt_segment.use_full_resolution()
-            base_x, base_y, base_z, base_valid = tgt_segment[:]
-            current_zyxs = np.stack([base_z, base_y, base_x], axis=-1).copy()
-            current_valid = np.asarray(base_valid, dtype=bool).copy()
-            current_uv_offset = (0, 0)
-        if args.verbose:
-            print("Using full input surface as initial conditioning for iterative growth.")
-    else:
-        with profiler.section("initialize_window"):
-            r0_s, r1_s, c0_s, c1_s = compute_window_and_split(
-                args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size
-            )
-            full_bounds = _stored_to_full_bounds(tgt_segment, (r0_s, r1_s, c0_s, c1_s))
-            current_zyxs, current_valid, current_uv_offset = _initialize_window_state(tgt_segment, full_bounds)
+    with profiler.section("initialize_window"):
+        cond_direction_init, direction_init = _get_growth_context(grow_direction)
+        r_edge_s, c_edge_s = _edge_index_from_valid(valid_s, cond_direction_init)
+        if r_edge_s is None and c_edge_s is None:
+            raise RuntimeError("No valid edge found for segment.")
+
+        if direction_init["axis"] == "col":
+            cond_edge_strip = stored_zyxs[:, c_edge_s:c_edge_s + 1]
+        else:
+            cond_edge_strip = stored_zyxs[r_edge_s:r_edge_s + 1, :]
+
+        init_bboxes, _ = get_cond_edge_bboxes(
+            cond_edge_strip, cond_direction_init, crop_size,
+            overlap_frac=args.bbox_overlap_frac,
+        )
+        r0_s, r1_s, c0_s, c1_s = get_window_bounds_from_bboxes(
+            stored_zyxs, valid_s, init_bboxes, pad=args.window_pad,
+        )
+
+        full_bounds = _stored_to_full_bounds(tgt_segment, (r0_s, r1_s, c0_s, c1_s))
+        current_zyxs, current_valid, current_uv_offset = _initialize_window_state(
+            tgt_segment, full_bounds,
+        )
 
     bbox_results = []
     one_shot = {
@@ -1140,25 +1149,46 @@ def main():
     if iteration_pbar is not None:
         iteration_pbar.close()
 
-    # Merge the full iteratively grown surface onto the full input canvas so
-    # output preserves all existing input points and includes all growth steps.
-    with profiler.section("final_merge_full_surface"):
-        grown_uv, grown_pts = _surface_to_uv_samples(current_zyxs, current_valid, current_uv_offset)
-        tgt_segment.use_full_resolution()
-        base_x, base_y, base_z, base_valid = tgt_segment[:]
-        base_zyxs = np.stack([base_z, base_y, base_x], axis=-1)
+    # Merge the grown surface back onto the stored-resolution base surface
+    # (already in memory from setup_segment) to avoid materializing full resolution.
+    with profiler.section("final_merge_stored_surface"):
+        scale_y, scale_x = tgt_segment._scale
+
+        sub_r = _scale_to_subsample_stride(scale_y)
+        sub_c = _scale_to_subsample_stride(scale_x)
+
+        # Phase-align subsampling so sampled full-res rows/cols are multiples of sub_r/sub_c,
+        # which correspond exactly to stored-res grid positions.
+        offset_r = int(current_uv_offset[0])
+        offset_c = int(current_uv_offset[1])
+        phase_r = (sub_r - offset_r % sub_r) % sub_r
+        phase_c = (sub_c - offset_c % sub_c) % sub_c
+
+        grown_stored_zyxs = current_zyxs[phase_r::sub_r, phase_c::sub_c]
+        grown_stored_valid = current_valid[phase_r::sub_r, phase_c::sub_c]
+
+        # Aligned full-res offset is guaranteed to be a multiple of sub_r/sub_c,
+        # so integer division by the stride gives an exact stored-res offset.
+        aligned_full_r = offset_r + phase_r
+        aligned_full_c = offset_c + phase_c
+        stored_offset_r = int(aligned_full_r // sub_r)
+        stored_offset_c = int(aligned_full_c // sub_c)
+
+        grown_uv, grown_pts = _surface_to_uv_samples(
+            grown_stored_zyxs, grown_stored_valid,
+            (stored_offset_r, stored_offset_c),
+        )
         merged = _merge_displaced_points_into_full_surface(
-            base_zyxs,
-            base_valid,
-            (0, 0),
-            {
-                "uv": grown_uv,
-                "world_displaced": grown_pts,
-            },
+            stored_zyxs, valid_s, (0, 0),
+            {"uv": grown_uv, "world_displaced": grown_pts},
             verbose=args.verbose,
         )
+
     with profiler.section("save_tifxyz"):
-        _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args)
+        _save_merged_surface_tifxyz(
+            args, merged, checkpoint_path, model_config, call_args,
+            input_scale=tgt_segment._scale,
+        )
 
     if args.napari:
         disp_bbox = None if stacked_displacement is None else stacked_displacement["bbox"]
