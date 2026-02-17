@@ -13,7 +13,6 @@ from vesuvius.neural_tracing.inference.common import (
     _print_agg_extrap_sampling_debug,
     _print_bbox_crop_debug_table,
     _print_iteration_summary,
-    _print_stacked_displacement_debug,
     _resolve_settings,
     _RuntimeProfiler,
     _save_merged_surface_tifxyz,
@@ -673,6 +672,128 @@ def _sample_displacement_for_extrap_uvs(
     }
 
 
+def _per_crop_displacement_bbox(per_crop_fields):
+    if per_crop_fields is None or len(per_crop_fields) == 0:
+        return None
+    min_corners = np.stack([np.asarray(item["min_corner"], dtype=np.int64) for item in per_crop_fields], axis=0)
+    max_exclusive = []
+    for item in per_crop_fields:
+        min_corner = np.asarray(item["min_corner"], dtype=np.int64)
+        disp = np.asarray(item["displacement"])
+        _, d, h, w = disp.shape
+        max_exclusive.append(min_corner + np.asarray([d, h, w], dtype=np.int64))
+    max_exclusive = np.stack(max_exclusive, axis=0)
+    global_min = min_corners.min(axis=0)
+    global_max_exclusive = max_exclusive.max(axis=0)
+    return (
+        int(global_min[0]),
+        int(global_max_exclusive[0] - 1),
+        int(global_min[1]),
+        int(global_max_exclusive[1] - 1),
+        int(global_min[2]),
+        int(global_max_exclusive[2] - 1),
+    )
+
+
+def _sample_displacement_for_extrap_uvs_from_crops(
+    per_crop_fields,
+    extrap_lookup,
+    grow_direction,
+    max_lines=None,
+    refine=None,
+):
+    if per_crop_fields is None or len(per_crop_fields) == 0 or extrap_lookup is None:
+        return _empty_stack_samples()
+
+    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
+    if sampled_uv.shape[0] == 0:
+        return _empty_stack_samples()
+
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
+    finite_world = np.isfinite(sampled_world).all(axis=1)
+    if not finite_world.any():
+        return _empty_stack_samples()
+
+    sampled_uv = sampled_uv[finite_world]
+    sampled_world = sampled_world[finite_world].astype(np.float32, copy=False)
+    n_points = int(sampled_world.shape[0])
+
+    disp_acc = np.zeros((n_points, 3), dtype=np.float32)
+    count_acc = np.zeros((n_points,), dtype=np.uint32)
+    ones_cache = {}
+
+    for item in per_crop_fields:
+        disp = np.asarray(item["displacement"], dtype=np.float32)
+        min_corner = np.asarray(item["min_corner"], dtype=np.float32)
+        _, d, h, w = disp.shape
+
+        z_local = sampled_world[:, 0] - float(min_corner[0])
+        y_local = sampled_world[:, 1] - float(min_corner[1])
+        x_local = sampled_world[:, 2] - float(min_corner[2])
+        in_bounds = (
+            (z_local >= 0.0) & (z_local <= float(d - 1)) &
+            (y_local >= 0.0) & (y_local <= float(h - 1)) &
+            (x_local >= 0.0) & (x_local <= float(w - 1))
+        )
+        if not in_bounds.any():
+            continue
+
+        point_idx = np.nonzero(in_bounds)[0]
+        coords_local = np.stack(
+            [
+                z_local[point_idx],
+                y_local[point_idx],
+                x_local[point_idx],
+            ],
+            axis=-1,
+        ).astype(np.float32, copy=False)
+
+        shape_key = (int(d), int(h), int(w))
+        count_field = ones_cache.get(shape_key)
+        if count_field is None:
+            count_field = np.ones(shape_key, dtype=np.uint8)
+            ones_cache[shape_key] = count_field
+
+        if refine is None:
+            sampled_disp, _, valid_mask = _sample_trilinear_displacement_stack(
+                disp,
+                count_field,
+                coords_local,
+            )
+        else:
+            sampled_disp, _, valid_mask = _sample_fractional_displacement_stack(
+                disp,
+                count_field,
+                coords_local,
+                refine_extra_steps=int(refine),
+            )
+        if not valid_mask.any():
+            continue
+
+        keep_idx = point_idx[valid_mask]
+        disp_acc[keep_idx] += sampled_disp[valid_mask]
+        count_acc[keep_idx] += 1
+
+    have_disp = count_acc > 0
+    if not have_disp.any():
+        return _empty_stack_samples()
+
+    disp_mean = np.zeros_like(disp_acc, dtype=np.float32)
+    disp_mean[have_disp] = disp_acc[have_disp] / count_acc[have_disp, None].astype(np.float32, copy=False)
+
+    sampled_uv = sampled_uv[have_disp]
+    sampled_world = sampled_world[have_disp]
+    sampled_disp = disp_mean[have_disp]
+    sampled_count = count_acc[have_disp]
+
+    return {
+        "uv": sampled_uv.astype(np.int64, copy=False),
+        "world": sampled_world.astype(np.float32, copy=False),
+        "displacement": sampled_disp.astype(np.float32, copy=False),
+        "stack_count": sampled_count.astype(np.uint32, copy=False),
+    }
+
+
 def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extra_steps):
     coords_local = np.asarray(coords_local, dtype=np.float32)
     if coords_local.ndim != 2 or coords_local.shape[1] != 3 or coords_local.shape[0] == 0:
@@ -1166,7 +1287,7 @@ def main():
         "extrap_coords_world": np.zeros((0, 3), dtype=np.float32),
     }
     extrap_uv_to_zyx = {}
-    stacked_displacement = None
+    disp_bbox = None
     displaced = {
         "uv": np.zeros((0, 2), dtype=np.int64),
         "world": np.zeros((0, 3), dtype=np.float32),
@@ -1261,19 +1382,7 @@ def main():
         _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
         bbox_results = bbox_crops
 
-        stacked_displacement = None
-        if run_model_inference and model_state is not None:
-            with profiler.section("iter_displacement_inference"):
-                per_crop_fields = _run_inference(
-                    args,
-                    bbox_crops,
-                    model_state,
-                    verbose=args.verbose,
-                )
-            with profiler.section("iter_stack_displacements"):
-                stacked_displacement = _stack_displacement_results(per_crop_fields)
-            del per_crop_fields
-        _print_stacked_displacement_debug(stacked_displacement, verbose=args.verbose)
+        disp_bbox = None
         if extrap_only_mode:
             with profiler.section("iter_sample_extrap_no_disp"):
                 agg_samples = _sample_extrap_no_disp(
@@ -1281,15 +1390,26 @@ def main():
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
                 )
-        else:
-            with profiler.section("iter_sample_stacked_displacement"):
-                agg_samples = _sample_displacement_for_extrap_uvs(
-                    stacked_displacement,
+        elif run_model_inference and model_state is not None:
+            with profiler.section("iter_displacement_inference"):
+                per_crop_fields = _run_inference(
+                    args,
+                    bbox_crops,
+                    model_state,
+                    verbose=args.verbose,
+                )
+            disp_bbox = _per_crop_displacement_bbox(per_crop_fields)
+            with profiler.section("iter_sample_crop_displacement"):
+                agg_samples = _sample_displacement_for_extrap_uvs_from_crops(
+                    per_crop_fields,
                     extrap_uv_to_zyx,
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
                     refine=args.refine,
                 )
+            del per_crop_fields
+        else:
+            agg_samples = _empty_stack_samples()
 
         _print_iteration_summary(
             bbox_results,
@@ -1388,7 +1508,6 @@ def main():
         )
 
     if args.napari:
-        disp_bbox = None if stacked_displacement is None else stacked_displacement["bbox"]
         with profiler.section("napari"):
             _show_napari(
                 current_zyxs,

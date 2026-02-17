@@ -828,8 +828,10 @@ def compute_edge_one_shot_extrapolation(
     if not edge_input_mask.any():
         return None
 
-    uv_cond_full = uv_cond[cond_valid_base]
-    uv_query = _build_uv_query_from_cond_points(uv_cond_full, grow_direction, cond_pct)
+    # Build query span from the edge-input conditioning band, not the full grown
+    # surface, so iterative runs do not blow up one-shot query allocations.
+    uv_query_seed = uv_cond[edge_input_mask]
+    uv_query = _build_uv_query_from_cond_points(uv_query_seed, grow_direction, cond_pct)
     if uv_query.size == 0:
         return None
 
