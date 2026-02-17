@@ -30,7 +30,6 @@ from vesuvius.neural_tracing.inference.infer_rowcol_split import (
     _crop_volume_from_min_corner,
     _edge_index_from_valid,
     _get_growth_context,
-    _grid_in_bounds_mask,
     _initialize_window_state,
     _points_to_voxels,
     _predict_displacement,
@@ -239,6 +238,154 @@ def _finite_uv_world(uv, world):
     return uv[keep].astype(np.float64, copy=False), world[keep].astype(np.float32, copy=False)
 
 
+def _is_dense_extrap_lookup(extrap_lookup):
+    return (
+        isinstance(extrap_lookup, dict)
+        and ("grid" in extrap_lookup)
+        and ("valid" in extrap_lookup)
+        and ("offset" in extrap_lookup)
+    )
+
+
+def _empty_dense_extrap_lookup():
+    return {
+        "grid": np.zeros((0, 0, 3), dtype=np.float32),
+        "valid": np.zeros((0, 0), dtype=bool),
+        "offset": (0, 0),
+    }
+
+
+def _build_dense_extrap_lookup(one_shot):
+    uv_query = np.asarray(one_shot.get("uv_query", np.zeros((0, 0, 2), dtype=np.int64)))
+    extrap_world = np.asarray(one_shot.get("extrap_coords_world", np.zeros((0, 3), dtype=np.float32)))
+    if uv_query.ndim != 3 or uv_query.shape[-1] != 2:
+        return _empty_dense_extrap_lookup()
+    if uv_query.shape[0] == 0 or uv_query.shape[1] == 0 or extrap_world.shape[0] == 0:
+        return _empty_dense_extrap_lookup()
+
+    h, w = uv_query.shape[:2]
+    if extrap_world.shape[0] != h * w:
+        return _empty_dense_extrap_lookup()
+
+    grid = extrap_world.reshape(h, w, 3).astype(np.float32, copy=False)
+    valid = np.isfinite(grid).all(axis=2)
+    offset = (int(uv_query[0, 0, 0]), int(uv_query[0, 0, 1]))
+    return {
+        "grid": grid,
+        "valid": valid,
+        "offset": offset,
+    }
+
+
+def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
+    if _is_dense_extrap_lookup(extrap_lookup):
+        valid = np.asarray(extrap_lookup["valid"], dtype=bool)
+        rows, cols = np.where(valid)
+        if rows.size == 0:
+            return np.zeros((0, 2), dtype=np.int64)
+        r0, c0 = (int(extrap_lookup["offset"][0]), int(extrap_lookup["offset"][1]))
+        uv_ordered = np.stack(
+            [
+                rows.astype(np.int64, copy=False) + r0,
+                cols.astype(np.int64, copy=False) + c0,
+            ],
+            axis=-1,
+        )
+    elif isinstance(extrap_lookup, dict):
+        return _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=max_lines)
+    else:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    if uv_ordered.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    if grow_direction in {"left", "right"}:
+        axis_idx = 1
+        near_to_far_desc = grow_direction == "left"
+    elif grow_direction in {"up", "down"}:
+        axis_idx = 0
+        near_to_far_desc = grow_direction == "up"
+    else:
+        raise ValueError(f"Unknown grow_direction '{grow_direction}'")
+
+    if axis_idx == 1:
+        primary = -uv_ordered[:, 1] if near_to_far_desc else uv_ordered[:, 1]
+        secondary = uv_ordered[:, 0]
+    else:
+        primary = -uv_ordered[:, 0] if near_to_far_desc else uv_ordered[:, 0]
+        secondary = uv_ordered[:, 1]
+    order = np.lexsort((secondary, primary))
+    uv_ordered = uv_ordered[order]
+
+    if max_lines is None:
+        return uv_ordered
+
+    axis_values = np.unique(uv_ordered[:, axis_idx]).astype(np.int64, copy=False)
+    if near_to_far_desc:
+        axis_values = axis_values[::-1]
+    selected_axis_values = axis_values[:int(max_lines)]
+    keep = np.isin(uv_ordered[:, axis_idx], selected_axis_values, assume_unique=False)
+    return uv_ordered[keep]
+
+
+def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
+    uv_int = np.asarray(uv_query_flat, dtype=np.int64)
+    if uv_int.ndim != 2 or uv_int.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+
+    if _is_dense_extrap_lookup(extrap_lookup):
+        grid = np.asarray(extrap_lookup["grid"], dtype=np.float32)
+        valid = np.asarray(extrap_lookup["valid"], dtype=bool)
+        r0, c0 = int(extrap_lookup["offset"][0]), int(extrap_lookup["offset"][1])
+        h, w = valid.shape
+        rr = uv_int[:, 0] - r0
+        cc = uv_int[:, 1] - c0
+        in_bounds = (
+            (rr >= 0) &
+            (rr < h) &
+            (cc >= 0) &
+            (cc < w)
+        )
+        if not in_bounds.any():
+            return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        idx = np.nonzero(in_bounds)[0]
+        rr_in = rr[idx]
+        cc_in = cc[idx]
+        valid_in = valid[rr_in, cc_in]
+        if not valid_in.any():
+            return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        keep_idx = idx[valid_in]
+        rr_keep = rr_in[valid_in]
+        cc_keep = cc_in[valid_in]
+        extrap_uv = uv_int[keep_idx]
+        extrap_world = grid[rr_keep, cc_keep].astype(np.float32, copy=False)
+        finite = np.isfinite(extrap_world).all(axis=1)
+        if not finite.any():
+            return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        return extrap_uv[finite], extrap_world[finite]
+
+    extrap_uv_to_zyx = extrap_lookup if isinstance(extrap_lookup, dict) else {}
+    extrap_uv_to_zyx_get = extrap_uv_to_zyx.get
+    extrap_uv_list = []
+    extrap_world_list = []
+    for uv in uv_int:
+        uv_key = (int(uv[0]), int(uv[1]))
+        pt = extrap_uv_to_zyx_get(uv_key)
+        if pt is None:
+            continue
+        pt_arr = np.asarray(pt)
+        if not np.isfinite(pt_arr).all():
+            continue
+        extrap_uv_list.append(uv_key)
+        extrap_world_list.append(pt_arr.astype(np.float32, copy=False))
+    if not extrap_world_list:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+    return (
+        np.asarray(extrap_uv_list, dtype=np.int64),
+        np.asarray(extrap_world_list, dtype=np.float32),
+    )
+
+
 def _build_bbox_crops(
     bboxes,
     tgt_segment,
@@ -249,15 +396,24 @@ def _build_bbox_crops(
     grow_direction,
     crop_size,
     cond_pct,
-    extrap_uv_to_zyx,
+    extrap_lookup,
+    keep_debug_points=False,
 ):
     cond_valid_base = np.asarray(cond_valid, dtype=bool)
-    cond_zyxs64 = np.asarray(cond_zyxs, dtype=np.float64)
+    cond_zyxs32 = np.asarray(cond_zyxs, dtype=np.float32)
+    uv_cond64 = np.asarray(uv_cond, dtype=np.float64)
     crop_size = tuple(int(v) for v in crop_size)
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+    crop_size_arr_f32 = crop_size_arr.astype(np.float32, copy=False)
     volume_for_crops = _resolve_segment_volume(tgt_segment, volume_scale=volume_scale)
-    extrap_uv_to_zyx = extrap_uv_to_zyx if isinstance(extrap_uv_to_zyx, dict) else {}
-    extrap_uv_to_zyx_get = extrap_uv_to_zyx.get
+
+    cond_rows, cond_cols = np.where(cond_valid_base)
+    if cond_rows.size == 0:
+        cond_uv_all = np.zeros((0, 2), dtype=np.float64)
+        cond_world_all = np.zeros((0, 3), dtype=np.float32)
+    else:
+        cond_uv_all = uv_cond64[cond_rows, cond_cols].astype(np.float64, copy=False)
+        cond_world_all = cond_zyxs32[cond_rows, cond_cols].astype(np.float32, copy=False)
 
     bbox_crops = []
 
@@ -267,39 +423,32 @@ def _build_bbox_crops(
         vol_crop = _crop_volume_from_min_corner(volume_for_crops, min_corner, crop_size)
         vol_crop = normalize_zscore(vol_crop)
 
-        cond_grid_local = cond_zyxs64 - min_corner[None, None, :]
-        cond_grid_valid = cond_valid_base.copy()
-        cond_grid_valid &= _grid_in_bounds_mask(cond_grid_local, crop_size)
-
-        cond_uv = uv_cond[cond_grid_valid].astype(np.float64, copy=False)
-        cond_world = cond_zyxs[cond_grid_valid].astype(np.float32, copy=False)
-        cond_local = cond_grid_local[cond_grid_valid].astype(np.float32, copy=False)
+        cond_local_all = cond_world_all - min_corner32[None, :]
+        cond_in_bounds = (
+            (cond_local_all[:, 0] >= 0.0) &
+            (cond_local_all[:, 0] < crop_size_arr_f32[0]) &
+            (cond_local_all[:, 1] >= 0.0) &
+            (cond_local_all[:, 1] < crop_size_arr_f32[1]) &
+            (cond_local_all[:, 2] >= 0.0) &
+            (cond_local_all[:, 2] < crop_size_arr_f32[2])
+        )
+        cond_uv = cond_uv_all[cond_in_bounds].astype(np.float64, copy=False)
+        cond_world = cond_world_all[cond_in_bounds].astype(np.float32, copy=False)
+        cond_local = cond_local_all[cond_in_bounds].astype(np.float32, copy=False)
         cond_vox = _points_to_voxels(cond_local, crop_size)
         uv_query = _build_uv_query_from_cond_points(cond_uv, grow_direction, cond_pct)
         uv_query_flat = uv_query.reshape(-1, 2).astype(np.float64, copy=False)
 
-        extrap_uv_list = []
-        extrap_world_list = []
-        for uv in uv_query_flat:
-            uv_key = (int(uv[0]), int(uv[1]))
-            pt = extrap_uv_to_zyx_get(uv_key)
-            if pt is None:
-                continue
-            pt_arr = np.asarray(pt)
-            if not np.isfinite(pt_arr).all():
-                continue
-            extrap_uv_list.append((float(uv_key[0]), float(uv_key[1])))
-            extrap_world_list.append(pt_arr.astype(np.float32, copy=False))
-
-        if extrap_world_list:
-            extrap_uv = np.asarray(extrap_uv_list, dtype=np.float64)
-            extrap_world = np.asarray(extrap_world_list, dtype=np.float32)
+        extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup)
+        if extrap_world.shape[0] > 0:
             extrap_local = extrap_world - min_corner32[None, :]
         else:
-            extrap_uv = np.zeros((0, 2), dtype=np.float64)
+            extrap_uv = np.zeros((0, 2), dtype=np.int64)
             extrap_world = np.zeros((0, 3), dtype=np.float32)
             extrap_local = np.zeros((0, 3), dtype=np.float32)
         extrap_vox = _points_to_voxels(extrap_local, crop_size)
+        cond_world_out = cond_world if keep_debug_points else np.zeros((0, 3), dtype=np.float32)
+        extrap_world_out = extrap_world if keep_debug_points else np.zeros((0, 3), dtype=np.float32)
 
         bbox_crops.append(
             {
@@ -311,8 +460,8 @@ def _build_bbox_crops(
                 "cond_vox": cond_vox,
                 "extrap_vox": extrap_vox,
                 "extrap_uv": extrap_uv.astype(np.int64, copy=False),
-                "cond_world": cond_world,
-                "extrap_world": extrap_world,
+                "cond_world": cond_world_out,
+                "extrap_world": extrap_world_out,
                 "n_cond": int(cond_uv.shape[0]),
                 "n_query": int(uv_query_flat.shape[0]),
                 "n_extrap": int(extrap_uv.shape[0]),
@@ -376,6 +525,9 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
                     "displacement": disp_pred[i],
                 }
             )
+        del model_inputs
+        del batch_inputs
+        del disp_pred
         done = (batch_start // batch_size) + 1
         if verbose:
             print(f"{desc}: batch {done}/{n_batches}")
@@ -424,10 +576,14 @@ def _stack_displacement_results(per_crop_fields):
             disp_block[:, finite_mask] += disp[:, finite_mask]
             count_block[finite_mask] += 1
 
-    disp_global = np.zeros_like(disp_sum, dtype=np.float32)
     valid = disp_count > 0
     if valid.any():
-        disp_global[:, valid] = disp_sum[:, valid] / disp_count[valid]
+        np.divide(
+            disp_sum,
+            disp_count[np.newaxis, ...],
+            out=disp_sum,
+            where=valid[np.newaxis, ...],
+        )
 
     bbox_inclusive = (
         int(global_min[0]),
@@ -438,7 +594,7 @@ def _stack_displacement_results(per_crop_fields):
         int(global_max_exclusive[2] - 1),
     )
     return {
-        "displacement": disp_global,
+        "displacement": disp_sum,
         "count": disp_count,
         "min_corner": global_min.astype(np.int64, copy=False),
         "shape": np.asarray(global_shape, dtype=np.int64),
@@ -457,15 +613,15 @@ def _empty_stack_samples():
 
 def _sample_displacement_for_extrap_uvs(
     stacked_displacement,
-    extrap_uv_to_zyx,
+    extrap_lookup,
     grow_direction,
     max_lines=None,
     refine=None,
 ):
-    if stacked_displacement is None or not extrap_uv_to_zyx:
+    if stacked_displacement is None or extrap_lookup is None:
         return _empty_stack_samples()
 
-    sampled_uv = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=max_lines)
+    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
@@ -474,7 +630,7 @@ def _sample_displacement_for_extrap_uvs(
     min_corner = np.asarray(stacked_displacement["min_corner"], dtype=np.int64)
     shape = np.asarray(stacked_displacement["shape"], dtype=np.int64)
 
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx)
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
     coords_local = sampled_world.astype(np.float64, copy=False) - min_corner[None, :].astype(np.float64)
     in_bounds = (
         (coords_local[:, 0] >= 0.0) & (coords_local[:, 0] <= float(shape[0] - 1)) &
@@ -561,21 +717,44 @@ def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extr
 
 
 def _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx):
+    sampled_uv = np.asarray(sampled_uv, dtype=np.int64)
+    if sampled_uv.ndim != 2 or sampled_uv.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    if _is_dense_extrap_lookup(extrap_uv_to_zyx):
+        grid = np.asarray(extrap_uv_to_zyx["grid"], dtype=np.float32)
+        valid = np.asarray(extrap_uv_to_zyx["valid"], dtype=bool)
+        r0, c0 = int(extrap_uv_to_zyx["offset"][0]), int(extrap_uv_to_zyx["offset"][1])
+        h, w = valid.shape
+        rr = sampled_uv[:, 0] - r0
+        cc = sampled_uv[:, 1] - c0
+        in_bounds = (
+            (rr >= 0) &
+            (rr < h) &
+            (cc >= 0) &
+            (cc < w)
+        )
+        if not in_bounds.all():
+            raise KeyError("Requested UV is outside dense extrapolation lookup bounds.")
+        if not valid[rr, cc].all():
+            raise KeyError("Requested UV is not valid in dense extrapolation lookup.")
+        return grid[rr, cc].astype(np.float32, copy=False)
+
     return np.asarray(
         [extrap_uv_to_zyx[(int(uv[0]), int(uv[1]))] for uv in sampled_uv],
         dtype=np.float32,
     )
 
 
-def _sample_extrap_no_disp(extrap_uv_to_zyx, grow_direction, max_lines=None):
-    if not extrap_uv_to_zyx:
+def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
+    if extrap_lookup is None:
         return _empty_stack_samples()
 
-    sampled_uv = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=max_lines)
+    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_uv_to_zyx)
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
     keep = np.isfinite(sampled_world).all(axis=1)
     if not keep.any():
         return _empty_stack_samples()
@@ -614,16 +793,24 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
     coords_t[:, 2] = 2.0 * coords_t[:, 2] / float(w_denom) - 1.0
     grid = coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
 
-    sample_inputs = torch.cat([disp_weighted_t, valid_t, count_t], dim=1)
-    sampled_all = F.grid_sample(
-        sample_inputs,
+    sampled_disp_weighted = F.grid_sample(
+        disp_weighted_t,
         grid,
         mode="bilinear",
         align_corners=True,
-    ).view(5, -1)
-    sampled_disp_weighted = sampled_all[:3].permute(1, 0)
-    sampled_valid_weight = sampled_all[3]
-    sampled_count = sampled_all[4]
+    ).view(3, -1).permute(1, 0)
+    sampled_valid_weight = F.grid_sample(
+        valid_t,
+        grid,
+        mode="bilinear",
+        align_corners=True,
+    ).view(-1)
+    sampled_count = F.grid_sample(
+        count_t,
+        grid,
+        mode="bilinear",
+        align_corners=True,
+    ).view(-1)
 
     eps = 1e-6
     valid_mask = sampled_valid_weight > eps
@@ -1044,10 +1231,18 @@ def main():
             }
 
         with profiler.section("iter_aggregate_extrapolation"):
-            one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
-            one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
-            one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
-            extrap_uv_to_zyx = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
+            if args.verbose or args.napari:
+                one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
+                one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
+                one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
+                extrap_uv_to_zyx = _grid_to_uv_world_dict(one_grid, one_valid, one_offset)
+            else:
+                extrap_uv_to_zyx = _build_dense_extrap_lookup(one_shot)
+            # Keep only lightweight one_shot fields after lookup construction.
+            one_shot["uv_query"] = np.zeros((0, 0, 2), dtype=np.float64)
+            one_shot["uv_query_flat"] = np.zeros((0, 2), dtype=np.float64)
+            one_shot["extrap_coords_local"] = np.zeros((0, 3), dtype=np.float32)
+            one_shot["extrap_coords_world"] = np.zeros((0, 3), dtype=np.float32)
 
         with profiler.section("iter_build_bbox_crops"):
             bbox_crops = _build_bbox_crops(
@@ -1060,7 +1255,8 @@ def main():
                 grow_direction=grow_direction,
                 crop_size=crop_size,
                 cond_pct=args.cond_pct,
-                extrap_uv_to_zyx=extrap_uv_to_zyx,
+                extrap_lookup=extrap_uv_to_zyx,
+                keep_debug_points=bool(args.napari),
             )
         _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
         bbox_results = bbox_crops
@@ -1076,6 +1272,7 @@ def main():
                 )
             with profiler.section("iter_stack_displacements"):
                 stacked_displacement = _stack_displacement_results(per_crop_fields)
+            del per_crop_fields
         _print_stacked_displacement_debug(stacked_displacement, verbose=args.verbose)
         if extrap_only_mode:
             with profiler.section("iter_sample_extrap_no_disp"):
