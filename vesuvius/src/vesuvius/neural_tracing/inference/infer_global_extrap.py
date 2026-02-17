@@ -16,7 +16,6 @@ from vesuvius.neural_tracing.inference.common import (
     _resolve_settings,
     _RuntimeProfiler,
     _save_merged_surface_tifxyz,
-    _select_extrap_uvs_for_sampling,
     _serialize_args,
     _show_napari,
 )
@@ -313,7 +312,17 @@ def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None
             axis=-1,
         )
     elif isinstance(extrap_lookup, dict):
-        return _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=max_lines)
+        uv_ordered = []
+        for uv_key, pt in extrap_lookup.items():
+            if pt is None:
+                continue
+            pt_arr = np.asarray(pt)
+            if pt_arr.shape != (3,) or not np.isfinite(pt_arr).all():
+                continue
+            uv_ordered.append((int(uv_key[0]), int(uv_key[1])))
+        if len(uv_ordered) == 0:
+            return np.zeros((0, 2), dtype=np.int64)
+        uv_ordered = np.asarray(uv_ordered, dtype=np.int64)
     else:
         return np.zeros((0, 2), dtype=np.int64)
 
@@ -341,12 +350,48 @@ def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None
     if max_lines is None:
         return uv_ordered
 
-    axis_values = np.unique(uv_ordered[:, axis_idx]).astype(np.int64, copy=False)
-    if near_to_far_desc:
-        axis_values = axis_values[::-1]
-    selected_axis_values = axis_values[:int(max_lines)]
-    keep = np.isin(uv_ordered[:, axis_idx], selected_axis_values, assume_unique=False)
-    return uv_ordered[keep]
+    depth_keep = int(max_lines)
+    if depth_keep < 1:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    # For ragged/non-rectangular fronts, keep near->far depth per boundary line
+    # (per row for left/right, per col for up/down), not global axis values.
+    if axis_idx == 1:
+        boundary_ids = np.unique(uv_ordered[:, 0]).astype(np.int64, copy=False)
+        picked = []
+        for r in boundary_ids:
+            row_uv = uv_ordered[uv_ordered[:, 0] == r]
+            if row_uv.shape[0] == 0:
+                continue
+            row_primary = -row_uv[:, 1] if near_to_far_desc else row_uv[:, 1]
+            row_order = np.argsort(row_primary, kind="stable")
+            picked.append(row_uv[row_order[:depth_keep]])
+    else:
+        boundary_ids = np.unique(uv_ordered[:, 1]).astype(np.int64, copy=False)
+        picked = []
+        for c in boundary_ids:
+            col_uv = uv_ordered[uv_ordered[:, 1] == c]
+            if col_uv.shape[0] == 0:
+                continue
+            col_primary = -col_uv[:, 0] if near_to_far_desc else col_uv[:, 0]
+            col_order = np.argsort(col_primary, kind="stable")
+            picked.append(col_uv[col_order[:depth_keep]])
+
+    if not picked:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    selected = np.concatenate(picked, axis=0).astype(np.int64, copy=False)
+    if selected.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    if axis_idx == 1:
+        sel_primary = -selected[:, 1] if near_to_far_desc else selected[:, 1]
+        sel_secondary = selected[:, 0]
+    else:
+        sel_primary = -selected[:, 0] if near_to_far_desc else selected[:, 0]
+        sel_secondary = selected[:, 1]
+    sel_order = np.lexsort((sel_secondary, sel_primary))
+    return selected[sel_order]
 
 
 def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
@@ -632,6 +677,41 @@ def _empty_stack_samples():
     }
 
 
+def _collect_candidate_extrap_uvs_from_bbox_crops(bbox_crops):
+    if bbox_crops is None or len(bbox_crops) == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    uv_list = []
+    for crop in bbox_crops:
+        uv = np.asarray(crop.get("extrap_uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
+        if uv.ndim != 2 or uv.shape[0] == 0 or uv.shape[1] != 2:
+            continue
+        uv_list.append(uv)
+
+    if not uv_list:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    uv_all = np.concatenate(uv_list, axis=0).astype(np.int64, copy=False)
+    return np.unique(uv_all, axis=0).astype(np.int64, copy=False)
+
+
+def _subset_extrap_lookup_to_uvs(extrap_lookup, candidate_uv):
+    if extrap_lookup is None:
+        return None
+    uv = np.asarray(candidate_uv, dtype=np.int64)
+    if uv.ndim != 2 or uv.shape[0] == 0 or uv.shape[1] != 2:
+        return {}
+
+    keep_uv, keep_world = _lookup_extrap_for_uv_query_flat(uv, extrap_lookup)
+    if keep_uv.shape[0] == 0:
+        return {}
+
+    return {
+        (int(keep_uv[i, 0]), int(keep_uv[i, 1])): keep_world[i].astype(np.float32, copy=False)
+        for i in range(keep_uv.shape[0])
+    }
+
+
 def _sample_displacement_for_extrap_uvs(
     stacked_displacement,
     extrap_lookup,
@@ -723,15 +803,21 @@ def _sample_displacement_for_extrap_uvs_from_crops(
     grow_direction,
     max_lines=None,
     refine=None,
+    candidate_uv=None,
 ):
     if per_crop_fields is None or len(per_crop_fields) == 0 or extrap_lookup is None:
         return _empty_stack_samples()
 
-    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
+    if candidate_uv is not None:
+        lookup_for_sampling = _subset_extrap_lookup_to_uvs(extrap_lookup, candidate_uv)
+    else:
+        lookup_for_sampling = extrap_lookup
+
+    sampled_uv = _select_extrap_uvs_from_lookup(lookup_for_sampling, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, lookup_for_sampling)
     finite_world = np.isfinite(sampled_world).all(axis=1)
     if not finite_world.any():
         return _empty_stack_samples()
@@ -1455,6 +1541,7 @@ def main():
                     model_state,
                     verbose=args.verbose,
                 )
+            candidate_uv = _collect_candidate_extrap_uvs_from_bbox_crops(bbox_crops)
             disp_bbox = _per_crop_displacement_bbox(per_crop_fields)
             with profiler.section("iter_sample_crop_displacement"):
                 agg_samples = _sample_displacement_for_extrap_uvs_from_crops(
@@ -1463,6 +1550,7 @@ def main():
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
                     refine=args.refine,
+                    candidate_uv=candidate_uv,
                 )
             del per_crop_fields
         else:
