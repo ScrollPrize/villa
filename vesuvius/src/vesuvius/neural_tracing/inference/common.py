@@ -402,13 +402,25 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
     if stride_y > 1 or stride_x > 1:
         merged_for_save = merged_for_save[::stride_y, ::stride_x]
 
-    out_dir = args.tifxyz_out_dir if args.tifxyz_out_dir else str(Path(args.tifxyz_path).parent)
+    overwrite_input_surface = bool(getattr(args, "overwrite_input_surface", False))
+    if overwrite_input_surface:
+        input_tifxyz_path = os.path.abspath(str(args.tifxyz_path))
+        tifxyz_uuid = os.path.basename(os.path.normpath(input_tifxyz_path))
+        if not tifxyz_uuid:
+            raise RuntimeError(
+                "--overwrite-input-surface requires --tifxyz-path to point to a tifxyz directory."
+            )
+        out_dir = os.path.dirname(input_tifxyz_path)
+        if args.tifxyz_out_dir:
+            print("--overwrite-input-surface set: ignoring --tifxyz-out-dir.")
+    else:
+        out_dir = args.tifxyz_out_dir if args.tifxyz_out_dir else str(Path(args.tifxyz_path).parent)
+        ckpt_name = "no_ckpt" if checkpoint_path is None else os.path.splitext(os.path.basename(str(checkpoint_path)))[0]
+        timestamp = datetime.now().strftime("%H%M%S")
+        tifxyz_uuid = f"displacement_{ckpt_name}_{timestamp}"
+
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
-
-    ckpt_name = "no_ckpt" if checkpoint_path is None else os.path.splitext(os.path.basename(str(checkpoint_path)))[0]
-    timestamp = datetime.now().strftime("%H%M%S")
-    tifxyz_uuid = f"displacement_{ckpt_name}_{timestamp}"
 
     uv_offset = merged.get("uv_offset", (0, 0))
     source = str(checkpoint_path) if checkpoint_path else "inference/infer_global_extrap.py"

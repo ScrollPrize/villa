@@ -97,6 +97,14 @@ def parse_args():
         help="Output tifxyz voxel size in micrometers. If unset, inferred from volume metadata.",
     )
     parser.add_argument(
+        "--overwrite-input-surface",
+        action="store_true",
+        help=(
+            "Overwrite the input tifxyz surface directory provided by --tifxyz-path "
+            "instead of creating a new timestamped output surface."
+        ),
+    )
+    parser.add_argument(
         "--skip-inference",
         action="store_true",
         help="Skip displacement model forward pass even if --checkpoint-path is provided.",
@@ -677,41 +685,6 @@ def _empty_stack_samples():
     }
 
 
-def _collect_candidate_extrap_uvs_from_bbox_crops(bbox_crops):
-    if bbox_crops is None or len(bbox_crops) == 0:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    uv_list = []
-    for crop in bbox_crops:
-        uv = np.asarray(crop.get("extrap_uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
-        if uv.ndim != 2 or uv.shape[0] == 0 or uv.shape[1] != 2:
-            continue
-        uv_list.append(uv)
-
-    if not uv_list:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    uv_all = np.concatenate(uv_list, axis=0).astype(np.int64, copy=False)
-    return np.unique(uv_all, axis=0).astype(np.int64, copy=False)
-
-
-def _subset_extrap_lookup_to_uvs(extrap_lookup, candidate_uv):
-    if extrap_lookup is None:
-        return None
-    uv = np.asarray(candidate_uv, dtype=np.int64)
-    if uv.ndim != 2 or uv.shape[0] == 0 or uv.shape[1] != 2:
-        return {}
-
-    keep_uv, keep_world = _lookup_extrap_for_uv_query_flat(uv, extrap_lookup)
-    if keep_uv.shape[0] == 0:
-        return {}
-
-    return {
-        (int(keep_uv[i, 0]), int(keep_uv[i, 1])): keep_world[i].astype(np.float32, copy=False)
-        for i in range(keep_uv.shape[0])
-    }
-
-
 def _sample_displacement_for_extrap_uvs(
     stacked_displacement,
     extrap_lookup,
@@ -803,21 +776,15 @@ def _sample_displacement_for_extrap_uvs_from_crops(
     grow_direction,
     max_lines=None,
     refine=None,
-    candidate_uv=None,
 ):
     if per_crop_fields is None or len(per_crop_fields) == 0 or extrap_lookup is None:
         return _empty_stack_samples()
 
-    if candidate_uv is not None:
-        lookup_for_sampling = _subset_extrap_lookup_to_uvs(extrap_lookup, candidate_uv)
-    else:
-        lookup_for_sampling = extrap_lookup
-
-    sampled_uv = _select_extrap_uvs_from_lookup(lookup_for_sampling, grow_direction, max_lines=max_lines)
+    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
 
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, lookup_for_sampling)
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
     finite_world = np.isfinite(sampled_world).all(axis=1)
     if not finite_world.any():
         return _empty_stack_samples()
@@ -1319,6 +1286,45 @@ def _surface_to_uv_samples(grid, valid, uv_offset):
     return uv[keep], pts[keep]
 
 
+def _surface_to_stored_uv_samples_nearest(
+    grid,
+    valid,
+    uv_offset,
+    sub_r,
+    sub_c,
+):
+    rows, cols = np.where(np.asarray(valid, dtype=bool))
+    if rows.size == 0:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+
+    pts = np.asarray(grid, dtype=np.float32)[rows, cols].astype(np.float32, copy=False)
+    finite = np.isfinite(pts).all(axis=1)
+    if not finite.any():
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+
+    rows = rows[finite].astype(np.int64, copy=False)
+    cols = cols[finite].astype(np.int64, copy=False)
+    pts = pts[finite]
+
+    r_abs = rows + int(uv_offset[0])
+    c_abs = cols + int(uv_offset[1])
+
+    # Project full-res UVs to nearest stored-resolution UV cell so growth that
+    # lands off a single phase still contributes at save resolution.
+    stored_r = np.rint(r_abs.astype(np.float64) / float(sub_r)).astype(np.int64)
+    stored_c = np.rint(c_abs.astype(np.float64) / float(sub_c)).astype(np.int64)
+    uv = np.stack([stored_r, stored_c], axis=-1)
+    uniq_uv, inv = np.unique(uv, axis=0, return_inverse=True)
+
+    pts_sum = np.zeros((uniq_uv.shape[0], 3), dtype=np.float64)
+    pts_count = np.zeros((uniq_uv.shape[0],), dtype=np.int64)
+    np.add.at(pts_sum, inv, pts.astype(np.float64, copy=False))
+    np.add.at(pts_count, inv, 1)
+
+    pts_mean = (pts_sum / np.maximum(pts_count[:, None], 1)).astype(np.float32, copy=False)
+    return uniq_uv.astype(np.int64, copy=False), pts_mean
+
+
 def _grid_to_uv_world_dict(grid, valid, offset):
     rows, cols = np.where(valid)
     if rows.size == 0:
@@ -1541,7 +1547,6 @@ def main():
                     model_state,
                     verbose=args.verbose,
                 )
-            candidate_uv = _collect_candidate_extrap_uvs_from_bbox_crops(bbox_crops)
             disp_bbox = _per_crop_displacement_bbox(per_crop_fields)
             with profiler.section("iter_sample_crop_displacement"):
                 agg_samples = _sample_displacement_for_extrap_uvs_from_crops(
@@ -1550,7 +1555,6 @@ def main():
                     grow_direction,
                     max_lines=args.agg_extrap_lines,
                     refine=args.refine,
-                    candidate_uv=candidate_uv,
                 )
             del per_crop_fields
         else:
@@ -1625,26 +1629,12 @@ def main():
         sub_r = _scale_to_subsample_stride(scale_y)
         sub_c = _scale_to_subsample_stride(scale_x)
 
-        # Phase-align subsampling so sampled full-res rows/cols are multiples of sub_r/sub_c,
-        # which correspond exactly to stored-res grid positions.
-        offset_r = int(current_uv_offset[0])
-        offset_c = int(current_uv_offset[1])
-        phase_r = (sub_r - offset_r % sub_r) % sub_r
-        phase_c = (sub_c - offset_c % sub_c) % sub_c
-
-        grown_stored_zyxs = current_zyxs[phase_r::sub_r, phase_c::sub_c]
-        grown_stored_valid = current_valid[phase_r::sub_r, phase_c::sub_c]
-
-        # Aligned full-res offset is guaranteed to be a multiple of sub_r/sub_c,
-        # so integer division by the stride gives an exact stored-res offset.
-        aligned_full_r = offset_r + phase_r
-        aligned_full_c = offset_c + phase_c
-        stored_offset_r = int(aligned_full_r // sub_r)
-        stored_offset_c = int(aligned_full_c // sub_c)
-
-        grown_uv, grown_pts = _surface_to_uv_samples(
-            grown_stored_zyxs, grown_stored_valid,
-            (stored_offset_r, stored_offset_c),
+        grown_uv, grown_pts = _surface_to_stored_uv_samples_nearest(
+            current_zyxs,
+            current_valid,
+            current_uv_offset,
+            sub_r,
+            sub_c,
         )
         merged = _merge_displaced_points_into_full_surface(
             stored_zyxs, valid_s, (0, 0),
