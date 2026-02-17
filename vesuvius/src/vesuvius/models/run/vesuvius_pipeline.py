@@ -80,9 +80,7 @@ def parse_arguments():
                       help='Skip the blending step (use existing blended outputs)')
     parser.add_argument('--skip-finalize', dest='skip_finalize', action='store_true',
                       help='Skip the finalization step (only generate blended logits)')
-    parser.add_argument('--fuse-blend-finalize', dest='fuse_blend_finalize', action='store_true',
-                      help='Fuse blending and finalization into a single pass (no intermediate float16 zarr)')
-
+    
     # Verbosity
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Reduce verbosity')
@@ -319,40 +317,6 @@ def run_finalize(args):
     return True
 
 
-def run_blend_and_finalize(args):
-    """Run fused blend + finalize in a single pass."""
-    cmd = ['vesuvius.blend_and_finalize', args.parts_dir, args.output]
-
-    cmd.extend(['--mode', args.mode])
-
-    if args.threshold:
-        cmd.append('--threshold')
-
-    if args.quiet:
-        cmd.append('--quiet')
-
-    print(f"Fused blend+finalize: {' '.join(cmd)}")
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE if args.quiet else None,
-        stderr=subprocess.PIPE if args.quiet else None,
-        universal_newlines=True,
-        bufsize=1
-    )
-
-    returncode = process.wait()
-
-    if returncode != 0:
-        if args.quiet:
-            stderr = process.stderr.read() if process.stderr else "No error output available"
-            print("Error in fused blend+finalize:")
-            print(stderr)
-        return False
-
-    return True
-
-
 def cleanup(args):
     """Clean up intermediate files."""
     if not args.keep_intermediates:
@@ -469,75 +433,53 @@ def run_pipeline():
                 print("Prediction failed. Aborting pipeline.")
                 return 1
     
-    # Check if parts directory exists and has contents (shared by blend paths)
-    def _parts_dir_ready():
+    # Blending step
+    if not args.skip_blend:
+        print("\n--- Step 2: Blending ---")
+        
+        # Check if parts directory exists and has contents (handle S3 paths)
         if args.parts_dir.startswith('s3://'):
             import fsspec
             fs = fsspec.filesystem('s3', anon=False)
+            # Remove s3:// prefix for fs operations
             parts_dir_no_prefix = args.parts_dir.replace('s3://', '')
             parts_exist = fs.exists(parts_dir_no_prefix)
-            return parts_exist and len(fs.ls(parts_dir_no_prefix)) > 0
+            parts_has_files = len(fs.ls(parts_dir_no_prefix)) > 0 if parts_exist else False
         else:
-            return os.path.exists(args.parts_dir) and bool(os.listdir(args.parts_dir))
-
-    # Fused blend + finalize path
-    if getattr(args, 'fuse_blend_finalize', False):
-        if not args.skip_blend and not args.skip_finalize:
-            print("\n--- Step 2+3: Fused Blend + Finalize ---")
-
-            if not _parts_dir_ready():
-                print("No prediction parts found. Please run the prediction step first.")
-                return 1
-
-            success = run_blend_and_finalize(args)
-            if not success:
-                print("Fused blend+finalize failed. Aborting pipeline.")
-                return 1
-        elif not args.skip_blend:
-            print("WARNING: --fuse-blend-finalize with --skip-finalize — falling back to blend-only")
-            if not _parts_dir_ready():
-                print("No prediction parts found. Please run the prediction step first.")
-                return 1
-            success = run_blend(args)
-            if not success:
-                print("Blending failed. Aborting pipeline.")
-                return 1
-    else:
-        # Separate blend + finalize (existing path)
-        # Blending step
-        if not args.skip_blend:
-            print("\n--- Step 2: Blending ---")
-
-            if not _parts_dir_ready():
-                print("No prediction parts found. Please run the prediction step first.")
-                return 1
-
-            success = run_blend(args)
-            if not success:
-                print("Blending failed. Aborting pipeline.")
-                return 1
-
-        # Finalization step
-        if not args.skip_finalize:
-            print("\n--- Step 3: Finalization ---")
-
-            # Check if blended path exists (handle S3 paths)
-            if args.blended_path.startswith('s3://'):
-                import fsspec
-                fs = fsspec.filesystem('s3', anon=False)
-                blended_path_no_prefix = args.blended_path.replace('s3://', '')
-                blended_exists = fs.exists(blended_path_no_prefix)
-            else:
-                blended_exists = os.path.exists(args.blended_path)
-
-            if not blended_exists:
-                print("No blended data found. Please run the blending step first.")
-                return 1
-
-            success = run_finalize(args)
-            if not success:
-                print("Finalization failed.")
-                return 1
+            parts_exist = os.path.exists(args.parts_dir)
+            parts_has_files = os.listdir(args.parts_dir) if parts_exist else False
+            
+        if not parts_exist or not parts_has_files:
+            print("No prediction parts found. Please run the prediction step first.")
+            return 1
+        
+        success = run_blend(args)
+        if not success:
+            print("Blending failed. Aborting pipeline.")
+            return 1
+    
+    # Finalization step
+    if not args.skip_finalize:
+        print("\n--- Step 3: Finalization ---")
+        
+        # Check if blended path exists (handle S3 paths)
+        if args.blended_path.startswith('s3://'):
+            import fsspec
+            fs = fsspec.filesystem('s3', anon=False)
+            # Remove s3:// prefix for fs operations
+            blended_path_no_prefix = args.blended_path.replace('s3://', '')
+            blended_exists = fs.exists(blended_path_no_prefix)
+        else:
+            blended_exists = os.path.exists(args.blended_path)
+            
+        if not blended_exists:
+            print("No blended data found. Please run the blending step first.")
+            return 1
+        
+        success = run_finalize(args)
+        if not success:
+            print("Finalization failed.")
+            return 1
     
     # Final cleanup
     cleanup(args)
