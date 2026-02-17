@@ -229,36 +229,45 @@ def _place_window_on_edge(edge_idx, window_size, cond_size, cond_direction, max_
     end = int(start) + int(window_size) - 1
     return int(start), int(end)
 
-def _get_cond_edge(cond_zyxs, cond_direction):
+def _get_cond_edge(cond_zyxs, cond_direction, cond_valid=None):
     spec = _get_direction_spec(cond_direction)
     edge_idx = spec["edge_idx"]
-    # For non-rectangular inputs the fixed column/row may have no valid cells.
-    # Instead, find the per-row (col axis) or per-col (row axis) frontier.
-    invalid = (cond_zyxs == -1).all(axis=-1)  # (n_rows, n_cols)
-    valid = ~invalid
+    # For non-rectangular inputs, compute a per-line frontier over valid cells
+    # instead of relying on one global extreme row/col index.
+    if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
+        valid = np.asarray(cond_valid, dtype=bool)
+    else:
+        valid = _valid_surface_mask(cond_zyxs)
+
+    if not valid.any():
+        out_len = cond_zyxs.shape[0] if spec["axis"] == "col" else cond_zyxs.shape[1]
+        return np.full((out_len, 3), -1, dtype=cond_zyxs.dtype)
+
     if spec["axis"] == "col":
         n_rows, n_cols = valid.shape
         out = np.full((n_rows, 3), -1, dtype=cond_zyxs.dtype)
         any_valid = valid.any(axis=1)
+        row_idx = np.arange(n_rows, dtype=np.int64)
         if edge_idx == 0 or (edge_idx == -1 and n_cols == 1):
             # leftmost valid column per row (first True)
             col_indices = np.argmax(valid, axis=1)
         else:
             # rightmost valid column per row (last True)
             col_indices = n_cols - 1 - np.argmax(valid[:, ::-1], axis=1)
-        out[any_valid] = cond_zyxs[np.where(any_valid)[0], col_indices[any_valid], :]
+        out[any_valid] = cond_zyxs[row_idx[any_valid], col_indices[any_valid], :]
         return out
     else:
         n_rows, n_cols = valid.shape
         out = np.full((n_cols, 3), -1, dtype=cond_zyxs.dtype)
         any_valid = valid.any(axis=0)
+        col_idx = np.arange(n_cols, dtype=np.int64)
         if edge_idx == 0 or (edge_idx == -1 and n_rows == 1):
             # topmost valid row per column (first True)
             row_indices = np.argmax(valid, axis=0)
         else:
             # bottommost valid row per column (last True)
             row_indices = n_rows - 1 - np.argmax(valid[::-1, :], axis=0)
-        out[any_valid] = cond_zyxs[row_indices[any_valid], np.where(any_valid)[0], :]
+        out[any_valid] = cond_zyxs[row_indices[any_valid], col_idx[any_valid], :]
         return out
 
 def _bbox_from_center(center, crop_size):
@@ -273,10 +282,10 @@ def _bbox_from_center(center, crop_size):
         int(min_corner[2]), int(max_corner[2]),
     )
 
-def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15):
+def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15, cond_valid=None):
     # Build center-out crop anchors along the conditioning edge. Each chunk grows
     # while its XYZ span still fits in one crop-sized bbox.
-    edge = _get_cond_edge(cond_zyxs, cond_direction)
+    edge = _get_cond_edge(cond_zyxs, cond_direction, cond_valid=cond_valid)
 
     edge_valid = ~(edge == -1).all(axis=1)
     if not edge_valid.any():
@@ -680,19 +689,15 @@ def setup_segment(args, volume):
 
 def compute_window_and_split(args, stored_zyxs, valid_s, grow_direction, h_s, w_s, crop_size):
     cond_direction, direction = _get_growth_context(grow_direction)
-    r_edge_s, c_edge_s = _edge_index_from_valid(valid_s, cond_direction)
-    if r_edge_s is None and c_edge_s is None:
-        raise RuntimeError("No valid edge found for segment.")
-
-    if direction["axis"] == "col":
-        cond_edge_strip = stored_zyxs[:, c_edge_s:c_edge_s + 1]
-    else:
-        cond_edge_strip = stored_zyxs[r_edge_s:r_edge_s + 1, :]
-
     bboxes, _ = get_cond_edge_bboxes(
-        cond_edge_strip, cond_direction, crop_size,
+        stored_zyxs,
+        cond_direction,
+        crop_size,
         overlap_frac=args.bbox_overlap_frac,
+        cond_valid=valid_s,
     )
+    if len(bboxes) == 0:
+        raise RuntimeError("No valid edge bboxes found for segment.")
 
     r0_s, r1_s, c0_s, c1_s = get_window_bounds_from_bboxes(
         stored_zyxs, valid_s, bboxes, pad=args.window_pad
@@ -770,26 +775,22 @@ def _build_edge_input_mask(cond_valid, cond_direction, edge_input_rowscols):
         raise ValueError("edge_input_rowscols must be >= 1")
 
     spec = _get_direction_spec(cond_direction)
-    edge_mask = np.zeros_like(cond_valid, dtype=bool)
-
     if spec["axis"] == "col":
-        valid_axis = np.any(cond_valid, axis=0)
-        axis_indices = np.where(valid_axis)[0]
-        if axis_indices.size == 0:
-            return edge_mask
-        keep = min(n_axis, axis_indices.size)
-        keep_axis = axis_indices[-keep:] if spec["edge_idx"] == -1 else axis_indices[:keep]
-        edge_mask[:, keep_axis] = True
+        if spec["edge_idx"] == -1:
+            # rank valid cells from right edge toward left, per row
+            rank = np.cumsum(cond_valid[:, ::-1], axis=1)[:, ::-1]
+        else:
+            # rank valid cells from left edge toward right, per row
+            rank = np.cumsum(cond_valid, axis=1)
     else:
-        valid_axis = np.any(cond_valid, axis=1)
-        axis_indices = np.where(valid_axis)[0]
-        if axis_indices.size == 0:
-            return edge_mask
-        keep = min(n_axis, axis_indices.size)
-        keep_axis = axis_indices[-keep:] if spec["edge_idx"] == -1 else axis_indices[:keep]
-        edge_mask[keep_axis, :] = True
+        if spec["edge_idx"] == -1:
+            # rank valid cells from bottom edge toward top, per column
+            rank = np.cumsum(cond_valid[::-1, :], axis=0)[::-1, :]
+        else:
+            # rank valid cells from top edge toward bottom, per column
+            rank = np.cumsum(cond_valid, axis=0)
 
-    return cond_valid & edge_mask
+    return cond_valid & (rank > 0) & (rank <= n_axis)
 
 
 def compute_edge_one_shot_extrapolation(

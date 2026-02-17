@@ -27,7 +27,6 @@ from vesuvius.neural_tracing.inference.infer_rowcol_split import (
     _build_uv_grid,
     _build_uv_query_from_cond_points,
     _crop_volume_from_min_corner,
-    _edge_index_from_valid,
     _get_growth_context,
     _initialize_window_state,
     _points_to_voxels,
@@ -1256,20 +1255,16 @@ def main():
     cond_direction, _ = _get_growth_context(grow_direction)
 
     with profiler.section("initialize_window"):
-        cond_direction_init, direction_init = _get_growth_context(grow_direction)
-        r_edge_s, c_edge_s = _edge_index_from_valid(valid_s, cond_direction_init)
-        if r_edge_s is None and c_edge_s is None:
-            raise RuntimeError("No valid edge found for segment.")
-
-        if direction_init["axis"] == "col":
-            cond_edge_strip = stored_zyxs[:, c_edge_s:c_edge_s + 1]
-        else:
-            cond_edge_strip = stored_zyxs[r_edge_s:r_edge_s + 1, :]
-
+        cond_direction_init, _ = _get_growth_context(grow_direction)
         init_bboxes, _ = get_cond_edge_bboxes(
-            cond_edge_strip, cond_direction_init, crop_size,
+            stored_zyxs,
+            cond_direction_init,
+            crop_size,
             overlap_frac=args.bbox_overlap_frac,
+            cond_valid=valid_s,
         )
+        if len(init_bboxes) == 0:
+            raise RuntimeError("No valid edge bboxes found for segment.")
         r0_s, r1_s, c0_s, c1_s = get_window_bounds_from_bboxes(
             stored_zyxs, valid_s, init_bboxes, pad=args.window_pad,
         )
