@@ -765,6 +765,79 @@ def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
     return np.stack(np.meshgrid(rows, cols, indexing='ij'), axis=-1)
 
 
+def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
+    """
+    Build extrapolation UVs from a per-line edge band.
+
+    Unlike _build_uv_query_from_cond_points(), this keeps a per-row/per-col
+    frontier so irregular/non-rectangular edges do not collapse to a single
+    global min/max line.
+    """
+    if uv_edge_pts is None or len(uv_edge_pts) == 0:
+        return np.zeros((0, 0, 2), dtype=np.int64)
+
+    _, direction = _get_growth_context(grow_direction)
+    uv = np.rint(np.asarray(uv_edge_pts)).astype(np.int64, copy=False)
+
+    def _mask_span(cond_span):
+        cond_span = int(max(1, cond_span))
+        if cond_pct <= 0:
+            return cond_span
+        total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
+        return max(1, total_span - cond_span)
+
+    if direction["axis"] == "col":
+        rows = uv[:, 0]
+        cols = uv[:, 1]
+        unique_rows, row_inv = np.unique(rows, return_inverse=True)
+        if unique_rows.size == 0:
+            return np.zeros((0, 0, 2), dtype=np.int64)
+
+        row_min = np.full((unique_rows.size,), np.iinfo(np.int64).max, dtype=np.int64)
+        row_max = np.full((unique_rows.size,), np.iinfo(np.int64).min, dtype=np.int64)
+        np.minimum.at(row_min, row_inv, cols)
+        np.maximum.at(row_max, row_inv, cols)
+
+        cond_span = int(np.median(row_max - row_min + 1))
+        mask_w = _mask_span(cond_span)
+        offsets = np.arange(mask_w, dtype=np.int64)
+
+        if direction["growth_sign"] > 0:
+            frontier = row_max
+            query_cols = (frontier[:, None] + 1) + offsets[None, :]
+        else:
+            frontier = row_min
+            query_cols = (frontier[:, None] - mask_w) + offsets[None, :]
+
+        query_rows = np.repeat(unique_rows[:, None], mask_w, axis=1)
+        return np.stack([query_rows, query_cols], axis=-1)
+
+    rows = uv[:, 0]
+    cols = uv[:, 1]
+    unique_cols, col_inv = np.unique(cols, return_inverse=True)
+    if unique_cols.size == 0:
+        return np.zeros((0, 0, 2), dtype=np.int64)
+
+    col_min = np.full((unique_cols.size,), np.iinfo(np.int64).max, dtype=np.int64)
+    col_max = np.full((unique_cols.size,), np.iinfo(np.int64).min, dtype=np.int64)
+    np.minimum.at(col_min, col_inv, rows)
+    np.maximum.at(col_max, col_inv, rows)
+
+    cond_span = int(np.median(col_max - col_min + 1))
+    mask_h = _mask_span(cond_span)
+    offsets = np.arange(mask_h, dtype=np.int64)
+
+    if direction["growth_sign"] > 0:
+        frontier = col_max
+        query_rows = (frontier[:, None] + 1) + offsets[None, :]
+    else:
+        frontier = col_min
+        query_rows = (frontier[:, None] - mask_h) + offsets[None, :]
+
+    query_cols = np.repeat(unique_cols[:, None], mask_h, axis=1)
+    return np.stack([query_rows, query_cols], axis=-1)
+
+
 def _build_edge_input_mask(cond_valid, cond_direction, edge_input_rowscols):
     cond_valid = np.asarray(cond_valid, dtype=bool)
     if cond_valid.ndim != 2:
@@ -832,7 +905,7 @@ def compute_edge_one_shot_extrapolation(
     # Build query span from the edge-input conditioning band, not the full grown
     # surface, so iterative runs do not blow up one-shot query allocations.
     uv_query_seed = uv_cond[edge_input_mask]
-    uv_query = _build_uv_query_from_cond_points(uv_query_seed, grow_direction, cond_pct)
+    uv_query = _build_uv_query_from_edge_band(uv_query_seed, grow_direction, cond_pct)
     if uv_query.size == 0:
         return None
 
@@ -1382,8 +1455,11 @@ def _run_growth_iterations(
         # has been assigned to at least one bbox. bboxes are centered on the edge points , but do not perfectly split the ratio of cond:extrap because
         # the bboxes are axis-aligned and the surface may curve in 3d despite the obvious 2d straightness
         bboxes, _ = get_cond_edge_bboxes(
-            cond_zyxs, cond_direction, crop_size,
+            cond_zyxs,
+            cond_direction,
+            crop_size,
             overlap_frac=args.bbox_overlap_frac,
+            cond_valid=valid,
         )
 
         pred_samples = []

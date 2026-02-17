@@ -1134,27 +1134,63 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
 
 def _boundary_axis_value(valid, uv_offset, grow_direction):
     valid = np.asarray(valid, dtype=bool)
-    rows, cols = np.where(valid)
-    if rows.size == 0:
+    if valid.size == 0 or not valid.any():
         return None
+
     _, growth_spec = _get_growth_context(grow_direction)
     r0, c0 = int(uv_offset[0]), int(uv_offset[1])
-    if growth_spec["axis"] == "row":
-        axis_vals = rows.astype(np.int64) + r0
+
+    if growth_spec["axis"] == "col":
+        # For left/right growth, boundary is measured per row by extreme column.
+        line_valid = np.any(valid, axis=1)
+        if not line_valid.any():
+            return None
+        n_cols = valid.shape[1]
+        if growth_spec["growth_sign"] > 0:
+            boundary_rel = n_cols - 1 - np.argmax(valid[:, ::-1], axis=1)
+        else:
+            boundary_rel = np.argmax(valid, axis=1)
+        line_ids = np.where(line_valid)[0].astype(np.int64, copy=False) + r0
+        boundary_vals = boundary_rel[line_valid].astype(np.int64, copy=False) + c0
     else:
-        axis_vals = cols.astype(np.int64) + c0
-    if growth_spec["growth_sign"] > 0:
-        return int(axis_vals.max())
-    return int(axis_vals.min())
+        # For up/down growth, boundary is measured per column by extreme row.
+        line_valid = np.any(valid, axis=0)
+        if not line_valid.any():
+            return None
+        n_rows = valid.shape[0]
+        if growth_spec["growth_sign"] > 0:
+            boundary_rel = n_rows - 1 - np.argmax(valid[::-1, :], axis=0)
+        else:
+            boundary_rel = np.argmax(valid, axis=0)
+        line_ids = np.where(line_valid)[0].astype(np.int64, copy=False) + c0
+        boundary_vals = boundary_rel[line_valid].astype(np.int64, copy=False) + r0
+
+    return line_ids, boundary_vals
 
 
 def _boundary_advanced(prev_boundary, next_boundary, grow_direction):
     if prev_boundary is None or next_boundary is None:
         return False
+
+    prev_lines, prev_vals = prev_boundary
+    next_lines, next_vals = next_boundary
+    if prev_lines.size == 0 or next_lines.size == 0:
+        return False
+
+    _, prev_idx, next_idx = np.intersect1d(
+        prev_lines,
+        next_lines,
+        assume_unique=False,
+        return_indices=True,
+    )
+    if prev_idx.size == 0:
+        return False
+
+    delta = next_vals[next_idx] - prev_vals[prev_idx]
     _, growth_spec = _get_growth_context(grow_direction)
     if growth_spec["growth_sign"] > 0:
-        return int(next_boundary) > int(prev_boundary)
-    return int(next_boundary) < int(prev_boundary)
+        return bool(np.any(delta > 0))
+    return bool(np.any(delta < 0))
 
 
 def _surface_to_uv_samples(grid, valid, uv_offset):
@@ -1313,6 +1349,7 @@ def main():
                 cond_direction,
                 crop_size,
                 overlap_frac=args.bbox_overlap_frac,
+                cond_valid=cond_valid,
             )
         if iteration_pbar is not None:
             iteration_pbar.set_postfix_str(f"bboxes={len(bboxes)}", refresh=True)
