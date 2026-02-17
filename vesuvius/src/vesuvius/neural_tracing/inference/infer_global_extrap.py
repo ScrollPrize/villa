@@ -1314,11 +1314,13 @@ def main():
                 crop_size,
                 overlap_frac=args.bbox_overlap_frac,
             )
+        if iteration_pbar is not None:
+            iteration_pbar.set_postfix_str(f"bboxes={len(bboxes)}", refresh=True)
         if len(bboxes) == 0:
             if args.verbose:
                 print("No edge bboxes available at current boundary; stopping iterative growth.")
             elif iteration_pbar is not None:
-                iteration_pbar.set_postfix_str("stopped: no edge bboxes", refresh=True)
+                iteration_pbar.set_postfix_str("bboxes=0 | stopped: no edge bboxes", refresh=True)
             break
 
         with profiler.section("iter_one_shot_extrapolation"):
@@ -1449,13 +1451,19 @@ def main():
             if args.verbose:
                 print("No newly added valid points this iteration; stopping iterative growth.")
             elif iteration_pbar is not None:
-                iteration_pbar.set_postfix_str("stopped: no new valid points", refresh=True)
+                iteration_pbar.set_postfix_str(
+                    f"bboxes={len(bboxes)} | stopped: no new valid points",
+                    refresh=True,
+                )
             break
         if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
             if args.verbose:
                 print("Boundary did not advance this iteration; stopping iterative growth.")
             elif iteration_pbar is not None:
-                iteration_pbar.set_postfix_str("stopped: boundary unchanged", refresh=True)
+                iteration_pbar.set_postfix_str(
+                    f"bboxes={len(bboxes)} | stopped: boundary unchanged",
+                    refresh=True,
+                )
             break
 
     if iteration_pbar is not None:
