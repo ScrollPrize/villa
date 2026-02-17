@@ -583,18 +583,23 @@ void run_generate(const po::variables_map& vm) {
                                     std::cout << ", avg " << key << ": " << avg_time << "s";
                                 }
                             }
+                            const size_t slice_extract_fast_count_snapshot = slice_extract_fast_count.load();
+                            const size_t slice_extract_fallback_count_snapshot = slice_extract_fallback_count.load();
+                            const int64_t slice_extract_fast_time_ns_snapshot = slice_extract_fast_time_ns.load();
+                            const int64_t slice_extract_fallback_time_ns_snapshot = slice_extract_fallback_time_ns.load();
+
                             std::cout << ", slice extract fast/fallback: "
-                                      << slice_extract_fast_count << "/" << slice_extract_fallback_count;
-                            if (slice_extract_fast_count > 0) {
+                                      << slice_extract_fast_count_snapshot << "/" << slice_extract_fallback_count_snapshot;
+                            if (slice_extract_fast_count_snapshot > 0) {
                                 std::cout << ", avg slice_extract_fast: "
-                                          << (static_cast<double>(slice_extract_fast_time_ns) /
-                                              static_cast<double>(slice_extract_fast_count) / 1e9)
+                                          << (static_cast<double>(slice_extract_fast_time_ns_snapshot) /
+                                              static_cast<double>(slice_extract_fast_count_snapshot) / 1e9)
                                           << "s";
                             }
-                            if (slice_extract_fallback_count > 0) {
+                            if (slice_extract_fallback_count_snapshot > 0) {
                                 std::cout << ", avg slice_extract_fallback: "
-                                          << (static_cast<double>(slice_extract_fallback_time_ns) /
-                                              static_cast<double>(slice_extract_fallback_count) / 1e9)
+                                          << (static_cast<double>(slice_extract_fallback_time_ns_snapshot) /
+                                              static_cast<double>(slice_extract_fallback_count_snapshot) / 1e9)
                                           << "s";
                             }
                             std::cout << std::endl;
