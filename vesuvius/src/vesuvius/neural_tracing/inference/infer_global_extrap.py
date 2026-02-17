@@ -265,9 +265,32 @@ def _build_dense_extrap_lookup(one_shot):
     if extrap_world.shape[0] != h * w:
         return _empty_dense_extrap_lookup()
 
+    uv_rows = uv_query[:, :, 0].astype(np.int64, copy=False)
+    uv_cols = uv_query[:, :, 1].astype(np.int64, copy=False)
+    r0 = int(uv_rows[0, 0])
+    c0 = int(uv_cols[0, 0])
+    expected_rows = r0 + np.arange(h, dtype=np.int64)[:, None]
+    expected_cols = c0 + np.arange(w, dtype=np.int64)[None, :]
+    is_rectilinear_dense = np.array_equal(uv_rows, expected_rows) and np.array_equal(uv_cols, expected_cols)
+
+    # Non-rectilinear per-line UV queries cannot be indexed via a dense offset grid.
+    # Fall back to sparse UV->point lookup to preserve exact mapping.
+    if not is_rectilinear_dense:
+        uv_flat = uv_query.reshape(-1, 2).astype(np.int64, copy=False)
+        world_flat = extrap_world.astype(np.float32, copy=False)
+        finite = np.isfinite(world_flat).all(axis=1)
+        if not finite.any():
+            return {}
+        uv_keep = uv_flat[finite]
+        world_keep = world_flat[finite]
+        return {
+            (int(uv_keep[i, 0]), int(uv_keep[i, 1])): world_keep[i]
+            for i in range(uv_keep.shape[0])
+        }
+
     grid = extrap_world.reshape(h, w, 3).astype(np.float32, copy=False)
     valid = np.isfinite(grid).all(axis=2)
-    offset = (int(uv_query[0, 0, 0]), int(uv_query[0, 0, 1]))
+    offset = (r0, c0)
     return {
         "grid": grid,
         "valid": valid,
