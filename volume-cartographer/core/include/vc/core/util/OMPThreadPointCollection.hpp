@@ -1,21 +1,22 @@
 #pragma once
 #include <vector>
 #include <cstdlib>
+#include <cstdint>
 #include <opencv2/core/matx.hpp>
 
 #include "omp.h"
 
 
-static bool has_min_dist_sq(const cv::Vec2i &p, const std::vector<cv::Vec2i> &list, float min_dist_sq)
+static bool has_min_dist_sq(const cv::Vec2i &p, const std::vector<cv::Vec2i> &list, double min_dist_sq)
 {
     for (const auto &o : list) {
         if (o[0] == -1 || o == p)
             continue;
 
-        const int dy = o[0] - p[0];
-        const int dx = o[1] - p[1];
-        const float d2 = static_cast<float>(dy * dy + dx * dx);
-        if (d2 < min_dist_sq)
+        const int64_t dy = static_cast<int64_t>(o[0]) - static_cast<int64_t>(p[0]);
+        const int64_t dx = static_cast<int64_t>(o[1]) - static_cast<int64_t>(p[1]);
+        const int64_t d2 = dy * dy + dx * dx;
+        if (static_cast<double>(d2) < min_dist_sq)
             return false;
     }
 
@@ -31,7 +32,7 @@ static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands,
         return {-1, -1};
     }
 
-    const float min_dist_sq = dist * dist;
+    const double min_dist_sq = static_cast<double>(dist) * static_cast<double>(dist);
     const int n = static_cast<int>(cands.size());
     int pos = idx % n;
 
