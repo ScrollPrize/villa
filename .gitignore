@@ -33,3 +33,4 @@ vesuvius/AGENTS.md
 /volume-cartographer/scratch
 /vesuvius/src/external
 
+*.cover

@@ -764,7 +764,6 @@ def compute_edge_one_shot_extrapolation(
         "edge_seed_uv": edge_seed_uv.astype(np.float64, copy=False),
         "edge_seed_world": edge_seed_world.astype(np.float32, copy=False),
         "query_uv_grid": query_uv_grid,
-        "query_uv": query_uv_grid.reshape(-1, 2),
         "min_corner": min_corner_arr,
         "extrapolated_local": extrapolated_local,
         "extrapolated_world": extrapolated_world,

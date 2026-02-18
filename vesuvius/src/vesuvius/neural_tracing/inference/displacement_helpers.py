@@ -14,13 +14,13 @@ def predict_displacement(args, model_state, model_inputs, use_tta=None):
     if use_tta is None:
         use_tta = bool(getattr(args, "tta", True))
 
-    def run_single_model_pass(model_inputs_batch):
+    def run_single_model_pass(model_obj, model_inputs_batch, amp_enabled_flag, amp_dtype_flag):
         with torch.no_grad():
-            if amp_enabled:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    output = model(model_inputs_batch)
+            if amp_enabled_flag:
+                with torch.autocast(device_type="cuda", dtype=amp_dtype_flag):
+                    output = model_obj(model_inputs_batch)
             else:
-                output = model(model_inputs_batch)
+                output = model_obj(model_inputs_batch)
         return output.get("displacement", None)
 
     if use_tta:
@@ -35,7 +35,7 @@ def predict_displacement(args, model_state, model_inputs, use_tta=None):
             outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
         )
 
-    return run_single_model_pass(model_inputs)
+    return run_single_model_pass(model, model_inputs, amp_enabled, amp_dtype)
 
 
 def load_model(args):

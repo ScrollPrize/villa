@@ -278,7 +278,7 @@ def _empty_edge_extrapolation():
     return {
         "edge_seed_uv": _empty_uv(dtype=np.float64),
         "edge_seed_world": _empty_world(dtype=np.float32),
-        "query_uv": _empty_uv(dtype=np.float64),
+        "query_uv_grid": np.zeros((0, 0, 2), dtype=np.int64),
         "extrapolated_world": _empty_world(dtype=np.float32),
     }
 
@@ -287,12 +287,14 @@ def _empty_edge_extrapolation():
 class ExtrapLookupArrays:
     uv: np.ndarray
     world: np.ndarray
+    lookup_sort_idx: np.ndarray
+    lookup_uv_sorted: np.ndarray
 
 
 def _empty_extrap_lookup_arrays():
-    return ExtrapLookupArrays(
-        uv=_empty_uv(dtype=np.int64),
-        world=_empty_world(dtype=np.float32),
+    return _make_extrap_lookup_arrays(
+        _empty_uv(dtype=np.int64),
+        _empty_world(dtype=np.float32),
     )
 
 
@@ -307,6 +309,39 @@ def _uv_struct_view(uv):
     if uv_int.ndim != 2 or uv_int.shape[1] != 2:
         return np.zeros((0,), dtype=[("r", np.int64), ("c", np.int64)])
     return uv_int.view([("r", np.int64), ("c", np.int64)]).reshape(-1)
+
+
+def _build_lookup_index(uv_int):
+    uv_view = _uv_struct_view(uv_int)
+    if uv_view.shape[0] == 0:
+        return np.zeros((0,), dtype=np.int64), uv_view
+    sort_idx = np.argsort(uv_view, kind="stable")
+    uv_sorted = uv_view[sort_idx]
+    return sort_idx.astype(np.int64, copy=False), uv_sorted
+
+
+def _make_extrap_lookup_arrays(uv, world):
+    uv_int, world32 = _coerce_uv_world(
+        uv,
+        world,
+        uv_dtype=np.int64,
+        world_dtype=np.float32,
+    )
+    if uv_int.shape[0] == 0:
+        empty_view = _uv_struct_view(_empty_uv(dtype=np.int64))
+        return ExtrapLookupArrays(
+            uv=_empty_uv(dtype=np.int64),
+            world=_empty_world(dtype=np.float32),
+            lookup_sort_idx=np.zeros((0,), dtype=np.int64),
+            lookup_uv_sorted=empty_view,
+        )
+    sort_idx, uv_sorted = _build_lookup_index(uv_int)
+    return ExtrapLookupArrays(
+        uv=uv_int,
+        world=world32,
+        lookup_sort_idx=sort_idx,
+        lookup_uv_sorted=uv_sorted,
+    )
 
 
 def _dedupe_uv_first_order_last_value(uv_int, world):
@@ -352,26 +387,21 @@ def _build_extrap_lookup_from_uv_world(uv_query_flat, extrap_world):
     uv_dedup, world_dedup = _dedupe_uv_first_order_last_value(uv_keep, world_keep)
     if uv_dedup.shape[0] == 0:
         return _empty_extrap_lookup_arrays()
-    return ExtrapLookupArrays(
-        uv=uv_dedup,
-        world=world_dedup,
-    )
+    return _make_extrap_lookup_arrays(uv_dedup, world_dedup)
 
 
 def _build_extrap_lookup_arrays(edge_extrapolation):
     query_uv_grid = np.asarray(edge_extrapolation.get("query_uv_grid", np.zeros((0, 0, 2), dtype=np.int64)))
     extrapolated_world = np.asarray(edge_extrapolation.get("extrapolated_world", _empty_world(dtype=np.float32)))
-    if query_uv_grid.ndim == 3 and query_uv_grid.shape[-1] == 2:
-        h, w = query_uv_grid.shape[:2]
-        if h < 1 or w < 1:
-            return _empty_extrap_lookup_arrays()
-        if extrapolated_world.shape[0] != h * w:
-            return _empty_extrap_lookup_arrays()
-        uv_flat = query_uv_grid.reshape(-1, 2).astype(np.int64, copy=False)
-        return _build_extrap_lookup_from_uv_world(uv_flat, extrapolated_world)
-
-    query_uv = np.asarray(edge_extrapolation.get("query_uv", _empty_uv(dtype=np.float64)))
-    return _build_extrap_lookup_from_uv_world(query_uv, extrapolated_world)
+    if query_uv_grid.ndim != 3 or query_uv_grid.shape[-1] != 2:
+        return _empty_extrap_lookup_arrays()
+    h, w = query_uv_grid.shape[:2]
+    if h < 1 or w < 1:
+        return _empty_extrap_lookup_arrays()
+    if extrapolated_world.shape[0] != h * w:
+        return _empty_extrap_lookup_arrays()
+    uv_flat = query_uv_grid.reshape(-1, 2).astype(np.int64, copy=False)
+    return _build_extrap_lookup_from_uv_world(uv_flat, extrapolated_world)
 
 
 def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
@@ -415,10 +445,9 @@ def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
     if lookup_uv.shape[0] == 0:
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
-    lookup_view = _uv_struct_view(lookup_uv)
+    lookup_sorted = lookup.lookup_uv_sorted
+    lookup_sort = lookup.lookup_sort_idx
     query_view = _uv_struct_view(uv_int)
-    lookup_sort = np.argsort(lookup_view, kind="stable")
-    lookup_sorted = lookup_view[lookup_sort]
     pos = np.searchsorted(lookup_sorted, query_view, side="left")
     in_bounds = pos < lookup_sorted.shape[0]
     matched = np.zeros((uv_int.shape[0],), dtype=bool)
@@ -1183,16 +1212,18 @@ def _build_extrap_lookup_from_grid(grid, valid, offset):
     rows_abs = rows.astype(np.int64) + int(offset[0])
     cols_abs = cols.astype(np.int64) + int(offset[1])
     uv = np.stack([rows_abs, cols_abs], axis=-1).astype(np.int64, copy=False)
-    return ExtrapLookupArrays(
-        uv=uv,
-        world=pts,
-    )
+    return _make_extrap_lookup_arrays(uv, pts)
 
 
 def _build_iteration_extrap_lookup(edge_extrapolation, verbose=False, napari=False):
     if verbose or napari:
+        query_uv_grid = np.asarray(edge_extrapolation.get("query_uv_grid", np.zeros((0, 0, 2), dtype=np.int64)))
+        if query_uv_grid.ndim == 3 and query_uv_grid.shape[-1] == 2:
+            query_uv_flat = query_uv_grid.reshape(-1, 2)
+        else:
+            query_uv_flat = _empty_uv(dtype=np.float64)
         query_uv, extrapolated_world = _finite_uv_world(
-            edge_extrapolation.get("query_uv"),
+            query_uv_flat,
             edge_extrapolation.get("extrapolated_world"),
         )
         uv_world_samples = [(query_uv, extrapolated_world)] if query_uv.shape[0] > 0 else []
@@ -1209,7 +1240,6 @@ def _build_iteration_extrap_lookup(edge_extrapolation, verbose=False, napari=Fal
 
     # Keep only lightweight metadata after extrapolation lookup construction.
     edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
-    edge_extrapolation["query_uv"] = _empty_uv(dtype=np.float64)
     edge_extrapolation["extrapolated_local"] = _empty_world(dtype=np.float32)
     edge_extrapolation["extrapolated_world"] = _empty_world(dtype=np.float32)
     return extrap_lookup
