@@ -739,23 +739,26 @@ def get_window_bounds_from_bboxes(zyxs, valid, bboxes, pad=2):
     c_min, c_max = w, -1
 
     z, y, x = zyxs[..., 0], zyxs[..., 1], zyxs[..., 2]
+    valid_rows, valid_cols = np.where(valid)
+    if valid_rows.size == 0:
+        return 0, h - 1, 0, w - 1
+    valid_z = z[valid_rows, valid_cols]
+    valid_y = y[valid_rows, valid_cols]
+    valid_x = x[valid_rows, valid_cols]
 
     for bbox in bboxes:
         z_min, z_max, y_min, y_max, x_min, x_max = bbox
-        in_bounds = (
-            (z >= z_min) & (z <= z_max) &
-            (y >= y_min) & (y <= y_max) &
-            (x >= x_min) & (x <= x_max) &
-            valid
+        hit_idx = np.flatnonzero(
+            (valid_z >= z_min) & (valid_z <= z_max) &
+            (valid_y >= y_min) & (valid_y <= y_max) &
+            (valid_x >= x_min) & (valid_x <= x_max)
         )
-        if not in_bounds.any():
+        if hit_idx.size == 0:
             continue
-        valid_rows = np.any(in_bounds, axis=1)
-        valid_cols = np.any(in_bounds, axis=0)
-        if not valid_rows.any() or not valid_cols.any():
-            continue
-        r0, r1 = np.where(valid_rows)[0][[0, -1]]
-        c0, c1 = np.where(valid_cols)[0][[0, -1]]
+        rows_hit = valid_rows[hit_idx]
+        cols_hit = valid_cols[hit_idx]
+        r0, r1 = rows_hit.min(), rows_hit.max()
+        c0, c1 = cols_hit.min(), cols_hit.max()
         r_min = min(r_min, r0)
         r_max = max(r_max, r1)
         c_min = min(c_min, c0)
