@@ -39,7 +39,11 @@ def _resolve_extrapolation_settings(args, runtime_config):
 
     method_kwargs = {}
     if method in {"rbf", "rbf_edge_only"}:
-        rbf_downsample_override = getattr(args, "rbf_downsample_factor", None)
+        rbf_scale = getattr(args, "rbf_scale", None)
+        preset = str(rbf_scale).strip().lower() if rbf_scale is not None else None
+        rbf_downsample_override = (
+            None if preset == "stored" else getattr(args, "rbf_downsample_factor", None)
+        )
         rbf_max_points_override = getattr(args, "rbf_max_points", None)
         rbf_downsample = int(
             rbf_downsample_override
@@ -48,7 +52,11 @@ def _resolve_extrapolation_settings(args, runtime_config):
         )
         edge_downsample_cfg = cfg.get("rbf_edge_downsample_factor", None)
         edge_downsample = rbf_downsample if edge_downsample_cfg is None else int(edge_downsample_cfg)
-        method_kwargs["downsample_factor"] = edge_downsample if method == "rbf_edge_only" else rbf_downsample
+        method_kwargs["downsample_factor"] = (
+            1
+            if preset == "stored"
+            else (edge_downsample if method == "rbf_edge_only" else rbf_downsample)
+        )
         method_kwargs["rbf_max_points"] = (
             int(rbf_max_points_override)
             if rbf_max_points_override is not None
@@ -70,15 +78,12 @@ def _resolve_extrapolation_settings(args, runtime_config):
             int(phase_rc_cfg[0]),
             int(phase_rc_cfg[1]),
         )
-        rbf_scale = getattr(args, "rbf_scale", None)
-        if rbf_scale is not None:
-            preset = str(rbf_scale).strip().lower()
+        if preset is not None:
             if preset == "stored":
                 # Stored-scale preset: run RBF in stored UV lattice and avoid
                 # additional control-point downsampling on top of lattice scaling.
                 method_kwargs["rbf_uv_domain"] = "stored_lattice"
                 method_kwargs["precision"] = "float32"
-                method_kwargs["downsample_factor"] = 1
             elif preset == "full":
                 method_kwargs["rbf_uv_domain"] = "full"
                 method_kwargs["precision"] = "float64"

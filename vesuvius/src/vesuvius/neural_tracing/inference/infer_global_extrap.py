@@ -89,12 +89,13 @@ def parse_args(argv=None):
     parser.add_argument(
         "--rbf-scale",
         type=str,
-        default=None,
+        default="stored",
         choices=("full", "stored"),
         help=(
             "RBF solve-space preset. "
             "'full' forces full-UV + float64 baseline behavior; "
-            "'stored' uses stored-lattice UV + float32 and disables extra RBF downsampling."
+            "'stored' uses stored-lattice UV + float32 and disables extra RBF downsampling "
+            "(default)."
         ),
     )
     parser.add_argument(
@@ -1429,46 +1430,252 @@ def _surface_to_stored_uv_samples_lattice(
 ):
     """Project full-resolution UV samples onto a fixed stored-resolution lattice.
 
-    Uses floor-division against a deterministic phase/stride lattice so iterative
-    growth does not shift between neighboring stored UV cells as boundaries move.
+    For each occupied stored UV cell, sample the full-resolution surface at the
+    corresponding lattice anchor using mask-aware bilinear interpolation via
+    torch.grid_sample.
     """
-    rows, cols, pts = _finite_valid_grid_points(grid, valid)
+    grid = np.asarray(grid, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
     sub_r = max(1, int(sub_r))
     sub_c = max(1, int(sub_c))
     phase_r = int(phase_rc[0])
     phase_c = int(phase_rc[1])
 
-    if rows.size == 0:
+    if grid.ndim != 3 or grid.shape[-1] != 3:
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
-            "mode": "lattice_floor",
+            "mode": "lattice_bilinear_torch",
             "stride_rc": [sub_r, sub_c],
             "phase_rc": [phase_r, phase_c],
             "n_full_valid": 0,
             "n_stored_valid": 0,
         },)
 
-    r_abs = rows.astype(np.int64, copy=False) + int(uv_offset[0])
-    c_abs = cols.astype(np.int64, copy=False) + int(uv_offset[1])
+    h, w = grid.shape[:2]
+    support = valid & np.isfinite(grid).all(axis=2)
+    n_full_valid = int(support.sum())
+    if n_full_valid < 1:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": 0,
+            "n_stored_valid": 0,
+        },)
 
-    stored_r = np.floor_divide(r_abs - phase_r, sub_r).astype(np.int64, copy=False)
-    stored_c = np.floor_divide(c_abs - phase_c, sub_c).astype(np.int64, copy=False)
+    # Deterministic stored-lattice sampling: query full grid at every lattice
+    # anchor that falls within the current full-resolution window bounds.
+    r_abs0 = int(uv_offset[0])
+    c_abs0 = int(uv_offset[1])
+    r_abs1 = r_abs0 + h - 1
+    c_abs1 = c_abs0 + w - 1
+    s_r_min = int(np.ceil((r_abs0 - phase_r) / float(sub_r)))
+    s_r_max = int(np.floor((r_abs1 - phase_r) / float(sub_r)))
+    s_c_min = int(np.ceil((c_abs0 - phase_c) / float(sub_c)))
+    s_c_max = int(np.floor((c_abs1 - phase_c) / float(sub_c)))
+    if s_r_max < s_r_min or s_c_max < s_c_min:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": n_full_valid,
+            "n_stored_valid": 0,
+        },)
+    stored_rows = np.arange(s_r_min, s_r_max + 1, dtype=np.int64)
+    stored_cols = np.arange(s_c_min, s_c_max + 1, dtype=np.int64)
+    sr, sc = np.meshgrid(stored_rows, stored_cols, indexing="ij")
+    uv_q = np.stack([sr.reshape(-1), sc.reshape(-1)], axis=-1).astype(np.int64, copy=False)
 
-    uv = np.stack([stored_r, stored_c], axis=-1)
-    uniq_uv, inv = np.unique(uv, axis=0, return_inverse=True)
-    pts_sum = np.zeros((uniq_uv.shape[0], 3), dtype=np.float64)
-    pts_count = np.zeros((uniq_uv.shape[0],), dtype=np.int64)
-    np.add.at(pts_sum, inv, pts.astype(np.float64, copy=False))
-    np.add.at(pts_count, inv, 1)
-    pts_mean = (pts_sum / np.maximum(pts_count[:, None], 1)).astype(np.float32, copy=False)
+    # Lattice anchors in absolute full-resolution UV coordinates.
+    q_r_abs = uv_q[:, 0].astype(np.float64, copy=False) * float(sub_r) + float(phase_r)
+    q_c_abs = uv_q[:, 1].astype(np.float64, copy=False) * float(sub_c) + float(phase_c)
+    q_r = q_r_abs - float(int(uv_offset[0]))
+    q_c = q_c_abs - float(int(uv_offset[1]))
+
+    in_grid = (
+        (q_r >= 0.0) &
+        (q_r <= float(max(h - 1, 0))) &
+        (q_c >= 0.0) &
+        (q_c <= float(max(w - 1, 0)))
+    )
+    if not bool(in_grid.any()):
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": n_full_valid,
+            "n_stored_valid": 0,
+        },)
+
+    uv_q = uv_q[in_grid].astype(np.int64, copy=False)
+    q_r = q_r[in_grid].astype(np.float32, copy=False)
+    q_c = q_c[in_grid].astype(np.float32, copy=False)
+
+    denom_r = float(max(h - 1, 1))
+    denom_c = float(max(w - 1, 1))
+    y_norm = (2.0 * q_r / denom_r) - 1.0
+    x_norm = (2.0 * q_c / denom_c) - 1.0
+    query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
+
+    value_np = np.where(support[..., None], grid, 0.0).astype(np.float32, copy=False)
+    value_t = torch.from_numpy(value_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
+    mask_t = torch.from_numpy(support.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).contiguous()
+    query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
+
+    with torch.no_grad():
+        sampled_num_t = F.grid_sample(
+            value_t,
+            query_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        sampled_den_t = F.grid_sample(
+            mask_t,
+            query_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+
+    sampled_num = (
+        sampled_num_t[0, :, :, 0]
+        .permute(1, 0)
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+    sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
+    can_sample = sampled_den > 1e-6
+    if not bool(can_sample.any()):
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": n_full_valid,
+            "n_stored_valid": 0,
+        },)
+
+    uv_keep = uv_q[can_sample].astype(np.int64, copy=False)
+    pts_bilinear = (
+        sampled_num[can_sample] / sampled_den[can_sample, None]
+    ).astype(np.float32, copy=False)
 
     projection_meta = {
-        "mode": "lattice_floor",
+        "mode": "lattice_bilinear_torch",
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
-        "n_full_valid": int(rows.size),
-        "n_stored_valid": int(uniq_uv.shape[0]),
+        "n_full_valid": n_full_valid,
+        "n_stored_valid": int(uv_keep.shape[0]),
     }
-    return uniq_uv.astype(np.int64, copy=False), pts_mean, projection_meta
+    return uv_keep, pts_bilinear, projection_meta
+
+
+def _infer_lattice_phase_rc(
+    stored_zyxs,
+    stored_valid,
+    full_zyxs,
+    full_valid,
+    full_uv_offset,
+    sub_r,
+    sub_c,
+    max_compare_points=50000,
+):
+    stored_zyxs = np.asarray(stored_zyxs, dtype=np.float32)
+    stored_valid = np.asarray(stored_valid, dtype=bool)
+    full_zyxs = np.asarray(full_zyxs, dtype=np.float32)
+    full_valid = np.asarray(full_valid, dtype=bool)
+    sub_r = max(1, int(sub_r))
+    sub_c = max(1, int(sub_c))
+    r0 = int(full_uv_offset[0])
+    c0 = int(full_uv_offset[1])
+
+    if sub_r == 1 and sub_c == 1:
+        return (0, 0), {"mode": "inferred", "pairs": 0, "median_err": 0.0}
+    if (
+        stored_zyxs.ndim != 3
+        or stored_zyxs.shape[-1] != 3
+        or stored_valid.shape != stored_zyxs.shape[:2]
+        or full_zyxs.ndim != 3
+        or full_zyxs.shape[-1] != 3
+        or full_valid.shape != full_zyxs.shape[:2]
+    ):
+        return (0, 0), {"mode": "fallback_invalid_input", "pairs": 0, "median_err": None}
+
+    hs, ws = stored_valid.shape
+    hf, wf = full_valid.shape
+    if hs < 1 or ws < 1 or hf < 1 or wf < 1:
+        return (0, 0), {"mode": "fallback_empty", "pairs": 0, "median_err": None}
+
+    stored_support = stored_valid & np.isfinite(stored_zyxs).all(axis=2)
+    full_support = full_valid & np.isfinite(full_zyxs).all(axis=2)
+    if not stored_support.any() or not full_support.any():
+        return (0, 0), {"mode": "fallback_no_support", "pairs": 0, "median_err": None}
+
+    row_abs = np.arange(r0, r0 + hf, dtype=np.int64)
+    col_abs = np.arange(c0, c0 + wf, dtype=np.int64)
+
+    best_phase = (0, 0)
+    best_pairs = -1
+    best_median = np.inf
+
+    for phase_r in range(sub_r):
+        row_local = np.where(((row_abs - phase_r) % sub_r) == 0)[0]
+        if row_local.size == 0:
+            continue
+        row_stored = np.floor_divide(row_abs[row_local] - phase_r, sub_r).astype(np.int64, copy=False)
+        row_in = (row_stored >= 0) & (row_stored < hs)
+        if not row_in.any():
+            continue
+        row_local = row_local[row_in]
+        row_stored = row_stored[row_in]
+
+        for phase_c in range(sub_c):
+            col_local = np.where(((col_abs - phase_c) % sub_c) == 0)[0]
+            if col_local.size == 0:
+                continue
+            col_stored = np.floor_divide(col_abs[col_local] - phase_c, sub_c).astype(np.int64, copy=False)
+            col_in = (col_stored >= 0) & (col_stored < ws)
+            if not col_in.any():
+                continue
+            col_local = col_local[col_in]
+            col_stored = col_stored[col_in]
+
+            rr_local, cc_local = np.meshgrid(row_local, col_local, indexing="ij")
+            rr_stored, cc_stored = np.meshgrid(row_stored, col_stored, indexing="ij")
+            rr_local = rr_local.reshape(-1)
+            cc_local = cc_local.reshape(-1)
+            rr_stored = rr_stored.reshape(-1)
+            cc_stored = cc_stored.reshape(-1)
+            if rr_local.size == 0:
+                continue
+
+            pair_mask = full_support[rr_local, cc_local] & stored_support[rr_stored, cc_stored]
+            n_pairs = int(pair_mask.sum())
+            if n_pairs < 1:
+                continue
+
+            sel = np.nonzero(pair_mask)[0]
+            if sel.size > int(max_compare_points):
+                sel = sel[: int(max_compare_points)]
+
+            full_pts = full_zyxs[rr_local[sel], cc_local[sel]].astype(np.float32, copy=False)
+            stored_pts = stored_zyxs[rr_stored[sel], cc_stored[sel]].astype(np.float32, copy=False)
+            errs = np.linalg.norm((full_pts - stored_pts).astype(np.float32, copy=False), axis=1)
+            median_err = float(np.median(errs)) if errs.size > 0 else float("inf")
+
+            if (n_pairs > best_pairs) or (n_pairs == best_pairs and median_err < best_median):
+                best_pairs = n_pairs
+                best_median = median_err
+                best_phase = (int(phase_r), int(phase_c))
+
+    if best_pairs < 1:
+        return (0, 0), {"mode": "fallback_no_pairs", "pairs": 0, "median_err": None}
+    return best_phase, {
+        "mode": "inferred",
+        "pairs": int(best_pairs),
+        "median_err": float(best_median),
+    }
+
 
 def _stored_uv_step_spacing_stats(uv, pts):
     uv = np.asarray(uv, dtype=np.int64)
@@ -1506,6 +1713,345 @@ def _stored_uv_step_spacing_stats(uv, pts):
         "mean": float(arr.mean()),
         "p90": float(np.percentile(arr, 90.0)),
     }
+
+
+def _filter_stored_merge_samples_to_new_cells(uv, pts, base_valid):
+    uv = np.asarray(uv, dtype=np.int64)
+    pts = np.asarray(pts, dtype=np.float32)
+    base_valid = np.asarray(base_valid, dtype=bool)
+    if uv.ndim != 2 or uv.shape[1] != 2 or pts.ndim != 2 or pts.shape[1] != 3:
+        return _empty_uv(dtype=np.int64), _empty_world(dtype=np.float32), {
+            "input_points": 0,
+            "kept_points": 0,
+            "dropped_existing_valid": 0,
+            "kept_outside_base": 0,
+            "kept_inside_invalid": 0,
+        }
+
+    n = min(int(uv.shape[0]), int(pts.shape[0]))
+    if n < 1:
+        return _empty_uv(dtype=np.int64), _empty_world(dtype=np.float32), {
+            "input_points": 0,
+            "kept_points": 0,
+            "dropped_existing_valid": 0,
+            "kept_outside_base": 0,
+            "kept_inside_invalid": 0,
+        }
+
+    uv_n = uv[:n].astype(np.int64, copy=False)
+    pts_n = pts[:n].astype(np.float32, copy=False)
+    h, w = base_valid.shape
+    inside = (
+        (uv_n[:, 0] >= 0) &
+        (uv_n[:, 0] < h) &
+        (uv_n[:, 1] >= 0) &
+        (uv_n[:, 1] < w)
+    )
+    keep = ~inside
+    if inside.any():
+        rr = uv_n[inside, 0]
+        cc = uv_n[inside, 1]
+        inside_keep = ~base_valid[rr, cc]
+        keep[inside] = inside_keep
+
+    kept_uv = uv_n[keep].astype(np.int64, copy=False)
+    kept_pts = pts_n[keep].astype(np.float32, copy=False)
+    kept_inside = int((inside & keep).sum())
+    kept_outside = int((~inside & keep).sum())
+    dropped_existing = int((inside & ~keep).sum())
+    meta = {
+        "input_points": int(n),
+        "kept_points": int(kept_uv.shape[0]),
+        "dropped_existing_valid": dropped_existing,
+        "kept_outside_base": kept_outside,
+        "kept_inside_invalid": kept_inside,
+    }
+    return kept_uv, kept_pts, meta
+
+
+def _compose_full_projection_source_original_wins(
+    current_zyxs,
+    current_valid,
+    current_uv_offset,
+    stored_zyxs,
+    stored_valid,
+    sub_r,
+    sub_c,
+    phase_rc=(0, 0),
+):
+    src_zyxs = np.asarray(current_zyxs, dtype=np.float32).copy()
+    src_valid = np.asarray(current_valid, dtype=bool).copy()
+    stored_zyxs = np.asarray(stored_zyxs, dtype=np.float32)
+    stored_valid = np.asarray(stored_valid, dtype=bool)
+    sub_r = max(1, int(sub_r))
+    sub_c = max(1, int(sub_c))
+    phase_r = int(phase_rc[0])
+    phase_c = int(phase_rc[1])
+
+    if (
+        src_zyxs.ndim != 3
+        or src_zyxs.shape[-1] != 3
+        or src_valid.shape != src_zyxs.shape[:2]
+        or stored_zyxs.ndim != 3
+        or stored_zyxs.shape[-1] != 3
+        or stored_valid.shape != stored_zyxs.shape[:2]
+    ):
+        return src_zyxs, src_valid, {"anchors_written": 0, "anchors_candidates": 0}
+
+    h, w = src_valid.shape
+    r0 = int(current_uv_offset[0])
+    c0 = int(current_uv_offset[1])
+
+    stored_support = stored_valid & np.isfinite(stored_zyxs).all(axis=2)
+    rr_s, cc_s = np.where(stored_support)
+    if rr_s.size == 0:
+        return src_zyxs, src_valid, {"anchors_written": 0, "anchors_candidates": 0}
+
+    rr_abs = rr_s.astype(np.int64, copy=False) * int(sub_r) + int(phase_r)
+    cc_abs = cc_s.astype(np.int64, copy=False) * int(sub_c) + int(phase_c)
+    rr_local = rr_abs - int(r0)
+    cc_local = cc_abs - int(c0)
+    inside = (
+        (rr_local >= 0)
+        & (rr_local < h)
+        & (cc_local >= 0)
+        & (cc_local < w)
+    )
+    if not inside.any():
+        return src_zyxs, src_valid, {"anchors_written": 0, "anchors_candidates": int(rr_s.size)}
+
+    rr_local = rr_local[inside].astype(np.int64, copy=False)
+    cc_local = cc_local[inside].astype(np.int64, copy=False)
+    rr_s = rr_s[inside].astype(np.int64, copy=False)
+    cc_s = cc_s[inside].astype(np.int64, copy=False)
+
+    src_zyxs[rr_local, cc_local] = stored_zyxs[rr_s, cc_s].astype(np.float32, copy=False)
+    src_valid[rr_local, cc_local] = True
+    return src_zyxs, src_valid, {
+        "anchors_written": int(rr_local.shape[0]),
+        "anchors_candidates": int(rr_abs.shape[0]),
+    }
+
+
+def _normalize_world_step_in_new_band_along_growth(
+    uv,
+    pts,
+    base_zyxs,
+    base_valid,
+    grow_direction,
+    ref_pairs=4,
+):
+    uv = np.asarray(uv, dtype=np.int64)
+    pts = np.asarray(pts, dtype=np.float32)
+    base_zyxs = np.asarray(base_zyxs, dtype=np.float32)
+    base_valid = np.asarray(base_valid, dtype=bool)
+    if (
+        uv.ndim != 2
+        or uv.shape[1] != 2
+        or pts.ndim != 2
+        or pts.shape[1] != 3
+        or uv.shape[0] != pts.shape[0]
+        or base_zyxs.ndim != 3
+        or base_zyxs.shape[-1] != 3
+        or base_valid.shape != base_zyxs.shape[:2]
+        or uv.shape[0] == 0
+    ):
+        return pts.astype(np.float32, copy=False), {
+            "applied": False,
+            "reason": "invalid_input",
+            "adjusted_points": 0,
+            "adjusted_lines": 0,
+        }
+
+    _, growth_spec = _get_growth_context(grow_direction)
+    if growth_spec["axis"] == "col":
+        line_axis = 0
+        grow_axis = 1
+    else:
+        line_axis = 1
+        grow_axis = 0
+    growth_sign = int(growth_spec["growth_sign"])
+    inward_sign = -growth_sign
+
+    finite_base = base_valid & np.isfinite(base_zyxs).all(axis=2)
+    if grow_axis == 1:
+        pair_mask = finite_base[:, :-1] & finite_base[:, 1:]
+        if pair_mask.any():
+            global_d = np.linalg.norm(
+                (base_zyxs[:, 1:, :] - base_zyxs[:, :-1, :]).astype(np.float32, copy=False),
+                axis=2,
+            )[pair_mask]
+        else:
+            global_d = np.zeros((0,), dtype=np.float32)
+    else:
+        pair_mask = finite_base[:-1, :] & finite_base[1:, :]
+        if pair_mask.any():
+            global_d = np.linalg.norm(
+                (base_zyxs[1:, :, :] - base_zyxs[:-1, :, :]).astype(np.float32, copy=False),
+                axis=2,
+            )[pair_mask]
+        else:
+            global_d = np.zeros((0,), dtype=np.float32)
+    global_ref = float(np.median(global_d)) if global_d.size > 0 else None
+
+    uv_key_dtype = _flat_index_dtype_for_shape(
+        max(int(np.max(uv[:, 0])) + 1, 1),
+        max(int(np.max(uv[:, 1])) + 1, 1),
+        prefer_int32=False,
+    )
+    rr = uv[:, 0].astype(uv_key_dtype, copy=False)
+    cc = uv[:, 1].astype(uv_key_dtype, copy=False)
+    stride = np.asarray(int(np.max(cc) + 2), dtype=uv_key_dtype)
+    keys = rr * stride + cc
+    key_to_idx = {int(k): int(i) for i, k in enumerate(keys.tolist())}
+
+    pts_orig = pts.astype(np.float32, copy=False)
+    pts_adj = pts_orig.copy()
+
+    hs, ws = base_valid.shape
+    adjusted_points = 0
+    adjusted_lines = 0
+    line_ids = np.unique(uv[:, line_axis])
+    eps = 1e-6
+
+    for line_id in line_ids.tolist():
+        line_id = int(line_id)
+        if grow_axis == 1:
+            if line_id < 0 or line_id >= hs:
+                continue
+            old_g = np.where(finite_base[line_id, :])[0].astype(np.int64, copy=False)
+        else:
+            if line_id < 0 or line_id >= ws:
+                continue
+            old_g = np.where(finite_base[:, line_id])[0].astype(np.int64, copy=False)
+        if old_g.size < 2:
+            continue
+
+        seam_g = int(old_g.max()) if growth_sign > 0 else int(old_g.min())
+        if grow_axis == 1:
+            seam_pt = base_zyxs[line_id, seam_g].astype(np.float32, copy=False)
+        else:
+            seam_pt = base_zyxs[seam_g, line_id].astype(np.float32, copy=False)
+        if not np.isfinite(seam_pt).all():
+            continue
+
+        d_local = []
+        for k in range(int(max(1, ref_pairs))):
+            b = seam_g + inward_sign * k
+            a = b + inward_sign
+            if grow_axis == 1:
+                if a < 0 or b < 0 or a >= ws or b >= ws:
+                    continue
+                if (not finite_base[line_id, a]) or (not finite_base[line_id, b]):
+                    continue
+                pa = base_zyxs[line_id, a].astype(np.float32, copy=False)
+                pb = base_zyxs[line_id, b].astype(np.float32, copy=False)
+            else:
+                if a < 0 or b < 0 or a >= hs or b >= hs:
+                    continue
+                if (not finite_base[a, line_id]) or (not finite_base[b, line_id]):
+                    continue
+                pa = base_zyxs[a, line_id].astype(np.float32, copy=False)
+                pb = base_zyxs[b, line_id].astype(np.float32, copy=False)
+            d_local.append(float(np.linalg.norm((pb - pa).astype(np.float32, copy=False))))
+
+        if len(d_local) > 0:
+            d_ref = float(np.median(np.asarray(d_local, dtype=np.float32)))
+        else:
+            d_ref = global_ref
+        if d_ref is None or (not np.isfinite(d_ref)) or d_ref <= eps:
+            continue
+
+        line_mask = uv[:, line_axis] == line_id
+        if not bool(line_mask.any()):
+            continue
+        line_idx = np.nonzero(line_mask)[0]
+        grow_vals = uv[line_idx, grow_axis].astype(np.int64, copy=False)
+        if growth_sign > 0:
+            new_mask = grow_vals > seam_g
+            order = np.argsort(grow_vals, kind="mergesort")
+        else:
+            new_mask = grow_vals < seam_g
+            order = np.argsort(-grow_vals, kind="mergesort")
+        if not bool(new_mask.any()):
+            continue
+        new_idx = line_idx[new_mask]
+        new_g = uv[new_idx, grow_axis].astype(np.int64, copy=False)
+        if growth_sign > 0:
+            sort_ord = np.argsort(new_g, kind="mergesort")
+        else:
+            sort_ord = np.argsort(-new_g, kind="mergesort")
+        new_idx = new_idx[sort_ord]
+        new_g = uv[new_idx, grow_axis].astype(np.int64, copy=False)
+
+        # Seam tangent (inward -> seam) as fallback direction.
+        g_inward = seam_g + inward_sign
+        seam_dir = None
+        if grow_axis == 1:
+            if 0 <= g_inward < ws and finite_base[line_id, g_inward]:
+                p_in = base_zyxs[line_id, g_inward].astype(np.float32, copy=False)
+                v = seam_pt - p_in
+                nv = float(np.linalg.norm(v))
+                if nv > eps:
+                    seam_dir = (v / nv).astype(np.float32, copy=False)
+        else:
+            if 0 <= g_inward < hs and finite_base[g_inward, line_id]:
+                p_in = base_zyxs[g_inward, line_id].astype(np.float32, copy=False)
+                v = seam_pt - p_in
+                nv = float(np.linalg.norm(v))
+                if nv > eps:
+                    seam_dir = (v / nv).astype(np.float32, copy=False)
+        if seam_dir is None:
+            seam_dir = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+
+        prev_g = int(seam_g)
+        prev_adj = seam_pt.astype(np.float32, copy=False)
+        last_dir = seam_dir.astype(np.float32, copy=False)
+        adjusted_this_line = 0
+
+        for idx, g_val in zip(new_idx.tolist(), new_g.tolist()):
+            idx = int(idx)
+            g_val = int(g_val)
+            if grow_axis == 1:
+                key_prev = int(np.asarray(line_id, dtype=uv_key_dtype) * stride + np.asarray(prev_g, dtype=uv_key_dtype))
+            else:
+                key_prev = int(np.asarray(prev_g, dtype=uv_key_dtype) * stride + np.asarray(line_id, dtype=uv_key_dtype))
+            idx_prev = key_to_idx.get(key_prev, None)
+            orig_prev = seam_pt if idx_prev is None else pts_orig[idx_prev].astype(np.float32, copy=False)
+            orig_cur = pts_orig[idx].astype(np.float32, copy=False)
+            vec = (orig_cur - orig_prev).astype(np.float32, copy=False)
+            nvec = float(np.linalg.norm(vec))
+            if nvec > eps:
+                dir_unit = (vec / nvec).astype(np.float32, copy=False)
+            else:
+                dir_unit = last_dir
+
+            step_count = abs(int(g_val - prev_g))
+            if step_count < 1:
+                continue
+            target_len = float(d_ref) * float(step_count)
+            adj_cur = (prev_adj + dir_unit * target_len).astype(np.float32, copy=False)
+            pts_adj[idx] = adj_cur
+
+            prev_adj = adj_cur
+            prev_g = g_val
+            last_dir = dir_unit
+            adjusted_points += 1
+            adjusted_this_line += 1
+
+        if adjusted_this_line > 0:
+            adjusted_lines += 1
+
+    return pts_adj.astype(np.float32, copy=False), {
+        "applied": True,
+        "reason": "ok",
+        "adjusted_points": int(adjusted_points),
+        "adjusted_lines": int(adjusted_lines),
+        "global_ref_step": None if global_ref is None else float(global_ref),
+        "growth_axis": "col" if grow_axis == 1 else "row",
+        "growth_sign": int(growth_sign),
+    }
+
 
 def _build_iteration_extrap_lookup(edge_extrapolation):
     return _build_extrap_lookup_arrays(edge_extrapolation)
@@ -1669,6 +2215,7 @@ def _run_growth_direction_step(
     cond_zyxs,
     cond_valid,
     cond_uv_offset,
+    lattice_phase_rc,
     stop_is_skip=False,
 ):
     uv_cond = _build_uv_grid(cond_uv_offset, cond_zyxs.shape[:2])
@@ -1739,7 +2286,7 @@ def _run_growth_direction_step(
             skip_bounds_check=True,
             profiler=profiler,
             rbf_lattice_stride_rc=rbf_lattice_stride_rc,
-            rbf_lattice_phase_rc=(0, 0),
+            rbf_lattice_phase_rc=lattice_phase_rc,
             **extrapolation_settings["method_kwargs"],
         )
     if edge_extrapolation is None:
@@ -1960,6 +2507,26 @@ def _run_with_args(args, parse_done):
         current_zyxs, current_valid, current_uv_offset = _initialize_window_state(
             tgt_segment, full_bounds,
         )
+    scale_y, scale_x = tgt_segment._scale
+    sub_r = _scale_to_subsample_stride(scale_y)
+    sub_c = _scale_to_subsample_stride(scale_x)
+    lattice_phase_rc, lattice_phase_meta = _infer_lattice_phase_rc(
+        stored_zyxs,
+        valid_s,
+        current_zyxs,
+        current_valid,
+        current_uv_offset,
+        sub_r,
+        sub_c,
+    )
+    if args.verbose:
+        print(
+            "Inferred stored lattice phase: "
+            f"phase_rc={lattice_phase_rc} stride_rc=({sub_r}, {sub_c}) "
+            f"mode={lattice_phase_meta.get('mode')} "
+            f"pairs={int(lattice_phase_meta.get('pairs', 0))} "
+            f"median_err={lattice_phase_meta.get('median_err')}"
+        )
 
     bbox_results = []
     edge_extrapolation = _empty_edge_extrapolation()
@@ -2005,6 +2572,7 @@ def _run_with_args(args, parse_done):
                         cond_zyxs=current_zyxs,
                         cond_valid=current_valid,
                         cond_uv_offset=current_uv_offset,
+                        lattice_phase_rc=lattice_phase_rc,
                         stop_is_skip=multi_direction_mode,
                     )
 
@@ -2041,19 +2609,56 @@ def _run_with_args(args, parse_done):
     # Merge the grown surface back onto the stored-resolution base surface
     # (already in memory from setup_segment) to avoid materializing full resolution.
     with profiler.section("final_merge_stored_surface"):
-        scale_y, scale_x = tgt_segment._scale
-
-        sub_r = _scale_to_subsample_stride(scale_y)
-        sub_c = _scale_to_subsample_stride(scale_x)
-
-        grown_uv, grown_pts, stored_projection = _surface_to_stored_uv_samples_lattice(
+        projection_src_zyxs, projection_src_valid, projection_src_meta = _compose_full_projection_source_original_wins(
             current_zyxs,
             current_valid,
             current_uv_offset,
+            stored_zyxs,
+            valid_s,
             sub_r,
             sub_c,
-            phase_rc=(0, 0),
+            phase_rc=lattice_phase_rc,
         )
+        if args.verbose:
+            print(
+                "Final projection source composition: "
+                f"anchors_written={projection_src_meta['anchors_written']} "
+                f"anchors_candidates={projection_src_meta['anchors_candidates']}"
+            )
+
+        grown_uv, grown_pts, stored_projection = _surface_to_stored_uv_samples_lattice(
+            projection_src_zyxs,
+            projection_src_valid,
+            current_uv_offset,
+            sub_r,
+            sub_c,
+            phase_rc=lattice_phase_rc,
+        )
+        if args.grow_direction != "all":
+            grown_pts, grow_spacing_meta = _normalize_world_step_in_new_band_along_growth(
+                grown_uv,
+                grown_pts,
+                stored_zyxs,
+                valid_s,
+                args.grow_direction,
+                ref_pairs=4,
+            )
+        else:
+            grow_spacing_meta = {
+                "applied": False,
+                "reason": "grow_direction_all",
+                "adjusted_points": 0,
+                "adjusted_lines": 0,
+            }
+        if args.verbose:
+            print(
+                "Grow-axis spacing normalization: "
+                f"applied={grow_spacing_meta.get('applied')} "
+                f"reason={grow_spacing_meta.get('reason')} "
+                f"adjusted_points={int(grow_spacing_meta.get('adjusted_points', 0))} "
+                f"adjusted_lines={int(grow_spacing_meta.get('adjusted_lines', 0))} "
+                f"global_ref_step={grow_spacing_meta.get('global_ref_step')}"
+            )
         if args.verbose:
             spacing_stats = _stored_uv_step_spacing_stats(grown_uv, grown_pts)
             if spacing_stats is None:
@@ -2067,12 +2672,35 @@ def _run_with_args(args, parse_done):
                     f"p90={spacing_stats['p90']:.4f}"
                 )
 
+        merge_uv, merge_pts, merge_filter_meta = _filter_stored_merge_samples_to_new_cells(
+            grown_uv,
+            grown_pts,
+            valid_s,
+        )
+        if args.verbose:
+            print(
+                "Stored merge filtering: "
+                f"in={merge_filter_meta['input_points']} "
+                f"kept={merge_filter_meta['kept_points']} "
+                f"dropped_existing_valid={merge_filter_meta['dropped_existing_valid']} "
+                f"kept_outside_base={merge_filter_meta['kept_outside_base']} "
+                f"kept_inside_invalid={merge_filter_meta['kept_inside_invalid']}"
+            )
+
         merged = _merge_displaced_points_into_full_surface(
             stored_zyxs, valid_s, (0, 0),
-            {"uv": grown_uv, "world_displaced": grown_pts},
+            {"uv": merge_uv, "world_displaced": merge_pts},
             verbose=args.verbose,
         )
         merged["stored_projection"] = stored_projection
+        merged["stored_merge_filter"] = merge_filter_meta
+        merged["stored_lattice_phase"] = {
+            "phase_rc": [int(lattice_phase_rc[0]), int(lattice_phase_rc[1])],
+            "stride_rc": [int(sub_r), int(sub_c)],
+            "inference": lattice_phase_meta,
+            "projection_source": projection_src_meta,
+        }
+        merged["grow_axis_spacing_normalization"] = grow_spacing_meta
 
     with profiler.section("save_tifxyz"):
         output_path = _save_merged_surface_tifxyz(
