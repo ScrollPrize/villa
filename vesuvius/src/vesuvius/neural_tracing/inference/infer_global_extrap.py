@@ -424,14 +424,14 @@ def _coerce_uv_world(uv, world, uv_dtype=np.int64, world_dtype=np.float32):
 
 def _finite_uv_world(uv, world):
     if uv is None or world is None:
-        return _empty_uv_world(uv_dtype=np.float64, world_dtype=np.float32)
-    uv, world = _coerce_uv_world(uv, world, uv_dtype=np.float64, world_dtype=np.float32)
+        return _empty_uv_world(uv_dtype=np.float32, world_dtype=np.float32)
+    uv, world = _coerce_uv_world(uv, world, uv_dtype=np.float32, world_dtype=np.float32)
     if uv.shape[0] == 0:
-        return _empty_uv_world(uv_dtype=np.float64, world_dtype=np.float32)
+        return _empty_uv_world(uv_dtype=np.float32, world_dtype=np.float32)
     keep = np.isfinite(world).all(axis=1)
     if not keep.any():
-        return _empty_uv_world(uv_dtype=np.float64, world_dtype=np.float32)
-    return uv[keep].astype(np.float64, copy=False), world[keep].astype(np.float32, copy=False)
+        return _empty_uv_world(uv_dtype=np.float32, world_dtype=np.float32)
+    return uv[keep].astype(np.float32, copy=False), world[keep].astype(np.float32, copy=False)
 
 
 def _empty_edge_extrapolation():
@@ -1486,10 +1486,10 @@ def _surface_to_stored_uv_samples_lattice(
     uv_q = np.stack([sr.reshape(-1), sc.reshape(-1)], axis=-1).astype(np.int64, copy=False)
 
     # Lattice anchors in absolute full-resolution UV coordinates.
-    q_r_abs = uv_q[:, 0].astype(np.float64, copy=False) * float(sub_r) + float(phase_r)
-    q_c_abs = uv_q[:, 1].astype(np.float64, copy=False) * float(sub_c) + float(phase_c)
-    q_r = q_r_abs - float(int(uv_offset[0]))
-    q_c = q_c_abs - float(int(uv_offset[1]))
+    q_r_abs = uv_q[:, 0].astype(np.int64, copy=False) * int(sub_r) + int(phase_r)
+    q_c_abs = uv_q[:, 1].astype(np.int64, copy=False) * int(sub_c) + int(phase_c)
+    q_r = (q_r_abs - int(uv_offset[0])).astype(np.float32, copy=False)
+    q_c = (q_c_abs - int(uv_offset[1])).astype(np.float32, copy=False)
 
     in_grid = (
         (q_r >= 0.0) &
@@ -2278,7 +2278,7 @@ def _run_growth_direction_step(
             edge_input_rowscols=args.edge_input_rowscols,
             cond_pct=args.cond_pct,
             method=extrapolation_settings["method"],
-            min_corner=np.zeros(3, dtype=np.float64),
+            min_corner=np.zeros(3, dtype=np.float32),
             crop_size=crop_size,
             degrade_prob=extrapolation_settings["degrade_prob"],
             degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],

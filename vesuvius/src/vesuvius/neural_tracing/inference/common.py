@@ -62,7 +62,7 @@ def _resolve_extrapolation_settings(args, runtime_config):
             if rbf_max_points_override is not None
             else cfg.get("rbf_max_points")
         )
-        # MUST RUN IN FLOAT64: RBF extrapolation in this pipeline is unstable at lower precision.
+        # Default to float64 for RBF unless CLI/config explicitly requests float32.
         method_kwargs["precision"] = cfg.get("rbf_precision", "float64")
         rbf_uv_domain = str(cfg.get("rbf_uv_domain", "full")).strip().lower()
         if rbf_uv_domain not in {"full", "stored_lattice"}:
@@ -189,6 +189,73 @@ def _validate_named_method(merge_method, valid_methods, method_label):
     return method
 
 
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+
+
+def _float32_sum_may_overflow(max_abs_value, max_count):
+    if max_count <= 0:
+        return False
+    if not np.isfinite(max_abs_value):
+        return True
+    if max_abs_value <= 0.0:
+        return False
+    return max_abs_value > (_FLOAT32_MAX / float(max_count))
+
+
+def _group_mean_float32_first(indices, values, n_groups):
+    """Compute grouped means with float32 accumulation unless overflow risk is detected."""
+    n_groups = max(0, int(n_groups))
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    vals = np.asarray(values, dtype=np.float32)
+    if vals.ndim != 2:
+        raise ValueError(f"values must be rank-2 [N, C], got shape {vals.shape}")
+    if idx.shape[0] != vals.shape[0]:
+        raise ValueError(
+            f"indices/values length mismatch: {idx.shape[0]} vs {vals.shape[0]}"
+        )
+    if idx.size > 0:
+        if int(idx.min()) < 0:
+            raise ValueError("indices must be non-negative")
+        max_idx = int(idx.max())
+        if max_idx >= n_groups:
+            n_groups = max_idx + 1
+    if n_groups == 0:
+        return np.zeros((0, vals.shape[1]), dtype=np.float32), np.zeros((0,), dtype=np.int64), False
+    counts = np.bincount(idx, minlength=n_groups).astype(np.int64, copy=False)
+    max_count = int(counts.max()) if counts.size > 0 else 0
+    max_abs_value = float(np.max(np.abs(vals))) if vals.size > 0 else 0.0
+    use_float64 = _float32_sum_may_overflow(max_abs_value, max_count)
+
+    if not use_float64:
+        sums32 = np.zeros((n_groups, vals.shape[1]), dtype=np.float32)
+        np.add.at(sums32, idx, vals)
+        if np.isfinite(sums32).all():
+            denom32 = np.maximum(counts[:, None], 1).astype(np.float32, copy=False)
+            means32 = (sums32 / denom32).astype(np.float32, copy=False)
+            return means32, counts, False
+
+    sums64 = np.zeros((n_groups, vals.shape[1]), dtype=np.float64)
+    np.add.at(sums64, idx, vals.astype(np.float64, copy=False))
+    means64 = sums64 / np.maximum(counts[:, None], 1)
+    return means64.astype(np.float32, copy=False), counts, True
+
+
+def _is_float64_precision(precision):
+    if precision is None:
+        return True
+    if precision in (torch.float64, np.float64, np.dtype(np.float64)):
+        return True
+    if precision in (torch.float32, np.float32, np.dtype(np.float32)):
+        return False
+    token = str(precision).strip().lower()
+    if token in {"float64", "fp64", "double", "f64", "torch.float64"}:
+        return True
+    if token in {"float32", "fp32", "single", "f32", "torch.float32"}:
+        return False
+    # Preserve legacy behavior for unknown precision tokens.
+    return True
+
+
 def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overlap_merge_method="mean"):
     """Merge list of (uv, world_pts) into a dense HxWx3 grid in UV space."""
     overlap_merge_method = _validate_named_method(
@@ -231,18 +298,37 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overla
     if not non_empty_samples:
         return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool), (uv_r_min, uv_c_min)
 
-    grid_acc = np.zeros((h, w, 3), dtype=np.float64)
-    grid_count = np.zeros((h, w), dtype=np.int32)
-
+    rows_all = []
+    cols_all = []
+    pts_all = []
     for uv, pts in non_empty_samples:
-        rows = uv[:, 0].astype(np.int64) - uv_r_min
-        cols = uv[:, 1].astype(np.int64) - uv_c_min
-        np.add.at(grid_acc, (rows, cols), pts.astype(np.float64))
-        np.add.at(grid_count, (rows, cols), 1)
+        rows = uv[:, 0].astype(np.int64, copy=False) - uv_r_min
+        cols = uv[:, 1].astype(np.int64, copy=False) - uv_c_min
+        pts32 = pts.astype(np.float32, copy=False)
+        if rows.size == 0 or cols.size == 0 or pts32.size == 0:
+            continue
+        rows_all.append(rows)
+        cols_all.append(cols)
+        pts_all.append(pts32)
 
+    if len(rows_all) == 0:
+        return np.full((h, w, 3), -1.0, dtype=np.float32), np.zeros((h, w), dtype=bool), (uv_r_min, uv_c_min)
+
+    rows_cat = np.concatenate(rows_all, axis=0)
+    cols_cat = np.concatenate(cols_all, axis=0)
+    pts_cat = np.concatenate(pts_all, axis=0).astype(np.float32, copy=False)
+    flat_idx = rows_cat * int(w) + cols_cat
+    means_flat, counts_flat, _ = _group_mean_float32_first(
+        flat_idx,
+        pts_cat,
+        n_groups=int(h * w),
+    )
+
+    grid_count = counts_flat.reshape(h, w)
     grid_valid = grid_count > 0
     grid_zyxs = np.full((h, w, 3), -1.0, dtype=np.float32)
-    grid_zyxs[grid_valid] = (grid_acc[grid_valid] / grid_count[grid_valid, np.newaxis]).astype(np.float32)
+    means_grid = means_flat.reshape(h, w, 3)
+    grid_zyxs[grid_valid] = means_grid[grid_valid].astype(np.float32, copy=False)
 
     return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 
@@ -933,17 +1019,23 @@ def compute_edge_one_shot_extrapolation(
         if uv_int.shape[0] == 0 or world.shape[0] == 0 or uv_int.shape[0] != world.shape[0]:
             return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
         uniq_uv, inv = np.unique(uv_int, axis=0, return_inverse=True)
-        world_sum = np.zeros((uniq_uv.shape[0], 3), dtype=np.float64)
-        world_count = np.zeros((uniq_uv.shape[0],), dtype=np.int64)
-        np.add.at(world_sum, inv, world.astype(np.float64, copy=False))
-        np.add.at(world_count, inv, 1)
-        world_mean = (world_sum / np.maximum(world_count[:, None], 1)).astype(np.float32, copy=False)
+        world_mean, _, _ = _group_mean_float32_first(
+            inv.astype(np.int64, copy=False),
+            world.astype(np.float32, copy=False),
+            n_groups=uniq_uv.shape[0],
+        )
         return uniq_uv.astype(np.int64, copy=False), world_mean
 
+    method_precision = method_kwargs.get("precision", None)
+    min_corner_dtype = (
+        np.float64
+        if (method in {"rbf", "rbf_edge_only"} and _is_float64_precision(method_precision))
+        else np.float32
+    )
     min_corner_arr = (
-        np.asarray(min_corner, dtype=np.float64)
+        np.asarray(min_corner, dtype=min_corner_dtype)
         if min_corner is not None
-        else np.zeros(3, dtype=np.float64)
+        else np.zeros(3, dtype=min_corner_dtype)
     )
     if min_corner_arr.shape != (3,):
         raise ValueError(f"min_corner must have shape (3,), got {min_corner_arr.shape}")

@@ -86,7 +86,7 @@ def apply_degradation(
         return zyx_local, False
 
     # Reshape to grid to compute distance from conditioning edge
-    zyx_grid = zyx_local.reshape(uv_shape + (3,))
+    zyx_grid = zyx_local.reshape(uv_shape + (3,)).astype(np.float32, copy=False)
     R, C = uv_shape
 
     # Compute distance from conditioning edge
@@ -103,7 +103,7 @@ def apply_degradation(
         # Conditioning on bottom, distance increases as row decreases
         distance = (R - 1 - np.arange(R))[:, None].repeat(C, axis=1)
 
-    distance = distance.astype(np.float64)
+    distance = distance.astype(np.float32, copy=False)
 
     # Avoid issues if all same distance
     if distance.max() < 1e-6:
@@ -113,17 +113,17 @@ def apply_degradation(
     if random.random() < 0.5:
         # Curvature bias: error = k * distance^2
         k = random.uniform(curvature_range[0], curvature_range[1])
-        direction = np.random.randn(3)
+        direction = np.random.randn(3).astype(np.float32, copy=False)
         direction = direction / (np.linalg.norm(direction) + 1e-8)
         error = k * (distance[:, :, None] ** 2) * direction
     else:
         # Gradient perturbation: linear tilt
         magnitude = random.uniform(gradient_range[0], gradient_range[1])
-        tilt = np.random.randn(3) * magnitude
+        tilt = (np.random.randn(3).astype(np.float32, copy=False) * np.float32(magnitude))
         error = distance[:, :, None] * tilt
 
-    degraded_grid = zyx_grid + error
-    return degraded_grid.reshape(-1, 3), True
+    degraded_grid = (zyx_grid + error).astype(np.float32, copy=False)
+    return degraded_grid.reshape(-1, 3).astype(np.float32, copy=False), True
 
 
 # Registry of extrapolation methods
@@ -397,7 +397,7 @@ def _extrapolate_linear_edge(
     col_to_idx = {c: i for i, c in enumerate(cols_unique)}
 
     # Build 2D grids for ZYX (NaN for missing entries to avoid zero corruption)
-    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float64)
+    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float32)
     for i, (uv, zyx) in enumerate(zip(uv_cond, zyx_cond)):
         ri, ci = row_to_idx[uv[0]], col_to_idx[uv[1]]
         zyx_grid[ri, ci] = zyx
@@ -428,7 +428,7 @@ def _extrapolate_linear_edge(
         if valid_rows_mask.any():
             median_gradient = np.nanmedian(gradient[valid_rows_mask], axis=0)
         else:
-            median_gradient = np.zeros(3, dtype=np.float64)
+            median_gradient = np.zeros(3, dtype=np.float32)
 
         # For rows with NaN edge or gradient, use median gradient fallback
         for ri in range(n_rows):
@@ -443,7 +443,7 @@ def _extrapolate_linear_edge(
                 gradient[ri] = median_gradient
 
         # For each query point, find matching row and extrapolate
-        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float32)
         for i, uv in enumerate(uv_query):
             query_row, query_col = uv[0], uv[1]
 
@@ -482,7 +482,7 @@ def _extrapolate_linear_edge(
         if valid_cols_mask.any():
             median_gradient = np.nanmedian(gradient[valid_cols_mask], axis=0)
         else:
-            median_gradient = np.zeros(3, dtype=np.float64)
+            median_gradient = np.zeros(3, dtype=np.float32)
 
         # For cols with NaN edge or gradient, use median gradient fallback
         for ci in range(n_cols):
@@ -497,7 +497,7 @@ def _extrapolate_linear_edge(
                 gradient[ci] = median_gradient
 
         # For each query point, find matching col and extrapolate
-        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float32)
         for i, uv in enumerate(uv_query):
             query_row, query_col = uv[0], uv[1]
 
@@ -536,7 +536,9 @@ def _extrapolate_rbf_edge_only(
     runs the standard RBF solver on that subset.
     """
     if len(uv_cond) == 0:
-        return np.zeros((0, 3), dtype=np.float64)
+        rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
+        out_dtype = np.float64 if rbf_precision == torch.float64 else np.float32
+        return np.zeros((0, 3), dtype=out_dtype)
 
     direction = _infer_cond_direction(uv_cond, uv_query, cond_direction)
     if direction is None:
