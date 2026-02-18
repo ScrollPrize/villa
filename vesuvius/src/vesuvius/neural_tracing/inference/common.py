@@ -56,6 +56,32 @@ def _resolve_extrapolation_settings(args, runtime_config):
         )
         # MUST RUN IN FLOAT64: RBF extrapolation in this pipeline is unstable at lower precision.
         method_kwargs["precision"] = cfg.get("rbf_precision", "float64")
+        rbf_uv_domain = str(cfg.get("rbf_uv_domain", "full")).strip().lower()
+        if rbf_uv_domain not in {"full", "stored_lattice"}:
+            raise ValueError(
+                "Unsupported rbf_uv_domain value. "
+                "Expected one of: ['full', 'stored_lattice']"
+            )
+        phase_rc_cfg = cfg.get("rbf_uv_phase_rc", (0, 0))
+        if not isinstance(phase_rc_cfg, (list, tuple)) or len(phase_rc_cfg) != 2:
+            raise ValueError("rbf_uv_phase_rc must be a 2-element list/tuple.")
+        method_kwargs["rbf_uv_domain"] = rbf_uv_domain
+        method_kwargs["rbf_uv_phase_rc"] = (
+            int(phase_rc_cfg[0]),
+            int(phase_rc_cfg[1]),
+        )
+        rbf_scale = getattr(args, "rbf_scale", None)
+        if rbf_scale is not None:
+            preset = str(rbf_scale).strip().lower()
+            if preset == "stored":
+                # Stored-scale preset: run RBF in stored UV lattice and avoid
+                # additional control-point downsampling on top of lattice scaling.
+                method_kwargs["rbf_uv_domain"] = "stored_lattice"
+                method_kwargs["precision"] = "float32"
+                method_kwargs["downsample_factor"] = 1
+            elif preset == "full":
+                method_kwargs["rbf_uv_domain"] = "full"
+                method_kwargs["precision"] = "float64"
 
     if method == "rbf_edge_only":
         method_kwargs["edge_band_frac"] = float(cfg.get("rbf_edge_band_frac", 0.10))
@@ -773,6 +799,8 @@ def compute_edge_one_shot_extrapolation(
     degrade_gradient_range=(0.05, 0.2),
     skip_bounds_check=True,
     profiler=None,
+    rbf_lattice_stride_rc=(1, 1),
+    rbf_lattice_phase_rc=(0, 0),
     **method_kwargs,
 ):
     cond_zyxs = np.asarray(cond_zyxs)
@@ -809,6 +837,56 @@ def compute_edge_one_shot_extrapolation(
         return None
 
     edge_seed_world = cond_zyxs[edge_seed_mask]
+    edge_seed_world_for_extrap = edge_seed_world
+    method_kwargs = dict(method_kwargs)
+    rbf_uv_domain = str(method_kwargs.pop("rbf_uv_domain", "full")).strip().lower()
+    if rbf_uv_domain not in {"full", "stored_lattice"}:
+        raise ValueError(
+            f"Unsupported rbf_uv_domain '{rbf_uv_domain}'. "
+            "Expected one of: ['full', 'stored_lattice']"
+        )
+    phase_override = method_kwargs.pop("rbf_uv_phase_rc", None)
+
+    def _normalize_pair(pair, label, min_value=None):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(f"{label} must be a 2-element list/tuple.")
+        a = int(pair[0])
+        b = int(pair[1])
+        if min_value is not None and (a < min_value or b < min_value):
+            raise ValueError(f"{label} elements must be >= {min_value}.")
+        return (a, b)
+
+    def _project_uv_to_stored_lattice(uv_arr, stride_rc, phase_rc):
+        uv_int = _coerce_uv_int_array(
+            uv_arr,
+            prefer_int32=False,
+            default_dtype=np.int64,
+        ).astype(np.int64, copy=False)
+        if uv_int.size == 0:
+            return uv_int
+        sub_r, sub_c = stride_rc
+        phase_r, phase_c = phase_rc
+        out = np.empty_like(uv_int, dtype=np.int64)
+        out[..., 0] = np.floor_divide(uv_int[..., 0] - phase_r, sub_r)
+        out[..., 1] = np.floor_divide(uv_int[..., 1] - phase_c, sub_c)
+        return out
+
+    def _aggregate_world_by_uv(uv_arr, world_arr):
+        uv_int = np.asarray(uv_arr, dtype=np.int64)
+        world = np.asarray(world_arr, dtype=np.float32)
+        if uv_int.ndim != 2 or uv_int.shape[1] != 2:
+            return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        if world.ndim != 2 or world.shape[1] != 3:
+            return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        if uv_int.shape[0] == 0 or world.shape[0] == 0 or uv_int.shape[0] != world.shape[0]:
+            return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        uniq_uv, inv = np.unique(uv_int, axis=0, return_inverse=True)
+        world_sum = np.zeros((uniq_uv.shape[0], 3), dtype=np.float64)
+        world_count = np.zeros((uniq_uv.shape[0],), dtype=np.int64)
+        np.add.at(world_sum, inv, world.astype(np.float64, copy=False))
+        np.add.at(world_count, inv, 1)
+        world_mean = (world_sum / np.maximum(world_count[:, None], 1)).astype(np.float32, copy=False)
+        return uniq_uv.astype(np.int64, copy=False), world_mean
 
     min_corner_arr = (
         np.asarray(min_corner, dtype=np.float64)
@@ -825,10 +903,36 @@ def compute_edge_one_shot_extrapolation(
     else:
         crop_size_use = tuple(int(v) for v in crop_size)
 
+    uv_cond_for_extrap = edge_seed_uv
+    uv_query_for_extrap = query_uv_grid
+    lattice_stride_rc = _normalize_pair(
+        rbf_lattice_stride_rc,
+        "rbf_lattice_stride_rc",
+        min_value=1,
+    )
+    lattice_phase_rc = _normalize_pair(
+        phase_override if phase_override is not None else rbf_lattice_phase_rc,
+        "rbf lattice phase",
+    )
+
+    if method in {"rbf", "rbf_edge_only"} and rbf_uv_domain == "stored_lattice":
+        uv_cond_stored = _project_uv_to_stored_lattice(
+            edge_seed_uv,
+            lattice_stride_rc,
+            lattice_phase_rc,
+        )
+        uv_cond_stored, edge_seed_world_for_extrap = _aggregate_world_by_uv(uv_cond_stored, edge_seed_world)
+        uv_query_for_extrap = _project_uv_to_stored_lattice(
+            query_uv_grid,
+            lattice_stride_rc,
+            lattice_phase_rc,
+        )
+        uv_cond_for_extrap = uv_cond_stored
+
     extrap_result = compute_extrapolation_infer(
-        uv_cond=edge_seed_uv,
-        zyx_cond=edge_seed_world,
-        uv_query=query_uv_grid,
+        uv_cond=uv_cond_for_extrap,
+        zyx_cond=edge_seed_world_for_extrap,
+        uv_query=uv_query_for_extrap,
         min_corner=min_corner_arr,
         crop_size=crop_size_use,
         method=method,
@@ -858,6 +962,9 @@ def compute_edge_one_shot_extrapolation(
         "edge_seed_uv": edge_seed_uv.astype(np.int64, copy=False),
         "edge_seed_world": edge_seed_world.astype(np.float32, copy=False),
         "query_uv_grid": query_uv_grid,
+        "rbf_uv_domain": rbf_uv_domain,
+        "rbf_lattice_stride_rc": lattice_stride_rc,
+        "rbf_lattice_phase_rc": lattice_phase_rc,
         "min_corner": min_corner_arr,
         "extrapolated_local": extrapolated_local,
         "extrapolated_world": extrapolated_world,

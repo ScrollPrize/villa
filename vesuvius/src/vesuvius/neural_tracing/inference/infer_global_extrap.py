@@ -87,6 +87,17 @@ def parse_args(argv=None):
     parser.add_argument("--config-path", type=str, default=None)
     parser.add_argument("--extrapolation-method", type=str, default=None)
     parser.add_argument(
+        "--rbf-scale",
+        type=str,
+        default=None,
+        choices=("full", "stored"),
+        help=(
+            "RBF solve-space preset. "
+            "'full' forces full-UV + float64 baseline behavior; "
+            "'stored' uses stored-lattice UV + float32 and disables extra RBF downsampling."
+        ),
+    )
+    parser.add_argument(
         "--rbf-downsample-factor",
         type=int,
         default=None,
@@ -301,6 +312,7 @@ _DENSE_ARG_TO_CLI = {
     "checkpoint_path": "--checkpoint-path",
     "config_path": "--config-path",
     "extrapolation_method": "--extrapolation-method",
+    "rbf_scale": "--rbf-scale",
     "rbf_downsample_factor": "--rbf-downsample-factor",
     "rbf_max_points": "--rbf-max-points",
     "tifxyz_out_dir": "--tifxyz-out-dir",
@@ -1658,6 +1670,11 @@ def _run_growth_direction_step(
 ):
     uv_cond = _build_uv_grid(cond_uv_offset, cond_zyxs.shape[:2])
     cond_direction, _ = _get_growth_context(grow_direction)
+    scale_y, scale_x = tgt_segment._scale
+    rbf_lattice_stride_rc = (
+        _scale_to_subsample_stride(scale_y),
+        _scale_to_subsample_stride(scale_x),
+    )
 
     with profiler.section("iter_get_edge_bboxes"):
         bboxes, _ = get_cond_edge_bboxes(
@@ -1718,6 +1735,8 @@ def _run_growth_direction_step(
             degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
             skip_bounds_check=True,
             profiler=profiler,
+            rbf_lattice_stride_rc=rbf_lattice_stride_rc,
+            rbf_lattice_phase_rc=(0, 0),
             **extrapolation_settings["method_kwargs"],
         )
     if edge_extrapolation is None:
