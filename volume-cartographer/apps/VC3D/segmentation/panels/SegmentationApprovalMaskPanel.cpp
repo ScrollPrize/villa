@@ -222,6 +222,13 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     });
 
     connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested);
+
+    connect(_groupApprovalMask, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        if (_restoringSettings) {
+            return;
+        }
+        writeSetting(vc3d::settings::segmentation::GROUP_APPROVAL_MASK_EXPANDED, expanded);
+    });
 }
 
 void SegmentationApprovalMaskPanel::writeSetting(const QString& key, const QVariant& value)
@@ -478,6 +485,11 @@ void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
     _autoApprovalThreshold = std::clamp(_autoApprovalThreshold, 0.0f, 10.0f);
     _autoApprovalMaxDistance = settings.value(segmentation::AUTO_APPROVAL_MAX_DISTANCE, _autoApprovalMaxDistance).toFloat();
     _autoApprovalMaxDistance = std::clamp(_autoApprovalMaxDistance, 0.0f, 500.0f);
+    const bool approvalMaskExpanded = settings.value(segmentation::GROUP_APPROVAL_MASK_EXPANDED,
+                                                     segmentation::GROUP_APPROVAL_MASK_EXPANDED_DEFAULT).toBool();
+    if (_groupApprovalMask) {
+        _groupApprovalMask->setExpanded(approvalMaskExpanded);
+    }
 
     // Don't restore edit states - user must explicitly enable editing each session
 

@@ -216,6 +216,7 @@ namespace segmentation {
     constexpr auto GROUP_LINE_EXPANDED = "group_line_expanded";
     constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
     constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
+    constexpr auto GROUP_APPROVAL_MASK_EXPANDED = "group_approval_mask_expanded";
     constexpr auto GROUP_CELL_REOPT_EXPANDED = "group_cell_reopt_expanded";
     constexpr auto GROUP_NEURAL_TRACER_EXPANDED = "group_neural_tracer_expanded";
 
@@ -224,6 +225,7 @@ namespace segmentation {
     constexpr bool GROUP_LINE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_APPROVAL_MASK_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_CELL_REOPT_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NEURAL_TRACER_EXPANDED_DEFAULT = true;
 
