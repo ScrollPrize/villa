@@ -2536,40 +2536,63 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     ceres::Problem problem;
     cv::Mat_<uint16_t> loss_status(params.state.size());
 
-    int r_outer = radius+3;
+    const int r_outer = radius + 3;
+    const int radius_sq = radius * radius;
+    const int y_outer_min = std::max(p[0] - r_outer, 0);
+    const int y_outer_max = std::min(p[0] + r_outer, params.dpoints.rows - 1);
+    const int x_outer_min = std::max(p[1] - r_outer, 0);
+    const int x_outer_max = std::min(p[1] + r_outer, params.dpoints.cols - 1);
 
-    for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++)
-            loss_status(oy,ox) = 0;
+    const int y_inner_min = std::max(p[0] - radius, 0);
+    const int y_inner_max = std::min(p[0] + radius, params.dpoints.rows - 1);
+    const int x_inner_min = std::max(p[1] - radius, 0);
+    const int x_inner_max = std::min(p[1] + radius, params.dpoints.cols - 1);
 
-    for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
-            cv::Vec2i op = {oy, ox};
-            if (cv::norm(p-op) <= radius) {
-                add_missing_losses(problem, loss_status, op, params, trace_data, settings);
+    for (int oy = y_outer_min; oy <= y_outer_max; ++oy)
+        for (int ox = x_outer_min; ox <= x_outer_max; ++ox)
+            loss_status(oy, ox) = 0;
+
+    for (int oy = y_inner_min; oy <= y_inner_max; ++oy) {
+        const int dy = oy - p[0];
+        const int dy2 = dy * dy;
+        for (int ox = x_inner_min; ox <= x_inner_max; ++ox) {
+            const int dx = ox - p[1];
+            if (dy2 + dx * dx <= radius_sq) {
+                add_missing_losses(problem, loss_status, {oy, ox}, params, trace_data, settings);
             }
         }
+    }
 
     auto t1 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     // Add anti-flipback loss if configured
     // This penalizes points that move too far in the inward (negative normal) direction
     if (flipback_config && flipback_config->anchors && flipback_config->surface_normals) {
-        for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
-            for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
-                cv::Vec2i op = {oy, ox};
-                if (cv::norm(p-op) <= radius && (params.state(op) & STATE_LOC_VALID)) {
-                    cv::Vec3d anchor = (*flipback_config->anchors)(op);
-                    cv::Vec3d normal = (*flipback_config->surface_normals)(op);
-                    // Only add loss if we have valid anchor and normal
-                    if (cv::norm(normal) > 0.5 && anchor[0] >= 0) {
-                        problem.AddResidualBlock(
-                            AntiFlipbackLoss::Create(anchor, normal, flipback_config->threshold, flipback_config->weight),
-                            nullptr,
-                            &params.dpoints(op)[0]);
-                    }
+        for (int oy = y_inner_min; oy <= y_inner_max; ++oy) {
+            const int dy = oy - p[0];
+            const int dy2 = dy * dy;
+            for (int ox = x_inner_min; ox <= x_inner_max; ++ox) {
+                const int dx = ox - p[1];
+                if (dy2 + dx * dx > radius_sq) {
+                    continue;
+                }
+                const cv::Vec2i op{oy, ox};
+                if (!(params.state(op) & STATE_LOC_VALID)) {
+                    continue;
+                }
+
+                const cv::Vec3d anchor = (*flipback_config->anchors)(op);
+                const cv::Vec3d normal = (*flipback_config->surface_normals)(op);
+                // Only add loss if we have valid anchor and normal
+                const double normal_sq = normal.dot(normal);
+                if (normal_sq > 0.25 && anchor[0] >= 0) {
+                    problem.AddResidualBlock(
+                        AntiFlipbackLoss::Create(anchor, normal, flipback_config->threshold, flipback_config->weight),
+                        nullptr,
+                        &params.dpoints(op)[0]);
                 }
             }
+        }
     }
 
     auto t2 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
@@ -2578,13 +2601,16 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     auto t3 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
-    for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++) {
-            cv::Vec2i op = {oy, ox};
+    for (int oy = y_outer_min; oy <= y_outer_max; ++oy) {
+        const int dy = oy - p[0];
+        const int dy2 = dy * dy;
+        for (int ox = x_outer_min; ox <= x_outer_max; ++ox) {
+            const cv::Vec2i op{oy, ox};
             if (!problem.HasParameterBlock(&params.dpoints(op)[0])) {
                 continue;
             }
-            bool fixed = cv::norm(p-op) > radius;
+            const int dx = ox - p[1];
+            bool fixed = (dy2 + dx * dx) > radius_sq;
             if (trace_data.cell_reopt_mode && !trace_data.interior_mask.empty()) {
                 if (!point_in_bounds(trace_data.interior_mask, op) || trace_data.interior_mask(op) == 0) {
                     fixed = true;
@@ -2594,6 +2620,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
                 problem.SetParameterBlockConstant(&params.dpoints(op)[0]);
             }
         }
+    }
 
     auto t4 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
