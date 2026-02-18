@@ -567,19 +567,37 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
     n_batches = (len(bbox_crops) + batch_size - 1) // batch_size
     for batch_start in range(0, len(bbox_crops), batch_size):
         batch = bbox_crops[batch_start:batch_start + batch_size]
-        batch_inputs = []
-        for crop in batch:
-            vol_t = torch.from_numpy(crop["volume"]).float().unsqueeze(0).unsqueeze(0)
-            cond_t = torch.from_numpy(crop["cond_vox"]).float().unsqueeze(0).unsqueeze(0)
-            if expected_in_channels == 2:
-                # Dense-displacement checkpoints may be trained without extrapolation
-                # conditioning (vol + cond only).
-                model_input = torch.cat([vol_t, cond_t], dim=1)
-            else:
-                extrap_t = torch.from_numpy(crop["extrap_vox"]).float().unsqueeze(0).unsqueeze(0)
-                model_input = torch.cat([vol_t, cond_t, extrap_t], dim=1)
-            batch_inputs.append(model_input)
-        model_inputs = torch.cat(batch_inputs, dim=0).to(args.device)
+        batch_len = len(batch)
+        first_vol = np.asarray(batch[0]["volume"], dtype=np.float32)
+        if first_vol.ndim != 3:
+            raise RuntimeError(f"Expected crop volume shape [D, H, W], got {tuple(first_vol.shape)}")
+        d, h, w = first_vol.shape
+        batch_np = np.empty((batch_len, expected_in_channels, d, h, w), dtype=np.float32)
+
+        for i, crop in enumerate(batch):
+            vol_np = np.asarray(crop["volume"], dtype=np.float32)
+            cond_np = np.asarray(crop["cond_vox"], dtype=np.float32)
+            if vol_np.shape != (d, h, w):
+                raise RuntimeError(
+                    f"All crop volumes in a batch must share shape {(d, h, w)}; got {tuple(vol_np.shape)}."
+                )
+            if cond_np.shape != (d, h, w):
+                raise RuntimeError(
+                    f"cond_vox shape must match volume shape {(d, h, w)}; got {tuple(cond_np.shape)}."
+                )
+
+            batch_np[i, 0] = vol_np
+            batch_np[i, 1] = cond_np
+
+            if expected_in_channels == 3:
+                extrap_np = np.asarray(crop["extrap_vox"], dtype=np.float32)
+                if extrap_np.shape != (d, h, w):
+                    raise RuntimeError(
+                        f"extrap_vox shape must match volume shape {(d, h, w)}; got {tuple(extrap_np.shape)}."
+                    )
+                batch_np[i, 2] = extrap_np
+
+        model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
         disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=use_tta)
         if disp_pred is None:
             raise RuntimeError("Model output did not contain 'displacement'.")
@@ -605,7 +623,7 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
                 }
             )
         del model_inputs
-        del batch_inputs
+        del batch_np
         del disp_pred
         done = (batch_start // batch_size) + 1
         if verbose:
