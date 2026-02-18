@@ -245,6 +245,15 @@ def _finite_uv_world(uv, world):
     return uv[keep].astype(np.float64, copy=False), world[keep].astype(np.float32, copy=False)
 
 
+def _empty_edge_extrapolation():
+    return {
+        "edge_seed_uv": np.zeros((0, 2), dtype=np.float64),
+        "edge_seed_world": np.zeros((0, 3), dtype=np.float32),
+        "query_uv": np.zeros((0, 2), dtype=np.float64),
+        "extrapolated_world": np.zeros((0, 3), dtype=np.float32),
+    }
+
+
 @dataclass(frozen=True)
 class ExtrapLookupArrays:
     uv: np.ndarray
@@ -599,141 +608,12 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
     return per_crop_fields
 
 
-def _stack_displacement_results(per_crop_fields):
-    if len(per_crop_fields) == 0:
-        return None
-
-    min_corners = np.stack([item["min_corner"] for item in per_crop_fields], axis=0).astype(np.int64, copy=False)
-    max_exclusive = []
-    for item in per_crop_fields:
-        min_corner = item["min_corner"]
-        disp = np.asarray(item["displacement"])
-        _, d, h, w = disp.shape
-        max_exclusive.append(min_corner + np.asarray([d, h, w], dtype=np.int64))
-    max_exclusive = np.stack(max_exclusive, axis=0).astype(np.int64, copy=False)
-
-    global_min = min_corners.min(axis=0)
-    global_max_exclusive = max_exclusive.max(axis=0)
-    global_shape = tuple((global_max_exclusive - global_min).tolist())
-    if any(v <= 0 for v in global_shape):
-        return None
-
-    disp_sum = np.zeros((3,) + global_shape, dtype=np.float32)
-    disp_count = np.zeros(global_shape, dtype=np.uint32)
-
-    for item in per_crop_fields:
-        min_corner = item["min_corner"]
-        disp = np.asarray(item["displacement"], dtype=np.float32)
-        _, d, h, w = disp.shape
-        start = (min_corner - global_min).astype(np.int64)
-        z0, y0, x0 = int(start[0]), int(start[1]), int(start[2])
-        z1, y1, x1 = z0 + int(d), y0 + int(h), x0 + int(w)
-
-        disp_block = disp_sum[:, z0:z1, y0:y1, x0:x1]
-        count_block = disp_count[z0:z1, y0:y1, x0:x1]
-
-        finite_mask = np.isfinite(disp).all(axis=0)
-        if finite_mask.all():
-            disp_block += disp
-            count_block += 1
-        else:
-            disp_block[:, finite_mask] += disp[:, finite_mask]
-            count_block[finite_mask] += 1
-
-    valid = disp_count > 0
-    if valid.any():
-        np.divide(
-            disp_sum,
-            disp_count[np.newaxis, ...],
-            out=disp_sum,
-            where=valid[np.newaxis, ...],
-        )
-
-    bbox_inclusive = (
-        int(global_min[0]),
-        int(global_max_exclusive[0] - 1),
-        int(global_min[1]),
-        int(global_max_exclusive[1] - 1),
-        int(global_min[2]),
-        int(global_max_exclusive[2] - 1),
-    )
-    return {
-        "displacement": disp_sum,
-        "count": disp_count,
-        "min_corner": global_min.astype(np.int64, copy=False),
-        "shape": np.asarray(global_shape, dtype=np.int64),
-        "bbox": bbox_inclusive,
-    }
-
-
 def _empty_stack_samples():
     return {
         "uv": np.zeros((0, 2), dtype=np.int64),
         "world": np.zeros((0, 3), dtype=np.float32),
         "displacement": np.zeros((0, 3), dtype=np.float32),
         "stack_count": np.zeros((0,), dtype=np.uint32),
-    }
-
-
-def _sample_displacement_for_extrap_uvs(
-    stacked_displacement,
-    extrap_lookup,
-    grow_direction,
-    max_lines=None,
-    refine=None,
-):
-    if stacked_displacement is None or extrap_lookup is None:
-        return _empty_stack_samples()
-
-    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
-    if sampled_uv.shape[0] == 0:
-        return _empty_stack_samples()
-
-    disp = np.asarray(stacked_displacement["displacement"], dtype=np.float32)
-    count = np.asarray(stacked_displacement["count"], dtype=np.uint32)
-    min_corner = np.asarray(stacked_displacement["min_corner"], dtype=np.int64)
-    shape = np.asarray(stacked_displacement["shape"], dtype=np.int64)
-
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
-    coords_local = sampled_world.astype(np.float64, copy=False) - min_corner[None, :].astype(np.float64)
-    in_bounds = (
-        (coords_local[:, 0] >= 0.0) & (coords_local[:, 0] <= float(shape[0] - 1)) &
-        (coords_local[:, 1] >= 0.0) & (coords_local[:, 1] <= float(shape[1] - 1)) &
-        (coords_local[:, 2] >= 0.0) & (coords_local[:, 2] <= float(shape[2] - 1))
-    )
-    if not in_bounds.any():
-        return _empty_stack_samples()
-
-    sampled_uv = sampled_uv[in_bounds]
-    sampled_world = sampled_world[in_bounds]
-    coords_local = coords_local[in_bounds].astype(np.float32, copy=False)
-
-    if refine is None:
-        sampled_disp, sampled_count, valid_mask = _sample_trilinear_displacement_stack(
-            disp,
-            count,
-            coords_local,
-        )
-    else:
-        sampled_disp, sampled_count, valid_mask = _sample_fractional_displacement_stack(
-            disp,
-            count,
-            coords_local,
-            refine_extra_steps=int(refine),
-        )
-    if not valid_mask.any():
-        return _empty_stack_samples()
-
-    sampled_uv = sampled_uv[valid_mask]
-    sampled_world = sampled_world[valid_mask]
-    sampled_disp = sampled_disp[valid_mask]
-    sampled_count = sampled_count[valid_mask]
-
-    return {
-        "uv": sampled_uv.astype(np.int64, copy=False),
-        "world": sampled_world.astype(np.float32, copy=False),
-        "displacement": sampled_disp.astype(np.float32, copy=False),
-        "stack_count": sampled_count.astype(np.uint32, copy=False),
     }
 
 
@@ -994,6 +874,16 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
     return sampled_disp_np, sampled_count_np, valid_mask_np
 
 
+def _empty_displaced_samples():
+    return {
+        "uv": np.zeros((0, 2), dtype=np.int64),
+        "world": np.zeros((0, 3), dtype=np.float32),
+        "displacement": np.zeros((0, 3), dtype=np.float32),
+        "world_displaced": np.zeros((0, 3), dtype=np.float32),
+        "stack_count": np.zeros((0,), dtype=np.uint32),
+    }
+
+
 def _apply_displacement(samples, verbose=True, skip_inference=False):
     world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
     displacement = np.asarray(samples.get("displacement", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
@@ -1006,13 +896,7 @@ def _apply_displacement(samples, verbose=True, skip_inference=False):
             if verbose:
                 print("== Applied Displacement ==")
                 print("Extrap-only mode: no extrapolated points selected to merge.")
-            return {
-                "uv": np.zeros((0, 2), dtype=np.int64),
-                "world": np.zeros((0, 3), dtype=np.float32),
-                "displacement": np.zeros((0, 3), dtype=np.float32),
-                "world_displaced": np.zeros((0, 3), dtype=np.float32),
-                "stack_count": np.zeros((0,), dtype=np.uint32),
-            }
+            return _empty_displaced_samples()
         uv = uv[:n].astype(np.int64, copy=False)
         world = world[:n].astype(np.float32, copy=False)
         stack_count = stack_count[:n].astype(np.uint32, copy=False)
@@ -1032,13 +916,7 @@ def _apply_displacement(samples, verbose=True, skip_inference=False):
         if verbose:
             print("== Applied Displacement ==")
             print("No sampled points to apply displacement.")
-        return {
-            "uv": np.zeros((0, 2), dtype=np.int64),
-            "world": np.zeros((0, 3), dtype=np.float32),
-            "displacement": np.zeros((0, 3), dtype=np.float32),
-            "world_displaced": np.zeros((0, 3), dtype=np.float32),
-            "stack_count": np.zeros((0,), dtype=np.uint32),
-        }
+        return _empty_displaced_samples()
 
     world_displaced = world + displacement
     disp_norm = np.linalg.norm(displacement.astype(np.float64), axis=1)
@@ -1240,23 +1118,6 @@ def _boundary_advanced(prev_boundary, next_boundary, grow_direction):
     return bool(np.any(delta < 0))
 
 
-def _surface_to_uv_samples(grid, valid, uv_offset):
-    rows, cols = np.where(np.asarray(valid, dtype=bool))
-    if rows.size == 0:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
-    r0, c0 = int(uv_offset[0]), int(uv_offset[1])
-    uv = np.stack(
-        [
-            rows.astype(np.int64, copy=False) + r0,
-            cols.astype(np.int64, copy=False) + c0,
-        ],
-        axis=-1,
-    )
-    pts = np.asarray(grid, dtype=np.float32)[rows, cols].astype(np.float32, copy=False)
-    keep = np.isfinite(pts).all(axis=1)
-    return uv[keep], pts[keep]
-
-
 def _surface_to_stored_uv_samples_nearest(
     grid,
     valid,
@@ -1346,21 +1207,14 @@ def main():
                 "infer_global_extrap currently supports only 2- or 3-channel models; "
                 f"got in_channels={expected_in_channels}"
             )
-    elif extrap_only_mode:
-        if args.verbose:
-            print("Running extrap-only iterative mode (--extrap-only set): skipping inference and stack sampling.")
-        if args.checkpoint_path is not None:
-            with profiler.section("load_checkpoint_config"):
-                model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
-    elif args.skip_inference:
-        if args.verbose:
-            print("Skipping displacement inference (--skip-inference set).")
-        if args.checkpoint_path is not None:
-            with profiler.section("load_checkpoint_config"):
-                model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
     else:
         if args.verbose:
-            print("Skipping displacement inference (no --checkpoint-path provided).")
+            if extrap_only_mode:
+                print("Running extrap-only iterative mode (--extrap-only set): skipping inference and stack sampling.")
+            elif args.skip_inference:
+                print("Skipping displacement inference (--skip-inference set).")
+            else:
+                print("Skipping displacement inference (no --checkpoint-path provided).")
         if args.checkpoint_path is not None:
             with profiler.section("load_checkpoint_config"):
                 model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
@@ -1398,21 +1252,10 @@ def main():
         )
 
     bbox_results = []
-    edge_extrapolation = {
-        "edge_seed_uv": np.zeros((0, 2), dtype=np.float64),
-        "edge_seed_world": np.zeros((0, 3), dtype=np.float32),
-        "query_uv": np.zeros((0, 2), dtype=np.float64),
-        "extrapolated_world": np.zeros((0, 3), dtype=np.float32),
-    }
+    edge_extrapolation = _empty_edge_extrapolation()
     extrap_lookup = _empty_extrap_lookup_arrays()
     disp_bbox = None
-    displaced = {
-        "uv": np.zeros((0, 2), dtype=np.int64),
-        "world": np.zeros((0, 3), dtype=np.float32),
-        "displacement": np.zeros((0, 3), dtype=np.float32),
-        "world_displaced": np.zeros((0, 3), dtype=np.float32),
-        "stack_count": np.zeros((0,), dtype=np.uint32),
-    }
+    displaced = _empty_displaced_samples()
 
     n_iterations = int(args.iterations)
     iteration_pbar = None
@@ -1465,12 +1308,7 @@ def main():
                 **extrapolation_settings["method_kwargs"],
             )
         if edge_extrapolation is None:
-            edge_extrapolation = {
-                "edge_seed_uv": np.zeros((0, 2), dtype=np.float64),
-                "edge_seed_world": np.zeros((0, 3), dtype=np.float32),
-                "query_uv": np.zeros((0, 2), dtype=np.float64),
-                "extrapolated_world": np.zeros((0, 3), dtype=np.float32),
-            }
+            edge_extrapolation = _empty_edge_extrapolation()
 
         with profiler.section("iter_aggregate_extrapolation"):
             if args.verbose or args.napari:
@@ -1555,12 +1393,13 @@ def main():
             max_lines=args.agg_extrap_lines,
             verbose=args.verbose,
         )
-        if extrap_only_mode:
-            with profiler.section("iter_apply_samples_direct"):
-                displaced = _apply_displacement(agg_samples, verbose=args.verbose, skip_inference=True)
-        else:
-            with profiler.section("iter_apply_displacement"):
-                displaced = _apply_displacement(agg_samples, verbose=args.verbose)
+        apply_section = "iter_apply_samples_direct" if extrap_only_mode else "iter_apply_displacement"
+        with profiler.section(apply_section):
+            displaced = _apply_displacement(
+                agg_samples,
+                verbose=args.verbose,
+                skip_inference=extrap_only_mode,
+            )
 
         prev_boundary = _boundary_axis_value(cond_valid, cond_uv_offset, grow_direction)
         with profiler.section("iter_merge_surface"):
