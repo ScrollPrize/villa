@@ -117,13 +117,15 @@ struct DistLoss {
         d[1] = a[1] - b[1];
         d[2] = a[2] - b[2];
 
-        T dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+        T dist_sq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+        const T d_sq = T(_d) * T(_d);
 
-        if (dist <= T(0)) {
+        if (dist_sq <= T(0)) {
             residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] + d[2]*d[2] - T(1));
         }
         else {
-            if (dist < T(_d))
+            const T dist = sqrt(dist_sq);
+            if (dist_sq < d_sq)
                 residual[0] = T(_w)*(T(_d)/dist - T(1));
             else
                 residual[0] = T(_w)*(dist/T(_d) - T(1));
@@ -160,14 +162,16 @@ struct DistLoss2D {
         d[0] = a[0] - b[0];
         d[1] = a[1] - b[1];
 
-        T dist = sqrt(d[0]*d[0] + d[1]*d[1]);
+        T dist_sq = d[0]*d[0] + d[1]*d[1];
+        const T d_sq = T(_d) * T(_d);
 
-        if (dist <= T(0)) {
+        if (dist_sq <= T(0)) {
             residual[0] = T(_w)*(d[0]*d[0] + d[1]*d[1] - T(1));
             std::cout << "uhohh" << std::endl;
         }
         else {
-            if (dist < T(_d))
+            const T dist = sqrt(dist_sq);
+            if (dist_sq < d_sq)
                 residual[0] = T(_w)*(T(_d)/(dist+T(1e-2)) - T(1));
             else
                 residual[0] = T(_w)*(dist/T(_d) - T(1));
@@ -239,14 +243,14 @@ struct StraightLoss {
         d2[1] = c[1] - b[1];
         d2[2] = c[2] - b[2];
         
-        T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2]);
-        T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2]);
-        if (l1 <= T(1e-12) || l2 <= T(1e-12)) {
+        T l1_sq = d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2];
+        T l2_sq = d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2];
+        if (l1_sq <= T(1e-24) || l2_sq <= T(1e-24)) {
             residual[0] = T(0);
             return true;
         }
 
-        T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(l1*l2);
+        T dot = (d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2])/(sqrt(l1_sq)*sqrt(l2_sq));
         
 
         if (dot <= T(kStraightAngleCosThreshold)) {
@@ -301,16 +305,16 @@ struct StraightLoss2D {
         d2[0] = c[0] - b[0];
         d2[1] = c[1] - b[1];
 
-        T l1 = sqrt(d1[0]*d1[0] + d1[1]*d1[1]);
-        T l2 = sqrt(d2[0]*d2[0] + d2[1]*d2[1]);
+        T l1_sq = d1[0]*d1[0] + d1[1]*d1[1];
+        T l2_sq = d2[0]*d2[0] + d2[1]*d2[1];
 
-        if (l1 <= T(0) || l2 <= T(0)) {
+        if (l1_sq <= T(0) || l2_sq <= T(0)) {
             residual[0] = T(_w)*((d1[0]*d1[0] + d1[1]*d1[1])*(d2[0]*d2[0] + d2[1]*d2[1]) - T(1));
             std::cout << "uhohh2" << std::endl;
             return true;
         }
 
-        T dot = (d1[0]*d2[0] + d1[1]*d2[1])/(l1*l2);
+        T dot = (d1[0]*d2[0] + d1[1]*d2[1])/(sqrt(l1_sq)*sqrt(l2_sq));
 
         residual[0] = T(_w)*(T(1)-dot);
 
@@ -1055,9 +1059,10 @@ struct NormalConstraintPlane {
             v1[0] * v2[1] - v1[1] * v2[0]
         };
 
-        double cross_len = std::sqrt(cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2]);
+        double cross_len_sq = cross_product[0]*cross_product[0] + cross_product[1]*cross_product[1] + cross_product[2]*cross_product[2];
+        double cross_len = std::sqrt(cross_len_sq);
 
-        if (cross_len < 1e-9) return true;
+        if (cross_len_sq < 1e-18) return true;
 
         cross_product[0] /= cross_len;
         cross_product[1] /= cross_len;
@@ -1534,8 +1539,9 @@ private:
         normal[1] = v1[2] * v2[0] - v1[0] * v2[2];
         normal[2] = v1[0] * v2[1] - v1[1] * v2[0];
 
-        T norm_len = ceres::sqrt(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
-        if (norm_len < T(1e-9)) return T(0.0);
+        T norm_len_sq = normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2];
+        if (norm_len_sq < T(1e-18)) return T(0.0);
+        T norm_len = ceres::sqrt(norm_len_sq);
         normal[0] /= norm_len;
         normal[1] /= norm_len;
         normal[2] /= norm_len;

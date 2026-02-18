@@ -183,8 +183,8 @@ void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPoint
             return;
         }
 
-        const float distance = std::sqrt(distanceSq);
-        if (distance > spacing) {
+        if (distanceSq > spacingSq) {
+            const float distance = std::sqrt(distanceSq);
             const cv::Vec3f direction = delta / distance;
             float travelled = spacing;
             while (travelled < distance) {
@@ -478,8 +478,9 @@ std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInCylinder(
     const float halfDepth = depth / 2.0f;
 
     // Normalize the plane normal for projection calculations
-    const float normalLen = std::sqrt(planeNormal.dot(planeNormal));
-    const cv::Vec3f normal = (normalLen > 1e-6f) ? planeNormal / normalLen : cv::Vec3f(0, 0, 1);
+    const float normalLenSq = planeNormal.dot(planeNormal);
+    const float normalLen = std::sqrt(normalLenSq);
+    const cv::Vec3f normal = (normalLenSq > 1e-12f) ? planeNormal / normalLen : cv::Vec3f(0, 0, 1);
 
     // Query bounding sphere that contains the cylinder
     // Bounding radius = sqrt(radius² + halfDepth²)

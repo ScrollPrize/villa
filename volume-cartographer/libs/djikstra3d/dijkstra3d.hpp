@@ -1613,6 +1613,7 @@ size_t edf_free_space(
   int64_t loc = 0;
   float radius = 0;
   float corner_increment = std::sqrt(sq(wx) + sq(wy) + sq(wz));
+  const float safe_radius2 = (safe_radius > 0.0f) ? safe_radius * safe_radius : 0.0f;
 
   const int64_t ZERO = 0; // set type of zero in a cross compiler friendly way
   int64_t xstart = std::max(ZERO, src_x - static_cast<int64_t>(safe_radius) - 1);
@@ -1635,10 +1636,11 @@ size_t edf_free_space(
           continue;
         }
 
-        radius = std::sqrt(sq(wx * (x - src_x)) + sq(wy * (y - src_y)) + sq(wz * (z - src_z)));
-        if (radius > safe_radius) {
+        const float radius2 = sq(wx * (x - src_x)) + sq(wy * (y - src_y)) + sq(wz * (z - src_z));
+        if (radius2 > safe_radius2) {
           continue;
         }
+        radius = std::sqrt(radius2);
 
         float dx = std::abs(static_cast<float>(x - src_x));
         float dy = std::abs(static_cast<float>(y - src_y));

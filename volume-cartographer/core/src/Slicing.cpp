@@ -1139,8 +1139,9 @@ cv::Mat_<cv::Vec3f> computeVolumeGradientsNative(
             float gy = (v_yp - v_ym) / 2.0f;
             float gz = (v_zp - v_zm) / 2.0f;
 
-            float len = std::sqrt(gx*gx + gy*gy + gz*gz);
-            if (len > 1e-6f) {
+            const float len2 = gx*gx + gy*gy + gz*gz;
+            if (len2 > 1e-12f) {
+                const float len = std::sqrt(len2);
                 gradients(y, x) = cv::Vec3f(-gx/len, -gy/len, -gz/len);
             } else {
                 gradients(y, x) = cv::Vec3f(0, 0, 1);
@@ -1150,4 +1151,3 @@ cv::Mat_<cv::Vec3f> computeVolumeGradientsNative(
 
     return gradients;
 }
-

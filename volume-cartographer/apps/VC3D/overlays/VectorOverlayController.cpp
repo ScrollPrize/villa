@@ -248,10 +248,11 @@ void VectorOverlayController::collectDirectionHints(CVolumeViewer* viewer,
         const float stepNominal = 2.0f;
         cv::Vec3f p1 = segSurface->coord(segPtr, {stepNominal, 0, 0});
         cv::Vec3f dir3 = p1 - p0;
-        float len = std::sqrt(dir3.dot(dir3));
-        if (len < 1e-5f) {
+        const float len2 = dir3.dot(dir3);
+        if (len2 < 1e-10f) {
             return;
         }
+        const float len = std::sqrt(len2);
         dir3 *= (1.0f / len);
 
         cv::Vec3f s0 = plane->project(p0, 1.0f, scale);
@@ -404,9 +405,9 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
             style.z = kArrowZ;
 
             QPointF dir2d(dir3d[0], dir3d[1]);
-            float len2d = std::sqrt(dir2d.x() * dir2d.x() + dir2d.y() * dir2d.y());
+            const float len2d2 = dir2d.x() * dir2d.x() + dir2d.y() * dir2d.y();
 
-            if (len2d < 0.1f) {
+            if (len2d2 < 0.01f) {
                 OverlayStyle dotStyle;
                 dotStyle.penColor = color;
                 dotStyle.brushColor = color;
@@ -414,7 +415,7 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
                 dotStyle.z = kArrowZ;
                 builder.addCircle(origin, 3.0f, true, dotStyle);
             } else {
-                dir2d /= len2d;
+                dir2d /= std::sqrt(len2d2);
                 QPointF end = origin + dir2d * kArrowLen;
                 builder.addArrow(origin, end, 5.0, 3.0, style);
             }
@@ -456,17 +457,17 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
 
                 if (hasU) {
                     tangentU = pRight - pLeft;
-                    float len = std::sqrt(tangentU.dot(tangentU));
-                    if (len > 1e-6f) {
-                        tangentU /= len;
+                    const float len2 = tangentU.dot(tangentU);
+                    if (len2 > 1e-12f) {
+                        tangentU /= std::sqrt(len2);
                     }
                 }
 
                 if (hasV) {
                     tangentV = pDown - pUp;
-                    float len = std::sqrt(tangentV.dot(tangentV));
-                    if (len > 1e-6f) {
-                        tangentV /= len;
+                    const float len2 = tangentV.dot(tangentV);
+                    if (len2 > 1e-12f) {
+                        tangentV /= std::sqrt(len2);
                     }
                 }
 
@@ -474,9 +475,9 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
                     // Left-hand rule: U x V gives normal pointing toward viewer
                     // (consistent with grid_normal in Geometry.cpp)
                     cv::Vec3f normal = tangentU.cross(tangentV);
-                    float len = std::sqrt(normal.dot(normal));
-                    if (len > 1e-6f) {
-                        normal /= len;
+                    const float len2 = normal.dot(normal);
+                    if (len2 > 1e-12f) {
+                        normal /= std::sqrt(len2);
                         drawNormalPair(origin, normal);
                     }
                 }
@@ -524,14 +525,14 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
 
         QPointF origin(p0[0], p0[1]);
         QPointF dir2d(p1[0] - p0[0], p1[1] - p0[1]);
-        float len2d = std::sqrt(dir2d.x() * dir2d.x() + dir2d.y() * dir2d.y());
+        const float len2d2 = dir2d.x() * dir2d.x() + dir2d.y() * dir2d.y();
 
         OverlayStyle style;
         style.penColor = color;
         style.penWidth = 3.0;
         style.z = kArrowZ;
 
-        if (len2d < 2.0f) {
+        if (len2d2 < 4.0f) {
             // Vector is mostly perpendicular to view plane
             OverlayStyle dotStyle;
             dotStyle.penColor = color;
@@ -540,7 +541,7 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
             dotStyle.z = kArrowZ;
             builder.addCircle(origin, 3.0f, true, dotStyle);
         } else {
-            dir2d /= len2d;
+            dir2d /= std::sqrt(len2d2);
             QPointF end = origin + dir2d * kArrowLen;
             builder.addArrow(origin, end, 5.0, 3.0, style);
         }
@@ -604,17 +605,17 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
 
             if (hasU) {
                 tangentU = pPlusU - pMinusU;
-                float len = std::sqrt(tangentU.dot(tangentU));
-                if (len > 1e-6f) {
-                    tangentU /= len;
+                const float len2 = tangentU.dot(tangentU);
+                if (len2 > 1e-12f) {
+                    tangentU /= std::sqrt(len2);
                 }
             }
 
             if (hasV) {
                 tangentV = pPlusV - pMinusV;
-                float len = std::sqrt(tangentV.dot(tangentV));
-                if (len > 1e-6f) {
-                    tangentV /= len;
+                const float len2 = tangentV.dot(tangentV);
+                if (len2 > 1e-12f) {
+                    tangentV /= std::sqrt(len2);
                 }
             }
 
@@ -622,9 +623,9 @@ void VectorOverlayController::collectSurfaceNormals(CVolumeViewer* viewer,
                 // Left-hand rule: U x V gives normal pointing toward viewer
                 // (consistent with grid_normal in Geometry.cpp)
                 cv::Vec3f normal = tangentU.cross(tangentV);
-                float len = std::sqrt(normal.dot(normal));
-                if (len > 1e-6f) {
-                    normal /= len;
+                const float len2 = normal.dot(normal);
+                if (len2 > 1e-12f) {
+                    normal /= std::sqrt(len2);
                     drawPlaneNormalPair(worldPos, normal);
                 }
             }
