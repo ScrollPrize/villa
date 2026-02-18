@@ -68,6 +68,7 @@ private:
     QLabel* _configStatus{nullptr};
     QPushButton* _runBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
+    QPushButton* _stopServiceBtn{nullptr};
     QLabel* _progressLabel{nullptr};
 
     QString _fitPythonPath;

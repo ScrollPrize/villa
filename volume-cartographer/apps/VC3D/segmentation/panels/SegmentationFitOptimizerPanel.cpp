@@ -107,13 +107,16 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     _configStatus->setVisible(false);
     _group->contentLayout()->addWidget(_configStatus);
 
-    // -- Run / Stop buttons --
+    // -- Run / Stop / Stop Service buttons --
     auto* btnRow = new QHBoxLayout();
     _runBtn = new QPushButton(tr("Run Optimization"), content);
     _stopBtn = new QPushButton(tr("Stop"), content);
     _stopBtn->setEnabled(false);
+    _stopServiceBtn = new QPushButton(tr("Stop Service"), content);
+    _stopServiceBtn->setEnabled(false);
     btnRow->addWidget(_runBtn);
     btnRow->addWidget(_stopBtn);
+    btnRow->addWidget(_stopServiceBtn);
     btnRow->addStretch(1);
     _group->contentLayout()->addLayout(btnRow);
 
@@ -203,6 +206,11 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         emit fitStopRequested();
     });
 
+    // Stop Service button — kills the Python process entirely
+    connect(_stopServiceBtn, &QPushButton::clicked, this, []() {
+        FitServiceManager::instance().stopService();
+    });
+
     // Connect to service manager signals
     auto& mgr = FitServiceManager::instance();
     connect(&mgr, &FitServiceManager::statusMessage, this, [this](const QString& msg) {
@@ -218,6 +226,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setText(tr("Service running"));
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
         }
+        if (_stopServiceBtn) _stopServiceBtn->setEnabled(true);
     });
     connect(&mgr, &FitServiceManager::serviceStopped, this, [this]() {
         if (_progressLabel) {
@@ -225,6 +234,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setStyleSheet(QString());
         }
         if (_stopBtn) _stopBtn->setEnabled(false);
+        if (_stopServiceBtn) _stopServiceBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
     });
     connect(&mgr, &FitServiceManager::serviceError, this, [this](const QString& err) {
