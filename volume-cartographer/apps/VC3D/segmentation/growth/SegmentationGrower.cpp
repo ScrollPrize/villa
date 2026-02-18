@@ -1822,11 +1822,13 @@ void SegmentationGrower::onFutureFinished()
         }
 
         const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::filesystem::path pathsDir = volpkgRoot / "paths";
+        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
+        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
         std::error_code mkdirEc;
-        std::filesystem::create_directories(pathsDir, mkdirEc);
+        std::filesystem::create_directories(segmentsDir, mkdirEc);
         if (mkdirEc) {
-            showStatus(tr("Failed to create paths directory for new segment: %1")
+            showStatus(tr("Failed to create %1 directory for new segment: %2")
+                           .arg(QString::fromStdString(segmentationDir))
                            .arg(QString::fromStdString(mkdirEc.message())),
                        kStatusLong);
             cleanupDenseTemporarySurfaces();
@@ -1837,8 +1839,8 @@ void SegmentationGrower::onFutureFinished()
 
         const std::string baseId = sanitizeSegmentId(
             result.surface->id.empty() ? std::string("dense_displacement") : result.surface->id);
-        const std::string newSegmentId = makeUniqueSegmentId(pathsDir, baseId);
-        const std::filesystem::path newSegmentPath = pathsDir / newSegmentId;
+        const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
+        const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
 
         try {
             result.surface->save(newSegmentPath.string(), newSegmentId, false);
