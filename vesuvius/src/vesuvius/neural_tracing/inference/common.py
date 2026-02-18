@@ -159,70 +159,6 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overla
     return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 
 
-def save_tifxyz_output(
-    args,
-    tgt_segment,
-    pred_samples,
-    tifxyz_uuid,
-    tifxyz_step_size,
-    tifxyz_voxel_size_um,
-    checkpoint_path,
-    cond_direction,
-    grow_direction,
-    volume_scale,
-    overlap_merge_method="mean",
-):
-    tgt_segment.use_full_resolution()
-    full_zyxs = tgt_segment.get_zyxs(stored_resolution=False)
-
-    h_full, w_full = full_zyxs.shape[:2]
-    pred_grid, pred_valid, (uv_r_min, uv_c_min) = _aggregate_pred_samples_to_uv_grid(
-        pred_samples,
-        base_uv_bounds=(0, 0, h_full - 1, w_full - 1),
-        overlap_merge_method=overlap_merge_method,
-    )
-    full_pred_zyxs = np.full_like(pred_grid, -1.0, dtype=np.float32)
-    r_off = -uv_r_min
-    c_off = -uv_c_min
-    full_pred_zyxs[r_off:r_off + h_full, c_off:c_off + w_full] = full_zyxs
-    full_pred_zyxs[pred_valid] = pred_grid[pred_valid]
-
-    scale_factor = 2 ** volume_scale
-    if scale_factor != 1:
-        full_pred_zyxs_out = np.where(
-            (full_pred_zyxs == -1).all(axis=-1, keepdims=True),
-            -1.0,
-            full_pred_zyxs * scale_factor,
-        )
-    else:
-        full_pred_zyxs_out = full_pred_zyxs
-
-    # Downsample grid to the correct tifxyz density (step_size spacing in full-res UV).
-    current_step_y = int(round(2 ** volume_scale))
-    current_step_x = int(round(2 ** volume_scale))
-
-    stride_y = int(round(float(tifxyz_step_size) / max(1, current_step_y)))
-    stride_x = int(round(float(tifxyz_step_size) / max(1, current_step_x)))
-    if stride_y > 1 or stride_x > 1:
-        full_pred_zyxs_out = full_pred_zyxs_out[::max(1, stride_y), ::max(1, stride_x)]
-
-    save_tifxyz(
-        full_pred_zyxs_out,
-        args.tifxyz_out_dir,
-        tifxyz_uuid,
-        step_size=tifxyz_step_size,
-        voxel_size_um=tifxyz_voxel_size_um,
-        source=str(checkpoint_path),
-        additional_metadata={
-            "grow_direction": grow_direction,
-            "cond_direction": cond_direction,
-            "extrapolation_method": args.extrapolation_method,
-            "refine_steps": None if args.refine is None else int(args.refine) + 1,
-        }
-    )
-    print(f"Saved tifxyz to {os.path.join(args.tifxyz_out_dir, tifxyz_uuid)}")
-
-
 def _load_optional_json(path):
     if not path:
         return {}
@@ -959,26 +895,6 @@ def setup_segment(args, volume):
     return tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s
 
 
-def _print_stacked_displacement_debug(stacked, verbose=True):
-    if not verbose:
-        return
-    if stacked is None:
-        print("== Displacement Stack ==")
-        print("No displacement stack available.")
-        return
-
-    count = np.asarray(stacked["count"])
-    total_vox = int(count.size)
-    covered = int((count > 0).sum())
-    max_overlap = int(count.max()) if covered > 0 else 0
-    bbox = stacked["bbox"]
-    print("== Displacement Stack ==")
-    print(f"bbox: z[{bbox[0]}, {bbox[1]}], y[{bbox[2]}, {bbox[3]}], x[{bbox[4]}, {bbox[5]}]")
-    print(f"shape: {tuple(int(v) for v in stacked['shape'])}")
-    print(f"covered voxels: {covered}/{total_vox}")
-    print(f"max overlap count: {max_overlap}")
-
-
 def _agg_extrap_axis_metadata(grow_direction):
     grow_direction = str(grow_direction).lower()
     if grow_direction in {"left", "right"}:
@@ -1061,16 +977,6 @@ def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max
     if stack_count.size > 0:
         sc = stack_count.astype(np.float64, copy=False)
         print(f"stack-count min/max/mean: {int(sc.min())}/{int(sc.max())}/{sc.mean():.2f}")
-
-
-def _print_sample_filter_debug(filter_stats, verbose=True):
-    if not verbose:
-        return
-    print("== Sample Filter ==")
-    n_input = int(filter_stats.get("n_input", 0))
-    n_after_stack_count = int(filter_stats.get("n_after_stack_count", 0))
-    print(f"input samples: {n_input}")
-    print(f"after min-stack-count: {n_after_stack_count}")
 
 
 def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args,
