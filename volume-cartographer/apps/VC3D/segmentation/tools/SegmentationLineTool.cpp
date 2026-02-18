@@ -77,8 +77,8 @@ void SegmentationLineTool::extendStroke(const cv::Vec3f& worldPos, bool forceSam
             return;
         }
 
-        const float distance = std::sqrt(distanceSq);
-        if (distance > spacing) {
+        if (distanceSq > spacingSq) {
+            const float distance = std::sqrt(distanceSq);
             const cv::Vec3f direction = delta / distance;
             float travelled = spacing;
             while (travelled < distance) {

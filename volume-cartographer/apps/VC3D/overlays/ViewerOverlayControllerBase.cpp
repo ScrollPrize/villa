@@ -80,14 +80,16 @@ float ViewerOverlayControllerBase::PathPrimitive::interpolateZ(float percent,
     for (size_t i = 1; i < points.size(); ++i) {
         const cv::Vec3f& p1 = points[i - 1];
         const cv::Vec3f& p2 = points[i];
-        float segmentLength = std::sqrt(std::pow(p2[0] - p1[0], 2.0f) + std::pow(p2[1] - p1[1], 2.0f));
+        const float segmentLength2 = std::pow(p2[0] - p1[0], 2.0f) + std::pow(p2[1] - p1[1], 2.0f);
 
-        if (accumulatedLength + segmentLength >= targetLength && segmentLength > 0.0f) {
-            float segmentPercent = (targetLength - accumulatedLength) / segmentLength;
-            return p1[2] + segmentPercent * (p2[2] - p1[2]);
+        if (segmentLength2 > 0.0f) {
+            const float segmentLength = std::sqrt(segmentLength2);
+            if (accumulatedLength + segmentLength >= targetLength) {
+                float segmentPercent = (targetLength - accumulatedLength) / segmentLength;
+                return p1[2] + segmentPercent * (p2[2] - p1[2]);
+            }
+            accumulatedLength += segmentLength;
         }
-
-        accumulatedLength += segmentLength;
     }
 
     return points.back()[2];

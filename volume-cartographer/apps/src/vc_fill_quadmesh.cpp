@@ -246,15 +246,15 @@ struct SampledZNormalLoss {
         T dot;
         dot = v[0]*n[0] + v[1]*n[1] + v[2]*n[2];
         
-        T la = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-        T lb = sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+        T la_sq = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
+        T lb_sq = n[0]*n[0] + n[1]*n[1] + n[2]*n[2];
         
-        if (la <= 0.0 || lb <= 0.0) {
+        if (la_sq <= 0.0 || lb_sq <= 0.0) {
             residual[0] = T(0);
             return true;
         }
-        
-        residual[0] = T(_w)*dot/(la*lb);
+
+        residual[0] = T(_w)*dot/(sqrt(la_sq) * sqrt(lb_sq));
         
         return true;
     }

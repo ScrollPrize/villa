@@ -105,8 +105,11 @@ static inline cv::Vec3f transform_normal(const cv::Vec3f& n, const AffineTransfo
     const double nx = invAT(0,0)*n[0] + invAT(0,1)*n[1] + invAT(0,2)*n[2];
     const double ny = invAT(1,0)*n[0] + invAT(1,1)*n[1] + invAT(1,2)*n[2];
     const double nz = invAT(2,0)*n[0] + invAT(2,1)*n[1] + invAT(2,2)*n[2];
-    const double L = std::sqrt(nx*nx + ny*ny + nz*nz);
-    if (L > 0) return {static_cast<float>(nx/L), static_cast<float>(ny/L), static_cast<float>(nz/L)};
+    const double L2 = nx*nx + ny*ny + nz*nz;
+    if (L2 > 0) {
+        const double invL = 1.0 / std::sqrt(L2);
+        return {static_cast<float>(nx*invL), static_cast<float>(ny*invL), static_cast<float>(nz*invL)};
+    }
     return n;
 }
 
