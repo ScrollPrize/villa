@@ -159,23 +159,20 @@ def _aggregate_pred_samples_to_uv_grid(pred_samples, base_uv_bounds=None, overla
     return grid_zyxs, grid_valid, (uv_r_min, uv_c_min)
 
 
-def _load_optional_json(path):
-    if not path:
-        return {}
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r") as f:
-        data = json.load(f)
-    return data if isinstance(data, dict) else {}
-
-
-def _resolve_settings(args, model_config=None, load_checkpoint_config_fn=None):
+def resolve_extrapolation_settings(args, model_config=None, load_checkpoint_config_fn=None):
     runtime_config = {}
     if model_config is None and args.checkpoint_path and load_checkpoint_config_fn is not None:
         model_config, _ = load_checkpoint_config_fn(args.checkpoint_path)
     if model_config:
         runtime_config.update(model_config)
-    runtime_config.update(_load_optional_json(args.config_path))
+
+    config_path = getattr(args, "config_path", None)
+    if config_path and os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config_data = json.load(f)
+        if isinstance(config_data, dict):
+            runtime_config.update(config_data)
+
     return _resolve_extrapolation_settings(args, runtime_config)
 
 
@@ -308,19 +305,6 @@ def _get_cond_edge(cond_zyxs, cond_direction, cond_valid=None):
     return out
 
 
-def _bbox_from_center(center, crop_size):
-    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
-    # Align to voxel indices so inclusive bounds match a crop of size crop_size.
-    half = (crop_size_arr - 1) / 2.0
-    min_corner = np.floor(center - half).astype(np.int64)
-    max_corner = min_corner + (crop_size_arr - 1)
-    return (
-        int(min_corner[0]), int(max_corner[0]),
-        int(min_corner[1]), int(max_corner[1]),
-        int(min_corner[2]), int(max_corner[2]),
-    )
-
-
 def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15, cond_valid=None):
     # Build center-out crop anchors along the conditioning edge. Each chunk grows
     # while its XYZ span still fits in one crop-sized bbox.
@@ -395,7 +379,15 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
         for chunk in chunks:
             pts = edge[chunk]
             center = (pts.min(axis=0) + pts.max(axis=0)) / 2
-            bbox = _bbox_from_center(center, crop_size)
+            # Align to voxel indices so inclusive bounds match a crop of size crop_size.
+            half = (crop_size_arr - 1) / 2.0
+            min_corner = np.floor(center - half).astype(np.int64)
+            max_corner = min_corner + (crop_size_arr - 1)
+            bbox = (
+                int(min_corner[0]), int(max_corner[0]),
+                int(min_corner[1]), int(max_corner[1]),
+                int(min_corner[2]), int(max_corner[2]),
+            )
             if bbox in seen_bboxes:
                 continue
             seen_bboxes.add(bbox)
@@ -938,24 +930,41 @@ def _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=Non
         return np.zeros((0, 2), dtype=np.int64)
 
     axis_idx, _, near_to_far_desc = _agg_extrap_axis_metadata(grow_direction)
-    if axis_idx == 1:
-        primary = -uv_ordered[:, 1] if near_to_far_desc else uv_ordered[:, 1]
-        secondary = uv_ordered[:, 0]
-    else:
-        primary = -uv_ordered[:, 0] if near_to_far_desc else uv_ordered[:, 0]
-        secondary = uv_ordered[:, 1]
+    primary_axis_vals = uv_ordered[:, axis_idx]
+    primary = -primary_axis_vals if near_to_far_desc else primary_axis_vals
+    secondary = uv_ordered[:, 1 - axis_idx]
     order = np.lexsort((secondary, primary))
     uv_ordered = uv_ordered[order]
 
     if max_lines is None:
         return uv_ordered
 
-    axis_values = np.unique(uv_ordered[:, axis_idx]).astype(np.int64)
-    if near_to_far_desc:
-        axis_values = axis_values[::-1]
-    selected_axis_values = axis_values[:int(max_lines)]
-    keep = np.isin(uv_ordered[:, axis_idx], selected_axis_values, assume_unique=False)
-    return uv_ordered[keep]
+    depth_keep = int(max_lines)
+    if depth_keep < 1:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    # For ragged/non-rectangular fronts, keep near->far depth per boundary line
+    # (per row for left/right, per col for up/down), not global axis values.
+    boundary_axis_idx = 1 - axis_idx
+    boundary_ids = np.unique(uv_ordered[:, boundary_axis_idx]).astype(np.int64, copy=False)
+    picked = []
+    for boundary_id in boundary_ids:
+        line_uv = uv_ordered[uv_ordered[:, boundary_axis_idx] == boundary_id]
+        if line_uv.shape[0] == 0:
+            continue
+        line_primary_vals = line_uv[:, axis_idx]
+        line_primary = -line_primary_vals if near_to_far_desc else line_primary_vals
+        line_order = np.argsort(line_primary, kind="stable")
+        picked.append(line_uv[line_order[:depth_keep]])
+    if not picked:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    selected = np.concatenate(picked, axis=0).astype(np.int64, copy=False)
+    sel_primary_vals = selected[:, axis_idx]
+    sel_primary = -sel_primary_vals if near_to_far_desc else sel_primary_vals
+    sel_secondary = selected[:, 1 - axis_idx]
+    sel_order = np.lexsort((sel_secondary, sel_primary))
+    return selected[sel_order]
 
 
 def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max_lines=None, verbose=True):

@@ -22,23 +22,23 @@ from vesuvius.neural_tracing.inference.common import (
     _print_bbox_crop_debug_table,
     _print_iteration_summary,
     _resolve_segment_volume,
-    _resolve_settings,
     _RuntimeProfiler,
     _scale_to_subsample_stride,
     _save_merged_surface_tifxyz,
+    _select_extrap_uvs_for_sampling,
     _serialize_args,
     _stored_to_full_bounds,
     _show_napari,
     compute_edge_one_shot_extrapolation,
     get_cond_edge_bboxes,
     get_window_bounds_from_bboxes,
+    resolve_extrapolation_settings,
     setup_segment,
 )
 from vesuvius.neural_tracing.inference.displacement_helpers import (
-    _build_model_inputs,
-    _predict_displacement,
     load_checkpoint_config,
     load_model,
+    predict_displacement,
 )
 from vesuvius.neural_tracing.inference.displacement_tta import TTA_MERGE_METHODS
 
@@ -378,25 +378,6 @@ def _build_extrap_lookup_arrays(edge_extrapolation):
     return _build_extrap_lookup_from_uv_world(query_uv, extrapolated_world)
 
 
-def _empty_uv_world_int():
-    return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
-
-
-def _growth_axis_params(grow_direction):
-    if grow_direction in {"left", "right"}:
-        return 1, (grow_direction == "left")
-    if grow_direction in {"up", "down"}:
-        return 0, (grow_direction == "up")
-    raise ValueError(f"Unknown grow_direction '{grow_direction}'")
-
-
-def _uv_sort_primary_secondary(uv, axis_idx, near_to_far_desc):
-    primary_axis_vals = uv[:, axis_idx]
-    primary = -primary_axis_vals if near_to_far_desc else primary_axis_vals
-    secondary = uv[:, 1 - axis_idx]
-    return primary, secondary
-
-
 def _empty_disp_count_valid():
     return (
         _empty_world(dtype=np.float32),
@@ -405,74 +386,36 @@ def _empty_disp_count_valid():
     )
 
 
-def _select_finite_extrap_uv_world(extrap_lookup, grow_direction, max_lines=None):
+def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
+    return _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=max_lines)
+
+
+def _prepare_sampled_extrap_points(extrap_lookup, grow_direction, max_lines=None):
     if extrap_lookup is None:
-        return _empty_uv_world_int()
-    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
+
+    sampled_uv = _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=max_lines)
     if sampled_uv.shape[0] == 0:
-        return _empty_uv_world_int()
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
-    finite_world = np.isfinite(sampled_world).all(axis=1)
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
+
+    extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(sampled_uv, extrap_lookup)
+    if extrap_uv.shape[0] != sampled_uv.shape[0] or not np.array_equal(extrap_uv, sampled_uv):
+        raise KeyError("Requested UV is not present in extrapolation lookup.")
+
+    finite_world = np.isfinite(extrap_world).all(axis=1)
     if not finite_world.any():
-        return _empty_uv_world_int()
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
+
     return (
         sampled_uv[finite_world].astype(np.int64, copy=False),
-        sampled_world[finite_world].astype(np.float32, copy=False),
+        extrap_world[finite_world].astype(np.float32, copy=False),
     )
-
-
-def _select_uv_depth_per_boundary(uv_ordered, axis_idx, near_to_far_desc, depth_keep):
-    boundary_axis_idx = 1 - axis_idx
-    boundary_ids = np.unique(uv_ordered[:, boundary_axis_idx]).astype(np.int64, copy=False)
-    picked = []
-    for boundary_id in boundary_ids:
-        line_uv = uv_ordered[uv_ordered[:, boundary_axis_idx] == boundary_id]
-        if line_uv.shape[0] == 0:
-            continue
-        line_primary, _ = _uv_sort_primary_secondary(line_uv, axis_idx, near_to_far_desc)
-        line_order = np.argsort(line_primary, kind="stable")
-        picked.append(line_uv[line_order[:depth_keep]])
-    if not picked:
-        return np.zeros((0, 2), dtype=np.int64)
-    return np.concatenate(picked, axis=0).astype(np.int64, copy=False)
-
-
-def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
-    lookup = _as_extrap_lookup_arrays(extrap_lookup)
-    uv_ordered = np.asarray(lookup.uv, dtype=np.int64)
-    if uv_ordered.ndim != 2 or uv_ordered.shape[1] != 2:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    if uv_ordered.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    axis_idx, near_to_far_desc = _growth_axis_params(grow_direction)
-    primary, secondary = _uv_sort_primary_secondary(uv_ordered, axis_idx, near_to_far_desc)
-    order = np.lexsort((secondary, primary))
-    uv_ordered = uv_ordered[order]
-
-    if max_lines is None:
-        return uv_ordered
-
-    depth_keep = int(max_lines)
-    if depth_keep < 1:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    # For ragged/non-rectangular fronts, keep near->far depth per boundary line
-    # (per row for left/right, per col for up/down), not global axis values.
-    selected = _select_uv_depth_per_boundary(uv_ordered, axis_idx, near_to_far_desc, depth_keep)
-    if selected.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    sel_primary, sel_secondary = _uv_sort_primary_secondary(selected, axis_idx, near_to_far_desc)
-    sel_order = np.lexsort((sel_secondary, sel_primary))
-    return selected[sel_order]
 
 
 def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
     uv_int = np.asarray(uv_query_flat, dtype=np.int64)
     if uv_int.ndim != 2 or uv_int.shape[1] != 2 or uv_int.shape[0] == 0:
-        return _empty_uv_world_int()
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
     lookup = _as_extrap_lookup_arrays(extrap_lookup)
     lookup_uv, lookup_world = _coerce_uv_world(
@@ -482,7 +425,7 @@ def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
         world_dtype=np.float32,
     )
     if lookup_uv.shape[0] == 0:
-        return _empty_uv_world_int()
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
     lookup_view = _uv_struct_view(lookup_uv)
     query_view = _uv_struct_view(uv_int)
@@ -495,7 +438,7 @@ def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
         pos_in = pos[in_bounds]
         matched[in_bounds] = lookup_sorted[pos_in] == query_view[in_bounds]
     if not matched.any():
-        return _empty_uv_world_int()
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
     keep_idx = np.nonzero(matched)[0]
     lookup_idx = lookup_sort[pos[keep_idx]]
@@ -609,17 +552,18 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
         batch = bbox_crops[batch_start:batch_start + batch_size]
         batch_inputs = []
         for crop in batch:
+            vol_t = torch.from_numpy(crop["volume"]).float().unsqueeze(0).unsqueeze(0)
+            cond_t = torch.from_numpy(crop["cond_vox"]).float().unsqueeze(0).unsqueeze(0)
             if expected_in_channels == 2:
                 # Dense-displacement checkpoints may be trained without extrapolation
                 # conditioning (vol + cond only).
-                vol_t = torch.from_numpy(crop["volume"]).float().unsqueeze(0).unsqueeze(0)
-                cond_t = torch.from_numpy(crop["cond_vox"]).float().unsqueeze(0).unsqueeze(0)
                 model_input = torch.cat([vol_t, cond_t], dim=1)
             else:
-                model_input = _build_model_inputs(crop["volume"], crop["cond_vox"], crop["extrap_vox"])
+                extrap_t = torch.from_numpy(crop["extrap_vox"]).float().unsqueeze(0).unsqueeze(0)
+                model_input = torch.cat([vol_t, cond_t, extrap_t], dim=1)
             batch_inputs.append(model_input)
         model_inputs = torch.cat(batch_inputs, dim=0).to(args.device)
-        disp_pred = _predict_displacement(args, model_state, model_inputs, use_tta=use_tta)
+        disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=use_tta)
         if disp_pred is None:
             raise RuntimeError("Model output did not contain 'displacement'.")
 
@@ -722,7 +666,7 @@ def _sample_displacement_for_extrap_uvs_from_crops(
     if per_crop_fields is None or len(per_crop_fields) == 0 or extrap_lookup is None:
         return _empty_stack_samples()
 
-    sampled_uv, sampled_world = _select_finite_extrap_uv_world(
+    sampled_uv, sampled_world = _prepare_sampled_extrap_points(
         extrap_lookup,
         grow_direction,
         max_lines=max_lines,
@@ -828,19 +772,8 @@ def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extr
     return sampled_disp, best_count, ever_valid
 
 
-def _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup):
-    sampled_uv = np.asarray(sampled_uv, dtype=np.int64)
-    if sampled_uv.ndim != 2 or sampled_uv.shape[0] == 0:
-        return _empty_world(dtype=np.float32)
-
-    extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(sampled_uv, extrap_lookup)
-    if extrap_uv.shape[0] != sampled_uv.shape[0] or not np.array_equal(extrap_uv, sampled_uv):
-        raise KeyError("Requested UV is not present in extrapolation lookup.")
-    return extrap_world.astype(np.float32, copy=False)
-
-
 def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
-    sampled_uv, sampled_world = _select_finite_extrap_uv_world(
+    sampled_uv, sampled_world = _prepare_sampled_extrap_points(
         extrap_lookup,
         grow_direction,
         max_lines=max_lines,
@@ -1260,14 +1193,6 @@ def _build_extrap_lookup_from_grid(grid, valid, offset):
     )
 
 
-def _clear_edge_extrapolation_payload(edge_extrapolation):
-    # Keep only lightweight metadata after extrapolation lookup construction.
-    edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
-    edge_extrapolation["query_uv"] = _empty_uv(dtype=np.float64)
-    edge_extrapolation["extrapolated_local"] = _empty_world(dtype=np.float32)
-    edge_extrapolation["extrapolated_world"] = _empty_world(dtype=np.float32)
-
-
 def _build_iteration_extrap_lookup(edge_extrapolation, verbose=False, napari=False):
     if verbose or napari:
         query_uv, extrapolated_world = _finite_uv_world(
@@ -1285,7 +1210,12 @@ def _build_iteration_extrap_lookup(edge_extrapolation, verbose=False, napari=Fal
         )
     else:
         extrap_lookup = _build_extrap_lookup_arrays(edge_extrapolation)
-    _clear_edge_extrapolation_payload(edge_extrapolation)
+
+    # Keep only lightweight metadata after extrapolation lookup construction.
+    edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
+    edge_extrapolation["query_uv"] = _empty_uv(dtype=np.float64)
+    edge_extrapolation["extrapolated_local"] = _empty_world(dtype=np.float32)
+    edge_extrapolation["extrapolated_world"] = _empty_world(dtype=np.float32)
     return extrap_lookup
 
 
@@ -1403,7 +1333,7 @@ def main():
                 model_config, checkpoint_path = load_checkpoint_config(args.checkpoint_path)
 
     with profiler.section("resolve_settings"):
-        extrapolation_settings = _resolve_settings(
+        extrapolation_settings = resolve_extrapolation_settings(
             args,
             model_config=model_config,
             load_checkpoint_config_fn=load_checkpoint_config,

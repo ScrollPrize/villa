@@ -7,30 +7,21 @@ from vesuvius.neural_tracing.inference.displacement_tta import run_model_tta
 from vesuvius.neural_tracing.models import load_checkpoint, resolve_checkpoint_path
 
 
-def _build_model_inputs(vol_crop, cond_vox, extrap_vox):
-    vol_t = torch.from_numpy(vol_crop).float().unsqueeze(0).unsqueeze(0)
-    cond_t = torch.from_numpy(cond_vox).float().unsqueeze(0).unsqueeze(0)
-    extrap_t = torch.from_numpy(extrap_vox).float().unsqueeze(0).unsqueeze(0)
-    return torch.cat([vol_t, cond_t, extrap_t], dim=1)
-
-
-def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
-    with torch.no_grad():
-        if amp_enabled:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                output = model(model_inputs)
-        else:
-            output = model(model_inputs)
-    disp = output.get("displacement", None)
-    return disp
-
-
-def _predict_displacement(args, model_state, model_inputs, use_tta=None):
+def predict_displacement(args, model_state, model_inputs, use_tta=None):
     model = model_state["model"]
     amp_enabled = model_state["amp_enabled"]
     amp_dtype = model_state["amp_dtype"]
     if use_tta is None:
         use_tta = bool(getattr(args, "tta", True))
+
+    def run_single_model_pass(model_inputs_batch):
+        with torch.no_grad():
+            if amp_enabled:
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    output = model(model_inputs_batch)
+            else:
+                output = model(model_inputs_batch)
+        return output.get("displacement", None)
 
     if use_tta:
         return run_model_tta(
@@ -38,13 +29,13 @@ def _predict_displacement(args, model_state, model_inputs, use_tta=None):
             model_inputs,
             amp_enabled,
             amp_dtype,
-            get_displacement_result=_get_displacement_result,
+            get_displacement_result=run_single_model_pass,
             merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
             outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
             outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
         )
 
-    return _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype)
+    return run_single_model_pass(model_inputs)
 
 
 def load_model(args):
