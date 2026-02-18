@@ -186,6 +186,7 @@ void SegmentationWidget::syncUiState()
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _approvalMaskPanel->syncUiState();
     _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
+    _neuralTracerPanel->syncUiState();
 }
 
 void SegmentationWidget::restoreSettings()
@@ -384,12 +385,20 @@ QString SegmentationWidget::neuralPythonPath() const { return _neuralTracerPanel
 QString SegmentationWidget::volumeZarrPath() const { return _neuralTracerPanel->volumeZarrPath(); }
 int SegmentationWidget::neuralVolumeScale() const { return _neuralTracerPanel->neuralVolumeScale(); }
 int SegmentationWidget::neuralBatchSize() const { return _neuralTracerPanel->neuralBatchSize(); }
+NeuralTracerModelType SegmentationWidget::neuralModelType() const { return _neuralTracerPanel->neuralModelType(); }
+NeuralTracerOutputMode SegmentationWidget::neuralOutputMode() const { return _neuralTracerPanel->neuralOutputMode(); }
+QString SegmentationWidget::denseCheckpointPath() const { return _neuralTracerPanel->denseCheckpointPath(); }
+QString SegmentationWidget::denseConfigPath() const { return _neuralTracerPanel->denseConfigPath(); }
 
 void SegmentationWidget::setNeuralTracerEnabled(bool enabled) { _neuralTracerPanel->setNeuralTracerEnabled(enabled); }
 void SegmentationWidget::setNeuralCheckpointPath(const QString& path) { _neuralTracerPanel->setNeuralCheckpointPath(path); }
 void SegmentationWidget::setNeuralPythonPath(const QString& path) { _neuralTracerPanel->setNeuralPythonPath(path); }
 void SegmentationWidget::setNeuralVolumeScale(int scale) { _neuralTracerPanel->setNeuralVolumeScale(scale); }
 void SegmentationWidget::setNeuralBatchSize(int size) { _neuralTracerPanel->setNeuralBatchSize(size); }
+void SegmentationWidget::setNeuralModelType(NeuralTracerModelType type) { _neuralTracerPanel->setNeuralModelType(type); }
+void SegmentationWidget::setNeuralOutputMode(NeuralTracerOutputMode mode) { _neuralTracerPanel->setNeuralOutputMode(mode); }
+void SegmentationWidget::setDenseCheckpointPath(const QString& path) { _neuralTracerPanel->setDenseCheckpointPath(path); }
+void SegmentationWidget::setDenseConfigPath(const QString& path) { _neuralTracerPanel->setDenseConfigPath(path); }
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 
 void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}

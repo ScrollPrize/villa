@@ -93,6 +93,8 @@ private:
         std::optional<CorrectionsBounds> correctionsBounds;
         std::unique_ptr<QuadSurface> beforeCrop;
         SegmentationCorrectionsPayload corrections;
+        bool denseDisplacement{false};
+        bool denseCreateNewSegment{false};
     };
 
     void finalize(bool ok);

@@ -29,6 +29,10 @@ public:
     [[nodiscard]] QString volumeZarrPath() const { return _volumeZarrPath; }
     [[nodiscard]] int neuralVolumeScale() const { return _neuralVolumeScale; }
     [[nodiscard]] int neuralBatchSize() const { return _neuralBatchSize; }
+    [[nodiscard]] NeuralTracerModelType neuralModelType() const { return _neuralModelType; }
+    [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const { return _neuralOutputMode; }
+    [[nodiscard]] QString denseCheckpointPath() const { return _denseCheckpointPath; }
+    [[nodiscard]] QString denseConfigPath() const { return _denseConfigPath; }
 
     // Setters
     void setNeuralTracerEnabled(bool enabled);
@@ -37,6 +41,10 @@ public:
     void setNeuralVolumeScale(int scale);
     void setNeuralBatchSize(int size);
     void setVolumeZarrPath(const QString& path);
+    void setNeuralModelType(NeuralTracerModelType type);
+    void setNeuralOutputMode(NeuralTracerOutputMode mode);
+    void setDenseCheckpointPath(const QString& path);
+    void setDenseConfigPath(const QString& path);
 
     void restoreSettings(QSettings& settings);
     void syncUiState();
@@ -50,11 +58,18 @@ signals:
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
+    void updateDenseUiState();
 
     CollapsibleSettingsGroup* _groupNeuralTracer{nullptr};
     QCheckBox* _chkNeuralTracerEnabled{nullptr};
+    QComboBox* _comboNeuralModelType{nullptr};
+    QComboBox* _comboNeuralOutputMode{nullptr};
     QLineEdit* _neuralCheckpointEdit{nullptr};
     QToolButton* _neuralCheckpointBrowse{nullptr};
+    QLineEdit* _denseCheckpointEdit{nullptr};
+    QToolButton* _denseCheckpointBrowse{nullptr};
+    QLineEdit* _denseConfigEdit{nullptr};
+    QToolButton* _denseConfigBrowse{nullptr};
     QLineEdit* _neuralPythonEdit{nullptr};
     QToolButton* _neuralPythonBrowse{nullptr};
     QComboBox* _comboNeuralVolumeScale{nullptr};
@@ -67,6 +82,10 @@ private:
     QString _volumeZarrPath;
     int _neuralVolumeScale{0};
     int _neuralBatchSize{4};
+    NeuralTracerModelType _neuralModelType{NeuralTracerModelType::Heatmap};
+    NeuralTracerOutputMode _neuralOutputMode{NeuralTracerOutputMode::OverwriteCurrentSegment};
+    QString _denseCheckpointPath;
+    QString _denseConfigPath;
 
     bool _restoringSettings{false};
     const QString _settingsGroup;

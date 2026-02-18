@@ -37,6 +37,26 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
                                            "Requires a trained model checkpoint."));
     _groupNeuralTracer->contentLayout()->addWidget(_chkNeuralTracerEnabled);
 
+    _groupNeuralTracer->addRow(tr("Model type:"), [&](QHBoxLayout* row) {
+        _comboNeuralModelType = new QComboBox(neuralParent);
+        _comboNeuralModelType->addItem(tr("Heatmap"), static_cast<int>(NeuralTracerModelType::Heatmap));
+        _comboNeuralModelType->addItem(tr("Dense displacement"), static_cast<int>(NeuralTracerModelType::DenseDisplacement));
+        _comboNeuralModelType->setToolTip(tr("Select which neural tracing model path to use."));
+        row->addWidget(_comboNeuralModelType);
+        row->addStretch(1);
+    });
+
+    _groupNeuralTracer->addRow(tr("Output mode:"), [&](QHBoxLayout* row) {
+        _comboNeuralOutputMode = new QComboBox(neuralParent);
+        _comboNeuralOutputMode->addItem(tr("Overwrite current segment"),
+                                        static_cast<int>(NeuralTracerOutputMode::OverwriteCurrentSegment));
+        _comboNeuralOutputMode->addItem(tr("Create new segment"),
+                                        static_cast<int>(NeuralTracerOutputMode::CreateNewSegment));
+        _comboNeuralOutputMode->setToolTip(tr("Choose whether dense displacement updates the current segment or creates a new one."));
+        row->addWidget(_comboNeuralOutputMode);
+        row->addStretch(1);
+    });
+
     _groupNeuralTracer->addRow(tr("Checkpoint:"), [&](QHBoxLayout* row) {
         _neuralCheckpointEdit = new QLineEdit(neuralParent);
         _neuralCheckpointEdit->setPlaceholderText(tr("Path to model checkpoint (.pt)"));
@@ -47,6 +67,28 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         row->addWidget(_neuralCheckpointEdit, 1);
         row->addWidget(_neuralCheckpointBrowse);
     }, tr("Path to the trained neural network checkpoint file."));
+
+    _groupNeuralTracer->addRow(tr("Dense ckpt:"), [&](QHBoxLayout* row) {
+        _denseCheckpointEdit = new QLineEdit(neuralParent);
+        _denseCheckpointEdit->setPlaceholderText(tr("Path to dense displacement checkpoint (.pt)"));
+        _denseCheckpointEdit->setToolTip(tr("Dense displacement checkpoint used when model type is Dense displacement."));
+        _denseCheckpointBrowse = new QToolButton(neuralParent);
+        _denseCheckpointBrowse->setText(QStringLiteral("..."));
+        _denseCheckpointBrowse->setToolTip(tr("Browse for dense displacement checkpoint."));
+        row->addWidget(_denseCheckpointEdit, 1);
+        row->addWidget(_denseCheckpointBrowse);
+    }, tr("Dense displacement model checkpoint."));
+
+    _groupNeuralTracer->addRow(tr("Dense config:"), [&](QHBoxLayout* row) {
+        _denseConfigEdit = new QLineEdit(neuralParent);
+        _denseConfigEdit->setPlaceholderText(tr("Optional dense displacement config (.json)"));
+        _denseConfigEdit->setToolTip(tr("Optional config JSON forwarded to dense displacement requests."));
+        _denseConfigBrowse = new QToolButton(neuralParent);
+        _denseConfigBrowse->setText(QStringLiteral("..."));
+        _denseConfigBrowse->setToolTip(tr("Browse for dense displacement config JSON."));
+        row->addWidget(_denseConfigEdit, 1);
+        row->addWidget(_denseConfigBrowse);
+    }, tr("Optional dense displacement config path."));
 
     _groupNeuralTracer->addRow(tr("Python:"), [&](QHBoxLayout* row) {
         _neuralPythonEdit = new QLineEdit(neuralParent);
@@ -91,6 +133,16 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         setNeuralTracerEnabled(enabled);
     });
 
+    connect(_comboNeuralModelType, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        auto type = static_cast<NeuralTracerModelType>(_comboNeuralModelType->itemData(index).toInt());
+        setNeuralModelType(type);
+    });
+
+    connect(_comboNeuralOutputMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        auto mode = static_cast<NeuralTracerOutputMode>(_comboNeuralOutputMode->itemData(index).toInt());
+        setNeuralOutputMode(mode);
+    });
+
     connect(_neuralCheckpointEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _neuralCheckpointPath = text.trimmed();
         writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
@@ -103,6 +155,36 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         if (!file.isEmpty()) {
             _neuralCheckpointPath = file;
             _neuralCheckpointEdit->setText(file);
+        }
+    });
+
+    connect(_denseCheckpointEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _denseCheckpointPath = text.trimmed();
+        writeSetting(QStringLiteral("neural_dense_checkpoint_path"), _denseCheckpointPath);
+    });
+
+    connect(_denseCheckpointBrowse, &QToolButton::clicked, this, [this]() {
+        const QString initial = _denseCheckpointPath.isEmpty() ? QDir::homePath() : _denseCheckpointPath;
+        const QString file = QFileDialog::getOpenFileName(this, tr("Select dense displacement checkpoint"),
+                                                          initial, tr("PyTorch Checkpoint (*.pt *.pth);;All Files (*)"));
+        if (!file.isEmpty()) {
+            _denseCheckpointPath = file;
+            _denseCheckpointEdit->setText(file);
+        }
+    });
+
+    connect(_denseConfigEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _denseConfigPath = text.trimmed();
+        writeSetting(QStringLiteral("neural_dense_config_path"), _denseConfigPath);
+    });
+
+    connect(_denseConfigBrowse, &QToolButton::clicked, this, [this]() {
+        const QString initial = _denseConfigPath.isEmpty() ? QDir::homePath() : QFileInfo(_denseConfigPath).absolutePath();
+        const QString file = QFileDialog::getOpenFileName(this, tr("Select dense displacement config"),
+                                                          initial, tr("JSON Files (*.json);;All Files (*)"));
+        if (!file.isEmpty()) {
+            _denseConfigPath = file;
+            _denseConfigEdit->setText(file);
         }
     });
 
@@ -160,6 +242,8 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
             _lblNeuralTracerStatus->setVisible(true);
         }
     });
+
+    updateDenseUiState();
 }
 
 void SegmentationNeuralTracerPanel::writeSetting(const QString& key, const QVariant& value)
@@ -247,6 +331,69 @@ void SegmentationNeuralTracerPanel::setNeuralBatchSize(int size)
     }
 }
 
+void SegmentationNeuralTracerPanel::setNeuralModelType(NeuralTracerModelType type)
+{
+    if (_neuralModelType == type) {
+        return;
+    }
+    _neuralModelType = type;
+    writeSetting(QStringLiteral("neural_model_type"), static_cast<int>(_neuralModelType));
+
+    if (_comboNeuralModelType) {
+        const QSignalBlocker blocker(_comboNeuralModelType);
+        int idx = _comboNeuralModelType->findData(static_cast<int>(_neuralModelType));
+        if (idx >= 0) {
+            _comboNeuralModelType->setCurrentIndex(idx);
+        }
+    }
+    updateDenseUiState();
+}
+
+void SegmentationNeuralTracerPanel::setNeuralOutputMode(NeuralTracerOutputMode mode)
+{
+    if (_neuralOutputMode == mode) {
+        return;
+    }
+    _neuralOutputMode = mode;
+    writeSetting(QStringLiteral("neural_output_mode"), static_cast<int>(_neuralOutputMode));
+
+    if (_comboNeuralOutputMode) {
+        const QSignalBlocker blocker(_comboNeuralOutputMode);
+        int idx = _comboNeuralOutputMode->findData(static_cast<int>(_neuralOutputMode));
+        if (idx >= 0) {
+            _comboNeuralOutputMode->setCurrentIndex(idx);
+        }
+    }
+}
+
+void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
+{
+    if (_denseCheckpointPath == path) {
+        return;
+    }
+    _denseCheckpointPath = path;
+    writeSetting(QStringLiteral("neural_dense_checkpoint_path"), _denseCheckpointPath);
+
+    if (_denseCheckpointEdit) {
+        const QSignalBlocker blocker(_denseCheckpointEdit);
+        _denseCheckpointEdit->setText(path);
+    }
+}
+
+void SegmentationNeuralTracerPanel::setDenseConfigPath(const QString& path)
+{
+    if (_denseConfigPath == path) {
+        return;
+    }
+    _denseConfigPath = path;
+    writeSetting(QStringLiteral("neural_dense_config_path"), _denseConfigPath);
+
+    if (_denseConfigEdit) {
+        const QSignalBlocker blocker(_denseConfigEdit);
+        _denseConfigEdit->setText(path);
+    }
+}
+
 void SegmentationNeuralTracerPanel::setVolumeZarrPath(const QString& path)
 {
     _volumeZarrPath = path;
@@ -263,6 +410,18 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     _neuralVolumeScale = std::clamp(_neuralVolumeScale, 0, 5);
     _neuralBatchSize = settings.value(QStringLiteral("neural_batch_size"), 4).toInt();
     _neuralBatchSize = std::clamp(_neuralBatchSize, 1, 64);
+    const int modelType = settings.value(QStringLiteral("neural_model_type"),
+                                         static_cast<int>(NeuralTracerModelType::Heatmap)).toInt();
+    _neuralModelType = modelType == static_cast<int>(NeuralTracerModelType::DenseDisplacement)
+        ? NeuralTracerModelType::DenseDisplacement
+        : NeuralTracerModelType::Heatmap;
+    const int outputMode = settings.value(QStringLiteral("neural_output_mode"),
+                                          static_cast<int>(NeuralTracerOutputMode::OverwriteCurrentSegment)).toInt();
+    _neuralOutputMode = outputMode == static_cast<int>(NeuralTracerOutputMode::CreateNewSegment)
+        ? NeuralTracerOutputMode::CreateNewSegment
+        : NeuralTracerOutputMode::OverwriteCurrentSegment;
+    _denseCheckpointPath = settings.value(QStringLiteral("neural_dense_checkpoint_path"), QString()).toString();
+    _denseConfigPath = settings.value(QStringLiteral("neural_dense_config_path"), QString()).toString();
 
     // Restore group expansion state
     const bool neuralExpanded = settings.value(QStringLiteral("group_neural_tracer_expanded"), false).toBool();
@@ -297,5 +456,58 @@ void SegmentationNeuralTracerPanel::syncUiState()
     if (_spinNeuralBatchSize) {
         const QSignalBlocker blocker(_spinNeuralBatchSize);
         _spinNeuralBatchSize->setValue(_neuralBatchSize);
+    }
+    if (_comboNeuralModelType) {
+        const QSignalBlocker blocker(_comboNeuralModelType);
+        int idx = _comboNeuralModelType->findData(static_cast<int>(_neuralModelType));
+        if (idx >= 0) {
+            _comboNeuralModelType->setCurrentIndex(idx);
+        }
+    }
+    if (_comboNeuralOutputMode) {
+        const QSignalBlocker blocker(_comboNeuralOutputMode);
+        int idx = _comboNeuralOutputMode->findData(static_cast<int>(_neuralOutputMode));
+        if (idx >= 0) {
+            _comboNeuralOutputMode->setCurrentIndex(idx);
+        }
+    }
+    if (_denseCheckpointEdit) {
+        const QSignalBlocker blocker(_denseCheckpointEdit);
+        _denseCheckpointEdit->setText(_denseCheckpointPath);
+    }
+    if (_denseConfigEdit) {
+        const QSignalBlocker blocker(_denseConfigEdit);
+        _denseConfigEdit->setText(_denseConfigPath);
+    }
+    updateDenseUiState();
+}
+
+void SegmentationNeuralTracerPanel::updateDenseUiState()
+{
+    const bool denseMode = _neuralModelType == NeuralTracerModelType::DenseDisplacement;
+    if (_neuralCheckpointEdit) {
+        _neuralCheckpointEdit->setEnabled(!denseMode);
+    }
+    if (_neuralCheckpointBrowse) {
+        _neuralCheckpointBrowse->setEnabled(!denseMode);
+    }
+    if (_denseCheckpointEdit) {
+        _denseCheckpointEdit->setEnabled(denseMode);
+        _denseCheckpointEdit->setVisible(denseMode);
+    }
+    if (_denseCheckpointBrowse) {
+        _denseCheckpointBrowse->setEnabled(denseMode);
+        _denseCheckpointBrowse->setVisible(denseMode);
+    }
+    if (_denseConfigEdit) {
+        _denseConfigEdit->setEnabled(denseMode);
+        _denseConfigEdit->setVisible(denseMode);
+    }
+    if (_denseConfigBrowse) {
+        _denseConfigBrowse->setEnabled(denseMode);
+        _denseConfigBrowse->setVisible(denseMode);
+    }
+    if (_comboNeuralOutputMode) {
+        _comboNeuralOutputMode->setEnabled(denseMode);
     }
 }
