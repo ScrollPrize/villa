@@ -324,14 +324,7 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
     overlap_frac = float(overlap_frac)
     overlap_frac = max(0.0, min(overlap_frac, 0.99))
 
-    def _indices_fit_single_bbox(indices):
-        pts = edge[indices]
-        spans = pts.max(axis=0) - pts.min(axis=0)
-        return (
-            spans[0] <= (crop_size_arr[0] - 1) and
-            spans[1] <= (crop_size_arr[1] - 1) and
-            spans[2] <= (crop_size_arr[2] - 1)
-        )
+    span_limit = crop_size_arr - 1
 
     def _chunk_ordered_indices(ordered_indices):
         chunks = []
@@ -339,10 +332,17 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
             return chunks
         start = 0
         while start < len(ordered_indices):
+            first_pt = edge[ordered_indices[start]]
+            running_min = first_pt.copy()
+            running_max = first_pt.copy()
             end = start + 1
             while end < len(ordered_indices):
-                candidate = ordered_indices[start:end + 1]
-                if _indices_fit_single_bbox(candidate):
+                next_pt = edge[ordered_indices[end]]
+                candidate_min = np.minimum(running_min, next_pt)
+                candidate_max = np.maximum(running_max, next_pt)
+                if np.all((candidate_max - candidate_min) <= span_limit):
+                    running_min = candidate_min
+                    running_max = candidate_max
                     end += 1
                     continue
                 break
