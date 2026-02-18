@@ -898,19 +898,19 @@ def compute_edge_one_shot_extrapolation(
         return None
 
     cond_direction, _ = _get_growth_context(grow_direction)
-    edge_input_mask = _build_edge_input_mask(cond_valid_base, cond_direction, edge_input_rowscols)
-    if not edge_input_mask.any():
+    edge_seed_mask = _build_edge_input_mask(cond_valid_base, cond_direction, edge_input_rowscols)
+    if not edge_seed_mask.any():
         return None
 
     # Build query span from the edge-input conditioning band, not the full grown
     # surface, so iterative runs do not blow up one-shot query allocations.
-    uv_query_seed = uv_cond[edge_input_mask]
-    uv_query = _build_uv_query_from_edge_band(uv_query_seed, grow_direction, cond_pct)
-    if uv_query.size == 0:
+    query_uv_seed = uv_cond[edge_seed_mask]
+    query_uv_grid = _build_uv_query_from_edge_band(query_uv_seed, grow_direction, cond_pct)
+    if query_uv_grid.size == 0:
         return None
 
-    uv_edge = uv_cond[edge_input_mask]
-    zyx_edge = cond_zyxs[edge_input_mask]
+    edge_seed_uv = uv_cond[edge_seed_mask]
+    edge_seed_world = cond_zyxs[edge_seed_mask]
 
     min_corner_arr = (
         np.asarray(min_corner, dtype=np.float64)
@@ -928,9 +928,9 @@ def compute_edge_one_shot_extrapolation(
         crop_size_use = tuple(int(v) for v in crop_size)
 
     extrap_result = compute_extrapolation_infer(
-        uv_cond=uv_edge,
-        zyx_cond=zyx_edge,
-        uv_query=uv_query,
+        uv_cond=edge_seed_uv,
+        zyx_cond=edge_seed_world,
+        uv_query=query_uv_grid,
         min_corner=min_corner_arr,
         crop_size=crop_size_use,
         method=method,
@@ -942,27 +942,27 @@ def compute_edge_one_shot_extrapolation(
         **method_kwargs,
     )
     if extrap_result is None:
-        extrap_local = np.zeros((0, 3), dtype=np.float32)
+        extrapolated_local = np.zeros((0, 3), dtype=np.float32)
         extrap_surface = None
     else:
-        extrap_local = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float32)
+        extrapolated_local = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float32)
         extrap_surface = extrap_result["extrap_surface"]
 
-    if extrap_local.size == 0:
-        extrap_world = np.zeros((0, 3), dtype=np.float32)
+    if extrapolated_local.size == 0:
+        extrapolated_world = np.zeros((0, 3), dtype=np.float32)
     else:
-        extrap_world = extrap_local + min_corner_arr[None, :].astype(np.float32, copy=False)
+        extrapolated_world = extrapolated_local + min_corner_arr[None, :].astype(np.float32, copy=False)
 
     return {
         "cond_direction": cond_direction,
-        "edge_input_mask": edge_input_mask,
-        "edge_uv": uv_edge.astype(np.float64, copy=False),
-        "edge_zyx": zyx_edge.astype(np.float32, copy=False),
-        "uv_query": uv_query,
-        "uv_query_flat": uv_query.reshape(-1, 2),
+        "edge_seed_mask": edge_seed_mask,
+        "edge_seed_uv": edge_seed_uv.astype(np.float64, copy=False),
+        "edge_seed_world": edge_seed_world.astype(np.float32, copy=False),
+        "query_uv_grid": query_uv_grid,
+        "query_uv": query_uv_grid.reshape(-1, 2),
         "min_corner": min_corner_arr,
-        "extrap_coords_local": extrap_local,
-        "extrap_coords_world": extrap_world,
+        "extrapolated_local": extrapolated_local,
+        "extrapolated_world": extrapolated_world,
         "extrap_surface": extrap_surface,
     }
 

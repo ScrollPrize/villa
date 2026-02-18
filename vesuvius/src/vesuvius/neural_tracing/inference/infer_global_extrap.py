@@ -325,20 +325,20 @@ def _build_extrap_lookup_from_uv_world(uv_query_flat, extrap_world):
     )
 
 
-def _build_extrap_lookup_arrays(one_shot):
-    uv_query = np.asarray(one_shot.get("uv_query", np.zeros((0, 0, 2), dtype=np.int64)))
-    extrap_world = np.asarray(one_shot.get("extrap_coords_world", np.zeros((0, 3), dtype=np.float32)))
-    if uv_query.ndim == 3 and uv_query.shape[-1] == 2:
-        h, w = uv_query.shape[:2]
+def _build_extrap_lookup_arrays(edge_extrapolation):
+    query_uv_grid = np.asarray(edge_extrapolation.get("query_uv_grid", np.zeros((0, 0, 2), dtype=np.int64)))
+    extrapolated_world = np.asarray(edge_extrapolation.get("extrapolated_world", np.zeros((0, 3), dtype=np.float32)))
+    if query_uv_grid.ndim == 3 and query_uv_grid.shape[-1] == 2:
+        h, w = query_uv_grid.shape[:2]
         if h < 1 or w < 1:
             return _empty_extrap_lookup_arrays()
-        if extrap_world.shape[0] != h * w:
+        if extrapolated_world.shape[0] != h * w:
             return _empty_extrap_lookup_arrays()
-        uv_flat = uv_query.reshape(-1, 2).astype(np.int64, copy=False)
-        return _build_extrap_lookup_from_uv_world(uv_flat, extrap_world)
+        uv_flat = query_uv_grid.reshape(-1, 2).astype(np.int64, copy=False)
+        return _build_extrap_lookup_from_uv_world(uv_flat, extrapolated_world)
 
-    uv_query_flat = np.asarray(one_shot.get("uv_query_flat", np.zeros((0, 2), dtype=np.float64)))
-    return _build_extrap_lookup_from_uv_world(uv_query_flat, extrap_world)
+    query_uv = np.asarray(edge_extrapolation.get("query_uv", np.zeros((0, 2), dtype=np.float64)))
+    return _build_extrap_lookup_from_uv_world(query_uv, extrapolated_world)
 
 
 def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
@@ -1398,11 +1398,11 @@ def main():
         )
 
     bbox_results = []
-    one_shot = {
-        "edge_uv": np.zeros((0, 2), dtype=np.float64),
-        "edge_zyx": np.zeros((0, 3), dtype=np.float32),
-        "uv_query_flat": np.zeros((0, 2), dtype=np.float64),
-        "extrap_coords_world": np.zeros((0, 3), dtype=np.float32),
+    edge_extrapolation = {
+        "edge_seed_uv": np.zeros((0, 2), dtype=np.float64),
+        "edge_seed_world": np.zeros((0, 3), dtype=np.float32),
+        "query_uv": np.zeros((0, 2), dtype=np.float64),
+        "extrapolated_world": np.zeros((0, 3), dtype=np.float32),
     }
     extrap_lookup = _empty_extrap_lookup_arrays()
     disp_bbox = None
@@ -1447,8 +1447,8 @@ def main():
                 iteration_pbar.set_postfix_str("bboxes=0 | stopped: no edge bboxes", refresh=True)
             break
 
-        with profiler.section("iter_one_shot_extrapolation"):
-            one_shot = compute_edge_one_shot_extrapolation(
+        with profiler.section("iter_edge_extrapolation"):
+            edge_extrapolation = compute_edge_one_shot_extrapolation(
                 cond_zyxs=cond_zyxs,
                 cond_valid=cond_valid,
                 uv_cond=uv_cond,
@@ -1464,27 +1464,36 @@ def main():
                 skip_bounds_check=True,
                 **extrapolation_settings["method_kwargs"],
             )
-        if one_shot is None:
-            one_shot = {
-                "edge_uv": np.zeros((0, 2), dtype=np.float64),
-                "edge_zyx": np.zeros((0, 3), dtype=np.float32),
-                "uv_query_flat": np.zeros((0, 2), dtype=np.float64),
-                "extrap_coords_world": np.zeros((0, 3), dtype=np.float32),
+        if edge_extrapolation is None:
+            edge_extrapolation = {
+                "edge_seed_uv": np.zeros((0, 2), dtype=np.float64),
+                "edge_seed_world": np.zeros((0, 3), dtype=np.float32),
+                "query_uv": np.zeros((0, 2), dtype=np.float64),
+                "extrapolated_world": np.zeros((0, 3), dtype=np.float32),
             }
 
         with profiler.section("iter_aggregate_extrapolation"):
             if args.verbose or args.napari:
-                one_uv, one_world = _finite_uv_world(one_shot.get("uv_query_flat"), one_shot.get("extrap_coords_world"))
-                one_samples = [(one_uv, one_world)] if len(one_uv) > 0 else []
-                one_grid, one_valid, one_offset = _aggregate_pred_samples_to_uv_grid(one_samples)
-                extrap_lookup = _build_extrap_lookup_from_grid(one_grid, one_valid, one_offset)
+                query_uv, extrapolated_world = _finite_uv_world(
+                    edge_extrapolation.get("query_uv"),
+                    edge_extrapolation.get("extrapolated_world"),
+                )
+                uv_world_samples = [(query_uv, extrapolated_world)] if len(query_uv) > 0 else []
+                aggregated_world_grid, aggregated_valid_mask, aggregated_uv_offset = _aggregate_pred_samples_to_uv_grid(
+                    uv_world_samples
+                )
+                extrap_lookup = _build_extrap_lookup_from_grid(
+                    aggregated_world_grid,
+                    aggregated_valid_mask,
+                    aggregated_uv_offset,
+                )
             else:
-                extrap_lookup = _build_extrap_lookup_arrays(one_shot)
-            # Keep only lightweight one_shot fields after lookup construction.
-            one_shot["uv_query"] = np.zeros((0, 0, 2), dtype=np.float64)
-            one_shot["uv_query_flat"] = np.zeros((0, 2), dtype=np.float64)
-            one_shot["extrap_coords_local"] = np.zeros((0, 3), dtype=np.float32)
-            one_shot["extrap_coords_world"] = np.zeros((0, 3), dtype=np.float32)
+                extrap_lookup = _build_extrap_lookup_arrays(edge_extrapolation)
+            # Keep only lightweight edge_extrapolation fields after lookup construction.
+            edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
+            edge_extrapolation["query_uv"] = np.zeros((0, 2), dtype=np.float64)
+            edge_extrapolation["extrapolated_local"] = np.zeros((0, 3), dtype=np.float32)
+            edge_extrapolation["extrapolated_world"] = np.zeros((0, 3), dtype=np.float32)
 
         with profiler.section("iter_build_bbox_crops"):
             bbox_crops = _build_bbox_crops(
@@ -1534,7 +1543,7 @@ def main():
 
         _print_iteration_summary(
             bbox_results,
-            one_shot,
+            edge_extrapolation,
             extrap_lookup,
             grow_direction,
             verbose=args.verbose,
@@ -1626,7 +1635,7 @@ def main():
                 current_zyxs,
                 current_valid,
                 bbox_results,
-                one_shot,
+                edge_extrapolation,
                 extrap_lookup,
                 disp_bbox=disp_bbox,
                 displaced=displaced,

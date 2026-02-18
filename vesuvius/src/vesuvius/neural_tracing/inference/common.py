@@ -520,15 +520,15 @@ def _agg_extrap_line_summary(extrap_lookup, grow_direction):
     }
 
 
-def _print_iteration_summary(bbox_results, one_shot, extrap_lookup, grow_direction, verbose=True):
+def _print_iteration_summary(bbox_results, edge_extrapolation, extrap_lookup, grow_direction, verbose=True):
     if not verbose:
         return
     agg_summary = _agg_extrap_line_summary(extrap_lookup, grow_direction)
     extrap_uv_count = int(_finite_uvs_from_extrap_lookup(extrap_lookup).shape[0])
     print("== Extrapolation Summary ==")
     print(f"bboxes: {len(bbox_results)}")
-    print(f"one-shot edge-input uv count: {len(one_shot.get('edge_uv', []))}")
-    print(f"one-shot extrap uv count (aggregated): {extrap_uv_count}")
+    print(f"edge-seed uv count: {len(edge_extrapolation.get('edge_seed_uv', []))}")
+    print(f"edge extrapolated uv count (aggregated): {extrap_uv_count}")
     print("== Aggregated Extrapolation ==")
     print(f"axis: {agg_summary['axis_name']}")
     print(f"available lines (near->far): {agg_summary['line_count']}")
@@ -543,7 +543,7 @@ def _show_napari(
     cond_zyxs,
     cond_valid,
     bbox_results,
-    one_shot,
+    edge_extrapolation,
     extrap_lookup,
     disp_bbox=None,
     displaced=None,
@@ -681,27 +681,27 @@ def _show_napari(
                 symbol="ring",
                 opacity=0.9,
             )
-    edge_cond = one_shot.get("edge_zyx") if one_shot is not None else None
-    if edge_cond is not None and len(edge_cond) > 0:
-        edge_cond = _downsample_points(edge_cond)
+    edge_seed_world_points = edge_extrapolation.get("edge_seed_world") if edge_extrapolation is not None else None
+    if edge_seed_world_points is not None and len(edge_seed_world_points) > 0:
+        edge_seed_world_points = _downsample_points(edge_seed_world_points)
         viewer.add_points(
-            edge_cond,
-            name="one_shot_edge_cond",
+            edge_seed_world_points,
+            name="edge_seed_world",
             size=point_size,
             face_color=[1.0, 1.0, 0.0],
             opacity=0.9,
         )
 
-    one_pts = np.zeros((0, 3), dtype=np.float32)
+    lookup_world_points = np.zeros((0, 3), dtype=np.float32)
     if extrap_lookup is not None:
         world_attr = getattr(extrap_lookup, "world", None)
         if world_attr is not None:
-            one_pts = np.asarray(world_attr, dtype=np.float32)
-    if one_pts.size > 0:
-        one_pts = _downsample_points(one_pts)
+            lookup_world_points = np.asarray(world_attr, dtype=np.float32)
+    if lookup_world_points.size > 0:
+        lookup_world_points = _downsample_points(lookup_world_points)
         viewer.add_points(
-            one_pts,
-            name="one_shot_agg_extrap",
+            lookup_world_points,
+            name="aggregated_extrapolated_world",
             size=point_size,
             face_color=[1.0, 0.4, 0.0],
             opacity=0.6,
@@ -713,7 +713,7 @@ def _show_napari(
             "merged_full_surface",
             "agg_extrap_sampled",
             "agg_extrap_displaced",
-            "one_shot_edge_cond",
+            "edge_seed_world",
             "disp_stack_bbox",
         }:
             return True
