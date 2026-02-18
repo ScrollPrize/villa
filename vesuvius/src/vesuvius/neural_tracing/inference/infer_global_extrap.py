@@ -11,36 +11,36 @@ from tqdm import tqdm
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.common import (
     _aggregate_pred_samples_to_uv_grid,
-    _print_agg_extrap_sampling_debug,
-    _print_bbox_crop_debug_table,
-    _print_iteration_summary,
-    _resolve_settings,
-    _RuntimeProfiler,
-    _save_merged_surface_tifxyz,
-    _serialize_args,
-    _show_napari,
-)
-from vesuvius.neural_tracing.inference.displacement_tta import TTA_MERGE_METHODS
-from vesuvius.neural_tracing.inference.infer_rowcol_split import (
     _bbox_to_min_corner_and_bounds_array,
-    _build_model_inputs,
     _build_uv_grid,
     _build_uv_query_from_cond_points,
     _crop_volume_from_min_corner,
     _get_growth_context,
     _initialize_window_state,
     _points_to_voxels,
-    _predict_displacement,
+    _print_agg_extrap_sampling_debug,
+    _print_bbox_crop_debug_table,
+    _print_iteration_summary,
     _resolve_segment_volume,
+    _resolve_settings,
+    _RuntimeProfiler,
     _scale_to_subsample_stride,
+    _save_merged_surface_tifxyz,
+    _serialize_args,
     _stored_to_full_bounds,
+    _show_napari,
     compute_edge_one_shot_extrapolation,
     get_cond_edge_bboxes,
     get_window_bounds_from_bboxes,
-    load_model,
-    load_checkpoint_config,
     setup_segment,
 )
+from vesuvius.neural_tracing.inference.displacement_helpers import (
+    _build_model_inputs,
+    _predict_displacement,
+    load_checkpoint_config,
+    load_model,
+)
+from vesuvius.neural_tracing.inference.displacement_tta import TTA_MERGE_METHODS
 
 
 def _parse_optional_tta_outlier_drop_thresh(value):

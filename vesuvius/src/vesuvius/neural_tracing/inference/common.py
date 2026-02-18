@@ -9,6 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import zarr
+
+import vesuvius.tifxyz as tifxyz
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
+from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHODS, apply_degradation
 
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
 
@@ -256,6 +261,702 @@ def _json_safe(value):
 
 def _serialize_args(args):
     return {str(k): _json_safe(v) for k, v in vars(args).items()}
+
+
+_DIRECTION_SPECS = {
+    "left": {
+        "axis": "col",
+        "edge_idx": -1,
+        "growth_sign": 1,
+        "opposite": "right",
+    },
+    "right": {
+        "axis": "col",
+        "edge_idx": 0,
+        "growth_sign": -1,
+        "opposite": "left",
+    },
+    "up": {
+        "axis": "row",
+        "edge_idx": -1,
+        "growth_sign": 1,
+        "opposite": "down",
+    },
+    "down": {
+        "axis": "row",
+        "edge_idx": 0,
+        "growth_sign": -1,
+        "opposite": "up",
+    },
+}
+
+
+def _get_direction_spec(direction):
+    spec = _DIRECTION_SPECS.get(direction)
+    if spec is None:
+        raise ValueError(f"Unknown direction '{direction}'")
+    return spec
+
+
+def _get_growth_context(grow_direction):
+    # Growth semantics are encoded by the opposite conditioning side.
+    cond_direction = _get_direction_spec(grow_direction)["opposite"]
+    growth_spec = _get_direction_spec(cond_direction)
+    return cond_direction, growth_spec
+
+
+def _in_bounds_mask(coords, size):
+    size = np.asarray(size)
+    return (
+        (coords[:, 0] >= 0) & (coords[:, 0] < size[0]) &
+        (coords[:, 1] >= 0) & (coords[:, 1] < size[1]) &
+        (coords[:, 2] >= 0) & (coords[:, 2] < size[2])
+    )
+
+
+def _points_to_voxels(points_local, crop_size):
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+    vox = np.zeros(tuple(crop_size_arr.tolist()), dtype=np.float32)
+    if points_local is None or len(points_local) == 0:
+        return vox
+    coords = np.rint(points_local).astype(np.int64)
+    coords = coords[_in_bounds_mask(coords, crop_size_arr)]
+    if coords.size > 0:
+        vox[coords[:, 0], coords[:, 1], coords[:, 2]] = 1.0
+    return vox
+
+
+def _valid_surface_mask(zyx_grid):
+    return np.isfinite(zyx_grid).all(axis=-1) & ~(zyx_grid == -1).all(axis=-1)
+
+
+def _get_cond_edge(cond_zyxs, cond_direction, cond_valid=None):
+    spec = _get_direction_spec(cond_direction)
+    edge_idx = spec["edge_idx"]
+    # For non-rectangular inputs, compute a per-line frontier over valid cells
+    # instead of relying on one global extreme row/col index.
+    if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
+        valid = np.asarray(cond_valid, dtype=bool)
+    else:
+        valid = _valid_surface_mask(cond_zyxs)
+
+    if not valid.any():
+        out_len = cond_zyxs.shape[0] if spec["axis"] == "col" else cond_zyxs.shape[1]
+        return np.full((out_len, 3), -1, dtype=cond_zyxs.dtype)
+
+    if spec["axis"] == "col":
+        n_rows, n_cols = valid.shape
+        out = np.full((n_rows, 3), -1, dtype=cond_zyxs.dtype)
+        any_valid = valid.any(axis=1)
+        row_idx = np.arange(n_rows, dtype=np.int64)
+        if edge_idx == 0 or (edge_idx == -1 and n_cols == 1):
+            # leftmost valid column per row (first True)
+            col_indices = np.argmax(valid, axis=1)
+        else:
+            # rightmost valid column per row (last True)
+            col_indices = n_cols - 1 - np.argmax(valid[:, ::-1], axis=1)
+        out[any_valid] = cond_zyxs[row_idx[any_valid], col_indices[any_valid], :]
+        return out
+
+    n_rows, n_cols = valid.shape
+    out = np.full((n_cols, 3), -1, dtype=cond_zyxs.dtype)
+    any_valid = valid.any(axis=0)
+    col_idx = np.arange(n_cols, dtype=np.int64)
+    if edge_idx == 0 or (edge_idx == -1 and n_rows == 1):
+        # topmost valid row per column (first True)
+        row_indices = np.argmax(valid, axis=0)
+    else:
+        # bottommost valid row per column (last True)
+        row_indices = n_rows - 1 - np.argmax(valid[::-1, :], axis=0)
+    out[any_valid] = cond_zyxs[row_indices[any_valid], col_idx[any_valid], :]
+    return out
+
+
+def _bbox_from_center(center, crop_size):
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+    # Align to voxel indices so inclusive bounds match a crop of size crop_size.
+    half = (crop_size_arr - 1) / 2.0
+    min_corner = np.floor(center - half).astype(np.int64)
+    max_corner = min_corner + (crop_size_arr - 1)
+    return (
+        int(min_corner[0]), int(max_corner[0]),
+        int(min_corner[1]), int(max_corner[1]),
+        int(min_corner[2]), int(max_corner[2]),
+    )
+
+
+def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15, cond_valid=None):
+    # Build center-out crop anchors along the conditioning edge. Each chunk grows
+    # while its XYZ span still fits in one crop-sized bbox.
+    edge = _get_cond_edge(cond_zyxs, cond_direction, cond_valid=cond_valid)
+
+    edge_valid = ~(edge == -1).all(axis=1)
+    if not edge_valid.any():
+        return [], edge
+    edge = edge[edge_valid]
+    n_edge = edge.shape[0]
+    if n_edge == 0:
+        return [], edge
+
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+
+    overlap_frac = float(overlap_frac)
+    overlap_frac = max(0.0, min(overlap_frac, 0.99))
+
+    def _indices_fit_single_bbox(indices):
+        pts = edge[indices]
+        spans = pts.max(axis=0) - pts.min(axis=0)
+        return (
+            spans[0] <= (crop_size_arr[0] - 1) and
+            spans[1] <= (crop_size_arr[1] - 1) and
+            spans[2] <= (crop_size_arr[2] - 1)
+        )
+
+    def _chunk_ordered_indices(ordered_indices):
+        chunks = []
+        if len(ordered_indices) == 0:
+            return chunks
+        start = 0
+        while start < len(ordered_indices):
+            end = start + 1
+            while end < len(ordered_indices):
+                candidate = ordered_indices[start:end + 1]
+                if _indices_fit_single_bbox(candidate):
+                    end += 1
+                    continue
+                break
+            chunk = ordered_indices[start:end]
+            if len(chunk) == 0:
+                break
+            chunks.append(chunk)
+            # Once a chunk reaches the side endpoint, further starts only create
+            # nested tail chunks that heavily overlap and can quantize to duplicates.
+            if end >= len(ordered_indices):
+                break
+            chunk_len = len(chunk)
+            overlap_count = int(round(chunk_len * overlap_frac))
+            # Slide by (chunk - overlap) so adjacent bboxes share context.
+            step = max(1, chunk_len - overlap_count)
+            start += step
+        return chunks
+
+    center_idx = n_edge // 2
+    first_side = np.arange(center_idx, -1, -1, dtype=np.int64)
+
+    first_chunks = _chunk_ordered_indices(first_side)
+    seam_overlap_count = 0
+    if first_chunks:
+        seam_overlap_count = int(round(len(first_chunks[0]) * overlap_frac))
+        seam_overlap_count = max(0, min(seam_overlap_count, center_idx + 1))
+    second_start = max(0, center_idx + 1 - seam_overlap_count)
+    second_side = np.arange(second_start, n_edge, dtype=np.int64)
+    second_chunks = _chunk_ordered_indices(second_side)
+
+    bboxes = []
+    seen_bboxes = set()
+
+    def _append_chunks(chunks):
+        for chunk in chunks:
+            pts = edge[chunk]
+            center = (pts.min(axis=0) + pts.max(axis=0)) / 2
+            bbox = _bbox_from_center(center, crop_size)
+            if bbox in seen_bboxes:
+                continue
+            seen_bboxes.add(bbox)
+            bboxes.append(bbox)
+
+    _append_chunks(first_chunks)
+    _append_chunks(second_chunks)
+
+    return bboxes, edge
+
+
+def _resolve_segment_volume(segment, volume_scale=None):
+    volume = segment.volume
+    if isinstance(volume, zarr.Group):
+        target_level = None
+        if volume_scale is not None:
+            target_level = int(volume_scale)
+        else:
+            extra = getattr(segment, "extra", None)
+            if isinstance(extra, dict):
+                for key in ("volume_scale", "vol_scale", "zarr_level", "volume_level", "level"):
+                    if key in extra:
+                        try:
+                            target_level = int(extra[key])
+                            break
+                        except (TypeError, ValueError):
+                            continue
+        if target_level is None:
+            target_level = 0
+        level_key = str(target_level)
+        if level_key in volume:
+            return volume[level_key]
+        numeric_levels = sorted([k for k in volume.keys() if k.isdigit()], key=int)
+        if numeric_levels:
+            level_ints = [int(k) for k in numeric_levels]
+            nearest = min(level_ints, key=lambda v: abs(v - target_level))
+            return volume[str(nearest)]
+    return volume
+
+
+def _bbox_to_min_corner_and_bounds_array(bbox):
+    z_min, z_max, y_min, y_max, x_min, x_max = bbox
+    min_corner = np.floor([z_min, y_min, x_min]).astype(np.int64)
+    bounds_array = np.asarray(
+        [
+            [z_min, y_min, x_min],
+            [z_max, y_max, x_max],
+        ],
+        dtype=np.int32,
+    )
+    return min_corner, bounds_array
+
+
+def _crop_volume_from_min_corner(volume, min_corner, crop_size):
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+    max_corner = min_corner + crop_size_arr
+    vol_crop = np.zeros(tuple(crop_size_arr.tolist()), dtype=volume.dtype)
+    vol_shape = np.array(volume.shape, dtype=np.int64)
+    src_starts = np.maximum(min_corner, 0)
+    src_ends = np.minimum(max_corner, vol_shape)
+    dst_starts = src_starts - min_corner
+    dst_ends = dst_starts + (src_ends - src_starts)
+
+    if np.all(src_ends > src_starts):
+        vol_crop[
+            dst_starts[0]:dst_ends[0],
+            dst_starts[1]:dst_ends[1],
+            dst_starts[2]:dst_ends[2],
+        ] = volume[
+            src_starts[0]:src_ends[0],
+            src_starts[1]:src_ends[1],
+            src_starts[2]:src_ends[2],
+        ]
+
+    return vol_crop
+
+
+def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
+    if uv_cond_pts is None or len(uv_cond_pts) == 0:
+        return np.zeros((0, 0, 2), dtype=np.float64)
+
+    _, direction = _get_growth_context(grow_direction)
+    uv_cond_pts = np.asarray(uv_cond_pts)
+    r_min = int(np.floor(uv_cond_pts[:, 0].min()))
+    r_max = int(np.ceil(uv_cond_pts[:, 0].max()))
+    c_min = int(np.floor(uv_cond_pts[:, 1].min()))
+    c_max = int(np.ceil(uv_cond_pts[:, 1].max()))
+
+    def _mask_span(cond_span):
+        cond_span = int(max(1, cond_span))
+        # cond_pct is conditioning fraction of the combined (cond + extrap) span.
+        # Rearranging gives extrap span to query beyond the current boundary.
+        if cond_pct <= 0:
+            return cond_span
+        total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
+        return max(1, total_span - cond_span)
+
+    if direction["axis"] == "col":
+        rows = np.arange(r_min, r_max + 1, dtype=np.int64)
+        mask_w = _mask_span(c_max - c_min + 1)
+        if direction["growth_sign"] > 0:
+            cols = np.arange(c_max + 1, c_max + mask_w + 1, dtype=np.int64)
+        else:
+            cols = np.arange(c_min - mask_w, c_min, dtype=np.int64)
+        return np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1)
+
+    cols = np.arange(c_min, c_max + 1, dtype=np.int64)
+    mask_h = _mask_span(r_max - r_min + 1)
+    if direction["growth_sign"] > 0:
+        rows = np.arange(r_max + 1, r_max + mask_h + 1, dtype=np.int64)
+    else:
+        rows = np.arange(r_min - mask_h, r_min, dtype=np.int64)
+    return np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1)
+
+
+def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
+    """
+    Build extrapolation UVs from a per-line edge band.
+
+    Unlike _build_uv_query_from_cond_points(), this keeps a per-row/per-col
+    frontier so irregular/non-rectangular edges do not collapse to a single
+    global min/max line.
+    """
+    if uv_edge_pts is None or len(uv_edge_pts) == 0:
+        return np.zeros((0, 0, 2), dtype=np.int64)
+
+    _, direction = _get_growth_context(grow_direction)
+    uv = np.rint(np.asarray(uv_edge_pts)).astype(np.int64, copy=False)
+
+    def _mask_span(cond_span):
+        cond_span = int(max(1, cond_span))
+        if cond_pct <= 0:
+            return cond_span
+        total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
+        return max(1, total_span - cond_span)
+
+    if direction["axis"] == "col":
+        rows = uv[:, 0]
+        cols = uv[:, 1]
+        unique_rows, row_inv = np.unique(rows, return_inverse=True)
+        if unique_rows.size == 0:
+            return np.zeros((0, 0, 2), dtype=np.int64)
+
+        row_min = np.full((unique_rows.size,), np.iinfo(np.int64).max, dtype=np.int64)
+        row_max = np.full((unique_rows.size,), np.iinfo(np.int64).min, dtype=np.int64)
+        np.minimum.at(row_min, row_inv, cols)
+        np.maximum.at(row_max, row_inv, cols)
+
+        cond_span = int(np.median(row_max - row_min + 1))
+        mask_w = _mask_span(cond_span)
+        offsets = np.arange(mask_w, dtype=np.int64)
+
+        if direction["growth_sign"] > 0:
+            frontier = row_max
+            query_cols = (frontier[:, None] + 1) + offsets[None, :]
+        else:
+            frontier = row_min
+            query_cols = (frontier[:, None] - mask_w) + offsets[None, :]
+
+        query_rows = np.repeat(unique_rows[:, None], mask_w, axis=1)
+        return np.stack([query_rows, query_cols], axis=-1)
+
+    rows = uv[:, 0]
+    cols = uv[:, 1]
+    unique_cols, col_inv = np.unique(cols, return_inverse=True)
+    if unique_cols.size == 0:
+        return np.zeros((0, 0, 2), dtype=np.int64)
+
+    col_min = np.full((unique_cols.size,), np.iinfo(np.int64).max, dtype=np.int64)
+    col_max = np.full((unique_cols.size,), np.iinfo(np.int64).min, dtype=np.int64)
+    np.minimum.at(col_min, col_inv, rows)
+    np.maximum.at(col_max, col_inv, rows)
+
+    cond_span = int(np.median(col_max - col_min + 1))
+    mask_h = _mask_span(cond_span)
+    offsets = np.arange(mask_h, dtype=np.int64)
+
+    if direction["growth_sign"] > 0:
+        frontier = col_max
+        query_rows = (frontier[:, None] + 1) + offsets[None, :]
+    else:
+        frontier = col_min
+        query_rows = (frontier[:, None] - mask_h) + offsets[None, :]
+
+    query_cols = np.repeat(unique_cols[:, None], mask_h, axis=1)
+    return np.stack([query_rows, query_cols], axis=-1)
+
+
+def _build_edge_input_mask(cond_valid, cond_direction, edge_input_rowscols):
+    cond_valid = np.asarray(cond_valid, dtype=bool)
+    if cond_valid.ndim != 2:
+        raise ValueError(f"cond_valid must be 2D, got shape {cond_valid.shape}")
+
+    n_axis = int(edge_input_rowscols)
+    if n_axis < 1:
+        raise ValueError("edge_input_rowscols must be >= 1")
+
+    spec = _get_direction_spec(cond_direction)
+    if spec["axis"] == "col":
+        if spec["edge_idx"] == -1:
+            # rank valid cells from right edge toward left, per row
+            rank = np.cumsum(cond_valid[:, ::-1], axis=1)[:, ::-1]
+        else:
+            # rank valid cells from left edge toward right, per row
+            rank = np.cumsum(cond_valid, axis=1)
+    else:
+        if spec["edge_idx"] == -1:
+            # rank valid cells from bottom edge toward top, per column
+            rank = np.cumsum(cond_valid[::-1, :], axis=0)[::-1, :]
+        else:
+            # rank valid cells from top edge toward bottom, per column
+            rank = np.cumsum(cond_valid, axis=0)
+
+    return cond_valid & (rank > 0) & (rank <= n_axis)
+
+
+def compute_extrapolation_infer(
+    uv_cond,
+    zyx_cond,
+    uv_query,
+    min_corner,
+    crop_size,
+    method="rbf",
+    cond_direction=None,
+    degrade_prob=0.0,
+    degrade_curvature_range=(0.001, 0.01),
+    degrade_gradient_range=(0.05, 0.2),
+    skip_bounds_check=False,
+    **method_kwargs,
+):
+    if method not in _EXTRAPOLATION_METHODS:
+        available = list(_EXTRAPOLATION_METHODS.keys())
+        raise ValueError(f"Unknown extrapolation method '{method}'. Available: {available}")
+
+    uv_cond_flat = uv_cond.reshape(-1, 2)
+    zyx_cond_flat = zyx_cond.reshape(-1, 3)
+    uv_query_flat = uv_query.reshape(-1, 2)
+    if uv_cond_flat.size == 0 or uv_query_flat.size == 0:
+        return None
+
+    extrapolate_fn = _EXTRAPOLATION_METHODS[method]
+    zyx_extrapolated = extrapolate_fn(
+        uv_cond=uv_cond_flat,
+        zyx_cond=zyx_cond_flat,
+        uv_query=uv_query_flat,
+        min_corner=min_corner,
+        crop_size=crop_size,
+        cond_direction=cond_direction,
+        **method_kwargs,
+    )
+
+    min_corner_arr = np.asarray(min_corner, dtype=zyx_extrapolated.dtype)
+    zyx_extrap_local_full = zyx_extrapolated - min_corner_arr[None, :]
+
+    if degrade_prob > 0.0 and cond_direction is not None:
+        uv_shape = uv_query.shape[:2]
+        zyx_extrap_local_full, _ = apply_degradation(
+            zyx_extrap_local_full,
+            uv_shape,
+            cond_direction,
+            degrade_prob=degrade_prob,
+            curvature_range=degrade_curvature_range,
+            gradient_range=degrade_gradient_range,
+        )
+    extrap_coords_local = zyx_extrap_local_full
+    extrap_surface = None
+    if not skip_bounds_check:
+        in_bounds = _in_bounds_mask(zyx_extrap_local_full, crop_size)
+        if not in_bounds.any():
+            return None
+
+        extrap_coords_local = zyx_extrap_local_full[in_bounds]
+
+        uv_query_shape = uv_query.shape[:2]
+        zyx_grid_local = zyx_extrap_local_full.reshape(uv_query_shape + (3,))
+        extrap_surface = voxelize_surface_grid(zyx_grid_local, crop_size)
+
+    return {
+        "extrap_coords_local": extrap_coords_local,
+        "extrap_surface": extrap_surface,
+    }
+
+
+def compute_edge_one_shot_extrapolation(
+    cond_zyxs,
+    cond_valid,
+    uv_cond,
+    grow_direction,
+    edge_input_rowscols,
+    cond_pct,
+    method="rbf",
+    min_corner=None,
+    crop_size=None,
+    degrade_prob=0.0,
+    degrade_curvature_range=(0.001, 0.01),
+    degrade_gradient_range=(0.05, 0.2),
+    skip_bounds_check=True,
+    **method_kwargs,
+):
+    cond_zyxs = np.asarray(cond_zyxs)
+    uv_cond = np.asarray(uv_cond)
+    if cond_zyxs.shape[:2] != uv_cond.shape[:2]:
+        raise ValueError(
+            f"cond_zyxs and uv_cond must share HxW; got {cond_zyxs.shape[:2]} vs {uv_cond.shape[:2]}"
+        )
+
+    if cond_valid is not None and np.asarray(cond_valid).shape == cond_zyxs.shape[:2]:
+        cond_valid_base = np.asarray(cond_valid, dtype=bool)
+    else:
+        cond_valid_base = _valid_surface_mask(cond_zyxs)
+
+    if not cond_valid_base.any():
+        return None
+
+    cond_direction, _ = _get_growth_context(grow_direction)
+    edge_seed_mask = _build_edge_input_mask(cond_valid_base, cond_direction, edge_input_rowscols)
+    if not edge_seed_mask.any():
+        return None
+
+    # Build query span from the edge-input conditioning band, not the full grown
+    # surface, so iterative runs do not blow up one-shot query allocations.
+    query_uv_seed = uv_cond[edge_seed_mask]
+    query_uv_grid = _build_uv_query_from_edge_band(query_uv_seed, grow_direction, cond_pct)
+    if query_uv_grid.size == 0:
+        return None
+
+    edge_seed_uv = uv_cond[edge_seed_mask]
+    edge_seed_world = cond_zyxs[edge_seed_mask]
+
+    min_corner_arr = (
+        np.asarray(min_corner, dtype=np.float64)
+        if min_corner is not None
+        else np.zeros(3, dtype=np.float64)
+    )
+    if min_corner_arr.shape != (3,):
+        raise ValueError(f"min_corner must have shape (3,), got {min_corner_arr.shape}")
+
+    if crop_size is None:
+        if not skip_bounds_check:
+            raise ValueError("crop_size is required when skip_bounds_check=False")
+        crop_size_use = (1, 1, 1)
+    else:
+        crop_size_use = tuple(int(v) for v in crop_size)
+
+    extrap_result = compute_extrapolation_infer(
+        uv_cond=edge_seed_uv,
+        zyx_cond=edge_seed_world,
+        uv_query=query_uv_grid,
+        min_corner=min_corner_arr,
+        crop_size=crop_size_use,
+        method=method,
+        cond_direction=cond_direction,
+        degrade_prob=degrade_prob,
+        degrade_curvature_range=degrade_curvature_range,
+        degrade_gradient_range=degrade_gradient_range,
+        skip_bounds_check=skip_bounds_check,
+        **method_kwargs,
+    )
+    if extrap_result is None:
+        extrapolated_local = np.zeros((0, 3), dtype=np.float32)
+        extrap_surface = None
+    else:
+        extrapolated_local = np.asarray(extrap_result["extrap_coords_local"], dtype=np.float32)
+        extrap_surface = extrap_result["extrap_surface"]
+
+    if extrapolated_local.size == 0:
+        extrapolated_world = np.zeros((0, 3), dtype=np.float32)
+    else:
+        extrapolated_world = extrapolated_local + min_corner_arr[None, :].astype(np.float32, copy=False)
+
+    return {
+        "cond_direction": cond_direction,
+        "edge_seed_mask": edge_seed_mask,
+        "edge_seed_uv": edge_seed_uv.astype(np.float64, copy=False),
+        "edge_seed_world": edge_seed_world.astype(np.float32, copy=False),
+        "query_uv_grid": query_uv_grid,
+        "query_uv": query_uv_grid.reshape(-1, 2),
+        "min_corner": min_corner_arr,
+        "extrapolated_local": extrapolated_local,
+        "extrapolated_world": extrapolated_world,
+        "extrap_surface": extrap_surface,
+    }
+
+
+def get_window_bounds_from_bboxes(zyxs, valid, bboxes, pad=2):
+    h, w = zyxs.shape[:2]
+    r_min, r_max = h, -1
+    c_min, c_max = w, -1
+
+    z, y, x = zyxs[..., 0], zyxs[..., 1], zyxs[..., 2]
+
+    for bbox in bboxes:
+        z_min, z_max, y_min, y_max, x_min, x_max = bbox
+        in_bounds = (
+            (z >= z_min) & (z <= z_max) &
+            (y >= y_min) & (y <= y_max) &
+            (x >= x_min) & (x <= x_max) &
+            valid
+        )
+        if not in_bounds.any():
+            continue
+        valid_rows = np.any(in_bounds, axis=1)
+        valid_cols = np.any(in_bounds, axis=0)
+        if not valid_rows.any() or not valid_cols.any():
+            continue
+        r0, r1 = np.where(valid_rows)[0][[0, -1]]
+        c0, c1 = np.where(valid_cols)[0][[0, -1]]
+        r_min = min(r_min, r0)
+        r_max = max(r_max, r1)
+        c_min = min(c_min, c0)
+        c_max = max(c_max, c1)
+
+    if r_max < r_min or c_max < c_min:
+        return 0, h - 1, 0, w - 1
+
+    r_min = max(0, r_min - pad)
+    r_max = min(h - 1, r_max + pad)
+    c_min = max(0, c_min - pad)
+    c_max = min(w - 1, c_max + pad)
+    return r_min, r_max, c_min, c_max
+
+
+def _build_uv_grid(uv_offset, shape_hw):
+    r0, c0 = uv_offset
+    h, w = shape_hw
+    rows = np.arange(r0, r0 + h, dtype=np.int64)
+    cols = np.arange(c0, c0 + w, dtype=np.int64)
+    return np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1)
+
+
+def _scale_to_subsample_stride(scale):
+    scale = float(scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"Invalid tifxyz scale: {scale}")
+    return max(1, int(round(1.0 / scale)))
+
+
+def _stored_to_full_bounds(tgt_segment, stored_bounds):
+    r0_s, r1_s, c0_s, c1_s = stored_bounds
+    scale_y, scale_x = tgt_segment._scale
+    full_h, full_w = tgt_segment.full_resolution_shape
+    sub_r = _scale_to_subsample_stride(scale_y)
+    sub_c = _scale_to_subsample_stride(scale_x)
+    # Convert stored grid indices to full-resolution UV indices using integer
+    # stride math to avoid float drift (e.g. 0.10000000149) dropping edge voxels.
+    r0_full = max(0, int(r0_s) * sub_r)
+    # Upper bound is exclusive. Map inclusive stored max directly, then +1.
+    r1_full = min(full_h, int(r1_s) * sub_r + 1)
+    c0_full = max(0, int(c0_s) * sub_c)
+    c1_full = min(full_w, int(c1_s) * sub_c + 1)
+    return r0_full, r1_full, c0_full, c1_full
+
+
+def _initialize_window_state(tgt_segment, full_bounds):
+    r0_full, r1_full, c0_full, c1_full = full_bounds
+    tgt_segment.use_full_resolution()
+    x, y, z, valid = tgt_segment[r0_full:r1_full, c0_full:c1_full]
+
+    window_zyxs = np.stack([z, y, x], axis=-1)
+    return window_zyxs.copy(), valid.copy(), (r0_full, c0_full)
+
+
+def setup_segment(args, volume):
+    tifxyz_path = Path(args.tifxyz_path)
+    if not tifxyz_path.exists():
+        raise FileNotFoundError(f"tifxyz path not found: {tifxyz_path}")
+    if not tifxyz_path.is_dir():
+        raise NotADirectoryError(f"tifxyz path must be a directory: {tifxyz_path}")
+
+    tgt_segment = tifxyz.read_tifxyz(tifxyz_path)
+    retarget_factor = 2 ** args.volume_scale
+    tgt_segment = tgt_segment.retarget(retarget_factor)
+    tgt_segment.volume = volume
+
+    tgt_segment.use_stored_resolution()
+    x_s, y_s, z_s, valid_s = tgt_segment[:]
+    stored_zyxs = np.stack([z_s, y_s, x_s], axis=-1)
+
+    h_s, w_s = stored_zyxs.shape[:2]
+    valid_rows = np.any(valid_s, axis=1)
+    valid_cols = np.any(valid_s, axis=0)
+    valid_dirs = []
+    if valid_cols.sum() >= 2:
+        valid_dirs.extend(["left", "right"])
+    if valid_rows.sum() >= 2:
+        valid_dirs.extend(["up", "down"])
+    if not valid_dirs:
+        raise RuntimeError("Segment too small to define a split direction.")
+    grow_direction = args.grow_direction
+    cond_direction, _ = _get_growth_context(grow_direction)
+    if cond_direction not in valid_dirs:
+        raise RuntimeError(
+            f"Requested grow_direction '{args.grow_direction}' (cond_direction='{cond_direction}') "
+            f"not available for this segment. Valid options: {valid_dirs}"
+        )
+
+    return tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s
 
 
 def _print_stacked_displacement_debug(stacked, verbose=True):
