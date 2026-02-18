@@ -641,6 +641,7 @@ std::optional<std::string> denseDirectionToToken(SegmentationGrowthDirection dir
     case SegmentationGrowthDirection::Down:
         return std::string("down");
     case SegmentationGrowthDirection::All:
+        return std::string("all");
     default:
         return std::nullopt;
     }
@@ -676,6 +677,10 @@ std::vector<SegmentationGrowthDirection> resolveDenseDirections(
     }
     if (allowedSet.empty()) {
         allowedSet.insert(order.begin(), order.end());
+    }
+
+    if (allowedSet.size() == order.size()) {
+        return {SegmentationGrowthDirection::All};
     }
 
     std::vector<SegmentationGrowthDirection> resolved;
@@ -786,6 +791,7 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         request["tifxyz_path"] = currentInputPath.toStdString();
         request["grow_direction"] = *directionToken;
         request["iterations"] = std::max(1, job.iterations);
+        request["edge_input_rowscols"] = 4;
         request["volume_path"] = job.volumeZarrPath.toStdString();
         request["volume_scale"] = std::max(0, job.volumeScale);
         request["checkpoint_path"] = job.checkpointPath.toStdString();

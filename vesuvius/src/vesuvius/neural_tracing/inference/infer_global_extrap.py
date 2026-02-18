@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import time
 
 _PROCESS_START = time.perf_counter()
@@ -61,7 +63,7 @@ def _parse_optional_tta_outlier_drop_thresh(value):
         ) from exc
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run global edge extrapolation with optional displacement-model stacking."
     )
@@ -231,7 +233,7 @@ def parse_args():
         help="Enable verbose debug logging and tables.",
     )
     parser.set_defaults(tta=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.edge_input_rowscols < 1:
         parser.error("--edge-input-rowscols must be >= 1")
@@ -262,6 +264,101 @@ def parse_args():
     if args.tifxyz_voxel_size_um is not None and args.tifxyz_voxel_size_um <= 0:
         parser.error("--tifxyz-voxel-size-um must be > 0 when provided.")
     return args
+
+
+_DENSE_ARG_ALIASES = {
+    "direction": "grow_direction",
+    "steps": "iterations",
+    "dense_checkpoint_path": "checkpoint_path",
+    "dense_config_path": "config_path",
+    "volume_zarr": "volume_path",
+    "lines_to_keep": "agg_extrap_lines",
+}
+
+_DENSE_ARG_TO_CLI = {
+    "tifxyz_path": "--tifxyz-path",
+    "volume_path": "--volume-path",
+    "volume_scale": "--volume-scale",
+    "grow_direction": "--grow-direction",
+    "cond_pct": "--cond-pct",
+    "crop_size": "--crop-size",
+    "window_pad": "--window-pad",
+    "bbox_overlap_frac": "--bbox-overlap-frac",
+    "checkpoint_path": "--checkpoint-path",
+    "config_path": "--config-path",
+    "extrapolation_method": "--extrapolation-method",
+    "rbf_downsample_factor": "--rbf-downsample-factor",
+    "tifxyz_out_dir": "--tifxyz-out-dir",
+    "tifxyz_step_size": "--tifxyz-step-size",
+    "tifxyz_voxel_size_um": "--tifxyz-voxel-size-um",
+    "device": "--device",
+    "batch_size": "--batch-size",
+    "iterations": "--iterations",
+    "refine": "--refine",
+    "tta_transform": "--tta-transform",
+    "tta_merge_method": "--tta-merge-method",
+    "tta_outlier_drop_thresh": "--tta-outlier-drop-thresh",
+    "tta_outlier_drop_min_keep": "--tta-outlier-drop-min-keep",
+    "tta_batch_size": "--tta-batch-size",
+    "edge_input_rowscols": "--edge-input-rowscols",
+    "agg_extrap_lines": "--lines-to-keep",
+    "napari_downsample": "--napari-downsample",
+    "napari_point_size": "--napari-point-size",
+}
+
+_DENSE_BOOL_TO_CLI = {
+    "overwrite_input_surface": "--overwrite-input-surface",
+    "skip_inference": "--skip-inference",
+    "extrap_only": "--extrap-only",
+    "napari": "--napari",
+    "profile": "--profile",
+    "verbose": "--verbose",
+}
+
+
+def normalize_dense_args(dense_args):
+    if not isinstance(dense_args, dict):
+        raise RuntimeError(f"dense_args must be a dict, got {type(dense_args).__name__}")
+    normalized = {}
+    for key, value in dense_args.items():
+        key_norm = str(key).replace("-", "_")
+        normalized[_DENSE_ARG_ALIASES.get(key_norm, key_norm)] = value
+    if normalized.get("edge_input_rowscols") is None:
+        normalized["edge_input_rowscols"] = 4
+    return normalized
+
+
+def _append_cli_arg(argv, flag, value):
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        argv.append(flag)
+        argv.extend(str(v) for v in value)
+        return
+    argv.extend([flag, str(value)])
+
+
+def _dense_args_to_argv(dense_args):
+    dense_args = normalize_dense_args(dense_args)
+    argv = []
+    for key, flag in _DENSE_ARG_TO_CLI.items():
+        if key not in dense_args:
+            continue
+        value = dense_args.get(key)
+        if key == "tta_outlier_drop_thresh" and value is None:
+            _append_cli_arg(argv, flag, "none")
+            continue
+        if value is None:
+            continue
+        _append_cli_arg(argv, flag, value)
+
+    for key, flag in _DENSE_BOOL_TO_CLI.items():
+        if bool(dense_args.get(key)):
+            argv.append(flag)
+
+    if "tta" in dense_args and (dense_args.get("tta") is False):
+        argv.append("--no-tta")
+    return argv
 
 
 def _empty_uv(dtype=np.int64):
@@ -1655,9 +1752,7 @@ def _run_growth_direction_step(
     }
 
 
-def main():
-    args = parse_args()
-    parse_done = time.perf_counter()
+def _run_with_args(args, parse_done):
     call_args = _serialize_args(args)
     crop_size = tuple(int(v) for v in args.crop_size)
     profiler = _RuntimeProfiler(enabled=args.profile, device=args.device)
@@ -1836,7 +1931,7 @@ def main():
         )
 
     with profiler.section("save_tifxyz"):
-        _save_merged_surface_tifxyz(
+        output_path = _save_merged_surface_tifxyz(
             args, merged, checkpoint_path, model_config, call_args,
             input_scale=tgt_segment._scale,
         )
@@ -1893,6 +1988,27 @@ def main():
         if outside_profile_window_s is not None:
             print(f"outside_profile_window: {float(outside_profile_window_s):.3f}s")
         print(f"process_runtime: {float(process_runtime_s):.3f}s")
+    return output_path
+
+
+def run_global_extrap(dense_args):
+    argv = _dense_args_to_argv(dense_args)
+    stderr_buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr_buffer):
+            args = parse_args(argv)
+    except SystemExit as exc:
+        stderr_text = stderr_buffer.getvalue().strip()
+        detail = stderr_text.splitlines()[-1] if stderr_text else "argument parsing failed"
+        raise RuntimeError(f"Invalid dense args for infer_global_extrap: {detail}") from exc
+    parse_done = time.perf_counter()
+    return _run_with_args(args, parse_done=parse_done)
+
+
+def main():
+    args = parse_args()
+    parse_done = time.perf_counter()
+    _run_with_args(args, parse_done=parse_done)
 
 
 if __name__ == "__main__":

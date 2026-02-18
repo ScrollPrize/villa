@@ -15,49 +15,6 @@ from vesuvius.neural_tracing.models import load_checkpoint
 HEATMAP_REQUEST_TYPE = "heatmap_next_points"
 DENSE_REQUEST_TYPE = "dense_displacement_grow"
 
-_DENSE_ARG_KEYS = {
-    "tifxyz_path",
-    "volume_path",
-    "volume_scale",
-    "grow_direction",
-    "cond_pct",
-    "crop_size",
-    "window_pad",
-    "bbox_overlap_frac",
-    "checkpoint_path",
-    "config_path",
-    "extrapolation_method",
-    "rbf_downsample_factor",
-    "tifxyz_out_dir",
-    "tifxyz_step_size",
-    "tifxyz_voxel_size_um",
-    "skip_inference",
-    "extrap_only",
-    "device",
-    "batch_size",
-    "iterations",
-    "refine",
-    "tta",
-    "tta_merge_method",
-    "tta_outlier_drop_thresh",
-    "tta_outlier_drop_min_keep",
-    "edge_input_rowscols",
-    "agg_extrap_lines",
-    "napari_downsample",
-    "napari_point_size",
-    "napari",
-    "profile",
-    "verbose",
-}
-
-_DENSE_ALIASES = {
-    "direction": "grow_direction",
-    "steps": "iterations",
-    "dense_checkpoint_path": "checkpoint_path",
-    "dense_config_path": "config_path",
-    "volume_zarr": "volume_path",
-}
-
 
 @click.command()
 @click.option(
@@ -151,13 +108,12 @@ def _merge_dense_args(dst, src):
     if not isinstance(src, dict):
         return
     for key, value in src.items():
-        key_norm = _normalize_key(key)
-        alias = _DENSE_ALIASES.get(key_norm, key_norm)
-        if alias in _DENSE_ARG_KEYS:
-            dst[alias] = value
+        dst[_normalize_key(key)] = value
 
 
 def _build_dense_args(request, state):
+    from vesuvius.neural_tracing.inference.infer_global_extrap import normalize_dense_args
+
     dense_args = {}
 
     _merge_dense_args(dense_args, request.get("dense_args"))
@@ -165,6 +121,7 @@ def _build_dense_args(request, state):
     _merge_dense_args(dense_args, request.get("overrides"))
     _merge_dense_args(dense_args, request)
 
+    dense_args = normalize_dense_args(dense_args)
     dense_args.setdefault("iterations", 1)
     dense_args.setdefault("volume_path", state.get("volume_zarr"))
     dense_args.setdefault("volume_scale", state.get("volume_scale"))
