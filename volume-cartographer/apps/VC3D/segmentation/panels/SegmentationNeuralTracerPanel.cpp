@@ -208,6 +208,13 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         writeSetting(QStringLiteral("neural_batch_size"), _neuralBatchSize);
     });
 
+    connect(_groupNeuralTracer, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        if (_restoringSettings) {
+            return;
+        }
+        writeSetting(vc3d::settings::segmentation::GROUP_NEURAL_TRACER_EXPANDED, expanded);
+    });
+
     // Connect to service manager signals
     auto& serviceManager = NeuralTraceServiceManager::instance();
     connect(&serviceManager, &NeuralTraceServiceManager::statusMessage, this, [this](const QString& message) {
@@ -419,6 +426,8 @@ void SegmentationNeuralTracerPanel::setVolumeZarrPath(const QString& path)
 
 void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
 {
+    using namespace vc3d::settings;
+
     _restoringSettings = true;
 
     _neuralTracerEnabled = settings.value(QStringLiteral("neural_tracer_enabled"), false).toBool();
@@ -455,7 +464,8 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     }
 
     // Restore group expansion state
-    const bool neuralExpanded = settings.value(QStringLiteral("group_neural_tracer_expanded"), false).toBool();
+    const bool neuralExpanded = settings.value(segmentation::GROUP_NEURAL_TRACER_EXPANDED,
+                                               segmentation::GROUP_NEURAL_TRACER_EXPANDED_DEFAULT).toBool();
     if (_groupNeuralTracer) {
         _groupNeuralTracer->setExpanded(neuralExpanded);
     }
