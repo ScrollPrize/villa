@@ -33,7 +33,6 @@ public:
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const { return _neuralOutputMode; }
     [[nodiscard]] DenseTtaMode denseTtaMode() const { return _denseTtaMode; }
     [[nodiscard]] QString denseCheckpointPath() const;
-    [[nodiscard]] QString denseConfigPath() const { return _denseConfigPath; }
 
     // Setters
     void setNeuralTracerEnabled(bool enabled);
@@ -46,7 +45,6 @@ public:
     void setNeuralOutputMode(NeuralTracerOutputMode mode);
     void setDenseTtaMode(DenseTtaMode mode);
     void setDenseCheckpointPath(const QString& path);
-    void setDenseConfigPath(const QString& path);
 
     void restoreSettings(QSettings& settings);
     void syncUiState();
@@ -76,10 +74,6 @@ private:
     QComboBox* _comboDenseCheckpointPreset{nullptr};
     QLineEdit* _neuralCheckpointEdit{nullptr};
     QToolButton* _neuralCheckpointBrowse{nullptr};
-    QLineEdit* _denseCheckpointEdit{nullptr};
-    QToolButton* _denseCheckpointBrowse{nullptr};
-    QLineEdit* _denseConfigEdit{nullptr};
-    QToolButton* _denseConfigBrowse{nullptr};
     QLineEdit* _neuralPythonEdit{nullptr};
     QToolButton* _neuralPythonBrowse{nullptr};
     QComboBox* _comboNeuralVolumeScale{nullptr};
@@ -96,8 +90,6 @@ private:
     NeuralTracerOutputMode _neuralOutputMode{NeuralTracerOutputMode::OverwriteCurrentSegment};
     DenseTtaMode _denseTtaMode{DenseTtaMode::Mirror};
     DenseCheckpointPreset _denseCheckpointPreset{DenseCheckpointPreset::DenseLatest};
-    QString _denseCheckpointPath;
-    QString _denseConfigPath;
 
     bool _restoringSettings{false};
     const QString _settingsGroup;

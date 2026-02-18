@@ -74,7 +74,6 @@ public:
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const;
     [[nodiscard]] DenseTtaMode denseTtaMode() const;
     [[nodiscard]] QString denseCheckpointPath() const;
-    [[nodiscard]] QString denseConfigPath() const;
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -154,7 +153,6 @@ public:
     void setNeuralOutputMode(NeuralTracerOutputMode mode);
     void setDenseTtaMode(DenseTtaMode mode);
     void setDenseCheckpointPath(const QString& path);
-    void setDenseConfigPath(const QString& path);
 
     /**
      * Set the volume zarr path for neural tracing.

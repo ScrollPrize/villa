@@ -48,7 +48,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     _groupNeuralTracer->addRow(tr("Model type:"), [&](QHBoxLayout* row) {
         _comboNeuralModelType = new QComboBox(neuralParent);
         _comboNeuralModelType->addItem(tr("Heatmap"), static_cast<int>(NeuralTracerModelType::Heatmap));
-        _comboNeuralModelType->addItem(tr("Dense displacement"), static_cast<int>(NeuralTracerModelType::DenseDisplacement));
+        _comboNeuralModelType->addItem(tr("Extrapolation growth"), static_cast<int>(NeuralTracerModelType::DenseDisplacement));
         _comboNeuralModelType->setToolTip(tr("Select which neural tracing model path to use."));
         row->addWidget(_comboNeuralModelType);
         row->addStretch(1);
@@ -65,7 +65,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         row->addStretch(1);
     });
 
-    _groupNeuralTracer->addRow(tr("Dense TTA:"), [&](QHBoxLayout* row) {
+    _groupNeuralTracer->addRow(tr("TTA Type:"), [&](QHBoxLayout* row) {
         _comboDenseTtaMode = new QComboBox(neuralParent);
         _comboDenseTtaMode->addItem(tr("Mirror TTA"), static_cast<int>(DenseTtaMode::Mirror));
         _comboDenseTtaMode->addItem(tr("Rotate3 TTA"), static_cast<int>(DenseTtaMode::Rotate3));
@@ -76,7 +76,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         row->addStretch(1);
     });
 
-    _groupNeuralTracer->addRow(tr("Dense source:"), [&](QHBoxLayout* row) {
+    _groupNeuralTracer->addRow(tr("Checkpoint path:"), [&](QHBoxLayout* row) {
         _comboDenseCheckpointPreset = new QComboBox(neuralParent);
         _comboDenseCheckpointPreset->addItem(
             tr("Dense Displacement Latest"),
@@ -93,36 +93,13 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     _groupNeuralTracer->addRow(tr("Checkpoint:"), [&](QHBoxLayout* row) {
         _neuralCheckpointEdit = new QLineEdit(neuralParent);
         _neuralCheckpointEdit->setPlaceholderText(tr("Path to model checkpoint (.pt)"));
-        _neuralCheckpointEdit->setToolTip(tr("Path to the trained neural network checkpoint file."));
+        _neuralCheckpointEdit->setToolTip(tr("Checkpoint path used for Heatmap and for Extrapolation growth when Checkpoint path is set to Custom path."));
         _neuralCheckpointBrowse = new QToolButton(neuralParent);
         _neuralCheckpointBrowse->setText(QStringLiteral("..."));
         _neuralCheckpointBrowse->setToolTip(tr("Browse for checkpoint file."));
         row->addWidget(_neuralCheckpointEdit, 1);
         row->addWidget(_neuralCheckpointBrowse);
     }, tr("Path to the trained neural network checkpoint file."));
-
-    _groupNeuralTracer->addRow(tr("Dense ckpt:"), [&](QHBoxLayout* row) {
-        _denseCheckpointEdit = new QLineEdit(neuralParent);
-        _denseCheckpointEdit->setPlaceholderText(tr("Custom dense displacement checkpoint path (.pt/.pth)"));
-        _denseCheckpointEdit->setToolTip(
-            tr("Custom dense displacement checkpoint used when Dense source is set to Custom path."));
-        _denseCheckpointBrowse = new QToolButton(neuralParent);
-        _denseCheckpointBrowse->setText(QStringLiteral("..."));
-        _denseCheckpointBrowse->setToolTip(tr("Browse for a custom dense displacement checkpoint."));
-        row->addWidget(_denseCheckpointEdit, 1);
-        row->addWidget(_denseCheckpointBrowse);
-    }, tr("Dense displacement model checkpoint. Disabled when using Dense Displacement Latest."));
-
-    _groupNeuralTracer->addRow(tr("Dense config:"), [&](QHBoxLayout* row) {
-        _denseConfigEdit = new QLineEdit(neuralParent);
-        _denseConfigEdit->setPlaceholderText(tr("Optional dense displacement config (.json)"));
-        _denseConfigEdit->setToolTip(tr("Optional config JSON forwarded to dense displacement requests."));
-        _denseConfigBrowse = new QToolButton(neuralParent);
-        _denseConfigBrowse->setText(QStringLiteral("..."));
-        _denseConfigBrowse->setToolTip(tr("Browse for dense displacement config JSON."));
-        row->addWidget(_denseConfigEdit, 1);
-        row->addWidget(_denseConfigBrowse);
-    }, tr("Optional dense displacement config path."));
 
     _groupNeuralTracer->addRow(tr("Python:"), [&](QHBoxLayout* row) {
         _neuralPythonEdit = new QLineEdit(neuralParent);
@@ -206,36 +183,6 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         }
     });
 
-    connect(_denseCheckpointEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        _denseCheckpointPath = text.trimmed();
-        writeSetting(QStringLiteral("neural_dense_checkpoint_path"), _denseCheckpointPath);
-    });
-
-    connect(_denseCheckpointBrowse, &QToolButton::clicked, this, [this]() {
-        const QString initial = _denseCheckpointPath.isEmpty() ? QDir::homePath() : _denseCheckpointPath;
-        const QString file = QFileDialog::getOpenFileName(this, tr("Select dense displacement checkpoint"),
-                                                          initial, tr("PyTorch Checkpoint (*.pt *.pth);;All Files (*)"));
-        if (!file.isEmpty()) {
-            _denseCheckpointPath = file;
-            _denseCheckpointEdit->setText(file);
-        }
-    });
-
-    connect(_denseConfigEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        _denseConfigPath = text.trimmed();
-        writeSetting(QStringLiteral("neural_dense_config_path"), _denseConfigPath);
-    });
-
-    connect(_denseConfigBrowse, &QToolButton::clicked, this, [this]() {
-        const QString initial = _denseConfigPath.isEmpty() ? QDir::homePath() : QFileInfo(_denseConfigPath).absolutePath();
-        const QString file = QFileDialog::getOpenFileName(this, tr("Select dense displacement config"),
-                                                          initial, tr("JSON Files (*.json);;All Files (*)"));
-        if (!file.isEmpty()) {
-            _denseConfigPath = file;
-            _denseConfigEdit->setText(file);
-        }
-    });
-
     connect(_neuralPythonEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _neuralPythonPath = text.trimmed();
         writeSetting(QStringLiteral("neural_python_path"), _neuralPythonPath);
@@ -307,7 +254,7 @@ QString SegmentationNeuralTracerPanel::denseCheckpointPath() const
     if (_denseCheckpointPreset == DenseCheckpointPreset::DenseLatest) {
         return kDenseLatestSentinel;
     }
-    return _denseCheckpointPath;
+    return _neuralCheckpointPath.trimmed();
 }
 
 void SegmentationNeuralTracerPanel::setNeuralTracerEnabled(bool enabled)
@@ -328,15 +275,16 @@ void SegmentationNeuralTracerPanel::setNeuralTracerEnabled(bool enabled)
 
 void SegmentationNeuralTracerPanel::setNeuralCheckpointPath(const QString& path)
 {
-    if (_neuralCheckpointPath == path) {
+    const QString trimmed = path.trimmed();
+    if (_neuralCheckpointPath == trimmed) {
         return;
     }
-    _neuralCheckpointPath = path;
+    _neuralCheckpointPath = trimmed;
     writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
 
     if (_neuralCheckpointEdit) {
         const QSignalBlocker blocker(_neuralCheckpointEdit);
-        _neuralCheckpointEdit->setText(path);
+        _neuralCheckpointEdit->setText(trimmed);
     }
 }
 
@@ -442,11 +390,8 @@ void SegmentationNeuralTracerPanel::setDenseTtaMode(DenseTtaMode mode)
 void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
 {
     const QString trimmed = path.trimmed();
-    const bool useLatestPreset = trimmed == kDenseLatestSentinel;
-    const DenseCheckpointPreset nextPreset = useLatestPreset
-        ? DenseCheckpointPreset::DenseLatest
-        : DenseCheckpointPreset::CustomPath;
-
+    const DenseCheckpointPreset nextPreset =
+        (trimmed == kDenseLatestSentinel) ? DenseCheckpointPreset::DenseLatest : DenseCheckpointPreset::CustomPath;
     if (_denseCheckpointPreset != nextPreset) {
         _denseCheckpointPreset = nextPreset;
         writeSetting(kDensePresetSettingKey,
@@ -461,38 +406,10 @@ void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
             }
         }
     }
-
-    if (useLatestPreset) {
-        updateDenseUiState();
-        return;
-    }
-
-    if (_denseCheckpointPath == trimmed) {
-        updateDenseUiState();
-        return;
-    }
-    _denseCheckpointPath = trimmed;
-    writeSetting(QStringLiteral("neural_dense_checkpoint_path"), _denseCheckpointPath);
-
-    if (_denseCheckpointEdit) {
-        const QSignalBlocker blocker(_denseCheckpointEdit);
-        _denseCheckpointEdit->setText(trimmed);
+    if (nextPreset == DenseCheckpointPreset::CustomPath) {
+        setNeuralCheckpointPath(trimmed);
     }
     updateDenseUiState();
-}
-
-void SegmentationNeuralTracerPanel::setDenseConfigPath(const QString& path)
-{
-    if (_denseConfigPath == path) {
-        return;
-    }
-    _denseConfigPath = path;
-    writeSetting(QStringLiteral("neural_dense_config_path"), _denseConfigPath);
-
-    if (_denseConfigEdit) {
-        const QSignalBlocker blocker(_denseConfigEdit);
-        _denseConfigEdit->setText(path);
-    }
 }
 
 void SegmentationNeuralTracerPanel::setVolumeZarrPath(const QString& path)
@@ -530,21 +447,12 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     } else {
         _denseTtaMode = DenseTtaMode::Mirror;
     }
-    _denseCheckpointPath = settings.value(QStringLiteral("neural_dense_checkpoint_path"), QString()).toString();
-    const QString presetValue = settings.value(kDensePresetSettingKey, QString()).toString();
+    const QString presetValue = settings.value(kDensePresetSettingKey, kDensePresetLatest).toString();
     if (presetValue == kDensePresetCustom) {
         _denseCheckpointPreset = DenseCheckpointPreset::CustomPath;
-    } else if (presetValue == kDensePresetLatest) {
-        _denseCheckpointPreset = DenseCheckpointPreset::DenseLatest;
-    } else if (_denseCheckpointPath == kDenseLatestSentinel || _denseCheckpointPath.isEmpty()) {
-        _denseCheckpointPreset = DenseCheckpointPreset::DenseLatest;
-        if (_denseCheckpointPath == kDenseLatestSentinel) {
-            _denseCheckpointPath.clear();
-        }
     } else {
-        _denseCheckpointPreset = DenseCheckpointPreset::CustomPath;
+        _denseCheckpointPreset = DenseCheckpointPreset::DenseLatest;
     }
-    _denseConfigPath = settings.value(QStringLiteral("neural_dense_config_path"), QString()).toString();
 
     // Restore group expansion state
     const bool neuralExpanded = settings.value(QStringLiteral("group_neural_tracer_expanded"), false).toBool();
@@ -608,26 +516,18 @@ void SegmentationNeuralTracerPanel::syncUiState()
             _comboDenseCheckpointPreset->setCurrentIndex(idx);
         }
     }
-    if (_denseCheckpointEdit) {
-        const QSignalBlocker blocker(_denseCheckpointEdit);
-        _denseCheckpointEdit->setText(_denseCheckpointPath);
-    }
-    if (_denseConfigEdit) {
-        const QSignalBlocker blocker(_denseConfigEdit);
-        _denseConfigEdit->setText(_denseConfigPath);
-    }
     updateDenseUiState();
 }
 
 void SegmentationNeuralTracerPanel::updateDenseUiState()
 {
     const bool denseMode = _neuralModelType == NeuralTracerModelType::DenseDisplacement;
-    const bool customDenseCheckpoint = _denseCheckpointPreset == DenseCheckpointPreset::CustomPath;
+    const bool useDenseLatestCheckpoint = denseMode && _denseCheckpointPreset == DenseCheckpointPreset::DenseLatest;
     if (_neuralCheckpointEdit) {
-        _neuralCheckpointEdit->setEnabled(!denseMode);
+        _neuralCheckpointEdit->setEnabled(!useDenseLatestCheckpoint);
     }
     if (_neuralCheckpointBrowse) {
-        _neuralCheckpointBrowse->setEnabled(!denseMode);
+        _neuralCheckpointBrowse->setEnabled(!useDenseLatestCheckpoint);
     }
     if (_comboDenseCheckpointPreset) {
         _comboDenseCheckpointPreset->setEnabled(denseMode);
@@ -636,22 +536,6 @@ void SegmentationNeuralTracerPanel::updateDenseUiState()
     if (_comboDenseTtaMode) {
         _comboDenseTtaMode->setEnabled(denseMode);
         _comboDenseTtaMode->setVisible(denseMode);
-    }
-    if (_denseCheckpointEdit) {
-        _denseCheckpointEdit->setEnabled(denseMode && customDenseCheckpoint);
-        _denseCheckpointEdit->setVisible(denseMode);
-    }
-    if (_denseCheckpointBrowse) {
-        _denseCheckpointBrowse->setEnabled(denseMode && customDenseCheckpoint);
-        _denseCheckpointBrowse->setVisible(denseMode);
-    }
-    if (_denseConfigEdit) {
-        _denseConfigEdit->setEnabled(denseMode);
-        _denseConfigEdit->setVisible(denseMode);
-    }
-    if (_denseConfigBrowse) {
-        _denseConfigBrowse->setEnabled(denseMode);
-        _denseConfigBrowse->setVisible(denseMode);
     }
     if (_comboNeuralOutputMode) {
         _comboNeuralOutputMode->setEnabled(denseMode);

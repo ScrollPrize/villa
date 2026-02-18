@@ -627,7 +627,6 @@ struct DenseDisplacementJob
     int volumeScale{0};
     int iterations{1};
     QString checkpointPath;
-    QString configPath;
     DenseTtaMode ttaMode{DenseTtaMode::Mirror};
     std::optional<nlohmann::json> customParams;
     std::vector<SegmentationGrowthDirection> directions;
@@ -825,9 +824,6 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         request["volume_path"] = job.volumeZarrPath.toStdString();
         request["volume_scale"] = std::max(0, job.volumeScale);
         request["checkpoint_path"] = job.checkpointPath.toStdString();
-        if (!job.configPath.trimmed().isEmpty()) {
-            request["config_path"] = job.configPath.toStdString();
-        }
         switch (job.ttaMode) {
         case DenseTtaMode::Rotate3:
             request["tta"] = true;
@@ -1335,7 +1331,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     if (denseMode) {
         const QString denseCheckpointPath = _context.widget->denseCheckpointPath().trimmed();
-        const QString denseConfigPath = _context.widget->denseConfigPath().trimmed();
         const QString pythonPath = _context.widget->neuralPythonPath();
         const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
         const int volumeScale = _context.widget->neuralVolumeScale();
@@ -1350,11 +1345,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         if (!usingDenseLatestPreset &&
             (!QFileInfo::exists(denseCheckpointPath) || !QFileInfo(denseCheckpointPath).isFile())) {
             showStatus(tr("Dense checkpoint does not exist: %1").arg(denseCheckpointPath), kStatusLong);
-            return false;
-        }
-        if (!denseConfigPath.isEmpty() &&
-            (!QFileInfo::exists(denseConfigPath) || !QFileInfo(denseConfigPath).isFile())) {
-            showStatus(tr("Dense config does not exist: %1").arg(denseConfigPath), kStatusLong);
             return false;
         }
         if (volumeZarr.isEmpty()) {
@@ -1428,7 +1418,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         denseJob.volumeScale = volumeScale;
         denseJob.iterations = std::max(1, sanitizedSteps);
         denseJob.checkpointPath = denseCheckpointPath;
-        denseJob.configPath = denseConfigPath;
         denseJob.ttaMode = denseTtaMode;
         denseJob.customParams = request.customParams;
         denseJob.directions = denseDirections;
