@@ -13,3 +13,9 @@ enum class NeuralTracerOutputMode {
     OverwriteCurrentSegment = 0,
     CreateNewSegment = 1,
 };
+
+enum class DenseTtaMode {
+    Mirror = 0,
+    Rotate3 = 1,
+    None = 2,
+};

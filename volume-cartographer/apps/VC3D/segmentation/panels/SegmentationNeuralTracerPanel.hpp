@@ -31,6 +31,7 @@ public:
     [[nodiscard]] int neuralBatchSize() const { return _neuralBatchSize; }
     [[nodiscard]] NeuralTracerModelType neuralModelType() const { return _neuralModelType; }
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const { return _neuralOutputMode; }
+    [[nodiscard]] DenseTtaMode denseTtaMode() const { return _denseTtaMode; }
     [[nodiscard]] QString denseCheckpointPath() const;
     [[nodiscard]] QString denseConfigPath() const { return _denseConfigPath; }
 
@@ -43,6 +44,7 @@ public:
     void setVolumeZarrPath(const QString& path);
     void setNeuralModelType(NeuralTracerModelType type);
     void setNeuralOutputMode(NeuralTracerOutputMode mode);
+    void setDenseTtaMode(DenseTtaMode mode);
     void setDenseCheckpointPath(const QString& path);
     void setDenseConfigPath(const QString& path);
 
@@ -70,6 +72,7 @@ private:
     QCheckBox* _chkNeuralTracerEnabled{nullptr};
     QComboBox* _comboNeuralModelType{nullptr};
     QComboBox* _comboNeuralOutputMode{nullptr};
+    QComboBox* _comboDenseTtaMode{nullptr};
     QComboBox* _comboDenseCheckpointPreset{nullptr};
     QLineEdit* _neuralCheckpointEdit{nullptr};
     QToolButton* _neuralCheckpointBrowse{nullptr};
@@ -91,6 +94,7 @@ private:
     int _neuralBatchSize{4};
     NeuralTracerModelType _neuralModelType{NeuralTracerModelType::Heatmap};
     NeuralTracerOutputMode _neuralOutputMode{NeuralTracerOutputMode::OverwriteCurrentSegment};
+    DenseTtaMode _denseTtaMode{DenseTtaMode::Mirror};
     DenseCheckpointPreset _denseCheckpointPreset{DenseCheckpointPreset::DenseLatest};
     QString _denseCheckpointPath;
     QString _denseConfigPath;

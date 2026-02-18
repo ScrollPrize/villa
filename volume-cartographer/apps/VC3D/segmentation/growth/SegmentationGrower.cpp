@@ -627,6 +627,7 @@ struct DenseDisplacementJob
     int iterations{1};
     QString checkpointPath;
     QString configPath;
+    DenseTtaMode ttaMode{DenseTtaMode::Mirror};
     std::optional<nlohmann::json> customParams;
     std::vector<SegmentationGrowthDirection> directions;
 };
@@ -799,6 +800,20 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         request["checkpoint_path"] = job.checkpointPath.toStdString();
         if (!job.configPath.trimmed().isEmpty()) {
             request["config_path"] = job.configPath.toStdString();
+        }
+        switch (job.ttaMode) {
+        case DenseTtaMode::Rotate3:
+            request["tta"] = true;
+            request["tta_transform"] = "rotate3";
+            break;
+        case DenseTtaMode::None:
+            request["tta"] = false;
+            break;
+        case DenseTtaMode::Mirror:
+        default:
+            request["tta"] = true;
+            request["tta_transform"] = "mirror";
+            break;
         }
 
         if (job.customParams) {
@@ -1294,6 +1309,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         const QString pythonPath = _context.widget->neuralPythonPath();
         const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
         const int volumeScale = _context.widget->neuralVolumeScale();
+        const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
         const auto outputMode = _context.widget->neuralOutputMode();
 
         if (denseCheckpointPath.isEmpty()) {
@@ -1353,6 +1369,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         denseJob.iterations = std::max(1, sanitizedSteps);
         denseJob.checkpointPath = denseCheckpointPath;
         denseJob.configPath = denseConfigPath;
+        denseJob.ttaMode = denseTtaMode;
         denseJob.customParams = request.customParams;
         denseJob.directions = denseDirections;
 

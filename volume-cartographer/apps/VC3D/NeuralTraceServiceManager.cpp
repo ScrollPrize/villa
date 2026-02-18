@@ -14,6 +14,13 @@ namespace
 {
 constexpr int kServiceStartTimeoutMs = 300000; // 5 minutes for torch compilation
 constexpr int kServiceStopTimeoutMs = 5000;    // 5 seconds to gracefully stop
+const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
+
+bool isCheckpointSentinel(const QString& checkpointPath)
+{
+    const QString trimmed = checkpointPath.trimmed();
+    return trimmed == kDenseLatestSentinel;
+}
 
 QString findPythonExecutable()
 {
@@ -114,7 +121,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         emit serviceError(_lastError);
         return false;
     }
-    if (!QFile::exists(checkpointPath)) {
+    if (!isCheckpointSentinel(checkpointPath) && !QFile::exists(checkpointPath)) {
         _lastError = tr("Checkpoint file does not exist: %1").arg(checkpointPath);
         emit serviceError(_lastError);
         return false;

@@ -25,6 +25,7 @@ const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest"
 const QString kDensePresetSettingKey = QStringLiteral("neural_dense_checkpoint_preset");
 const QString kDensePresetLatest = QStringLiteral("latest");
 const QString kDensePresetCustom = QStringLiteral("custom");
+const QString kDenseTtaModeSettingKey = QStringLiteral("neural_dense_tta_mode");
 } // namespace
 
 SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& settingsGroup,
@@ -61,6 +62,17 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
                                         static_cast<int>(NeuralTracerOutputMode::CreateNewSegment));
         _comboNeuralOutputMode->setToolTip(tr("Choose whether dense displacement updates the current segment or creates a new one."));
         row->addWidget(_comboNeuralOutputMode);
+        row->addStretch(1);
+    });
+
+    _groupNeuralTracer->addRow(tr("Dense TTA:"), [&](QHBoxLayout* row) {
+        _comboDenseTtaMode = new QComboBox(neuralParent);
+        _comboDenseTtaMode->addItem(tr("Mirror TTA"), static_cast<int>(DenseTtaMode::Mirror));
+        _comboDenseTtaMode->addItem(tr("Rotate3 TTA"), static_cast<int>(DenseTtaMode::Rotate3));
+        _comboDenseTtaMode->addItem(tr("None"), static_cast<int>(DenseTtaMode::None));
+        _comboDenseTtaMode->setToolTip(
+            tr("Dense displacement test-time augmentation mode. Mirror is default."));
+        row->addWidget(_comboDenseTtaMode);
         row->addStretch(1);
     });
 
@@ -163,6 +175,11 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     connect(_comboNeuralOutputMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         auto mode = static_cast<NeuralTracerOutputMode>(_comboNeuralOutputMode->itemData(index).toInt());
         setNeuralOutputMode(mode);
+    });
+
+    connect(_comboDenseTtaMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        auto mode = static_cast<DenseTtaMode>(_comboDenseTtaMode->itemData(index).toInt());
+        setDenseTtaMode(mode);
     });
 
     connect(_comboDenseCheckpointPreset, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -405,6 +422,23 @@ void SegmentationNeuralTracerPanel::setNeuralOutputMode(NeuralTracerOutputMode m
     }
 }
 
+void SegmentationNeuralTracerPanel::setDenseTtaMode(DenseTtaMode mode)
+{
+    if (_denseTtaMode == mode) {
+        return;
+    }
+    _denseTtaMode = mode;
+    writeSetting(kDenseTtaModeSettingKey, static_cast<int>(_denseTtaMode));
+
+    if (_comboDenseTtaMode) {
+        const QSignalBlocker blocker(_comboDenseTtaMode);
+        int idx = _comboDenseTtaMode->findData(static_cast<int>(_denseTtaMode));
+        if (idx >= 0) {
+            _comboDenseTtaMode->setCurrentIndex(idx);
+        }
+    }
+}
+
 void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
 {
     const QString trimmed = path.trimmed();
@@ -487,6 +521,15 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     _neuralOutputMode = outputMode == static_cast<int>(NeuralTracerOutputMode::CreateNewSegment)
         ? NeuralTracerOutputMode::CreateNewSegment
         : NeuralTracerOutputMode::OverwriteCurrentSegment;
+    const int ttaModeValue = settings.value(kDenseTtaModeSettingKey,
+                                            static_cast<int>(DenseTtaMode::Mirror)).toInt();
+    if (ttaModeValue == static_cast<int>(DenseTtaMode::Rotate3)) {
+        _denseTtaMode = DenseTtaMode::Rotate3;
+    } else if (ttaModeValue == static_cast<int>(DenseTtaMode::None)) {
+        _denseTtaMode = DenseTtaMode::None;
+    } else {
+        _denseTtaMode = DenseTtaMode::Mirror;
+    }
     _denseCheckpointPath = settings.value(QStringLiteral("neural_dense_checkpoint_path"), QString()).toString();
     const QString presetValue = settings.value(kDensePresetSettingKey, QString()).toString();
     if (presetValue == kDensePresetCustom) {
@@ -551,6 +594,13 @@ void SegmentationNeuralTracerPanel::syncUiState()
             _comboNeuralOutputMode->setCurrentIndex(idx);
         }
     }
+    if (_comboDenseTtaMode) {
+        const QSignalBlocker blocker(_comboDenseTtaMode);
+        int idx = _comboDenseTtaMode->findData(static_cast<int>(_denseTtaMode));
+        if (idx >= 0) {
+            _comboDenseTtaMode->setCurrentIndex(idx);
+        }
+    }
     if (_comboDenseCheckpointPreset) {
         const QSignalBlocker blocker(_comboDenseCheckpointPreset);
         int idx = _comboDenseCheckpointPreset->findData(static_cast<int>(_denseCheckpointPreset));
@@ -582,6 +632,10 @@ void SegmentationNeuralTracerPanel::updateDenseUiState()
     if (_comboDenseCheckpointPreset) {
         _comboDenseCheckpointPreset->setEnabled(denseMode);
         _comboDenseCheckpointPreset->setVisible(denseMode);
+    }
+    if (_comboDenseTtaMode) {
+        _comboDenseTtaMode->setEnabled(denseMode);
+        _comboDenseTtaMode->setVisible(denseMode);
     }
     if (_denseCheckpointEdit) {
         _denseCheckpointEdit->setEnabled(denseMode && customDenseCheckpoint);

@@ -72,6 +72,7 @@ public:
     [[nodiscard]] int neuralBatchSize() const;
     [[nodiscard]] NeuralTracerModelType neuralModelType() const;
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const;
+    [[nodiscard]] DenseTtaMode denseTtaMode() const;
     [[nodiscard]] QString denseCheckpointPath() const;
     [[nodiscard]] QString denseConfigPath() const;
 
@@ -151,6 +152,7 @@ public:
     void setNeuralBatchSize(int size);
     void setNeuralModelType(NeuralTracerModelType type);
     void setNeuralOutputMode(NeuralTracerOutputMode mode);
+    void setDenseTtaMode(DenseTtaMode mode);
     void setDenseCheckpointPath(const QString& path);
     void setDenseConfigPath(const QString& path);
 
