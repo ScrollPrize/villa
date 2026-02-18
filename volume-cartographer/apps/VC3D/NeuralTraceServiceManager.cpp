@@ -48,10 +48,15 @@ QString normalizeCheckpointValue(const QString& checkpointPath)
 
 QString normalizePythonValue(const QString& pythonPath)
 {
-    if (pythonPath.trimmed().isEmpty()) {
+    const QString trimmed = pythonPath.trimmed();
+    if (trimmed.isEmpty()) {
         return QString();
     }
-    return normalizeExistingPath(pythonPath);
+
+    // Keep venv wrappers/symlinks intact. Canonicalizing can resolve to the
+    // base interpreter (e.g. uv/cpython) and lose venv site-packages.
+    QFileInfo info(trimmed);
+    return QDir::cleanPath(info.absoluteFilePath());
 }
 
 QString findPythonExecutable()
