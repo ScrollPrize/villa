@@ -93,6 +93,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--rbf-max-points",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on RBF conditioning points after downsampling. "
+            "When set, takes precedence over checkpoint/config rbf_max_points."
+        ),
+    )
+    parser.add_argument(
         "--tifxyz-out-dir",
         type=str,
         default=None,
@@ -239,6 +248,8 @@ def parse_args(argv=None):
         parser.error("--edge-input-rowscols must be >= 1")
     if args.rbf_downsample_factor is not None and args.rbf_downsample_factor < 1:
         parser.error("--rbf-downsample-factor must be >= 1 when provided")
+    if args.rbf_max_points is not None and args.rbf_max_points < 1:
+        parser.error("--rbf-max-points must be >= 1 when provided")
     if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
         parser.error("--bbox-overlap-frac must be in [0, 1)")
     if args.batch_size < 1:
@@ -288,6 +299,7 @@ _DENSE_ARG_TO_CLI = {
     "config_path": "--config-path",
     "extrapolation_method": "--extrapolation-method",
     "rbf_downsample_factor": "--rbf-downsample-factor",
+    "rbf_max_points": "--rbf-max-points",
     "tifxyz_out_dir": "--tifxyz-out-dir",
     "tifxyz_step_size": "--tifxyz-step-size",
     "tifxyz_voxel_size_um": "--tifxyz-voxel-size-um",
@@ -1634,6 +1646,7 @@ def _run_growth_direction_step(
             degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
             degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
             skip_bounds_check=True,
+            profiler=profiler,
             **extrapolation_settings["method_kwargs"],
         )
     if edge_extrapolation is None:

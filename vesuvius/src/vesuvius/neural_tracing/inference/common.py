@@ -3,7 +3,7 @@ import os
 import colorsys
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +40,7 @@ def _resolve_extrapolation_settings(args, runtime_config):
     method_kwargs = {}
     if method in {"rbf", "rbf_edge_only"}:
         rbf_downsample_override = getattr(args, "rbf_downsample_factor", None)
+        rbf_max_points_override = getattr(args, "rbf_max_points", None)
         rbf_downsample = int(
             rbf_downsample_override
             if rbf_downsample_override is not None
@@ -48,7 +49,11 @@ def _resolve_extrapolation_settings(args, runtime_config):
         edge_downsample_cfg = cfg.get("rbf_edge_downsample_factor", None)
         edge_downsample = rbf_downsample if edge_downsample_cfg is None else int(edge_downsample_cfg)
         method_kwargs["downsample_factor"] = edge_downsample if method == "rbf_edge_only" else rbf_downsample
-        method_kwargs["rbf_max_points"] = cfg.get("rbf_max_points")
+        method_kwargs["rbf_max_points"] = (
+            int(rbf_max_points_override)
+            if rbf_max_points_override is not None
+            else cfg.get("rbf_max_points")
+        )
         # MUST RUN IN FLOAT64: RBF extrapolation in this pipeline is unstable at lower precision.
         method_kwargs["precision"] = cfg.get("rbf_precision", "float64")
 
@@ -476,6 +481,12 @@ def _compute_query_mask_span(cond_span, cond_pct):
     return max(1, total_span - cond_span)
 
 
+def _profile_section(profiler, name):
+    if profiler is None:
+        return nullcontext()
+    return profiler.section(name)
+
+
 def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     """
     Build extrapolation UVs from a per-line frontier over edge-conditioning UVs.
@@ -538,6 +549,68 @@ def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     return np.stack([query_rows, query_cols], axis=-1)
 
 
+def _build_uv_query_from_edge_mask(edge_seed_mask, uv_cond, grow_direction, cond_pct):
+    """Build query UV grid directly from a 2D edge-seed mask."""
+    mask = np.asarray(edge_seed_mask, dtype=bool)
+    if mask.ndim != 2 or not mask.any():
+        return np.zeros((0, 0, 2), dtype=np.int64)
+
+    uv = np.rint(np.asarray(uv_cond)).astype(np.int64, copy=False)
+    if uv.ndim != 3 or uv.shape[2] != 2 or uv.shape[:2] != mask.shape:
+        raise ValueError(
+            f"uv_cond must have shape (H, W, 2) matching edge_seed_mask; got {uv.shape} and {mask.shape}"
+        )
+
+    _, direction = _get_growth_context(grow_direction)
+    growth_sign = int(direction["growth_sign"])
+    if direction["axis"] == "col":
+        active_lines = np.flatnonzero(mask.any(axis=1))
+        if active_lines.size == 0:
+            return np.zeros((0, 0, 2), dtype=np.int64)
+        line_mask = mask[active_lines]
+        min_idx = np.argmax(line_mask, axis=1)
+        max_idx = (line_mask.shape[1] - 1) - np.argmax(line_mask[:, ::-1], axis=1)
+
+        line_vals = uv[active_lines, 0, 0]
+        axis_uv = uv[active_lines, :, 1]
+        line_min = axis_uv[np.arange(active_lines.size), min_idx]
+        line_max = axis_uv[np.arange(active_lines.size), max_idx]
+
+        cond_span = int(np.median(line_max - line_min + 1))
+        extrap_span = _compute_query_mask_span(cond_span, cond_pct)
+        offsets = np.arange(extrap_span, dtype=np.int64)
+        frontier = line_max if growth_sign > 0 else line_min
+        if growth_sign > 0:
+            query_axis = (frontier[:, None] + 1) + offsets[None, :]
+        else:
+            query_axis = (frontier[:, None] - extrap_span) + offsets[None, :]
+        query_lines = np.repeat(line_vals[:, None], extrap_span, axis=1)
+        return np.stack([query_lines, query_axis], axis=-1)
+
+    active_lines = np.flatnonzero(mask.any(axis=0))
+    if active_lines.size == 0:
+        return np.zeros((0, 0, 2), dtype=np.int64)
+    line_mask = mask[:, active_lines]
+    min_idx = np.argmax(line_mask, axis=0)
+    max_idx = (line_mask.shape[0] - 1) - np.argmax(line_mask[::-1, :], axis=0)
+
+    line_vals = uv[0, active_lines, 1]
+    axis_uv = uv[:, active_lines, 0]
+    line_min = axis_uv[min_idx, np.arange(active_lines.size)]
+    line_max = axis_uv[max_idx, np.arange(active_lines.size)]
+
+    cond_span = int(np.median(line_max - line_min + 1))
+    extrap_span = _compute_query_mask_span(cond_span, cond_pct)
+    offsets = np.arange(extrap_span, dtype=np.int64)
+    frontier = line_max if growth_sign > 0 else line_min
+    if growth_sign > 0:
+        query_axis = (frontier[:, None] + 1) + offsets[None, :]
+    else:
+        query_axis = (frontier[:, None] - extrap_span) + offsets[None, :]
+    query_lines = np.repeat(line_vals[:, None], extrap_span, axis=1)
+    return np.stack([query_axis, query_lines], axis=-1)
+
+
 def _build_edge_input_mask(cond_valid, cond_direction, edge_input_rowscols):
     cond_valid = np.asarray(cond_valid, dtype=bool)
     if cond_valid.ndim != 2:
@@ -578,6 +651,7 @@ def compute_extrapolation_infer(
     degrade_curvature_range=(0.001, 0.01),
     degrade_gradient_range=(0.05, 0.2),
     skip_bounds_check=False,
+    profiler=None,
     **method_kwargs,
 ):
     if method not in _EXTRAPOLATION_METHODS:
@@ -591,15 +665,17 @@ def compute_extrapolation_infer(
         return None
 
     extrapolate_fn = _EXTRAPOLATION_METHODS[method]
-    zyx_extrapolated = extrapolate_fn(
-        uv_cond=uv_cond_flat,
-        zyx_cond=zyx_cond_flat,
-        uv_query=uv_query_flat,
-        min_corner=min_corner,
-        crop_size=crop_size,
-        cond_direction=cond_direction,
-        **method_kwargs,
-    )
+    with _profile_section(profiler, "iter_edge_extrapolate_call"):
+        zyx_extrapolated = extrapolate_fn(
+            uv_cond=uv_cond_flat,
+            zyx_cond=zyx_cond_flat,
+            uv_query=uv_query_flat,
+            min_corner=min_corner,
+            crop_size=crop_size,
+            cond_direction=cond_direction,
+            profiler=profiler,
+            **method_kwargs,
+        )
 
     min_corner_arr = np.asarray(min_corner, dtype=zyx_extrapolated.dtype)
     zyx_extrap_local_full = zyx_extrapolated - min_corner_arr[None, :]
@@ -647,6 +723,7 @@ def compute_edge_one_shot_extrapolation(
     degrade_curvature_range=(0.001, 0.01),
     degrade_gradient_range=(0.05, 0.2),
     skip_bounds_check=True,
+    profiler=None,
     **method_kwargs,
 ):
     cond_zyxs = np.asarray(cond_zyxs)
@@ -665,14 +742,15 @@ def compute_edge_one_shot_extrapolation(
         return None
 
     cond_direction, _ = _get_growth_context(grow_direction)
-    edge_seed_mask = _build_edge_input_mask(cond_valid_base, cond_direction, edge_input_rowscols)
+    with _profile_section(profiler, "iter_edge_mask_build"):
+        edge_seed_mask = _build_edge_input_mask(cond_valid_base, cond_direction, edge_input_rowscols)
     if not edge_seed_mask.any():
         return None
 
     # Build query span from the edge-input conditioning band, not the full grown
     # surface, so iterative runs do not blow up one-shot query allocations.
-    query_uv_seed = uv_cond[edge_seed_mask]
-    query_uv_grid = _build_uv_query_from_edge_band(query_uv_seed, grow_direction, cond_pct)
+    with _profile_section(profiler, "iter_edge_query_build"):
+        query_uv_grid = _build_uv_query_from_edge_mask(edge_seed_mask, uv_cond, grow_direction, cond_pct)
     if query_uv_grid.size == 0:
         return None
 
@@ -706,6 +784,7 @@ def compute_edge_one_shot_extrapolation(
         degrade_curvature_range=degrade_curvature_range,
         degrade_gradient_range=degrade_gradient_range,
         skip_bounds_check=skip_bounds_check,
+        profiler=profiler,
         **method_kwargs,
     )
     if extrap_result is None:
