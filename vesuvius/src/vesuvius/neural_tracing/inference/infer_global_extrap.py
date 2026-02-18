@@ -1428,7 +1428,12 @@ def _surface_to_stored_uv_samples_lattice(
     sub_c,
     phase_rc=(0, 0),
 ):
-    """Project full-resolution UV samples onto stored UV cells by aggregation."""
+    """Project full-resolution UV samples onto a fixed stored-resolution lattice.
+
+    For each occupied stored UV cell, sample the full-resolution surface at the
+    corresponding lattice anchor using mask-aware bilinear interpolation via
+    torch.grid_sample.
+    """
     grid = np.asarray(grid, dtype=np.float32)
     valid = np.asarray(valid, dtype=bool)
     sub_r = max(1, int(sub_r))
@@ -1436,75 +1441,141 @@ def _surface_to_stored_uv_samples_lattice(
     phase_r = int(phase_rc[0])
     phase_c = int(phase_rc[1])
 
-    def _empty_projection(n_full_valid=0, n_candidate_cells=0):
-        n_full_valid = int(n_full_valid)
-        n_candidate_cells = int(n_candidate_cells)
+    if grid.ndim != 3 or grid.shape[-1] != 3:
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
-            "mode": "lattice_cell_aggregate",
+            "mode": "lattice_bilinear_torch",
             "stride_rc": [sub_r, sub_c],
             "phase_rc": [phase_r, phase_c],
-            "n_full_valid": n_full_valid,
-            "n_support_points": n_full_valid,
-            "n_candidate_stored_cells": n_candidate_cells,
+            "n_full_valid": 0,
             "n_stored_valid": 0,
-            "n_dropped_empty_cells": n_candidate_cells,
         },)
 
-    if grid.ndim != 3 or grid.shape[-1] != 3:
-        return _empty_projection()
-
+    h, w = grid.shape[:2]
     support = valid & np.isfinite(grid).all(axis=2)
     n_full_valid = int(support.sum())
     if n_full_valid < 1:
-        return _empty_projection()
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": 0,
+            "n_stored_valid": 0,
+        },)
 
+    # Deterministic stored-lattice sampling: query at each stored cell center
+    # in full-resolution UV so bilinear interpolation can blend neighbors.
+    cell_center_r = 0.5 * float(sub_r - 1)
+    cell_center_c = 0.5 * float(sub_c - 1)
     r_abs0 = int(uv_offset[0])
     c_abs0 = int(uv_offset[1])
-    rr_local, cc_local = np.where(support)
-    if rr_local.size == 0:
-        return _empty_projection(n_full_valid=n_full_valid)
+    r_abs1 = r_abs0 + h - 1
+    c_abs1 = c_abs0 + w - 1
+    s_r_min = int(np.ceil((r_abs0 - (phase_r + cell_center_r)) / float(sub_r)))
+    s_r_max = int(np.floor((r_abs1 - (phase_r + cell_center_r)) / float(sub_r)))
+    s_c_min = int(np.ceil((c_abs0 - (phase_c + cell_center_c)) / float(sub_c)))
+    s_c_max = int(np.floor((c_abs1 - (phase_c + cell_center_c)) / float(sub_c)))
+    if s_r_max < s_r_min or s_c_max < s_c_min:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": n_full_valid,
+            "n_stored_valid": 0,
+        },)
+    stored_rows = np.arange(s_r_min, s_r_max + 1, dtype=np.int64)
+    stored_cols = np.arange(s_c_min, s_c_max + 1, dtype=np.int64)
+    sr, sc = np.meshgrid(stored_rows, stored_cols, indexing="ij")
+    uv_q = np.stack([sr.reshape(-1), sc.reshape(-1)], axis=-1).astype(np.int64, copy=False)
 
-    pts_support = grid[rr_local, cc_local].astype(np.float32, copy=False)
-    rr_abs = rr_local.astype(np.int64, copy=False) + r_abs0
-    cc_abs = cc_local.astype(np.int64, copy=False) + c_abs0
-    stored_rr = np.floor_divide(rr_abs - phase_r, sub_r).astype(np.int64, copy=False)
-    stored_cc = np.floor_divide(cc_abs - phase_c, sub_c).astype(np.int64, copy=False)
-    uv_cells = np.stack([stored_rr, stored_cc], axis=-1).astype(np.int64, copy=False)
-    if uv_cells.shape[0] == 0:
-        return _empty_projection(n_full_valid=n_full_valid)
+    # Stored cell centers in absolute full-resolution UV coordinates.
+    q_r_abs = (
+        uv_q[:, 0].astype(np.float32, copy=False) * float(sub_r) +
+        float(phase_r) + float(cell_center_r)
+    )
+    q_c_abs = (
+        uv_q[:, 1].astype(np.float32, copy=False) * float(sub_c) +
+        float(phase_c) + float(cell_center_c)
+    )
+    q_r = (q_r_abs - float(uv_offset[0])).astype(np.float32, copy=False)
+    q_c = (q_c_abs - float(uv_offset[1])).astype(np.float32, copy=False)
 
-    uniq_uv, inv = np.unique(uv_cells, axis=0, return_inverse=True)
-    if uniq_uv.shape[0] == 0:
-        return _empty_projection(n_full_valid=n_full_valid)
+    in_grid = (
+        (q_r >= 0.0) &
+        (q_r <= float(max(h - 1, 0))) &
+        (q_c >= 0.0) &
+        (q_c <= float(max(w - 1, 0)))
+    )
+    if not bool(in_grid.any()):
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": n_full_valid,
+            "n_stored_valid": 0,
+        },)
 
-    sums = np.zeros((uniq_uv.shape[0], 3), dtype=np.float64)
-    counts = np.zeros((uniq_uv.shape[0],), dtype=np.int64)
-    np.add.at(sums, inv, pts_support.astype(np.float64, copy=False))
-    np.add.at(counts, inv, 1)
-    nonzero = counts > 0
-    if not bool(nonzero.any()):
-        return _empty_projection(
-            n_full_valid=n_full_valid,
-            n_candidate_cells=uniq_uv.shape[0],
+    uv_q = uv_q[in_grid].astype(np.int64, copy=False)
+    q_r = q_r[in_grid].astype(np.float32, copy=False)
+    q_c = q_c[in_grid].astype(np.float32, copy=False)
+
+    denom_r = float(max(h - 1, 1))
+    denom_c = float(max(w - 1, 1))
+    y_norm = (2.0 * q_r / denom_r) - 1.0
+    x_norm = (2.0 * q_c / denom_c) - 1.0
+    query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
+
+    value_np = np.where(support[..., None], grid, 0.0).astype(np.float32, copy=False)
+    value_t = torch.from_numpy(value_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
+    mask_t = torch.from_numpy(support.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).contiguous()
+    query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
+
+    with torch.no_grad():
+        sampled_num_t = F.grid_sample(
+            value_t,
+            query_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        sampled_den_t = F.grid_sample(
+            mask_t,
+            query_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
         )
 
-    uv_keep = uniq_uv[nonzero].astype(np.int64, copy=False)
-    pts_mean = (
-        sums[nonzero] / counts[nonzero, None].astype(np.float64, copy=False)
+    sampled_num = (
+        sampled_num_t[0, :, :, 0]
+        .permute(1, 0)
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+    sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
+    can_sample = sampled_den > 1e-6
+    if not bool(can_sample.any()):
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_bilinear_torch",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": n_full_valid,
+            "n_stored_valid": 0,
+        },)
+
+    uv_keep = uv_q[can_sample].astype(np.int64, copy=False)
+    pts_bilinear = (
+        sampled_num[can_sample] / sampled_den[can_sample, None]
     ).astype(np.float32, copy=False)
-    n_candidates = int(uniq_uv.shape[0])
-    n_emitted = int(uv_keep.shape[0])
+
     projection_meta = {
-        "mode": "lattice_cell_aggregate",
+        "mode": "lattice_bilinear_torch",
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
         "n_full_valid": n_full_valid,
-        "n_support_points": n_full_valid,
-        "n_candidate_stored_cells": n_candidates,
-        "n_stored_valid": n_emitted,
-        "n_dropped_empty_cells": int(n_candidates - n_emitted),
+        "n_stored_valid": int(uv_keep.shape[0]),
     }
-    return uv_keep, pts_mean, projection_meta
+    return uv_keep, pts_bilinear, projection_meta
 
 
 def _infer_lattice_phase_rc(
@@ -2571,24 +2642,6 @@ def _run_with_args(args, parse_done):
             sub_c,
             phase_rc=lattice_phase_rc,
         )
-        if args.verbose:
-            support_points = stored_projection.get(
-                "n_support_points",
-                stored_projection.get("n_full_valid", 0),
-            )
-            candidate_cells = stored_projection.get(
-                "n_candidate_stored_cells",
-                stored_projection.get("n_stored_valid", 0),
-            )
-            emitted_cells = stored_projection.get("n_stored_valid", 0)
-            dropped_cells = stored_projection.get("n_dropped_empty_cells", 0)
-            print(
-                "Stored projection coverage: "
-                f"support_points={int(0 if support_points is None else support_points)} "
-                f"candidate_cells={int(0 if candidate_cells is None else candidate_cells)} "
-                f"emitted_cells={int(0 if emitted_cells is None else emitted_cells)} "
-                f"dropped_empty_cells={int(0 if dropped_cells is None else dropped_cells)}"
-            )
         if args.grow_direction != "all":
             grown_pts, grow_spacing_meta = _normalize_world_step_in_new_band_along_growth(
                 grown_uv,
