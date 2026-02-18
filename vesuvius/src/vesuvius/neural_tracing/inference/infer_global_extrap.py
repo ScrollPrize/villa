@@ -492,6 +492,9 @@ def _build_bbox_crops(
     else:
         cond_uv_all = uv_cond64[cond_rows, cond_cols].astype(np.float64, copy=False)
         cond_world_all = cond_zyxs32[cond_rows, cond_cols].astype(np.float32, copy=False)
+    cond_world_z = cond_world_all[:, 0]
+    cond_world_y = cond_world_all[:, 1]
+    cond_world_x = cond_world_all[:, 2]
 
     bbox_crops = []
 
@@ -501,18 +504,23 @@ def _build_bbox_crops(
         vol_crop = _crop_volume_from_min_corner(volume_for_crops, min_corner, crop_size)
         vol_crop = normalize_zscore(vol_crop)
 
-        cond_local_all = cond_world_all - min_corner32[None, :]
+        max_corner_exclusive32 = min_corner32 + crop_size_arr_f32
         cond_in_bounds = (
-            (cond_local_all[:, 0] >= 0.0) &
-            (cond_local_all[:, 0] < crop_size_arr_f32[0]) &
-            (cond_local_all[:, 1] >= 0.0) &
-            (cond_local_all[:, 1] < crop_size_arr_f32[1]) &
-            (cond_local_all[:, 2] >= 0.0) &
-            (cond_local_all[:, 2] < crop_size_arr_f32[2])
+            (cond_world_z >= min_corner32[0]) &
+            (cond_world_z < max_corner_exclusive32[0]) &
+            (cond_world_y >= min_corner32[1]) &
+            (cond_world_y < max_corner_exclusive32[1]) &
+            (cond_world_x >= min_corner32[2]) &
+            (cond_world_x < max_corner_exclusive32[2])
         )
-        cond_uv = cond_uv_all[cond_in_bounds].astype(np.float64, copy=False)
-        cond_world = cond_world_all[cond_in_bounds].astype(np.float32, copy=False)
-        cond_local = cond_local_all[cond_in_bounds].astype(np.float32, copy=False)
+        if not bool(cond_in_bounds.any()):
+            cond_uv = np.zeros((0, 2), dtype=np.float64)
+            cond_world = np.zeros((0, 3), dtype=np.float32)
+            cond_local = np.zeros((0, 3), dtype=np.float32)
+        else:
+            cond_uv = cond_uv_all[cond_in_bounds].astype(np.float64, copy=False)
+            cond_world = cond_world_all[cond_in_bounds].astype(np.float32, copy=False)
+            cond_local = (cond_world - min_corner32[None, :]).astype(np.float32, copy=False)
         cond_vox = _points_to_voxels(cond_local, crop_size)
         uv_query = _build_uv_query_from_edge_band(cond_uv, grow_direction, cond_pct)
         uv_query_flat = uv_query.reshape(-1, 2).astype(np.float64, copy=False)
@@ -1105,17 +1113,30 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
         w,
     )
 
-    for i in write_indices:
-        rr = int(rr_all[i])
-        cc = int(cc_all[i])
-        if merged_valid[rr, cc]:
-            n_overwrite_existing += 1
-        else:
-            n_new_valid += 1
+    if write_indices.shape[0] > 0:
+        rr = rr_all[write_indices].astype(np.int64, copy=False)
+        cc = cc_all[write_indices].astype(np.int64, copy=False)
+        pts_write = pts_n[write_indices].astype(np.float32, copy=False)
+        flat = rr * int(w) + cc
 
-        merged_zyxs[rr, cc] = pts_n[i]
-        merged_valid[rr, cc] = True
-        n_written += 1
+        uniq_flat, counts = np.unique(flat, return_counts=True)
+        rr_u = (uniq_flat // int(w)).astype(np.int64, copy=False)
+        cc_u = (uniq_flat % int(w)).astype(np.int64, copy=False)
+        pre_valid = merged_valid[rr_u, cc_u]
+
+        n_written = int(write_indices.shape[0])
+        n_new_valid = int((~pre_valid).sum())
+        n_overwrite_existing = int((counts - (~pre_valid).astype(np.int64)).sum())
+
+        # Preserve loop semantics: final value at each UV is from last write.
+        _, rev_first_idx = np.unique(flat[::-1], return_index=True)
+        last_pos = (flat.shape[0] - 1 - rev_first_idx).astype(np.int64, copy=False)
+        rr_last = rr[last_pos]
+        cc_last = cc[last_pos]
+        pts_last = pts_write[last_pos]
+
+        merged_zyxs[rr_last, cc_last] = pts_last
+        merged_valid[rr_last, cc_last] = True
 
     _print_section_header(verbose, "Merge Displaced Into Full Surface")
     if verbose:
