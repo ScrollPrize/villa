@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.inference.common import (
     _RuntimeProfiler,
     _scale_to_subsample_stride,
     _save_merged_surface_tifxyz,
-    _select_extrap_uvs_for_sampling,
+    _select_extrap_uv_indices_for_sampling,
     _serialize_args,
     _stored_to_full_bounds,
     _show_napari,
@@ -403,29 +403,39 @@ def _build_extrap_lookup_arrays(edge_extrapolation):
     return _build_extrap_lookup_from_uv_world(uv_flat, extrapolated_world)
 
 
-def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
-    return _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=max_lines)
-
-
 def _prepare_sampled_extrap_points(extrap_lookup, grow_direction, max_lines=None):
     if extrap_lookup is None:
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
-    sampled_uv = _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=max_lines)
-    if sampled_uv.shape[0] == 0:
+    lookup = _as_extrap_lookup_arrays(extrap_lookup)
+    lookup_uv, lookup_world = _coerce_uv_world(
+        lookup.uv,
+        lookup.world,
+        uv_dtype=np.int64,
+        world_dtype=np.float32,
+    )
+    if lookup_uv.shape[0] == 0:
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
-    extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(sampled_uv, extrap_lookup)
-    if extrap_uv.shape[0] != sampled_uv.shape[0] or not np.array_equal(extrap_uv, sampled_uv):
-        raise KeyError("Requested UV is not present in extrapolation lookup.")
-
-    finite_world = np.isfinite(extrap_world).all(axis=1)
+    finite_world = np.isfinite(lookup_world).all(axis=1)
     if not finite_world.any():
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
+    finite_idx = np.nonzero(finite_world)[0]
+    finite_uv = lookup_uv[finite_idx]
+    selected_finite_idx = _select_extrap_uv_indices_for_sampling(
+        finite_uv,
+        grow_direction,
+        max_lines=max_lines,
+    )
+    if selected_finite_idx.shape[0] == 0:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
+    selected_idx = finite_idx[selected_finite_idx]
+    sampled_uv = lookup_uv[selected_idx]
+    sampled_world = lookup_world[selected_idx]
 
     return (
-        sampled_uv[finite_world].astype(np.int64, copy=False),
-        extrap_world[finite_world].astype(np.float32, copy=False),
+        sampled_uv.astype(np.int64, copy=False),
+        sampled_world.astype(np.float32, copy=False),
     )
 
 

@@ -884,24 +884,24 @@ def _finite_uvs_from_extrap_lookup(extrap_lookup):
     return np.zeros((0, 2), dtype=np.int64)
 
 
-def _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=None):
-    uv_ordered = _finite_uvs_from_extrap_lookup(extrap_lookup)
-    if uv_ordered.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.int64)
-
+def _select_extrap_uv_indices_for_sampling(uv_ordered, grow_direction, max_lines=None):
+    uv_ordered = np.asarray(uv_ordered, dtype=np.int64)
+    if uv_ordered.ndim != 2 or uv_ordered.shape[1] != 2 or uv_ordered.shape[0] == 0:
+        return np.zeros((0,), dtype=np.int64)
     axis_idx, _, near_to_far_desc = _agg_extrap_axis_metadata(grow_direction)
     primary_axis_vals = uv_ordered[:, axis_idx]
     primary = -primary_axis_vals if near_to_far_desc else primary_axis_vals
     secondary = uv_ordered[:, 1 - axis_idx]
     order = np.lexsort((secondary, primary))
-    uv_ordered = uv_ordered[order]
+    ordered_idx = order.astype(np.int64, copy=False)
+    uv_ordered = uv_ordered[ordered_idx]
 
     if max_lines is None:
-        return uv_ordered
+        return ordered_idx
 
     depth_keep = int(max_lines)
     if depth_keep < 1:
-        return np.zeros((0, 2), dtype=np.int64)
+        return np.zeros((0,), dtype=np.int64)
 
     # For ragged/non-rectangular fronts, keep near->far depth per boundary line
     # (per row for left/right, per col for up/down), not global axis values.
@@ -909,22 +909,40 @@ def _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=Non
     boundary_ids = np.unique(uv_ordered[:, boundary_axis_idx]).astype(np.int64, copy=False)
     picked = []
     for boundary_id in boundary_ids:
-        line_uv = uv_ordered[uv_ordered[:, boundary_axis_idx] == boundary_id]
+        line_mask = uv_ordered[:, boundary_axis_idx] == boundary_id
+        line_idx = np.nonzero(line_mask)[0]
+        line_uv = uv_ordered[line_idx]
         if line_uv.shape[0] == 0:
             continue
         line_primary_vals = line_uv[:, axis_idx]
         line_primary = -line_primary_vals if near_to_far_desc else line_primary_vals
         line_order = np.argsort(line_primary, kind="stable")
-        picked.append(line_uv[line_order[:depth_keep]])
+        picked.append(line_idx[line_order[:depth_keep]])
     if not picked:
-        return np.zeros((0, 2), dtype=np.int64)
+        return np.zeros((0,), dtype=np.int64)
 
-    selected = np.concatenate(picked, axis=0).astype(np.int64, copy=False)
-    sel_primary_vals = selected[:, axis_idx]
+    selected_order_idx = np.concatenate(picked, axis=0).astype(np.int64, copy=False)
+    selected_uv = uv_ordered[selected_order_idx]
+    sel_primary_vals = selected_uv[:, axis_idx]
     sel_primary = -sel_primary_vals if near_to_far_desc else sel_primary_vals
-    sel_secondary = selected[:, 1 - axis_idx]
+    sel_secondary = selected_uv[:, 1 - axis_idx]
     sel_order = np.lexsort((sel_secondary, sel_primary))
-    return selected[sel_order]
+    selected_order_idx = selected_order_idx[sel_order]
+    return ordered_idx[selected_order_idx].astype(np.int64, copy=False)
+
+
+def _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=None):
+    uv_ordered = _finite_uvs_from_extrap_lookup(extrap_lookup)
+    if uv_ordered.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    selected_idx = _select_extrap_uv_indices_for_sampling(
+        uv_ordered,
+        grow_direction,
+        max_lines=max_lines,
+    )
+    if selected_idx.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    return uv_ordered[selected_idx].astype(np.int64, copy=False)
 
 
 def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max_lines=None, verbose=True):
