@@ -12,8 +12,11 @@ except ImportError:  # pragma: no cover - optional dependency in some environmen
     snapshot_download = None
 
 
-_CHECKPOINT_SENTINEL_TO_REPO = {
-    "extrap_displacement_latest": "scrollprize/extrap_displacement_latest",
+_CHECKPOINT_SENTINELS = {
+    "extrap_displacement_latest": {
+        "repo_id": "scrollprize/extrap_displacement_latest",
+        "checkpoint_filename": "extrap_displacement_latest.pth",
+    },
 }
 _HF_CHECKPOINT_CACHE_ROOT = Path("/tmp/vesuvius_hf_models")
 
@@ -194,9 +197,11 @@ def make_model(config):
 
 def _resolve_checkpoint_sentinel(checkpoint_path):
     sentinel = str(checkpoint_path).strip()
-    repo_id = _CHECKPOINT_SENTINEL_TO_REPO.get(sentinel)
-    if repo_id is None:
+    sentinel_config = _CHECKPOINT_SENTINELS.get(sentinel)
+    if sentinel_config is None:
         return None
+    repo_id = sentinel_config["repo_id"]
+    checkpoint_filename = sentinel_config["checkpoint_filename"]
 
     if snapshot_download is None:
         raise ImportError(
@@ -225,7 +230,14 @@ def _resolve_checkpoint_sentinel(checkpoint_path):
             f"'{repo_id}' into '{cache_dir}': {exc}"
         ) from exc
 
-    return Path(downloaded)
+    resolved_checkpoint = Path(downloaded) / checkpoint_filename
+    if not resolved_checkpoint.exists():
+        raise FileNotFoundError(
+            f"Checkpoint sentinel '{sentinel}' expected file '{checkpoint_filename}' in "
+            f"'{downloaded}', but it was not found."
+        )
+
+    return resolved_checkpoint
 
 
 def resolve_checkpoint_path(checkpoint_path):
