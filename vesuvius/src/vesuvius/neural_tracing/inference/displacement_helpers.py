@@ -7,15 +7,11 @@ from vesuvius.neural_tracing.inference.displacement_tta import run_model_tta
 from vesuvius.neural_tracing.models import load_checkpoint, resolve_checkpoint_path
 
 
-def _build_model_inputs(vol_crop, cond_vox, extrap_vox, other_wraps_vox=None):
+def _build_model_inputs(vol_crop, cond_vox, extrap_vox):
     vol_t = torch.from_numpy(vol_crop).float().unsqueeze(0).unsqueeze(0)
     cond_t = torch.from_numpy(cond_vox).float().unsqueeze(0).unsqueeze(0)
     extrap_t = torch.from_numpy(extrap_vox).float().unsqueeze(0).unsqueeze(0)
-    inputs = [vol_t, cond_t, extrap_t]
-    if other_wraps_vox is not None:
-        other_t = torch.from_numpy(other_wraps_vox).float().unsqueeze(0).unsqueeze(0)
-        inputs.append(other_t)
-    return torch.cat(inputs, dim=1)
+    return torch.cat([vol_t, cond_t, extrap_t], dim=1)
 
 
 def _get_displacement_result(model, model_inputs, amp_enabled, amp_dtype):
