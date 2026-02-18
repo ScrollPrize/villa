@@ -1391,24 +1391,39 @@ def _finite_valid_grid_points(grid, valid):
     return rows, cols, pts[finite].astype(np.float32, copy=False)
 
 
-def _surface_to_stored_uv_samples_nearest(
+def _surface_to_stored_uv_samples_lattice(
     grid,
     valid,
     uv_offset,
     sub_r,
     sub_c,
+    phase_rc=(0, 0),
 ):
+    """Project full-resolution UV samples onto a fixed stored-resolution lattice.
+
+    Uses floor-division against a deterministic phase/stride lattice so iterative
+    growth does not shift between neighboring stored UV cells as boundaries move.
+    """
     rows, cols, pts = _finite_valid_grid_points(grid, valid)
     if rows.size == 0:
-        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_floor",
+            "stride_rc": [int(sub_r), int(sub_c)],
+            "phase_rc": [int(phase_rc[0]), int(phase_rc[1])],
+            "n_full_valid": 0,
+            "n_stored_valid": 0,
+        },)
+
+    sub_r = max(1, int(sub_r))
+    sub_c = max(1, int(sub_c))
+    phase_r = int(phase_rc[0])
+    phase_c = int(phase_rc[1])
 
     r_abs = rows + int(uv_offset[0])
     c_abs = cols + int(uv_offset[1])
 
-    # Project full-res UVs to nearest stored-resolution UV cell so growth that
-    # lands off a single phase still contributes at save resolution.
-    stored_r = np.rint(r_abs.astype(np.float64) / float(sub_r)).astype(np.int64)
-    stored_c = np.rint(c_abs.astype(np.float64) / float(sub_c)).astype(np.int64)
+    stored_r = np.floor_divide(r_abs - phase_r, sub_r).astype(np.int64, copy=False)
+    stored_c = np.floor_divide(c_abs - phase_c, sub_c).astype(np.int64, copy=False)
     uv = np.stack([stored_r, stored_c], axis=-1)
     uniq_uv, inv = np.unique(uv, axis=0, return_inverse=True)
 
@@ -1418,8 +1433,52 @@ def _surface_to_stored_uv_samples_nearest(
     np.add.at(pts_count, inv, 1)
 
     pts_mean = (pts_sum / np.maximum(pts_count[:, None], 1)).astype(np.float32, copy=False)
-    return uniq_uv.astype(np.int64, copy=False), pts_mean
+    projection_meta = {
+        "mode": "lattice_floor",
+        "stride_rc": [sub_r, sub_c],
+        "phase_rc": [phase_r, phase_c],
+        "n_full_valid": int(rows.size),
+        "n_stored_valid": int(uniq_uv.shape[0]),
+    }
+    return uniq_uv.astype(np.int64, copy=False), pts_mean, projection_meta
 
+
+def _stored_uv_step_spacing_stats(uv, pts):
+    uv = np.asarray(uv, dtype=np.int64)
+    pts = np.asarray(pts, dtype=np.float32)
+    if uv.ndim != 2 or uv.shape[1] != 2 or uv.shape[0] < 2:
+        return None
+
+    dists = []
+    # Evaluate per-step spacing along stored rows for each stored column.
+    unique_cols = np.unique(uv[:, 1])
+    for col in unique_cols:
+        idx = np.where(uv[:, 1] == col)[0]
+        if idx.size < 2:
+            continue
+        rr = uv[idx, 0]
+        pp = pts[idx]
+        order = np.argsort(rr)
+        rr = rr[order]
+        pp = pp[order]
+        dr = np.diff(rr)
+        if dr.size == 0:
+            continue
+        keep = dr > 0
+        if not keep.any():
+            continue
+        dp = np.linalg.norm((pp[1:] - pp[:-1]).astype(np.float64), axis=1)
+        dists.extend((dp[keep] / dr[keep]).tolist())
+
+    if len(dists) == 0:
+        return None
+    arr = np.asarray(dists, dtype=np.float64)
+    return {
+        "n_pairs": int(arr.size),
+        "median": float(np.median(arr)),
+        "mean": float(arr.mean()),
+        "p90": float(np.percentile(arr, 90.0)),
+    }
 
 def _build_iteration_extrap_lookup(edge_extrapolation):
     return _build_extrap_lookup_arrays(edge_extrapolation)
@@ -1930,18 +1989,33 @@ def _run_with_args(args, parse_done):
         sub_r = _scale_to_subsample_stride(scale_y)
         sub_c = _scale_to_subsample_stride(scale_x)
 
-        grown_uv, grown_pts = _surface_to_stored_uv_samples_nearest(
+        grown_uv, grown_pts, stored_projection = _surface_to_stored_uv_samples_lattice(
             current_zyxs,
             current_valid,
             current_uv_offset,
             sub_r,
             sub_c,
+            phase_rc=(0, 0),
         )
+        if args.verbose:
+            spacing_stats = _stored_uv_step_spacing_stats(grown_uv, grown_pts)
+            if spacing_stats is None:
+                print("Stored projection spacing stats: no adjacent pairs")
+            else:
+                print(
+                    "Stored projection spacing stats (per stored UV step): "
+                    f"n={spacing_stats['n_pairs']} "
+                    f"median={spacing_stats['median']:.4f} "
+                    f"mean={spacing_stats['mean']:.4f} "
+                    f"p90={spacing_stats['p90']:.4f}"
+                )
+
         merged = _merge_displaced_points_into_full_surface(
             stored_zyxs, valid_s, (0, 0),
             {"uv": grown_uv, "world_displaced": grown_pts},
             verbose=args.verbose,
         )
+        merged["stored_projection"] = stored_projection
 
     with profiler.section("save_tifxyz"):
         output_path = _save_merged_surface_tifxyz(

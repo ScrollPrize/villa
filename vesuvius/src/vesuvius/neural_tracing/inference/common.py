@@ -93,7 +93,11 @@ def resolve_tifxyz_params(args, model_config, volume_scale):
                 tifxyz_voxel_size_um = json.load(meta_fp).get("voxelsize", None)
     if tifxyz_voxel_size_um is None:
         tifxyz_voxel_size_um = 8.24
-    tifxyz_step_size = int(round(float(tifxyz_step_size) * (2 ** volume_scale)))
+
+    # Keep output tifxyz spacing in stored-resolution units.
+    # The old behavior multiplied by 2**volume_scale, which inflated output
+    # spacing as inference scale increased.
+    tifxyz_step_size = int(round(float(tifxyz_step_size)))
     return tifxyz_step_size, tifxyz_voxel_size_um
 
 
@@ -1049,6 +1053,10 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
     os.makedirs(out_dir, exist_ok=True)
 
     uv_offset = merged.get("uv_offset", (0, 0))
+    stored_projection = merged.get("stored_projection", {})
+    stored_proj_mode = str(stored_projection.get("mode", "unknown"))
+    stored_proj_stride = stored_projection.get("stride_rc", [None, None])
+    stored_proj_phase = stored_projection.get("phase_rc", [None, None])
     source = str(checkpoint_path) if checkpoint_path else "inference/infer_global_extrap.py"
     save_tifxyz(
         merged_for_save,
@@ -1062,6 +1070,10 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
             "extrapolation_method": args.extrapolation_method,
             "uv_offset_rc": [int(uv_offset[0]), int(uv_offset[1])],
             "agg_extrap_lines": None if args.agg_extrap_lines is None else int(args.agg_extrap_lines),
+            "stored_projection_mode": stored_proj_mode,
+            "stored_projection_stride_rc": _json_safe(stored_proj_stride),
+            "stored_projection_phase_rc": _json_safe(stored_proj_phase),
+            "effective_step_size_used": int(tifxyz_step_size),
             "run_argv": list(sys.argv[1:]),
             "run_args": _json_safe(call_args),
         },
