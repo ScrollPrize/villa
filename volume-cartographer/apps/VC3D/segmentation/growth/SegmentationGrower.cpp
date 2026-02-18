@@ -821,7 +821,7 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         request["tifxyz_path"] = currentInputPath.toStdString();
         request["grow_direction"] = *directionToken;
         request["iterations"] = std::max(1, job.iterations);
-        request["edge_input_rowscols"] = 4;
+        request["edge_input_rowscols"] = 40;
         request["volume_path"] = job.volumeZarrPath.toStdString();
         request["volume_scale"] = std::max(0, job.volumeScale);
         request["checkpoint_path"] = job.checkpointPath.toStdString();

@@ -78,8 +78,8 @@ def parse_args(argv=None):
     )
     parser.add_argument("--cond-pct", type=float, default=0.50)
     parser.add_argument("--crop-size", type=int, nargs=3, default=[128, 128, 128])
-    parser.add_argument("--window-pad", type=int, default=10)
-    parser.add_argument("--bbox-overlap-frac", type=float, default=0.15)
+    parser.add_argument("--window-pad", type=int, default=20)
+    parser.add_argument("--bbox-overlap-frac", type=float, default=0.0)
     parser.add_argument("--checkpoint-path", type=str, default=None)
     parser.add_argument("--config-path", type=str, default=None)
     parser.add_argument("--extrapolation-method", type=str, default=None)
@@ -132,7 +132,7 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
         "--iterations",
         type=int,
@@ -196,17 +196,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--edge-input-rowscols",
         type=int,
-        required=True,
+        default=40,
         help="Number of edge rows/cols from conditioning region to use in one-shot extrapolation.",
     )
     parser.add_argument(
         "--lines-to-keep",
         dest="agg_extrap_lines",
         type=int,
-        default=None,
+        default=20,
         help=(
-            "Optional number of near->far rows/cols to sample from one-shot aggregated extrapolation. "
-            "If unset, samples all available lines."
+            "Number of near->far rows/cols to sample from one-shot aggregated extrapolation. "
+            "Defaults to 20."
         ),
     )
     parser.add_argument(
@@ -324,7 +324,7 @@ def normalize_dense_args(dense_args):
         key_norm = str(key).replace("-", "_")
         normalized[_DENSE_ARG_ALIASES.get(key_norm, key_norm)] = value
     if normalized.get("edge_input_rowscols") is None:
-        normalized["edge_input_rowscols"] = 4
+        normalized["edge_input_rowscols"] = 40
     return normalized
 
 
