@@ -206,6 +206,56 @@ def _serialize_args(args):
     return {str(k): _json_safe(v) for k, v in vars(args).items()}
 
 
+_INT32_INFO = np.iinfo(np.int32)
+
+
+def _int_dtype_for_value_range(min_value, max_value, prefer_int32=True):
+    min_i = int(min_value)
+    max_i = int(max_value)
+    if prefer_int32 and min_i >= int(_INT32_INFO.min) and max_i <= int(_INT32_INFO.max):
+        return np.int32
+    return np.int64
+
+
+def _coerce_int_array_for_range(values, prefer_int32=True, default_dtype=np.int32, round_values=False):
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return np.asarray(arr, dtype=default_dtype)
+
+    if arr.dtype.kind in "iu":
+        min_value = int(arr.min())
+        max_value = int(arr.max())
+        out_dtype = _int_dtype_for_value_range(min_value, max_value, prefer_int32=prefer_int32)
+        return arr.astype(out_dtype, copy=False)
+
+    arr_num = np.rint(arr) if round_values else np.asarray(arr)
+    finite = np.isfinite(arr_num)
+    if not bool(finite.all()):
+        raise ValueError("Expected finite numeric values for integer coercion.")
+    min_value = int(arr_num.min())
+    max_value = int(arr_num.max())
+    out_dtype = _int_dtype_for_value_range(min_value, max_value, prefer_int32=prefer_int32)
+    return arr_num.astype(out_dtype, copy=False)
+
+
+def _coerce_uv_int_array(values, prefer_int32=True, default_dtype=np.int32):
+    return _coerce_int_array_for_range(
+        values,
+        prefer_int32=prefer_int32,
+        default_dtype=default_dtype,
+        round_values=True,
+    )
+
+
+def _flat_index_dtype_for_shape(height, width, prefer_int32=True):
+    h = max(0, int(height))
+    w = max(0, int(width))
+    if h == 0 or w == 0:
+        return np.int32 if prefer_int32 else np.int64
+    max_flat = h * w - 1
+    return _int_dtype_for_value_range(0, max_flat, prefer_int32=prefer_int32)
+
+
 _DIRECTION_SPECS = {
     "left": {
         "axis": "col",
@@ -259,11 +309,26 @@ def _in_bounds_mask(coords, size):
 
 def _points_to_voxels(points_local, crop_size):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+    crop_size_dtype = _int_dtype_for_value_range(
+        0,
+        int(crop_size_arr.max()) if crop_size_arr.size > 0 else 0,
+        prefer_int32=True,
+    )
+    crop_size_idx = crop_size_arr.astype(crop_size_dtype, copy=False)
     vox = np.zeros(tuple(crop_size_arr.tolist()), dtype=np.float32)
     if points_local is None or len(points_local) == 0:
         return vox
-    coords = np.rint(points_local).astype(np.int64)
-    coords = coords[_in_bounds_mask(coords, crop_size_arr)]
+    points_local_arr = np.asarray(points_local)
+    finite_pts = np.isfinite(points_local_arr).all(axis=1)
+    if not bool(finite_pts.any()):
+        return vox
+    coords = _coerce_int_array_for_range(
+        points_local_arr[finite_pts],
+        prefer_int32=True,
+        default_dtype=np.int32,
+        round_values=True,
+    )
+    coords = coords[_in_bounds_mask(coords, crop_size_idx)]
     if coords.size > 0:
         vox[coords[:, 0], coords[:, 1], coords[:, 2]] = 1.0
     return vox
@@ -496,26 +561,47 @@ def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     Build extrapolation UVs from a per-line frontier over edge-conditioning UVs.
     """
     if uv_edge_pts is None or len(uv_edge_pts) == 0:
-        return np.zeros((0, 0, 2), dtype=np.int64)
+        return np.zeros((0, 0, 2), dtype=np.int32)
 
     _, direction = _get_growth_context(grow_direction)
-    uv = np.rint(np.asarray(uv_edge_pts)).astype(np.int64, copy=False)
+    uv = _coerce_uv_int_array(uv_edge_pts, prefer_int32=True, default_dtype=np.int32)
 
     if direction["axis"] == "col":
         rows = uv[:, 0]
         cols = uv[:, 1]
         unique_rows, row_inv = np.unique(rows, return_inverse=True)
         if unique_rows.size == 0:
-            return np.zeros((0, 0, 2), dtype=np.int64)
+            return np.zeros((0, 0, 2), dtype=np.int32)
 
-        row_min = np.full((unique_rows.size,), np.iinfo(np.int64).max, dtype=np.int64)
-        row_max = np.full((unique_rows.size,), np.iinfo(np.int64).min, dtype=np.int64)
+        row_min = np.full((unique_rows.size,), np.iinfo(uv.dtype).max, dtype=uv.dtype)
+        row_max = np.full((unique_rows.size,), np.iinfo(uv.dtype).min, dtype=uv.dtype)
         np.minimum.at(row_min, row_inv, cols)
         np.maximum.at(row_max, row_inv, cols)
 
-        cond_span = int(np.median(row_max - row_min + 1))
+        cond_span = int(
+            np.median(
+                row_max.astype(np.int64, copy=False) - row_min.astype(np.int64, copy=False) + 1
+            )
+        )
         mask_w = _compute_query_mask_span(cond_span, cond_pct)
-        offsets = np.arange(mask_w, dtype=np.int64)
+        row_val_min = int(unique_rows.min())
+        row_val_max = int(unique_rows.max())
+        if direction["growth_sign"] > 0:
+            col_val_min = int(row_max.min()) + 1
+            col_val_max = int(row_max.max()) + int(mask_w)
+        else:
+            col_val_min = int(row_min.min()) - int(mask_w)
+            col_val_max = int(row_min.max()) - 1
+        query_dtype = _int_dtype_for_value_range(
+            min(row_val_min, col_val_min),
+            max(row_val_max, col_val_max),
+            prefer_int32=True,
+        )
+
+        unique_rows = unique_rows.astype(query_dtype, copy=False)
+        row_min = row_min.astype(query_dtype, copy=False)
+        row_max = row_max.astype(query_dtype, copy=False)
+        offsets = np.arange(mask_w, dtype=query_dtype)
 
         if direction["growth_sign"] > 0:
             frontier = row_max
@@ -531,16 +617,37 @@ def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     cols = uv[:, 1]
     unique_cols, col_inv = np.unique(cols, return_inverse=True)
     if unique_cols.size == 0:
-        return np.zeros((0, 0, 2), dtype=np.int64)
+        return np.zeros((0, 0, 2), dtype=np.int32)
 
-    col_min = np.full((unique_cols.size,), np.iinfo(np.int64).max, dtype=np.int64)
-    col_max = np.full((unique_cols.size,), np.iinfo(np.int64).min, dtype=np.int64)
+    col_min = np.full((unique_cols.size,), np.iinfo(uv.dtype).max, dtype=uv.dtype)
+    col_max = np.full((unique_cols.size,), np.iinfo(uv.dtype).min, dtype=uv.dtype)
     np.minimum.at(col_min, col_inv, rows)
     np.maximum.at(col_max, col_inv, rows)
 
-    cond_span = int(np.median(col_max - col_min + 1))
+    cond_span = int(
+        np.median(
+            col_max.astype(np.int64, copy=False) - col_min.astype(np.int64, copy=False) + 1
+        )
+    )
     mask_h = _compute_query_mask_span(cond_span, cond_pct)
-    offsets = np.arange(mask_h, dtype=np.int64)
+    col_val_min = int(unique_cols.min())
+    col_val_max = int(unique_cols.max())
+    if direction["growth_sign"] > 0:
+        row_val_min = int(col_max.min()) + 1
+        row_val_max = int(col_max.max()) + int(mask_h)
+    else:
+        row_val_min = int(col_min.min()) - int(mask_h)
+        row_val_max = int(col_min.max()) - 1
+    query_dtype = _int_dtype_for_value_range(
+        min(row_val_min, col_val_min),
+        max(row_val_max, col_val_max),
+        prefer_int32=True,
+    )
+
+    unique_cols = unique_cols.astype(query_dtype, copy=False)
+    col_min = col_min.astype(query_dtype, copy=False)
+    col_max = col_max.astype(query_dtype, copy=False)
+    offsets = np.arange(mask_h, dtype=query_dtype)
 
     if direction["growth_sign"] > 0:
         frontier = col_max
@@ -691,7 +798,11 @@ def compute_edge_one_shot_extrapolation(
 
     # Build query span from the edge-input conditioning band, not the full grown
     # surface, so iterative runs do not blow up one-shot query allocations.
-    edge_seed_uv = uv_cond[edge_seed_mask]
+    edge_seed_uv = _coerce_uv_int_array(
+        uv_cond[edge_seed_mask],
+        prefer_int32=True,
+        default_dtype=np.int32,
+    )
     with _profile_section(profiler, "iter_edge_query_build"):
         query_uv_grid = _build_uv_query_from_edge_band(edge_seed_uv, grow_direction, cond_pct)
     if query_uv_grid.size == 0:
@@ -744,7 +855,7 @@ def compute_edge_one_shot_extrapolation(
     return {
         "cond_direction": cond_direction,
         "edge_seed_mask": edge_seed_mask,
-        "edge_seed_uv": edge_seed_uv.astype(np.float64, copy=False),
+        "edge_seed_uv": edge_seed_uv.astype(np.int64, copy=False),
         "edge_seed_world": edge_seed_world.astype(np.float32, copy=False),
         "query_uv_grid": query_uv_grid,
         "min_corner": min_corner_arr,
@@ -990,7 +1101,7 @@ def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max
     if max_lines is not None:
         print(f"line limit requested: {int(max_lines)}")
     if stack_count.size > 0:
-        sc = stack_count.astype(np.float64, copy=False)
+        sc = stack_count.astype(np.float32, copy=False)
         print(f"stack-count min/max/mean: {int(sc.min())}/{int(sc.max())}/{sc.mean():.2f}")
 
 
@@ -1447,33 +1558,49 @@ class RunTimeProfiler:
         )
         rows = []
 
-        def _visit(node_id, depth, parent_total_s):
+        def _visit(node_id, parent_total_s, prefix, is_last):
             node = self._nodes[node_id]
             total_s = float(node["total_s"])
             self_s = float(node["self_s"])
+            child_s = max(0.0, total_s - self_s)
             count = int(node["count"])
             avg_s = total_s / max(count, 1)
             self_avg_s = self_s / max(count, 1)
             pct_parent = 0.0 if parent_total_s <= 0.0 else (100.0 * total_s / parent_total_s)
             pct_total = 0.0 if total_base <= 0.0 else (100.0 * total_s / total_base)
+            branch = "`- " if is_last else "|- "
             rows.append(
                 {
-                    "section": f"{'  ' * depth}{node['name']}",
+                    "section": f"{prefix}{branch}{node['name']}",
                     "calls": f"{count:d}",
-                    "total_s": f"{total_s:.3f}",
+                    "incl_s": f"{total_s:.3f}",
                     "avg_s": f"{avg_s:.3f}",
+                    "child_s": f"{child_s:.3f}",
                     "self_s": f"{self_s:.3f}",
                     "self_avg_s": f"{self_avg_s:.3f}",
-                    "pct_parent": f"{pct_parent:.1f}%",
-                    "pct_total": f"{pct_total:.1f}%",
+                    "pct_parent_incl": f"{pct_parent:.1f}%",
+                    "pct_total_incl": f"{pct_total:.1f}%",
                 }
             )
-            for child_id in node["children"]:
-                _visit(child_id, depth + 1, total_s)
+            child_prefix = prefix + ("   " if is_last else "|  ")
+            children = node["children"]
+            for idx, child_id in enumerate(children):
+                _visit(
+                    child_id,
+                    total_s,
+                    child_prefix,
+                    is_last=(idx == (len(children) - 1)),
+                )
 
         top_level_total = self._top_level_total()
-        for child_id in self._nodes[self._root_id]["children"]:
-            _visit(child_id, depth=0, parent_total_s=top_level_total)
+        root_children = self._nodes[self._root_id]["children"]
+        for idx, child_id in enumerate(root_children):
+            _visit(
+                child_id,
+                top_level_total,
+                prefix="",
+                is_last=(idx == (len(root_children) - 1)),
+            )
         return rows
 
     def total_profiled_time(self, inclusive=False):
@@ -1488,16 +1615,18 @@ class RunTimeProfiler:
         headers = (
             "section",
             "calls",
-            "total_s",
+            "incl_s",
             "avg_s",
+            "child_s",
             "self_s",
             "self_avg_s",
-            "%parent",
-            "%total",
+            "%parent_incl",
+            "%total_incl",
         )
-        align_right = (False, True, True, True, True, True, True, True)
+        align_right = (False, True, True, True, True, True, True, True, True)
         rows = self._build_summary_rows(total_runtime_s=total_runtime_s)
         print("== Performance Profile ==")
+        print("(incl_s is inclusive and overlaps across nested rows; self_s is exclusive.)")
         if not rows:
             print("No profiled sections.")
         else:
@@ -1505,12 +1634,13 @@ class RunTimeProfiler:
                 (
                     row["section"],
                     row["calls"],
-                    row["total_s"],
+                    row["incl_s"],
                     row["avg_s"],
+                    row["child_s"],
                     row["self_s"],
                     row["self_avg_s"],
-                    row["pct_parent"],
-                    row["pct_total"],
+                    row["pct_parent_incl"],
+                    row["pct_total_incl"],
                 )
                 for row in rows
             ]

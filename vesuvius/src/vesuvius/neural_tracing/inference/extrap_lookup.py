@@ -4,6 +4,7 @@ import numpy as np
 
 
 _UV_STRUCT_DTYPE = np.dtype([("r", np.int64), ("c", np.int64)])
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def _empty_uv():
@@ -19,6 +20,13 @@ def _uv_struct_view(uv):
     if uv_int.ndim != 2 or uv_int.shape[1] != 2:
         return np.zeros((0,), dtype=_UV_STRUCT_DTYPE)
     return uv_int.view(_UV_STRUCT_DTYPE).reshape(-1)
+
+
+def _index_dtype_for_length(length, prefer_int32=True):
+    n_rows = max(0, int(length))
+    if prefer_int32 and n_rows <= (_INT32_MAX + 1):
+        return np.int32
+    return np.int64
 
 
 @dataclass(frozen=True)
@@ -41,12 +49,19 @@ class ExtrapLookupArrays:
             )
 
         n_rows = int(uv.shape[0])
-        lookup_sort_idx = np.asarray(self.lookup_sort_idx, dtype=np.int64)
+        index_dtype = _index_dtype_for_length(n_rows, prefer_int32=True)
+        lookup_sort_idx = np.asarray(self.lookup_sort_idx)
         if lookup_sort_idx.ndim != 1:
             raise ValueError(
                 "lookup_sort_idx must be a 1D array; "
                 f"got {tuple(lookup_sort_idx.shape)}"
             )
+        if lookup_sort_idx.dtype.kind not in "iu":
+            raise ValueError(
+                "lookup_sort_idx must be an integer array; "
+                f"got dtype {lookup_sort_idx.dtype}"
+            )
+        lookup_sort_idx = lookup_sort_idx.astype(index_dtype, copy=False)
         if lookup_sort_idx.shape[0] != n_rows:
             raise ValueError(
                 "lookup_sort_idx length must match uv rows: "
@@ -54,7 +69,7 @@ class ExtrapLookupArrays:
             )
         if n_rows > 0:
             sort_idx_sorted = np.sort(lookup_sort_idx)
-            expected_idx = np.arange(n_rows, dtype=np.int64)
+            expected_idx = np.arange(n_rows, dtype=index_dtype)
             if not np.array_equal(sort_idx_sorted, expected_idx):
                 raise ValueError("lookup_sort_idx must be a permutation of [0, N).")
 

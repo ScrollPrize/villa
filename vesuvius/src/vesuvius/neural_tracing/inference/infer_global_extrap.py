@@ -17,7 +17,9 @@ from vesuvius.neural_tracing.inference.common import (
     _bbox_to_min_corner_and_bounds_array,
     _build_uv_grid,
     _build_uv_query_from_edge_band,
+    _coerce_uv_int_array,
     _crop_volume_from_min_corner,
+    _flat_index_dtype_for_shape,
     _get_growth_context,
     _initialize_window_state,
     _points_to_voxels,
@@ -49,6 +51,7 @@ from vesuvius.neural_tracing.inference.displacement_tta import (
 )
 
 _ALL_GROW_DIRECTION_ORDER = ("left", "right", "up", "down")
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def _parse_optional_tta_outlier_drop_thresh(value):
@@ -417,7 +420,7 @@ def _finite_uv_world(uv, world):
 
 def _empty_edge_extrapolation():
     return {
-        "edge_seed_uv": _empty_uv(dtype=np.float64),
+        "edge_seed_uv": _empty_uv(dtype=np.int64),
         "edge_seed_world": _empty_world(dtype=np.float32),
         "query_uv_grid": np.zeros((0, 0, 2), dtype=np.int64),
         "extrapolated_world": _empty_world(dtype=np.float32),
@@ -445,11 +448,12 @@ def _uv_struct_view(uv):
 
 def _build_lookup_index(uv_int):
     uv_view = _uv_struct_view(uv_int)
+    sort_idx_dtype = np.int32 if uv_view.shape[0] <= (_INT32_MAX + 1) else np.int64
     if uv_view.shape[0] == 0:
-        return np.zeros((0,), dtype=np.int64), uv_view
+        return np.zeros((0,), dtype=sort_idx_dtype), uv_view
     sort_idx = np.argsort(uv_view, kind="stable")
     uv_sorted = uv_view[sort_idx]
-    return sort_idx.astype(np.int64, copy=False), uv_sorted
+    return sort_idx.astype(sort_idx_dtype, copy=False), uv_sorted
 
 
 def _make_extrap_lookup_arrays(uv, world):
@@ -464,7 +468,7 @@ def _make_extrap_lookup_arrays(uv, world):
         return ExtrapLookupArrays(
             uv=_empty_uv(dtype=np.int64),
             world=_empty_world(dtype=np.float32),
-            lookup_sort_idx=np.zeros((0,), dtype=np.int64),
+            lookup_sort_idx=np.zeros((0,), dtype=np.int32),
             lookup_uv_sorted=empty_view,
         )
     sort_idx, uv_sorted = _build_lookup_index(uv_int)
@@ -621,7 +625,7 @@ def _build_bbox_crops(
 ):
     cond_valid_base = np.asarray(cond_valid, dtype=bool)
     cond_zyxs32 = np.asarray(cond_zyxs, dtype=np.float32)
-    uv_cond64 = np.asarray(uv_cond, dtype=np.float64)
+    uv_cond_int = _coerce_uv_int_array(uv_cond, prefer_int32=True, default_dtype=np.int32)
     crop_size = tuple(int(v) for v in crop_size)
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
     crop_size_arr_f32 = crop_size_arr.astype(np.float32, copy=False)
@@ -629,10 +633,10 @@ def _build_bbox_crops(
 
     cond_rows, cond_cols = np.where(cond_valid_base)
     if cond_rows.size == 0:
-        cond_uv_all = np.zeros((0, 2), dtype=np.float64)
+        cond_uv_all = np.zeros((0, 2), dtype=uv_cond_int.dtype)
         cond_world_all = np.zeros((0, 3), dtype=np.float32)
     else:
-        cond_uv_all = uv_cond64[cond_rows, cond_cols].astype(np.float64, copy=False)
+        cond_uv_all = uv_cond_int[cond_rows, cond_cols].astype(uv_cond_int.dtype, copy=False)
         cond_world_all = cond_zyxs32[cond_rows, cond_cols].astype(np.float32, copy=False)
     cond_world_z = cond_world_all[:, 0]
     cond_world_y = cond_world_all[:, 1]
@@ -656,16 +660,20 @@ def _build_bbox_crops(
             (cond_world_x < max_corner_exclusive32[2])
         )
         if not bool(cond_in_bounds.any()):
-            cond_uv = np.zeros((0, 2), dtype=np.float64)
+            cond_uv = np.zeros((0, 2), dtype=cond_uv_all.dtype)
             cond_world = np.zeros((0, 3), dtype=np.float32)
             cond_local = np.zeros((0, 3), dtype=np.float32)
         else:
-            cond_uv = cond_uv_all[cond_in_bounds].astype(np.float64, copy=False)
+            cond_uv = cond_uv_all[cond_in_bounds].astype(cond_uv_all.dtype, copy=False)
             cond_world = cond_world_all[cond_in_bounds].astype(np.float32, copy=False)
             cond_local = (cond_world - min_corner32[None, :]).astype(np.float32, copy=False)
         cond_vox = _points_to_voxels(cond_local, crop_size)
         uv_query = _build_uv_query_from_edge_band(cond_uv, grow_direction, cond_pct)
-        uv_query_flat = uv_query.reshape(-1, 2).astype(np.float64, copy=False)
+        uv_query_flat = _coerce_uv_int_array(
+            uv_query.reshape(-1, 2),
+            prefer_int32=True,
+            default_dtype=np.int32,
+        )
 
         extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup)
         if extrap_world.shape[0] > 0:
@@ -1124,18 +1132,21 @@ def _expand_surface_canvas_to_fit_points(
 
 
 def _compute_merge_write_indices(uv_n, pts_n, r0, c0, h, w):
+    idx_dtype = np.asarray(uv_n).dtype if np.asarray(uv_n).dtype.kind in "iu" else np.int64
     if uv_n.shape[0] == 0 or pts_n.shape[0] == 0:
         return (
-            np.zeros((0,), dtype=np.int64),
-            np.zeros((0,), dtype=np.int64),
-            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=idx_dtype),
+            np.zeros((0,), dtype=idx_dtype),
+            np.zeros((0,), dtype=idx_dtype),
             0,
             0,
         )
 
     finite_mask = np.isfinite(pts_n).all(axis=1)
-    rr_all = uv_n[:, 0] - r0
-    cc_all = uv_n[:, 1] - c0
+    r0_arr = np.asarray(r0, dtype=idx_dtype)
+    c0_arr = np.asarray(c0, dtype=idx_dtype)
+    rr_all = uv_n[:, 0].astype(idx_dtype, copy=False) - r0_arr
+    cc_all = uv_n[:, 1].astype(idx_dtype, copy=False) - c0_arr
     in_bounds_mask = (
         finite_mask &
         (rr_all >= 0) &
@@ -1189,7 +1200,7 @@ def _apply_displacement(samples, verbose=True, skip_inference=False):
         return _empty_displaced_samples()
 
     world_displaced = world + displacement
-    disp_norm = np.linalg.norm(displacement.astype(np.float64), axis=1)
+    disp_norm = np.linalg.norm(displacement.astype(np.float32, copy=False), axis=1)
 
     _print_section_header(verbose, "Applied Displacement")
     if verbose:
@@ -1201,7 +1212,7 @@ def _apply_displacement(samples, verbose=True, skip_inference=False):
 
         axis_names = ("z", "y", "x")
         for axis_idx, axis_name in enumerate(axis_names):
-            vals = world_displaced[:, axis_idx].astype(np.float64, copy=False)
+            vals = world_displaced[:, axis_idx].astype(np.float32, copy=False)
             print(
                 f"{axis_name} min/max/mean/median: "
                 f"{vals.min():.4f} / {vals.max():.4f} / {vals.mean():.4f} / {np.median(vals):.4f}"
@@ -1242,7 +1253,7 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     h, w = merged_valid.shape
 
     n = min(int(uv.shape[0]), int(pts.shape[0]))
-    uv_n = uv[:n].astype(np.int64, copy=False)
+    uv_n = _coerce_uv_int_array(uv[:n], prefer_int32=True, default_dtype=np.int32)
     pts_n = pts[:n].astype(np.float32, copy=False)
     merged_zyxs, merged_valid, r0, c0, h, w = _expand_surface_canvas_to_fit_points(
         merged_zyxs,
@@ -1267,14 +1278,16 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     )
 
     if write_indices.shape[0] > 0:
-        rr = rr_all[write_indices].astype(np.int64, copy=False)
-        cc = cc_all[write_indices].astype(np.int64, copy=False)
+        flat_dtype = _flat_index_dtype_for_shape(h, w, prefer_int32=True)
+        rr = rr_all[write_indices].astype(flat_dtype, copy=False)
+        cc = cc_all[write_indices].astype(flat_dtype, copy=False)
         pts_write = pts_n[write_indices].astype(np.float32, copy=False)
-        flat = rr * int(w) + cc
+        w_arr = np.asarray(int(w), dtype=flat_dtype)
+        flat = rr * w_arr + cc
 
         uniq_flat, counts = np.unique(flat, return_counts=True)
-        rr_u = (uniq_flat // int(w)).astype(np.int64, copy=False)
-        cc_u = (uniq_flat % int(w)).astype(np.int64, copy=False)
+        rr_u = (uniq_flat // w_arr).astype(np.int64, copy=False)
+        cc_u = (uniq_flat % w_arr).astype(np.int64, copy=False)
         pre_valid = merged_valid[rr_u, cc_u]
 
         n_written = int(write_indices.shape[0])
@@ -1466,12 +1479,12 @@ def _stored_uv_step_spacing_stats(uv, pts):
         keep = dr > 0
         if not keep.any():
             continue
-        dp = np.linalg.norm((pp[1:] - pp[:-1]).astype(np.float64), axis=1)
+        dp = np.linalg.norm((pp[1:] - pp[:-1]).astype(np.float32, copy=False), axis=1)
         dists.extend((dp[keep] / dr[keep]).tolist())
 
     if len(dists) == 0:
         return None
-    arr = np.asarray(dists, dtype=np.float64)
+    arr = np.asarray(dists, dtype=np.float32)
     return {
         "n_pairs": int(arr.size),
         "median": float(np.median(arr)),
