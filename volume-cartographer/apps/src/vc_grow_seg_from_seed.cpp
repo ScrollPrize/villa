@@ -806,44 +806,45 @@ int main(int argc, char *argv[])
             int changed_count = 0;
             int corrections_this_iter = 0;
 
-            #pragma omp parallel for schedule(dynamic, 8) reduction(+:changed_count, corrections_this_iter)
-            for (int r = 0; r < rows; ++r) {
-                for (int c = 0; c < cols; ++c) {
-                    const float curr = hit_dist(r, c);
-                    if (!(curr > 0.0f) || !std::isfinite(curr)) {
+            #pragma omp parallel for schedule(dynamic, 32) reduction(+:changed_count, corrections_this_iter)
+            for (int i = 0; i < static_cast<int>(active_vertices.size()); ++i) {
+                const int r = active_vertices[i][0];
+                const int c = active_vertices[i][1];
+
+                const float curr = hit_dist(r, c);
+                if (!(curr > 0.0f) || !std::isfinite(curr)) {
+                    continue;
+                }
+                if (!vertex_folded(hit_dist, r, c, curr)) {
+                    continue;
+                }
+
+                float lo = 0.0f;
+                float hi = curr;
+                for (int step = 0; step < 16; ++step) {
+                    const float mid = 0.5f * (lo + hi);
+                    if (mid <= 0.0f) {
+                        hi = mid;
                         continue;
                     }
-                    if (!vertex_folded(hit_dist, r, c, curr)) {
-                        continue;
-                    }
-
-                    float lo = 0.0f;
-                    float hi = curr;
-                    for (int step = 0; step < 16; ++step) {
-                        const float mid = 0.5f * (lo + hi);
-                        if (mid <= 0.0f) {
-                            hi = mid;
-                            continue;
-                        }
-                        if (vertex_folded(hit_dist, r, c, mid)) {
-                            hi = mid;
-                        } else {
-                            lo = mid;
-                        }
-                    }
-
-                    const float min_keep_dist = static_cast<float>(neighbor_step * 0.5);
-                    if (lo > min_keep_dist && !vertex_folded(hit_dist, r, c, lo)) {
-                        if (std::abs(lo - curr) > 1e-4f) {
-                            next_dist(r, c) = lo;
-                            ++changed_count;
-                            ++corrections_this_iter;
-                        }
+                    if (vertex_folded(hit_dist, r, c, mid)) {
+                        hi = mid;
                     } else {
-                        next_dist(r, c) = -1.0f;
+                        lo = mid;
+                    }
+                }
+
+                const float min_keep_dist = static_cast<float>(neighbor_step * 0.5);
+                if (lo > min_keep_dist && !vertex_folded(hit_dist, r, c, lo)) {
+                    if (std::abs(lo - curr) > 1e-4f) {
+                        next_dist(r, c) = lo;
                         ++changed_count;
                         ++corrections_this_iter;
                     }
+                } else {
+                    next_dist(r, c) = -1.0f;
+                    ++changed_count;
+                    ++corrections_this_iter;
                 }
             }
 
@@ -864,42 +865,39 @@ int main(int argc, char *argv[])
         cv::Mat_<float> smooth_dist(rows, cols);
         smooth_dist.setTo(-1.0f);
 
-        #pragma omp parallel for schedule(static)
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                if (!src_valid(r, c)) {
-                    continue;
-                }
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int i = 0; i < static_cast<int>(active_vertices.size()); ++i) {
+            const int r = active_vertices[i][0];
+            const int c = active_vertices[i][1];
 
-                float samples[81];
-                int count = 0;
-                const int r0 = std::max(0, r - window_radius);
-                const int r1 = std::min(rows - 1, r + window_radius);
-                const int c0 = std::max(0, c - window_radius);
-                const int c1 = std::min(cols - 1, c + window_radius);
+            float samples[81];
+            int count = 0;
+            const int r0 = std::max(0, r - window_radius);
+            const int r1 = std::min(rows - 1, r + window_radius);
+            const int c0 = std::max(0, c - window_radius);
+            const int c1 = std::min(cols - 1, c + window_radius);
 
-                for (int rr = r0; rr <= r1; ++rr) {
-                    for (int cc = c0; cc <= c1; ++cc) {
-                        const float d = hit_dist(rr, cc);
-                        if (d > 0.0f) {
-                            samples[count++] = d;
-                        }
+            for (int rr = r0; rr <= r1; ++rr) {
+                for (int cc = c0; cc <= c1; ++cc) {
+                    const float d = hit_dist(rr, cc);
+                    if (d > 0.0f) {
+                        samples[count++] = d;
                     }
                 }
-
-                if (count == 0) {
-                    continue;
-                }
-
-                const int mid = count / 2;
-                std::nth_element(samples, samples + mid, samples + count);
-                float median = samples[mid];
-                if ((count % 2) == 0) {
-                    std::nth_element(samples, samples + mid - 1, samples + count);
-                    median = 0.5f * (median + samples[mid - 1]);
-                }
-                smooth_dist(r, c) = median;
             }
+
+            if (count == 0) {
+                continue;
+            }
+
+            const int mid = count / 2;
+            std::nth_element(samples, samples + mid, samples + count);
+            float median = samples[mid];
+            if ((count % 2) == 0) {
+                std::nth_element(samples, samples + mid - 1, samples + count);
+                median = 0.5f * (median + samples[mid - 1]);
+            }
+            smooth_dist(r, c) = median;
         }
 
         // Reconstruct points along each vertex normal using the smoothed distances.
@@ -970,26 +968,27 @@ int main(int argc, char *argv[])
             return true;
         };
 
-        #pragma omp parallel for schedule(static)
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                cv::Vec3f cand;
-                if (!compute_candidate(r, c, cand)) {
-                    continue;
-                }
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int i = 0; i < static_cast<int>(active_vertices.size()); ++i) {
+            const int r = active_vertices[i][0];
+            const int c = active_vertices[i][1];
 
-                bool ok = true;
-                ok = ok && quad_orientation_ok(r - 1, c - 1, r, c, cand);
-                ok = ok && quad_orientation_ok(r - 1, c, r, c, cand);
-                ok = ok && quad_orientation_ok(r, c - 1, r, c, cand);
-                ok = ok && quad_orientation_ok(r, c, r, c, cand);
-
-                if (!ok) {
-                    continue;
-                }
-
-                new_points(r, c) = cand;
+            cv::Vec3f cand;
+            if (!compute_candidate(r, c, cand)) {
+                continue;
             }
+
+            bool ok = true;
+            ok = ok && quad_orientation_ok(r - 1, c - 1, r, c, cand);
+            ok = ok && quad_orientation_ok(r - 1, c, r, c, cand);
+            ok = ok && quad_orientation_ok(r, c - 1, r, c, cand);
+            ok = ok && quad_orientation_ok(r, c, r, c, cand);
+
+            if (!ok) {
+                continue;
+            }
+
+            new_points(r, c) = cand;
         }
 
         // Calculate scale factor from world extent change, not point spacing.
