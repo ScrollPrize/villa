@@ -36,6 +36,7 @@
 #include <cctype>
 #include <cstring>
 #include <set>
+#include <unordered_set>
 
 #include <opencv2/core.hpp>
 
@@ -696,10 +697,20 @@ std::vector<SegmentationGrowthDirection> resolveDenseDirections(
     return resolved;
 }
 
-QString createDenseSnapshotPath()
+QString createDenseSnapshotPath(const QString& preferredDir)
 {
+    QString outputDir = preferredDir.trimmed();
+    if (outputDir.isEmpty()) {
+        outputDir = QDir::tempPath();
+    }
+
+    QDir dir(outputDir);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        dir = QDir(QDir::tempPath());
+    }
+
     const QString suffix = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    return QDir(QDir::tempPath()).filePath(QStringLiteral("vc_dense_input_%1").arg(suffix));
+    return dir.filePath(QStringLiteral("vc_dense_input_%1").arg(suffix));
 }
 
 nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::json& request)
@@ -779,6 +790,22 @@ std::string makeUniqueSegmentId(const std::filesystem::path& pathsDir, const std
 TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
 {
     TracerGrowthResult result;
+    std::vector<std::filesystem::path> temporaryPaths;
+    temporaryPaths.reserve(job.directions.size() + 1);
+    if (!job.tifxyzInputPath.isEmpty()) {
+        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
+    }
+
+    auto finalizeResult = [&]() -> TracerGrowthResult {
+        result.temporarySurfacePaths.clear();
+        result.temporarySurfacePaths.reserve(temporaryPaths.size());
+        for (const auto& path : temporaryPaths) {
+            if (!path.empty()) {
+                result.temporarySurfacePaths.push_back(path);
+            }
+        }
+        return result;
+    };
 
     QString currentInputPath = job.tifxyzInputPath;
     QString finalOutputPath = job.tifxyzInputPath;
@@ -832,7 +859,7 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
             response = sendSocketJsonRequest(job.socketPath, request);
         } catch (const std::exception& ex) {
             result.error = QStringLiteral("Dense displacement request failed: %1").arg(ex.what());
-            return result;
+            return finalizeResult();
         }
 
         if (response.contains("error")) {
@@ -843,20 +870,23 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
                 serviceError = QString::fromStdString(response["error"].dump());
             }
             result.error = QStringLiteral("Dense displacement service error: %1").arg(serviceError);
-            return result;
+            return finalizeResult();
         }
         if (!response.contains("output_tifxyz_path") || !response["output_tifxyz_path"].is_string()) {
             result.error = QStringLiteral("Dense displacement response missing output_tifxyz_path.");
-            return result;
+            return finalizeResult();
         }
 
         finalOutputPath = QString::fromStdString(response["output_tifxyz_path"].get<std::string>());
         currentInputPath = finalOutputPath;
+        if (!finalOutputPath.isEmpty()) {
+            temporaryPaths.emplace_back(finalOutputPath.toStdString());
+        }
     }
 
     if (finalOutputPath.isEmpty()) {
         result.error = QStringLiteral("Dense displacement did not produce an output path.");
-        return result;
+        return finalizeResult();
     }
 
     std::unique_ptr<QuadSurface> loaded;
@@ -864,16 +894,16 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         loaded = load_quad_from_tifxyz(finalOutputPath.toStdString());
     } catch (const std::exception& ex) {
         result.error = QStringLiteral("Failed to load dense displacement output: %1").arg(ex.what());
-        return result;
+        return finalizeResult();
     }
     if (!loaded) {
         result.error = QStringLiteral("Dense displacement output could not be loaded.");
-        return result;
+        return finalizeResult();
     }
 
     result.surface = loaded.release();
     result.statusMessage = QStringLiteral("Dense displacement growth completed");
-    return result;
+    return finalizeResult();
 }
 } // namespace
 
@@ -1351,7 +1381,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             return false;
         }
 
-        const QString denseInputPath = createDenseSnapshotPath();
+        const QString segmentationPath = QString::fromStdString(segmentationSurface->path.string());
+        const QString denseSnapshotDir = segmentationPath.isEmpty()
+            ? QString()
+            : QFileInfo(segmentationPath).dir().absolutePath();
+        const QString denseInputPath = createDenseSnapshotPath(denseSnapshotDir);
         try {
             const QFileInfo snapshotInfo(denseInputPath);
             const std::string snapshotId = snapshotInfo.fileName().toStdString();
@@ -1693,8 +1727,50 @@ void SegmentationGrower::onFutureFinished()
     ActiveRequest request = std::move(*_activeRequest);
     _activeRequest.reset();
 
+    auto cleanupDenseTemporarySurfaces = [&](const std::filesystem::path& preservePath = std::filesystem::path()) {
+        if (!request.denseDisplacement || request.denseCreateNewSegment) {
+            return;
+        }
+        if (result.temporarySurfacePaths.empty()) {
+            return;
+        }
+
+        const std::filesystem::path preserved = preservePath.lexically_normal();
+        std::unordered_set<std::string> visited;
+        for (const auto& rawPath : result.temporarySurfacePaths) {
+            if (rawPath.empty()) {
+                continue;
+            }
+            const std::filesystem::path candidate = rawPath.lexically_normal();
+            if (!preserved.empty() && candidate == preserved) {
+                continue;
+            }
+
+            const std::string key = candidate.string();
+            if (!visited.insert(key).second) {
+                continue;
+            }
+
+            std::error_code existsEc;
+            if (!std::filesystem::exists(candidate, existsEc) || existsEc) {
+                continue;
+            }
+
+            std::error_code rmEc;
+            std::filesystem::remove_all(candidate, rmEc);
+            if (rmEc) {
+                qCInfo(lcSegGrowth) << "Failed to remove dense temporary surface"
+                                    << QString::fromStdString(candidate.string())
+                                    << QString::fromStdString(rmEc.message());
+            }
+        }
+    };
+
     if (!result.error.isEmpty()) {
         qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;
+        cleanupDenseTemporarySurfaces(request.segmentationSurface
+                                          ? request.segmentationSurface->path
+                                          : std::filesystem::path());
         showStatus(result.error, kStatusLong);
         finalize(false);
         return;
@@ -1702,6 +1778,9 @@ void SegmentationGrower::onFutureFinished()
 
     if (!result.surface) {
         qCInfo(lcSegGrowth) << "Tracer growth returned null surface";
+        cleanupDenseTemporarySurfaces(request.segmentationSurface
+                                          ? request.segmentationSurface->path
+                                          : std::filesystem::path());
         showStatus(tr("Tracer growth did not return a surface."), kStatusMedium);
         finalize(false);
         return;
@@ -1896,6 +1975,39 @@ void SegmentationGrower::onFutureFinished()
             if (surfaceToPersist) {
                 ensureSurfaceMetaObject(surfaceToPersist);
                 surfaceToPersist->saveOverwrite();
+
+                // Dense overwrite mode persists an updated segment in-place;
+                // force reload from disk so in-app references observe the new geometry.
+                if (request.denseDisplacement && !request.denseCreateNewSegment) {
+                    std::shared_ptr<QuadSurface> reloadedSurface;
+                    const std::string persistedId = surfaceToPersist->id;
+
+                    if (request.volumeContext.package && !persistedId.empty()) {
+                        request.volumeContext.package->unloadSurface(persistedId);
+                        reloadedSurface = request.volumeContext.package->loadSurface(persistedId);
+                    }
+
+                    if (!reloadedSurface && !surfaceToPersist->path.empty()) {
+                        try {
+                            auto loadedFromDisk = load_quad_from_tifxyz(surfaceToPersist->path.string());
+                            if (loadedFromDisk) {
+                                reloadedSurface.reset(loadedFromDisk.release());
+                            }
+                        } catch (const std::exception& ex) {
+                            qCInfo(lcSegGrowth) << "Dense overwrite reload fallback failed" << ex.what();
+                        }
+                    }
+
+                    if (reloadedSurface) {
+                        if (_context.surfaces && !persistedId.empty() && _context.surfaces->surface(persistedId)) {
+                            _context.surfaces->setSurface(persistedId, reloadedSurface, true, false);
+                        }
+                        request.segmentationSurface = reloadedSurface;
+                        surfaceToPersist = reloadedSurface.get();
+                    } else {
+                        qCInfo(lcSegGrowth) << "Dense overwrite reload skipped; using in-memory geometry";
+                    }
+                }
             }
         } catch (const std::exception& ex) {
             qCInfo(lcSegGrowth) << "Failed to save tracer result" << ex.what();
@@ -2054,6 +2166,8 @@ void SegmentationGrower::onFutureFinished()
     }
 
     qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
+
+    cleanupDenseTemporarySurfaces(surfaceToPersist ? surfaceToPersist->path : std::filesystem::path());
     delete result.surface;
 
     QString message;

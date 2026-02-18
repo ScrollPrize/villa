@@ -214,6 +214,7 @@ struct TracerGrowthResult {
     QuadSurface* surface{nullptr};
     QString error;
     QString statusMessage;
+    std::vector<std::filesystem::path> temporarySurfacePaths;
 };
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,

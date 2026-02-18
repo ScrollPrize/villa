@@ -3,6 +3,7 @@ import os
 import random
 import socket
 import threading
+import time
 from pathlib import Path
 
 import click
@@ -35,8 +36,15 @@ DENSE_REQUEST_TYPE = "dense_displacement_grow"
 )
 @click.option("--volume_scale", type=int, required=True, help="OME scale to use")
 @click.option("--socket_path", type=click.Path(), required=True, help="Path to Unix domain socket")
+@click.option(
+    "--parent_pid",
+    type=int,
+    required=False,
+    default=None,
+    help="Optional parent PID watchdog. Service exits if this PID is no longer its parent.",
+)
 @click.option("--no-cache", is_flag=True, help="Disable crop cache")
-def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, no_cache):
+def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, parent_pid, no_cache):
     state = {
         "checkpoint_path": checkpoint_path,
         "volume_zarr": volume_zarr,
@@ -46,6 +54,21 @@ def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, no_cache):
         "inference_lock": threading.Lock(),
         "dense_lock": threading.Lock(),
     }
+
+    if parent_pid is not None and int(parent_pid) > 1:
+        parent_pid = int(parent_pid)
+
+        def parent_watchdog():
+            while True:
+                if os.getppid() != parent_pid:
+                    print(
+                        f"parent process {parent_pid} is gone (current ppid={os.getppid()}); exiting.",
+                        flush=True,
+                    )
+                    os._exit(0)
+                time.sleep(1.0)
+
+        threading.Thread(target=parent_watchdog, daemon=True).start()
 
     socket_path = Path(socket_path)
     if socket_path.exists():

@@ -209,7 +209,8 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         "--checkpoint_path", checkpointPath,
         "--volume_zarr", volumeZarr,
         "--volume_scale", QString::number(volumeScale),
-        "--socket_path", _socketPath
+        "--socket_path", _socketPath,
+        "--parent_pid", QString::number(QCoreApplication::applicationPid())
     };
 
     emit statusMessage(tr("Starting neural trace service..."));
