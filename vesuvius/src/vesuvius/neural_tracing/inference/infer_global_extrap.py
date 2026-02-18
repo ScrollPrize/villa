@@ -1405,34 +1405,34 @@ def _surface_to_stored_uv_samples_lattice(
     growth does not shift between neighboring stored UV cells as boundaries move.
     """
     rows, cols, pts = _finite_valid_grid_points(grid, valid)
-    if rows.size == 0:
-        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
-            "mode": "lattice_floor",
-            "stride_rc": [int(sub_r), int(sub_c)],
-            "phase_rc": [int(phase_rc[0]), int(phase_rc[1])],
-            "n_full_valid": 0,
-            "n_stored_valid": 0,
-        },)
-
     sub_r = max(1, int(sub_r))
     sub_c = max(1, int(sub_c))
     phase_r = int(phase_rc[0])
     phase_c = int(phase_rc[1])
 
-    r_abs = rows + int(uv_offset[0])
-    c_abs = cols + int(uv_offset[1])
+    if rows.size == 0:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
+            "mode": "lattice_floor",
+            "stride_rc": [sub_r, sub_c],
+            "phase_rc": [phase_r, phase_c],
+            "n_full_valid": 0,
+            "n_stored_valid": 0,
+        },)
+
+    r_abs = rows.astype(np.int64, copy=False) + int(uv_offset[0])
+    c_abs = cols.astype(np.int64, copy=False) + int(uv_offset[1])
 
     stored_r = np.floor_divide(r_abs - phase_r, sub_r).astype(np.int64, copy=False)
     stored_c = np.floor_divide(c_abs - phase_c, sub_c).astype(np.int64, copy=False)
+
     uv = np.stack([stored_r, stored_c], axis=-1)
     uniq_uv, inv = np.unique(uv, axis=0, return_inverse=True)
-
     pts_sum = np.zeros((uniq_uv.shape[0], 3), dtype=np.float64)
     pts_count = np.zeros((uniq_uv.shape[0],), dtype=np.int64)
     np.add.at(pts_sum, inv, pts.astype(np.float64, copy=False))
     np.add.at(pts_count, inv, 1)
-
     pts_mean = (pts_sum / np.maximum(pts_count[:, None], 1)).astype(np.float32, copy=False)
+
     projection_meta = {
         "mode": "lattice_floor",
         "stride_rc": [sub_r, sub_c],
@@ -1441,7 +1441,6 @@ def _surface_to_stored_uv_samples_lattice(
         "n_stored_valid": int(uniq_uv.shape[0]),
     }
     return uniq_uv.astype(np.int64, copy=False), pts_mean, projection_meta
-
 
 def _stored_uv_step_spacing_stats(uv, pts):
     uv = np.asarray(uv, dtype=np.int64)
@@ -1811,6 +1810,27 @@ def _run_growth_direction_step(
             verbose=args.verbose,
             iteration_pbar=iteration_pbar,
         )
+
+    if args.verbose:
+        full_valid_n = int(np.asarray(merged_iter["merged_valid"], dtype=bool).sum())
+        displaced_uv = np.asarray(displaced.get("uv", _empty_uv(dtype=np.int64)), dtype=np.int64)
+        displaced_pts = np.asarray(displaced.get("world_displaced", _empty_world(dtype=np.float32)), dtype=np.float32)
+        displaced_n = int(min(displaced_uv.shape[0], displaced_pts.shape[0]))
+        print(
+            f"Iteration merge counts: full_valid={full_valid_n} displaced_samples={displaced_n}"
+        )
+        if displaced_n > 1:
+            iter_spacing = _stored_uv_step_spacing_stats(
+                displaced_uv[:displaced_n], displaced_pts[:displaced_n]
+            )
+            if iter_spacing is not None:
+                print(
+                    "Iteration displaced spacing (per UV step): "
+                    f"n={iter_spacing['n_pairs']} "
+                    f"median={iter_spacing['median']:.4f} "
+                    f"mean={iter_spacing['mean']:.4f} "
+                    f"p90={iter_spacing['p90']:.4f}"
+                )
 
     return {
         "merged_iter": merged_iter,
