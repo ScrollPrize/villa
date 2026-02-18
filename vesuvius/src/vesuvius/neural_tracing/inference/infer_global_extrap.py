@@ -350,6 +350,65 @@ def _build_extrap_lookup_arrays(edge_extrapolation):
     return _build_extrap_lookup_from_uv_world(query_uv, extrapolated_world)
 
 
+def _empty_uv_world_int():
+    return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+
+
+def _growth_axis_params(grow_direction):
+    if grow_direction in {"left", "right"}:
+        return 1, (grow_direction == "left")
+    if grow_direction in {"up", "down"}:
+        return 0, (grow_direction == "up")
+    raise ValueError(f"Unknown grow_direction '{grow_direction}'")
+
+
+def _uv_sort_primary_secondary(uv, axis_idx, near_to_far_desc):
+    primary_axis_vals = uv[:, axis_idx]
+    primary = -primary_axis_vals if near_to_far_desc else primary_axis_vals
+    secondary = uv[:, 1 - axis_idx]
+    return primary, secondary
+
+
+def _empty_disp_count_valid():
+    return (
+        np.zeros((0, 3), dtype=np.float32),
+        np.zeros((0,), dtype=np.uint32),
+        np.zeros((0,), dtype=bool),
+    )
+
+
+def _select_finite_extrap_uv_world(extrap_lookup, grow_direction, max_lines=None):
+    if extrap_lookup is None:
+        return _empty_uv_world_int()
+    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
+    if sampled_uv.shape[0] == 0:
+        return _empty_uv_world_int()
+    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
+    finite_world = np.isfinite(sampled_world).all(axis=1)
+    if not finite_world.any():
+        return _empty_uv_world_int()
+    return (
+        sampled_uv[finite_world].astype(np.int64, copy=False),
+        sampled_world[finite_world].astype(np.float32, copy=False),
+    )
+
+
+def _select_uv_depth_per_boundary(uv_ordered, axis_idx, near_to_far_desc, depth_keep):
+    boundary_axis_idx = 1 - axis_idx
+    boundary_ids = np.unique(uv_ordered[:, boundary_axis_idx]).astype(np.int64, copy=False)
+    picked = []
+    for boundary_id in boundary_ids:
+        line_uv = uv_ordered[uv_ordered[:, boundary_axis_idx] == boundary_id]
+        if line_uv.shape[0] == 0:
+            continue
+        line_primary, _ = _uv_sort_primary_secondary(line_uv, axis_idx, near_to_far_desc)
+        line_order = np.argsort(line_primary, kind="stable")
+        picked.append(line_uv[line_order[:depth_keep]])
+    if not picked:
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.concatenate(picked, axis=0).astype(np.int64, copy=False)
+
+
 def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
     lookup = _as_extrap_lookup_arrays(extrap_lookup)
     uv_ordered = np.asarray(lookup.uv, dtype=np.int64)
@@ -359,21 +418,8 @@ def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None
     if uv_ordered.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int64)
 
-    if grow_direction in {"left", "right"}:
-        axis_idx = 1
-        near_to_far_desc = grow_direction == "left"
-    elif grow_direction in {"up", "down"}:
-        axis_idx = 0
-        near_to_far_desc = grow_direction == "up"
-    else:
-        raise ValueError(f"Unknown grow_direction '{grow_direction}'")
-
-    if axis_idx == 1:
-        primary = -uv_ordered[:, 1] if near_to_far_desc else uv_ordered[:, 1]
-        secondary = uv_ordered[:, 0]
-    else:
-        primary = -uv_ordered[:, 0] if near_to_far_desc else uv_ordered[:, 0]
-        secondary = uv_ordered[:, 1]
+    axis_idx, near_to_far_desc = _growth_axis_params(grow_direction)
+    primary, secondary = _uv_sort_primary_secondary(uv_ordered, axis_idx, near_to_far_desc)
     order = np.lexsort((secondary, primary))
     uv_ordered = uv_ordered[order]
 
@@ -386,40 +432,11 @@ def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None
 
     # For ragged/non-rectangular fronts, keep near->far depth per boundary line
     # (per row for left/right, per col for up/down), not global axis values.
-    if axis_idx == 1:
-        boundary_ids = np.unique(uv_ordered[:, 0]).astype(np.int64, copy=False)
-        picked = []
-        for r in boundary_ids:
-            row_uv = uv_ordered[uv_ordered[:, 0] == r]
-            if row_uv.shape[0] == 0:
-                continue
-            row_primary = -row_uv[:, 1] if near_to_far_desc else row_uv[:, 1]
-            row_order = np.argsort(row_primary, kind="stable")
-            picked.append(row_uv[row_order[:depth_keep]])
-    else:
-        boundary_ids = np.unique(uv_ordered[:, 1]).astype(np.int64, copy=False)
-        picked = []
-        for c in boundary_ids:
-            col_uv = uv_ordered[uv_ordered[:, 1] == c]
-            if col_uv.shape[0] == 0:
-                continue
-            col_primary = -col_uv[:, 0] if near_to_far_desc else col_uv[:, 0]
-            col_order = np.argsort(col_primary, kind="stable")
-            picked.append(col_uv[col_order[:depth_keep]])
-
-    if not picked:
-        return np.zeros((0, 2), dtype=np.int64)
-
-    selected = np.concatenate(picked, axis=0).astype(np.int64, copy=False)
+    selected = _select_uv_depth_per_boundary(uv_ordered, axis_idx, near_to_far_desc, depth_keep)
     if selected.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int64)
 
-    if axis_idx == 1:
-        sel_primary = -selected[:, 1] if near_to_far_desc else selected[:, 1]
-        sel_secondary = selected[:, 0]
-    else:
-        sel_primary = -selected[:, 0] if near_to_far_desc else selected[:, 0]
-        sel_secondary = selected[:, 1]
+    sel_primary, sel_secondary = _uv_sort_primary_secondary(selected, axis_idx, near_to_far_desc)
     sel_order = np.lexsort((sel_secondary, sel_primary))
     return selected[sel_order]
 
@@ -427,17 +444,17 @@ def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None
 def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
     uv_int = np.asarray(uv_query_flat, dtype=np.int64)
     if uv_int.ndim != 2 or uv_int.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world_int()
 
     lookup = _as_extrap_lookup_arrays(extrap_lookup)
     lookup_uv = np.asarray(lookup.uv, dtype=np.int64)
     lookup_world = np.asarray(lookup.world, dtype=np.float32)
     if lookup_uv.ndim != 2 or lookup_uv.shape[1] != 2:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world_int()
     if lookup_world.ndim != 2 or lookup_world.shape[1] != 3:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world_int()
     if lookup_uv.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world_int()
 
     lookup_view = _uv_struct_view(lookup_uv)
     query_view = _uv_struct_view(uv_int)
@@ -450,7 +467,7 @@ def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
         pos_in = pos[in_bounds]
         matched[in_bounds] = lookup_sorted[pos_in] == query_view[in_bounds]
     if not matched.any():
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world_int()
 
     keep_idx = np.nonzero(matched)[0]
     lookup_idx = lookup_sort[pos[keep_idx]]
@@ -650,17 +667,13 @@ def _sample_displacement_for_extrap_uvs_from_crops(
     if per_crop_fields is None or len(per_crop_fields) == 0 or extrap_lookup is None:
         return _empty_stack_samples()
 
-    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
+    sampled_uv, sampled_world = _select_finite_extrap_uv_world(
+        extrap_lookup,
+        grow_direction,
+        max_lines=max_lines,
+    )
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
-
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
-    finite_world = np.isfinite(sampled_world).all(axis=1)
-    if not finite_world.any():
-        return _empty_stack_samples()
-
-    sampled_uv = sampled_uv[finite_world]
-    sampled_world = sampled_world[finite_world].astype(np.float32, copy=False)
     n_points = int(sampled_world.shape[0])
 
     disp_acc = np.zeros((n_points, 3), dtype=np.float32)
@@ -742,11 +755,7 @@ def _sample_displacement_for_extrap_uvs_from_crops(
 def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extra_steps):
     coords_local = np.asarray(coords_local, dtype=np.float32)
     if coords_local.ndim != 2 or coords_local.shape[1] != 3 or coords_local.shape[0] == 0:
-        return (
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0,), dtype=np.uint32),
-            np.zeros((0,), dtype=bool),
-        )
+        return _empty_disp_count_valid()
 
     refine_extra_steps = max(int(refine_extra_steps), 0)
     refine_parts = refine_extra_steps + 1
@@ -794,20 +803,13 @@ def _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup):
 
 
 def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
-    if extrap_lookup is None:
-        return _empty_stack_samples()
-
-    sampled_uv = _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=max_lines)
+    sampled_uv, sampled_world = _select_finite_extrap_uv_world(
+        extrap_lookup,
+        grow_direction,
+        max_lines=max_lines,
+    )
     if sampled_uv.shape[0] == 0:
         return _empty_stack_samples()
-
-    sampled_world = _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup)
-    keep = np.isfinite(sampled_world).all(axis=1)
-    if not keep.any():
-        return _empty_stack_samples()
-
-    sampled_uv = sampled_uv[keep].astype(np.int64, copy=False)
-    sampled_world = sampled_world[keep].astype(np.float32, copy=False)
     n = int(sampled_world.shape[0])
     return {
         "uv": sampled_uv,
@@ -819,11 +821,7 @@ def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
 
 def _sample_trilinear_displacement_stack(disp, count, coords_local):
     if coords_local is None or len(coords_local) == 0:
-        return (
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0,), dtype=np.uint32),
-            np.zeros((0,), dtype=bool),
-        )
+        return _empty_disp_count_valid()
 
     disp_t = torch.from_numpy(np.asarray(disp, dtype=np.float32)).unsqueeze(0)  # [1, 3, D, H, W]
     count_t = torch.from_numpy(np.asarray(count, dtype=np.float32)).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
@@ -882,6 +880,71 @@ def _empty_displaced_samples():
         "world_displaced": np.zeros((0, 3), dtype=np.float32),
         "stack_count": np.zeros((0,), dtype=np.uint32),
     }
+
+
+def _expand_surface_canvas_to_fit_points(
+    merged_zyxs,
+    merged_valid,
+    uv_n,
+    uv_offset,
+    original_shape,
+    original_offset,
+    verbose=True,
+):
+    r0, c0 = int(uv_offset[0]), int(uv_offset[1])
+    h, w = merged_valid.shape
+    if uv_n.size == 0:
+        return merged_zyxs, merged_valid, r0, c0, h, w
+
+    min_r = min(r0, int(uv_n[:, 0].min()))
+    max_r = max(r0 + h - 1, int(uv_n[:, 0].max()))
+    min_c = min(c0, int(uv_n[:, 1].min()))
+    max_c = max(c0 + w - 1, int(uv_n[:, 1].max()))
+    new_h = max_r - min_r + 1
+    new_w = max_c - min_c + 1
+    if new_h == h and new_w == w:
+        return merged_zyxs, merged_valid, r0, c0, h, w
+
+    expanded_zyxs = np.full((new_h, new_w, 3), -1.0, dtype=np.float32)
+    expanded_valid = np.zeros((new_h, new_w), dtype=bool)
+    rr0 = r0 - min_r
+    cc0 = c0 - min_c
+    expanded_zyxs[rr0:rr0 + h, cc0:cc0 + w] = merged_zyxs
+    expanded_valid[rr0:rr0 + h, cc0:cc0 + w] = merged_valid
+
+    if verbose:
+        print("== Merge Displaced Into Full Surface ==")
+        print(
+            f"expanded UV canvas: shape ({original_shape[0]}, {original_shape[1]}) -> ({new_h}, {new_w}), "
+            f"offset ({int(original_offset[0])}, {int(original_offset[1])}) -> ({min_r}, {min_c})"
+        )
+    return expanded_zyxs, expanded_valid, min_r, min_c, new_h, new_w
+
+
+def _compute_merge_write_indices(uv_n, pts_n, r0, c0, h, w):
+    if uv_n.shape[0] == 0 or pts_n.shape[0] == 0:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            0,
+            0,
+        )
+
+    finite_mask = np.isfinite(pts_n).all(axis=1)
+    rr_all = uv_n[:, 0] - r0
+    cc_all = uv_n[:, 1] - c0
+    in_bounds_mask = (
+        finite_mask &
+        (rr_all >= 0) &
+        (rr_all < h) &
+        (cc_all >= 0) &
+        (cc_all < w)
+    )
+    n_nonfinite = int((~finite_mask).sum())
+    n_out_of_bounds = int((finite_mask & ~in_bounds_mask).sum())
+    write_indices = np.nonzero(in_bounds_mask)[0]
+    return rr_all, cc_all, write_indices, n_nonfinite, n_out_of_bounds
 
 
 def _apply_displacement(samples, verbose=True, skip_inference=False):
@@ -974,56 +1037,27 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     n = min(int(uv.shape[0]), int(pts.shape[0]))
     uv_n = uv[:n].astype(np.int64, copy=False)
     pts_n = pts[:n].astype(np.float32, copy=False)
-    if uv_n.size > 0:
-        min_r = min(r0, int(uv_n[:, 0].min()))
-        max_r = max(r0 + h - 1, int(uv_n[:, 0].max()))
-        min_c = min(c0, int(uv_n[:, 1].min()))
-        max_c = max(c0 + w - 1, int(uv_n[:, 1].max()))
-        new_h = max_r - min_r + 1
-        new_w = max_c - min_c + 1
-        if new_h != h or new_w != w:
-            expanded_zyxs = np.full((new_h, new_w, 3), -1.0, dtype=np.float32)
-            expanded_valid = np.zeros((new_h, new_w), dtype=bool)
-
-            rr0 = r0 - min_r
-            cc0 = c0 - min_c
-            expanded_zyxs[rr0:rr0 + h, cc0:cc0 + w] = merged_zyxs
-            expanded_valid[rr0:rr0 + h, cc0:cc0 + w] = merged_valid
-
-            merged_zyxs = expanded_zyxs
-            merged_valid = expanded_valid
-            r0, c0 = min_r, min_c
-            h, w = new_h, new_w
-            if verbose:
-                print("== Merge Displaced Into Full Surface ==")
-                print(
-                    f"expanded UV canvas: shape ({cond_valid.shape[0]}, {cond_valid.shape[1]}) -> ({h}, {w}), "
-                    f"offset ({int(cond_uv_offset[0])}, {int(cond_uv_offset[1])}) -> ({r0}, {c0})"
-                )
+    merged_zyxs, merged_valid, r0, c0, h, w = _expand_surface_canvas_to_fit_points(
+        merged_zyxs,
+        merged_valid,
+        uv_n,
+        (r0, c0),
+        cond_valid.shape,
+        cond_uv_offset,
+        verbose=verbose,
+    )
 
     n_written = 0
     n_new_valid = 0
     n_overwrite_existing = 0
-    if n > 0:
-        finite_mask = np.isfinite(pts_n).all(axis=1)
-        rr_all = uv_n[:, 0] - r0
-        cc_all = uv_n[:, 1] - c0
-        in_bounds_mask = (
-            finite_mask &
-            (rr_all >= 0) &
-            (rr_all < h) &
-            (cc_all >= 0) &
-            (cc_all < w)
-        )
-        n_nonfinite = int((~finite_mask).sum())
-        n_out_of_bounds = int((finite_mask & ~in_bounds_mask).sum())
-        write_indices = np.nonzero(in_bounds_mask)[0]
-    else:
-        rr_all = np.zeros((0,), dtype=np.int64)
-        cc_all = np.zeros((0,), dtype=np.int64)
-        n_nonfinite = 0
-        n_out_of_bounds = 0
-        write_indices = np.zeros((0,), dtype=np.int64)
+    rr_all, cc_all, write_indices, n_nonfinite, n_out_of_bounds = _compute_merge_write_indices(
+        uv_n,
+        pts_n,
+        r0,
+        c0,
+        h,
+        w,
+    )
 
     for i in write_indices:
         rr = int(rr_all[i])
@@ -1116,6 +1150,14 @@ def _boundary_advanced(prev_boundary, next_boundary, grow_direction):
     if growth_spec["growth_sign"] > 0:
         return bool(np.any(delta > 0))
     return bool(np.any(delta < 0))
+
+
+def _report_iteration_stop(verbose, iteration_pbar, message, postfix=None):
+    if verbose:
+        print(message)
+        return
+    if iteration_pbar is not None and postfix is not None:
+        iteration_pbar.set_postfix_str(postfix, refresh=True)
 
 
 def _surface_to_stored_uv_samples_nearest(
@@ -1232,10 +1274,9 @@ def main():
     cond_direction, _ = _get_growth_context(grow_direction)
 
     with profiler.section("initialize_window"):
-        cond_direction_init, _ = _get_growth_context(grow_direction)
         init_bboxes, _ = get_cond_edge_bboxes(
             stored_zyxs,
-            cond_direction_init,
+            cond_direction,
             crop_size,
             overlap_frac=args.bbox_overlap_frac,
             cond_valid=valid_s,
@@ -1284,10 +1325,12 @@ def main():
         if iteration_pbar is not None:
             iteration_pbar.set_postfix_str(f"bboxes={len(bboxes)}", refresh=True)
         if len(bboxes) == 0:
-            if args.verbose:
-                print("No edge bboxes available at current boundary; stopping iterative growth.")
-            elif iteration_pbar is not None:
-                iteration_pbar.set_postfix_str("bboxes=0 | stopped: no edge bboxes", refresh=True)
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                "No edge bboxes available at current boundary; stopping iterative growth.",
+                postfix="bboxes=0 | stopped: no edge bboxes",
+            )
             break
 
         with profiler.section("iter_edge_extrapolation"):
@@ -1420,22 +1463,20 @@ def main():
         current_uv_offset = merged_iter["uv_offset"]
 
         if int(merged_iter.get("n_new_valid", 0)) < 1:
-            if args.verbose:
-                print("No newly added valid points this iteration; stopping iterative growth.")
-            elif iteration_pbar is not None:
-                iteration_pbar.set_postfix_str(
-                    f"bboxes={len(bboxes)} | stopped: no new valid points",
-                    refresh=True,
-                )
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                "No newly added valid points this iteration; stopping iterative growth.",
+                postfix=f"bboxes={len(bboxes)} | stopped: no new valid points",
+            )
             break
         if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
-            if args.verbose:
-                print("Boundary did not advance this iteration; stopping iterative growth.")
-            elif iteration_pbar is not None:
-                iteration_pbar.set_postfix_str(
-                    f"bboxes={len(bboxes)} | stopped: boundary unchanged",
-                    refresh=True,
-                )
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                "Boundary did not advance this iteration; stopping iterative growth.",
+                postfix=f"bboxes={len(bboxes)} | stopped: boundary unchanged",
+            )
             break
 
     if iteration_pbar is not None:
