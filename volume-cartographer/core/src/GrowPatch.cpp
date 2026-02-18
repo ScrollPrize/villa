@@ -3799,9 +3799,20 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                       << ", dense_qr=" << std::boolalpha << resume_local_config.use_dense_qr
                       << std::noboolalpha << ")" << std::endl;
             std::vector<cv::Vec2i> opt_local;
-            for (int j = used_area.y; j < used_area.br().y; ++j) {
-                for (int i = used_area.x; i < used_area.br().x; ++i) {
-                    if ((trace_params.state(j, i) & STATE_LOC_VALID) && (i % opt_step == 0 && j % opt_step == 0)) {
+            const int used_w = used_area.width;
+            const int used_h = used_area.height;
+            opt_local.reserve(static_cast<size_t>(used_w / opt_step + 2) * static_cast<size_t>(used_h / opt_step + 2));
+
+            auto first_aligned = [&](int v) {
+                int m = v % opt_step;
+                return (m == 0) ? v : (v + (opt_step - m));
+            };
+
+            const int j0 = first_aligned(used_area.y);
+            const int i0 = first_aligned(used_area.x);
+            for (int j = j0; j < used_area.br().y; j += opt_step) {
+                for (int i = i0; i < used_area.br().x; i += opt_step) {
+                    if (trace_params.state(j, i) & STATE_LOC_VALID) {
                         opt_local.push_back({j, i});
                     }
                 }
@@ -3814,6 +3825,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 int total = opt_local.size();
                 auto start_time = std::chrono::high_resolution_clock::now();
 
+                std::atomic<int> last_report_done{0};
+                constexpr int kReportEvery = 64;
+
                 #pragma omp parallel
                 while (true)
                 {
@@ -3822,16 +3836,25 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                         break;
 
                     local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config, nullptr, &timing_accum);
-                    done++;
-#pragma omp critical
-                    {
-                        auto now = std::chrono::high_resolution_clock::now();
-                        double elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
-                        double eta_seconds = (elapsed_seconds / done.load()) * (total - done.load());
+                    const int completed = ++done;
 
-                        printf("  optimizing... %d/%d (%.2f%%) | elapsed: %.1fs | eta: %.1fs\r",
-                               done.load(), total, (100.0 * done.load() / total), elapsed_seconds, eta_seconds);
-                        fflush(stdout);
+                    if (completed == total || (completed % kReportEvery) == 0) {
+                        int prev = last_report_done.load(std::memory_order_relaxed);
+                        if (completed > prev &&
+                            last_report_done.compare_exchange_strong(prev, completed,
+                                                                     std::memory_order_relaxed,
+                                                                     std::memory_order_relaxed)) {
+#pragma omp critical
+                            {
+                                auto now = std::chrono::high_resolution_clock::now();
+                                double elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
+                                double eta_seconds = (elapsed_seconds / std::max(1, completed)) * (total - completed);
+
+                                printf("  optimizing... %d/%d (%.2f%%) | elapsed: %.1fs | eta: %.1fs\r",
+                                       completed, total, (100.0 * completed / total), elapsed_seconds, eta_seconds);
+                                fflush(stdout);
+                            }
+                        }
                     }
                 }
                 printf("\n");
