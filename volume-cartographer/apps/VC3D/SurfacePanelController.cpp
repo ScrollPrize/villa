@@ -435,6 +435,9 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
 
     std::cout << "Adding segmentation: " << segId << std::endl;
     try {
+        if (!_volumePkg->addSingleSegmentation(segId)) {
+            _volumePkg->refreshSegmentations();
+        }
         auto surf = _volumePkg->loadSurface(segId);
         if (!surf) {
             return;

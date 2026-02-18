@@ -1389,7 +1389,33 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         try {
             const QFileInfo snapshotInfo(denseInputPath);
             const std::string snapshotId = snapshotInfo.fileName().toStdString();
-            segmentationSurface->save(denseInputPath.toStdString(), snapshotId, false);
+
+            // QuadSurface::save mutates the instance path/id/meta. Preserve and restore
+            // so taking a dense snapshot does not retarget the live segmentation surface.
+            const std::filesystem::path originalSurfacePath = segmentationSurface->path;
+            const std::string originalSurfaceId = segmentationSurface->id;
+            std::unique_ptr<nlohmann::json> originalSurfaceMeta;
+            if (segmentationSurface->meta) {
+                originalSurfaceMeta = std::make_unique<nlohmann::json>(*segmentationSurface->meta);
+            }
+
+            const auto restoreLiveSurfaceState = [&]() {
+                segmentationSurface->path = originalSurfacePath;
+                segmentationSurface->id = originalSurfaceId;
+                if (originalSurfaceMeta) {
+                    segmentationSurface->meta = std::make_unique<nlohmann::json>(*originalSurfaceMeta);
+                } else {
+                    segmentationSurface->meta.reset();
+                }
+            };
+
+            try {
+                segmentationSurface->save(denseInputPath.toStdString(), snapshotId, false);
+            } catch (...) {
+                restoreLiveSurfaceState();
+                throw;
+            }
+            restoreLiveSurfaceState();
         } catch (const std::exception& ex) {
             showStatus(tr("Failed to prepare dense displacement input: %1").arg(ex.what()), kStatusLong);
             return false;
@@ -1728,7 +1754,7 @@ void SegmentationGrower::onFutureFinished()
     _activeRequest.reset();
 
     auto cleanupDenseTemporarySurfaces = [&](const std::filesystem::path& preservePath = std::filesystem::path()) {
-        if (!request.denseDisplacement || request.denseCreateNewSegment) {
+        if (!request.denseDisplacement) {
             return;
         }
         if (result.temporarySurfacePaths.empty()) {
@@ -1789,6 +1815,7 @@ void SegmentationGrower::onFutureFinished()
     if (request.denseDisplacement && request.denseCreateNewSegment) {
         if (!request.volumeContext.package) {
             showStatus(tr("Dense displacement new-segment mode requires an active volume package."), kStatusLong);
+            cleanupDenseTemporarySurfaces();
             delete result.surface;
             finalize(false);
             return;
@@ -1802,6 +1829,7 @@ void SegmentationGrower::onFutureFinished()
             showStatus(tr("Failed to create paths directory for new segment: %1")
                            .arg(QString::fromStdString(mkdirEc.message())),
                        kStatusLong);
+            cleanupDenseTemporarySurfaces();
             delete result.surface;
             finalize(false);
             return;
@@ -1816,10 +1844,19 @@ void SegmentationGrower::onFutureFinished()
             result.surface->save(newSegmentPath.string(), newSegmentId, false);
         } catch (const std::exception& ex) {
             showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);
+            cleanupDenseTemporarySurfaces();
             delete result.surface;
             finalize(false);
             return;
         }
+
+        // The new directory exists on disk now, but VolumePkg may not know this ID yet.
+        // Register it before any loadSurface call.
+        if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
+            request.volumeContext.package->refreshSegmentations();
+        }
+
+        cleanupDenseTemporarySurfaces(newSegmentPath);
         delete result.surface;
 
         if (_surfacePanel) {

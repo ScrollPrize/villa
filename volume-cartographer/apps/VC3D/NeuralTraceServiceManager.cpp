@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QThread>
 #include <QUuid>
@@ -20,6 +21,37 @@ bool isCheckpointSentinel(const QString& checkpointPath)
 {
     const QString trimmed = checkpointPath.trimmed();
     return trimmed == kDenseLatestSentinel;
+}
+
+QString normalizeExistingPath(const QString& path)
+{
+    const QString trimmed = path.trimmed();
+    if (trimmed.isEmpty()) {
+        return QString();
+    }
+
+    QFileInfo info(trimmed);
+    const QString canonical = info.canonicalFilePath();
+    if (!canonical.isEmpty()) {
+        return QDir::cleanPath(canonical);
+    }
+    return QDir::cleanPath(info.absoluteFilePath());
+}
+
+QString normalizeCheckpointValue(const QString& checkpointPath)
+{
+    if (isCheckpointSentinel(checkpointPath)) {
+        return kDenseLatestSentinel;
+    }
+    return normalizeExistingPath(checkpointPath);
+}
+
+QString normalizePythonValue(const QString& pythonPath)
+{
+    if (pythonPath.trimmed().isEmpty()) {
+        return QString();
+    }
+    return normalizeExistingPath(pythonPath);
 }
 
 QString findPythonExecutable()
@@ -92,11 +124,18 @@ bool NeuralTraceServiceManager::ensureServiceRunning(const QString& checkpointPa
                                                       int volumeScale,
                                                       const QString& pythonPath)
 {
+    const QString normalizedCheckpoint = normalizeCheckpointValue(checkpointPath);
+    const QString normalizedVolumeZarr = normalizeExistingPath(volumeZarr);
+    const QString normalizedPython = normalizePythonValue(pythonPath);
+
+    const bool sameConfig = (_currentCheckpointPath == normalizedCheckpoint &&
+                             _currentVolumeZarr == normalizedVolumeZarr &&
+                             _currentVolumeScale == volumeScale &&
+                             _currentPythonPath == normalizedPython);
+
     // Check if already running with same config
     if (_process && _process->state() == QProcess::Running && _serviceReady) {
-        if (_currentCheckpointPath == checkpointPath &&
-            _currentVolumeZarr == volumeZarr &&
-            _currentVolumeScale == volumeScale) {
+        if (sameConfig) {
             return true;
         }
         // Configuration changed, need to restart
@@ -104,7 +143,14 @@ bool NeuralTraceServiceManager::ensureServiceRunning(const QString& checkpointPa
         stopService();
     }
 
-    return startService(checkpointPath, volumeZarr, volumeScale, pythonPath);
+    // If a process object still exists and was not explicitly stopped above, clear it safely.
+    if (_process && _process->state() != QProcess::NotRunning) {
+        stopService();
+    } else if (_process) {
+        _process.reset();
+    }
+
+    return startService(normalizedCheckpoint, normalizedVolumeZarr, volumeScale, normalizedPython);
 }
 
 bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
@@ -114,6 +160,12 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
 {
     _lastError.clear();
     _serviceReady = false;
+
+    if (_process && _process->state() != QProcess::NotRunning) {
+        stopService();
+    } else if (_process) {
+        _process.reset();
+    }
 
     // Validate inputs
     if (checkpointPath.isEmpty()) {
@@ -241,6 +293,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
             _currentCheckpointPath = checkpointPath;
             _currentVolumeZarr = volumeZarr;
             _currentVolumeScale = volumeScale;
+            _currentPythonPath = pythonPath;
             emit statusMessage(tr("Neural trace service ready"));
             emit serviceStarted();
             return true;
@@ -289,6 +342,7 @@ void NeuralTraceServiceManager::stopService()
     _currentCheckpointPath.clear();
     _currentVolumeZarr.clear();
     _currentVolumeScale = 0;
+    _currentPythonPath.clear();
 
     emit serviceStopped();
 }
