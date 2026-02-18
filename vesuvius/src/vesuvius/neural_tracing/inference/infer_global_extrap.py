@@ -232,25 +232,58 @@ def parse_args():
     return args
 
 
+def _empty_uv(dtype=np.int64):
+    return np.zeros((0, 2), dtype=dtype)
+
+
+def _empty_world(dtype=np.float32):
+    return np.zeros((0, 3), dtype=dtype)
+
+
+def _empty_counts(dtype=np.uint32):
+    return np.zeros((0,), dtype=dtype)
+
+
+def _empty_valid_mask():
+    return np.zeros((0,), dtype=bool)
+
+
+def _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32):
+    return _empty_uv(dtype=uv_dtype), _empty_world(dtype=world_dtype)
+
+
+def _coerce_uv_world(uv, world, uv_dtype=np.int64, world_dtype=np.float32):
+    uv_arr = np.asarray(uv, dtype=uv_dtype)
+    world_arr = np.asarray(world, dtype=world_dtype)
+    if uv_arr.ndim != 2 or uv_arr.shape[1] != 2:
+        return _empty_uv_world(uv_dtype=uv_dtype, world_dtype=world_dtype)
+    if world_arr.ndim != 2 or world_arr.shape[1] != 3:
+        return _empty_uv_world(uv_dtype=uv_dtype, world_dtype=world_dtype)
+    if uv_arr.shape[0] == 0 or world_arr.shape[0] == 0:
+        return _empty_uv_world(uv_dtype=uv_dtype, world_dtype=world_dtype)
+    if uv_arr.shape[0] != world_arr.shape[0]:
+        return _empty_uv_world(uv_dtype=uv_dtype, world_dtype=world_dtype)
+    return uv_arr, world_arr
+
+
 def _finite_uv_world(uv, world):
     if uv is None or world is None:
-        return np.zeros((0, 2), dtype=np.float64), np.zeros((0, 3), dtype=np.float32)
-    uv = np.asarray(uv)
-    world = np.asarray(world)
-    if uv.size == 0 or world.size == 0:
-        return np.zeros((0, 2), dtype=np.float64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world(uv_dtype=np.float64, world_dtype=np.float32)
+    uv, world = _coerce_uv_world(uv, world, uv_dtype=np.float64, world_dtype=np.float32)
+    if uv.shape[0] == 0:
+        return _empty_uv_world(uv_dtype=np.float64, world_dtype=np.float32)
     keep = np.isfinite(world).all(axis=1)
     if not keep.any():
-        return np.zeros((0, 2), dtype=np.float64), np.zeros((0, 3), dtype=np.float32)
+        return _empty_uv_world(uv_dtype=np.float64, world_dtype=np.float32)
     return uv[keep].astype(np.float64, copy=False), world[keep].astype(np.float32, copy=False)
 
 
 def _empty_edge_extrapolation():
     return {
-        "edge_seed_uv": np.zeros((0, 2), dtype=np.float64),
-        "edge_seed_world": np.zeros((0, 3), dtype=np.float32),
-        "query_uv": np.zeros((0, 2), dtype=np.float64),
-        "extrapolated_world": np.zeros((0, 3), dtype=np.float32),
+        "edge_seed_uv": _empty_uv(dtype=np.float64),
+        "edge_seed_world": _empty_world(dtype=np.float32),
+        "query_uv": _empty_uv(dtype=np.float64),
+        "extrapolated_world": _empty_world(dtype=np.float32),
     }
 
 
@@ -262,8 +295,8 @@ class ExtrapLookupArrays:
 
 def _empty_extrap_lookup_arrays():
     return ExtrapLookupArrays(
-        uv=np.zeros((0, 2), dtype=np.int64),
-        world=np.zeros((0, 3), dtype=np.float32),
+        uv=_empty_uv(dtype=np.int64),
+        world=_empty_world(dtype=np.float32),
     )
 
 
@@ -283,10 +316,7 @@ def _uv_struct_view(uv):
 def _dedupe_uv_first_order_last_value(uv_int, world):
     uv_view = _uv_struct_view(uv_int)
     if uv_view.shape[0] == 0:
-        return (
-            np.zeros((0, 2), dtype=np.int64),
-            np.zeros((0, 3), dtype=np.float32),
-        )
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
     sort_idx = np.argsort(uv_view, kind="stable")
     uv_sorted = uv_view[sort_idx]
@@ -309,15 +339,13 @@ def _dedupe_uv_first_order_last_value(uv_int, world):
 
 
 def _build_extrap_lookup_from_uv_world(uv_query_flat, extrap_world):
-    uv_int = np.asarray(uv_query_flat, dtype=np.int64)
-    world = np.asarray(extrap_world, dtype=np.float32)
-    if uv_int.ndim != 2 or uv_int.shape[1] != 2:
-        return _empty_extrap_lookup_arrays()
-    if world.ndim != 2 or world.shape[1] != 3:
-        return _empty_extrap_lookup_arrays()
-    if uv_int.shape[0] == 0 or world.shape[0] == 0:
-        return _empty_extrap_lookup_arrays()
-    if uv_int.shape[0] != world.shape[0]:
+    uv_int, world = _coerce_uv_world(
+        uv_query_flat,
+        extrap_world,
+        uv_dtype=np.int64,
+        world_dtype=np.float32,
+    )
+    if uv_int.shape[0] == 0:
         return _empty_extrap_lookup_arrays()
 
     finite = np.isfinite(world).all(axis=1)
@@ -336,7 +364,7 @@ def _build_extrap_lookup_from_uv_world(uv_query_flat, extrap_world):
 
 def _build_extrap_lookup_arrays(edge_extrapolation):
     query_uv_grid = np.asarray(edge_extrapolation.get("query_uv_grid", np.zeros((0, 0, 2), dtype=np.int64)))
-    extrapolated_world = np.asarray(edge_extrapolation.get("extrapolated_world", np.zeros((0, 3), dtype=np.float32)))
+    extrapolated_world = np.asarray(edge_extrapolation.get("extrapolated_world", _empty_world(dtype=np.float32)))
     if query_uv_grid.ndim == 3 and query_uv_grid.shape[-1] == 2:
         h, w = query_uv_grid.shape[:2]
         if h < 1 or w < 1:
@@ -346,12 +374,12 @@ def _build_extrap_lookup_arrays(edge_extrapolation):
         uv_flat = query_uv_grid.reshape(-1, 2).astype(np.int64, copy=False)
         return _build_extrap_lookup_from_uv_world(uv_flat, extrapolated_world)
 
-    query_uv = np.asarray(edge_extrapolation.get("query_uv", np.zeros((0, 2), dtype=np.float64)))
+    query_uv = np.asarray(edge_extrapolation.get("query_uv", _empty_uv(dtype=np.float64)))
     return _build_extrap_lookup_from_uv_world(query_uv, extrapolated_world)
 
 
 def _empty_uv_world_int():
-    return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
+    return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
 
 def _growth_axis_params(grow_direction):
@@ -371,9 +399,9 @@ def _uv_sort_primary_secondary(uv, axis_idx, near_to_far_desc):
 
 def _empty_disp_count_valid():
     return (
-        np.zeros((0, 3), dtype=np.float32),
-        np.zeros((0,), dtype=np.uint32),
-        np.zeros((0,), dtype=bool),
+        _empty_world(dtype=np.float32),
+        _empty_counts(dtype=np.uint32),
+        _empty_valid_mask(),
     )
 
 
@@ -443,16 +471,16 @@ def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None
 
 def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
     uv_int = np.asarray(uv_query_flat, dtype=np.int64)
-    if uv_int.ndim != 2 or uv_int.shape[0] == 0:
+    if uv_int.ndim != 2 or uv_int.shape[1] != 2 or uv_int.shape[0] == 0:
         return _empty_uv_world_int()
 
     lookup = _as_extrap_lookup_arrays(extrap_lookup)
-    lookup_uv = np.asarray(lookup.uv, dtype=np.int64)
-    lookup_world = np.asarray(lookup.world, dtype=np.float32)
-    if lookup_uv.ndim != 2 or lookup_uv.shape[1] != 2:
-        return _empty_uv_world_int()
-    if lookup_world.ndim != 2 or lookup_world.shape[1] != 3:
-        return _empty_uv_world_int()
+    lookup_uv, lookup_world = _coerce_uv_world(
+        lookup.uv,
+        lookup.world,
+        uv_dtype=np.int64,
+        world_dtype=np.float32,
+    )
     if lookup_uv.shape[0] == 0:
         return _empty_uv_world_int()
 
@@ -627,10 +655,10 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
 
 def _empty_stack_samples():
     return {
-        "uv": np.zeros((0, 2), dtype=np.int64),
-        "world": np.zeros((0, 3), dtype=np.float32),
-        "displacement": np.zeros((0, 3), dtype=np.float32),
-        "stack_count": np.zeros((0,), dtype=np.uint32),
+        "uv": _empty_uv(dtype=np.int64),
+        "world": _empty_world(dtype=np.float32),
+        "displacement": _empty_world(dtype=np.float32),
+        "stack_count": _empty_counts(dtype=np.uint32),
     }
 
 
@@ -655,6 +683,33 @@ def _per_crop_displacement_bbox(per_crop_fields):
         int(global_min[2]),
         int(global_max_exclusive[2] - 1),
     )
+
+
+def _local_coords_in_bounds(world_points, min_corner, shape_dhw):
+    d, h, w = (int(shape_dhw[0]), int(shape_dhw[1]), int(shape_dhw[2]))
+    min_corner = np.asarray(min_corner, dtype=np.float32)
+    world_points = np.asarray(world_points, dtype=np.float32)
+
+    z_local = world_points[:, 0] - float(min_corner[0])
+    y_local = world_points[:, 1] - float(min_corner[1])
+    x_local = world_points[:, 2] - float(min_corner[2])
+    in_bounds = (
+        (z_local >= 0.0) & (z_local <= float(d - 1)) &
+        (y_local >= 0.0) & (y_local <= float(h - 1)) &
+        (x_local >= 0.0) & (x_local <= float(w - 1))
+    )
+    point_idx = np.nonzero(in_bounds)[0]
+    if point_idx.size == 0:
+        return point_idx, np.zeros((0, 3), dtype=np.float32)
+    coords_local = np.stack(
+        [
+            z_local[point_idx],
+            y_local[point_idx],
+            x_local[point_idx],
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    return point_idx, coords_local
 
 
 def _sample_displacement_for_extrap_uvs_from_crops(
@@ -685,26 +740,13 @@ def _sample_displacement_for_extrap_uvs_from_crops(
         min_corner = np.asarray(item["min_corner"], dtype=np.float32)
         _, d, h, w = disp.shape
 
-        z_local = sampled_world[:, 0] - float(min_corner[0])
-        y_local = sampled_world[:, 1] - float(min_corner[1])
-        x_local = sampled_world[:, 2] - float(min_corner[2])
-        in_bounds = (
-            (z_local >= 0.0) & (z_local <= float(d - 1)) &
-            (y_local >= 0.0) & (y_local <= float(h - 1)) &
-            (x_local >= 0.0) & (x_local <= float(w - 1))
+        point_idx, coords_local = _local_coords_in_bounds(
+            sampled_world,
+            min_corner,
+            (d, h, w),
         )
-        if not in_bounds.any():
+        if point_idx.size == 0:
             continue
-
-        point_idx = np.nonzero(in_bounds)[0]
-        coords_local = np.stack(
-            [
-                z_local[point_idx],
-                y_local[point_idx],
-                x_local[point_idx],
-            ],
-            axis=-1,
-        ).astype(np.float32, copy=False)
 
         shape_key = (int(d), int(h), int(w))
         count_field = ones_cache.get(shape_key)
@@ -712,19 +754,14 @@ def _sample_displacement_for_extrap_uvs_from_crops(
             count_field = np.ones(shape_key, dtype=np.uint8)
             ones_cache[shape_key] = count_field
 
-        if refine is None:
-            sampled_disp, _, valid_mask = _sample_trilinear_displacement_stack(
-                disp,
-                count_field,
-                coords_local,
-            )
-        else:
-            sampled_disp, _, valid_mask = _sample_fractional_displacement_stack(
-                disp,
-                count_field,
-                coords_local,
-                refine_extra_steps=int(refine),
-            )
+        sample_fn = _sample_trilinear_displacement_stack if refine is None else _sample_fractional_displacement_stack
+        sample_kwargs = {} if refine is None else {"refine_extra_steps": int(refine)}
+        sampled_disp, _, valid_mask = sample_fn(
+            disp,
+            count_field,
+            coords_local,
+            **sample_kwargs,
+        )
         if not valid_mask.any():
             continue
 
@@ -794,7 +831,7 @@ def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extr
 def _lookup_extrap_zyxs_for_uvs(sampled_uv, extrap_lookup):
     sampled_uv = np.asarray(sampled_uv, dtype=np.int64)
     if sampled_uv.ndim != 2 or sampled_uv.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32)
+        return _empty_world(dtype=np.float32)
 
     extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(sampled_uv, extrap_lookup)
     if extrap_uv.shape[0] != sampled_uv.shape[0] or not np.array_equal(extrap_uv, sampled_uv):
@@ -819,6 +856,17 @@ def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
     }
 
 
+def _coords_local_to_grid(coords_local, d, h, w):
+    coords_t = torch.from_numpy(np.asarray(coords_local, dtype=np.float32)).clone()
+    d_denom = max(int(d) - 1, 1)
+    h_denom = max(int(h) - 1, 1)
+    w_denom = max(int(w) - 1, 1)
+    coords_t[:, 0] = 2.0 * coords_t[:, 0] / float(d_denom) - 1.0
+    coords_t[:, 1] = 2.0 * coords_t[:, 1] / float(h_denom) - 1.0
+    coords_t[:, 2] = 2.0 * coords_t[:, 2] / float(w_denom) - 1.0
+    return coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+
+
 def _sample_trilinear_displacement_stack(disp, count, coords_local):
     if coords_local is None or len(coords_local) == 0:
         return _empty_disp_count_valid()
@@ -828,15 +876,8 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
     valid_t = (count_t > 0).to(dtype=disp_t.dtype)
     disp_weighted_t = disp_t * valid_t
 
-    coords_t = torch.from_numpy(np.asarray(coords_local, dtype=np.float32)).clone()
     _, _, d, h, w = disp_t.shape
-    d_denom = max(int(d) - 1, 1)
-    h_denom = max(int(h) - 1, 1)
-    w_denom = max(int(w) - 1, 1)
-    coords_t[:, 0] = 2.0 * coords_t[:, 0] / float(d_denom) - 1.0
-    coords_t[:, 1] = 2.0 * coords_t[:, 1] / float(h_denom) - 1.0
-    coords_t[:, 2] = 2.0 * coords_t[:, 2] / float(w_denom) - 1.0
-    grid = coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+    grid = _coords_local_to_grid(coords_local, d=d, h=h, w=w)
 
     sampled_disp_weighted = F.grid_sample(
         disp_weighted_t,
@@ -874,11 +915,11 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
 
 def _empty_displaced_samples():
     return {
-        "uv": np.zeros((0, 2), dtype=np.int64),
-        "world": np.zeros((0, 3), dtype=np.float32),
-        "displacement": np.zeros((0, 3), dtype=np.float32),
-        "world_displaced": np.zeros((0, 3), dtype=np.float32),
-        "stack_count": np.zeros((0,), dtype=np.uint32),
+        "uv": _empty_uv(dtype=np.int64),
+        "world": _empty_world(dtype=np.float32),
+        "displacement": _empty_world(dtype=np.float32),
+        "world_displaced": _empty_world(dtype=np.float32),
+        "stack_count": _empty_counts(dtype=np.uint32),
     }
 
 
@@ -912,8 +953,8 @@ def _expand_surface_canvas_to_fit_points(
     expanded_zyxs[rr0:rr0 + h, cc0:cc0 + w] = merged_zyxs
     expanded_valid[rr0:rr0 + h, cc0:cc0 + w] = merged_valid
 
+    _print_section_header(verbose, "Merge Displaced Into Full Surface")
     if verbose:
-        print("== Merge Displaced Into Full Surface ==")
         print(
             f"expanded UV canvas: shape ({original_shape[0]}, {original_shape[1]}) -> ({new_h}, {new_w}), "
             f"offset ({int(original_offset[0])}, {int(original_offset[1])}) -> ({min_r}, {min_c})"
@@ -947,24 +988,29 @@ def _compute_merge_write_indices(uv_n, pts_n, r0, c0, h, w):
     return rr_all, cc_all, write_indices, n_nonfinite, n_out_of_bounds
 
 
+def _print_section_header(verbose, title):
+    if verbose:
+        print(f"== {title} ==")
+
+
 def _apply_displacement(samples, verbose=True, skip_inference=False):
-    world = np.asarray(samples.get("world", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
-    displacement = np.asarray(samples.get("displacement", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
-    uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
-    stack_count = np.asarray(samples.get("stack_count", np.zeros((0,), dtype=np.uint32)), dtype=np.uint32)
+    world = np.asarray(samples.get("world", _empty_world(dtype=np.float32)), dtype=np.float32)
+    displacement = np.asarray(samples.get("displacement", _empty_world(dtype=np.float32)), dtype=np.float32)
+    uv = np.asarray(samples.get("uv", _empty_uv(dtype=np.int64)), dtype=np.int64)
+    stack_count = np.asarray(samples.get("stack_count", _empty_counts(dtype=np.uint32)), dtype=np.uint32)
 
     if skip_inference:
         n = int(min(uv.shape[0], world.shape[0], stack_count.shape[0]))
         if n == 0:
+            _print_section_header(verbose, "Applied Displacement")
             if verbose:
-                print("== Applied Displacement ==")
                 print("Extrap-only mode: no extrapolated points selected to merge.")
             return _empty_displaced_samples()
         uv = uv[:n].astype(np.int64, copy=False)
         world = world[:n].astype(np.float32, copy=False)
         stack_count = stack_count[:n].astype(np.uint32, copy=False)
+        _print_section_header(verbose, "Applied Displacement")
         if verbose:
-            print("== Applied Displacement ==")
             print("Extrap-only mode: bypassed displacement sampling; merging extrapolated points directly.")
             print(f"n points: {n}")
         return {
@@ -976,16 +1022,16 @@ def _apply_displacement(samples, verbose=True, skip_inference=False):
         }
 
     if world.shape[0] == 0 or displacement.shape[0] == 0:
+        _print_section_header(verbose, "Applied Displacement")
         if verbose:
-            print("== Applied Displacement ==")
             print("No sampled points to apply displacement.")
         return _empty_displaced_samples()
 
     world_displaced = world + displacement
     disp_norm = np.linalg.norm(displacement.astype(np.float64), axis=1)
 
+    _print_section_header(verbose, "Applied Displacement")
     if verbose:
-        print("== Applied Displacement ==")
         print(f"n points: {world.shape[0]}")
         print(
             "disp_norm min/max/mean/median: "
@@ -1013,12 +1059,12 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     merged_zyxs = np.asarray(cond_zyxs, dtype=np.float32).copy()
     merged_valid = np.asarray(cond_valid, dtype=bool).copy()
 
-    uv = np.asarray(displaced.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
-    pts = np.asarray(displaced.get("world_displaced", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    uv = np.asarray(displaced.get("uv", _empty_uv(dtype=np.int64)), dtype=np.int64)
+    pts = np.asarray(displaced.get("world_displaced", _empty_world(dtype=np.float32)), dtype=np.float32)
 
     if uv.shape[0] == 0 or pts.shape[0] == 0:
+        _print_section_header(verbose, "Merge Displaced Into Full Surface")
         if verbose:
-            print("== Merge Displaced Into Full Surface ==")
             print("No displaced points to merge.")
         return {
             "merged_zyxs": merged_zyxs,
@@ -1071,8 +1117,8 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
         merged_valid[rr, cc] = True
         n_written += 1
 
+    _print_section_header(verbose, "Merge Displaced Into Full Surface")
     if verbose:
-        print("== Merge Displaced Into Full Surface ==")
         print(f"written points: {n_written}")
         print(f"new valid points: {n_new_valid}")
         print(f"overwrote existing valid points: {n_overwrite_existing}")
@@ -1091,6 +1137,14 @@ def _merge_displaced_points_into_full_surface(cond_zyxs, cond_valid, cond_uv_off
     }
 
 
+def _extreme_true_index(mask, axis, toward_max):
+    mask = np.asarray(mask, dtype=bool)
+    if toward_max:
+        flipped = np.flip(mask, axis=axis)
+        return mask.shape[axis] - 1 - np.argmax(flipped, axis=axis)
+    return np.argmax(mask, axis=axis)
+
+
 def _boundary_axis_value(valid, uv_offset, grow_direction):
     valid = np.asarray(valid, dtype=bool)
     if valid.size == 0 or not valid.any():
@@ -1099,30 +1153,19 @@ def _boundary_axis_value(valid, uv_offset, grow_direction):
     _, growth_spec = _get_growth_context(grow_direction)
     r0, c0 = int(uv_offset[0]), int(uv_offset[1])
 
-    if growth_spec["axis"] == "col":
-        # For left/right growth, boundary is measured per row by extreme column.
-        line_valid = np.any(valid, axis=1)
-        if not line_valid.any():
-            return None
-        n_cols = valid.shape[1]
-        if growth_spec["growth_sign"] > 0:
-            boundary_rel = n_cols - 1 - np.argmax(valid[:, ::-1], axis=1)
-        else:
-            boundary_rel = np.argmax(valid, axis=1)
-        line_ids = np.where(line_valid)[0].astype(np.int64, copy=False) + r0
-        boundary_vals = boundary_rel[line_valid].astype(np.int64, copy=False) + c0
-    else:
-        # For up/down growth, boundary is measured per column by extreme row.
-        line_valid = np.any(valid, axis=0)
-        if not line_valid.any():
-            return None
-        n_rows = valid.shape[0]
-        if growth_spec["growth_sign"] > 0:
-            boundary_rel = n_rows - 1 - np.argmax(valid[::-1, :], axis=0)
-        else:
-            boundary_rel = np.argmax(valid, axis=0)
-        line_ids = np.where(line_valid)[0].astype(np.int64, copy=False) + c0
-        boundary_vals = boundary_rel[line_valid].astype(np.int64, copy=False) + r0
+    is_col_growth = growth_spec["axis"] == "col"
+    line_axis = 0 if is_col_growth else 1
+    boundary_axis = 1 - line_axis
+    line_valid = np.any(valid, axis=boundary_axis)
+    if not line_valid.any():
+        return None
+
+    toward_max = growth_spec["growth_sign"] > 0
+    boundary_rel = _extreme_true_index(valid, axis=boundary_axis, toward_max=toward_max)
+    line_base = r0 if line_axis == 0 else c0
+    boundary_base = c0 if boundary_axis == 1 else r0
+    line_ids = np.where(line_valid)[0].astype(np.int64, copy=False) + line_base
+    boundary_vals = boundary_rel[line_valid].astype(np.int64, copy=False) + boundary_base
 
     return line_ids, boundary_vals
 
@@ -1160,6 +1203,20 @@ def _report_iteration_stop(verbose, iteration_pbar, message, postfix=None):
         iteration_pbar.set_postfix_str(postfix, refresh=True)
 
 
+def _finite_valid_grid_points(grid, valid):
+    rows, cols = np.where(np.asarray(valid, dtype=bool))
+    if rows.size == 0:
+        return _empty_counts(dtype=np.int64), _empty_counts(dtype=np.int64), _empty_world(dtype=np.float32)
+
+    pts = np.asarray(grid, dtype=np.float32)[rows, cols].astype(np.float32, copy=False)
+    finite = np.isfinite(pts).all(axis=1)
+    if not finite.any():
+        return _empty_counts(dtype=np.int64), _empty_counts(dtype=np.int64), _empty_world(dtype=np.float32)
+    rows = rows[finite].astype(np.int64, copy=False)
+    cols = cols[finite].astype(np.int64, copy=False)
+    return rows, cols, pts[finite].astype(np.float32, copy=False)
+
+
 def _surface_to_stored_uv_samples_nearest(
     grid,
     valid,
@@ -1167,18 +1224,9 @@ def _surface_to_stored_uv_samples_nearest(
     sub_r,
     sub_c,
 ):
-    rows, cols = np.where(np.asarray(valid, dtype=bool))
+    rows, cols, pts = _finite_valid_grid_points(grid, valid)
     if rows.size == 0:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
-
-    pts = np.asarray(grid, dtype=np.float32)[rows, cols].astype(np.float32, copy=False)
-    finite = np.isfinite(pts).all(axis=1)
-    if not finite.any():
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3), dtype=np.float32)
-
-    rows = rows[finite].astype(np.int64, copy=False)
-    cols = cols[finite].astype(np.int64, copy=False)
-    pts = pts[finite]
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32)
 
     r_abs = rows + int(uv_offset[0])
     c_abs = cols + int(uv_offset[1])
@@ -1200,23 +1248,116 @@ def _surface_to_stored_uv_samples_nearest(
 
 
 def _build_extrap_lookup_from_grid(grid, valid, offset):
-    rows, cols = np.where(np.asarray(valid, dtype=bool))
+    rows, cols, pts = _finite_valid_grid_points(grid, valid)
     if rows.size == 0:
         return _empty_extrap_lookup_arrays()
     rows_abs = rows.astype(np.int64) + int(offset[0])
     cols_abs = cols.astype(np.int64) + int(offset[1])
-    pts = np.asarray(grid, dtype=np.float32)[rows, cols]
-    finite_mask = np.isfinite(pts).all(axis=1)
-    if not finite_mask.any():
-        return _empty_extrap_lookup_arrays()
-    rows_abs = rows_abs[finite_mask]
-    cols_abs = cols_abs[finite_mask]
-    pts = pts[finite_mask].astype(np.float32, copy=False)
     uv = np.stack([rows_abs, cols_abs], axis=-1).astype(np.int64, copy=False)
     return ExtrapLookupArrays(
         uv=uv,
         world=pts,
     )
+
+
+def _clear_edge_extrapolation_payload(edge_extrapolation):
+    # Keep only lightweight metadata after extrapolation lookup construction.
+    edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
+    edge_extrapolation["query_uv"] = _empty_uv(dtype=np.float64)
+    edge_extrapolation["extrapolated_local"] = _empty_world(dtype=np.float32)
+    edge_extrapolation["extrapolated_world"] = _empty_world(dtype=np.float32)
+
+
+def _build_iteration_extrap_lookup(edge_extrapolation, verbose=False, napari=False):
+    if verbose or napari:
+        query_uv, extrapolated_world = _finite_uv_world(
+            edge_extrapolation.get("query_uv"),
+            edge_extrapolation.get("extrapolated_world"),
+        )
+        uv_world_samples = [(query_uv, extrapolated_world)] if query_uv.shape[0] > 0 else []
+        aggregated_world_grid, aggregated_valid_mask, aggregated_uv_offset = _aggregate_pred_samples_to_uv_grid(
+            uv_world_samples
+        )
+        extrap_lookup = _build_extrap_lookup_from_grid(
+            aggregated_world_grid,
+            aggregated_valid_mask,
+            aggregated_uv_offset,
+        )
+    else:
+        extrap_lookup = _build_extrap_lookup_arrays(edge_extrapolation)
+    _clear_edge_extrapolation_payload(edge_extrapolation)
+    return extrap_lookup
+
+
+def _sample_iteration_agg_samples(
+    args,
+    profiler,
+    grow_direction,
+    extrap_only_mode,
+    run_model_inference,
+    model_state,
+    bbox_crops,
+    extrap_lookup,
+):
+    disp_bbox = None
+    if extrap_only_mode:
+        with profiler.section("iter_sample_extrap_no_disp"):
+            agg_samples = _sample_extrap_no_disp(
+                extrap_lookup,
+                grow_direction,
+                max_lines=args.agg_extrap_lines,
+            )
+        return agg_samples, disp_bbox
+
+    if run_model_inference and model_state is not None:
+        with profiler.section("iter_displacement_inference"):
+            per_crop_fields = _run_inference(
+                args,
+                bbox_crops,
+                model_state,
+                verbose=args.verbose,
+            )
+        disp_bbox = _per_crop_displacement_bbox(per_crop_fields)
+        with profiler.section("iter_sample_crop_displacement"):
+            agg_samples = _sample_displacement_for_extrap_uvs_from_crops(
+                per_crop_fields,
+                extrap_lookup,
+                grow_direction,
+                max_lines=args.agg_extrap_lines,
+                refine=args.refine,
+            )
+        del per_crop_fields
+        return agg_samples, disp_bbox
+
+    return _empty_stack_samples(), disp_bbox
+
+
+def _iteration_should_stop(
+    merged_iter,
+    prev_boundary,
+    next_boundary,
+    grow_direction,
+    n_bboxes,
+    verbose,
+    iteration_pbar,
+):
+    if int(merged_iter.get("n_new_valid", 0)) < 1:
+        _report_iteration_stop(
+            verbose,
+            iteration_pbar,
+            "No newly added valid points this iteration; stopping iterative growth.",
+            postfix=f"bboxes={n_bboxes} | stopped: no new valid points",
+        )
+        return True
+    if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
+        _report_iteration_stop(
+            verbose,
+            iteration_pbar,
+            "Boundary did not advance this iteration; stopping iterative growth.",
+            postfix=f"bboxes={n_bboxes} | stopped: boundary unchanged",
+        )
+        return True
+    return False
 
 
 def main():
@@ -1354,27 +1495,11 @@ def main():
             edge_extrapolation = _empty_edge_extrapolation()
 
         with profiler.section("iter_aggregate_extrapolation"):
-            if args.verbose or args.napari:
-                query_uv, extrapolated_world = _finite_uv_world(
-                    edge_extrapolation.get("query_uv"),
-                    edge_extrapolation.get("extrapolated_world"),
-                )
-                uv_world_samples = [(query_uv, extrapolated_world)] if len(query_uv) > 0 else []
-                aggregated_world_grid, aggregated_valid_mask, aggregated_uv_offset = _aggregate_pred_samples_to_uv_grid(
-                    uv_world_samples
-                )
-                extrap_lookup = _build_extrap_lookup_from_grid(
-                    aggregated_world_grid,
-                    aggregated_valid_mask,
-                    aggregated_uv_offset,
-                )
-            else:
-                extrap_lookup = _build_extrap_lookup_arrays(edge_extrapolation)
-            # Keep only lightweight edge_extrapolation fields after lookup construction.
-            edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
-            edge_extrapolation["query_uv"] = np.zeros((0, 2), dtype=np.float64)
-            edge_extrapolation["extrapolated_local"] = np.zeros((0, 3), dtype=np.float32)
-            edge_extrapolation["extrapolated_world"] = np.zeros((0, 3), dtype=np.float32)
+            extrap_lookup = _build_iteration_extrap_lookup(
+                edge_extrapolation,
+                verbose=args.verbose,
+                napari=args.napari,
+            )
 
         with profiler.section("iter_build_bbox_crops"):
             bbox_crops = _build_bbox_crops(
@@ -1393,34 +1518,16 @@ def main():
         _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
         bbox_results = bbox_crops
 
-        disp_bbox = None
-        if extrap_only_mode:
-            with profiler.section("iter_sample_extrap_no_disp"):
-                agg_samples = _sample_extrap_no_disp(
-                    extrap_lookup,
-                    grow_direction,
-                    max_lines=args.agg_extrap_lines,
-                )
-        elif run_model_inference and model_state is not None:
-            with profiler.section("iter_displacement_inference"):
-                per_crop_fields = _run_inference(
-                    args,
-                    bbox_crops,
-                    model_state,
-                    verbose=args.verbose,
-                )
-            disp_bbox = _per_crop_displacement_bbox(per_crop_fields)
-            with profiler.section("iter_sample_crop_displacement"):
-                agg_samples = _sample_displacement_for_extrap_uvs_from_crops(
-                    per_crop_fields,
-                    extrap_lookup,
-                    grow_direction,
-                    max_lines=args.agg_extrap_lines,
-                    refine=args.refine,
-                )
-            del per_crop_fields
-        else:
-            agg_samples = _empty_stack_samples()
+        agg_samples, disp_bbox = _sample_iteration_agg_samples(
+            args,
+            profiler,
+            grow_direction,
+            extrap_only_mode,
+            run_model_inference,
+            model_state,
+            bbox_crops,
+            extrap_lookup,
+        )
 
         _print_iteration_summary(
             bbox_results,
@@ -1462,21 +1569,15 @@ def main():
         current_valid = merged_iter["merged_valid"]
         current_uv_offset = merged_iter["uv_offset"]
 
-        if int(merged_iter.get("n_new_valid", 0)) < 1:
-            _report_iteration_stop(
-                args.verbose,
-                iteration_pbar,
-                "No newly added valid points this iteration; stopping iterative growth.",
-                postfix=f"bboxes={len(bboxes)} | stopped: no new valid points",
-            )
-            break
-        if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
-            _report_iteration_stop(
-                args.verbose,
-                iteration_pbar,
-                "Boundary did not advance this iteration; stopping iterative growth.",
-                postfix=f"bboxes={len(bboxes)} | stopped: boundary unchanged",
-            )
+        if _iteration_should_stop(
+            merged_iter,
+            prev_boundary,
+            next_boundary,
+            grow_direction,
+            n_bboxes=len(bboxes),
+            verbose=args.verbose,
+            iteration_pbar=iteration_pbar,
+        ):
             break
 
     if iteration_pbar is not None:
