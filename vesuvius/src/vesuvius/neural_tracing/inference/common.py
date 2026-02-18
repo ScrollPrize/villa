@@ -465,64 +465,25 @@ def _crop_volume_from_min_corner(volume, min_corner, crop_size):
     return vol_crop
 
 
-def _build_uv_query_from_cond_points(uv_cond_pts, grow_direction, cond_pct):
-    if uv_cond_pts is None or len(uv_cond_pts) == 0:
-        return np.zeros((0, 0, 2), dtype=np.float64)
-
-    _, direction = _get_growth_context(grow_direction)
-    uv_cond_pts = np.asarray(uv_cond_pts)
-    r_min = int(np.floor(uv_cond_pts[:, 0].min()))
-    r_max = int(np.ceil(uv_cond_pts[:, 0].max()))
-    c_min = int(np.floor(uv_cond_pts[:, 1].min()))
-    c_max = int(np.ceil(uv_cond_pts[:, 1].max()))
-
-    def _mask_span(cond_span):
-        cond_span = int(max(1, cond_span))
-        # cond_pct is conditioning fraction of the combined (cond + extrap) span.
-        # Rearranging gives extrap span to query beyond the current boundary.
-        if cond_pct <= 0:
-            return cond_span
-        total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
-        return max(1, total_span - cond_span)
-
-    if direction["axis"] == "col":
-        rows = np.arange(r_min, r_max + 1, dtype=np.int64)
-        mask_w = _mask_span(c_max - c_min + 1)
-        if direction["growth_sign"] > 0:
-            cols = np.arange(c_max + 1, c_max + mask_w + 1, dtype=np.int64)
-        else:
-            cols = np.arange(c_min - mask_w, c_min, dtype=np.int64)
-        return np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1)
-
-    cols = np.arange(c_min, c_max + 1, dtype=np.int64)
-    mask_h = _mask_span(r_max - r_min + 1)
-    if direction["growth_sign"] > 0:
-        rows = np.arange(r_max + 1, r_max + mask_h + 1, dtype=np.int64)
-    else:
-        rows = np.arange(r_min - mask_h, r_min, dtype=np.int64)
-    return np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1)
+def _compute_query_mask_span(cond_span, cond_pct):
+    cond_span = int(max(1, cond_span))
+    # cond_pct is conditioning fraction of the combined (cond + extrap) span.
+    # Rearranging gives extrap span to query beyond the current boundary.
+    if cond_pct <= 0:
+        return cond_span
+    total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
+    return max(1, total_span - cond_span)
 
 
 def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     """
-    Build extrapolation UVs from a per-line edge band.
-
-    Unlike _build_uv_query_from_cond_points(), this keeps a per-row/per-col
-    frontier so irregular/non-rectangular edges do not collapse to a single
-    global min/max line.
+    Build extrapolation UVs from a per-line frontier over edge-conditioning UVs.
     """
     if uv_edge_pts is None or len(uv_edge_pts) == 0:
         return np.zeros((0, 0, 2), dtype=np.int64)
 
     _, direction = _get_growth_context(grow_direction)
     uv = np.rint(np.asarray(uv_edge_pts)).astype(np.int64, copy=False)
-
-    def _mask_span(cond_span):
-        cond_span = int(max(1, cond_span))
-        if cond_pct <= 0:
-            return cond_span
-        total_span = max(cond_span + 1, int(round(cond_span / float(cond_pct))))
-        return max(1, total_span - cond_span)
 
     if direction["axis"] == "col":
         rows = uv[:, 0]
@@ -537,7 +498,7 @@ def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
         np.maximum.at(row_max, row_inv, cols)
 
         cond_span = int(np.median(row_max - row_min + 1))
-        mask_w = _mask_span(cond_span)
+        mask_w = _compute_query_mask_span(cond_span, cond_pct)
         offsets = np.arange(mask_w, dtype=np.int64)
 
         if direction["growth_sign"] > 0:
@@ -562,7 +523,7 @@ def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     np.maximum.at(col_max, col_inv, rows)
 
     cond_span = int(np.median(col_max - col_min + 1))
-    mask_h = _mask_span(cond_span)
+    mask_h = _compute_query_mask_span(cond_span, cond_pct)
     offsets = np.arange(mask_h, dtype=np.int64)
 
     if direction["growth_sign"] > 0:

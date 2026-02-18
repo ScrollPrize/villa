@@ -12,7 +12,7 @@ from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.common import (
     _bbox_to_min_corner_and_bounds_array,
     _build_uv_grid,
-    _build_uv_query_from_cond_points,
+    _build_uv_query_from_edge_band,
     _crop_volume_from_min_corner,
     _get_growth_context,
     _initialize_window_state,
@@ -513,7 +513,7 @@ def _build_bbox_crops(
         cond_world = cond_world_all[cond_in_bounds].astype(np.float32, copy=False)
         cond_local = cond_local_all[cond_in_bounds].astype(np.float32, copy=False)
         cond_vox = _points_to_voxels(cond_local, crop_size)
-        uv_query = _build_uv_query_from_cond_points(cond_uv, grow_direction, cond_pct)
+        uv_query = _build_uv_query_from_edge_band(cond_uv, grow_direction, cond_pct)
         uv_query_flat = uv_query.reshape(-1, 2).astype(np.float64, copy=False)
 
         extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup)
