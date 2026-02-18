@@ -10,7 +10,6 @@ from tqdm import tqdm
 
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.common import (
-    _aggregate_pred_samples_to_uv_grid,
     _bbox_to_min_corner_and_bounds_array,
     _build_uv_grid,
     _build_uv_query_from_cond_points,
@@ -1181,44 +1180,17 @@ def _surface_to_stored_uv_samples_nearest(
     return uniq_uv.astype(np.int64, copy=False), pts_mean
 
 
-def _build_extrap_lookup_from_grid(grid, valid, offset):
-    rows, cols, pts = _finite_valid_grid_points(grid, valid)
-    if rows.size == 0:
-        return _empty_extrap_lookup_arrays()
-    rows_abs = rows.astype(np.int64) + int(offset[0])
-    cols_abs = cols.astype(np.int64) + int(offset[1])
-    uv = np.stack([rows_abs, cols_abs], axis=-1).astype(np.int64, copy=False)
-    return _make_extrap_lookup_arrays(uv, pts)
+def _build_iteration_extrap_lookup(edge_extrapolation):
+    return _build_extrap_lookup_arrays(edge_extrapolation)
 
 
-def _build_iteration_extrap_lookup(edge_extrapolation, verbose=False, napari=False):
-    if verbose or napari:
-        query_uv_grid = np.asarray(edge_extrapolation.get("query_uv_grid", np.zeros((0, 0, 2), dtype=np.int64)))
-        if query_uv_grid.ndim == 3 and query_uv_grid.shape[-1] == 2:
-            query_uv_flat = query_uv_grid.reshape(-1, 2)
-        else:
-            query_uv_flat = _empty_uv(dtype=np.float64)
-        query_uv, extrapolated_world = _finite_uv_world(
-            query_uv_flat,
-            edge_extrapolation.get("extrapolated_world"),
-        )
-        uv_world_samples = [(query_uv, extrapolated_world)] if query_uv.shape[0] > 0 else []
-        aggregated_world_grid, aggregated_valid_mask, aggregated_uv_offset = _aggregate_pred_samples_to_uv_grid(
-            uv_world_samples
-        )
-        extrap_lookup = _build_extrap_lookup_from_grid(
-            aggregated_world_grid,
-            aggregated_valid_mask,
-            aggregated_uv_offset,
-        )
-    else:
-        extrap_lookup = _build_extrap_lookup_arrays(edge_extrapolation)
-
+def _prune_edge_extrapolation_after_lookup(edge_extrapolation):
+    pruned = dict(edge_extrapolation) if isinstance(edge_extrapolation, dict) else {}
     # Keep only lightweight metadata after extrapolation lookup construction.
-    edge_extrapolation["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
-    edge_extrapolation["extrapolated_local"] = _empty_world(dtype=np.float32)
-    edge_extrapolation["extrapolated_world"] = _empty_world(dtype=np.float32)
-    return extrap_lookup
+    pruned["query_uv_grid"] = np.zeros((0, 0, 2), dtype=np.int64)
+    pruned["extrapolated_local"] = _empty_world(dtype=np.float32)
+    pruned["extrapolated_world"] = _empty_world(dtype=np.float32)
+    return pruned
 
 
 def _sample_iteration_agg_samples(
@@ -1427,11 +1399,8 @@ def main():
             edge_extrapolation = _empty_edge_extrapolation()
 
         with profiler.section("iter_aggregate_extrapolation"):
-            extrap_lookup = _build_iteration_extrap_lookup(
-                edge_extrapolation,
-                verbose=args.verbose,
-                napari=args.napari,
-            )
+            extrap_lookup = _build_iteration_extrap_lookup(edge_extrapolation)
+            edge_extrapolation = _prune_edge_extrapolation_after_lookup(edge_extrapolation)
 
         with profiler.section("iter_build_bbox_crops"):
             bbox_crops = _build_bbox_crops(
