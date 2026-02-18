@@ -648,8 +648,9 @@ static bool fit_normal_tiny(
     n0[0] = params[0];
     n0[1] = params[1];
     n0[2] = params[2];
-    const double len = std::sqrt(n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2]);
-    if (!(len > 1e-12)) return false;
+    const double len2 = n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2];
+    if (!(len2 > 1e-24)) return false;
+    const double len = std::sqrt(len2);
     out_n = cv::Point3f(static_cast<float>(n0[0] / len), static_cast<float>(n0[1] / len), static_cast<float>(n0[2] / len));
 
     if (inout_init_n != nullptr) {
@@ -1061,8 +1062,9 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
             c(az, z0, y0, x0), c(az, z1, y0, x0), c(az, z0, y1, x0), c(az, z1, y1, x0),
             c(az, z0, y0, x1), c(az, z1, y0, x1), c(az, z0, y1, x1), c(az, z1, y1, x1));
 
-        const double nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
-        if (!(nlen > 1e-12)) return false;
+        const double nlen2 = nx * nx + ny * ny + nz * nz;
+        if (!(nlen2 > 1e-24)) return false;
+        const double nlen = std::sqrt(nlen2);
         out_n_xyz = cv::Point3f(static_cast<float>(nx / nlen), static_cast<float>(ny / nlen), static_cast<float>(nz / nlen));
         return true;
     };

@@ -277,16 +277,16 @@ public:
                 
                 // Distance to neighbor in X direction
                 cv::Vec3f v = points(j, i) - points(j, i-1);
-                double dist_x = std::sqrt(v.dot(v));
-                if (dist_x > 0) {
-                    sum_x += dist_x;
+                const double dist_x_sq = v.dot(v);
+                if (dist_x_sq > 0) {
+                    sum_x += std::sqrt(dist_x_sq);
                 }
                 
                 // Distance to neighbor in Y direction
                 v = points(j, i) - points(j-1, i);
-                double dist_y = std::sqrt(v.dot(v));
-                if (dist_y > 0) {
-                    sum_y += dist_y;
+                const double dist_y_sq = v.dot(v);
+                if (dist_y_sq > 0) {
+                    sum_y += std::sqrt(dist_y_sq);
                 }
                 count++;
             }

@@ -367,8 +367,8 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
 
                 // For circle mode, skip pixels outside the radius
                 if (!useRectangle) {
-                    const float distance = std::sqrt(static_cast<float>(dr * dr + dc * dc));
-                    if (distance > radiusSteps) {
+                    const float distanceSq = static_cast<float>(dr * dr + dc * dc);
+                    if (distanceSq > static_cast<float>(radiusSteps * radiusSteps)) {
                         continue;
                     }
                 }
@@ -1283,4 +1283,3 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     const qreal opacity = static_cast<qreal>(_approvalMaskOpacity) / 100.0;
     builder.addImage(cache.compositeImage, topLeft, gridToSceneScale, opacity, kApprovalMaskZ);
 }
-

@@ -65,12 +65,13 @@ struct SpacingConstraint {
     bool operator()(const T* const p1, const T* const p2, T* residual) const {
         T dx = p1[0] - p2[0];
         T dy = p1[1] - p2[1];
-        T dist_norm = ceres::sqrt(dx * dx + dy * dy)/T(target_distance_);
+        T dist_sq = dx * dx + dy * dy;
+        T dist_norm_sq = dist_sq / (T(target_distance_) * T(target_distance_));
         //FIXME
-        if (dist_norm < T(1.0))
-            residual[0] = T(weight_) * (dist_norm-T(1.0))/dist_norm;
+        if (dist_norm_sq < T(1.0))
+            residual[0] = T(weight_) * ((ceres::sqrt(dist_sq)/T(target_distance_)-T(1.0))/(ceres::sqrt(dist_sq)/T(target_distance_)));
         else
-            residual[0] = T(weight_) * (dist_norm-T(1.0));
+            residual[0] = T(weight_) * (ceres::sqrt(dist_sq)/T(target_distance_)-T(1.0));
 
         // residual[0] = T(weight_) * (ceres::sqrt(dx * dx + dy * dy)/T(target_distance_) - T(1.0));
         return true;

@@ -186,11 +186,11 @@ float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& para
     );
 
     // Normalize the surface normal (in case it isn't already)
-    float normalLen = std::sqrt(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
-    if (normalLen < 0.0001f) {
+    const float normalLenSq = normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2];
+    if (normalLenSq < 1e-8f) {
         return params.lightAmbient;
     }
-    cv::Vec3f n = normal / normalLen;
+    cv::Vec3f n = normal / std::sqrt(normalLenSq);
 
     // Lambertian diffuse: N dot L
     float nDotL = n[0]*lightDir[0] + n[1]*lightDir[1] + n[2]*lightDir[2];
