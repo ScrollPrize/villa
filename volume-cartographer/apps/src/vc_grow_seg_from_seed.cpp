@@ -644,62 +644,80 @@ int main(int argc, char *argv[])
             return ray_dir_valid(rr, cc) != 0;
         };
 
+        // Build a compact list of vertices that have valid source points + ray directions.
+        // This avoids re-checking invalid cells inside the expensive march loop.
+        std::vector<cv::Vec2i> active_vertices;
+        active_vertices.reserve(static_cast<size_t>(rows) * static_cast<size_t>(cols) / 2);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (src_valid(r, c) && ray_dir_valid(r, c)) {
+                    active_vertices.emplace_back(r, c);
+                }
+            }
+        }
+
         // Cast a ray per valid vertex
         const int max_steps = (neighbor_max_distance > 0.0)
                                 ? static_cast<int>(std::ceil(neighbor_max_distance / neighbor_step))
                                 : 0;
 
-        // Traverse grid
-        #pragma omp parallel for schedule(static)
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                const cv::Vec3f start = src_points(r, c);
-                if (!is_valid_vertex(start)) {
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (int i = 0; i < static_cast<int>(active_vertices.size()); ++i) {
+            const int r = active_vertices[i][0];
+            const int c = active_vertices[i][1];
+
+            const cv::Vec3f start = src_points(r, c);
+            if (!is_valid_vertex(start)) {
+                continue;
+            }
+
+            const cv::Vec3f n = ray_dirs(r, c);
+            const cv::Vec3d step_vec(
+                static_cast<double>(n[0]) * neighbor_step,
+                static_cast<double>(n[1]) * neighbor_step,
+                static_cast<double>(n[2]) * neighbor_step);
+            cv::Vec3d pos(
+                static_cast<double>(start[0]),
+                static_cast<double>(start[1]),
+                static_cast<double>(start[2]));
+            double t = 0.0;
+
+            // March along the ray until threshold is hit or max distance reached
+            bool clearance_met = (required_clearance_steps == 0);
+            bool left_surface = false;
+            int below_counter = 0;
+
+            for (int k = 1; k <= max_steps; ++k) {
+                pos += step_vec;
+                t += neighbor_step;
+                if (!clearance_met && k >= required_clearance_steps) {
+                    clearance_met = true;
+                }
+
+                const float v = get_val<double, CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, pos);
+                if (!std::isfinite(v)) {
                     continue;
                 }
 
-                const cv::Vec3f n = ray_dirs(r, c);
-                if (!has_ray_dir(r, c)) {
-                    continue; // leave invalid
+                if (!clearance_met) {
+                    continue;
                 }
 
-                // March along the ray until threshold is hit or max distance reached
-                bool clearance_met = (required_clearance_steps == 0);
-                bool left_surface = false;
-                int below_counter = 0;
-
-                for (int k = 1; k <= max_steps; ++k) {
-                    const double t = neighbor_step * static_cast<double>(k);
-                    if (!clearance_met && k >= required_clearance_steps) {
-                        clearance_met = true;
-                    }
-
-                    const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
-                    const float v = get_val<double, CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, pos);
-                    if (!std::isfinite(v)) {
-                        continue;
-                    }
-
-                    if (!clearance_met) {
-                        continue;
-                    }
-
-                    if (!left_surface) {
-                        if (v <= neighbor_exit_threshold) {
-                            below_counter += 1;
-                            if (below_counter >= neighbor_exit_count) {
-                                left_surface = true;
-                            }
-                        } else {
-                            below_counter = 0;
+                if (!left_surface) {
+                    if (v <= neighbor_exit_threshold) {
+                        below_counter += 1;
+                        if (below_counter >= neighbor_exit_count) {
+                            left_surface = true;
                         }
-                        continue;
+                    } else {
+                        below_counter = 0;
                     }
+                    continue;
+                }
 
-                    if (v >= neighbor_threshold) {
-                        hit_dist(r, c) = static_cast<float>(t);
-                        break;
-                    }
+                if (v >= neighbor_threshold) {
+                    hit_dist(r, c) = static_cast<float>(t);
+                    break;
                 }
             }
         }
@@ -784,8 +802,11 @@ int main(int argc, char *argv[])
         int fold_corrections = 0;
         const int max_fold_iters = std::max(1, neighbor_spike_window * 4);
         for (int iter = 0; iter < max_fold_iters; ++iter) {
-            bool changed = false;
             cv::Mat_<float> next_dist = hit_dist.clone();
+            int changed_count = 0;
+            int corrections_this_iter = 0;
+
+            #pragma omp parallel for schedule(dynamic, 8) reduction(+:changed_count, corrections_this_iter)
             for (int r = 0; r < rows; ++r) {
                 for (int c = 0; c < cols; ++c) {
                     const float curr = hit_dist(r, c);
@@ -815,19 +836,20 @@ int main(int argc, char *argv[])
                     if (lo > min_keep_dist && !vertex_folded(hit_dist, r, c, lo)) {
                         if (std::abs(lo - curr) > 1e-4f) {
                             next_dist(r, c) = lo;
-                            changed = true;
-                            ++fold_corrections;
+                            ++changed_count;
+                            ++corrections_this_iter;
                         }
                     } else {
                         next_dist(r, c) = -1.0f;
-                        changed = true;
-                        ++fold_corrections;
+                        ++changed_count;
+                        ++corrections_this_iter;
                     }
                 }
             }
 
             hit_dist = std::move(next_dist);
-            if (!changed) {
+            fold_corrections += corrections_this_iter;
+            if (changed_count == 0) {
                 break;
             }
         }
