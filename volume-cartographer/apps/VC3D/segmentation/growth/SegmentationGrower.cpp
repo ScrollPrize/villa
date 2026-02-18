@@ -49,6 +49,8 @@ Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
 namespace
 {
+const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
+
 QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
     if (!pkg) {
@@ -1298,7 +1300,9 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             showStatus(tr("Dense displacement requires a dense checkpoint path."), kStatusLong);
             return false;
         }
-        if (!QFileInfo::exists(denseCheckpointPath) || !QFileInfo(denseCheckpointPath).isFile()) {
+        const bool usingDenseLatestPreset = denseCheckpointPath == kDenseLatestSentinel;
+        if (!usingDenseLatestPreset &&
+            (!QFileInfo::exists(denseCheckpointPath) || !QFileInfo(denseCheckpointPath).isFile())) {
             showStatus(tr("Dense checkpoint does not exist: %1").arg(denseCheckpointPath), kStatusLong);
             return false;
         }

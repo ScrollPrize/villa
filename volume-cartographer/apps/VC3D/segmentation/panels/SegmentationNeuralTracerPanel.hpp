@@ -31,7 +31,7 @@ public:
     [[nodiscard]] int neuralBatchSize() const { return _neuralBatchSize; }
     [[nodiscard]] NeuralTracerModelType neuralModelType() const { return _neuralModelType; }
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const { return _neuralOutputMode; }
-    [[nodiscard]] QString denseCheckpointPath() const { return _denseCheckpointPath; }
+    [[nodiscard]] QString denseCheckpointPath() const;
     [[nodiscard]] QString denseConfigPath() const { return _denseConfigPath; }
 
     // Setters
@@ -60,10 +60,17 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void updateDenseUiState();
 
+    enum class DenseCheckpointPreset
+    {
+        DenseLatest = 0,
+        CustomPath = 1
+    };
+
     CollapsibleSettingsGroup* _groupNeuralTracer{nullptr};
     QCheckBox* _chkNeuralTracerEnabled{nullptr};
     QComboBox* _comboNeuralModelType{nullptr};
     QComboBox* _comboNeuralOutputMode{nullptr};
+    QComboBox* _comboDenseCheckpointPreset{nullptr};
     QLineEdit* _neuralCheckpointEdit{nullptr};
     QToolButton* _neuralCheckpointBrowse{nullptr};
     QLineEdit* _denseCheckpointEdit{nullptr};
@@ -84,6 +91,7 @@ private:
     int _neuralBatchSize{4};
     NeuralTracerModelType _neuralModelType{NeuralTracerModelType::Heatmap};
     NeuralTracerOutputMode _neuralOutputMode{NeuralTracerOutputMode::OverwriteCurrentSegment};
+    DenseCheckpointPreset _denseCheckpointPreset{DenseCheckpointPreset::DenseLatest};
     QString _denseCheckpointPath;
     QString _denseConfigPath;
 

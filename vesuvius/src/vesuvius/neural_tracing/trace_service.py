@@ -19,10 +19,13 @@ DENSE_REQUEST_TYPE = "dense_displacement_grow"
 @click.command()
 @click.option(
     "--checkpoint_path",
-    type=click.Path(exists=True),
+    type=str,
     required=False,
     default=None,
-    help="Optional heatmap checkpoint path. Dense requests do not require this.",
+    help=(
+        "Optional heatmap checkpoint path or checkpoint sentinel. "
+        "Dense requests do not require this."
+    ),
 )
 @click.option(
     "--volume_zarr",
