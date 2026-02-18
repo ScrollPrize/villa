@@ -695,9 +695,12 @@ def _sample_displacement_for_extrap_uvs_from_crops(
     disp_acc = np.zeros((n_points, 3), dtype=np.float32)
     count_acc = np.zeros((n_points,), dtype=np.uint32)
     for item in per_crop_fields:
-        disp = np.asarray(item["displacement"], dtype=np.float32)
+        disp_t = item.get("_disp_t")
+        if disp_t is None:
+            disp_t = _as_displacement_tensor(item["displacement"])
+            item["_disp_t"] = disp_t
         min_corner = np.asarray(item["min_corner"], dtype=np.float32)
-        _, d, h, w = disp.shape
+        _, _, d, h, w = disp_t.shape
 
         point_idx, coords_local = _local_coords_in_bounds(
             sampled_world,
@@ -710,7 +713,7 @@ def _sample_displacement_for_extrap_uvs_from_crops(
         sample_fn = _sample_trilinear_displacement_stack if refine is None else _sample_fractional_displacement_stack
         sample_kwargs = {} if refine is None else {"refine_extra_steps": int(refine)}
         sampled_disp, valid_mask = sample_fn(
-            disp,
+            disp_t,
             coords_local,
             **sample_kwargs,
         )
@@ -749,35 +752,44 @@ def _sample_fractional_displacement_stack(disp, coords_local, refine_extra_steps
             np.zeros((0,), dtype=bool),
         )
 
+    disp_t = _as_displacement_tensor(disp)
     refine_extra_steps = max(int(refine_extra_steps), 0)
     refine_parts = refine_extra_steps + 1
     refine_fraction = 1.0 / float(refine_parts)
 
-    start_coords = coords_local.copy()
-    current_coords = coords_local.copy()
-    ever_valid = np.zeros((coords_local.shape[0],), dtype=bool)
+    start_coords_t = torch.from_numpy(coords_local.copy())
+    current_coords_t = start_coords_t.clone()
+    ever_valid_t = torch.zeros((coords_local.shape[0],), dtype=torch.bool)
 
     for _ in range(refine_parts):
-        stage_disp, stage_valid = _sample_trilinear_displacement_stack(
-            disp,
-            current_coords,
+        stage_disp_t, stage_valid_t = _sample_trilinear_displacement_stack_tensor(
+            disp_t,
+            current_coords_t,
         )
-        if not stage_valid.any():
+        if not bool(stage_valid_t.any()):
             continue
-        delta = stage_disp * refine_fraction
-        finite_delta = np.isfinite(delta).all(axis=1)
-        apply_mask = stage_valid & finite_delta
-        if not apply_mask.any():
+        delta_t = stage_disp_t * refine_fraction
+        finite_delta_t = torch.isfinite(delta_t).all(dim=1)
+        apply_mask_t = stage_valid_t & finite_delta_t
+        if not bool(apply_mask_t.any()):
             continue
-        current_coords[apply_mask] = current_coords[apply_mask] + delta[apply_mask]
-        ever_valid |= apply_mask
+        current_coords_t[apply_mask_t] = current_coords_t[apply_mask_t] + delta_t[apply_mask_t]
+        ever_valid_t |= apply_mask_t
 
-    sampled_disp = (current_coords - start_coords).astype(np.float32, copy=False)
-    finite_disp = np.isfinite(sampled_disp).all(axis=1)
-    if not bool(finite_disp.all()):
-        sampled_disp = np.where(finite_disp[:, None], sampled_disp, 0.0).astype(np.float32, copy=False)
-        ever_valid &= finite_disp
-    return sampled_disp, ever_valid
+    sampled_disp_t = current_coords_t - start_coords_t
+    finite_disp_t = torch.isfinite(sampled_disp_t).all(dim=1)
+    if not bool(finite_disp_t.all()):
+        sampled_disp_t = torch.where(
+            finite_disp_t[:, None],
+            sampled_disp_t,
+            torch.zeros_like(sampled_disp_t),
+        )
+        ever_valid_t &= finite_disp_t
+
+    return (
+        sampled_disp_t.numpy().astype(np.float32, copy=False),
+        ever_valid_t.numpy().astype(bool, copy=False),
+    )
 
 
 def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
@@ -797,15 +809,75 @@ def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
     }
 
 
-def _coords_local_to_grid(coords_local, d, h, w):
-    coords_t = torch.from_numpy(np.asarray(coords_local, dtype=np.float32)).clone()
+def _as_displacement_tensor(disp):
+    if torch.is_tensor(disp):
+        disp_t = disp.detach()
+        if disp_t.ndim == 4:
+            disp_t = disp_t.unsqueeze(0)
+        if disp_t.ndim != 5 or disp_t.shape[0] != 1 or disp_t.shape[1] < 3:
+            raise RuntimeError(f"Expected displacement tensor with shape [1, 3+, D, H, W], got {tuple(disp_t.shape)}")
+        return disp_t[:, :3].to(dtype=torch.float32, device="cpu").contiguous()
+
+    disp_np = np.asarray(disp, dtype=np.float32)
+    if disp_np.ndim != 4 or disp_np.shape[0] < 3:
+        raise RuntimeError(f"Expected displacement array with shape [3+, D, H, W], got {tuple(disp_np.shape)}")
+    return torch.from_numpy(disp_np[:3]).unsqueeze(0).contiguous()
+
+
+def _coords_local_to_grid(coords_t, d, h, w):
     d_denom = max(int(d) - 1, 1)
     h_denom = max(int(h) - 1, 1)
     w_denom = max(int(w) - 1, 1)
-    coords_t[:, 0] = 2.0 * coords_t[:, 0] / float(d_denom) - 1.0
-    coords_t[:, 1] = 2.0 * coords_t[:, 1] / float(h_denom) - 1.0
-    coords_t[:, 2] = 2.0 * coords_t[:, 2] / float(w_denom) - 1.0
-    return coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+    coords_norm = coords_t.clone()
+    coords_norm[:, 0] = 2.0 * coords_norm[:, 0] / float(d_denom) - 1.0
+    coords_norm[:, 1] = 2.0 * coords_norm[:, 1] / float(h_denom) - 1.0
+    coords_norm[:, 2] = 2.0 * coords_norm[:, 2] / float(w_denom) - 1.0
+    return coords_norm[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+
+
+def _sample_trilinear_displacement_stack_tensor(disp_t, coords_local):
+    if coords_local is None:
+        return (
+            torch.zeros((0, 3), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.bool),
+        )
+
+    if torch.is_tensor(coords_local):
+        coords_t = coords_local.to(dtype=torch.float32, device="cpu")
+    else:
+        coords_np = np.asarray(coords_local, dtype=np.float32)
+        if coords_np.ndim != 2 or coords_np.shape[1] != 3:
+            return (
+                torch.zeros((0, 3), dtype=torch.float32),
+                torch.zeros((0,), dtype=torch.bool),
+            )
+        coords_t = torch.from_numpy(coords_np)
+
+    if coords_t.ndim != 2 or coords_t.shape[1] != 3 or coords_t.shape[0] == 0:
+        return (
+            torch.zeros((0, 3), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.bool),
+        )
+
+    _, _, d, h, w = disp_t.shape
+    valid_mask_t = (
+        (coords_t[:, 0] >= 0.0) & (coords_t[:, 0] <= float(d - 1)) &
+        (coords_t[:, 1] >= 0.0) & (coords_t[:, 1] <= float(h - 1)) &
+        (coords_t[:, 2] >= 0.0) & (coords_t[:, 2] <= float(w - 1))
+    )
+
+    sampled_disp_t = torch.zeros((coords_t.shape[0], 3), dtype=disp_t.dtype, device=disp_t.device)
+    if bool(valid_mask_t.any()):
+        valid_coords_t = coords_t[valid_mask_t]
+        grid = _coords_local_to_grid(valid_coords_t, d=d, h=h, w=w)
+        sampled_valid_t = F.grid_sample(
+            disp_t,
+            grid,
+            mode="bilinear",
+            align_corners=True,
+        ).view(3, -1).permute(1, 0)
+        sampled_disp_t[valid_mask_t] = sampled_valid_t
+    return sampled_disp_t, valid_mask_t
 
 
 def _sample_trilinear_displacement_stack(disp, coords_local):
@@ -815,36 +887,12 @@ def _sample_trilinear_displacement_stack(disp, coords_local):
             np.zeros((0,), dtype=bool),
         )
 
-    disp_t = torch.from_numpy(np.asarray(disp, dtype=np.float32)).unsqueeze(0)  # [1, 3, D, H, W]
-    _, _, d, h, w = disp_t.shape
-    valid_t = torch.ones((1, 1, d, h, w), dtype=disp_t.dtype)
-    grid = _coords_local_to_grid(coords_local, d=d, h=h, w=w)
-
-    sampled_disp = F.grid_sample(
-        disp_t,
-        grid,
-        mode="bilinear",
-        align_corners=True,
-    ).view(3, -1).permute(1, 0)
-    sampled_valid_weight = F.grid_sample(
-        valid_t,
-        grid,
-        mode="bilinear",
-        align_corners=True,
-    ).view(-1)
-
-    eps = 1e-6
-    valid_mask = sampled_valid_weight > eps
-    sampled_disp_out = torch.zeros_like(sampled_disp)
-    if bool(valid_mask.any()):
-        sampled_disp_out[valid_mask] = (
-            sampled_disp[valid_mask] /
-            sampled_valid_weight[valid_mask].unsqueeze(-1)
-        )
-
-    sampled_disp_np = sampled_disp_out.cpu().numpy().astype(np.float32, copy=False)
-    valid_mask_np = valid_mask.cpu().numpy().astype(bool, copy=False)
-    return sampled_disp_np, valid_mask_np
+    disp_t = _as_displacement_tensor(disp)
+    sampled_disp_t, valid_mask_t = _sample_trilinear_displacement_stack_tensor(disp_t, coords_local)
+    return (
+        sampled_disp_t.numpy().astype(np.float32, copy=False),
+        valid_mask_t.numpy().astype(bool, copy=False),
+    )
 
 
 def _empty_displaced_samples():
