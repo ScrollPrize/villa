@@ -906,18 +906,25 @@ def _select_extrap_uv_indices_for_sampling(uv_ordered, grow_direction, max_lines
     # For ragged/non-rectangular fronts, keep near->far depth per boundary line
     # (per row for left/right, per col for up/down), not global axis values.
     boundary_axis_idx = 1 - axis_idx
-    boundary_ids = np.unique(uv_ordered[:, boundary_axis_idx]).astype(np.int64, copy=False)
+    boundary_ids = uv_ordered[:, boundary_axis_idx]
+    line_primary_vals = uv_ordered[:, axis_idx]
+    line_primary = -line_primary_vals if near_to_far_desc else line_primary_vals
+    original_pos = np.arange(uv_ordered.shape[0], dtype=np.int64)
+    grouped_order = np.lexsort((original_pos, line_primary, boundary_ids))
+
+    grouped_boundary = boundary_ids[grouped_order]
+    if grouped_boundary.shape[0] == 0:
+        return np.zeros((0,), dtype=np.int64)
+    group_starts = np.flatnonzero(
+        np.concatenate(([True], grouped_boundary[1:] != grouped_boundary[:-1]))
+    )
+    group_ends = np.concatenate((group_starts[1:], np.array([grouped_boundary.shape[0]], dtype=np.int64)))
+
     picked = []
-    for boundary_id in boundary_ids:
-        line_mask = uv_ordered[:, boundary_axis_idx] == boundary_id
-        line_idx = np.nonzero(line_mask)[0]
-        line_uv = uv_ordered[line_idx]
-        if line_uv.shape[0] == 0:
-            continue
-        line_primary_vals = line_uv[:, axis_idx]
-        line_primary = -line_primary_vals if near_to_far_desc else line_primary_vals
-        line_order = np.argsort(line_primary, kind="stable")
-        picked.append(line_idx[line_order[:depth_keep]])
+    for start, end in zip(group_starts, group_ends):
+        keep = min(depth_keep, int(end - start))
+        if keep > 0:
+            picked.append(grouped_order[start:start + keep])
     if not picked:
         return np.zeros((0,), dtype=np.int64)
 
