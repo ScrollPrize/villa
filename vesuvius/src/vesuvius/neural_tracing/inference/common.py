@@ -100,12 +100,56 @@ def _resolve_extrapolation_settings(args, runtime_config):
     }
 
 
-def resolve_tifxyz_params(args, model_config, volume_scale):
+def _normalize_scale_rc(scale_rc, source_label):
+    if scale_rc is None:
+        return None
+    if not isinstance(scale_rc, (list, tuple)) or len(scale_rc) != 2:
+        raise RuntimeError(f"Expected {source_label} scale as [scale_y, scale_x], got {scale_rc!r}")
+    scale_y = float(scale_rc[0])
+    scale_x = float(scale_rc[1])
+    if (not np.isfinite(scale_y)) or (not np.isfinite(scale_x)) or scale_y <= 0.0 or scale_x <= 0.0:
+        raise RuntimeError(f"Invalid {source_label} scale: {scale_rc!r}")
+    return (scale_y, scale_x)
+
+
+def _read_tifxyz_scale_from_meta(tifxyz_path):
+    if tifxyz_path is None:
+        return None
+    meta_path = Path(tifxyz_path) / "meta.json"
+    if not meta_path.exists():
+        raise RuntimeError(
+            f"Unable to resolve stored tifxyz density scale: missing meta.json at {meta_path}"
+        )
+    with open(meta_path, "rt") as meta_fp:
+        meta = json.load(meta_fp)
+    return _normalize_scale_rc(meta.get("scale"), source_label=str(meta_path))
+
+
+def resolve_tifxyz_params(args, model_config, volume_scale, input_scale=None):
     tifxyz_step_size = args.tifxyz_step_size
     tifxyz_voxel_size_um = args.tifxyz_voxel_size_um
+    stored_scale_rc = None
+    stored_step_size = None
+
+    # Output tifxyz scale is a density property of the input tifxyz lattice and
+    # must remain independent of retargeted coordinate scale.
+    stored_scale_rc = _read_tifxyz_scale_from_meta(getattr(args, "tifxyz_path", None))
+    if stored_scale_rc is None and input_scale is not None:
+        stored_scale_rc = _normalize_scale_rc(input_scale, source_label="input_scale")
+    if stored_scale_rc is not None:
+        step_y = _scale_to_subsample_stride(stored_scale_rc[0])
+        step_x = _scale_to_subsample_stride(stored_scale_rc[1])
+        if step_y != step_x:
+            raise RuntimeError(
+                "infer_global_extrap requires isotropic stored tifxyz scale for output, "
+                f"but got stored scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
+            )
+        stored_step_size = int(step_y)
 
     if tifxyz_step_size is None:
-        if model_config is not None:
+        if stored_step_size is not None:
+            tifxyz_step_size = stored_step_size
+        elif model_config is not None:
             tifxyz_step_size = model_config.get(
                 "step_size",
                 model_config.get("heatmap_step_size", 10),
@@ -120,11 +164,14 @@ def resolve_tifxyz_params(args, model_config, volume_scale):
     if tifxyz_voxel_size_um is None:
         tifxyz_voxel_size_um = 8.24
 
-    # Keep output tifxyz spacing in stored-resolution units.
-    # The old behavior multiplied by 2**volume_scale, which inflated output
-    # spacing as inference scale increased.
     tifxyz_step_size = int(round(float(tifxyz_step_size)))
-    return tifxyz_step_size, tifxyz_voxel_size_um
+    if stored_step_size is not None and tifxyz_step_size != stored_step_size:
+        raise RuntimeError(
+            "--tifxyz-step-size cannot override the stored input tifxyz scale for infer_global_extrap. "
+            f"Expected step_size={stored_step_size} for scale={stored_scale_rc}, got {tifxyz_step_size}."
+        )
+
+    return tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc
 
 
 def _validate_named_method(merge_method, valid_methods, method_label):
@@ -1235,20 +1282,9 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
             merged_for_save * scale_factor,
         )
 
-    tifxyz_step_size, tifxyz_voxel_size_um = resolve_tifxyz_params(
-        args, model_config, args.volume_scale
+    tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc = resolve_tifxyz_params(
+        args, model_config, args.volume_scale, input_scale=input_scale
     )
-    current_step = int(round(2 ** int(args.volume_scale)))
-    if input_scale is not None:
-        # Stored-resolution input: stride accounts for the scale factor
-        stride_y = max(1, int(round(float(tifxyz_step_size) * input_scale[0] / max(1, current_step))))
-        stride_x = max(1, int(round(float(tifxyz_step_size) * input_scale[1] / max(1, current_step))))
-    else:
-        # Full-resolution input (legacy)
-        stride_y = max(1, int(round(float(tifxyz_step_size) / max(1, current_step))))
-        stride_x = stride_y
-    if stride_y > 1 or stride_x > 1:
-        merged_for_save = merged_for_save[::stride_y, ::stride_x]
 
     overwrite_input_surface = bool(getattr(args, "overwrite_input_surface", False))
     if overwrite_input_surface:
@@ -1276,6 +1312,14 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
     stored_proj_stride = stored_projection.get("stride_rc", [None, None])
     stored_proj_phase = stored_projection.get("phase_rc", [None, None])
     source = str(checkpoint_path) if checkpoint_path else "inference/infer_global_extrap.py"
+    output_scale_rc = [
+        float(1.0 / float(tifxyz_step_size)),
+        float(1.0 / float(tifxyz_step_size)),
+    ]
+    print(
+        "Saving tifxyz with stored density scale "
+        f"{output_scale_rc} (step_size={int(tifxyz_step_size)})."
+    )
     save_tifxyz(
         merged_for_save,
         out_dir,
@@ -1292,6 +1336,12 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
             "stored_projection_stride_rc": _json_safe(stored_proj_stride),
             "stored_projection_phase_rc": _json_safe(stored_proj_phase),
             "effective_step_size_used": int(tifxyz_step_size),
+            "effective_scale_rc": output_scale_rc,
+            "input_stored_scale_rc": (
+                None
+                if stored_scale_rc is None
+                else [float(stored_scale_rc[0]), float(stored_scale_rc[1])]
+            ),
             "run_argv": list(sys.argv[1:]),
             "run_args": _json_safe(call_args),
         },

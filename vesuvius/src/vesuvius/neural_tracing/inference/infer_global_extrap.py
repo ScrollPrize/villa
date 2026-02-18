@@ -125,7 +125,10 @@ def parse_args(argv=None):
         "--tifxyz-step-size",
         type=int,
         default=None,
-        help="Output tifxyz UV step size. If unset, inferred from checkpoint config/volume metadata.",
+        help=(
+            "Output tifxyz UV step size. If unset, inferred from the stored input tifxyz scale. "
+            "When provided, must match the stored input scale."
+        ),
     )
     parser.add_argument(
         "--tifxyz-voxel-size-um",
