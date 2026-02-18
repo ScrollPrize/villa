@@ -6,6 +6,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,6 +20,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <array>
 
 namespace {
 const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
@@ -26,6 +28,28 @@ const QString kDensePresetSettingKey = QStringLiteral("neural_dense_checkpoint_p
 const QString kDensePresetLatest = QStringLiteral("latest");
 const QString kDensePresetCustom = QStringLiteral("custom");
 const QString kDenseTtaModeSettingKey = QStringLiteral("neural_dense_tta_mode");
+const QString kDenseTtaMergeMethodSettingKey = QStringLiteral("neural_dense_tta_merge_method");
+const QString kDenseTtaOutlierDropThreshSettingKey = QStringLiteral("neural_dense_tta_outlier_drop_thresh");
+const QString kDenseTtaMergeMethodDefault = QStringLiteral("vector_geomedian");
+constexpr double kDenseTtaOutlierDropThreshDefault = 1.25;
+
+QString normalizeDenseTtaMergeMethod(const QString& method)
+{
+    const QString normalized = method.trimmed().toLower();
+    static const std::array<const char*, 5> kSupportedMethods = {
+        "median",
+        "mean",
+        "trimmed_mean",
+        "vector_medoid",
+        "vector_geomedian",
+    };
+    for (const char* candidate : kSupportedMethods) {
+        if (normalized == QLatin1String(candidate)) {
+            return normalized;
+        }
+    }
+    return kDenseTtaMergeMethodDefault;
+}
 } // namespace
 
 SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& settingsGroup,
@@ -73,6 +97,30 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         _comboDenseTtaMode->setToolTip(
             tr("Dense displacement test-time augmentation mode. Mirror is default."));
         row->addWidget(_comboDenseTtaMode);
+        row->addStretch(1);
+    });
+
+    _groupNeuralTracer->addRow(tr("TTA merge:"), [&](QHBoxLayout* row) {
+        _comboDenseTtaMergeMethod = new QComboBox(neuralParent);
+        _comboDenseTtaMergeMethod->addItem(tr("Vector geomedian"), QStringLiteral("vector_geomedian"));
+        _comboDenseTtaMergeMethod->addItem(tr("Vector medoid"), QStringLiteral("vector_medoid"));
+        _comboDenseTtaMergeMethod->addItem(tr("Median"), QStringLiteral("median"));
+        _comboDenseTtaMergeMethod->addItem(tr("Trimmed mean"), QStringLiteral("trimmed_mean"));
+        _comboDenseTtaMergeMethod->addItem(tr("Mean"), QStringLiteral("mean"));
+        _comboDenseTtaMergeMethod->setToolTip(
+            tr("How to merge TTA displacement predictions."));
+        row->addWidget(_comboDenseTtaMergeMethod);
+
+        auto* threshLabel = new QLabel(tr("Outlier thresh:"), neuralParent);
+        _spinDenseTtaOutlierDropThresh = new QDoubleSpinBox(neuralParent);
+        _spinDenseTtaOutlierDropThresh->setDecimals(2);
+        _spinDenseTtaOutlierDropThresh->setRange(0.01, 100.0);
+        _spinDenseTtaOutlierDropThresh->setSingleStep(0.05);
+        _spinDenseTtaOutlierDropThresh->setToolTip(
+            tr("Outlier threshold multiplier for dropping inconsistent TTA variants."));
+        row->addSpacing(12);
+        row->addWidget(threshLabel);
+        row->addWidget(_spinDenseTtaOutlierDropThresh);
         row->addStretch(1);
     });
 
@@ -157,6 +205,14 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     connect(_comboDenseTtaMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         auto mode = static_cast<DenseTtaMode>(_comboDenseTtaMode->itemData(index).toInt());
         setDenseTtaMode(mode);
+    });
+
+    connect(_comboDenseTtaMergeMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        setDenseTtaMergeMethod(_comboDenseTtaMergeMethod->itemData(index).toString());
+    });
+
+    connect(_spinDenseTtaOutlierDropThresh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setDenseTtaOutlierDropThresh(value);
     });
 
     connect(_comboDenseCheckpointPreset, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -394,6 +450,39 @@ void SegmentationNeuralTracerPanel::setDenseTtaMode(DenseTtaMode mode)
     }
 }
 
+void SegmentationNeuralTracerPanel::setDenseTtaMergeMethod(const QString& method)
+{
+    const QString normalized = normalizeDenseTtaMergeMethod(method);
+    if (_denseTtaMergeMethod == normalized) {
+        return;
+    }
+    _denseTtaMergeMethod = normalized;
+    writeSetting(kDenseTtaMergeMethodSettingKey, _denseTtaMergeMethod);
+
+    if (_comboDenseTtaMergeMethod) {
+        const QSignalBlocker blocker(_comboDenseTtaMergeMethod);
+        const int idx = _comboDenseTtaMergeMethod->findData(_denseTtaMergeMethod);
+        if (idx >= 0) {
+            _comboDenseTtaMergeMethod->setCurrentIndex(idx);
+        }
+    }
+}
+
+void SegmentationNeuralTracerPanel::setDenseTtaOutlierDropThresh(double threshold)
+{
+    const double sanitized = std::max(0.01, threshold);
+    if (qFuzzyCompare(_denseTtaOutlierDropThresh + 1.0, sanitized + 1.0)) {
+        return;
+    }
+    _denseTtaOutlierDropThresh = sanitized;
+    writeSetting(kDenseTtaOutlierDropThreshSettingKey, _denseTtaOutlierDropThresh);
+
+    if (_spinDenseTtaOutlierDropThresh) {
+        const QSignalBlocker blocker(_spinDenseTtaOutlierDropThresh);
+        _spinDenseTtaOutlierDropThresh->setValue(_denseTtaOutlierDropThresh);
+    }
+}
+
 void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
 {
     const QString trimmed = path.trimmed();
@@ -455,6 +544,14 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
         _denseTtaMode = DenseTtaMode::None;
     } else {
         _denseTtaMode = DenseTtaMode::Mirror;
+    }
+    _denseTtaMergeMethod = normalizeDenseTtaMergeMethod(
+        settings.value(kDenseTtaMergeMethodSettingKey, kDenseTtaMergeMethodDefault).toString());
+    _denseTtaOutlierDropThresh = settings.value(
+        kDenseTtaOutlierDropThreshSettingKey,
+        kDenseTtaOutlierDropThreshDefault).toDouble();
+    if (_denseTtaOutlierDropThresh <= 0.0) {
+        _denseTtaOutlierDropThresh = kDenseTtaOutlierDropThreshDefault;
     }
     const QString presetValue = settings.value(kDensePresetSettingKey, kDensePresetLatest).toString();
     if (presetValue == kDensePresetCustom) {
@@ -519,6 +616,17 @@ void SegmentationNeuralTracerPanel::syncUiState()
             _comboDenseTtaMode->setCurrentIndex(idx);
         }
     }
+    if (_comboDenseTtaMergeMethod) {
+        const QSignalBlocker blocker(_comboDenseTtaMergeMethod);
+        int idx = _comboDenseTtaMergeMethod->findData(_denseTtaMergeMethod);
+        if (idx >= 0) {
+            _comboDenseTtaMergeMethod->setCurrentIndex(idx);
+        }
+    }
+    if (_spinDenseTtaOutlierDropThresh) {
+        const QSignalBlocker blocker(_spinDenseTtaOutlierDropThresh);
+        _spinDenseTtaOutlierDropThresh->setValue(_denseTtaOutlierDropThresh);
+    }
     if (_comboDenseCheckpointPreset) {
         const QSignalBlocker blocker(_comboDenseCheckpointPreset);
         int idx = _comboDenseCheckpointPreset->findData(static_cast<int>(_denseCheckpointPreset));
@@ -546,6 +654,14 @@ void SegmentationNeuralTracerPanel::updateDenseUiState()
     if (_comboDenseTtaMode) {
         _comboDenseTtaMode->setEnabled(denseMode);
         _comboDenseTtaMode->setVisible(denseMode);
+    }
+    if (_comboDenseTtaMergeMethod) {
+        _comboDenseTtaMergeMethod->setEnabled(denseMode);
+        _comboDenseTtaMergeMethod->setVisible(denseMode);
+    }
+    if (_spinDenseTtaOutlierDropThresh) {
+        _spinDenseTtaOutlierDropThresh->setEnabled(denseMode);
+        _spinDenseTtaOutlierDropThresh->setVisible(denseMode);
     }
     if (_comboNeuralOutputMode) {
         _comboNeuralOutputMode->setEnabled(denseMode);

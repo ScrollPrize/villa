@@ -17,6 +17,14 @@ HEATMAP_REQUEST_TYPE = "heatmap_next_points"
 DENSE_REQUEST_TYPE = "dense_displacement_grow"
 
 
+def _print_json_log(label, payload):
+    try:
+        body = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception as exc:  # pragma: no cover - defensive logging fallback
+        body = f"<unserializable payload: {exc}> {payload!r}"
+    print(f"[trace_service] {label}: {body}", flush=True)
+
+
 @click.command()
 @click.option(
     "--checkpoint_path",
@@ -164,7 +172,22 @@ def _build_dense_args(request, state):
 def _process_dense_request(request, state):
     dense_args, err = _build_dense_args(request, state)
     if err is not None:
+        _print_json_log(
+            "dense request rejected",
+            {
+                "request_type": DENSE_REQUEST_TYPE,
+                "error": err,
+                "request_keys": sorted(str(k) for k in request.keys())
+                if isinstance(request, dict)
+                else [],
+            },
+        )
         return {"error": err}
+
+    _print_json_log(
+        "dense request args",
+        {"request_type": DENSE_REQUEST_TYPE, "run_args": dense_args},
+    )
 
     from vesuvius.neural_tracing.inference.infer_global_extrap import run_global_extrap
 

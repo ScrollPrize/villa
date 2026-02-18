@@ -73,6 +73,8 @@ public:
     [[nodiscard]] NeuralTracerModelType neuralModelType() const;
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const;
     [[nodiscard]] DenseTtaMode denseTtaMode() const;
+    [[nodiscard]] QString denseTtaMergeMethod() const;
+    [[nodiscard]] double denseTtaOutlierDropThresh() const;
     [[nodiscard]] QString denseCheckpointPath() const;
 
     void setPendingChanges(bool pending);
@@ -152,6 +154,8 @@ public:
     void setNeuralModelType(NeuralTracerModelType type);
     void setNeuralOutputMode(NeuralTracerOutputMode mode);
     void setDenseTtaMode(DenseTtaMode mode);
+    void setDenseTtaMergeMethod(const QString& method);
+    void setDenseTtaOutlierDropThresh(double threshold);
     void setDenseCheckpointPath(const QString& path);
 
     /**

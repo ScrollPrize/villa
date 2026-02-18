@@ -1462,18 +1462,17 @@ def _surface_to_stored_uv_samples_lattice(
             "n_stored_valid": 0,
         },)
 
-    # Deterministic stored-lattice sampling: query at each stored cell center
-    # in full-resolution UV so bilinear interpolation can blend neighbors.
-    cell_center_r = 0.5 * float(sub_r - 1)
-    cell_center_c = 0.5 * float(sub_c - 1)
+    # Deterministic stored-lattice sampling: query exact lattice anchors first.
+    # If an anchor has no support, optionally retry that stored cell at a
+    # fractional center location to recover sparse holes.
     r_abs0 = int(uv_offset[0])
     c_abs0 = int(uv_offset[1])
     r_abs1 = r_abs0 + h - 1
     c_abs1 = c_abs0 + w - 1
-    s_r_min = int(np.ceil((r_abs0 - (phase_r + cell_center_r)) / float(sub_r)))
-    s_r_max = int(np.floor((r_abs1 - (phase_r + cell_center_r)) / float(sub_r)))
-    s_c_min = int(np.ceil((c_abs0 - (phase_c + cell_center_c)) / float(sub_c)))
-    s_c_max = int(np.floor((c_abs1 - (phase_c + cell_center_c)) / float(sub_c)))
+    s_r_min = int(np.ceil((r_abs0 - phase_r) / float(sub_r)))
+    s_r_max = int(np.floor((r_abs1 - phase_r) / float(sub_r)))
+    s_c_min = int(np.ceil((c_abs0 - phase_c) / float(sub_c)))
+    s_c_max = int(np.floor((c_abs1 - phase_c) / float(sub_c)))
     if s_r_max < s_r_min or s_c_max < s_c_min:
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
             "mode": "lattice_bilinear_torch",
@@ -1487,17 +1486,11 @@ def _surface_to_stored_uv_samples_lattice(
     sr, sc = np.meshgrid(stored_rows, stored_cols, indexing="ij")
     uv_q = np.stack([sr.reshape(-1), sc.reshape(-1)], axis=-1).astype(np.int64, copy=False)
 
-    # Stored cell centers in absolute full-resolution UV coordinates.
-    q_r_abs = (
-        uv_q[:, 0].astype(np.float32, copy=False) * float(sub_r) +
-        float(phase_r) + float(cell_center_r)
-    )
-    q_c_abs = (
-        uv_q[:, 1].astype(np.float32, copy=False) * float(sub_c) +
-        float(phase_c) + float(cell_center_c)
-    )
-    q_r = (q_r_abs - float(uv_offset[0])).astype(np.float32, copy=False)
-    q_c = (q_c_abs - float(uv_offset[1])).astype(np.float32, copy=False)
+    # Lattice anchors in absolute full-resolution UV coordinates.
+    q_r_abs = uv_q[:, 0].astype(np.int64, copy=False) * int(sub_r) + int(phase_r)
+    q_c_abs = uv_q[:, 1].astype(np.int64, copy=False) * int(sub_c) + int(phase_c)
+    q_r = (q_r_abs - int(uv_offset[0])).astype(np.float32, copy=False)
+    q_c = (q_c_abs - int(uv_offset[1])).astype(np.float32, copy=False)
 
     in_grid = (
         (q_r >= 0.0) &
@@ -1520,40 +1513,63 @@ def _surface_to_stored_uv_samples_lattice(
 
     denom_r = float(max(h - 1, 1))
     denom_c = float(max(w - 1, 1))
-    y_norm = (2.0 * q_r / denom_r) - 1.0
-    x_norm = (2.0 * q_c / denom_c) - 1.0
-    query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
-
     value_np = np.where(support[..., None], grid, 0.0).astype(np.float32, copy=False)
     value_t = torch.from_numpy(value_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
     mask_t = torch.from_numpy(support.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).contiguous()
-    query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
 
-    with torch.no_grad():
-        sampled_num_t = F.grid_sample(
-            value_t,
-            query_t,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
+    def _sample_world_and_mask(qr, qc):
+        y_norm = (2.0 * qr / denom_r) - 1.0
+        x_norm = (2.0 * qc / denom_c) - 1.0
+        query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
+        query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
+        with torch.no_grad():
+            sampled_num_t = F.grid_sample(
+                value_t,
+                query_t,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            sampled_den_t = F.grid_sample(
+                mask_t,
+                query_t,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+        sampled_num = (
+            sampled_num_t[0, :, :, 0]
+            .permute(1, 0)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
         )
-        sampled_den_t = F.grid_sample(
-            mask_t,
-            query_t,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
+        sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
+        return sampled_num, sampled_den
 
-    sampled_num = (
-        sampled_num_t[0, :, :, 0]
-        .permute(1, 0)
-        .cpu()
-        .numpy()
-        .astype(np.float32, copy=False)
-    )
-    sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
+    sampled_num, sampled_den = _sample_world_and_mask(q_r, q_c)
     can_sample = sampled_den > 1e-6
+    n_anchor_sampled = int(can_sample.sum())
+    n_fallback_tried = 0
+    n_fallback_recovered = 0
+
+    if not bool(can_sample.all()):
+        fallback_idx = np.nonzero(~can_sample)[0]
+        n_fallback_tried = int(fallback_idx.shape[0])
+        if n_fallback_tried > 0:
+            cell_center_r = 0.5 * float(sub_r - 1)
+            cell_center_c = 0.5 * float(sub_c - 1)
+            q_r_fallback = (q_r[fallback_idx] + float(cell_center_r)).astype(np.float32, copy=False)
+            q_c_fallback = (q_c[fallback_idx] + float(cell_center_c)).astype(np.float32, copy=False)
+            sampled_num_fb, sampled_den_fb = _sample_world_and_mask(q_r_fallback, q_c_fallback)
+            can_fb = sampled_den_fb > 1e-6
+            if bool(can_fb.any()):
+                recovered_idx = fallback_idx[can_fb]
+                sampled_num[recovered_idx] = sampled_num_fb[can_fb]
+                sampled_den[recovered_idx] = sampled_den_fb[can_fb]
+                can_sample[recovered_idx] = True
+                n_fallback_recovered = int(can_fb.sum())
+
     if not bool(can_sample.any()):
         return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + ({
             "mode": "lattice_bilinear_torch",
@@ -1573,6 +1589,9 @@ def _surface_to_stored_uv_samples_lattice(
         "stride_rc": [sub_r, sub_c],
         "phase_rc": [phase_r, phase_c],
         "n_full_valid": n_full_valid,
+        "n_anchor_sampled": n_anchor_sampled,
+        "n_fallback_tried": n_fallback_tried,
+        "n_fallback_recovered": n_fallback_recovered,
         "n_stored_valid": int(uv_keep.shape[0]),
     }
     return uv_keep, pts_bilinear, projection_meta

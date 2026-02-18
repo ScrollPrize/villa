@@ -628,6 +628,8 @@ struct DenseDisplacementJob
     int iterations{1};
     QString checkpointPath;
     DenseTtaMode ttaMode{DenseTtaMode::Mirror};
+    QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
+    double ttaOutlierDropThresh{1.25};
     std::optional<nlohmann::json> customParams;
     std::vector<SegmentationGrowthDirection> directions;
 };
@@ -824,6 +826,8 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         request["volume_path"] = job.volumeZarrPath.toStdString();
         request["volume_scale"] = std::max(0, job.volumeScale);
         request["checkpoint_path"] = job.checkpointPath.toStdString();
+        request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
+        request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
         switch (job.ttaMode) {
         case DenseTtaMode::Rotate3:
             request["tta"] = true;
@@ -1335,6 +1339,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
         const int volumeScale = _context.widget->neuralVolumeScale();
         const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
+        const QString denseTtaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
+        const double denseTtaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
         const auto outputMode = _context.widget->neuralOutputMode();
 
         if (denseCheckpointPath.isEmpty()) {
@@ -1419,6 +1425,10 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         denseJob.iterations = std::max(1, sanitizedSteps);
         denseJob.checkpointPath = denseCheckpointPath;
         denseJob.ttaMode = denseTtaMode;
+        denseJob.ttaMergeMethod = denseTtaMergeMethod.isEmpty()
+            ? QStringLiteral("vector_geomedian")
+            : denseTtaMergeMethod;
+        denseJob.ttaOutlierDropThresh = std::max(0.01, denseTtaOutlierDropThresh);
         denseJob.customParams = request.customParams;
         denseJob.directions = denseDirections;
 

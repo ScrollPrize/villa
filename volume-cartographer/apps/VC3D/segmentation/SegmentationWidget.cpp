@@ -388,6 +388,8 @@ int SegmentationWidget::neuralBatchSize() const { return _neuralTracerPanel->neu
 NeuralTracerModelType SegmentationWidget::neuralModelType() const { return _neuralTracerPanel->neuralModelType(); }
 NeuralTracerOutputMode SegmentationWidget::neuralOutputMode() const { return _neuralTracerPanel->neuralOutputMode(); }
 DenseTtaMode SegmentationWidget::denseTtaMode() const { return _neuralTracerPanel->denseTtaMode(); }
+QString SegmentationWidget::denseTtaMergeMethod() const { return _neuralTracerPanel->denseTtaMergeMethod(); }
+double SegmentationWidget::denseTtaOutlierDropThresh() const { return _neuralTracerPanel->denseTtaOutlierDropThresh(); }
 QString SegmentationWidget::denseCheckpointPath() const { return _neuralTracerPanel->denseCheckpointPath(); }
 
 void SegmentationWidget::setNeuralTracerEnabled(bool enabled) { _neuralTracerPanel->setNeuralTracerEnabled(enabled); }
@@ -398,6 +400,8 @@ void SegmentationWidget::setNeuralBatchSize(int size) { _neuralTracerPanel->setN
 void SegmentationWidget::setNeuralModelType(NeuralTracerModelType type) { _neuralTracerPanel->setNeuralModelType(type); }
 void SegmentationWidget::setNeuralOutputMode(NeuralTracerOutputMode mode) { _neuralTracerPanel->setNeuralOutputMode(mode); }
 void SegmentationWidget::setDenseTtaMode(DenseTtaMode mode) { _neuralTracerPanel->setDenseTtaMode(mode); }
+void SegmentationWidget::setDenseTtaMergeMethod(const QString& method) { _neuralTracerPanel->setDenseTtaMergeMethod(method); }
+void SegmentationWidget::setDenseTtaOutlierDropThresh(double threshold) { _neuralTracerPanel->setDenseTtaOutlierDropThresh(threshold); }
 void SegmentationWidget::setDenseCheckpointPath(const QString& path) { _neuralTracerPanel->setDenseCheckpointPath(path); }
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 

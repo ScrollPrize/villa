@@ -10,6 +10,7 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QSettings;
+class QDoubleSpinBox;
 class QSpinBox;
 class QToolButton;
 class CollapsibleSettingsGroup;
@@ -32,6 +33,8 @@ public:
     [[nodiscard]] NeuralTracerModelType neuralModelType() const { return _neuralModelType; }
     [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const { return _neuralOutputMode; }
     [[nodiscard]] DenseTtaMode denseTtaMode() const { return _denseTtaMode; }
+    [[nodiscard]] QString denseTtaMergeMethod() const { return _denseTtaMergeMethod; }
+    [[nodiscard]] double denseTtaOutlierDropThresh() const { return _denseTtaOutlierDropThresh; }
     [[nodiscard]] QString denseCheckpointPath() const;
 
     // Setters
@@ -44,6 +47,8 @@ public:
     void setNeuralModelType(NeuralTracerModelType type);
     void setNeuralOutputMode(NeuralTracerOutputMode mode);
     void setDenseTtaMode(DenseTtaMode mode);
+    void setDenseTtaMergeMethod(const QString& method);
+    void setDenseTtaOutlierDropThresh(double threshold);
     void setDenseCheckpointPath(const QString& path);
 
     void restoreSettings(QSettings& settings);
@@ -71,6 +76,7 @@ private:
     QComboBox* _comboNeuralModelType{nullptr};
     QComboBox* _comboNeuralOutputMode{nullptr};
     QComboBox* _comboDenseTtaMode{nullptr};
+    QComboBox* _comboDenseTtaMergeMethod{nullptr};
     QComboBox* _comboDenseCheckpointPreset{nullptr};
     QLineEdit* _neuralCheckpointEdit{nullptr};
     QToolButton* _neuralCheckpointBrowse{nullptr};
@@ -78,6 +84,7 @@ private:
     QToolButton* _neuralPythonBrowse{nullptr};
     QComboBox* _comboNeuralVolumeScale{nullptr};
     QSpinBox* _spinNeuralBatchSize{nullptr};
+    QDoubleSpinBox* _spinDenseTtaOutlierDropThresh{nullptr};
     QLabel* _lblNeuralTracerStatus{nullptr};
 
     bool _neuralTracerEnabled{false};
@@ -89,6 +96,8 @@ private:
     NeuralTracerModelType _neuralModelType{NeuralTracerModelType::Heatmap};
     NeuralTracerOutputMode _neuralOutputMode{NeuralTracerOutputMode::OverwriteCurrentSegment};
     DenseTtaMode _denseTtaMode{DenseTtaMode::Mirror};
+    QString _denseTtaMergeMethod{QStringLiteral("vector_geomedian")};
+    double _denseTtaOutlierDropThresh{1.25};
     DenseCheckpointPreset _denseCheckpointPreset{DenseCheckpointPreset::DenseLatest};
 
     bool _restoringSettings{false};
