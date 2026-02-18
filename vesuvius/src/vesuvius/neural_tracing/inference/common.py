@@ -1335,8 +1335,10 @@ class RunTimeProfiler:
     def __init__(self, enabled=False, device=None):
         self.enabled = bool(enabled)
         self._totals = {}
+        self._exclusive_totals = {}
         self._counts = {}
         self._order = []
+        self._stack = []
         self._device = None
         self._use_cuda_sync = False
         if self.enabled and device is not None:
@@ -1359,17 +1361,31 @@ class RunTimeProfiler:
             return
         self._sync_cuda()
         start = time.perf_counter()
+        self._stack.append({"name": name, "start": start, "child_elapsed": 0.0})
         try:
             yield
         finally:
             self._sync_cuda()
-            elapsed = time.perf_counter() - start
+            end = time.perf_counter()
+            frame = self._stack.pop()
+            elapsed = end - frame["start"]
+            exclusive_elapsed = max(0.0, elapsed - float(frame["child_elapsed"]))
+            if self._stack:
+                self._stack[-1]["child_elapsed"] += elapsed
             if name not in self._totals:
                 self._totals[name] = 0.0
+                self._exclusive_totals[name] = 0.0
                 self._counts[name] = 0
                 self._order.append(name)
             self._totals[name] += elapsed
+            self._exclusive_totals[name] += exclusive_elapsed
             self._counts[name] += 1
+
+    def total_profiled_time(self, inclusive=False):
+        if not self.enabled:
+            return 0.0
+        src = self._totals if inclusive else self._exclusive_totals
+        return float(sum(float(v) for v in src.values()))
 
     def print_summary(self, total_runtime_s=None):
         if not self.enabled:
@@ -1377,9 +1393,14 @@ class RunTimeProfiler:
         print("== Performance Profile ==")
         for name in self._order:
             total_s = float(self._totals.get(name, 0.0))
+            self_s = float(self._exclusive_totals.get(name, 0.0))
             count = int(self._counts.get(name, 0))
             avg_s = total_s / max(count, 1)
-            print(f"{name}: {total_s:.3f}s ({count}x, avg {avg_s:.3f}s)")
+            self_avg_s = self_s / max(count, 1)
+            print(
+                f"{name}: {total_s:.3f}s ({count}x, avg {avg_s:.3f}s, "
+                f"self {self_s:.3f}s, self_avg {self_avg_s:.3f}s)"
+            )
         if total_runtime_s is not None:
             print(f"total_runtime: {float(total_runtime_s):.3f}s")
 

@@ -1,6 +1,8 @@
 import argparse
 import time
 
+_PROCESS_START = time.perf_counter()
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -39,7 +41,12 @@ from vesuvius.neural_tracing.inference.displacement_helpers import (
     load_model,
     predict_displacement,
 )
-from vesuvius.neural_tracing.inference.displacement_tta import TTA_MERGE_METHODS
+from vesuvius.neural_tracing.inference.displacement_tta import (
+    TTA_MERGE_METHODS,
+    TTA_TRANSFORM_MODES,
+)
+
+_ALL_GROW_DIRECTION_ORDER = ("left", "right", "up", "down")
 
 
 def _parse_optional_tta_outlier_drop_thresh(value):
@@ -61,7 +68,12 @@ def parse_args():
     parser.add_argument("--tifxyz-path", type=str, required=True)
     parser.add_argument("--volume-path", type=str, required=True)
     parser.add_argument("--volume-scale", type=int, default=1)
-    parser.add_argument("--grow-direction", type=str, required=True, choices=["left", "right", "up", "down"])
+    parser.add_argument(
+        "--grow-direction",
+        type=str,
+        required=True,
+        choices=[*_ALL_GROW_DIRECTION_ORDER, "all"],
+    )
     parser.add_argument("--cond-pct", type=float, default=0.50)
     parser.add_argument("--crop-size", type=int, nargs=3, default=[128, 128, 128])
     parser.add_argument("--window-pad", type=int, default=10)
@@ -139,14 +151,24 @@ def parse_args():
         "--no-tta",
         dest="tta",
         action="store_false",
-        help="Disable mirroring-based test-time augmentation (enabled by default).",
+        help="Disable test-time augmentation (enabled by default).",
+    )
+    parser.add_argument(
+        "--tta-transform",
+        type=str,
+        default="mirror",
+        choices=TTA_TRANSFORM_MODES,
+        help=(
+            "TTA transform set: 'mirror' uses 8 flip variants; "
+            "'rotate3' uses 3 axis-transpose variants (z-up, x-up, y-up)."
+        ),
     )
     parser.add_argument(
         "--tta-merge-method",
         type=str,
         default="vector_geomedian",
         choices=TTA_MERGE_METHODS,
-        help="How to merge mirrored TTA displacement predictions.",
+        help="How to merge TTA displacement predictions.",
     )
     parser.add_argument(
         "--tta-outlier-drop-thresh",
@@ -165,8 +187,8 @@ def parse_args():
         type=int,
         default=2,
         help=(
-            "Number of TTA mirrored variants to evaluate per forward pass. "
-            "Use 1 to keep model batch at --batch-size; use 8 to fuse all variants."
+            "Number of TTA variants to evaluate per forward pass. "
+            "Use 1 to keep model batch at --batch-size; use 8 (mirror) or 3 (rotate3) to fuse all variants."
         ),
     )
     parser.add_argument(
@@ -567,7 +589,7 @@ def _build_bbox_crops(
 
     return bbox_crops
 
-def _run_inference(args, bbox_crops, model_state, verbose=True):
+def _run_inference(args, bbox_crops, model_state, profiler, verbose=True):
     expected_in_channels = int(model_state["expected_in_channels"])
     if expected_in_channels not in (2, 3):
         raise RuntimeError(
@@ -586,61 +608,72 @@ def _run_inference(args, bbox_crops, model_state, verbose=True):
     n_batches = (len(bbox_crops) + batch_size - 1) // batch_size
     for batch_start in range(0, len(bbox_crops), batch_size):
         batch = bbox_crops[batch_start:batch_start + batch_size]
-        batch_len = len(batch)
-        first_vol = np.asarray(batch[0]["volume"], dtype=np.float32)
-        if first_vol.ndim != 3:
-            raise RuntimeError(f"Expected crop volume shape [D, H, W], got {tuple(first_vol.shape)}")
-        d, h, w = first_vol.shape
-        batch_np = np.empty((batch_len, expected_in_channels, d, h, w), dtype=np.float32)
+        with profiler.section("iter_infer_batch_pack_np"):
+            batch_len = len(batch)
+            first_vol = np.asarray(batch[0]["volume"], dtype=np.float32)
+            if first_vol.ndim != 3:
+                raise RuntimeError(f"Expected crop volume shape [D, H, W], got {tuple(first_vol.shape)}")
+            d, h, w = first_vol.shape
+            batch_np = np.empty((batch_len, expected_in_channels, d, h, w), dtype=np.float32)
 
-        for i, crop in enumerate(batch):
-            vol_np = np.asarray(crop["volume"], dtype=np.float32)
-            cond_np = np.asarray(crop["cond_vox"], dtype=np.float32)
-            if vol_np.shape != (d, h, w):
-                raise RuntimeError(
-                    f"All crop volumes in a batch must share shape {(d, h, w)}; got {tuple(vol_np.shape)}."
-                )
-            if cond_np.shape != (d, h, w):
-                raise RuntimeError(
-                    f"cond_vox shape must match volume shape {(d, h, w)}; got {tuple(cond_np.shape)}."
-                )
-
-            batch_np[i, 0] = vol_np
-            batch_np[i, 1] = cond_np
-
-            if expected_in_channels == 3:
-                extrap_np = np.asarray(crop["extrap_vox"], dtype=np.float32)
-                if extrap_np.shape != (d, h, w):
+            for i, crop in enumerate(batch):
+                vol_np = np.asarray(crop["volume"], dtype=np.float32)
+                cond_np = np.asarray(crop["cond_vox"], dtype=np.float32)
+                if vol_np.shape != (d, h, w):
                     raise RuntimeError(
-                        f"extrap_vox shape must match volume shape {(d, h, w)}; got {tuple(extrap_np.shape)}."
+                        f"All crop volumes in a batch must share shape {(d, h, w)}; got {tuple(vol_np.shape)}."
                     )
-                batch_np[i, 2] = extrap_np
+                if cond_np.shape != (d, h, w):
+                    raise RuntimeError(
+                        f"cond_vox shape must match volume shape {(d, h, w)}; got {tuple(cond_np.shape)}."
+                    )
 
-        model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
-        disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=use_tta)
-        if disp_pred is None:
-            raise RuntimeError("Model output did not contain 'displacement'.")
+                batch_np[i, 0] = vol_np
+                batch_np[i, 1] = cond_np
 
-        if disp_pred.ndim != 5 or disp_pred.shape[1] < 3:
-            raise RuntimeError(f"Unexpected displacement shape: {tuple(disp_pred.shape)}")
+                if expected_in_channels == 3:
+                    extrap_np = np.asarray(crop["extrap_vox"], dtype=np.float32)
+                    if extrap_np.shape != (d, h, w):
+                        raise RuntimeError(
+                            f"extrap_vox shape must match volume shape {(d, h, w)}; got {tuple(extrap_np.shape)}."
+                        )
+                    batch_np[i, 2] = extrap_np
 
-        # NumPy conversion does not support BF16 directly in some torch builds.
-        disp_pred = (
-            disp_pred[:, :3]
-            .detach()
-            .to(dtype=torch.float32)
-            .cpu()
-            .numpy()
-            .astype(np.float32, copy=False)
-        )
-        for i, crop in enumerate(batch):
-            per_crop_fields.append(
-                {
-                    "bbox_idx": int(crop["bbox_idx"]),
-                    "min_corner": np.asarray(crop["min_corner"], dtype=np.int64),
-                    "displacement": disp_pred[i],
-                }
+        with profiler.section("iter_infer_h2d"):
+            model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
+        with profiler.section("iter_infer_model_forward"):
+            disp_pred = predict_displacement(
+                args,
+                model_state,
+                model_inputs,
+                use_tta=use_tta,
+                profiler=profiler,
             )
+        with profiler.section("iter_infer_d2h_convert"):
+            if disp_pred is None:
+                raise RuntimeError("Model output did not contain 'displacement'.")
+
+            if disp_pred.ndim != 5 or disp_pred.shape[1] < 3:
+                raise RuntimeError(f"Unexpected displacement shape: {tuple(disp_pred.shape)}")
+
+            # NumPy conversion does not support BF16 directly in some torch builds.
+            disp_pred = (
+                disp_pred[:, :3]
+                .detach()
+                .to(dtype=torch.float32)
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+        with profiler.section("iter_infer_collect_outputs"):
+            for i, crop in enumerate(batch):
+                per_crop_fields.append(
+                    {
+                        "bbox_idx": int(crop["bbox_idx"]),
+                        "min_corner": np.asarray(crop["min_corner"], dtype=np.int64),
+                        "displacement": disp_pred[i],
+                    }
+                )
         del model_inputs
         del batch_np
         del disp_pred
@@ -1318,6 +1351,7 @@ def _sample_iteration_agg_samples(
                 args,
                 bbox_crops,
                 model_state,
+                profiler=profiler,
                 verbose=args.verbose,
             )
         disp_bbox = _per_crop_displacement_bbox(per_crop_fields)
@@ -1335,6 +1369,19 @@ def _sample_iteration_agg_samples(
     return _empty_stack_samples(), disp_bbox
 
 
+def _iteration_stop_reason(
+    merged_iter,
+    prev_boundary,
+    next_boundary,
+    grow_direction,
+):
+    if int(merged_iter.get("n_new_valid", 0)) < 1:
+        return "no_new_valid"
+    if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
+        return "boundary_unchanged"
+    return None
+
+
 def _iteration_should_stop(
     merged_iter,
     prev_boundary,
@@ -1344,7 +1391,13 @@ def _iteration_should_stop(
     verbose,
     iteration_pbar,
 ):
-    if int(merged_iter.get("n_new_valid", 0)) < 1:
+    stop_reason = _iteration_stop_reason(
+        merged_iter,
+        prev_boundary,
+        next_boundary,
+        grow_direction,
+    )
+    if stop_reason == "no_new_valid":
         _report_iteration_stop(
             verbose,
             iteration_pbar,
@@ -1352,7 +1405,7 @@ def _iteration_should_stop(
             postfix=f"bboxes={n_bboxes} | stopped: no new valid points",
         )
         return True
-    if not _boundary_advanced(prev_boundary, next_boundary, grow_direction):
+    if stop_reason == "boundary_unchanged":
         _report_iteration_stop(
             verbose,
             iteration_pbar,
@@ -1363,8 +1416,248 @@ def _iteration_should_stop(
     return False
 
 
+def _available_growth_directions(valid_s):
+    valid_s = np.asarray(valid_s, dtype=bool)
+    valid_rows = np.any(valid_s, axis=1)
+    valid_cols = np.any(valid_s, axis=0)
+    directions = []
+    if valid_cols.sum() >= 2:
+        directions.extend(["left", "right"])
+    if valid_rows.sum() >= 2:
+        directions.extend(["up", "down"])
+    return directions
+
+
+def _resolve_growth_directions(requested_grow_direction, valid_s):
+    if requested_grow_direction != "all":
+        return [requested_grow_direction]
+
+    available = set(_available_growth_directions(valid_s))
+    resolved = [direction for direction in _ALL_GROW_DIRECTION_ORDER if direction in available]
+    if len(resolved) == 0:
+        raise RuntimeError("Segment too small to define a split direction.")
+    return resolved
+
+
+def _setup_segment_with_requested_direction(args, volume):
+    if args.grow_direction != "all":
+        return setup_segment(args, volume)
+
+    unavailable_exc = None
+    for candidate in _ALL_GROW_DIRECTION_ORDER:
+        candidate_args = argparse.Namespace(**vars(args))
+        candidate_args.grow_direction = candidate
+        try:
+            return setup_segment(candidate_args, volume)
+        except RuntimeError as exc:
+            if "not available for this segment" in str(exc):
+                unavailable_exc = exc
+                continue
+            raise
+
+    if unavailable_exc is not None:
+        raise unavailable_exc
+    raise RuntimeError("Unable to initialize segment for grow-direction=all.")
+
+
+def _run_growth_direction_step(
+    args,
+    profiler,
+    extrapolation_settings,
+    tgt_segment,
+    crop_size,
+    extrap_only_mode,
+    run_model_inference,
+    model_state,
+    iteration_pbar,
+    grow_direction,
+    cond_zyxs,
+    cond_valid,
+    cond_uv_offset,
+    stop_is_skip=False,
+):
+    uv_cond = _build_uv_grid(cond_uv_offset, cond_zyxs.shape[:2])
+    cond_direction, _ = _get_growth_context(grow_direction)
+
+    with profiler.section("iter_get_edge_bboxes"):
+        bboxes, _ = get_cond_edge_bboxes(
+            cond_zyxs,
+            cond_direction,
+            crop_size,
+            overlap_frac=args.bbox_overlap_frac,
+            cond_valid=cond_valid,
+        )
+    if iteration_pbar is not None:
+        iteration_pbar.set_postfix_str(
+            f"dir={grow_direction} | bboxes={len(bboxes)}",
+            refresh=True,
+        )
+    if len(bboxes) == 0:
+        if stop_is_skip:
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                f"No edge bboxes for direction '{grow_direction}'; skipping this direction.",
+                postfix=f"dir={grow_direction} | bboxes=0 | skipped: no edge bboxes",
+            )
+        else:
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                "No edge bboxes available at current boundary; stopping iterative growth.",
+                postfix=f"dir={grow_direction} | bboxes=0 | stopped: no edge bboxes",
+            )
+        return {
+            "merged_iter": {
+                "merged_zyxs": cond_zyxs,
+                "merged_valid": cond_valid,
+                "uv_offset": cond_uv_offset,
+            },
+            "bbox_results": [],
+            "edge_extrapolation": _empty_edge_extrapolation(),
+            "extrap_lookup": _empty_extrap_lookup_arrays(),
+            "disp_bbox": None,
+            "displaced": _empty_displaced_samples(),
+            "stop_requested": True,
+            "progressed": False,
+        }
+
+    with profiler.section("iter_edge_extrapolation"):
+        edge_extrapolation = compute_edge_one_shot_extrapolation(
+            cond_zyxs=cond_zyxs,
+            cond_valid=cond_valid,
+            uv_cond=uv_cond,
+            grow_direction=grow_direction,
+            edge_input_rowscols=args.edge_input_rowscols,
+            cond_pct=args.cond_pct,
+            method=extrapolation_settings["method"],
+            min_corner=np.zeros(3, dtype=np.float64),
+            crop_size=crop_size,
+            degrade_prob=extrapolation_settings["degrade_prob"],
+            degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
+            degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
+            skip_bounds_check=True,
+            **extrapolation_settings["method_kwargs"],
+        )
+    if edge_extrapolation is None:
+        edge_extrapolation = _empty_edge_extrapolation()
+
+    with profiler.section("iter_aggregate_extrapolation"):
+        extrap_lookup = _build_iteration_extrap_lookup(edge_extrapolation)
+        edge_extrapolation = _prune_edge_extrapolation_after_lookup(edge_extrapolation)
+
+    with profiler.section("iter_build_bbox_crops"):
+        bbox_results = _build_bbox_crops(
+            bboxes=bboxes,
+            tgt_segment=tgt_segment,
+            volume_scale=args.volume_scale,
+            cond_zyxs=cond_zyxs,
+            cond_valid=cond_valid,
+            uv_cond=uv_cond,
+            grow_direction=grow_direction,
+            crop_size=crop_size,
+            cond_pct=args.cond_pct,
+            extrap_lookup=extrap_lookup,
+            keep_debug_points=bool(args.napari),
+        )
+    _print_bbox_crop_debug_table(bbox_results, verbose=args.verbose)
+
+    agg_samples, disp_bbox = _sample_iteration_agg_samples(
+        args,
+        profiler,
+        grow_direction,
+        extrap_only_mode,
+        run_model_inference,
+        model_state,
+        bbox_results,
+        extrap_lookup,
+    )
+
+    _print_iteration_summary(
+        bbox_results,
+        edge_extrapolation,
+        extrap_lookup,
+        grow_direction,
+        verbose=args.verbose,
+    )
+    _print_agg_extrap_sampling_debug(
+        agg_samples,
+        extrap_lookup,
+        grow_direction,
+        max_lines=args.agg_extrap_lines,
+        verbose=args.verbose,
+    )
+    apply_section = "iter_apply_samples_direct" if extrap_only_mode else "iter_apply_displacement"
+    with profiler.section(apply_section):
+        displaced = _apply_displacement(
+            agg_samples,
+            verbose=args.verbose,
+            skip_inference=extrap_only_mode,
+        )
+
+    prev_boundary = _boundary_axis_value(cond_valid, cond_uv_offset, grow_direction)
+    with profiler.section("iter_merge_surface"):
+        merged_iter = _merge_displaced_points_into_full_surface(
+            cond_zyxs,
+            cond_valid,
+            cond_uv_offset,
+            displaced,
+            verbose=args.verbose,
+        )
+    next_boundary = _boundary_axis_value(
+        merged_iter["merged_valid"],
+        merged_iter["uv_offset"],
+        grow_direction,
+    )
+
+    if stop_is_skip:
+        stop_reason = _iteration_stop_reason(
+            merged_iter,
+            prev_boundary,
+            next_boundary,
+            grow_direction,
+        )
+        stop_requested = stop_reason is not None
+        if stop_reason == "no_new_valid":
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                f"No newly added valid points for direction '{grow_direction}'; skipping this direction.",
+                postfix=f"dir={grow_direction} | bboxes={len(bboxes)} | skipped: no new valid points",
+            )
+        elif stop_reason == "boundary_unchanged":
+            _report_iteration_stop(
+                args.verbose,
+                iteration_pbar,
+                f"Boundary did not advance for direction '{grow_direction}'; skipping this direction.",
+                postfix=f"dir={grow_direction} | bboxes={len(bboxes)} | skipped: boundary unchanged",
+            )
+    else:
+        stop_requested = _iteration_should_stop(
+            merged_iter,
+            prev_boundary,
+            next_boundary,
+            grow_direction,
+            n_bboxes=len(bboxes),
+            verbose=args.verbose,
+            iteration_pbar=iteration_pbar,
+        )
+
+    return {
+        "merged_iter": merged_iter,
+        "bbox_results": bbox_results,
+        "edge_extrapolation": edge_extrapolation,
+        "extrap_lookup": extrap_lookup,
+        "disp_bbox": disp_bbox,
+        "displaced": displaced,
+        "stop_requested": bool(stop_requested),
+        "progressed": bool(not stop_requested),
+    }
+
+
 def main():
     args = parse_args()
+    parse_done = time.perf_counter()
     call_args = _serialize_args(args)
     crop_size = tuple(int(v) for v in args.crop_size)
     profiler = _RuntimeProfiler(enabled=args.profile, device=args.device)
@@ -1414,17 +1707,27 @@ def main():
 
     with profiler.section("setup_segment"):
         volume = zarr.open_group(args.volume_path, mode="r")
-        tgt_segment, stored_zyxs, valid_s, grow_direction, h_s, w_s = setup_segment(args, volume)
-    cond_direction, _ = _get_growth_context(grow_direction)
+        tgt_segment, stored_zyxs, valid_s, _, h_s, w_s = _setup_segment_with_requested_direction(args, volume)
+    grow_directions = _resolve_growth_directions(args.grow_direction, valid_s)
+    multi_direction_mode = (args.grow_direction == "all")
+    if args.verbose and args.grow_direction == "all":
+        missing_dirs = [direction for direction in _ALL_GROW_DIRECTION_ORDER if direction not in grow_directions]
+        print(f"Resolved all-direction growth order: {grow_directions}")
+        if len(missing_dirs) > 0:
+            print(f"Skipping unavailable directions for this segment: {missing_dirs}")
 
     with profiler.section("initialize_window"):
-        init_bboxes, _ = get_cond_edge_bboxes(
-            stored_zyxs,
-            cond_direction,
-            crop_size,
-            overlap_frac=args.bbox_overlap_frac,
-            cond_valid=valid_s,
-        )
+        init_bboxes = []
+        for direction in grow_directions:
+            cond_direction, _ = _get_growth_context(direction)
+            direction_bboxes, _ = get_cond_edge_bboxes(
+                stored_zyxs,
+                cond_direction,
+                crop_size,
+                overlap_frac=args.bbox_overlap_frac,
+                cond_valid=valid_s,
+            )
+            init_bboxes.extend(direction_bboxes)
         if len(init_bboxes) == 0:
             raise RuntimeError("No valid edge bboxes found for segment.")
         r0_s, r1_s, c0_s, c1_s = get_window_bounds_from_bboxes(
@@ -1452,132 +1755,60 @@ def main():
 
     for iteration in iteration_iter:
         if args.verbose:
-            print(f"[iteration {iteration + 1}/{n_iterations}]")
-        cond_zyxs = current_zyxs
-        cond_valid = current_valid
-        cond_uv_offset = current_uv_offset
-        uv_cond = _build_uv_grid(cond_uv_offset, cond_zyxs.shape[:2])
+            if multi_direction_mode:
+                print(f"[iteration {iteration + 1}/{n_iterations}]")
+            else:
+                print(
+                    f"[iteration {iteration + 1}/{n_iterations} | dir={grow_directions[0]}]"
+                )
 
-        with profiler.section("iter_get_edge_bboxes"):
-            bboxes, _ = get_cond_edge_bboxes(
-                cond_zyxs,
-                cond_direction,
-                crop_size,
-                overlap_frac=args.bbox_overlap_frac,
-                cond_valid=cond_valid,
+        iteration_progressed = False
+        should_break_outer = False
+        for grow_direction in grow_directions:
+            if args.verbose and multi_direction_mode:
+                print(f"[iteration {iteration + 1}/{n_iterations} | dir={grow_direction}]")
+            step_result = _run_growth_direction_step(
+                args=args,
+                profiler=profiler,
+                extrapolation_settings=extrapolation_settings,
+                tgt_segment=tgt_segment,
+                crop_size=crop_size,
+                extrap_only_mode=extrap_only_mode,
+                run_model_inference=run_model_inference,
+                model_state=model_state,
+                iteration_pbar=iteration_pbar,
+                grow_direction=grow_direction,
+                cond_zyxs=current_zyxs,
+                cond_valid=current_valid,
+                cond_uv_offset=current_uv_offset,
+                stop_is_skip=multi_direction_mode,
             )
-        if iteration_pbar is not None:
-            iteration_pbar.set_postfix_str(f"bboxes={len(bboxes)}", refresh=True)
-        if len(bboxes) == 0:
+
+            merged_iter = step_result["merged_iter"]
+            current_zyxs = merged_iter["merged_zyxs"]
+            current_valid = merged_iter["merged_valid"]
+            current_uv_offset = merged_iter["uv_offset"]
+            bbox_results = step_result["bbox_results"]
+            edge_extrapolation = step_result["edge_extrapolation"]
+            extrap_lookup = step_result["extrap_lookup"]
+            disp_bbox = step_result["disp_bbox"]
+            displaced = step_result["displaced"]
+
+            if step_result["progressed"]:
+                iteration_progressed = True
+            if (not multi_direction_mode) and step_result["stop_requested"]:
+                should_break_outer = True
+                break
+
+        if should_break_outer:
+            break
+        if multi_direction_mode and (not iteration_progressed):
             _report_iteration_stop(
                 args.verbose,
                 iteration_pbar,
-                "No edge bboxes available at current boundary; stopping iterative growth.",
-                postfix="bboxes=0 | stopped: no edge bboxes",
+                "No directional progress this iteration; stopping iterative growth.",
+                postfix="stopped: no directional progress",
             )
-            break
-
-        with profiler.section("iter_edge_extrapolation"):
-            edge_extrapolation = compute_edge_one_shot_extrapolation(
-                cond_zyxs=cond_zyxs,
-                cond_valid=cond_valid,
-                uv_cond=uv_cond,
-                grow_direction=grow_direction,
-                edge_input_rowscols=args.edge_input_rowscols,
-                cond_pct=args.cond_pct,
-                method=extrapolation_settings["method"],
-                min_corner=np.zeros(3, dtype=np.float64),
-                crop_size=crop_size,
-                degrade_prob=extrapolation_settings["degrade_prob"],
-                degrade_curvature_range=extrapolation_settings["degrade_curvature_range"],
-                degrade_gradient_range=extrapolation_settings["degrade_gradient_range"],
-                skip_bounds_check=True,
-                **extrapolation_settings["method_kwargs"],
-            )
-        if edge_extrapolation is None:
-            edge_extrapolation = _empty_edge_extrapolation()
-
-        with profiler.section("iter_aggregate_extrapolation"):
-            extrap_lookup = _build_iteration_extrap_lookup(edge_extrapolation)
-            edge_extrapolation = _prune_edge_extrapolation_after_lookup(edge_extrapolation)
-
-        with profiler.section("iter_build_bbox_crops"):
-            bbox_crops = _build_bbox_crops(
-                bboxes=bboxes,
-                tgt_segment=tgt_segment,
-                volume_scale=args.volume_scale,
-                cond_zyxs=cond_zyxs,
-                cond_valid=cond_valid,
-                uv_cond=uv_cond,
-                grow_direction=grow_direction,
-                crop_size=crop_size,
-                cond_pct=args.cond_pct,
-                extrap_lookup=extrap_lookup,
-                keep_debug_points=bool(args.napari),
-            )
-        _print_bbox_crop_debug_table(bbox_crops, verbose=args.verbose)
-        bbox_results = bbox_crops
-
-        agg_samples, disp_bbox = _sample_iteration_agg_samples(
-            args,
-            profiler,
-            grow_direction,
-            extrap_only_mode,
-            run_model_inference,
-            model_state,
-            bbox_crops,
-            extrap_lookup,
-        )
-
-        _print_iteration_summary(
-            bbox_results,
-            edge_extrapolation,
-            extrap_lookup,
-            grow_direction,
-            verbose=args.verbose,
-        )
-        _print_agg_extrap_sampling_debug(
-            agg_samples,
-            extrap_lookup,
-            grow_direction,
-            max_lines=args.agg_extrap_lines,
-            verbose=args.verbose,
-        )
-        apply_section = "iter_apply_samples_direct" if extrap_only_mode else "iter_apply_displacement"
-        with profiler.section(apply_section):
-            displaced = _apply_displacement(
-                agg_samples,
-                verbose=args.verbose,
-                skip_inference=extrap_only_mode,
-            )
-
-        prev_boundary = _boundary_axis_value(cond_valid, cond_uv_offset, grow_direction)
-        with profiler.section("iter_merge_surface"):
-            merged_iter = _merge_displaced_points_into_full_surface(
-                cond_zyxs,
-                cond_valid,
-                cond_uv_offset,
-                displaced,
-                verbose=args.verbose,
-            )
-        next_boundary = _boundary_axis_value(
-            merged_iter["merged_valid"],
-            merged_iter["uv_offset"],
-            grow_direction,
-        )
-        current_zyxs = merged_iter["merged_zyxs"]
-        current_valid = merged_iter["merged_valid"]
-        current_uv_offset = merged_iter["uv_offset"]
-
-        if _iteration_should_stop(
-            merged_iter,
-            prev_boundary,
-            next_boundary,
-            grow_direction,
-            n_bboxes=len(bboxes),
-            verbose=args.verbose,
-            iteration_pbar=iteration_pbar,
-        ):
             break
 
     if iteration_pbar is not None:
@@ -1627,12 +1858,41 @@ def main():
 
     if args.profile:
         profiler.sync()
+        run_end = time.perf_counter()
         total_runtime_s = (
-            time.perf_counter() - run_start
+            run_end - run_start
             if run_start is not None
             else None
         )
+        process_runtime_s = run_end - _PROCESS_START
+        startup_and_argparse_s = parse_done - _PROCESS_START
+        pre_profile_window_s = (
+            run_start - _PROCESS_START
+            if run_start is not None
+            else 0.0
+        )
+        outside_profile_window_s = (
+            max(0.0, process_runtime_s - total_runtime_s)
+            if total_runtime_s is not None
+            else None
+        )
+        sum_profiled_sections_s = profiler.total_profiled_time(inclusive=False)
+        profiled_gap_s = (
+            max(0.0, total_runtime_s - sum_profiled_sections_s)
+            if total_runtime_s is not None
+            else None
+        )
         profiler.print_summary(total_runtime_s=total_runtime_s)
+        if total_runtime_s is not None:
+            print(f"profile_window_runtime: {float(total_runtime_s):.3f}s")
+        print(f"sum_profiled_sections_exclusive: {float(sum_profiled_sections_s):.3f}s")
+        if profiled_gap_s is not None:
+            print(f"profiled_gap: {float(profiled_gap_s):.3f}s")
+        print(f"startup_and_argparse: {float(startup_and_argparse_s):.3f}s")
+        print(f"pre_profile_window: {float(pre_profile_window_s):.3f}s")
+        if outside_profile_window_s is not None:
+            print(f"outside_profile_window: {float(outside_profile_window_s):.3f}s")
+        print(f"process_runtime: {float(process_runtime_s):.3f}s")
 
 
 if __name__ == "__main__":
