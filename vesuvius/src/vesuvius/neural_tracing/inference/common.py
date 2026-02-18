@@ -292,23 +292,31 @@ def _agg_extrap_axis_metadata(grow_direction):
     return axis_idx, axis_name, near_to_far_desc
 
 
-def _finite_uvs_from_extrap_map(extrap_uv_to_zyx):
-    if not extrap_uv_to_zyx:
+def _finite_uvs_from_extrap_lookup(extrap_lookup):
+    if extrap_lookup is None:
         return np.zeros((0, 2), dtype=np.int64)
-    finite_uv = []
-    for uv_key, pt in extrap_uv_to_zyx.items():
-        if pt is None:
-            continue
-        pt_arr = np.asarray(pt)
-        if pt_arr.shape == (3,) and np.isfinite(pt_arr).all():
-            finite_uv.append((int(uv_key[0]), int(uv_key[1])))
-    if len(finite_uv) == 0:
-        return np.zeros((0, 2), dtype=np.int64)
-    return np.asarray(finite_uv, dtype=np.int64).reshape(-1, 2)
+
+    uv_attr = getattr(extrap_lookup, "uv", None)
+    world_attr = getattr(extrap_lookup, "world", None)
+    if uv_attr is not None and world_attr is not None:
+        uv = np.asarray(uv_attr, dtype=np.int64)
+        world = np.asarray(world_attr, dtype=np.float32)
+        if uv.ndim != 2 or uv.shape[1] != 2:
+            return np.zeros((0, 2), dtype=np.int64)
+        if world.ndim != 2 or world.shape[1] != 3:
+            return np.zeros((0, 2), dtype=np.int64)
+        if uv.shape[0] != world.shape[0]:
+            return np.zeros((0, 2), dtype=np.int64)
+        finite = np.isfinite(world).all(axis=1)
+        if not finite.any():
+            return np.zeros((0, 2), dtype=np.int64)
+        return uv[finite].astype(np.int64, copy=False)
+
+    return np.zeros((0, 2), dtype=np.int64)
 
 
-def _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=None):
-    uv_ordered = _finite_uvs_from_extrap_map(extrap_uv_to_zyx)
+def _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=None):
+    uv_ordered = _finite_uvs_from_extrap_lookup(extrap_lookup)
     if uv_ordered.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int64)
 
@@ -333,10 +341,10 @@ def _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=
     return uv_ordered[keep]
 
 
-def _print_agg_extrap_sampling_debug(samples, extrap_uv_to_zyx, grow_direction, max_lines=None, verbose=True):
+def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max_lines=None, verbose=True):
     if not verbose:
         return
-    all_uv = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=None)
+    all_uv = _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=None)
     sampled_uv = np.asarray(samples.get("uv", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64)
     axis_idx, axis_name, _ = _agg_extrap_axis_metadata(grow_direction)
     total_uv = int(all_uv.shape[0])
@@ -486,8 +494,8 @@ def _print_bbox_crop_debug_table(bbox_crops, verbose=True):
     )
 
 
-def _agg_extrap_line_summary(extrap_uv_to_zyx, grow_direction):
-    uv_ordered = _select_extrap_uvs_for_sampling(extrap_uv_to_zyx, grow_direction, max_lines=None)
+def _agg_extrap_line_summary(extrap_lookup, grow_direction):
+    uv_ordered = _select_extrap_uvs_for_sampling(extrap_lookup, grow_direction, max_lines=None)
     axis_idx, axis_name, _ = _agg_extrap_axis_metadata(grow_direction)
     if uv_ordered.shape[0] == 0:
         return {
@@ -512,14 +520,15 @@ def _agg_extrap_line_summary(extrap_uv_to_zyx, grow_direction):
     }
 
 
-def _print_iteration_summary(bbox_results, one_shot, extrap_uv_to_zyx, grow_direction, verbose=True):
+def _print_iteration_summary(bbox_results, one_shot, extrap_lookup, grow_direction, verbose=True):
     if not verbose:
         return
-    agg_summary = _agg_extrap_line_summary(extrap_uv_to_zyx, grow_direction)
+    agg_summary = _agg_extrap_line_summary(extrap_lookup, grow_direction)
+    extrap_uv_count = int(_finite_uvs_from_extrap_lookup(extrap_lookup).shape[0])
     print("== Extrapolation Summary ==")
     print(f"bboxes: {len(bbox_results)}")
     print(f"one-shot edge-input uv count: {len(one_shot.get('edge_uv', []))}")
-    print(f"one-shot extrap uv count (aggregated): {len(extrap_uv_to_zyx)}")
+    print(f"one-shot extrap uv count (aggregated): {extrap_uv_count}")
     print("== Aggregated Extrapolation ==")
     print(f"axis: {agg_summary['axis_name']}")
     print(f"available lines (near->far): {agg_summary['line_count']}")
@@ -535,7 +544,7 @@ def _show_napari(
     cond_valid,
     bbox_results,
     one_shot,
-    extrap_uv_to_zyx,
+    extrap_lookup,
     disp_bbox=None,
     displaced=None,
     merged=None,
@@ -683,8 +692,12 @@ def _show_napari(
             opacity=0.9,
         )
 
-    if extrap_uv_to_zyx:
-        one_pts = np.asarray(list(extrap_uv_to_zyx.values()), dtype=np.float32)
+    one_pts = np.zeros((0, 3), dtype=np.float32)
+    if extrap_lookup is not None:
+        world_attr = getattr(extrap_lookup, "world", None)
+        if world_attr is not None:
+            one_pts = np.asarray(world_attr, dtype=np.float32)
+    if one_pts.size > 0:
         one_pts = _downsample_points(one_pts)
         viewer.add_points(
             one_pts,
