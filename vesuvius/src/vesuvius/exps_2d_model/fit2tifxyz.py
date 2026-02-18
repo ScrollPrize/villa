@@ -94,7 +94,7 @@ def _apply_global_transform_from_state_dict(*, uv: torch.Tensor, st: dict) -> to
 	return torch.cat([x, y], dim=1)
 
 
-def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float) -> None:
+def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -115,10 +115,21 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 			[float(np.max(xf)), float(np.max(yf)), float(np.max(zf))],
 		],
 	}
+	if model_source is not None:
+		meta["model_source"] = str(model_source)
+	else:
+		meta.pop("model_source", None)
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression="lzw")
+
+	# Create model.pt symlink pointing to the source checkpoint
+	if model_source is not None:
+		link = out_dir / "model.pt"
+		if link.is_symlink() or link.exists():
+			link.unlink()
+		link.symlink_to(model_source.resolve())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -262,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
 				y[~v] = -1.0
 				z_use[~v] = -1.0
 		out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
-		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale)
+		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input))
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 		if mask is not None:

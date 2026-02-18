@@ -107,6 +107,10 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
+    FitServiceManager.cpp
+    FitServiceManager.hpp
+    segmentation/panels/SegmentationFitOptimizerPanel.cpp
+    segmentation/panels/SegmentationFitOptimizerPanel.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp
@@ -147,6 +151,7 @@ target_link_libraries(VC3D
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Network
     opencv_ximgproc
 )
 

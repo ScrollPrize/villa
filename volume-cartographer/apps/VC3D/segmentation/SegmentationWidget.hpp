@@ -23,6 +23,7 @@ class SegmentationApprovalMaskPanel;
 class SegmentationCellReoptPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
+class SegmentationFitOptimizerPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -162,6 +163,16 @@ public:
     void setCellReoptMode(bool enabled);
     void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
 
+    // Fit optimizer getters — delegated to panel
+    [[nodiscard]] QString fitPythonPath() const;
+    [[nodiscard]] QString fitModelPath() const;
+    [[nodiscard]] QString fitOutputDir() const;
+    [[nodiscard]] QString fitConfigText() const;
+
+    // Fit optimizer setters
+    void setFitModelPath(const QString& path);
+    void setFitOutputDir(const QString& path);
+
 signals:
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
@@ -207,6 +218,11 @@ signals:
     void neuralTracerEnabledChanged(bool enabled);
     void neuralTracerStatusMessage(const QString& message);
 
+    // Fit optimizer signals
+    void fitOptimizeRequested();
+    void fitStopRequested();
+    void fitStatusMessage(const QString& message);
+
     // Cell reoptimization signals
     void cellReoptModeChanged(bool enabled);
     void cellReoptMaxStepsChanged(int steps);
@@ -236,5 +252,6 @@ private:
     SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
+    SegmentationFitOptimizerPanel* _fitOptimizerPanel{nullptr};
 
 };

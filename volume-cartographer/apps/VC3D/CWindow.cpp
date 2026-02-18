@@ -23,6 +23,8 @@
 #include <QClipboard>
 #include <QDateTime>
 #include <QFileDialog>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTextStream>
 #include <QFileInfo>
 #include <QDir>
@@ -91,6 +93,7 @@
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
+#include "FitServiceManager.hpp"
 #include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -1765,6 +1768,84 @@ void CWindow::CreateWidgets(void)
                 _segmentationWidget->setActiveVolume(fallbackId);
                 _segmentationGrowthVolumeId = currentVolumeId;
             }
+        }
+    });
+
+    // -- Fit optimizer connections --
+    connect(_segmentationWidget, &SegmentationWidget::fitOptimizeRequested, this, [this]() {
+        auto& mgr = FitServiceManager::instance();
+
+        // Ensure service is running
+        const QString pythonPath = _segmentationWidget->fitPythonPath();
+        if (!mgr.ensureServiceRunning(pythonPath)) {
+            statusBar()->showMessage(tr("Failed to start fit service: %1").arg(mgr.lastError()), 5000);
+            return;
+        }
+
+        // Get model path from panel (user may have set it, or auto-detected)
+        QString modelPath = _segmentationWidget->fitModelPath();
+
+        // If not set, try to auto-detect from the active segmentation surface
+        if (modelPath.isEmpty()) {
+            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
+                _surf_col->surface("segmentation"));
+            if (activeSurface && !activeSurface->path.empty()) {
+                auto modelLink = activeSurface->path / "model.pt";
+                if (std::filesystem::is_symlink(modelLink) || std::filesystem::exists(modelLink)) {
+                    modelPath = QString::fromStdString(
+                        std::filesystem::canonical(modelLink).string());
+                }
+            }
+        }
+
+        if (modelPath.isEmpty()) {
+            statusBar()->showMessage(
+                tr("No model path set and no model.pt found in segment directory."), 5000);
+            return;
+        }
+
+        // Build optimization request
+        QJsonObject request;
+        request[QStringLiteral("model_input")] = modelPath;
+        request[QStringLiteral("model_output")] = modelPath; // overwrite in-place
+
+        // Output dir: panel setting, or segment's parent directory
+        QString outputDir = _segmentationWidget->fitOutputDir();
+        if (outputDir.isEmpty()) {
+            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
+                _surf_col->surface("segmentation"));
+            if (activeSurface && !activeSurface->path.empty()) {
+                outputDir = QString::fromStdString(
+                    activeSurface->path.parent_path().string());
+            }
+        }
+        request[QStringLiteral("output_dir")] = outputDir;
+
+        // Parse config JSON from the editor
+        QString configText = _segmentationWidget->fitConfigText().trimmed();
+        if (!configText.isEmpty()) {
+            QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
+            if (doc.isObject()) {
+                request[QStringLiteral("config")] = doc.object();
+            }
+        }
+
+        mgr.startOptimization(request);
+        statusBar()->showMessage(tr("Fit optimization started."), 3000);
+    });
+
+    connect(_segmentationWidget, &SegmentationWidget::fitStopRequested, this, [this]() {
+        FitServiceManager::instance().stopOptimization();
+        statusBar()->showMessage(tr("Fit optimization stop requested."), 3000);
+    });
+
+    // Auto-reload segments when fit optimization finishes
+    connect(&FitServiceManager::instance(), &FitServiceManager::optimizationFinished,
+            this, [this](const QString& outputDir) {
+        statusBar()->showMessage(
+            tr("Fit optimization finished. Reloading segments from %1").arg(outputDir), 5000);
+        if (_surfacePanel) {
+            _surfacePanel->loadSurfacesIncremental();
         }
     });
 
@@ -4084,6 +4165,23 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
                     viewer->clearOverlayGroup("segmentation_radius_indicator");
                 }
             });
+        }
+
+        // Auto-detect model.pt symlink for fit optimizer panel
+        if (_segmentationWidget && activeSurfaceShared && !activeSurfaceShared->path.empty()) {
+            auto modelLink = activeSurfaceShared->path / "model.pt";
+            if (std::filesystem::is_symlink(modelLink) || std::filesystem::exists(modelLink)) {
+                try {
+                    auto resolved = std::filesystem::canonical(modelLink);
+                    _segmentationWidget->setFitModelPath(
+                        QString::fromStdString(resolved.string()));
+                } catch (const std::filesystem::filesystem_error&) {
+                    // Symlink target doesn't exist — ignore
+                }
+            }
+            // Set output dir to the segment's parent directory
+            _segmentationWidget->setFitOutputDir(
+                QString::fromStdString(activeSurfaceShared->path.parent_path().string()));
         }
     } else {
         _segmentationModule->endEditingSession();

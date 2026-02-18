@@ -10,6 +10,7 @@
 #include "panels/SegmentationCellReoptPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
 #include "panels/SegmentationDirectionFieldPanel.hpp"
+#include "panels/SegmentationFitOptimizerPanel.hpp"
 #include "VCSettings.hpp"
 
 #include <QSettings>
@@ -54,6 +55,9 @@ void SegmentationWidget::buildUi()
 
     _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
+
+    _fitOptimizerPanel = new SegmentationFitOptimizerPanel(QStringLiteral("segmentation_edit"), this);
+    layout->addWidget(_fitOptimizerPanel);
 
     _correctionsPanel = new SegmentationCorrectionsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_correctionsPanel);
@@ -165,6 +169,14 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::neuralTracerEnabledChanged);
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerStatusMessage,
             this, &SegmentationWidget::neuralTracerStatusMessage);
+
+    // Forward fit optimizer panel signals
+    connect(_fitOptimizerPanel, &SegmentationFitOptimizerPanel::fitOptimizeRequested,
+            this, &SegmentationWidget::fitOptimizeRequested);
+    connect(_fitOptimizerPanel, &SegmentationFitOptimizerPanel::fitStopRequested,
+            this, &SegmentationWidget::fitStopRequested);
+    connect(_fitOptimizerPanel, &SegmentationFitOptimizerPanel::fitStatusMessage,
+            this, &SegmentationWidget::fitStatusMessage);
 }
 
 void SegmentationWidget::syncUiState()
@@ -186,6 +198,7 @@ void SegmentationWidget::syncUiState()
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _approvalMaskPanel->syncUiState();
     _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
+    _fitOptimizerPanel->syncUiState(_editingEnabled, false);
 }
 
 void SegmentationWidget::restoreSettings()
@@ -204,6 +217,7 @@ void SegmentationWidget::restoreSettings()
     _approvalMaskPanel->restoreSettings(settings);
     _neuralTracerPanel->restoreSettings(settings);
     _cellReoptPanel->restoreSettings(settings);
+    _fitOptimizerPanel->restoreSettings(settings);
 
     settings.endGroup();
     _restoringSettings = false;
@@ -393,3 +407,13 @@ void SegmentationWidget::setNeuralBatchSize(int size) { _neuralTracerPanel->setN
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 
 void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}
+
+// --- Fit optimizer delegations ---
+
+QString SegmentationWidget::fitPythonPath() const { return _fitOptimizerPanel->fitPythonPath(); }
+QString SegmentationWidget::fitModelPath() const { return _fitOptimizerPanel->fitModelPath(); }
+QString SegmentationWidget::fitOutputDir() const { return _fitOptimizerPanel->fitOutputDir(); }
+QString SegmentationWidget::fitConfigText() const { return _fitOptimizerPanel->fitConfigText(); }
+
+void SegmentationWidget::setFitModelPath(const QString& path) { _fitOptimizerPanel->setFitModelPath(path); }
+void SegmentationWidget::setFitOutputDir(const QString& path) { _fitOptimizerPanel->setFitOutputDir(path); }
