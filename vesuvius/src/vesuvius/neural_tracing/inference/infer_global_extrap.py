@@ -694,8 +694,6 @@ def _sample_displacement_for_extrap_uvs_from_crops(
 
     disp_acc = np.zeros((n_points, 3), dtype=np.float32)
     count_acc = np.zeros((n_points,), dtype=np.uint32)
-    ones_cache = {}
-
     for item in per_crop_fields:
         disp = np.asarray(item["displacement"], dtype=np.float32)
         min_corner = np.asarray(item["min_corner"], dtype=np.float32)
@@ -709,17 +707,10 @@ def _sample_displacement_for_extrap_uvs_from_crops(
         if point_idx.size == 0:
             continue
 
-        shape_key = (int(d), int(h), int(w))
-        count_field = ones_cache.get(shape_key)
-        if count_field is None:
-            count_field = np.ones(shape_key, dtype=np.uint8)
-            ones_cache[shape_key] = count_field
-
         sample_fn = _sample_trilinear_displacement_stack if refine is None else _sample_fractional_displacement_stack
         sample_kwargs = {} if refine is None else {"refine_extra_steps": int(refine)}
-        sampled_disp, _, valid_mask = sample_fn(
+        sampled_disp, valid_mask = sample_fn(
             disp,
-            count_field,
             coords_local,
             **sample_kwargs,
         )
@@ -750,12 +741,11 @@ def _sample_displacement_for_extrap_uvs_from_crops(
     }
 
 
-def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extra_steps):
+def _sample_fractional_displacement_stack(disp, coords_local, refine_extra_steps):
     coords_local = np.asarray(coords_local, dtype=np.float32)
     if coords_local.ndim != 2 or coords_local.shape[1] != 3 or coords_local.shape[0] == 0:
         return (
             _empty_world(dtype=np.float32),
-            _empty_counts(dtype=np.uint32),
             np.zeros((0,), dtype=bool),
         )
 
@@ -765,16 +755,13 @@ def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extr
 
     start_coords = coords_local.copy()
     current_coords = coords_local.copy()
-    best_count = np.zeros((coords_local.shape[0],), dtype=np.uint32)
     ever_valid = np.zeros((coords_local.shape[0],), dtype=bool)
 
     for _ in range(refine_parts):
-        stage_disp, stage_count, stage_valid = _sample_trilinear_displacement_stack(
+        stage_disp, stage_valid = _sample_trilinear_displacement_stack(
             disp,
-            count,
             current_coords,
         )
-        np.maximum(best_count, stage_count, out=best_count)
         if not stage_valid.any():
             continue
         delta = stage_disp * refine_fraction
@@ -790,7 +777,7 @@ def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extr
     if not bool(finite_disp.all()):
         sampled_disp = np.where(finite_disp[:, None], sampled_disp, 0.0).astype(np.float32, copy=False)
         ever_valid &= finite_disp
-    return sampled_disp, best_count, ever_valid
+    return sampled_disp, ever_valid
 
 
 def _sample_extrap_no_disp(extrap_lookup, grow_direction, max_lines=None):
@@ -821,24 +808,20 @@ def _coords_local_to_grid(coords_local, d, h, w):
     return coords_t[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
 
 
-def _sample_trilinear_displacement_stack(disp, count, coords_local):
+def _sample_trilinear_displacement_stack(disp, coords_local):
     if coords_local is None or len(coords_local) == 0:
         return (
             _empty_world(dtype=np.float32),
-            _empty_counts(dtype=np.uint32),
             np.zeros((0,), dtype=bool),
         )
 
     disp_t = torch.from_numpy(np.asarray(disp, dtype=np.float32)).unsqueeze(0)  # [1, 3, D, H, W]
-    count_t = torch.from_numpy(np.asarray(count, dtype=np.float32)).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-    valid_t = (count_t > 0).to(dtype=disp_t.dtype)
-    disp_weighted_t = disp_t * valid_t
-
     _, _, d, h, w = disp_t.shape
+    valid_t = torch.ones((1, 1, d, h, w), dtype=disp_t.dtype)
     grid = _coords_local_to_grid(coords_local, d=d, h=h, w=w)
 
-    sampled_disp_weighted = F.grid_sample(
-        disp_weighted_t,
+    sampled_disp = F.grid_sample(
+        disp_t,
         grid,
         mode="bilinear",
         align_corners=True,
@@ -849,26 +832,19 @@ def _sample_trilinear_displacement_stack(disp, count, coords_local):
         mode="bilinear",
         align_corners=True,
     ).view(-1)
-    sampled_count = F.grid_sample(
-        count_t,
-        grid,
-        mode="bilinear",
-        align_corners=True,
-    ).view(-1)
 
     eps = 1e-6
     valid_mask = sampled_valid_weight > eps
-    sampled_disp = torch.zeros_like(sampled_disp_weighted)
+    sampled_disp_out = torch.zeros_like(sampled_disp)
     if bool(valid_mask.any()):
-        sampled_disp[valid_mask] = (
-            sampled_disp_weighted[valid_mask] /
+        sampled_disp_out[valid_mask] = (
+            sampled_disp[valid_mask] /
             sampled_valid_weight[valid_mask].unsqueeze(-1)
         )
 
-    sampled_disp_np = sampled_disp.cpu().numpy().astype(np.float32, copy=False)
-    sampled_count_np = np.rint(sampled_count.cpu().numpy()).astype(np.uint32, copy=False)
+    sampled_disp_np = sampled_disp_out.cpu().numpy().astype(np.float32, copy=False)
     valid_mask_np = valid_mask.cpu().numpy().astype(bool, copy=False)
-    return sampled_disp_np, sampled_count_np, valid_mask_np
+    return sampled_disp_np, valid_mask_np
 
 
 def _empty_displaced_samples():
