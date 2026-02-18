@@ -1941,62 +1941,64 @@ def _run_with_args(args, parse_done):
         iteration_iter = iteration_pbar
 
     for iteration in iteration_iter:
-        if args.verbose:
-            if multi_direction_mode:
-                print(f"[iteration {iteration + 1}/{n_iterations}]")
-            else:
-                print(
-                    f"[iteration {iteration + 1}/{n_iterations} | dir={grow_directions[0]}]"
-                )
+        with profiler.section("iter_iteration"):
+            if args.verbose:
+                if multi_direction_mode:
+                    print(f"[iteration {iteration + 1}/{n_iterations}]")
+                else:
+                    print(
+                        f"[iteration {iteration + 1}/{n_iterations} | dir={grow_directions[0]}]"
+                    )
 
-        iteration_progressed = False
-        should_break_outer = False
-        for grow_direction in grow_directions:
-            if args.verbose and multi_direction_mode:
-                print(f"[iteration {iteration + 1}/{n_iterations} | dir={grow_direction}]")
-            step_result = _run_growth_direction_step(
-                args=args,
-                profiler=profiler,
-                extrapolation_settings=extrapolation_settings,
-                tgt_segment=tgt_segment,
-                crop_size=crop_size,
-                extrap_only_mode=extrap_only_mode,
-                run_model_inference=run_model_inference,
-                model_state=model_state,
-                iteration_pbar=iteration_pbar,
-                grow_direction=grow_direction,
-                cond_zyxs=current_zyxs,
-                cond_valid=current_valid,
-                cond_uv_offset=current_uv_offset,
-                stop_is_skip=multi_direction_mode,
-            )
+            iteration_progressed = False
+            should_break_outer = False
+            for grow_direction in grow_directions:
+                with profiler.section("iter_growth_direction"):
+                    if args.verbose and multi_direction_mode:
+                        print(f"[iteration {iteration + 1}/{n_iterations} | dir={grow_direction}]")
+                    step_result = _run_growth_direction_step(
+                        args=args,
+                        profiler=profiler,
+                        extrapolation_settings=extrapolation_settings,
+                        tgt_segment=tgt_segment,
+                        crop_size=crop_size,
+                        extrap_only_mode=extrap_only_mode,
+                        run_model_inference=run_model_inference,
+                        model_state=model_state,
+                        iteration_pbar=iteration_pbar,
+                        grow_direction=grow_direction,
+                        cond_zyxs=current_zyxs,
+                        cond_valid=current_valid,
+                        cond_uv_offset=current_uv_offset,
+                        stop_is_skip=multi_direction_mode,
+                    )
 
-            merged_iter = step_result["merged_iter"]
-            current_zyxs = merged_iter["merged_zyxs"]
-            current_valid = merged_iter["merged_valid"]
-            current_uv_offset = merged_iter["uv_offset"]
-            bbox_results = step_result["bbox_results"]
-            edge_extrapolation = step_result["edge_extrapolation"]
-            extrap_lookup = step_result["extrap_lookup"]
-            disp_bbox = step_result["disp_bbox"]
-            displaced = step_result["displaced"]
+                    merged_iter = step_result["merged_iter"]
+                    current_zyxs = merged_iter["merged_zyxs"]
+                    current_valid = merged_iter["merged_valid"]
+                    current_uv_offset = merged_iter["uv_offset"]
+                    bbox_results = step_result["bbox_results"]
+                    edge_extrapolation = step_result["edge_extrapolation"]
+                    extrap_lookup = step_result["extrap_lookup"]
+                    disp_bbox = step_result["disp_bbox"]
+                    displaced = step_result["displaced"]
 
-            if step_result["progressed"]:
-                iteration_progressed = True
-            if (not multi_direction_mode) and step_result["stop_requested"]:
-                should_break_outer = True
+                    if step_result["progressed"]:
+                        iteration_progressed = True
+                    if (not multi_direction_mode) and step_result["stop_requested"]:
+                        should_break_outer = True
+                        break
+
+            if should_break_outer:
                 break
-
-        if should_break_outer:
-            break
-        if multi_direction_mode and (not iteration_progressed):
-            _report_iteration_stop(
-                args.verbose,
-                iteration_pbar,
-                "No directional progress this iteration; stopping iterative growth.",
-                postfix="stopped: no directional progress",
-            )
-            break
+            if multi_direction_mode and (not iteration_progressed):
+                _report_iteration_stop(
+                    args.verbose,
+                    iteration_pbar,
+                    "No directional progress this iteration; stopping iterative growth.",
+                    postfix="stopped: no directional progress",
+                )
+                break
 
     if iteration_pbar is not None:
         iteration_pbar.close()

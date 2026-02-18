@@ -1363,16 +1363,36 @@ def _show_napari(
 class RunTimeProfiler:
     def __init__(self, enabled=False, device=None):
         self.enabled = bool(enabled)
-        self._totals = {}
-        self._exclusive_totals = {}
-        self._counts = {}
-        self._order = []
+        self._nodes = []
+        self._root_id = self._new_node("__root__", parent_id=None)
         self._stack = []
         self._device = None
         self._use_cuda_sync = False
         if self.enabled and device is not None:
             self._device = torch.device(device)
             self._use_cuda_sync = self._device.type == "cuda" and torch.cuda.is_available()
+
+    def _new_node(self, name, parent_id):
+        node = {
+            "name": str(name),
+            "parent_id": parent_id,
+            "children": [],
+            "children_by_name": {},
+            "total_s": 0.0,
+            "self_s": 0.0,
+            "count": 0,
+        }
+        self._nodes.append(node)
+        return len(self._nodes) - 1
+
+    def _get_or_create_child_node(self, parent_id, name):
+        parent = self._nodes[parent_id]
+        node_id = parent["children_by_name"].get(name)
+        if node_id is None:
+            node_id = self._new_node(name, parent_id=parent_id)
+            parent["children_by_name"][name] = node_id
+            parent["children"].append(node_id)
+        return node_id
 
     def _sync_cuda(self):
         if self._use_cuda_sync:
@@ -1388,9 +1408,12 @@ class RunTimeProfiler:
         if not self.enabled:
             yield
             return
+        name = str(name)
+        parent_id = self._stack[-1]["node_id"] if self._stack else self._root_id
+        node_id = self._get_or_create_child_node(parent_id, name)
         self._sync_cuda()
         start = time.perf_counter()
-        self._stack.append({"name": name, "start": start, "child_elapsed": 0.0})
+        self._stack.append({"node_id": node_id, "start": start, "child_elapsed": 0.0})
         try:
             yield
         finally:
@@ -1401,35 +1424,114 @@ class RunTimeProfiler:
             exclusive_elapsed = max(0.0, elapsed - float(frame["child_elapsed"]))
             if self._stack:
                 self._stack[-1]["child_elapsed"] += elapsed
-            if name not in self._totals:
-                self._totals[name] = 0.0
-                self._exclusive_totals[name] = 0.0
-                self._counts[name] = 0
-                self._order.append(name)
-            self._totals[name] += elapsed
-            self._exclusive_totals[name] += exclusive_elapsed
-            self._counts[name] += 1
+            node = self._nodes[frame["node_id"]]
+            node["total_s"] += elapsed
+            node["self_s"] += exclusive_elapsed
+            node["count"] += 1
+
+    def _iter_nodes(self):
+        for node_id, node in enumerate(self._nodes):
+            if node_id == self._root_id:
+                continue
+            yield node_id, node
+
+    def _top_level_total(self):
+        root = self._nodes[self._root_id]
+        return float(sum(float(self._nodes[node_id]["total_s"]) for node_id in root["children"]))
+
+    def _build_summary_rows(self, total_runtime_s=None):
+        total_base = (
+            float(total_runtime_s)
+            if total_runtime_s is not None and float(total_runtime_s) > 0.0
+            else self._top_level_total()
+        )
+        rows = []
+
+        def _visit(node_id, depth, parent_total_s):
+            node = self._nodes[node_id]
+            total_s = float(node["total_s"])
+            self_s = float(node["self_s"])
+            count = int(node["count"])
+            avg_s = total_s / max(count, 1)
+            self_avg_s = self_s / max(count, 1)
+            pct_parent = 0.0 if parent_total_s <= 0.0 else (100.0 * total_s / parent_total_s)
+            pct_total = 0.0 if total_base <= 0.0 else (100.0 * total_s / total_base)
+            rows.append(
+                {
+                    "section": f"{'  ' * depth}{node['name']}",
+                    "calls": f"{count:d}",
+                    "total_s": f"{total_s:.3f}",
+                    "avg_s": f"{avg_s:.3f}",
+                    "self_s": f"{self_s:.3f}",
+                    "self_avg_s": f"{self_avg_s:.3f}",
+                    "pct_parent": f"{pct_parent:.1f}%",
+                    "pct_total": f"{pct_total:.1f}%",
+                }
+            )
+            for child_id in node["children"]:
+                _visit(child_id, depth + 1, total_s)
+
+        top_level_total = self._top_level_total()
+        for child_id in self._nodes[self._root_id]["children"]:
+            _visit(child_id, depth=0, parent_total_s=top_level_total)
+        return rows
 
     def total_profiled_time(self, inclusive=False):
         if not self.enabled:
             return 0.0
-        src = self._totals if inclusive else self._exclusive_totals
-        return float(sum(float(v) for v in src.values()))
+        field = "total_s" if inclusive else "self_s"
+        return float(sum(float(node[field]) for _, node in self._iter_nodes()))
 
     def print_summary(self, total_runtime_s=None):
         if not self.enabled:
             return
+        headers = (
+            "section",
+            "calls",
+            "total_s",
+            "avg_s",
+            "self_s",
+            "self_avg_s",
+            "%parent",
+            "%total",
+        )
+        align_right = (False, True, True, True, True, True, True, True)
+        rows = self._build_summary_rows(total_runtime_s=total_runtime_s)
         print("== Performance Profile ==")
-        for name in self._order:
-            total_s = float(self._totals.get(name, 0.0))
-            self_s = float(self._exclusive_totals.get(name, 0.0))
-            count = int(self._counts.get(name, 0))
-            avg_s = total_s / max(count, 1)
-            self_avg_s = self_s / max(count, 1)
-            print(
-                f"{name}: {total_s:.3f}s ({count}x, avg {avg_s:.3f}s, "
-                f"self {self_s:.3f}s, self_avg {self_avg_s:.3f}s)"
-            )
+        if not rows:
+            print("No profiled sections.")
+        else:
+            table_rows = [
+                (
+                    row["section"],
+                    row["calls"],
+                    row["total_s"],
+                    row["avg_s"],
+                    row["self_s"],
+                    row["self_avg_s"],
+                    row["pct_parent"],
+                    row["pct_total"],
+                )
+                for row in rows
+            ]
+            widths = []
+            for idx, header in enumerate(headers):
+                width = max(len(header), *(len(row[idx]) for row in table_rows))
+                widths.append(width)
+
+            def _fmt(cells):
+                parts = []
+                for idx, cell in enumerate(cells):
+                    if align_right[idx]:
+                        parts.append(str(cell).rjust(widths[idx]))
+                    else:
+                        parts.append(str(cell).ljust(widths[idx]))
+                return " | ".join(parts)
+
+            print(_fmt(headers))
+            print("-+-".join("-" * width for width in widths))
+            for row in table_rows:
+                print(_fmt(row))
         if total_runtime_s is not None:
             print(f"total_runtime: {float(total_runtime_s):.3f}s")
 
