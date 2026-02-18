@@ -549,68 +549,6 @@ def _build_uv_query_from_edge_band(uv_edge_pts, grow_direction, cond_pct):
     return np.stack([query_rows, query_cols], axis=-1)
 
 
-def _build_uv_query_from_edge_mask(edge_seed_mask, uv_cond, grow_direction, cond_pct):
-    """Build query UV grid directly from a 2D edge-seed mask."""
-    mask = np.asarray(edge_seed_mask, dtype=bool)
-    if mask.ndim != 2 or not mask.any():
-        return np.zeros((0, 0, 2), dtype=np.int64)
-
-    uv = np.rint(np.asarray(uv_cond)).astype(np.int64, copy=False)
-    if uv.ndim != 3 or uv.shape[2] != 2 or uv.shape[:2] != mask.shape:
-        raise ValueError(
-            f"uv_cond must have shape (H, W, 2) matching edge_seed_mask; got {uv.shape} and {mask.shape}"
-        )
-
-    _, direction = _get_growth_context(grow_direction)
-    growth_sign = int(direction["growth_sign"])
-    if direction["axis"] == "col":
-        active_lines = np.flatnonzero(mask.any(axis=1))
-        if active_lines.size == 0:
-            return np.zeros((0, 0, 2), dtype=np.int64)
-        line_mask = mask[active_lines]
-        min_idx = np.argmax(line_mask, axis=1)
-        max_idx = (line_mask.shape[1] - 1) - np.argmax(line_mask[:, ::-1], axis=1)
-
-        line_vals = uv[active_lines, 0, 0]
-        axis_uv = uv[active_lines, :, 1]
-        line_min = axis_uv[np.arange(active_lines.size), min_idx]
-        line_max = axis_uv[np.arange(active_lines.size), max_idx]
-
-        cond_span = int(np.median(line_max - line_min + 1))
-        extrap_span = _compute_query_mask_span(cond_span, cond_pct)
-        offsets = np.arange(extrap_span, dtype=np.int64)
-        frontier = line_max if growth_sign > 0 else line_min
-        if growth_sign > 0:
-            query_axis = (frontier[:, None] + 1) + offsets[None, :]
-        else:
-            query_axis = (frontier[:, None] - extrap_span) + offsets[None, :]
-        query_lines = np.repeat(line_vals[:, None], extrap_span, axis=1)
-        return np.stack([query_lines, query_axis], axis=-1)
-
-    active_lines = np.flatnonzero(mask.any(axis=0))
-    if active_lines.size == 0:
-        return np.zeros((0, 0, 2), dtype=np.int64)
-    line_mask = mask[:, active_lines]
-    min_idx = np.argmax(line_mask, axis=0)
-    max_idx = (line_mask.shape[0] - 1) - np.argmax(line_mask[::-1, :], axis=0)
-
-    line_vals = uv[0, active_lines, 1]
-    axis_uv = uv[:, active_lines, 0]
-    line_min = axis_uv[min_idx, np.arange(active_lines.size)]
-    line_max = axis_uv[max_idx, np.arange(active_lines.size)]
-
-    cond_span = int(np.median(line_max - line_min + 1))
-    extrap_span = _compute_query_mask_span(cond_span, cond_pct)
-    offsets = np.arange(extrap_span, dtype=np.int64)
-    frontier = line_max if growth_sign > 0 else line_min
-    if growth_sign > 0:
-        query_axis = (frontier[:, None] + 1) + offsets[None, :]
-    else:
-        query_axis = (frontier[:, None] - extrap_span) + offsets[None, :]
-    query_lines = np.repeat(line_vals[:, None], extrap_span, axis=1)
-    return np.stack([query_axis, query_lines], axis=-1)
-
-
 def _build_edge_input_mask(cond_valid, cond_direction, edge_input_rowscols):
     cond_valid = np.asarray(cond_valid, dtype=bool)
     if cond_valid.ndim != 2:
@@ -749,12 +687,12 @@ def compute_edge_one_shot_extrapolation(
 
     # Build query span from the edge-input conditioning band, not the full grown
     # surface, so iterative runs do not blow up one-shot query allocations.
+    edge_seed_uv = uv_cond[edge_seed_mask]
     with _profile_section(profiler, "iter_edge_query_build"):
-        query_uv_grid = _build_uv_query_from_edge_mask(edge_seed_mask, uv_cond, grow_direction, cond_pct)
+        query_uv_grid = _build_uv_query_from_edge_band(edge_seed_uv, grow_direction, cond_pct)
     if query_uv_grid.size == 0:
         return None
 
-    edge_seed_uv = uv_cond[edge_seed_mask]
     edge_seed_world = cond_zyxs[edge_seed_mask]
 
     min_corner_arr = (
