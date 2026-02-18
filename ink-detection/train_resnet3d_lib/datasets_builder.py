@@ -717,7 +717,6 @@ def build_datasets(run_state):
                 volume.shape[:2],
                 label_suffix=train_label_suffix,
                 mask_suffix=train_mask_suffix,
-                is_frag=("frag" in sid),
             )
             mask_store, xyxys, sample_bbox_indices = _build_mask_store_and_patch_index(
                 mask,
@@ -773,7 +772,6 @@ def build_datasets(run_state):
                 volume.shape[:2],
                 label_suffix=val_label_suffix,
                 mask_suffix=val_mask_suffix,
-                is_frag=("frag" in sid),
             )
             mask_store_val, val_xyxys, val_sample_bbox_indices = _build_mask_store_and_patch_index(
                 mask_val,

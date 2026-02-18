@@ -9,11 +9,11 @@ metric:
 
 parameters:
   training.objective:
-    value: erm
+    value: group_dro
   training.loss_mode:
-    value: batch
+    value: per_sample
   training.sampler:
-    value: shuffle
+    value: group_stratified
   training.cv_fold:
     value: 0
 
@@ -22,7 +22,7 @@ parameters:
     value: 1
 
   training_hyperparameters.training.epochs:
-    value: 30
+    value: 20
 
   training_hyperparameters.training.lr:
     distribution: log_uniform_values
@@ -32,7 +32,10 @@ parameters:
   training_hyperparameters.training.weight_decay:
     distribution: log_uniform_values
     min: 1e-8
-    max: 1e-2
+    max: 0.1
+
+  group_dro.robust_step_size:
+    value: 0.01
 
   training.stitch_all_val:
     value: true
@@ -43,9 +46,9 @@ parameters:
   wandb.tags:
     value:
       - ink-2um
-      - erm
+      - group_dro
       - hparam_sweep
-      - shuffle
+      - group_stratified
       - accum1
       - fold0
 

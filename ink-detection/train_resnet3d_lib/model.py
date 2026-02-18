@@ -723,12 +723,14 @@ class StitchManager:
             )
 
         if (not sanity_checking) and (model.trainer is None or model.trainer.is_global_zero):
+            current_epoch = int(getattr(getattr(model, "trainer", None), "current_epoch", 0))
+            eval_epoch = int(current_epoch + 1)
+            total_epochs = int(getattr(CFG, "epochs"))
+            is_final_eval_epoch = bool(eval_epoch == total_epochs)
             should_run_stitch_metrics = bool(getattr(CFG, "eval_stitch_metrics", True)) and bool(segment_to_val)
             if should_run_stitch_metrics:
                 stitch_every_n_epochs = max(1, int(getattr(CFG, "eval_stitch_every_n_epochs", 1)))
                 stitch_plus_one = bool(getattr(CFG, "eval_stitch_every_n_epochs_plus_one", False))
-                current_epoch = int(getattr(getattr(model, "trainer", None), "current_epoch", 0))
-                eval_epoch = int(current_epoch + 1)
                 if stitch_plus_one and stitch_every_n_epochs > 1:
                     mod = eval_epoch % stitch_every_n_epochs
                     should_run_epoch = (eval_epoch >= stitch_every_n_epochs) and (mod == 0 or mod == 1)
@@ -772,12 +774,51 @@ class StitchManager:
                 component_pad = int(getattr(CFG, "eval_component_pad", 5))
                 enable_full_region_metrics = bool(getattr(CFG, "eval_stitch_full_region_metrics", False))
                 save_stitch_debug_images = bool(getattr(CFG, "eval_save_stitch_debug_images", False))
+                eval_topological_metrics_every_n_epochs = int(
+                    getattr(CFG, "eval_topological_metrics_every_n_epochs", 1)
+                )
+                if eval_topological_metrics_every_n_epochs < 1:
+                    raise ValueError(
+                        "eval_topological_metrics_every_n_epochs must be >= 1, "
+                        f"got {eval_topological_metrics_every_n_epochs}"
+                    )
+                eval_save_stitch_debug_images_every_n_epochs = int(
+                    getattr(CFG, "eval_save_stitch_debug_images_every_n_epochs", 1)
+                )
+                if eval_save_stitch_debug_images_every_n_epochs < 1:
+                    raise ValueError(
+                        "eval_save_stitch_debug_images_every_n_epochs must be >= 1, "
+                        f"got {eval_save_stitch_debug_images_every_n_epochs}"
+                    )
+                run_topological_metrics = bool(
+                    (eval_epoch % eval_topological_metrics_every_n_epochs) == 0 or is_final_eval_epoch
+                )
+                save_stitch_debug_images_now = bool(
+                    save_stitch_debug_images
+                    and (
+                        (eval_epoch % eval_save_stitch_debug_images_every_n_epochs) == 0
+                        or is_final_eval_epoch
+                    )
+                )
                 stitched_inputs_output_dir = osp.join(
                     str(getattr(CFG, "figures_dir", ".")),
                     "metrics_stitched_debug",
                 )
-                if not save_stitch_debug_images:
+                if not save_stitch_debug_images_now:
                     stitched_inputs_output_dir = None
+                if not run_topological_metrics:
+                    log(
+                        f"skip topological stitched metrics epoch={current_epoch} "
+                        f"eval_epoch={eval_epoch} "
+                        f"eval_topological_metrics_every_n_epochs={eval_topological_metrics_every_n_epochs}"
+                    )
+                if save_stitch_debug_images and (not save_stitch_debug_images_now):
+                    log(
+                        f"skip stitched debug inputs epoch={current_epoch} "
+                        f"eval_epoch={eval_epoch} "
+                        "eval_save_stitch_debug_images_every_n_epochs="
+                        f"{eval_save_stitch_debug_images_every_n_epochs}"
+                    )
 
                 def _parse_list(value, cast_fn):
                     if value is None:
@@ -809,7 +850,8 @@ class StitchManager:
                 stability_metric_directions = {
                     str(metric_name): bool(higher_is_better)
                     for metric_name, higher_is_better in component_metric_specs(
-                        enable_skeleton_metrics=enable_skeleton_metrics
+                        enable_skeleton_metrics=enable_skeleton_metrics,
+                        include_cadenced_metrics=run_topological_metrics,
                     )
                 }
                 group_stability_values = {
@@ -850,12 +892,13 @@ class StitchManager:
                         component_pad=component_pad,
                         skeleton_method=skeleton_thinning_type,
                         enable_skeleton_metrics=enable_skeleton_metrics,
+                        include_cadenced_metrics=run_topological_metrics,
                         enable_full_region_metrics=enable_full_region_metrics,
                         threshold_grid=threshold_grid,
                         stitched_inputs_output_dir=stitched_inputs_output_dir,
                         gt_cache_max=cache_max,
                         component_rows_collector=global_component_rows,
-                        eval_epoch=int(current_epoch + 1),
+                        eval_epoch=eval_epoch,
                     )
 
                     safe_segment_id = segment_id_key.replace("/", "_")
@@ -912,7 +955,8 @@ class StitchManager:
                         worst_k=component_worst_k,
                         id_key="global_component_id",
                         metric_specs=component_metric_specs(
-                            enable_skeleton_metrics=enable_skeleton_metrics
+                            enable_skeleton_metrics=enable_skeleton_metrics,
+                            include_cadenced_metrics=run_topological_metrics,
                         ),
                     )
                     for metric_name, stats in global_stats.items():

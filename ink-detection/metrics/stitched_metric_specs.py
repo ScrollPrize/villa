@@ -3,13 +3,16 @@ from __future__ import annotations
 from typing import Set, Tuple
 
 
-COMPONENT_METRIC_SPECS_BASE: Tuple[Tuple[str, bool], ...] = (
+COMPONENT_METRIC_SPECS_ALWAYS: Tuple[Tuple[str, bool], ...] = (
     ("dice_hard", True),
     ("dice_soft", True),
     ("accuracy", True),
-    ("voi", False),
     ("mpm", False),
     ("drd", False),
+)
+
+COMPONENT_METRIC_SPECS_CADENCED: Tuple[Tuple[str, bool], ...] = (
+    ("voi", False),
     ("betti_l1", False),
     ("betti_match_err", False),
     ("betti_match_err_dim0", False),
@@ -32,10 +35,17 @@ COMPONENT_METRIC_SPECS_SKELETON: Tuple[Tuple[str, bool], ...] = (
 )
 
 
-def component_metric_specs(*, enable_skeleton_metrics: bool) -> Tuple[Tuple[str, bool], ...]:
+def component_metric_specs(
+    *,
+    enable_skeleton_metrics: bool,
+    include_cadenced_metrics: bool = True,
+) -> Tuple[Tuple[str, bool], ...]:
+    specs = COMPONENT_METRIC_SPECS_ALWAYS
+    if bool(include_cadenced_metrics):
+        specs = specs + COMPONENT_METRIC_SPECS_CADENCED
     if bool(enable_skeleton_metrics):
-        return COMPONENT_METRIC_SPECS_BASE + COMPONENT_METRIC_SPECS_SKELETON
-    return COMPONENT_METRIC_SPECS_BASE
+        specs = specs + COMPONENT_METRIC_SPECS_SKELETON
+    return specs
 
 
 COMPONENT_DESCRIPTOR_METRICS: Tuple[str, ...] = (

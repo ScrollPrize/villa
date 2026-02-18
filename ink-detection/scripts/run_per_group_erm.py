@@ -11,12 +11,25 @@ def load_json(path: Path):
     return json.loads(path.read_text())
 
 
+def parse_folds(raw_folds):
+    if raw_folds is None:
+        return [None]
+    folds = []
+    for item in str(raw_folds).split(","):
+        token = item.strip()
+        if token == "":
+            raise ValueError("empty token in --folds")
+        if not token.isdigit():
+            raise ValueError(f"invalid fold value in --folds: {token!r}")
+        folds.append(int(token))
+    if not folds:
+        raise ValueError("--folds produced an empty set")
+    return folds
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run ERM training once per group (no sweep).")
     parser.add_argument("--metadata_json", type=str, default=None)
-    parser.add_argument("--project", type=str, default=None)
-    parser.add_argument("--entity", type=str, default=None)
-    parser.add_argument("--wandb_group", type=str, default=None)
     parser.add_argument("--outputs_path", type=str, default=None)
     parser.add_argument(
         "--init_ckpt_path",
@@ -35,6 +48,27 @@ def main():
         type=str,
         default=None,
         help="Segments metadata key used to define groups (defaults to group_dro.group_key or base_path).",
+    )
+    parser.add_argument(
+        "--folds",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated cv folds to run (e.g. '0,1,2'). "
+            "If omitted, keep metadata.training.cv_fold as-is."
+        ),
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Optional override for training_hyperparameters.training.lr.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+        help="Optional override for training_hyperparameters.training.weight_decay.",
     )
     parser.add_argument("--dry_run", action="store_true")
     args, passthrough = parser.parse_known_args()
@@ -76,6 +110,7 @@ def main():
         group_names = sorted(group_to_segments.keys())
     else:
         group_names = [s.strip() for s in str(args.groups).split(",") if s.strip()]
+    folds = parse_folds(args.folds)
 
     train_script = (project_root / "train_resnet3d.py").resolve()
 
@@ -90,42 +125,62 @@ def main():
                 raise ValueError(f"Group {group_name!r} is not present in training.train_segments (group_key={group_key!r}).")
 
             safe_group_name = group_name.replace("/", "_")
-            run_name = f"erm_group_{safe_group_name}"
 
-            md = json.loads(json.dumps(base_metadata))
-            md.setdefault("training", {})
-            md["training"]["objective"] = "erm"
-            md["training"]["sampler"] = "shuffle"
-            md["training"]["loss_mode"] = "batch"
-            md["training"]["train_segments"] = list(segment_ids)
-            md["training"]["val_segments"] = val_segments
+            for fold in folds:
+                run_name = f"erm_group_{safe_group_name}"
+                if fold is not None:
+                    run_name = f"{run_name}_fold{int(fold)}"
 
-            per_group_metadata_path = tmp_dir / f"metadata_{run_name}.json"
-            per_group_metadata_path.write_text(json.dumps(md, indent=2))
+                md = json.loads(json.dumps(base_metadata))
+                md.setdefault("training", {})
+                if not isinstance(md["training"], dict):
+                    raise TypeError(f"metadata.training must be an object, got {type(md['training']).__name__}")
+                md["training"]["objective"] = "erm"
+                md["training"]["sampler"] = "shuffle"
+                md["training"]["loss_mode"] = "batch"
+                md["training"]["train_segments"] = list(segment_ids)
+                md["training"]["val_segments"] = val_segments
+                if fold is not None:
+                    md["training"]["cv_fold"] = int(fold)
 
-            cmd = [
-                sys.executable,
-                str(train_script),
-                "--metadata_json",
-                str(per_group_metadata_path),
-                "--run_name",
-                run_name,
-            ]
-            if args.project is not None:
-                cmd += ["--project", str(args.project)]
-            if args.entity is not None:
-                cmd += ["--entity", str(args.entity)]
-            if args.wandb_group is not None:
-                cmd += ["--wandb_group", str(args.wandb_group)]
-            if args.outputs_path is not None:
-                cmd += ["--outputs_path", str(args.outputs_path)]
-            if args.init_ckpt_path is not None:
-                cmd += ["--init_ckpt_path", str(args.init_ckpt_path)]
-            cmd += passthrough
+                if args.lr is not None or args.weight_decay is not None:
+                    md.setdefault("training_hyperparameters", {})
+                    if not isinstance(md["training_hyperparameters"], dict):
+                        raise TypeError(
+                            "metadata.training_hyperparameters must be an object, "
+                            f"got {type(md['training_hyperparameters']).__name__}"
+                        )
+                    md["training_hyperparameters"].setdefault("training", {})
+                    if not isinstance(md["training_hyperparameters"]["training"], dict):
+                        raise TypeError(
+                            "metadata.training_hyperparameters.training must be an object, "
+                            f"got {type(md['training_hyperparameters']['training']).__name__}"
+                        )
+                    if args.lr is not None:
+                        md["training_hyperparameters"]["training"]["lr"] = float(args.lr)
+                    if args.weight_decay is not None:
+                        md["training_hyperparameters"]["training"]["weight_decay"] = float(args.weight_decay)
 
-            print("running:", " ".join(shlex.quote(c) for c in cmd))
-            if not args.dry_run:
-                subprocess.run(cmd, check=True)
+                per_group_metadata_path = tmp_dir / f"metadata_{run_name}.json"
+                per_group_metadata_path.write_text(json.dumps(md, indent=2))
+
+                cmd = [
+                    sys.executable,
+                    str(train_script),
+                    "--metadata_json",
+                    str(per_group_metadata_path),
+                    "--run_name",
+                    run_name,
+                ]
+                if args.outputs_path is not None:
+                    cmd += ["--outputs_path", str(args.outputs_path)]
+                if args.init_ckpt_path is not None:
+                    cmd += ["--init_ckpt_path", str(args.init_ckpt_path)]
+                cmd += passthrough
+
+                print("running:", " ".join(shlex.quote(c) for c in cmd))
+                if not args.dry_run:
+                    subprocess.run(cmd, check=True)
     finally:
         tmp_dir_ctx.cleanup()
 

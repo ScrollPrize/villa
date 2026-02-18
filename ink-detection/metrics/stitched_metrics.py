@@ -435,10 +435,12 @@ def _compute_full_region_metrics(
     pfm_weight_recall: Optional[np.ndarray],
     pfm_weight_precision: Optional[np.ndarray],
     enable_skeleton_metrics: bool = True,
+    include_cadenced_metrics: bool = True,
     skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     enable_skeleton_metrics = bool(enable_skeleton_metrics)
+    include_cadenced_metrics = bool(include_cadenced_metrics)
     if enable_skeleton_metrics and skel_gt is None:
         raise ValueError("skel_gt is required when enable_skeleton_metrics is True")
     if (not enable_skeleton_metrics) and (skel_gt is not None):
@@ -473,6 +475,7 @@ def _compute_full_region_metrics(
         pfm_weight_recall_sum=pfm_weight_recall_sum_i,
         pfm_weight_precision=pfm_weight_precision,
         enable_skeleton_metrics=enable_skeleton_metrics,
+        include_cadenced_metrics=include_cadenced_metrics,
         skeleton_method=skeleton_method,
         timings=timings,
     )
@@ -480,26 +483,31 @@ def _compute_full_region_metrics(
         "dice_hard": float(full_metrics["dice"]),
         "dice_soft": float(soft_dice_from_prob(pred_prob_clean, gt_bin)),
         "accuracy": float(full_metrics["accuracy"]),
-        "voi": float(full_metrics["voi"]),
         "mpm": float(full_metrics["mpm"]),
         "drd": float(full_metrics["drd"]),
-        "betti/beta0_pred": float(full_metrics["betti_beta0_pred"]),
-        "betti/beta1_pred": float(full_metrics["betti_beta1_pred"]),
-        "betti/beta0_gt": float(full_metrics["betti_beta0_gt"]),
-        "betti/beta1_gt": float(full_metrics["betti_beta1_gt"]),
-        "betti/abs_beta0_err": float(full_metrics["betti_abs_beta0_err"]),
-        "betti/abs_beta1_err": float(full_metrics["betti_abs_beta1_err"]),
-        "betti/l1_betti_err": float(full_metrics["betti_l1"]),
-        "betti/match_err": float(full_metrics["betti_match_err"]),
-        "betti/match_err_dim0": float(full_metrics["betti_match_err_dim0"]),
-        "betti/match_err_dim1": float(full_metrics["betti_match_err_dim1"]),
-        "euler_pred": float(full_metrics["euler_pred"]),
-        "euler_gt": float(full_metrics["euler_gt"]),
-        "abs_euler_err": float(full_metrics["abs_euler_err"]),
-        "boundary/hd": float(full_metrics["boundary_hd"]),
-        "boundary/hd95": float(full_metrics["boundary_hd95"]),
-        "boundary/assd": float(full_metrics["boundary_assd"]),
     }
+    if include_cadenced_metrics:
+        out.update(
+            {
+                "voi": float(full_metrics["voi"]),
+                "betti/beta0_pred": float(full_metrics["betti_beta0_pred"]),
+                "betti/beta1_pred": float(full_metrics["betti_beta1_pred"]),
+                "betti/beta0_gt": float(full_metrics["betti_beta0_gt"]),
+                "betti/beta1_gt": float(full_metrics["betti_beta1_gt"]),
+                "betti/abs_beta0_err": float(full_metrics["betti_abs_beta0_err"]),
+                "betti/abs_beta1_err": float(full_metrics["betti_abs_beta1_err"]),
+                "betti/l1_betti_err": float(full_metrics["betti_l1"]),
+                "betti/match_err": float(full_metrics["betti_match_err"]),
+                "betti/match_err_dim0": float(full_metrics["betti_match_err_dim0"]),
+                "betti/match_err_dim1": float(full_metrics["betti_match_err_dim1"]),
+                "euler_pred": float(full_metrics["euler_pred"]),
+                "euler_gt": float(full_metrics["euler_gt"]),
+                "abs_euler_err": float(full_metrics["abs_euler_err"]),
+                "boundary/hd": float(full_metrics["boundary_hd"]),
+                "boundary/hd95": float(full_metrics["boundary_hd95"]),
+                "boundary/assd": float(full_metrics["boundary_assd"]),
+            }
+        )
     if enable_skeleton_metrics:
         out.update(
             {
@@ -510,13 +518,16 @@ def _compute_full_region_metrics(
             }
         )
 
-    tau_values = np.asarray([1.0], dtype=np.float32) if boundary_tols is None else np.asarray(boundary_tols)
-    for tau in tau_values:
-        tau_f = float(tau)
-        tau_key = str(tau_f).replace(".", "p")
-        bf = boundary_precision_recall_f1(pred_bin_clean, gt_bin, tau=tau_f, boundary_k=boundary_k)
-        out[f"boundary/bf1_tau{tau_key}"] = float(bf["b_f1"])
-        out[f"boundary/nsd_tau{tau_key}"] = float(nsd_surface_dice(pred_bin_clean, gt_bin, tau=tau_f, boundary_k=boundary_k))
+    if include_cadenced_metrics:
+        tau_values = np.asarray([1.0], dtype=np.float32) if boundary_tols is None else np.asarray(boundary_tols)
+        for tau in tau_values:
+            tau_f = float(tau)
+            tau_key = str(tau_f).replace(".", "p")
+            bf = boundary_precision_recall_f1(pred_bin_clean, gt_bin, tau=tau_f, boundary_k=boundary_k)
+            out[f"boundary/bf1_tau{tau_key}"] = float(bf["b_f1"])
+            out[f"boundary/nsd_tau{tau_key}"] = float(
+                nsd_surface_dice(pred_bin_clean, gt_bin, tau=tau_f, boundary_k=boundary_k)
+            )
     return out
 
 
@@ -526,6 +537,7 @@ def _build_components_manifest(
     full_off_y: int,
     full_off_x: int,
     enable_skeleton_metrics: bool = True,
+    include_cadenced_metrics: bool = True,
 ) -> List[Dict[str, Any]]:
     components_manifest: List[Dict[str, Any]] = []
     for row in component_rows:
@@ -545,20 +557,25 @@ def _build_components_manifest(
             "accuracy": float(row["accuracy"]),
             "mpm": float(row["mpm"]),
             "drd": float(row["drd"]),
-            "voi": float(row["voi"]),
-            "betti_l1": float(row["betti_l1"]),
-            "abs_euler_err": float(row["abs_euler_err"]),
-            "boundary_hd95": float(row["boundary_hd95"]),
-            "betti_abs_beta0_err": float(row["betti_abs_beta0_err"]),
-            "betti_abs_beta1_err": float(row["betti_abs_beta1_err"]),
-            "betti_beta0_pred": float(row["betti_beta0_pred"]),
-            "betti_beta1_pred": float(row["betti_beta1_pred"]),
-            "betti_beta0_gt": float(row["betti_beta0_gt"]),
-            "betti_beta1_gt": float(row["betti_beta1_gt"]),
-            "betti_match_err": float(row["betti_match_err"]),
-            "betti_match_err_dim0": float(row["betti_match_err_dim0"]),
-            "betti_match_err_dim1": float(row["betti_match_err_dim1"]),
         }
+        if include_cadenced_metrics:
+            entry.update(
+                {
+                    "voi": float(row["voi"]),
+                    "betti_l1": float(row["betti_l1"]),
+                    "abs_euler_err": float(row["abs_euler_err"]),
+                    "boundary_hd95": float(row["boundary_hd95"]),
+                    "betti_abs_beta0_err": float(row["betti_abs_beta0_err"]),
+                    "betti_abs_beta1_err": float(row["betti_abs_beta1_err"]),
+                    "betti_beta0_pred": float(row["betti_beta0_pred"]),
+                    "betti_beta1_pred": float(row["betti_beta1_pred"]),
+                    "betti_beta0_gt": float(row["betti_beta0_gt"]),
+                    "betti_beta1_gt": float(row["betti_beta1_gt"]),
+                    "betti_match_err": float(row["betti_match_err"]),
+                    "betti_match_err_dim0": float(row["betti_match_err_dim0"]),
+                    "betti_match_err_dim1": float(row["betti_match_err_dim1"]),
+                }
+            )
         if enable_skeleton_metrics:
             entry.update(
                 {
@@ -792,6 +809,7 @@ def compute_stitched_metrics(
     component_pad: int = 5,
     skeleton_method: str = "guo_hall",
     enable_skeleton_metrics: bool = True,
+    include_cadenced_metrics: bool = True,
     enable_full_region_metrics: bool = False,
     threshold_grid: Optional[np.ndarray] = None,
     stitched_inputs_output_dir: Optional[str] = None,
@@ -825,6 +843,7 @@ def compute_stitched_metrics(
     pad_i = max(0, int(component_pad))
     component_min_area_i = _normalize_component_min_area(component_min_area)
     enable_skeleton_metrics = bool(enable_skeleton_metrics)
+    include_cadenced_metrics = bool(include_cadenced_metrics)
     roi_key = (0, 0)
     if roi_offset is not None:
         roi_key = (int(roi_offset[0]), int(roi_offset[1]))
@@ -842,6 +861,7 @@ def compute_stitched_metrics(
         str(pred_has_digest),
         int(betti_connectivity),
         bool(enable_skeleton_metrics),
+        bool(include_cadenced_metrics),
         str(skeleton_method) if enable_skeleton_metrics else "__disabled__",
         int(pad_i),
         bool(enable_multi_crops),
@@ -1071,7 +1091,10 @@ def compute_stitched_metrics(
         want_component_rows = component_rows_collector is not None
         need_full_gt_pfm_maps = bool(enable_skeleton_metrics and stitched_inputs_output_dir)
         need_full_gt_contour = bool(enable_skeleton_metrics and stitched_inputs_output_dir)
-        metric_specs_i = component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics)
+        metric_specs_i = component_metric_specs(
+            enable_skeleton_metrics=enable_skeleton_metrics,
+            include_cadenced_metrics=include_cadenced_metrics,
+        )
 
         off_y, off_x = [int(v) for v in roi_key]
         crop_states: List[Dict[str, Any]] = []
@@ -1132,6 +1155,7 @@ def compute_stitched_metrics(
                     connectivity=betti_connectivity,
                     pad=pad_i,
                     component_id_offset=int(crop_entry.get("component_id_offset", 0) or 0),
+                    include_cadenced_metrics=include_cadenced_metrics,
                     enable_skeleton_metrics=enable_skeleton_metrics,
                     skeleton_method=skeleton_method,
                     skel_gt_full=skel_gt_c,
@@ -1292,6 +1316,7 @@ def compute_stitched_metrics(
                     worst_q=component_worst_q,
                     worst_k=component_worst_k,
                     enable_skeleton_metrics=enable_skeleton_metrics,
+                    include_cadenced_metrics=include_cadenced_metrics,
                     gt_lab=np.asarray(crop_entry.get("gt_lab")),
                     pred_lab=pred_lab_t,
                     n_gt=int(crop_entry.get("n_gt", 0) or 0),
@@ -1314,6 +1339,7 @@ def compute_stitched_metrics(
                         full_off_y=full_off_y,
                         full_off_x=full_off_x,
                         enable_skeleton_metrics=enable_skeleton_metrics,
+                        include_cadenced_metrics=include_cadenced_metrics,
                     )
                     for entry in components_manifest_c:
                         global_entry = dict(entry)
@@ -1379,6 +1405,7 @@ def compute_stitched_metrics(
             int(n_gt),
             connectivity=betti_connectivity,
             pad=pad_i,
+            include_cadenced_metrics=include_cadenced_metrics,
             enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
             skel_gt_full=skel_gt,
@@ -1524,6 +1551,7 @@ def compute_stitched_metrics(
             worst_q=component_worst_q,
             worst_k=component_worst_k,
             enable_skeleton_metrics=enable_skeleton_metrics,
+            include_cadenced_metrics=include_cadenced_metrics,
             gt_lab=gt_lab,
             pred_lab=pred_lab_t,
             n_gt=n_gt,
@@ -1567,6 +1595,7 @@ def compute_stitched_metrics(
                 pfm_weight_recall=pfm_weight_recall_full,
                 pfm_weight_precision=pfm_weight_precision_full,
                 enable_skeleton_metrics=enable_skeleton_metrics,
+                include_cadenced_metrics=include_cadenced_metrics,
                 skeleton_method=skeleton_method,
                 timings=full_region_timings_t,
             )
@@ -1591,6 +1620,7 @@ def compute_stitched_metrics(
                 full_off_y=full_off_y,
                 full_off_x=full_off_x,
                 enable_skeleton_metrics=enable_skeleton_metrics,
+                include_cadenced_metrics=include_cadenced_metrics,
             )
 
         if want_component_rows:

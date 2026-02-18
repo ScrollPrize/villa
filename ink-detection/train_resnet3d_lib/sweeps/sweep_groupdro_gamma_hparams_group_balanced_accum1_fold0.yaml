@@ -1,10 +1,10 @@
 program: train_resnet3d.py
-project: ink-group-dro
+project: ink-2um-experiments
 entity: vesuvius-challenge
-method: grid
+method: random
 
 metric:
-  name: val/worst_group_loss.min
+  name: val/worst_group_loss_ema.min
   goal: minimize
 
 parameters:
@@ -14,24 +14,47 @@ parameters:
     value: per_sample
   training.sampler:
     value: group_balanced
+  training.cv_fold:
+    value: 0
+
+
+  training_hyperparameters.training.accumulate_grad_batches:
+    value: 1
+
+  training_hyperparameters.training.epochs:
+    value: 20
+
+  training_hyperparameters.training.lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+
+  training_hyperparameters.training.weight_decay:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 1.0
 
   group_dro.robust_step_size:
     values: [0.01, 0.05, 0.1, 0.2]
 
-  training_hyperparameters.training.weight_decay:
-    values: [0.000001, 0.0001, 0.1, 1.0]
+  group_dro.gamma:
+    values: [0.01, 0.05, 0.1, 0.2]
 
   training.stitch_all_val:
     value: true
   training.stitch_train:
     value: true
   training.stitch_downsample:
-    value: 8
+    value: 1
   wandb.tags:
     value:
       - ink-2um
       - group_dro
-      - ablation_weight_decay_step_size
+      - hparam_sweep
+      - group_balanced
+      - gamma
+      - accum1
+      - fold0
 
 command:
   - ${env}

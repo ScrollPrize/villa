@@ -116,6 +116,7 @@
       "seed": 130697,
       "eval_threshold": 0.5,
       "eval_stitch_metrics": true,
+      "eval_topological_metrics_every_n_epochs": 5,
       "eval_drd_block_size": 8,
       "eval_boundary_k": 3,
       "eval_boundary_tols": [
@@ -129,6 +130,7 @@
       "eval_component_pad": 5,
       "eval_stitch_full_region_metrics": false,
       "eval_save_stitch_debug_images": true,
+      "eval_save_stitch_debug_images_every_n_epochs": 5,
       "eval_threshold_grid_min": 0.4,
       "eval_threshold_grid_max": 0.7,
       "eval_threshold_grid_steps": 5,
@@ -169,7 +171,7 @@
     }
   },
   "training": {
-    "data_backend": "tiff",
+    "data_backend": "zarr",
     "objective": "erm",
     "sampler": "shuffle",
     "loss_mode": "batch",

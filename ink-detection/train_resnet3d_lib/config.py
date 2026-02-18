@@ -100,6 +100,7 @@ class CFG:
     eval_stitch_metrics = True
     eval_stitch_every_n_epochs = 1
     eval_stitch_every_n_epochs_plus_one = False
+    eval_topological_metrics_every_n_epochs = 1
     eval_drd_block_size = 8
     eval_boundary_k = 3
     eval_boundary_tols = [1.0]
@@ -111,6 +112,7 @@ class CFG:
     eval_component_pad = 5
     eval_stitch_full_region_metrics = False
     eval_save_stitch_debug_images = True
+    eval_save_stitch_debug_images_every_n_epochs = 1
     eval_threshold_grid_min = 0.40
     eval_threshold_grid_max = 0.70
     eval_threshold_grid_steps = 5
@@ -536,6 +538,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("max_grad_norm", "max_grad_norm"),
         ("eval_threshold", "eval_threshold"),
         ("eval_stitch_metrics", "eval_stitch_metrics"),
+        ("eval_topological_metrics_every_n_epochs", "eval_topological_metrics_every_n_epochs"),
         ("eval_drd_block_size", "eval_drd_block_size"),
         ("eval_boundary_k", "eval_boundary_k"),
         ("eval_boundary_tols", "eval_boundary_tols"),
@@ -547,6 +550,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("eval_component_pad", "eval_component_pad"),
         ("eval_stitch_full_region_metrics", "eval_stitch_full_region_metrics"),
         ("eval_save_stitch_debug_images", "eval_save_stitch_debug_images"),
+        ("eval_save_stitch_debug_images_every_n_epochs", "eval_save_stitch_debug_images_every_n_epochs"),
         ("eval_threshold_grid_min", "eval_threshold_grid_min"),
         ("eval_threshold_grid_max", "eval_threshold_grid_max"),
         ("eval_threshold_grid_steps", "eval_threshold_grid_steps"),
@@ -685,6 +689,22 @@ def apply_metadata_hyperparameters(cfg, metadata):
         raise ValueError(
             "metadata.training.stitching_schedule.eval_every_n_epochs must be >= 1, "
             f"got {cfg.eval_stitch_every_n_epochs}"
+        )
+    cfg.eval_topological_metrics_every_n_epochs = int(
+        getattr(cfg, "eval_topological_metrics_every_n_epochs", 1)
+    )
+    if cfg.eval_topological_metrics_every_n_epochs < 1:
+        raise ValueError(
+            "training_hyperparameters.training.eval_topological_metrics_every_n_epochs must be >= 1, "
+            f"got {cfg.eval_topological_metrics_every_n_epochs}"
+        )
+    cfg.eval_save_stitch_debug_images_every_n_epochs = int(
+        getattr(cfg, "eval_save_stitch_debug_images_every_n_epochs", 1)
+    )
+    if cfg.eval_save_stitch_debug_images_every_n_epochs < 1:
+        raise ValueError(
+            "training_hyperparameters.training.eval_save_stitch_debug_images_every_n_epochs must be >= 1, "
+            f"got {cfg.eval_save_stitch_debug_images_every_n_epochs}"
         )
     cfg.eval_wandb_media_downsample = int(getattr(cfg, "eval_wandb_media_downsample", 1))
     if cfg.eval_wandb_media_downsample < 1:

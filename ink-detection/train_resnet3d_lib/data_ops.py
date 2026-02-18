@@ -94,31 +94,6 @@ def read_image_layers(
     layer_read_workers = int(getattr(CFG, "layer_read_workers", 1) or 1)
     layer_read_workers = max(1, min(layer_read_workers, len(idxs)))
 
-    if "frag" in fragment_id:
-        images_list = []
-        for i in idxs:
-            image = None
-            for image_path in _iter_layer_paths(i):
-                image = _read_gray(image_path)
-                if image is not None:
-                    break
-            if image is None:
-                raise FileNotFoundError(
-                    f"Could not read layer for {fragment_id}: {layers_dir}/{i}.[tif|tiff|png|jpg|jpeg]"
-                )
-
-            pad0 = (256 - image.shape[0] % 256)
-            pad1 = (256 - image.shape[1] % 256)
-
-            image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
-            image = cv2.resize(image, (image.shape[1] // 2, image.shape[0] // 2), interpolation=cv2.INTER_AREA)
-            np.clip(image, 0, 200, out=image)
-            images_list.append(image)
-
-        images = np.stack(images_list, axis=2)
-        del images_list
-        return images
-
     first = None
     for image_path in _iter_layer_paths(idxs[0]):
         first = _read_gray(image_path)
@@ -211,27 +186,17 @@ def read_image_mask(
 
     def _assert_bottom_right_pad_compatible(a_name, a_hw, b_name, b_hw, multiple):
         _assert_bottom_right_pad_compatible_global(fragment_id, a_name, a_hw, b_name, b_hw, multiple)
-    if "frag" not in fragment_id:
-        pad_multiple = 256
-        _assert_bottom_right_pad_compatible("image", images.shape[:2], "label", mask.shape[:2], pad_multiple)
-        _assert_bottom_right_pad_compatible("image", images.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple)
-        _assert_bottom_right_pad_compatible("label", mask.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple)
+    pad_multiple = 256
+    _assert_bottom_right_pad_compatible("image", images.shape[:2], "label", mask.shape[:2], pad_multiple)
+    _assert_bottom_right_pad_compatible("image", images.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple)
+    _assert_bottom_right_pad_compatible("label", mask.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple)
 
-    if "frag" in fragment_id:
-        pad0 = max(0, images.shape[0] * 2 - fragment_mask.shape[0])
-        pad1 = max(0, images.shape[1] * 2 - fragment_mask.shape[1])
-        fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
-    else:
-        fragment_mask_padded = np.zeros((images.shape[0], images.shape[1]), dtype=fragment_mask.dtype)
-        h = min(fragment_mask.shape[0], fragment_mask_padded.shape[0])
-        w = min(fragment_mask.shape[1], fragment_mask_padded.shape[1])
-        fragment_mask_padded[:h, :w] = fragment_mask[:h, :w]
-        fragment_mask = fragment_mask_padded
-        del fragment_mask_padded
-
-    if 'frag' in fragment_id:
-        fragment_mask = cv2.resize(fragment_mask, (fragment_mask.shape[1] // 2, fragment_mask.shape[0] // 2), interpolation=cv2.INTER_AREA)
-        mask = cv2.resize(mask, (mask.shape[1] // 2, mask.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    fragment_mask_padded = np.zeros((images.shape[0], images.shape[1]), dtype=fragment_mask.dtype)
+    h = min(fragment_mask.shape[0], fragment_mask_padded.shape[0])
+    w = min(fragment_mask.shape[1], fragment_mask_padded.shape[1])
+    fragment_mask_padded[:h, :w] = fragment_mask[:h, :w]
+    fragment_mask = fragment_mask_padded
+    del fragment_mask_padded
 
     target_h = min(images.shape[0], mask.shape[0], fragment_mask.shape[0])
     target_w = min(images.shape[1], mask.shape[1], fragment_mask.shape[1])
@@ -302,11 +267,10 @@ def read_image_fragment_mask(
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
 
-    if "frag" not in fragment_id:
-        pad_multiple = 256
-        _assert_bottom_right_pad_compatible_global(
-            fragment_id, "image", images.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple
-        )
+    pad_multiple = 256
+    _assert_bottom_right_pad_compatible_global(
+        fragment_id, "image", images.shape[:2], "mask", fragment_mask.shape[:2], pad_multiple
+    )
 
     target_h = min(images.shape[0], fragment_mask.shape[0])
     target_w = min(images.shape[1], fragment_mask.shape[1])
@@ -391,7 +355,6 @@ class ZarrSegmentVolume:
         self.fragment_id = str(fragment_id)
         _require_dict(seg_meta, name=f"segments[{self.fragment_id!r}]")
         self.path = resolve_segment_zarr_path(self.fragment_id)
-        self.is_frag = "frag" in self.fragment_id
 
         idxs = _compute_selected_layer_indices(self.fragment_id, layer_range=layer_range)
         if reverse_layers:
@@ -414,12 +377,8 @@ class ZarrSegmentVolume:
         pad_w = int(256 - (self._base_w % 256))
         self._padded_h = int(self._base_h + pad_h)
         self._padded_w = int(self._base_w + pad_w)
-        if self.is_frag:
-            self._out_h = int(self._padded_h // 2)
-            self._out_w = int(self._padded_w // 2)
-        else:
-            self._out_h = int(self._padded_h)
-            self._out_w = int(self._padded_w)
+        self._out_h = int(self._padded_h)
+        self._out_w = int(self._padded_w)
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -523,7 +482,7 @@ class ZarrSegmentVolume:
             raise ValueError(f"{self.fragment_id}: invalid zarr read shape={data.shape}")
         return data
 
-    def _read_nonfrag_patch_unflipped(self, y1, y2, x1, x2):
+    def _read_patch_unflipped(self, y1, y2, x1, x2):
         out_h = int(y2 - y1)
         out_w = int(x2 - x1)
         out = np.zeros((out_h, out_w, int(CFG.in_chans)), dtype=self._dtype)
@@ -536,26 +495,8 @@ class ZarrSegmentVolume:
             out[yy1 - int(y1):yy2 - int(y1), xx1 - int(x1):xx2 - int(x1), :] = block
         return out
 
-    def _read_nonfrag_patch(self, y1, y2, x1, x2):
-        return self._read_nonfrag_patch_unflipped(y1, y2, x1, x2)
-
-    def _read_frag_patch_unflipped(self, y1, y2, x1, x2):
-        # "frag" segments are resized by 2x downsampling after padding.
-        py1 = int(y1) * 2
-        py2 = int(y2) * 2
-        px1 = int(x1) * 2
-        px2 = int(x2) * 2
-
-        raw = self._read_nonfrag_patch_unflipped(py1, py2, px1, px2)
-        out_h = int(y2 - y1)
-        out_w = int(x2 - x1)
-        out = np.zeros((out_h, out_w, int(CFG.in_chans)), dtype=self._dtype)
-        for c in range(int(CFG.in_chans)):
-            out[:, :, c] = cv2.resize(raw[:, :, c], (out_w, out_h), interpolation=cv2.INTER_AREA)
-        return out
-
-    def _read_frag_patch(self, y1, y2, x1, x2):
-        return self._read_frag_patch_unflipped(y1, y2, x1, x2)
+    def _read_patch(self, y1, y2, x1, x2):
+        return self._read_patch_unflipped(y1, y2, x1, x2)
 
     def read_patch(self, y1, y2, x1, x2):
         y1 = int(y1)
@@ -565,10 +506,7 @@ class ZarrSegmentVolume:
         if y2 <= y1 or x2 <= x1:
             raise ValueError(f"{self.fragment_id}: invalid patch coords {(x1, y1, x2, y2)}")
 
-        if self.is_frag:
-            patch = self._read_frag_patch(y1, y2, x1, x2)
-        else:
-            patch = self._read_nonfrag_patch(y1, y2, x1, x2)
+        patch = self._read_patch(y1, y2, x1, x2)
 
         patch = _from_uint16_to_uint8(patch, fragment_id=self.fragment_id)
         np.clip(patch, 0, 200, out=patch)
@@ -588,7 +526,6 @@ def read_label_and_fragment_mask_for_shape(
     *,
     label_suffix="",
     mask_suffix="",
-    is_frag=False,
 ):
     image_h = int(image_shape_hw[0])
     image_w = int(image_shape_hw[1])
@@ -612,49 +549,37 @@ def read_label_and_fragment_mask_for_shape(
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
 
-    if not bool(is_frag):
-        pad_multiple = 256
-        _assert_bottom_right_pad_compatible_global(
-            str(fragment_id),
-            "image",
-            (image_h, image_w),
-            "label",
-            mask.shape[:2],
-            pad_multiple,
-        )
-        _assert_bottom_right_pad_compatible_global(
-            str(fragment_id),
-            "image",
-            (image_h, image_w),
-            "mask",
-            fragment_mask.shape[:2],
-            pad_multiple,
-        )
-        _assert_bottom_right_pad_compatible_global(
-            str(fragment_id),
-            "label",
-            mask.shape[:2],
-            "mask",
-            fragment_mask.shape[:2],
-            pad_multiple,
-        )
+    pad_multiple = 256
+    _assert_bottom_right_pad_compatible_global(
+        str(fragment_id),
+        "image",
+        (image_h, image_w),
+        "label",
+        mask.shape[:2],
+        pad_multiple,
+    )
+    _assert_bottom_right_pad_compatible_global(
+        str(fragment_id),
+        "image",
+        (image_h, image_w),
+        "mask",
+        fragment_mask.shape[:2],
+        pad_multiple,
+    )
+    _assert_bottom_right_pad_compatible_global(
+        str(fragment_id),
+        "label",
+        mask.shape[:2],
+        "mask",
+        fragment_mask.shape[:2],
+        pad_multiple,
+    )
 
-    if bool(is_frag):
-        pad0 = max(0, image_h * 2 - fragment_mask.shape[0])
-        pad1 = max(0, image_w * 2 - fragment_mask.shape[1])
-        fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
-        fragment_mask = cv2.resize(
-            fragment_mask,
-            (fragment_mask.shape[1] // 2, fragment_mask.shape[0] // 2),
-            interpolation=cv2.INTER_AREA,
-        )
-        mask = cv2.resize(mask, (mask.shape[1] // 2, mask.shape[0] // 2), interpolation=cv2.INTER_AREA)
-    else:
-        fragment_mask_padded = np.zeros((image_h, image_w), dtype=fragment_mask.dtype)
-        h = min(fragment_mask.shape[0], fragment_mask_padded.shape[0])
-        w = min(fragment_mask.shape[1], fragment_mask_padded.shape[1])
-        fragment_mask_padded[:h, :w] = fragment_mask[:h, :w]
-        fragment_mask = fragment_mask_padded
+    fragment_mask_padded = np.zeros((image_h, image_w), dtype=fragment_mask.dtype)
+    h = min(fragment_mask.shape[0], fragment_mask_padded.shape[0])
+    w = min(fragment_mask.shape[1], fragment_mask_padded.shape[1])
+    fragment_mask_padded[:h, :w] = fragment_mask[:h, :w]
+    fragment_mask = fragment_mask_padded
 
     target_h = min(image_h, mask.shape[0], fragment_mask.shape[0])
     target_w = min(image_w, mask.shape[1], fragment_mask.shape[1])
@@ -690,16 +615,15 @@ def read_fragment_mask_for_shape(
     if fragment_mask is None:
         raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
 
-    if "frag" not in str(fragment_id):
-        pad_multiple = 256
-        _assert_bottom_right_pad_compatible_global(
-            str(fragment_id),
-            "image",
-            (image_h, image_w),
-            "mask",
-            fragment_mask.shape[:2],
-            pad_multiple,
-        )
+    pad_multiple = 256
+    _assert_bottom_right_pad_compatible_global(
+        str(fragment_id),
+        "image",
+        (image_h, image_w),
+        "mask",
+        fragment_mask.shape[:2],
+        pad_multiple,
+    )
 
     target_h = min(image_h, fragment_mask.shape[0])
     target_w = min(image_w, fragment_mask.shape[1])

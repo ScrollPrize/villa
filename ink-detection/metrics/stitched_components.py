@@ -27,6 +27,7 @@ def _build_gt_component_templates(
     connectivity: int,
     pad: int,
     component_id_offset: int = 0,
+    include_cadenced_metrics: bool = True,
     enable_skeleton_metrics: bool = True,
     skeleton_method: str = "guo_hall",
     skel_gt_full: Optional[np.ndarray] = None,
@@ -58,7 +59,10 @@ def _build_gt_component_templates(
         x1 = min(gt_bin.shape[1], int(xs.max()) + 1 + pad)
         crop_gt = gt_bin[y0:y1, x0:x1]
         crop_gt_lab, _ = _label_components(crop_gt, connectivity=connectivity)
-        gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
+        gt_beta0: Optional[int] = None
+        gt_beta1: Optional[int] = None
+        if include_cadenced_metrics:
+            gt_beta0, gt_beta1 = betti_numbers_2d(crop_gt, connectivity=connectivity)
         gt_skel: Optional[np.ndarray] = None
         if enable_skeleton_metrics:
             if skel_gt_full_i is not None:
@@ -86,10 +90,13 @@ def _build_gt_component_templates(
         template = {
             "component_id": int(gi) + int(component_id_offset),
             "bbox": [int(y0), int(y1), int(x0), int(x1)],
-            "gt_beta0": int(gt_beta0),
-            "gt_beta1": int(gt_beta1),
             "gt_lab": crop_gt_lab,
         }
+        if include_cadenced_metrics:
+            if gt_beta0 is None or gt_beta1 is None:
+                raise ValueError("internal error: gt betti numbers are required when cadenced metrics are enabled")
+            template["gt_beta0"] = int(gt_beta0)
+            template["gt_beta1"] = int(gt_beta1)
         if enable_skeleton_metrics:
             if gt_skel is None:
                 raise ValueError("internal error: gt_skel is required when enable_skeleton_metrics is True")
@@ -242,6 +249,7 @@ def component_metrics_by_gt_bbox(
     worst_q: Optional[float] = 0.2,
     worst_k: Optional[int] = 2,
     enable_skeleton_metrics: bool = True,
+    include_cadenced_metrics: bool = True,
     gt_lab: Optional[np.ndarray] = None,
     pred_lab: np.ndarray,
     n_gt: Optional[int] = None,
@@ -270,11 +278,15 @@ def component_metrics_by_gt_bbox(
             int(n_gt),
             connectivity=connectivity,
             pad=pad,
+            include_cadenced_metrics=include_cadenced_metrics,
             enable_skeleton_metrics=enable_skeleton_metrics,
             skeleton_method=skeleton_method,
         )
 
-    metric_specs = component_metric_specs(enable_skeleton_metrics=enable_skeleton_metrics)
+    metric_specs = component_metric_specs(
+        enable_skeleton_metrics=enable_skeleton_metrics,
+        include_cadenced_metrics=include_cadenced_metrics,
+    )
     rows: List[Dict[str, Any]] = []
     for template in gt_component_templates:
         gi = int(template["component_id"])
@@ -291,12 +303,14 @@ def component_metrics_by_gt_bbox(
                 f"{crop_gt_lab.shape} vs {crop_gt.shape}"
             )
 
-        t0 = time.perf_counter()
-        # Use cropped global predicted labels to avoid per-crop relabeling.
-        # This intentionally makes VOI follow the global partition restricted to the bbox.
-        crop_pred_lab = pred_lab_full[y0:y1, x0:x1]
-        if timings is not None:
-            timings["label_pred"] = timings.get("label_pred", 0.0) + (time.perf_counter() - t0)
+        crop_pred_lab: Optional[np.ndarray] = None
+        if include_cadenced_metrics:
+            t0 = time.perf_counter()
+            # Use cropped global predicted labels to avoid per-crop relabeling.
+            # This intentionally makes VOI follow the global partition restricted to the bbox.
+            crop_pred_lab = pred_lab_full[y0:y1, x0:x1]
+            if timings is not None:
+                timings["label_pred"] = timings.get("label_pred", 0.0) + (time.perf_counter() - t0)
         t0 = time.perf_counter()
         local_metric_timings: Dict[str, float] = {}
         skel_gt: Optional[np.ndarray] = None
@@ -322,8 +336,8 @@ def component_metrics_by_gt_bbox(
             connectivity=connectivity,
             drd_block_size=drd_block_size,
             boundary_k=boundary_k,
-            gt_beta0=int(template["gt_beta0"]),
-            gt_beta1=int(template["gt_beta1"]),
+            gt_beta0=int(template["gt_beta0"]) if include_cadenced_metrics else None,
+            gt_beta1=int(template["gt_beta1"]) if include_cadenced_metrics else None,
             skel_gt=skel_gt,
             gt_lab=crop_gt_lab,
             pred_lab=crop_pred_lab,
@@ -331,6 +345,7 @@ def component_metrics_by_gt_bbox(
             pfm_weight_recall_sum=pfm_weight_recall_sum,
             pfm_weight_precision=pfm_weight_precision,
             enable_skeleton_metrics=enable_skeleton_metrics,
+            include_cadenced_metrics=include_cadenced_metrics,
             skeleton_method=skeleton_method,
             timings=local_metric_timings,
         )
@@ -350,22 +365,27 @@ def component_metrics_by_gt_bbox(
             "dice_hard": dice_hard,
             "dice_soft": dice_soft,
             "accuracy": float(local_metrics["accuracy"]),
-            "voi": float(local_metrics["voi"]),
             "mpm": float(local_metrics["mpm"]),
             "drd": float(local_metrics["drd"]),
-            "betti_l1": float(local_metrics["betti_l1"]),
-            "betti_match_err": float(local_metrics["betti_match_err"]),
-            "betti_match_err_dim0": float(local_metrics["betti_match_err_dim0"]),
-            "betti_match_err_dim1": float(local_metrics["betti_match_err_dim1"]),
-            "abs_euler_err": float(local_metrics["abs_euler_err"]),
-            "boundary_hd95": float(local_metrics["boundary_hd95"]),
-            "betti_abs_beta0_err": float(local_metrics["betti_abs_beta0_err"]),
-            "betti_abs_beta1_err": float(local_metrics["betti_abs_beta1_err"]),
-            "betti_beta0_pred": float(local_metrics["betti_beta0_pred"]),
-            "betti_beta1_pred": float(local_metrics["betti_beta1_pred"]),
-            "betti_beta0_gt": float(local_metrics["betti_beta0_gt"]),
-            "betti_beta1_gt": float(local_metrics["betti_beta1_gt"]),
         }
+        if include_cadenced_metrics:
+            row.update(
+                {
+                    "voi": float(local_metrics["voi"]),
+                    "betti_l1": float(local_metrics["betti_l1"]),
+                    "betti_match_err": float(local_metrics["betti_match_err"]),
+                    "betti_match_err_dim0": float(local_metrics["betti_match_err_dim0"]),
+                    "betti_match_err_dim1": float(local_metrics["betti_match_err_dim1"]),
+                    "abs_euler_err": float(local_metrics["abs_euler_err"]),
+                    "boundary_hd95": float(local_metrics["boundary_hd95"]),
+                    "betti_abs_beta0_err": float(local_metrics["betti_abs_beta0_err"]),
+                    "betti_abs_beta1_err": float(local_metrics["betti_abs_beta1_err"]),
+                    "betti_beta0_pred": float(local_metrics["betti_beta0_pred"]),
+                    "betti_beta1_pred": float(local_metrics["betti_beta1_pred"]),
+                    "betti_beta0_gt": float(local_metrics["betti_beta0_gt"]),
+                    "betti_beta1_gt": float(local_metrics["betti_beta1_gt"]),
+                }
+            )
         if enable_skeleton_metrics:
             row.update(
                 {

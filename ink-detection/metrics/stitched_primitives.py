@@ -871,6 +871,7 @@ def _local_metrics_from_binary(
     pfm_weight_recall_sum: Optional[float] = None,
     pfm_weight_precision: Optional[np.ndarray] = None,
     enable_skeleton_metrics: bool = True,
+    include_cadenced_metrics: bool = True,
     skeleton_method: str = "guo_hall",
     timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
@@ -879,6 +880,7 @@ def _local_metrics_from_binary(
     if pred_bin.shape != gt_bin.shape:
         raise ValueError(f"pred_bin/gt_bin shape mismatch: {pred_bin.shape} vs {gt_bin.shape}")
     enable_skeleton_metrics = bool(enable_skeleton_metrics)
+    include_cadenced_metrics = bool(include_cadenced_metrics)
     if (not enable_skeleton_metrics) and (skel_gt is not None):
         raise ValueError("skel_gt must be None when enable_skeleton_metrics is False")
 
@@ -886,54 +888,68 @@ def _local_metrics_from_binary(
     c = confusion_counts(pred_bin, gt_bin)
     if timings is not None:
         timings["confusion_counts"] = timings.get("confusion_counts", 0.0) + (time.perf_counter() - t0)
-    t0 = time.perf_counter()
-    if gt_lab is None:
-        gt_lab_i, _ = _label_components(gt_bin, connectivity=connectivity)
-    else:
-        gt_lab_i = _as_int_labels_2d(gt_lab)
-        if gt_lab_i.shape != gt_bin.shape:
-            raise ValueError(f"gt_lab/gt_bin shape mismatch: {gt_lab_i.shape} vs {gt_bin.shape}")
-    if pred_lab is None:
-        pred_lab_i, _ = _label_components(pred_bin, connectivity=connectivity)
-    else:
-        pred_lab_i = _as_int_labels_2d(pred_lab)
-        if pred_lab_i.shape != pred_bin.shape:
-            raise ValueError(f"pred_lab/pred_bin shape mismatch: {pred_lab_i.shape} vs {pred_bin.shape}")
-    if timings is not None:
-        timings["label_components"] = timings.get("label_components", 0.0) + (time.perf_counter() - t0)
-    t0 = time.perf_counter()
-    voi_split, voi_merge = voi_split_merge_from_labels(gt_lab_i, pred_lab_i)
-    if timings is not None:
-        timings["voi"] = timings.get("voi", 0.0) + (time.perf_counter() - t0)
-    voi_total = float(voi_split + voi_merge)
-    if gt_beta0 is None or gt_beta1 is None:
+    voi_total: Optional[float] = None
+    gt_beta0_i: Optional[int] = None
+    gt_beta1_i: Optional[int] = None
+    pred_beta0_i: Optional[int] = None
+    pred_beta1_i: Optional[int] = None
+    abs_beta0_err: Optional[float] = None
+    abs_beta1_err: Optional[float] = None
+    betti_l1: Optional[float] = None
+    euler_pred: Optional[float] = None
+    euler_gt: Optional[float] = None
+    abs_euler_err: Optional[float] = None
+    betti_match: Optional[Dict[str, float]] = None
+    hd: Optional[Dict[str, float]] = None
+    if include_cadenced_metrics:
         t0 = time.perf_counter()
-        gt_beta0_i, gt_beta1_i = betti_numbers_2d(gt_bin, connectivity=connectivity)
+        if gt_lab is None:
+            gt_lab_i, _ = _label_components(gt_bin, connectivity=connectivity)
+        else:
+            gt_lab_i = _as_int_labels_2d(gt_lab)
+            if gt_lab_i.shape != gt_bin.shape:
+                raise ValueError(f"gt_lab/gt_bin shape mismatch: {gt_lab_i.shape} vs {gt_bin.shape}")
+        if pred_lab is None:
+            pred_lab_i, _ = _label_components(pred_bin, connectivity=connectivity)
+        else:
+            pred_lab_i = _as_int_labels_2d(pred_lab)
+            if pred_lab_i.shape != pred_bin.shape:
+                raise ValueError(f"pred_lab/pred_bin shape mismatch: {pred_lab_i.shape} vs {pred_bin.shape}")
         if timings is not None:
-            timings["betti_gt"] = timings.get("betti_gt", 0.0) + (time.perf_counter() - t0)
-    else:
-        gt_beta0_i = int(gt_beta0)
-        gt_beta1_i = int(gt_beta1)
-    t0 = time.perf_counter()
-    pred_beta0_i, pred_beta1_i = betti_numbers_2d(pred_bin, connectivity=connectivity)
-    if timings is not None:
-        timings["betti_pred"] = timings.get("betti_pred", 0.0) + (time.perf_counter() - t0)
-    abs_beta0_err = float(abs(pred_beta0_i - gt_beta0_i))
-    abs_beta1_err = float(abs(pred_beta1_i - gt_beta1_i))
-    betti_l1 = float(abs_beta0_err + abs_beta1_err)
-    euler_pred = float(pred_beta0_i - pred_beta1_i)
-    euler_gt = float(gt_beta0_i - gt_beta1_i)
-    abs_euler_err = float(abs(euler_pred - euler_gt))
+            timings["label_components"] = timings.get("label_components", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        voi_split, voi_merge = voi_split_merge_from_labels(gt_lab_i, pred_lab_i)
+        if timings is not None:
+            timings["voi"] = timings.get("voi", 0.0) + (time.perf_counter() - t0)
+        voi_total = float(voi_split + voi_merge)
+        if gt_beta0 is None or gt_beta1 is None:
+            t0 = time.perf_counter()
+            gt_beta0_i, gt_beta1_i = betti_numbers_2d(gt_bin, connectivity=connectivity)
+            if timings is not None:
+                timings["betti_gt"] = timings.get("betti_gt", 0.0) + (time.perf_counter() - t0)
+        else:
+            gt_beta0_i = int(gt_beta0)
+            gt_beta1_i = int(gt_beta1)
+        t0 = time.perf_counter()
+        pred_beta0_i, pred_beta1_i = betti_numbers_2d(pred_bin, connectivity=connectivity)
+        if timings is not None:
+            timings["betti_pred"] = timings.get("betti_pred", 0.0) + (time.perf_counter() - t0)
+        abs_beta0_err = float(abs(pred_beta0_i - gt_beta0_i))
+        abs_beta1_err = float(abs(pred_beta1_i - gt_beta1_i))
+        betti_l1 = float(abs_beta0_err + abs_beta1_err)
+        euler_pred = float(pred_beta0_i - pred_beta1_i)
+        euler_gt = float(gt_beta0_i - gt_beta1_i)
+        abs_euler_err = float(abs(euler_pred - euler_gt))
 
-    t0 = time.perf_counter()
-    betti_match = betti_matching_error(pred_bin, gt_bin)
-    if timings is not None:
-        timings["betti_matching"] = timings.get("betti_matching", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        betti_match = betti_matching_error(pred_bin, gt_bin)
+        if timings is not None:
+            timings["betti_matching"] = timings.get("betti_matching", 0.0) + (time.perf_counter() - t0)
 
-    t0 = time.perf_counter()
-    hd = hausdorff_metrics(pred_bin, gt_bin, boundary_k=boundary_k)
-    if timings is not None:
-        timings["boundary_hausdorff"] = timings.get("boundary_hausdorff", 0.0) + (time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        hd = hausdorff_metrics(pred_bin, gt_bin, boundary_k=boundary_k)
+        if timings is not None:
+            timings["boundary_hausdorff"] = timings.get("boundary_hausdorff", 0.0) + (time.perf_counter() - t0)
 
     pfm: Optional[float] = None
     pfm_nonempty: Optional[float] = None
@@ -1005,26 +1021,47 @@ def _local_metrics_from_binary(
     out = {
         "dice": float(dice_from_confusion(c)),
         "accuracy": float(accuracy_from_confusion(c)),
-        "voi": voi_total,
         "mpm": mpm_val,
         "drd": drd_val,
-        "betti_beta0_pred": float(pred_beta0_i),
-        "betti_beta1_pred": float(pred_beta1_i),
-        "betti_beta0_gt": float(gt_beta0_i),
-        "betti_beta1_gt": float(gt_beta1_i),
-        "betti_abs_beta0_err": abs_beta0_err,
-        "betti_abs_beta1_err": abs_beta1_err,
-        "betti_l1": betti_l1,
-        "betti_match_err": float(betti_match["betti_match_err"]),
-        "betti_match_err_dim0": float(betti_match["betti_match_err_dim0"]),
-        "betti_match_err_dim1": float(betti_match["betti_match_err_dim1"]),
-        "euler_pred": euler_pred,
-        "euler_gt": euler_gt,
-        "abs_euler_err": abs_euler_err,
-        "boundary_hd": float(hd["hd"]),
-        "boundary_hd95": float(hd["hd95"]),
-        "boundary_assd": float(hd["assd"]),
     }
+    if include_cadenced_metrics:
+        if (
+            voi_total is None
+            or gt_beta0_i is None
+            or gt_beta1_i is None
+            or pred_beta0_i is None
+            or pred_beta1_i is None
+            or abs_beta0_err is None
+            or abs_beta1_err is None
+            or betti_l1 is None
+            or euler_pred is None
+            or euler_gt is None
+            or abs_euler_err is None
+            or betti_match is None
+            or hd is None
+        ):
+            raise ValueError("internal error: cadenced stitched metrics were not fully computed")
+        out.update(
+            {
+                "voi": voi_total,
+                "betti_beta0_pred": float(pred_beta0_i),
+                "betti_beta1_pred": float(pred_beta1_i),
+                "betti_beta0_gt": float(gt_beta0_i),
+                "betti_beta1_gt": float(gt_beta1_i),
+                "betti_abs_beta0_err": abs_beta0_err,
+                "betti_abs_beta1_err": abs_beta1_err,
+                "betti_l1": betti_l1,
+                "betti_match_err": float(betti_match["betti_match_err"]),
+                "betti_match_err_dim0": float(betti_match["betti_match_err_dim0"]),
+                "betti_match_err_dim1": float(betti_match["betti_match_err_dim1"]),
+                "euler_pred": euler_pred,
+                "euler_gt": euler_gt,
+                "abs_euler_err": abs_euler_err,
+                "boundary_hd": float(hd["hd"]),
+                "boundary_hd95": float(hd["hd95"]),
+                "boundary_assd": float(hd["assd"]),
+            }
+        )
     if enable_skeleton_metrics:
         if pfm is None or pfm_nonempty is None:
             raise ValueError("internal error: pfm metrics are required when enable_skeleton_metrics is True")
