@@ -11,6 +11,12 @@
 
 #include <iostream>
 
+#if defined(Q_OS_LINUX)
+#include <signal.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+#endif
+
 namespace
 {
 constexpr int kServiceStartTimeoutMs = 300000; // 5 minutes for torch compilation
@@ -205,6 +211,16 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
     // Create process
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
+
+#if defined(Q_OS_LINUX)
+    const qint64 parentPid = QCoreApplication::applicationPid();
+    _process->setChildProcessModifier([parentPid]() {
+        ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (::getppid() != static_cast<pid_t>(parentPid)) {
+            _exit(1);
+        }
+    });
+#endif
 
     connect(_process.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &NeuralTraceServiceManager::handleProcessFinished);

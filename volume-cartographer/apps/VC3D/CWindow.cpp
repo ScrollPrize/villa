@@ -91,6 +91,7 @@
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
+#include "NeuralTraceServiceManager.hpp"
 #include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -2901,6 +2902,8 @@ void CWindow::saveWindowState()
 void CWindow::closeEvent(QCloseEvent* event)
 {
     saveWindowState();
+    NeuralTraceServiceManager::instance().stopService();
+    event->accept();
     std::quick_exit(0);
 }
 
