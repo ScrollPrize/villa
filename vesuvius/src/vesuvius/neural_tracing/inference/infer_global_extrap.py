@@ -244,10 +244,6 @@ def _empty_counts(dtype=np.uint32):
     return np.zeros((0,), dtype=dtype)
 
 
-def _empty_valid_mask():
-    return np.zeros((0,), dtype=bool)
-
-
 def _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32):
     return _empty_uv(dtype=uv_dtype), _empty_world(dtype=world_dtype)
 
@@ -376,14 +372,6 @@ def _build_extrap_lookup_arrays(edge_extrapolation):
 
     query_uv = np.asarray(edge_extrapolation.get("query_uv", _empty_uv(dtype=np.float64)))
     return _build_extrap_lookup_from_uv_world(query_uv, extrapolated_world)
-
-
-def _empty_disp_count_valid():
-    return (
-        _empty_world(dtype=np.float32),
-        _empty_counts(dtype=np.uint32),
-        _empty_valid_mask(),
-    )
 
 
 def _select_extrap_uvs_from_lookup(extrap_lookup, grow_direction, max_lines=None):
@@ -736,7 +724,11 @@ def _sample_displacement_for_extrap_uvs_from_crops(
 def _sample_fractional_displacement_stack(disp, count, coords_local, refine_extra_steps):
     coords_local = np.asarray(coords_local, dtype=np.float32)
     if coords_local.ndim != 2 or coords_local.shape[1] != 3 or coords_local.shape[0] == 0:
-        return _empty_disp_count_valid()
+        return (
+            _empty_world(dtype=np.float32),
+            _empty_counts(dtype=np.uint32),
+            np.zeros((0,), dtype=bool),
+        )
 
     refine_extra_steps = max(int(refine_extra_steps), 0)
     refine_parts = refine_extra_steps + 1
@@ -802,7 +794,11 @@ def _coords_local_to_grid(coords_local, d, h, w):
 
 def _sample_trilinear_displacement_stack(disp, count, coords_local):
     if coords_local is None or len(coords_local) == 0:
-        return _empty_disp_count_valid()
+        return (
+            _empty_world(dtype=np.float32),
+            _empty_counts(dtype=np.uint32),
+            np.zeros((0,), dtype=bool),
+        )
 
     disp_t = torch.from_numpy(np.asarray(disp, dtype=np.float32)).unsqueeze(0)  # [1, 3, D, H, W]
     count_t = torch.from_numpy(np.asarray(count, dtype=np.float32)).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
