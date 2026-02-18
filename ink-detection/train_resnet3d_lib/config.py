@@ -626,9 +626,18 @@ def apply_metadata_hyperparameters(cfg, metadata):
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()
     cfg.loss_mode = str(training_cfg.get("loss_mode", getattr(cfg, "loss_mode", "batch"))).lower()
     cfg.erm_group_topk = int(training_cfg.get("erm_group_topk", getattr(cfg, "erm_group_topk", 0) or 0))
-    cfg.save_every_epoch = bool(training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)))
-    cfg.stitch_all_val = bool(training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)))
-    cfg.stitch_train = bool(training_cfg.get("stitch_train", getattr(cfg, "stitch_train", False)))
+    cfg.save_every_epoch = parse_bool_strict(
+        training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)),
+        key="metadata.training.save_every_epoch",
+    )
+    cfg.stitch_all_val = parse_bool_strict(
+        training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)),
+        key="metadata.training.stitch_all_val",
+    )
+    cfg.stitch_train = parse_bool_strict(
+        training_cfg.get("stitch_train", getattr(cfg, "stitch_train", False)),
+        key="metadata.training.stitch_train",
+    )
     cfg.data_backend = str(training_cfg.get("data_backend", getattr(cfg, "data_backend", "zarr"))).lower().strip()
     if cfg.data_backend not in {"zarr", "tiff"}:
         raise ValueError(f"training.data_backend must be 'zarr' or 'tiff', got {cfg.data_backend!r}")
@@ -651,7 +660,10 @@ def apply_metadata_hyperparameters(cfg, metadata):
         or 1
     )
     cfg.stitch_log_only_downsample = max(1, int(cfg.stitch_log_only_downsample))
-    cfg.stitch_use_roi = bool(training_cfg.get("stitch_use_roi", getattr(cfg, "stitch_use_roi", True)))
+    cfg.stitch_use_roi = parse_bool_strict(
+        training_cfg.get("stitch_use_roi", getattr(cfg, "stitch_use_roi", True)),
+        key="metadata.training.stitch_use_roi",
+    )
 
     stitching_schedule_cfg = training_cfg.get("stitching_schedule")
     if stitching_schedule_cfg is None:

@@ -251,6 +251,31 @@ class StitchManager:
         self.log_only_loaders = list(loaders or [])
         self.log_only_segment_ids = [str(x) for x in (segment_ids or [])]
 
+    def _distributed_world_size(self, model):
+        trainer = getattr(model, "trainer", None)
+        if trainer is None:
+            return 1
+        return int(getattr(trainer, "world_size", 1) or 1)
+
+    def _reduce_sum_distributed(self, model, tensor):
+        strategy = getattr(getattr(model, "trainer", None), "strategy", None)
+        if strategy is None or not hasattr(strategy, "reduce"):
+            raise RuntimeError("distributed stitch reduction requested but trainer.strategy.reduce is unavailable")
+        return strategy.reduce(tensor, reduce_op="sum")
+
+    def sync_val_buffers_distributed(self, model):
+        if self._distributed_world_size(model) <= 1:
+            return False
+        device = model.device
+        for pred_buf, count_buf in self.buffers.values():
+            pred_tensor = torch.from_numpy(np.ascontiguousarray(pred_buf)).to(device=device, dtype=torch.float32)
+            count_tensor = torch.from_numpy(np.ascontiguousarray(count_buf)).to(device=device, dtype=torch.float32)
+            pred_tensor = self._reduce_sum_distributed(model, pred_tensor)
+            count_tensor = self._reduce_sum_distributed(model, count_tensor)
+            pred_buf[...] = pred_tensor.detach().cpu().numpy()
+            count_buf[...] = count_tensor.detach().cpu().numpy()
+        return True
+
     def _gaussian_weights(self, h: int, w: int) -> np.ndarray:
         h = int(h)
         w = int(w)
@@ -527,11 +552,9 @@ class StitchManager:
         train_segment_viz = {}
         did_run_log_only = False
         if stitch_train_mode and (not is_global_zero):
-            # Only rank-0 runs the extra train visualization pass + logging.
-            for pred_buf, count_buf in self.buffers.values():
-                pred_buf.fill(0)
-                count_buf.fill(0)
-            return
+            # Non-zero ranks skip the extra train stitch pass, but still need to
+            # participate in distributed val-buffer reduction.
+            stitch_train_mode = False
         if stitch_train_mode and (not sanity_checking):
             train_segment_viz = self.run_train_stitch_pass(model) or {}
             did_run_train_stitch = bool(train_segment_viz)
@@ -549,6 +572,14 @@ class StitchManager:
             did_run_log_only = self.run_log_only_stitch_pass(model)
             if not did_run_log_only:
                 log_only_mode = False
+
+        did_sync_val_buffers = self.sync_val_buffers_distributed(model)
+        if did_sync_val_buffers and (not is_global_zero):
+            # Non-zero ranks are done once global stitched val buffers are reduced.
+            for pred_buf, count_buf in self.buffers.values():
+                pred_buf.fill(0)
+                count_buf.fill(0)
+            return
 
         log_train_stitch = bool(stitch_train_mode and did_run_train_stitch)
 
@@ -1271,6 +1302,34 @@ class RegressionPLModel(pl.LightningModule):
         self._ema_metrics[name] = ema
         self.log(f"{name}_ema", ema, on_step=False, on_epoch=True, prog_bar=False)
 
+    def _distributed_world_size(self):
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return 1
+        return int(getattr(trainer, "world_size", 1) or 1)
+
+    def _reduce_sum_distributed(self, tensor):
+        if self._distributed_world_size() <= 1:
+            return tensor
+        strategy = getattr(getattr(self, "trainer", None), "strategy", None)
+        if strategy is None or not hasattr(strategy, "reduce"):
+            raise RuntimeError("distributed validation reduction requested but trainer.strategy.reduce is unavailable")
+        return strategy.reduce(tensor, reduce_op="sum")
+
+    def _sync_validation_accumulators(self):
+        if self._distributed_world_size() <= 1:
+            return
+        self._val_loss_sum = self._reduce_sum_distributed(self._val_loss_sum)
+        self._val_dice_sum = self._reduce_sum_distributed(self._val_dice_sum)
+        self._val_bce_sum = self._reduce_sum_distributed(self._val_bce_sum)
+        self._val_dice_loss_sum = self._reduce_sum_distributed(self._val_dice_loss_sum)
+        self._val_count = self._reduce_sum_distributed(self._val_count)
+        self._val_group_loss_sum = self._reduce_sum_distributed(self._val_group_loss_sum)
+        self._val_group_dice_sum = self._reduce_sum_distributed(self._val_group_dice_sum)
+        self._val_group_bce_sum = self._reduce_sum_distributed(self._val_group_bce_sum)
+        self._val_group_dice_loss_sum = self._reduce_sum_distributed(self._val_group_dice_loss_sum)
+        self._val_group_count = self._reduce_sum_distributed(self._val_group_count)
+
     def training_step(self, batch, batch_idx):
         x, y, g = batch
         outputs = self(x)
@@ -1459,6 +1518,8 @@ class RegressionPLModel(pl.LightningModule):
         return {"loss": per_sample_loss.mean()}
 
     def on_validation_epoch_end(self):
+        self._sync_validation_accumulators()
+
         if self._val_count.item() > 0:
             avg_loss = self._val_loss_sum / self._val_count
             avg_dice = self._val_dice_sum / self._val_count
