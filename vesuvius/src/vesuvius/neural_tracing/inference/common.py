@@ -14,6 +14,7 @@ import zarr
 import vesuvius.tifxyz as tifxyz
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
 from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHODS, apply_degradation
+from vesuvius.neural_tracing.inference.extrap_lookup import ExtrapLookupArrays
 
 from vesuvius.neural_tracing.tifxyz import save_tifxyz
 
@@ -865,23 +866,19 @@ def _finite_uvs_from_extrap_lookup(extrap_lookup):
     if extrap_lookup is None:
         return np.zeros((0, 2), dtype=np.int64)
 
-    uv_attr = getattr(extrap_lookup, "uv", None)
-    world_attr = getattr(extrap_lookup, "world", None)
-    if uv_attr is not None and world_attr is not None:
-        uv = np.asarray(uv_attr, dtype=np.int64)
-        world = np.asarray(world_attr, dtype=np.float32)
-        if uv.ndim != 2 or uv.shape[1] != 2:
-            return np.zeros((0, 2), dtype=np.int64)
-        if world.ndim != 2 or world.shape[1] != 3:
-            return np.zeros((0, 2), dtype=np.int64)
-        if uv.shape[0] != world.shape[0]:
-            return np.zeros((0, 2), dtype=np.int64)
-        finite = np.isfinite(world).all(axis=1)
-        if not finite.any():
-            return np.zeros((0, 2), dtype=np.int64)
-        return uv[finite].astype(np.int64, copy=False)
+    if not isinstance(extrap_lookup, ExtrapLookupArrays):
+        raise TypeError(
+            "extrap_lookup must be ExtrapLookupArrays or None; "
+            f"got {type(extrap_lookup).__name__}"
+        )
 
-    return np.zeros((0, 2), dtype=np.int64)
+    if extrap_lookup.uv.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    finite = np.isfinite(extrap_lookup.world).all(axis=1)
+    if not finite.any():
+        return np.zeros((0, 2), dtype=np.int64)
+    return extrap_lookup.uv[finite].astype(np.int64, copy=False)
 
 
 def _select_extrap_uv_indices_for_sampling(uv_ordered, grow_direction, max_lines=None):

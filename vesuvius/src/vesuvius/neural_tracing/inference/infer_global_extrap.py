@@ -1,6 +1,5 @@
 import argparse
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -9,6 +8,7 @@ import zarr
 from tqdm import tqdm
 
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
+from vesuvius.neural_tracing.inference.extrap_lookup import ExtrapLookupArrays
 from vesuvius.neural_tracing.inference.common import (
     _bbox_to_min_corner_and_bounds_array,
     _build_uv_grid,
@@ -280,15 +280,6 @@ def _empty_edge_extrapolation():
         "query_uv_grid": np.zeros((0, 0, 2), dtype=np.int64),
         "extrapolated_world": _empty_world(dtype=np.float32),
     }
-
-
-@dataclass(frozen=True)
-class ExtrapLookupArrays:
-    uv: np.ndarray
-    world: np.ndarray
-    lookup_sort_idx: np.ndarray
-    lookup_uv_sorted: np.ndarray
-
 
 def _empty_extrap_lookup_arrays():
     return _make_extrap_lookup_arrays(
