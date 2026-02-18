@@ -167,7 +167,8 @@ def parse_args():
         help="Number of edge rows/cols from conditioning region to use in one-shot extrapolation.",
     )
     parser.add_argument(
-        "--agg-extrap-lines",
+        "--lines-to-keep",
+        dest="agg_extrap_lines",
         type=int,
         default=None,
         help=(
@@ -214,7 +215,7 @@ def parse_args():
     if args.refine is not None and args.refine < 1:
         parser.error("--refine must be >= 1 when provided")
     if args.agg_extrap_lines is not None and args.agg_extrap_lines < 1:
-        parser.error("--agg-extrap-lines must be >= 1 when provided")
+        parser.error("--lines-to-keep must be >= 1 when provided")
     if args.napari_downsample < 1:
         parser.error("--napari-downsample must be >= 1")
     if args.napari_point_size <= 0:
