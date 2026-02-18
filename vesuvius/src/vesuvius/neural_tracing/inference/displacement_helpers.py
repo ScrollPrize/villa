@@ -33,6 +33,7 @@ def predict_displacement(args, model_state, model_inputs, use_tta=None):
             merge_method=getattr(args, "tta_merge_method", "vector_geomedian"),
             outlier_drop_thresh=getattr(args, "tta_outlier_drop_thresh", 1.25),
             outlier_drop_min_keep=getattr(args, "tta_outlier_drop_min_keep", 4),
+            tta_batch_size=getattr(args, "tta_batch_size", 2),
         )
 
     return run_single_model_pass(model, model_inputs, amp_enabled, amp_dtype)

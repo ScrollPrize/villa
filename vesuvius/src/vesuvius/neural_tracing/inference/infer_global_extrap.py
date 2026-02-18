@@ -161,6 +161,15 @@ def parse_args():
         help="Minimum number of TTA variants to keep after outlier filtering.",
     )
     parser.add_argument(
+        "--tta-batch-size",
+        type=int,
+        default=2,
+        help=(
+            "Number of TTA mirrored variants to evaluate per forward pass. "
+            "Use 1 to keep model batch at --batch-size; use 8 to fuse all variants."
+        ),
+    )
+    parser.add_argument(
         "--edge-input-rowscols",
         type=int,
         required=True,
@@ -224,6 +233,8 @@ def parse_args():
         parser.error("--tta-outlier-drop-thresh must be > 0 when provided.")
     if args.tta_outlier_drop_min_keep < 1:
         parser.error("--tta-outlier-drop-min-keep must be >= 1.")
+    if args.tta_batch_size < 1:
+        parser.error("--tta-batch-size must be >= 1.")
     if args.tifxyz_step_size is not None and args.tifxyz_step_size < 1:
         parser.error("--tifxyz-step-size must be >= 1 when provided.")
     if args.tifxyz_voxel_size_um is not None and args.tifxyz_voxel_size_um <= 0:
