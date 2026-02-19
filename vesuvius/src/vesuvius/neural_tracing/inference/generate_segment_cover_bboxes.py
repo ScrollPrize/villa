@@ -270,20 +270,32 @@ def _intervals_touch_or_overlap(min_a, max_a, min_b, max_b):
     return max(float(min_a), float(min_b)) <= (min(float(max_a), float(max_b)) + 1.0)
 
 
-def _touching_relation_holds(bbox_a, bbox_b, relation, allow_overlap=False):
+def _intervals_overlap(min_a, max_a, min_b, max_b):
+    return max(float(min_a), float(min_b)) <= min(float(max_a), float(max_b))
+
+
+def _touching_relation_holds(bbox_a, bbox_b, relation, allow_overlap=False, require_overlap=False):
     if relation == "right":
+        if require_overlap:
+            return _intervals_overlap(bbox_a[4], bbox_a[5], bbox_b[4], bbox_b[5])
         if allow_overlap:
             return _intervals_touch_or_overlap(bbox_a[4], bbox_a[5], bbox_b[4], bbox_b[5])
         return int(bbox_a[5]) + 1 == int(bbox_b[4])
     if relation == "left":
+        if require_overlap:
+            return _intervals_overlap(bbox_a[4], bbox_a[5], bbox_b[4], bbox_b[5])
         if allow_overlap:
             return _intervals_touch_or_overlap(bbox_a[4], bbox_a[5], bbox_b[4], bbox_b[5])
         return int(bbox_b[5]) + 1 == int(bbox_a[4])
     if relation == "down":
+        if require_overlap:
+            return _intervals_overlap(bbox_a[2], bbox_a[3], bbox_b[2], bbox_b[3])
         if allow_overlap:
             return _intervals_touch_or_overlap(bbox_a[2], bbox_a[3], bbox_b[2], bbox_b[3])
         return int(bbox_a[3]) + 1 == int(bbox_b[2])
     if relation == "up":
+        if require_overlap:
+            return _intervals_overlap(bbox_a[2], bbox_a[3], bbox_b[2], bbox_b[3])
         if allow_overlap:
             return _intervals_touch_or_overlap(bbox_a[2], bbox_a[3], bbox_b[2], bbox_b[3])
         return int(bbox_b[3]) + 1 == int(bbox_a[2])
@@ -370,7 +382,13 @@ def _is_candidate_better(obj, axis, shift, best_obj, best_axis, best_shift):
     return int(shift) < int(best_shift)
 
 
-def _optimize_band_bboxes(records, points_zyx_band, max_passes=10, allow_neighbor_overlap=False):
+def _optimize_band_bboxes(
+    records,
+    points_zyx_band,
+    max_passes=10,
+    allow_neighbor_overlap=False,
+    require_neighbor_overlap=False,
+):
     if not records:
         return records
 
@@ -429,6 +447,7 @@ def _optimize_band_bboxes(records, points_zyx_band, max_passes=10, allow_neighbo
                             nbr_bbox,
                             relation,
                             allow_overlap=bool(allow_neighbor_overlap),
+                            require_overlap=bool(require_neighbor_overlap),
                         ):
                             ok_touch = False
                             break
@@ -470,6 +489,8 @@ def _prune_band_bboxes_via_reopt(
     points_zyx_band,
     max_passes=5,
     max_remove=None,
+    allow_neighbor_overlap=False,
+    require_neighbor_overlap=False,
 ):
     if not optimized_records:
         return optimized_records, {"initial": 0, "removed": 0, "final": 0, "attempts": 0}
@@ -498,14 +519,21 @@ def _prune_band_bboxes_via_reopt(
             attempts += 1
             trial_records_seeded = _augment_records_with_uncovered_points(trial_records, points_zyx_band)
             trial_optimized = None
-            # Try both contact modes; accept any full-coverage solution.
-            for allow_overlap in (True, False):
+            if bool(require_neighbor_overlap):
+                contact_modes = ((True, True),)
+            elif bool(allow_neighbor_overlap):
+                contact_modes = ((True, False), (False, False))
+            else:
+                contact_modes = ((False, False), (True, False))
+            # Try contact modes in order; accept any full-coverage solution.
+            for allow_overlap, require_overlap in contact_modes:
                 try:
                     trial_optimized = _optimize_band_bboxes(
                         trial_records_seeded,
                         points_zyx_band,
                         max_passes=max_passes,
                         allow_neighbor_overlap=allow_overlap,
+                        require_neighbor_overlap=require_overlap,
                     )
                     break
                 except RuntimeError:
@@ -720,8 +748,22 @@ def _validate_generation_inputs(crop_size, overlap, prune_max_remove_per_band, b
     return crop_size_zyx, overlap, band_workers
 
 
-def _optimize_single_band(z_band, band_records, band_points, prune_bboxes, prune_max_remove_per_band):
-    optimized = _optimize_band_bboxes(band_records, band_points, max_passes=5)
+def _optimize_single_band(
+    z_band,
+    band_records,
+    band_points,
+    prune_bboxes,
+    prune_max_remove_per_band,
+    overlap,
+):
+    overlap_positive = bool(float(overlap) > 0.0)
+    optimized = _optimize_band_bboxes(
+        band_records,
+        band_points,
+        max_passes=5,
+        allow_neighbor_overlap=overlap_positive,
+        require_neighbor_overlap=overlap_positive,
+    )
     prune_stats = None
     if prune_bboxes:
         optimized, prune_stats = _prune_band_bboxes_via_reopt(
@@ -729,6 +771,8 @@ def _optimize_single_band(z_band, band_records, band_points, prune_bboxes, prune
             band_points,
             max_passes=5,
             max_remove=prune_max_remove_per_band,
+            allow_neighbor_overlap=overlap_positive,
+            require_neighbor_overlap=overlap_positive,
         )
     optimized_sorted = sorted(optimized, key=lambda r: (int(r["grid_index"][1]), int(r["grid_index"][2])))
     return int(z_band), optimized_sorted, prune_stats
@@ -773,7 +817,14 @@ def _generate_segment_cover_records(
 
     if band_workers == 1 or len(band_jobs) <= 1:
         band_results = [
-            _optimize_single_band(z_band, band_records, band_points, prune_bboxes, prune_max_remove_per_band)
+            _optimize_single_band(
+                z_band,
+                band_records,
+                band_points,
+                prune_bboxes,
+                prune_max_remove_per_band,
+                overlap,
+            )
             for z_band, band_records, band_points in band_jobs
         ]
     else:
@@ -786,6 +837,7 @@ def _generate_segment_cover_records(
                     band_points,
                     prune_bboxes,
                     prune_max_remove_per_band,
+                    overlap,
                 )
                 for z_band, band_records, band_points in band_jobs
             ]

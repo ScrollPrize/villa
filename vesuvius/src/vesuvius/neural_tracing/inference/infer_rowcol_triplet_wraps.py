@@ -107,6 +107,22 @@ def parse_args(argv=None):
     parser.add_argument("--save-original-copy", dest="save_original_copy", action="store_true")
     parser.add_argument("--no-save-original-copy", dest="save_original_copy", action="store_false")
     parser.set_defaults(save_original_copy=False)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Total number of iterative passes to run. Requires --iter-direction when provided.",
+    )
+    parser.add_argument(
+        "--iter-direction",
+        type=str,
+        default=None,
+        choices=("front", "back"),
+        help="Output direction used as the next iteration input when --iterations is provided.",
+    )
+    parser.add_argument("--keep-previous-wrap", dest="keep_previous_wrap", action="store_true")
+    parser.add_argument("--no-keep-previous-wrap", dest="keep_previous_wrap", action="store_false")
+    parser.set_defaults(keep_previous_wrap=True)
 
     parser.add_argument("--tifxyz-step-size", type=int, default=None)
     parser.add_argument("--tifxyz-voxel-size-um", type=float, default=None)
@@ -129,6 +145,12 @@ def parse_args(argv=None):
         parser.error("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
+    if args.iterations is not None and args.iterations < 1:
+        parser.error("--iterations must be >= 1 when provided.")
+    if args.iterations is not None and args.iter_direction is None:
+        parser.error("--iter-direction is required when --iterations is provided.")
+    if args.iterations is None and args.iter_direction is not None:
+        parser.error("--iter-direction requires --iterations.")
     return args
 
 
@@ -807,49 +829,66 @@ def _rescale_grid_for_save(grid, valid, scale_factor):
     return out
 
 
-def run(args):
-    args = _canonicalize_tta_settings(args)
-    retarget_factor = float(2 ** int(args.volume_scale))
-    surface, input_grid, input_valid = _load_input_grid(args.tifxyz_path, retarget_factor=retarget_factor)
-    input_uuid = Path(args.tifxyz_path).resolve().name
-    out_prefix = args.output_prefix if args.output_prefix else input_uuid
+def _append_iteration_suffix(uuid_base, iteration_index, iterative_mode):
+    if not bool(iterative_mode):
+        return str(uuid_base)
+    return f"{uuid_base}_iteration_{int(iteration_index)}"
 
-    model_state = load_model(args)
-    model_config = model_state["model_config"]
-    crop_size = _resolve_crop_size(args, model_config)
-    tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc = resolve_tifxyz_params(
-        args,
-        model_config,
-        args.volume_scale,
-        input_scale=surface.get_scale_tuple(),
-    )
-    if stored_scale_rc is not None:
-        step_y = _scale_to_subsample_stride(stored_scale_rc[0])
-        step_x = _scale_to_subsample_stride(stored_scale_rc[1])
-        if step_y != step_x:
-            raise RuntimeError(
-                "Triplet wrap inference currently requires isotropic stored scale; "
-                f"got scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
-            )
-    dense_subsample_stride = int(max(1, tifxyz_step_size))
 
+def _extract_surface_points_for_iteration(input_grid, input_valid, retarget_factor, verbose):
     rows, cols = np.where(input_valid)
     world_points = input_grid[rows, cols].astype(np.float32, copy=False)
     uv_points = np.stack([rows, cols], axis=-1).astype(np.int32, copy=False)
     if world_points.shape[0] == 0:
         raise RuntimeError("Input tifxyz has no valid points.")
-    if args.verbose:
+    if verbose:
         world_min = np.min(world_points, axis=0).astype(np.float32, copy=False)
         world_max = np.max(world_points, axis=0).astype(np.float32, copy=False)
         _log(
-            args.verbose,
+            verbose,
             "input lattice world bounds after retarget: "
             f"retarget_factor={retarget_factor:g} "
             f"z=[{world_min[0]:.3f},{world_max[0]:.3f}] "
             f"y=[{world_min[1]:.3f},{world_max[1]:.3f}] "
             f"x=[{world_min[2]:.3f},{world_max[2]:.3f}]",
         )
+    return world_points, uv_points
 
+
+def _run_single_iteration(
+    args,
+    model_state,
+    crop_size,
+    volume_arr,
+    input_tifxyz_path,
+    out_dir,
+    out_prefix,
+    retarget_factor,
+    tifxyz_step_size,
+    tifxyz_voxel_size_um,
+    stored_scale_rc,
+    dense_subsample_stride,
+    save_scale_factor,
+    iteration_index,
+    iterations_requested,
+    iterative_mode,
+    iter_direction,
+    keep_previous_wrap,
+    preloaded_input=None,
+):
+    if preloaded_input is None:
+        _, input_grid, input_valid = _load_input_grid(input_tifxyz_path, retarget_factor=retarget_factor)
+    else:
+        _, input_grid, input_valid = preloaded_input
+    input_path_resolved = Path(input_tifxyz_path).resolve()
+    input_uuid = input_path_resolved.name
+
+    world_points, uv_points = _extract_surface_points_for_iteration(
+        input_grid=input_grid,
+        input_valid=input_valid,
+        retarget_factor=retarget_factor,
+        verbose=bool(args.verbose),
+    )
     records = _generate_cover_bboxes_from_points(
         world_points,
         tifxyz_uuid=input_uuid,
@@ -860,20 +899,6 @@ def run(args):
         band_workers=int(args.bbox_band_workers),
     )
     _log(args.verbose, f"generated bboxes (retargeted coords): {len(records)}")
-
-    volume_root = zarr.open(args.volume_path, mode="r")
-
-    class _Holder:
-        pass
-
-    holder = _Holder()
-    holder.volume = volume_root
-    holder.extra = {}
-    volume_arr = _resolve_segment_volume(holder, volume_scale=args.volume_scale)
-    _log(
-        args.verbose,
-        f"resolved volume level shape={tuple(int(v) for v in volume_arr.shape)} volume_scale={int(args.volume_scale)}",
-    )
 
     infer_out = _run_triplet_inference(
         args=args,
@@ -900,10 +925,6 @@ def run(args):
         infer_out["front_valid"],
     )
 
-    out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
-    os.makedirs(out_dir, exist_ok=True)
-    save_scale_factor = int(2 ** int(args.volume_scale))
-
     run_meta = {
         "checkpoint_path": str(args.checkpoint_path),
         "crop_size": [int(v) for v in crop_size],
@@ -929,6 +950,11 @@ def run(args):
         "projection_dense_scale_factor": int(dense_subsample_stride),
         "front_projection": infer_out["front_projection_meta"],
         "back_projection": infer_out["back_projection_meta"],
+        "iteration_index": int(iteration_index),
+        "iterations_requested": int(iterations_requested),
+        "iter_direction": None if iter_direction is None else str(iter_direction),
+        "keep_previous_wrap": bool(keep_previous_wrap),
+        "iterative_mode": bool(iterative_mode),
         "run_argv": list(sys.argv[1:]),
     }
 
@@ -937,16 +963,18 @@ def run(args):
     input_grid_save = _rescale_grid_for_save(input_grid, input_valid, save_scale_factor)
     back_merged_save = _rescale_grid_for_save(back_merged, back_merged_valid, save_scale_factor)
     front_merged_save = _rescale_grid_for_save(front_merged, front_merged_valid, save_scale_factor)
+    original_uuid = _append_iteration_suffix(out_prefix, iteration_index, iterative_mode)
+    back_uuid = _append_iteration_suffix(f"{out_prefix}_back", iteration_index, iterative_mode)
+    front_uuid = _append_iteration_suffix(f"{out_prefix}_front", iteration_index, iterative_mode)
 
     if args.save_original_copy:
-        original_target = Path(out_dir) / out_prefix
-        input_path_resolved = Path(args.tifxyz_path).resolve()
+        original_target = Path(out_dir) / original_uuid
         if original_target.resolve() != input_path_resolved:
             outputs["original"] = _save_surface(
                 input_grid_save,
                 input_valid,
                 out_dir,
-                out_prefix,
+                original_uuid,
                 tifxyz_step_size,
                 tifxyz_voxel_size_um,
                 source=source,
@@ -959,28 +987,169 @@ def run(args):
                 "original output path equals input tifxyz path; skipping rewrite and reusing input as unchanged original.",
             )
 
-    outputs["back"] = _save_surface(
-        back_merged_save,
-        back_merged_valid,
-        out_dir,
-        f"{out_prefix}_back",
-        tifxyz_step_size,
-        tifxyz_voxel_size_um,
-        source=source,
-        metadata={**run_meta, "surface_role": "back"},
+    save_back = True
+    save_front = True
+    if bool(iterative_mode) and int(iteration_index) >= 2 and (not bool(keep_previous_wrap)):
+        if str(iter_direction) == "front":
+            save_back = False
+        elif str(iter_direction) == "back":
+            save_front = False
+
+    if save_back:
+        outputs["back"] = _save_surface(
+            back_merged_save,
+            back_merged_valid,
+            out_dir,
+            back_uuid,
+            tifxyz_step_size,
+            tifxyz_voxel_size_um,
+            source=source,
+            metadata={**run_meta, "surface_role": "back"},
+        )
+    if save_front:
+        outputs["front"] = _save_surface(
+            front_merged_save,
+            front_merged_valid,
+            out_dir,
+            front_uuid,
+            tifxyz_step_size,
+            tifxyz_voxel_size_um,
+            source=source,
+            metadata={**run_meta, "surface_role": "front"},
+        )
+
+    chain_valid_cells = None
+    if iter_direction in {"front", "back"}:
+        chain_valid_cells = int(infer_out[f"n_{iter_direction}_cells"])
+
+    return {
+        "input_tifxyz_path": str(input_path_resolved),
+        "outputs": outputs,
+        "n_pred_back_cells": int(infer_out["n_back_cells"]),
+        "n_pred_front_cells": int(infer_out["n_front_cells"]),
+        "chain_valid_cells": chain_valid_cells,
+    }
+
+
+def run(args):
+    args = _canonicalize_tta_settings(args)
+    retarget_factor = float(2 ** int(args.volume_scale))
+    surface, input_grid, input_valid = _load_input_grid(args.tifxyz_path, retarget_factor=retarget_factor)
+    input_uuid = Path(args.tifxyz_path).resolve().name
+    out_prefix = args.output_prefix if args.output_prefix else input_uuid
+
+    model_state = load_model(args)
+    model_config = model_state["model_config"]
+    crop_size = _resolve_crop_size(args, model_config)
+    tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc = resolve_tifxyz_params(
+        args,
+        model_config,
+        args.volume_scale,
+        input_scale=surface.get_scale_tuple(),
     )
-    outputs["front"] = _save_surface(
-        front_merged_save,
-        front_merged_valid,
-        out_dir,
-        f"{out_prefix}_front",
-        tifxyz_step_size,
-        tifxyz_voxel_size_um,
-        source=source,
-        metadata={**run_meta, "surface_role": "front"},
+    if stored_scale_rc is not None:
+        step_y = _scale_to_subsample_stride(stored_scale_rc[0])
+        step_x = _scale_to_subsample_stride(stored_scale_rc[1])
+        if step_y != step_x:
+            raise RuntimeError(
+                "Triplet wrap inference currently requires isotropic stored scale; "
+                f"got scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
+            )
+    dense_subsample_stride = int(max(1, tifxyz_step_size))
+
+    volume_root = zarr.open(args.volume_path, mode="r")
+
+    class _Holder:
+        pass
+
+    holder = _Holder()
+    holder.volume = volume_root
+    holder.extra = {}
+    volume_arr = _resolve_segment_volume(holder, volume_scale=args.volume_scale)
+    _log(
+        args.verbose,
+        f"resolved volume level shape={tuple(int(v) for v in volume_arr.shape)} volume_scale={int(args.volume_scale)}",
     )
 
-    return outputs
+    out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
+    os.makedirs(out_dir, exist_ok=True)
+    save_scale_factor = int(2 ** int(args.volume_scale))
+    iterative_mode = args.iterations is not None
+    iterations_requested = int(args.iterations) if iterative_mode else 1
+    iter_direction = str(args.iter_direction) if iterative_mode else None
+    current_tifxyz_path = str(Path(args.tifxyz_path).resolve())
+    outputs_by_iteration = {}
+    iterations_completed = 0
+    stop_reason = None
+
+    for iteration_index in range(1, iterations_requested + 1):
+        _log(
+            args.verbose,
+            f"[iteration {iteration_index}/{iterations_requested}] input={current_tifxyz_path}",
+        )
+        iter_result = _run_single_iteration(
+            args=args,
+            model_state=model_state,
+            crop_size=crop_size,
+            volume_arr=volume_arr,
+            input_tifxyz_path=current_tifxyz_path,
+            out_dir=out_dir,
+            out_prefix=out_prefix,
+            retarget_factor=retarget_factor,
+            tifxyz_step_size=tifxyz_step_size,
+            tifxyz_voxel_size_um=tifxyz_voxel_size_um,
+            stored_scale_rc=stored_scale_rc,
+            dense_subsample_stride=dense_subsample_stride,
+            save_scale_factor=save_scale_factor,
+            iteration_index=iteration_index,
+            iterations_requested=iterations_requested,
+            iterative_mode=iterative_mode,
+            iter_direction=iter_direction,
+            keep_previous_wrap=bool(args.keep_previous_wrap),
+            preloaded_input=(surface, input_grid, input_valid) if iteration_index == 1 else None,
+        )
+        outputs_by_iteration[str(iteration_index)] = {
+            "input_tifxyz_path": iter_result["input_tifxyz_path"],
+            "outputs": iter_result["outputs"],
+            "n_pred_back_cells": int(iter_result["n_pred_back_cells"]),
+            "n_pred_front_cells": int(iter_result["n_pred_front_cells"]),
+        }
+        iterations_completed = int(iteration_index)
+
+        if not iterative_mode:
+            continue
+
+        chain_valid_cells = int(iter_result["chain_valid_cells"])
+        outputs_by_iteration[str(iteration_index)]["chain_valid_cells"] = chain_valid_cells
+        outputs_by_iteration[str(iteration_index)]["chained_direction"] = str(iter_direction)
+        if chain_valid_cells <= 0 and iteration_index < iterations_requested:
+            stop_reason = f"no_valid_{iter_direction}_cells"
+            _log(
+                args.verbose,
+                f"stopping iterative chaining early at iteration {iteration_index}: {stop_reason}",
+            )
+            break
+
+        if iteration_index < iterations_requested:
+            next_input_path = iter_result["outputs"].get(iter_direction, None)
+            if next_input_path is None:
+                raise RuntimeError(
+                    f"Iteration {iteration_index} did not save chained direction output '{iter_direction}'."
+                )
+            current_tifxyz_path = str(next_input_path)
+
+    if not iterative_mode:
+        return outputs_by_iteration["1"]["outputs"]
+
+    return {
+        "iterations_requested": int(iterations_requested),
+        "iterations_completed": int(iterations_completed),
+        "iter_direction": str(iter_direction),
+        "keep_previous_wrap": bool(args.keep_previous_wrap),
+        "stopped_early": bool(iterations_completed < iterations_requested),
+        "stop_reason": stop_reason,
+        "outputs_by_iteration": outputs_by_iteration,
+    }
 
 
 def main(argv=None):
