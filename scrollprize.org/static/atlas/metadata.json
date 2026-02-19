@@ -1,8 +1,685 @@
 {
+  "PHerc0332": {
+    "sample": {
+      "id": "PHerc0332",
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": [
+          {
+            "from_volume_id": "20231027191953",
+            "transforms": [
+              {
+                "to_volume_id": "20231117143551",
+                "matrix": [
+                  [
+                    0.4151412067359984,
+                    0.00048378007463328903,
+                    -0.00018589243000010215,
+                    -68.00272003705008
+                  ],
+                  [
+                    -4.8392696705699846e-05,
+                    0.4147879124302306,
+                    5.521936651202975e-05,
+                    -254.7753120163574
+                  ],
+                  [
+                    0.0004776395202003243,
+                    0.00033798145979504216,
+                    0.41324998657862283,
+                    58.80085957090315
+                  ]
+                ],
+                "derivation_path": "20231027191953-20231117143551"
+              },
+              {
+                "to_volume_id": "20231201141544",
+                "matrix": [
+                  [
+                    0.9999308109657453,
+                    -0.0001676620500204413,
+                    0.00013129198269003605,
+                    0.9174690368161557
+                  ],
+                  [
+                    0.00014651126713670845,
+                    1.0003065625100374,
+                    -0.00013597433171619054,
+                    -0.4375259575383937
+                  ],
+                  [
+                    0.0001755787791800993,
+                    0.000216361230460076,
+                    0.9999379091310834,
+                    -9.124087998562956
+                  ]
+                ],
+                "derivation_path": "20231027191953-20231201141544"
+              }
+            ]
+          },
+          {
+            "from_volume_id": "20231117143551",
+            "transforms": [
+              {
+                "to_volume_id": "20231027191953",
+                "matrix": [
+                  [
+                    2.4088173615219333,
+                    -0.0028103620137297767,
+                    0.0010839349394258053,
+                    163.02638549087757
+                  ],
+                  [
+                    0.0002814038590013859,
+                    2.4108705744098757,
+                    -0.00032201921194479553,
+                    614.2683740606326
+                  ],
+                  [
+                    -0.002784371483278172,
+                    -0.001968511173798586,
+                    2.4198417993562455,
+                    -142.97965071071692
+                  ]
+                ],
+                "derivation_path": "20231117143551-20231027191953\u207b\u00b9"
+              },
+              {
+                "to_volume_id": "20231201141544",
+                "matrix": [
+                  [
+                    2.4086502850285934,
+                    -0.0032146375200706144,
+                    0.001401619761049078,
+                    163.8108133128397
+                  ],
+                  [
+                    0.0006347876138639051,
+                    2.4116095128618333,
+                    -0.0006509954938075901,
+                    614.0624865224522
+                  ],
+                  [
+                    -0.00236120050274435,
+                    -0.0014472634632014464,
+                    2.419691669919783,
+                    -151.93333314354675
+                  ]
+                ],
+                "derivation_path": "20231117143551-20231027191953\u207b\u00b9.20231027191953-20231201141544"
+              }
+            ]
+          },
+          {
+            "from_volume_id": "20231201141544",
+            "transforms": [
+              {
+                "to_volume_id": "20231027191953",
+                "matrix": [
+                  [
+                    1.0000691923100027,
+                    0.00016765066082952235,
+                    -0.00013128642258709053,
+                    -0.9186570359749587
+                  ],
+                  [
+                    -0.00014650036610116274,
+                    0.9996934774791802,
+                    0.00013596032873974598,
+                    0.43876676953248
+                  ],
+                  [
+                    -0.00017557013218400883,
+                    -0.0002163377793693654,
+                    1.0000620883586024,
+                    9.124720924976529
+                  ]
+                ],
+                "derivation_path": "20231201141544-20231027191953\u207b\u00b9"
+              },
+              {
+                "to_volume_id": "20231117143551",
+                "matrix": [
+                  [
+                    0.4151698930782703,
+                    0.0005532706983476534,
+                    -0.00024034060075882958,
+                    -68.38557637746655
+                  ],
+                  [
+                    -0.00010917232100501562,
+                    0.41466075053460427,
+                    0.00011162384922717651,
+                    -254.59276854637886
+                  ],
+                  [
+                    0.00040506870000583153,
+                    0.000248556353026356,
+                    0.4132756278364685,
+                    62.57135987881076
+                  ]
+                ],
+                "derivation_path": "20231201141544-20231027191953\u207b\u00b9.20231027191953-20231117143551"
+              }
+            ]
+          }
+        ],
+        "legacy_data_url": "https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHerc0332/photos/PHerc0332_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is a smaller scroll known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um)."
+    },
+    "scans": {
+      "20231201141544": {
+        "id": "20231201141544",
+        "sample_id": "PHerc0332",
+        "long_id": "20231201141544-3.240um-70keV",
+        "creation": {
+          "date": "2023-12-01T14:15:44Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 70.0,
+            "pixel_size_um": 3.24,
+            "scan_name": "PHerc332, 70 keV, 3.24 um, merged"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 70.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 3.24
+        }
+      },
+      "20231117143551": {
+        "id": "20231117143551",
+        "sample_id": "PHerc0332",
+        "long_id": "20231117143551-7.910um-53keV",
+        "creation": {
+          "date": "2023-11-17T14:35:51Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 53.0,
+            "pixel_size_um": 7.91,
+            "scan_name": "PHerc0332, 53 keV, 7.91 um, merged"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91
+        }
+      },
+      "20231027191953": {
+        "id": "20231027191953",
+        "sample_id": "PHerc0332",
+        "long_id": "20231027191953-3.240um-53keV",
+        "creation": {
+          "date": "2023-10-27T19:19:53Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 53.0,
+            "pixel_size_um": 3.24,
+            "scan_name": "PHerc332, 53 keV, 3.24 um, merged"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 3.24
+        }
+      }
+    },
+    "volumes": {
+      "20231201141544": {
+        "id": "20231201141544",
+        "sample_id": "PHerc0332",
+        "scan_id": "20231201141544",
+        "long_id": "20231201141544-3.240um-70keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-02T11:10:05Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 11784,
+            "window_u16_max": 63304,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230206171837-jl2mv",
+            "workflow_creation": "2025-12-02T11:10:05Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20231201141544"
+          }
+        },
+        "properties": {
+          "energy_keV": 70.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 3.24,
+          "data_format": "uint8",
+          "transforms": null,
+          "shape": [
+            22929,
+            9414,
+            9414
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHerc0332/volumes/20231201141544-3.240um-70keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      },
+      "20231117143551": {
+        "id": "20231117143551",
+        "sample_id": "PHerc0332",
+        "scan_id": "20231117143551",
+        "long_id": "20231117143551-7.910um-53keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-02T11:03:15Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 12160,
+            "window_u16_max": 56960,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230206171837-cmv9l",
+            "workflow_creation": "2025-12-02T11:03:15Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20231117143551"
+          }
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91,
+          "data_format": "uint8",
+          "transforms": null,
+          "shape": [
+            9777,
+            3550,
+            3400
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHerc0332/volumes/20231117143551-7.910um-53keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      },
+      "20231027191953": {
+        "id": "20231027191953",
+        "sample_id": "PHerc0332",
+        "scan_id": "20231027191953",
+        "long_id": "20231027191953-3.240um-53keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-02T10:57:07Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 11464,
+            "window_u16_max": 53384,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230206171837-f5hsb",
+            "workflow_creation": "2025-12-02T10:57:07Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20231027191953"
+          }
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 3.24,
+          "data_format": "uint8",
+          "transforms": [
+            {
+              "to_volume_id": "20231117143551",
+              "transformation_matrix": [
+                [
+                  0.4151412067359984,
+                  0.00048378007463328903,
+                  -0.00018589243000010215,
+                  -68.00272003705008
+                ],
+                [
+                  -4.8392696705699846e-05,
+                  0.4147879124302306,
+                  5.521936651202975e-05,
+                  -254.7753120163574
+                ],
+                [
+                  0.0004776395202003243,
+                  0.00033798145979504216,
+                  0.41324998657862283,
+                  58.80085957090315
+                ]
+              ],
+              "from_landmarks": [
+                [
+                  1480.0,
+                  4963.0,
+                  102.0
+                ],
+                [
+                  4174.0,
+                  4396.0,
+                  21699.0
+                ],
+                [
+                  2145.0,
+                  5176.0,
+                  9999.0
+                ],
+                [
+                  5135.0,
+                  2426.0,
+                  4967.0
+                ],
+                [
+                  6111.0,
+                  6360.0,
+                  15016.0
+                ],
+                [
+                  5330.0,
+                  1813.0,
+                  1999.0
+                ],
+                [
+                  4225.0,
+                  4606.0,
+                  1998.0
+                ],
+                [
+                  4129.0,
+                  6608.0,
+                  18022.0
+                ]
+              ],
+              "to_landmarks": [
+                [
+                  549.0,
+                  1803.0,
+                  103.0
+                ],
+                [
+                  1662.0,
+                  1569.0,
+                  9029.0
+                ],
+                [
+                  824.0,
+                  1893.0,
+                  4194.0
+                ],
+                [
+                  2064.0,
+                  752.0,
+                  2115.0
+                ],
+                [
+                  2470.0,
+                  2383.0,
+                  6269.0
+                ],
+                [
+                  2146.0,
+                  497.0,
+                  888.0
+                ],
+                [
+                  1686.0,
+                  1656.0,
+                  888.0
+                ],
+                [
+                  1646.0,
+                  2488.0,
+                  7511.0
+                ]
+              ]
+            },
+            {
+              "to_volume_id": "20231201141544",
+              "transformation_matrix": [
+                [
+                  0.9999308109657453,
+                  -0.0001676620500204413,
+                  0.00013129198269003605,
+                  0.9174690368161557
+                ],
+                [
+                  0.00014651126713670845,
+                  1.0003065625100374,
+                  -0.00013597433171619054,
+                  -0.4375259575383937
+                ],
+                [
+                  0.0001755787791800993,
+                  0.000216361230460076,
+                  0.9999379091310834,
+                  -9.124087998562956
+                ]
+              ],
+              "from_landmarks": [
+                [
+                  2450.0,
+                  2908.0,
+                  506.0
+                ],
+                [
+                  6242.0,
+                  6530.0,
+                  22007.0
+                ],
+                [
+                  2153.0,
+                  6941.0,
+                  9999.0
+                ],
+                [
+                  5211.0,
+                  2689.0,
+                  4999.0
+                ],
+                [
+                  3946.0,
+                  5400.0,
+                  14999.0
+                ],
+                [
+                  3642.0,
+                  1408.0,
+                  11999.0
+                ]
+              ],
+              "to_landmarks": [
+                [
+                  2450.0,
+                  2908.0,
+                  498.0
+                ],
+                [
+                  6244.0,
+                  6529.0,
+                  21999.0
+                ],
+                [
+                  2154.0,
+                  6942.0,
+                  9991.0
+                ],
+                [
+                  5212.0,
+                  2690.0,
+                  4991.0
+                ],
+                [
+                  3948.0,
+                  5400.0,
+                  14991.0
+                ],
+                [
+                  3644.0,
+                  1407.0,
+                  11990.0
+                ]
+              ]
+            }
+          ],
+          "shape": [
+            22929,
+            9414,
+            9414
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHerc0332/volumes/20231027191953-3.240um-53keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      }
+    },
+    "segments": {}
+  },
+  "PHercParis1Fr39": {
+    "sample": {
+      "id": "PHercParis1Fr39",
+      "properties": {
+        "type": "fragment",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/fragments/Frag4/PHercParis1Fr39.volpkg/",
+        "description": "PHerc. Paris 1 Fr 39"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHercParis1Fr39/photos/PHercParis1Fr39_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. Paris 1 Fr 39 is a fragment of a Herculaneum papyrus, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nOriginally held back for automated scoring in the [Kaggle ink detection competition](https://kaggle.com/competitions/vesuvius-challenge-ink-detection/), this fragment has since been released.\n\nSee also: [EduceLab-Scrolls paper](https://arxiv.org/abs/2304.02084), [EduceLab 2023 Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)."
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc0826": {
     "sample": {
       "id": "PHerc0826",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -385,6 +1062,10 @@
             8169,
             8169
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -412,10 +1093,73 @@
     },
     "segments": {}
   },
+  "PHerc0483B": {
+    "sample": {
+      "id": "PHerc0483B",
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0483B/photos/PHerc0483B_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0483b/JPGEnhanced/DSC03379.jpg",
+                "date": "2026-02-18T16:04:04.656165Z",
+                "workflow_execution": "s3copy-pherc0483b-3a9f45cb"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0483B/photos/PHerc0483B_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0483b/Masks/DSC03379_mask.png",
+                "date": "2026-02-18T16:04:04.873271Z",
+                "workflow_execution": "s3copy-pherc0483b-15e4593d"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc0211": {
     "sample": {
       "id": "PHerc0211",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -798,6 +1542,10 @@
             7948,
             7948
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -828,7 +1576,10 @@
   "PHerc0490A": {
     "sample": {
       "id": "PHerc0490A",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -1198,6 +1949,10 @@
             9101,
             9101
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -1228,7 +1983,10 @@
   "PHerc0306B": {
     "sample": {
       "id": "PHerc0306B",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -1598,6 +2356,10 @@
             8849,
             8849
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -1628,7 +2390,10 @@
   "PHerc0813": {
     "sample": {
       "id": "PHerc0813",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -2011,6 +2776,10 @@
             7947,
             7947
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -2041,7 +2810,10 @@
   "PHerc1218": {
     "sample": {
       "id": "PHerc1218",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -2411,6 +3183,10 @@
             7593,
             7593
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -2438,10 +3214,49 @@
     },
     "segments": {}
   },
+  "PHerc51Cr4Fr8": {
+    "sample": {
+      "id": "PHerc51Cr4Fr8",
+      "properties": {
+        "type": "fragment",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/fragments/Frag6/PHerc51Cr4Fr8.volpkg/",
+        "description": "PHerc. 51 Cr 4 Fr 8"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHerc51Cr4Fr8/photos/PHerc51Cr4Fr8_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. 51 Cr 4 Fr 8 is a fragment of a Herculaneum papyrus, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nSee also: [EduceLab-Scrolls paper](https://arxiv.org/abs/2304.02084), [EduceLab 2023 Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)."
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc0125": {
     "sample": {
       "id": "PHerc0125",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -2824,6 +3639,10 @@
             8387,
             8387
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -2854,7 +3673,10 @@
   "PHerc0175B": {
     "sample": {
       "id": "PHerc0175B",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -3224,6 +4046,10 @@
             9613,
             9613
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -3251,10 +4077,49 @@
     },
     "segments": {}
   },
+  "PHerc1667Cr1Fr3": {
+    "sample": {
+      "id": "PHerc1667Cr1Fr3",
+      "properties": {
+        "type": "fragment",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/fragments/Frag5/PHerc1667Cr1Fr3.volpkg/",
+        "description": "PHerc. 1667 Cr 1 Fr 3"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHerc1667Cr1Fr3/photos/PHerc1667Cr1Fr3_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. 1667 Cr 1 Fr 3 is a fragment from the same scroll as PHerc. 1667 (Scroll 4), from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi). It was partially opened in 1987 via the Oslo method. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nListed on [Chartes.it](https://www.chartes.it/index.php?r=document/view&id=1691).\n\nSee also: [EduceLab-Scrolls paper](https://arxiv.org/abs/2304.02084), [EduceLab 2023 Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)."
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc1451": {
     "sample": {
       "id": "PHerc1451",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -3624,6 +4489,10 @@
             5815,
             5815
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -3654,7 +4523,10 @@
   "PHerc0358": {
     "sample": {
       "id": "PHerc0358",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -4038,6 +4910,10 @@
             7783,
             7783
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -4065,10 +4941,49 @@
     },
     "segments": {}
   },
+  "PHercParis1Fr34": {
+    "sample": {
+      "id": "PHercParis1Fr34",
+      "properties": {
+        "type": "fragment",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/fragments/Frag3/PHercParis1Fr34.volpkg/",
+        "description": "PHerc. Paris 1 Fr 34"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHercParis1Fr34/photos/PHercParis1Fr34_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. Paris 1 Fr 34 is a fragment of a Herculaneum papyrus, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nSee also: [EduceLab-Scrolls paper](https://arxiv.org/abs/2304.02084), [EduceLab 2023 Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)."
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc0191": {
     "sample": {
       "id": "PHerc0191",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -4451,6 +5366,10 @@
             8387,
             8387
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -4481,7 +5400,10 @@
   "PHerc0800": {
     "sample": {
       "id": "PHerc0800",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -4851,6 +5773,10 @@
             9867,
             9867
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -4881,7 +5807,10 @@
   "PHerc0490B": {
     "sample": {
       "id": "PHerc0490B",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -5251,6 +6180,10 @@
             8343,
             8343
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -5278,10 +6211,49 @@
     },
     "segments": {}
   },
+  "PHercParis2Fr47": {
+    "sample": {
+      "id": "PHercParis2Fr47",
+      "properties": {
+        "type": "fragment",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/fragments/Frag1/PHercParis2Fr47.volpkg/",
+        "description": "PHerc. Paris 2 Fr 47"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHercParis2Fr47/photos/PHercParis2Fr47_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. Paris 2 Fr 47 is a fragment of a Herculaneum papyrus, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nSee also: [EduceLab-Scrolls paper](https://arxiv.org/abs/2304.02084), [EduceLab 2023 Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)."
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc0483A": {
     "sample": {
       "id": "PHerc0483A",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -5651,6 +6623,10 @@
             8849,
             8849
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -5678,10 +6654,452 @@
     },
     "segments": {}
   },
+  "PHerc1667": {
+    "sample": {
+      "id": "PHerc1667",
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": [
+          {
+            "from_volume_id": "20231107190228",
+            "transforms": [
+              {
+                "to_volume_id": "20231117161658",
+                "matrix": [
+                  [
+                    0.4155922380047027,
+                    0.003183129908139097,
+                    -0.0008521399929353689,
+                    69.06699837569994
+                  ],
+                  [
+                    0.0003993645079494003,
+                    0.41809799461101,
+                    0.0030482254825336804,
+                    -60.87277464176055
+                  ],
+                  [
+                    0.0021139334228769953,
+                    -0.00018336409867937136,
+                    0.41337991244719396,
+                    58.3979422734862
+                  ]
+                ],
+                "derivation_path": "20231107190228-20231117161658"
+              },
+              {
+                "to_volume_id": "20251217075048",
+                "matrix": [
+                  [
+                    0.21548204197050994,
+                    -1.3480286710689011,
+                    -0.007341038126969894,
+                    12148.317507014423
+                  ],
+                  [
+                    -1.338687636731197,
+                    -0.22876489978544823,
+                    -0.09381579878294875,
+                    14558.770677876577
+                  ],
+                  [
+                    0.08705266043423283,
+                    0.012314047369592745,
+                    -1.3541311145141128,
+                    36850.19695709514
+                  ]
+                ],
+                "derivation_path": "20231107190228-20231117161658.20231117161658-20251217075048\u207b\u00b9"
+              }
+            ]
+          },
+          {
+            "from_volume_id": "20231117161658",
+            "transforms": [
+              {
+                "to_volume_id": "20231107190228",
+                "matrix": [
+                  [
+                    2.406196393517758,
+                    -0.018317001105627166,
+                    0.005095193220295047,
+                    -167.60131788267282
+                  ],
+                  [
+                    -0.0022086658948973856,
+                    2.3917928537278503,
+                    -0.017641413621294028,
+                    146.77783555280314
+                  ],
+                  [
+                    -0.012305735753292546,
+                    0.0011546034224790712,
+                    2.4190483479929323,
+                    -140.34724163764182
+                  ]
+                ],
+                "derivation_path": "20231117161658-20231107190228\u207b\u00b9"
+              },
+              {
+                "to_volume_id": "20251217075048",
+                "matrix": [
+                  [
+                    0.5215597940837622,
+                    -3.228160802871612,
+                    0.007120727845433622,
+                    11915.371996649377
+                  ],
+                  [
+                    -3.2194856258880042,
+                    -0.5227458296108656,
+                    -0.22973008901314615,
+                    14762.725661766222
+                  ],
+                  [
+                    0.22610217963704587,
+                    0.02629462240233314,
+                    -3.275482322608939,
+                    37027.46281243874
+                  ]
+                ],
+                "derivation_path": "20231117161658-20251217075048\u207b\u00b9"
+              }
+            ]
+          },
+          {
+            "from_volume_id": "20251217075048",
+            "transforms": [
+              {
+                "to_volume_id": "20231107190228",
+                "matrix": [
+                  [
+                    0.12330607470478018,
+                    -0.723934241994301,
+                    0.04948654813782487,
+                    7218.042223394509
+                  ],
+                  [
+                    -0.7221209469897432,
+                    -0.1154615453864197,
+                    0.011914085970223696,
+                    10014.496289324945
+                  ],
+                  [
+                    0.0013602008573648423,
+                    -0.0475893360647144,
+                    -0.7351912551445308,
+                    27768.26063179994
+                  ]
+                ],
+                "derivation_path": "20251217075048-20231117161658.20231117161658-20231107190228\u207b\u00b9"
+              },
+              {
+                "to_volume_id": "20231117161658",
+                "matrix": [
+                  [
+                    0.04894528368092889,
+                    -0.30118842812051105,
+                    0.021230635246071054,
+                    3077.0443172435525
+                  ],
+                  [
+                    -0.3018639295342486,
+                    -0.04870841724998129,
+                    0.002759989904253394,
+                    4213.694590508793
+                  ],
+                  [
+                    0.0009553516004725475,
+                    -0.021181652863766696,
+                    -0.3038108700311329,
+                    11550.66125267576
+                  ]
+                ],
+                "derivation_path": "20251217075048-20231117161658"
+              }
+            ]
+          }
+        ],
+        "legacy_data_url": "https://dl.ash2txt.org/full-scrolls/Scroll4/PHerc1667.volpkg/"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHerc1667/photos/PHerc1667_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is similar in size to PHerc. 332 (Scroll 3)."
+    },
+    "scans": {
+      "20231107190228": {
+        "id": "20231107190228",
+        "sample_id": "PHerc1667",
+        "long_id": "20231107190228-3.240um-88keV",
+        "creation": {
+          "date": "2023-11-07T19:02:28Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 88.0,
+            "pixel_size_um": 3.24,
+            "scan_name": "PHerc1667, 88 keV, 3.24 um, merged volume"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 88.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 3.24
+        }
+      },
+      "20231117161658": {
+        "id": "20231117161658",
+        "sample_id": "PHerc1667",
+        "long_id": "20231117161658-7.910um-53keV",
+        "creation": {
+          "date": "2023-11-17T16:16:58Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 53.0,
+            "pixel_size_um": 7.91,
+            "scan_name": "PHerc1667, 53 keV, 7.91 um, merged"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91
+        }
+      }
+    },
+    "volumes": {
+      "20231107190228": {
+        "id": "20231107190228",
+        "sample_id": "PHerc1667",
+        "scan_id": "20231107190228",
+        "long_id": "20231107190228-3.240um-88keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-02T12:56:39Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 12460,
+            "window_u16_max": 61260,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230206171837-qwf2h",
+            "workflow_creation": "2025-12-02T12:56:39Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20231107190228"
+          }
+        },
+        "properties": {
+          "energy_keV": 88.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 3.24,
+          "data_format": "uint8",
+          "transforms": [
+            {
+              "to_volume_id": "20231117161658",
+              "transformation_matrix": [
+                [
+                  0.4155922380047027,
+                  0.003183129908139097,
+                  -0.0008521399929353689,
+                  69.06699837569994
+                ],
+                [
+                  0.0003993645079494003,
+                  0.41809799461101,
+                  0.0030482254825336804,
+                  -60.87277464176055
+                ],
+                [
+                  0.0021139334228769953,
+                  -0.00018336409867937136,
+                  0.41337991244719396,
+                  58.3979422734862
+                ]
+              ],
+              "from_landmarks": [
+                [
+                  2261.0,
+                  4502.0,
+                  204.0
+                ],
+                [
+                  2541.0,
+                  3101.0,
+                  24999.0
+                ],
+                [
+                  6305.0,
+                  2398.0,
+                  12428.0
+                ],
+                [
+                  6972.0,
+                  1669.0,
+                  4997.0
+                ],
+                [
+                  390.0,
+                  4010.0,
+                  15836.0
+                ]
+              ],
+              "to_landmarks": [
+                [
+                  1022.0,
+                  1823.0,
+                  146.0
+                ],
+                [
+                  1112.0,
+                  1313.0,
+                  10396.0
+                ],
+                [
+                  2688.0,
+                  982.0,
+                  5210.0
+                ],
+                [
+                  2967.0,
+                  655.0,
+                  2138.0
+                ],
+                [
+                  232.0,
+                  1664.0,
+                  6606.0
+                ]
+              ]
+            }
+          ],
+          "shape": [
+            26132,
+            7960,
+            8120
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHerc1667/volumes/20231107190228-3.240um-88keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      },
+      "20231117161658": {
+        "id": "20231117161658",
+        "sample_id": "PHerc1667",
+        "scan_id": "20231117161658",
+        "long_id": "20231117161658-7.910um-53keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-02T13:00:55Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 12240,
+            "window_u16_max": 59440,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230206171837-wqvnv",
+            "workflow_creation": "2025-12-02T13:00:55Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20231117161658"
+          }
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91,
+          "data_format": "uint8",
+          "transforms": null,
+          "shape": [
+            11173,
+            3340,
+            3440
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHerc1667/volumes/20231117161658-7.910um-53keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      }
+    },
+    "segments": {}
+  },
   "PHerc0257": {
     "sample": {
       "id": "PHerc0257",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -6064,6 +7482,10 @@
             8388,
             8388
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -6091,10 +7513,214 @@
     },
     "segments": {}
   },
+  "PHercParis4": {
+    "sample": {
+      "id": "PHercParis4",
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHercParis4/photos/PHercParis4_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nThis is the scroll for which we have by far the most segments, where the [first letters](https://scrollprize.org/firstletters) were discovered and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed."
+    },
+    "scans": {
+      "20230206171837": {
+        "id": "20230206171837",
+        "sample_id": "PHercParis4",
+        "long_id": "20230206171837-7.910um-54keV",
+        "creation": {
+          "date": "2023-02-06T17:18:37Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 54.0,
+            "pixel_size_um": 7.91,
+            "scan_name": "PHercParis4 54keV stitched_part_2, cropped 8316x7812+900+948"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 54.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91
+        }
+      },
+      "20230205180739": {
+        "id": "20230205180739",
+        "sample_id": "PHercParis4",
+        "long_id": "20230205180739-7.910um-54keV",
+        "creation": {
+          "date": "2023-02-05T18:07:39Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 54.0,
+            "pixel_size_um": 7.91,
+            "scan_name": "PHercParis4 54keV stitched_part_1, cropped 8096x7888+1184+1040"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 54.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91
+        }
+      }
+    },
+    "volumes": {
+      "20230206171837": {
+        "id": "20230206171837",
+        "sample_id": "PHercParis4",
+        "scan_id": "20230206171837",
+        "long_id": "20230206171837-7.910um-54keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-03T09:11:11Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 14500,
+            "window_u16_max": 72500,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230206171837",
+            "workflow_creation": "2025-12-03T09:11:11Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20230206171837"
+          }
+        },
+        "properties": {
+          "energy_keV": 54.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91,
+          "data_format": "uint8",
+          "transforms": null,
+          "shape": [
+            10529,
+            7812,
+            8316
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHercParis4/volumes/20230206171837-7.910um-54keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      },
+      "20230205180739": {
+        "id": "20230205180739",
+        "sample_id": "PHercParis4",
+        "scan_id": "20230205180739",
+        "long_id": "20230205180739-7.910um-54keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-03T09:13:49Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 14500,
+            "window_u16_max": 75000,
+            "workflow_name": "mask-layers-sam2long-phercparis4-20230205180739",
+            "workflow_creation": "2025-12-03T09:13:49Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20230205180739"
+          }
+        },
+        "properties": {
+          "energy_keV": 54.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91,
+          "data_format": "uint8",
+          "transforms": null,
+          "shape": [
+            14369,
+            7888,
+            8096
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHercParis4/volumes/20230205180739-7.910um-54keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      }
+    },
+    "segments": {}
+  },
   "PHerc1545": {
     "sample": {
       "id": "PHerc1545",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo-mask",
@@ -6454,6 +8080,10 @@
             7506,
             7506
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -6484,7 +8114,10 @@
   "PHerc1447": {
     "sample": {
       "id": "PHerc1447",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -6854,6 +8487,10 @@
             8343,
             8343
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -6881,10 +8518,49 @@
     },
     "segments": {}
   },
+  "PHercParis2Fr143": {
+    "sample": {
+      "id": "PHercParis2Fr143",
+      "properties": {
+        "type": "fragment",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/fragments/Frag2/PHercParis2Fr143.volpkg/",
+        "description": "PHerc. Paris 2 Fr 143"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHercParis2Fr143/photos/PHercParis2Fr143_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. Paris 2 Fr 143 is a fragment of a Herculaneum papyrus, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nSee also: [EduceLab-Scrolls paper](https://arxiv.org/abs/2304.02084), [EduceLab 2023 Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)."
+    },
+    "scans": {},
+    "volumes": {},
+    "segments": {}
+  },
   "PHerc1203": {
     "sample": {
       "id": "PHerc1203",
-      "properties": null,
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null
+      },
       "data": [
         {
           "type": "photo",
@@ -7267,6 +8943,10 @@
             6844,
             6844
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -7294,10 +8974,130 @@
     },
     "segments": {}
   },
+  "PHerc0172": {
+    "sample": {
+      "id": "PHerc0172",
+      "properties": {
+        "type": "scroll",
+        "volume_transforms": null,
+        "legacy_data_url": "https://dl.ash2txt.org/full-scrolls/Scroll5/PHerc172.volpkg/"
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "samples/PHerc0172/photos/PHerc0172_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "https",
+                  "url": "https://data.aws.ash2txt.org",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": null
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc. 172 is a rolled Herculaneum papyrus from the [Bodleian Library](https://www.bodleian.ox.ac.uk/home) in Oxford, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is similar in size to PHerc. Paris 4 (Scroll 1)."
+    },
+    "scans": {
+      "20241024131838": {
+        "id": "20241024131838",
+        "sample_id": "PHerc0172",
+        "long_id": "20241024131838-7.910um-53keV",
+        "creation": {
+          "date": "2024-10-24T13:18:38Z",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "DLS (Diamond Light Source)",
+            "energy_keV": 53.0,
+            "pixel_size_um": 7.91,
+            "scan_name": "PHerc0172, 53 keV, 7.91 um"
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91
+        }
+      }
+    },
+    "volumes": {
+      "20241024131838": {
+        "id": "20241024131838",
+        "sample_id": "PHerc0172",
+        "scan_id": "20241024131838",
+        "long_id": "20241024131838-7.910um-53keV-masked.zarr",
+        "suffix": "masked.zarr",
+        "creation": {
+          "date": "2025-12-03T09:24:29Z",
+          "process": "mask_layers_zarr_export",
+          "metadata": {
+            "target_window_f32_min": -0.03,
+            "target_window_f32_max": 0.145,
+            "window_u16_min": 0,
+            "window_u16_max": 65535,
+            "workflow_name": "mask-layers-sam2long-pherc0172-rewindowed",
+            "workflow_creation": "2025-12-03T09:24:29Z"
+          },
+          "derived_from": {
+            "type": "scan",
+            "id": "20241024131838"
+          }
+        },
+        "properties": {
+          "energy_keV": 53.0,
+          "detector_distance_mm": null,
+          "pixel_size_um": 7.91,
+          "data_format": "uint8",
+          "transforms": null,
+          "shape": [
+            20616,
+            6700,
+            9100
+          ],
+          "license": {
+            "name": "EduceLab Data License",
+            "url": "https://dl.ash2txt.org/LICENSE.txt"
+          },
+          "public_release": true
+        },
+        "data": [
+          {
+            "type": "ome-zarr",
+            "origins": [
+              {
+                "path": "samples/PHerc0172/volumes/20241024131838-7.910um-53keV-masked.zarr/",
+                "access_roots": [
+                  {
+                    "type": "https",
+                    "url": "https://data.aws.ash2txt.org",
+                    "usage": "public-read"
+                  }
+                ],
+                "copy_info": null
+              }
+            ],
+            "properties": null,
+            "parameters": null,
+            "creation_info": null
+          }
+        ]
+      }
+    },
+    "segments": {}
+  },
   "PHerc0009B": {
     "sample": {
       "id": "PHerc0009B",
       "properties": {
+        "type": "fragment",
         "volume_transforms": [
           {
             "from_volume_id": "20250521125136",
@@ -8117,6 +9917,10 @@
             7837,
             7837
           ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          },
           "public_release": true
         },
         "data": [
@@ -8173,7 +9977,11 @@
             29112,
             28259,
             28259
-          ]
+          ],
+          "license": {
+            "name": "CC BY-NC 4.0",
+            "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+          }
         },
         "data": [
           {
