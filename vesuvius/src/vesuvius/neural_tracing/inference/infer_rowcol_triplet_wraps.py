@@ -101,6 +101,12 @@ def parse_args(argv=None):
     parser.add_argument("--tta-outlier-drop-thresh", type=float, default=1.25)
     parser.add_argument("--tta-outlier-drop-min-keep", type=int, default=4)
     parser.add_argument("--tta-batch-size", type=int, default=2)
+    parser.add_argument("--flip-check-enabled", dest="flip_check_enabled", action="store_true")
+    parser.add_argument("--no-flip-check", dest="flip_check_enabled", action="store_false")
+    parser.set_defaults(flip_check_enabled=True)
+    parser.add_argument("--flip-check-abs-margin", type=float, default=0.25)
+    parser.add_argument("--flip-check-rel-margin", type=float, default=0.08)
+    parser.add_argument("--flip-check-min-band-points", type=int, default=32)
 
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--output-prefix", type=str, default=None)
@@ -151,6 +157,12 @@ def parse_args(argv=None):
         parser.error("--iter-direction is required when --iterations is provided.")
     if args.iterations is None and args.iter_direction is not None:
         parser.error("--iter-direction requires --iterations.")
+    if args.flip_check_abs_margin < 0.0:
+        parser.error("--flip-check-abs-margin must be >= 0")
+    if args.flip_check_rel_margin < 0.0:
+        parser.error("--flip-check-rel-margin must be >= 0")
+    if args.flip_check_min_band_points < 1:
+        parser.error("--flip-check-min-band-points must be >= 1")
     return args
 
 
@@ -243,6 +255,109 @@ def _split_triplet_displacement_channels(disp_batch):
     back = disp_batch[:, 0:3]
     front = disp_batch[:, 3:6]
     return back, front
+
+
+def _score_xy_distance_in_band(
+    points_zyx,
+    band_z_min,
+    band_z_max,
+    center_y,
+    center_x,
+    min_band_points,
+):
+    pts = np.asarray(points_zyx, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+        return None
+    finite = np.isfinite(pts).all(axis=1)
+    if not bool(finite.any()):
+        return None
+    pts = pts[finite]
+    z_vals = pts[:, 0]
+    in_band = (z_vals >= float(band_z_min)) & (z_vals <= float(band_z_max))
+    if int(np.count_nonzero(in_band)) < int(min_band_points):
+        return None
+    pts_band = pts[in_band]
+    y_vals = pts_band[:, 1].astype(np.float64, copy=False)
+    x_vals = pts_band[:, 2].astype(np.float64, copy=False)
+    dy = y_vals - float(center_y)
+    dx = x_vals - float(center_x)
+    radial = np.sqrt((dy * dy) + (dx * dx))
+    if radial.size == 0 or not bool(np.isfinite(radial).any()):
+        return None
+    score = float(np.median(radial))
+    xy_center = np.asarray([float(np.median(y_vals)), float(np.median(x_vals))], dtype=np.float64)
+    if not np.isfinite(score) or not bool(np.isfinite(xy_center).all()):
+        return None
+    return {
+        "score": score,
+        "xy_center": xy_center,
+        "points_in_band": int(pts_band.shape[0]),
+    }
+
+
+def _z_extent(points_zyx):
+    pts = np.asarray(points_zyx, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+        return None
+    finite = np.isfinite(pts).all(axis=1)
+    if not bool(finite.any()):
+        return None
+    z_vals = pts[finite, 0].astype(np.float64, copy=False)
+    return float(np.min(z_vals)), float(np.max(z_vals))
+
+
+def _maybe_swap_bbox_front_back(
+    world_center_zyx,
+    world_back_zyx,
+    world_front_zyx,
+    center_y,
+    center_x,
+    abs_margin,
+    rel_margin,
+    min_band_points,
+):
+    abs_margin = max(0.0, float(abs_margin))
+    rel_margin = max(0.0, float(rel_margin))
+    min_band_points = max(1, int(min_band_points))
+
+    center_extent = _z_extent(world_center_zyx)
+    back_extent = _z_extent(world_back_zyx)
+    front_extent = _z_extent(world_front_zyx)
+    if center_extent is None or back_extent is None or front_extent is None:
+        return False, "insufficient_band_points"
+
+    band_z_min = min(center_extent[0], back_extent[0], front_extent[0])
+    band_z_max = max(center_extent[1], back_extent[1], front_extent[1])
+    back_score = _score_xy_distance_in_band(
+        world_back_zyx,
+        band_z_min=band_z_min,
+        band_z_max=band_z_max,
+        center_y=float(center_y),
+        center_x=float(center_x),
+        min_band_points=min_band_points,
+    )
+    front_score = _score_xy_distance_in_band(
+        world_front_zyx,
+        band_z_min=band_z_min,
+        band_z_max=band_z_max,
+        center_y=float(center_y),
+        center_x=float(center_x),
+        min_band_points=min_band_points,
+    )
+    if back_score is None or front_score is None:
+        return False, "insufficient_band_points"
+
+    sep_xy = float(np.linalg.norm(front_score["xy_center"] - back_score["xy_center"]))
+    if not np.isfinite(sep_xy):
+        sep_xy = 0.0
+    margin = max(abs_margin, rel_margin * sep_xy)
+    gap = abs(front_score["score"] - back_score["score"])
+    if gap <= margin:
+        return False, "ambiguous"
+
+    if front_score["score"] > back_score["score"]:
+        return True, "swap_confident"
+    return False, "already_oriented"
 
 
 def _accumulate_displaced(sum_grid, count_grid, uv_rc, world_zyx):
@@ -682,6 +797,17 @@ def _run_triplet_inference(
     sum_front = np.zeros((h, w, 3), dtype=np.float32)
     count_back = np.zeros((h, w), dtype=np.uint32)
     count_front = np.zeros((h, w), dtype=np.uint32)
+    flip_checks_total = 0
+    flip_swaps_applied = 0
+    flip_skipped_ambiguous = 0
+    flip_skipped_insufficient_points = 0
+
+    volume_shape = np.asarray(np.shape(volume_arr), dtype=np.float64)
+    if volume_shape.size < 3:
+        raise RuntimeError(f"Expected 3D volume for center-based flip checks, got shape={tuple(np.shape(volume_arr))}")
+    volume_center_zyx = 0.5 * np.maximum(volume_shape[:3] - 1.0, 0.0)
+    volume_center_y = float(volume_center_zyx[1])
+    volume_center_x = float(volume_center_zyx[2])
 
     expected_in_channels = int(model_state["expected_in_channels"])
     if expected_in_channels != 2:
@@ -734,33 +860,60 @@ def _run_triplet_inference(
             back_disp, back_valid = _sample_trilinear_displacement_stack(back_batch[i], local)
             front_disp, front_valid = _sample_trilinear_displacement_stack(front_batch[i], local)
 
+            uv_b = np.zeros((0, 2), dtype=np.int32)
+            world_b = np.zeros((0, 3), dtype=np.float32)
             if bool(back_valid.any()):
                 uv_b = uv[back_valid]
                 world_b = world[back_valid] + back_disp[back_valid]
                 finite_b = np.isfinite(world_b).all(axis=1)
                 uv_b = uv_b[finite_b]
                 world_b = world_b[finite_b]
-                if uv_b.shape[0] > 0:
-                    world_b_robust = _robustify_samples_with_dense_projection(
-                        uv_b,
-                        world_b,
-                        subsample_stride=int(dense_subsample_stride),
-                    )
-                    _accumulate_displaced(sum_back, count_back, uv_b, world_b_robust)
 
+            uv_f = np.zeros((0, 2), dtype=np.int32)
+            world_f = np.zeros((0, 3), dtype=np.float32)
             if bool(front_valid.any()):
                 uv_f = uv[front_valid]
                 world_f = world[front_valid] + front_disp[front_valid]
                 finite_f = np.isfinite(world_f).all(axis=1)
                 uv_f = uv_f[finite_f]
                 world_f = world_f[finite_f]
-                if uv_f.shape[0] > 0:
-                    world_f_robust = _robustify_samples_with_dense_projection(
-                        uv_f,
-                        world_f,
-                        subsample_stride=int(dense_subsample_stride),
-                    )
-                    _accumulate_displaced(sum_front, count_front, uv_f, world_f_robust)
+
+            if bool(args.flip_check_enabled) and uv_b.shape[0] > 0 and uv_f.shape[0] > 0:
+                flip_checks_total += 1
+                should_swap, swap_reason = _maybe_swap_bbox_front_back(
+                    world_center_zyx=world,
+                    world_back_zyx=world_b,
+                    world_front_zyx=world_f,
+                    center_y=volume_center_y,
+                    center_x=volume_center_x,
+                    abs_margin=float(args.flip_check_abs_margin),
+                    rel_margin=float(args.flip_check_rel_margin),
+                    min_band_points=int(args.flip_check_min_band_points),
+                )
+                if should_swap:
+                    uv_b, uv_f = uv_f, uv_b
+                    world_b, world_f = world_f, world_b
+                    flip_swaps_applied += 1
+                elif swap_reason == "ambiguous":
+                    flip_skipped_ambiguous += 1
+                elif swap_reason == "insufficient_band_points":
+                    flip_skipped_insufficient_points += 1
+
+            if uv_b.shape[0] > 0:
+                world_b_robust = _robustify_samples_with_dense_projection(
+                    uv_b,
+                    world_b,
+                    subsample_stride=int(dense_subsample_stride),
+                )
+                _accumulate_displaced(sum_back, count_back, uv_b, world_b_robust)
+
+            if uv_f.shape[0] > 0:
+                world_f_robust = _robustify_samples_with_dense_projection(
+                    uv_f,
+                    world_f,
+                    subsample_stride=int(dense_subsample_stride),
+                )
+                _accumulate_displaced(sum_front, count_front, uv_f, world_f_robust)
 
         del model_inputs
         del disp_pred
@@ -791,6 +944,10 @@ def _run_triplet_inference(
         "front_projection_meta": front_proj_meta,
         "n_back_cells": int(back_projected_valid.sum()),
         "n_front_cells": int(front_projected_valid.sum()),
+        "flip_checks_total": int(flip_checks_total),
+        "flip_swaps_applied": int(flip_swaps_applied),
+        "flip_skipped_ambiguous": int(flip_skipped_ambiguous),
+        "flip_skipped_insufficient_points": int(flip_skipped_insufficient_points),
     }
 
 
@@ -939,6 +1096,14 @@ def _run_single_iteration(
         "tta_merge_method_effective": str(args.tta_merge_method),
         "n_pred_back_cells": int(infer_out["n_back_cells"]),
         "n_pred_front_cells": int(infer_out["n_front_cells"]),
+        "flip_check_enabled": bool(args.flip_check_enabled),
+        "flip_check_abs_margin": float(args.flip_check_abs_margin),
+        "flip_check_rel_margin": float(args.flip_check_rel_margin),
+        "flip_check_min_band_points": int(args.flip_check_min_band_points),
+        "flip_checks_total": int(infer_out.get("flip_checks_total", 0)),
+        "flip_swaps_applied": int(infer_out.get("flip_swaps_applied", 0)),
+        "flip_skipped_ambiguous": int(infer_out.get("flip_skipped_ambiguous", 0)),
+        "flip_skipped_insufficient_points": int(infer_out.get("flip_skipped_insufficient_points", 0)),
         "save_coordinate_scale_factor": int(save_scale_factor),
         "stored_scale_rc": None if stored_scale_rc is None else [float(stored_scale_rc[0]), float(stored_scale_rc[1])],
         "effective_step_size_used": int(tifxyz_step_size),
