@@ -35,6 +35,7 @@ class ExportConfig:
 	scale: float = 0.1
 	single_segment: bool = False
 	copy_model: bool = False
+	output_name: str | None = None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -63,6 +64,11 @@ def _build_parser() -> argparse.ArgumentParser:
 		action="store_true",
 		default=False,
 		help="Copy the model checkpoint into the tifxyz dir instead of creating a symlink",
+	)
+	g.add_argument(
+		"--output-name",
+		default=None,
+		help="Override the tifxyz directory name (e.g. 'my_segment_v002.tifxyz')",
 	)
 	return p
 
@@ -165,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
 		"offset_z": int(round(float(args.offset[2]))),
 		"single_segment": bool(args.single_segment),
 		"copy_model": bool(args.copy_model),
+		"output_name": None if args.output_name in (None, "") else str(args.output_name),
 	}
 	cfg = ExportConfig(**base)
 	dev = torch.device(cfg.device)
@@ -315,7 +322,8 @@ def main(argv: list[str] | None = None) -> int:
 				mask_all[:, col:col + hm] = mask_w
 			col += hm + BORDER_W  # skip border columns (already -1)
 
-		out_dir = out_base / f"{cfg.prefix}combined.tifxyz"
+		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}combined.tifxyz"
+		out_dir = out_base / seg_name
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")

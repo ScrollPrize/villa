@@ -19,6 +19,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <iostream>
+
 static const char* kDefaultConfig = R"({
     "base": {
         "dir_v": 10.0,
@@ -75,6 +77,17 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         row->addWidget(_modelEdit, 1);
         row->addWidget(_modelBrowse);
     }, tr("Fit model checkpoint (.pt). Auto-populated from segment's model.pt symlink."));
+
+    // -- Data input (zarr) --
+    _group->addRow(tr("Data:"), [&](QHBoxLayout* row) {
+        _dataInputEdit = new QLineEdit(content);
+        _dataInputEdit->setPlaceholderText(
+            tr("Path to input data (.zarr)"));
+        _dataInputBrowse = new QToolButton(content);
+        _dataInputBrowse->setText(QStringLiteral("..."));
+        row->addWidget(_dataInputEdit, 1);
+        row->addWidget(_dataInputBrowse);
+    }, tr("Input data zarr (e.g. s5_cos.zarr) required by the fit optimizer."));
 
     // -- Output directory --
     _group->addRow(tr("Output:"), [&](QHBoxLayout* row) {
@@ -165,6 +178,22 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         }
     });
 
+    // Data input
+    connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _fitDataInputPath = text.trimmed();
+        writeSetting(QStringLiteral("fit_data_input_path"), _fitDataInputPath);
+    });
+    connect(_dataInputBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _fitDataInputPath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_fitDataInputPath).absolutePath();
+        QString path = QFileDialog::getExistingDirectory(
+            this, tr("Select input data (.zarr directory)"), initial);
+        if (!path.isEmpty()) {
+            _fitDataInputPath = path;
+            _dataInputEdit->setText(path);
+        }
+    });
+
     // Output dir
     connect(_outputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _fitOutputDir = text.trimmed();
@@ -238,6 +267,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         if (_runBtn) _runBtn->setEnabled(true);
     });
     connect(&mgr, &FitServiceManager::serviceError, this, [this](const QString& err) {
+        std::cerr << "[fit-optimizer] service error: " << err.toStdString() << std::endl;
         if (_progressLabel) {
             _progressLabel->setText(tr("Error: %1").arg(err));
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
@@ -277,6 +307,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     });
     connect(&mgr, &FitServiceManager::optimizationError, this,
             [this](const QString& err) {
+        std::cerr << "[fit-optimizer] optimization error: " << err.toStdString() << std::endl;
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
         if (_progressLabel) {
@@ -305,6 +336,7 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
 
     _fitPythonPath = settings.value(QStringLiteral("fit_python_path"), QString()).toString();
     _fitModelPath = settings.value(QStringLiteral("fit_model_path"), QString()).toString();
+    _fitDataInputPath = settings.value(QStringLiteral("fit_data_input_path"), QString()).toString();
     _fitOutputDir = settings.value(QStringLiteral("fit_output_dir"), QString()).toString();
     _fitConfigText = settings.value(QStringLiteral("fit_config_text"), QString()).toString();
 
@@ -330,6 +362,10 @@ void SegmentationFitOptimizerPanel::syncUiState(bool /*editingEnabled*/, bool op
     if (_modelEdit) {
         const QSignalBlocker b(_modelEdit);
         _modelEdit->setText(_fitModelPath);
+    }
+    if (_dataInputEdit) {
+        const QSignalBlocker b(_dataInputEdit);
+        _dataInputEdit->setText(_fitDataInputPath);
     }
     if (_outputEdit) {
         const QSignalBlocker b(_outputEdit);
@@ -369,6 +405,17 @@ void SegmentationFitOptimizerPanel::setFitModelPath(const QString& path)
     if (_modelEdit) {
         const QSignalBlocker b(_modelEdit);
         _modelEdit->setText(path);
+    }
+}
+
+void SegmentationFitOptimizerPanel::setFitDataInputPath(const QString& path)
+{
+    if (_fitDataInputPath == path) return;
+    _fitDataInputPath = path;
+    writeSetting(QStringLiteral("fit_data_input_path"), _fitDataInputPath);
+    if (_dataInputEdit) {
+        const QSignalBlocker b(_dataInputEdit);
+        _dataInputEdit->setText(path);
     }
 }
 

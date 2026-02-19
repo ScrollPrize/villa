@@ -1782,44 +1782,120 @@ void CWindow::CreateWidgets(void)
             return;
         }
 
-        // Get model path from panel (user may have set it, or auto-detected)
-        QString modelPath = _segmentationWidget->fitModelPath();
-
-        // If not set, try to auto-detect from the active segmentation surface
-        if (modelPath.isEmpty()) {
-            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
-                _surf_col->surface("segmentation"));
-            if (activeSurface && !activeSurface->path.empty()) {
-                auto modelLink = activeSurface->path / "model.pt";
-                if (std::filesystem::is_symlink(modelLink) || std::filesystem::exists(modelLink)) {
-                    modelPath = QString::fromStdString(
-                        std::filesystem::canonical(modelLink).string());
-                }
-            }
+        // Get the active segment path
+        std::filesystem::path segPath;
+        auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
+            _surf_col->surface("segmentation"));
+        if (activeSurface && !activeSurface->path.empty()) {
+            segPath = activeSurface->path;
         }
 
+        // Get model path — from panel or auto-detected from segment's model.pt
+        QString modelPath = _segmentationWidget->fitModelPath();
+        if (modelPath.isEmpty() && !segPath.empty()) {
+            auto modelFile = segPath / "model.pt";
+            if (std::filesystem::exists(modelFile)) {
+                try {
+                    modelPath = QString::fromStdString(
+                        std::filesystem::canonical(modelFile).string());
+                } catch (const std::filesystem::filesystem_error&) {}
+            }
+        }
         if (modelPath.isEmpty()) {
             statusBar()->showMessage(
                 tr("No model path set and no model.pt found in segment directory."), 5000);
             return;
         }
 
-        // Build optimization request
-        QJsonObject request;
-        request[QStringLiteral("model_input")] = modelPath;
-        request[QStringLiteral("model_output")] = modelPath; // overwrite in-place
+        // Data input path (zarr)
+        QString dataInput = _segmentationWidget->fitDataInputPath();
+        if (dataInput.isEmpty()) {
+            statusBar()->showMessage(
+                tr("No data input path set. Set the zarr path in the Fit Optimizer panel."), 5000);
+            return;
+        }
 
         // Output dir: panel setting, or segment's parent directory
         QString outputDir = _segmentationWidget->fitOutputDir();
-        if (outputDir.isEmpty()) {
-            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
-                _surf_col->surface("segmentation"));
-            if (activeSurface && !activeSurface->path.empty()) {
-                outputDir = QString::fromStdString(
-                    activeSurface->path.parent_path().string());
-            }
+        if (outputDir.isEmpty() && !segPath.empty()) {
+            outputDir = QString::fromStdString(segPath.parent_path().string());
         }
+
+        // --- Compute next version name ---
+        // Current segment: e.g. "winding_combined.tifxyz" or "winding_combined_v003.tifxyz"
+        // New segment:     "winding_combined_v004.tifxyz"
+        QString outputName;
+        if (!segPath.empty()) {
+            auto segName = segPath.filename().string(); // e.g. "winding_combined.tifxyz"
+            // Strip .tifxyz suffix
+            std::string baseName = segName;
+            const std::string tifxyzSuffix = ".tifxyz";
+            if (baseName.size() > tifxyzSuffix.size() &&
+                baseName.compare(baseName.size() - tifxyzSuffix.size(),
+                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
+            }
+            // Strip existing _vNNN suffix to get the root name
+            std::string rootName = baseName;
+            if (rootName.size() > 5) { // at least "_v001"
+                auto pos = rootName.rfind("_v");
+                if (pos != std::string::npos && pos + 2 < rootName.size()) {
+                    bool allDigits = true;
+                    for (size_t i = pos + 2; i < rootName.size(); ++i) {
+                        if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
+                            allDigits = false;
+                            break;
+                        }
+                    }
+                    if (allDigits) {
+                        rootName = rootName.substr(0, pos);
+                    }
+                }
+            }
+            // Scan siblings for highest existing version
+            int maxVersion = 0;
+            auto parentDir = segPath.parent_path();
+            std::error_code ec;
+            for (auto& entry : std::filesystem::directory_iterator(parentDir, ec)) {
+                auto name = entry.path().filename().string();
+                // Check if it starts with rootName + "_v" and ends with .tifxyz
+                std::string prefix = rootName + "_v";
+                if (name.size() > prefix.size() + tifxyzSuffix.size() &&
+                    name.compare(0, prefix.size(), prefix) == 0 &&
+                    name.compare(name.size() - tifxyzSuffix.size(),
+                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                    auto numStr = name.substr(prefix.size(),
+                        name.size() - prefix.size() - tifxyzSuffix.size());
+                    bool allDigits = true;
+                    for (auto c : numStr) {
+                        if (!std::isdigit(static_cast<unsigned char>(c))) {
+                            allDigits = false;
+                            break;
+                        }
+                    }
+                    if (allDigits && !numStr.empty()) {
+                        int v = std::stoi(numStr);
+                        if (v > maxVersion) maxVersion = v;
+                    }
+                }
+            }
+            int nextVersion = maxVersion + 1;
+            char numBuf[16];
+            std::snprintf(numBuf, sizeof(numBuf), "_v%03d", nextVersion);
+            outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
+        }
+
+        // Build optimization request
+        QJsonObject request;
+        request[QStringLiteral("model_input")] = modelPath;
+        // model_output left unset — service will use temp file
+        request[QStringLiteral("data_input")] = dataInput;
         request[QStringLiteral("output_dir")] = outputDir;
+        request[QStringLiteral("single_segment")] = true;
+        request[QStringLiteral("copy_model")] = true;
+        if (!outputName.isEmpty()) {
+            request[QStringLiteral("output_name")] = outputName;
+        }
 
         // Parse config JSON from the editor
         QString configText = _segmentationWidget->fitConfigText().trimmed();
@@ -1831,7 +1907,8 @@ void CWindow::CreateWidgets(void)
         }
 
         mgr.startOptimization(request);
-        statusBar()->showMessage(tr("Fit optimization started."), 3000);
+        statusBar()->showMessage(
+            tr("Fit optimization started. Output: %1").arg(outputName), 3000);
     });
 
     connect(_segmentationWidget, &SegmentationWidget::fitStopRequested, this, [this]() {
@@ -4167,17 +4244,15 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
             });
         }
 
-        // Auto-detect model.pt symlink for fit optimizer panel
+        // Auto-detect model.pt (copy or symlink) for fit optimizer panel
         if (_segmentationWidget && activeSurfaceShared && !activeSurfaceShared->path.empty()) {
-            auto modelLink = activeSurfaceShared->path / "model.pt";
-            if (std::filesystem::is_symlink(modelLink) || std::filesystem::exists(modelLink)) {
+            auto modelFile = activeSurfaceShared->path / "model.pt";
+            if (std::filesystem::exists(modelFile)) {
                 try {
-                    auto resolved = std::filesystem::canonical(modelLink);
+                    auto resolved = std::filesystem::canonical(modelFile);
                     _segmentationWidget->setFitModelPath(
                         QString::fromStdString(resolved.string()));
-                } catch (const std::filesystem::filesystem_error&) {
-                    // Symlink target doesn't exist — ignore
-                }
+                } catch (const std::filesystem::filesystem_error&) {}
             }
             // Set output dir to the segment's parent directory
             _segmentationWidget->setFitOutputDir(

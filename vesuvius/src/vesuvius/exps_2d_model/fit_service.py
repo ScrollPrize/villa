@@ -119,9 +119,10 @@ def _run_optimization(body: dict[str, Any]) -> None:
         _job.set_error("missing 'output_dir'")
         return
 
-    # model_output defaults to overwriting model_input
+    # When no explicit model_output given, use a temp file in output_dir
+    # so we never overwrite the input model.
     if not model_output:
-        model_output = model_input
+        model_output = str(Path(output_dir) / "_fit_reopt_model.pt")
 
     try:
         # Build argv for fit.py from the config dict.
@@ -184,7 +185,15 @@ def _run_optimization(body: dict[str, Any]) -> None:
             export_argv.append("--single-segment")
         if body.get("copy_model"):
             export_argv.append("--copy-model")
+        output_name = body.get("output_name")
+        if output_name:
+            export_argv.extend(["--output-name", str(output_name)])
         fit2tifxyz.main(export_argv)
+
+        # Clean up temp model file — it's been copied into the tifxyz dir
+        tmp_model = Path(model_output)
+        if tmp_model.name == "_fit_reopt_model.pt" and tmp_model.exists():
+            tmp_model.unlink()
 
         _job.set_finished(str(output_dir))
         print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
