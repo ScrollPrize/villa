@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from contextlib import nullcontext
 
 
 TTA_FLIP_COMBOS = [
@@ -12,11 +13,23 @@ TTA_FLIP_COMBOS = [
     [-2, -3],
     [-1, -2, -3],
 ]
+TTA_ROTATE3_PERMS = [
+    (0, 1, 2),  # z-up
+    (2, 0, 1),  # x-up
+    (1, 2, 0),  # y-up
+]
 
 # Mapping from flip dim to displacement channel that must be negated:
 # dim -1 (W/X) -> channel 2, dim -2 (H/Y) -> channel 1, dim -3 (D/Z) -> channel 0
 FLIP_DIM_TO_CHANNEL = {-1: 2, -2: 1, -3: 0}
 TTA_MERGE_METHODS = ("median", "mean", "trimmed_mean", "vector_medoid", "vector_geomedian")
+TTA_TRANSFORM_MODES = ("mirror", "rotate3")
+
+
+def _profile_section(profiler, name):
+    if profiler is None:
+        return nullcontext()
+    return profiler.section(name)
 
 
 def _validate_tta_merge_method(merge_method):
@@ -27,6 +40,23 @@ def _validate_tta_merge_method(merge_method):
             f"Supported methods: {list(TTA_MERGE_METHODS)}"
         )
     return method
+
+
+def _validate_tta_transform_mode(transform_mode):
+    mode = str(transform_mode).strip().lower()
+    if mode not in TTA_TRANSFORM_MODES:
+        raise ValueError(
+            f"Unknown --tta-transform '{transform_mode}'. "
+            f"Supported modes: {list(TTA_TRANSFORM_MODES)}"
+        )
+    return mode
+
+
+def _inverse_axis_perm(perm):
+    inv = [0, 0, 0]
+    for new_axis, old_axis in enumerate(perm):
+        inv[old_axis] = new_axis
+    return tuple(inv)
 
 
 def _compute_vector_geomedian(points, max_iters=8, eps=1e-6, tol=1e-4):
@@ -217,65 +247,102 @@ def run_model_tta(
     amp_dtype,
     get_displacement_result,
     merge_method="vector_geomedian",
+    transform_mode="mirror",
     outlier_drop_thresh=1.25,
     outlier_drop_min_keep=4,
+    tta_batch_size=2,
+    profiler=None,
 ):
-    """Run mirroring-based TTA on a batch, returning merged displacement."""
+    """Run TTA on a batch, returning merged displacement."""
     if inputs.ndim != 5:
         raise RuntimeError(f"Expected inputs with shape [B, C, D, H, W], got {tuple(inputs.shape)}")
     _validate_tta_merge_method(merge_method)
+    mode = _validate_tta_transform_mode(transform_mode)
 
     batch_size = int(inputs.shape[0])
     if batch_size <= 0:
         raise RuntimeError("TTA received an empty batch.")
 
-    # Stack all mirrored variants along the batch dimension and run one forward pass.
-    tta_inputs = []
-    for flip_dims in TTA_FLIP_COMBOS:
-        x = inputs
-        for d in flip_dims:
-            x = x.flip(d)
-        tta_inputs.append(x)
-
-    tta_inputs = torch.cat(tta_inputs, dim=0)
-    disp_all = get_displacement_result(model, tta_inputs, amp_enabled, amp_dtype)
-
-    n_tta = len(TTA_FLIP_COMBOS)
-    expected_batch = batch_size * n_tta
-    if disp_all.shape[0] != expected_batch:
-        raise RuntimeError(
-            f"Unexpected TTA output batch size {disp_all.shape[0]} (expected {expected_batch})."
-        )
+    n_tta = len(TTA_FLIP_COMBOS) if mode == "mirror" else len(TTA_ROTATE3_PERMS)
+    if tta_batch_size is None:
+        tta_batch_size = n_tta
+    tta_batch_size = int(tta_batch_size)
+    if tta_batch_size < 1:
+        raise RuntimeError(f"tta_batch_size must be >= 1; got {tta_batch_size}.")
+    tta_batch_size = min(tta_batch_size, n_tta)
 
     aligned_displacements = []
 
-    for tta_idx, flip_dims in enumerate(TTA_FLIP_COMBOS):
-        start = tta_idx * batch_size
-        end = start + batch_size
-        disp = disp_all[start:end]
-
-        # Un-flip displacement outputs back to the original orientation.
-        for d in reversed(flip_dims):
-            disp = disp.flip(d)
-
-        # Negate displacement components along flipped spatial axes.
-        if flip_dims:
-            sign = torch.ones((1, disp.shape[1], 1, 1, 1), device=disp.device, dtype=disp.dtype)
-            for d in flip_dims:
-                ch = FLIP_DIM_TO_CHANNEL[d]
-                if ch >= disp.shape[1]:
-                    raise RuntimeError(
-                        f"TTA channel index {ch} out of bounds for displacement with {disp.shape[1]} channels."
+    for chunk_start in range(0, n_tta, tta_batch_size):
+        with _profile_section(profiler, "iter_tta_build_variants"):
+            tta_inputs = []
+            if mode == "mirror":
+                transform_chunk = TTA_FLIP_COMBOS[chunk_start:chunk_start + tta_batch_size]
+                for flip_dims in transform_chunk:
+                    x = inputs
+                    for d in flip_dims:
+                        x = x.flip(d)
+                    tta_inputs.append(x)
+            else:
+                transform_chunk = TTA_ROTATE3_PERMS[chunk_start:chunk_start + tta_batch_size]
+                for perm in transform_chunk:
+                    tta_inputs.append(
+                        inputs.permute(0, 1, 2 + perm[0], 2 + perm[1], 2 + perm[2])
                     )
-                sign[:, ch] = -1
-            disp = disp * sign
+            tta_inputs = torch.cat(tta_inputs, dim=0)
+        with _profile_section(profiler, "iter_tta_forward_chunk"):
+            disp_all = get_displacement_result(model, tta_inputs, amp_enabled, amp_dtype)
+        expected_batch = batch_size * len(transform_chunk)
+        if disp_all.shape[0] != expected_batch:
+            raise RuntimeError(
+                f"Unexpected TTA output batch size {disp_all.shape[0]} (expected {expected_batch})."
+            )
 
-        aligned_displacements.append(disp)
+        with _profile_section(profiler, "iter_tta_align_outputs"):
+            for local_idx, transform in enumerate(transform_chunk):
+                start = local_idx * batch_size
+                end = start + batch_size
+                disp = disp_all[start:end]
 
-    disp_stack = torch.stack(aligned_displacements, dim=0)
-    disp_stack = _drop_tta_outlier_variants(
-        disp_stack,
-        thresh=outlier_drop_thresh,
-        min_keep=outlier_drop_min_keep,
-    )
-    return _merge_tta_displacements(disp_stack, merge_method)
+                if mode == "mirror":
+                    flip_dims = transform
+                    # Un-flip displacement outputs back to the original orientation.
+                    for d in reversed(flip_dims):
+                        disp = disp.flip(d)
+
+                    # Negate displacement components along flipped spatial axes.
+                    if flip_dims:
+                        sign = torch.ones((1, disp.shape[1], 1, 1, 1), device=disp.device, dtype=disp.dtype)
+                        for d in flip_dims:
+                            ch = FLIP_DIM_TO_CHANNEL[d]
+                            if ch >= disp.shape[1]:
+                                raise RuntimeError(
+                                    f"TTA channel index {ch} out of bounds for displacement with {disp.shape[1]} channels."
+                                )
+                            sign[:, ch] = -1
+                        disp = disp * sign
+                else:
+                    perm = transform
+                    inv_perm = _inverse_axis_perm(perm)
+                    disp = disp.permute(0, 1, 2 + inv_perm[0], 2 + inv_perm[1], 2 + inv_perm[2])
+                    if disp.shape[1] < 3:
+                        raise RuntimeError(
+                            f"Rotation TTA expects at least 3 displacement channels, got {disp.shape[1]}."
+                        )
+                    disp_xyz = disp[:, :3]
+                    disp_xyz = disp_xyz[:, inv_perm]
+                    if disp.shape[1] == 3:
+                        disp = disp_xyz
+                    else:
+                        disp = torch.cat([disp_xyz, disp[:, 3:]], dim=1)
+
+                aligned_displacements.append(disp)
+
+    with _profile_section(profiler, "iter_tta_merge"):
+        disp_stack = torch.stack(aligned_displacements, dim=0)
+        disp_stack = _drop_tta_outlier_variants(
+            disp_stack,
+            thresh=outlier_drop_thresh,
+            min_keep=outlier_drop_min_keep,
+        )
+        return _merge_tta_displacements(disp_stack, merge_method)

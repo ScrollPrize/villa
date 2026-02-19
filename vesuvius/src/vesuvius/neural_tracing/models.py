@@ -6,6 +6,20 @@ from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.neural_tracing.youssef_mae import Vesuvius3dViTModel
 
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    snapshot_download = None
+
+
+_CHECKPOINT_SENTINELS = {
+    "extrap_displacement_latest": {
+        "repo_id": "scrollprize/extrap_displacement_latest",
+        "checkpoint_filename": "extrap_displacement_latest.pth",
+    },
+}
+_HF_CHECKPOINT_CACHE_ROOT = Path("/tmp/vesuvius_hf_models")
+
 
 class SlotConditionedHead(nn.Module):
     """
@@ -181,8 +195,61 @@ def make_model(config):
         raise RuntimeError('unexpected model_type, should be unet or vit')
 
 
+def _resolve_checkpoint_sentinel(checkpoint_path):
+    sentinel = str(checkpoint_path).strip()
+    sentinel_config = _CHECKPOINT_SENTINELS.get(sentinel)
+    if sentinel_config is None:
+        return None
+    repo_id = sentinel_config["repo_id"]
+    checkpoint_filename = sentinel_config["checkpoint_filename"]
+
+    if snapshot_download is None:
+        raise ImportError(
+            "The huggingface_hub package is required to resolve "
+            f"checkpoint sentinel '{sentinel}'. Install it with: pip install huggingface_hub"
+        )
+
+    cache_dir = _HF_CHECKPOINT_CACHE_ROOT / repo_id.replace("/", "__")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        downloaded = snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(cache_dir),
+            local_dir_use_symlinks=False,
+        )
+    except TypeError:
+        # Compatibility with huggingface_hub versions that do not support local_dir_use_symlinks.
+        downloaded = snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(cache_dir),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download checkpoint sentinel '{sentinel}' from Hugging Face repo "
+            f"'{repo_id}' into '{cache_dir}': {exc}"
+        ) from exc
+
+    resolved_checkpoint = Path(downloaded) / checkpoint_filename
+    if not resolved_checkpoint.exists():
+        raise FileNotFoundError(
+            f"Checkpoint sentinel '{sentinel}' expected file '{checkpoint_filename}' in "
+            f"'{downloaded}', but it was not found."
+        )
+
+    return resolved_checkpoint
+
+
 def resolve_checkpoint_path(checkpoint_path):
-    path = Path(checkpoint_path)
+    checkpoint_text = str(checkpoint_path).strip() if checkpoint_path is not None else ""
+    if not checkpoint_text:
+        raise FileNotFoundError("Checkpoint path is empty.")
+
+    resolved_sentinel_path = _resolve_checkpoint_sentinel(checkpoint_text)
+    if resolved_sentinel_path is not None:
+        path = resolved_sentinel_path
+    else:
+        path = Path(checkpoint_text)
     if path.is_dir():
         candidates = list(path.glob("ckpt_*.pth"))
         if not candidates:
@@ -245,4 +312,3 @@ def strip_state(state):
             continue
         new_state[new_key] = v
     return new_state
-

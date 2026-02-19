@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QThread>
 #include <QUuid>
@@ -10,10 +11,59 @@
 
 #include <iostream>
 
+#if defined(Q_OS_LINUX)
+#include <signal.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+#endif
+
 namespace
 {
 constexpr int kServiceStartTimeoutMs = 300000; // 5 minutes for torch compilation
 constexpr int kServiceStopTimeoutMs = 5000;    // 5 seconds to gracefully stop
+const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
+
+bool isCheckpointSentinel(const QString& checkpointPath)
+{
+    const QString trimmed = checkpointPath.trimmed();
+    return trimmed == kDenseLatestSentinel;
+}
+
+QString normalizeExistingPath(const QString& path)
+{
+    const QString trimmed = path.trimmed();
+    if (trimmed.isEmpty()) {
+        return QString();
+    }
+
+    QFileInfo info(trimmed);
+    const QString canonical = info.canonicalFilePath();
+    if (!canonical.isEmpty()) {
+        return QDir::cleanPath(canonical);
+    }
+    return QDir::cleanPath(info.absoluteFilePath());
+}
+
+QString normalizeCheckpointValue(const QString& checkpointPath)
+{
+    if (isCheckpointSentinel(checkpointPath)) {
+        return kDenseLatestSentinel;
+    }
+    return normalizeExistingPath(checkpointPath);
+}
+
+QString normalizePythonValue(const QString& pythonPath)
+{
+    const QString trimmed = pythonPath.trimmed();
+    if (trimmed.isEmpty()) {
+        return QString();
+    }
+
+    // Keep venv wrappers/symlinks intact. Canonicalizing can resolve to the
+    // base interpreter (e.g. uv/cpython) and lose venv site-packages.
+    QFileInfo info(trimmed);
+    return QDir::cleanPath(info.absoluteFilePath());
+}
 
 QString findPythonExecutable()
 {
@@ -85,11 +135,18 @@ bool NeuralTraceServiceManager::ensureServiceRunning(const QString& checkpointPa
                                                       int volumeScale,
                                                       const QString& pythonPath)
 {
+    const QString normalizedCheckpoint = normalizeCheckpointValue(checkpointPath);
+    const QString normalizedVolumeZarr = normalizeExistingPath(volumeZarr);
+    const QString normalizedPython = normalizePythonValue(pythonPath);
+
+    const bool sameConfig = (_currentCheckpointPath == normalizedCheckpoint &&
+                             _currentVolumeZarr == normalizedVolumeZarr &&
+                             _currentVolumeScale == volumeScale &&
+                             _currentPythonPath == normalizedPython);
+
     // Check if already running with same config
     if (_process && _process->state() == QProcess::Running && _serviceReady) {
-        if (_currentCheckpointPath == checkpointPath &&
-            _currentVolumeZarr == volumeZarr &&
-            _currentVolumeScale == volumeScale) {
+        if (sameConfig) {
             return true;
         }
         // Configuration changed, need to restart
@@ -97,7 +154,14 @@ bool NeuralTraceServiceManager::ensureServiceRunning(const QString& checkpointPa
         stopService();
     }
 
-    return startService(checkpointPath, volumeZarr, volumeScale, pythonPath);
+    // If a process object still exists and was not explicitly stopped above, clear it safely.
+    if (_process && _process->state() != QProcess::NotRunning) {
+        stopService();
+    } else if (_process) {
+        _process.reset();
+    }
+
+    return startService(normalizedCheckpoint, normalizedVolumeZarr, volumeScale, normalizedPython);
 }
 
 bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
@@ -108,13 +172,19 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
     _lastError.clear();
     _serviceReady = false;
 
+    if (_process && _process->state() != QProcess::NotRunning) {
+        stopService();
+    } else if (_process) {
+        _process.reset();
+    }
+
     // Validate inputs
     if (checkpointPath.isEmpty()) {
         _lastError = tr("Checkpoint path is required");
         emit serviceError(_lastError);
         return false;
     }
-    if (!QFile::exists(checkpointPath)) {
+    if (!isCheckpointSentinel(checkpointPath) && !QFile::exists(checkpointPath)) {
         _lastError = tr("Checkpoint file does not exist: %1").arg(checkpointPath);
         emit serviceError(_lastError);
         return false;
@@ -141,6 +211,16 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
     // Create process
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
+
+#if defined(Q_OS_LINUX)
+    const qint64 parentPid = QCoreApplication::applicationPid();
+    _process->setChildProcessModifier([parentPid]() {
+        ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (::getppid() != static_cast<pid_t>(parentPid)) {
+            _exit(1);
+        }
+    });
+#endif
 
     connect(_process.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &NeuralTraceServiceManager::handleProcessFinished);
@@ -202,7 +282,8 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         "--checkpoint_path", checkpointPath,
         "--volume_zarr", volumeZarr,
         "--volume_scale", QString::number(volumeScale),
-        "--socket_path", _socketPath
+        "--socket_path", _socketPath,
+        "--parent_pid", QString::number(QCoreApplication::applicationPid())
     };
 
     emit statusMessage(tr("Starting neural trace service..."));
@@ -233,6 +314,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
             _currentCheckpointPath = checkpointPath;
             _currentVolumeZarr = volumeZarr;
             _currentVolumeScale = volumeScale;
+            _currentPythonPath = pythonPath;
             emit statusMessage(tr("Neural trace service ready"));
             emit serviceStarted();
             return true;
@@ -281,6 +363,7 @@ void NeuralTraceServiceManager::stopService()
     _currentCheckpointPath.clear();
     _currentVolumeZarr.clear();
     _currentVolumeScale = 0;
+    _currentPythonPath.clear();
 
     emit serviceStopped();
 }

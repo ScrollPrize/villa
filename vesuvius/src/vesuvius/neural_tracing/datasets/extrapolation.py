@@ -6,6 +6,7 @@ Supports multiple extrapolation methods via the `method` parameter.
 import numpy as np
 import torch
 import random
+from contextlib import nullcontext
 from typing import Callable, Optional
 
 from .common import voxelize_surface_grid
@@ -85,7 +86,7 @@ def apply_degradation(
         return zyx_local, False
 
     # Reshape to grid to compute distance from conditioning edge
-    zyx_grid = zyx_local.reshape(uv_shape + (3,))
+    zyx_grid = zyx_local.reshape(uv_shape + (3,)).astype(np.float32, copy=False)
     R, C = uv_shape
 
     # Compute distance from conditioning edge
@@ -102,7 +103,7 @@ def apply_degradation(
         # Conditioning on bottom, distance increases as row decreases
         distance = (R - 1 - np.arange(R))[:, None].repeat(C, axis=1)
 
-    distance = distance.astype(np.float64)
+    distance = distance.astype(np.float32, copy=False)
 
     # Avoid issues if all same distance
     if distance.max() < 1e-6:
@@ -112,17 +113,17 @@ def apply_degradation(
     if random.random() < 0.5:
         # Curvature bias: error = k * distance^2
         k = random.uniform(curvature_range[0], curvature_range[1])
-        direction = np.random.randn(3)
+        direction = np.random.randn(3).astype(np.float32, copy=False)
         direction = direction / (np.linalg.norm(direction) + 1e-8)
         error = k * (distance[:, :, None] ** 2) * direction
     else:
         # Gradient perturbation: linear tilt
         magnitude = random.uniform(gradient_range[0], gradient_range[1])
-        tilt = np.random.randn(3) * magnitude
+        tilt = (np.random.randn(3).astype(np.float32, copy=False) * np.float32(magnitude))
         error = distance[:, :, None] * tilt
 
-    degraded_grid = zyx_grid + error
-    return degraded_grid.reshape(-1, 3), True
+    degraded_grid = (zyx_grid + error).astype(np.float32, copy=False)
+    return degraded_grid.reshape(-1, 3).astype(np.float32, copy=False), True
 
 
 # Registry of extrapolation methods
@@ -166,6 +167,12 @@ def _run_fallback_method(
     )
 
 
+def _profile_section(profiler, name: str):
+    if profiler is None:
+        return nullcontext()
+    return profiler.section(name)
+
+
 def _downsample_uv_cond_directional(
     uv_cond: np.ndarray,
     zyx_cond: np.ndarray,
@@ -187,44 +194,25 @@ def _downsample_uv_cond_directional(
     zyx = np.asarray(zyx_cond)
 
     keep_mask = np.zeros((uv.shape[0],), dtype=bool)
-
     if cond_direction in {"left", "right"}:
-        # Horizontal growth: keep all rows, decimate columns from edge inward.
-        row_vals = np.unique(uv[:, 0])
-        for row in row_vals:
-            row_idx = np.where(uv[:, 0] == row)[0]
-            if row_idx.size == 0:
-                continue
-            cols = uv[row_idx, 1]
-            if cond_direction == "left":
-                # Conditioning edge is high-col side.
-                order = np.argsort(-cols, kind="stable")
-            else:
-                # Conditioning edge is low-col side.
-                order = np.argsort(cols, kind="stable")
-            row_idx_ordered = row_idx[order]
-            keep_mask[row_idx_ordered[::stride]] = True
-
+        line_vals = uv[:, 0]
+        boundary_vals = -uv[:, 1] if cond_direction == "left" else uv[:, 1]
     elif cond_direction in {"up", "down"}:
-        # Vertical growth: keep all cols, decimate rows from edge inward.
-        col_vals = np.unique(uv[:, 1])
-        for col in col_vals:
-            col_idx = np.where(uv[:, 1] == col)[0]
-            if col_idx.size == 0:
-                continue
-            rows = uv[col_idx, 0]
-            if cond_direction == "up":
-                # Conditioning edge is high-row side.
-                order = np.argsort(-rows, kind="stable")
-            else:
-                # Conditioning edge is low-row side.
-                order = np.argsort(rows, kind="stable")
-            col_idx_ordered = col_idx[order]
-            keep_mask[col_idx_ordered[::stride]] = True
-
+        line_vals = uv[:, 1]
+        boundary_vals = -uv[:, 0] if cond_direction == "up" else uv[:, 0]
     else:
         # Unknown direction: preserve legacy behavior.
         keep_mask[::stride] = True
+        return uv[keep_mask], zyx[keep_mask]
+
+    # Sort once by line, then by edge-distance ordering within each line.
+    sorted_idx = np.lexsort((boundary_vals, line_vals))
+    sorted_lines = line_vals[sorted_idx]
+    group_starts = np.flatnonzero(np.r_[True, sorted_lines[1:] != sorted_lines[:-1]])
+    group_ends = np.r_[group_starts[1:], sorted_idx.size]
+
+    for start, end in zip(group_starts, group_ends):
+        keep_mask[sorted_idx[start:end:stride]] = True
 
     if not keep_mask.any():
         keep_mask[::stride] = True
@@ -281,30 +269,32 @@ def _extrapolate_rbf(
         (M, 3) extrapolated ZYX coordinates
     """
     from vesuvius.neural_tracing.datasets.interpolation.torch_rbf import RBFInterpolator
+    profiler = kwargs.get("profiler")
 
-    # Downsample for RBF fitting.
-    stride = max(1, int(downsample_factor))
-    cond_direction = kwargs.get("cond_direction")
-    uv_cond_ds, zyx_cond_ds = _downsample_uv_cond_directional(
-        uv_cond,
-        zyx_cond,
-        stride,
-        cond_direction=cond_direction,
-    )
+    with _profile_section(profiler, "iter_edge_rbf_downsample"):
+        # Downsample for RBF fitting.
+        stride = max(1, int(downsample_factor))
+        cond_direction = kwargs.get("cond_direction")
+        uv_cond_ds, zyx_cond_ds = _downsample_uv_cond_directional(
+            uv_cond,
+            zyx_cond,
+            stride,
+            cond_direction=cond_direction,
+        )
 
-    # Optional cap on the number of control points to reduce solve cost on large crops.
-    if rbf_max_points is not None:
-        max_pts = int(rbf_max_points)
-        if max_pts > 0 and len(uv_cond_ds) > max_pts:
-            keep_idx = np.linspace(0, len(uv_cond_ds) - 1, num=max_pts, dtype=np.int64)
-            uv_cond_ds = uv_cond_ds[keep_idx]
-            zyx_cond_ds = zyx_cond_ds[keep_idx]
+        # Optional cap on the number of control points to reduce solve cost on large crops.
+        if rbf_max_points is not None:
+            max_pts = int(rbf_max_points)
+            if max_pts > 0 and len(uv_cond_ds) > max_pts:
+                keep_idx = np.linspace(0, len(uv_cond_ds) - 1, num=max_pts, dtype=np.int64)
+                uv_cond_ds = uv_cond_ds[keep_idx]
+                zyx_cond_ds = zyx_cond_ds[keep_idx]
 
-    rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
-    np_precision = np.float64 if rbf_precision == torch.float64 else np.float32
-    uv_cond_t = torch.from_numpy(np.asarray(uv_cond_ds, dtype=np_precision))
-    zyx_cond_t = torch.from_numpy(np.asarray(zyx_cond_ds, dtype=np_precision))
-    uv_query_t = torch.from_numpy(np.asarray(uv_query, dtype=np_precision))
+        rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
+        np_precision = np.float64 if rbf_precision == torch.float64 else np.float32
+        uv_cond_t = torch.from_numpy(np.asarray(uv_cond_ds, dtype=np_precision))
+        zyx_cond_t = torch.from_numpy(np.asarray(zyx_cond_ds, dtype=np_precision))
+        uv_query_t = torch.from_numpy(np.asarray(uv_query, dtype=np_precision))
 
     smoothing = kwargs.get('smoothing', 0.0)
     rbf_kwargs = dict(
@@ -314,26 +304,27 @@ def _extrapolate_rbf(
         precision=rbf_precision,
     )
 
-    try:
-        rbf = RBFInterpolator(
-            smoothing=smoothing,
-            **rbf_kwargs,
-        )
-        return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
-    except ValueError as exc:
-        # Degenerate UV geometry can make the RBF system singular for some crops.
-        if "Singular matrix" not in str(exc):
-            raise
-
+    with _profile_section(profiler, "iter_edge_rbf_solve_eval"):
         try:
             rbf = RBFInterpolator(
-                smoothing=max(float(smoothing), float(singular_smoothing)),
+                smoothing=smoothing,
                 **rbf_kwargs,
             )
             return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
-        except ValueError as retry_exc:
-            if "Singular matrix" not in str(retry_exc):
+        except ValueError as exc:
+            # Degenerate UV geometry can make the RBF system singular for some crops.
+            if "Singular matrix" not in str(exc):
                 raise
+
+            try:
+                rbf = RBFInterpolator(
+                    smoothing=max(float(smoothing), float(singular_smoothing)),
+                    **rbf_kwargs,
+                )
+                return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
+            except ValueError as retry_exc:
+                if "Singular matrix" not in str(retry_exc):
+                    raise
 
     # Last-resort fallback for singular systems; this avoids killing dataloader workers.
     return _run_fallback_method(
@@ -406,7 +397,7 @@ def _extrapolate_linear_edge(
     col_to_idx = {c: i for i, c in enumerate(cols_unique)}
 
     # Build 2D grids for ZYX (NaN for missing entries to avoid zero corruption)
-    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float64)
+    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float32)
     for i, (uv, zyx) in enumerate(zip(uv_cond, zyx_cond)):
         ri, ci = row_to_idx[uv[0]], col_to_idx[uv[1]]
         zyx_grid[ri, ci] = zyx
@@ -437,7 +428,7 @@ def _extrapolate_linear_edge(
         if valid_rows_mask.any():
             median_gradient = np.nanmedian(gradient[valid_rows_mask], axis=0)
         else:
-            median_gradient = np.zeros(3, dtype=np.float64)
+            median_gradient = np.zeros(3, dtype=np.float32)
 
         # For rows with NaN edge or gradient, use median gradient fallback
         for ri in range(n_rows):
@@ -452,7 +443,7 @@ def _extrapolate_linear_edge(
                 gradient[ri] = median_gradient
 
         # For each query point, find matching row and extrapolate
-        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float32)
         for i, uv in enumerate(uv_query):
             query_row, query_col = uv[0], uv[1]
 
@@ -491,7 +482,7 @@ def _extrapolate_linear_edge(
         if valid_cols_mask.any():
             median_gradient = np.nanmedian(gradient[valid_cols_mask], axis=0)
         else:
-            median_gradient = np.zeros(3, dtype=np.float64)
+            median_gradient = np.zeros(3, dtype=np.float32)
 
         # For cols with NaN edge or gradient, use median gradient fallback
         for ci in range(n_cols):
@@ -506,7 +497,7 @@ def _extrapolate_linear_edge(
                 gradient[ci] = median_gradient
 
         # For each query point, find matching col and extrapolate
-        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float32)
         for i, uv in enumerate(uv_query):
             query_row, query_col = uv[0], uv[1]
 
@@ -545,7 +536,9 @@ def _extrapolate_rbf_edge_only(
     runs the standard RBF solver on that subset.
     """
     if len(uv_cond) == 0:
-        return np.zeros((0, 3), dtype=np.float64)
+        rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
+        out_dtype = np.float64 if rbf_precision == torch.float64 else np.float32
+        return np.zeros((0, 3), dtype=out_dtype)
 
     direction = _infer_cond_direction(uv_cond, uv_query, cond_direction)
     if direction is None:
