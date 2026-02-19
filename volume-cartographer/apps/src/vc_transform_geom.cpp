@@ -125,8 +125,8 @@ static bool invert_affine_in_place(AffineTransform& T) {
 
     if (cv::invert(A, Ainv, cv::DECOMP_SVD) <= 0.0) return false;
 
-    const double inv_residual = cv::norm(A * Ainv - cv::Mat::eye(3, 3, CV_64F), cv::NORM_FRO);
-    const double ref_scale = cv::norm(A, cv::NORM_FRO) * cv::norm(Ainv, cv::NORM_FRO);
+    const double inv_residual = cv::norm(A * Ainv - cv::Mat::eye(3, 3, CV_64F), cv::NORM_L2);
+    const double ref_scale = cv::norm(A, cv::NORM_L2) * cv::norm(Ainv, cv::NORM_L2);
     if (!std::isfinite(inv_residual) || inv_residual > 1e-12 * (ref_scale + 1.0)) return false;
 
     cv::Matx33d Ai;
@@ -150,9 +150,9 @@ static inline bool apply_affine_point(const cv::Vec3d& p, const AffineTransform&
     const double x = p[0], y = p[1], z = p[2];
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
 
-    const double nx = std::fma(A.M(0,0), x, std::fma(A.M(0,1), y, std::fma(A.M(0,2), z, A.M(0,3)));
-    const double ny = std::fma(A.M(1,0), x, std::fma(A.M(1,1), y, std::fma(A.M(1,2), z, A.M(1,3)));
-    const double nz = std::fma(A.M(2,0), x, std::fma(A.M(2,1), y, std::fma(A.M(2,2), z, A.M(2,3)));
+    const double nx = A.M(0,0) * x + A.M(0,1) * y + A.M(0,2) * z + A.M(0,3);
+    const double ny = A.M(1,0) * x + A.M(1,1) * y + A.M(1,2) * z + A.M(1,3);
+    const double nz = A.M(2,0) * x + A.M(2,1) * y + A.M(2,2) * z + A.M(2,3);
 
     if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz)) return false;
     out = {nx, ny, nz};
