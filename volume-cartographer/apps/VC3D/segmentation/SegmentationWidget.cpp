@@ -165,6 +165,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::neuralTracerEnabledChanged);
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerStatusMessage,
             this, &SegmentationWidget::neuralTracerStatusMessage);
+    connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::copyWithNtRequested,
+            this, &SegmentationWidget::copyWithNtRequested);
 }
 
 void SegmentationWidget::syncUiState()
@@ -391,6 +393,7 @@ DenseTtaMode SegmentationWidget::denseTtaMode() const { return _neuralTracerPane
 QString SegmentationWidget::denseTtaMergeMethod() const { return _neuralTracerPanel->denseTtaMergeMethod(); }
 double SegmentationWidget::denseTtaOutlierDropThresh() const { return _neuralTracerPanel->denseTtaOutlierDropThresh(); }
 QString SegmentationWidget::denseCheckpointPath() const { return _neuralTracerPanel->denseCheckpointPath(); }
+QString SegmentationWidget::copyCheckpointPath() const { return _neuralTracerPanel->copyCheckpointPath(); }
 
 void SegmentationWidget::setNeuralTracerEnabled(bool enabled) { _neuralTracerPanel->setNeuralTracerEnabled(enabled); }
 void SegmentationWidget::setNeuralCheckpointPath(const QString& path) { _neuralTracerPanel->setNeuralCheckpointPath(path); }
@@ -403,6 +406,7 @@ void SegmentationWidget::setDenseTtaMode(DenseTtaMode mode) { _neuralTracerPanel
 void SegmentationWidget::setDenseTtaMergeMethod(const QString& method) { _neuralTracerPanel->setDenseTtaMergeMethod(method); }
 void SegmentationWidget::setDenseTtaOutlierDropThresh(double threshold) { _neuralTracerPanel->setDenseTtaOutlierDropThresh(threshold); }
 void SegmentationWidget::setDenseCheckpointPath(const QString& path) { _neuralTracerPanel->setDenseCheckpointPath(path); }
+void SegmentationWidget::setCopyCheckpointPath(const QString& path) { _neuralTracerPanel->setCopyCheckpointPath(path); }
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 
 void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}

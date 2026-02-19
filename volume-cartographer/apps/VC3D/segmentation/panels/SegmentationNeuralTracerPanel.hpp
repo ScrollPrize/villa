@@ -7,6 +7,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QPushButton;
 class QLabel;
 class QLineEdit;
 class QSettings;
@@ -36,6 +37,7 @@ public:
     [[nodiscard]] QString denseTtaMergeMethod() const { return _denseTtaMergeMethod; }
     [[nodiscard]] double denseTtaOutlierDropThresh() const { return _denseTtaOutlierDropThresh; }
     [[nodiscard]] QString denseCheckpointPath() const;
+    [[nodiscard]] QString copyCheckpointPath() const;
 
     // Setters
     void setNeuralTracerEnabled(bool enabled);
@@ -50,6 +52,7 @@ public:
     void setDenseTtaMergeMethod(const QString& method);
     void setDenseTtaOutlierDropThresh(double threshold);
     void setDenseCheckpointPath(const QString& path);
+    void setCopyCheckpointPath(const QString& path);
 
     void restoreSettings(QSettings& settings);
     void syncUiState();
@@ -60,6 +63,7 @@ public:
 signals:
     void neuralTracerEnabledChanged(bool enabled);
     void neuralTracerStatusMessage(const QString& message);
+    void copyWithNtRequested();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -71,6 +75,12 @@ private:
         CustomPath = 1
     };
 
+    enum class CopyCheckpointPreset
+    {
+        CopyLatest = 0,
+        CustomPath = 1
+    };
+
     CollapsibleSettingsGroup* _groupNeuralTracer{nullptr};
     QCheckBox* _chkNeuralTracerEnabled{nullptr};
     QComboBox* _comboNeuralModelType{nullptr};
@@ -78,6 +88,8 @@ private:
     QComboBox* _comboDenseTtaMode{nullptr};
     QComboBox* _comboDenseTtaMergeMethod{nullptr};
     QComboBox* _comboDenseCheckpointPreset{nullptr};
+    QComboBox* _comboCopyCheckpointPreset{nullptr};
+    QPushButton* _btnCopyWithNt{nullptr};
     QLineEdit* _neuralCheckpointEdit{nullptr};
     QToolButton* _neuralCheckpointBrowse{nullptr};
     QLineEdit* _neuralPythonEdit{nullptr};
@@ -99,6 +111,7 @@ private:
     QString _denseTtaMergeMethod{QStringLiteral("vector_geomedian")};
     double _denseTtaOutlierDropThresh{1.25};
     DenseCheckpointPreset _denseCheckpointPreset{DenseCheckpointPreset::DenseLatest};
+    CopyCheckpointPreset _copyCheckpointPreset{CopyCheckpointPreset::CopyLatest};
 
     bool _restoringSettings{false};
     const QString _settingsGroup;

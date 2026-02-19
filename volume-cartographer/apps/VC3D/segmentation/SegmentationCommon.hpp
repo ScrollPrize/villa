@@ -7,6 +7,7 @@ Q_DECLARE_LOGGING_CATEGORY(lcSegWidget)
 enum class NeuralTracerModelType {
     Heatmap = 0,
     DenseDisplacement = 1,
+    DisplacementCopy = 2,
 };
 
 enum class NeuralTracerOutputMode {

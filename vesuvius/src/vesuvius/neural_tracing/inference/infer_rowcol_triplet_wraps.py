@@ -43,6 +43,38 @@ _TTA_MERGE_ALIASES = {
     "vector_mean": "mean",
     "vector_median": "median",
 }
+_COPY_ARG_ALIASES = {
+    "dense_checkpoint_path": "checkpoint_path",
+    "volume_zarr": "volume_path",
+    "tifxyz_out_dir": "out_dir",
+}
+_COPY_ARG_TO_CLI = {
+    "tifxyz_path": "--tifxyz-path",
+    "volume_path": "--volume-path",
+    "checkpoint_path": "--checkpoint-path",
+    "device": "--device",
+    "volume_scale": "--volume-scale",
+    "crop_size": "--crop-size",
+    "batch_size": "--batch-size",
+    "crop_input_workers": "--crop-input-workers",
+    "bbox_overlap": "--bbox-overlap",
+    "bbox_prune_max_remove_per_band": "--bbox-prune-max-remove-per-band",
+    "bbox_band_workers": "--bbox-band-workers",
+    "tta_merge_method": "--tta-merge-method",
+    "tta_transform": "--tta-transform",
+    "tta_outlier_drop_thresh": "--tta-outlier-drop-thresh",
+    "tta_outlier_drop_min_keep": "--tta-outlier-drop-min-keep",
+    "tta_batch_size": "--tta-batch-size",
+    "flip_check_abs_margin": "--flip-check-abs-margin",
+    "flip_check_rel_margin": "--flip-check-rel-margin",
+    "flip_check_min_band_points": "--flip-check-min-band-points",
+    "out_dir": "--out-dir",
+    "output_prefix": "--output-prefix",
+    "iterations": "--iterations",
+    "iter_direction": "--iter-direction",
+    "tifxyz_step_size": "--tifxyz-step-size",
+    "tifxyz_voxel_size_um": "--tifxyz-voxel-size-um",
+}
 _DENSE_PROJECTION_INTERP_METHOD = "catmull_rom"
 _DENSE_PROJECTION_NEIGHBORHOOD_RADIUS = 5
 _DENSE_PROJECTION_REJECT_OUTLIER_FRACTION = 0.25
@@ -164,6 +196,54 @@ def parse_args(argv=None):
     if args.flip_check_min_band_points < 1:
         parser.error("--flip-check-min-band-points must be >= 1")
     return args
+
+
+def normalize_copy_args(copy_args):
+    if not isinstance(copy_args, dict):
+        raise RuntimeError(f"copy_args must be a dict, got {type(copy_args).__name__}")
+    normalized = {}
+    for key, value in copy_args.items():
+        key_norm = str(key).replace("-", "_")
+        normalized[_COPY_ARG_ALIASES.get(key_norm, key_norm)] = value
+    return normalized
+
+
+def _append_cli_arg(argv, flag, value):
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        argv.append(flag)
+        argv.extend(str(v) for v in value)
+        return
+    argv.extend([flag, str(value)])
+
+
+def _copy_args_to_argv(copy_args):
+    copy_args = normalize_copy_args(copy_args)
+    argv = []
+
+    for key, flag in _COPY_ARG_TO_CLI.items():
+        if key not in copy_args:
+            continue
+        value = copy_args.get(key)
+        if value is None:
+            continue
+        _append_cli_arg(argv, flag, value)
+
+    if "tta" in copy_args and bool(copy_args.get("tta")) is False:
+        argv.append("--no-tta")
+    if "bbox_prune" in copy_args and bool(copy_args.get("bbox_prune")) is False:
+        argv.append("--no-bbox-prune")
+    if "flip_check_enabled" in copy_args and bool(copy_args.get("flip_check_enabled")) is False:
+        argv.append("--no-flip-check")
+    if "save_original_copy" in copy_args and bool(copy_args.get("save_original_copy")):
+        argv.append("--save-original-copy")
+    if "keep_previous_wrap" in copy_args and bool(copy_args.get("keep_previous_wrap")) is False:
+        argv.append("--no-keep-previous-wrap")
+    if "verbose" in copy_args and bool(copy_args.get("verbose")):
+        argv.append("--verbose")
+
+    return argv
 
 
 def _log(verbose, msg):
@@ -1315,6 +1395,16 @@ def run(args):
         "stop_reason": stop_reason,
         "outputs_by_iteration": outputs_by_iteration,
     }
+
+
+def run_copy_displacement(copy_args):
+    argv = _copy_args_to_argv(copy_args)
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        detail = str(exc)
+        raise RuntimeError(f"Invalid copy args for infer_rowcol_triplet_wraps: {detail}") from exc
+    return run(args)
 
 
 def main(argv=None):

@@ -13,6 +13,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -24,9 +25,13 @@
 
 namespace {
 const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
+const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 const QString kDensePresetSettingKey = QStringLiteral("neural_dense_checkpoint_preset");
+const QString kCopyPresetSettingKey = QStringLiteral("neural_copy_checkpoint_preset");
 const QString kDensePresetLatest = QStringLiteral("latest");
+const QString kCopyPresetLatest = QStringLiteral("latest");
 const QString kDensePresetCustom = QStringLiteral("custom");
+const QString kCopyPresetCustom = QStringLiteral("custom");
 const QString kDenseTtaModeSettingKey = QStringLiteral("neural_dense_tta_mode");
 const QString kDenseTtaMergeMethodSettingKey = QStringLiteral("neural_dense_tta_merge_method");
 const QString kDenseTtaOutlierDropThreshSettingKey = QStringLiteral("neural_dense_tta_outlier_drop_thresh");
@@ -69,10 +74,15 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
                                            "Requires a trained model checkpoint."));
     _groupNeuralTracer->contentLayout()->addWidget(_chkNeuralTracerEnabled);
 
+    _btnCopyWithNt = new QPushButton(tr("Copy with NT"), neuralParent);
+    _btnCopyWithNt->setToolTip(tr("Run displacement copy inference and create front/back output segments."));
+    _groupNeuralTracer->contentLayout()->addWidget(_btnCopyWithNt);
+
     _groupNeuralTracer->addRow(tr("Model type:"), [&](QHBoxLayout* row) {
         _comboNeuralModelType = new QComboBox(neuralParent);
         _comboNeuralModelType->addItem(tr("Heatmap"), static_cast<int>(NeuralTracerModelType::Heatmap));
         _comboNeuralModelType->addItem(tr("Extrapolation growth"), static_cast<int>(NeuralTracerModelType::DenseDisplacement));
+        _comboNeuralModelType->addItem(tr("Displacement Copy"), static_cast<int>(NeuralTracerModelType::DisplacementCopy));
         _comboNeuralModelType->setToolTip(tr("Select which neural tracing model path to use."));
         row->addWidget(_comboNeuralModelType);
         row->addStretch(1);
@@ -135,6 +145,20 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         _comboDenseCheckpointPreset->setToolTip(
             tr("Choose a built-in dense displacement checkpoint preset or provide a custom checkpoint file path."));
         row->addWidget(_comboDenseCheckpointPreset);
+        row->addStretch(1);
+    });
+
+    _groupNeuralTracer->addRow(tr("Copy checkpoint path:"), [&](QHBoxLayout* row) {
+        _comboCopyCheckpointPreset = new QComboBox(neuralParent);
+        _comboCopyCheckpointPreset->addItem(
+            tr("Copy Displacement Latest"),
+            static_cast<int>(CopyCheckpointPreset::CopyLatest));
+        _comboCopyCheckpointPreset->addItem(
+            tr("Custom path"),
+            static_cast<int>(CopyCheckpointPreset::CustomPath));
+        _comboCopyCheckpointPreset->setToolTip(
+            tr("Choose a built-in displacement copy checkpoint preset or provide a custom checkpoint file path."));
+        row->addWidget(_comboCopyCheckpointPreset);
         row->addStretch(1);
     });
 
@@ -224,6 +248,15 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         updateDenseUiState();
     });
 
+    connect(_comboCopyCheckpointPreset, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _copyCheckpointPreset = static_cast<CopyCheckpointPreset>(_comboCopyCheckpointPreset->itemData(index).toInt());
+        writeSetting(kCopyPresetSettingKey,
+                     _copyCheckpointPreset == CopyCheckpointPreset::CopyLatest
+                         ? kCopyPresetLatest
+                         : kCopyPresetCustom);
+        updateDenseUiState();
+    });
+
     connect(_neuralCheckpointEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _neuralCheckpointPath = text.trimmed();
         writeSetting(QStringLiteral("neural_checkpoint_path"), _neuralCheckpointPath);
@@ -269,6 +302,10 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
             return;
         }
         writeSetting(vc3d::settings::segmentation::GROUP_NEURAL_TRACER_EXPANDED, expanded);
+    });
+
+    connect(_btnCopyWithNt, &QPushButton::clicked, this, [this]() {
+        emit copyWithNtRequested();
     });
 
     // Connect to service manager signals
@@ -320,6 +357,14 @@ QString SegmentationNeuralTracerPanel::denseCheckpointPath() const
     return _neuralCheckpointPath.trimmed();
 }
 
+QString SegmentationNeuralTracerPanel::copyCheckpointPath() const
+{
+    if (_copyCheckpointPreset == CopyCheckpointPreset::CopyLatest) {
+        return kCopyLatestSentinel;
+    }
+    return _neuralCheckpointPath.trimmed();
+}
+
 void SegmentationNeuralTracerPanel::setNeuralTracerEnabled(bool enabled)
 {
     if (_neuralTracerEnabled == enabled) {
@@ -333,6 +378,7 @@ void SegmentationNeuralTracerPanel::setNeuralTracerEnabled(bool enabled)
         _chkNeuralTracerEnabled->setChecked(enabled);
     }
 
+    updateDenseUiState();
     emit neuralTracerEnabledChanged(enabled);
 }
 
@@ -508,6 +554,31 @@ void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
     updateDenseUiState();
 }
 
+void SegmentationNeuralTracerPanel::setCopyCheckpointPath(const QString& path)
+{
+    const QString trimmed = path.trimmed();
+    const CopyCheckpointPreset nextPreset =
+        (trimmed == kCopyLatestSentinel) ? CopyCheckpointPreset::CopyLatest : CopyCheckpointPreset::CustomPath;
+    if (_copyCheckpointPreset != nextPreset) {
+        _copyCheckpointPreset = nextPreset;
+        writeSetting(kCopyPresetSettingKey,
+                     _copyCheckpointPreset == CopyCheckpointPreset::CopyLatest
+                         ? kCopyPresetLatest
+                         : kCopyPresetCustom);
+        if (_comboCopyCheckpointPreset) {
+            const QSignalBlocker blocker(_comboCopyCheckpointPreset);
+            const int idx = _comboCopyCheckpointPreset->findData(static_cast<int>(_copyCheckpointPreset));
+            if (idx >= 0) {
+                _comboCopyCheckpointPreset->setCurrentIndex(idx);
+            }
+        }
+    }
+    if (nextPreset == CopyCheckpointPreset::CustomPath) {
+        setNeuralCheckpointPath(trimmed);
+    }
+    updateDenseUiState();
+}
+
 void SegmentationNeuralTracerPanel::setVolumeZarrPath(const QString& path)
 {
     _volumeZarrPath = path;
@@ -528,9 +599,13 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     _neuralBatchSize = std::clamp(_neuralBatchSize, 1, 64);
     const int modelType = settings.value(QStringLiteral("neural_model_type"),
                                          static_cast<int>(NeuralTracerModelType::Heatmap)).toInt();
-    _neuralModelType = modelType == static_cast<int>(NeuralTracerModelType::DenseDisplacement)
-        ? NeuralTracerModelType::DenseDisplacement
-        : NeuralTracerModelType::Heatmap;
+    if (modelType == static_cast<int>(NeuralTracerModelType::DenseDisplacement)) {
+        _neuralModelType = NeuralTracerModelType::DenseDisplacement;
+    } else if (modelType == static_cast<int>(NeuralTracerModelType::DisplacementCopy)) {
+        _neuralModelType = NeuralTracerModelType::DisplacementCopy;
+    } else {
+        _neuralModelType = NeuralTracerModelType::Heatmap;
+    }
     const int outputMode = settings.value(QStringLiteral("neural_output_mode"),
                                           static_cast<int>(NeuralTracerOutputMode::OverwriteCurrentSegment)).toInt();
     _neuralOutputMode = outputMode == static_cast<int>(NeuralTracerOutputMode::CreateNewSegment)
@@ -558,6 +633,12 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
         _denseCheckpointPreset = DenseCheckpointPreset::CustomPath;
     } else {
         _denseCheckpointPreset = DenseCheckpointPreset::DenseLatest;
+    }
+    const QString copyPresetValue = settings.value(kCopyPresetSettingKey, kCopyPresetLatest).toString();
+    if (copyPresetValue == kCopyPresetCustom) {
+        _copyCheckpointPreset = CopyCheckpointPreset::CustomPath;
+    } else {
+        _copyCheckpointPreset = CopyCheckpointPreset::CopyLatest;
     }
 
     // Restore group expansion state
@@ -634,36 +715,55 @@ void SegmentationNeuralTracerPanel::syncUiState()
             _comboDenseCheckpointPreset->setCurrentIndex(idx);
         }
     }
+    if (_comboCopyCheckpointPreset) {
+        const QSignalBlocker blocker(_comboCopyCheckpointPreset);
+        int idx = _comboCopyCheckpointPreset->findData(static_cast<int>(_copyCheckpointPreset));
+        if (idx >= 0) {
+            _comboCopyCheckpointPreset->setCurrentIndex(idx);
+        }
+    }
     updateDenseUiState();
 }
 
 void SegmentationNeuralTracerPanel::updateDenseUiState()
 {
     const bool denseMode = _neuralModelType == NeuralTracerModelType::DenseDisplacement;
+    const bool copyMode = _neuralModelType == NeuralTracerModelType::DisplacementCopy;
+    const bool displacementMode = denseMode || copyMode;
     const bool useDenseLatestCheckpoint = denseMode && _denseCheckpointPreset == DenseCheckpointPreset::DenseLatest;
+    const bool useCopyLatestCheckpoint = copyMode && _copyCheckpointPreset == CopyCheckpointPreset::CopyLatest;
+    const bool usingLatestCheckpoint = useDenseLatestCheckpoint || useCopyLatestCheckpoint;
     if (_neuralCheckpointEdit) {
-        _neuralCheckpointEdit->setEnabled(!useDenseLatestCheckpoint);
+        _neuralCheckpointEdit->setEnabled(!usingLatestCheckpoint);
     }
     if (_neuralCheckpointBrowse) {
-        _neuralCheckpointBrowse->setEnabled(!useDenseLatestCheckpoint);
+        _neuralCheckpointBrowse->setEnabled(!usingLatestCheckpoint);
     }
     if (_comboDenseCheckpointPreset) {
         _comboDenseCheckpointPreset->setEnabled(denseMode);
         _comboDenseCheckpointPreset->setVisible(denseMode);
     }
+    if (_comboCopyCheckpointPreset) {
+        _comboCopyCheckpointPreset->setEnabled(copyMode);
+        _comboCopyCheckpointPreset->setVisible(copyMode);
+    }
     if (_comboDenseTtaMode) {
-        _comboDenseTtaMode->setEnabled(denseMode);
-        _comboDenseTtaMode->setVisible(denseMode);
+        _comboDenseTtaMode->setEnabled(displacementMode);
+        _comboDenseTtaMode->setVisible(displacementMode);
     }
     if (_comboDenseTtaMergeMethod) {
-        _comboDenseTtaMergeMethod->setEnabled(denseMode);
-        _comboDenseTtaMergeMethod->setVisible(denseMode);
+        _comboDenseTtaMergeMethod->setEnabled(displacementMode);
+        _comboDenseTtaMergeMethod->setVisible(displacementMode);
     }
     if (_spinDenseTtaOutlierDropThresh) {
-        _spinDenseTtaOutlierDropThresh->setEnabled(denseMode);
-        _spinDenseTtaOutlierDropThresh->setVisible(denseMode);
+        _spinDenseTtaOutlierDropThresh->setEnabled(displacementMode);
+        _spinDenseTtaOutlierDropThresh->setVisible(displacementMode);
     }
     if (_comboNeuralOutputMode) {
         _comboNeuralOutputMode->setEnabled(denseMode);
+    }
+    if (_btnCopyWithNt) {
+        _btnCopyWithNt->setEnabled(_neuralTracerEnabled && copyMode);
+        _btnCopyWithNt->setVisible(copyMode);
     }
 }

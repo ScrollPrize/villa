@@ -1766,6 +1766,8 @@ void CWindow::CreateWidgets(void)
             }
         }
     });
+    connect(_segmentationWidget, &SegmentationWidget::copyWithNtRequested,
+            this, &CWindow::onCopyWithNtRequested);
 
     // Create Drawing widget
     _drawingWidget = new DrawingWidget();
@@ -4103,6 +4105,36 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     };
 
     if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {
+        return;
+    }
+}
+
+void CWindow::onCopyWithNtRequested()
+{
+    if (!_segmentationGrower) {
+        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        return;
+    }
+
+    SegmentationGrower::Context context{
+        _segmentationModule.get(),
+        _segmentationWidget,
+        _surf_col,
+        _viewerManager.get(),
+        chunk_cache
+    };
+    _segmentationGrower->updateContext(context);
+
+    SegmentationGrower::VolumeContext volumeContext{
+        fVpkg,
+        currentVolume,
+        currentVolumeId,
+        _segmentationGrowthVolumeId.empty() ? currentVolumeId : _segmentationGrowthVolumeId,
+        _normalGridPath,
+        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+    };
+
+    if (!_segmentationGrower->startCopyWithNt(volumeContext)) {
         return;
     }
 }

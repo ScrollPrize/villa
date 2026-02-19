@@ -17,6 +17,10 @@ _CHECKPOINT_SENTINELS = {
         "repo_id": "scrollprize/extrap_displacement_latest",
         "checkpoint_filename": "extrap_displacement_latest.pth",
     },
+    "copy_displacement_latest": {
+        "repo_id": "scrollprize/copy_displacement_latest",
+        "checkpoint_filename": "copy_displacement_latest.pth",
+    },
 }
 _HF_CHECKPOINT_CACHE_ROOT = Path("/tmp/vesuvius_hf_models")
 
@@ -230,14 +234,33 @@ def _resolve_checkpoint_sentinel(checkpoint_path):
             f"'{repo_id}' into '{cache_dir}': {exc}"
         ) from exc
 
-    resolved_checkpoint = Path(downloaded) / checkpoint_filename
-    if not resolved_checkpoint.exists():
+    downloaded_path = Path(downloaded)
+    if checkpoint_filename:
+        resolved_checkpoint = downloaded_path / checkpoint_filename
+        if resolved_checkpoint.exists():
+            return resolved_checkpoint
+
+    candidates = sorted(
+        p for p in downloaded_path.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".pth", ".pt"}
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if checkpoint_filename:
         raise FileNotFoundError(
             f"Checkpoint sentinel '{sentinel}' expected file '{checkpoint_filename}' in "
-            f"'{downloaded}', but it was not found."
+            f"'{downloaded}', but it was not found. "
+            f"Found {len(candidates)} .pt/.pth candidate(s)."
         )
-
-    return resolved_checkpoint
+    if len(candidates) == 0:
+        raise FileNotFoundError(
+            f"Checkpoint sentinel '{sentinel}' in '{downloaded}' did not contain any .pt/.pth files."
+        )
+    raise RuntimeError(
+        f"Checkpoint sentinel '{sentinel}' in '{downloaded}' is ambiguous: "
+        f"found multiple .pt/.pth files ({', '.join(str(p.relative_to(downloaded_path)) for p in candidates)})."
+    )
 
 
 def resolve_checkpoint_path(checkpoint_path):

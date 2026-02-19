@@ -76,6 +76,7 @@ public:
     [[nodiscard]] QString denseTtaMergeMethod() const;
     [[nodiscard]] double denseTtaOutlierDropThresh() const;
     [[nodiscard]] QString denseCheckpointPath() const;
+    [[nodiscard]] QString copyCheckpointPath() const;
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
@@ -157,6 +158,7 @@ public:
     void setDenseTtaMergeMethod(const QString& method);
     void setDenseTtaOutlierDropThresh(double threshold);
     void setDenseCheckpointPath(const QString& path);
+    void setCopyCheckpointPath(const QString& path);
 
     /**
      * Set the volume zarr path for neural tracing.
@@ -219,6 +221,7 @@ signals:
     // Neural tracer signals
     void neuralTracerEnabledChanged(bool enabled);
     void neuralTracerStatusMessage(const QString& message);
+    void copyWithNtRequested();
 
     // Cell reoptimization signals
     void cellReoptModeChanged(bool enabled);
