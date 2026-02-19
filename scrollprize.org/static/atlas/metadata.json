@@ -2,7 +2,55 @@
   "PHerc0826": {
     "sample": {
       "id": "PHerc0826",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0826/photos/PHerc0826_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/post-esrf-photos/0826/JPGEnhanced/DSC05583.jpg",
+                "date": "2026-02-18T16:04:04.220089Z",
+                "workflow_execution": "s3copy-pherc0826-040d3565"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0826/photos/PHerc0826_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/post-esrf-photos/0826/Masks/DSC05583_mask.png",
+                "date": "2026-02-18T16:04:04.438743Z",
+                "workflow_execution": "s3copy-pherc0826-108a0067"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720174915": {
@@ -367,7 +415,55 @@
   "PHerc0211": {
     "sample": {
       "id": "PHerc0211",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0211/photos/PHerc0211_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0211/JPGEnhanced/DSC03581.jpg",
+                "date": "2026-02-18T16:04:05.089340Z",
+                "workflow_execution": "s3copy-pherc0211-4e22edab"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0211/photos/PHerc0211_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0211/Masks/DSC03581_mask.png",
+                "date": "2026-02-18T16:04:05.306143Z",
+                "workflow_execution": "s3copy-pherc0211-13427813"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720140115": {
@@ -732,7 +828,55 @@
   "PHerc0490A": {
     "sample": {
       "id": "PHerc0490A",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0490A/photos/PHerc0490A_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0490a/JPGEnhanced/DSC04650.jpg",
+                "date": "2026-02-18T16:04:05.522329Z",
+                "workflow_execution": "s3copy-pherc0490a-b95725f9"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0490A/photos/PHerc0490A_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0490a/Masks/DSC04650_mask.png",
+                "date": "2026-02-18T16:04:05.738422Z",
+                "workflow_execution": "s3copy-pherc0490a-9a5bf295"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250509181146": {
@@ -1084,7 +1228,55 @@
   "PHerc0306B": {
     "sample": {
       "id": "PHerc0306B",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0306B/photos/PHerc0306B_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0306b/JPGEnhanced/DSC05791.jpg",
+                "date": "2026-02-18T16:04:05.955550Z",
+                "workflow_execution": "s3copy-pherc0306b-22fe6cfb"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0306B/photos/PHerc0306B_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0306b/Masks/DSC05791_mask.png",
+                "date": "2026-02-18T16:04:06.173310Z",
+                "workflow_execution": "s3copy-pherc0306b-425ef11f"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250510062844": {
@@ -1436,7 +1628,55 @@
   "PHerc0813": {
     "sample": {
       "id": "PHerc0813",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0813/photos/PHerc0813_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/post-esrf-photos/0813/JPGEnhanced/DSC03255.jpg",
+                "date": "2026-02-18T16:04:35.368925Z",
+                "workflow_execution": "s3copy-pherc0813-c99677b2"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0813/photos/PHerc0813_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/post-esrf-photos/0813/Masks/DSC03255_mask.png",
+                "date": "2026-02-18T16:04:35.591824Z",
+                "workflow_execution": "s3copy-pherc0813-375efcde"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720160015": {
@@ -1801,7 +2041,55 @@
   "PHerc1218": {
     "sample": {
       "id": "PHerc1218",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc1218/photos/PHerc1218_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1218/single-rotation-with-ruler/DSC03773.jpg",
+                "date": "2026-02-18T16:04:35.814247Z",
+                "workflow_execution": "s3copy-pherc1218-c4877d11"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc1218/photos/PHerc1218_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1218/single-rotation-with-ruler/DSC03773_mask.png",
+                "date": "2026-02-18T16:04:36.036921Z",
+                "workflow_execution": "s3copy-pherc1218-8e2b3ec4"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250510170249": {
@@ -2153,7 +2441,55 @@
   "PHerc0125": {
     "sample": {
       "id": "PHerc0125",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0125/photos/PHerc0125_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/125/single-rotation-with-ruler/DSC09799.jpg",
+                "date": "2026-02-18T16:04:36.262039Z",
+                "workflow_execution": "s3copy-pherc0125-115c5435"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0125/photos/PHerc0125_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/125/single-rotation-with-ruler/DSC09799_mask.png",
+                "date": "2026-02-18T16:04:36.487804Z",
+                "workflow_execution": "s3copy-pherc0125-f75a7b7b"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720091415": {
@@ -2518,7 +2854,55 @@
   "PHerc0175B": {
     "sample": {
       "id": "PHerc0175B",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0175B/photos/PHerc0175B_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/175b/single-rotation-with-ruler/DSC01080.jpg",
+                "date": "2026-02-18T16:04:36.715488Z",
+                "workflow_execution": "s3copy-pherc0175b-2e9bdf67"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0175B/photos/PHerc0175B_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/175b/single-rotation-with-ruler/DSC01080_mask.png",
+                "date": "2026-02-18T16:04:36.938738Z",
+                "workflow_execution": "s3copy-pherc0175b-5af9486b"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250510115222": {
@@ -2870,7 +3254,55 @@
   "PHerc1451": {
     "sample": {
       "id": "PHerc1451",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc1451/photos/PHerc1451_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/scrolls/1451/FullScene/DSC05197.jpg",
+                "date": "2026-02-18T16:04:37.162230Z",
+                "workflow_execution": "s3copy-pherc1451-25e39ca4"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc1451/photos/PHerc1451_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/scrolls/1451/Masked/DSC05197_masked_mask.png",
+                "date": "2026-02-18T16:04:37.385996Z",
+                "workflow_execution": "s3copy-pherc1451-e8ffa3b5"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250509145349": {
@@ -3222,7 +3654,56 @@
   "PHerc0358": {
     "sample": {
       "id": "PHerc0358",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0358/photos/PHerc0358_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0358/JPGEnhanced/DSC01161.jpg",
+                "date": "2026-02-18T16:05:05.536216Z",
+                "workflow_execution": "s3copy-pherc0358-99c1dc7d"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0358/photos/PHerc0358_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0358/Masks/DSC01161_mask.png",
+                "date": "2026-02-18T16:05:05.760359Z",
+                "workflow_execution": "s3copy-pherc0358-bd61c43a"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ],
+      "description": "PHerc 358 is a rolled Herculaneum papyrus from the Biblioteca Nazionale di Napoli, carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the ESRF (European Synchrotron Radiation Facility) in Grenoble, France."
     },
     "scans": {
       "20250719150703": {
@@ -3587,7 +4068,55 @@
   "PHerc0191": {
     "sample": {
       "id": "PHerc0191",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0191/photos/PHerc0191_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0191/JPGEnhanced/DSC02391.jpg",
+                "date": "2026-02-18T16:05:05.985517Z",
+                "workflow_execution": "s3copy-pherc0191-59c244a1"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0191/photos/PHerc0191_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0191/Masks/DSC02391_mask.png",
+                "date": "2026-02-18T16:05:06.211282Z",
+                "workflow_execution": "s3copy-pherc0191-0ef0d728"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720024445": {
@@ -3952,7 +4481,55 @@
   "PHerc0800": {
     "sample": {
       "id": "PHerc0800",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0800/photos/PHerc0800_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/800/single-rotation-with-ruler/DSC09827.jpg",
+                "date": "2026-02-18T16:05:06.434989Z",
+                "workflow_execution": "s3copy-pherc0800-40a62cd1"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0800/photos/PHerc0800_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/800/single-rotation-with-ruler/DSC09827_mask.png",
+                "date": "2026-02-18T16:05:06.661859Z",
+                "workflow_execution": "s3copy-pherc0800-05ad5bbc"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250510225703": {
@@ -4304,7 +4881,55 @@
   "PHerc0490B": {
     "sample": {
       "id": "PHerc0490B",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0490B/photos/PHerc0490B_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0490b/JPGEnhanced/DSC05370.jpg",
+                "date": "2026-02-18T16:05:06.886912Z",
+                "workflow_execution": "s3copy-pherc0490b-fb0a5121"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0490B/photos/PHerc0490B_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0490b/Masks/DSC05370_mask.png",
+                "date": "2026-02-18T16:05:07.109885Z",
+                "workflow_execution": "s3copy-pherc0490b-d6949825"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250509082300": {
@@ -4656,7 +5281,55 @@
   "PHerc0483A": {
     "sample": {
       "id": "PHerc0483A",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0483A/photos/PHerc0483A_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0483a/JPGEnhanced/DSC02830.jpg",
+                "date": "2026-02-18T16:05:07.333416Z",
+                "workflow_execution": "s3copy-pherc0483a-5114639c"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0483A/photos/PHerc0483A_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0483a/Masks/DSC02830_mask.png",
+                "date": "2026-02-18T16:05:07.558496Z",
+                "workflow_execution": "s3copy-pherc0483a-524b724b"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250510022723": {
@@ -5008,7 +5681,55 @@
   "PHerc0257": {
     "sample": {
       "id": "PHerc0257",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0257/photos/PHerc0257_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0257/JPGEnhanced/DSC05475.jpg",
+                "date": "2026-02-18T16:06:40.639773Z",
+                "workflow_execution": "s3copy-pherc0257-bcbf58a2"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0257/photos/PHerc0257_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0257/Masks/DSC05475_mask.png",
+                "date": "2026-02-18T16:06:40.874825Z",
+                "workflow_execution": "s3copy-pherc0257-749e6966"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720113058": {
@@ -5373,7 +6094,32 @@
   "PHerc1545": {
     "sample": {
       "id": "PHerc1545",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc1545/photos/PHerc1545_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1545/single-rotation-with-ruler/DSC06654_mask.png",
+                "date": "2026-02-18T16:06:41.106351Z",
+                "workflow_execution": "s3copy-pherc1545-4b9ac4ca"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720045926": {
@@ -5738,7 +6484,55 @@
   "PHerc1447": {
     "sample": {
       "id": "PHerc1447",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc1447/photos/PHerc1447_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1447/single-rotation-with-ruler/DSC08842.jpg",
+                "date": "2026-02-18T16:06:41.337517Z",
+                "workflow_execution": "s3copy-pherc1447-efd74e3e"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc1447/photos/PHerc1447_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1447/single-rotation-with-ruler/DSC08842_mask.png",
+                "date": "2026-02-18T16:06:41.722635Z",
+                "workflow_execution": "s3copy-pherc1447-8c51e875"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250509011039": {
@@ -6090,7 +6884,55 @@
   "PHerc1203": {
     "sample": {
       "id": "PHerc1203",
-      "properties": null
+      "properties": null,
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc1203/photos/PHerc1203_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1203/single-rotation-with-ruler/DSC03292.jpg",
+                "date": "2026-02-18T16:06:41.996621Z",
+                "workflow_execution": "s3copy-pherc1203-e10d3da2"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc1203/photos/PHerc1203_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/srwr/1203/single-rotation-with-ruler/DSC03292_mask.png",
+                "date": "2026-02-18T16:06:42.242746Z",
+                "workflow_execution": "s3copy-pherc1203-79c4c487"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
       "20250720004030": {
@@ -6516,9 +7358,341 @@
             ]
           }
         ]
-      }
+      },
+      "data": [
+        {
+          "type": "photo",
+          "origins": [
+            {
+              "path": "PHerc0009B/photos/PHerc0009B_photo.jpg",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0009b/JPGEnhanced/DSC00415.jpg",
+                "date": "2026-02-18T16:06:42.477133Z",
+                "workflow_execution": "s3copy-pherc0009b-f2baeb49"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        },
+        {
+          "type": "photo-mask",
+          "origins": [
+            {
+              "path": "PHerc0009B/photos/PHerc0009B_mask.png",
+              "access_roots": [
+                {
+                  "type": "s3",
+                  "url": "s3://vesuvius-challenge-open-data",
+                  "usage": "public-read"
+                }
+              ],
+              "copy_info": {
+                "source_path": "s3://philodemos/photogrammetry/grenoble-photos/0009b/Masks/DSC00415_mask.png",
+                "date": "2026-02-18T16:06:42.717886Z",
+                "workflow_execution": "s3copy-pherc0009b-bdf8a855"
+              }
+            }
+          ],
+          "properties": null,
+          "parameters": null,
+          "creation_info": null
+        }
+      ]
     },
     "scans": {
+      "20250509053741": {
+        "id": "20250509053741",
+        "sample_id": "PHerc0009B",
+        "long_id": "20250509053741-8.640um-1.2m-116keV",
+        "creation": {
+          "date": "2025-05-09T07:37:41.308728+02:00",
+          "process": "xray tomography",
+          "metadata": {
+            "location": "ESRF Grenoble",
+            "beamline": "bm18",
+            "energy_keV": 116.0,
+            "detector_distance_mm": 1200.02,
+            "pixel_size_um": 8.64,
+            "metadata": {
+              "tomo": {
+                "acquisition": {
+                  "scanRadix": "SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_HA",
+                  "scanType": "helical",
+                  "nb_scans": 1,
+                  "date": "2025-05-09T07:37:41.308728+02:00",
+                  "beamline": "bm18",
+                  "machineMode": "16 bunch",
+                  "machineCurrentStart": 83.606018,
+                  "machineCurrentStop": 81.95,
+                  "sampleDetectorDistance": 1200.02,
+                  "sourceSampleDistance": 178000.0,
+                  "xray_magnification": 1.006742,
+                  "energy": 116.0,
+                  "scanRange": 360.0,
+                  "rotationMode": "continuous",
+                  "half_acquisition": false,
+                  "tomo_N": 12000,
+                  "ref_N": 401,
+                  "dark_N": 400,
+                  "z_start": -33.0,
+                  "z_end": -105.576,
+                  "z_step": 0,
+                  "detector": {
+                    "sensor": "IRIS_15",
+                    "sensorPixelSize": 0.00425,
+                    "roi_size": "[2528, 1200]",
+                    "sensorBinning": 2,
+                    "opticsName": "Fixed_X1",
+                    "opticsType": "FixedmagOptic",
+                    "optical_magnification": 1.0,
+                    "samplePixelSize": 0.00864,
+                    "scintillator": "GAGG_100_reflective"
+                  },
+                  "acq_mode": "SINGLE",
+                  "expo_time": 0.03,
+                  "subframe": 0.03,
+                  "latency_time": 0.003,
+                  "accumulation": 1,
+                  "scan_time": 396.148826,
+                  "comment": "wba11 = Mo 1.3mm, wba12 = sapphire 5mm, wba33 = SiO2 block 25mm",
+                  "attenuators": {
+                    "wba11": {
+                      "thickness": 1.3,
+                      "type": "molybdenum"
+                    },
+                    "wba12": {
+                      "thickness": 5.0,
+                      "type": "sapphire"
+                    },
+                    "wba13": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba14": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba15": {
+                      "thickness": 0.0,
+                      "type": "free pass"
+                    },
+                    "wba21": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba22": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba23": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba24": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba25": {
+                      "thickness": 0.0,
+                      "type": "empty"
+                    },
+                    "wba31": {
+                      "thickness": 0.0,
+                      "type": "free pass"
+                    },
+                    "wba32": {
+                      "thickness": 0.0,
+                      "type": "free pass"
+                    },
+                    "wba33": {
+                      "thickness": 25.0,
+                      "type": "SiO2_block"
+                    }
+                  },
+                  "motors": {
+                    "att11": 119.5,
+                    "att12": 79.5,
+                    "att13": 1.0,
+                    "att14": 1.0,
+                    "att15": 198.0,
+                    "att21": 198.0,
+                    "att22": 198.0,
+                    "att23": 198.0,
+                    "att24": 198.0,
+                    "att25": 198.0,
+                    "att31": 198.0,
+                    "att32": 198.0,
+                    "att33": 125.7,
+                    "dzfocus": -42.77,
+                    "dzmag": 16.19,
+                    "dzrotc": -0.01,
+                    "dzz": 257.05,
+                    "foc1twin": 4.68,
+                    "foc2twin": "error",
+                    "focus10x": "error",
+                    "focus2": -0.48,
+                    "focus3": 0.13,
+                    "focus4": -42.77,
+                    "focus5": -2.21,
+                    "focus6": "error",
+                    "focus7": -2.67,
+                    "focusrefl": -3.07,
+                    "focusx2": 0.54,
+                    "focusx4": -0.02,
+                    "fsd": 3.3,
+                    "fshg": 22.08,
+                    "fsho": -64.08,
+                    "fshut_axis": 0.0,
+                    "fsl": 75.12,
+                    "fsr": -53.04,
+                    "fsu": 7.05,
+                    "fsvg": 10.35,
+                    "fsvo": 1.88,
+                    "fur1": 0.0,
+                    "girderx": 399.98,
+                    "kore": "error",
+                    "lfddiaph": 0.0,
+                    "lfdfocus": 13.67,
+                    "lfdrotc": 0.01,
+                    "lfdz": -0.0,
+                    "lthx1": -0.9,
+                    "lthx2": 0.0,
+                    "lthy1": 0.0,
+                    "lthy2": 0.0,
+                    "lz1": 0.0,
+                    "lz2": 0.0,
+                    "ostwin": -56.0,
+                    "psh1": -11.83,
+                    "psh2": 3.5,
+                    "pshg": 3.5,
+                    "psho": -10.0,
+                    "psv1": 1.15,
+                    "psv2": -1.8,
+                    "psvg": 1.9,
+                    "psvo": 0.24,
+                    "psx": 0.0,
+                    "psy": 0.0,
+                    "qsh1": -47.5,
+                    "qsh2": 95.0,
+                    "qshg": 95.0,
+                    "qsho": 0.0,
+                    "qsv1": 2.0,
+                    "qsv2": -4.0,
+                    "qsvg": 4.0,
+                    "qsvo": 0.0,
+                    "rotc10x": "error",
+                    "rotc2": "error",
+                    "rotc3": -0.02,
+                    "rotc4": -4.37,
+                    "rotc5": -45.59,
+                    "rotc6": "error",
+                    "rotc7": -0.01,
+                    "rotc9": -1.87,
+                    "rotcrefl": 1.4,
+                    "rotctwin": "error",
+                    "rotcx2": 0.91,
+                    "rotcx4": 0.0,
+                    "srot": 0.0,
+                    "ssh1": -47.29,
+                    "ssh2": 94.59,
+                    "sshg": 94.59,
+                    "ssho": -0.0,
+                    "ssv1": 1.88,
+                    "ssv2": -3.76,
+                    "ssvg": 3.96,
+                    "ssvo": -0.0,
+                    "sx": 0.0,
+                    "sy": 0.0,
+                    "sz": -33.0,
+                    "tsh1": -46.49,
+                    "tsh2": 92.97,
+                    "tshg": 92.97,
+                    "tsho": 0.0,
+                    "tsv1": 1.8,
+                    "tsv2": -3.6,
+                    "tsvg": 4.0,
+                    "tsvo": 0.0,
+                    "yc12": 398.66,
+                    "yc3": 350.0,
+                    "yc4": 350.0,
+                    "yc5": 350.0,
+                    "yc6": 350.0,
+                    "yc7": 350.0,
+                    "yc8": -80.45,
+                    "yc9": -39.42,
+                    "ycBT": 315.96,
+                    "yrot": 7.65,
+                    "zc1": 1.2,
+                    "zc2": 3.71,
+                    "zc3": 0.0,
+                    "zc4": 3.75,
+                    "zc5": 25.0,
+                    "zc6": 524.81,
+                    "zc7": 2.63,
+                    "zc8": 300.0,
+                    "zc9": 272.29,
+                    "zcBT": -113.71,
+                    "zfocus": "error",
+                    "zmag": "error",
+                    "zrotc": "error",
+                    "zyscint": "error",
+                    "zz": "error"
+                  },
+                  "motors_dial": {
+                    "yrot_dial": 212.97
+                  }
+                },
+                "processing": {
+                  "general": {
+                    "WorkFlowScheme": "nabu",
+                    "BlissFirstScan": "/data/visitor/in1215/bm18/20250506/RAW_DATA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001.h5",
+                    "BlissLastScan": "/data/visitor/in1215/bm18/20250506/RAW_DATA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001.h5",
+                    "FlatField": "Standard",
+                    "DoubleFlatsScheme": false,
+                    "DetectorDistortionCorrection": false
+                  },
+                  "preprocessing": {
+                    "phase": {
+                      "method": "Paganin",
+                      "delta_beta": 1000.0,
+                      "unsharp_coeff": 4.0,
+                      "unsharp_sigma": 1.2,
+                      "unsharp_method": "gaussian",
+                      "padding_type": "edge"
+                    }
+                  },
+                  "reconstruction": {
+                    "method": "GHBP",
+                    "prefix": "SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001",
+                    "rotation_axis_position": "3918.25"
+                  },
+                  "postprocessing": {
+                    "32BitsConversion": {
+                      "data_min": -0.043094608932733536,
+                      "data_max": 0.1823032796382904
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "derived_from": null
+        },
+        "properties": {
+          "energy_keV": 116.0,
+          "detector_distance_mm": 1200.02,
+          "pixel_size_um": 8.64
+        }
+      },
       "20250718080859": {
         "id": "20250718080859",
         "sample_id": "PHerc0009B",
@@ -6818,290 +7992,6 @@
           "energy_keV": 77.0,
           "detector_distance_mm": 350.0,
           "pixel_size_um": 2.401
-        }
-      },
-      "20250509053741": {
-        "id": "20250509053741",
-        "sample_id": "PHerc0009B",
-        "long_id": "20250509053741-8.640um-1.2m-116keV",
-        "creation": {
-          "date": "2025-05-09T07:37:41.308728+02:00",
-          "process": "xray tomography",
-          "metadata": {
-            "location": "ESRF Grenoble",
-            "beamline": "bm18",
-            "energy_keV": 116.0,
-            "detector_distance_mm": 1200.02,
-            "pixel_size_um": 8.64,
-            "metadata": {
-              "tomo": {
-                "acquisition": {
-                  "scanRadix": "SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_HA",
-                  "scanType": "helical",
-                  "nb_scans": 1,
-                  "date": "2025-05-09T07:37:41.308728+02:00",
-                  "beamline": "bm18",
-                  "machineMode": "16 bunch",
-                  "machineCurrentStart": 83.606018,
-                  "machineCurrentStop": 81.95,
-                  "sampleDetectorDistance": 1200.02,
-                  "sourceSampleDistance": 178000.0,
-                  "xray_magnification": 1.006742,
-                  "energy": 116.0,
-                  "scanRange": 360.0,
-                  "rotationMode": "continuous",
-                  "half_acquisition": false,
-                  "tomo_N": 12000,
-                  "ref_N": 401,
-                  "dark_N": 400,
-                  "z_start": -33.0,
-                  "z_end": -105.576,
-                  "z_step": 0,
-                  "detector": {
-                    "sensor": "IRIS_15",
-                    "sensorPixelSize": 0.00425,
-                    "roi_size": "[2528, 1200]",
-                    "sensorBinning": 2,
-                    "opticsName": "Fixed_X1",
-                    "opticsType": "FixedmagOptic",
-                    "optical_magnification": 1.0,
-                    "samplePixelSize": 0.00864,
-                    "scintillator": "GAGG_100_reflective"
-                  },
-                  "acq_mode": "SINGLE",
-                  "expo_time": 0.03,
-                  "subframe": 0.03,
-                  "latency_time": 0.003,
-                  "accumulation": 1,
-                  "scan_time": 396.148826,
-                  "comment": "wba11 = Mo 1.3mm, wba12 = sapphire 5mm, wba33 = SiO2 block 25mm",
-                  "attenuators": {
-                    "wba11": {
-                      "thickness": 1.3,
-                      "type": "molybdenum"
-                    },
-                    "wba12": {
-                      "thickness": 5.0,
-                      "type": "sapphire"
-                    },
-                    "wba13": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba14": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba15": {
-                      "thickness": 0.0,
-                      "type": "free pass"
-                    },
-                    "wba21": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba22": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba23": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba24": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba25": {
-                      "thickness": 0.0,
-                      "type": "empty"
-                    },
-                    "wba31": {
-                      "thickness": 0.0,
-                      "type": "free pass"
-                    },
-                    "wba32": {
-                      "thickness": 0.0,
-                      "type": "free pass"
-                    },
-                    "wba33": {
-                      "thickness": 25.0,
-                      "type": "SiO2_block"
-                    }
-                  },
-                  "motors": {
-                    "att11": 119.5,
-                    "att12": 79.5,
-                    "att13": 1.0,
-                    "att14": 1.0,
-                    "att15": 198.0,
-                    "att21": 198.0,
-                    "att22": 198.0,
-                    "att23": 198.0,
-                    "att24": 198.0,
-                    "att25": 198.0,
-                    "att31": 198.0,
-                    "att32": 198.0,
-                    "att33": 125.7,
-                    "dzfocus": -42.77,
-                    "dzmag": 16.19,
-                    "dzrotc": -0.01,
-                    "dzz": 257.05,
-                    "foc1twin": 4.68,
-                    "foc2twin": "error",
-                    "focus10x": "error",
-                    "focus2": -0.48,
-                    "focus3": 0.13,
-                    "focus4": -42.77,
-                    "focus5": -2.21,
-                    "focus6": "error",
-                    "focus7": -2.67,
-                    "focusrefl": -3.07,
-                    "focusx2": 0.54,
-                    "focusx4": -0.02,
-                    "fsd": 3.3,
-                    "fshg": 22.08,
-                    "fsho": -64.08,
-                    "fshut_axis": 0.0,
-                    "fsl": 75.12,
-                    "fsr": -53.04,
-                    "fsu": 7.05,
-                    "fsvg": 10.35,
-                    "fsvo": 1.88,
-                    "fur1": 0.0,
-                    "girderx": 399.98,
-                    "kore": "error",
-                    "lfddiaph": 0.0,
-                    "lfdfocus": 13.67,
-                    "lfdrotc": 0.01,
-                    "lfdz": -0.0,
-                    "lthx1": -0.9,
-                    "lthx2": 0.0,
-                    "lthy1": 0.0,
-                    "lthy2": 0.0,
-                    "lz1": 0.0,
-                    "lz2": 0.0,
-                    "ostwin": -56.0,
-                    "psh1": -11.83,
-                    "psh2": 3.5,
-                    "pshg": 3.5,
-                    "psho": -10.0,
-                    "psv1": 1.15,
-                    "psv2": -1.8,
-                    "psvg": 1.9,
-                    "psvo": 0.24,
-                    "psx": 0.0,
-                    "psy": 0.0,
-                    "qsh1": -47.5,
-                    "qsh2": 95.0,
-                    "qshg": 95.0,
-                    "qsho": 0.0,
-                    "qsv1": 2.0,
-                    "qsv2": -4.0,
-                    "qsvg": 4.0,
-                    "qsvo": 0.0,
-                    "rotc10x": "error",
-                    "rotc2": "error",
-                    "rotc3": -0.02,
-                    "rotc4": -4.37,
-                    "rotc5": -45.59,
-                    "rotc6": "error",
-                    "rotc7": -0.01,
-                    "rotc9": -1.87,
-                    "rotcrefl": 1.4,
-                    "rotctwin": "error",
-                    "rotcx2": 0.91,
-                    "rotcx4": 0.0,
-                    "srot": 0.0,
-                    "ssh1": -47.29,
-                    "ssh2": 94.59,
-                    "sshg": 94.59,
-                    "ssho": -0.0,
-                    "ssv1": 1.88,
-                    "ssv2": -3.76,
-                    "ssvg": 3.96,
-                    "ssvo": -0.0,
-                    "sx": 0.0,
-                    "sy": 0.0,
-                    "sz": -33.0,
-                    "tsh1": -46.49,
-                    "tsh2": 92.97,
-                    "tshg": 92.97,
-                    "tsho": 0.0,
-                    "tsv1": 1.8,
-                    "tsv2": -3.6,
-                    "tsvg": 4.0,
-                    "tsvo": 0.0,
-                    "yc12": 398.66,
-                    "yc3": 350.0,
-                    "yc4": 350.0,
-                    "yc5": 350.0,
-                    "yc6": 350.0,
-                    "yc7": 350.0,
-                    "yc8": -80.45,
-                    "yc9": -39.42,
-                    "ycBT": 315.96,
-                    "yrot": 7.65,
-                    "zc1": 1.2,
-                    "zc2": 3.71,
-                    "zc3": 0.0,
-                    "zc4": 3.75,
-                    "zc5": 25.0,
-                    "zc6": 524.81,
-                    "zc7": 2.63,
-                    "zc8": 300.0,
-                    "zc9": 272.29,
-                    "zcBT": -113.71,
-                    "zfocus": "error",
-                    "zmag": "error",
-                    "zrotc": "error",
-                    "zyscint": "error",
-                    "zz": "error"
-                  },
-                  "motors_dial": {
-                    "yrot_dial": 212.97
-                  }
-                },
-                "processing": {
-                  "general": {
-                    "WorkFlowScheme": "nabu",
-                    "BlissFirstScan": "/data/visitor/in1215/bm18/20250506/RAW_DATA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001.h5",
-                    "BlissLastScan": "/data/visitor/in1215/bm18/20250506/RAW_DATA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001/SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001.h5",
-                    "FlatField": "Standard",
-                    "DoubleFlatsScheme": false,
-                    "DetectorDistortionCorrection": false
-                  },
-                  "preprocessing": {
-                    "phase": {
-                      "method": "Paganin",
-                      "delta_beta": 1000.0,
-                      "unsharp_coeff": 4.0,
-                      "unsharp_sigma": 1.2,
-                      "unsharp_method": "gaussian",
-                      "padding_type": "edge"
-                    }
-                  },
-                  "reconstruction": {
-                    "method": "GHBP",
-                    "prefix": "SCROLLS_TA_HEL_4.320um_1.0m_116keV_binmean_2_PHerc0009B_TA_0001",
-                    "rotation_axis_position": "3918.25"
-                  },
-                  "postprocessing": {
-                    "32BitsConversion": {
-                      "data_min": -0.043094608932733536,
-                      "data_max": 0.1823032796382904
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "derived_from": null
-        },
-        "properties": {
-          "energy_keV": 116.0,
-          "detector_distance_mm": 1200.02,
-          "pixel_size_um": 8.64
         }
       }
     },
