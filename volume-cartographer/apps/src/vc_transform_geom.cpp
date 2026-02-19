@@ -112,7 +112,22 @@ static bool invert_affine_in_place(AffineTransform& T) {
         for (int c = 0; c < 3; ++c)
             A.at<double>(r, c) = T.M(r, c);
 
-    if (cv::invert(A, Ainv, cv::DECOMP_LU) < 1e-12) return false;
+    const cv::SVD svd(A, cv::SVD::FULL_UV);
+    const auto* w = svd.w.ptr<double>(0);
+    if (!std::isfinite(w[0]) || !std::isfinite(w[2])) return false;
+
+    const double smax = w[0];
+    const double smin = w[2];
+    if (smax <= 0.0) return false;
+
+    const double rcond = smin / smax;
+    if (!std::isfinite(rcond) || rcond < std::numeric_limits<double>::epsilon()) return false;
+
+    if (cv::invert(A, Ainv, cv::DECOMP_SVD) <= 0.0) return false;
+
+    const double inv_residual = cv::norm(A * Ainv - cv::Mat::eye(3, 3, CV_64F), cv::NORM_FRO);
+    const double ref_scale = cv::norm(A, cv::NORM_FRO) * cv::norm(Ainv, cv::NORM_FRO);
+    if (!std::isfinite(inv_residual) || inv_residual > 1e-12 * (ref_scale + 1.0)) return false;
 
     cv::Matx33d Ai;
     for (int r = 0; r < 3; ++r)
