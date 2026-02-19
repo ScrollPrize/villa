@@ -140,7 +140,7 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
         point_weights = batch['point_weights'] if 'point_weights' in batch else torch.ones_like(valid_mask)
     point_normals = batch.get('point_normals', None)
 
-    dense_gt_displacement = batch.get('dense_gt_displacement', None)  # [B, 3, D, H, W]
+    dense_gt_displacement = batch.get('dense_gt_displacement', None)  # [B, C, D, H, W]
     dense_loss_weight = batch.get('dense_loss_weight', None)  # [B, 1, D, H, W]
 
     sdt_target = batch['sdt'].unsqueeze(1) if use_sdt and 'sdt' in batch else None  # [B, 1, D, H, W]
@@ -180,6 +180,8 @@ def train(config_path):
     config.setdefault('use_extrapolation', True)
     config.setdefault('use_other_wrap_cond', False)
     config.setdefault('use_dense_displacement', False)
+    config.setdefault('use_triplet_wrap_displacement', False)
+    config.setdefault('triplet_dense_weight_mode', 'band')
     default_in_channels = 2 + int(config.get('use_extrapolation', True)) + int(config.get('use_other_wrap_cond', False))
     config.setdefault('in_channels', default_in_channels)
     if int(config['in_channels']) != default_in_channels:
@@ -221,8 +223,10 @@ def train(config_path):
     config.setdefault('wandb_resume_mode', 'allow')
 
     # Build targets dict based on config
+    triplet_mode = bool(config.get('use_triplet_wrap_displacement', False))
+    displacement_out_channels = 6 if triplet_mode else 3
     targets = {
-        'displacement': {'out_channels': 3, 'activation': 'none'}
+        'displacement': {'out_channels': displacement_out_channels, 'activation': 'none'}
     }
     use_sdt = config.get('use_sdt', False)
     if use_sdt:
@@ -312,6 +316,16 @@ def train(config_path):
         )
     mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
     use_dense_displacement = bool(config.get('use_dense_displacement', False))
+    if triplet_mode and not use_dense_displacement:
+        raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
+    if triplet_mode and config.get('use_extrapolation', True):
+        raise ValueError("use_triplet_wrap_displacement=True requires use_extrapolation=False")
+    if triplet_mode and config.get('use_sdt', False):
+        raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_sdt")
+    if triplet_mode and config.get('use_heatmap_targets', False):
+        raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_heatmap_targets")
+    if triplet_mode and config.get('use_segmentation', False):
+        raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_segmentation")
     disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
     if disp_supervision not in {'vector', 'normal_scalar'}:
         raise ValueError(
@@ -569,7 +583,7 @@ def train(config_path):
             accelerator.print(f"Displacement supervision: {disp_supervision} ({normal_loss_type}, beta={normal_loss_beta})")
         else:
             accelerator.print(f"Displacement supervision: {disp_supervision} ({disp_loss_type}, beta={disp_huber_beta})")
-        output_str = "Output: displacement (3ch)"
+        output_str = f"Output: displacement ({displacement_out_channels}ch)"
         if use_sdt:
             output_str += " + SDT (1ch)"
         if use_heatmap:
@@ -631,7 +645,7 @@ def train(config_path):
         with accelerator.accumulate(model):
             # Forward pass
             output = model(inputs)
-            disp_pred = output['displacement']  # [B, 3, D, H, W]
+            disp_pred = output['displacement']  # [B, C, D, H, W]
             grad_norm = None
 
             surf_loss = compute_displacement_loss(

@@ -443,6 +443,176 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     plt.close(fig)
 
 
+def _make_dense_triplet_visualization(
+    inputs,
+    disp_pred,
+    dense_gt_displacement,
+    dense_loss_weight=None,
+    save_path=None,
+):
+    """Triplet-mode dense visualization with explicit cond->front/back panels."""
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    b = 0
+    D, H, W = inputs.shape[2], inputs.shape[3], inputs.shape[4]
+
+    vol_3d = inputs[b, 0].cpu().numpy()
+    cond_3d = inputs[b, 1].cpu().numpy()
+    pred_3d = disp_pred[b].cpu().numpy()
+    gt_3d = dense_gt_displacement[b].cpu().numpy()
+
+    if pred_3d.shape[0] != 6 or gt_3d.shape[0] != 6:
+        raise ValueError(
+            "Triplet visualization expects 6-channel displacement fields "
+            f"(got pred={pred_3d.shape[0]}, gt={gt_3d.shape[0]})"
+        )
+
+    pred_back_mag_3d = np.linalg.norm(pred_3d[:3], axis=0)
+    pred_front_mag_3d = np.linalg.norm(pred_3d[3:6], axis=0)
+    gt_back_mag_3d = np.linalg.norm(gt_3d[:3], axis=0)
+    gt_front_mag_3d = np.linalg.norm(gt_3d[3:6], axis=0)
+
+    cond_mask_3d = cond_3d > 0.5
+    other_wraps_union_3d = ((gt_back_mag_3d < 0.5) | (gt_front_mag_3d < 0.5))
+
+    if dense_loss_weight is None:
+        weight_3d = np.ones((D, H, W), dtype=np.float32)
+    else:
+        w = dense_loss_weight[b].cpu().numpy()
+        weight_3d = w[0] if w.ndim == 4 else w
+    supervised_mask = weight_3d > 0
+    cond_supervised = cond_mask_3d & supervised_mask
+
+    def _safe_percentile(arr, p, fallback=1.0):
+        if arr.size == 0:
+            return fallback
+        val = np.percentile(arr, p)
+        return float(val if np.isfinite(val) and val > 1e-8 else fallback)
+
+    front_vmax = max(
+        _safe_percentile(pred_front_mag_3d[cond_supervised], 99, fallback=1.0),
+        _safe_percentile(gt_front_mag_3d[cond_supervised], 99, fallback=1.0),
+    )
+    back_vmax = max(
+        _safe_percentile(pred_back_mag_3d[cond_supervised], 99, fallback=1.0),
+        _safe_percentile(gt_back_mag_3d[cond_supervised], 99, fallback=1.0),
+    )
+
+    z0, y0, x0 = D // 2, H // 2, W // 2
+    slices = [
+        ("z", z0, f"z={z0}", "x", "y", [-W / 2, W / 2, H / 2, -H / 2]),
+        ("y", y0, f"y={y0}", "x", "z", [-W / 2, W / 2, D / 2, -D / 2]),
+        ("x", x0, f"x={x0}", "y", "z", [-H / 2, H / 2, D / 2, -D / 2]),
+    ]
+
+    def _slice(arr, axis, idx):
+        if axis == "z":
+            return arr[idx]
+        if axis == "y":
+            return arr[:, idx, :]
+        return arr[:, :, idx]
+
+    # Show only supervised band voxels in displacement panels.
+    gt_front_band = np.where(supervised_mask, gt_front_mag_3d, np.nan)
+    pred_front_band = np.where(supervised_mask, pred_front_mag_3d, np.nan)
+    gt_back_band = np.where(supervised_mask, gt_back_mag_3d, np.nan)
+    pred_back_band = np.where(supervised_mask, pred_back_mag_3d, np.nan)
+
+    disp_cmap = plt.cm.inferno.copy()
+    disp_cmap.set_bad(color="black")
+
+    n_cols = 5
+    fig = plt.figure(figsize=(4 * n_cols + 4, 14))
+    gs = GridSpec(3, n_cols + 1, figure=fig, width_ratios=[1] * n_cols + [1.2], wspace=0.3)
+    axes = np.empty((3, n_cols), dtype=object)
+    for r in range(3):
+        for c in range(n_cols):
+            axes[r, c] = fig.add_subplot(gs[r, c])
+    ax_text = fig.add_subplot(gs[:, n_cols])
+    ax_text.axis("off")
+
+    for row, (axis, idx, label, xlabel, ylabel, extent) in enumerate(slices):
+        vol_slice = _slice(vol_3d, axis, idx)
+        cond_slice = _slice(cond_mask_3d, axis, idx)
+        other_slice = _slice(other_wraps_union_3d, axis, idx)
+        gt_front_slice = _slice(gt_front_band, axis, idx)
+        pred_front_slice = _slice(pred_front_band, axis, idx)
+        gt_back_slice = _slice(gt_back_band, axis, idx)
+        pred_back_slice = _slice(pred_back_band, axis, idx)
+
+        vol_norm = (vol_slice - vol_slice.min()) / (vol_slice.max() - vol_slice.min() + 1e-8)
+        overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
+
+        other_color = np.array([0.6, 1.0, 0.6], dtype=np.float32)   # light green
+        cond_color = np.array([1.0, 0.0, 1.0], dtype=np.float32)    # magenta
+        overlay[other_slice] = 0.40 * overlay[other_slice] + 0.60 * other_color
+        overlay[cond_slice] = 0.20 * overlay[cond_slice] + 0.80 * cond_color
+
+        axes[row, 0].imshow(overlay, extent=extent)
+        axes[row, 0].set_title(f"Overlay ({label})")
+        axes[row, 0].set_ylabel(ylabel)
+
+        axes[row, 1].imshow(gt_front_slice, cmap=disp_cmap, vmin=0, vmax=front_vmax, extent=extent)
+        axes[row, 1].set_title("GT Cond->Front |disp| (band)")
+        axes[row, 1].set_yticks([])
+
+        axes[row, 2].imshow(pred_front_slice, cmap=disp_cmap, vmin=0, vmax=front_vmax, extent=extent)
+        axes[row, 2].set_title("Pred Cond->Front |disp| (band)")
+        axes[row, 2].set_yticks([])
+
+        axes[row, 3].imshow(gt_back_slice, cmap=disp_cmap, vmin=0, vmax=back_vmax, extent=extent)
+        axes[row, 3].set_title("GT Cond->Back |disp| (band)")
+        axes[row, 3].set_yticks([])
+
+        axes[row, 4].imshow(pred_back_slice, cmap=disp_cmap, vmin=0, vmax=back_vmax, extent=extent)
+        axes[row, 4].set_title("Pred Cond->Back |disp| (band)")
+        axes[row, 4].set_yticks([])
+
+        for c in range(n_cols):
+            axes[row, c].set_xlabel(xlabel)
+
+    band_front_gt_vals = gt_front_mag_3d[supervised_mask]
+    band_front_pred_vals = pred_front_mag_3d[supervised_mask]
+    band_back_gt_vals = gt_back_mag_3d[supervised_mask]
+    band_back_pred_vals = pred_back_mag_3d[supervised_mask]
+
+    stats_lines = [
+        "=" * 42,
+        "TRIPLET DENSE DISPLACEMENT",
+        "=" * 42,
+        f"Supervised voxels: {int(supervised_mask.sum())}",
+        f"Conditioning voxels: {int(cond_mask_3d.sum())}",
+        f"Cond&supervised voxels: {int(cond_supervised.sum())}",
+        "",
+        "--- Band (supervised) -> Front ---",
+        f"GT   mean |disp|: {float(band_front_gt_vals.mean()) if band_front_gt_vals.size > 0 else 0.0:.4f}",
+        f"Pred mean |disp|: {float(band_front_pred_vals.mean()) if band_front_pred_vals.size > 0 else 0.0:.4f}",
+        "",
+        "--- Band (supervised) -> Back ---",
+        f"GT   mean |disp|: {float(band_back_gt_vals.mean()) if band_back_gt_vals.size > 0 else 0.0:.4f}",
+        f"Pred mean |disp|: {float(band_back_pred_vals.mean()) if band_back_pred_vals.size > 0 else 0.0:.4f}",
+        "",
+        "Overlay colors:",
+        "  Front/Back wraps = light green",
+        "  Conditioning = magenta",
+        "=" * 42,
+    ]
+    ax_text.text(
+        0.05, 0.95, "\n".join(stats_lines),
+        transform=ax_text.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="gray"),
+    )
+
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
 def make_dense_visualization(
     inputs,
     disp_pred,
@@ -469,10 +639,42 @@ def make_dense_visualization(
 
     pred_3d = disp_pred[b].cpu().numpy()
     gt_3d = dense_gt_displacement[b].cpu().numpy()
-    pred_mag_3d = np.linalg.norm(pred_3d, axis=0)
-    gt_mag_3d = np.linalg.norm(gt_3d, axis=0)
-    gt_surface_3d = (gt_mag_3d < 0.5).astype(np.float32)
-    resid_mag_3d = np.linalg.norm(pred_3d - gt_3d, axis=0)
+    triplet_mode = pred_3d.shape[0] == 6 and gt_3d.shape[0] == 6
+    if triplet_mode:
+        _make_dense_triplet_visualization(
+            inputs=inputs,
+            disp_pred=disp_pred,
+            dense_gt_displacement=dense_gt_displacement,
+            dense_loss_weight=dense_loss_weight,
+            save_path=save_path,
+        )
+        return
+
+    pred_back_mag_3d = None
+    pred_front_mag_3d = None
+    gt_back_mag_3d = None
+    gt_front_mag_3d = None
+    other_wraps_union_3d = None
+
+    if triplet_mode:
+        pred_back_mag_3d = np.linalg.norm(pred_3d[:3], axis=0)
+        pred_front_mag_3d = np.linalg.norm(pred_3d[3:6], axis=0)
+        gt_back_mag_3d = np.linalg.norm(gt_3d[:3], axis=0)
+        gt_front_mag_3d = np.linalg.norm(gt_3d[3:6], axis=0)
+        other_wraps_union_3d = ((gt_back_mag_3d < 0.5) | (gt_front_mag_3d < 0.5)).astype(np.float32)
+
+        # Aggregate maps for global stats columns.
+        pred_mag_3d = 0.5 * (pred_back_mag_3d + pred_front_mag_3d)
+        gt_mag_3d = 0.5 * (gt_back_mag_3d + gt_front_mag_3d)
+        gt_surface_3d = other_wraps_union_3d
+        resid_back_mag_3d = np.linalg.norm(pred_3d[:3] - gt_3d[:3], axis=0)
+        resid_front_mag_3d = np.linalg.norm(pred_3d[3:6] - gt_3d[3:6], axis=0)
+        resid_mag_3d = 0.5 * (resid_back_mag_3d + resid_front_mag_3d)
+    else:
+        pred_mag_3d = np.linalg.norm(pred_3d, axis=0)
+        gt_mag_3d = np.linalg.norm(gt_3d, axis=0)
+        gt_surface_3d = (gt_mag_3d < 0.5).astype(np.float32)
+        resid_mag_3d = np.linalg.norm(pred_3d - gt_3d, axis=0)
 
     if dense_loss_weight is None:
         weight_3d = np.ones((D, H, W), dtype=np.float32)
@@ -499,6 +701,15 @@ def make_dense_visualization(
     resid_for_scale = resid_mag_3d[supervised_mask] if np.any(supervised_mask) else resid_mag_3d.reshape(-1)
     disp_vmax = max(_safe_percentile(pred_for_scale, 99), _safe_percentile(gt_for_scale, 99))
     resid_vmax = _safe_percentile(resid_for_scale, 99)
+    back_disp_vmax = None
+    front_disp_vmax = None
+    if triplet_mode:
+        pred_back_for_scale = pred_back_mag_3d[supervised_mask] if np.any(supervised_mask) else pred_back_mag_3d.reshape(-1)
+        gt_back_for_scale = gt_back_mag_3d[supervised_mask] if np.any(supervised_mask) else gt_back_mag_3d.reshape(-1)
+        pred_front_for_scale = pred_front_mag_3d[supervised_mask] if np.any(supervised_mask) else pred_front_mag_3d.reshape(-1)
+        gt_front_for_scale = gt_front_mag_3d[supervised_mask] if np.any(supervised_mask) else gt_front_mag_3d.reshape(-1)
+        back_disp_vmax = max(_safe_percentile(pred_back_for_scale, 99), _safe_percentile(gt_back_for_scale, 99))
+        front_disp_vmax = max(_safe_percentile(pred_front_for_scale, 99), _safe_percentile(gt_front_for_scale, 99))
 
     sdt_pred_3d = sdt_pred[b, 0].cpu().numpy() if sdt_pred is not None else None
     sdt_gt_3d = sdt_target[b, 0].cpu().numpy() if sdt_target is not None else None
@@ -514,7 +725,7 @@ def make_dense_visualization(
     use_aux = aux_3d is not None
     use_sdt = sdt_pred_3d is not None
     use_hm = hm_pred_3d is not None
-    n_cols = 6 + int(use_aux) + int(use_sdt) + int(use_hm) + int(has_seg)
+    n_cols = 6 + int(use_aux) + int(triplet_mode) * 3 + int(use_sdt) + int(use_hm) + int(has_seg)
 
     fig = plt.figure(figsize=(4 * n_cols + 4, 14))
     gs = GridSpec(3, n_cols + 1, figure=fig, width_ratios=[1] * n_cols + [1.2], wspace=0.3)
@@ -558,6 +769,32 @@ def make_dense_visualization(
         axes[row, col].set_title("Conditioning")
         axes[row, col].set_yticks([])
         col += 1
+
+        if triplet_mode:
+            other_wraps_slice = _slice(other_wraps_union_3d, axis, idx)
+            back_pred_slice = _slice(pred_back_mag_3d, axis, idx)
+            back_gt_slice = _slice(gt_back_mag_3d, axis, idx)
+            front_pred_slice = _slice(pred_front_mag_3d, axis, idx)
+            front_gt_slice = _slice(gt_front_mag_3d, axis, idx)
+
+            axes[row, col].imshow(other_wraps_slice, cmap="gray", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Other Wraps (Both)")
+            axes[row, col].set_yticks([])
+            col += 1
+
+            pair_extent = [extent[0], extent[0] + 2 * (extent[1] - extent[0]), extent[2], extent[3]]
+            back_pair = np.concatenate([back_pred_slice, back_gt_slice], axis=1)
+            front_pair = np.concatenate([front_pred_slice, front_gt_slice], axis=1)
+
+            axes[row, col].imshow(back_pair, cmap="hot", vmin=0, vmax=back_disp_vmax, extent=pair_extent)
+            axes[row, col].set_title("Behind Disp (L:Pred R:GT)")
+            axes[row, col].set_yticks([])
+            col += 1
+
+            axes[row, col].imshow(front_pair, cmap="hot", vmin=0, vmax=front_disp_vmax, extent=pair_extent)
+            axes[row, col].set_title("Front Disp (L:Pred R:GT)")
+            axes[row, col].set_yticks([])
+            col += 1
 
         if use_aux:
             axes[row, col].imshow(aux_slice, cmap="gray", extent=extent)
@@ -615,6 +852,10 @@ def make_dense_visualization(
     cond_mask = cond_3d > 0.5
     cond_pred = pred_mag_3d[cond_mask]
     cond_gt = gt_mag_3d[cond_mask]
+    cond_back_pred = pred_back_mag_3d[cond_mask] if triplet_mode else None
+    cond_back_gt = gt_back_mag_3d[cond_mask] if triplet_mode else None
+    cond_front_pred = pred_front_mag_3d[cond_mask] if triplet_mode else None
+    cond_front_gt = gt_front_mag_3d[cond_mask] if triplet_mode else None
 
     gt_floor = 0.10
     improvement_clip = 100.0
@@ -633,6 +874,7 @@ def make_dense_visualization(
         "=" * 40,
         "DENSE DISPLACEMENT STATS",
         "=" * 40,
+        f"Triplet mode: {'yes' if triplet_mode else 'no'}",
         f"Supervised voxels: {int(supervised_mask.sum())}",
         f"Total voxels:      {int(weight_3d.size)}",
         "",
@@ -649,8 +891,17 @@ def make_dense_visualization(
         f"N cond voxels: {int(cond_mask.sum())}",
         f"Pred |disp| @ cond mean: {float(cond_pred.mean()) if cond_pred.size > 0 else 0.0:.4f}",
         f"GT   |disp| @ cond mean: {float(cond_gt.mean()) if cond_gt.size > 0 else 0.0:.4f}",
-        "=" * 40,
     ]
+    if triplet_mode:
+        stats_lines.extend([
+            "",
+            "--- Conditioning voxels (per neighbor) ---",
+            f"Behind Pred|disp| @ cond mean: {float(cond_back_pred.mean()) if cond_back_pred.size > 0 else 0.0:.4f}",
+            f"Behind GT  |disp| @ cond mean: {float(cond_back_gt.mean()) if cond_back_gt.size > 0 else 0.0:.4f}",
+            f"Front  Pred|disp| @ cond mean: {float(cond_front_pred.mean()) if cond_front_pred.size > 0 else 0.0:.4f}",
+            f"Front  GT  |disp| @ cond mean: {float(cond_front_gt.mean()) if cond_front_gt.size > 0 else 0.0:.4f}",
+        ])
+    stats_lines.append("=" * 40)
     ax_text.text(
         0.05, 0.95, "\n".join(stats_lines),
         transform=ax_text.transAxes,
