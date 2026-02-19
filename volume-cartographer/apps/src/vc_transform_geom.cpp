@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -27,6 +28,50 @@ struct AffineTransform {
     cv::Mat_<double> M; // 4x4
     AffineTransform() { M = cv::Mat_<double>::eye(4, 4); }
 };
+
+static int count_valid_points(const cv::Mat_<cv::Vec3f>& points)
+{
+    int valid_count = 0;
+    for (int j = 0; j < points.rows; ++j) {
+        for (int i = 0; i < points.cols; ++i) {
+            const auto& p = points(j, i);
+            if (p[0] == -1.f) continue;
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+            ++valid_count;
+        }
+    }
+    return valid_count;
+}
+
+static inline float clamp_to_float(double value, float fallback, int& replacement_count)
+{
+    constexpr double k_float_max = std::numeric_limits<float>::max();
+    if (!std::isfinite(value)) {
+        ++replacement_count;
+        return fallback;
+    }
+    if (value > k_float_max || value < -k_float_max) {
+        ++replacement_count;
+        return fallback;
+    }
+    return static_cast<float>(value);
+}
+
+static inline cv::Vec3f cast_to_finite_float(const cv::Vec3d& value,
+                                            const cv::Vec3f& fallback,
+                                            int& replacement_count)
+{
+    return {
+        clamp_to_float(value[0], fallback[0], replacement_count),
+        clamp_to_float(value[1], fallback[1], replacement_count),
+        clamp_to_float(value[2], fallback[2], replacement_count)
+    };
+}
+
+static inline cv::Vec3d cast_to_double(const cv::Vec3f& value)
+{
+    return {static_cast<double>(value[0]), static_cast<double>(value[1]), static_cast<double>(value[2])};
+}
 
 static AffineTransform load_affine_json(const std::string& filename) {
     AffineTransform t;
@@ -67,7 +112,22 @@ static bool invert_affine_in_place(AffineTransform& T) {
         for (int c = 0; c < 3; ++c)
             A.at<double>(r, c) = T.M(r, c);
 
-    if (cv::invert(A, Ainv, cv::DECOMP_LU) < 1e-12) return false;
+    const cv::SVD svd(A, cv::SVD::FULL_UV);
+    const auto* w = svd.w.ptr<double>(0);
+    if (!std::isfinite(w[0]) || !std::isfinite(w[2])) return false;
+
+    const double smax = w[0];
+    const double smin = w[2];
+    if (smax <= 0.0) return false;
+
+    const double rcond = smin / smax;
+    if (!std::isfinite(rcond) || rcond < std::numeric_limits<double>::epsilon()) return false;
+
+    if (cv::invert(A, Ainv, cv::DECOMP_SVD) <= 0.0) return false;
+
+    const double inv_residual = cv::norm(A * Ainv - cv::Mat::eye(3, 3, CV_64F), cv::NORM_L2);
+    const double ref_scale = cv::norm(A, cv::NORM_L2) * cv::norm(Ainv, cv::NORM_L2);
+    if (!std::isfinite(inv_residual) || inv_residual > 1e-12 * (ref_scale + 1.0)) return false;
 
     cv::Matx33d Ai;
     for (int r = 0; r < 3; ++r)
@@ -86,15 +146,27 @@ static bool invert_affine_in_place(AffineTransform& T) {
     return true;
 }
 
-static inline cv::Vec3f apply_affine_point(const cv::Vec3f& p, const AffineTransform& A) {
+static inline bool apply_affine_point(const cv::Vec3d& p, const AffineTransform& A, cv::Vec3d& out) {
     const double x = p[0], y = p[1], z = p[2];
-    const double nx = A.M(0,0)*x + A.M(0,1)*y + A.M(0,2)*z + A.M(0,3);
-    const double ny = A.M(1,0)*x + A.M(1,1)*y + A.M(1,2)*z + A.M(1,3);
-    const double nz = A.M(2,0)*x + A.M(2,1)*y + A.M(2,2)*z + A.M(2,3);
-    return {static_cast<float>(nx), static_cast<float>(ny), static_cast<float>(nz)};
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+
+    const double nx = A.M(0,0) * x + A.M(0,1) * y + A.M(0,2) * z + A.M(0,3);
+    const double ny = A.M(1,0) * x + A.M(1,1) * y + A.M(1,2) * z + A.M(1,3);
+    const double nz = A.M(2,0) * x + A.M(2,1) * y + A.M(2,2) * z + A.M(2,3);
+
+    if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz)) return false;
+    out = {nx, ny, nz};
+    return true;
 }
 
 static inline cv::Vec3f transform_normal(const cv::Vec3f& n, const AffineTransform& A) {
+    if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) return n;
+
+    const double det = A.M(0,0)*(A.M(1,1)*A.M(2,2) - A.M(1,2)*A.M(2,1))
+                     - A.M(0,1)*(A.M(1,0)*A.M(2,2) - A.M(1,2)*A.M(2,0))
+                     + A.M(0,2)*(A.M(1,0)*A.M(2,1) - A.M(1,1)*A.M(2,0));
+    if (!std::isfinite(det) || std::abs(det) < std::numeric_limits<double>::epsilon()) return n;
+
     // Proper normal transform: n' ∝ (A^{-1})^T * n (ignore uniform pre-scale)
     cv::Matx33d Lin(
         A.M(0,0), A.M(0,1), A.M(0,2),
@@ -105,8 +177,10 @@ static inline cv::Vec3f transform_normal(const cv::Vec3f& n, const AffineTransfo
     const double nx = invAT(0,0)*n[0] + invAT(0,1)*n[1] + invAT(0,2)*n[2];
     const double ny = invAT(1,0)*n[0] + invAT(1,1)*n[1] + invAT(1,2)*n[2];
     const double nz = invAT(2,0)*n[0] + invAT(2,1)*n[1] + invAT(2,2)*n[2];
+    if (!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz)) return n;
     const double L2 = nx*nx + ny*ny + nz*nz;
     if (L2 > 0) {
+        if (!std::isfinite(L2)) return n;
         const double invL = 1.0 / std::sqrt(L2);
         return {static_cast<float>(nx*invL), static_cast<float>(ny*invL), static_cast<float>(nz*invL)};
     }
@@ -130,6 +204,7 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
+        AA->M = AA->M.clone();
         if (invert && !invert_affine_in_place(*AA)) {
             std::cerr << "non-invertible affine" << std::endl; return 2;
         }
@@ -141,16 +216,57 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         std::cerr << "failed to load tifxyz: " << e.what() << std::endl; return 3;
     }
 
+    int sanitize_replacements = 0;
     cv::Mat_<cv::Vec3f>* P = surf->rawPointsPtr();
     for (int j = 0; j < P->rows; ++j) {
         for (int i = 0; i < P->cols; ++i) {
             cv::Vec3f& p = (*P)(j,i);
             if (p[0] == -1) continue; // keep invalids
-            cv::Vec3f q = p * static_cast<float>(scale_before_affine);
-            if (AA) q = apply_affine_point(q, *AA);
-            q *= static_cast<float>(scale_after_affine);
-            p = q;
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+                p = cv::Vec3f(-1.f, -1.f, -1.f);
+                continue;
+            }
+
+            cv::Vec3d q = cast_to_double(p);
+            cv::Vec3f pre_scale = cast_to_finite_float(q, p, sanitize_replacements);
+            q[0] *= scale_before_affine;
+            q[1] *= scale_before_affine;
+            q[2] *= scale_before_affine;
+            if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2])) {
+                p = pre_scale;
+                q = cast_to_double(p);
+            }
+
+            const cv::Vec3f pre_affine = cast_to_finite_float(q, pre_scale, sanitize_replacements);
+            if (AA) {
+                cv::Vec3d q_after;
+                if (apply_affine_point(q, *AA, q_after)) {
+                    q = q_after;
+                } else {
+                    q = cast_to_double(pre_affine);
+                }
+            }
+
+            const cv::Vec3f post_affine = cast_to_finite_float(q, pre_affine, sanitize_replacements);
+            q[0] *= scale_after_affine;
+            q[1] *= scale_after_affine;
+            q[2] *= scale_after_affine;
+            if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2])) {
+                q = cast_to_double(post_affine);
+            }
+            p = cast_to_finite_float(q, post_affine, sanitize_replacements);
         }
+    }
+
+    if (sanitize_replacements > 0) {
+        std::cout << "Replaced " << sanitize_replacements
+                  << " non-finite transform components with finite fallbacks." << std::endl;
+    }
+
+    int final_valid_count = count_valid_points(*P);
+    if (final_valid_count == 0) {
+        std::cerr << "No valid points remain after transform; aborting save" << std::endl;
+        return 7;
     }
 
     // Points were modified in-place; invalidate cached derived geometry so bbox
@@ -162,9 +278,6 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     // workflows where physical scale is defined by the target volume context.
     const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*P);
     (*surf->meta)["area_vx2"] = area_vx2;
-
-    // QuadSurface exposes points directly, but not a writable raw normal grid API.
-    // Keep TIFXYZ point transforms here and leave normal recomputation to downstream tools.
 
     try {
         std::filesystem::path out = outDir;
@@ -235,6 +348,7 @@ static int run_obj(const std::filesystem::path& inFile,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
+        AA->M = AA->M.clone();
         if (invert && !invert_affine_in_place(*AA)) {
             std::cerr << "non-invertible affine" << std::endl; return 2;
         }
@@ -260,11 +374,35 @@ static int run_obj(const std::filesystem::path& inFile,
             std::istringstream ss(line);
             char c; ss >> c; // 'v'
             double x, y, z; ss >> x >> y >> z;
-            cv::Vec3f p = {static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
-            p *= static_cast<float>(scale_before_affine);
-            if (AA) p = apply_affine_point(p, *AA);
-            p *= static_cast<float>(scale_after_affine);
-            out << std::setprecision(9) << "v " << p[0] << " " << p[1] << " " << p[2] << "\n";
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                out << "v " << x << " " << y << " " << z << "\n";
+                continue;
+            }
+
+            int dummy = 0;
+            cv::Vec3d p = {x * scale_before_affine, y * scale_before_affine, z * scale_before_affine};
+            cv::Vec3f pre_scale = cast_to_finite_float(p, cv::Vec3f(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)), dummy);
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) p = cast_to_double(pre_scale);
+
+            cv::Vec3f pre_affine = pre_scale;
+            if (AA) {
+                cv::Vec3d q;
+                if (apply_affine_point(p, *AA, q)) {
+                    p = q;
+                } else {
+                    p = cast_to_double(pre_affine);
+                }
+                pre_affine = cast_to_finite_float(p, pre_scale, dummy);
+            }
+
+            p[0] *= scale_after_affine;
+            p[1] *= scale_after_affine;
+            p[2] *= scale_after_affine;
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ) {
+                p = cast_to_double(pre_affine);
+            }
+            const cv::Vec3f out_p = cast_to_finite_float(p, pre_affine, dummy);
+            out << std::setprecision(9) << "v " << out_p[0] << " " << out_p[1] << " " << out_p[2] << "\n";
         } else if (starts_with(line, "vn ")) {
             std::istringstream ss(line);
             std::string tag; ss >> tag; // "vn"
