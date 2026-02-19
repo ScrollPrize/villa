@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,8 @@ class ExportConfig:
 	z_step: int = 10
 	grid_step: int = 10
 	scale: float = 0.1
+	single_segment: bool = False
+	copy_model: bool = False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -48,6 +51,18 @@ def _build_parser() -> argparse.ArgumentParser:
 		nargs=3,
 		default=(0.0, 0.0, 0.0),
 		help="Offsets (x y z) in original voxel/pixel units.",
+	)
+	g.add_argument(
+		"--single-segment",
+		action="store_true",
+		default=False,
+		help="Export all windings into a single tifxyz (horizontally, separated by 2 invalid-point border)",
+	)
+	g.add_argument(
+		"--copy-model",
+		action="store_true",
+		default=False,
+		help="Copy the model checkpoint into the tifxyz dir instead of creating a symlink",
 	)
 	return p
 
@@ -94,7 +109,7 @@ def _apply_global_transform_from_state_dict(*, uv: torch.Tensor, st: dict) -> to
 	return torch.cat([x, y], dim=1)
 
 
-def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None) -> None:
+def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None, copy_model: bool = False) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -124,12 +139,15 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression="lzw")
 
-	# Create model.pt symlink pointing to the source checkpoint
+	# Create model.pt symlink or copy pointing to the source checkpoint
 	if model_source is not None:
-		link = out_dir / "model.pt"
-		if link.is_symlink() or link.exists():
-			link.unlink()
-		link.symlink_to(model_source.resolve())
+		dest = out_dir / "model.pt"
+		if dest.is_symlink() or dest.exists():
+			dest.unlink()
+		if copy_model:
+			shutil.copy2(str(model_source.resolve()), str(dest))
+		else:
+			dest.symlink_to(model_source.resolve())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -145,6 +163,8 @@ def main(argv: list[str] | None = None) -> int:
 		"offset_x": float(args.offset[0]),
 		"offset_y": float(args.offset[1]),
 		"offset_z": int(round(float(args.offset[2]))),
+		"single_segment": bool(args.single_segment),
+		"copy_model": bool(args.copy_model),
 	}
 	cfg = ExportConfig(**base)
 	dev = torch.device(cfg.device)
@@ -256,10 +276,9 @@ def main(argv: list[str] | None = None) -> int:
 	z_grid = z_vals.reshape(-1, 1).repeat(hm, axis=1)
 
 	meta_scale = float(cfg.scale) * float(cfg.downscale)
-	for wi in range(wm):
-		x = xy_lr[idx_z_a, :, wi, 0]
-		y = xy_lr[idx_z_a, :, wi, 1]
-		z_use = z_grid
+	BORDER_W = 2  # invalid-point border width between windings in single-segment mode
+
+	def _apply_crop_mask(x: np.ndarray, y: np.ndarray, z_use: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
 		mask = None
 		if crop_bounds_fullres is not None:
 			x0, y0, x1, y1 = crop_bounds_fullres
@@ -268,16 +287,51 @@ def main(argv: list[str] | None = None) -> int:
 			if np.any(~v):
 				x = x.copy()
 				y = y.copy()
-				z_use = z_grid.copy()
+				z_use = z_use.copy()
 				x[~v] = -1.0
 				y[~v] = -1.0
 				z_use[~v] = -1.0
-		out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
-		_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input))
+		return x, y, z_use, mask
+
+	if cfg.single_segment:
+		# Combine all windings horizontally into one tifxyz, separated by
+		# BORDER_W columns of invalid (-1) points.
+		nz = len(idx_z)
+		total_w = wm * hm + max(0, wm - 1) * BORDER_W
+		x_all = np.full((nz, total_w), -1.0, dtype=np.float32)
+		y_all = np.full((nz, total_w), -1.0, dtype=np.float32)
+		z_all = np.full((nz, total_w), -1.0, dtype=np.float32)
+		mask_all = np.full((nz, total_w), 0, dtype=np.uint8) if crop_bounds_fullres is not None else None
+
+		col = 0
+		for wi in range(wm):
+			x_w = xy_lr[idx_z_a, :, wi, 0]
+			y_w = xy_lr[idx_z_a, :, wi, 1]
+			x_w, y_w, z_w, mask_w = _apply_crop_mask(x_w, y_w, z_grid)
+			x_all[:, col:col + hm] = x_w
+			y_all[:, col:col + hm] = y_w
+			z_all[:, col:col + hm] = z_w
+			if mask_all is not None and mask_w is not None:
+				mask_all[:, col:col + hm] = mask_w
+			col += hm + BORDER_W  # skip border columns (already -1)
+
+		out_dir = out_base / f"{cfg.prefix}combined.tifxyz"
+		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
-		if mask is not None:
-			tifffile.imwrite(str(out_dir / "mask.tif"), mask, compression="lzw")
+		if mask_all is not None:
+			tifffile.imwrite(str(out_dir / "mask.tif"), mask_all, compression="lzw")
+	else:
+		for wi in range(wm):
+			x = xy_lr[idx_z_a, :, wi, 0]
+			y = xy_lr[idx_z_a, :, wi, 1]
+			x, y, z_use, mask = _apply_crop_mask(x, y, z_grid)
+			out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
+			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
+			if model_params is not None:
+				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+			if mask is not None:
+				tifffile.imwrite(str(out_dir / "mask.tif"), mask, compression="lzw")
 
 	return 0
 

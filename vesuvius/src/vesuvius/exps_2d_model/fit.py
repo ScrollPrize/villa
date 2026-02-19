@@ -215,7 +215,8 @@ def main(argv: list[str] | None = None) -> int:
 		print("[point_constraints] winding_collection_avg", winding_avg)
 		print("[point_constraints] winding_error_obs_minus_avg_plus_winda", winding_err)
 
-	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=vis_cfg.out_dir)
+	_out_dir = vis_cfg.out_dir  # None means skip all debug/vis output
+	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=_out_dir)
 	data = fit_data.FitData(
 		cos=data.cos,
 		grad_mag=data.grad_mag,
@@ -269,27 +270,31 @@ def main(argv: list[str] | None = None) -> int:
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
 			)
-		vis.save_corr_points(
-			data=data,
-			xy_lr=xy_lr_corr,
-			xy_conn=xy_conn_corr,
-			points_xyz_winda=pts_corr,
-			idx_left=idx_l_corr,
-			valid_left=ok_l_corr,
-			idx_right=idx_r_corr,
-			valid_right=ok_r_corr,
-			winding_avg=winding_avg,
-			winding_err=winding_err,
-			postfix="init",
-			out_dir=vis_cfg.out_dir,
-			scale=vis_cfg.scale,
-		)
+		if _out_dir is not None:
+			vis.save_corr_points(
+				data=data,
+				xy_lr=xy_lr_corr,
+				xy_conn=xy_conn_corr,
+				points_xyz_winda=pts_corr,
+				idx_left=idx_l_corr,
+				valid_left=ok_l_corr,
+				idx_right=idx_r_corr,
+				valid_right=ok_r_corr,
+				winding_avg=winding_avg,
+				winding_err=winding_err,
+				postfix="init",
+				out_dir=_out_dir,
+				scale=vis_cfg.scale,
+			)
 
-	vis.save(model=mdl, data=data, postfix="init", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
-	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_init.tif")
+	if _out_dir is not None:
+		vis.save(model=mdl, data=data, postfix="init", out_dir=_out_dir, scale=vis_cfg.scale)
+		mdl.save_tiff(data=data, path=f"{_out_dir}/raw_init.tif")
 	stages = optimizer.load_stages_cfg(cfg)
 	def _save_model_snapshot(*, stage: str, step: int) -> None:
-		out = Path(vis_cfg.out_dir)
+		if _out_dir is None:
+			return
+		out = Path(_out_dir)
 		out.mkdir(parents=True, exist_ok=True)
 		out_snap = out / "model_snapshots"
 		out_snap.mkdir(parents=True, exist_ok=True)
@@ -307,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	_save_model_snapshot(stage="init", step=0)
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None, vis_losses=None) -> None:
-		if int(points_all.shape[0]) > 0:
+		if _out_dir is not None and int(points_all.shape[0]) > 0:
 			if res is not None:
 				xy_lr_corr = res.xy_lr
 				xy_conn_corr = res.xy_conn
@@ -340,64 +345,66 @@ def main(argv: list[str] | None = None) -> int:
 				winding_avg=wavg,
 				winding_err=werr,
 				postfix=f"{stage}_{step:06d}",
-				out_dir=vis_cfg.out_dir,
+				out_dir=_out_dir,
 				scale=vis_cfg.scale,
 			)
-		vis.save(
-			model=mdl,
-			data=data,
-			res=res,
-			vis_losses=vis_losses,
-			postfix=f"{stage}_{step:06d}",
-			out_dir=vis_cfg.out_dir,
-			scale=vis_cfg.scale,
-		)
-		mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_{stage}_{step:06d}.tif")
+		if _out_dir is not None:
+			vis.save(
+				model=mdl,
+				data=data,
+				res=res,
+				vis_losses=vis_losses,
+				postfix=f"{stage}_{step:06d}",
+				out_dir=_out_dir,
+				scale=vis_cfg.scale,
+			)
+			mdl.save_tiff(data=data, path=f"{_out_dir}/raw_{stage}_{step:06d}.tif")
 		_save_model_snapshot(stage=stage, step=step)
 
 	data = optimizer.optimize(
 		model=mdl,
 		data=data,
 		data_cfg=data_cfg,
-		data_out_dir_base=vis_cfg.out_dir,
+		data_out_dir_base=_out_dir,
 		stages=stages,
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,
 	)
-	if int(points_all.shape[0]) > 0:
-		with torch.no_grad():
-			xy_lr_corr = mdl._grid_xy()
-			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-			pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
-				points_xyz_winda=points_all,
+	if _out_dir is not None:
+		if int(points_all.shape[0]) > 0:
+			with torch.no_grad():
+				xy_lr_corr = mdl._grid_xy()
+				xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
+				pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
+					points_xyz_winda=points_all,
+					xy_conn=xy_conn_corr,
+				)
+				_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
+					points_xyz_winda=pts_corr,
+					collection_idx=points_collection_idx,
+					xy_conn=xy_conn_corr,
+					idx_left=idx_l_corr,
+					valid_left=ok_l_corr,
+					idx_right=idx_r_corr,
+					valid_right=ok_r_corr,
+				)
+			vis.save_corr_points(
+				data=data,
+				xy_lr=xy_lr_corr,
 				xy_conn=xy_conn_corr,
-			)
-			_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
 				points_xyz_winda=pts_corr,
-				collection_idx=points_collection_idx,
-				xy_conn=xy_conn_corr,
 				idx_left=idx_l_corr,
 				valid_left=ok_l_corr,
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
+				winding_avg=wavgf,
+				winding_err=werrf,
+				postfix="final",
+				out_dir=_out_dir,
+				scale=vis_cfg.scale,
 			)
-		vis.save_corr_points(
-			data=data,
-			xy_lr=xy_lr_corr,
-			xy_conn=xy_conn_corr,
-			points_xyz_winda=pts_corr,
-			idx_left=idx_l_corr,
-			valid_left=ok_l_corr,
-			idx_right=idx_r_corr,
-			valid_right=ok_r_corr,
-			winding_avg=wavgf,
-			winding_err=werrf,
-			postfix="final",
-			out_dir=vis_cfg.out_dir,
-			scale=vis_cfg.scale,
-		)
-	vis.save(model=mdl, data=data, postfix="final", out_dir=vis_cfg.out_dir, scale=vis_cfg.scale)
-	mdl.save_tiff(data=data, path=f"{vis_cfg.out_dir}/raw_final.tif")
+		vis.save(model=mdl, data=data, postfix="final", out_dir=_out_dir, scale=vis_cfg.scale)
+		mdl.save_tiff(data=data, path=f"{_out_dir}/raw_final.tif")
 	_save_model_snapshot(stage="final", step=0)
 	_save_model_output_final()
 	return 0

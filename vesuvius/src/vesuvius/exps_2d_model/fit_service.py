@@ -105,11 +105,15 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
     model_input = body.get("model_input")
     model_output = body.get("model_output")
+    data_input = body.get("data_input")
     output_dir = body.get("output_dir")
     config = body.get("config", {})
 
     if not model_input:
         _job.set_error("missing 'model_input'")
+        return
+    if not data_input:
+        _job.set_error("missing 'data_input'")
         return
     if not output_dir:
         _job.set_error("missing 'output_dir'")
@@ -131,9 +135,13 @@ def _run_optimization(body: dict[str, Any]) -> None:
             # Inject model_input / model_output into the args section
             cfg = dict(config)
             args_section = dict(cfg.get("args", {}))
+            args_section["input"] = str(data_input)
             args_section["model-input"] = str(model_input)
             args_section["model-output"] = str(model_output)
-            args_section["out-dir"] = str(output_dir)
+            # Only set out-dir if explicitly requested (enables debug vis output).
+            # By default we skip vis output for speed.
+            if body.get("out_dir"):
+                args_section["out-dir"] = str(body["out_dir"])
             cfg["args"] = args_section
             json.dump(cfg, f, indent=2)
             cfg_path = f.name
@@ -171,7 +179,12 @@ def _run_optimization(body: dict[str, Any]) -> None:
         # Export to tifxyz
         _job.set_running("exporting", 0, 0, 0.0)
         import fit2tifxyz
-        fit2tifxyz.main(["--input", str(model_output), "--output", str(output_dir)])
+        export_argv = ["--input", str(model_output), "--output", str(output_dir)]
+        if body.get("single_segment"):
+            export_argv.append("--single-segment")
+        if body.get("copy_model"):
+            export_argv.append("--copy-model")
+        fit2tifxyz.main(export_argv)
 
         _job.set_finished(str(output_dir))
         print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
