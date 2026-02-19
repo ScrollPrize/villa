@@ -204,6 +204,7 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
+        AA->M = AA->M.clone();
         if (invert && !invert_affine_in_place(*AA)) {
             std::cerr << "non-invertible affine" << std::endl; return 2;
         }
@@ -278,9 +279,6 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*P);
     (*surf->meta)["area_vx2"] = area_vx2;
 
-    // QuadSurface exposes points directly, but not a writable raw normal grid API.
-    // Keep TIFXYZ point transforms here and leave normal recomputation to downstream tools.
-
     try {
         std::filesystem::path out = outDir;
         surf->save(out);
@@ -350,6 +348,7 @@ static int run_obj(const std::filesystem::path& inFile,
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
+        AA->M = AA->M.clone();
         if (invert && !invert_affine_in_place(*AA)) {
             std::cerr << "non-invertible affine" << std::endl; return 2;
         }
