@@ -4,6 +4,7 @@
 // writing the transformed result.
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/Surface.hpp"
 
 #include <boost/program_options.hpp>
@@ -16,7 +17,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <sstream>
 #include <string>
 
@@ -152,6 +152,16 @@ static int run_tifxyz(const std::filesystem::path& inDir,
             p = q;
         }
     }
+
+    // Points were modified in-place; invalidate cached derived geometry so bbox
+    // and other cached quantities are recomputed from transformed points.
+    surf->invalidateCache();
+
+    // Keep voxel-space area metadata consistent with transformed geometry.
+    // area_cm2 intentionally remains unchanged for cross-volume registration
+    // workflows where physical scale is defined by the target volume context.
+    const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*P);
+    (*surf->meta)["area_vx2"] = area_vx2;
 
     // QuadSurface exposes points directly, but not a writable raw normal grid API.
     // Keep TIFXYZ point transforms here and leave normal recomputation to downstream tools.
