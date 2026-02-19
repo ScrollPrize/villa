@@ -89,13 +89,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--rbf-scale",
         type=str,
-        default="stored",
+        default="full",
         choices=("full", "stored"),
         help=(
             "RBF solve-space preset. "
-            "'full' forces full-UV + float64 baseline behavior; "
-            "'stored' uses stored-lattice UV + float32 and disables extra RBF downsampling "
-            "(default)."
+            "'full' forces full-UV + float64 baseline behavior (default); "
+            "'stored' uses stored-lattice UV + float32 and disables extra RBF downsampling."
         ),
     )
     parser.add_argument(
