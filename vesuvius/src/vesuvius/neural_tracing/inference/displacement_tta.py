@@ -59,6 +59,41 @@ def _inverse_axis_perm(perm):
     return tuple(inv)
 
 
+def _negate_flipped_displacement_channels(disp, flip_dims):
+    if not flip_dims:
+        return disp
+    n_channels = int(disp.shape[1])
+    n_vector_channels = (n_channels // 3) * 3
+    if n_vector_channels <= 0:
+        return disp
+
+    sign = torch.ones((1, n_channels, 1, 1, 1), device=disp.device, dtype=disp.dtype)
+    for d in flip_dims:
+        base_ch = FLIP_DIM_TO_CHANNEL[d]
+        sign[:, base_ch:n_vector_channels:3] = -1
+    return disp * sign
+
+
+def _reorder_rotated_displacement_channels(disp, inv_perm):
+    if disp.shape[1] < 3:
+        raise RuntimeError(
+            f"Rotation TTA expects at least 3 displacement channels, got {disp.shape[1]}."
+        )
+
+    n_channels = int(disp.shape[1])
+    n_vector_channels = (n_channels // 3) * 3
+    disp_vectors = disp[:, :n_vector_channels].reshape(
+        disp.shape[0], n_vector_channels // 3, 3, disp.shape[2], disp.shape[3], disp.shape[4]
+    )
+    disp_vectors = disp_vectors[:, :, list(inv_perm), :, :, :]
+    disp_vectors = disp_vectors.reshape(
+        disp.shape[0], n_vector_channels, disp.shape[2], disp.shape[3], disp.shape[4]
+    )
+    if n_vector_channels == n_channels:
+        return disp_vectors
+    return torch.cat([disp_vectors, disp[:, n_vector_channels:]], dim=1)
+
+
 def _compute_vector_geomedian(points, max_iters=8, eps=1e-6, tol=1e-4):
     as_torch = torch.is_tensor(points)
     pts_in = points if as_torch else torch.as_tensor(points)
@@ -309,32 +344,13 @@ def run_model_tta(
                     # Un-flip displacement outputs back to the original orientation.
                     for d in reversed(flip_dims):
                         disp = disp.flip(d)
-
                     # Negate displacement components along flipped spatial axes.
-                    if flip_dims:
-                        sign = torch.ones((1, disp.shape[1], 1, 1, 1), device=disp.device, dtype=disp.dtype)
-                        for d in flip_dims:
-                            ch = FLIP_DIM_TO_CHANNEL[d]
-                            if ch >= disp.shape[1]:
-                                raise RuntimeError(
-                                    f"TTA channel index {ch} out of bounds for displacement with {disp.shape[1]} channels."
-                                )
-                            sign[:, ch] = -1
-                        disp = disp * sign
+                    disp = _negate_flipped_displacement_channels(disp, flip_dims)
                 else:
                     perm = transform
                     inv_perm = _inverse_axis_perm(perm)
                     disp = disp.permute(0, 1, 2 + inv_perm[0], 2 + inv_perm[1], 2 + inv_perm[2])
-                    if disp.shape[1] < 3:
-                        raise RuntimeError(
-                            f"Rotation TTA expects at least 3 displacement channels, got {disp.shape[1]}."
-                        )
-                    disp_xyz = disp[:, :3]
-                    disp_xyz = disp_xyz[:, inv_perm]
-                    if disp.shape[1] == 3:
-                        disp = disp_xyz
-                    else:
-                        disp = torch.cat([disp_xyz, disp[:, 3:]], dim=1)
+                    disp = _reorder_rotated_displacement_channels(disp, inv_perm)
 
                 aligned_displacements.append(disp)
 
