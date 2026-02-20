@@ -629,13 +629,15 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
                 mgr.connectToExternal(_externalHost, _externalPort);
                 // Wait for serviceStarted signal to emit lasagnaOptimizeRequested
                 auto* conn = new QMetaObject::Connection;
+                auto* errConn = new QMetaObject::Connection;
                 *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
-                    [this, conn]() {
+                    [this, conn, errConn]() {
                         QObject::disconnect(*conn);
+                        QObject::disconnect(*errConn);
                         delete conn;
+                        delete errConn;
                         emit lasagnaOptimizeRequested();
                     });
-                auto* errConn = new QMetaObject::Connection;
                 *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
                     [this, conn, errConn](const QString&) {
                         QObject::disconnect(*conn);
@@ -1090,11 +1092,21 @@ void SegmentationLasagnaPanel::onDiscoveredServiceSelected(int index)
     // Auto-connect; fetch datasets once connected
     auto& mgr = LasagnaServiceManager::instance();
     auto* conn = new QMetaObject::Connection;
+    auto* errConn = new QMetaObject::Connection;
     *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
-        [this, conn]() {
+        [this, conn, errConn]() {
             QObject::disconnect(*conn);
+            QObject::disconnect(*errConn);
             delete conn;
+            delete errConn;
             LasagnaServiceManager::instance().fetchDatasets();
+        });
+    *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
+        [conn, errConn](const QString&) {
+            QObject::disconnect(*conn);
+            QObject::disconnect(*errConn);
+            delete conn;
+            delete errConn;
         });
     mgr.connectToExternal(host, port);
 }

@@ -77,10 +77,10 @@ QString findLasagnaServiceScript()
     QString appDir = QCoreApplication::applicationDirPath();
     QStringList searchPaths = {
         // Development: build dir is volume-cartographer/build/bin/
-        QDir(appDir).filePath("../../vesuvius/src/vesuvius/exps_2d_model/lasagna_service.py"),
-        QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/lasagna_service.py"),
+        QDir(appDir).filePath("../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
+        QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
         // Installed
-        QDir(appDir).filePath("../share/vesuvius/exps_2d_model/lasagna_service.py"),
+        QDir(appDir).filePath("../share/vesuvius/exps_2d_model/fit_service.py"),
         // Environment variable
         qEnvironmentVariable("LASAGNA_SERVICE_PATH"),
     };
@@ -187,7 +187,7 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
 
     QString scriptPath = findLasagnaServiceScript();
     if (scriptPath.isEmpty()) {
-        _lastError = tr("Could not find lasagna_service.py. Set LASAGNA_SERVICE_PATH environment variable.");
+        _lastError = tr("Could not find fit_service.py. Set LASAGNA_SERVICE_PATH environment variable.");
         emit serviceError(_lastError);
         return false;
     }
