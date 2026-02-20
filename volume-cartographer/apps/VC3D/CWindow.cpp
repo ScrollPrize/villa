@@ -1778,13 +1778,16 @@ void CWindow::CreateWidgets(void)
         // Ensure service is running (external or internal)
         if (mgr.isExternal()) {
             if (!mgr.isRunning()) {
-                statusBar()->showMessage(
-                    tr("External service not connected. Select a service or check host/port."), 5000);
+                auto msg = tr("External service not connected. Select a service or check host/port.");
+                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
                 return;
             }
         } else {
             if (!mgr.ensureServiceRunning()) {
-                statusBar()->showMessage(tr("Failed to start fit service: %1").arg(mgr.lastError()), 5000);
+                auto msg = tr("Failed to start fit service: %1").arg(mgr.lastError());
+                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
                 return;
             }
         }
@@ -1809,16 +1812,18 @@ void CWindow::CreateWidgets(void)
             }
         }
         if (modelPath.isEmpty()) {
-            statusBar()->showMessage(
-                tr("No model.pt found in segment directory. Cannot run fit optimizer."), 5000);
+            auto msg = tr("No model.pt found in segment directory. Cannot run fit optimizer.");
+            std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+            statusBar()->showMessage(msg, 5000);
             return;
         }
 
         // Data input path (zarr)
         QString dataInput = _segmentationWidget->fitDataInputPath();
         if (dataInput.isEmpty()) {
-            statusBar()->showMessage(
-                tr("No data input path set. Set the zarr path in the Fit Optimizer panel."), 5000);
+            auto msg = tr("No data input path set. Set the zarr path in the Fit Optimizer panel.");
+            std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+            statusBar()->showMessage(msg, 5000);
             return;
         }
 

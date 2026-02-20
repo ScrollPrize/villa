@@ -130,3 +130,5 @@ sshfs: bad mount point `vis_fit_cos.ome.zarr': No such file or directory
 hendrik@staticsheep model2d_fullsize_exps]$ python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output s5_cos.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 1500 2000 6000 3000 3000 4000 --z-step 5
 
 python $SRC/fit2tifxyz.py --input res_growz/model_snapshots/model_final_000000.pt --prefix edit_ --single-segment --copy-model --output ../s5/PHerc172.volpkg/paths/
+
+[hendrik@staticsheep volumes_lasagna]$ python /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/villa/vesuvius/src/vesuvius/exps_2d_model/fit_service.py --host 0.0.0.0 --port 9999 --data-dir ./

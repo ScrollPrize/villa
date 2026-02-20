@@ -856,8 +856,17 @@ void SegmentationFitOptimizerPanel::refreshDiscoveredServices()
         QJsonObject svc = val.toObject();
         QString host = svc[QStringLiteral("host")].toString();
         int port = svc[QStringLiteral("port")].toInt();
-        int pid = svc[QStringLiteral("pid")].toInt();
-        QString label = QStringLiteral("%1:%2 (pid %3)").arg(host).arg(port).arg(pid);
+
+        // Build a descriptive label from whatever info is available
+        QString label;
+        if (svc.contains(QStringLiteral("name"))) {
+            label = QStringLiteral("%1 (%2:%3)")
+                .arg(svc[QStringLiteral("name")].toString())
+                .arg(host).arg(port);
+        } else {
+            int pid = svc[QStringLiteral("pid")].toInt();
+            label = QStringLiteral("%1:%2 (pid %3)").arg(host).arg(port).arg(pid);
+        }
         _discoveryCombo->addItem(label, QJsonDocument(svc).toJson(QJsonDocument::Compact));
     }
 }

@@ -16,6 +16,7 @@ import argparse
 import atexit
 import json
 import os
+import subprocess
 import sys
 import threading
 import traceback
@@ -98,6 +99,53 @@ def _remove_announcement() -> None:
         except OSError:
             pass
         _announce_file = None
+
+
+# ---------------------------------------------------------------------------
+# mDNS announcement via avahi-publish-service
+# ---------------------------------------------------------------------------
+
+_avahi_proc: subprocess.Popen | None = None
+
+
+def _start_avahi_publish(port: int) -> None:
+    """Publish service via avahi-publish-service (auto-unregisters on exit)."""
+    global _avahi_proc
+
+    txt_records: list[str] = []
+    if _data_dir:
+        txt_records.append(f"data_dir={_data_dir}")
+    datasets = _list_datasets()
+    if datasets:
+        txt_records.append("datasets=" + ",".join(d["name"] for d in datasets))
+
+    cmd = [
+        "avahi-publish-service",
+        f"Fit Optimizer (pid {os.getpid()})",
+        "_fitoptimizer._tcp",
+        str(port),
+    ] + txt_records
+
+    try:
+        _avahi_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[fit-service] mDNS: registered as _fitoptimizer._tcp on port {port}",
+              flush=True)
+    except FileNotFoundError:
+        print("[fit-service] avahi-publish-service not found, skipping mDNS",
+              flush=True)
+
+
+def _stop_avahi_publish() -> None:
+    """Stop the avahi-publish-service subprocess."""
+    global _avahi_proc
+    if _avahi_proc is not None:
+        _avahi_proc.terminate()
+        try:
+            _avahi_proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _avahi_proc.kill()
+        _avahi_proc = None
 
 
 # ---------------------------------------------------------------------------
@@ -370,9 +418,11 @@ def main() -> None:
     server = HTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]
 
-    # Write service announcement for discovery
+    # Write service announcement for discovery (file-based + mDNS)
     _write_announcement(args.host, actual_port)
+    _start_avahi_publish(actual_port)
     atexit.register(_remove_announcement)
+    atexit.register(_stop_avahi_publish)
 
     # This exact format is parsed by FitServiceManager on the C++ side
     print(f"listening on http://{args.host}:{actual_port}", flush=True)
@@ -382,6 +432,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _stop_avahi_publish()
         _remove_announcement()
         server.server_close()
 

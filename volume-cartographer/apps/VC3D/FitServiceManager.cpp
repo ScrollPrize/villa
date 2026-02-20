@@ -12,6 +12,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QSet>
 #include <QUrl>
 
 #include <iostream>
@@ -488,42 +489,106 @@ void FitServiceManager::handleStatusReply(QNetworkReply* reply)
 QJsonArray FitServiceManager::discoverServices()
 {
     QJsonArray result;
+
+    // Track seen host:port to avoid duplicates between file and mDNS discovery
+    QSet<QString> seen;
+
+    // --- File-based discovery (local) ---
     QString dirPath = QDir::homePath() + QStringLiteral("/.fit_services");
     QDir dir(dirPath);
-    if (!dir.exists()) {
-        return result;
-    }
+    if (dir.exists()) {
+        const auto entries = dir.entryInfoList(
+            QStringList{QStringLiteral("*.json")}, QDir::Files);
+        for (const QFileInfo& fi : entries) {
+            QFile f(fi.absoluteFilePath());
+            if (!f.open(QIODevice::ReadOnly)) {
+                continue;
+            }
+            QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+            f.close();
+            if (!doc.isObject()) {
+                QFile::remove(fi.absoluteFilePath());
+                continue;
+            }
+            QJsonObject obj = doc.object();
+            int pid = obj[QStringLiteral("pid")].toInt(-1);
+            if (pid <= 0) {
+                QFile::remove(fi.absoluteFilePath());
+                continue;
+            }
 
-    const auto entries = dir.entryInfoList(
-        QStringList{QStringLiteral("*.json")}, QDir::Files);
-    for (const QFileInfo& fi : entries) {
-        QFile f(fi.absoluteFilePath());
-        if (!f.open(QIODevice::ReadOnly)) {
-            continue;
-        }
-        QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
-        f.close();
-        if (!doc.isObject()) {
-            QFile::remove(fi.absoluteFilePath());
-            continue;
-        }
-        QJsonObject obj = doc.object();
-        int pid = obj[QStringLiteral("pid")].toInt(-1);
-        if (pid <= 0) {
-            QFile::remove(fi.absoluteFilePath());
-            continue;
-        }
-
-        // Check if PID is still alive
 #ifdef Q_OS_UNIX
-        if (kill(pid, 0) != 0) {
-            QFile::remove(fi.absoluteFilePath());
-            continue;
-        }
+            if (kill(pid, 0) != 0) {
+                QFile::remove(fi.absoluteFilePath());
+                continue;
+            }
 #endif
 
-        result.append(obj);
+            QString key = QStringLiteral("%1:%2")
+                .arg(obj[QStringLiteral("host")].toString())
+                .arg(obj[QStringLiteral("port")].toInt());
+            seen.insert(key);
+            result.append(obj);
+        }
     }
+
+    // --- mDNS discovery via avahi-browse ---
+    QProcess proc;
+    proc.start(QStringLiteral("avahi-browse"),
+               {QStringLiteral("-r"), QStringLiteral("-t"),
+                QStringLiteral("--parsable"), QStringLiteral("_fitoptimizer._tcp")});
+    if (proc.waitForFinished(5000)) {
+        // Parsable output format (resolved lines start with '='):
+        // =;interface;protocol;name;type;domain;hostname;address;port;txt1 txt2 ...
+        QString output = QString::fromUtf8(proc.readAllStandardOutput());
+        for (const QString& line : output.split('\n')) {
+            if (!line.startsWith('=')) {
+                continue;
+            }
+            QStringList fields = line.split(';');
+            if (fields.size() < 9) {
+                continue;
+            }
+
+            QString host = fields[7];
+            int port = fields[8].toInt();
+            QString key = QStringLiteral("%1:%2").arg(host).arg(port);
+            if (seen.contains(key)) {
+                continue;
+            }
+            seen.insert(key);
+
+            QJsonObject obj;
+            obj[QStringLiteral("host")] = host;
+            obj[QStringLiteral("port")] = port;
+            obj[QStringLiteral("name")] = fields[3];
+
+            // Parse TXT records (field 9+, space-separated, each quoted)
+            if (fields.size() > 9) {
+                QString txtRaw = fields[9];
+                for (const QString& record : txtRaw.split(' ')) {
+                    QString r = record.trimmed();
+                    if (r.startsWith('"') && r.endsWith('"')) {
+                        r = r.mid(1, r.size() - 2);
+                    }
+                    if (r.startsWith(QStringLiteral("data_dir="))) {
+                        obj[QStringLiteral("data_dir")] = r.mid(9);
+                    } else if (r.startsWith(QStringLiteral("datasets="))) {
+                        QJsonArray ds;
+                        for (const QString& d : r.mid(9).split(',')) {
+                            if (!d.isEmpty()) {
+                                ds.append(d);
+                            }
+                        }
+                        obj[QStringLiteral("datasets")] = ds;
+                    }
+                }
+            }
+
+            result.append(obj);
+        }
+    }
+
     return result;
 }
 
