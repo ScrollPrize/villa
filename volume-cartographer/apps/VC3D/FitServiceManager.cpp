@@ -21,6 +21,15 @@
 #include <signal.h>
 #endif
 
+// Avahi client library for mDNS service discovery
+#ifdef Q_OS_LINUX
+#include <avahi-client/client.h>
+#include <avahi-client/lookup.h>
+#include <avahi-common/error.h>
+#include <avahi-common/malloc.h>
+#include <avahi-common/simple-watch.h>
+#endif
+
 namespace
 {
 constexpr int kServiceStartTimeoutMs = 60000;  // 1 minute (no torch compile)
@@ -599,89 +608,124 @@ QJsonArray FitServiceManager::discoverServices()
         }
     }
 
-    // --- mDNS discovery via avahi-browse ---
-    QProcess proc;
-    proc.start(QStringLiteral("avahi-browse"),
-               {QStringLiteral("-r"), QStringLiteral("-t"),
-                QStringLiteral("--parsable"), QStringLiteral("_fitoptimizer._tcp")});
-    bool finished = proc.waitForFinished(5000);
-    if (!finished) {
-        proc.terminate();
-        if (!proc.waitForFinished(2000)) {
-            proc.kill();
-            proc.waitForFinished(1000);
-        }
-    }
-    if (finished) {
-        // Parsable output format (resolved lines start with '='):
-        // =;interface;protocol;name;type;domain;hostname;address;port;txt1 txt2 ...
-        QString output = QString::fromUtf8(proc.readAllStandardOutput());
-        for (const QString& line : output.split('\n')) {
-            if (!line.startsWith('=')) {
-                continue;
-            }
-            QStringList fields = line.split(';');
-            if (fields.size() < 9) {
-                continue;
+    // --- mDNS discovery via avahi-client library ---
+#ifdef Q_OS_LINUX
+    {
+        struct AvahiDiscovery {
+            QJsonArray* result;
+            QSet<QString>* seen;
+            AvahiSimplePoll* poll;
+            AvahiClient* client;
+            int pendingResolves{0};
+            bool browseComplete{false};
+
+            void maybeQuit() {
+                if (browseComplete && pendingResolves <= 0)
+                    avahi_simple_poll_quit(poll);
             }
 
-            QString host = fields[7];
-            int port = fields[8].toInt();
-            QString key = QStringLiteral("%1:%2").arg(host).arg(port);
-            if (seen.contains(key)) {
-                continue;
-            }
-            seen.insert(key);
+            void addResolved(const char* name, const AvahiAddress* addr,
+                             uint16_t port, AvahiStringList* txt) {
+                char addrBuf[AVAHI_ADDRESS_STR_MAX];
+                avahi_address_snprint(addrBuf, sizeof(addrBuf), addr);
+                QString host = QString::fromUtf8(addrBuf);
+                QString key = QStringLiteral("%1:%2").arg(host).arg(port);
+                if (seen->contains(key)) return;
+                seen->insert(key);
 
-            // Unescape avahi parsable \NNN octal escape sequences
-            auto unescapeAvahi = [](const QString& s) -> QString {
-                QString out;
-                out.reserve(s.size());
-                for (int i = 0; i < s.size(); ++i) {
-                    if (s[i] == '\\' && i + 3 < s.size()) {
-                        bool ok;
-                        int code = s.mid(i + 1, 3).toInt(&ok, 10);
-                        if (ok && code >= 0 && code <= 127) {
-                            out.append(QChar(code));
-                            i += 3;
-                            continue;
+                QJsonObject obj;
+                obj[QStringLiteral("host")] = host;
+                obj[QStringLiteral("port")] = static_cast<int>(port);
+                obj[QStringLiteral("name")] = QString::fromUtf8(name);
+
+                for (auto* t = txt; t; t = avahi_string_list_get_next(t)) {
+                    char* k = nullptr;
+                    char* v = nullptr;
+                    if (avahi_string_list_get_pair(t, &k, &v, nullptr) == 0 && k) {
+                        QString tk = QString::fromUtf8(k);
+                        QString tv = v ? QString::fromUtf8(v) : QString();
+                        if (tk == QStringLiteral("data_dir"))
+                            obj[QStringLiteral("data_dir")] = tv;
+                        else if (tk == QStringLiteral("datasets")) {
+                            QJsonArray ds;
+                            for (const QString& d : tv.split(','))
+                                if (!d.isEmpty()) ds.append(d);
+                            obj[QStringLiteral("datasets")] = ds;
                         }
-                    }
-                    out.append(s[i]);
-                }
-                return out;
-            };
-
-            QJsonObject obj;
-            obj[QStringLiteral("host")] = host;
-            obj[QStringLiteral("port")] = port;
-            obj[QStringLiteral("name")] = unescapeAvahi(fields[3]);
-
-            // Parse TXT records (field 9+, space-separated, each quoted)
-            if (fields.size() > 9) {
-                QString txtRaw = fields[9];
-                for (const QString& record : txtRaw.split(' ')) {
-                    QString r = record.trimmed();
-                    if (r.startsWith('"') && r.endsWith('"')) {
-                        r = r.mid(1, r.size() - 2);
-                    }
-                    if (r.startsWith(QStringLiteral("data_dir="))) {
-                        obj[QStringLiteral("data_dir")] = r.mid(9);
-                    } else if (r.startsWith(QStringLiteral("datasets="))) {
-                        QJsonArray ds;
-                        for (const QString& d : r.mid(9).split(',')) {
-                            if (!d.isEmpty()) {
-                                ds.append(d);
-                            }
-                        }
-                        obj[QStringLiteral("datasets")] = ds;
+                        avahi_free(k);
+                        avahi_free(v);
                     }
                 }
+                result->append(obj);
             }
 
-            result.append(obj);
+            static void resolveCallback(
+                    AvahiServiceResolver* r, AvahiIfIndex, AvahiProtocol,
+                    AvahiResolverEvent event, const char* name, const char*,
+                    const char*, const char*, const AvahiAddress* addr,
+                    uint16_t port, AvahiStringList* txt,
+                    AvahiLookupResultFlags, void* userdata) {
+                auto* self = static_cast<AvahiDiscovery*>(userdata);
+                if (event == AVAHI_RESOLVER_FOUND && addr)
+                    self->addResolved(name, addr, port, txt);
+                self->pendingResolves--;
+                avahi_service_resolver_free(r);
+                self->maybeQuit();
+            }
+
+            static void browseCallback(
+                    AvahiServiceBrowser*, AvahiIfIndex iface,
+                    AvahiProtocol proto, AvahiBrowserEvent event,
+                    const char* name, const char* type, const char* domain,
+                    AvahiLookupResultFlags, void* userdata) {
+                auto* self = static_cast<AvahiDiscovery*>(userdata);
+                if (event == AVAHI_BROWSER_NEW) {
+                    self->pendingResolves++;
+                    avahi_service_resolver_new(
+                        self->client, iface, proto, name, type, domain,
+                        AVAHI_PROTO_UNSPEC, static_cast<AvahiLookupFlags>(0),
+                        resolveCallback, userdata);
+                } else if (event == AVAHI_BROWSER_ALL_FOR_NOW ||
+                           event == AVAHI_BROWSER_FAILURE) {
+                    self->browseComplete = true;
+                    self->maybeQuit();
+                }
+            }
+        };
+
+        auto* poll = avahi_simple_poll_new();
+        if (poll) {
+            int error = 0;
+            auto* client = avahi_client_new(
+                avahi_simple_poll_get(poll), static_cast<AvahiClientFlags>(0),
+                [](AvahiClient*, AvahiClientState, void*) {}, nullptr, &error);
+
+            if (client) {
+                AvahiDiscovery ctx{&result, &seen, poll, client, 0, false};
+                auto* browser = avahi_service_browser_new(
+                    client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+                    "_fitoptimizer._tcp", nullptr,
+                    static_cast<AvahiLookupFlags>(0),
+                    AvahiDiscovery::browseCallback, &ctx);
+
+                if (browser) {
+                    QElapsedTimer timer;
+                    timer.start();
+                    while (!timer.hasExpired(5000)) {
+                        if (avahi_simple_poll_iterate(poll, 200) != 0)
+                            break;
+                    }
+                    avahi_service_browser_free(browser);
+                }
+                avahi_client_free(client);
+            } else {
+                std::cerr << "[fit-service] avahi client error: "
+                          << avahi_strerror(error) << std::endl;
+            }
+            avahi_simple_poll_free(poll);
         }
     }
+#endif
 
     return result;
 }

@@ -1926,51 +1926,15 @@ void CWindow::CreateWidgets(void)
             int cz = static_cast<int>(focus->p[2]);
 
             // Build/override the "args" section with --bbox CX CY CZ W H
+            // and --z-size for the full 3D extent (no grow stages needed)
             QJsonObject args = config[QStringLiteral("args")].toObject();
             args[QStringLiteral("bbox")] = QJsonArray{cx, cy, cz, nmW, nmH};
-            args[QStringLiteral("z-size")] = 1;
+            args[QStringLiteral("z-size")] = nmD;
             config[QStringLiteral("args")] = args;
-
-            // Override grow.generations in any grow stage to match depth
-            if (nmD > 1) {
-                QJsonArray stages = config[QStringLiteral("stages")].toArray();
-                bool hasGrow = false;
-                for (int i = 0; i < stages.size(); ++i) {
-                    QJsonObject stage = stages[i].toObject();
-                    if (stage.contains(QStringLiteral("grow"))) {
-                        QJsonObject grow = stage[QStringLiteral("grow")].toObject();
-                        grow[QStringLiteral("generations")] = nmD;
-                        stage[QStringLiteral("grow")] = grow;
-                        stages[i] = stage;
-                        hasGrow = true;
-                    }
-                }
-                // If no grow stage exists, append a default one
-                if (!hasGrow) {
-                    QJsonObject growStage;
-                    growStage[QStringLiteral("name")] = QStringLiteral("auto_grow");
-                    QJsonObject grow;
-                    grow[QStringLiteral("directions")] = QJsonArray{
-                        QStringLiteral("down"), QStringLiteral("up")};
-                    grow[QStringLiteral("generations")] = nmD;
-                    grow[QStringLiteral("steps")] = 1;
-                    growStage[QStringLiteral("grow")] = grow;
-                    QJsonObject localOpt;
-                    localOpt[QStringLiteral("opt_window")] = 2;
-                    localOpt[QStringLiteral("steps")] = 300;
-                    localOpt[QStringLiteral("lr")] = 0.1;
-                    localOpt[QStringLiteral("params")] = QJsonArray{
-                        QStringLiteral("mesh_ms"), QStringLiteral("conn_offset_ms")};
-                    localOpt[QStringLiteral("min_scaledown")] = 0;
-                    growStage[QStringLiteral("local_opt")] = localOpt;
-                    stages.append(growStage);
-                }
-                config[QStringLiteral("stages")] = stages;
-            }
 
             std::cerr << "[fit-optimizer] new model: bbox center=(" << cx << "," << cy
                       << "," << cz << ") size=(" << nmW << "x" << nmH
-                      << ") depth=" << nmD << std::endl;
+                      << "x" << nmD << ")" << std::endl;
         }
 
         // Build optimization request
