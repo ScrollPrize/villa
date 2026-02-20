@@ -276,6 +276,22 @@ def load_stages(path: str) -> list[Stage]:
 		return load_stages_cfg(cfg)
 
 
+def total_steps_for_stages(stages: list[Stage]) -> int:
+	"""Compute the total number of optimization steps across all stages."""
+	total = 0
+	for stage in stages:
+		if stage.grow is None:
+			total += max(0, stage.global_opt.steps)
+		else:
+			generations = max(0, int(stage.grow.get("generations", 0)))
+			local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
+			for _gi in range(generations):
+				total += max(0, stage.global_opt.steps)
+				for lo in local_opts:
+					total += max(0, lo.steps)
+	return total
+
+
 def optimize(
 	*,
 	model,
@@ -285,6 +301,7 @@ def optimize(
 	stages: list[Stage],
 	snapshot_interval: int,
 	snapshot_fn,
+	progress_fn=None,
 ) -> fit_data.FitData:
 	data_z0 = data_cfg.unet_z if data_cfg is not None else None
 	def _masked_mean_per_z(*, lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -532,6 +549,9 @@ def optimize(
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
+			_done_steps[0] += 1
+			if progress_fn is not None:
+				progress_fn(step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()))
 
 			step1 = step + 1
 			if step == 0 or step1 == opt_cfg.steps or (step1 % 100) == 0:
@@ -555,6 +575,9 @@ def optimize(
 	snap_int = int(snapshot_interval)
 	if snap_int < 0:
 		snap_int = 0
+
+	_total_steps = total_steps_for_stages(stages)
+	_done_steps = [0]  # mutable counter
 
 	for si, stage in enumerate(stages):
 		if stage.grow is None:

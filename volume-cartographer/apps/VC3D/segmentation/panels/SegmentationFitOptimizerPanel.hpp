@@ -10,6 +10,7 @@ class CollapsibleSettingsGroup;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
+class QProgressBar;
 class QPushButton;
 class QSettings;
 class QToolButton;
@@ -73,6 +74,7 @@ private:
     QPushButton* _runBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
+    QProgressBar* _progressBar{nullptr};
     QLabel* _progressLabel{nullptr};
 
     QString _fitPythonPath;

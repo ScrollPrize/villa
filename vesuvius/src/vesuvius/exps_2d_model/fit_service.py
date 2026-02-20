@@ -119,33 +119,29 @@ def _run_optimization(body: dict[str, Any]) -> None:
         _job.set_error("missing 'output_dir'")
         return
 
-    # When no explicit model_output given, use a temp file in output_dir
-    # so we never overwrite the input model.
-    if not model_output:
-        model_output = str(Path(output_dir) / "_fit_reopt_model.pt")
-
     try:
-        # Build argv for fit.py from the config dict.
-        # The config is the full JSON config (base, stages, args) just like
-        # direct_from_zarr.json.  We write it to a temp file and pass as
-        # a positional json config arg.
         import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False, dir=output_dir
-        ) as f:
-            # Inject model_input / model_output into the args section
-            cfg = dict(config)
-            args_section = dict(cfg.get("args", {}))
-            args_section["input"] = str(data_input)
-            args_section["model-input"] = str(model_input)
-            args_section["model-output"] = str(model_output)
-            # Only set out-dir if explicitly requested (enables debug vis output).
-            # By default we skip vis output for speed.
-            if body.get("out_dir"):
-                args_section["out-dir"] = str(body["out_dir"])
-            cfg["args"] = args_section
-            json.dump(cfg, f, indent=2)
-            cfg_path = f.name
+        # Use a temp directory for all intermediate files (config json,
+        # model output, etc.) so nothing leaks into the volpkg paths dir.
+        tmp_dir = tempfile.mkdtemp(prefix="fit_reopt_")
+
+        # model_output goes into temp dir
+        if not model_output:
+            model_output = str(Path(tmp_dir) / "model_reopt.pt")
+
+        # Build argv for fit.py from the config dict.
+        cfg = dict(config)
+        args_section = dict(cfg.get("args", {}))
+        args_section["input"] = str(data_input)
+        args_section["model-input"] = str(model_input)
+        args_section["model-output"] = str(model_output)
+        # Only set out-dir if explicitly requested (enables debug vis output).
+        # By default we skip vis output for speed.
+        if body.get("out_dir"):
+            args_section["out-dir"] = str(body["out_dir"])
+        cfg["args"] = args_section
+        cfg_path = str(Path(tmp_dir) / "fit_config.json")
+        Path(cfg_path).write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
         # Monkey-patch the optimizer to report progress & check cancellation.
         import optimizer as opt_mod
@@ -154,15 +150,23 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
         def _patched_optimize(**kwargs: Any) -> Any:
             orig_snapshot = kwargs.get("snapshot_fn")
+            orig_progress = kwargs.get("progress_fn")
 
             def _wrapped_snapshot(*, stage: str, step: int, loss: float, **kw: Any) -> None:
-                _job.set_running(stage, step, 0, loss)
                 if _job.cancelled:
                     raise KeyboardInterrupt("cancelled by user")
                 if orig_snapshot is not None:
                     orig_snapshot(stage=stage, step=step, loss=loss, **kw)
 
+            def _wrapped_progress(*, step: int, total: int, loss: float) -> None:
+                _job.set_running("optimizing", step, total, loss)
+                if _job.cancelled:
+                    raise KeyboardInterrupt("cancelled by user")
+                if orig_progress is not None:
+                    orig_progress(step=step, total=total, loss=loss)
+
             kwargs["snapshot_fn"] = _wrapped_snapshot
+            kwargs["progress_fn"] = _wrapped_progress
             return _orig_optimize(**kwargs)
 
         opt_mod.optimize = _patched_optimize
@@ -190,10 +194,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
             export_argv.extend(["--output-name", str(output_name)])
         fit2tifxyz.main(export_argv)
 
-        # Clean up temp model file — it's been copied into the tifxyz dir
-        tmp_model = Path(model_output)
-        if tmp_model.name == "_fit_reopt_model.pt" and tmp_model.exists():
-            tmp_model.unlink()
+        # Clean up temp directory (config json, intermediate model, etc.)
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
         _job.set_finished(str(output_dir))
         print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
@@ -246,6 +249,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": f"bad json: {exc}"}, 400)
                 return
             _job.set_idle()
+            _job.set_running("starting", 0, 0, 0.0)
             _job_thread = threading.Thread(target=_run_optimization, args=(body,), daemon=True)
             _job_thread.start()
             self._send_json({"status": "started"})

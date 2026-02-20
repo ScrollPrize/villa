@@ -29,6 +29,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_opt.add_args(p)
 	cli_vis.add_args(p)
 	point_constraints.add_args(p)
+	p.add_argument("--progress", action="store_true", default=False,
+		help="Print machine-readable PROGRESS lines to stdout")
 	return p
 
 
@@ -59,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
 	model_cfg = cli_model.from_args(args)
 	opt_cfg = cli_opt.from_args(args)
 	vis_cfg = cli_vis.from_args(args)
+	progress_enabled = bool(args.progress)
 	points_cfg = point_constraints.from_args(args)
 	points_tensor, points_collection_idx = point_constraints.load_points_tensor(points_cfg)
 	point_constraints.print_points_tensor(points_tensor)
@@ -361,6 +364,10 @@ def main(argv: list[str] | None = None) -> int:
 			mdl.save_tiff(data=data, path=f"{_out_dir}/raw_{stage}_{step:06d}.tif")
 		_save_model_snapshot(stage=stage, step=step)
 
+	def _progress(*, step: int, total: int, loss: float) -> None:
+		if progress_enabled:
+			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
+
 	data = optimizer.optimize(
 		model=mdl,
 		data=data,
@@ -369,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
 		stages=stages,
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,
+		progress_fn=_progress,
 	)
 	if _out_dir is not None:
 		if int(points_all.shape[0]) > 0:

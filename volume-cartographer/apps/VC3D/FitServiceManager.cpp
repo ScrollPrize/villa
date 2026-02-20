@@ -19,7 +19,7 @@ namespace
 {
 constexpr int kServiceStartTimeoutMs = 60000;  // 1 minute (no torch compile)
 constexpr int kServiceStopTimeoutMs = 5000;
-constexpr int kPollIntervalMs = 1500;
+constexpr int kPollIntervalMs = 500;
 
 QString findPythonExecutable()
 {

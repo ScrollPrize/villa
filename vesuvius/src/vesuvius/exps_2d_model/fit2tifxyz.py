@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
 				mask_all[:, col:col + hm] = mask_w
 			col += hm + BORDER_W  # skip border columns (already -1)
 
-		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}combined.tifxyz"
+		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
 		if model_params is not None:

@@ -11,6 +11,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -132,6 +133,14 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     btnRow->addWidget(_stopServiceBtn);
     btnRow->addStretch(1);
     _group->contentLayout()->addLayout(btnRow);
+
+    // -- Progress bar --
+    _progressBar = new QProgressBar(content);
+    _progressBar->setRange(0, 100);
+    _progressBar->setValue(0);
+    _progressBar->setTextVisible(true);
+    _progressBar->setVisible(false);
+    _group->contentLayout()->addWidget(_progressBar);
 
     // -- Progress label --
     _progressLabel = new QLabel(content);
@@ -258,6 +267,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(true);
     });
     connect(&mgr, &FitServiceManager::serviceStopped, this, [this]() {
+        if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Service stopped"));
             _progressLabel->setStyleSheet(QString());
@@ -284,13 +294,23 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         }
     });
     connect(&mgr, &FitServiceManager::optimizationProgress, this,
-            [this](const QString& stage, int step, int /*total*/, double loss) {
+            [this](const QString& stage, int step, int total, double loss) {
+        if (_progressBar) {
+            if (total > 0) {
+                _progressBar->setRange(0, total);
+                _progressBar->setValue(step);
+                _progressBar->setFormat(
+                    tr("%1/%2  Loss: %3")
+                        .arg(step).arg(total).arg(loss, 0, 'g', 5));
+                _progressBar->setVisible(true);
+            } else {
+                _progressBar->setVisible(false);
+            }
+        }
         if (_progressLabel) {
             _progressLabel->setText(
-                tr("Stage: %1  |  Step: %2  |  Loss: %3")
-                    .arg(stage)
-                    .arg(step)
-                    .arg(loss, 0, 'g', 5));
+                tr("Step %1/%2  |  Loss: %3  |  Stage: %4")
+                    .arg(step).arg(total).arg(loss, 0, 'g', 5).arg(stage));
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
@@ -299,6 +319,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             [this](const QString& outputDir) {
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
+        if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization finished. Output: %1").arg(outputDir));
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
@@ -310,6 +331,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         std::cerr << "[fit-optimizer] optimization error: " << err.toStdString() << std::endl;
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
+        if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization error: %1").arg(err));
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
