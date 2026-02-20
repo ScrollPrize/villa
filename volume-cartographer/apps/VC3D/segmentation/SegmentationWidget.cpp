@@ -410,12 +410,7 @@ void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}
 
 // --- Fit optimizer delegations ---
 
-QString SegmentationWidget::fitPythonPath() const { return _fitOptimizerPanel->fitPythonPath(); }
-QString SegmentationWidget::fitModelPath() const { return _fitOptimizerPanel->fitModelPath(); }
 QString SegmentationWidget::fitDataInputPath() const { return _fitOptimizerPanel->fitDataInputPath(); }
-QString SegmentationWidget::fitOutputDir() const { return _fitOptimizerPanel->fitOutputDir(); }
 QString SegmentationWidget::fitConfigText() const { return _fitOptimizerPanel->fitConfigText(); }
 
-void SegmentationWidget::setFitModelPath(const QString& path) { _fitOptimizerPanel->setFitModelPath(path); }
 void SegmentationWidget::setFitDataInputPath(const QString& path) { _fitOptimizerPanel->setFitDataInputPath(path); }
-void SegmentationWidget::setFitOutputDir(const QString& path) { _fitOptimizerPanel->setFitOutputDir(path); }

@@ -1783,8 +1783,7 @@ void CWindow::CreateWidgets(void)
                 return;
             }
         } else {
-            const QString pythonPath = _segmentationWidget->fitPythonPath();
-            if (!mgr.ensureServiceRunning(pythonPath)) {
+            if (!mgr.ensureServiceRunning()) {
                 statusBar()->showMessage(tr("Failed to start fit service: %1").arg(mgr.lastError()), 5000);
                 return;
             }
@@ -1798,9 +1797,9 @@ void CWindow::CreateWidgets(void)
             segPath = activeSurface->path;
         }
 
-        // Get model path — from panel or auto-detected from segment's model.pt
-        QString modelPath = _segmentationWidget->fitModelPath();
-        if (modelPath.isEmpty() && !segPath.empty()) {
+        // Model path — must exist as model.pt inside the segment directory
+        QString modelPath;
+        if (!segPath.empty()) {
             auto modelFile = segPath / "model.pt";
             if (std::filesystem::exists(modelFile)) {
                 try {
@@ -1811,7 +1810,7 @@ void CWindow::CreateWidgets(void)
         }
         if (modelPath.isEmpty()) {
             statusBar()->showMessage(
-                tr("No model path set and no model.pt found in segment directory."), 5000);
+                tr("No model.pt found in segment directory. Cannot run fit optimizer."), 5000);
             return;
         }
 
@@ -1823,9 +1822,9 @@ void CWindow::CreateWidgets(void)
             return;
         }
 
-        // Output dir: panel setting, or segment's parent directory
-        QString outputDir = _segmentationWidget->fitOutputDir();
-        if (outputDir.isEmpty() && !segPath.empty()) {
+        // Output dir: always use the segment's parent directory (paths dir)
+        QString outputDir;
+        if (!segPath.empty()) {
             outputDir = QString::fromStdString(segPath.parent_path().string());
         }
 
@@ -4252,20 +4251,6 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
             });
         }
 
-        // Auto-detect model.pt (copy or symlink) for fit optimizer panel
-        if (_segmentationWidget && activeSurfaceShared && !activeSurfaceShared->path.empty()) {
-            auto modelFile = activeSurfaceShared->path / "model.pt";
-            if (std::filesystem::exists(modelFile)) {
-                try {
-                    auto resolved = std::filesystem::canonical(modelFile);
-                    _segmentationWidget->setFitModelPath(
-                        QString::fromStdString(resolved.string()));
-                } catch (const std::filesystem::filesystem_error&) {}
-            }
-            // Set output dir to the segment's parent directory
-            _segmentationWidget->setFitOutputDir(
-                QString::fromStdString(activeSurfaceShared->path.parent_path().string()));
-        }
     } else {
         _segmentationModule->endEditingSession();
 

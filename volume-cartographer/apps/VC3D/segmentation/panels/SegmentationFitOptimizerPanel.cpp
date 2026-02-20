@@ -274,17 +274,6 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         row->addWidget(_connectionCombo, 1);
     }, tr("Internal launches a local Python process. External connects to a running service."));
 
-    // -- Internal widget: Python path --
-    _internalWidget = _group->addRow(tr("Python:"), [&](QHBoxLayout* row) {
-        _pythonEdit = new QLineEdit(content);
-        _pythonEdit->setPlaceholderText(
-            tr("Path to Python (leave empty for auto-detect)"));
-        _pythonBrowse = new QToolButton(content);
-        _pythonBrowse->setText(QStringLiteral("..."));
-        row->addWidget(_pythonEdit, 1);
-        row->addWidget(_pythonBrowse);
-    }, tr("Python executable with torch installed."));
-
     // -- External widgets: discovery + host/port --
     _externalWidget = new QWidget(content);
     auto* extLayout = new QVBoxLayout(_externalWidget);
@@ -326,17 +315,6 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     _group->contentLayout()->addWidget(_externalWidget);
     _externalWidget->setVisible(false);  // Start hidden (internal mode)
 
-    // -- Model checkpoint --
-    _group->addRow(tr("Model:"), [&](QHBoxLayout* row) {
-        _modelEdit = new QLineEdit(content);
-        _modelEdit->setPlaceholderText(
-            tr("Path to fit model (.pt) — auto-detected from segment"));
-        _modelBrowse = new QToolButton(content);
-        _modelBrowse->setText(QStringLiteral("..."));
-        row->addWidget(_modelEdit, 1);
-        row->addWidget(_modelBrowse);
-    }, tr("Fit model checkpoint (.pt). Auto-populated from segment's model.pt symlink."));
-
     // -- Data input (zarr) — stacked: file browse (page 0) or dataset combo (page 1) --
     _dataInputStack = new QStackedWidget(content);
 
@@ -361,17 +339,6 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     _group->addRow(tr("Data:"), [&](QHBoxLayout* row) {
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data zarr (e.g. s5_cos.zarr) required by the fit optimizer."));
-
-    // -- Output directory --
-    _group->addRow(tr("Output:"), [&](QHBoxLayout* row) {
-        _outputEdit = new QLineEdit(content);
-        _outputEdit->setPlaceholderText(
-            tr("Output directory for tifxyz segments"));
-        _outputBrowse = new QToolButton(content);
-        _outputBrowse->setText(QStringLiteral("..."));
-        row->addWidget(_outputEdit, 1);
-        row->addWidget(_outputBrowse);
-    }, tr("Directory where re-exported tifxyz segments will be written."));
 
     // -- Profile dropdown --
     _group->addRow(tr("Profile:"), [&](QHBoxLayout* row) {
@@ -487,39 +454,6 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         _dataInputStack->setCurrentIndex(1);  // Show dataset combo
     });
 
-    // Python path
-    connect(_pythonEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        _fitPythonPath = text.trimmed();
-        writeSetting(QStringLiteral("fit_python_path"), _fitPythonPath);
-    });
-    connect(_pythonBrowse, &QToolButton::clicked, this, [this]() {
-        QString initial = _fitPythonPath.isEmpty()
-            ? QDir::homePath() : QFileInfo(_fitPythonPath).absolutePath();
-        QString file = QFileDialog::getOpenFileName(
-            this, tr("Select Python executable"), initial, tr("All Files (*)"));
-        if (!file.isEmpty()) {
-            _fitPythonPath = file;
-            _pythonEdit->setText(file);
-        }
-    });
-
-    // Model path
-    connect(_modelEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        _fitModelPath = text.trimmed();
-        writeSetting(QStringLiteral("fit_model_path"), _fitModelPath);
-    });
-    connect(_modelBrowse, &QToolButton::clicked, this, [this]() {
-        QString initial = _fitModelPath.isEmpty()
-            ? QDir::homePath() : QFileInfo(_fitModelPath).absolutePath();
-        QString file = QFileDialog::getOpenFileName(
-            this, tr("Select fit model checkpoint"), initial,
-            tr("PyTorch Checkpoint (*.pt *.pth);;All Files (*)"));
-        if (!file.isEmpty()) {
-            _fitModelPath = file;
-            _modelEdit->setText(file);
-        }
-    });
-
     // Data input
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _fitDataInputPath = text.trimmed();
@@ -533,22 +467,6 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         if (!path.isEmpty()) {
             _fitDataInputPath = path;
             _dataInputEdit->setText(path);
-        }
-    });
-
-    // Output dir
-    connect(_outputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        _fitOutputDir = text.trimmed();
-        writeSetting(QStringLiteral("fit_output_dir"), _fitOutputDir);
-    });
-    connect(_outputBrowse, &QToolButton::clicked, this, [this]() {
-        QString initial = _fitOutputDir.isEmpty()
-            ? QDir::homePath() : _fitOutputDir;
-        QString dir = QFileDialog::getExistingDirectory(
-            this, tr("Select output directory"), initial);
-        if (!dir.isEmpty()) {
-            _fitOutputDir = dir;
-            _outputEdit->setText(dir);
         }
     });
 
@@ -736,10 +654,7 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
 {
     _restoringSettings = true;
 
-    _fitPythonPath = settings.value(QStringLiteral("fit_python_path"), QString()).toString();
-    _fitModelPath = settings.value(QStringLiteral("fit_model_path"), QString()).toString();
     _fitDataInputPath = settings.value(QStringLiteral("fit_data_input_path"), QString()).toString();
-    _fitOutputDir = settings.value(QStringLiteral("fit_output_dir"), QString()).toString();
     _fitConfigText = settings.value(QStringLiteral("fit_config_text"), QString()).toString();
 
     _connectionMode = settings.value(QStringLiteral("fit_connection_mode"), 0).toInt();
@@ -788,21 +703,9 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
 
 void SegmentationFitOptimizerPanel::syncUiState(bool /*editingEnabled*/, bool optimizing)
 {
-    if (_pythonEdit) {
-        const QSignalBlocker b(_pythonEdit);
-        _pythonEdit->setText(_fitPythonPath);
-    }
-    if (_modelEdit) {
-        const QSignalBlocker b(_modelEdit);
-        _modelEdit->setText(_fitModelPath);
-    }
     if (_dataInputEdit) {
         const QSignalBlocker b(_dataInputEdit);
         _dataInputEdit->setText(_fitDataInputPath);
-    }
-    if (_outputEdit) {
-        const QSignalBlocker b(_outputEdit);
-        _outputEdit->setText(_fitOutputDir);
     }
     if (_configEdit && _configEdit->toPlainText() != _fitConfigText) {
         const QSignalBlocker b(_configEdit);
@@ -819,28 +722,6 @@ void SegmentationFitOptimizerPanel::syncUiState(bool /*editingEnabled*/, bool op
 // Setters
 // ---------------------------------------------------------------------------
 
-void SegmentationFitOptimizerPanel::setFitPythonPath(const QString& path)
-{
-    if (_fitPythonPath == path) return;
-    _fitPythonPath = path;
-    writeSetting(QStringLiteral("fit_python_path"), _fitPythonPath);
-    if (_pythonEdit) {
-        const QSignalBlocker b(_pythonEdit);
-        _pythonEdit->setText(path);
-    }
-}
-
-void SegmentationFitOptimizerPanel::setFitModelPath(const QString& path)
-{
-    if (_fitModelPath == path) return;
-    _fitModelPath = path;
-    writeSetting(QStringLiteral("fit_model_path"), _fitModelPath);
-    if (_modelEdit) {
-        const QSignalBlocker b(_modelEdit);
-        _modelEdit->setText(path);
-    }
-}
-
 void SegmentationFitOptimizerPanel::setFitDataInputPath(const QString& path)
 {
     if (_fitDataInputPath == path) return;
@@ -849,17 +730,6 @@ void SegmentationFitOptimizerPanel::setFitDataInputPath(const QString& path)
     if (_dataInputEdit) {
         const QSignalBlocker b(_dataInputEdit);
         _dataInputEdit->setText(path);
-    }
-}
-
-void SegmentationFitOptimizerPanel::setFitOutputDir(const QString& path)
-{
-    if (_fitOutputDir == path) return;
-    _fitOutputDir = path;
-    writeSetting(QStringLiteral("fit_output_dir"), _fitOutputDir);
-    if (_outputEdit) {
-        const QSignalBlocker b(_outputEdit);
-        _outputEdit->setText(path);
     }
 }
 
@@ -965,11 +835,10 @@ void SegmentationFitOptimizerPanel::updateConnectionWidgets()
 {
     bool external = (_connectionMode == 1);
 
-    // Show/hide python path row (internal) vs external widgets
-    if (_internalWidget) _internalWidget->setVisible(!external);
+    // Show/hide external widgets (discovery + host/port)
     if (_externalWidget) _externalWidget->setVisible(external);
 
-    // Reset data input stack when switching modes
+    // Reset data input stack when switching to internal
     if (!external) {
         if (_dataInputStack) _dataInputStack->setCurrentIndex(0);
     }

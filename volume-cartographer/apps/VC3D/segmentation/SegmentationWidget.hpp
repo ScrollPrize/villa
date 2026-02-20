@@ -164,16 +164,11 @@ public:
     void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
 
     // Fit optimizer getters — delegated to panel
-    [[nodiscard]] QString fitPythonPath() const;
-    [[nodiscard]] QString fitModelPath() const;
     [[nodiscard]] QString fitDataInputPath() const;
-    [[nodiscard]] QString fitOutputDir() const;
     [[nodiscard]] QString fitConfigText() const;
 
     // Fit optimizer setters
-    void setFitModelPath(const QString& path);
     void setFitDataInputPath(const QString& path);
-    void setFitOutputDir(const QString& path);
 
 signals:
     void editingModeChanged(bool enabled);
