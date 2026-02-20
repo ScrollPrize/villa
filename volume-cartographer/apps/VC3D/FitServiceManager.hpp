@@ -52,9 +52,11 @@ public:
 
     /**
      * Submit an optimization job.
-     * @param config  JSON body for POST /optimize  (model_input, output_dir, config).
+     * @param config  JSON body for POST /optimize.
+     * @param localOutputDir  Where to unpack results (external mode only).
      */
-    void startOptimization(const QJsonObject& config);
+    void startOptimization(const QJsonObject& config,
+                           const QString& localOutputDir = QString());
 
     /** Request cancellation of the running optimization. */
     void stopOptimization();
@@ -102,6 +104,9 @@ private:
     void handleStatusReply(QNetworkReply* reply);
     void handleOptimizeReply(QNetworkReply* reply);
 
+    /** Download results archive from external service and unpack. */
+    void downloadResults();
+
     std::unique_ptr<QProcess> _process;
     QNetworkAccessManager* _nam{nullptr};
     QTimer* _pollTimer{nullptr};
@@ -112,4 +117,5 @@ private:
     QString _lastError;
     bool _serviceReady{false};
     bool _optimizationRunning{false};
+    QString _localOutputDir;  // where to unpack results (external mode)
 };

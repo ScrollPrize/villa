@@ -165,6 +165,7 @@ class _JobState:
         self._error: str | None = None
         self._cancel = False
         self._output_dir: str | None = None
+        self._results_tmp: str | None = None  # temp dir to clean up after download
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -186,10 +187,11 @@ class _JobState:
             self._total_steps = total
             self._loss = loss
 
-    def set_finished(self, output_dir: str) -> None:
+    def set_finished(self, output_dir: str, results_tmp: str | None = None) -> None:
         with self._lock:
             self._state = "finished"
             self._output_dir = output_dir
+            self._results_tmp = results_tmp
 
     def set_error(self, msg: str) -> None:
         with self._lock:
@@ -198,10 +200,28 @@ class _JobState:
 
     def set_idle(self) -> None:
         with self._lock:
+            # Clean up any leftover results temp dir from previous run
+            if self._results_tmp:
+                import shutil
+                shutil.rmtree(self._results_tmp, ignore_errors=True)
             self._state = "idle"
             self._error = None
             self._cancel = False
             self._output_dir = None
+            self._results_tmp = None
+
+    @property
+    def results_tmp(self) -> str | None:
+        with self._lock:
+            return self._results_tmp
+
+    def clear_results(self) -> None:
+        """Clean up results temp dir after download."""
+        with self._lock:
+            if self._results_tmp:
+                import shutil
+                shutil.rmtree(self._results_tmp, ignore_errors=True)
+                self._results_tmp = None
 
     def request_cancel(self) -> None:
         with self._lock:
@@ -227,30 +247,48 @@ _job_thread: threading.Thread | None = None
 # ---------------------------------------------------------------------------
 
 def _run_optimization(body: dict[str, Any]) -> None:
-    """Run fit.py then fit2tifxyz.py based on the request body."""
+    """Run fit.py then fit2tifxyz.py based on the request body.
+
+    Supports two modes:
+      - Local (internal): model_input and output_dir are local paths.
+      - Remote (external): model_data contains base64-encoded model bytes,
+        output goes to a temp dir, caller downloads results via GET /results.
+    """
     global _job
+    import base64
+    import tempfile
 
     model_input = body.get("model_input")
+    model_data = body.get("model_data")  # base64-encoded model bytes
     model_output = body.get("model_output")
     data_input = body.get("data_input")
     output_dir = body.get("output_dir")
     config = body.get("config", {})
 
-    if not model_input:
-        _job.set_error("missing 'model_input'")
+    if not model_input and not model_data:
+        _job.set_error("missing 'model_input' or 'model_data'")
         return
     if not data_input:
         _job.set_error("missing 'data_input'")
         return
-    if not output_dir:
-        _job.set_error("missing 'output_dir'")
-        return
 
     try:
-        import tempfile
         # Use a temp directory for all intermediate files (config json,
         # model output, etc.) so nothing leaks into the volpkg paths dir.
         tmp_dir = tempfile.mkdtemp(prefix="fit_reopt_")
+
+        # Handle model_data (external/remote mode): decode and save to temp
+        if model_data:
+            model_bytes = base64.b64decode(model_data)
+            model_input = str(Path(tmp_dir) / "model_input.pt")
+            Path(model_input).write_bytes(model_bytes)
+            print(f"[fit-service] received model data ({len(model_bytes)} bytes)", flush=True)
+
+        # If no output_dir, create a temp dir for results (external mode)
+        results_tmp = None
+        if not output_dir:
+            results_tmp = tempfile.mkdtemp(prefix="fit_results_")
+            output_dir = results_tmp
 
         # model_output goes into temp dir
         if not model_output:
@@ -321,11 +359,11 @@ def _run_optimization(body: dict[str, Any]) -> None:
             export_argv.extend(["--output-name", str(output_name)])
         fit2tifxyz.main(export_argv)
 
-        # Clean up temp directory (config json, intermediate model, etc.)
+        # Clean up intermediate files (but keep results_tmp for download)
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        _job.set_finished(str(output_dir))
+        _job.set_finished(str(output_dir), results_tmp=results_tmp)
         print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
 
     except KeyboardInterrupt:
@@ -362,8 +400,44 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(_job.snapshot())
         elif self.path == "/datasets":
             self._send_json({"datasets": _list_datasets()})
+        elif self.path == "/results":
+            self._handle_results()
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _handle_results(self) -> None:
+        """Package finished optimization results as tar.gz and send them."""
+        import tarfile
+        import io
+
+        snap = _job.snapshot()
+        if snap["state"] != "finished":
+            self._send_json({"error": "no finished results available"}, 404)
+            return
+
+        output_dir = snap["output_dir"]
+        if not output_dir or not Path(output_dir).is_dir():
+            self._send_json({"error": "output directory not found"}, 404)
+            return
+
+        # Create tar.gz in memory.  Archive paths are relative to output_dir
+        # so the tar contains e.g. "winding_combined_v004.tifxyz/meta.json".
+        # Extracting in the local paths dir recreates the tifxyz subdirectory.
+        buf = io.BytesIO()
+        out_path = Path(output_dir)
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for child in sorted(out_path.iterdir()):
+                tar.add(str(child), arcname=child.name)
+
+        data = buf.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+        print(f"[fit-service] results downloaded ({len(data)} bytes)", flush=True)
+        _job.clear_results()
 
     def do_POST(self) -> None:  # noqa: N802
         global _job_thread

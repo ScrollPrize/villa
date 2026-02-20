@@ -377,12 +377,15 @@ void FitServiceManager::handleReadyReadStderr()
 // HTTP communication
 // ---------------------------------------------------------------------------
 
-void FitServiceManager::startOptimization(const QJsonObject& config)
+void FitServiceManager::startOptimization(const QJsonObject& config,
+                                           const QString& localOutputDir)
 {
     if (!isRunning()) {
         emit optimizationError(tr("Fit optimizer service is not running"));
         return;
     }
+
+    _localOutputDir = localOutputDir;
 
     QUrl url(QStringLiteral("%1/optimize").arg(baseUrl()));
     QNetworkRequest req(url);
@@ -468,8 +471,13 @@ void FitServiceManager::handleStatusReply(QNetworkReply* reply)
     } else if (state == "finished") {
         _optimizationRunning = false;
         _pollTimer->stop();
-        QString outputDir = obj["output_dir"].toString();
-        emit optimizationFinished(outputDir);
+        if (_isExternal && !_localOutputDir.isEmpty()) {
+            // External mode: download results archive and unpack locally
+            downloadResults();
+        } else {
+            QString outputDir = obj["output_dir"].toString();
+            emit optimizationFinished(outputDir);
+        }
     } else if (state == "error") {
         _optimizationRunning = false;
         _pollTimer->stop();
@@ -480,6 +488,65 @@ void FitServiceManager::handleStatusReply(QNetworkReply* reply)
         _optimizationRunning = false;
         _pollTimer->stop();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Results download (external mode)
+// ---------------------------------------------------------------------------
+
+void FitServiceManager::downloadResults()
+{
+    emit statusMessage(tr("Downloading results from external service..."));
+
+    QUrl url(QStringLiteral("%1/results").arg(baseUrl()));
+    QNetworkRequest req(url);
+
+    QNetworkReply* reply = _nam->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            emit optimizationError(
+                tr("Failed to download results: %1").arg(reply->errorString()));
+            return;
+        }
+
+        QByteArray data = reply->readAll();
+        std::cout << "[fit-optimizer] downloaded results archive ("
+                  << data.size() << " bytes)" << std::endl;
+
+        // Write tar.gz to a temp file, then extract into _localOutputDir
+        QString tarPath = _localOutputDir + QStringLiteral("/.fit_results.tar.gz");
+        QFile tarFile(tarPath);
+        if (!tarFile.open(QIODevice::WriteOnly)) {
+            emit optimizationError(tr("Cannot write temp file: %1").arg(tarPath));
+            return;
+        }
+        tarFile.write(data);
+        tarFile.close();
+
+        // Extract using tar
+        QProcess tar;
+        tar.setWorkingDirectory(_localOutputDir);
+        tar.start(QStringLiteral("tar"),
+                  {QStringLiteral("xzf"), tarPath});
+        if (!tar.waitForFinished(30000)) {
+            QFile::remove(tarPath);
+            emit optimizationError(tr("tar extraction timed out"));
+            return;
+        }
+        QFile::remove(tarPath);
+
+        if (tar.exitCode() != 0) {
+            QString err = QString::fromUtf8(tar.readAllStandardError());
+            emit optimizationError(tr("tar extraction failed: %1").arg(err));
+            return;
+        }
+
+        std::cout << "[fit-optimizer] results unpacked to "
+                  << _localOutputDir.toStdString() << std::endl;
+        emit optimizationFinished(_localOutputDir);
+    });
 }
 
 // ---------------------------------------------------------------------------

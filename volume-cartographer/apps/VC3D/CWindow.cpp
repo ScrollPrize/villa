@@ -1899,14 +1899,30 @@ void CWindow::CreateWidgets(void)
 
         // Build optimization request
         QJsonObject request;
-        request[QStringLiteral("model_input")] = modelPath;
-        // model_output left unset — service will use temp file
         request[QStringLiteral("data_input")] = dataInput;
-        request[QStringLiteral("output_dir")] = outputDir;
         request[QStringLiteral("single_segment")] = true;
         request[QStringLiteral("copy_model")] = true;
         if (!outputName.isEmpty()) {
             request[QStringLiteral("output_name")] = outputName;
+        }
+
+        if (mgr.isExternal()) {
+            // External mode: send model.pt as base64 data (no local paths)
+            QFile modelFile(modelPath);
+            if (!modelFile.open(QIODevice::ReadOnly)) {
+                auto msg = tr("Cannot read model file: %1").arg(modelPath);
+                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+            QByteArray modelBytes = modelFile.readAll();
+            modelFile.close();
+            request[QStringLiteral("model_data")] =
+                QString::fromLatin1(modelBytes.toBase64());
+        } else {
+            // Internal mode: send local paths directly
+            request[QStringLiteral("model_input")] = modelPath;
+            request[QStringLiteral("output_dir")] = outputDir;
         }
 
         // Parse config JSON from the editor
@@ -1918,7 +1934,7 @@ void CWindow::CreateWidgets(void)
             }
         }
 
-        mgr.startOptimization(request);
+        mgr.startOptimization(request, mgr.isExternal() ? outputDir : QString());
         statusBar()->showMessage(
             tr("Fit optimization started. Output: %1").arg(outputName), 3000);
     });
