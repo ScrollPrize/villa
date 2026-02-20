@@ -322,6 +322,132 @@ def run_preprocess(
 	)
 
 
+def run_integrate_directions(
+	*,
+	z_volume_path: str,
+	y_volume_path: str | None = None,
+	x_volume_path: str | None = None,
+	output_path: str,
+	batch_size: int = 32,
+) -> None:
+	"""Integrate dir channels from axis-y and axis-x volumes into the axis-z reference volume.
+
+	The z-volume shape is the reference. For each source (y/x) volume:
+	  - Z indices are mapped via ratio = z_step_eff / source_downscale (= raw step).
+	  - The 2D YX plane is resized with bilinear interpolation to match z-volume dims.
+	  - Only the sparse dimension actually changes size; the other is already identical.
+
+	Output channels: [cos, grad_mag, dir0_z, dir1_z, valid, dir0_y, dir1_y, dir0_x, dir1_x]
+	(y/x pairs only present if the corresponding volume is provided)
+	"""
+	import torch.nn.functional as F
+
+	z_vol = zarr.open(str(z_volume_path), mode="r")
+	z_shape = tuple(int(v) for v in z_vol.shape)
+	if len(z_shape) != 4 or z_shape[0] != 5:
+		raise ValueError(f"z-volume must have shape (5, Z, Y, X), got {z_shape}")
+	_, ref_z, ref_y, ref_x = z_shape
+
+	z_params = dict(z_vol.attrs.get("preprocess_params", {}))
+	z_step_eff = int(z_params.get("z_step_eff", 1))
+
+	# (axis_label, zarr handle, z-index ratio)
+	sources: list[tuple[str, zarr.Array, float]] = []
+	channel_names: list[str] = ["cos", "grad_mag", "dir0", "dir1", "valid"]
+
+	if y_volume_path:
+		y_vol = zarr.open(str(y_volume_path), mode="r")
+		y_params = dict(y_vol.attrs.get("preprocess_params", {}))
+		# Y-volume's Z dim uses downscale_xy (Z is a plane dim for axis=y)
+		y_ds = int(y_params.get("downscale_xy", 1))
+		sources.append(("y", y_vol, float(z_step_eff) / float(max(1, y_ds))))
+		channel_names.extend(["dir0_y", "dir1_y"])
+
+	if x_volume_path:
+		x_vol = zarr.open(str(x_volume_path), mode="r")
+		x_params = dict(x_vol.attrs.get("preprocess_params", {}))
+		x_ds = int(x_params.get("downscale_xy", 1))
+		sources.append(("x", x_vol, float(z_step_eff) / float(max(1, x_ds))))
+		channel_names.extend(["dir0_x", "dir1_x"])
+
+	if not sources:
+		raise ValueError("at least one of y_volume_path or x_volume_path must be provided")
+
+	n_out_ch = len(channel_names)
+	z_chunks = tuple(int(v) for v in z_vol.chunks)
+	out_chunks = (1,) + z_chunks[1:]
+
+	out = zarr.open(
+		str(output_path),
+		mode="w",
+		shape=(n_out_ch, ref_z, ref_y, ref_x),
+		chunks=out_chunks,
+		dtype=np.uint8,
+		fill_value=0,
+		dimension_separator="/",
+	)
+	out_params = dict(z_params)
+	out_params["channels"] = channel_names
+	out.attrs["preprocess_params"] = out_params
+
+	print(f"[integrate_directions] z_volume={z_volume_path} shape={z_shape}")
+	for ax_label, vol, z_ratio in sources:
+		print(f"[integrate_directions] {ax_label}_volume shape={tuple(int(v) for v in vol.shape)} z_ratio={z_ratio:.1f}")
+	print(f"[integrate_directions] -> {output_path} shape=({n_out_ch}, {ref_z}, {ref_y}, {ref_x})")
+
+	t0 = time.time()
+	for zi_start in range(0, ref_z, batch_size):
+		zi_end = min(ref_z, zi_start + batch_size)
+
+		# Copy all 5 z-volume channels for this batch
+		out[:5, zi_start:zi_end] = np.asarray(z_vol[:5, zi_start:zi_end])
+
+		ch_off = 5
+		for ax_label, vol, z_ratio in sources:
+			vol_nz = int(vol.shape[1])
+			vol_ny = int(vol.shape[2])
+			vol_nx = int(vol.shape[3])
+
+			# Map z-vol Z indices to source Z indices
+			src_indices = [min(int(round(zi * z_ratio)), vol_nz - 1) for zi in range(zi_start, zi_end)]
+
+			# Read dir0 (ch 2) and dir1 (ch 3) for each source Z index
+			slices = []
+			for sj in src_indices:
+				slices.append(np.asarray(vol[2:4, sj]))  # (2, Yv, Xv)
+			combined = np.stack(slices).astype(np.float32)  # (batch, 2, Yv, Xv)
+
+			# Resize to (ref_y, ref_x) via bilinear interpolation
+			if vol_ny != ref_y or vol_nx != ref_x:
+				combined_t = torch.from_numpy(combined)
+				resized_t = F.interpolate(combined_t, size=(ref_y, ref_x), mode="bilinear", align_corners=False)
+				combined = resized_t.numpy()
+
+			out[ch_off, zi_start:zi_end] = np.clip(combined[:, 0], 0, 255).astype(np.uint8)
+			out[ch_off + 1, zi_start:zi_end] = np.clip(combined[:, 1], 0, 255).astype(np.uint8)
+			ch_off += 2
+
+		elapsed = max(1e-6, time.time() - t0)
+		per = elapsed / max(1, zi_end)
+		eta = per * max(0, ref_z - zi_end)
+		bar_w = 30
+		fill = int(round(float(zi_end) / float(max(1, ref_z)) * bar_w))
+		bar = "#" * fill + "-" * (bar_w - fill)
+		print(
+			f"\r[integrate_directions] [{bar}] {zi_end}/{ref_z} "
+			f"({100.0 * zi_end / max(1, ref_z):.1f}%) "
+			f"eta {int(eta // 60):02d}:{int(eta % 60):02d}",
+			end="", flush=True,
+		)
+
+	print("", flush=True)
+	print(f"[integrate_directions] done in {time.time() - t0:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main(argv: list[str] | None = None) -> int:
 	p = argparse.ArgumentParser(
 		description="Run tiled UNet cos inference on an OME-Zarr volume and write 8-bit OME-Zarr."
@@ -368,5 +494,32 @@ def main(argv: list[str] | None = None) -> int:
 	return 0
 
 
+def main_integrate(argv: list[str] | None = None) -> int:
+	p = argparse.ArgumentParser(
+		description="Integrate direction channels from axis-y / axis-x preprocessed volumes into the axis-z reference volume."
+	)
+	p.add_argument("--z-volume", required=True, help="Axis-z preprocessed zarr (reference shape).")
+	p.add_argument("--y-volume", default=None, help="Axis-y preprocessed zarr (optional).")
+	p.add_argument("--x-volume", default=None, help="Axis-x preprocessed zarr (optional).")
+	p.add_argument("--output", required=True, help="Output zarr path.")
+	p.add_argument("--batch-size", type=int, default=32, help="Z-slices per batch for resize (default: 32).")
+	args = p.parse_args(argv)
+
+	if args.y_volume is None and args.x_volume is None:
+		p.error("at least one of --y-volume or --x-volume must be provided")
+
+	run_integrate_directions(
+		z_volume_path=str(args.z_volume),
+		y_volume_path=str(args.y_volume) if args.y_volume else None,
+		x_volume_path=str(args.x_volume) if args.x_volume else None,
+		output_path=str(args.output),
+		batch_size=int(args.batch_size),
+	)
+	return 0
+
+
 if __name__ == "__main__":
+	import sys
+	if len(sys.argv) > 1 and sys.argv[1] == "integrate":
+		raise SystemExit(main_integrate(sys.argv[2:]))
 	raise SystemExit(main())
