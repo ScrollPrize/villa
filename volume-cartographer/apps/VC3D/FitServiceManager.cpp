@@ -625,10 +625,29 @@ QJsonArray FitServiceManager::discoverServices()
             }
             seen.insert(key);
 
+            // Unescape avahi parsable \NNN octal escape sequences
+            auto unescapeAvahi = [](const QString& s) -> QString {
+                QString out;
+                out.reserve(s.size());
+                for (int i = 0; i < s.size(); ++i) {
+                    if (s[i] == '\\' && i + 3 < s.size()) {
+                        bool ok;
+                        int code = s.mid(i + 1, 3).toInt(&ok, 10);
+                        if (ok && code >= 0 && code <= 127) {
+                            out.append(QChar(code));
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    out.append(s[i]);
+                }
+                return out;
+            };
+
             QJsonObject obj;
             obj[QStringLiteral("host")] = host;
             obj[QStringLiteral("port")] = port;
-            obj[QStringLiteral("name")] = fields[3];
+            obj[QStringLiteral("name")] = unescapeAvahi(fields[3]);
 
             // Parse TXT records (field 9+, space-separated, each quoted)
             if (fields.size() > 9) {

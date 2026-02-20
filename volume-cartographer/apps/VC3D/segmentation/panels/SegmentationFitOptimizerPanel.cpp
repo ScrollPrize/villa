@@ -5,6 +5,8 @@
 #include "elements/CollapsibleSettingsGroup.hpp"
 
 #include <QComboBox>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrent>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -638,6 +640,34 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setVisible(true);
         }
     });
+
+    // Run service discovery once on startup (in background thread)
+    auto* watcher = new QFutureWatcher<QJsonArray>(this);
+    connect(watcher, &QFutureWatcher<QJsonArray>::finished, this, [this, watcher]() {
+        QJsonArray services = watcher->result();
+        watcher->deleteLater();
+        if (!_discoveryCombo) return;
+        _discoveryCombo->clear();
+        _discoveryCombo->addItem(tr("(manual entry)"));
+        for (const auto& val : services) {
+            QJsonObject svc = val.toObject();
+            QString host = svc[QStringLiteral("host")].toString();
+            int port = svc[QStringLiteral("port")].toInt();
+            QString label;
+            if (svc.contains(QStringLiteral("name"))) {
+                label = QStringLiteral("%1 (%2:%3)")
+                    .arg(svc[QStringLiteral("name")].toString())
+                    .arg(host).arg(port);
+            } else {
+                int pid = svc[QStringLiteral("pid")].toInt();
+                label = QStringLiteral("%1:%2 (pid %3)").arg(host).arg(port).arg(pid);
+            }
+            _discoveryCombo->addItem(label, QJsonDocument(svc).toJson(QJsonDocument::Compact));
+        }
+    });
+    watcher->setFuture(QtConcurrent::run([]() {
+        return FitServiceManager::discoverServices();
+    }));
 }
 
 // ---------------------------------------------------------------------------
